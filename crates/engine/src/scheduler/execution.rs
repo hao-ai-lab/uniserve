@@ -159,8 +159,7 @@ impl Scheduler {
             .filter_map(|(index, id)| {
                 self.media_state(*id).and_then(|state| {
                     let inflight = self.inflight_len(*id);
-                    (!state.cancelled
-                        && state.failure.is_none()
+                    (!state.terminal_intent.is_terminal()
                         && inflight < max_unresolved
                         && self.media_planner.next(state.projected).is_some())
                     .then_some((inflight, index, *id))
@@ -212,23 +211,23 @@ impl Scheduler {
             } else {
                 vec![self.media_completion_product(request_key, op_id)]
             };
-            let operation = Operation::registered(
+            let operation = Operation::registered(uniserve_worker_ipc::OperationSpec {
                 request_key,
                 op_id,
                 parent,
                 work,
-                RouteId(0),
-                uniserve_worker_ipc::Domain::Flow,
-                Bounds {
+                route: RouteId(0),
+                domain: uniserve_worker_ipc::Domain::Flow,
+                bounds: Bounds {
                     max_points: 1,
                     ..Bounds::default()
                 },
-                Vec::new(),
+                inputs: Vec::new(),
                 outputs,
                 predicate,
-                None,
-                0,
-            );
+                rng: None,
+                control_seq: 0,
+            });
             if matches!(
                 quantum,
                 MediaQuantum::Transition | MediaQuantum::Flow { .. }
@@ -450,15 +449,15 @@ impl Scheduler {
         let state = self.running.get(&id)?;
         let cursor = self.projected_cursor(id)?;
         let mut projected = ProjectedBranch {
-            phase: state.lifecycle.phase,
-            image_id: state.image_gen.image_id,
-            conditioning_position: state.image_gen.cond_pos,
-            steps_done: state.image_gen.steps_done,
-            conditioning: state.image_gen.conditioning.clone(),
-            latent: state.image_gen.latent.clone(),
-            feedback_source: state.feedback.source_product.clone(),
-            feedback_feature: state.feedback.encoded_product.clone(),
-            feedback_step: state.feedback.ingest_step,
+            phase: state.cursor.lifecycle.phase,
+            image_id: state.cursor.image_gen.image_id,
+            conditioning_position: state.cursor.image_gen.cond_pos,
+            steps_done: state.cursor.image_gen.steps_done,
+            conditioning: state.cursor.image_gen.conditioning.clone(),
+            latent: state.cursor.image_gen.latent.clone(),
+            feedback_source: state.cursor.feedback.source_product.clone(),
+            feedback_feature: state.cursor.feedback.encoded_product.clone(),
+            feedback_step: state.cursor.feedback.ingest_step,
             chainable: true,
         };
         if projected.phase == Phase::DenoiseGen && projected.steps_done >= state.req.image.steps {
@@ -580,7 +579,7 @@ impl Scheduler {
         }
         if projected.phase == Phase::Prefill
             && cursor.prompt_cursor >= state.context.prompt_ids.len() as u32
-            && state.ingest.mm_cursor >= state.context.images.len()
+            && state.cursor.ingest.mm_cursor >= state.context.images.len()
         {
             projected.phase = Phase::DecodeUnd;
         }
@@ -808,7 +807,7 @@ impl Scheduler {
         };
         if queue.len() >= self.executor.pipeline_depth().max(1)
             || queue.len() >= self.caps.max_unresolved_window as usize
-            || state.cancelled
+            || state.terminal_intent.is_terminal()
             || self.pending_finishes.contains_key(&id)
             || self.custom_logits_processors > 0
             || !Self::device_token_relay_eligible(state)
@@ -855,10 +854,14 @@ impl Scheduler {
                 return self
                     .projected_inflight_variant(id)
                     .is_some_and(|variant| variant == ForwardMode::TokenDecode)
-                    && state.und.tokens_emitted.saturating_add(1) < state.req.max_und_tokens;
+                    && state.cursor.und.tokens_emitted.saturating_add(1)
+                        < state.req.max_und_tokens;
             }
-            if !matches!(state.lifecycle.phase, Phase::Prefill | Phase::DecodeUnd)
-                || (state.lifecycle.phase == Phase::Prefill && state.starts_gen_after_context())
+            if !matches!(
+                state.cursor.lifecycle.phase,
+                Phase::Prefill | Phase::DecodeUnd
+            ) || (state.cursor.lifecycle.phase == Phase::Prefill
+                && state.starts_gen_after_context())
                 || queue.iter().any(|op| {
                     !matches!(
                         op.operation.work,
@@ -872,8 +875,9 @@ impl Scheduler {
                 return false;
             };
             return projected.prompt_cursor as usize >= state.effective_prompt().len()
-                && state.ingest.mm_cursor >= state.context.images.len()
-                && state.und.tokens_emitted.saturating_add(queue.len()) < state.req.max_und_tokens;
+                && state.cursor.ingest.mm_cursor >= state.context.images.len()
+                && state.cursor.und.tokens_emitted.saturating_add(queue.len())
+                    < state.req.max_und_tokens;
         }
         predecessor
             .operation
@@ -892,7 +896,7 @@ impl Scheduler {
         let state = self.running.get(&id)?;
         let cursor = self.projected_cursor(id)?;
         if cursor.prompt_cursor < state.context.prompt_ids.len() as u32
-            || state.ingest.mm_cursor < state.context.images.len()
+            || state.cursor.ingest.mm_cursor < state.context.images.len()
         {
             return None;
         }
@@ -944,9 +948,9 @@ impl Scheduler {
     /// check; a continuing request therefore names the same sampled token.
     pub(super) fn can_reuse_resolved_token_product(&self, id: RequestId) -> bool {
         self.running.get(&id).is_some_and(|state| {
-            state.resources.worker_registered
+            state.cursor.resources.worker_registered
                 && self.custom_logits_processors == 0
-                && state.und.tokens_emitted > 0
+                && state.cursor.und.tokens_emitted > 0
                 && state
                     .latest_device_version
                     .as_ref()
@@ -955,8 +959,8 @@ impl Scheduler {
                             .device_products_reachable(resident.producer, ForwardMode::TokenDecode)
                     })
                 && state.is_replayable_text()
-                && state.lifecycle.phase == Phase::DecodeUnd
-                && !state.ingest.round_closing
+                && state.cursor.lifecycle.phase == Phase::DecodeUnd
+                && !state.cursor.ingest.round_closing
                 && (!state.req.behavior.gen_output
                     || state.req.policy.trigger.direct_token().is_some())
         })
@@ -1022,7 +1026,7 @@ impl Scheduler {
             let Some(state) = self.running.get_mut(&id) else {
                 continue;
             };
-            if state.cancelled
+            if state.terminal_intent.is_terminal()
                 || state.cpu_pending.is_some()
                 || state.cpu_masks.is_some()
                 || self.pending_finishes.contains_key(&id)
@@ -1038,9 +1042,9 @@ impl Scheduler {
             };
             let task = CpuTask {
                 key,
-                n_generated: state.und.tokens_emitted,
+                n_generated: state.cursor.und.tokens_emitted,
                 eos,
-                generated: state.replay.generated_ids.clone(),
+                generated: state.cursor.replay.generated_ids.clone(),
                 sampling: state.req.sampling.clone(),
                 pipeline,
             };
@@ -1303,8 +1307,9 @@ impl Scheduler {
                 "op_id": op_id,
             }));
             if let Some(state) = self.media_state_mut(id) {
-                state.failure = Some("worker returned an unknown media operation".to_string());
-                state.cancelled = true;
+                state.terminal_intent = MediaTerminalIntent::Failure(
+                    "worker returned an unknown media operation".to_string(),
+                );
             } else if self.running.contains_key(&id) {
                 self.finish(id, FinishReason::Error);
             }
@@ -1332,7 +1337,7 @@ impl Scheduler {
         let Some(state) = self.media_state(id) else {
             return;
         };
-        let already_failed = state.failure.is_some();
+        let already_failed = matches!(state.terminal_intent, MediaTerminalIntent::Failure(_));
         if !already_failed {
             let valid = record.status == OpStatus::Ok
                 && record.request_key == operation.request_key
@@ -1340,8 +1345,8 @@ impl Scheduler {
                 && (!operation.advances_state || record.selected_point > 0);
             if !valid {
                 if let Some(state) = self.media_state_mut(id) {
-                    state.failure = Some("media worker operation failed".to_string());
-                    state.cancelled = true;
+                    state.terminal_intent =
+                        MediaTerminalIntent::Failure("media worker operation failed".to_string());
                 }
             } else if let Some(state) = self.media_state_mut(id) {
                 state.committed = cursor_after;
@@ -1362,9 +1367,16 @@ impl Scheduler {
             if self.has_inflight(id) {
                 return None;
             }
-            if let Some(message) = state.failure.clone() {
-                Some((MediaEvent::Failed { message }, CloseReason::Error))
-            } else if state.cancelled || state.event_tx.is_closed() {
+            if let MediaTerminalIntent::Failure(message) = &state.terminal_intent {
+                Some((
+                    MediaEvent::Failed {
+                        message: message.clone(),
+                    },
+                    CloseReason::Error,
+                ))
+            } else if matches!(state.terminal_intent, MediaTerminalIntent::Cancel)
+                || state.event_tx.is_closed()
+            {
                 Some((MediaEvent::Aborted, CloseReason::Cancelled))
             } else if state.committed.materialized {
                 let event = match std::fs::metadata(&state.request.output_path) {
@@ -1753,9 +1765,9 @@ impl Scheduler {
                         "op_id": op_id,
                     }));
                     if let Some(state) = self.media_state_mut(id) {
-                        state.failure =
-                            Some("worker returned an out-of-order media operation".to_string());
-                        state.cancelled = true;
+                        state.terminal_intent = MediaTerminalIntent::Failure(
+                            "worker returned an out-of-order media operation".to_string(),
+                        );
                     } else if self.running.contains_key(&id) {
                         self.finish(id, FinishReason::Error);
                     }
@@ -1902,7 +1914,10 @@ impl Scheduler {
                         self.release_products(completed_predicates);
                     }
                 }
-                let semantic_blocked = self.running.get(&id).is_some_and(|state| state.cancelled)
+                let semantic_blocked = self
+                    .running
+                    .get(&id)
+                    .is_some_and(|state| state.terminal_intent.is_terminal())
                     || self.pending_finishes.contains_key(&id);
                 if semantic_blocked {
                     self.release_transition_resources(id, &apply);
@@ -2056,8 +2071,11 @@ impl Scheduler {
                     .map_or(0, |state| state.public_token_seq);
                 if record.status == OpStatus::Predicated {
                     if let Some(state) = self.running.get_mut(&id) {
-                        state.resources.blocks_sent =
-                            state.resources.blocks_sent.saturating_sub(apply.new_blocks);
+                        state.cursor.resources.blocks_sent = state
+                            .cursor
+                            .resources
+                            .blocks_sent
+                            .saturating_sub(apply.new_blocks);
                     }
                     let unused_products = operation.outputs.to_vec();
                     self.release_products(unused_products);
@@ -2164,17 +2182,17 @@ impl Scheduler {
                 {
                     progress_ops.push(json!({
                         "request_id": id.0,
-                        "phase": phase_str(st.lifecycle.phase),
-                        "generated_tokens": st.und.tokens_emitted,
-                        "images_done": st.image_gen.images_done,
-                        "image_id": st.image_gen.image_id,
-                        "steps_done": st.image_gen.steps_done,
-                        "pos": st.und.logical_pos,
-                        "kvlen": st.und.physical_kv_len,
-                        "next_token": st.und.next_token,
-                        "text_since_image": st.und.text_since_image,
-                        "gen_branch_pending": st.image_gen.branch_pending,
-                        "context_round_closing": st.ingest.round_closing,
+                        "phase": phase_str(st.cursor.lifecycle.phase),
+                        "generated_tokens": st.cursor.und.tokens_emitted,
+                        "images_done": st.cursor.image_gen.images_done,
+                        "image_id": st.cursor.image_gen.image_id,
+                        "steps_done": st.cursor.image_gen.steps_done,
+                        "pos": st.cursor.und.logical_pos,
+                        "kvlen": st.cursor.und.physical_kv_len,
+                        "next_token": st.cursor.und.next_token,
+                        "text_since_image": st.cursor.und.text_since_image,
+                        "gen_branch_pending": st.cursor.image_gen.branch_pending,
+                        "context_round_closing": st.cursor.ingest.round_closing,
                     }));
                 }
             }

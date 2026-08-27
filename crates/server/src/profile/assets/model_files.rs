@@ -33,12 +33,11 @@ impl ResolvedModelFiles {
 }
 
 fn resolve_local_model_files(model_dir: &Path) -> Result<ResolvedModelFiles> {
-    let tokenizer_path = local_file_if_exists(model_dir, "tokenizer.json").ok_or_else(|| {
-        Error::message(format!(
-            "local model directory '{}' does not contain tokenizer.json",
-            model_dir.display()
-        ))
-    })?;
+    let tokenizer_path =
+        local_file_if_exists(model_dir, "tokenizer.json").ok_or_else(|| Error::MissingFile {
+            model: model_dir.display().to_string(),
+            file: "tokenizer.json",
+        })?;
     Ok(ResolvedModelFiles {
         tokenizer_path,
         tokenizer_config_path: local_file_if_exists(model_dir, "tokenizer_config.json"),
@@ -50,13 +49,11 @@ fn resolve_local_model_files(model_dir: &Path) -> Result<ResolvedModelFiles> {
 }
 
 async fn resolve_remote_model_files(model_id: &str) -> Result<ResolvedModelFiles> {
-    let api = build_api().map_err(|error| Error::message(error.to_report_string()))?;
+    let api = build_api(model_id)?;
     let repo = api.model(model_id.to_string());
-    let info = repo.info().await.map_err(|error| {
-        Error::message(format!(
-            "failed to fetch model '{model_id}': {}",
-            error.as_report()
-        ))
+    let info = repo.info().await.map_err(|error| Error::Remote {
+        model: model_id.to_owned(),
+        message: error.as_report().to_string(),
     })?;
     let siblings = info
         .siblings
@@ -64,9 +61,10 @@ async fn resolve_remote_model_files(model_id: &str) -> Result<ResolvedModelFiles
         .map(|sibling| sibling.rfilename.as_str())
         .collect::<std::collections::BTreeSet<_>>();
     if !siblings.contains("tokenizer.json") {
-        return Err(Error::message(format!(
-            "model '{model_id}' does not expose tokenizer.json on Hugging Face"
-        )));
+        return Err(Error::MissingFile {
+            model: model_id.to_owned(),
+            file: "tokenizer.json",
+        });
     }
     let tokenizer_path = download_known_file(&repo, model_id, "tokenizer.json").await?;
     let tokenizer_config_path =
@@ -103,7 +101,7 @@ fn resolve_cached_model_files(model_id: &str) -> Result<Option<ResolvedModelFile
     let model_dir = tokenizer_path
         .parent()
         .ok_or_else(|| {
-            Error::message("resolved tokenizer file has no parent directory".to_string())
+            Error::invalid("resolved tokenizer file has no parent directory".to_string())
         })?
         .to_path_buf();
     let config_path = match cache_repo.get("config.json") {
@@ -135,22 +133,23 @@ async fn download_if_present(
 }
 
 async fn download_known_file(repo: &ApiRepo, model_id: &str, filename: &str) -> Result<PathBuf> {
-    repo.get(filename).await.map_err(|error| {
-        Error::message(format!(
-            "failed to download '{filename}' for model '{model_id}': {}",
-            error.as_report()
-        ))
+    repo.get(filename).await.map_err(|error| Error::Remote {
+        model: model_id.to_owned(),
+        message: format!("failed to download '{filename}': {}", error.as_report()),
     })
 }
 
-fn build_api() -> anyhow::Result<Api> {
+fn build_api(model_id: &str) -> Result<Api> {
     let mut builder = ApiBuilder::from_env().with_progress(true);
     if let Ok(token) = std::env::var(HF_TOKEN_ENV)
         && !token.is_empty()
     {
         builder = builder.with_token(Some(token));
     }
-    Ok(builder.build()?)
+    builder.build().map_err(|error| Error::Remote {
+        model: model_id.to_owned(),
+        message: error.to_report_string(),
+    })
 }
 
 fn local_file_if_exists(dir: &Path, filename: &str) -> Option<PathBuf> {

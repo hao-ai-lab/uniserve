@@ -103,16 +103,16 @@ fn generation_request(
         max_cfg_branches: 3,
         encoder_cache_entries: 256,
     };
-    let resources = GenerationResourceBounds::conservative(
-        &context,
-        &[],
-        &behavior,
-        &policy,
-        &image,
+    let resources = GenerationResourceBounds::conservative(uniserve_core::GenerationResourceSpec {
+        context: &context,
+        negative_context: &[],
+        behavior: &behavior,
+        policy: &policy,
+        image: &image,
         max_und_tokens,
-        &cache,
-        &capabilities,
-    )
+        cache: &cache,
+        capabilities: &capabilities,
+    })
     .expect("bounded simulation request");
     GenerationRequest {
         request_id,

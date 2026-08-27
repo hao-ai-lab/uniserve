@@ -2,20 +2,17 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
-use std::sync::Arc;
-
-mod client;
 mod error;
 pub mod generation;
 mod in_process;
 pub mod media;
 pub mod metrics;
 
-pub use client::{EngineStatus, StreamCancelCause, StreamControl, StreamControlRequest};
 pub use error::{Error, Result};
-pub use generation::{GenerationEventStream, GenerationSubmission};
 pub use in_process::EngineClient;
-pub use media::{MediaEventStream, MediaSubmission};
+pub use media::MediaSubmission;
+pub use uniserve_engine::MediaEventRx;
+pub use uniserve_engine::StreamCancelCause;
 
 impl EngineClient {
     pub fn snapshot(&self) -> EngineSnapshot {
@@ -25,19 +22,20 @@ impl EngineClient {
             max_model_len: self.max_model_len(),
             model_dtype: self.model_dtype(),
             generation_capabilities: self.generation_capabilities(),
+            sampling_controls: if self.supports_token_sampling() {
+                crate::serving::ServedSamplingControl::ALL.to_vec()
+            } else {
+                Vec::new()
+            },
         }
     }
 
-    pub fn status(self: &Arc<Self>) -> EngineStatus {
-        EngineStatus::new(self)
-    }
-
     pub async fn cancel_request(&self, request_id: &str) -> Result<()> {
-        self.cancel(&[request_id.to_string()]).await
+        self.cancel(std::iter::once(request_id)).await
     }
 
     pub async fn abort_request(&self, request_id: &str) -> Result<()> {
-        self.abort(&[request_id.to_string()]).await
+        self.abort(std::iter::once(request_id)).await
     }
 }
 
@@ -49,4 +47,5 @@ pub struct EngineSnapshot {
     pub max_model_len: u32,
     pub model_dtype: uniserve_core::ModelDtype,
     pub generation_capabilities: uniserve_core::GenerationRuntimeCapabilities,
+    pub sampling_controls: Vec<crate::serving::ServedSamplingControl>,
 }

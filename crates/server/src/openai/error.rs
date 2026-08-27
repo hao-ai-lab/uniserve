@@ -126,14 +126,14 @@ pub fn serve_error_to_api(error: ServeError) -> ApiError {
         | ServeError::ContextCapacityExceeded { .. }
         | ServeError::DuplicateRequestId { .. }
         | ServeError::Tokenize { .. }) => ApiError::invalid_request(error.to_string(), None),
-        ServeError::ModelResolution(message) => {
-            ApiError::server_error(format!("model resolution error: {message}"))
+        ServeError::ModelResolution(source) => {
+            ApiError::server_error(format!("model resolution error: {source}"))
         }
-        ServeError::Engine(message) => {
-            ApiError::server_error(format!("engine runtime error: {message}"))
+        ServeError::Engine(source) => {
+            ApiError::server_error(format!("engine runtime error: {source}"))
         }
-        ServeError::OutputProcessing { message, .. } => {
-            ApiError::server_error(format!("output processing error: {message}"))
+        ServeError::OutputProcessing { source, .. } => {
+            ApiError::server_error(format!("output processing error: {source}"))
         }
     }
 }

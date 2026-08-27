@@ -7,8 +7,7 @@ use crate::U64Gauge;
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct ServingRequestLabels {
     pub model_name: String,
-    pub profile_id: String,
-    pub description_id: String,
+    pub description: String,
     pub state: &'static str,
 }
 
@@ -26,16 +25,14 @@ impl ServingMetrics {
     pub fn set_request_states(
         &self,
         model_name: &str,
-        profile_id: &str,
-        description_id: &str,
+        description: &str,
         states: impl IntoIterator<Item = (&'static str, u64)>,
     ) {
         for (state, value) in states {
             self.requests
                 .get_or_create(&ServingRequestLabels {
                     model_name: model_name.to_string(),
-                    profile_id: profile_id.to_string(),
-                    description_id: description_id.to_string(),
+                    description: description.to_string(),
                     state,
                 })
                 .set(value);
@@ -52,7 +49,6 @@ mod tests {
         let metrics = Metrics::new();
         metrics.serving.set_request_states(
             "served-model",
-            "profile",
             "description",
             [("active", 2), ("finished", 7)],
         );

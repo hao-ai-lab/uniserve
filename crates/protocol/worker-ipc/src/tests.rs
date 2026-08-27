@@ -1,12 +1,14 @@
 //! Protocol round trips, canonical identity, and descriptor validation.
 
-use uniserve_core::{BlockId, KvGroupKind, RequestId};
+use std::collections::BTreeMap;
+
+use uniserve_core::{BlockId, CfgRenorm, Digest, KvGroupKind, ModelDtype, RequestId};
 
 use super::*;
 use crate::codec::{decode_request, decode_response, encode_request, encode_response};
 
-fn digest_string(seed: u8) -> String {
-    format!("{seed:02x}").repeat(32)
+fn digest_string(seed: u8) -> Digest {
+    Digest::try_from(format!("{seed:02x}").repeat(32)).unwrap()
 }
 
 fn request_key() -> RequestKey {
@@ -94,54 +96,54 @@ fn continuation_product(op: OpId) -> ProductRef {
 }
 
 fn token_decode_operation() -> Operation {
-    Operation::registered(
-        request_key(),
-        OpId(11),
-        fixed_parent(),
-        ForwardMode::TokenDecode,
-        RouteId(1),
-        Domain::Decode,
-        Bounds {
+    Operation::registered(OperationSpec {
+        request_key: request_key(),
+        op_id: OpId(11),
+        parent: fixed_parent(),
+        work: ForwardMode::TokenDecode,
+        route: RouteId(1),
+        domain: Domain::Decode,
+        bounds: Bounds {
             max_points: 1,
             max_tokens: 1,
             max_kv_pages: 1,
             ..Bounds::default()
         },
-        Vec::new(),
-        vec![
+        inputs: Vec::new(),
+        outputs: vec![
             output_product(OpId(11)),
             selected_point_product(OpId(11)),
             accepted_span_product(OpId(11)),
             continuation_product(OpId(11)),
         ],
-        None,
-        Some(Rng {
+        predicate: None,
+        rng: Some(Rng {
             seed: 99,
             semantic_index_base: 4,
             draw_layout: DrawLayout::TargetSampling,
         }),
-        0,
-    )
+        control_seq: 0,
+    })
 }
 
 fn operation_for(work: ForwardMode, op_id: OpId, advances: bool) -> Operation {
-    Operation::registered(
-        request_key(),
+    Operation::registered(OperationSpec {
+        request_key: request_key(),
         op_id,
-        fixed_parent(),
+        parent: fixed_parent(),
         work,
-        RouteId(1),
-        work.domain(),
-        Bounds {
+        route: RouteId(1),
+        domain: work.domain(),
+        bounds: Bounds {
             max_points: if advances { 1 } else { 0 },
             ..Bounds::default()
         },
-        Vec::new(),
-        Vec::new(),
-        None,
-        None,
-        0,
-    )
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        predicate: None,
+        rng: None,
+        control_seq: 0,
+    })
 }
 
 fn completion_record() -> ModelOutput {
@@ -190,7 +192,7 @@ fn admission() -> Admission {
 fn execute_round_trip(batch: Batch) -> Batch {
     let request = WorkerRequest::execute(batch);
     let decoded = decode_request(&encode_request(&request).unwrap()).unwrap();
-    decoded.batch.unwrap()
+    decoded.batch().unwrap().clone()
 }
 
 fn partitions_for_operations(operations: Vec<Operation>) -> Vec<BatchPartition> {
@@ -357,23 +359,23 @@ fn version_ref_device_point_round_trips() {
             producer_plan_digest: digest_string(0xcc),
         },
     };
-    let operation = Operation::registered(
-        request_key(),
-        OpId(12),
-        device_parent.clone(),
-        ForwardMode::TokenDecode,
-        RouteId(1),
-        Domain::Decode,
-        Bounds {
+    let operation = Operation::registered(OperationSpec {
+        request_key: request_key(),
+        op_id: OpId(12),
+        parent: device_parent.clone(),
+        work: ForwardMode::TokenDecode,
+        route: RouteId(1),
+        domain: Domain::Decode,
+        bounds: Bounds {
             max_points: 1,
             ..Bounds::default()
         },
-        Vec::new(),
-        vec![output_product(OpId(12))],
-        None,
-        None,
-        0,
-    );
+        inputs: Vec::new(),
+        outputs: vec![output_product(OpId(12))],
+        predicate: None,
+        rng: None,
+        control_seq: 0,
+    });
     let batch = execute_round_trip(batch_with_operations(2, Vec::new(), vec![operation]));
     assert_eq!(batch.operations().next().unwrap().parent, device_parent);
 }
@@ -414,7 +416,7 @@ fn completion_report_round_trips_records_and_product_payloads() {
     );
     let response = WorkerResponse::completion_report(report.clone());
     let decoded = decode_response(&encode_response(&response).unwrap()).unwrap();
-    assert_eq!(decoded.completion_report.unwrap(), report);
+    assert_eq!(decoded.report().unwrap(), &report);
 }
 
 #[test]
@@ -452,12 +454,7 @@ fn error_completion_round_trips_with_its_error_code() {
         decode_response(&encode_response(&WorkerResponse::completion_report(report)).unwrap())
             .unwrap();
     assert_eq!(
-        decoded
-            .completion_report
-            .unwrap()
-            .completions()
-            .next()
-            .unwrap(),
+        decoded.report().unwrap().completions().next().unwrap(),
         &record
     );
 }
@@ -771,7 +768,13 @@ fn capabilities_round_trip_with_the_canonical_layout() {
     assert_eq!(caps.protocol_layout_digest, protocol_layout_digest());
     let response = WorkerResponse::capabilities(caps.clone());
     let decoded = decode_response(&encode_response(&response).unwrap()).unwrap();
-    let decoded = decoded.capabilities.unwrap();
+    let WorkerResponse::Capabilities {
+        capabilities: decoded,
+        ..
+    } = decoded
+    else {
+        panic!("decoded response must preserve its capabilities variant");
+    };
     assert_eq!(decoded, caps);
 }
 
@@ -787,16 +790,23 @@ fn kv_free_capabilities_round_trip_without_kv_geometry() {
         latent_page_units: 64,
         num_latent_pages: 3,
         latent_width: 1,
-        latent_dtype: "float32".into(),
+        latent_dtype: Some(ModelDtype::Float32),
         bytes_per_token: 0,
         groups: Vec::new(),
-        kv_dtype: String::new(),
+        kv_dtype: None,
         resource_classes: vec![ResourceClass::ImageLatent],
         ..WorkerCapabilities::default()
     };
     let response = WorkerResponse::capabilities(caps.clone());
     let decoded = decode_response(&encode_response(&response).unwrap()).unwrap();
-    assert_eq!(decoded.capabilities.unwrap(), caps);
+    let WorkerResponse::Capabilities {
+        capabilities: decoded,
+        ..
+    } = decoded
+    else {
+        panic!("decoded response must preserve its capabilities variant");
+    };
+    assert_eq!(decoded, caps);
 }
 
 #[test]
@@ -945,7 +955,7 @@ fn full_image() -> ImageParams {
         steps: 20,
         cfg_text_scale: 5.0,
         cfg_img_scale: 1.5,
-        cfg_renorm_type: "global".into(),
+        cfg_renorm_type: CfgRenorm::Global,
         cfg_renorm_min: 0.1,
         cfg_interval: (0.2, 0.9),
         timestep_shift: 3.0,
@@ -994,14 +1004,14 @@ fn comprehensive_batch() -> Batch {
             }
         };
         let domain = work.domain();
-        operations.push(Operation::registered(
-            key,
+        operations.push(Operation::registered(OperationSpec {
+            request_key: key,
             op_id,
             parent,
             work,
-            RouteId(1 + index as u32),
+            route: RouteId(1 + index as u32),
             domain,
-            Bounds {
+            bounds: Bounds {
                 max_points: if work.advances_state() { 1 } else { 0 },
                 max_tokens: 7 + index as u32,
                 max_kv_pages: 3,
@@ -1009,13 +1019,13 @@ fn comprehensive_batch() -> Batch {
                 max_completion_bytes: 4096,
                 max_transfer_bytes: 1 << 16,
             },
-            vec![product_for(key, OpId(2), 0, ProductKind::VisionFeature)],
-            vec![
+            inputs: vec![product_for(key, OpId(2), 0, ProductKind::VisionFeature)],
+            outputs: vec![
                 product_for(key, op_id, 0, ProductKind::Token),
                 product_for(key, op_id, 1, ProductKind::Kv),
             ],
-            Some(product_for(key, OpId(3), 0, ProductKind::Completion)),
-            Some(Rng {
+            predicate: Some(product_for(key, OpId(3), 0, ProductKind::Completion)),
+            rng: Some(Rng {
                 seed: 99 + index as u64,
                 semantic_index_base: 4,
                 draw_layout: match index % 3 {
@@ -1024,8 +1034,8 @@ fn comprehensive_batch() -> Batch {
                     _ => DrawLayout::FlowNoise,
                 },
             }),
-            index as u64,
-        ));
+            control_seq: index as u64,
+        }));
     }
     let und_admission = Admission::new(
         session_key(100),
@@ -1104,7 +1114,7 @@ fn snapshot_fixture() -> SnapshotRef {
             },
         },
         digest: digest_string(0xdd),
-        locator: digest_string(0xdd),
+        locator: digest_string(0xdd).to_string(),
     }
 }
 
@@ -1125,7 +1135,7 @@ fn recovery_placement_fixture() -> RecoveryPlacement {
 /// One fixture per `RequestKind`, plus call-id coverage on the execute frame.
 fn request_fixtures() -> Vec<WorkerRequest> {
     let mut execute = WorkerRequest::execute(comprehensive_batch());
-    execute.call_id = Some(91);
+    execute.set_call_id(Some(91));
     vec![
         WorkerRequest::get_capabilities(),
         execute,
@@ -1194,9 +1204,9 @@ fn full_caps() -> WorkerCapabilities {
         latent_page_units: 64,
         num_latent_pages: 17,
         latent_width: 16,
-        latent_dtype: "bfloat16".into(),
-        model_identity: digest_string(0x21),
-        weight_digest: digest_string(0x22),
+        latent_dtype: Some(ModelDtype::BFloat16),
+        model_identity: Some(digest_string(0x21)),
+        weight_digest: Some(digest_string(0x22)),
         lanes: vec![LaneCapabilities {
             lane_id: "decode".into(),
             domains: vec![Domain::Decode],
@@ -1341,47 +1351,44 @@ fn full_completion_report() -> CompletionReport {
 /// One fixture per `ResponseKind`, plus a second capabilities frame that
 /// exercises non-default capability values.
 fn response_fixtures() -> Vec<WorkerResponse> {
-    let bare = |kind: ResponseKind| WorkerResponse {
-        kind,
-        call_id: Some(17),
-        capabilities: None,
-        completion_report: None,
-        pressure: None,
-        message: None,
-        code: None,
-        retryable: None,
-        fatal: None,
-        phase: None,
-        route: None,
-        operations: Vec::new(),
-        snapshot: None,
-    };
     vec![
-        WorkerResponse::capabilities(WorkerCapabilities::default()),
-        WorkerResponse::capabilities(full_caps()),
-        WorkerResponse::completion_report(full_completion_report()),
-        WorkerResponse::ok(),
-        WorkerResponse {
-            message: Some("device fault on decode".into()),
-            code: Some("compute_error".into()),
-            retryable: Some(true),
-            fatal: Some(false),
-            phase: Some("execute".into()),
-            route: Some("und.decode".into()),
-            operations: vec![
-                ErrorOperationIdentity {
-                    request_key: session_key(100),
-                    op_id: OpId(11),
-                },
-                ErrorOperationIdentity {
-                    request_key: session_key(101),
-                    op_id: OpId(12),
-                },
-            ],
-            ..bare(ResponseKind::Error)
+        WorkerResponse::Capabilities {
+            call_id: None,
+            capabilities: WorkerCapabilities::default(),
         },
-        WorkerResponse {
-            pressure: Some(vec![
+        WorkerResponse::Capabilities {
+            call_id: Some(17),
+            capabilities: full_caps(),
+        },
+        WorkerResponse::Result {
+            call_id: Some(17),
+            completion_report: full_completion_report(),
+        },
+        WorkerResponse::Ok { call_id: Some(17) },
+        WorkerResponse::Error {
+            call_id: Some(17),
+            error: WorkerResponseError {
+                message: "device fault on decode".into(),
+                code: Some("compute_error".into()),
+                retryable: true,
+                fatal: false,
+                phase: Some("execute".into()),
+                route: Some("und.decode".into()),
+                operations: vec![
+                    ErrorOperationIdentity {
+                        request_key: session_key(100),
+                        op_id: OpId(11),
+                    },
+                    ErrorOperationIdentity {
+                        request_key: session_key(101),
+                        op_id: OpId(12),
+                    },
+                ],
+            },
+        },
+        WorkerResponse::Pressure {
+            call_id: Some(17),
+            pressure: vec![
                 ResourcePressure {
                     class: ResourceClass::KvBlock,
                     total: 81,
@@ -1396,10 +1403,12 @@ fn response_fixtures() -> Vec<WorkerResponse> {
                     evictable: 87,
                     free: 88,
                 },
-            ]),
-            ..bare(ResponseKind::Pressure)
+            ],
         },
-        WorkerResponse::snapshot(snapshot_fixture()),
+        WorkerResponse::Snapshot {
+            call_id: Some(17),
+            snapshot: snapshot_fixture(),
+        },
     ]
 }
 
@@ -1408,7 +1417,7 @@ fn every_request_kind_round_trips_through_the_wire() {
     let fixtures = request_fixtures();
     for kind in RequestKind::ALL {
         assert!(
-            fixtures.iter().any(|request| request.kind == kind),
+            fixtures.iter().any(|request| request.kind() == kind),
             "no fixture covers request kind {kind:?}"
         );
     }
@@ -1418,7 +1427,7 @@ fn every_request_kind_round_trips_through_the_wire() {
             decode_request(&bytes).unwrap(),
             request,
             "round trip for {:?}",
-            request.kind
+            request.kind()
         );
     }
 }
@@ -1435,7 +1444,7 @@ fn every_response_kind_round_trips_through_the_wire() {
         ResponseKind::Snapshot,
     ] {
         assert!(
-            fixtures.iter().any(|response| response.kind == kind),
+            fixtures.iter().any(|response| response.kind() == kind),
             "no fixture covers response kind {kind:?}"
         );
     }
@@ -1445,24 +1454,22 @@ fn every_response_kind_round_trips_through_the_wire() {
             decode_response(&bytes).unwrap(),
             response,
             "round trip for {:?}",
-            response.kind
+            response.kind()
         );
     }
 }
 
 #[test]
-fn wire_decode_rejects_malformed_frames_and_payload_shapes() {
+fn wire_decode_rejects_malformed_frames() {
     let garbage: &[u8] = &[0x01, 0x02, 0x03];
     assert!(decode_request(garbage).is_err());
     assert!(decode_response(garbage).is_err());
 
-    let mut request = WorkerRequest::get_capabilities();
-    request.kind = RequestKind::Execute;
-    let bytes = encode_request(&request).unwrap();
-    assert!(decode_request(&bytes).is_err());
+    let mut request = encode_request(&WorkerRequest::get_capabilities()).unwrap();
+    request.truncate(request.len() / 2);
+    assert!(decode_request(&request).is_err());
 
-    let mut response = WorkerResponse::ok();
-    response.kind = ResponseKind::Capabilities;
-    let bytes = encode_response(&response).unwrap();
-    assert!(decode_response(&bytes).is_err());
+    let mut response = encode_response(&WorkerResponse::ok()).unwrap();
+    response.truncate(response.len() / 2);
+    assert!(decode_response(&response).is_err());
 }

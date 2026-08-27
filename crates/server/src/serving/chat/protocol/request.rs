@@ -4,9 +4,7 @@ use llm_multimodal::ImageDetail;
 use serde::{Deserialize, Serialize};
 
 use crate::serving::chat::protocol::error::{Error, Result};
-use crate::serving::chat::protocol::event::{
-    AssistantContentBlock, AssistantMessage, AssistantMessageExt,
-};
+use crate::serving::chat::protocol::event::{AssistantContentBlock, AssistantMessage};
 
 /// Role label for one text-only chat message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,7 +150,7 @@ pub enum ChatMessage {
     /// User message content.
     User { content: ChatContent },
     /// Assistant history content assembled from structured assistant blocks.
-    Assistant { content: Vec<AssistantContentBlock> },
+    Assistant { content: AssistantMessage },
     /// Tool response content associated with one prior assistant tool call.
     ToolResponse {
         content: ChatContent,
@@ -204,14 +202,18 @@ impl ChatMessage {
     /// Construct one chat message with assistant role and plain string content.
     pub fn assistant_text(text: impl Into<String>) -> Self {
         Self::Assistant {
-            content: vec![AssistantContentBlock::Text { text: text.into() }],
+            content: AssistantMessage {
+                content: vec![AssistantContentBlock::Text { text: text.into() }],
+            },
         }
     }
 
     /// Construct one chat message with assistant role and structured content
     /// blocks.
     pub fn assistant_blocks(content: Vec<AssistantContentBlock>) -> Self {
-        Self::Assistant { content }
+        Self::Assistant {
+            content: AssistantMessage { content },
+        }
     }
 
     /// Construct one tool-role message.
@@ -269,9 +271,7 @@ impl ChatMessage {
 
 impl From<AssistantMessage> for ChatMessage {
     fn from(value: AssistantMessage) -> Self {
-        Self::Assistant {
-            content: value.content,
-        }
+        Self::Assistant { content: value }
     }
 }
 

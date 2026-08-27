@@ -1,18 +1,16 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::mpsc;
 use tracing::warn;
 
-use super::client::StreamCancelCause;
 use super::error::{Error, Result};
-use super::generation::{GenerationEventStream, GenerationSubmission};
-use super::media::{MediaEventStream, MediaSubmission};
-use uniserve_core::GenerationEvent;
+use super::media::MediaSubmission;
 use uniserve_core::{GenerationRuntimeCapabilities, ModelDtype, RequestId};
-use uniserve_engine::EngineCore;
 use uniserve_engine::EngineHandle;
 use uniserve_engine::executor::Executor;
+use uniserve_engine::{EngineCore, EventRx, MediaEventRx};
+
+use crate::serving::TokenizedGenerateReqInput;
 
 /// In-process engine client owned by the server layer.
 pub struct EngineClient {
@@ -119,6 +117,10 @@ impl EngineClient {
         self.core.generation_capabilities()
     }
 
+    pub fn supports_token_sampling(&self) -> bool {
+        self.core.supports_token_sampling()
+    }
+
     pub fn model_dtype(&self) -> ModelDtype {
         self.core.model_dtype()
     }
@@ -139,17 +141,17 @@ impl EngineClient {
         None
     }
 
-    pub async fn submit_generation(
+    pub async fn submit_generation(&self, input: &TokenizedGenerateReqInput) -> Result<EventRx> {
+        self.submit_generation_request(input.request_id.to_string(), input.request.clone())
+            .await
+    }
+
+    async fn submit_generation_request(
         &self,
-        submission: GenerationSubmission,
-    ) -> Result<GenerationEventStream> {
-        let GenerationSubmission {
-            external_request_id,
-            mut request,
-            ..
-        } = submission;
+        external_request_id: String,
+        mut request: uniserve_core::GenerationRequest,
+    ) -> Result<EventRx> {
         let rid = self.core.next_request_id();
-        let decoder_ack_required = !request.stop_strings.is_empty();
         request.request_id = rid;
         {
             let mut active = lock_active(&self.active);
@@ -160,64 +162,19 @@ impl EngineClient {
             }
             active.insert(external_request_id.clone(), rid);
         }
-        let mut scheduler_rx = self.core.submit(request).map_err(|e| {
+        let mut scheduler_rx = self.core.submit(request).map_err(|error| {
             remove_active_request(&self.active, &external_request_id, rid);
-            Error::ClientClosed {
-                message: e.to_string(),
-            }
+            Error::from(error)
         })?;
-        scheduler_rx.delegate_cancellation();
-        let (event_tx, event_rx) =
-            mpsc::channel::<GenerationEvent>(uniserve_engine::EVENT_BUFFER_CAPACITY);
         let active = Arc::clone(&self.active);
         let active_id = external_request_id.clone();
-        tokio::spawn(async move {
-            let mut reached_terminal = false;
-            while let Some(event) = scheduler_rx.recv().await {
-                reached_terminal = matches!(
-                    event,
-                    GenerationEvent::Finished { .. }
-                        | GenerationEvent::Rejected { .. }
-                        | GenerationEvent::Error { .. }
-                );
-                if event_tx.send(event).await.is_err() {
-                    remove_active_request(&active, &active_id, rid);
-                    return;
-                }
-                if reached_terminal {
-                    break;
-                }
-            }
-            if !reached_terminal {
-                let _ = event_tx
-                    .send(GenerationEvent::Error {
-                        message: "generation event stream closed before a terminal event"
-                            .to_string(),
-                    })
-                    .await;
-            }
+        scheduler_rx.set_on_finish(move || {
             remove_active_request(&active, &active_id, rid);
         });
-        let handle = self.handle();
-        let acknowledge_handle = handle.clone();
-        Ok(GenerationEventStream::with_control_policy(
-            event_rx,
-            move |cause, output_token_count| match cause {
-                StreamCancelCause::StopStringMatched => {
-                    handle.stop_at(rid, output_token_count);
-                }
-                StreamCancelCause::DroppedStream => {
-                    handle.cancel_at(rid, output_token_count);
-                }
-            },
-            move |output_token_count| {
-                acknowledge_handle.acknowledge_at(rid, output_token_count);
-            },
-            !decoder_ack_required,
-        ))
+        Ok(scheduler_rx)
     }
 
-    pub async fn submit_media(&self, submission: MediaSubmission) -> Result<MediaEventStream> {
+    pub async fn submit_media(&self, submission: MediaSubmission) -> Result<MediaEventRx> {
         let MediaSubmission {
             external_request_id,
             prompt,
@@ -243,55 +200,49 @@ impl EngineClient {
             priority,
             output_path,
         };
-        let mut scheduler_rx = self
-            .core
-            .handle()
-            .submit_media(request)
-            .map_err(|message| {
-                remove_active_request(&self.active, &external_request_id, rid);
-                Error::ClientClosed { message }
-            })?;
-        scheduler_rx.delegate_cancellation();
-        let (event_tx, event_rx) = mpsc::channel(1);
+        let mut scheduler_rx = self.core.handle().submit_media(request).map_err(|error| {
+            remove_active_request(&self.active, &external_request_id, rid);
+            Error::from(error)
+        })?;
         let active = Arc::clone(&self.active);
         let active_id = external_request_id.clone();
-        tokio::spawn(async move {
-            let event = scheduler_rx
-                .recv()
-                .await
-                .unwrap_or(uniserve_core::MediaEvent::Aborted);
-            let _ = event_tx.send(event).await;
+        scheduler_rx.set_on_finish(move || {
             remove_active_request(&active, &active_id, rid);
         });
-        let handle = self.handle();
-        Ok(MediaEventStream::with_cancel(event_rx, move || {
-            handle.cancel(rid);
-        }))
+        Ok(scheduler_rx)
     }
 
-    pub async fn abort(&self, ids: &[String]) -> Result<()> {
+    pub async fn abort<I, S>(&self, ids: I) -> Result<()>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
         let handle = self.handle();
         let active = lock_active(&self.active);
         for id in ids {
-            if let Some(rid) = active.get(id).copied() {
+            if let Some(rid) = active.get(id.as_ref()).copied() {
                 handle.abort(rid);
             }
         }
         Ok(())
     }
 
-    pub async fn cancel(&self, ids: &[String]) -> Result<()> {
+    pub async fn cancel<I, S>(&self, ids: I) -> Result<()>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
         let handle = self.handle();
         let active = lock_active(&self.active);
         for id in ids {
-            if let Some(rid) = active.get(id).copied() {
+            if let Some(rid) = active.get(id.as_ref()).copied() {
                 handle.cancel(rid);
             }
         }
         Ok(())
     }
 
-    pub async fn shutdown(self) -> Result<()> {
+    pub async fn shutdown(&self) -> Result<()> {
         self.core.shutdown();
         Ok(())
     }
@@ -299,7 +250,7 @@ impl EngineClient {
 
 #[cfg(test)]
 mod tests {
-    use crate::engine_client::{EngineClient, GenerationSubmission};
+    use crate::engine_client::EngineClient;
     use uniserve_core::{
         ContextSegment, FeedbackNextToken, FeedbackSource, GeneratedImageFeedbackRecipe,
         GenerationBehaviorDescriptor, GenerationConstraint, GenerationEvent,
@@ -345,7 +296,7 @@ mod tests {
             },
         };
         let mut stream = client
-            .submit_generation(GenerationSubmission::new("req-text", generation))
+            .submit_generation_request("req-text".to_string(), generation)
             .await
             .expect("submit request");
 
@@ -425,20 +376,21 @@ mod tests {
                 ..GenerationResourceBounds::default()
             },
         };
-        request.resources = GenerationResourceBounds::conservative(
-            &request.context,
-            &request.negative_context,
-            &request.behavior,
-            &request.policy,
-            &request.image,
-            request.max_und_tokens,
-            &request.cache,
-            &client.generation_capabilities(),
-        )
-        .expect("request resources must fit the in-process runtime");
+        request.resources =
+            GenerationResourceBounds::conservative(uniserve_core::GenerationResourceSpec {
+                context: &request.context,
+                negative_context: &request.negative_context,
+                behavior: &request.behavior,
+                policy: &request.policy,
+                image: &request.image,
+                max_und_tokens: request.max_und_tokens,
+                cache: &request.cache,
+                capabilities: &client.generation_capabilities(),
+            })
+            .expect("request resources must fit the in-process runtime");
 
         let mut stream = client
-            .submit_generation(GenerationSubmission::new("req-image", request))
+            .submit_generation_request("req-image".to_string(), request)
             .await
             .expect("submit generation request");
 

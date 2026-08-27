@@ -50,31 +50,32 @@ fn main() {
             ..Default::default()
         };
         let cache = Default::default();
-        let resources = GenerationResourceBounds::conservative(
-            &context,
-            &[],
-            &behavior,
-            &policy,
-            &image,
-            20,
-            &cache,
-            &GenerationRuntimeCapabilities {
-                supports_understanding: true,
-                supports_vision_encode: false,
-                supports_latent_encode: false,
-                supports_image_generation: true,
-                max_latent_units: 64,
-                latent_downsample: 16,
-                max_vae_grid_tokens: 64,
-                max_vit_grid_tokens: 64,
-                max_latent_feature_bytes: 1 << 20,
-                max_vision_feature_bytes: 1 << 20,
-                commit_marker_tokens: 2,
-                max_cfg_branches: 3,
-                encoder_cache_entries: 256,
-            },
-        )
-        .expect("bounded simulation request");
+        let resources =
+            GenerationResourceBounds::conservative(uniserve_core::GenerationResourceSpec {
+                context: &context,
+                negative_context: &[],
+                behavior: &behavior,
+                policy: &policy,
+                image: &image,
+                max_und_tokens: 20,
+                cache: &cache,
+                capabilities: &GenerationRuntimeCapabilities {
+                    supports_understanding: true,
+                    supports_vision_encode: false,
+                    supports_latent_encode: false,
+                    supports_image_generation: true,
+                    max_latent_units: 64,
+                    latent_downsample: 16,
+                    max_vae_grid_tokens: 64,
+                    max_vit_grid_tokens: 64,
+                    max_latent_feature_bytes: 1 << 20,
+                    max_vision_feature_bytes: 1 << 20,
+                    commit_marker_tokens: 2,
+                    max_cfg_branches: 3,
+                    encoder_cache_entries: 256,
+                },
+            })
+            .expect("bounded simulation request");
         let request = GenerationRequest {
             request_id: id,
             context,

@@ -14,8 +14,8 @@ pub(crate) fn completion_token_count(visible: u32, internal: u32) -> u32 {
 ///
 /// `model` is the resolved model name the caller extracted from its own
 /// request shape.
-pub fn check_model_served(model: &str, served_model_names: &[String]) -> Result<(), ApiError> {
-    if !served_model_names.iter().any(|n| n == model) {
+pub fn check_model_served(model: &str, served_model_name: &str) -> Result<(), ApiError> {
+    if model != served_model_name {
         return Err(ApiError::model_not_found(model.to_string()));
     }
     Ok(())

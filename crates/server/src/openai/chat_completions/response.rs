@@ -8,9 +8,7 @@ use crate::openai::types::{
     ContentPart, FunctionCallDelta, FunctionCallResponse, ImageUrl, StreamPublicCommit,
     StreamSemanticRoot, ToolCall, ToolCallDelta, Usage,
 };
-use crate::serving::chat::{
-    AssistantBlockKind, AssistantContentBlock, AssistantMessage, AssistantMessageExt as _,
-};
+use crate::serving::chat::{AssistantBlockKind, AssistantContentBlock, AssistantMessage};
 use crate::serving::text::DecodedLogprobs;
 use crate::serving::{CandidateId, FinishStatus, ServeEvent};
 use asynk_strim_attr::{TryYielder, try_stream};
@@ -809,9 +807,9 @@ fn attach_public_commit(chunk: &mut ChatCompletionStreamResponse, commit: Option
         .to_string(),
         committed_at: commit.committed_at,
         semantic_root: StreamSemanticRoot {
-            producer_op_id: commit.semantic_root.producer_op_id,
+            producer_op_id: commit.semantic_root.producer_op_id.0,
             point_index: commit.semantic_root.point_index,
-            semantic_digest: commit.semantic_root.semantic_digest,
+            semantic_digest: commit.semantic_root.semantic_digest.to_string(),
         },
     });
 }

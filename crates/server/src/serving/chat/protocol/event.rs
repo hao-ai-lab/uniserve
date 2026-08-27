@@ -74,52 +74,6 @@ impl AssistantContentBlock {
     }
 }
 
-#[easy_ext::ext(AssistantMessageExt)]
-impl [AssistantContentBlock] {
-    /// Concatenate all visible final-answer text blocks.
-    pub fn text(&self) -> String {
-        self.iter()
-            .filter_map(|block| match block {
-                AssistantContentBlock::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// Concatenate all extracted reasoning blocks, if any.
-    pub fn reasoning(&self) -> Option<String> {
-        Some(
-            self.iter()
-                .filter_map(|block| match block {
-                    AssistantContentBlock::Reasoning { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect(),
-        )
-        .filter(|s: &String| !s.is_empty())
-    }
-
-    /// Return whether this assistant message contains any non-empty reasoning
-    /// text blocks.
-    pub fn has_reasoning(&self) -> bool {
-        self.iter().any(|block| match block {
-            AssistantContentBlock::Reasoning { text } => !text.is_empty(),
-            _ => false,
-        })
-    }
-
-    /// Return finalized assistant tool calls in encounter order.
-    pub fn tool_calls(&self) -> impl Iterator<Item = &AssistantToolCall> {
-        self.iter().filter_map(AssistantContentBlock::as_tool_call)
-    }
-
-    /// Return whether this assistant message contains any tool-call blocks.
-    pub fn has_tool_calls(&self) -> bool {
-        self.iter()
-            .any(|block| matches!(block, AssistantContentBlock::ToolCall(_)))
-    }
-}
-
 /// Final structured assistant message assembled from the event stream.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssistantMessage {
@@ -135,6 +89,53 @@ impl Deref for AssistantMessage {
 }
 
 impl AssistantMessage {
+    /// Concatenate all visible final-answer text blocks.
+    pub fn text(&self) -> String {
+        self.content
+            .iter()
+            .filter_map(|block| match block {
+                AssistantContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Concatenate all extracted reasoning blocks, if any.
+    pub fn reasoning(&self) -> Option<String> {
+        Some(
+            self.content
+                .iter()
+                .filter_map(|block| match block {
+                    AssistantContentBlock::Reasoning { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect(),
+        )
+        .filter(|text: &String| !text.is_empty())
+    }
+
+    /// Return whether this assistant message contains any non-empty reasoning text blocks.
+    pub fn has_reasoning(&self) -> bool {
+        self.content.iter().any(|block| match block {
+            AssistantContentBlock::Reasoning { text } => !text.is_empty(),
+            _ => false,
+        })
+    }
+
+    /// Return finalized assistant tool calls in encounter order.
+    pub fn tool_calls(&self) -> impl Iterator<Item = &AssistantToolCall> {
+        self.content
+            .iter()
+            .filter_map(AssistantContentBlock::as_tool_call)
+    }
+
+    /// Return whether this assistant message contains any tool-call blocks.
+    pub fn has_tool_calls(&self) -> bool {
+        self.content
+            .iter()
+            .any(|block| matches!(block, AssistantContentBlock::ToolCall(_)))
+    }
+
     /// Push one new block to the end of the message content.
     pub fn push_block(&mut self, block: AssistantContentBlock) {
         self.content.push(block);
@@ -181,6 +182,9 @@ pub enum ChatEvent {
         logprobs: Option<DecodedLogprobs>,
         token_ids: Vec<u32>,
     },
+    PublicCommit {
+        commit: uniserve_core::PublicCommit,
+    },
     /// One assistant output block has ended.
     BlockEnd {
         index: usize,
@@ -194,7 +198,10 @@ pub enum ChatEvent {
     },
     /// One incremental tool-call arguments delta for the currently open tool
     /// call.
-    ToolCallArgumentsDelta { index: usize, delta: String },
+    ToolCallArgumentsDelta {
+        index: usize,
+        delta: String,
+    },
     /// One tool call has ended.
     ToolCallEnd {
         index: usize,

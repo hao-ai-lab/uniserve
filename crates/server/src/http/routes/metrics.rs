@@ -12,8 +12,7 @@ pub(super) async fn scrape(State(state): State<Arc<AppState>>) -> Response {
     let identity = state.runtime().model().served_identity();
     METRICS.serving.set_request_states(
         state.served_model_name(),
-        &identity.profile_id,
-        &identity.description_id,
+        identity.description.id(),
         state.runtime().metrics_snapshot().state_counts(),
     );
     match METRICS.render() {

@@ -11,15 +11,15 @@ impl Scheduler {
         if self
             .running
             .get(&id)
-            .is_some_and(|state| state.ingest.round_closing)
+            .is_some_and(|state| state.cursor.ingest.round_closing)
         {
             let close_token = self
                 .running
                 .get(&id)
-                .map(|state| state.und.next_token)
+                .map(|state| state.cursor.und.next_token)
                 .unwrap_or_default();
             if let Some(state) = self.running.get_mut(&id) {
-                state.ingest.round_closing = false;
+                state.cursor.ingest.round_closing = false;
             }
             return self.close_context_round(id, close_token);
         }
@@ -38,14 +38,14 @@ impl Scheduler {
                 .is_some_and(|st| st.req.policy.trigger.round_close_token_ids().contains(&tok));
             if is_round_close {
                 if let Some(st) = self.running.get_mut(&id) {
-                    st.und.tokens_emitted += 1;
+                    st.cursor.und.tokens_emitted += 1;
                 }
                 if burst_result {
                     return self.close_context_round(id, tok);
                 }
                 if let Some(st) = self.running.get_mut(&id) {
-                    st.und.next_token = tok;
-                    st.ingest.round_closing = true;
+                    st.cursor.und.next_token = tok;
+                    st.cursor.ingest.round_closing = true;
                 }
                 return;
             }
@@ -53,10 +53,10 @@ impl Scheduler {
                 let Some(st) = self.running.get_mut(&id) else {
                     return;
                 };
-                st.und.tokens_emitted += 1;
+                st.cursor.und.tokens_emitted += 1;
                 (
                     st.can_open_gen_branch(),
-                    st.image_gen.images_done,
+                    st.cursor.image_gen.images_done,
                     st.req.image.max_images as usize,
                 )
             };
@@ -88,9 +88,9 @@ impl Scheduler {
                 return;
             }
             if let Some(st) = self.running.get_mut(&id) {
-                st.und.next_token = tok;
-                st.lifecycle.phase = Phase::DecodeUnd;
-                st.und.round_tokens.push(tok);
+                st.cursor.und.next_token = tok;
+                st.cursor.lifecycle.phase = Phase::DecodeUnd;
+                st.cursor.und.round_tokens.push(tok);
             }
             self.invalidate_cpu_masks(id);
             if can_open_gen_branch
@@ -136,15 +136,16 @@ impl Scheduler {
                         }
                         if *is_final_step
                             && self.running.get(&id).is_some_and(|st| {
-                                st.ingest.mm_cursor >= st.context.images.len()
-                                    && st.ingest.prompt_cursor >= st.context.prompt_ids.len() as u32
+                                st.cursor.ingest.mm_cursor >= st.context.images.len()
+                                    && st.cursor.ingest.prompt_cursor
+                                        >= st.context.prompt_ids.len() as u32
                             })
                         {
                             let bos = self.ctrl.bos;
                             if let Some(st) = self.running.get_mut(&id) {
-                                st.und.next_token = bos;
-                                st.und.round_tokens.clear();
-                                st.lifecycle.phase = Phase::DecodeUnd;
+                                st.cursor.und.next_token = bos;
+                                st.cursor.und.round_tokens.clear();
+                                st.cursor.lifecycle.phase = Phase::DecodeUnd;
                             }
                         }
                         return;
@@ -163,17 +164,17 @@ impl Scheduler {
                             .and_then(|st| st.req.policy.feedback.as_ref())
                             .is_some_and(|feedback| feedback.sample_continuation);
                         if let Some(st) = self.running.get_mut(&id) {
-                            st.image_gen.images_done += 1;
-                            st.und.text_since_image = 0;
-                            st.und.round_tokens.clear();
+                            st.cursor.image_gen.images_done += 1;
+                            st.cursor.und.text_since_image = 0;
+                            st.cursor.und.round_tokens.clear();
                         }
                         if !sample_continuation {
                             let Some(next_token) = self.feedback_next_token(id) else {
                                 return self.finish(id, FinishReason::Error);
                             };
                             if let Some(st) = self.running.get_mut(&id) {
-                                st.und.next_token = next_token;
-                                st.lifecycle.phase = Phase::DecodeUnd;
+                                st.cursor.und.next_token = next_token;
+                                st.cursor.lifecycle.phase = Phase::DecodeUnd;
                             }
                             return;
                         }
@@ -182,10 +183,10 @@ impl Scheduler {
                         };
                         let (can_open_gen_branch, images_done, max_images) = {
                             let st = self.running.get_mut(&id).unwrap();
-                            st.und.tokens_emitted += 1;
+                            st.cursor.und.tokens_emitted += 1;
                             (
                                 st.can_open_gen_branch(),
-                                st.image_gen.images_done,
+                                st.cursor.image_gen.images_done,
                                 st.req.image.max_images as usize,
                             )
                         };
@@ -213,9 +214,9 @@ impl Scheduler {
                             return;
                         }
                         if let Some(st) = self.running.get_mut(&id) {
-                            st.und.next_token = tok;
-                            st.lifecycle.phase = Phase::DecodeUnd;
-                            st.und.round_tokens.push(tok);
+                            st.cursor.und.next_token = tok;
+                            st.cursor.lifecycle.phase = Phase::DecodeUnd;
+                            st.cursor.und.round_tokens.push(tok);
                         }
                         self.invalidate_cpu_masks(id);
                         if can_open_gen_branch
@@ -236,7 +237,7 @@ impl Scheduler {
                 let (cursor, prompt_len) = {
                     let st = self.running.get(&id).unwrap();
                     (
-                        st.ingest.prompt_cursor as usize,
+                        st.cursor.ingest.prompt_cursor as usize,
                         st.effective_prompt().len(),
                     )
                 };
@@ -244,19 +245,19 @@ impl Scheduler {
                     return;
                 }
                 if self.running.get(&id).is_some_and(|st| {
-                    st.ingest.mm_cursor < st.context.images.len()
-                        || st.ingest.prompt_cursor < st.context.prompt_ids.len() as u32
+                    st.cursor.ingest.mm_cursor < st.context.images.len()
+                        || st.cursor.ingest.prompt_cursor < st.context.prompt_ids.len() as u32
                 }) {
                     return;
                 }
                 let (starts_gen_after_context, can_open_gen_branch) = {
                     let st = self.running.get_mut(&id).unwrap();
-                    st.und.tokens_emitted += 1;
+                    st.cursor.und.tokens_emitted += 1;
                     (st.starts_gen_after_context(), st.can_open_gen_branch())
                 };
                 if self.running.get(&id).is_some_and(|state| {
                     state.req.sampling.prompt_logprobs_requested()
-                        && state.ingest.prompt_logprobs_emitted
+                        && state.cursor.ingest.prompt_logprobs_emitted
                             != state.context.prompt_ids.len().saturating_sub(1)
                 }) {
                     tracing::error!(
@@ -297,7 +298,10 @@ impl Scheduler {
                 let logprob = view.sampled_logprob;
                 let (images_done, max_images) = {
                     let st = self.running.get(&id).unwrap();
-                    (st.image_gen.images_done, st.req.image.max_images as usize)
+                    (
+                        st.cursor.image_gen.images_done,
+                        st.req.image.max_images as usize,
+                    )
                 };
                 // the model requested an image inline; honor it while the
                 // request is still under its image budget.
@@ -320,8 +324,8 @@ impl Scheduler {
                     return;
                 }
                 if let Some(st) = self.running.get_mut(&id) {
-                    st.und.next_token = tok;
-                    st.lifecycle.phase = Phase::DecodeUnd;
+                    st.cursor.und.next_token = tok;
+                    st.cursor.lifecycle.phase = Phase::DecodeUnd;
                 }
                 self.invalidate_cpu_masks(id);
                 if can_open_gen_branch
@@ -342,10 +346,10 @@ impl Scheduler {
                             start_step,
                             ..
                         } => start_step,
-                        _ => st.image_gen.steps_done,
+                        _ => st.cursor.image_gen.steps_done,
                     };
                     (
-                        st.image_gen.image_id,
+                        st.cursor.image_gen.image_id,
                         st.req.image.height,
                         st.req.image.width,
                         st.req.image.steps,
@@ -355,7 +359,7 @@ impl Scheduler {
                 let sd = self
                     .running
                     .get(&id)
-                    .map(|s| s.image_gen.steps_done)
+                    .map(|s| s.cursor.image_gen.steps_done)
                     .unwrap_or(0);
                 if prev_sd == 0 && sd >= 1 {
                     self.emit(
@@ -377,7 +381,10 @@ impl Scheduler {
             }
             ForwardMode::GenDecode => {}
             ForwardMode::Materialize => {
-                let image_id = self.running.get(&id).map_or(0, |st| st.image_gen.image_id);
+                let image_id = self
+                    .running
+                    .get(&id)
+                    .map_or(0, |st| st.cursor.image_gen.image_id);
                 self.emit(id, GenerationEvent::ImageCommit { image_id });
                 let image = view.image_png.clone();
                 if let Some(image_b64) = image.clone() {
@@ -422,19 +429,19 @@ impl Scheduler {
                         return self.finish(id, FinishReason::Error);
                     }
                     if let Some(st) = self.running.get_mut(&id) {
-                        st.feedback.image_b64 = image;
-                        st.feedback.ingest_step = 0;
-                        st.feedback.source_product = source_product;
-                        st.feedback.encoded_product = None;
-                        st.lifecycle.phase = Phase::FeedbackEncode;
-                        if let Some(product) = st.feedback.source_product.clone() {
-                            st.ingest.transient_encoder_products.push(product);
+                        st.cursor.feedback.image_b64 = image;
+                        st.cursor.feedback.ingest_step = 0;
+                        st.cursor.feedback.source_product = source_product;
+                        st.cursor.feedback.encoded_product = None;
+                        st.cursor.lifecycle.phase = Phase::FeedbackEncode;
+                        if let Some(product) = st.cursor.feedback.source_product.clone() {
+                            st.cursor.ingest.transient_encoder_products.push(product);
                         }
                     }
                 } else {
                     if let Some(st) = self.running.get_mut(&id) {
-                        st.image_gen.images_done += 1;
-                        st.und.text_since_image = 0;
+                        st.cursor.image_gen.images_done += 1;
+                        st.cursor.und.text_since_image = 0;
                     }
                     self.finish(id, FinishReason::ImageDone);
                 }
@@ -473,21 +480,27 @@ impl Scheduler {
                             return self.finish(id, FinishReason::Error);
                         };
                         if let Some(st) = self.running.get_mut(&id) {
-                            st.ingest.acquired_encoder_pins.push(EncoderCachePin {
-                                key: *cache_key,
-                                product: product.clone(),
-                            });
+                            st.cursor
+                                .ingest
+                                .acquired_encoder_pins
+                                .push(EncoderCachePin {
+                                    key: *cache_key,
+                                    product: product.clone(),
+                                });
                         }
                         product
                     } else if let Some(st) = self.running.get_mut(&id) {
-                        st.ingest.transient_encoder_products.push(feature.clone());
+                        st.cursor
+                            .ingest
+                            .transient_encoder_products
+                            .push(feature.clone());
                         feature.clone()
                     } else {
                         feature.clone()
                     };
                     if let Some(st) = self.running.get_mut(&id) {
-                        st.ingest.encoded_product = Some(selected_product);
-                        st.lifecycle.phase = Phase::IngestState;
+                        st.cursor.ingest.encoded_product = Some(selected_product);
+                        st.cursor.lifecycle.phase = Phase::IngestState;
                     }
                     if !free_products.is_empty() {
                         self.release_products(free_products);
@@ -513,9 +526,12 @@ impl Scheduler {
                         return self.finish(id, FinishReason::Error);
                     }
                     if let Some(st) = self.running.get_mut(&id) {
-                        st.ingest.transient_encoder_products.push(feature.clone());
-                        st.feedback.encoded_product = Some(feature);
-                        st.lifecycle.phase = Phase::FeedbackState;
+                        st.cursor
+                            .ingest
+                            .transient_encoder_products
+                            .push(feature.clone());
+                        st.cursor.feedback.encoded_product = Some(feature);
+                        st.cursor.lifecycle.phase = Phase::FeedbackState;
                     }
                 }
                 _ => self.finish(id, FinishReason::Error),
@@ -539,14 +555,14 @@ impl Scheduler {
         let Some(state) = self.running.get_mut(&id) else {
             return;
         };
-        let processed_before = state.ingest.prompt_logprobs_processed;
-        let emitted_before = state.ingest.prompt_logprobs_emitted;
+        let processed_before = state.cursor.ingest.prompt_logprobs_processed;
+        let emitted_before = state.cursor.ingest.prompt_logprobs_emitted;
         let expected_total = state.context.prompt_ids.len().saturating_sub(1);
-        state.ingest.prompt_logprobs_processed = processed_before.saturating_add(total);
+        state.cursor.ingest.prompt_logprobs_processed = processed_before.saturating_add(total);
         let skip = emitted_before.saturating_sub(processed_before);
         let remaining = expected_total.saturating_sub(emitted_before);
         let selected: Vec<_> = positions.into_iter().skip(skip).take(remaining).collect();
-        state.ingest.prompt_logprobs_emitted = emitted_before.saturating_add(selected.len());
+        state.cursor.ingest.prompt_logprobs_emitted = emitted_before.saturating_add(selected.len());
         if selected.is_empty() {
             return;
         }
@@ -567,7 +583,7 @@ impl Scheduler {
         let products = self
             .running
             .get_mut(&id)
-            .map(|state| std::mem::take(&mut state.ingest.transient_encoder_products))
+            .map(|state| std::mem::take(&mut state.cursor.ingest.transient_encoder_products))
             .unwrap_or_default();
         self.release_products(products);
     }
@@ -582,18 +598,18 @@ impl Scheduler {
         };
         if let Some(st) = self.running.get_mut(&id)
             && st.continues_after_gen_commit()
-            && st.und.tokens_emitted > st.replay.generated_ids.len()
-            && st.replay.generated_ids.last().copied() != Some(start)
+            && st.cursor.und.tokens_emitted > st.cursor.replay.generated_ids.len()
+            && st.cursor.replay.generated_ids.last().copied() != Some(start)
         {
-            st.replay.generated_ids.push(start);
+            st.cursor.replay.generated_ids.push(start);
         }
     }
 
     pub(super) fn promote_gen_branch_reservation(&mut self, id: RequestId) -> bool {
         let Some((required_blocks, reserves_envelope)) = self.running.get(&id).map(|st| {
             (
-                st.resources.worstcase_blocks,
-                st.resources.reserve_worstcase,
+                st.cursor.resources.worstcase_blocks,
+                st.cursor.resources.reserve_worstcase,
             )
         }) else {
             return false;
@@ -615,7 +631,7 @@ impl Scheduler {
             return false;
         }
         if let Some(st) = self.running.get_mut(&id) {
-            st.image_gen.branch_pending = false;
+            st.cursor.image_gen.branch_pending = false;
         }
         self.trace_record(json!({
             "event": "gen_branch_capacity_ready",
@@ -632,12 +648,12 @@ impl Scheduler {
     pub(super) fn begin_image(&mut self, id: RequestId) {
         self.record_gen_trigger_for_replay(id);
         if let Some(st) = self.running.get_mut(&id) {
-            st.image_gen.cond_pos = st.und.logical_pos;
-            st.image_gen.steps_done = 0;
-            st.image_gen.image_id += 1;
-            st.und.text_since_image = 0;
-            st.lifecycle.phase = Phase::CloseKv;
-            st.image_gen.branch_pending = true;
+            st.cursor.image_gen.cond_pos = st.cursor.und.logical_pos;
+            st.cursor.image_gen.steps_done = 0;
+            st.cursor.image_gen.image_id += 1;
+            st.cursor.und.text_since_image = 0;
+            st.cursor.lifecycle.phase = Phase::CloseKv;
+            st.cursor.image_gen.branch_pending = true;
         }
         self.promote_gen_branch_reservation(id);
     }
@@ -646,12 +662,12 @@ impl Scheduler {
         let mut progressed = false;
         for state in self.running.values_mut() {
             if state.event_tx.is_closed() {
-                state.cancelled = true;
+                state.terminal_intent = TerminalIntent::Cancel;
                 continue;
             }
             let before = state.output_journal.len();
             if flush_public_journal(&state.event_tx, &mut state.output_journal) {
-                state.cancelled = true;
+                state.terminal_intent = TerminalIntent::Cancel;
             }
             progressed |= state.output_journal.len() != before;
         }
@@ -667,7 +683,7 @@ impl Scheduler {
     pub(super) fn emit(&mut self, id: RequestId, ev: GenerationEvent) {
         if let Some(st) = self.running.get_mut(&id) {
             if enqueue_public_event(&st.event_tx, &mut st.output_journal, ev) {
-                st.cancelled = true;
+                st.terminal_intent = TerminalIntent::Cancel;
             } else {
                 st.public_event_seq = st.public_event_seq.saturating_add(1);
             }
@@ -704,7 +720,7 @@ impl Scheduler {
             modality,
             committed_at: uniserve_core::now_monotonic_secs(),
             semantic_root: SemanticRoot {
-                producer_op_id: producer_op_id.0,
+                producer_op_id,
                 point_index,
                 semantic_digest,
             },
@@ -765,8 +781,8 @@ impl Scheduler {
         root: Option<&VersionRef>,
     ) -> bool {
         let action = if let Some(st) = self.running.get_mut(&id) {
-            st.replay.generated_ids.push(tok);
-            st.und.text_since_image = st.und.text_since_image.saturating_add(1);
+            st.cursor.replay.generated_ids.push(tok);
+            st.cursor.und.text_since_image = st.cursor.und.text_since_image.saturating_add(1);
             st.req.behavior.und_tokens
         } else {
             return false;
@@ -860,7 +876,7 @@ impl Scheduler {
         };
         // `tokens_emitted` already counts the token being resolved, so the floor
         // is cleared only once at least `min_tokens` tokens have been emitted.
-        let generated = state.und.tokens_emitted;
+        let generated = state.cursor.und.tokens_emitted;
         let under_floor = generated <= state.req.sampling.min_tokens;
         let stop_hit = state.req.policy.termination.stop_finishes
             && !under_floor
@@ -873,7 +889,11 @@ impl Scheduler {
 
         if stop_hit {
             self.emit_terminal_stop_token(id, token_id, logprob, top_logprobs, root);
-            self.finish_after_inflight(id, FinishReason::Stop, Some(format!("token:{token_id}")));
+            self.finish_after_inflight(
+                id,
+                FinishReason::Stop,
+                Some(uniserve_core::StopReason::Token(token_id)),
+            );
             return true;
         }
         if eos_hit || max_hit {
@@ -905,7 +925,7 @@ impl Scheduler {
 
     pub(super) fn emit_st(&self, st: &mut ReqState, ev: GenerationEvent) {
         if enqueue_public_event(&st.event_tx, &mut st.output_journal, ev) {
-            st.cancelled = true;
+            st.terminal_intent = TerminalIntent::Cancel;
         } else {
             st.public_event_seq = st.public_event_seq.saturating_add(1);
         }
@@ -919,7 +939,7 @@ impl Scheduler {
         &mut self,
         id: RequestId,
         reason: FinishReason,
-        stop_reason: Option<String>,
+        stop_reason: Option<uniserve_core::StopReason>,
     ) {
         let semantic_pending = !matches!(reason, FinishReason::Error)
             && self
@@ -959,7 +979,7 @@ impl Scheduler {
         &mut self,
         id: RequestId,
         reason: FinishReason,
-        stop_reason: Option<String>,
+        stop_reason: Option<uniserve_core::StopReason>,
     ) {
         self.pending_finishes.remove(&id);
         if reason == FinishReason::Error
@@ -967,13 +987,13 @@ impl Scheduler {
         {
             tracing::error!(
                 request_id = id.0,
-                phase = phase_str(state.lifecycle.phase),
-                generated_tokens = state.und.tokens_emitted,
-                images_done = state.image_gen.images_done,
-                image_id = state.image_gen.image_id,
-                denoise_steps_done = state.image_gen.steps_done,
-                logical_position = state.und.logical_pos,
-                physical_kv_len = state.und.physical_kv_len,
+                phase = phase_str(state.cursor.lifecycle.phase),
+                generated_tokens = state.cursor.und.tokens_emitted,
+                images_done = state.cursor.image_gen.images_done,
+                image_id = state.cursor.image_gen.image_id,
+                denoise_steps_done = state.cursor.image_gen.steps_done,
+                logical_position = state.cursor.und.logical_pos,
+                physical_kv_len = state.cursor.und.physical_kv_len,
                 "scheduler request terminated with an internal error"
             );
         }
@@ -1021,14 +1041,14 @@ impl Scheduler {
             self.reserved_encoder_entries = self
                 .reserved_encoder_entries
                 .saturating_sub(st.req.resources.encoder_cache_keys.len());
-            if st.resources.reserve_worstcase {
+            if st.cursor.resources.reserve_worstcase {
                 self.reserved_blocks = self
                     .reserved_blocks
-                    .saturating_sub(st.resources.worstcase_blocks);
+                    .saturating_sub(st.cursor.resources.worstcase_blocks);
             }
             let mut free_encoder_products =
-                std::mem::take(&mut st.ingest.transient_encoder_products);
-            for pin in &st.ingest.acquired_encoder_pins {
+                std::mem::take(&mut st.cursor.ingest.transient_encoder_products);
+            for pin in &st.cursor.ingest.acquired_encoder_pins {
                 if let Some(product) = self.enc_cache.release(pin.key, &pin.product) {
                     free_encoder_products.push(product);
                 }
@@ -1043,21 +1063,21 @@ impl Scheduler {
                 self.completed_traces.pop_front();
             }
             self.completed_traces.push_back(st.trace.clone());
-            self.trace_request_finished(
+            self.trace_request_finished(super::control::FinishedTrace {
                 id,
-                &reason,
-                stop_reason.as_deref(),
-                st.context.prompt_ids.len(),
-                st.und.tokens_emitted,
-                st.image_gen.images_done,
-                "running",
-            );
+                reason: &reason,
+                stop_reason: stop_reason.as_ref(),
+                prompt_tokens: st.context.prompt_ids.len(),
+                completion_tokens: st.cursor.und.tokens_emitted,
+                images: st.cursor.image_gen.images_done,
+                queue: "running",
+            });
             let terminal = GenerationEvent::Finished {
                 reason,
                 stop_reason,
                 prompt_tokens: st.context.prompt_ids.len(),
-                completion_tokens: st.und.tokens_emitted,
-                images: st.image_gen.images_done,
+                completion_tokens: st.cursor.und.tokens_emitted,
+                images: st.cursor.image_gen.images_done,
             };
             let closed = enqueue_public_event(&st.event_tx, &mut st.output_journal, terminal);
             if !closed {

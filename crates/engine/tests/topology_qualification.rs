@@ -17,19 +17,21 @@ use uniserve_core::{
     GenerationPolicyDescriptor, GenerationRequest, GenerationResourceBounds, ImageParams,
     RequestId, SamplingParams, UndVisibility,
 };
-use uniserve_core::{FinishReason, GenerationEvent};
-use uniserve_engine::executor::{ControlOp, Executor, WorkerExecError, WorkerLossError};
+use uniserve_core::{Digest as SemanticDigest, FinishReason, GenerationEvent};
+use uniserve_engine::executor::{
+    ControlOp, Executor, TransferBackend, WorkerExecError, WorkerKind, WorkerLossError,
+};
 use uniserve_engine::scheduler::{
     ControlTokens, LogitsProcessor, MaskContribution, ProcCtx, ProcessorDeclaration, Scheduler,
     SchedulerConfig,
 };
-use uniserve_engine::worker::{MultiprocExecutor, WorkerLaunchConfig};
+use uniserve_engine::worker::{MultiprocExecutor, WorkerLaunchConfig, WorkerSpawnSpec};
 use uniserve_worker_ipc::{
     Admission, AttentionRegime, Batch, BatchPartition, BlockTable, Bounds, CachePageAllocation,
-    CloseReason, Control, DType, DimBound, Disposition, Domain, ErrorCode, ExecutionCapability,
+    CloseReason, Control, DType, DimBound, Disposition, ErrorCode, ExecutionCapability,
     ForwardMode, ForwardRow, OpId, OpStatus, Operation, Point, PointRange, ProductKind,
     ProductPayload, ProductRef, RequestKey, RouteId, SamplingOwnership, ShapeBound, StorageClass,
-    TRANSFER_DESCRIPTOR_PREFIX, TokenMode, UndAdmission, VersionRef, encode_token_product_bytes,
+    TRANSFER_DESCRIPTOR_PREFIX, UndAdmission, VersionRef, encode_token_product_bytes,
 };
 
 const WORLD_SIZE: usize = 2;
@@ -65,7 +67,7 @@ fn qualify_rank_protocol() -> anyhow::Result<()> {
         Some(admission.clone()),
         OpId(1),
         root.clone(),
-        TokenMode::Extend,
+        ForwardMode::TokenExtend,
         &[7, 8],
         0,
         BlockId(1),
@@ -86,7 +88,7 @@ fn qualify_rank_protocol() -> anyhow::Result<()> {
         Some(admission.clone()),
         OpId(1),
         root.clone(),
-        TokenMode::Extend,
+        ForwardMode::TokenExtend,
         &[7, 8, 9],
         0,
         BlockId(1),
@@ -139,7 +141,7 @@ fn qualify_rank_protocol() -> anyhow::Result<()> {
         producer_op_id: OpId(99),
         point: Point::Fixed {
             point_index: 1,
-            semantic_digest: "f".repeat(64),
+            semantic_digest: SemanticDigest::try_from("f".repeat(64))?,
         },
     };
     let unreachable = Control::Close {
@@ -185,7 +187,7 @@ fn qualify_rank_protocol() -> anyhow::Result<()> {
         None,
         OpId(2),
         selected,
-        TokenMode::Decode,
+        ForwardMode::TokenDecode,
         &[first_record.committed_tokens[0]],
         2,
         BlockId(1),
@@ -204,7 +206,7 @@ fn qualify_rank_protocol() -> anyhow::Result<()> {
     assert!(
         acknowledgements
             .iter()
-            .all(|acknowledgement| acknowledgement.ok)
+            .all(|acknowledgement| acknowledgement.result.is_ok())
     );
     assert_eq!(executor.in_flight(), 0);
     executor.shutdown();
@@ -239,7 +241,7 @@ fn qualify_peer_replacement() -> anyhow::Result<()> {
             Some(first_admission),
             OpId(1),
             first_root,
-            TokenMode::Extend,
+            ForwardMode::TokenExtend,
             &[3],
             0,
             BlockId(1),
@@ -259,7 +261,7 @@ fn qualify_peer_replacement() -> anyhow::Result<()> {
         Some(lost_admission),
         OpId(2),
         lost_root,
-        TokenMode::Extend,
+        ForwardMode::TokenExtend,
         &[4],
         0,
         BlockId(2),
@@ -285,7 +287,7 @@ fn qualify_peer_replacement() -> anyhow::Result<()> {
             Some(recovered_admission),
             OpId(3),
             recovered_root,
-            TokenMode::Extend,
+            ForwardMode::TokenExtend,
             &[5],
             0,
             BlockId(1),
@@ -305,23 +307,23 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         prefill_cuda_graph: false,
         ..WorkerLaunchConfig::default()
     };
-    let mut executor = MultiprocExecutor::spawn_staged_with_config(
-        path_text(&worker)?,
-        "",
-        "cpu",
-        WORLD_SIZE,
-        PIPELINE_DEPTH,
-        1 << 20,
-        8 << 20,
-        Some(4096),
-        16,
-        256,
-        256,
-        "torch_sdpa",
-        "full",
-        Some("shm"),
-        &config,
-    )?;
+    let mut executor = MultiprocExecutor::spawn(WorkerSpawnSpec {
+        python: worker,
+        model: String::new(),
+        device: "cpu".into(),
+        world_size: WORLD_SIZE,
+        pipeline_depth: PIPELINE_DEPTH,
+        req_slot_cap: 1 << 20,
+        resp_slot_cap: 8 << 20,
+        kv_token_capacity: Some(4096),
+        block_size: 16,
+        max_batch_operations: 256,
+        max_batch_tokens: 256,
+        attention_backend: uniserve_worker_ipc::AttentionBackend::TorchSdpa,
+        worker_kind: Some(WorkerKind::Full),
+        transfer_backend: TransferBackend::Shm,
+        launch: config,
+    })?;
 
     let slow_admission = text_admission(31, 1, 1)?;
     let slow_root = VersionRef::admission_root(
@@ -335,7 +337,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         Some(slow_admission.clone()),
         OpId(1),
         slow_root,
-        TokenMode::Extend,
+        ForwardMode::TokenExtend,
         &[6],
         0,
         BlockId(1),
@@ -373,7 +375,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         Some(fast_admission),
         OpId(1),
         fast_root,
-        TokenMode::Extend,
+        ForwardMode::TokenExtend,
         &[9],
         0,
         BlockId(2),
@@ -743,37 +745,29 @@ fn spawn_rank_group() -> anyhow::Result<MultiprocExecutor> {
         prefill_cuda_graph: false,
         ..WorkerLaunchConfig::default()
     };
-    MultiprocExecutor::spawn_with_config(
-        path_text(&worker)?,
-        "",
-        "cpu",
-        WORLD_SIZE,
-        PIPELINE_DEPTH,
-        1 << 20,
-        8 << 20,
-        Some(4096),
-        16,
-        256,
-        256,
-        "torch_sdpa",
-        &config,
-    )
+    MultiprocExecutor::spawn(WorkerSpawnSpec {
+        python: worker,
+        model: String::new(),
+        device: "cpu".into(),
+        world_size: WORLD_SIZE,
+        pipeline_depth: PIPELINE_DEPTH,
+        req_slot_cap: 1 << 20,
+        resp_slot_cap: 8 << 20,
+        kv_token_capacity: Some(4096),
+        block_size: 16,
+        max_batch_operations: 256,
+        max_batch_tokens: 256,
+        attention_backend: uniserve_worker_ipc::AttentionBackend::TorchSdpa,
+        worker_kind: None,
+        transfer_backend: TransferBackend::Inproc,
+        launch: config,
+    })
 }
 
 fn worker_python() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../..")
         .join(".venv/bin/python")
-}
-
-fn path_text(path: &Path) -> anyhow::Result<&str> {
-    anyhow::ensure!(
-        path.is_file(),
-        "worker Python is missing at {}",
-        path.display()
-    );
-    path.to_str()
-        .ok_or_else(|| anyhow::anyhow!("worker Python path is not UTF-8"))
 }
 
 fn execute(
@@ -805,7 +799,7 @@ fn assert_execution_error(
 }
 
 fn text_admission(session_id: u64, epoch: u64, request_pool_idx: u32) -> anyhow::Result<Admission> {
-    Admission::new(
+    Ok(Admission::new(
         RequestKey::new(1, RequestId(session_id), epoch),
         request_pool_idx,
         Some(UndAdmission {
@@ -819,17 +813,16 @@ fn text_admission(session_id: u64, epoch: u64, request_pool_idx: u32) -> anyhow:
             initial_position: 0,
         }),
         None,
-    )
+    )?)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn token_batch(
     step_id: u64,
     collective_seq: u64,
     admission: Option<Admission>,
     op_id: OpId,
     parent: VersionRef,
-    mode: TokenMode,
+    mode: ForwardMode,
     tokens: &[u32],
     control_seq: u64,
     page: BlockId,
@@ -875,28 +868,25 @@ fn token_batch(
         shape_bound: ShapeBound::default(),
         point_range: PointRange::default(),
     };
-    let operation = Operation::registered(
+    let operation = Operation::registered(uniserve_worker_ipc::OperationSpec {
         request_key,
         op_id,
         parent,
-        ForwardMode::from_token(mode),
-        RouteId(0),
-        match mode {
-            TokenMode::Extend => Domain::Prefill,
-            TokenMode::Decode | TokenMode::Verify => Domain::Decode,
-        },
-        Bounds {
+        work: mode,
+        route: RouteId(0),
+        domain: mode.domain(),
+        bounds: Bounds {
             max_points: 1,
             max_tokens: tokens.len().max(1) as u32,
             max_kv_pages: u32::from(prefix_length == 0),
             ..Bounds::default()
         },
-        vec![input.clone()],
-        vec![token_output, finish_output],
-        None,
-        None,
+        inputs: vec![input.clone()],
+        outputs: vec![token_output, finish_output],
+        predicate: None,
+        rng: None,
         control_seq,
-    );
+    });
     let input_length = tokens.len() as u32;
     let partition = BatchPartition {
         partition_id: 1,

@@ -8,7 +8,27 @@ mod uniproc;
 
 pub use multiproc::MultiprocExecutor;
 pub use staged_executor::StagedExecutor;
-pub use uniproc::{LaneConfig, UniprocExecutor, WorkerLaunchConfig};
+pub use uniproc::{FlashInferBackend, LaneConfig, UniprocExecutor, WorkerLaunchConfig};
+
+/// Complete context required to spawn one worker pool.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkerSpawnSpec {
+    pub python: std::path::PathBuf,
+    pub model: String,
+    pub device: String,
+    pub world_size: usize,
+    pub pipeline_depth: usize,
+    pub req_slot_cap: usize,
+    pub resp_slot_cap: usize,
+    pub kv_token_capacity: Option<u64>,
+    pub block_size: u32,
+    pub max_batch_operations: u32,
+    pub max_batch_tokens: u32,
+    pub attention_backend: uniserve_worker_ipc::AttentionBackend,
+    pub worker_kind: Option<crate::executor::WorkerKind>,
+    pub transfer_backend: crate::executor::TransferBackend,
+    pub launch: WorkerLaunchConfig,
+}
 
 pub(crate) fn park_descriptors(fds: &[i32], timeout: std::time::Duration) -> anyhow::Result<()> {
     if fds.is_empty() {

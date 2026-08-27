@@ -3,25 +3,14 @@
 mod reasoning;
 mod tool;
 
-use crate::serving::text::tokenizer::DynTokenizer;
-use futures::{Stream, StreamExt as _};
-use trait_set::trait_set;
-
 use self::reasoning::reasoning_event_stream;
 use self::tool::tool_event_stream;
 use super::structured::structured_chat_event_stream;
-use crate::serving::chat::output::error::Result;
-use crate::serving::chat::output::parser::reasoning::Qwen3ReasoningParser;
-use crate::serving::chat::output::parser::tool::Qwen3XmlToolParser;
-use crate::serving::chat::output::processor::{
-    AssistantEvent, ContentEvent, DynChatEventStream, DynDecodedTextEventStream,
-};
-use crate::serving::chat::output::request::{ChatRequest, ChatToolChoice};
+use crate::profile::reasoning::Qwen3ReasoningParser;
+use crate::profile::tools::Qwen3XmlToolParser;
 use crate::serving::chat::output::{Error, Result as ChatResult};
-
-trait_set! {
-    trait ContentEventStream = Stream<Item = Result<ContentEvent>> + Send + 'static;
-}
+use crate::serving::chat::protocol::{ChatRequest, ChatToolChoice};
+use crate::serving::text::tokenizer::DynTokenizer;
 
 /// Request-scoped Qwen3 reasoning and tool-call processor.
 pub struct Qwen3ChatOutputProcessor {
@@ -73,11 +62,17 @@ impl Qwen3ChatOutputProcessor {
     /// 1. [`reasoning_event_stream`] — reasoning/content separation
     /// 2. [`tool_event_stream`] — tool-call parsing
     /// 3. [`structured_chat_event_stream`] — final block assembly
-    pub fn process(self, decoded: DynDecodedTextEventStream) -> Result<DynChatEventStream> {
+    pub fn process(
+        self,
+        decoded: impl futures::Stream<
+            Item = crate::serving::text::Result<crate::serving::text::DecodedTextEvent>,
+        > + Send,
+    ) -> ChatResult<impl futures::Stream<Item = ChatResult<crate::serving::chat::ChatEvent>> + Send>
+    {
         let reasoning = reasoning_event_stream(decoded, self.reasoning_parser);
         let tool = tool_event_stream(reasoning, self.tool_parser);
         let structured = structured_chat_event_stream(tool);
 
-        Ok(structured.boxed())
+        Ok(structured)
     }
 }

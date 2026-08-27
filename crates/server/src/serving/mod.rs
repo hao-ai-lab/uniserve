@@ -8,6 +8,7 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+mod assembly;
 pub mod chat;
 mod input;
 mod model;
@@ -21,28 +22,28 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::ops::Deref;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Instant;
 
-use crate::engine_client::{EngineClient, GenerationSubmission, MediaEventStream, MediaSubmission};
-use crate::engine_client::{GenerationEventStream, StreamCancelCause};
+use crate::engine_client::{EngineClient, MediaEventRx, MediaSubmission, StreamCancelCause};
 use asynk_strim_attr::{TryYielder, try_stream};
 use futures::{Stream, StreamExt as _};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::Notify;
 use uniserve_core::{GenerationEvent, PublicCommit};
+use uniserve_engine::EventRx;
 
 pub use input::{
     CacheBounds, DecodeControls, GenerateReqInput, ImageGenControls, ImageInput, ModalitySelection,
     ModelEventIdentity, OutputContract, OutputProcessorPolicy, PromptInput, SamplingConfig,
-    SchedulingBounds, StopConfig, SubmissionMetadata, TokenizedGenerateReqInput,
+    SchedulingBounds, StopConfig, TokenizedGenerateReqInput,
 };
 pub use model::{
-    BagelDesc, Qwen3Desc, ResolvedModel, SenseNovaDesc, ServedEndpoint, ServedFeature,
-    ServedModality, ServedModelCapabilities, ServedSamplingControl,
+    ResolvedAssets, ResolvedModel, ServedEndpoint, ServedFeature, ServedModality,
+    ServedModelCapabilities, ServedSamplingControl,
 };
 
 use crate::serving::chat::{
@@ -51,9 +52,10 @@ use crate::serving::chat::{
 use crate::serving::omni::{SenseNovaOutputProcessor, SenseNovaTextDelta};
 use crate::serving::text::output::stop_string_holdback_bytes;
 use crate::serving::text::{
-    DecodedLogprobs, DecodedPromptLogprobs, DecodedTextEvent, FinishReason, StopReason,
-    TextDecodeOptions,
+    DecodedLogprobs, DecodedPromptLogprobs, FinishReason, StopReason, TextDecodeOptions,
 };
+
+use assembly::{assemble_chat_event_stream, assemble_event_stream};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -144,6 +146,46 @@ pub type Result<T> = std::result::Result<T, ServeError>;
 
 static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Debug, Error)]
+pub enum TokenizeError {
+    #[error(transparent)]
+    Tokenizer(#[from] crate::profile::tokenizer::TokenizerError),
+    #[error(transparent)]
+    Chat(#[from] crate::serving::chat::Error),
+    #[error(transparent)]
+    Text(#[from] crate::serving::text::Error),
+    #[error(transparent)]
+    Sampling(#[from] uniserve_core::SamplingParamsError),
+    #[error(transparent)]
+    Generation(#[from] uniserve_core::GenerationRequestError),
+    #[error(transparent)]
+    Omni(#[from] crate::serving::omni::OmniError),
+    #[error("{field} must be non-negative or -1, got {value}")]
+    InvalidLogprobCount { field: &'static str, value: i32 },
+    #[error("min_tokens ({min_tokens}) exceeds max_tokens ({max_tokens})")]
+    MinTokensExceedsMaximum { min_tokens: u32, max_tokens: u32 },
+    #[error("this model does not support logprobs")]
+    UnsupportedLogprobs,
+    #[error("{0}")]
+    Invalid(String),
+    #[error("tokenization task failed")]
+    Task(#[source] tokio::task::JoinError),
+}
+
+#[derive(Debug, Error)]
+pub enum OutputProcessingError {
+    #[error(transparent)]
+    Tokenizer(#[from] crate::profile::tokenizer::TokenizerError),
+    #[error(transparent)]
+    Chat(#[from] crate::serving::chat::Error),
+    #[error(transparent)]
+    Text(#[from] crate::serving::text::Error),
+    #[error(transparent)]
+    Reasoning(#[from] crate::profile::reasoning::ReasoningError),
+    #[error("{0}")]
+    Malformed(String),
+}
+
 /// Runtime-local serving errors.
 #[derive(Debug, Error)]
 pub enum ServeError {
@@ -175,20 +217,32 @@ pub enum ServeError {
     },
     #[error("request `{request_id}` is already active")]
     DuplicateRequestId { request_id: ServeRequestId },
-    #[error("model resolution failed: {0}")]
-    ModelResolution(String),
-    #[error("engine runtime error: {0}")]
-    Engine(String),
-    #[error("request `{request_id}` cannot be tokenized: {message}")]
+    #[error(transparent)]
+    ModelResolution(#[from] crate::serving::model::ModelResolutionError),
+    #[error(transparent)]
+    Engine(#[from] crate::engine_client::Error),
+    #[error("request `{request_id}` cannot be tokenized")]
     Tokenize {
         request_id: ServeRequestId,
-        message: String,
+        #[source]
+        source: TokenizeError,
     },
-    #[error("request `{request_id}` output processing failed: {message}")]
+    #[error("request `{request_id}` output processing failed")]
     OutputProcessing {
         request_id: ServeRequestId,
-        message: String,
+        #[source]
+        source: OutputProcessingError,
     },
+}
+
+fn malformed_output(
+    request_id: impl Into<ServeRequestId>,
+    message: impl Into<String>,
+) -> ServeError {
+    ServeError::OutputProcessing {
+        request_id: request_id.into(),
+        source: OutputProcessingError::Malformed(message.into()),
+    }
 }
 
 /// Fold cache namespace/salt into a stable isolation key.
@@ -254,11 +308,11 @@ impl ServingRuntime {
         self.model.served_model_name()
     }
 
-    pub fn tokenizer(&self) -> Option<crate::serving::text::tokenizer::DynTokenizer> {
-        self.model.tokenizer()
+    pub fn engine(&self) -> &EngineClient {
+        &self.engine
     }
 
-    pub async fn generate_video(&self, request: VideoGenerationInput) -> Result<MediaEventStream> {
+    pub async fn generate_video(&self, request: VideoGenerationInput) -> Result<MediaEventRx> {
         if !self
             .model
             .served_capabilities()
@@ -273,7 +327,7 @@ impl ServingRuntime {
         if request.prompt.trim().is_empty() {
             return Err(ServeError::Tokenize {
                 request_id: request.request_id,
-                message: "video prompt must not be empty".to_string(),
+                source: TokenizeError::Invalid("video prompt must not be empty".to_string()),
             });
         }
         let submission = MediaSubmission::new(
@@ -285,7 +339,7 @@ impl ServingRuntime {
         self.engine
             .submit_media(submission)
             .await
-            .map_err(|error| ServeError::Engine(error.to_string()))
+            .map_err(ServeError::Engine)
     }
 
     pub fn runtime_id(&self) -> u64 {
@@ -323,8 +377,8 @@ impl ServingRuntime {
 
         if !self.requests.register(
             request_id.clone(),
-            identity.profile_id.clone(),
-            identity.description_id.clone(),
+            identity.served_name.clone(),
+            identity.description.clone(),
             0,
             RequestLifecycleState::Compiling,
         ) {
@@ -341,7 +395,7 @@ impl ServingRuntime {
             tokenized = tokio::task::spawn_blocking(move || model.tokenize(request)) => {
                 tokenized.unwrap_or_else(|error| Err(ServeError::Tokenize {
                     request_id: tokenize_request_id,
-                    message: format!("tokenize worker failed: {error}"),
+                    source: TokenizeError::Task(error),
                 }))
             }
         };
@@ -374,9 +428,12 @@ impl ServingRuntime {
             return Ok(self.control_event_stream(request_id, terminal));
         }
 
+        let engine_stream = self.engine.submit_generation(&tokenized).await;
+
         let TokenizedGenerateReqInput {
             request_id: _,
-            request,
+            request: _,
+            tokenizer,
             prompt_token_ids,
             decode,
             emit_token_ids,
@@ -384,15 +441,14 @@ impl ServingRuntime {
             generated_logprobs_requested,
             skip_special_tokens,
             output_processor,
-            submission,
             identity,
             cache,
             resources,
         } = tokenized;
 
         let event_context = EventContext {
-            profile_id: identity.profile_id.clone(),
-            description_id: identity.description_id.clone(),
+            served_name: identity.served_name.clone(),
+            description: identity.description.clone(),
             compile_duration_us,
             cache,
             resources,
@@ -400,32 +456,29 @@ impl ServingRuntime {
             metrics: Arc::clone(&self.metrics),
         };
 
-        let mut engine_submission = GenerationSubmission::new(request_id.to_string(), request);
-        engine_submission.trace_headers = submission.trace_headers;
-
-        let tokenizer =
-            self.model
-                .tokenizer()
-                .ok_or_else(|| ServeError::UnsupportedCapability {
+        let stream_result: Result<ServeEventStream> = match engine_stream {
+            Ok(stream) => {
+                let assembly = StreamAssemblySpec {
                     request_id: request_id.clone(),
-                    capability: "text_generation",
-                })?;
-        let stream_result: Result<ServeEventStream> =
-            match self.engine.submit_generation(engine_submission).await {
-                Ok(stream) => Ok(Box::pin(assemble_event_stream(
-                    request_id.clone(),
                     event_context,
                     prompt_token_ids,
                     tokenizer,
                     prompt_logprobs_requested,
                     generated_logprobs_requested,
                     emit_token_ids,
-                    decode,
-                    output_processor,
+                    decode_options: decode,
                     stream,
-                )) as ServeEventStream),
-                Err(error) => Err(ServeError::Engine(error.to_string())),
-            };
+                };
+                let output: ServeEventStream = match output_processor {
+                    OutputProcessorPolicy::Qwen3(processor) => {
+                        Box::pin(assemble_chat_event_stream(assembly, processor))
+                    }
+                    output_processor => Box::pin(assemble_event_stream(assembly, output_processor)),
+                };
+                Ok(output)
+            }
+            Err(error) => Err(ServeError::Engine(error)),
+        };
 
         if let Some(terminal) = self.requests.control_terminal(&request_id) {
             if let Ok(stream) = stream_result {
@@ -503,10 +556,7 @@ impl ServingRuntime {
             .requests
             .mark_control(&request_id, RequestLifecycleState::Cancelling);
         if engine_may_own_request {
-            self.engine
-                .cancel_request(&request_id)
-                .await
-                .map_err(|message| ServeControlError::Engine(message.to_string()))?;
+            self.engine.cancel_request(&request_id).await?;
         }
         Ok(())
     }
@@ -521,10 +571,7 @@ impl ServingRuntime {
             .requests
             .mark_control(&request_id, RequestLifecycleState::Aborting);
         if engine_may_own_request {
-            self.engine
-                .abort_request(&request_id)
-                .await
-                .map_err(|message| ServeControlError::Engine(message.to_string()))?;
+            self.engine.abort_request(&request_id).await?;
         }
         let _ = reason;
         Ok(())
@@ -545,12 +592,7 @@ impl ServingRuntime {
 
     pub async fn shutdown(self) -> std::result::Result<(), crate::engine_client::Error> {
         self.drain().await;
-        Arc::try_unwrap(self.engine)
-            .map_err(|_| crate::engine_client::Error::ClientClosed {
-                message: "engine client still has an active owner during shutdown".to_string(),
-            })?
-            .shutdown()
-            .await
+        self.engine.shutdown().await
     }
 }
 
@@ -563,8 +605,8 @@ pub enum AbortReason {
 
 #[derive(Debug, Error)]
 pub enum ServeControlError {
-    #[error("engine control failed: {0}")]
-    Engine(String),
+    #[error(transparent)]
+    Engine(#[from] crate::engine_client::Error),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -586,8 +628,8 @@ pub enum RequestLifecycleState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequestStatsSnapshot {
     pub request_id: ServeRequestId,
-    pub profile_id: String,
-    pub description_id: String,
+    pub served_name: String,
+    pub description: String,
     pub state: RequestLifecycleState,
     pub prompt_tokens: u32,
     pub visible_output_tokens: u32,
@@ -602,14 +644,14 @@ pub struct RequestStatsSnapshot {
 impl RequestStatsSnapshot {
     fn submitting(
         request_id: ServeRequestId,
-        profile_id: String,
-        description_id: String,
+        served_name: String,
+        description: String,
         compile_us: u64,
     ) -> Self {
         Self {
             request_id,
-            profile_id,
-            description_id,
+            served_name,
+            description,
             state: RequestLifecycleState::Submitting,
             prompt_tokens: 0,
             visible_output_tokens: 0,
@@ -659,8 +701,8 @@ impl RuntimeRequestRegistry {
     fn register(
         &self,
         request_id: ServeRequestId,
-        profile_id: String,
-        description_id: String,
+        served_name: String,
+        description: String,
         compile_us: u64,
         initial_state: RequestLifecycleState,
     ) -> bool {
@@ -672,8 +714,8 @@ impl RuntimeRequestRegistry {
         state.completed_order.retain(|id| id != &request_id);
         let mut stats = RequestStatsSnapshot::submitting(
             request_id.clone(),
-            profile_id,
-            description_id,
+            served_name,
+            description,
             compile_us,
         );
         stats.state = initial_state;
@@ -945,13 +987,25 @@ impl RuntimeRequestRegistry {
 
 #[derive(Debug, Clone)]
 struct EventContext {
-    profile_id: String,
-    description_id: String,
+    served_name: String,
+    description: String,
     compile_duration_us: u64,
     cache: CacheAccounting,
     resources: ResourceAccounting,
     skip_special_tokens: bool,
     metrics: Arc<RuntimeLifecycleMetrics>,
+}
+
+struct StreamAssemblySpec {
+    request_id: ServeRequestId,
+    event_context: EventContext,
+    prompt_token_ids: Vec<u32>,
+    tokenizer: crate::serving::text::tokenizer::DynTokenizer,
+    prompt_logprobs_requested: bool,
+    generated_logprobs_requested: bool,
+    emit_token_ids: bool,
+    decode_options: TextDecodeOptions,
+    stream: EventRx,
 }
 
 #[derive(Debug, Default)]
@@ -1231,8 +1285,8 @@ pub struct RuntimeTimings {
 pub enum ServeEvent {
     Accepted {
         request_id: ServeRequestId,
-        profile_id: String,
-        description_id: String,
+        served_name: String,
+        description: String,
         compile_duration_us: u64,
         prompt_token_count: usize,
         prompt_token_ids: Vec<u32>,
@@ -1432,943 +1486,16 @@ async fn control_aware_event_stream(
     }
 }
 
-// ==========================================================================
-// Single engine -> ServeEvent stream assembler.
-// ==========================================================================
-
-/// Runtime output sink built from the model-supplied [`OutputProcessorPolicy`].
-enum OutputSink {
-    /// Raw visible text.
-    Raw,
-    /// Qwen3 chat reasoning/tool parsing.
-    Chat(ChatOutputBridge),
-    /// SenseNova reasoning and visible-answer filtering.
-    SenseNova(SenseNovaOutputProcessor),
-}
-
-fn build_output_sink(
-    request_id: &ServeRequestId,
-    policy: OutputProcessorPolicy,
-    tokenizer: &crate::serving::text::tokenizer::DynTokenizer,
-    prompt_token_ids: &[u32],
-) -> Result<OutputSink> {
-    match policy {
-        OutputProcessorPolicy::None | OutputProcessorPolicy::Bagel => Ok(OutputSink::Raw),
-        OutputProcessorPolicy::Qwen3 {
-            request,
-            parse_reasoning,
-        } => {
-            let mut request = *request;
-            let processor = Qwen3ChatOutputProcessor::new(
-                &mut request,
-                std::sync::Arc::clone(tokenizer),
-                parse_reasoning,
-            )
-            .map_err(|error| ServeError::OutputProcessing {
-                request_id: request_id.clone(),
-                message: error.to_string(),
-            })?;
-            let bridge =
-                ChatOutputBridge::new(processor).map_err(|error| ServeError::OutputProcessing {
-                    request_id: request_id.clone(),
-                    message: error.to_string(),
-                })?;
-            Ok(OutputSink::Chat(bridge))
-        }
-        OutputProcessorPolicy::SenseNova(output_filter) => {
-            let processor = SenseNovaOutputProcessor::new(
-                output_filter,
-                std::sync::Arc::clone(tokenizer),
-                prompt_token_ids,
-            )
-            .map_err(|error| ServeError::OutputProcessing {
-                request_id: request_id.clone(),
-                message: error.to_string(),
-            })?;
-            Ok(OutputSink::SenseNova(processor))
-        }
-    }
-}
-
-enum ChatDecodedInput {
-    Event(Box<DecodedTextEvent>),
-    Barrier(Arc<AtomicBool>),
-}
-
-struct ChatDecodedInputStream {
-    receiver: mpsc::Receiver<ChatDecodedInput>,
-}
-
-impl Stream for ChatDecodedInputStream {
-    type Item = crate::serving::chat::output::Result<DecodedTextEvent>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
-        loop {
-            match self.receiver.poll_recv(cx) {
-                Poll::Ready(Some(ChatDecodedInput::Event(event))) => {
-                    return Poll::Ready(Some(Ok(*event)));
-                }
-                Poll::Ready(Some(ChatDecodedInput::Barrier(reached))) => {
-                    reached.store(true, Ordering::Release);
-                }
-                Poll::Ready(None) => return Poll::Ready(None),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-    }
-}
-
-struct ChatOutputBridge {
-    sender: mpsc::Sender<ChatDecodedInput>,
-    output: crate::serving::chat::output::DynChatEventStream,
-}
-
-impl ChatOutputBridge {
-    fn new(processor: Qwen3ChatOutputProcessor) -> crate::serving::chat::output::Result<Self> {
-        let (sender, receiver) = mpsc::channel(2);
-        let decoded = Box::pin(ChatDecodedInputStream { receiver });
-        let output = processor.process(decoded)?;
-        Ok(Self { sender, output })
-    }
-
-    async fn push(
-        &mut self,
-        request_id: &ServeRequestId,
-        event: DecodedTextEvent,
-    ) -> Result<Vec<ChatEvent>> {
-        self.sender
-            .try_send(ChatDecodedInput::Event(Box::new(event)))
-            .map_err(|_| ServeError::OutputProcessing {
-                request_id: request_id.clone(),
-                message: "chat output processor closed before receiving decoded text".to_string(),
-            })?;
-        let reached = Arc::new(AtomicBool::new(false));
-        self.sender
-            .try_send(ChatDecodedInput::Barrier(Arc::clone(&reached)))
-            .map_err(|_| ServeError::OutputProcessing {
-                request_id: request_id.clone(),
-                message: "chat output processor closed before its synchronization barrier"
-                    .to_string(),
-            })?;
-
-        let mut events = Vec::new();
-        futures::future::poll_fn(|cx| {
-            loop {
-                match self.output.as_mut().poll_next(cx) {
-                    Poll::Ready(Some(Ok(event))) => events.push(event),
-                    Poll::Ready(Some(Err(error))) => {
-                        return Poll::Ready(Err(ServeError::OutputProcessing {
-                            request_id: request_id.clone(),
-                            message: error.to_string(),
-                        }));
-                    }
-                    Poll::Ready(None) => {
-                        return Poll::Ready(Err(ServeError::OutputProcessing {
-                            request_id: request_id.clone(),
-                            message: "chat output processor closed before terminal output"
-                                .to_string(),
-                        }));
-                    }
-                    Poll::Pending if reached.load(Ordering::Acquire) => {
-                        return Poll::Ready(Ok(std::mem::take(&mut events)));
-                    }
-                    Poll::Pending => return Poll::Pending,
-                }
-            }
-        })
-        .await
-    }
-}
-
-struct ChatDone {
-    prompt_token_count: usize,
-    output_token_count: usize,
-    visible_output_token_count: usize,
-    internal_token_count: usize,
-    finish_reason: FinishReason,
-}
-
-enum MappedChatEvent {
-    Ignore,
-    Event(ServeEvent),
-    Done(ChatDone),
-}
-
-fn map_chat_event(event: ChatEvent) -> MappedChatEvent {
-    match event {
-        ChatEvent::Start { .. } => MappedChatEvent::Ignore,
-        ChatEvent::BlockStart { index, kind } => {
-            MappedChatEvent::Event(ServeEvent::OutputBlockStart {
-                candidate_id: CandidateId::PRIMARY,
-                index,
-                kind,
-            })
-        }
-        ChatEvent::BlockDelta { kind, delta, .. } => match kind {
-            AssistantBlockKind::Text => MappedChatEvent::Event(ServeEvent::TextDelta {
-                candidate_id: CandidateId::PRIMARY,
-                text: delta,
-                token_ids: Vec::new(),
-                logprobs: None,
-            }),
-            AssistantBlockKind::Reasoning => MappedChatEvent::Event(ServeEvent::ReasoningDelta {
-                candidate_id: CandidateId::PRIMARY,
-                text: delta,
-            }),
-            AssistantBlockKind::ToolCall => MappedChatEvent::Ignore,
-        },
-        ChatEvent::LogprobsDelta {
-            token_ids,
-            logprobs,
-        } => MappedChatEvent::Event(ServeEvent::TextDelta {
-            candidate_id: CandidateId::PRIMARY,
-            text: String::new(),
-            token_ids,
-            logprobs,
-        }),
-        ChatEvent::BlockEnd { index, block } => {
-            MappedChatEvent::Event(ServeEvent::OutputBlockEnd {
-                candidate_id: CandidateId::PRIMARY,
-                index,
-                block,
-            })
-        }
-        ChatEvent::ToolCallStart { index, id, name } => {
-            MappedChatEvent::Event(ServeEvent::ToolCallStart {
-                candidate_id: CandidateId::PRIMARY,
-                index,
-                id,
-                name,
-            })
-        }
-        ChatEvent::ToolCallArgumentsDelta { index, delta } => {
-            MappedChatEvent::Event(ServeEvent::ToolCallArgumentsDelta {
-                candidate_id: CandidateId::PRIMARY,
-                index,
-                delta,
-            })
-        }
-        ChatEvent::ToolCallEnd { index, call } => MappedChatEvent::Event(ServeEvent::ToolCallEnd {
-            candidate_id: CandidateId::PRIMARY,
-            index,
-            id: call.id,
-            name: call.name,
-            arguments: call.arguments,
-        }),
-        ChatEvent::Done {
-            prompt_token_count,
-            output_token_count,
-            visible_output_token_count,
-            internal_token_count,
-            finish_reason,
-            ..
-        } => MappedChatEvent::Done(ChatDone {
-            prompt_token_count,
-            output_token_count,
-            visible_output_token_count,
-            internal_token_count,
-            finish_reason,
-        }),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn emit_text_update(
-    request_id: &ServeRequestId,
-    sink: &mut OutputSink,
-    text: String,
-    token_ids: Vec<u32>,
-    logprobs: Option<DecodedLogprobs>,
-    mut public_commit: Option<PublicCommit>,
-    finished: Option<crate::serving::text::Finished>,
-    started: &Instant,
-    first_visible_output_us: &mut Option<u64>,
-    y: &mut TryYielder<ServeEvent, ServeError>,
-) -> Result<Option<ChatDone>> {
-    if let OutputSink::Chat(bridge) = sink {
-        let events = bridge
-            .push(
-                request_id,
-                DecodedTextEvent::TextDelta {
-                    delta: text,
-                    token_ids,
-                    logprobs,
-                    public_commit: public_commit.clone(),
-                    finished,
-                },
-            )
-            .await?;
-        let mut done = None;
-        for event in events {
-            match map_chat_event(event) {
-                MappedChatEvent::Ignore => {}
-                MappedChatEvent::Event(event) => {
-                    let visible = matches!(&event, ServeEvent::TextDelta { text, .. } if !text.is_empty())
-                        || matches!(&event, ServeEvent::ReasoningDelta { text, .. } if !text.is_empty())
-                        || matches!(&event, ServeEvent::ToolCallStart { .. });
-                    if visible {
-                        first_visible_output_us
-                            .get_or_insert_with(|| started.elapsed().as_micros() as u64);
-                        if let Some(commit) = public_commit.take() {
-                            y.yield_ok(ServeEvent::PublicCommit { commit }).await;
-                        }
-                    }
-                    y.yield_ok(event).await;
-                }
-                MappedChatEvent::Done(next) => {
-                    if done.replace(next).is_some() {
-                        return Err(ServeError::OutputProcessing {
-                            request_id: request_id.clone(),
-                            message: "chat output processor emitted multiple terminal events"
-                                .to_string(),
-                        });
-                    }
-                }
-            }
-        }
-        return Ok(done);
-    }
-
-    let delta: SenseNovaTextDelta = match sink {
-        OutputSink::SenseNova(processor) => processor.push(&text),
-        OutputSink::Raw => SenseNovaTextDelta {
-            visible: text,
-            reasoning: String::new(),
-        },
-        OutputSink::Chat(_) => unreachable!("chat sink handled above"),
-    };
-
-    if !delta.reasoning.is_empty() {
-        first_visible_output_us.get_or_insert_with(|| started.elapsed().as_micros() as u64);
-        if let Some(commit) = public_commit.take() {
-            y.yield_ok(ServeEvent::PublicCommit { commit }).await;
-        }
-        y.yield_ok(ServeEvent::ReasoningDelta {
-            candidate_id: CandidateId::PRIMARY,
-            text: delta.reasoning,
-        })
-        .await;
-    }
-    if !delta.visible.is_empty() {
-        first_visible_output_us.get_or_insert_with(|| started.elapsed().as_micros() as u64);
-        if let Some(commit) = public_commit.take() {
-            y.yield_ok(ServeEvent::PublicCommit { commit }).await;
-        }
-    }
-    if !delta.visible.is_empty()
-        || !token_ids.is_empty()
-        || logprobs.is_some()
-        || finished.is_some()
-    {
-        y.yield_ok(ServeEvent::TextDelta {
-            candidate_id: CandidateId::PRIMARY,
-            text: delta.visible,
-            token_ids,
-            logprobs,
-        })
-        .await;
-    }
-    Ok(finished.map(|finished| ChatDone {
-        prompt_token_count: finished.prompt_token_count,
-        output_token_count: finished.output_token_count,
-        visible_output_token_count: finished
-            .output_token_count
-            .saturating_sub(finished.internal_token_count),
-        internal_token_count: finished.internal_token_count,
-        finish_reason: finished.finish_reason,
-    }))
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn emit_terminal(
-    request_id: &ServeRequestId,
-    event_context: &EventContext,
-    started: &Instant,
-    queue_us: Option<u64>,
-    first_visible_output_us: Option<u64>,
-    image_count: u32,
-    image_steps: u32,
-    finish_detail: Option<String>,
-    done: ChatDone,
-    y: &mut TryYielder<ServeEvent, ServeError>,
-) {
-    debug_assert_eq!(
-        done.output_token_count,
-        done.visible_output_token_count
-            .saturating_add(done.internal_token_count)
-    );
-    y.yield_ok(ServeEvent::Usage {
-        prompt_tokens: done.prompt_token_count.min(u32::MAX as usize) as u32,
-        visible_output_tokens: done.visible_output_token_count.min(u32::MAX as usize) as u32,
-        internal_tokens: done.internal_token_count.min(u32::MAX as usize) as u32,
-        image_count,
-        image_steps,
-        cache: event_context.cache.clone(),
-        resources: event_context.resources.clone(),
-        timings: RuntimeTimings {
-            compile_us: event_context.compile_duration_us,
-            queue_us,
-            first_visible_output_us,
-            total_us: started.elapsed().as_micros() as u64,
-        },
-    })
-    .await;
-    match done.finish_reason.reason() {
-        uniserve_core::FinishReason::Cancelled => {
-            y.yield_ok(ServeEvent::Cancelled {
-                request_id: request_id.clone(),
-            })
-            .await;
-        }
-        uniserve_core::FinishReason::Aborted => {
-            y.yield_ok(ServeEvent::Aborted {
-                request_id: request_id.clone(),
-            })
-            .await;
-        }
-        uniserve_core::FinishReason::Error => {
-            y.yield_ok(ServeEvent::Failed {
-                request_id: request_id.clone(),
-                message: finish_detail.unwrap_or_else(|| "engine execution failed".to_string()),
-            })
-            .await;
-        }
-        _ => {
-            y.yield_ok(ServeEvent::Finished {
-                candidate_id: CandidateId::PRIMARY,
-                reason: FinishStatus::from(&done.finish_reason),
-                finish_detail,
-            })
-            .await;
-        }
-    }
-}
-
-#[try_stream]
-#[allow(clippy::too_many_arguments)]
-async fn assemble_event_stream(
-    request_id: ServeRequestId,
-    event_context: EventContext,
-    prompt_token_ids: Vec<u32>,
-    tokenizer: crate::serving::text::tokenizer::DynTokenizer,
-    prompt_logprobs_requested: bool,
-    generated_logprobs_requested: bool,
-    emit_token_ids: bool,
-    mut decode_options: TextDecodeOptions,
-    output_processor: OutputProcessorPolicy,
-    mut stream: GenerationEventStream,
-    mut y: TryYielder<ServeEvent, ServeError>,
-) -> Result<()> {
-    let started = Instant::now();
-    let mut first_visible_output_us = None;
-    let mut queue_us = None;
-    let mut emitted_output_tokens = 0_u32;
-    let mut image_count = 0_u32;
-    let mut image_steps = 0_u32;
-    let expected_prompt_positions = prompt_token_ids.len().saturating_sub(1);
-    let mut prompt_positions = Vec::new();
-    let mut accepted = false;
-    let mut pending_scheduled = None;
-    let mut pending_token = None;
-    let mut last_public_commit = None;
-    let mut pending_image_events = Vec::new();
-    let mut sink = build_output_sink(&request_id, output_processor, &tokenizer, &prompt_token_ids)?;
-    let mut decoder = tokenizer.create_decode_stream(
-        &prompt_token_ids,
-        decode_options.skip_special_tokens,
-        stop_string_holdback_bytes(&decode_options),
-    );
-    macro_rules! emit_accepted {
-        ($prompt_logprobs:expr) => {{
-            let prompt_logprobs: Option<DecodedPromptLogprobs> = $prompt_logprobs;
-            y.yield_ok(ServeEvent::Accepted {
-                request_id: request_id.clone(),
-                profile_id: event_context.profile_id.clone(),
-                description_id: event_context.description_id.clone(),
-                compile_duration_us: event_context.compile_duration_us,
-                prompt_token_count: prompt_token_ids.len(),
-                prompt_token_ids: prompt_token_ids.clone(),
-                prompt_logprobs: prompt_logprobs.clone(),
-            })
-            .await;
-            if let OutputSink::Chat(bridge) = &mut sink {
-                let events = bridge
-                    .push(
-                        &request_id,
-                        DecodedTextEvent::Start {
-                            prompt_token_ids: Arc::from(prompt_token_ids.clone()),
-                            prompt_logprobs,
-                            queued_at: None,
-                            scheduled_at: None,
-                        },
-                    )
-                    .await?;
-                for event in events {
-                    if !matches!(map_chat_event(event), MappedChatEvent::Ignore) {
-                        return Err(ServeError::OutputProcessing {
-                            request_id: request_id.clone(),
-                            message: "chat output processor emitted output while initializing"
-                                .to_string(),
-                        });
-                    }
-                }
-            }
-            accepted = true;
-            if let Some((queued_at, scheduled_at)) = pending_scheduled.take() {
-                y.yield_ok(ServeEvent::Scheduled {
-                    request_id: request_id.clone(),
-                    queued_at: Some(queued_at),
-                    scheduled_at: Some(scheduled_at),
-                    cache: event_context.cache.clone(),
-                    resources: event_context.resources.clone(),
-                })
-                .await;
-            }
-        }};
-    }
-    macro_rules! flush_pending_images {
-        () => {{
-            for event in pending_image_events.drain(..) {
-                y.yield_ok(event).await;
-            }
-        }};
-    }
-    macro_rules! consume_token {
-        ($id:expr, $logprobs:expr, $public_commit:expr) => {{
-            let id = $id;
-            let logprobs: Option<DecodedLogprobs> = $logprobs;
-            let public_commit: Option<PublicCommit> = $public_commit;
-            if public_commit.is_some() {
-                last_public_commit = public_commit.clone();
-            }
-            flush_pending_images!();
-            emitted_output_tokens = emitted_output_tokens.saturating_add(1);
-            let new_bytes =
-                decoder
-                    .push_token(id)
-                    .map_err(|error| ServeError::OutputProcessing {
-                        request_id: request_id.clone(),
-                        message: error.to_string(),
-                    })?;
-            let matched_stop = if emitted_output_tokens > decode_options.min_tokens {
-                decode_options.stop_strings.as_ref().and_then(|stops| {
-                    crate::serving::text::output::matches_stop_string(
-                        stops,
-                        decoder.output(),
-                        new_bytes,
-                    )
-                })
-            } else {
-                None
-            };
-            let (text, stop_string) = if let Some((index, offset)) = matched_stop {
-                let stop_string = decode_options
-                    .stop_strings
-                    .as_mut()
-                    .ok_or_else(|| ServeError::OutputProcessing {
-                        request_id: request_id.clone(),
-                        message: "stop-string match lost its configured stop set".to_string(),
-                    })?
-                    .swap_remove(index);
-                let truncate_to = if decode_options.include_stop_str_in_output {
-                    offset + stop_string.len()
-                } else {
-                    offset
-                };
-                let (last_chunk, _) = decoder.flush(Some(truncate_to)).map_err(|error| {
-                    ServeError::OutputProcessing {
-                        request_id: request_id.clone(),
-                        message: error.to_string(),
-                    }
-                })?;
-                (last_chunk.unwrap_or_default(), Some(stop_string))
-            } else {
-                (decoder.next_chunk().unwrap_or_default(), None)
-            };
-            let finished = stop_string
-                .as_ref()
-                .map(|stop_string| crate::serving::text::Finished {
-                    prompt_token_count: prompt_token_ids.len(),
-                    output_token_count: emitted_output_tokens as usize,
-                    internal_token_count: 0,
-                    finish_reason: FinishReason::with_stop_reason(
-                        uniserve_core::FinishReason::Stop,
-                        Some(StopReason::Text(stop_string.clone())),
-                    ),
-                });
-            if stop_string.is_none() {
-                stream.acknowledge_text_prefix();
-            } else {
-                stream.cancel_at_consumed_prefix(StreamCancelCause::StopStringMatched);
-            }
-            let emitted_ids = if emit_token_ids { vec![id] } else { Vec::new() };
-            let done = emit_text_update(
-                &request_id,
-                &mut sink,
-                text,
-                emitted_ids,
-                logprobs,
-                public_commit,
-                finished,
-                &started,
-                &mut first_visible_output_us,
-                &mut y,
-            )
-            .await?;
-            if stop_string.is_some() {
-                let done = done.ok_or_else(|| ServeError::OutputProcessing {
-                    request_id: request_id.clone(),
-                    message: "output processor omitted the stop-string terminal event".to_string(),
-                })?;
-                emit_terminal(
-                    &request_id,
-                    &event_context,
-                    &started,
-                    queue_us,
-                    first_visible_output_us,
-                    image_count,
-                    image_steps,
-                    Some("stop".to_string()),
-                    done,
-                    &mut y,
-                )
-                .await;
-                return Ok(());
-            }
-        }};
-    }
-    macro_rules! ensure_output_ready {
-        ($kind:literal) => {{
-            if !accepted || pending_token.is_some() {
-                return Err(ServeError::OutputProcessing {
-                    request_id: request_id.clone(),
-                    message: concat!($kind, " arrived before output metadata was complete")
-                        .to_string(),
-                });
-            }
-        }};
-    }
-    if !prompt_logprobs_requested || expected_prompt_positions == 0 {
-        let prompt_logprobs =
-            if prompt_logprobs_requested {
-                let first_token_id = prompt_token_ids.first().copied().ok_or_else(|| {
-                    ServeError::OutputProcessing {
-                        request_id: request_id.clone(),
-                        message: "prompt logprobs require a non-empty tokenized prompt".to_string(),
-                    }
-                })?;
-                let first_token = tokenizer
-                    .decode(&[first_token_id], event_context.skip_special_tokens)
-                    .map_err(|error| ServeError::OutputProcessing {
-                        request_id: request_id.clone(),
-                        message: error.to_string(),
-                    })?;
-                Some(DecodedPromptLogprobs {
-                    first_token_id,
-                    first_token,
-                    scored_positions: Vec::new(),
-                })
-            } else {
-                None
-            };
-        emit_accepted!(prompt_logprobs);
-    }
-    while let Some(event) = stream.next().await {
-        match event {
-            GenerationEvent::Scheduled {
-                queued_at,
-                scheduled_at,
-            } => {
-                queue_us = Some(((scheduled_at - queued_at).max(0.0) * 1_000_000.0) as u64);
-                if accepted {
-                    y.yield_ok(ServeEvent::Scheduled {
-                        request_id: request_id.clone(),
-                        queued_at: Some(queued_at),
-                        scheduled_at: Some(scheduled_at),
-                        cache: event_context.cache.clone(),
-                        resources: event_context.resources.clone(),
-                    })
-                    .await;
-                } else {
-                    pending_scheduled = Some((queued_at, scheduled_at));
-                }
-                event_context
-                    .metrics
-                    .scheduled
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            GenerationEvent::PromptLogprobs { positions } => {
-                prompt_positions.extend(positions);
-                if prompt_positions.len() > expected_prompt_positions {
-                    return Err(ServeError::OutputProcessing {
-                        request_id: request_id.clone(),
-                        message: "engine returned more prompt logprob positions than requested"
-                            .to_string(),
-                    });
-                }
-                if !accepted && prompt_positions.len() == expected_prompt_positions {
-                    let positions = std::mem::take(&mut prompt_positions);
-                    let decoded = crate::serving::text::output::decode_prompt_logprobs(
-                        &request_id,
-                        tokenizer.as_ref(),
-                        &prompt_token_ids,
-                        &positions,
-                        event_context.skip_special_tokens,
-                    )
-                    .map_err(|error| ServeError::OutputProcessing {
-                        request_id: request_id.clone(),
-                        message: error.to_string(),
-                    })?;
-                    emit_accepted!(Some(decoded));
-                }
-            }
-            GenerationEvent::TextToken {
-                id, public_commit, ..
-            } => {
-                if !accepted {
-                    return Err(ServeError::OutputProcessing {
-                        request_id: request_id.clone(),
-                        message: "engine began generation before prompt logprobs were complete"
-                            .to_string(),
-                    });
-                }
-                if pending_token.is_some() {
-                    return Err(ServeError::OutputProcessing {
-                        request_id: request_id.clone(),
-                        message: "engine emitted a new token before resolving prior logprobs"
-                            .to_string(),
-                    });
-                }
-                if generated_logprobs_requested {
-                    pending_token = Some((id, public_commit));
-                } else {
-                    consume_token!(id, None, public_commit);
-                }
-            }
-            GenerationEvent::TokenLogprobs { id, candidates } => {
-                let (pending, public_commit) =
-                    pending_token
-                        .take()
-                        .ok_or_else(|| ServeError::OutputProcessing {
-                            request_id: request_id.clone(),
-                            message: "engine returned token logprobs without a pending token"
-                                .to_string(),
-                        })?;
-                if pending != id || candidates.first().is_none_or(|entry| entry.token_id != id) {
-                    return Err(ServeError::OutputProcessing {
-                        request_id: request_id.clone(),
-                        message: "token logprobs do not match the emitted token".to_string(),
-                    });
-                }
-                let logprobs = crate::serving::text::output::decode_logprobs(
-                    tokenizer.as_ref(),
-                    &[uniserve_core::PositionLogprobs {
-                        entries: candidates,
-                    }],
-                    event_context.skip_special_tokens,
-                )
-                .map_err(|error| ServeError::OutputProcessing {
-                    request_id: request_id.clone(),
-                    message: error.to_string(),
-                })?;
-                consume_token!(id, Some(logprobs), public_commit);
-            }
-            GenerationEvent::ImageBegin {
-                image_id,
-                height,
-                width,
-                steps,
-            } => {
-                ensure_output_ready!("image-begin event");
-                first_visible_output_us.get_or_insert_with(|| started.elapsed().as_micros() as u64);
-                y.yield_ok(ServeEvent::ImageBegin {
-                    candidate_id: CandidateId::PRIMARY,
-                    image_id: image_id.to_string(),
-                    width: Some(width),
-                    height: Some(height),
-                    steps: Some(steps as u32),
-                    elapsed_us: started.elapsed().as_micros() as u64,
-                })
-                .await;
-            }
-            GenerationEvent::ImageStep { image_id, step } => {
-                ensure_output_ready!("image-step event");
-                image_steps = image_steps.saturating_add(1);
-                y.yield_ok(ServeEvent::ImageStep {
-                    candidate_id: CandidateId::PRIMARY,
-                    image_id: image_id.to_string(),
-                    step: step as u32,
-                    elapsed_us: started.elapsed().as_micros() as u64,
-                })
-                .await;
-            }
-            GenerationEvent::ImageCommit { image_id } => {
-                ensure_output_ready!("image-commit event");
-                pending_image_events.push(ServeEvent::ImageCommit {
-                    candidate_id: CandidateId::PRIMARY,
-                    image_id: image_id.to_string(),
-                    elapsed_us: started.elapsed().as_micros() as u64,
-                });
-            }
-            GenerationEvent::ImageDone {
-                image_id,
-                height,
-                width,
-                bytes,
-                sha256,
-                pixels_png_b64,
-                public_commit,
-            } => {
-                ensure_output_ready!("image-done event");
-                image_count = image_count.saturating_add(1);
-                if let Some(commit) = public_commit {
-                    pending_image_events.push(ServeEvent::PublicCommit { commit });
-                }
-                pending_image_events.push(ServeEvent::ImageDone {
-                    candidate_id: CandidateId::PRIMARY,
-                    image_id: image_id.to_string(),
-                    width: Some(width),
-                    height: Some(height),
-                    bytes: Some(bytes),
-                    sha256: Some(sha256),
-                    pixels_png_b64: Some(pixels_png_b64),
-                    elapsed_us: started.elapsed().as_micros() as u64,
-                });
-            }
-            GenerationEvent::Finished {
-                reason,
-                stop_reason,
-                prompt_tokens,
-                completion_tokens,
-                images,
-            } => {
-                ensure_output_ready!("terminal event");
-                flush_pending_images!();
-                let (last_chunk, _) =
-                    decoder
-                        .flush(None)
-                        .map_err(|error| ServeError::OutputProcessing {
-                            request_id: request_id.clone(),
-                            message: error.to_string(),
-                        })?;
-                let finish_detail = generation_finish_detail(&reason).to_string();
-                let finished = crate::serving::text::Finished {
-                    prompt_token_count: prompt_tokens,
-                    output_token_count: completion_tokens,
-                    internal_token_count: completion_tokens
-                        .saturating_sub(emitted_output_tokens as usize),
-                    finish_reason: generation_text_finish_reason(reason, stop_reason),
-                };
-                let done = emit_text_update(
-                    &request_id,
-                    &mut sink,
-                    last_chunk.unwrap_or_default(),
-                    Vec::new(),
-                    None,
-                    last_public_commit,
-                    Some(finished),
-                    &started,
-                    &mut first_visible_output_us,
-                    &mut y,
-                )
-                .await?
-                .ok_or_else(|| ServeError::OutputProcessing {
-                    request_id: request_id.clone(),
-                    message: "output processor omitted the engine terminal event".to_string(),
-                })?;
-                image_count = image_count.max(images.min(u32::MAX as usize) as u32);
-                emit_terminal(
-                    &request_id,
-                    &event_context,
-                    &started,
-                    queue_us,
-                    first_visible_output_us,
-                    image_count,
-                    image_steps,
-                    Some(finish_detail),
-                    done,
-                    &mut y,
-                )
-                .await;
-                return Ok(());
-            }
-            GenerationEvent::Rejected { message } => {
-                flush_pending_images!();
-                y.yield_ok(ServeEvent::Rejected {
-                    request_id: request_id.clone(),
-                    message,
-                })
-                .await;
-                return Ok(());
-            }
-            GenerationEvent::Error { message } => {
-                flush_pending_images!();
-                y.yield_ok(ServeEvent::Failed {
-                    request_id: request_id.clone(),
-                    message,
-                })
-                .await;
-                return Ok(());
-            }
-            GenerationEvent::MediaCompleted { .. }
-            | GenerationEvent::MediaFailed { .. }
-            | GenerationEvent::MediaAborted => {
-                return Err(ServeError::OutputProcessing {
-                    request_id,
-                    message: "generation request received a media lifecycle event".to_string(),
-                });
-            }
-        }
-    }
-
-    flush_pending_images!();
-    Err(ServeError::OutputProcessing {
-        request_id,
-        message: "engine stream closed before a terminal event".to_string(),
-    })
-}
-
-fn generation_text_finish_reason(
-    reason: uniserve_core::FinishReason,
-    stop_reason: Option<String>,
-) -> FinishReason {
-    if reason == uniserve_core::FinishReason::Stop {
-        return FinishReason::with_stop_reason(
-            reason,
-            stop_reason.map(|reason| {
-                reason
-                    .strip_prefix("token:")
-                    .and_then(|id| id.parse().ok())
-                    .map_or_else(|| StopReason::Text(reason), StopReason::TokenId)
-            }),
-        );
-    }
-    FinishReason::new(reason)
-}
-
-fn generation_finish_detail(reason: &uniserve_core::FinishReason) -> &'static str {
-    match reason {
-        uniserve_core::FinishReason::Eos => "eos",
-        uniserve_core::FinishReason::MaxTokens => "max_tokens",
-        uniserve_core::FinishReason::Stop => "stop",
-        uniserve_core::FinishReason::ImageDone => "image_done",
-        uniserve_core::FinishReason::Cancelled => "cancelled",
-        uniserve_core::FinishReason::Aborted => "aborted",
-        uniserve_core::FinishReason::Repetition => "repetition",
-        uniserve_core::FinishReason::Error => "error",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine_client::GenerationEventStream;
     use uniserve_core::{PublicModality, SemanticRoot, TokenLogprob};
+    use uniserve_engine::EventRx;
 
     fn event_context() -> EventContext {
         EventContext {
-            profile_id: "profile".to_string(),
-            description_id: "bagel".to_string(),
+            served_name: "profile".to_string(),
+            description: "bagel".to_string(),
             compile_duration_us: 7,
             cache: CacheAccounting {
                 read_enabled: true,
@@ -2391,9 +1518,10 @@ mod tests {
             modality,
             committed_at: event_seq as f64,
             semantic_root: SemanticRoot {
-                producer_op_id: event_seq,
+                producer_op_id: uniserve_core::OpId(event_seq),
                 point_index: event_seq as u32,
-                semantic_digest: format!("{event_seq:064x}"),
+                semantic_digest: uniserve_core::Digest::try_from(format!("{event_seq:064x}"))
+                    .expect("valid digest"),
             },
         }
     }
@@ -2437,16 +1565,18 @@ mod tests {
         drop(tx);
 
         let events = assemble_event_stream(
-            "req".into(),
-            event_context(),
-            vec![b'p' as u32],
-            tokenizer,
-            false,
-            true,
-            true,
-            TextDecodeOptions::default(),
+            StreamAssemblySpec {
+                request_id: "req".into(),
+                event_context: event_context(),
+                prompt_token_ids: vec![b'p' as u32],
+                tokenizer,
+                prompt_logprobs_requested: false,
+                generated_logprobs_requested: true,
+                emit_token_ids: true,
+                decode_options: TextDecodeOptions::default(),
+                stream: EventRx::from_receiver(rx),
+            },
             bagel_output_policy(),
-            GenerationEventStream::new(rx),
         )
         .collect::<Vec<_>>()
         .await;
@@ -2488,16 +1618,18 @@ mod tests {
         .unwrap();
 
         let events = assemble_event_stream(
-            "feedback-output".into(),
-            event_context(),
-            vec![b'p' as u32],
-            tokenizer,
-            false,
-            false,
-            false,
-            TextDecodeOptions::default(),
+            StreamAssemblySpec {
+                request_id: "feedback-output".into(),
+                event_context: event_context(),
+                prompt_token_ids: vec![b'p' as u32],
+                tokenizer,
+                prompt_logprobs_requested: false,
+                generated_logprobs_requested: false,
+                emit_token_ids: false,
+                decode_options: TextDecodeOptions::default(),
+                stream: EventRx::from_receiver(rx),
+            },
             bagel_output_policy(),
-            GenerationEventStream::new(rx),
         );
         tokio::pin!(events);
         assert!(matches!(
@@ -2535,7 +1667,7 @@ mod tests {
             height: 1,
             width: 1,
             bytes: 3,
-            sha256: "image".to_string(),
+            sha256: uniserve_core::Digest::zero(),
             pixels_png_b64: "cG5n".to_string(),
             public_commit: Some(public_commit(3, PublicModality::Image)),
         })

@@ -1,7 +1,10 @@
 //! Executor contracts shared by scheduler, worker IPC, and local engines.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+use std::str::FromStr;
 use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
 
 use uniserve_core::{CommandWaker, RequestId};
 use uniserve_worker_ipc::{
@@ -11,7 +14,7 @@ use uniserve_worker_ipc::{
 
 /// Synchronous model-engine seam used by deterministic local implementations.
 pub trait ModelEngine: Send {
-    fn caps(&self) -> WorkerCapabilities;
+    fn caps(&self) -> &WorkerCapabilities;
     fn execute(&mut self, batch: Batch) -> anyhow::Result<CompletionReport>;
     fn drop_session(&mut self, id: RequestId) -> anyhow::Result<()>;
 }
@@ -24,7 +27,8 @@ pub trait ModelEngine: Send {
 ///
 /// `Full` holds the whole model and runs every model op. The other kinds are
 /// model-backed stages with explicit weight-materialization scopes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WorkerKind {
     /// Whole model; runs ALL model ops in one mixed-batch forward.
     Full,
@@ -119,7 +123,7 @@ impl WorkerKind {
 
 /// One pool in a staged topology: `count` instances of `kind`, each with the
 /// given tensor-parallel size.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PoolSpec {
     pub kind: WorkerKind,
     /// Number of data-parallel pool instances of this kind (e.g. `encoder:2`).
@@ -130,7 +134,7 @@ pub struct PoolSpec {
 
 /// The `--workers` topology: an ordered list of pool specs. `full:1` (one Full
 /// pool, tp = `--worker-ranks`) is the default.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkersSpec {
     pub pools: Vec<PoolSpec>,
 }
@@ -149,13 +153,13 @@ impl WorkersSpec {
 
     /// Parse `--workers`, e.g. `encoder:2,prefill:1:tp=4,decode:1:tp=4`.
     /// Each entry is `kind[:count[:tp=N]]`; `count` and `tp` default to 1.
-    pub fn parse(s: &str) -> anyhow::Result<Self> {
+    pub fn parse(s: &str) -> Result<Self, WorkersSpecError> {
         let mut pools = Vec::new();
         for entry in s.split(',').map(str::trim).filter(|e| !e.is_empty()) {
             let mut parts = entry.split(':');
             let kind_str = parts.next().unwrap_or("").trim();
             let kind = WorkerKind::from_token(kind_str)
-                .ok_or_else(|| anyhow::anyhow!("unknown worker kind {kind_str:?} in --workers"))?;
+                .ok_or_else(|| WorkersSpecError::UnknownWorkerKind(kind_str.to_owned()))?;
             let mut count = 1usize;
             let mut tp = 1usize;
             for part in parts {
@@ -163,18 +167,20 @@ impl WorkersSpec {
                 if let Some(tp_str) = part.strip_prefix("tp=") {
                     tp = tp_str
                         .parse::<usize>()
-                        .map_err(|_| anyhow::anyhow!("invalid tp in --workers entry {entry:?}"))?
+                        .map_err(|_| WorkersSpecError::InvalidTensorParallel(entry.to_owned()))?
                         .max(1);
                 } else {
                     count = part
                         .parse::<usize>()
-                        .map_err(|_| anyhow::anyhow!("invalid count in --workers entry {entry:?}"))?
+                        .map_err(|_| WorkersSpecError::InvalidCount(entry.to_owned()))?
                         .max(1);
                 }
             }
             pools.push(PoolSpec { kind, count, tp });
         }
-        anyhow::ensure!(!pools.is_empty(), "--workers must list at least one pool");
+        if pools.is_empty() {
+            return Err(WorkersSpecError::Empty);
+        }
         Ok(Self { pools })
     }
 
@@ -190,48 +196,125 @@ impl WorkersSpec {
     }
 }
 
+impl FromStr for WorkersSpec {
+    type Err = WorkersSpecError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WorkersSpecError {
+    #[error("workers must list at least one pool")]
+    Empty,
+    #[error("unknown worker kind {0:?}")]
+    UnknownWorkerKind(String),
+    #[error("invalid worker count in entry {0:?}")]
+    InvalidCount(String),
+    #[error("invalid tensor-parallel size in entry {0:?}")]
+    InvalidTensorParallel(String),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferBackend {
+    #[default]
+    Inproc,
+    Shm,
+    CudaIpc,
+}
+
+impl TransferBackend {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Inproc => "inproc",
+            Self::Shm => "shm",
+            Self::CudaIpc => "cuda_ipc",
+        }
+    }
+}
+
+impl std::fmt::Display for TransferBackend {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for TransferBackend {
+    type Err = TransferSpecError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "inproc" => Ok(Self::Inproc),
+            "shm" => Ok(Self::Shm),
+            "cuda_ipc" => Ok(Self::CudaIpc),
+            _ => Err(TransferSpecError::UnsupportedBackend(value.to_owned())),
+        }
+    }
+}
+
 /// Per-edge local data-plane transfer selection (`--transfer`), e.g.
 /// `encoder->prefill=shm,prefill->decode=cuda_ipc`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransferSpec {
     /// (producer kind, consumer kind) → backend name.
-    pub edges: std::collections::BTreeMap<(WorkerKind, WorkerKind), String>,
+    pub edges: std::collections::BTreeMap<(WorkerKind, WorkerKind), TransferBackend>,
 }
 
 impl TransferSpec {
-    pub fn parse(s: &str) -> anyhow::Result<Self> {
+    pub fn parse(s: &str) -> Result<Self, TransferSpecError> {
         let mut edges = std::collections::BTreeMap::new();
         for entry in s.split(',').map(str::trim).filter(|e| !e.is_empty()) {
-            let (edge, backend) = entry.split_once('=').ok_or_else(|| {
-                anyhow::anyhow!("--transfer entry {entry:?} must be edge=backend")
-            })?;
+            let (edge, backend) = entry
+                .split_once('=')
+                .ok_or_else(|| TransferSpecError::InvalidEntry(entry.to_owned()))?;
             let (src, dst) = edge
                 .split_once("->")
-                .ok_or_else(|| anyhow::anyhow!("--transfer edge {edge:?} must be src->dst"))?;
+                .ok_or_else(|| TransferSpecError::InvalidEdge(edge.to_owned()))?;
             let src = WorkerKind::from_token(src.trim())
-                .ok_or_else(|| anyhow::anyhow!("unknown src kind in --transfer {edge:?}"))?;
+                .ok_or_else(|| TransferSpecError::UnknownWorkerKind(src.trim().to_owned()))?;
             let dst = WorkerKind::from_token(dst.trim())
-                .ok_or_else(|| anyhow::anyhow!("unknown dst kind in --transfer {edge:?}"))?;
-            let backend = backend.trim();
-            anyhow::ensure!(
-                matches!(backend, "shm" | "cuda_ipc"),
-                "unsupported local transfer backend {backend:?}"
-            );
-            anyhow::ensure!(
-                edges.insert((src, dst), backend.to_string()).is_none(),
-                "duplicate --transfer edge {edge:?}"
-            );
+                .ok_or_else(|| TransferSpecError::UnknownWorkerKind(dst.trim().to_owned()))?;
+            let backend = TransferBackend::from_str(backend.trim())?;
+            if backend == TransferBackend::Inproc {
+                return Err(TransferSpecError::ExplicitInproc);
+            }
+            if edges.insert((src, dst), backend).is_some() {
+                return Err(TransferSpecError::DuplicateEdge(edge.to_owned()));
+            }
         }
         Ok(Self { edges })
     }
 
     /// Backend for an edge, or `"inproc"` (the in-process zero-transfer default).
-    pub fn backend_for(&self, src: WorkerKind, dst: WorkerKind) -> &str {
-        self.edges
-            .get(&(src, dst))
-            .map(String::as_str)
-            .unwrap_or("inproc")
+    pub fn backend_for(&self, src: WorkerKind, dst: WorkerKind) -> TransferBackend {
+        self.edges.get(&(src, dst)).copied().unwrap_or_default()
     }
+}
+
+impl FromStr for TransferSpec {
+    type Err = TransferSpecError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TransferSpecError {
+    #[error("transfer entry {0:?} must be edge=backend")]
+    InvalidEntry(String),
+    #[error("transfer edge {0:?} must be src->dst")]
+    InvalidEdge(String),
+    #[error("unknown worker kind {0:?} in transfer edge")]
+    UnknownWorkerKind(String),
+    #[error("unsupported transfer backend {0:?}")]
+    UnsupportedBackend(String),
+    #[error("inproc is the implicit backend and cannot be assigned to an edge")]
+    ExplicitInproc,
+    #[error("duplicate transfer edge {0:?}")]
+    DuplicateEdge(String),
 }
 
 /// One typed control operation carried over the executor control plane.
@@ -279,7 +362,7 @@ impl ControlOp {
                 placement,
             } => WorkerRequest::restore_session(snapshot.clone(), placement.clone()),
         };
-        req.call_id = Some(call_id);
+        req.set_call_id(Some(call_id));
         req
     }
 }
@@ -288,9 +371,13 @@ impl ControlOp {
 #[derive(Debug, Clone)]
 pub struct ControlAck {
     pub rank: u32,
-    pub ok: bool,
-    pub message: Option<String>,
-    pub snapshot: Option<SnapshotRef>,
+    pub result: Result<Option<SnapshotRef>, ControlError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ControlError {
+    #[error("worker control failed: {message}")]
+    Worker { message: String },
 }
 
 /// A worker-reported execution error classified for scheduler failure policy.
@@ -351,7 +438,7 @@ impl std::error::Error for WorkerLossError {}
 
 /// The asynchronous, pipelined boundary the scheduler drives.
 pub trait Executor: Send {
-    fn caps(&self) -> WorkerCapabilities;
+    fn caps(&self) -> &WorkerCapabilities;
     fn pipeline_depth(&self) -> usize;
     fn in_flight(&self) -> usize;
 
@@ -435,7 +522,7 @@ pub trait Executor: Send {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uniserve_core::RequestId;
+    use uniserve_core::{Digest, RequestId};
     use uniserve_worker_ipc::{Bounds, ForwardMode, OpId, RequestKey, RouteId, VersionRef};
 
     #[test]
@@ -471,20 +558,20 @@ mod tests {
 
     fn op(work: ForwardMode) -> Operation {
         let request_key = RequestKey::new(1, RequestId(1), 1);
-        Operation::registered(
+        Operation::registered(uniserve_worker_ipc::OperationSpec {
             request_key,
-            OpId(1),
-            VersionRef::admission_root(request_key, OpId(1), "0".repeat(64)),
+            op_id: OpId(1),
+            parent: VersionRef::admission_root(request_key, OpId(1), Digest::zero()),
             work,
-            RouteId(0),
-            work.domain(),
-            Bounds::default(),
-            Vec::new(),
-            Vec::new(),
-            None,
-            None,
-            0,
-        )
+            route: RouteId(0),
+            domain: work.domain(),
+            bounds: Bounds::default(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            predicate: None,
+            rng: None,
+            control_seq: 0,
+        })
     }
 
     #[test]
@@ -534,16 +621,16 @@ mod tests {
         let t = TransferSpec::parse("encoder->prefill=cuda_ipc,prefill->decode=shm").unwrap();
         assert_eq!(
             t.backend_for(WorkerKind::Encoder, WorkerKind::Prefill),
-            "cuda_ipc"
+            TransferBackend::CudaIpc
         );
         assert_eq!(
             t.backend_for(WorkerKind::Prefill, WorkerKind::Decode),
-            "shm"
+            TransferBackend::Shm
         );
         // Unconfigured edge falls back to the in-process backend.
         assert_eq!(
             t.backend_for(WorkerKind::Decode, WorkerKind::Full),
-            "inproc"
+            TransferBackend::Inproc
         );
         assert!(TransferSpec::parse("bad-entry").is_err());
         assert!(TransferSpec::parse("prefill->decode=tcp").is_err());

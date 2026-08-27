@@ -8,24 +8,9 @@ pub use error::{Error, Result};
 pub use renderer::hf::{ChatTemplateContentFormatOption, HfChatRenderer};
 
 pub use crate::serving::chat::protocol::{
-    AssistantContentBlock, AssistantMessageExt, AssistantToolCall, ChatContent, ChatContentPart,
-    ChatMessage, ChatRequest, ChatRole, ChatToolChoice, GenerationPromptMode, ReasoningEffort,
-    Tool,
+    AssistantContentBlock, AssistantToolCall, ChatContent, ChatContentPart, ChatMessage,
+    ChatRequest, ChatRole, ChatToolChoice, GenerationPromptMode, ReasoningEffort, Tool,
 };
-
-pub mod event {
-    pub use crate::serving::chat::protocol::{
-        AssistantBlockKind, AssistantContentBlock, AssistantMessage, AssistantMessageExt,
-        AssistantToolCall, ChatEvent,
-    };
-}
-
-pub mod request {
-    pub use crate::serving::chat::protocol::{
-        ChatContent, ChatContentPart, ChatMessage, ChatOptions, ChatRequest, ChatRole,
-        ChatToolChoice, GenerationPromptMode, ReasoningEffort, Tool,
-    };
-}
 
 use std::collections::HashMap;
 

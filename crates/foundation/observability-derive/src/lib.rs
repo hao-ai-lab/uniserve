@@ -24,7 +24,7 @@ use syn::spanned::Spanned;
 /// The generated method is:
 ///
 /// ```ignore
-/// pub(crate) fn register(registry: &mut ::prometheus_client::registry::Registry) -> Self
+/// pub fn register(registry: &mut ::prometheus_client::registry::Registry) -> Self
 /// ```
 ///
 /// It constructs every field, registers a clone with the supplied name and
@@ -89,7 +89,7 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
 
     Ok(quote! {
         impl #impl_generics #struct_ident #ty_generics #where_clause {
-            pub(crate) fn register(registry: &mut ::prometheus_client::registry::Registry) -> Self {
+            pub fn register(registry: &mut ::prometheus_client::registry::Registry) -> Self {
                 #(#registrations)*
                 Self {
                     #(#field_idents),*

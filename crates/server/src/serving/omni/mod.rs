@@ -3,6 +3,7 @@
 mod output;
 
 use std::io::Cursor;
+use thiserror::Error;
 
 use crate::profile::omni::bagel::{BagelProfile, CONTEXT_SYSTEM_PROMPT};
 use crate::profile::omni::resolution::{ResolutionPolicy, resolve_resolution};
@@ -20,7 +21,7 @@ use crate::serving::chat::{
     ChatContent, ChatContentPart, ChatMessage, ChatRequest, GenerationPromptMode, HfChatRenderer,
 };
 use crate::serving::input::{
-    GenerateReqInput, ModelEventIdentity, OutputProcessorPolicy, PromptInput, SubmissionMetadata,
+    GenerateReqInput, ModalitySelection, ModelEventIdentity, OutputProcessorPolicy, PromptInput,
     TokenizedGenerateReqInput,
 };
 use crate::serving::text::TextDecodeOptions;
@@ -31,6 +32,32 @@ use crate::serving::{
 
 pub(crate) use output::{SenseNovaOutputProcessor, SenseNovaTextDelta};
 
+type OmniResult<T> = std::result::Result<T, OmniError>;
+
+#[derive(Debug, Error)]
+pub enum OmniError {
+    #[error(transparent)]
+    Tokenizer(#[from] crate::profile::tokenizer::TokenizerError),
+    #[error(transparent)]
+    Chat(#[from] crate::serving::chat::Error),
+    #[error(transparent)]
+    Resolution(#[from] crate::profile::omni::resolution::ResolutionError),
+    #[error(transparent)]
+    Generation(#[from] uniserve_core::GenerationRequestError),
+    #[error(transparent)]
+    Sampling(#[from] uniserve_core::SamplingParamsError),
+    #[error(transparent)]
+    Assets(#[from] crate::profile::assets::Error),
+    #[error("{0}")]
+    Invalid(String),
+}
+
+impl From<String> for OmniError {
+    fn from(message: String) -> Self {
+        Self::Invalid(message)
+    }
+}
+
 const DEFAULT_STEPS: u16 = 50;
 const DEFAULT_TEMPERATURE: f32 = 0.0;
 const DEFAULT_TOP_P: f32 = 1.0;
@@ -39,18 +66,18 @@ const DEFAULT_TOP_K: u32 = 0;
 mod context_image_defaults {
     pub(super) const CFG_TEXT_SCALE: f32 = 4.0;
     pub(super) const CFG_IMG_SCALE: f32 = 2.0;
-    pub(super) const CFG_RENORM_TYPE: &str = "text_channel";
     pub(super) const CFG_RENORM_MIN: f32 = 0.0;
     pub(super) const CFG_INTERVAL: (f32, f32) = (0.0, 1.0);
     pub(super) const RESOLUTION: u32 = 512;
 }
 
-struct RuntimeBinding<'a> {
-    tokenizer: DynTokenizer,
-    capabilities: &'a GenerationRuntimeCapabilities,
-    default_max_output_tokens: Option<u32>,
-    max_model_tokens: u32,
-    identity: ModelEventIdentity,
+pub(super) struct RuntimeBinding<'a> {
+    pub(super) tokenizer: DynTokenizer,
+    pub(super) renderer: &'a HfChatRenderer,
+    pub(super) capabilities: &'a GenerationRuntimeCapabilities,
+    pub(super) default_max_output_tokens: Option<u32>,
+    pub(super) max_model_tokens: u32,
+    pub(super) identity: ModelEventIdentity,
 }
 
 #[derive(Debug, Clone)]
@@ -76,26 +103,14 @@ struct RenderedImage {
     b64: String,
 }
 
-pub(crate) fn tokenize_sensenova(
+pub(super) fn tokenize_sensenova(
     profile: &SenseNovaProfile,
-    tokenizer: DynTokenizer,
-    renderer: &HfChatRenderer,
-    capabilities: &GenerationRuntimeCapabilities,
-    default_max_output_tokens: Option<u32>,
-    max_model_tokens: u32,
-    identity: ModelEventIdentity,
+    binding: RuntimeBinding<'_>,
     request: GenerateReqInput,
 ) -> Result<TokenizedGenerateReqInput> {
     let request_id = request.request_id.clone();
-    let binding = RuntimeBinding {
-        tokenizer,
-        capabilities,
-        default_max_output_tokens,
-        max_model_tokens,
-        identity,
-    };
     let result = (|| {
-        let lowered = lower_sensenova(profile, &binding.tokenizer, renderer, &request)?;
+        let lowered = lower_sensenova(profile, &binding.tokenizer, binding.renderer, &request)?;
         let context = build_sensenova_context(profile, &lowered)?;
         let policy = profile
             .generation_policy_for_dimensions(lowered.image.width, lowered.image.height)
@@ -109,32 +124,20 @@ pub(crate) fn tokenize_sensenova(
             OutputProcessorPolicy::SenseNova(profile.output_filter.clone()),
         )
     })();
-    result.map_err(|message| ServeError::Tokenize {
+    result.map_err(|source| ServeError::Tokenize {
         request_id,
-        message,
+        source: crate::serving::TokenizeError::Omni(source),
     })
 }
 
-pub(crate) fn tokenize_bagel(
+pub(super) fn tokenize_bagel(
     profile: &BagelProfile,
-    tokenizer: DynTokenizer,
-    renderer: &HfChatRenderer,
-    capabilities: &GenerationRuntimeCapabilities,
-    default_max_output_tokens: Option<u32>,
-    max_model_tokens: u32,
-    identity: ModelEventIdentity,
+    binding: RuntimeBinding<'_>,
     request: GenerateReqInput,
 ) -> Result<TokenizedGenerateReqInput> {
     let request_id = request.request_id.clone();
-    let binding = RuntimeBinding {
-        tokenizer,
-        capabilities,
-        default_max_output_tokens,
-        max_model_tokens,
-        identity,
-    };
     let result = (|| {
-        let lowered = lower_bagel(profile, &binding.tokenizer, renderer, &request)?;
+        let lowered = lower_bagel(profile, &binding.tokenizer, binding.renderer, &request)?;
         let context = build_bagel_context(profile, &lowered)?;
         let policy = profile
             .generation_policy_for_dimensions(lowered.image.width, lowered.image.height)
@@ -148,9 +151,9 @@ pub(crate) fn tokenize_bagel(
             OutputProcessorPolicy::Bagel,
         )
     })();
-    result.map_err(|message| ServeError::Tokenize {
+    result.map_err(|source| ServeError::Tokenize {
         request_id,
-        message,
+        source: crate::serving::TokenizeError::Omni(source),
     })
 }
 
@@ -159,7 +162,7 @@ fn lower_sensenova(
     tokenizer: &DynTokenizer,
     renderer: &HfChatRenderer,
     request: &GenerateReqInput,
-) -> std::result::Result<LoweredInput, String> {
+) -> OmniResult<LoweredInput> {
     let constraint = generation_constraint(request);
     let (prompt_ids, images) = sensenova_prompt(profile, tokenizer, renderer, request, constraint)?;
     validate_prompt(&prompt_ids)?;
@@ -187,7 +190,7 @@ fn lower_bagel(
     tokenizer: &DynTokenizer,
     renderer: &HfChatRenderer,
     request: &GenerateReqInput,
-) -> std::result::Result<LoweredInput, String> {
+) -> OmniResult<LoweredInput> {
     let constraint = generation_constraint(request);
     let (prompt_ids, images, context_image_mode) =
         bagel_prompt(profile, tokenizer, renderer, request, constraint)?;
@@ -226,7 +229,7 @@ fn sensenova_prompt(
     renderer: &HfChatRenderer,
     request: &GenerateReqInput,
     constraint: GenerationConstraint,
-) -> std::result::Result<(Vec<u32>, Vec<RenderedImage>), String> {
+) -> OmniResult<(Vec<u32>, Vec<RenderedImage>)> {
     match &request.prompt {
         PromptInput::Text(prompt) => {
             let images = top_level_images(request);
@@ -254,7 +257,7 @@ fn bagel_prompt(
     renderer: &HfChatRenderer,
     request: &GenerateReqInput,
     constraint: GenerationConstraint,
-) -> std::result::Result<(Vec<u32>, Vec<RenderedImage>, bool), String> {
+) -> OmniResult<(Vec<u32>, Vec<RenderedImage>, bool)> {
     match &request.prompt {
         PromptInput::Chat { .. } => {
             let (prompt_ids, images) = render_bagel_chat(tokenizer, renderer, request, constraint)?;
@@ -306,7 +309,7 @@ fn render_sensenova_chat(
     renderer: &HfChatRenderer,
     request: &GenerateReqInput,
     constraint: GenerationConstraint,
-) -> std::result::Result<(Vec<u32>, Vec<RenderedImage>), String> {
+) -> OmniResult<(Vec<u32>, Vec<RenderedImage>)> {
     let PromptInput::Chat {
         messages,
         tools,
@@ -352,7 +355,7 @@ fn tokenize_sensenova_with_slots(
     placeholders: &[String],
     images: Vec<PositionedImageInput>,
     profile: &SenseNovaProfile,
-) -> std::result::Result<(Vec<u32>, Vec<RenderedImage>), String> {
+) -> OmniResult<(Vec<u32>, Vec<RenderedImage>)> {
     let marker = format!(
         "{}{}",
         profile.controls.start_of_image_text, profile.controls.end_of_image_text
@@ -364,7 +367,7 @@ fn tokenize_sensenova_with_slots(
     let images = images
         .into_iter()
         .zip(byte_offsets)
-        .map(|(image, byte_offset)| {
+        .map(|(image, byte_offset)| -> OmniResult<RenderedImage> {
             let prefix = tokenizer
                 .encode(&clean[..byte_offset], false)
                 .map_err(|error| {
@@ -375,16 +378,16 @@ fn tokenize_sensenova_with_slots(
                 .checked_sub(1)
                 .ok_or_else(|| "SenseNova image marker encodes to no tokens".to_string())?;
             if prefix[position] != profile.controls.end_of_image {
-                return Err(
+                return Err(OmniError::Invalid(
                     "SenseNova image marker does not end at its configured token".to_string(),
-                );
+                ));
             }
             let position = position
                 .try_into()
                 .map_err(|_| "SenseNova image placement exceeds the token range".to_string())?;
             Ok(rendered_image(&image, position))
         })
-        .collect::<std::result::Result<Vec<_>, String>>()?;
+        .collect::<OmniResult<Vec<_>>>()?;
     Ok((prompt_ids, images))
 }
 
@@ -393,7 +396,7 @@ fn render_bagel_chat(
     renderer: &HfChatRenderer,
     request: &GenerateReqInput,
     constraint: GenerationConstraint,
-) -> std::result::Result<(Vec<u32>, Vec<RenderedImage>), String> {
+) -> OmniResult<(Vec<u32>, Vec<RenderedImage>)> {
     let PromptInput::Chat {
         messages,
         tools,
@@ -432,7 +435,7 @@ fn tokenize_bagel_with_slots(
     rendered: &str,
     placeholders: &[String],
     images: Vec<PositionedImageInput>,
-) -> std::result::Result<(Vec<u32>, Vec<RenderedImage>), String> {
+) -> OmniResult<(Vec<u32>, Vec<RenderedImage>)> {
     let (clean, byte_offsets) = replace_rendered_slots(rendered, placeholders, "")?;
     let prompt_ids = tokenizer
         .encode(&clean, false)
@@ -449,7 +452,7 @@ fn tokenize_bagel_with_slots(
                 .map_err(|_| "Bagel image placement exceeds the token range".to_string())?;
             Ok(rendered_image(&image, position))
         })
-        .collect::<std::result::Result<Vec<_>, String>>()?;
+        .collect::<OmniResult<Vec<_>>>()?;
     Ok((prompt_ids, images))
 }
 
@@ -460,7 +463,7 @@ fn finish_tokenized(
     mut lowered: LoweredInput,
     mut context: Vec<CoreContextSegment>,
     output_processor: OutputProcessorPolicy,
-) -> std::result::Result<TokenizedGenerateReqInput, String> {
+) -> OmniResult<TokenizedGenerateReqInput> {
     let prompt_tokens = u32::try_from(lowered.prompt_ids.len())
         .map_err(|_| "generation prompt exceeds the supported token count".to_string())?;
     let behavior = GenerationBehaviorDescriptor::resolve(lowered.constraint, policy);
@@ -499,17 +502,18 @@ fn finish_tokenized(
         })
         .into_iter()
         .collect::<Vec<_>>();
-    let mut resources = GenerationResourceBounds::conservative(
-        &context,
-        &negative_context,
-        &behavior,
-        policy,
-        &lowered.image,
-        max_tokens,
-        &cache,
-        binding.capabilities,
-    )
-    .map_err(|error| error.to_string())?;
+    let mut resources =
+        GenerationResourceBounds::conservative(uniserve_core::GenerationResourceSpec {
+            context: &context,
+            negative_context: &negative_context,
+            behavior: &behavior,
+            policy,
+            image: &lowered.image,
+            max_und_tokens: max_tokens,
+            cache: &cache,
+            capabilities: binding.capabilities,
+        })
+        .map_err(|error| error.to_string())?;
     if resources.max_kv_tokens > binding.max_model_tokens as usize && behavior.und_decode {
         let excess = resources.max_kv_tokens - binding.max_model_tokens as usize;
         max_tokens = max_tokens
@@ -522,23 +526,24 @@ fn finish_tokenized(
                     binding.max_model_tokens
                 )
             })?;
-        resources = GenerationResourceBounds::conservative(
-            &context,
-            &negative_context,
-            &behavior,
+        resources = GenerationResourceBounds::conservative(uniserve_core::GenerationResourceSpec {
+            context: &context,
+            negative_context: &negative_context,
+            behavior: &behavior,
             policy,
-            &lowered.image,
-            max_tokens,
-            &cache,
-            binding.capabilities,
-        )
+            image: &lowered.image,
+            max_und_tokens: max_tokens,
+            cache: &cache,
+            capabilities: binding.capabilities,
+        })
         .map_err(|error| error.to_string())?;
     }
     if resources.max_kv_tokens > binding.max_model_tokens as usize {
         return Err(format!(
             "generation requires {} KV tokens, exceeding the {}-token runtime limit",
             resources.max_kv_tokens, binding.max_model_tokens
-        ));
+        )
+        .into());
     }
 
     let cache_accounting = CacheAccounting {
@@ -573,6 +578,7 @@ fn finish_tokenized(
     Ok(TokenizedGenerateReqInput {
         request_id: request.request_id,
         request: generation,
+        tokenizer: std::sync::Arc::clone(&binding.tokenizer),
         prompt_token_ids,
         decode: TextDecodeOptions {
             skip_special_tokens: request.decode.skip_special_tokens,
@@ -590,10 +596,6 @@ fn finish_tokenized(
         generated_logprobs_requested,
         skip_special_tokens: request.decode.skip_special_tokens,
         output_processor,
-        submission: SubmissionMetadata {
-            trace_headers: (!request.scheduling.trace_context.is_empty())
-                .then(|| request.scheduling.trace_context.clone()),
-        },
         identity: binding.identity.clone(),
         cache: cache_accounting,
         resources: resource_accounting,
@@ -604,7 +606,7 @@ fn apply_request_sampling(
     tokenizer: &DynTokenizer,
     request: &GenerateReqInput,
     sampling: &mut SamplingParams,
-) -> std::result::Result<(), String> {
+) -> OmniResult<()> {
     sampling.ignore_eos = request.sampling.ignore_eos;
     sampling.min_tokens = request.sampling.min_tokens.unwrap_or(0) as usize;
     sampling.min_p = request.sampling.min_p.unwrap_or(0.0);
@@ -638,26 +640,24 @@ fn apply_request_sampling(
         .stop
         .bad_words
         .iter()
-        .map(|word| {
-            tokenizer
-                .encode(word, false)
-                .map_err(|error| error.to_string())
-        })
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+        .map(|word| tokenizer.encode(word, false).map_err(OmniError::from))
+        .collect::<OmniResult<Vec<_>>>()?;
     Ok(())
 }
 
-fn resolve_sampling(request: &GenerateReqInput) -> std::result::Result<SamplingParams, String> {
+fn resolve_sampling(request: &GenerateReqInput) -> OmniResult<SamplingParams> {
     let temperature = finite(
         request.sampling.temperature.unwrap_or(DEFAULT_TEMPERATURE),
         "temperature",
     )?;
     if temperature < 0.0 {
-        return Err("temperature must be non-negative".to_string());
+        return Err(OmniError::Invalid(
+            "temperature must be non-negative".to_string(),
+        ));
     }
     let top_p = finite(request.sampling.top_p.unwrap_or(DEFAULT_TOP_P), "top_p")?;
     if !(0.0..=1.0).contains(&top_p) || top_p == 0.0 {
-        return Err("top_p must be in (0, 1]".to_string());
+        return Err(OmniError::Invalid("top_p must be in (0, 1]".to_string()));
     }
     Ok(SamplingParams {
         temperature,
@@ -682,20 +682,20 @@ fn resolve_image_params(
     resolution_policy: &ResolutionPolicy,
     request: &GenerateReqInput,
     constraint: GenerationConstraint,
-) -> std::result::Result<ImageParams, String> {
+) -> OmniResult<ImageParams> {
     let image = request.image_gen.clone().unwrap_or_default();
     let resolution = resolve_resolution(
         resolution_policy,
-        image
-            .resolution
-            .as_deref()
-            .or(Some(defaults.resolution.as_str())),
+        image.resolution.or(Some(defaults.resolution)),
         image.width,
         image.height,
-    )?;
+    )
+    .map_err(|error| error.to_string())?;
     let steps = image.steps.unwrap_or(defaults.steps);
     if steps == 0 {
-        return Err("image.steps must be positive".to_string());
+        return Err(OmniError::Invalid(
+            "image.steps must be positive".to_string(),
+        ));
     }
     let cfg_interval = image
         .cfg_interval
@@ -749,11 +749,13 @@ fn resolve_image_params(
 fn bagel_context_image_params(
     profile: &BagelProfile,
     request: &GenerateReqInput,
-) -> std::result::Result<ImageParams, String> {
+) -> OmniResult<ImageParams> {
     let image = request.image_gen.clone().unwrap_or_default();
     let steps = image.steps.unwrap_or(DEFAULT_STEPS);
     if steps == 0 {
-        return Err("image.steps must be positive".to_string());
+        return Err(OmniError::Invalid(
+            "image.steps must be positive".to_string(),
+        ));
     }
     let max_images = image.max_images.unwrap_or(2);
     validate_max_images(max_images, profile.image_defaults.max_images_limit)?;
@@ -761,7 +763,7 @@ fn bagel_context_image_params(
         steps,
         cfg_text_scale: context_image_defaults::CFG_TEXT_SCALE,
         cfg_img_scale: context_image_defaults::CFG_IMG_SCALE,
-        cfg_renorm_type: context_image_defaults::CFG_RENORM_TYPE.to_string(),
+        cfg_renorm_type: uniserve_core::CfgRenorm::TextChannel,
         cfg_renorm_min: context_image_defaults::CFG_RENORM_MIN,
         cfg_interval: context_image_defaults::CFG_INTERVAL,
         timestep_shift: image
@@ -788,36 +790,36 @@ fn bagel_context_image_params(
 fn build_sensenova_context(
     profile: &SenseNovaProfile,
     lowered: &LoweredInput,
-) -> std::result::Result<Vec<CoreContextSegment>, String> {
+) -> OmniResult<Vec<CoreContextSegment>> {
     let image_count = lowered.images.len();
     let ingests = lowered
         .images
         .iter()
-        .map(|image| {
+        .map(|image| -> OmniResult<ImageIngestRecipe> {
             let (width, height) = image_dimensions(&image.b64)?;
             profile
                 .image_ingest_for_dimensions(width, height, image_count)
-                .map_err(|error| error.to_string())
+                .map_err(OmniError::from)
         })
-        .collect::<std::result::Result<Vec<_>, String>>()?;
+        .collect::<OmniResult<Vec<_>>>()?;
     assemble_context(&lowered.prompt_ids, &lowered.images, ingests)
 }
 
 fn build_bagel_context(
     profile: &BagelProfile,
     lowered: &LoweredInput,
-) -> std::result::Result<Vec<CoreContextSegment>, String> {
+) -> OmniResult<Vec<CoreContextSegment>> {
     let image_count = lowered.images.len();
     let ingests = lowered
         .images
         .iter()
-        .map(|image| {
+        .map(|image| -> OmniResult<ImageIngestRecipe> {
             let (width, height) = image_dimensions(&image.b64)?;
             profile
                 .image_ingest_for_dimensions(width, height, image_count)
-                .map_err(|error| error.to_string())
+                .map_err(OmniError::from)
         })
-        .collect::<std::result::Result<Vec<_>, String>>()?;
+        .collect::<OmniResult<Vec<_>>>()?;
     assemble_context(&lowered.prompt_ids, &lowered.images, ingests)
 }
 
@@ -825,9 +827,11 @@ fn assemble_context(
     prompt_ids: &[u32],
     images: &[RenderedImage],
     ingests: Vec<ImageIngestRecipe>,
-) -> std::result::Result<Vec<CoreContextSegment>, String> {
+) -> OmniResult<Vec<CoreContextSegment>> {
     if images.len() != ingests.len() {
-        return Err("image ingest declarations do not match input images".to_string());
+        return Err(OmniError::Invalid(
+            "image ingest declarations do not match input images".to_string(),
+        ));
     }
     let mut indexed = images.iter().cloned().zip(ingests).collect::<Vec<_>>();
     indexed.sort_by_key(|(image, _)| image.position);
@@ -869,13 +873,10 @@ fn assemble_context(
 }
 
 pub(crate) fn generation_constraint(request: &GenerateReqInput) -> GenerationConstraint {
-    match (
-        request.modalities.output_text,
-        request.modalities.output_image,
-    ) {
-        (true, false) => GenerationConstraint::UndOnly,
-        (false, true) => GenerationConstraint::GenOnly,
-        (true, true) | (false, false) => GenerationConstraint::Default,
+    match request.modalities {
+        ModalitySelection::Text => GenerationConstraint::UndOnly,
+        ModalitySelection::Image => GenerationConstraint::GenOnly,
+        ModalitySelection::TextAndImage => GenerationConstraint::Default,
     }
 }
 
@@ -892,7 +893,7 @@ fn top_level_images(request: &GenerateReqInput) -> Vec<PositionedImageInput> {
 fn replace_chat_images(
     request_id: &str,
     messages: &mut [ChatMessage],
-) -> std::result::Result<(Vec<PositionedImageInput>, Vec<String>), String> {
+) -> OmniResult<(Vec<PositionedImageInput>, Vec<String>)> {
     let mut images = Vec::new();
     let mut placeholders = Vec::new();
     for message in messages {
@@ -935,13 +936,15 @@ fn replace_rendered_slots(
     rendered: &str,
     placeholders: &[String],
     replacement: &str,
-) -> std::result::Result<(String, Vec<usize>), String> {
+) -> OmniResult<(String, Vec<usize>)> {
     let mut clean = String::with_capacity(rendered.len());
     let mut cursor = 0;
     let mut byte_offsets = Vec::with_capacity(placeholders.len());
     for placeholder in placeholders {
         if rendered.matches(placeholder).count() != 1 {
-            return Err("chat rendering must preserve one slot per input image".to_string());
+            return Err(OmniError::Invalid(
+                "chat rendering must preserve one slot per input image".to_string(),
+            ));
         }
         let relative = rendered[cursor..]
             .find(placeholder)
@@ -956,13 +959,15 @@ fn replace_rendered_slots(
     Ok((clean, byte_offsets))
 }
 
-fn data_image_payload(url: &str) -> std::result::Result<String, String> {
+fn data_image_payload(url: &str) -> OmniResult<String> {
     let (metadata, payload) = url
         .split_once(',')
         .ok_or_else(|| "image chat requires a data:image/*;base64 URL".to_string())?;
     if !metadata.starts_with("data:image/") || !metadata.ends_with(";base64") || payload.is_empty()
     {
-        return Err("image chat requires a data:image/*;base64 URL".to_string());
+        return Err(OmniError::Invalid(
+            "image chat requires a data:image/*;base64 URL".to_string(),
+        ));
     }
     base64::engine::general_purpose::STANDARD
         .decode(payload)
@@ -992,48 +997,54 @@ fn prompt_with_image_slots(prompt: &str, placeholders: &[String]) -> String {
     output
 }
 
-fn image_dimensions(b64: &str) -> std::result::Result<(u32, u32), String> {
+fn image_dimensions(b64: &str) -> OmniResult<(u32, u32)> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64)
         .map_err(|error| format!("invalid input image base64: {error}"))?;
-    image::ImageReader::new(Cursor::new(bytes))
+    Ok(image::ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|error| format!("invalid input image data: {error}"))?
         .into_dimensions()
-        .map_err(|error| format!("invalid input image data: {error}"))
+        .map_err(|error| format!("invalid input image data: {error}"))?)
 }
 
-fn validate_prompt(prompt_ids: &[u32]) -> std::result::Result<(), String> {
+fn validate_prompt(prompt_ids: &[u32]) -> OmniResult<()> {
     if prompt_ids.is_empty() {
-        Err("generation requires a non-empty prompt".to_string())
+        Err(OmniError::Invalid(
+            "generation requires a non-empty prompt".to_string(),
+        ))
     } else {
         Ok(())
     }
 }
 
-fn validate_max_images(value: u16, limit: u16) -> std::result::Result<(), String> {
+fn validate_max_images(value: u16, limit: u16) -> OmniResult<()> {
     if value == 0 {
-        return Err("image.max_images must be positive".to_string());
+        return Err(OmniError::Invalid(
+            "image.max_images must be positive".to_string(),
+        ));
     }
     if value > limit {
-        return Err(format!("image.max_images exceeds model limit {limit}"));
+        return Err(format!("image.max_images exceeds model limit {limit}").into());
     }
     Ok(())
 }
 
-fn validate_cfg_interval(value: (f32, f32)) -> std::result::Result<(), String> {
+fn validate_cfg_interval(value: (f32, f32)) -> OmniResult<()> {
     let (lo, hi) = value;
     if !lo.is_finite() || !hi.is_finite() || lo > hi {
-        return Err("image.cfg_interval must be a finite ordered pair".to_string());
+        return Err(OmniError::Invalid(
+            "image.cfg_interval must be a finite ordered pair".to_string(),
+        ));
     }
     Ok(())
 }
 
-fn finite(value: f32, name: &str) -> std::result::Result<f32, String> {
+fn finite(value: f32, name: &str) -> OmniResult<f32> {
     if value.is_finite() {
         Ok(value)
     } else {
-        Err(format!("{name} must be finite"))
+        Err(format!("{name} must be finite").into())
     }
 }
 

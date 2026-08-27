@@ -1,10 +1,8 @@
 //! Bounded per-lineage CPU continuations for configured token processors.
 
-use std::sync::Arc;
-
 use uniserve_core::{RequestId, SamplingParams};
 
-use crate::scheduler::logits::{LogitsProcessor, ProcCtx, run_pipeline_checked};
+use crate::scheduler::logits::{PipelineProcessor, ProcCtx, run_pipeline_checked};
 
 const CPU_TASK_CAPACITY: usize = 256;
 const CPU_WORKERS: usize = 4;
@@ -29,7 +27,7 @@ pub(crate) struct CpuTask {
     pub eos: Vec<u32>,
     pub generated: Vec<u32>,
     pub sampling: SamplingParams,
-    pub pipeline: Vec<Arc<dyn LogitsProcessor>>,
+    pub pipeline: Vec<PipelineProcessor>,
 }
 
 pub(crate) struct CpuResult {
@@ -46,7 +44,9 @@ impl CpuTask {
                 generated: &self.generated,
                 sampling: &self.sampling,
             };
-            let (allowed, suppress) = run_pipeline_checked(&self.pipeline, &ctx)?;
+            let masks = run_pipeline_checked(&self.pipeline, &ctx)?;
+            let allowed = masks.allowed;
+            let suppress = masks.suppress;
             Ok(CpuMasks { allowed, suppress })
         })();
         CpuResult {

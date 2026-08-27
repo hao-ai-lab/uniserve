@@ -468,6 +468,18 @@ pub struct GenerationResourceBounds {
     pub generated_feedback_makes_non_replayable: bool,
 }
 
+/// Inputs used to derive conservative resources for one generation graph.
+pub struct GenerationResourceSpec<'a> {
+    pub context: &'a [ContextSegment],
+    pub negative_context: &'a [ContextSegment],
+    pub behavior: &'a GenerationBehaviorDescriptor,
+    pub policy: &'a GenerationPolicyDescriptor,
+    pub image: &'a ImageParams,
+    pub max_und_tokens: usize,
+    pub cache: &'a GenerationCachePolicyDescriptor,
+    pub capabilities: &'a GenerationRuntimeCapabilities,
+}
+
 /// Worker and scheduler limits needed to compile a bounded generation graph.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct GenerationRuntimeCapabilities {
@@ -486,38 +498,64 @@ pub struct GenerationRuntimeCapabilities {
     pub encoder_cache_entries: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum GenerationCapabilityError {
+    #[error("runtime_und_execution")]
+    Understanding,
+    #[error("runtime_vae_encode")]
+    LatentEncode,
+    #[error("runtime_vit_encode")]
+    VisionEncode,
+    #[error("runtime_gen_denoise")]
+    ImageGeneration,
+}
+
+impl GenerationCapabilityError {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Understanding => "runtime_und_execution",
+            Self::LatentEncode => "runtime_vae_encode",
+            Self::VisionEncode => "runtime_vit_encode",
+            Self::ImageGeneration => "runtime_gen_denoise",
+        }
+    }
+}
+
 impl GenerationRuntimeCapabilities {
     /// Whether this runtime covers every branch the request needs. On a gap,
     /// returns the admission-capability name of the first missing branch.
-    pub fn covers(&self, needs: &GenerationCapabilityNeeds) -> Result<(), &'static str> {
+    pub fn covers(
+        &self,
+        needs: &GenerationCapabilityNeeds,
+    ) -> Result<(), GenerationCapabilityError> {
         if needs.understanding && !self.supports_understanding {
-            return Err("runtime_und_execution");
+            return Err(GenerationCapabilityError::Understanding);
         }
         if needs.latent_encode && !self.supports_latent_encode {
-            return Err("runtime_vae_encode");
+            return Err(GenerationCapabilityError::LatentEncode);
         }
         if needs.vision_encode && !self.supports_vision_encode {
-            return Err("runtime_vit_encode");
+            return Err(GenerationCapabilityError::VisionEncode);
         }
         if needs.image_generation && !self.supports_image_generation {
-            return Err("runtime_gen_denoise");
+            return Err(GenerationCapabilityError::ImageGeneration);
         }
         Ok(())
     }
 }
 
 impl GenerationResourceBounds {
-    #[allow(clippy::too_many_arguments)]
-    pub fn conservative(
-        context: &[ContextSegment],
-        negative_context: &[ContextSegment],
-        behavior: &GenerationBehaviorDescriptor,
-        policy: &GenerationPolicyDescriptor,
-        image: &ImageParams,
-        max_und_tokens: usize,
-        cache: &GenerationCachePolicyDescriptor,
-        capabilities: &GenerationRuntimeCapabilities,
-    ) -> Result<Self, GenerationResourceError> {
+    pub fn conservative(spec: GenerationResourceSpec<'_>) -> Result<Self, GenerationResourceError> {
+        let GenerationResourceSpec {
+            context,
+            negative_context,
+            behavior,
+            policy,
+            image,
+            max_und_tokens,
+            cache,
+            capabilities,
+        } = spec;
         let context_tokens = context
             .iter()
             .map(|segment| match segment {
@@ -1004,16 +1042,16 @@ impl GenerationRequest {
         &self,
         capabilities: &GenerationRuntimeCapabilities,
     ) -> Result<(), GenerationResourceError> {
-        let required = GenerationResourceBounds::conservative(
-            &self.context,
-            &self.negative_context,
-            &self.behavior,
-            &self.policy,
-            &self.image,
-            self.max_und_tokens,
-            &self.cache,
+        let required = GenerationResourceBounds::conservative(GenerationResourceSpec {
+            context: &self.context,
+            negative_context: &self.negative_context,
+            behavior: &self.behavior,
+            policy: &self.policy,
+            image: &self.image,
+            max_und_tokens: self.max_und_tokens,
+            cache: &self.cache,
             capabilities,
-        )?;
+        })?;
         self.resources.validate_covers(&required)
     }
 }
@@ -1214,16 +1252,16 @@ mod tests {
             policy,
             resources: GenerationResourceBounds::default(),
         };
-        request.resources = GenerationResourceBounds::conservative(
-            &request.context,
-            &request.negative_context,
-            &request.behavior,
-            &request.policy,
-            &request.image,
-            request.max_und_tokens,
-            &request.cache,
-            &runtime_capabilities(),
-        )
+        request.resources = GenerationResourceBounds::conservative(GenerationResourceSpec {
+            context: &request.context,
+            negative_context: &request.negative_context,
+            behavior: &request.behavior,
+            policy: &request.policy,
+            image: &request.image,
+            max_und_tokens: request.max_und_tokens,
+            cache: &request.cache,
+            capabilities: &runtime_capabilities(),
+        })
         .expect("bounded request fixture");
         request
     }
@@ -1356,16 +1394,16 @@ mod tests {
         request.cache.read = true;
         request.cache.write = true;
         request.image.max_images = 2;
-        let bounds = GenerationResourceBounds::conservative(
-            &request.context,
-            &request.negative_context,
-            &request.behavior,
-            &request.policy,
-            &request.image,
-            request.max_und_tokens,
-            &request.cache,
-            &runtime_capabilities(),
-        )
+        let bounds = GenerationResourceBounds::conservative(GenerationResourceSpec {
+            context: &request.context,
+            negative_context: &request.negative_context,
+            behavior: &request.behavior,
+            policy: &request.policy,
+            image: &request.image,
+            max_und_tokens: request.max_und_tokens,
+            cache: &request.cache,
+            capabilities: &runtime_capabilities(),
+        })
         .expect("bounded resources");
 
         assert_eq!(bounds.context_tokens, 4);
@@ -1401,16 +1439,16 @@ mod tests {
         request.policy.feedback = None;
         request.max_und_tokens = 256;
 
-        let bounds = GenerationResourceBounds::conservative(
-            &request.context,
-            &request.negative_context,
-            &request.behavior,
-            &request.policy,
-            &request.image,
-            request.max_und_tokens,
-            &request.cache,
-            &runtime_capabilities(),
-        )
+        let bounds = GenerationResourceBounds::conservative(GenerationResourceSpec {
+            context: &request.context,
+            negative_context: &request.negative_context,
+            behavior: &request.behavior,
+            policy: &request.policy,
+            image: &request.image,
+            max_und_tokens: request.max_und_tokens,
+            cache: &request.cache,
+            capabilities: &runtime_capabilities(),
+        })
         .expect("exact per-step image resources");
 
         assert_eq!(bounds.max_kv_tokens, 35 + 256 + 1_026 + 1_371);
@@ -1427,16 +1465,16 @@ mod tests {
         let mut capabilities = runtime_capabilities();
         capabilities.max_vit_grid_tokens = 0;
         assert_eq!(
-            GenerationResourceBounds::conservative(
-                &request.context,
-                &request.negative_context,
-                &request.behavior,
-                &request.policy,
-                &request.image,
-                request.max_und_tokens,
-                &request.cache,
-                &capabilities,
-            ),
+            GenerationResourceBounds::conservative(GenerationResourceSpec {
+                context: &request.context,
+                negative_context: &request.negative_context,
+                behavior: &request.behavior,
+                policy: &request.policy,
+                image: &request.image,
+                max_und_tokens: request.max_und_tokens,
+                cache: &request.cache,
+                capabilities: &capabilities,
+            }),
             Err(GenerationResourceError::UnboundedImageKv {
                 operation: "vit_encode",
             })
@@ -1448,16 +1486,16 @@ mod tests {
         };
         ingest.step_kv_tokens.pop();
         assert_eq!(
-            GenerationResourceBounds::conservative(
-                &invalid_request.context,
-                &invalid_request.negative_context,
-                &invalid_request.behavior,
-                &invalid_request.policy,
-                &invalid_request.image,
-                invalid_request.max_und_tokens,
-                &invalid_request.cache,
-                &runtime_capabilities(),
-            ),
+            GenerationResourceBounds::conservative(GenerationResourceSpec {
+                context: &invalid_request.context,
+                negative_context: &invalid_request.negative_context,
+                behavior: &invalid_request.behavior,
+                policy: &invalid_request.policy,
+                image: &invalid_request.image,
+                max_und_tokens: invalid_request.max_und_tokens,
+                cache: &invalid_request.cache,
+                capabilities: &runtime_capabilities(),
+            }),
             Err(GenerationResourceError::ImageIngestKvArity {
                 steps: 2,
                 effects: 1,

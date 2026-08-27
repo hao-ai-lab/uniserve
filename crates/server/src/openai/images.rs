@@ -12,7 +12,7 @@ use crate::openai::utils::{ResolvedRequestContext, check_model_served};
 /// value.
 pub fn lower_image_generation_request(
     request: ImageGenerationRequest,
-    served_model_names: &[String],
+    served_model_name: &str,
     context: ResolvedRequestContext,
 ) -> Result<GenerateReqInput, ApiError> {
     if request.prompt.trim().is_empty() {
@@ -28,7 +28,7 @@ pub fn lower_image_generation_request(
         ));
     }
     if let Some(model) = request.model.as_deref() {
-        check_model_served(model, served_model_names)?;
+        check_model_served(model, served_model_name)?;
     }
     if request.steps == Some(0) {
         return Err(ApiError::invalid_request(
@@ -46,10 +46,7 @@ pub fn lower_image_generation_request(
     Ok(GenerateReqInput {
         stream: false,
         prompt: PromptInput::Text(request.prompt),
-        modalities: ModalitySelection {
-            output_text: false,
-            output_image: true,
-        },
+        modalities: ModalitySelection::Image,
         negative_text: request.negative_prompt,
         image_gen: Some(ImageGenControls {
             width,

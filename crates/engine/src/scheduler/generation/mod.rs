@@ -8,7 +8,7 @@ use uniserve_core::{
 use uniserve_worker_ipc::{
     Bounds, DType, DimBound, Domain, DrawLayout, ForwardMode, ModelOutput, OpId, OpStatus,
     Operation, Point, PointRange, ProductKind, ProductPayload, ProductRef, RequestKey,
-    ResourceClass, Rng, RouteId, SamplingState, ShapeBound, StorageClass, TokenMode, VersionRef,
+    ResourceClass, Rng, RouteId, SamplingState, ShapeBound, StorageClass, VersionRef,
     encode_sampling_state_bytes, encode_token_product_bytes,
 };
 
@@ -430,6 +430,14 @@ pub(crate) enum ContextLoweringError {
     ImagePositionBeyondContext { position: u32, token_count: usize },
 }
 
+impl std::fmt::Display for ContextLoweringError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "context lowering failed: {self:?}")
+    }
+}
+
+impl std::error::Error for ContextLoweringError {}
+
 /// Lifecycle phase for a canonical generation request.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GenerationPhase {
@@ -726,6 +734,14 @@ pub(crate) enum CursorApplyError {
     MissingLatentProduct,
     DuplicateOperation { op_id: u64 },
 }
+
+impl std::fmt::Display for CursorApplyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "cursor transition failed: {self:?}")
+    }
+}
+
+impl std::error::Error for CursorApplyError {}
 
 /// Locate the completion product a given operation produced for `kind`.
 fn find_product(
@@ -1286,10 +1302,10 @@ impl GenerationPlanner {
                     });
                 }
                 let draft_token_ids = spec_token_ids.unwrap_or_default();
-                let mode = if draft_token_ids.is_empty() {
-                    TokenMode::Decode
+                let work = if draft_token_ids.is_empty() {
+                    ForwardMode::TokenDecode
                 } else {
-                    TokenMode::Verify
+                    ForwardMode::TokenVerify
                 };
                 let token_cost = 1 + draft_token_ids.len();
                 // A verify supplies the drafts it checks. A device-relay
@@ -1308,7 +1324,7 @@ impl GenerationPlanner {
                 let sampling_delta = operation_sampling_delta(&request.sampling, &sampling_state);
                 (
                     Wire {
-                        work: ForwardMode::from_token(mode),
+                        work,
                         inputs: Vec::new(),
                         outputs: token_outputs(
                             logprob_blob_bound(&request.sampling, 0)?,
@@ -1996,6 +2012,14 @@ pub(crate) enum PlanningError {
     ProductGenerationExhausted,
 }
 
+impl std::fmt::Display for PlanningError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "generation planning failed: {self:?}")
+    }
+}
+
+impl std::error::Error for PlanningError {}
+
 /// Ephemeral scheduler builder consumed when an operation is registered.
 #[derive(Debug)]
 pub(crate) struct PlannedTransition {
@@ -2137,20 +2161,20 @@ impl PlannedTransition {
         });
         inputs.extend(host_input.iter().cloned());
         inputs.extend(sampling_input.iter().cloned());
-        let operation = Operation::registered(
+        let operation = Operation::registered(uniserve_worker_ipc::OperationSpec {
             request_key,
             op_id,
             parent,
-            self.work,
-            self.route,
-            self.domain,
-            self.bounds,
+            work: self.work,
+            route: self.route,
+            domain: self.domain,
+            bounds: self.bounds,
             inputs,
             outputs,
-            self.predicate,
-            self.rng,
-            self.control_seq,
-        );
+            predicate: self.predicate,
+            rng: self.rng,
+            control_seq: self.control_seq,
+        });
         let mut input_products = Vec::with_capacity(2);
         if let Some(product) = host_input {
             let bytes = if !self.input_tokens.is_empty() {
@@ -2702,6 +2726,14 @@ pub(crate) enum TransitionValidationError {
     InvalidGeneratedLogprobCandidates,
 }
 
+impl std::fmt::Display for TransitionValidationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "worker transition validation failed: {self:?}")
+    }
+}
+
+impl std::error::Error for TransitionValidationError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2761,8 +2793,8 @@ mod tests {
             .expect("plan sequence extension")
     }
 
-    fn digest() -> String {
-        "ab".repeat(32)
+    fn digest() -> uniserve_core::Digest {
+        uniserve_core::Digest::try_from("ab".repeat(32)).expect("canonical digest fixture")
     }
 
     fn completion(request_key: RequestKey, op_id: u64, selected_point: u32) -> ModelOutput {

@@ -10,7 +10,8 @@ use uniserve_core::{
 };
 use uniserve_engine::executor::Executor;
 use uniserve_engine::scheduler::{ControlTokens, Scheduler};
-use uniserve_engine::worker::{UniprocExecutor, WorkerLaunchConfig};
+use uniserve_engine::worker::{UniprocExecutor, WorkerLaunchConfig, WorkerSpawnSpec};
+use uniserve_engine::{AttentionBackend, TransferBackend};
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -21,20 +22,23 @@ fn main() -> anyhow::Result<()> {
         stub: true,
         ..WorkerLaunchConfig::default()
     };
-    let engine = UniprocExecutor::spawn_with_config(
-        "python3",
-        "",
-        "cpu",
-        2,
-        1 << 20,
-        8 << 20,
-        None,
-        256,
-        32,
-        8192,
-        "auto",
-        &worker_config,
-    )?;
+    let engine = UniprocExecutor::spawn(WorkerSpawnSpec {
+        python: "python3".into(),
+        model: String::new(),
+        device: "cpu".into(),
+        world_size: 1,
+        pipeline_depth: 2,
+        req_slot_cap: 1 << 20,
+        resp_slot_cap: 8 << 20,
+        kv_token_capacity: None,
+        block_size: 256,
+        max_batch_operations: 32,
+        max_batch_tokens: 8192,
+        attention_backend: AttentionBackend::Auto,
+        worker_kind: None,
+        transfer_backend: TransferBackend::Inproc,
+        launch: worker_config,
+    })?;
     println!("caps from worker: {:?}", engine.caps());
 
     let ctrl = ControlTokens {

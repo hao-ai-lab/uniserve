@@ -24,8 +24,8 @@ use uniserve_worker_ipc::{
     Admission, Batch, CompletionReport, Digest, DrawLayout, ErrorCode, FinishFlags, ForwardMode,
     LogicalLengths, MixedExecutionCapability, ModelOutput, OpStatus, Operation,
     PartitionCompletion, Point, ProductKind, ProductPayload, ProductRef, RegistrationAck,
-    RequestKind, ResourceClass, SamplingState, TimingCounters, TokenMode, TokenSpan, TransferMode,
-    WorkerCapabilities, decode_sampling_state_bytes,
+    RequestKind, ResourceClass, SamplingState, TimingCounters, TokenSpan, WorkerCapabilities,
+    decode_sampling_state_bytes,
 };
 
 const DEFAULT_TEXT_LEN: usize = 8;
@@ -60,7 +60,7 @@ impl SimExecutor {
     }
 
     pub fn with_depth(mut engine: Box<dyn ModelEngine>, depth: usize) -> Self {
-        let caps = engine.caps();
+        let caps = engine.caps().clone();
         let depth = depth.max(1);
         let (to_worker, jobs) = crossbeam_channel::unbounded();
         let (results_tx, from_worker) = crossbeam_channel::unbounded();
@@ -122,8 +122,8 @@ impl SimExecutor {
 }
 
 impl Executor for SimExecutor {
-    fn caps(&self) -> WorkerCapabilities {
-        self.caps.clone()
+    fn caps(&self) -> &WorkerCapabilities {
+        &self.caps
     }
 
     fn pipeline_depth(&self) -> usize {
@@ -212,9 +212,7 @@ impl Executor for SimExecutor {
         self.apply_control(&operation)?;
         Ok(vec![ControlAck {
             rank: 0,
-            ok: true,
-            message: None,
-            snapshot: None,
+            result: Ok(None),
         }])
     }
 
@@ -342,7 +340,7 @@ impl SimEngine {
             latent_page_units: 64,
             num_latent_pages: 1_025,
             latent_width: 16,
-            latent_dtype: "bfloat16".into(),
+            latent_dtype: Some(uniserve_core::ModelDtype::BFloat16),
             latent_downsample: 16,
             max_vae_grid_tokens: 1_024,
             max_vit_grid_tokens: 64,
@@ -368,8 +366,13 @@ impl SimEngine {
                 })
                 .collect(),
             resource_classes: vec![ResourceClass::ImageLatent],
-            model_identity: "0".repeat(64),
-            weight_digest: "1".repeat(64),
+            model_identity: Some(Digest::zero()),
+            weight_digest: Some(
+                Digest::try_from(
+                    "1111111111111111111111111111111111111111111111111111111111111111",
+                )
+                .expect("constant digest"),
+            ),
             ..WorkerCapabilities::default()
         };
         Self {
@@ -381,10 +384,16 @@ impl SimEngine {
         }
     }
 
-    fn synth_logits(&self, session_id: RequestId, index: usize) -> Vec<f32> {
-        let mut logits = vec![0.0; self.vocab];
-        let natural = if index >= self.text_len {
-            self.fake_eos
+    fn synth_logits(
+        vocab: usize,
+        text_len: usize,
+        fake_eos: u32,
+        session_id: RequestId,
+        index: usize,
+    ) -> Vec<f32> {
+        let mut logits = vec![0.0; vocab];
+        let natural = if index >= text_len {
+            fake_eos
         } else {
             1_000 + ((session_id.0 as u32 * 7 + index as u32) % 5_000)
         };
@@ -397,19 +406,21 @@ impl SimEngine {
         if alternate_two != natural {
             logits[alternate_two as usize] = 6.0;
         }
-        logits[self.fake_eos as usize] = if index >= self.text_len { 100.0 } else { 1.0 };
+        logits[fake_eos as usize] = if index >= text_len { 100.0 } else { 1.0 };
         logits
     }
 
     fn sample(
-        &self,
+        vocab: usize,
+        text_len: usize,
+        fake_eos: u32,
         operation: &Operation,
         session: &SimSession,
         index: usize,
         state: Option<&SamplingState>,
     ) -> anyhow::Result<Option<SampleOutput>> {
         let session_id = operation.request_key.session_id;
-        let mut logits = self.synth_logits(session_id, index);
+        let mut logits = Self::synth_logits(vocab, text_len, fake_eos, session_id, index);
         match session.sampling() {
             Some(sampling) => {
                 let draw = if sampling.temperature > 0.0 {
@@ -470,8 +481,8 @@ impl SimEngine {
                 ))
             }
             None => Ok(Some(SampleOutput {
-                token: if index >= self.text_len {
-                    self.fake_eos
+                token: if index >= text_len {
+                    fake_eos
                 } else {
                     1_000 + ((session_id.0 as u32 * 7 + index as u32) % 5_000)
                 },
@@ -484,7 +495,9 @@ impl SimEngine {
     /// Execute one operation against its session, producing the terminal
     /// [`ModelOutput`] and any resolved output-product values.
     fn execute_operation(
-        &self,
+        vocab: usize,
+        text_len: usize,
+        fake_eos: u32,
         operation: &Operation,
         session: &mut SimSession,
         input_products: &[ProductPayload],
@@ -504,7 +517,7 @@ impl SimEngine {
             committed_tokens: Vec::new(),
             finish_flags: FinishFlags::default(),
             product_generations: operation.outputs.iter().map(|out| out.generation).collect(),
-            semantic_digest: String::new(),
+            semantic_digest: Digest::zero(),
             error_code: None,
             timing_counters: TimingCounters::default(),
         };
@@ -521,7 +534,6 @@ impl SimEngine {
             work @ (ForwardMode::TokenExtend
             | ForwardMode::TokenDecode
             | ForwardMode::TokenVerify) => {
-                let mode = work.token_mode().expect("token mode");
                 let visual_state = operation.inputs.iter().any(|input| {
                     matches!(
                         input.kind,
@@ -564,8 +576,15 @@ impl SimEngine {
                 } else if samples_token {
                     let index = session.emitted;
                     let sampling_state = operation_sampling_state(operation, input_products)?;
-                    let Some(output) =
-                        self.sample(operation, session, index, sampling_state.as_ref())?
+                    let Some(output) = Self::sample(
+                        vocab,
+                        text_len,
+                        fake_eos,
+                        operation,
+                        session,
+                        index,
+                        sampling_state.as_ref(),
+                    )?
                     else {
                         record.status = OpStatus::Error;
                         record.selected_point = point_index;
@@ -575,7 +594,7 @@ impl SimEngine {
                             .compute_semantic_digest(&parent_semantic, &operation.plan_digest);
                         return Ok((record, Vec::new()));
                     };
-                    record.finish_flags.eos = output.token == self.fake_eos;
+                    record.finish_flags.eos = output.token == fake_eos;
                     if let Some(state) = sampling_state.as_ref() {
                         record.finish_flags.stop =
                             state.finish_token_ids.binary_search(&output.token).is_ok()
@@ -621,9 +640,10 @@ impl SimEngine {
                     };
                     record.logical_lengths.token_len = 1;
                     if !visual_state {
-                        let query_tokens = match mode {
-                            TokenMode::Extend => operation.bounds.max_tokens,
-                            TokenMode::Decode | TokenMode::Verify => 1,
+                        let query_tokens = match work {
+                            ForwardMode::TokenExtend => operation.bounds.max_tokens,
+                            ForwardMode::TokenDecode | ForwardMode::TokenVerify => 1,
+                            _ => unreachable!(),
                         };
                         session.logical_position =
                             session.logical_position.saturating_add(query_tokens);
@@ -637,11 +657,12 @@ impl SimEngine {
                             session.kv_published_len,
                         );
                     }
-                    match mode {
-                        TokenMode::Extend => session.emitted = session.emitted.max(1),
-                        TokenMode::Decode | TokenMode::Verify => {
+                    match work {
+                        ForwardMode::TokenExtend => session.emitted = session.emitted.max(1),
+                        ForwardMode::TokenDecode | ForwardMode::TokenVerify => {
                             session.emitted = session.emitted.saturating_add(1)
                         }
+                        _ => unreachable!(),
                     }
                     record.committed_tokens = vec![output.token];
                     // Fold the generated token into the device-resident penalty
@@ -678,8 +699,7 @@ impl SimEngine {
             work @ (ForwardMode::TransferProduct
             | ForwardMode::TransferKvPublish
             | ForwardMode::TransferKvInstall) => {
-                let mode = work.transfer_mode().expect("transfer mode");
-                if mode == TransferMode::KvPublish {
+                if work == ForwardMode::TransferKvPublish {
                     session.kv_published_len = session.kv_visible_len;
                 }
                 set_kv_lengths(
@@ -774,7 +794,7 @@ impl SimEngine {
             committed_tokens: Vec::new(),
             finish_flags: FinishFlags::default(),
             product_generations: Vec::new(),
-            semantic_digest: String::new(),
+            semantic_digest: Digest::zero(),
             error_code: None,
             timing_counters: TimingCounters::default(),
         };
@@ -842,7 +862,7 @@ fn operation_sampling_state(
         .iter()
         .find(|payload| payload.product == *reference)
         .ok_or_else(|| anyhow::anyhow!("operation sampling-state input has no payload"))?;
-    decode_sampling_state_bytes(&payload.bytes).map(Some)
+    Ok(Some(decode_sampling_state_bytes(&payload.bytes)?))
 }
 
 fn set_kv_lengths(lengths: &mut LogicalLengths, visible: u32, _committed: u32, _published: u32) {
@@ -894,8 +914,8 @@ impl Default for SimEngine {
 }
 
 impl ModelEngine for SimEngine {
-    fn caps(&self) -> WorkerCapabilities {
-        self.caps.clone()
+    fn caps(&self) -> &WorkerCapabilities {
+        &self.caps
     }
 
     fn execute(&mut self, batch: Batch) -> anyhow::Result<CompletionReport> {
@@ -915,15 +935,17 @@ impl ModelEngine for SimEngine {
             }
         }
         let input_products = batch.input_products;
+        let vocab = self.vocab;
+        let text_len = self.text_len;
+        let fake_eos = self.fake_eos;
         let mut partition_reports = Vec::with_capacity(batch.partitions.len());
         for partition in batch.partitions {
             let mut completions = Vec::with_capacity(partition.operations.len());
             let mut products = Vec::new();
             for operation in partition.operations {
-                let mut session = self
+                let session = self
                     .sessions
-                    .get(&operation.request_key.session_id)
-                    .cloned()
+                    .get_mut(&operation.request_key.session_id)
                     .ok_or_else(|| {
                         anyhow::anyhow!(
                             "session {} has no admission",
@@ -1024,7 +1046,7 @@ impl ModelEngine for SimEngine {
                         {
                             session.predicate_values.insert(completion.clone(), false);
                         }
-                        let completion = Self::predicated_completion(&operation, &session);
+                        let completion = Self::predicated_completion(&operation, session);
                         session.terminal.insert(
                             operation.op_id.0,
                             RecordedCompletion {
@@ -1033,15 +1055,19 @@ impl ModelEngine for SimEngine {
                                 products: Vec::new(),
                             },
                         );
-                        self.sessions
-                            .insert(operation.request_key.session_id, session);
                         completions.push(completion);
                         continue;
                     }
                 }
 
-                let (completion, op_products) =
-                    self.execute_operation(&operation, &mut session, &input_products)?;
+                let (completion, op_products) = Self::execute_operation(
+                    vocab,
+                    text_len,
+                    fake_eos,
+                    &operation,
+                    session,
+                    &input_products,
+                )?;
                 if operation.advances_state && completion.status == OpStatus::Ok {
                     session.point_index = completion.selected_point;
                     session.committed_semantic = completion.semantic_digest.clone();
@@ -1054,8 +1080,6 @@ impl ModelEngine for SimEngine {
                         products: op_products.clone(),
                     },
                 );
-                self.sessions
-                    .insert(operation.request_key.session_id, session);
                 completions.push(completion);
                 products.extend(op_products);
             }
@@ -1136,24 +1160,24 @@ mod tests {
         let request_key = request_key();
         let admission = admission();
         let parent = VersionRef::admission_root(request_key, OpId(1), admission.digest.clone());
-        let operation = Operation::registered(
+        let operation = Operation::registered(uniserve_worker_ipc::OperationSpec {
             request_key,
-            OpId(op_id),
+            op_id: OpId(op_id),
             parent,
-            ForwardMode::TokenExtend,
-            RouteId(0),
-            Domain::Prefill,
-            Bounds {
+            work: ForwardMode::TokenExtend,
+            route: RouteId(0),
+            domain: Domain::Prefill,
+            bounds: Bounds {
                 max_points: 1,
                 max_tokens: 2,
                 ..Bounds::default()
             },
-            Vec::new(),
-            token_outputs(OpId(op_id)),
-            None,
-            None,
-            0,
-        );
+            inputs: Vec::new(),
+            outputs: token_outputs(OpId(op_id)),
+            predicate: None,
+            rng: None,
+            control_seq: 0,
+        });
         Batch::new(
             step_id,
             vec![admission],
@@ -1199,7 +1223,8 @@ mod tests {
 
     #[test]
     fn default_capabilities_admit_public_image_geometry() {
-        let caps = SimEngine::new().caps();
+        let engine = SimEngine::new();
+        let caps = engine.caps();
         let latent_units = (2_048 / caps.latent_downsample) * (1_152 / caps.latent_downsample);
         assert!(u64::from(latent_units) <= caps.latent_capacity_units());
     }

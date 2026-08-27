@@ -8,13 +8,13 @@ license.workspace = true
 ignored = ["flatbuffers-build", "flatc-fork", "serde_bytes"]
 
 [dependencies]
-anyhow.workspace = true
 flatbuffers.workspace = true
 iceoryx2.workspace = true
 iceoryx2-bb-elementary-traits.workspace = true
 serde.workspace = true
 serde_bytes.workspace = true
 sha2.workspace = true
+thiserror.workspace = true
 uniserve-core.workspace = true
 
 [build-dependencies]

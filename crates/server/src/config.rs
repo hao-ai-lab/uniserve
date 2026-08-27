@@ -9,8 +9,9 @@ use serde::Serialize;
 use serde_json::Value;
 use uniserve_engine::worker::WorkerLaunchConfig;
 use uniserve_engine::{
-    DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
-    DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS, SchedulingPolicy,
+    AttentionBackend, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
+    DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS,
+    SchedulingPolicy, TransferSpec, WorkersSpec,
 };
 
 /// How the HTTP server obtains its listening socket.
@@ -37,14 +38,14 @@ pub enum EngineBackendKind {
 
 /// Configuration of the in-process UniServe engine. Rust owns scheduling and
 /// engine execution; Python owns model forward execution.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct EngineSettings {
     /// Which forward-only worker to drive.
     pub backend: EngineBackendKind,
     /// Compute device for the worker.
     pub device: String,
     /// Attention backend preference forwarded to the Python worker.
-    pub attention_backend: String,
+    pub attention_backend: AttentionBackend,
     /// KV block size in tokens.
     pub block_size: u32,
     /// Op-batches kept in flight against the worker.
@@ -72,17 +73,16 @@ pub struct EngineSettings {
     /// Response-ring slot capacity in bytes for the worker IPC transport.
     pub resp_slot_cap: usize,
     /// Python interpreter used to launch the worker.
-    pub worker_python: String,
+    pub worker_python: PathBuf,
     /// Number of tensor-parallel worker rank processes (tp size of the single
     /// Full pool in the default topology).
-    pub worker_ranks: usize,
     /// Staged-worker topology, e.g. `encoder:2,prefill:1:tp=4,decode:1:tp=4`.
     /// `None` selects one Full pool. A multi-stage spec
     /// composes pools behind a `StagedExecutor`.
-    pub workers: Option<String>,
+    pub workers: WorkersSpec,
     /// Per-edge data-plane transfer backend (`--transfer`), e.g.
     /// `encoder->prefill=shm,prefill->decode=cuda_ipc`.
-    pub transfer: Option<String>,
+    pub transfer: TransferSpec,
     /// Explicit Python worker launch/runtime configuration.
     pub worker_launch: WorkerLaunchConfig,
 }
@@ -92,7 +92,7 @@ impl Default for EngineSettings {
         Self {
             backend: EngineBackendKind::Worker,
             device: "cuda".to_string(),
-            attention_backend: "auto".to_string(),
+            attention_backend: AttentionBackend::Auto,
             block_size: 64,
             pipeline_depth: 2,
             max_batch: DEFAULT_MAX_BATCH,
@@ -104,17 +104,16 @@ impl Default for EngineSettings {
             max_model_len: None,
             kv_token_capacity: None,
             resp_slot_cap: EngineSettings::DEFAULT_RESP_SLOT_CAP,
-            worker_python: "python3".to_string(),
-            worker_ranks: 1,
-            workers: None,
-            transfer: None,
+            worker_python: "python3".into(),
+            workers: WorkersSpec::single_full(1),
+            transfer: TransferSpec::default(),
             worker_launch: WorkerLaunchConfig::default(),
         }
     }
 }
 
 /// Normalized runtime configuration for the minimal OpenAI-compatible server.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Config {
     /// In-process UniServe Rust engine settings (the southbound boundary).
     pub engine: EngineSettings,
@@ -140,9 +139,8 @@ pub struct Config {
     pub enable_log_requests: bool,
     /// When `true`, set `X-Request-Id` on every HTTP response.
     pub enable_request_id_headers: bool,
-    /// When `true`, suppress periodic stats logging (throughput, queue depth,
-    /// cache usage).
-    pub disable_log_stats: bool,
+    /// Whether to emit periodic stats logging (throughput, queue depth, cache usage).
+    pub log_stats: bool,
     /// Bearer token accepted by the public serving API. Omitted from serialized
     /// config snapshots because it is a secret.
     #[serde(skip_serializing)]
@@ -177,7 +175,7 @@ impl Default for Config {
             chat_template_content_format: ChatTemplateContentFormatOption::default(),
             enable_log_requests: false,
             enable_request_id_headers: false,
-            disable_log_stats: false,
+            log_stats: true,
             api_key: None,
             request_timeout: None,
             max_concurrent_requests: None,
@@ -257,7 +255,15 @@ impl EngineSettings {
             self.resp_slot_cap > 0,
             "resp_slot_cap must be greater than 0"
         );
-        anyhow::ensure!(self.worker_ranks > 0, "worker_ranks must be greater than 0");
+        anyhow::ensure!(
+            !self.workers.pools.is_empty()
+                && self
+                    .workers
+                    .pools
+                    .iter()
+                    .all(|pool| pool.count > 0 && pool.tp > 0),
+            "workers must contain positive pool counts and tensor-parallel sizes"
+        );
         Ok(())
     }
 }

@@ -12,6 +12,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("request `{request_id}` is already in flight")]
     DuplicateRequestId { request_id: String },
+    #[error(transparent)]
+    Submit(#[from] uniserve_engine::SubmitError),
     #[error("engine client is closed: {message}")]
     ClientClosed { message: String },
     #[error("engine status is unavailable because the engine client is closed")]

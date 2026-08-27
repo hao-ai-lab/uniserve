@@ -5,7 +5,7 @@ use uniserve_core::{
     ImageKvEffect, Modality, TriggerPolicyDescriptor,
 };
 
-use super::resolution::{ResolutionBucket, ResolutionPolicy};
+use super::resolution::{ResolutionBucket, ResolutionName, ResolutionPolicy};
 use super::{
     GenerationControls, ImageGenerationDefaults, OutputFilterPolicy, encode, required_token,
     required_token_id, stride_resize_tokens,
@@ -69,18 +69,18 @@ impl BagelProfile {
             ..GenerationPolicyDescriptor::default()
         };
         let default_resolution = ResolutionBucket {
-            name: "1:1".to_string(),
+            name: ResolutionName::Square,
             width: 512,
             height: 512,
         };
         Ok(Self {
             controls,
             image_defaults: ImageGenerationDefaults {
-                resolution: "1:1".to_string(),
+                resolution: ResolutionName::Square,
                 steps: 50,
                 cfg_text_scale: 4.0,
                 cfg_img_scale: 1.0,
-                cfg_renorm_type: "global".to_string(),
+                cfg_renorm_type: uniserve_core::CfgRenorm::Global,
                 cfg_renorm_min: 0.0,
                 cfg_interval: (0.0, 1.0),
                 timestep_shift: 1.0,
@@ -192,11 +192,11 @@ impl BagelProfile {
         let feedback = policy
             .feedback
             .as_mut()
-            .ok_or_else(|| assets::Error::message("Bagel generation policy has no feedback"))?;
+            .ok_or_else(|| assets::Error::invalid("Bagel generation policy has no feedback"))?;
         if feedback.ingest.steps.as_slice() != [ImageIngestStep::VaeEncode]
             || feedback.ingest.step_kv_tokens.len() != 1
         {
-            return Err(assets::Error::message(
+            return Err(assets::Error::invalid(
                 "Bagel feedback recipe does not match its image processor",
             ));
         }

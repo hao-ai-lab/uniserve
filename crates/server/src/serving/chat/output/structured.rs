@@ -7,12 +7,12 @@ use crate::serving::text::DecodedLogprobs;
 use asynk_strim_attr::{TryYielder, try_stream};
 use futures::{StreamExt as _, pin_mut};
 
-use super::processor::{AssistantEvent, AssistantEventStream};
+use super::processor::AssistantEvent;
 use crate::serving::chat::output::error::Error;
-use crate::serving::chat::output::event::{
+use crate::serving::chat::output::{FinishReason, Result};
+use crate::serving::chat::protocol::{
     AssistantBlockKind, AssistantContentBlock, AssistantMessage, AssistantToolCall, ChatEvent,
 };
-use crate::serving::chat::output::{FinishReason, Result};
 
 /// One currently open assistant text-like block being assembled from streamed
 /// deltas.
@@ -230,7 +230,7 @@ impl StructuredEventState {
 /// stream.
 #[try_stream]
 pub async fn structured_chat_event_stream(
-    stream: impl AssistantEventStream,
+    stream: impl futures::Stream<Item = Result<AssistantEvent>> + Send,
     mut y: TryYielder<ChatEvent, Error>,
 ) -> Result<()> {
     pin_mut!(stream);
@@ -258,13 +258,16 @@ pub async fn structured_chat_event_stream(
                     y.yield_ok(next).await;
                 }
             }
-            AssistantEvent::LogprobsDelta {
+            AssistantEvent::SampleDelta {
                 logprobs,
                 token_ids,
             } => {
                 for next in state.process_logprobs_delta(logprobs, token_ids)? {
                     y.yield_ok(next).await;
                 }
+            }
+            AssistantEvent::PublicCommit(commit) => {
+                y.yield_ok(ChatEvent::PublicCommit { commit }).await;
             }
             AssistantEvent::ToolCallStart { id, name } => {
                 for next in state.start_tool_call(id, name)? {

@@ -2,7 +2,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::engine_client::EngineStatus;
 use crate::serving::ServingRuntime;
 use tokio::time::{Duration, Instant, sleep_until};
 use tracing::warn;
@@ -11,9 +10,7 @@ const SHUTDOWN_REFCOUNT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Shared router state for one configured model and one generate funnel.
 pub struct AppState {
-    served_model_name: String,
     runtime: ServingRuntime,
-    engine_status: EngineStatus,
     enable_log_requests: bool,
     enable_request_id_headers: bool,
     api_key: Option<String>,
@@ -24,19 +21,9 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(
-        served_model_name: String,
-        runtime: ServingRuntime,
-        engine_status: EngineStatus,
-    ) -> Self {
-        assert!(
-            !served_model_name.is_empty(),
-            "served_model_name must not be empty"
-        );
+    pub fn new(runtime: ServingRuntime) -> Self {
         Self {
-            served_model_name,
             runtime,
-            engine_status,
             enable_log_requests: false,
             enable_request_id_headers: false,
             api_key: None,
@@ -106,15 +93,11 @@ impl AppState {
     }
 
     pub fn served_model_name(&self) -> &str {
-        &self.served_model_name
+        self.runtime.served_model_name()
     }
 
-    pub fn served_model_names(&self) -> &[String] {
-        std::slice::from_ref(&self.served_model_name)
-    }
-
-    pub fn engine_status(&self) -> &EngineStatus {
-        &self.engine_status
+    pub fn engine(&self) -> &crate::engine_client::EngineClient {
+        self.runtime.engine()
     }
 
     pub fn server_load(&self) -> u64 {

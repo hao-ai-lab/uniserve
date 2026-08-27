@@ -19,7 +19,7 @@ pub(crate) async fn images_generations(
 ) -> Response {
     let request_context = resolve_request_context(&headers);
     let input =
-        match lower_image_generation_request(body, state.served_model_names(), request_context) {
+        match lower_image_generation_request(body, state.served_model_name(), request_context) {
             Ok(input) => input,
             Err(error) => return ApiError::from(error).into_response(),
         };

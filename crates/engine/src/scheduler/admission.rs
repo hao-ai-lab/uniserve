@@ -87,10 +87,10 @@ impl Scheduler {
             epoch: self.next_epoch,
             version: 0,
             admission_digest: None,
-            resolved_semantic: String::new(),
+            resolved_semantic: uniserve_core::Digest::zero(),
             resolved_producer_op_id: 0,
             committed_version: 0,
-            committed_semantic: String::new(),
+            committed_semantic: uniserve_core::Digest::zero(),
             committed_producer_op_id: 0,
             control_seq: 0,
             public_event_seq: 0,
@@ -106,9 +106,7 @@ impl Scheduler {
             context,
             event_tx,
             queued_at: now(),
-            cancelled: false,
-            aborted: false,
-            stop_matched: false,
+            terminal_intent: super::TerminalIntent::None,
             cpu_pending: None,
             cpu_masks: None,
             cpu_generation: 0,
@@ -208,8 +206,7 @@ impl Scheduler {
                 projected: MediaCursor::default(),
                 fixed_parent: root.clone(),
                 projected_parent: root,
-                cancelled: false,
-                failure: None,
+                terminal_intent: MediaTerminalIntent::None,
             });
             self.order.push(id);
         }
@@ -231,7 +228,7 @@ impl Scheduler {
     pub(super) fn missing_required_capability(
         &self,
         request: &GenerationRequest,
-    ) -> Option<&'static str> {
+    ) -> Option<uniserve_core::GenerationCapabilityError> {
         let context_steps = request.context.iter().flat_map(|segment| match segment {
             uniserve_core::ContextSegment::Image { ingest, .. } => ingest.steps.clone(),
             uniserve_core::ContextSegment::UndTokens { .. } => Vec::new(),
@@ -396,19 +393,18 @@ impl Scheduler {
         // A cancelled request closes only after every submitted descendant has
         // resolved. Host KV ownership then remains pinned through the close
         // acknowledgement and ordered worker session retirement.
-        let cancelled: Vec<(RequestId, bool, bool)> = self
+        let cancelled: Vec<(RequestId, TerminalIntent)> = self
             .running
             .iter()
-            .filter(|(id, s)| s.cancelled && !self.has_inflight(**id))
-            .map(|(k, s)| (*k, s.aborted, s.stop_matched))
+            .filter(|(id, state)| state.terminal_intent.is_terminal() && !self.has_inflight(**id))
+            .map(|(id, state)| (*id, state.terminal_intent))
             .collect();
-        for (id, aborted, stop_matched) in cancelled {
-            let reason = if stop_matched {
-                FinishReason::Stop
-            } else if aborted {
-                FinishReason::Aborted
-            } else {
-                FinishReason::Cancelled
+        for (id, intent) in cancelled {
+            let reason = match intent {
+                TerminalIntent::StopMatched => FinishReason::Stop,
+                TerminalIntent::Abort => FinishReason::Aborted,
+                TerminalIntent::Cancel => FinishReason::Cancelled,
+                TerminalIntent::None => continue,
             };
             self.finish(id, reason);
         }
@@ -417,21 +413,20 @@ impl Scheduler {
             .iter()
             .filter_map(|id| {
                 self.media_state(*id)
-                    .filter(|state| state.cancelled && !self.has_inflight(state.request.request_id))
-                    .map(|state| state.request.request_id)
+                    .filter(|state| {
+                        state.terminal_intent.is_terminal()
+                            && !self.has_inflight(state.request.request_id)
+                    })
+                    .map(|state| (state.request.request_id, state.terminal_intent.clone()))
             })
             .collect::<Vec<_>>();
-        for id in media {
-            let event = self
-                .media_state(id)
-                .and_then(|state| state.failure.clone())
-                .map_or(MediaEvent::Aborted, |message| MediaEvent::Failed {
-                    message,
-                });
-            let reason = if matches!(event, MediaEvent::Failed { .. }) {
-                CloseReason::Error
-            } else {
-                CloseReason::Cancelled
+        for (id, intent) in media {
+            let (event, reason) = match intent {
+                MediaTerminalIntent::Failure(message) => {
+                    (MediaEvent::Failed { message }, CloseReason::Error)
+                }
+                MediaTerminalIntent::Cancel => (MediaEvent::Aborted, CloseReason::Cancelled),
+                MediaTerminalIntent::None => continue,
             };
             self.finish_media(id, event, reason, None);
         }
@@ -452,8 +447,8 @@ impl Scheduler {
             let Some(head) = self.pending.peek_request() else {
                 break;
             };
-            if head.resources.reserve_worstcase {
-                let need = head.resources.worstcase_blocks;
+            if head.cursor.resources.reserve_worstcase {
+                let need = head.cursor.resources.worstcase_blocks;
                 let encoder_entries = head.req.resources.encoder_cache_keys.len();
                 let encoder_ok = self
                     .reserved_encoder_entries
@@ -594,12 +589,12 @@ impl Scheduler {
             .queue_wait_us_max
             .fetch_max(queue_wait_us, Ordering::Relaxed);
         let generation = behavior_str(&st.req);
-        let phase = phase_str(st.lifecycle.phase);
+        let phase = phase_str(st.cursor.lifecycle.phase);
         let prompt_tokens = st.context.prompt_ids.len();
         let max_tokens = st.req.max_und_tokens;
         let priority = st.req.priority;
-        let reserve_worstcase = st.resources.reserve_worstcase;
-        let worstcase_blocks = st.resources.worstcase_blocks;
+        let reserve_worstcase = st.cursor.resources.reserve_worstcase;
+        let worstcase_blocks = st.cursor.resources.worstcase_blocks;
         let encoder_entries = st.req.resources.encoder_cache_keys.len();
         self.emit_st(
             &mut st,

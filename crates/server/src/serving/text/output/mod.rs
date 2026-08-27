@@ -14,9 +14,9 @@ mod logprobs;
 
 use std::sync::Arc;
 
-use futures::{StreamExt as _, pin_mut};
+use futures::{Stream, StreamExt as _, pin_mut};
 
-use crate::serving::text::{Error, Result, TextOutputStream};
+use crate::serving::text::{Error, Result};
 
 /// Final decoded text plus terminal stream metadata.
 #[derive(Debug, Clone, PartialEq)]
@@ -31,85 +31,79 @@ pub struct CollectedTextOutput {
     pub finish_reason: FinishReason,
 }
 
-#[allow(clippy::manual_async_fn, reason = "specify `Send` bound")]
-#[easy_ext::ext(TextOutputStreamExt)]
-impl<T: TextOutputStream> T {
+impl CollectedTextOutput {
     /// Collect the stream to completion and return the final decoded text plus
     /// terminal metadata.
-    pub fn collect_output(self) -> impl Future<Output = Result<CollectedTextOutput>> + Send {
-        async move {
-            let stream = self;
-            pin_mut!(stream);
-            let mut prompt_logprobs = None;
-            let mut prompt_token_ids: Arc<[u32]> = Arc::from([]);
-            let mut collected: Option<CollectedTextOutput> = None;
+    pub async fn collect(
+        stream: impl Stream<Item = Result<DecodedTextEvent>> + Send,
+    ) -> Result<Self> {
+        pin_mut!(stream);
+        let mut prompt_logprobs = None;
+        let mut prompt_token_ids: Arc<[u32]> = Arc::from([]);
+        let mut collected: Option<CollectedTextOutput> = None;
 
-            while let Some(event) = stream.next().await.transpose()? {
-                match event {
-                    DecodedTextEvent::Start {
-                        prompt_logprobs: start_prompt_logprobs,
-                        prompt_token_ids: start_prompt_token_ids,
-                        ..
-                    } => {
-                        prompt_logprobs = start_prompt_logprobs;
-                        prompt_token_ids = start_prompt_token_ids;
-                    }
-                    DecodedTextEvent::TextDelta {
-                        delta,
-                        token_ids: delta_token_ids,
-                        logprobs: mut delta_logprobs,
-                        finished,
-                        ..
-                    } => {
-                        if let Some(c) = collected.as_mut() {
-                            c.text.push_str(&delta);
-                            c.token_ids.extend(delta_token_ids);
-                            if let Some(dlp) = delta_logprobs.as_mut() {
-                                if let Some(lp) = c.logprobs.as_mut() {
-                                    lp.positions.extend_from_slice(&dlp.positions);
-                                } else {
-                                    c.logprobs = delta_logprobs;
-                                }
+        while let Some(event) = stream.next().await.transpose()? {
+            match event {
+                DecodedTextEvent::Start {
+                    prompt_logprobs: start_prompt_logprobs,
+                    prompt_token_ids: start_prompt_token_ids,
+                    ..
+                } => {
+                    prompt_logprobs = start_prompt_logprobs;
+                    prompt_token_ids = start_prompt_token_ids;
+                }
+                DecodedTextEvent::TextDelta {
+                    delta,
+                    token_ids: delta_token_ids,
+                    logprobs: mut delta_logprobs,
+                    finished,
+                    ..
+                } => {
+                    if let Some(c) = collected.as_mut() {
+                        c.text.push_str(&delta);
+                        c.token_ids.extend(delta_token_ids);
+                        if let Some(dlp) = delta_logprobs.as_mut() {
+                            if let Some(lp) = c.logprobs.as_mut() {
+                                lp.positions.extend_from_slice(&dlp.positions);
+                            } else {
+                                c.logprobs = delta_logprobs;
                             }
-                        } else {
-                            collected = Some(CollectedTextOutput {
-                                text: delta,
-                                prompt_token_ids: Arc::clone(&prompt_token_ids),
-                                prompt_logprobs: prompt_logprobs.take(),
-                                logprobs: delta_logprobs,
-                                token_ids: delta_token_ids,
-                                output_token_count: 0,
-                                internal_token_count: 0,
-                                finish_reason: FinishReason::new(
-                                    uniserve_core::FinishReason::Error,
-                                ),
-                            })
-                        };
-
-                        if let Some(finished) = finished {
-                            let Some(mut collected) = collected else {
-                                return Err(Error::MalformedOutput {
-                                    request_id: "unknown".to_string(),
-                                    message:
-                                        "terminal text event arrived before any collected text"
-                                            .to_string(),
-                                });
-                            };
-                            collected.finish_reason = finished.finish_reason;
-                            collected.output_token_count = finished.output_token_count;
-                            collected.internal_token_count = finished.internal_token_count;
-                            return Ok(collected);
                         }
+                    } else {
+                        collected = Some(CollectedTextOutput {
+                            text: delta,
+                            prompt_token_ids: Arc::clone(&prompt_token_ids),
+                            prompt_logprobs: prompt_logprobs.take(),
+                            logprobs: delta_logprobs,
+                            token_ids: delta_token_ids,
+                            output_token_count: 0,
+                            internal_token_count: 0,
+                            finish_reason: FinishReason::new(uniserve_core::FinishReason::Error),
+                        })
+                    };
+
+                    if let Some(finished) = finished {
+                        let Some(mut collected) = collected else {
+                            return Err(Error::MalformedOutput {
+                                request_id: "unknown".to_string(),
+                                message: "terminal text event arrived before any collected text"
+                                    .to_string(),
+                            });
+                        };
+                        collected.finish_reason = finished.finish_reason;
+                        collected.output_token_count = finished.output_token_count;
+                        collected.internal_token_count = finished.internal_token_count;
+                        return Ok(collected);
                     }
                 }
             }
-
-            // Note: this is actually unreachable, as the underlying stream always emit an
-            // error on unexpected close.
-            Err(Error::StreamClosedBeforeTerminalOutput {
-                request_id: "unknown".to_string(),
-            })
         }
+
+        // Note: this is actually unreachable, as the underlying stream always emit an
+        // error on unexpected close.
+        Err(Error::StreamClosedBeforeTerminalOutput {
+            request_id: "unknown".to_string(),
+        })
     }
 }
 
@@ -173,7 +167,7 @@ mod tests {
             }),
         ]);
 
-        let collected = stream.collect_output().await.unwrap();
+        let collected = CollectedTextOutput::collect(stream).await.unwrap();
         assert_eq!(collected.text, "bc");
         assert_eq!(
             collected.prompt_logprobs,
@@ -291,7 +285,7 @@ mod tests {
             }),
         ]);
 
-        let collected = stream.collect_output().await.unwrap();
+        let collected = CollectedTextOutput::collect(stream).await.unwrap();
         assert_eq!(collected.text, "hello");
         assert_eq!(collected.prompt_logprobs, None);
         assert_eq!(collected.token_ids, vec![1, 2, 3, 4, 5]);

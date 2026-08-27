@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
-use crate::engine_client::GenerationEventStream;
-use crate::profile::tokenizer::{DynTokenizer, IncrementalDecoder};
+use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer, IncrementalDecoder};
 use asynk_strim_attr::{TryYielder, try_stream};
 use serde::{Deserialize, Serialize};
 use tracing::{Level, debug, trace};
 use uniserve_core::{GenerationEvent, PositionLogprobs, PublicCommit};
+use uniserve_engine::EventRx;
 
 use super::finish::{FinishReason, StopReason};
 use super::logprobs::{
@@ -65,6 +65,149 @@ struct TokenDecode {
     stop: Option<(String, usize)>,
 }
 
+struct DecodeState<'a> {
+    decoder: IncrementalDecoder<'a>,
+    options: TextDecodeOptions,
+    prompt_positions: Vec<PositionLogprobs>,
+    queued_at: Option<f64>,
+    scheduled_at: Option<f64>,
+    started: bool,
+    pending_token: Option<(u32, Option<PublicCommit>)>,
+    last_public_commit: Option<PublicCommit>,
+    output_token_count: usize,
+    accumulated_token_ids: Vec<u32>,
+    accumulated_logprobs: Option<DecodedLogprobs>,
+}
+
+impl DecodeState<'_> {
+    async fn emit_start_if_ready(
+        &mut self,
+        request_id: &str,
+        tokenizer: &HuggingFaceTokenizer,
+        prompt_token_ids: &[u32],
+        prompt_logprobs_requested: bool,
+        expected_prompt_positions: usize,
+        y: &mut TryYielder<DecodedTextEvent, Error>,
+    ) -> Result<(), Error> {
+        let prompt_ready =
+            !prompt_logprobs_requested || self.prompt_positions.len() == expected_prompt_positions;
+        if self.started || !prompt_ready || self.scheduled_at.is_none() {
+            return Ok(());
+        }
+        let prompt_logprobs = prompt_logprobs_requested
+            .then(|| {
+                decode_prompt_logprobs(
+                    request_id,
+                    tokenizer,
+                    prompt_token_ids,
+                    &self.prompt_positions,
+                    self.options.skip_special_tokens,
+                )
+            })
+            .transpose()?;
+        y.yield_ok(DecodedTextEvent::Start {
+            prompt_token_ids: Arc::from(prompt_token_ids),
+            prompt_logprobs,
+            queued_at: self.queued_at,
+            scheduled_at: self.scheduled_at,
+        })
+        .await;
+        self.started = true;
+        Ok(())
+    }
+
+    async fn consume_token(
+        &mut self,
+        tokenizer: &HuggingFaceTokenizer,
+        prompt_token_count: usize,
+        token_id: u32,
+        positions: Vec<PositionLogprobs>,
+        public_commit: Option<PublicCommit>,
+        intermediate: bool,
+        raw_stream: &mut EventRx,
+        y: &mut TryYielder<DecodedTextEvent, Error>,
+    ) -> Result<bool, Error> {
+        if public_commit.is_some() {
+            self.last_public_commit = public_commit.clone();
+        }
+        let decoded_logprobs = (!positions.is_empty())
+            .then(|| decode_logprobs(tokenizer, &positions, self.options.skip_special_tokens))
+            .transpose()?;
+        let decoded = decode_one_token(
+            &mut self.decoder,
+            token_id,
+            self.output_token_count,
+            &mut self.options,
+            intermediate,
+        )?;
+        self.output_token_count = self.output_token_count.saturating_add(1);
+        if !intermediate {
+            self.accumulated_token_ids.push(token_id);
+            if let Some(logprobs) = decoded_logprobs.as_ref() {
+                self.accumulated_logprobs
+                    .get_or_insert_with(|| DecodedLogprobs {
+                        positions: Vec::new(),
+                    })
+                    .positions
+                    .extend_from_slice(&logprobs.positions);
+            }
+        }
+        if let Some((stop_string, offset)) = decoded.stop {
+            raw_stream.cancel_at_consumed_prefix(
+                crate::engine_client::StreamCancelCause::StopStringMatched,
+            );
+            let truncate_to = Some(if self.options.include_stop_str_in_output {
+                offset + stop_string.len()
+            } else {
+                offset
+            });
+            let (last_chunk, text) = self.decoder.flush(truncate_to)?;
+            let (delta, token_ids, logprobs) = if intermediate {
+                (
+                    last_chunk.unwrap_or_default(),
+                    vec![token_id],
+                    decoded_logprobs,
+                )
+            } else {
+                (
+                    text,
+                    std::mem::take(&mut self.accumulated_token_ids),
+                    self.accumulated_logprobs.take(),
+                )
+            };
+            y.yield_ok(DecodedTextEvent::TextDelta {
+                delta,
+                token_ids,
+                logprobs,
+                public_commit: public_commit.or_else(|| self.last_public_commit.clone()),
+                finished: Some(Finished {
+                    prompt_token_count,
+                    output_token_count: self.output_token_count,
+                    internal_token_count: 0,
+                    finish_reason: FinishReason::with_stop_reason(
+                        uniserve_core::FinishReason::Stop,
+                        Some(StopReason::Text(stop_string)),
+                    ),
+                }),
+            })
+            .await;
+            return Ok(true);
+        }
+        raw_stream.acknowledge_consumed_prefix();
+        if intermediate {
+            y.yield_ok(DecodedTextEvent::TextDelta {
+                delta: decoded.delta,
+                token_ids: vec![token_id],
+                logprobs: decoded_logprobs,
+                public_commit,
+                finished: None,
+            })
+            .await;
+        }
+        Ok(false)
+    }
+}
+
 fn decode_one_token(
     decoder: &mut IncrementalDecoder<'_>,
     token_id: u32,
@@ -100,8 +243,8 @@ pub async fn decoded_text_event_stream(
     prompt_token_ids: Vec<u32>,
     prompt_logprobs_requested: bool,
     generated_logprobs_requested: bool,
-    mut raw_stream: GenerationEventStream,
-    mut decode_options: TextDecodeOptions,
+    mut raw_stream: EventRx,
+    decode_options: TextDecodeOptions,
     intermediate: bool,
     mut y: TryYielder<DecodedTextEvent, Error>,
 ) -> crate::serving::text::Result<()> {
@@ -111,136 +254,25 @@ pub async fn decoded_text_event_stream(
         });
     }
     let prompt_token_count = prompt_token_ids.len();
-    let mut decoder = tokenizer.create_decode_stream(
+    let decoder = tokenizer.create_decode_stream(
         &prompt_token_ids,
         decode_options.skip_special_tokens,
         stop_string_holdback_bytes(&decode_options),
     );
     let expected_prompt_positions = prompt_token_count.saturating_sub(1);
-    let mut prompt_positions: Vec<PositionLogprobs> = Vec::new();
-    let mut queued_at = None;
-    let mut scheduled_at = None;
-    let mut started = false;
-    let mut pending_token = None;
-    let mut last_public_commit = None;
-    let mut output_token_count = 0_usize;
-    let mut accumulated_token_ids = Vec::new();
-    let mut accumulated_logprobs: Option<DecodedLogprobs> = None;
-
-    macro_rules! emit_start_if_ready {
-        () => {{
-            let prompt_ready =
-                !prompt_logprobs_requested || prompt_positions.len() == expected_prompt_positions;
-            if !started && prompt_ready && scheduled_at.is_some() {
-                let prompt_logprobs = prompt_logprobs_requested
-                    .then(|| {
-                        decode_prompt_logprobs(
-                            &request_id,
-                            tokenizer.as_ref(),
-                            &prompt_token_ids,
-                            &prompt_positions,
-                            decode_options.skip_special_tokens,
-                        )
-                    })
-                    .transpose()?;
-                y.yield_ok(DecodedTextEvent::Start {
-                    prompt_token_ids: Arc::from(prompt_token_ids.clone()),
-                    prompt_logprobs,
-                    queued_at,
-                    scheduled_at,
-                })
-                .await;
-                started = true;
-            }
-        }};
-    }
-
-    macro_rules! consume_token {
-        ($token_id:expr, $positions:expr, $public_commit:expr) => {{
-            let token_id = $token_id;
-            let public_commit: Option<PublicCommit> = $public_commit;
-            if public_commit.is_some() {
-                last_public_commit = public_commit.clone();
-            }
-            let positions: Vec<PositionLogprobs> = $positions;
-            let decoded_logprobs = (!positions.is_empty())
-                .then(|| {
-                    decode_logprobs(
-                        tokenizer.as_ref(),
-                        &positions,
-                        decode_options.skip_special_tokens,
-                    )
-                })
-                .transpose()?;
-            let decoded = decode_one_token(
-                &mut decoder,
-                token_id,
-                output_token_count,
-                &mut decode_options,
-                intermediate,
-            )?;
-            output_token_count = output_token_count.saturating_add(1);
-            if !intermediate {
-                accumulated_token_ids.push(token_id);
-                if let Some(logprobs) = decoded_logprobs.as_ref() {
-                    accumulated_logprobs
-                        .get_or_insert_with(|| DecodedLogprobs {
-                            positions: Vec::new(),
-                        })
-                        .positions
-                        .extend_from_slice(&logprobs.positions);
-                }
-            }
-            if let Some((stop_string, offset)) = decoded.stop {
-                raw_stream.cancel_at_consumed_prefix(
-                    crate::engine_client::StreamCancelCause::StopStringMatched,
-                );
-                let truncate_to = Some(if decode_options.include_stop_str_in_output {
-                    offset + stop_string.len()
-                } else {
-                    offset
-                });
-                let (last_chunk, text) = decoder.flush(truncate_to)?;
-                let (delta, token_ids, logprobs) = if intermediate {
-                    (
-                        last_chunk.unwrap_or_default(),
-                        vec![token_id],
-                        decoded_logprobs,
-                    )
-                } else {
-                    (text, accumulated_token_ids, accumulated_logprobs)
-                };
-                y.yield_ok(DecodedTextEvent::TextDelta {
-                    delta,
-                    token_ids,
-                    logprobs,
-                    public_commit: public_commit.or_else(|| last_public_commit.clone()),
-                    finished: Some(Finished {
-                        prompt_token_count,
-                        output_token_count,
-                        internal_token_count: 0,
-                        finish_reason: FinishReason::with_stop_reason(
-                            uniserve_core::FinishReason::Stop,
-                            Some(StopReason::Text(stop_string)),
-                        ),
-                    }),
-                })
-                .await;
-                return Ok(());
-            }
-            raw_stream.acknowledge_text_prefix();
-            if intermediate {
-                y.yield_ok(DecodedTextEvent::TextDelta {
-                    delta: decoded.delta,
-                    token_ids: vec![token_id],
-                    logprobs: decoded_logprobs,
-                    public_commit,
-                    finished: None,
-                })
-                .await;
-            }
-        }};
-    }
+    let mut state = DecodeState {
+        decoder,
+        options: decode_options,
+        prompt_positions: Vec::new(),
+        queued_at: None,
+        scheduled_at: None,
+        started: false,
+        pending_token: None,
+        last_public_commit: None,
+        output_token_count: 0,
+        accumulated_token_ids: Vec::new(),
+        accumulated_logprobs: None,
+    };
 
     while let Some(event) = raw_stream.next().await {
         match event {
@@ -248,9 +280,18 @@ pub async fn decoded_text_event_stream(
                 queued_at: queued,
                 scheduled_at: scheduled,
             } => {
-                queued_at = Some(queued);
-                scheduled_at = Some(scheduled);
-                emit_start_if_ready!();
+                state.queued_at = Some(queued);
+                state.scheduled_at = Some(scheduled);
+                state
+                    .emit_start_if_ready(
+                        &request_id,
+                        tokenizer.as_ref(),
+                        &prompt_token_ids,
+                        prompt_logprobs_requested,
+                        expected_prompt_positions,
+                        &mut y,
+                    )
+                    .await?;
             }
             GenerationEvent::PromptLogprobs { positions } => {
                 if !prompt_logprobs_requested {
@@ -259,26 +300,44 @@ pub async fn decoded_text_event_stream(
                         message: "engine returned unrequested prompt logprobs".to_string(),
                     });
                 }
-                prompt_positions.extend(positions);
-                if prompt_positions.len() > expected_prompt_positions {
+                state.prompt_positions.extend(positions);
+                if state.prompt_positions.len() > expected_prompt_positions {
                     return Err(Error::MalformedOutput {
                         request_id: request_id.clone(),
                         message: "engine returned too many prompt logprob positions".to_string(),
                     });
                 }
-                emit_start_if_ready!();
+                state
+                    .emit_start_if_ready(
+                        &request_id,
+                        tokenizer.as_ref(),
+                        &prompt_token_ids,
+                        prompt_logprobs_requested,
+                        expected_prompt_positions,
+                        &mut y,
+                    )
+                    .await?;
             }
             GenerationEvent::TextToken {
                 id, public_commit, ..
             } => {
-                emit_start_if_ready!();
-                if !started {
+                state
+                    .emit_start_if_ready(
+                        &request_id,
+                        tokenizer.as_ref(),
+                        &prompt_token_ids,
+                        prompt_logprobs_requested,
+                        expected_prompt_positions,
+                        &mut y,
+                    )
+                    .await?;
+                if !state.started {
                     return Err(Error::MalformedOutput {
                         request_id: request_id.clone(),
                         message: "generation began before prompt metadata was complete".to_string(),
                     });
                 }
-                if pending_token.is_some() {
+                if state.pending_token.is_some() {
                     return Err(Error::MalformedOutput {
                         request_id: request_id.clone(),
                         message: "engine emitted a new token before resolving prior logprobs"
@@ -286,31 +345,56 @@ pub async fn decoded_text_event_stream(
                     });
                 }
                 if generated_logprobs_requested {
-                    pending_token = Some((id, public_commit));
-                } else {
-                    consume_token!(id, Vec::new(), public_commit);
+                    state.pending_token = Some((id, public_commit));
+                } else if state
+                    .consume_token(
+                        tokenizer.as_ref(),
+                        prompt_token_count,
+                        id,
+                        Vec::new(),
+                        public_commit,
+                        intermediate,
+                        &mut raw_stream,
+                        &mut y,
+                    )
+                    .await?
+                {
+                    return Ok(());
                 }
             }
             GenerationEvent::TokenLogprobs { id, candidates } => {
                 let (pending, public_commit) =
-                    pending_token.take().ok_or_else(|| Error::MalformedOutput {
-                        request_id: request_id.clone(),
-                        message: "engine returned token logprobs without a pending token"
-                            .to_string(),
-                    })?;
+                    state
+                        .pending_token
+                        .take()
+                        .ok_or_else(|| Error::MalformedOutput {
+                            request_id: request_id.clone(),
+                            message: "engine returned token logprobs without a pending token"
+                                .to_string(),
+                        })?;
                 if pending != id || candidates.first().is_none_or(|entry| entry.token_id != id) {
                     return Err(Error::MalformedOutput {
                         request_id: request_id.clone(),
                         message: "token logprobs do not match the emitted token".to_string(),
                     });
                 }
-                consume_token!(
-                    id,
-                    vec![PositionLogprobs {
-                        entries: candidates,
-                    }],
-                    public_commit
-                );
+                if state
+                    .consume_token(
+                        tokenizer.as_ref(),
+                        prompt_token_count,
+                        id,
+                        vec![PositionLogprobs {
+                            entries: candidates,
+                        }],
+                        public_commit,
+                        intermediate,
+                        &mut raw_stream,
+                        &mut y,
+                    )
+                    .await?
+                {
+                    return Ok(());
+                }
             }
             GenerationEvent::Finished {
                 reason,
@@ -318,8 +402,17 @@ pub async fn decoded_text_event_stream(
                 completion_tokens,
                 ..
             } => {
-                emit_start_if_ready!();
-                if !started || pending_token.is_some() {
+                state
+                    .emit_start_if_ready(
+                        &request_id,
+                        tokenizer.as_ref(),
+                        &prompt_token_ids,
+                        prompt_logprobs_requested,
+                        expected_prompt_positions,
+                        &mut y,
+                    )
+                    .await?;
+                if !state.started || state.pending_token.is_some() {
                     return Err(Error::MalformedOutput {
                         request_id: request_id.clone(),
                         message: "terminal event arrived before output metadata was complete"
@@ -327,16 +420,21 @@ pub async fn decoded_text_event_stream(
                     });
                 }
                 let finish_reason = text_finish_reason(reason, stop_reason);
-                let (last_chunk, text) = decoder.flush(None)?;
+                let (last_chunk, text) = state.decoder.flush(None)?;
                 let full_text = tracing::enabled!(Level::TRACE).then(|| text.clone());
                 let (delta, token_ids, logprobs) = if intermediate {
                     (last_chunk.unwrap_or_default(), Vec::new(), None)
                 } else {
-                    (text, accumulated_token_ids, accumulated_logprobs)
+                    (
+                        text,
+                        std::mem::take(&mut state.accumulated_token_ids),
+                        state.accumulated_logprobs.take(),
+                    )
                 };
                 debug!(
                     ?finish_reason,
-                    output_token_count, "request finished with decoded text"
+                    output_token_count = state.output_token_count,
+                    "request finished with decoded text"
                 );
                 if let Some(full_text) = full_text {
                     trace!(full_text, "terminal decoded text");
@@ -345,11 +443,12 @@ pub async fn decoded_text_event_stream(
                     delta,
                     token_ids,
                     logprobs,
-                    public_commit: last_public_commit,
+                    public_commit: state.last_public_commit,
                     finished: Some(Finished {
                         prompt_token_count,
                         output_token_count: completion_tokens,
-                        internal_token_count: completion_tokens.saturating_sub(output_token_count),
+                        internal_token_count: completion_tokens
+                            .saturating_sub(state.output_token_count),
                         finish_reason,
                     }),
                 })
@@ -382,16 +481,14 @@ pub async fn decoded_text_event_stream(
 
 fn text_finish_reason(
     reason: uniserve_core::FinishReason,
-    stop_reason: Option<String>,
+    stop_reason: Option<uniserve_core::StopReason>,
 ) -> FinishReason {
     if reason == uniserve_core::FinishReason::Stop {
         return FinishReason::with_stop_reason(
             reason,
-            stop_reason.map(|reason| {
-                reason
-                    .strip_prefix("token:")
-                    .and_then(|id| id.parse().ok())
-                    .map_or_else(|| StopReason::Text(reason), StopReason::TokenId)
+            stop_reason.map(|reason| match reason {
+                uniserve_core::StopReason::Token(id) => StopReason::TokenId(id),
+                uniserve_core::StopReason::String(value) => StopReason::Text(value),
             }),
         );
     }

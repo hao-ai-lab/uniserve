@@ -4,9 +4,8 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use crate::codec::{decode_request, decode_response, encode_request, encode_response};
+use crate::codec::{CodecError, decode_request, decode_response, encode_request, encode_response};
 use crate::{RequestKind, ResponseKind, WorkerRequest, WorkerResponse};
-use anyhow::{Context, bail};
 use iceoryx2::active_request::ActiveRequest;
 use iceoryx2::pending_response::PendingResponse;
 use iceoryx2::port::client::Client;
@@ -21,6 +20,73 @@ pub use events::{
 };
 
 pub const DEFAULT_SERVICE_PREFIX: &str = "uniserve/worker";
+
+pub type IpcResult<T> = std::result::Result<T, IpcError>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum IpcError {
+    #[error(transparent)]
+    Codec(#[from] CodecError),
+    #[error("worker IPC error: {0}")]
+    Transport(String),
+}
+
+impl IpcError {
+    pub(crate) fn transport(message: impl Into<String>) -> Self {
+        Self::Transport(message.into())
+    }
+}
+
+trait IpcContext<T> {
+    fn context(self, message: &str) -> IpcResult<T>;
+    fn with_context<F, D>(self, message: F) -> IpcResult<T>
+    where
+        F: FnOnce() -> D,
+        D: std::fmt::Display;
+}
+
+impl<T, E> IpcContext<T> for std::result::Result<T, E>
+where
+    E: std::fmt::Debug,
+{
+    fn context(self, message: &str) -> IpcResult<T> {
+        self.map_err(|error| IpcError::transport(format!("{message}: {error:?}")))
+    }
+
+    fn with_context<F, D>(self, message: F) -> IpcResult<T>
+    where
+        F: FnOnce() -> D,
+        D: std::fmt::Display,
+    {
+        self.map_err(|error| IpcError::transport(format!("{}: {error:?}", message())))
+    }
+}
+
+impl<T> IpcContext<T> for Option<T> {
+    fn context(self, message: &str) -> IpcResult<T> {
+        self.ok_or_else(|| IpcError::transport(message))
+    }
+
+    fn with_context<F, D>(self, message: F) -> IpcResult<T>
+    where
+        F: FnOnce() -> D,
+        D: std::fmt::Display,
+    {
+        self.ok_or_else(|| IpcError::transport(message().to_string()))
+    }
+}
+
+macro_rules! ipc_bail {
+    ($($arg:tt)*) => {
+        return Err(IpcError::transport(format!($($arg)*)))
+    };
+}
+
+macro_rules! ipc_error {
+    ($($arg:tt)*) => {
+        IpcError::transport(format!($($arg)*))
+    };
+}
 
 /// Wire protocol version this build emits on every [`Header`].
 pub const WIRE_VERSION: u16 = 7;
@@ -87,12 +153,12 @@ pub struct Frame {
 }
 
 impl Frame {
-    pub fn decode_request(&self) -> anyhow::Result<WorkerRequest> {
-        decode_request(&self.payload)
+    pub fn decode_request(&self) -> IpcResult<WorkerRequest> {
+        decode_request(&self.payload).map_err(Into::into)
     }
 
-    pub fn decode_response(&self) -> anyhow::Result<WorkerResponse> {
-        decode_response(&self.payload)
+    pub fn decode_response(&self) -> IpcResult<WorkerResponse> {
+        decode_response(&self.payload).map_err(Into::into)
     }
 }
 
@@ -105,9 +171,9 @@ pub type Pending = PendingResponse<IxService, [u8], Header, [u8], Header>;
 /// Convert an encoded payload length to the `u32` carried in [`Header::len`],
 /// rejecting payloads that do not fit instead of silently truncating with an
 /// `as u32` cast (which would corrupt the length on the receiving side).
-fn payload_len_u32(len: usize) -> anyhow::Result<u32> {
+fn payload_len_u32(len: usize) -> IpcResult<u32> {
     u32::try_from(len).map_err(|_| {
-        anyhow::anyhow!(
+        ipc_error!(
             "IPC payload of {len} bytes exceeds the maximum frame size of {} bytes",
             u32::MAX
         )
@@ -134,8 +200,8 @@ impl ClientEndpoint {
         service: &str,
         initial_max_slice_len: usize,
         max_inflight: usize,
-    ) -> anyhow::Result<Self> {
-        let service_name = ServiceName::new(service)?;
+    ) -> IpcResult<Self> {
+        let service_name = ServiceName::new(service).context("invalid iceoryx2 service name")?;
         let node = NodeBuilder::new()
             .create::<IxService>()
             .context("creating iceoryx2 client node")?;
@@ -172,13 +238,13 @@ impl ClientEndpoint {
 
     /// Park for {result, command, death} until a wake fires or `timeout`
     /// elapses. Returns which sources fired.
-    pub fn wait_wake(&self, timeout: Duration) -> anyhow::Result<WakeEvents> {
+    pub fn wait_wake(&self, timeout: Duration) -> IpcResult<WakeEvents> {
         self.events.wait(timeout)
     }
 
     /// Drain queued wake ids after a composite executor parked on this
     /// listener's descriptor.
-    pub fn drain_wakes(&self) -> anyhow::Result<WakeEvents> {
+    pub fn drain_wakes(&self) -> IpcResult<WakeEvents> {
         self.events.drain()
     }
 
@@ -198,21 +264,21 @@ impl ClientEndpoint {
         self.events.death_wake()
     }
 
-    pub fn send_request(&self, req: &WorkerRequest) -> anyhow::Result<Pending> {
+    pub fn send_request(&self, req: &WorkerRequest) -> IpcResult<Pending> {
         let payload = encode_request(req)?;
         let mut header = header_for_request(req);
         header.len = payload_len_u32(payload.len())?;
         self.send_raw(header, &payload)
     }
 
-    pub fn send_request_attempt(&self, req: &WorkerRequest) -> anyhow::Result<Pending> {
+    pub fn send_request_attempt(&self, req: &WorkerRequest) -> IpcResult<Pending> {
         let payload = encode_request(req)?;
         let mut header = header_for_request(req);
         header.len = payload_len_u32(payload.len())?;
         self.send_raw_attempt(header, &payload)
     }
 
-    pub fn send_raw(&self, header: Header, payload: &[u8]) -> anyhow::Result<Pending> {
+    pub fn send_raw(&self, header: Header, payload: &[u8]) -> IpcResult<Pending> {
         let deadline = Instant::now() + self.connect_timeout;
         loop {
             let pending = self.send_raw_attempt(header, payload)?;
@@ -221,13 +287,13 @@ impl ClientEndpoint {
             }
             drop(pending);
             if Instant::now() >= deadline {
-                bail!("iceoryx2 worker service has no connected server");
+                ipc_bail!("iceoryx2 worker service has no connected server");
             }
             std::thread::sleep(Duration::from_millis(20));
         }
     }
 
-    pub fn send_raw_attempt(&self, header: Header, payload: &[u8]) -> anyhow::Result<Pending> {
+    pub fn send_raw_attempt(&self, header: Header, payload: &[u8]) -> IpcResult<Pending> {
         let mut request = self
             .client
             .loan_slice_uninit(payload.len())
@@ -239,7 +305,7 @@ impl ClientEndpoint {
         Ok(pending)
     }
 
-    pub fn try_recv_response(&self, pending: &Pending) -> anyhow::Result<Option<Frame>> {
+    pub fn try_recv_response(&self, pending: &Pending) -> IpcResult<Option<Frame>> {
         let Some(response) = pending.receive().context("receiving iceoryx2 response")? else {
             return Ok(None);
         };
@@ -253,7 +319,7 @@ impl ClientEndpoint {
         &self,
         pending: &Pending,
         timeout: Duration,
-    ) -> anyhow::Result<Option<Frame>> {
+    ) -> IpcResult<Option<Frame>> {
         let deadline = Instant::now() + timeout;
         loop {
             if let Some(frame) = self.try_recv_response(pending)? {
@@ -280,8 +346,8 @@ impl ServerEndpoint {
         service: &str,
         initial_max_slice_len: usize,
         max_inflight: usize,
-    ) -> anyhow::Result<Self> {
-        let service_name = ServiceName::new(service)?;
+    ) -> IpcResult<Self> {
+        let service_name = ServiceName::new(service).context("invalid iceoryx2 service name")?;
         let node = NodeBuilder::new()
             .create::<IxService>()
             .context("creating iceoryx2 server node")?;
@@ -317,7 +383,7 @@ impl ServerEndpoint {
         })
     }
 
-    pub fn try_recv(&mut self) -> anyhow::Result<Option<Frame>> {
+    pub fn try_recv(&mut self) -> IpcResult<Option<Frame>> {
         let Some(active) = self
             .server
             .receive()
@@ -333,7 +399,7 @@ impl ServerEndpoint {
         Ok(Some(Frame { header, payload }))
     }
 
-    pub fn recv(&mut self) -> anyhow::Result<Frame> {
+    pub fn recv(&mut self) -> IpcResult<Frame> {
         loop {
             if let Some(frame) = self.try_recv()? {
                 return Ok(frame);
@@ -344,7 +410,7 @@ impl ServerEndpoint {
 
     /// Park until an inbound request or asynchronous completion wake fires, or
     /// `timeout` elapses. The caller re-checks all progress sources after return.
-    pub fn wait_incoming(&self, timeout: Duration) -> anyhow::Result<()> {
+    pub fn wait_incoming(&self, timeout: Duration) -> IpcResult<()> {
         self.events.wait_request(timeout)
     }
 
@@ -353,14 +419,14 @@ impl ServerEndpoint {
         self.events.completion_wake()
     }
 
-    pub fn respond(&mut self, resp: &WorkerResponse) -> anyhow::Result<()> {
+    pub fn respond(&mut self, resp: &WorkerResponse) -> IpcResult<()> {
         let payload = encode_response(resp)?;
         let mut header = header_for_response(resp);
         header.len = payload_len_u32(payload.len())?;
         self.respond_raw(header, &payload)
     }
 
-    pub fn respond_raw(&mut self, header: Header, payload: &[u8]) -> anyhow::Result<()> {
+    pub fn respond_raw(&mut self, header: Header, payload: &[u8]) -> IpcResult<()> {
         let pos = self
             .active
             .iter()
@@ -402,11 +468,11 @@ impl ServerEndpoint {
 /// treating `header.op_id` as identifying every op in the frame.
 pub fn header_for_request(req: &WorkerRequest) -> Header {
     let mut h = Header {
-        kind: request_kind_code(req.kind),
-        call_id: req.call_id.unwrap_or_default(),
+        kind: request_kind_code(req.kind()),
+        call_id: req.call_id().unwrap_or_default(),
         ..Default::default()
     };
-    if let Some(batch) = &req.batch {
+    if let Some(batch) = req.batch() {
         h.step_id = batch.step_id;
         // Hint only: first op's id. See the doc comment above.
         if let Some(operation) = batch.operations().next() {
@@ -425,11 +491,11 @@ pub fn header_for_request(req: &WorkerRequest) -> Header {
 /// payload to correlate individual sequences.
 pub fn header_for_response(resp: &WorkerResponse) -> Header {
     let mut h = Header {
-        kind: response_kind_code(resp.kind),
-        call_id: resp.call_id.unwrap_or_default(),
+        kind: response_kind_code(resp.kind()),
+        call_id: resp.call_id().unwrap_or_default(),
         ..Default::default()
     };
-    if let Some(report) = &resp.completion_report {
+    if let Some(report) = resp.report() {
         h.step_id = report.step_id;
         // Hint only: first completion's op id. See the doc comment above.
         if let Some(completion) = report.completions().next() {
@@ -439,16 +505,16 @@ pub fn header_for_response(resp: &WorkerResponse) -> Header {
     h
 }
 
-fn verify_header_len(header: Header, actual: usize) -> anyhow::Result<()> {
+fn verify_header_len(header: Header, actual: usize) -> IpcResult<()> {
     if !is_supported_wire_version(header.version) {
-        bail!(
+        ipc_bail!(
             "unsupported IPC wire version {}: this build requires {}",
             header.version,
             WIRE_VERSION
         );
     }
     if header.len as usize != actual {
-        bail!(
+        ipc_bail!(
             "IPC payload length mismatch: header={} actual={actual}",
             header.len
         );

@@ -6,12 +6,11 @@ use futures::{StreamExt as _, pin_mut};
 use thiserror_ext::AsReport as _;
 use tracing::warn;
 
-use super::ContentEvent;
+use crate::profile::reasoning::{Qwen3ReasoningParser, ReasoningDelta};
 use crate::serving::chat::output::Result;
 use crate::serving::chat::output::error::Error;
-use crate::serving::chat::output::event::AssistantBlockKind;
-use crate::serving::chat::output::parser::reasoning::{Qwen3ReasoningParser, ReasoningDelta};
-use crate::serving::chat::output::processor::DecodedTextEventStream;
+use crate::serving::chat::output::processor::ReasoningEvent;
+use crate::serving::chat::protocol::AssistantBlockKind;
 
 struct ReasoningState {
     parser: Option<Qwen3ReasoningParser>,
@@ -26,9 +25,9 @@ impl ReasoningState {
         }
     }
 
-    fn process_delta(&mut self, delta: String) -> Vec<ContentEvent> {
+    fn process_delta(&mut self, delta: String) -> Vec<ReasoningEvent> {
         let Some(parser) = self.parser.as_mut().filter(|_| !self.parser_failed) else {
-            return vec![ContentEvent::TextDelta {
+            return vec![ReasoningEvent::TextDelta {
                 kind: AssistantBlockKind::Text,
                 delta,
             }];
@@ -56,7 +55,7 @@ impl ReasoningState {
         }
     }
 
-    fn finish(&mut self) -> Vec<ContentEvent> {
+    fn finish(&mut self) -> Vec<ReasoningEvent> {
         let Some(parser) = self.parser.as_mut().filter(|_| !self.parser_failed) else {
             return Vec::new();
         };
@@ -74,13 +73,13 @@ impl ReasoningState {
     }
 }
 
-fn push_text_delta(events: &mut Vec<ContentEvent>, kind: AssistantBlockKind, delta: String) {
+fn push_text_delta(events: &mut Vec<ReasoningEvent>, kind: AssistantBlockKind, delta: String) {
     if !delta.is_empty() {
-        events.push(ContentEvent::TextDelta { kind, delta });
+        events.push(ReasoningEvent::TextDelta { kind, delta });
     }
 }
 
-fn push_reasoning_delta(events: &mut Vec<ContentEvent>, delta: ReasoningDelta) {
+fn push_reasoning_delta(events: &mut Vec<ReasoningEvent>, delta: ReasoningDelta) {
     if let Some(reasoning) = delta.reasoning {
         push_text_delta(events, AssistantBlockKind::Reasoning, reasoning);
     }
@@ -91,9 +90,9 @@ fn push_reasoning_delta(events: &mut Vec<ContentEvent>, delta: ReasoningDelta) {
 
 #[try_stream]
 pub async fn reasoning_event_stream(
-    decoded_stream: impl DecodedTextEventStream,
+    decoded_stream: impl futures::Stream<Item = crate::serving::text::Result<DecodedTextEvent>> + Send,
     parser: Option<Qwen3ReasoningParser>,
-    mut y: TryYielder<ContentEvent, Error>,
+    mut y: TryYielder<ReasoningEvent, Error>,
 ) -> Result<()> {
     pin_mut!(decoded_stream);
     let mut state = ReasoningState::new(parser);
@@ -107,7 +106,7 @@ pub async fn reasoning_event_stream(
                 scheduled_at,
             } => {
                 state.initialize(&prompt_token_ids);
-                y.yield_ok(ContentEvent::Start {
+                y.yield_ok(ReasoningEvent::Start {
                     prompt_token_ids,
                     prompt_logprobs,
                     queued_at,
@@ -119,14 +118,17 @@ pub async fn reasoning_event_stream(
                 delta,
                 token_ids,
                 logprobs,
+                public_commit,
                 finished,
-                ..
             } => {
+                if let Some(commit) = public_commit {
+                    y.yield_ok(ReasoningEvent::PublicCommit(commit)).await;
+                }
                 for next in state.process_delta(delta) {
                     y.yield_ok(next).await;
                 }
                 if logprobs.is_some() || !token_ids.is_empty() {
-                    y.yield_ok(ContentEvent::LogprobsDelta {
+                    y.yield_ok(ReasoningEvent::SampleDelta {
                         logprobs,
                         token_ids,
                     })
@@ -136,7 +138,7 @@ pub async fn reasoning_event_stream(
                     for next in state.finish() {
                         y.yield_ok(next).await;
                     }
-                    y.yield_ok(ContentEvent::Done {
+                    y.yield_ok(ReasoningEvent::Done {
                         prompt_token_count: finished.prompt_token_count,
                         output_token_count: finished.output_token_count,
                         internal_token_count: finished.internal_token_count,

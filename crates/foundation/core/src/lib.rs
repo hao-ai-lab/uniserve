@@ -7,26 +7,30 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 pub mod codec;
+mod digest;
 mod events;
 pub mod generation;
 pub mod philox;
 pub mod product_blob;
 pub mod sampling;
+pub use codec::stats::WorkerForwardStats;
+pub use digest::{Digest, DigestError};
 pub use events::{
-    FinishReason, GenerationEvent, MediaEvent, MediaRequest, PositionLogprobs, PublicCommit,
-    PublicModality, SemanticRoot, TokenLogprob,
+    FinishReason, GenerationEvent, MediaEvent, MediaRequest, MediaRequestError, PositionLogprobs,
+    PublicCommit, PublicCommitError, PublicModality, SemanticRoot, StopReason, TokenLogprob,
 };
 pub use generation::{
     ContextSegment, FeedbackNextToken, FeedbackSource, GenOnlyStartPolicyDescriptor,
     GeneratedImageFeedbackRecipe, GenerationBehaviorDescriptor, GenerationCachePolicyDescriptor,
-    GenerationCapabilityNeeds, GenerationConstraint, GenerationConstraintParseError,
-    GenerationPolicyDescriptor, GenerationRequest, GenerationRequestError,
-    GenerationResourceBounds, GenerationResourceError, GenerationRuntimeCapabilities,
-    ImageIngestRecipe, ImageIngestStep, ImageKvEffect, ImageSegment, SegmentPlacement,
-    TerminationPolicyDescriptor, TriggerPolicyDescriptor, UndTokenAction, UndVisibility,
-    VisibilityPolicyDescriptor, encoder_cache_key,
+    GenerationCapabilityError, GenerationCapabilityNeeds, GenerationConstraint,
+    GenerationConstraintParseError, GenerationPolicyDescriptor, GenerationRequest,
+    GenerationRequestError, GenerationResourceBounds, GenerationResourceError,
+    GenerationResourceSpec, GenerationRuntimeCapabilities, ImageIngestRecipe, ImageIngestStep,
+    ImageKvEffect, ImageSegment, SegmentPlacement, TerminationPolicyDescriptor,
+    TriggerPolicyDescriptor, UndTokenAction, UndVisibility, VisibilityPolicyDescriptor,
+    encoder_cache_key,
 };
-pub use sampling::{SampleOutput, apply_sampling, score_token_logprobs, try_apply_sampling_counts};
+pub use sampling::{SampleOutput, score_token_logprobs, try_apply_sampling_counts};
 
 /// A cloneable, thread-safe wake the command ingress fires after enqueuing a
 /// command, so a parked executor wakes immediately.
@@ -36,37 +40,54 @@ pub use sampling::{SampleOutput, apply_sampling, score_token_logprobs, try_apply
 /// command front door and fires it on every send) can share the type without a
 /// cross-crate dependency. The no-op value is reserved for executor fixtures
 /// that do not run the threaded scheduler loop.
+pub trait Wake: Send + Sync {
+    fn wake(&self);
+}
+
+impl<F> Wake for F
+where
+    F: Fn() + Send + Sync,
+{
+    fn wake(&self) {
+        self()
+    }
+}
+
 #[derive(Clone, Default)]
-pub struct CommandWaker(Option<Arc<dyn Fn() + Send + Sync>>);
+pub enum CommandWaker {
+    #[default]
+    Noop,
+    Live(Arc<dyn Wake>),
+}
 
 impl CommandWaker {
     /// A waker that does nothing.
     pub fn noop() -> Self {
-        Self(None)
+        Self::Noop
     }
 
     /// Wrap a wake closure (e.g. fire an iceoryx2 notifier).
     pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
-        Self(Some(Arc::new(wake)))
+        Self::Live(Arc::new(wake))
     }
 
     /// Fire the wake. A no-op for the polling variant.
     pub fn wake(&self) {
-        if let Some(f) = &self.0 {
-            f();
+        if let Self::Live(waker) = self {
+            waker.wake();
         }
     }
 
     /// Whether this is the no-op waker.
     pub fn is_noop(&self) -> bool {
-        self.0.is_none()
+        matches!(self, Self::Noop)
     }
 }
 
 impl std::fmt::Debug for CommandWaker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CommandWaker")
-            .field("active", &self.0.is_some())
+        f.debug_tuple("CommandWaker")
+            .field(&if self.is_noop() { "Noop" } else { "Live" })
             .finish()
     }
 }
@@ -167,6 +188,71 @@ impl ModelDtype {
         }
     }
 }
+
+impl std::str::FromStr for ModelDtype {
+    type Err = ModelDtypeParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value).ok_or_else(|| ModelDtypeParseError(value.to_owned()))
+    }
+}
+
+impl std::fmt::Display for ModelDtype {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unsupported model dtype {0:?}")]
+pub struct ModelDtypeParseError(String);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KvCacheDtype {
+    #[serde(rename = "float16")]
+    Float16,
+    #[serde(rename = "bfloat16")]
+    BFloat16,
+    #[serde(rename = "float32")]
+    Float32,
+    #[serde(rename = "float8_e4m3fn")]
+    Float8E4m3Fn,
+}
+
+impl KvCacheDtype {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Float16 => "float16",
+            Self::BFloat16 => "bfloat16",
+            Self::Float32 => "float32",
+            Self::Float8E4m3Fn => "float8_e4m3fn",
+        }
+    }
+}
+
+impl std::str::FromStr for KvCacheDtype {
+    type Err = KvCacheDtypeParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "float16" => Ok(Self::Float16),
+            "bfloat16" => Ok(Self::BFloat16),
+            "float32" => Ok(Self::Float32),
+            "float8_e4m3fn" => Ok(Self::Float8E4m3Fn),
+            _ => Err(KvCacheDtypeParseError(value.to_owned())),
+        }
+    }
+}
+
+impl std::fmt::Display for KvCacheDtype {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unsupported KV-cache dtype {0:?}")]
+pub struct KvCacheDtypeParseError(String);
 
 /// Text sampling parameters.
 ///
@@ -351,7 +437,7 @@ pub struct ImageParams {
     pub steps: u16,
     pub cfg_text_scale: f32,
     pub cfg_img_scale: f32,
-    pub cfg_renorm_type: String,
+    pub cfg_renorm_type: CfgRenorm,
     pub cfg_renorm_min: f32,
     pub cfg_interval: (f32, f32),
     #[serde(default = "default_timestep_shift")]
@@ -426,9 +512,49 @@ pub enum ImageParamsError {
     NonFinite { field: &'static str, got: f32 },
     #[error("cfg_interval must be an ordered pair, got ({lo}, {hi})")]
     CfgIntervalOrder { lo: f32, hi: f32 },
-    #[error("cfg_renorm_type must not be empty")]
-    EmptyCfgRenormType,
 }
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CfgRenorm {
+    None,
+    #[default]
+    Global,
+    TextChannel,
+}
+
+impl CfgRenorm {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Global => "global",
+            Self::TextChannel => "text_channel",
+        }
+    }
+}
+
+impl std::str::FromStr for CfgRenorm {
+    type Err = CfgRenormParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "none" => Ok(Self::None),
+            "global" => Ok(Self::Global),
+            "text_channel" => Ok(Self::TextChannel),
+            _ => Err(CfgRenormParseError(value.to_owned())),
+        }
+    }
+}
+
+impl std::fmt::Display for CfgRenorm {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unsupported CFG renormalization mode {0:?}")]
+pub struct CfgRenormParseError(String);
 
 impl ImageParams {
     /// Upper bound on diffusion steps.
@@ -500,9 +626,6 @@ impl ImageParams {
                 hi: self.cfg_interval.1,
             });
         }
-        if self.cfg_renorm_type.trim().is_empty() {
-            return Err(ImageParamsError::EmptyCfgRenormType);
-        }
         if self.max_images == 0 || self.max_images > Self::MAX_IMAGES {
             return Err(ImageParamsError::MaxImages {
                 got: self.max_images,
@@ -519,7 +642,7 @@ impl Default for ImageParams {
             steps: 50,
             cfg_text_scale: 4.0,
             cfg_img_scale: 1.0,
-            cfg_renorm_type: "global".into(),
+            cfg_renorm_type: CfgRenorm::Global,
             cfg_renorm_min: 0.0,
             cfg_interval: (0.0, 1.0),
             timestep_shift: 1.0,

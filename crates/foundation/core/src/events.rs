@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::RequestId;
+use crate::{Digest, DigestError, OpId, RequestId};
 
 /// Terminal cause for one engine generation lineage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -14,6 +14,14 @@ pub enum FinishReason {
     Aborted,
     Repetition,
     Error,
+}
+
+/// Typed payload identifying the exact stop condition that ended generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum StopReason {
+    Token(u32),
+    String(String),
 }
 
 /// One ranked vocabulary candidate at a generated or prompt token position.
@@ -41,9 +49,9 @@ pub enum PublicModality {
 /// Exact fixed state point that semantically owns a visible publication.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SemanticRoot {
-    pub producer_op_id: u64,
+    pub producer_op_id: OpId,
     pub point_index: u32,
-    pub semantic_digest: String,
+    pub semantic_digest: Digest,
 }
 
 /// Scheduler publication identity carried through decoding and protocol layers.
@@ -56,27 +64,37 @@ pub struct PublicCommit {
 }
 
 impl PublicCommit {
-    pub fn validate_for(&self, modality: PublicModality) -> Result<(), &'static str> {
+    pub fn validate_for(&self, modality: PublicModality) -> Result<(), PublicCommitError> {
         if self.event_seq == 0 {
-            return Err("public event sequence must be positive");
+            return Err(PublicCommitError::ZeroSequence);
         }
         if self.modality != modality {
-            return Err("public event modality does not match its payload");
+            return Err(PublicCommitError::ModalityMismatch {
+                expected: modality,
+                actual: self.modality,
+            });
         }
         if !self.committed_at.is_finite() || self.committed_at < 0.0 {
-            return Err("public commit timestamp must be finite and nonnegative");
+            return Err(PublicCommitError::InvalidTimestamp(self.committed_at));
         }
-        if self.semantic_root.semantic_digest.len() != 64
-            || !self
-                .semantic_root
-                .semantic_digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return Err("public semantic digest must be lowercase SHA-256 hex");
-        }
+        Digest::validate(self.semantic_root.semantic_digest.as_str())?;
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum PublicCommitError {
+    #[error("public event sequence must be positive")]
+    ZeroSequence,
+    #[error("public event modality mismatch: expected {expected:?}, got {actual:?}")]
+    ModalityMismatch {
+        expected: PublicModality,
+        actual: PublicModality,
+    },
+    #[error("public commit timestamp must be finite and nonnegative, got {0}")]
+    InvalidTimestamp(f64),
+    #[error(transparent)]
+    Digest(#[from] DigestError),
 }
 
 /// Typed text and image event stream emitted by an engine.
@@ -117,7 +135,7 @@ pub enum GenerationEvent {
         height: u32,
         width: u32,
         bytes: u64,
-        sha256: String,
+        sha256: Digest,
         pixels_png_b64: String,
         public_commit: Option<PublicCommit>,
     },
@@ -130,7 +148,7 @@ pub enum GenerationEvent {
     MediaAborted,
     Finished {
         reason: FinishReason,
-        stop_reason: Option<String>,
+        stop_reason: Option<StopReason>,
         prompt_tokens: usize,
         completion_tokens: usize,
         images: usize,
@@ -154,15 +172,23 @@ pub struct MediaRequest {
 }
 
 impl MediaRequest {
-    pub fn validate(&self) -> Result<(), &'static str> {
+    pub fn validate(&self) -> Result<(), MediaRequestError> {
         if self.prompt.trim().is_empty() {
-            return Err("media prompt must not be empty");
+            return Err(MediaRequestError::EmptyPrompt);
         }
         if self.output_path.is_empty() {
-            return Err("media output path must not be empty");
+            return Err(MediaRequestError::EmptyOutputPath);
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum MediaRequestError {
+    #[error("media prompt must not be empty")]
+    EmptyPrompt,
+    #[error("media output path must not be empty")]
+    EmptyOutputPath,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,10 +198,4 @@ pub enum MediaEvent {
     Rejected { message: String },
     Failed { message: String },
     Aborted,
-}
-
-impl MediaEvent {
-    pub fn is_terminal(&self) -> bool {
-        true
-    }
 }

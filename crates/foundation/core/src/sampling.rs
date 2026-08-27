@@ -11,8 +11,6 @@
 //! small descriptor lists the host computed (recent tokens, allowed/suppress
 //! masks). No logits tensor crosses the wire — this runs inside the worker.
 
-use std::collections::BTreeMap;
-
 use crate::SamplingParams;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -24,41 +22,6 @@ pub struct SampleOutput {
 }
 
 const NEG_INF: f32 = f32::NEG_INFINITY;
-
-/// Apply the full sampling pipeline to `logits` (modified in place) and draw a
-/// token. `recent` is the bounded recent-output window for penalties; `allowed`
-/// / `suppress` are the host-computed masks.
-pub fn apply_sampling(
-    logits: &mut [f32],
-    p: &SamplingParams,
-    recent: &[u32],
-    allowed: Option<&[u32]>,
-    suppress: Option<&[u32]>,
-    n_logprobs: usize,
-) -> SampleOutput {
-    let mut counts = BTreeMap::<u32, u32>::new();
-    for &token in recent {
-        let count = counts.entry(token).or_default();
-        *count = count.saturating_add(1);
-    }
-    let key = crate::philox::sampling_key(
-        seed_from(p, recent),
-        0,
-        0,
-        0,
-        crate::philox::DRAW_LAYOUT_TARGET,
-    );
-    try_apply_sampling_counts(
-        logits,
-        p,
-        &counts.into_iter().collect::<Vec<_>>(),
-        allowed,
-        suppress,
-        n_logprobs,
-        crate::philox::sampling_uniform(key, 0, 0, 0),
-    )
-    .expect("sampling inputs must leave a valid distribution")
-}
 
 /// Apply the full sampling pipeline from canonical branch-local token counts.
 ///
@@ -365,18 +328,35 @@ fn sample_categorical(probs: &[f32], draw: f32) -> u32 {
     (probs.len().saturating_sub(1)) as u32
 }
 
-fn seed_from(p: &SamplingParams, recent: &[u32]) -> u64 {
-    let mut s = p.seed.unwrap_or(0x9E3779B97F4A7C15);
-    s = s.wrapping_add(recent.len() as u64);
-    if let Some(&last) = recent.last() {
-        s = s.wrapping_mul(0x100000001B3).wrapping_add(last as u64);
-    }
-    s | 1
-}
-
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
+
+    fn sample_valid_fixture(
+        logits: &mut [f32],
+        params: &SamplingParams,
+        recent: &[u32],
+        allowed: Option<&[u32]>,
+        suppress: Option<&[u32]>,
+        n_logprobs: usize,
+    ) -> SampleOutput {
+        let mut counts = BTreeMap::<u32, u32>::new();
+        for &token in recent {
+            *counts.entry(token).or_default() += 1;
+        }
+        try_apply_sampling_counts(
+            logits,
+            params,
+            &counts.into_iter().collect::<Vec<_>>(),
+            allowed,
+            suppress,
+            n_logprobs,
+            0.0,
+        )
+        .expect("test input must leave a valid sampling distribution")
+    }
 
     fn base_logits() -> Vec<f32> {
         vec![0.0, 1.0, 2.0, 3.0, 0.5]
@@ -385,7 +365,7 @@ mod tests {
     #[test]
     fn greedy_argmax_default() {
         let mut l = base_logits();
-        let out = apply_sampling(&mut l, &SamplingParams::default(), &[], None, None, 0);
+        let out = sample_valid_fixture(&mut l, &SamplingParams::default(), &[], None, None, 0);
         assert_eq!(out.token, 3);
     }
 
@@ -396,14 +376,14 @@ mod tests {
             logit_bias: vec![(0, 100.0)],
             ..Default::default()
         };
-        let out = apply_sampling(&mut l, &p, &[], None, None, 0);
+        let out = sample_valid_fixture(&mut l, &p, &[], None, None, 0);
         assert_eq!(out.token, 0, "huge bias must make token 0 win");
     }
 
     #[test]
     fn allowed_tokens_restricts() {
         let mut l = base_logits();
-        let out = apply_sampling(
+        let out = sample_valid_fixture(
             &mut l,
             &SamplingParams::default(),
             &[],
@@ -417,7 +397,8 @@ mod tests {
     #[test]
     fn suppress_masks_argmax() {
         let mut l = base_logits();
-        let out = apply_sampling(&mut l, &SamplingParams::default(), &[], None, Some(&[3]), 0);
+        let out =
+            sample_valid_fixture(&mut l, &SamplingParams::default(), &[], None, Some(&[3]), 0);
         assert_eq!(out.token, 2, "token 3 suppressed; next is 2");
     }
 
@@ -462,7 +443,7 @@ mod tests {
             repetition_penalty: 100.0,
             ..Default::default()
         };
-        let out = apply_sampling(&mut l, &p, &[3, 3, 3], None, None, 0);
+        let out = sample_valid_fixture(&mut l, &p, &[3, 3, 3], None, None, 0);
         assert_ne!(out.token, 3, "repeated token 3 should be demoted");
     }
 
@@ -473,7 +454,7 @@ mod tests {
             n_logprobs: 3,
             ..Default::default()
         };
-        let out = apply_sampling(&mut l, &p, &[], None, None, 3);
+        let out = sample_valid_fixture(&mut l, &p, &[], None, None, 3);
         assert_eq!(out.token, 3);
         assert_eq!(out.top.len(), 3);
         assert_eq!(out.top[0].0, 3); // highest-logprob token first
@@ -499,7 +480,7 @@ mod tests {
     fn defaults_are_noop_argmax() {
         // Every transform unset => plain argmax, deterministic.
         let mut l = base_logits();
-        let out = apply_sampling(&mut l, &SamplingParams::default(), &[1, 2], None, None, 0);
+        let out = sample_valid_fixture(&mut l, &SamplingParams::default(), &[1, 2], None, None, 0);
         assert_eq!(out.token, 3);
     }
 
@@ -528,7 +509,7 @@ mod tests {
             min_p: 0.3,
             ..Default::default()
         };
-        apply_sampling(&mut l, &p, &[], None, None, 0);
+        sample_valid_fixture(&mut l, &p, &[], None, None, 0);
         assert!(l[0].is_finite(), "top token survives min-p");
         assert!(l[1].is_finite(), "second token survives min-p");
         assert_eq!(l[2], NEG_INF, "token below min_p*maxp pruned");
@@ -544,7 +525,7 @@ mod tests {
             top_k: 2,
             ..Default::default()
         };
-        apply_sampling(&mut l, &p, &[], None, None, 0);
+        sample_valid_fixture(&mut l, &p, &[], None, None, 0);
         assert!(l[0].is_finite(), "highest logit kept");
         assert!(l[1].is_finite(), "second-highest logit kept");
         assert_eq!(l[2], NEG_INF, "3rd-ranked logit pruned by top_k=2");
@@ -561,7 +542,7 @@ mod tests {
             top_p: 0.7,
             ..Default::default()
         };
-        apply_sampling(&mut l, &p, &[], None, None, 0);
+        sample_valid_fixture(&mut l, &p, &[], None, None, 0);
         assert!(l[0].is_finite(), "token0 inside nucleus");
         assert!(l[1].is_finite(), "token1 completes nucleus mass >=0.7");
         assert_eq!(l[2], NEG_INF, "token2 outside top-p nucleus pruned");
@@ -578,7 +559,7 @@ mod tests {
             top_k: 2,
             ..Default::default()
         };
-        let out = apply_sampling(&mut l, &p, &[], None, None, 5);
+        let out = sample_valid_fixture(&mut l, &p, &[], None, None, 5);
         assert_eq!(out.top.len(), 2, "only the 2 survivors are reportable");
         let reported: Vec<u32> = out.top.iter().map(|&(t, _, _)| t).collect();
         assert!(
@@ -609,7 +590,7 @@ mod tests {
             frequency_penalty: 1.0,
             ..Default::default()
         };
-        apply_sampling(&mut l, &p, &[1, 1, 2], None, None, 0);
+        sample_valid_fixture(&mut l, &p, &[1, 1, 2], None, None, 0);
         assert_eq!(l[0], 3.0, "non-recent token untouched");
         assert_eq!(l[3], 3.0, "non-recent token untouched");
         assert_eq!(l[2], 2.0, "count 1 => -1.0");
@@ -627,7 +608,7 @@ mod tests {
             presence_penalty: 1.0,
             ..Default::default()
         };
-        apply_sampling(&mut l, &p, &[1, 1, 2], None, None, 0);
+        sample_valid_fixture(&mut l, &p, &[1, 1, 2], None, None, 0);
         assert_eq!(l[0], 3.0, "non-recent token untouched");
         assert_eq!(l[3], 3.0, "non-recent token untouched");
         assert_eq!(l[1], 2.0, "appeared => flat -1.0");
@@ -646,7 +627,7 @@ mod tests {
             repetition_penalty: 2.0,
             ..Default::default()
         };
-        apply_sampling(&mut l, &p, &[0, 1], None, None, 0);
+        sample_valid_fixture(&mut l, &p, &[0, 1], None, None, 0);
         assert_eq!(l[0], 2.0, "positive logit DIVIDED by penalty (4/2)");
         assert_eq!(l[1], -8.0, "negative logit MULTIPLIED by penalty (-4*2)");
         assert_eq!(l[2], 0.0, "non-recent token untouched");
@@ -667,7 +648,7 @@ mod tests {
         let recent = [1u32, 1, 2];
 
         let mut lf = vec![3.0f32, 3.0, 3.0];
-        apply_sampling(
+        sample_valid_fixture(
             &mut lf,
             &SamplingParams {
                 frequency_penalty: 0.5,
@@ -684,7 +665,7 @@ mod tests {
         );
 
         let mut lp = vec![3.0f32, 3.0, 3.0];
-        apply_sampling(
+        sample_valid_fixture(
             &mut lp,
             &SamplingParams {
                 presence_penalty: 0.5,

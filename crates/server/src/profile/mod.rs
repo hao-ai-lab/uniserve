@@ -54,6 +54,24 @@ impl ModelDescription {
     }
 }
 
+impl std::str::FromStr for ModelDescription {
+    type Err = ModelDescriptionParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "qwen3" => Ok(Self::Qwen3),
+            "sensenova" => Ok(Self::SenseNova),
+            "bagel" => Ok(Self::Bagel),
+            "minimax-h3" | "minimax_h3" => Ok(Self::MiniMaxH3),
+            _ => Err(ModelDescriptionParseError(value.to_owned())),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unsupported model description {0:?}")]
+pub struct ModelDescriptionParseError(String);
+
 /// Deployment-owned profile inputs applied after repository metadata.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileDeploymentConfig {
@@ -63,10 +81,9 @@ pub struct ProfileDeploymentConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelIdentity {
-    pub model_id: String,
-    pub profile_id: String,
-    pub description_id: String,
-    pub config_fingerprint: String,
+    pub served_name: String,
+    pub description: ModelDescription,
+    pub fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -101,58 +118,45 @@ pub struct CommonModelProfile {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Qwen3ModelProfile {
-    pub common: CommonModelProfile,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SenseNovaModelProfile {
+pub(crate) struct SenseNovaModelProfile {
     pub common: CommonModelProfile,
     pub preprocessing: SenseNovaProfile,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct BagelModelProfile {
+pub(crate) struct BagelModelProfile {
     pub common: CommonModelProfile,
     pub preprocessing: BagelProfile,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MiniMaxH3ModelProfile {
-    pub common: CommonModelProfile,
-}
-
 /// The closed resolved profile value consumed by the serving model description.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum ModelProfile {
-    Qwen3(Qwen3ModelProfile),
+pub(crate) enum ModelProfile {
+    Qwen3(CommonModelProfile),
     SenseNova(SenseNovaModelProfile),
     Bagel(BagelModelProfile),
-    MiniMaxH3(MiniMaxH3ModelProfile),
+    MiniMaxH3(CommonModelProfile),
 }
 
 impl ModelProfile {
-    pub fn minimax_h3(model_id: &str) -> Self {
+    pub(crate) fn minimax_h3(model_id: &str) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(b"uniserve-minimax-h3-t2va-v0.2\0");
         hasher.update(model_id.as_bytes());
         let config_fingerprint = format!("{:x}", hasher.finalize());
-        Self::MiniMaxH3(MiniMaxH3ModelProfile {
-            common: CommonModelProfile {
-                identity: ModelIdentity {
-                    model_id: model_id.to_string(),
-                    profile_id: format!("minimax_h3:{}", &config_fingerprint[..16]),
-                    description_id: "minimax_h3".to_string(),
-                    config_fingerprint,
-                },
-                generation_defaults: GenerationDefaultsDescriptor::default(),
-                context_limits: ContextLimits::default(),
-                stop_tokens: StopTokenPolicy::default(),
+        Self::MiniMaxH3(CommonModelProfile {
+            identity: ModelIdentity {
+                served_name: model_id.to_string(),
+                description: ModelDescription::MiniMaxH3,
+                fingerprint: Some(config_fingerprint),
             },
+            generation_defaults: GenerationDefaultsDescriptor::default(),
+            context_limits: ContextLimits::default(),
+            stop_tokens: StopTokenPolicy::default(),
         })
     }
 
-    pub fn resolve(
+    pub(crate) fn resolve(
         description: ModelDescription,
         model_id: &str,
         files: &ResolvedModelFiles,
@@ -162,25 +166,23 @@ impl ModelProfile {
         let model_config = load_model_config(files.config_path.as_deref())?;
         let actual_model_type = model_config
             .model_type()
-            .ok_or_else(|| assets::Error::message("configured model config has no model_type"))?;
+            .ok_or(assets::Error::MissingField {
+                field: "model_type",
+            })?;
         if actual_model_type != description.model_type() {
-            return Err(assets::Error::message(format!(
-                "model description {} requires model_type {:?}, found {:?}",
-                description.id(),
-                description.model_type(),
-                actual_model_type
-            )));
+            return Err(assets::Error::ModelTypeMismatch {
+                expected: description.model_type(),
+                actual: actual_model_type.to_owned(),
+            });
         }
         let generation_config = load_generation_config(files.generation_config_path.as_deref())?;
         let tokenizer_config = load_tokenizer_config(files.tokenizer_config_path.as_deref())?;
         let config_fingerprint = profile_fingerprint(files, deployment)?;
-        let description_id = description.id().to_string();
         let common = CommonModelProfile {
             identity: ModelIdentity {
-                model_id: model_id.to_string(),
-                profile_id: format!("{description_id}:{}", &config_fingerprint[..16]),
-                description_id,
-                config_fingerprint,
+                served_name: model_id.to_string(),
+                description,
+                fingerprint: Some(config_fingerprint),
             },
             generation_defaults: generation_defaults(&generation_config),
             context_limits: ContextLimits {
@@ -192,7 +194,7 @@ impl ModelProfile {
             stop_tokens: stop_token_policy(&tokenizer_config, &generation_config, tokenizer),
         };
         match description {
-            ModelDescription::Qwen3 => Ok(Self::Qwen3(Qwen3ModelProfile { common })),
+            ModelDescription::Qwen3 => Ok(Self::Qwen3(common)),
             ModelDescription::SenseNova => Ok(Self::SenseNova(SenseNovaModelProfile {
                 common,
                 preprocessing: SenseNovaProfile::resolve(tokenizer)?,
@@ -205,21 +207,21 @@ impl ModelProfile {
         }
     }
 
-    pub fn common(&self) -> &CommonModelProfile {
+    pub(crate) fn common(&self) -> &CommonModelProfile {
         match self {
-            Self::Qwen3(profile) => &profile.common,
+            Self::Qwen3(profile) => profile,
             Self::SenseNova(profile) => &profile.common,
             Self::Bagel(profile) => &profile.common,
-            Self::MiniMaxH3(profile) => &profile.common,
+            Self::MiniMaxH3(profile) => profile,
         }
     }
 
-    pub fn common_mut(&mut self) -> &mut CommonModelProfile {
+    pub(crate) fn common_mut(&mut self) -> &mut CommonModelProfile {
         match self {
-            Self::Qwen3(profile) => &mut profile.common,
+            Self::Qwen3(profile) => profile,
             Self::SenseNova(profile) => &mut profile.common,
             Self::Bagel(profile) => &mut profile.common,
-            Self::MiniMaxH3(profile) => &mut profile.common,
+            Self::MiniMaxH3(profile) => profile,
         }
     }
 }
@@ -287,15 +289,13 @@ fn profile_fingerprint(
                 .and_then(|name| name.to_str())
                 .unwrap_or_default(),
         );
-        hasher.update(fs::read(path).map_err(|error| {
-            assets::Error::message(format!(
-                "failed to fingerprint '{}': {error}",
-                path.display()
-            ))
+        hasher.update(fs::read(path).map_err(|source| assets::Error::Io {
+            path: path.to_path_buf(),
+            source,
         })?);
     }
     hasher.update(serde_json::to_vec(deployment).map_err(|error| {
-        assets::Error::message(format!("failed to fingerprint deployment profile: {error}"))
+        assets::Error::invalid(format!("failed to fingerprint deployment profile: {error}"))
     })?);
     Ok(format!("{:x}", hasher.finalize()))
 }
@@ -393,7 +393,7 @@ mod tests {
                 &tokenizer,
             )
             .unwrap();
-            assert_eq!(profile.common().identity.description_id, description.id());
+            assert_eq!(profile.common().identity.description, description);
             assert_eq!(profile.common().context_limits.max_model_tokens, Some(4096));
             assert_eq!(
                 profile.common().generation_defaults.max_output_tokens,
@@ -403,7 +403,10 @@ mod tests {
                 ModelProfile::Qwen3(_) => assert_eq!(description, ModelDescription::Qwen3),
                 ModelProfile::SenseNova(profile) => {
                     assert_eq!(description, ModelDescription::SenseNova);
-                    assert_eq!(profile.preprocessing.image_defaults.resolution, "16:9");
+                    assert_eq!(
+                        profile.preprocessing.image_defaults.resolution,
+                        crate::profile::omni::resolution::ResolutionName::Landscape16x9
+                    );
                     assert_eq!(
                         profile.preprocessing.image_ingest.steps,
                         vec![ImageIngestStep::VitEncode]

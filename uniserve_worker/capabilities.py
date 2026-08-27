@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, TypeVar, cast
 
-from .batch import Domain, SamplingOwnership, ForwardMode, protocol_layout_digest
+from .batch import Domain, ForwardMode, SamplingOwnership, protocol_layout_digest
 from .foundation.errors import invalid_descriptor
 
 # Two work variants are never admitted onto a configured serving route:
@@ -575,7 +575,7 @@ class WorkerCapabilities:
             "latent_page_units": self.latent_page_units,
             "num_latent_pages": self.num_latent_pages,
             "latent_width": self.latent_width,
-            "latent_dtype": self.latent_dtype,
+            "latent_dtype": self.latent_dtype or None,
             "latent_downsample": self.latent_downsample,
             "max_vae_grid_tokens": self.max_vae_grid_tokens,
             "max_vit_grid_tokens": self.max_vit_grid_tokens,
@@ -586,7 +586,7 @@ class WorkerCapabilities:
             "max_cfg_branches": self.max_cfg_branches,
             "bytes_per_token": self.bytes_per_token,
             "groups": [value.to_mapping() for value in self.groups],
-            "kv_dtype": self.kv_dtype,
+            "kv_dtype": self.kv_dtype or None,
             "model_dtype": self.model_dtype,
             "attention_backend": self.attention_backend,
             "rank": self.rank.to_mapping(),
@@ -601,8 +601,8 @@ class WorkerCapabilities:
             "mixed_buckets": [bucket.to_mapping() for bucket in self.mixed_buckets],
             "sampling_ownership": self.sampling_ownership.value,
             "resource_classes": [value.value for value in self.resource_classes],
-            "model_identity": self.model_identity,
-            "weight_digest": self.weight_digest,
+            "model_identity": self.model_identity or None,
+            "weight_digest": self.weight_digest or None,
             "protocol_layout_digest": self.protocol_layout_digest,
             "lanes": [lane.to_mapping() for lane in self.lanes],
         }

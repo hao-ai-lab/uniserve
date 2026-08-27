@@ -12,11 +12,11 @@ use uniserve_core::{
 };
 use uniserve_server::profile::assets::ResolvedModelFiles;
 use uniserve_server::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
-use uniserve_server::profile::{ModelDescription, ModelProfile, ProfileDeploymentConfig};
+use uniserve_server::profile::{ModelDescription, ProfileDeploymentConfig};
 use uniserve_server::serving::chat::{
     ChatContentPart, ChatMessage, ChatTemplateContentFormatOption, HfChatRenderer,
 };
-use uniserve_server::serving::{GenerateReqInput, ResolvedModel};
+use uniserve_server::serving::{GenerateReqInput, ResolvedAssets, ResolvedModel};
 
 const PNG_1X1: &str =
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
@@ -98,25 +98,25 @@ fn try_resolved_model(
     };
     let tokenizer: DynTokenizer =
         Arc::new(HuggingFaceTokenizer::new(&files.tokenizer_path).unwrap());
-    let profile = ModelProfile::resolve(
-        description,
-        description.id(),
-        &files,
-        &ProfileDeploymentConfig::default(),
-        tokenizer.as_ref(),
-    )
-    .unwrap();
     let renderer = HfChatRenderer::new(
         Some(CHAT_TEMPLATE.to_string()),
         HashMap::new(),
         ChatTemplateContentFormatOption::String,
     )
     .unwrap();
-    let model = ResolvedModel::resolve(
-        profile,
+    let assets = ResolvedAssets::from_files(
+        description,
+        description.id(),
+        &files,
+        &ProfileDeploymentConfig::default(),
         Arc::clone(&tokenizer),
         renderer,
+    )
+    .unwrap();
+    let model = ResolvedModel::resolve(
+        assets,
         capabilities,
+        uniserve_server::serving::ServedSamplingControl::ALL.to_vec(),
         4096,
         true,
     )?;

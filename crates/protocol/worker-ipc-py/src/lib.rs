@@ -232,23 +232,22 @@ impl PyServer {
     fn recv(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let mut endpoint = self.take_endpoint()?;
         let (endpoint, result) = py.detach(move || {
-            let result = (|| {
+            let result: anyhow::Result<WorkerRequest> = (|| {
                 let frame = endpoint.recv()?;
-                frame.decode_request()
+                Ok(frame.decode_request()?)
             })();
             (endpoint, result)
         });
         self.replace_endpoint(endpoint)?;
-        let req = result.map_err(|err: anyhow::Error| {
-            py_runtime(format!("failed to receive IPC request: {err:#}"))
-        })?;
+        let req =
+            result.map_err(|err| py_runtime(format!("failed to receive IPC request: {err:#}")))?;
         pythonize_request(py, &req)
     }
 
     fn try_recv(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         let mut endpoint = self.take_endpoint()?;
         let (endpoint, result) = py.detach(move || {
-            let result = (|| {
+            let result: anyhow::Result<Option<WorkerRequest>> = (|| {
                 let Some(frame) = endpoint.try_recv()? else {
                     return Ok(None);
                 };
@@ -257,9 +256,8 @@ impl PyServer {
             (endpoint, result)
         });
         self.replace_endpoint(endpoint)?;
-        let Some(req) = result.map_err(|err: anyhow::Error| {
-            py_runtime(format!("failed to receive IPC request: {err:#}"))
-        })?
+        let Some(req) =
+            result.map_err(|err| py_runtime(format!("failed to receive IPC request: {err:#}")))?
         else {
             return Ok(None);
         };
@@ -289,7 +287,7 @@ impl PyServer {
     fn respond(&self, py: Python<'_>, response: &Bound<'_, PyAny>) -> PyResult<()> {
         // Per-step result reports use the typed extractor. Every other response
         // kind is decoded by the schema-derived converter.
-        let resp: WorkerResponse = match convert::try_completion_response_from_py(response) {
+        let resp: WorkerResponse = match convert::try_completion_response_from_py(response)? {
             Some(resp) => resp,
             None => depythonize(response)
                 .map_err(|err| PyErr::new::<PyValueError, _>(format!("invalid response: {err}")))?,
@@ -310,7 +308,7 @@ fn pythonize_request(py: Python<'_>, request: &WorkerRequest) -> PyResult<Py<PyA
     // protocol objects directly: the decoded Rust batch has already passed
     // `Batch::validate`, and control content digests are carried across so the
     // worker never re-derives them.
-    if request.kind == RequestKind::Execute {
+    if request.kind() == RequestKind::Execute {
         let object = convert::execute_request_to_py(py, request)?;
         return Ok(object.into_any().unbind());
     }

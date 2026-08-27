@@ -9,16 +9,16 @@
 
 use std::path::PathBuf;
 
-use uniserve_core::RequestId;
+use uniserve_core::{Digest, RequestId};
 use uniserve_worker_ipc::{
     Bounds, DType, DimBound, Domain, DrawLayout, FinishFlags, ForwardMode, LogicalLengths,
-    ModelOutput, OpId, OpStatus, Operation, Point, PointRange, ProductKind, ProductRef, RequestKey,
-    Rng, RouteId, ShapeBound, StorageClass, TimingCounters, TokenSpan, VersionRef,
-    protocol_layout_digest,
+    ModelOutput, OpId, OpStatus, Operation, OperationSpec, Point, PointRange, ProductKind,
+    ProductRef, RequestKey, Rng, RouteId, ShapeBound, StorageClass, TimingCounters, TokenSpan,
+    VersionRef, protocol_layout_digest,
 };
 
-fn digest_string(seed: u8) -> String {
-    format!("{seed:02x}").repeat(32)
+fn digest_string(seed: u8) -> Digest {
+    Digest::try_from(format!("{seed:02x}").repeat(32)).unwrap()
 }
 
 fn request_key() -> RequestKey {
@@ -107,14 +107,14 @@ fn canonical_operation() -> Operation {
             max_points: 1,
         },
     };
-    Operation::registered(
-        request_key(),
-        OpId(11),
+    Operation::registered(OperationSpec {
+        request_key: request_key(),
+        op_id: OpId(11),
         parent,
-        ForwardMode::TokenDecode,
-        RouteId(9),
-        Domain::Decode,
-        Bounds {
+        work: ForwardMode::TokenDecode,
+        route: RouteId(9),
+        domain: Domain::Decode,
+        bounds: Bounds {
             max_points: 1,
             max_tokens: 1,
             max_kv_pages: 2,
@@ -122,24 +122,24 @@ fn canonical_operation() -> Operation {
             max_completion_bytes: 4096,
             max_transfer_bytes: 0,
         },
-        vec![input],
-        vec![
+        inputs: vec![input],
+        outputs: vec![
             token_output,
             selected_point_output,
             accepted_span_output,
             continuation_output,
         ],
-        None,
-        Some(Rng {
+        predicate: None,
+        rng: Some(Rng {
             seed: 0x0123_4567_89ab_cdef,
             semantic_index_base: 40,
             draw_layout: DrawLayout::TargetSampling,
         }),
-        7,
-    )
+        control_seq: 7,
+    })
 }
 
-fn canonical_completion(semantic_digest: String) -> ModelOutput {
+fn canonical_completion(semantic_digest: Digest) -> ModelOutput {
     ModelOutput {
         request_key: request_key(),
         op_id: OpId(11),
@@ -195,7 +195,7 @@ fn emit_digest_parity_fixture() {
     assert_eq!(plan_digest, operation.plan_digest);
 
     // The completion carries the semantic digest it names once host-validated.
-    let semantic_digest = canonical_completion(String::new())
+    let semantic_digest = canonical_completion(Digest::zero())
         .compute_semantic_digest(&parent_semantic_digest, &plan_digest);
     let completion = canonical_completion(semantic_digest.clone());
     completion

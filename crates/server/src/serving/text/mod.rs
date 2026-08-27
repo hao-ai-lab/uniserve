@@ -12,20 +12,11 @@ pub use error::{Error, Result};
 pub use output::{
     CollectedTextOutput, DecodedLogprobs, DecodedPositionLogprobs, DecodedPromptLogprobs,
     DecodedTextEvent, DecodedTokenLogprob, FinishReason, Finished, StopReason, TextDecodeOptions,
-    TextOutputStreamExt,
 };
 
 mod error;
 pub mod output;
 pub use crate::profile::tokenizer;
-
-use futures::Stream;
-use trait_set::trait_set;
-
-trait_set! {
-    /// Shared streamed decoded-text output type.
-    pub trait TextOutputStream = Stream<Item = Result<DecodedTextEvent>> + Send + 'static;
-}
 
 /// Tokenizer/model-derived hints used to enrich sampling parameters before they
 /// are lowered into an engine request.

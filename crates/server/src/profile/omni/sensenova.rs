@@ -5,7 +5,7 @@ use uniserve_core::{
     ImageKvEffect, Modality, TriggerPolicyDescriptor,
 };
 
-use super::resolution::{ResolutionBucket, ResolutionPolicy};
+use super::resolution::{ResolutionBucket, ResolutionName, ResolutionPolicy};
 use super::{
     DelimitedTextPolicy, GenerationControls, ImageGenerationDefaults, OutputFilterPolicy, chatml,
     encode, pixel_bound_tokens, required_token, required_token_id,
@@ -74,11 +74,11 @@ impl SenseNovaProfile {
         Ok(Self {
             controls,
             image_defaults: ImageGenerationDefaults {
-                resolution: "16:9".to_string(),
+                resolution: ResolutionName::Landscape16x9,
                 steps: 50,
                 cfg_text_scale: 4.0,
                 cfg_img_scale: 1.0,
-                cfg_renorm_type: "none".to_string(),
+                cfg_renorm_type: uniserve_core::CfgRenorm::None,
                 cfg_renorm_min: 0.0,
                 cfg_interval: (0.0, 1.0),
                 timestep_shift: 3.0,
@@ -176,11 +176,11 @@ impl SenseNovaProfile {
         let feedback = policy
             .feedback
             .as_mut()
-            .ok_or_else(|| assets::Error::message("SenseNova generation policy has no feedback"))?;
+            .ok_or_else(|| assets::Error::invalid("SenseNova generation policy has no feedback"))?;
         if feedback.ingest.steps.as_slice() != [ImageIngestStep::VitEncode]
             || feedback.ingest.step_kv_tokens.len() != 1
         {
-            return Err(assets::Error::message(
+            return Err(assets::Error::invalid(
                 "SenseNova feedback recipe does not match its image processor",
             ));
         }
@@ -191,22 +191,22 @@ impl SenseNovaProfile {
 
 fn resolution_policy() -> ResolutionPolicy {
     let buckets = [
-        ("1:1", 1536, 1536),
-        ("16:9", 2048, 1152),
-        ("1.5K", 2048, 1152),
-        ("9:16", 1152, 2048),
-        ("3:2", 1888, 1248),
-        ("2:3", 1248, 1888),
-        ("4:3", 1760, 1312),
-        ("3:4", 1312, 1760),
-        ("1:2", 1088, 2144),
-        ("2:1", 2144, 1088),
-        ("1:3", 864, 2592),
-        ("3:1", 2592, 864),
+        (ResolutionName::Square, 1536, 1536),
+        (ResolutionName::Landscape16x9, 2048, 1152),
+        (ResolutionName::OnePointFiveK, 2048, 1152),
+        (ResolutionName::Portrait9x16, 1152, 2048),
+        (ResolutionName::Landscape3x2, 1888, 1248),
+        (ResolutionName::Portrait2x3, 1248, 1888),
+        (ResolutionName::Landscape4x3, 1760, 1312),
+        (ResolutionName::Portrait3x4, 1312, 1760),
+        (ResolutionName::Portrait1x2, 1088, 2144),
+        (ResolutionName::Landscape2x1, 2144, 1088),
+        (ResolutionName::Portrait1x3, 864, 2592),
+        (ResolutionName::Landscape3x1, 2592, 864),
     ]
     .into_iter()
     .map(|(name, width, height)| ResolutionBucket {
-        name: name.to_string(),
+        name,
         width,
         height,
     })

@@ -92,20 +92,23 @@ fn main() -> anyhow::Result<()> {
         stub: true,
         ..WorkerLaunchConfig::default()
     };
-    let engine = UniprocExecutor::spawn_with_config(
-        "python3",
-        "",
-        "cpu",
-        2,
-        1 << 20,
-        8 << 20,
-        None,
-        256,
-        32,
-        8192,
-        "auto",
-        &worker_config,
-    )?;
+    let engine = UniprocExecutor::spawn(uniserve_engine::WorkerSpawnSpec {
+        python: "python3".into(),
+        model: String::new(),
+        device: "cpu".into(),
+        world_size: 1,
+        pipeline_depth: 2,
+        req_slot_cap: 1 << 20,
+        resp_slot_cap: 8 << 20,
+        kv_token_capacity: None,
+        block_size: 256,
+        max_batch_operations: 32,
+        max_batch_tokens: 8192,
+        attention_backend: uniserve_engine::AttentionBackend::Auto,
+        worker_kind: None,
+        transfer_backend: uniserve_engine::TransferBackend::Inproc,
+        launch: worker_config,
+    })?;
     let waker = engine.command_waker();
     let sched = Scheduler::new(Box::new(engine), ControlTokens::default(), 32);
 

@@ -5,14 +5,12 @@ use futures::{StreamExt as _, pin_mut};
 use thiserror_ext::AsReport as _;
 use tracing::warn;
 
-use super::{AssistantEvent, ContentEvent, ContentEventStream};
+use crate::profile::tools::{Qwen3XmlToolParser, ToolCallDelta, ToolParserOutput};
 use crate::serving::chat::output::Result;
 use crate::serving::chat::output::error::Error;
-use crate::serving::chat::output::event::AssistantBlockKind;
-use crate::serving::chat::output::parser::tool::{
-    Qwen3XmlToolParser, ToolCallDelta, ToolParserOutput,
-};
 use crate::serving::chat::output::processor::generate_tool_call_id;
+use crate::serving::chat::output::processor::{AssistantEvent, ReasoningEvent};
+use crate::serving::chat::protocol::AssistantBlockKind;
 
 struct ToolState {
     parser: Qwen3XmlToolParser,
@@ -142,7 +140,7 @@ fn push_text_delta(events: &mut Vec<AssistantEvent>, kind: AssistantBlockKind, d
 
 #[try_stream]
 pub async fn tool_event_stream(
-    stream: impl ContentEventStream,
+    stream: impl futures::Stream<Item = Result<ReasoningEvent>> + Send,
     parser: Option<Qwen3XmlToolParser>,
     mut y: TryYielder<AssistantEvent, Error>,
 ) -> Result<()> {
@@ -158,7 +156,7 @@ pub async fn tool_event_stream(
     let mut state = ToolState::new(parser);
     while let Some(event) = stream.next().await.transpose()? {
         match event {
-            ContentEvent::Start {
+            ReasoningEvent::Start {
                 prompt_token_ids,
                 prompt_logprobs,
                 queued_at,
@@ -172,22 +170,25 @@ pub async fn tool_event_stream(
                 })
                 .await;
             }
-            ContentEvent::TextDelta { kind, delta } => {
+            ReasoningEvent::TextDelta { kind, delta } => {
                 for next in state.process_text_delta(kind, delta)? {
                     y.yield_ok(next).await;
                 }
             }
-            ContentEvent::LogprobsDelta {
+            ReasoningEvent::SampleDelta {
                 logprobs,
                 token_ids,
             } => {
-                y.yield_ok(AssistantEvent::LogprobsDelta {
+                y.yield_ok(AssistantEvent::SampleDelta {
                     logprobs,
                     token_ids,
                 })
                 .await;
             }
-            ContentEvent::Done {
+            ReasoningEvent::PublicCommit(commit) => {
+                y.yield_ok(AssistantEvent::PublicCommit(commit)).await;
+            }
+            ReasoningEvent::Done {
                 prompt_token_count,
                 output_token_count,
                 internal_token_count,

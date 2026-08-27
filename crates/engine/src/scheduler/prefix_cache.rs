@@ -56,11 +56,11 @@ pub(crate) fn lookup(
         (lookup.cached_blocks * block_size) as u64,
         Ordering::Relaxed,
     );
-    state.replay.block_hashes = lookup.block_hashes;
-    state.replay.prefix_cached_blocks = lookup.cached_blocks;
-    state.ingest.prompt_cursor = (lookup.cached_blocks * block_size) as u32;
-    state.und.logical_pos = state.ingest.prompt_cursor;
-    state.und.physical_kv_len = state.ingest.prompt_cursor;
+    state.cursor.replay.block_hashes = lookup.block_hashes;
+    state.cursor.replay.prefix_cached_blocks = lookup.cached_blocks;
+    state.cursor.ingest.prompt_cursor = (lookup.cached_blocks * block_size) as u32;
+    state.cursor.und.logical_pos = state.cursor.ingest.prompt_cursor;
+    state.cursor.und.physical_kv_len = state.cursor.ingest.prompt_cursor;
 }
 
 pub(crate) fn cache_blocks(
@@ -68,7 +68,7 @@ pub(crate) fn cache_blocks(
     state: &mut ReqState,
     pool: &BlockPool,
 ) {
-    if state.replay.blocks_cached {
+    if state.cursor.replay.blocks_cached {
         return;
     }
     let prompt = state.effective_prompt().to_vec();
@@ -76,9 +76,9 @@ pub(crate) fn cache_blocks(
         pool,
         &state.block_tables,
         &prompt,
-        &state.replay.block_hashes,
+        &state.cursor.replay.block_hashes,
         state.req.cache.write,
     ) {
-        state.replay.blocks_cached = true;
+        state.cursor.replay.blocks_cached = true;
     }
 }

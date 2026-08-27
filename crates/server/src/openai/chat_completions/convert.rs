@@ -35,13 +35,11 @@ pub struct ChatResponseContext {
 /// response-only metadata.
 pub fn lower_chat_request(
     request: ChatCompletionRequest,
-    served_model_names: &[String],
+    served_model_name: &str,
     context: ResolvedRequestContext,
 ) -> Result<(GenerateReqInput, ChatResponseContext), ApiError> {
-    validate::validate_request_compat(&request, served_model_names)?;
-    let response_model = served_model_names.first().cloned().ok_or_else(|| {
-        ApiError::server_error("chat completion has no served model configured".to_string())
-    })?;
+    validate::validate_request_compat(&request, served_model_name)?;
+    let response_model = served_model_name.to_owned();
     let request_id = format!("chatcmpl-{}", context.request_id);
     let include_usage = request
         .stream_options
@@ -133,9 +131,13 @@ pub fn lower_chat_request(
 }
 
 fn convert_modalities(modalities: &[ChatModality]) -> ModalitySelection {
-    ModalitySelection {
-        output_text: modalities.contains(&ChatModality::Text),
-        output_image: modalities.contains(&ChatModality::Image),
+    match (
+        modalities.contains(&ChatModality::Text),
+        modalities.contains(&ChatModality::Image),
+    ) {
+        (true, false) => ModalitySelection::Text,
+        (false, true) => ModalitySelection::Image,
+        (true, true) | (false, false) => ModalitySelection::TextAndImage,
     }
 }
 
@@ -274,13 +276,11 @@ fn convert_tools(tools: Option<Vec<Tool>>) -> Result<Vec<tools::Tool>, ApiError>
         .unwrap_or_default()
         .into_iter()
         .map(|tool| {
-            if tool.tool_type != "function" {
-                bail_invalid_request!("Only function tools are supported.");
-            }
+            let Tool::Function { function } = tool;
             Ok(tools::Tool {
-                name: tool.function.name,
-                description: tool.function.description,
-                parameters: tool.function.parameters,
+                name: function.name,
+                description: function.description,
+                parameters: function.parameters,
                 strict: None,
             })
         })

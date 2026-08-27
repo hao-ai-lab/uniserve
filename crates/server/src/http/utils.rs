@@ -1,9 +1,6 @@
 pub(crate) use crate::openai::ResolvedRequestContext;
 use axum::http::HeaderMap;
-use thiserror_ext::AsReport;
 use uuid::Uuid;
-
-use crate::openai::ApiError;
 
 /// Return the current Unix timestamp in seconds for OpenAI response objects.
 ///
@@ -11,14 +8,6 @@ use crate::openai::ApiError;
 /// companion) so this matches the fractional-second timestamps used elsewhere.
 pub(crate) fn unix_timestamp() -> u64 {
     uniserve_core::now_unix_secs_u64()
-}
-
-/// Construct an API error when engine status is unavailable.
-pub(crate) fn engine_status_error(error: impl AsReport) -> ApiError {
-    ApiError::server_error(format!(
-        "engine status is unavailable: {}",
-        error.as_report()
-    ))
 }
 
 /// Extract the external request ID and tracing metadata from HTTP headers.

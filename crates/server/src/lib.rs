@@ -14,12 +14,8 @@ use std::sync::Arc;
 
 use crate::engine_client::EngineClient;
 pub use crate::profile::ModelDescription;
-use crate::profile::assets::ResolvedModelFiles;
-use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
-use crate::profile::{ModelProfile, ProfileDeploymentConfig};
 pub use crate::serving::chat::ChatTemplateContentFormatOption;
-use crate::serving::chat::{ChatTemplateLoadOptions, HfChatRenderer};
-use crate::serving::{ResolvedModel, ServingRuntime};
+use crate::serving::{ResolvedAssets, ResolvedModel, ServingRuntime};
 use anyhow::{Context as _, Result};
 pub use config::{Config, EngineBackendKind, EngineSettings, HttpListenerMode};
 use tracing::info;
@@ -39,24 +35,19 @@ struct RuntimeControlTokens {
 }
 
 fn runtime_control_tokens(
-    profile: &ModelProfile,
+    assets: &ResolvedAssets,
     backend: EngineBackendKind,
 ) -> RuntimeControlTokens {
-    let controls = match profile {
-        ModelProfile::Qwen3(_) => None,
-        ModelProfile::SenseNova(profile) => Some(&profile.preprocessing.controls),
-        ModelProfile::Bagel(profile) => Some(&profile.preprocessing.controls),
-        ModelProfile::MiniMaxH3(_) => None,
-    };
+    let controls = assets.generation_controls();
     let bos = controls.map_or(0, |value| value.bos);
     let start_of_image = controls.map_or(0, |value| value.start_of_image);
     let end_of_image = controls.map_or(0, |value| value.end_of_image);
     let primary_eos = controls
         .map(|value| value.eos)
         .filter(|value| *value != 0)
-        .or(profile.common().stop_tokens.primary_eos_token_id);
-    let mut eos = profile
-        .common()
+        .or(assets.profile().stop_tokens.primary_eos_token_id);
+    let mut eos = assets
+        .profile()
         .stop_tokens
         .eos_token_ids
         .iter()
@@ -77,111 +68,14 @@ fn runtime_control_tokens(
     }
 }
 
-fn load_tokenizer(files: &ResolvedModelFiles) -> Result<DynTokenizer> {
-    Ok(Arc::new(
-        HuggingFaceTokenizer::new(&files.tokenizer_path).with_context(|| {
-            format!(
-                "failed to load tokenizer from {}",
-                files.tokenizer_path.display()
-            )
-        })?,
-    ))
-}
-
-async fn resolve_model_assets(
-    config: &Config,
-) -> Result<(
-    ModelProfile,
-    Option<DynTokenizer>,
-    Option<HfChatRenderer>,
-    u32,
-)> {
-    if config.model_description == ModelDescription::MiniMaxH3 {
-        let max_model_tokens = config.engine.max_model_len.unwrap_or(1);
-        return Ok((
-            ModelProfile::minimax_h3(&config.model),
-            None,
-            None,
-            max_model_tokens,
-        ));
-    }
-    let files = ResolvedModelFiles::new(&config.model)
-        .await
-        .with_context(|| format!("failed to resolve model files for `{}`", config.model))?;
-    let tokenizer = load_tokenizer(&files)?;
-    let deployment = ProfileDeploymentConfig {
-        chat_template_override: config.chat_template.clone(),
-        max_model_tokens: config.engine.max_model_len,
-    };
-    let mut profile = ModelProfile::resolve(
-        config.model_description,
-        &config.model,
-        &files,
-        &deployment,
-        tokenizer.as_ref(),
-    )
-    .with_context(|| format!("failed to resolve model profile for `{}`", config.model))?;
-    let max_model_tokens = config
-        .engine
-        .max_model_len
-        .or(profile.common().context_limits.max_model_tokens)
-        .unwrap_or(EngineSettings::DEFAULT_MAX_MODEL_LEN);
-    profile.common_mut().context_limits.max_model_tokens = Some(max_model_tokens);
-    let renderer = HfChatRenderer::load(
-        &files,
-        ChatTemplateLoadOptions {
-            chat_template_content_format: config.chat_template_content_format,
-            chat_template: config.chat_template.clone(),
-            default_chat_template_kwargs: config
-                .default_chat_template_kwargs
-                .clone()
-                .unwrap_or_default(),
-        },
-        None,
-    )
-    .context("failed to load the configured Hugging Face chat template")?;
-    Ok((profile, Some(tokenizer), Some(renderer), max_model_tokens))
-}
-
 /// Build the shared application state for one resolved model and one engine client.
 pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
-    if config.model_description == ModelDescription::MiniMaxH3 {
-        std::fs::create_dir_all(&config.media_spool).with_context(|| {
-            format!(
-                "failed to create media spool {}",
-                config.media_spool.display()
-            )
-        })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&config.media_spool, std::fs::Permissions::from_mode(0o700))
-                .with_context(|| {
-                format!(
-                    "failed to secure media spool {}",
-                    config.media_spool.display()
-                )
-            })?;
-        }
-        let probe = config
-            .media_spool
-            .join(format!(".probe-{}", uuid::Uuid::new_v4()));
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&probe)
-            .with_context(|| {
-                format!(
-                    "media spool {} is not writable",
-                    config.media_spool.display()
-                )
-            })?;
-        std::fs::remove_file(&probe)
-            .with_context(|| format!("failed to remove media spool probe {}", probe.display()))?;
-    }
-    let (mut profile, tokenizer, renderer, effective_max_model_len) =
-        resolve_model_assets(config).await?;
-    let control_tokens = runtime_control_tokens(&profile, config.engine.backend);
+    let assets = ResolvedAssets::load(config)
+        .await
+        .with_context(|| format!("failed to resolve model assets for `{}`", config.model))?;
+    let effective_max_model_len = assets.max_model_tokens();
+    let request_slot_capacity = assets.request_slot_capacity();
+    let control_tokens = runtime_control_tokens(&assets, config.engine.backend);
 
     let (backend, eos) = match config.engine.backend {
         EngineBackendKind::Sim => (EngineBackend::Sim, control_tokens.eos.clone()),
@@ -210,15 +104,10 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         max_model_len: effective_max_model_len,
         kv_token_capacity: config.engine.kv_token_capacity,
         worker_python: config.engine.worker_python.clone(),
-        worker_ranks: config.engine.worker_ranks,
         workers: config.engine.workers.clone(),
         transfer: config.engine.transfer.clone(),
         worker_launch: config.engine.worker_launch.clone(),
-        req_slot_cap: if config.model_description == ModelDescription::MiniMaxH3 {
-            EngineSettings::MEDIA_IPC_SLOT_CAP
-        } else {
-            1 << 20
-        },
+        req_slot_cap: request_slot_capacity,
         resp_slot_cap: config.engine.resp_slot_cap,
         bos: control_tokens.bos,
         eos,
@@ -248,31 +137,20 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     .context("failed to start the UniServe engine")?;
 
     let engine = Arc::new(client);
-    let engine_status = engine.status();
     let snapshot = engine.snapshot();
     let route_max_model_len = effective_max_model_len.min(snapshot.max_model_len);
-    profile.common_mut().context_limits.max_model_tokens = Some(route_max_model_len);
-    let model = if matches!(&profile, ModelProfile::MiniMaxH3(_)) {
-        ResolvedModel::resolve_media(profile)
-    } else {
-        ResolvedModel::resolve(
-            profile,
-            tokenizer.expect("text model resolved a tokenizer"),
-            renderer.expect("text model resolved a renderer"),
-            snapshot.generation_capabilities,
-            route_max_model_len,
-            config.reasoning_parsing,
-        )
-    }
+    let model = ResolvedModel::resolve(
+        assets,
+        snapshot.generation_capabilities,
+        snapshot.sampling_controls,
+        route_max_model_len,
+        config.reasoning_parsing,
+    )
     .context("failed to bind the configured model description")?;
-    let public_model_name = config
-        .served_model_name
-        .clone()
-        .unwrap_or_else(|| model.served_model_name().to_string());
-    let runtime = ServingRuntime::new(model, engine, !config.disable_log_stats);
+    let runtime = ServingRuntime::new(model, Arc::clone(&engine), config.log_stats);
 
     Ok(Arc::new(
-        AppState::new(public_model_name, runtime, engine_status)
+        AppState::new(runtime)
             .with_log_requests(config.enable_log_requests)
             .with_request_id_headers(config.enable_request_id_headers)
             .with_api_key(config.api_key.clone())

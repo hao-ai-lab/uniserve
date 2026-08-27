@@ -21,11 +21,11 @@ pub struct GenerationControls {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImageGenerationDefaults {
-    pub resolution: String,
+    pub resolution: resolution::ResolutionName,
     pub steps: u16,
     pub cfg_text_scale: f32,
     pub cfg_img_scale: f32,
-    pub cfg_renorm_type: String,
+    pub cfg_renorm_type: uniserve_core::CfgRenorm,
     pub cfg_renorm_min: f32,
     pub cfg_interval: (f32, f32),
     pub timestep_shift: f32,
@@ -55,7 +55,7 @@ pub(super) fn required_token(
         .token_to_id(token)
         .map(|id| (id, token.to_string()))
         .ok_or_else(|| {
-            AssetError::message(format!(
+            AssetError::invalid(format!(
                 "configured {role} control token {token:?} is missing from the tokenizer"
             ))
         })
@@ -133,7 +133,7 @@ fn dimensions_to_tokens(
         || !width.is_multiple_of(token_stride)
         || !height.is_multiple_of(token_stride)
     {
-        return Err(AssetError::message(
+        return Err(AssetError::invalid(
             "image dimensions are outside the configured token stride",
         ));
     }
@@ -141,7 +141,7 @@ fn dimensions_to_tokens(
         .saturating_mul(u64::from(height / token_stride))
         .saturating_add(u64::from(marker_tokens));
     u32::try_from(tokens)
-        .map_err(|_| AssetError::message("image token count exceeds the engine range"))
+        .map_err(|_| AssetError::invalid("image token count exceeds the engine range"))
 }
 
 fn stride_resize(
@@ -154,7 +154,7 @@ fn stride_resize(
 ) -> assets::Result<(u32, u32)> {
     if width == 0 || height == 0 || max_side == 0 || min_side == 0 || stride == 0 || max_pixels == 0
     {
-        return Err(AssetError::message(
+        return Err(AssetError::invalid(
             "configured stride-resize geometry requires positive values",
         ));
     }
@@ -189,13 +189,13 @@ fn pixel_bound_resize(
     max_pixels: u64,
 ) -> assets::Result<(u32, u32)> {
     if width == 0 || height == 0 || factor == 0 || min_pixels == 0 || max_pixels < min_pixels {
-        return Err(AssetError::message(
+        return Err(AssetError::invalid(
             "configured pixel-bound geometry is invalid",
         ));
     }
     let aspect = f64::from(width.max(height)) / f64::from(width.min(height));
     if aspect > 200.0 {
-        return Err(AssetError::message(
+        return Err(AssetError::invalid(
             "input image aspect ratio must not exceed 200",
         ));
     }

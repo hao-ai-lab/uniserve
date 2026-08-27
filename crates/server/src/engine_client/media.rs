@@ -1,8 +1,5 @@
 use std::collections::BTreeMap;
 
-use tokio::sync::mpsc;
-use uniserve_core::MediaEvent;
-
 /// Frontend-owned metadata and the compact fixed-profile media input.
 #[derive(Debug, Clone)]
 pub struct MediaSubmission {
@@ -32,59 +29,6 @@ impl MediaSubmission {
             arrival_time: None,
             data_parallel_rank: None,
             trace_headers: None,
-        }
-    }
-}
-
-/// One terminal media event. Dropping a live receiver cancels the request.
-pub struct MediaEventStream {
-    rx: mpsc::Receiver<MediaEvent>,
-    cancel: Option<Box<dyn FnOnce() + Send + 'static>>,
-    finished: bool,
-}
-
-impl MediaEventStream {
-    pub fn new(rx: mpsc::Receiver<MediaEvent>) -> Self {
-        Self {
-            rx,
-            cancel: None,
-            finished: false,
-        }
-    }
-
-    pub fn with_cancel(
-        rx: mpsc::Receiver<MediaEvent>,
-        cancel: impl FnOnce() + Send + 'static,
-    ) -> Self {
-        Self {
-            rx,
-            cancel: Some(Box::new(cancel)),
-            finished: false,
-        }
-    }
-
-    pub async fn next(&mut self) -> Option<MediaEvent> {
-        let event = self.rx.recv().await?;
-        self.finished = true;
-        self.cancel = None;
-        Some(event)
-    }
-
-    pub fn cancel(&mut self) {
-        if !self.finished
-            && let Some(cancel) = self.cancel.take()
-        {
-            cancel();
-        }
-    }
-}
-
-impl Drop for MediaEventStream {
-    fn drop(&mut self) {
-        if !self.finished
-            && let Some(cancel) = self.cancel.take()
-        {
-            cancel();
         }
     }
 }

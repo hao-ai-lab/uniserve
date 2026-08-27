@@ -5,8 +5,6 @@ use axum::extract::State;
 use serde::Serialize;
 
 use crate::AppState;
-use crate::http::utils::engine_status_error;
-use crate::openai::ApiError;
 
 #[derive(Serialize)]
 pub(crate) struct VersionResponse {
@@ -15,16 +13,9 @@ pub(crate) struct VersionResponse {
 }
 
 /// Get engine and Rust frontend version metadata.
-pub(super) async fn version(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<VersionResponse>, ApiError> {
-    let version = state
-        .engine_status()
-        .version()
-        .map_err(engine_status_error)?;
-
-    Ok(Json(VersionResponse {
-        version,
+pub(super) async fn version(State(state): State<Arc<AppState>>) -> Json<VersionResponse> {
+    Json(VersionResponse {
+        version: state.engine().uniserve_version().to_owned(),
         rust_frontend_version: env!("CARGO_PKG_VERSION"),
-    }))
+    })
 }

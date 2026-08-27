@@ -1,15 +1,11 @@
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use crate::serving::text::{DecodedLogprobs, DecodedPositionLogprobs, DecodedPromptLogprobs};
-use futures::Stream;
-use futures::StreamExt as _;
-use trait_set::trait_set;
+use futures::{Stream, StreamExt as _, pin_mut};
 
 use crate::serving::chat::FinishReason;
 use crate::serving::chat::error::{Error, Result};
-use crate::serving::chat::event::{AssistantContentBlock, AssistantMessage, ChatEvent};
+use crate::serving::chat::{AssistantContentBlock, AssistantMessage, ChatEvent};
 
 /// Final structured assistant message plus terminal stream metadata.
 #[derive(Debug, Clone, PartialEq)]
@@ -26,39 +22,19 @@ pub struct CollectedAssistantMessage {
     pub finish_reason: FinishReason,
 }
 
-/// Per-request stream of chat events.
-pub struct ChatEventStream {
-    request_id: String,
-    inner: Pin<Box<dyn Stream<Item = Result<ChatEvent>> + Send>>,
-}
-
-impl ChatEventStream {
-    pub fn new(
-        request_id: String,
-        inner: impl crate::serving::chat::output::processor::ChatEventStream,
-    ) -> Self {
-        Self {
-            request_id,
-            inner: Box::pin(inner.map(|event| event.map_err(Error::from))),
-        }
-    }
-
-    /// Return the request ID associated with this stream.
-    pub fn request_id(&self) -> &str {
-        &self.request_id
-    }
-
-    /// Collect the stream to completion and return the final assembled
-    /// assistant message.
-    pub async fn collect_message(mut self) -> Result<CollectedAssistantMessage> {
-        use futures::StreamExt as _;
-
+impl CollectedAssistantMessage {
+    pub async fn collect(
+        request_id: impl Into<String>,
+        stream: impl Stream<Item = Result<ChatEvent>> + Send,
+    ) -> Result<Self> {
+        let request_id = request_id.into();
+        pin_mut!(stream);
         let mut message = AssistantMessage::default();
         let mut prompt_logprobs = None;
         let mut prompt_token_ids: Arc<[u32]> = Arc::from([]);
         let mut logprob_positions: Vec<DecodedPositionLogprobs> = Vec::new();
         let mut token_ids: Vec<u32> = Vec::new();
-        while let Some(event) = self.next().await.transpose()? {
+        while let Some(event) = stream.next().await.transpose()? {
             match event {
                 ChatEvent::Start {
                     prompt_logprobs: start_prompt_logprobs,
@@ -106,27 +82,14 @@ impl ChatEventStream {
                 }
                 ChatEvent::BlockStart { .. }
                 | ChatEvent::BlockDelta { .. }
+                | ChatEvent::PublicCommit { .. }
                 | ChatEvent::ToolCallStart { .. }
                 | ChatEvent::ToolCallArgumentsDelta { .. } => {}
             }
         }
 
-        Err(Error::StreamClosedBeforeTerminalOutput {
-            request_id: self.request_id,
-        })
+        Err(Error::StreamClosedBeforeTerminalOutput { request_id })
     }
-}
-
-impl Stream for ChatEventStream {
-    type Item = Result<ChatEvent>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.inner).poll_next(cx)
-    }
-}
-
-trait_set! {
-    pub trait ChatEventStreamTrait = Stream<Item = Result<ChatEvent>> + Send + 'static;
 }
 
 #[cfg(test)]
@@ -138,23 +101,22 @@ mod tests {
     };
     use futures::stream;
 
-    use super::{ChatEventStream, CollectedAssistantMessage};
+    use super::CollectedAssistantMessage;
+    use crate::serving::chat::ChatEvent;
     use crate::serving::chat::error::Error;
-    use crate::serving::chat::event::ChatEvent;
 
     #[tokio::test]
     async fn collect_message_requires_terminal_done_event() {
-        let stream = ChatEventStream::new(
-            "chat-missing-done".to_string(),
-            stream::iter([Ok(ChatEvent::Start {
-                queued_at: None,
-                scheduled_at: None,
-                prompt_token_ids: vec![].into(),
-                prompt_logprobs: None,
-            })]),
-        );
+        let stream = stream::iter([Ok(ChatEvent::Start {
+            queued_at: None,
+            scheduled_at: None,
+            prompt_token_ids: vec![].into(),
+            prompt_logprobs: None,
+        })]);
 
-        let error = stream.collect_message().await.expect_err("missing done");
+        let error = CollectedAssistantMessage::collect("chat-missing-done", stream)
+            .await
+            .expect_err("missing done");
         assert!(matches!(
             error,
             Error::StreamClosedBeforeTerminalOutput { request_id }
@@ -164,51 +126,50 @@ mod tests {
 
     #[tokio::test]
     async fn collect_message_retains_prompt_and_sample_logprobs() {
-        let stream = ChatEventStream::new(
-            "chat-logprobs".to_string(),
-            stream::iter(vec![
-                Ok(ChatEvent::Start {
-                    queued_at: None,
-                    scheduled_at: None,
-                    prompt_token_ids: vec![10, 11].into(),
-                    prompt_logprobs: Some(DecodedPromptLogprobs {
-                        first_token_id: 0,
-                        first_token: "o".to_string(),
-                        scored_positions: vec![DecodedPositionLogprobs {
-                            entries: vec![DecodedTokenLogprob {
-                                token_id: 0,
-                                token: "p".to_string(),
-                                logprob: -0.1,
-                                rank: 1,
-                            }],
+        let stream = stream::iter(vec![
+            Ok(ChatEvent::Start {
+                queued_at: None,
+                scheduled_at: None,
+                prompt_token_ids: vec![10, 11].into(),
+                prompt_logprobs: Some(DecodedPromptLogprobs {
+                    first_token_id: 0,
+                    first_token: "o".to_string(),
+                    scored_positions: vec![DecodedPositionLogprobs {
+                        entries: vec![DecodedTokenLogprob {
+                            token_id: 0,
+                            token: "p".to_string(),
+                            logprob: -0.1,
+                            rank: 1,
                         }],
-                    }),
+                    }],
                 }),
-                Ok(ChatEvent::LogprobsDelta {
-                    logprobs: Some(DecodedLogprobs {
-                        positions: vec![DecodedPositionLogprobs {
-                            entries: vec![DecodedTokenLogprob {
-                                token_id: 0,
-                                token: "a".to_string(),
-                                logprob: -0.2,
-                                rank: 1,
-                            }],
+            }),
+            Ok(ChatEvent::LogprobsDelta {
+                logprobs: Some(DecodedLogprobs {
+                    positions: vec![DecodedPositionLogprobs {
+                        entries: vec![DecodedTokenLogprob {
+                            token_id: 0,
+                            token: "a".to_string(),
+                            logprob: -0.2,
+                            rank: 1,
                         }],
-                    }),
-                    token_ids: vec![],
+                    }],
                 }),
-                Ok(ChatEvent::Done {
-                    message: Default::default(),
-                    prompt_token_count: 2,
-                    output_token_count: 1,
-                    visible_output_token_count: 1,
-                    internal_token_count: 0,
-                    finish_reason: FinishReason::stop_eos(),
-                }),
-            ]),
-        );
+                token_ids: vec![],
+            }),
+            Ok(ChatEvent::Done {
+                message: Default::default(),
+                prompt_token_count: 2,
+                output_token_count: 1,
+                visible_output_token_count: 1,
+                internal_token_count: 0,
+                finish_reason: FinishReason::stop_eos(),
+            }),
+        ]);
 
-        let collected = stream.collect_message().await.unwrap();
+        let collected = CollectedAssistantMessage::collect("chat-logprobs", stream)
+            .await
+            .unwrap();
         assert_eq!(
             collected,
             CollectedAssistantMessage {

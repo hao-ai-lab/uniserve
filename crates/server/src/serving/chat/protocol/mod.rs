@@ -8,8 +8,7 @@ pub mod request;
 
 pub use error::{Error, Result};
 pub use event::{
-    AssistantBlockKind, AssistantContentBlock, AssistantMessage, AssistantMessageExt,
-    AssistantToolCall, ChatEvent,
+    AssistantBlockKind, AssistantContentBlock, AssistantMessage, AssistantToolCall, ChatEvent,
 };
 pub use request::{
     ChatContent, ChatContentPart, ChatMessage, ChatOptions, ChatRequest, ChatRole, ChatToolChoice,

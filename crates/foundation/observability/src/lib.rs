@@ -15,10 +15,13 @@ mod request;
 mod scheduler;
 mod serving;
 
-pub use api_server::*;
-pub use request::*;
-pub use scheduler::*;
-pub use serving::*;
+pub use api_server::{ApiServerMetrics, HttpHandlerLabels, HttpRequestLabels};
+pub use request::{FinishedReasonLabels, PromptTokenSourceLabels, RequestMetrics};
+pub use scheduler::{
+    EngineBackendLabels, EngineComponentLabels, EngineDomainKindLabels, EngineDomainLabels,
+    EngineLabels, EngineModeLabels, EnginePathLabels, SchedulerMetrics, WaitingReasonLabels,
+};
+pub use serving::{ServingMetrics, ServingRequestLabels};
 
 // Note: `prometheus-client` appends the `_total` suffix automatically when
 // encoding counters, so all counter family registration names in this crate

@@ -8,11 +8,18 @@
 //! trait-object tower in front of it.
 
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use crate::config::EngineSettings;
+use crate::profile::assets::ResolvedModelFiles;
 use crate::profile::omni::bagel::BagelProfile;
 use crate::profile::omni::sensenova::SenseNovaProfile;
-use crate::profile::tokenizer::DynTokenizer;
-use crate::profile::{CommonModelProfile, ModelIdentity, ModelProfile};
+use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer, TokenizerError};
+use crate::profile::{
+    CommonModelProfile, ModelDescription, ModelIdentity, ModelProfile, ProfileDeploymentConfig,
+};
+use thiserror::Error;
 use uniserve_core::{
     ContextSegment as CoreContextSegment, GenerationBehaviorDescriptor,
     GenerationCachePolicyDescriptor, GenerationCapabilityNeeds, GenerationConstraint,
@@ -20,10 +27,12 @@ use uniserve_core::{
     GenerationRuntimeCapabilities, ImageParams, RequestId, SamplingParams, UndVisibility,
 };
 
-use crate::serving::chat::{ChatRequest, HfChatRenderer, Qwen3ChatOutputProcessor};
+use crate::serving::chat::{
+    ChatRequest, ChatTemplateLoadOptions, HfChatRenderer, Qwen3ChatOutputProcessor,
+};
 use crate::serving::input::{
     GenerateReqInput, ModelEventIdentity, OutputContract, OutputProcessorPolicy, PromptInput,
-    SubmissionMetadata, TokenizedGenerateReqInput,
+    TokenizedGenerateReqInput,
 };
 use crate::serving::text::{SamplingHints, TextDecodeOptions, resolve_max_tokens};
 use crate::serving::{
@@ -31,7 +40,10 @@ use crate::serving::{
 };
 
 /// Public endpoint admitted by one resolved model description.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum ServedEndpoint {
     ChatCompletions,
     ImageGenerations,
@@ -39,7 +51,10 @@ pub enum ServedEndpoint {
 }
 
 /// Public input or output modality admitted by one resolved description.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum ServedModality {
     Text,
     Image,
@@ -49,7 +64,10 @@ pub enum ServedModality {
 
 /// Public behavior whose semantics are owned by the resolved description and
 /// the shared response path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum ServedFeature {
     Streaming,
     Usage,
@@ -60,7 +78,10 @@ pub enum ServedFeature {
 }
 
 /// Sampling control admitted by every configured sampler route.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum ServedSamplingControl {
     Greedy,
     Temperature,
@@ -113,10 +134,238 @@ pub struct ServedModelCapabilities {
 
 /// The closed load-bound model owner.
 pub enum ResolvedModel {
-    Qwen3(Qwen3Desc),
+    Text(Qwen3Desc),
+    Omni(OmniDesc),
+    Media(MiniMaxH3Desc),
+}
+
+pub enum OmniDesc {
     SenseNova(SenseNovaDesc),
     Bagel(BagelDesc),
-    MiniMaxH3(MiniMaxH3Desc),
+}
+
+/// Typed assets awaiting validation against the running worker capabilities.
+pub enum ResolvedAssets {
+    Text {
+        profile: CommonModelProfile,
+        tokenizer: DynTokenizer,
+        renderer: HfChatRenderer,
+    },
+    Omni {
+        profile: CommonModelProfile,
+        tokenizer: DynTokenizer,
+        renderer: HfChatRenderer,
+        preprocessing: OmniPreprocessing,
+    },
+    Media {
+        profile: CommonModelProfile,
+    },
+}
+
+pub enum OmniPreprocessing {
+    SenseNova(SenseNovaProfile),
+    Bagel(BagelProfile),
+}
+
+#[derive(Debug, Error)]
+pub enum ModelResolutionError {
+    #[error(transparent)]
+    Assets(#[from] crate::profile::assets::Error),
+    #[error(transparent)]
+    Tokenizer(#[from] TokenizerError),
+    #[error(transparent)]
+    Chat(#[from] crate::serving::chat::Error),
+    #[error("model asset path `{path}` could not be prepared")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "configured model description `{description}` requires worker capability `{capability}`"
+    )]
+    MissingCapability {
+        description: &'static str,
+        capability: uniserve_core::GenerationCapabilityError,
+    },
+}
+
+impl ResolvedAssets {
+    pub(crate) async fn load(
+        config: &crate::Config,
+    ) -> std::result::Result<Self, ModelResolutionError> {
+        let served_name = config
+            .served_model_name
+            .clone()
+            .unwrap_or_else(|| config.model.clone());
+        if config.model_description == ModelDescription::MiniMaxH3 {
+            prepare_media_spool(&config.media_spool)?;
+            let mut profile = ModelProfile::minimax_h3(&served_name);
+            profile.common_mut().context_limits.max_model_tokens =
+                Some(config.engine.max_model_len.unwrap_or(1));
+            let ModelProfile::MiniMaxH3(profile) = profile else {
+                unreachable!("MiniMax H3 construction returns its matching closed variant")
+            };
+            return Ok(Self::Media { profile });
+        }
+
+        let files = ResolvedModelFiles::new(&config.model).await?;
+        let tokenizer: DynTokenizer = Arc::new(HuggingFaceTokenizer::new(&files.tokenizer_path)?);
+        let deployment = ProfileDeploymentConfig {
+            chat_template_override: config.chat_template.clone(),
+            max_model_tokens: config.engine.max_model_len,
+        };
+        let mut profile = ModelProfile::resolve(
+            config.model_description,
+            &served_name,
+            &files,
+            &deployment,
+            tokenizer.as_ref(),
+        )?;
+        let max_model_tokens = config
+            .engine
+            .max_model_len
+            .or(profile.common().context_limits.max_model_tokens)
+            .unwrap_or(EngineSettings::DEFAULT_MAX_MODEL_LEN);
+        profile.common_mut().context_limits.max_model_tokens = Some(max_model_tokens);
+        let renderer = HfChatRenderer::load(
+            &files,
+            ChatTemplateLoadOptions {
+                chat_template_content_format: config.chat_template_content_format,
+                chat_template: config.chat_template.clone(),
+                default_chat_template_kwargs: config
+                    .default_chat_template_kwargs
+                    .clone()
+                    .unwrap_or_default(),
+            },
+            None,
+        )?;
+        Ok(match profile {
+            ModelProfile::Qwen3(profile) => Self::Text {
+                profile,
+                tokenizer,
+                renderer,
+            },
+            ModelProfile::SenseNova(profile) => Self::Omni {
+                profile: profile.common,
+                tokenizer,
+                renderer,
+                preprocessing: OmniPreprocessing::SenseNova(profile.preprocessing),
+            },
+            ModelProfile::Bagel(profile) => Self::Omni {
+                profile: profile.common,
+                tokenizer,
+                renderer,
+                preprocessing: OmniPreprocessing::Bagel(profile.preprocessing),
+            },
+            ModelProfile::MiniMaxH3(_) => unreachable!("media assets return before file loading"),
+        })
+    }
+
+    pub fn from_files(
+        description: ModelDescription,
+        served_name: &str,
+        files: &ResolvedModelFiles,
+        deployment: &ProfileDeploymentConfig,
+        tokenizer: DynTokenizer,
+        renderer: HfChatRenderer,
+    ) -> std::result::Result<Self, ModelResolutionError> {
+        let profile = ModelProfile::resolve(
+            description,
+            served_name,
+            files,
+            deployment,
+            tokenizer.as_ref(),
+        )?;
+        Ok(match profile {
+            ModelProfile::Qwen3(profile) => Self::Text {
+                profile,
+                tokenizer,
+                renderer,
+            },
+            ModelProfile::SenseNova(profile) => Self::Omni {
+                profile: profile.common,
+                tokenizer,
+                renderer,
+                preprocessing: OmniPreprocessing::SenseNova(profile.preprocessing),
+            },
+            ModelProfile::Bagel(profile) => Self::Omni {
+                profile: profile.common,
+                tokenizer,
+                renderer,
+                preprocessing: OmniPreprocessing::Bagel(profile.preprocessing),
+            },
+            ModelProfile::MiniMaxH3(profile) => Self::Media { profile },
+        })
+    }
+
+    pub(crate) fn profile(&self) -> &CommonModelProfile {
+        match self {
+            Self::Text { profile, .. } | Self::Omni { profile, .. } | Self::Media { profile } => {
+                profile
+            }
+        }
+    }
+
+    pub(crate) fn max_model_tokens(&self) -> u32 {
+        self.profile()
+            .context_limits
+            .max_model_tokens
+            .unwrap_or(EngineSettings::DEFAULT_MAX_MODEL_LEN)
+    }
+
+    pub(crate) fn request_slot_capacity(&self) -> usize {
+        if matches!(self, Self::Media { .. }) {
+            EngineSettings::MEDIA_IPC_SLOT_CAP
+        } else {
+            1 << 20
+        }
+    }
+
+    pub(crate) fn generation_controls(&self) -> Option<&crate::profile::omni::GenerationControls> {
+        match self {
+            Self::Omni {
+                preprocessing: OmniPreprocessing::SenseNova(value),
+                ..
+            } => Some(&value.controls),
+            Self::Omni {
+                preprocessing: OmniPreprocessing::Bagel(value),
+                ..
+            } => Some(&value.controls),
+            Self::Text { .. } | Self::Media { .. } => None,
+        }
+    }
+}
+
+fn prepare_media_spool(path: &Path) -> std::result::Result<(), ModelResolutionError> {
+    std::fs::create_dir_all(path).map_err(|source| ModelResolutionError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(
+            |source| ModelResolutionError::Io {
+                path: path.to_path_buf(),
+                source,
+            },
+        )?;
+    }
+    let probe = path.join(format!(".probe-{}", uuid::Uuid::new_v4()));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .map_err(|source| ModelResolutionError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    std::fs::remove_file(&probe).map_err(|source| ModelResolutionError::Io {
+        path: probe,
+        source,
+    })?;
+    Ok(())
 }
 
 /// Text chat description: HF tokenization + chat template + fixed Qwen3 parser
@@ -127,6 +376,7 @@ pub struct Qwen3Desc {
     renderer: HfChatRenderer,
     hints: SamplingHints,
     capabilities: GenerationRuntimeCapabilities,
+    sampling_controls: Vec<ServedSamplingControl>,
     logprobs_supported: bool,
     parse_reasoning: bool,
 }
@@ -139,6 +389,7 @@ pub struct SenseNovaDesc {
     renderer: HfChatRenderer,
     preprocessing: SenseNovaProfile,
     capabilities: GenerationRuntimeCapabilities,
+    sampling_controls: Vec<ServedSamplingControl>,
     default_max_output_tokens: Option<u32>,
     max_model_tokens: u32,
 }
@@ -150,6 +401,7 @@ pub struct BagelDesc {
     renderer: HfChatRenderer,
     preprocessing: BagelProfile,
     capabilities: GenerationRuntimeCapabilities,
+    sampling_controls: Vec<ServedSamplingControl>,
     default_max_output_tokens: Option<u32>,
     max_model_tokens: u32,
 }
@@ -164,147 +416,132 @@ impl ResolvedModel {
     /// The typed description selects the variant; required description-owned
     /// assets are checked before construction.
     pub fn resolve(
-        profile: ModelProfile,
-        tokenizer: DynTokenizer,
-        renderer: HfChatRenderer,
+        assets: ResolvedAssets,
         capabilities: GenerationRuntimeCapabilities,
+        sampling_controls: Vec<ServedSamplingControl>,
         max_model_tokens: u32,
         parse_reasoning: bool,
     ) -> Result<Self> {
-        match profile {
-            ModelProfile::Qwen3(profile) => {
+        match assets {
+            ResolvedAssets::Text {
+                profile,
+                tokenizer,
+                renderer,
+            } => {
                 validate_runtime_capabilities(
-                    &profile.common.identity,
+                    &profile.identity,
                     &capabilities,
                     GenerationCapabilityNeeds {
                         understanding: true,
                         ..GenerationCapabilityNeeds::default()
                     },
                 )?;
-                let hints = sampling_hints(&profile.common, max_model_tokens);
-                Ok(Self::Qwen3(Qwen3Desc {
-                    identity: profile.common.identity,
+                let hints = sampling_hints(&profile, max_model_tokens);
+                let logprobs_supported =
+                    sampling_controls.contains(&ServedSamplingControl::Logprobs);
+                Ok(Self::Text(Qwen3Desc {
+                    identity: profile.identity,
                     tokenizer,
                     renderer,
                     hints,
                     capabilities,
-                    logprobs_supported: true,
+                    sampling_controls,
+                    logprobs_supported,
                     parse_reasoning,
                 }))
             }
-            ModelProfile::SenseNova(profile) => {
+            ResolvedAssets::Omni {
+                profile,
+                tokenizer,
+                renderer,
+                preprocessing,
+            } => {
+                let (generation_policy, image_ingest) = match &preprocessing {
+                    OmniPreprocessing::SenseNova(value) => {
+                        (&value.generation_policy, &value.image_ingest)
+                    }
+                    OmniPreprocessing::Bagel(value) => {
+                        (&value.generation_policy, &value.image_ingest)
+                    }
+                };
                 validate_runtime_capabilities(
-                    &profile.common.identity,
+                    &profile.identity,
                     &capabilities,
-                    configured_omni_needs(
-                        &profile.preprocessing.generation_policy,
-                        &profile.preprocessing.image_ingest,
-                    ),
+                    configured_omni_needs(generation_policy, image_ingest),
                 )?;
                 let default_max_output_tokens = profile
-                    .common
                     .context_limits
                     .max_output_tokens
-                    .or(profile.common.generation_defaults.max_output_tokens);
-                Ok(Self::SenseNova(SenseNovaDesc {
-                    identity: profile.common.identity,
-                    tokenizer,
-                    renderer,
-                    preprocessing: profile.preprocessing,
-                    capabilities,
-                    default_max_output_tokens,
-                    max_model_tokens,
+                    .or(profile.generation_defaults.max_output_tokens);
+                Ok(Self::Omni(match preprocessing {
+                    OmniPreprocessing::SenseNova(preprocessing) => {
+                        OmniDesc::SenseNova(SenseNovaDesc {
+                            identity: profile.identity,
+                            tokenizer,
+                            renderer,
+                            preprocessing,
+                            capabilities,
+                            sampling_controls,
+                            default_max_output_tokens,
+                            max_model_tokens,
+                        })
+                    }
+                    OmniPreprocessing::Bagel(preprocessing) => OmniDesc::Bagel(BagelDesc {
+                        identity: profile.identity,
+                        tokenizer,
+                        renderer,
+                        preprocessing,
+                        capabilities,
+                        sampling_controls,
+                        default_max_output_tokens,
+                        max_model_tokens,
+                    }),
                 }))
             }
-            ModelProfile::Bagel(profile) => {
-                validate_runtime_capabilities(
-                    &profile.common.identity,
-                    &capabilities,
-                    configured_omni_needs(
-                        &profile.preprocessing.generation_policy,
-                        &profile.preprocessing.image_ingest,
-                    ),
-                )?;
-                let default_max_output_tokens = profile
-                    .common
-                    .context_limits
-                    .max_output_tokens
-                    .or(profile.common.generation_defaults.max_output_tokens);
-                Ok(Self::Bagel(BagelDesc {
-                    identity: profile.common.identity,
-                    tokenizer,
-                    renderer,
-                    preprocessing: profile.preprocessing,
-                    capabilities,
-                    default_max_output_tokens,
-                    max_model_tokens,
-                }))
-            }
-            ModelProfile::MiniMaxH3(_) => Err(ServeError::ModelResolution(
-                "MiniMax H3 must be resolved through the media-only composition root".to_string(),
-            )),
-        }
-    }
-
-    pub fn resolve_media(profile: ModelProfile) -> Result<Self> {
-        match profile {
-            ModelProfile::MiniMaxH3(profile) => Ok(Self::MiniMaxH3(MiniMaxH3Desc {
-                identity: profile.common.identity,
+            ResolvedAssets::Media { profile } => Ok(Self::Media(MiniMaxH3Desc {
+                identity: profile.identity,
             })),
-            _ => Err(ServeError::ModelResolution(
-                "media composition root requires a media model profile".to_string(),
-            )),
         }
     }
 
     /// Served-model identity used by `/v1/models` and event provenance.
     pub fn served_identity(&self) -> &ModelIdentity {
         match self {
-            Self::Qwen3(d) => &d.identity,
-            Self::SenseNova(d) => &d.identity,
-            Self::Bagel(d) => &d.identity,
-            Self::MiniMaxH3(d) => &d.identity,
+            Self::Text(d) => &d.identity,
+            Self::Omni(OmniDesc::SenseNova(d)) => &d.identity,
+            Self::Omni(OmniDesc::Bagel(d)) => &d.identity,
+            Self::Media(d) => &d.identity,
         }
     }
 
     /// Friendly served-model name.
     pub fn served_model_name(&self) -> &str {
-        &self.served_identity().model_id
+        &self.served_identity().served_name
     }
 
     /// Event identity stamped onto `Accepted`.
     pub fn event_identity(&self) -> ModelEventIdentity {
         let identity = self.served_identity();
         ModelEventIdentity {
-            profile_id: identity.profile_id.clone(),
-            description_id: identity.description_id.clone(),
-        }
-    }
-
-    /// Tokenizer bound into the resolved description.
-    pub fn tokenizer(&self) -> Option<DynTokenizer> {
-        match self {
-            Self::Qwen3(d) => Some(std::sync::Arc::clone(&d.tokenizer)),
-            Self::SenseNova(d) => Some(std::sync::Arc::clone(&d.tokenizer)),
-            Self::Bagel(d) => Some(std::sync::Arc::clone(&d.tokenizer)),
-            Self::MiniMaxH3(_) => None,
+            served_name: identity.served_name.clone(),
+            description: identity.description.id().to_string(),
         }
     }
 
     /// True when the description supports image output.
     pub fn supports_image_output(&self) -> bool {
-        matches!(self, Self::SenseNova(_) | Self::Bagel(_))
+        matches!(self, Self::Omni(_))
     }
 
     /// True when the description supports image input.
     pub fn supports_image_input(&self) -> bool {
-        matches!(self, Self::SenseNova(_) | Self::Bagel(_))
+        matches!(self, Self::Omni(_))
     }
 
     /// Exact route capabilities exposed by model discovery and enforced by
     /// request admission.
     pub fn served_capabilities(&self) -> ServedModelCapabilities {
-        if matches!(self, Self::MiniMaxH3(_)) {
+        if matches!(self, Self::Media(_)) {
             return ServedModelCapabilities {
                 endpoints: vec![ServedEndpoint::VideoGenerations],
                 input_modalities: vec![ServedModality::Text],
@@ -316,36 +553,41 @@ impl ResolvedModel {
         let mut endpoints = vec![ServedEndpoint::ChatCompletions];
         let mut input_modalities = vec![ServedModality::Text];
         let mut output_modalities = vec![ServedModality::Text];
-        let mut features = vec![
-            ServedFeature::Streaming,
-            ServedFeature::Usage,
-            ServedFeature::Logprobs,
-        ];
+        let sampling_controls = match self {
+            Self::Text(description) => description.sampling_controls.clone(),
+            Self::Omni(OmniDesc::SenseNova(description)) => description.sampling_controls.clone(),
+            Self::Omni(OmniDesc::Bagel(description)) => description.sampling_controls.clone(),
+            Self::Media(_) => unreachable!("media capabilities returned above"),
+        };
+        let mut features = vec![ServedFeature::Streaming, ServedFeature::Usage];
+        if sampling_controls.contains(&ServedSamplingControl::Logprobs) {
+            features.push(ServedFeature::Logprobs);
+        }
         match self {
-            Self::Qwen3(_) => {
+            Self::Text(_) => {
                 features.push(ServedFeature::Reasoning);
                 features.push(ServedFeature::ToolCalling);
             }
-            Self::SenseNova(_) => {
+            Self::Omni(OmniDesc::SenseNova(_)) => {
                 endpoints.push(ServedEndpoint::ImageGenerations);
                 input_modalities.push(ServedModality::Image);
                 output_modalities.push(ServedModality::Image);
                 features.push(ServedFeature::Reasoning);
                 features.push(ServedFeature::RepeatedInterleave);
             }
-            Self::Bagel(_) => {
+            Self::Omni(OmniDesc::Bagel(_)) => {
                 endpoints.push(ServedEndpoint::ImageGenerations);
                 input_modalities.push(ServedModality::Image);
                 output_modalities.push(ServedModality::Image);
             }
-            Self::MiniMaxH3(_) => unreachable!("media capabilities returned above"),
+            Self::Media(_) => unreachable!("media capabilities returned above"),
         }
         ServedModelCapabilities {
             endpoints,
             input_modalities,
             output_modalities,
             features,
-            sampling_controls: ServedSamplingControl::ALL.to_vec(),
+            sampling_controls,
         }
     }
 
@@ -355,18 +597,15 @@ impl ResolvedModel {
             request_id: request.request_id.clone(),
             capability,
         };
-        if matches!(self, Self::MiniMaxH3(_)) {
+        if matches!(self, Self::Media(_)) {
             return Err(reject("generation_endpoint"));
         }
         let has_input_image = request.has_input_image();
         if has_input_image && !self.supports_image_input() {
             return Err(reject("image_input"));
         }
-        if request.modalities.output_image && !self.supports_image_output() {
+        if request.modalities.includes_image() && !self.supports_image_output() {
             return Err(reject("image_output"));
-        }
-        if !request.modalities.output_text && !request.modalities.output_image {
-            return Err(reject("no_output_modality"));
         }
         let declared = self.served_capabilities();
         if request.uses_tools() && !declared.features.contains(&ServedFeature::ToolCalling) {
@@ -376,14 +615,14 @@ impl ResolvedModel {
             return Err(reject("reasoning"));
         }
         let (capabilities, needs) = match self {
-            Self::Qwen3(d) => (
+            Self::Text(d) => (
                 &d.capabilities,
                 GenerationCapabilityNeeds {
                     understanding: true,
                     ..Default::default()
                 },
             ),
-            Self::SenseNova(d) => (
+            Self::Omni(OmniDesc::SenseNova(d)) => (
                 &d.capabilities,
                 omni_capability_needs(
                     &d.preprocessing.generation_policy,
@@ -391,7 +630,7 @@ impl ResolvedModel {
                     request,
                 ),
             ),
-            Self::Bagel(d) => (
+            Self::Omni(OmniDesc::Bagel(d)) => (
                 &d.capabilities,
                 omni_capability_needs(
                     &d.preprocessing.generation_policy,
@@ -399,10 +638,10 @@ impl ResolvedModel {
                     request,
                 ),
             ),
-            Self::MiniMaxH3(_) => unreachable!("media generation was rejected above"),
+            Self::Media(_) => unreachable!("media generation was rejected above"),
         };
         if let Err(capability) = capabilities.covers(&needs) {
-            return Err(reject(capability));
+            return Err(reject(capability.as_str()));
         }
         Ok(())
     }
@@ -411,28 +650,10 @@ impl ResolvedModel {
     /// [`TokenizedGenerateReqInput`]. Inherent (not `From`/`TryFrom`/`Into`).
     pub fn tokenize(&self, request: GenerateReqInput) -> Result<TokenizedGenerateReqInput> {
         match self {
-            Self::Qwen3(d) => d.tokenize(request),
-            Self::SenseNova(d) => crate::serving::omni::tokenize_sensenova(
-                &d.preprocessing,
-                std::sync::Arc::clone(&d.tokenizer),
-                &d.renderer,
-                &d.capabilities,
-                d.default_max_output_tokens,
-                d.max_model_tokens,
-                self.event_identity(),
-                request,
-            ),
-            Self::Bagel(d) => crate::serving::omni::tokenize_bagel(
-                &d.preprocessing,
-                std::sync::Arc::clone(&d.tokenizer),
-                &d.renderer,
-                &d.capabilities,
-                d.default_max_output_tokens,
-                d.max_model_tokens,
-                self.event_identity(),
-                request,
-            ),
-            Self::MiniMaxH3(_) => Err(ServeError::UnsupportedCapability {
+            Self::Text(d) => d.tokenize(request),
+            Self::Omni(OmniDesc::SenseNova(d)) => d.tokenize(request),
+            Self::Omni(OmniDesc::Bagel(d)) => d.tokenize(request),
+            Self::Media(_) => Err(ServeError::UnsupportedCapability {
                 request_id: request.request_id,
                 capability: "generation_endpoint",
             }),
@@ -454,10 +675,10 @@ fn validate_runtime_capabilities(
     needs: GenerationCapabilityNeeds,
 ) -> Result<()> {
     capabilities.covers(&needs).map_err(|capability| {
-        ServeError::ModelResolution(format!(
-            "configured model description `{}` requires worker capability `{capability}`",
-            identity.description_id
-        ))
+        ServeError::ModelResolution(ModelResolutionError::MissingCapability {
+            description: identity.description.id(),
+            capability,
+        })
     })
 }
 
@@ -500,22 +721,16 @@ impl Qwen3Desc {
     fn tokenize(&self, request: GenerateReqInput) -> Result<TokenizedGenerateReqInput> {
         let request_id = request.request_id.clone();
         self.tokenize_inner(request)
-            .map_err(|message| ServeError::Tokenize {
-                request_id,
-                message,
-            })
+            .map_err(|source| ServeError::Tokenize { request_id, source })
     }
 
     fn tokenize_inner(
         &self,
         request: GenerateReqInput,
-    ) -> std::result::Result<TokenizedGenerateReqInput, String> {
+    ) -> std::result::Result<TokenizedGenerateReqInput, crate::serving::TokenizeError> {
         let (prompt_token_ids, output_processor, skip_special_tokens) = match &request.prompt {
             PromptInput::Text(text) => {
-                let ids = self
-                    .tokenizer
-                    .encode(text, false)
-                    .map_err(|error| error.to_string())?;
+                let ids = self.tokenizer.encode(text, false)?;
                 (
                     ids,
                     OutputProcessorPolicy::None,
@@ -545,32 +760,18 @@ impl Qwen3Desc {
                         min_tokens: request.sampling.min_tokens.unwrap_or(0),
                     },
                 };
-                chat_request.validate().map_err(|error| error.to_string())?;
+                chat_request.validate()?;
                 // Build the processor once to apply parser-driven request
                 // adjustments (e.g. disabling special-token skipping).
-                let _processor = Qwen3ChatOutputProcessor::new(
+                let processor = Qwen3ChatOutputProcessor::new(
                     &mut chat_request,
                     std::sync::Arc::clone(&self.tokenizer),
                     self.parse_reasoning,
-                )
-                .map_err(|error| error.to_string())?;
-                let rendered_text = self
-                    .renderer
-                    .render(&chat_request)
-                    .map_err(|error| error.to_string())?;
-                let ids = self
-                    .tokenizer
-                    .encode(&rendered_text, false)
-                    .map_err(|error| error.to_string())?;
+                )?;
+                let rendered_text = self.renderer.render(&chat_request)?;
+                let ids = self.tokenizer.encode(&rendered_text, false)?;
                 let skip = chat_request.decode_options.skip_special_tokens;
-                (
-                    ids,
-                    OutputProcessorPolicy::Qwen3 {
-                        request: Box::new(chat_request),
-                        parse_reasoning: self.parse_reasoning,
-                    },
-                    skip,
-                )
+                (ids, OutputProcessorPolicy::Qwen3(processor), skip)
             }
         };
 
@@ -616,7 +817,7 @@ impl Qwen3Desc {
             policy,
             resources: resources.clone(),
         };
-        generation.validate().map_err(|error| error.to_string())?;
+        generation.validate()?;
 
         let cache_accounting = CacheAccounting {
             read_enabled: cache.read,
@@ -641,6 +842,7 @@ impl Qwen3Desc {
         Ok(TokenizedGenerateReqInput {
             request_id: request.request_id,
             request: generation,
+            tokenizer: std::sync::Arc::clone(&self.tokenizer),
             prompt_token_ids,
             decode,
             emit_token_ids: matches!(
@@ -651,13 +853,9 @@ impl Qwen3Desc {
             generated_logprobs_requested,
             skip_special_tokens,
             output_processor,
-            submission: SubmissionMetadata {
-                trace_headers: (!request.scheduling.trace_context.is_empty())
-                    .then(|| request.scheduling.trace_context.clone()),
-            },
             identity: ModelEventIdentity {
-                profile_id: self.identity.profile_id.clone(),
-                description_id: self.identity.description_id.clone(),
+                served_name: self.identity.served_name.clone(),
+                description: self.identity.description.id().to_string(),
             },
             cache: cache_accounting,
             resources: resource_accounting,
@@ -668,7 +866,7 @@ impl Qwen3Desc {
         &self,
         request: &GenerateReqInput,
         prompt_len: u32,
-    ) -> std::result::Result<LoweredSampling, String> {
+    ) -> std::result::Result<LoweredSampling, crate::serving::TokenizeError> {
         let sampling = &request.sampling;
         let stop = &request.stop;
         let hints = &self.hints;
@@ -689,8 +887,7 @@ impl Qwen3Desc {
             hints.default_max_tokens,
             hints.max_model_len,
             prompt_len,
-        )
-        .map_err(|error| error.to_string())?;
+        )?;
         let min_tokens = sampling.min_tokens.unwrap_or(0);
         let frequency_penalty = sampling.frequency_penalty.unwrap_or(0.0);
         let presence_penalty = sampling.presence_penalty.unwrap_or(0.0);
@@ -711,13 +908,14 @@ impl Qwen3Desc {
             if let Some(value) = value
                 && value < -1
             {
-                return Err(format!("{field} must be non-negative or -1, got {value}"));
+                return Err(crate::serving::TokenizeError::InvalidLogprobCount { field, value });
             }
         }
         if min_tokens > max_tokens {
-            return Err(format!(
-                "min_tokens ({min_tokens}) exceeds max_tokens ({max_tokens})"
-            ));
+            return Err(crate::serving::TokenizeError::MinTokensExceedsMaximum {
+                min_tokens,
+                max_tokens,
+            });
         }
 
         let bad_words_ids = tokenize_bad_words(&stop.bad_words, self.tokenizer.as_ref())?;
@@ -759,11 +957,11 @@ impl Qwen3Desc {
             typical_p: 1.0,
             forced_token_ids: Vec::new(),
         };
-        core.validate().map_err(|error| error.to_string())?;
+        core.validate()?;
 
         // Logprob feature gate.
         if (stop.logprobs.is_some() || stop.prompt_logprobs.is_some()) && !self.logprobs_supported {
-            return Err("this model does not support logprobs".to_string());
+            return Err(crate::serving::TokenizeError::UnsupportedLogprobs);
         }
 
         Ok(LoweredSampling {
@@ -771,6 +969,46 @@ impl Qwen3Desc {
             max_tokens,
             stop_token_ids,
         })
+    }
+}
+
+impl SenseNovaDesc {
+    fn tokenize(&self, request: GenerateReqInput) -> Result<TokenizedGenerateReqInput> {
+        crate::serving::omni::tokenize_sensenova(
+            &self.preprocessing,
+            crate::serving::omni::RuntimeBinding {
+                tokenizer: std::sync::Arc::clone(&self.tokenizer),
+                renderer: &self.renderer,
+                capabilities: &self.capabilities,
+                default_max_output_tokens: self.default_max_output_tokens,
+                max_model_tokens: self.max_model_tokens,
+                identity: ModelEventIdentity {
+                    served_name: self.identity.served_name.clone(),
+                    description: self.identity.description.id().to_string(),
+                },
+            },
+            request,
+        )
+    }
+}
+
+impl BagelDesc {
+    fn tokenize(&self, request: GenerateReqInput) -> Result<TokenizedGenerateReqInput> {
+        crate::serving::omni::tokenize_bagel(
+            &self.preprocessing,
+            crate::serving::omni::RuntimeBinding {
+                tokenizer: std::sync::Arc::clone(&self.tokenizer),
+                renderer: &self.renderer,
+                capabilities: &self.capabilities,
+                default_max_output_tokens: self.default_max_output_tokens,
+                max_model_tokens: self.max_model_tokens,
+                identity: ModelEventIdentity {
+                    served_name: self.identity.served_name.clone(),
+                    description: self.identity.description.id().to_string(),
+                },
+            },
+            request,
+        )
     }
 }
 
@@ -785,18 +1023,14 @@ struct LoweredSampling {
 fn tokenize_bad_words(
     bad_words: &[String],
     tokenizer: &crate::profile::tokenizer::HuggingFaceTokenizer,
-) -> std::result::Result<Option<Vec<Vec<u32>>>, String> {
+) -> std::result::Result<Option<Vec<Vec<u32>>>, crate::profile::tokenizer::TokenizerError> {
     if bad_words.is_empty() {
         return Ok(None);
     }
     let mut all_token_ids = Vec::new();
     for bad_word in bad_words {
-        let without_space = tokenizer
-            .encode(bad_word, false)
-            .map_err(|e| e.to_string())?;
-        let with_space = tokenizer
-            .encode(&format!(" {}", bad_word.trim_start()), false)
-            .map_err(|e| e.to_string())?;
+        let without_space = tokenizer.encode(bad_word, false)?;
+        let with_space = tokenizer.encode(&format!(" {}", bad_word.trim_start()), false)?;
         let keep_with_space = !with_space.is_empty()
             && (without_space.is_empty()
                 || (with_space[0] != without_space[0] && with_space.len() == without_space.len()));

@@ -28,7 +28,7 @@ pub(crate) async fn chat_completions(
     let stream = body.stream;
     let request_context = resolve_request_context(&headers);
     let (input, response) =
-        match lower_chat_request(body, state.served_model_names(), request_context) {
+        match lower_chat_request(body, state.served_model_name(), request_context) {
             Ok(lowered) => lowered,
             Err(error) => return ApiError::from(error).into_response(),
         };

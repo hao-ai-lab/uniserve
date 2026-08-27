@@ -138,17 +138,13 @@ where
     let Some(path) = path else {
         return Ok(T::default());
     };
-    let content = std::fs::read_to_string(path).map_err(|error| {
-        Error::message(format!(
-            "failed to read config file `{}`: {error}",
-            path.display()
-        ))
+    let content = std::fs::read_to_string(path).map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
     })?;
-    serde_json::from_str(&content).map_err(|error| {
-        Error::message(format!(
-            "failed to parse config file `{}` as JSON: {error}",
-            path.display()
-        ))
+    serde_json::from_str(&content).map_err(|source| Error::Json {
+        path: path.to_path_buf(),
+        source,
     })
 }
 

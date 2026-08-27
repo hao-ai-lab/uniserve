@@ -5,19 +5,20 @@
 //! boundary.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use crate::executor::{ControlAck, ControlOp, Executor, WorkerExecError};
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
-use uniserve_core::CommandWaker;
+use uniserve_core::{CommandWaker, KvCacheDtype, ModelDtype};
 use uniserve_worker_ipc::{
-    Batch, CompletionReport, Domain, ResponseKind, WorkerCapabilities, WorkerRequest,
-    WorkerResponse,
+    Batch, CompletionReport, Domain, WorkerCapabilities, WorkerRequest, WorkerResponse,
 };
 use uniserve_worker_ipc::{ClientEndpoint, Frame, Pending, service_name};
 
+use crate::worker::WorkerSpawnSpec;
 use crate::worker::death_watch::DeathWatcher;
 
 fn enqueue_ready(ready: &mut VecDeque<CompletionReport>, report: CompletionReport) {
@@ -86,16 +87,52 @@ impl LaneConfig {
 }
 
 /// Explicit Python worker launch configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlashInferBackend {
+    #[default]
+    Auto,
+    Fa2,
+    Fa3,
+}
+
+impl FlashInferBackend {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Fa2 => "fa2",
+            Self::Fa3 => "fa3",
+        }
+    }
+}
+
+impl std::str::FromStr for FlashInferBackend {
+    type Err = FlashInferBackendParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "fa2" => Ok(Self::Fa2),
+            "fa3" => Ok(Self::Fa3),
+            _ => Err(FlashInferBackendParseError(value.to_owned())),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unsupported FlashInfer backend {0:?}")]
+pub struct FlashInferBackendParseError(String);
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WorkerLaunchConfig {
     pub stub: bool,
     pub load_format: String,
-    pub download_dir: Option<String>,
+    pub download_dir: Option<PathBuf>,
     pub load_threads: Option<u32>,
-    pub checksum_manifest: Option<String>,
-    pub model_dtype: String,
-    pub kv_cache_dtype: Option<String>,
-    pub kv_memory_fraction: String,
+    pub checksum_manifest: Option<PathBuf>,
+    pub model_dtype: ModelDtype,
+    pub kv_cache_dtype: Option<KvCacheDtype>,
+    pub kv_memory_fraction: f64,
     pub mesh: Option<String>,
     pub tp_backend: Option<String>,
     pub lanes: Vec<LaneConfig>,
@@ -107,14 +144,14 @@ pub struct WorkerLaunchConfig {
     pub flow_graph_shapes: Option<String>,
     pub flashinfer_workspace_size: u64,
     pub flashinfer_use_tensor_core: Option<String>,
-    pub flashinfer_decode_backend: String,
-    pub flashinfer_prefill_backend: String,
+    pub flashinfer_decode_backend: FlashInferBackend,
+    pub flashinfer_prefill_backend: FlashInferBackend,
     pub flashinfer_decode_split_tile_size: Option<u32>,
     pub flashinfer_prefill_split_tile_size: Option<u32>,
     pub flashinfer_disable_split_kv: bool,
     pub flashinfer_fast_decode_plan: bool,
-    pub snapshot_dir: Option<String>,
-    pub media_spool: Option<String>,
+    pub snapshot_dir: Option<PathBuf>,
+    pub media_spool: Option<PathBuf>,
 }
 
 impl Default for WorkerLaunchConfig {
@@ -125,9 +162,9 @@ impl Default for WorkerLaunchConfig {
             download_dir: None,
             load_threads: None,
             checksum_manifest: None,
-            model_dtype: "bfloat16".to_string(),
+            model_dtype: ModelDtype::BFloat16,
             kv_cache_dtype: None,
-            kv_memory_fraction: "0.70".to_string(),
+            kv_memory_fraction: 0.70,
             mesh: None,
             tp_backend: None,
             lanes: Vec::new(),
@@ -139,8 +176,8 @@ impl Default for WorkerLaunchConfig {
             flow_graph_shapes: None,
             flashinfer_workspace_size: 512 * 1024 * 1024,
             flashinfer_use_tensor_core: None,
-            flashinfer_decode_backend: "fa2".to_string(),
-            flashinfer_prefill_backend: "auto".to_string(),
+            flashinfer_decode_backend: FlashInferBackend::Fa2,
+            flashinfer_prefill_backend: FlashInferBackend::Auto,
             flashinfer_decode_split_tile_size: None,
             flashinfer_prefill_split_tile_size: None,
             flashinfer_disable_split_kv: false,
@@ -168,12 +205,12 @@ impl WorkerLaunchConfig {
         if let Some(value) = &self.checksum_manifest {
             cmd.arg("--checksum-manifest").arg(value);
         }
-        cmd.arg("--model-dtype").arg(&self.model_dtype);
+        cmd.arg("--model-dtype").arg(self.model_dtype.as_str());
         if let Some(value) = &self.kv_cache_dtype {
-            cmd.arg("--kv-cache-dtype").arg(value);
+            cmd.arg("--kv-cache-dtype").arg(value.as_str());
         }
         cmd.arg("--kv-memory-fraction")
-            .arg(&self.kv_memory_fraction);
+            .arg(self.kv_memory_fraction.to_string());
         if let Some(value) = &self.mesh {
             cmd.arg("--mesh").arg(value);
         }
@@ -207,9 +244,9 @@ impl WorkerLaunchConfig {
             cmd.arg("--flashinfer-use-tensor-core").arg(value);
         }
         cmd.arg("--flashinfer-decode-backend")
-            .arg(&self.flashinfer_decode_backend);
+            .arg(self.flashinfer_decode_backend.as_str());
         cmd.arg("--flashinfer-prefill-backend")
-            .arg(&self.flashinfer_prefill_backend);
+            .arg(self.flashinfer_prefill_backend.as_str());
         if let Some(value) = self.flashinfer_decode_split_tile_size {
             cmd.arg("--flashinfer-decode-split-tile-size")
                 .arg(value.to_string());
@@ -273,171 +310,28 @@ enum OutstandingKind {
 }
 
 impl UniprocExecutor {
-    #[allow(clippy::too_many_arguments)]
-    pub fn spawn(
-        python: &str,
-        model_dir: &str,
-        device: &str,
-        pipeline_depth: usize,
-        req_slot_cap: usize,
-        resp_slot_cap: usize,
-        kv_token_capacity: Option<u64>,
-        block_size: u32,
-        max_batch_operations: u32,
-        max_batch_tokens: u32,
-        attention_backend: &str,
-    ) -> anyhow::Result<Self> {
-        Self::spawn_with_config(
-            python,
-            model_dir,
-            device,
-            pipeline_depth,
-            req_slot_cap,
-            resp_slot_cap,
-            kv_token_capacity,
-            block_size,
-            max_batch_operations,
-            max_batch_tokens,
-            attention_backend,
-            &WorkerLaunchConfig::default(),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn spawn_with_config(
-        python: &str,
-        model_dir: &str,
-        device: &str,
-        pipeline_depth: usize,
-        req_slot_cap: usize,
-        resp_slot_cap: usize,
-        kv_token_capacity: Option<u64>,
-        block_size: u32,
-        max_batch_operations: u32,
-        max_batch_tokens: u32,
-        attention_backend: &str,
-        worker_config: &WorkerLaunchConfig,
-    ) -> anyhow::Result<Self> {
-        Self::spawn_ranked_with_config(
-            python,
-            model_dir,
-            device,
-            pipeline_depth,
-            req_slot_cap,
-            resp_slot_cap,
-            kv_token_capacity,
-            block_size,
-            max_batch_operations,
-            max_batch_tokens,
-            attention_backend,
-            0,
-            1,
-            None,
-            worker_config,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn spawn_ranked(
-        python: &str,
-        model_dir: &str,
-        device: &str,
-        pipeline_depth: usize,
-        req_slot_cap: usize,
-        resp_slot_cap: usize,
-        kv_token_capacity: Option<u64>,
-        block_size: u32,
-        max_batch_operations: u32,
-        max_batch_tokens: u32,
-        attention_backend: &str,
-        tp_rank: u32,
-        tp_size: u32,
-        tp_init_method: Option<&str>,
-    ) -> anyhow::Result<Self> {
-        Self::spawn_ranked_with_config(
-            python,
-            model_dir,
-            device,
-            pipeline_depth,
-            req_slot_cap,
-            resp_slot_cap,
-            kv_token_capacity,
-            block_size,
-            max_batch_operations,
-            max_batch_tokens,
-            attention_backend,
-            tp_rank,
-            tp_size,
-            tp_init_method,
-            &WorkerLaunchConfig::default(),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn spawn_ranked_with_config(
-        python: &str,
-        model_dir: &str,
-        device: &str,
-        pipeline_depth: usize,
-        req_slot_cap: usize,
-        resp_slot_cap: usize,
-        kv_token_capacity: Option<u64>,
-        block_size: u32,
-        max_batch_operations: u32,
-        max_batch_tokens: u32,
-        attention_backend: &str,
-        tp_rank: u32,
-        tp_size: u32,
-        tp_init_method: Option<&str>,
-        worker_config: &WorkerLaunchConfig,
-    ) -> anyhow::Result<Self> {
-        let mut me = Self::spawn_ranked_deferred_with_config(
-            python,
-            model_dir,
-            device,
-            pipeline_depth,
-            req_slot_cap,
-            resp_slot_cap,
-            kv_token_capacity,
-            block_size,
-            max_batch_operations,
-            max_batch_tokens,
-            attention_backend,
-            tp_rank,
-            tp_size,
-            tp_init_method,
-            None,
-            None,
-            worker_config,
-        )?;
+    pub fn spawn(spec: WorkerSpawnSpec) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            spec.world_size == 1,
+            "uniproc worker world size must be one"
+        );
+        let mut me = Self::spawn_rank_deferred(&spec, &spec.device, 0, 1, None, &spec.launch)?;
         me.finish_startup()?;
         Ok(me)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn spawn_ranked_deferred_with_config(
-        python: &str,
-        model_dir: &str,
+    pub(crate) fn spawn_rank_deferred(
+        spec: &WorkerSpawnSpec,
         device: &str,
-        pipeline_depth: usize,
-        req_slot_cap: usize,
-        resp_slot_cap: usize,
-        kv_token_capacity: Option<u64>,
-        block_size: u32,
-        max_batch_operations: u32,
-        max_batch_tokens: u32,
-        attention_backend: &str,
         tp_rank: u32,
         tp_size: u32,
         tp_init_method: Option<&str>,
-        worker_kind: Option<&str>,
-        transfer_backend: Option<&str>,
         worker_config: &WorkerLaunchConfig,
     ) -> anyhow::Result<Self> {
-        let depth = pipeline_depth.max(1);
-        let max_payload = req_slot_cap.max(resp_slot_cap).max(1);
+        let depth = spec.pipeline_depth.max(1);
+        let max_payload = spec.req_slot_cap.max(spec.resp_slot_cap).max(1);
         let service = service_name(&format!("{}_{}_{}", std::process::id(), tp_rank, nano_id()));
-        let mut cmd = Command::new(python);
+        let mut cmd = Command::new(&spec.python);
         cmd.arg("-m")
             .arg("uniserve_worker.main")
             .arg("--service-name")
@@ -449,17 +343,17 @@ impl UniprocExecutor {
             .arg("--ipc-max-inflight")
             .arg(depth.to_string())
             .arg("--model")
-            .arg(model_dir)
+            .arg(&spec.model)
             .arg("--device")
             .arg(device)
             .arg("--attention-backend")
-            .arg(attention_backend)
+            .arg(spec.attention_backend.as_wire_name())
             .arg("--block-size")
-            .arg(block_size.to_string())
+            .arg(spec.block_size.to_string())
             .arg("--max-batch-operations")
-            .arg(max_batch_operations.to_string())
+            .arg(spec.max_batch_operations.to_string())
             .arg("--max-batch-tokens")
-            .arg(max_batch_tokens.to_string())
+            .arg(spec.max_batch_tokens.to_string())
             .arg("--tp-rank")
             .arg(tp_rank.to_string())
             .arg("--tp-size")
@@ -467,14 +361,15 @@ impl UniprocExecutor {
         // Staged topology: tell the worker which pipeline stage it serves.
         // Omitted for the default `full` worker so the command line stays
         // identical to the direct full-pool command shape.
-        if let Some(kind) = worker_kind {
-            cmd.arg("--worker-kind").arg(kind);
+        if let Some(kind) = spec.worker_kind {
+            cmd.arg("--worker-kind").arg(kind.as_str());
         }
         // Data-plane Tier-2 backend for this stage's tensor handoffs. The
         // default (in-process) is omitted so the full-pool worker command
         // line stays byte-identical.
-        if let Some(backend) = transfer_backend.filter(|b| *b != "inproc") {
-            cmd.arg("--transfer-backend").arg(backend);
+        if spec.transfer_backend != crate::executor::TransferBackend::Inproc {
+            cmd.arg("--transfer-backend")
+                .arg(spec.transfer_backend.as_str());
         }
         cmd.env("RANK", tp_rank.to_string())
             .env("WORLD_SIZE", tp_size.to_string())
@@ -493,7 +388,7 @@ impl UniprocExecutor {
         {
             cmd.arg("--tp-init-method").arg(init_method);
         }
-        if let Some(c) = kv_token_capacity {
+        if let Some(c) = spec.kv_token_capacity {
             cmd.arg("--kv-token-capacity").arg(c.to_string());
         }
         worker_config.append_worker_args(&mut cmd);
@@ -531,20 +426,17 @@ impl UniprocExecutor {
         );
         let call_id = self.alloc_call_id();
         let mut req = WorkerRequest::get_capabilities();
-        req.call_id = Some(call_id);
+        req.set_call_id(Some(call_id));
         let pending =
             self.send_request_with_timeout(&req, "caps handshake", WORKER_CONNECT_TIMEOUT)?;
         let resp = self.wait_pending_response(&pending, "caps handshake")?;
         let wr = resp.decode_response()?;
-        let caps = match wr.kind {
-            ResponseKind::Capabilities => wr
-                .capabilities
-                .ok_or_else(|| anyhow::anyhow!("capabilities response is missing its payload"))?,
-            ResponseKind::Error => bail!(
-                "worker error during caps: {}",
-                wr.message.unwrap_or_default()
-            ),
-            kind => bail!("unexpected capabilities response kind: {kind:?}"),
+        let caps = match wr {
+            WorkerResponse::Capabilities { capabilities, .. } => capabilities,
+            WorkerResponse::Error { error, .. } => {
+                bail!("worker error during caps: {}", error.message)
+            }
+            other => bail!("unexpected capabilities response kind: {:?}", other.kind()),
         };
         caps.validate()
             .context("worker reported invalid capabilities during startup")?;
@@ -667,7 +559,7 @@ impl UniprocExecutor {
             );
         }
         let wr = frame.decode_response()?;
-        if let Some(echoed) = wr.call_id
+        if let Some(echoed) = wr.call_id()
             && echoed != call_id
         {
             bail!("worker response echoed call id {echoed}, expected {call_id}");
@@ -678,32 +570,25 @@ impl UniprocExecutor {
                 remaining_partitions,
             } => self.route_batch(step_id, remaining_partitions, wr),
             OutstandingKind::Control => {
-                let (ok, snapshot) = match wr.kind {
-                    ResponseKind::Ok => (true, None),
-                    ResponseKind::Snapshot => (
-                        true,
-                        Some(wr.snapshot.clone().ok_or_else(|| {
-                            anyhow::anyhow!("snapshot response is missing its payload")
-                        })?),
-                    ),
-                    ResponseKind::Error => (false, None),
-                    kind => bail!("unexpected control response kind: {kind:?}"),
+                let result = match wr {
+                    WorkerResponse::Ok { .. } => Ok(None),
+                    WorkerResponse::Snapshot { snapshot, .. } => Ok(Some(snapshot)),
+                    WorkerResponse::Error { error, .. } => {
+                        Err(crate::executor::ControlError::Worker {
+                            message: error.message,
+                        })
+                    }
+                    other => bail!("unexpected control response kind: {:?}", other.kind()),
                 };
-                if !ok {
-                    tracing::error!(
-                        call_id,
-                        "worker control call error: {}",
-                        wr.message.clone().unwrap_or_default()
-                    );
+                if let Err(error) = &result {
+                    tracing::error!(call_id, %error, "worker control call error");
                 }
                 if self.awaited == Some(call_id) {
                     self.acks.insert(
                         call_id,
                         ControlAck {
                             rank: self.rank,
-                            ok,
-                            message: wr.message,
-                            snapshot,
+                            result,
                         },
                     );
                 }
@@ -718,11 +603,11 @@ impl UniprocExecutor {
         mut remaining_partitions: HashSet<u32>,
         wr: WorkerResponse,
     ) -> anyhow::Result<()> {
-        match wr.kind {
-            ResponseKind::Result => {
-                let r = wr
-                    .completion_report
-                    .ok_or_else(|| anyhow::anyhow!("completion report missing"))?;
+        match wr {
+            WorkerResponse::Result {
+                completion_report: r,
+                ..
+            } => {
                 if r.step_id != step_id {
                     bail!(
                         "worker result step id mismatch: expected {step_id}, got {}",
@@ -746,26 +631,18 @@ impl UniprocExecutor {
                 }
                 Ok(())
             }
-            ResponseKind::Error => {
-                let fatal = wr
-                    .fatal
-                    .ok_or_else(|| anyhow::anyhow!("error response missing fatality"))?;
-                let retryable = wr
-                    .retryable
-                    .ok_or_else(|| anyhow::anyhow!("error response missing retryability"))?;
-                Err(WorkerExecError {
-                    step_id: Some(step_id),
-                    fatal,
-                    retryable,
-                    code: wr.code.clone(),
-                    message: wr.message.clone().unwrap_or_default(),
-                    phase: wr.phase.clone(),
-                    route: wr.route.clone(),
-                    operations: wr.operations.clone(),
-                }
-                .into())
+            WorkerResponse::Error { error, .. } => Err(WorkerExecError {
+                step_id: Some(step_id),
+                fatal: error.fatal,
+                retryable: error.retryable,
+                code: error.code,
+                message: error.message,
+                phase: error.phase,
+                route: error.route,
+                operations: error.operations,
             }
-            kind => bail!("unexpected execute response kind: {kind:?}"),
+            .into()),
+            other => bail!("unexpected execute response kind: {:?}", other.kind()),
         }
     }
 
@@ -776,7 +653,7 @@ impl UniprocExecutor {
     ) -> anyhow::Result<()> {
         let call_id = self.alloc_call_id();
         let mut request = WorkerRequest::poll_completions(step_id);
-        request.call_id = Some(call_id);
+        request.set_call_id(Some(call_id));
         let pending = self.send_request_checked(&request, "completion poll")?;
         self.pending.insert(
             call_id,
@@ -847,8 +724,8 @@ impl UniprocExecutor {
 }
 
 impl Executor for UniprocExecutor {
-    fn caps(&self) -> WorkerCapabilities {
-        self.caps.clone()
+    fn caps(&self) -> &WorkerCapabilities {
+        &self.caps
     }
 
     fn pipeline_depth(&self) -> usize {
@@ -892,7 +769,7 @@ impl Executor for UniprocExecutor {
             .collect::<HashSet<_>>();
         let call_id = self.alloc_call_id();
         let mut req = WorkerRequest::execute(batch);
-        req.call_id = Some(call_id);
+        req.set_call_id(Some(call_id));
         let pending = self.send_request_checked(&req, "batch submit")?;
         self.pending.insert(
             call_id,
@@ -1029,7 +906,7 @@ impl Executor for UniprocExecutor {
             if matches!(self.child.try_wait(), Ok(None)) {
                 let call_id = self.alloc_call_id();
                 let mut req = WorkerRequest::shutdown();
-                req.call_id = Some(call_id);
+                req.set_call_id(Some(call_id));
                 if let Ok(pending) = self.send_request_checked(&req, "shutdown") {
                     let _ = self
                         .client

@@ -16,7 +16,11 @@ use uniserve_core::SamplingParams;
 
 const TOKEN_ID_OUTPUT_BOUND: usize = u32::MAX as usize;
 pub type TokenMask = Option<Vec<u32>>;
-pub type ProcessorMasks = (TokenMask, TokenMask);
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProcessorMasks {
+    pub allowed: TokenMask,
+    pub suppress: TokenMask,
+}
 
 /// Per-request, per-step context a processor inspects.
 pub struct ProcCtx<'a> {
@@ -49,6 +53,47 @@ pub trait LogitsProcessor: Send + Sync {
     /// the reference `is_argmax_invariant`: whether the processor can change the argmax.
     fn is_argmax_invariant(&self) -> bool;
     fn contribute(&self, ctx: &ProcCtx) -> MaskContribution;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinLogitsProcessor {
+    MinTokens,
+    BadWords,
+    AllowedTokens,
+}
+
+pub const DEFAULT_PIPELINE: [BuiltinLogitsProcessor; 3] = [
+    BuiltinLogitsProcessor::MinTokens,
+    BuiltinLogitsProcessor::BadWords,
+    BuiltinLogitsProcessor::AllowedTokens,
+];
+
+impl BuiltinLogitsProcessor {
+    fn processor(self) -> &'static dyn LogitsProcessor {
+        static MIN_TOKENS: MinTokensProcessor = MinTokensProcessor;
+        static BAD_WORDS: BadWordsProcessor = BadWordsProcessor;
+        static ALLOWED_TOKENS: AllowedTokensProcessor = AllowedTokensProcessor;
+        match self {
+            Self::MinTokens => &MIN_TOKENS,
+            Self::BadWords => &BAD_WORDS,
+            Self::AllowedTokens => &ALLOWED_TOKENS,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) enum PipelineProcessor {
+    Builtin(BuiltinLogitsProcessor),
+    Custom(Arc<dyn LogitsProcessor>),
+}
+
+impl PipelineProcessor {
+    fn processor(&self) -> &dyn LogitsProcessor {
+        match self {
+            Self::Builtin(processor) => processor.processor(),
+            Self::Custom(processor) => processor.as_ref(),
+        }
+    }
 }
 
 /// Suppress EOS (and other stop ids) until `min_tokens` is reached
@@ -136,19 +181,19 @@ impl LogitsProcessor for AllowedTokensProcessor {
 }
 
 /// The default control-flow pipeline (order matches the reference non-argmax-invariant set).
-pub fn default_pipeline() -> Vec<Arc<dyn LogitsProcessor>> {
-    vec![
-        Arc::new(MinTokensProcessor),
-        Arc::new(BadWordsProcessor),
-        Arc::new(AllowedTokensProcessor),
-    ]
+pub(crate) fn default_pipeline() -> Vec<PipelineProcessor> {
+    DEFAULT_PIPELINE
+        .into_iter()
+        .map(PipelineProcessor::Builtin)
+        .collect()
 }
 
 /// Merge all processors' contributions into a single `(allowed, suppress)` pair.
-pub fn run_pipeline(pipeline: &[Arc<dyn LogitsProcessor>], ctx: &ProcCtx) -> ProcessorMasks {
+pub(crate) fn run_pipeline(pipeline: &[PipelineProcessor], ctx: &ProcCtx) -> ProcessorMasks {
     let mut allowed: Option<Vec<u32>> = None;
     let mut suppress: Vec<u32> = Vec::new();
-    for p in pipeline {
+    for entry in pipeline {
+        let p = entry.processor();
         let c = p.contribute(ctx);
         if let Some(a) = c.allowed {
             allowed = Some(match allowed {
@@ -165,16 +210,17 @@ pub fn run_pipeline(pipeline: &[Arc<dyn LogitsProcessor>], ctx: &ProcCtx) -> Pro
     } else {
         Some(suppress)
     };
-    (allowed, suppress)
+    ProcessorMasks { allowed, suppress }
 }
 
 pub(crate) fn run_pipeline_checked(
-    pipeline: &[Arc<dyn LogitsProcessor>],
+    pipeline: &[PipelineProcessor],
     ctx: &ProcCtx,
 ) -> Result<ProcessorMasks, String> {
     let mut allowed: Option<Vec<u32>> = None;
     let mut suppress = Vec::new();
-    for processor in pipeline {
+    for entry in pipeline {
+        let processor = entry.processor();
         let contribution = processor.contribute(ctx);
         let declaration = processor.declaration();
         let output_tokens = contribution
@@ -201,14 +247,14 @@ pub(crate) fn run_pipeline_checked(
     }
     suppress.sort_unstable();
     suppress.dedup();
-    Ok((
+    Ok(ProcessorMasks {
         allowed,
-        if suppress.is_empty() {
+        suppress: if suppress.is_empty() {
             None
         } else {
             Some(suppress)
         },
-    ))
+    })
 }
 
 #[cfg(test)]
@@ -236,11 +282,11 @@ mod tests {
             min_tokens: 5,
             ..Default::default()
         };
-        let (_a, sup) = run_pipeline(&pipe, &ctx(2, &[151645, 151643], &[], &sp));
-        assert_eq!(sup, Some(vec![151643, 151645]));
+        let masks = run_pipeline(&pipe, &ctx(2, &[151645, 151643], &[], &sp));
+        assert_eq!(masks.suppress, Some(vec![151643, 151645]));
         // at/after the floor, EOS is allowed again
-        let (_a, sup) = run_pipeline(&pipe, &ctx(5, &[151645, 151643], &[], &sp));
-        assert_eq!(sup, None);
+        let masks = run_pipeline(&pipe, &ctx(5, &[151645, 151643], &[], &sp));
+        assert_eq!(masks.suppress, None);
     }
 
     #[test]
@@ -251,11 +297,11 @@ mod tests {
             ..Default::default()
         };
         // recent ends in [7, 8] -> emitting 9 would complete the bad word.
-        let (_a, sup) = run_pipeline(&pipe, &ctx(2, &[0], &[1, 7, 8], &sp));
-        assert_eq!(sup, Some(vec![9]));
+        let masks = run_pipeline(&pipe, &ctx(2, &[0], &[1, 7, 8], &sp));
+        assert_eq!(masks.suppress, Some(vec![9]));
         // recent does not match the prefix -> no suppression.
-        let (_a, sup) = run_pipeline(&pipe, &ctx(2, &[0], &[1, 2, 3], &sp));
-        assert_eq!(sup, None);
+        let masks = run_pipeline(&pipe, &ctx(2, &[0], &[1, 2, 3], &sp));
+        assert_eq!(masks.suppress, None);
     }
 
     #[test]
@@ -265,8 +311,8 @@ mod tests {
             allowed_token_ids: Some(vec![3, 4]),
             ..Default::default()
         };
-        let (allow, _s) = run_pipeline(&pipe, &ctx(0, &[0], &[], &sp));
-        assert_eq!(allow, Some(vec![3, 4]));
+        let masks = run_pipeline(&pipe, &ctx(0, &[0], &[], &sp));
+        assert_eq!(masks.allowed, Some(vec![3, 4]));
     }
 
     /// Adding a processor needs no scheduler edit — just push onto the pipeline.
@@ -296,13 +342,13 @@ mod tests {
             }
         }
         let mut pipe = default_pipeline();
-        pipe.push(Arc::new(BanZero));
+        pipe.push(PipelineProcessor::Custom(Arc::new(BanZero)));
         let sp = SamplingParams {
             min_tokens: 3,
             ..Default::default()
         };
-        let (_a, sup) = run_pipeline(&pipe, &ctx(0, &[42], &[], &sp));
-        let sup = sup.unwrap();
+        let masks = run_pipeline(&pipe, &ctx(0, &[42], &[], &sp));
+        let sup = masks.suppress.unwrap();
         assert!(sup.contains(&0) && sup.contains(&42));
     }
 }

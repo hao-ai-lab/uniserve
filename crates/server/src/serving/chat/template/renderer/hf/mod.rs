@@ -13,13 +13,9 @@ use self::format::{
 };
 use self::template::{CompiledChatTemplate, TemplateContext};
 use self::value::{TemplateValue, to_template_value};
+use crate::serving::chat::protocol::{ChatContent, ChatContentPart, ChatMessage, ChatRequest};
 use crate::serving::chat::template::error::Result;
-use crate::serving::chat::template::request::{
-    ChatContent, ChatContentPart, ChatMessage, ChatRequest,
-};
-use crate::serving::chat::template::{
-    AssistantContentBlock, AssistantMessageExt, ChatTemplateLoadOptions, Error, Tool,
-};
+use crate::serving::chat::template::{ChatTemplateLoadOptions, Error, Tool};
 
 mod error;
 mod format;
@@ -311,7 +307,7 @@ fn to_template_message(
 }
 
 fn to_template_tool_calls(
-    content: &[AssistantContentBlock],
+    content: &crate::serving::chat::AssistantMessage,
 ) -> Result<Option<Vec<TemplateToolCall>>> {
     let mut tool_calls = Vec::new();
 
@@ -428,7 +424,7 @@ mod tests {
     use serde_json::Value;
 
     use super::{ChatTemplateContentFormatOption, HfChatRenderer, MultimodalRenderInfo};
-    use crate::serving::chat::template::request::{
+    use crate::serving::chat::protocol::{
         ChatContentPart, ChatMessage, ChatRequest, ChatRole, ChatToolChoice, GenerationPromptMode,
         ReasoningEffort, Tool,
     };

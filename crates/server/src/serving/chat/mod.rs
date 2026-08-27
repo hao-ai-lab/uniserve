@@ -9,39 +9,20 @@ pub use crate::profile::reasoning::{ReasoningDelta, ReasoningError};
 pub use crate::profile::tools::ToolParserError;
 pub use crate::serving::text::{FinishReason, StopReason};
 pub use error::{Error, Result};
-pub use event::{
-    AssistantBlockKind, AssistantContentBlock, AssistantMessage, AssistantMessageExt,
-    AssistantToolCall, ChatEvent,
-};
 pub use output::Qwen3ChatOutputProcessor;
-pub use renderer::hf::{ChatTemplateContentFormatOption, HfChatRenderer};
-pub use request::{
+pub use protocol::{
+    AssistantBlockKind, AssistantContentBlock, AssistantMessage, AssistantToolCall, ChatEvent,
+};
+pub use protocol::{
     ChatContent, ChatContentPart, ChatMessage, ChatOptions, ChatRequest, ChatRole, ChatToolChoice,
     GenerationPromptMode, ReasoningEffort, Tool,
 };
-pub use stream::{ChatEventStream, ChatEventStreamTrait, CollectedAssistantMessage};
+pub use stream::CollectedAssistantMessage;
 pub use template::ChatTemplateLoadOptions;
+pub use template::renderer::hf::{ChatTemplateContentFormatOption, HfChatRenderer};
 
 mod error;
 pub mod output;
 pub mod protocol;
-pub mod template;
-pub mod parser {
-    pub use crate::serving::chat::output::parser::*;
-}
-pub mod renderer {
-    pub use crate::serving::chat::template::renderer::*;
-}
-pub mod event {
-    pub use crate::serving::chat::protocol::{
-        AssistantBlockKind, AssistantContentBlock, AssistantMessage, AssistantMessageExt,
-        AssistantToolCall, ChatEvent,
-    };
-}
-pub mod request {
-    pub use crate::serving::chat::protocol::{
-        ChatContent, ChatContentPart, ChatMessage, ChatOptions, ChatRequest, ChatRole,
-        ChatToolChoice, GenerationPromptMode, ReasoningEffort, Tool,
-    };
-}
 pub mod stream;
+pub mod template;

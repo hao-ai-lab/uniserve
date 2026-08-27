@@ -124,11 +124,9 @@ pub struct StreamOptions {
 // ============================================================================
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct Tool {
-    #[serde(rename = "type")]
-    pub tool_type: String,
-    pub function: Function,
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Tool {
+    Function { function: Function },
 }
 
 #[serde_with::skip_serializing_none]
@@ -377,9 +375,9 @@ pub struct ModelObject {
 /// Load-bound identity of the configured model description.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServedModelIdentity {
-    pub profile_id: String,
-    pub description_id: String,
-    pub config_fingerprint: String,
+    pub served_name: String,
+    pub description: crate::profile::ModelDescription,
+    pub fingerprint: Option<String>,
 }
 
 /// Typed public capabilities for the configured model route.
@@ -392,54 +390,10 @@ pub struct ModelCapabilities {
     pub sampling_controls: Vec<ModelSamplingControl>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ModelEndpoint {
-    ChatCompletions,
-    ImageGenerations,
-    VideoGenerations,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ModelModality {
-    Text,
-    Image,
-    Video,
-    Audio,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ModelFeature {
-    Streaming,
-    Usage,
-    Logprobs,
-    Reasoning,
-    ToolCalling,
-    RepeatedInterleave,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ModelSamplingControl {
-    Greedy,
-    Temperature,
-    TopK,
-    TopP,
-    MinP,
-    RepetitionPenalty,
-    FrequencyPenalty,
-    PresencePenalty,
-    LogitBias,
-    AllowedTokenIds,
-    BadWords,
-    MinTokens,
-    Logprobs,
-    StopTokenIds,
-    Eos,
-    StopStrings,
-}
+pub type ModelEndpoint = crate::serving::ServedEndpoint;
+pub type ModelModality = crate::serving::ServedModality;
+pub type ModelFeature = crate::serving::ServedFeature;
+pub type ModelSamplingControl = crate::serving::ServedSamplingControl;
 
 /// Response body for `GET /v1/models`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

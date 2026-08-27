@@ -11,10 +11,12 @@ use educe::Educe;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use thiserror_ext::AsReport as _;
+use uniserve_core::{KvCacheDtype, ModelDtype};
 use uniserve_engine::worker::{LaneConfig, WorkerLaunchConfig};
 use uniserve_engine::{
-    DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
-    DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS,
+    AttentionBackend, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
+    DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS,
+    FlashInferBackend, TransferSpec, WorkersSpec,
 };
 use uniserve_server::{
     ChatTemplateContentFormatOption, Config, EngineBackendKind, EngineSettings, HttpListenerMode,
@@ -69,27 +71,6 @@ impl From<SchedulerPolicyArg> for SchedulingPolicy {
     }
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub(crate) enum ModelDescriptionArg {
-    Qwen3,
-    #[value(name = "sensenova")]
-    SenseNova,
-    Bagel,
-    #[value(name = "minimax-h3")]
-    MiniMaxH3,
-}
-
-impl From<ModelDescriptionArg> for ModelDescription {
-    fn from(value: ModelDescriptionArg) -> Self {
-        match value {
-            ModelDescriptionArg::Qwen3 => ModelDescription::Qwen3,
-            ModelDescriptionArg::SenseNova => ModelDescription::SenseNova,
-            ModelDescriptionArg::Bagel => ModelDescription::Bagel,
-            ModelDescriptionArg::MiniMaxH3 => ModelDescription::MiniMaxH3,
-        }
-    }
-}
-
 /// Arguments for the `serve` command.
 #[derive(Educe, Clone, Args)]
 #[educe(Debug)]
@@ -135,8 +116,8 @@ pub(crate) struct SharedRuntimeArgs {
     pub model: String,
 
     /// Closed model description that owns configured preprocessing and output behavior.
-    #[arg(long, value_enum)]
-    pub model_description: ModelDescriptionArg,
+    #[arg(long)]
+    pub model_description: ModelDescription,
 
     /// Shared absolute directory used for generated media files.
     #[arg(long, default_value = "/tmp/uniserve-media")]
@@ -162,10 +143,10 @@ pub(crate) struct SharedRuntimeArgs {
     pub device: String,
     /// Attention backend preference forwarded to the Python worker.
     #[arg(long, default_value = "auto")]
-    pub attention_backend: String,
+    pub attention_backend: AttentionBackend,
     /// Python interpreter used to launch the forward-only worker.
-    #[arg(long, default_value_t = default_worker_python(), hide = true)]
-    pub worker_python: String,
+    #[arg(long, default_value_os_t = default_worker_python(), hide = true)]
+    pub worker_python: std::path::PathBuf,
     /// Number of tensor-parallel worker rank processes behind each engine.
     #[arg(long = "tp-size", default_value_t = 1, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub worker_ranks: usize,
@@ -173,11 +154,11 @@ pub(crate) struct SharedRuntimeArgs {
     /// Unset = a single Full pool; a multi-stage spec composes local pools
     /// behind a StagedExecutor.
     #[arg(long, hide = true)]
-    pub workers: Option<String>,
+    pub workers: Option<WorkersSpec>,
     /// Per-edge data-plane transfer backend, e.g.
     /// `encoder->prefill=shm,prefill->decode=cuda_ipc`.
     #[arg(long, hide = true)]
-    pub transfer: Option<String>,
+    pub transfer: Option<TransferSpec>,
     /// KV block size in tokens (the page size).
     #[arg(long = "page-size", default_value_t = 64, value_parser = clap::builder::RangedU64ValueParser::<u32>::new().range(1..))]
     pub block_size: u32,
@@ -248,12 +229,9 @@ pub(crate) struct SharedRuntimeArgs {
     /// Front-door HTTP admission limit for in-flight inference requests.
     #[arg(long = "max-concurrent-requests", value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(1..))]
     pub max_concurrent_requests: Option<u64>,
-    /// Disable periodic logging of engine statistics.
-    #[arg(long)]
-    pub disable_log_stats: bool,
     /// Enable or disable periodic logging of engine statistics.
-    #[arg(long = "log-stats", action = ArgAction::Set)]
-    pub log_stats: Option<bool>,
+    #[arg(long = "log-stats", action = ArgAction::Set, default_value_t = true)]
+    pub log_stats: bool,
 
     /// The single model name used in the API. Defaults to the resolved model ID.
     #[arg(long)]
@@ -263,12 +241,6 @@ pub(crate) struct SharedRuntimeArgs {
 impl SharedRuntimeArgs {
     pub(crate) fn resolved_model(&self) -> String {
         self.model.clone()
-    }
-
-    fn disable_log_stats(&self) -> bool {
-        self.log_stats
-            .map(|enabled| !enabled)
-            .unwrap_or(self.disable_log_stats)
     }
 
     fn configured_api_key(&self) -> Option<String> {
@@ -281,10 +253,9 @@ impl SharedRuntimeArgs {
 
     /// Build the UniServe Rust-engine settings from these CLI arguments.
     pub(crate) fn engine_settings(&self) -> EngineSettings {
-        let is_media = matches!(self.model_description, ModelDescriptionArg::MiniMaxH3);
+        let is_media = self.model_description == ModelDescription::MiniMaxH3;
         let mut worker_launch = self.worker_launch.to_config();
-        worker_launch.media_spool =
-            is_media.then(|| self.media_spool.to_string_lossy().into_owned());
+        worker_launch.media_spool = is_media.then(|| self.media_spool.clone());
         EngineSettings {
             backend: if self.sim {
                 EngineBackendKind::Sim
@@ -311,9 +282,11 @@ impl SharedRuntimeArgs {
                 self.resp_slot_cap
             },
             worker_python: self.worker_python.clone(),
-            worker_ranks: self.worker_ranks,
-            workers: self.workers.clone(),
-            transfer: self.transfer.clone(),
+            workers: self
+                .workers
+                .clone()
+                .unwrap_or_else(|| WorkersSpec::single_full(self.worker_ranks)),
+            transfer: self.transfer.clone().unwrap_or_default(),
             worker_launch,
         }
     }
@@ -322,13 +295,12 @@ impl SharedRuntimeArgs {
     fn into_config(self, listener_mode: HttpListenerMode) -> Config {
         let engine = self.engine_settings();
         let model = self.resolved_model();
-        let disable_log_stats = self.disable_log_stats();
         let api_key = self.configured_api_key();
         let request_timeout = self.request_timeout.map(Duration::from_secs);
         Config {
             engine,
             model,
-            model_description: self.model_description.into(),
+            model_description: self.model_description,
             served_model_name: self.served_model_name,
             media_spool: self.media_spool,
             listener_mode,
@@ -337,7 +309,7 @@ impl SharedRuntimeArgs {
             chat_template_content_format: self.chat_template_content_format,
             enable_log_requests: self.enable_log_requests,
             enable_request_id_headers: self.enable_request_id_headers,
-            disable_log_stats,
+            log_stats: self.log_stats,
             api_key,
             request_timeout,
             max_concurrent_requests: self.max_concurrent_requests,
@@ -358,19 +330,19 @@ pub(crate) struct WorkerLaunchArgs {
     pub load_format: String,
     /// Hugging Face cache root for repository model paths.
     #[arg(long)]
-    pub download_dir: Option<String>,
+    pub download_dir: Option<std::path::PathBuf>,
     /// Concurrent checkpoint file readers.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
     pub load_threads: Option<u32>,
     /// JSON map of checkpoint-relative paths to SHA-256 digests.
     #[arg(long)]
-    pub checksum_manifest: Option<String>,
+    pub checksum_manifest: Option<std::path::PathBuf>,
     #[arg(long = "dtype", default_value = "bfloat16")]
-    pub model_dtype: String,
+    pub model_dtype: ModelDtype,
     #[arg(long)]
-    pub kv_cache_dtype: Option<String>,
+    pub kv_cache_dtype: Option<KvCacheDtype>,
     #[arg(long = "mem-fraction-static", default_value = "0.70")]
-    pub kv_memory_fraction: String,
+    pub kv_memory_fraction: f64,
     /// Parallelism mesh forwarded to the Python worker, e.g.
     /// `tower=text:cuda:0;gen:cuda:1,tower-kv-capacity=65536`.
     #[arg(long, hide = true)]
@@ -397,9 +369,9 @@ pub(crate) struct WorkerLaunchArgs {
     #[arg(long, hide = true)]
     pub flashinfer_use_tensor_core: Option<String>,
     #[arg(long, default_value = "fa2", hide = true)]
-    pub flashinfer_decode_backend: String,
+    pub flashinfer_decode_backend: FlashInferBackend,
     #[arg(long, default_value = "auto", hide = true)]
-    pub flashinfer_prefill_backend: String,
+    pub flashinfer_prefill_backend: FlashInferBackend,
     #[arg(long, hide = true)]
     pub flashinfer_decode_split_tile_size: Option<u32>,
     #[arg(long, hide = true)]
@@ -409,7 +381,7 @@ pub(crate) struct WorkerLaunchArgs {
     #[arg(long, action = ArgAction::Set, default_value_t = true, hide = true)]
     pub flashinfer_fast_decode_plan: bool,
     #[arg(long, hide = true)]
-    pub snapshot_dir: Option<String>,
+    pub snapshot_dir: Option<std::path::PathBuf>,
 }
 
 impl WorkerLaunchArgs {
@@ -457,24 +429,24 @@ fn non_empty_secret(value: Option<&str>) -> Option<String> {
 
 /// Default worker interpreter: a `python3`/`python` next to the running binary
 /// (the env `bin/` for a `pip install`), then `$VIRTUAL_ENV`, then `python3`.
-fn default_worker_python() -> String {
+fn default_worker_python() -> std::path::PathBuf {
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
         for name in ["python3", "python"] {
             let candidate = dir.join(name);
             if candidate.is_file() {
-                return candidate.to_string_lossy().into_owned();
+                return candidate;
             }
         }
     }
     if let Ok(venv) = std::env::var("VIRTUAL_ENV") {
         let candidate = std::path::Path::new(&venv).join("bin").join("python");
         if candidate.is_file() {
-            return candidate.to_string_lossy().into_owned();
+            return candidate;
         }
     }
-    "python3".to_string()
+    "python3".into()
 }
 
 #[cfg(test)]

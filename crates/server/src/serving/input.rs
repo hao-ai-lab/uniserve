@@ -8,10 +8,9 @@ use std::collections::{BTreeMap, HashMap};
 
 use uniserve_core::GenerationRequest;
 
-use crate::serving::chat::{
-    AssistantMessageExt, ChatMessage, ChatRequest, ChatToolChoice, ReasoningEffort, Tool,
-};
+use crate::serving::chat::{ChatMessage, ChatToolChoice, ReasoningEffort, Tool};
 use crate::serving::text::TextDecodeOptions;
+use crate::serving::text::tokenizer::DynTokenizer;
 use crate::serving::{CacheAccounting, ResourceAccounting, ServeRequestId};
 
 /// One supported public input image. Model-specific placement is resolved by
@@ -34,20 +33,28 @@ pub enum PromptInput {
     },
 }
 
-/// Output-modality selection: text output, image output, or an admitted
-/// combination. The input side is inferred from the prompt and images.
+/// Closed output-modality selection. The input side is inferred from the prompt
+/// and images.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ModalitySelection {
-    pub output_text: bool,
-    pub output_image: bool,
+pub enum ModalitySelection {
+    Text,
+    Image,
+    TextAndImage,
+}
+
+impl ModalitySelection {
+    pub const fn includes_text(self) -> bool {
+        matches!(self, Self::Text | Self::TextAndImage)
+    }
+
+    pub const fn includes_image(self) -> bool {
+        matches!(self, Self::Image | Self::TextAndImage)
+    }
 }
 
 impl Default for ModalitySelection {
     fn default() -> Self {
-        Self {
-            output_text: true,
-            output_image: false,
-        }
+        Self::Text
     }
 }
 
@@ -86,14 +93,14 @@ pub struct StopConfig {
 /// seed, and image-count bounds.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ImageGenControls {
-    pub resolution: Option<String>,
+    pub resolution: Option<crate::profile::omni::resolution::ResolutionName>,
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub steps: Option<u16>,
     pub cfg_text_scale: Option<f32>,
     pub cfg_img_scale: Option<f32>,
     pub cfg_interval: Option<[f32; 2]>,
-    pub cfg_renorm_type: Option<String>,
+    pub cfg_renorm_type: Option<uniserve_core::CfgRenorm>,
     pub cfg_renorm_min: Option<f32>,
     pub timestep_shift: Option<f32>,
     pub seed: Option<u64>,
@@ -239,43 +246,34 @@ impl GenerateReqInput {
 
 /// Model-supplied committed-event processor selection, built inside
 /// [`crate::serving::model::ResolvedModel::tokenize`].
-#[derive(Debug, Clone)]
 pub enum OutputProcessorPolicy {
     /// Raw visible text.
     None,
     /// Qwen3 chat reasoning + tool parsing over decoded text. The flag
     /// selects whether `<think>` delimiters are parsed into reasoning blocks
     /// or streamed verbatim as content.
-    Qwen3 {
-        request: Box<ChatRequest>,
-        parse_reasoning: bool,
-    },
+    Qwen3(crate::serving::chat::Qwen3ChatOutputProcessor),
     /// SenseNova reasoning and visible-answer filtering over committed text.
     SenseNova(crate::profile::omni::OutputFilterPolicy),
     /// Bagel committed-event output policy.
     Bagel,
 }
 
-/// Submission-envelope inputs carried alongside the engine request.
-#[derive(Debug, Clone)]
-pub struct SubmissionMetadata {
-    pub trace_headers: Option<BTreeMap<String, String>>,
-}
-
 /// Model identity stamped onto `Accepted` events.
 #[derive(Debug, Clone)]
 pub struct ModelEventIdentity {
-    pub profile_id: String,
-    pub description_id: String,
+    pub served_name: String,
+    pub description: String,
 }
 
 /// The sole value submitted to the engine client, produced by
 /// [`crate::serving::model::ResolvedModel::tokenize`].
-#[derive(Debug, Clone)]
 pub struct TokenizedGenerateReqInput {
     pub request_id: ServeRequestId,
     /// Canonical engine request from the public funnel.
     pub request: GenerationRequest,
+    /// The model-bound tokenizer that owns decoding for this request.
+    pub tokenizer: DynTokenizer,
     pub prompt_token_ids: Vec<u32>,
     pub decode: TextDecodeOptions,
     pub emit_token_ids: bool,
@@ -283,7 +281,6 @@ pub struct TokenizedGenerateReqInput {
     pub generated_logprobs_requested: bool,
     pub skip_special_tokens: bool,
     pub output_processor: OutputProcessorPolicy,
-    pub submission: SubmissionMetadata,
     pub identity: ModelEventIdentity,
     pub cache: CacheAccounting,
     pub resources: ResourceAccounting,

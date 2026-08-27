@@ -1,5 +1,15 @@
 use super::*;
 
+pub(super) struct FinishedTrace<'a> {
+    pub id: RequestId,
+    pub reason: &'a FinishReason,
+    pub stop_reason: Option<&'a uniserve_core::StopReason>,
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub images: usize,
+    pub queue: &'static str,
+}
+
 impl Scheduler {
     /// Abort every queued/gated/running request with a terminal event.
     pub(super) fn abort_all_requests(&mut self) {
@@ -82,7 +92,8 @@ impl Scheduler {
         if self.media_state(id).is_some() {
             self.media_state_mut(id)
                 .expect("media state exists")
-                .cancelled = true;
+                .terminal_intent
+                .cancel();
             let drained = !self.has_inflight(id);
             if drained {
                 self.finish_media(id, MediaEvent::Aborted, CloseReason::Cancelled, None);
@@ -97,9 +108,11 @@ impl Scheduler {
                 };
                 st.cancel_cutoff = Some(cutoff);
             }
-            st.cancelled = true;
-            st.aborted = abort;
-            st.stop_matched = false;
+            st.terminal_intent = if abort {
+                TerminalIntent::Abort
+            } else {
+                TerminalIntent::Cancel
+            };
         }
         // also drop from the waiting queue if not yet admitted (reporting the reason)
         if let Some(st) = self.pending.remove_request(id) {
@@ -108,15 +121,15 @@ impl Scheduler {
             } else {
                 FinishReason::Cancelled
             };
-            self.trace_request_finished(
+            self.trace_request_finished(FinishedTrace {
                 id,
-                &reason,
-                None,
-                st.context.prompt_ids.len(),
-                0,
-                0,
-                "pending",
-            );
+                reason: &reason,
+                stop_reason: None,
+                prompt_tokens: st.context.prompt_ids.len(),
+                completion_tokens: 0,
+                images: 0,
+                queue: "pending",
+            });
             let _ = st.event_tx.send(GenerationEvent::Finished {
                 reason,
                 stop_reason: None,
@@ -188,9 +201,7 @@ impl Scheduler {
         // dominates it. Prefixes acknowledged before the match already committed.
         state.pending_commits.clear();
         state.cancel_cutoff = Some(cutoff);
-        state.cancelled = true;
-        state.aborted = false;
-        state.stop_matched = true;
+        state.terminal_intent = TerminalIntent::StopMatched;
     }
 
     /// Accept only controls declared in the worker capability handshake.
@@ -229,12 +240,12 @@ impl Scheduler {
             "trace_id": st.trace.trace_id.0,
             "queue": queue,
             "generation": behavior_str(&st.req),
-            "initial_phase": phase_str(st.lifecycle.phase),
+            "initial_phase": phase_str(st.cursor.lifecycle.phase),
             "prompt_tokens": st.context.prompt_ids.len(),
             "max_tokens": st.req.max_und_tokens,
             "priority": st.req.priority,
-            "reserve_worstcase": st.resources.reserve_worstcase,
-            "worstcase_blocks": st.resources.worstcase_blocks,
+            "reserve_worstcase": st.cursor.resources.reserve_worstcase,
+            "worstcase_blocks": st.cursor.resources.worstcase_blocks,
             "image": {
                 "steps": st.req.image.steps,
                 "max_images": st.req.image.max_images,
@@ -247,17 +258,16 @@ impl Scheduler {
         }));
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn trace_request_finished(
-        &mut self,
-        id: RequestId,
-        reason: &FinishReason,
-        stop_reason: Option<&str>,
-        prompt_tokens: usize,
-        completion_tokens: usize,
-        images: usize,
-        queue: &'static str,
-    ) {
+    pub(super) fn trace_request_finished(&mut self, trace: FinishedTrace<'_>) {
+        let FinishedTrace {
+            id,
+            reason,
+            stop_reason,
+            prompt_tokens,
+            completion_tokens,
+            images,
+            queue,
+        } = trace;
         self.trace_record(json!({
             "event": "request_finished",
             "at_s": now(),

@@ -9,7 +9,7 @@ use uniserve_worker_ipc::{
     Batch, CompletionReport, ModelOutput, SamplingOwnership, WorkerCapabilities,
 };
 
-use crate::WorkerLaunchConfig;
+use crate::worker::WorkerSpawnSpec;
 
 /// How long a single rank may go without producing output, while batches are in
 /// flight, before `next_result` treats it as dead and bails. Generous so a
@@ -17,26 +17,7 @@ use crate::WorkerLaunchConfig;
 /// rank does not wedge the scheduler loop forever.
 const NEXT_RESULT_DEADLINE: Duration = Duration::from_secs(300);
 
-#[derive(Clone)]
-struct MultiprocSpawnSpec {
-    python: String,
-    model_dir: String,
-    device: String,
-    world_size: usize,
-    pipeline_depth: usize,
-    req_slot_cap: usize,
-    resp_slot_cap: usize,
-    kv_token_capacity: Option<u64>,
-    block_size: u32,
-    max_batch_operations: u32,
-    max_batch_tokens: u32,
-    attention_backend: String,
-    worker_kind: Option<String>,
-    transfer_backend: Option<String>,
-    worker_config: WorkerLaunchConfig,
-}
-
-impl MultiprocSpawnSpec {
+impl WorkerSpawnSpec {
     fn launch(&self) -> anyhow::Result<Vec<Box<dyn Executor>>> {
         let tp_init_method = if self.world_size > 1 {
             Some(allocate_tp_init_method()?)
@@ -46,33 +27,16 @@ impl MultiprocSpawnSpec {
         let mut launched = Vec::with_capacity(self.world_size);
         for rank in 0..self.world_size {
             let rank_device = device_for_rank(&self.device, rank, self.world_size);
-            let mut rank_config = self.worker_config.clone();
-            if let Some(root) = &self.worker_config.snapshot_dir {
-                rank_config.snapshot_dir = Some(
-                    std::path::PathBuf::from(root)
-                        .join("ranks")
-                        .join(rank.to_string())
-                        .to_string_lossy()
-                        .into_owned(),
-                );
+            let mut rank_config = self.launch.clone();
+            if let Some(root) = &self.launch.snapshot_dir {
+                rank_config.snapshot_dir = Some(root.join("ranks").join(rank.to_string()));
             }
-            launched.push(crate::UniprocExecutor::spawn_ranked_deferred_with_config(
-                &self.python,
-                &self.model_dir,
+            launched.push(crate::UniprocExecutor::spawn_rank_deferred(
+                self,
                 &rank_device,
-                self.pipeline_depth,
-                self.req_slot_cap,
-                self.resp_slot_cap,
-                self.kv_token_capacity,
-                self.block_size,
-                self.max_batch_operations,
-                self.max_batch_tokens,
-                &self.attention_backend,
                 rank as u32,
                 self.world_size as u32,
                 tp_init_method.as_deref(),
-                self.worker_kind.as_deref(),
-                self.transfer_backend.as_deref(),
                 &rank_config,
             )?);
         }
@@ -98,7 +62,7 @@ pub struct MultiprocExecutor {
     rank_errors: Vec<BTreeMap<u64, WorkerExecError>>,
     rank_returned_partitions: Vec<BTreeMap<u64, BTreeSet<u32>>>,
     rank_successes: Vec<BTreeSet<u64>>,
-    spawn_spec: Option<MultiprocSpawnSpec>,
+    spawn_spec: Option<WorkerSpawnSpec>,
     known_sessions: BTreeSet<RequestId>,
     dirty_sessions: BTreeSet<RequestId>,
 }
@@ -110,12 +74,12 @@ impl MultiprocExecutor {
 
     fn from_workers(
         workers: Vec<Box<dyn Executor>>,
-        spawn_spec: Option<MultiprocSpawnSpec>,
+        spawn_spec: Option<WorkerSpawnSpec>,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(!workers.is_empty(), "need >= 1 worker");
         let n = workers.len();
         let tp_size = u32::try_from(n).context("TP world size exceeds the wire representation")?;
-        let caps = workers[0].caps();
+        let caps = workers[0].caps().clone();
         let mut canonical = caps.clone();
         canonical.rank.tp_rank = 0;
         for (rank, worker) in workers.iter().enumerate() {
@@ -135,7 +99,7 @@ impl MultiprocExecutor {
                 worker.pipeline_depth(),
                 rank_caps.pipeline_depth.max(1),
             );
-            let mut normalized = rank_caps;
+            let mut normalized = rank_caps.clone();
             normalized.rank.tp_rank = 0;
             anyhow::ensure!(
                 normalized == canonical,
@@ -162,185 +126,8 @@ impl MultiprocExecutor {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn spawn(
-        python: &str,
-        model_dir: &str,
-        device: &str,
-        world_size: usize,
-        pipeline_depth: usize,
-        req_slot_cap: usize,
-        resp_slot_cap: usize,
-        kv_token_capacity: Option<u64>,
-        block_size: u32,
-        max_batch_operations: u32,
-        max_batch_tokens: u32,
-        attention_backend: &str,
-    ) -> anyhow::Result<Self> {
-        Self::spawn_with_config(
-            python,
-            model_dir,
-            device,
-            world_size,
-            pipeline_depth,
-            req_slot_cap,
-            resp_slot_cap,
-            kv_token_capacity,
-            block_size,
-            max_batch_operations,
-            max_batch_tokens,
-            attention_backend,
-            &WorkerLaunchConfig::default(),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn spawn_with_config(
-        python: &str,
-        model_dir: &str,
-        device: &str,
-        world_size: usize,
-        pipeline_depth: usize,
-        req_slot_cap: usize,
-        resp_slot_cap: usize,
-        kv_token_capacity: Option<u64>,
-        block_size: u32,
-        max_batch_operations: u32,
-        max_batch_tokens: u32,
-        attention_backend: &str,
-        worker_config: &WorkerLaunchConfig,
-    ) -> anyhow::Result<Self> {
-        Self::spawn_inner(
-            python,
-            model_dir,
-            device,
-            world_size,
-            pipeline_depth,
-            req_slot_cap,
-            resp_slot_cap,
-            kv_token_capacity,
-            block_size,
-            max_batch_operations,
-            max_batch_tokens,
-            attention_backend,
-            None,
-            None,
-            worker_config,
-        )
-    }
-
-    /// Spawn a tensor-parallel pool for a staged worker kind: every rank is told
-    /// which pipeline stage it serves. `world_size == 1` yields a one-rank pool
-    /// (still a valid `Executor`), so the `StagedExecutor` composition can treat
-    /// every pool uniformly regardless of its tp size.
-    #[allow(clippy::too_many_arguments)]
-    pub fn spawn_staged(
-        python: &str,
-        model_dir: &str,
-        device: &str,
-        world_size: usize,
-        pipeline_depth: usize,
-        req_slot_cap: usize,
-        resp_slot_cap: usize,
-        kv_token_capacity: Option<u64>,
-        block_size: u32,
-        max_batch_operations: u32,
-        max_batch_tokens: u32,
-        attention_backend: &str,
-        worker_kind: &str,
-        transfer_backend: Option<&str>,
-    ) -> anyhow::Result<Self> {
-        Self::spawn_staged_with_config(
-            python,
-            model_dir,
-            device,
-            world_size,
-            pipeline_depth,
-            req_slot_cap,
-            resp_slot_cap,
-            kv_token_capacity,
-            block_size,
-            max_batch_operations,
-            max_batch_tokens,
-            attention_backend,
-            worker_kind,
-            transfer_backend,
-            &WorkerLaunchConfig::default(),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn spawn_staged_with_config(
-        python: &str,
-        model_dir: &str,
-        device: &str,
-        world_size: usize,
-        pipeline_depth: usize,
-        req_slot_cap: usize,
-        resp_slot_cap: usize,
-        kv_token_capacity: Option<u64>,
-        block_size: u32,
-        max_batch_operations: u32,
-        max_batch_tokens: u32,
-        attention_backend: &str,
-        worker_kind: &str,
-        transfer_backend: Option<&str>,
-        worker_config: &WorkerLaunchConfig,
-    ) -> anyhow::Result<Self> {
-        Self::spawn_inner(
-            python,
-            model_dir,
-            device,
-            world_size,
-            pipeline_depth,
-            req_slot_cap,
-            resp_slot_cap,
-            kv_token_capacity,
-            block_size,
-            max_batch_operations,
-            max_batch_tokens,
-            attention_backend,
-            Some(worker_kind),
-            transfer_backend,
-            worker_config,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn spawn_inner(
-        python: &str,
-        model_dir: &str,
-        device: &str,
-        world_size: usize,
-        pipeline_depth: usize,
-        req_slot_cap: usize,
-        resp_slot_cap: usize,
-        kv_token_capacity: Option<u64>,
-        block_size: u32,
-        max_batch_operations: u32,
-        max_batch_tokens: u32,
-        attention_backend: &str,
-        worker_kind: Option<&str>,
-        transfer_backend: Option<&str>,
-        worker_config: &WorkerLaunchConfig,
-    ) -> anyhow::Result<Self> {
-        let spec = MultiprocSpawnSpec {
-            python: python.to_string(),
-            model_dir: model_dir.to_string(),
-            device: device.to_string(),
-            world_size: world_size.max(1),
-            pipeline_depth,
-            req_slot_cap,
-            resp_slot_cap,
-            kv_token_capacity,
-            block_size,
-            max_batch_operations,
-            max_batch_tokens,
-            attention_backend: attention_backend.to_string(),
-            worker_kind: worker_kind.map(str::to_string),
-            transfer_backend: transfer_backend.map(str::to_string),
-            worker_config: worker_config.clone(),
-        };
+    pub fn spawn(spec: WorkerSpawnSpec) -> anyhow::Result<Self> {
+        anyhow::ensure!(spec.world_size > 0, "worker world size must be positive");
         let workers = spec.launch()?;
         Self::from_workers(workers, Some(spec))
     }
@@ -431,7 +218,7 @@ impl MultiprocExecutor {
     fn install_replacement(
         &mut self,
         workers: Vec<Box<dyn Executor>>,
-        spec: &MultiprocSpawnSpec,
+        spec: &WorkerSpawnSpec,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
             workers.len() == spec.world_size,
@@ -867,8 +654,8 @@ fn device_for_rank(device: &str, rank: usize, world_size: usize) -> String {
 }
 
 impl Executor for MultiprocExecutor {
-    fn caps(&self) -> WorkerCapabilities {
-        self.caps.clone()
+    fn caps(&self) -> &WorkerCapabilities {
+        &self.caps
     }
 
     fn pipeline_depth(&self) -> usize {
@@ -1123,21 +910,21 @@ impl Executor for MultiprocExecutor {
                 self.recover_workers(&error)?;
                 continue;
             }
-            let succeeded = acks.iter().all(|ack| ack.ok);
+            let succeeded = acks.iter().all(|ack| ack.result.is_ok());
             if succeeded && let ControlOp::SnapshotSession(placement) = &op {
                 let session_id = placement.request_key.session_id;
-                let references = acks
-                    .iter()
-                    .map(|ack| {
-                        ack.snapshot.as_ref().ok_or_else(|| {
+                let references =
+                    acks.iter()
+                        .map(|ack| {
+                            ack.result.as_ref().ok().and_then(Option::as_ref).ok_or_else(|| {
                             anyhow::anyhow!(
                                 "rank {} acknowledged session {} snapshot without a reference",
                                 ack.rank,
                                 session_id.0
                             )
                         })
-                    })
-                    .collect::<anyhow::Result<Vec<_>>>()?;
+                        })
+                        .collect::<anyhow::Result<Vec<_>>>()?;
                 anyhow::ensure!(
                     !references.is_empty(),
                     "session snapshot control selected no tensor-parallel rank"

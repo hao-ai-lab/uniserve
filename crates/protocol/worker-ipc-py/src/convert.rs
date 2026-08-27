@@ -13,19 +13,20 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use pyo3::exceptions::PyValueError;
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyString};
 use uniserve_core::{ImageParams, SamplingParams};
 use uniserve_worker_ipc::{
-    Admission, AttentionRegime, Batch, BatchPartition, BlockTable, CacheCopy, CachePageAllocation,
+    Admission, AttentionRegime, Batch, BatchPartition, BlockTable, CachePageAllocation,
     CloseReason, CompletionReport, Control, DType, DecodeKind, DecodePlacement, DimBound,
     Disposition, Domain, DrawLayout, ErrorCode, ErrorOperationIdentity, ExecutionCapability,
     FinishFlags, ForwardMode, ForwardRow, GenAdmission, LatentPlacement, LogicalLengths,
     MediaAdmission, MediaProfileId, ModelOutput, OpId, OpStatus, Operation, PartitionCompletion,
-    Point, PointRange, ProductKind, ProductPayload, ProductRef, RecoveryPlacement, RegistrationAck,
-    RequestKey, RequestKind, ResponseKind, ShapeBound, SnapshotRef, StorageClass, TimingCounters,
-    TokenSpan, UndAdmission, VersionRef, WorkerForwardStats, WorkerRequest, WorkerResponse,
+    Point, PointRange, ProductKind, ProductPayload, ProductRef, RegistrationAck, RequestKey,
+    RequestKind, ShapeBound, StorageClass, TimingCounters, TokenSpan, UndAdmission, VersionRef,
+    WorkerForwardStats, WorkerRequest, WorkerResponse,
 };
 
 #[cfg(test)]
@@ -40,50 +41,25 @@ pub(crate) fn execute_request_to_py<'py>(
     py: Python<'py>,
     request: &WorkerRequest,
 ) -> PyResult<Bound<'py, PyDict>> {
+    let WorkerRequest::Execute { call_id, batch } = request else {
+        return Err(PyValueError::new_err(
+            "native execute conversion requires an execute request",
+        ));
+    };
     let dict = PyDict::new(py);
-    dict.set_item(intern!(py, "kind"), request_kind_py(py, request.kind))?;
-    dict.set_item(intern!(py, "call_id"), request.call_id)?;
-    dict.set_item(
-        intern!(py, "batch"),
-        request
-            .batch
-            .as_ref()
-            .map(|batch| batch_to_py(py, batch))
-            .transpose()?,
-    )?;
-    dict.set_item(intern!(py, "step_id"), request.step_id)?;
-    dict.set_item(intern!(py, "session_id"), request.session_id.map(|id| id.0))?;
-    dict.set_item(
+    dict.set_item(intern!(py, "kind"), request_kind_py(py, request.kind()))?;
+    dict.set_item(intern!(py, "call_id"), call_id)?;
+    dict.set_item(intern!(py, "batch"), batch_to_py(py, batch)?)?;
+    for key in [
+        intern!(py, "step_id"),
+        intern!(py, "session_id"),
         intern!(py, "copies"),
-        request
-            .copies
-            .as_ref()
-            .map(|copies| dict_list(py, copies, |copy| cache_copy_to_py(py, copy)))
-            .transpose()?,
-    )?;
-    match &request.product_handles {
-        Some(handles) => dict.set_item(
-            intern!(py, "product_handles"),
-            PyList::new(py, handles.iter().copied())?,
-        )?,
-        None => dict.set_item(intern!(py, "product_handles"), py.None())?,
-    }
-    dict.set_item(
+        intern!(py, "product_handles"),
         intern!(py, "snapshot"),
-        request
-            .snapshot
-            .as_ref()
-            .map(|snapshot| snapshot_to_py(py, snapshot))
-            .transpose()?,
-    )?;
-    dict.set_item(
         intern!(py, "recovery_placement"),
-        request
-            .recovery_placement
-            .as_ref()
-            .map(|placement| recovery_placement_to_py(py, placement))
-            .transpose()?,
-    )?;
+    ] {
+        dict.set_item(key, py.None())?;
+    }
     Ok(dict)
 }
 
@@ -272,21 +248,7 @@ impl NativeRequestTypes {
     }
 
     fn work<'py>(&self, py: Python<'py>, work: ForwardMode) -> Bound<'py, PyAny> {
-        let index = match work {
-            ForwardMode::TokenExtend => 0,
-            ForwardMode::TokenDecode => 1,
-            ForwardMode::TokenVerify => 2,
-            ForwardMode::Draft => 3,
-            ForwardMode::EncodeVision => 4,
-            ForwardMode::EncodeLatent => 5,
-            ForwardMode::TransferProduct => 6,
-            ForwardMode::TransferKvPublish => 7,
-            ForwardMode::TransferKvInstall => 8,
-            ForwardMode::GenTransition => 9,
-            ForwardMode::GenFlow => 10,
-            ForwardMode::Materialize => 11,
-            ForwardMode::GenDecode => 12,
-        };
+        let index = work as usize;
         self.works[index].bind(py).clone()
     }
 
@@ -991,55 +953,6 @@ fn image_to_py<'py>(py: Python<'py>, image: &ImageParams) -> PyResult<Bound<'py,
     Ok(dict)
 }
 
-fn version_ref_to_py<'py>(
-    py: Python<'py>,
-    version: &VersionRef,
-    context: &mut RequestConversion<'py>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let point = PyDict::new(py);
-    match &version.point {
-        Point::Fixed {
-            point_index,
-            semantic_digest,
-        } => {
-            point.set_item(intern!(py, "kind"), intern!(py, "fixed"))?;
-            let value = PyDict::new(py);
-            value.set_item(intern!(py, "point_index"), *point_index)?;
-            value.set_item(intern!(py, "semantic_digest"), semantic_digest.as_str())?;
-            point.set_item(intern!(py, "value"), value)?;
-        }
-        Point::Device {
-            point_index,
-            selected_point,
-            producer_plan_digest,
-        } => {
-            point.set_item(intern!(py, "kind"), intern!(py, "device"))?;
-            let value = PyDict::new(py);
-            value.set_item(intern!(py, "point_index"), *point_index)?;
-            value.set_item(
-                intern!(py, "selected_point"),
-                selected_point
-                    .as_ref()
-                    .map(|selected_point| product_ref_to_py(py, selected_point, context))
-                    .transpose()?,
-            )?;
-            value.set_item(
-                intern!(py, "producer_plan_digest"),
-                producer_plan_digest.as_str(),
-            )?;
-            point.set_item(intern!(py, "value"), value)?;
-        }
-    }
-    let dict = PyDict::new(py);
-    dict.set_item(
-        intern!(py, "request_key"),
-        context.request_key(version.request_key)?,
-    )?;
-    dict.set_item(intern!(py, "producer_op_id"), version.producer_op_id.0)?;
-    dict.set_item(intern!(py, "point"), point)?;
-    Ok(dict)
-}
-
 fn product_ref_to_py<'py>(
     py: Python<'py>,
     product: &ProductRef,
@@ -1118,65 +1031,6 @@ fn product_payload_to_py<'py>(
     Ok(dict)
 }
 
-fn snapshot_to_py<'py>(py: Python<'py>, snapshot: &SnapshotRef) -> PyResult<Bound<'py, PyDict>> {
-    let mut context = RequestConversion::new(py);
-    let dict = PyDict::new(py);
-    dict.set_item(
-        intern!(py, "version"),
-        version_ref_to_py(py, &snapshot.version, &mut context)?,
-    )?;
-    dict.set_item(intern!(py, "digest"), snapshot.digest.as_str())?;
-    dict.set_item(intern!(py, "locator"), snapshot.locator.as_str())?;
-    Ok(dict)
-}
-
-fn cache_copy_to_py<'py>(py: Python<'py>, copy: &CacheCopy) -> PyResult<Bound<'py, PyDict>> {
-    let dict = PyDict::new(py);
-    dict.set_item(intern!(py, "group_id"), copy.group_id)?;
-    dict.set_item(intern!(py, "source_page"), copy.source_page.0)?;
-    dict.set_item(intern!(py, "destination_page"), copy.destination_page.0)?;
-    Ok(dict)
-}
-
-fn block_table_to_py<'py>(py: Python<'py>, table: &BlockTable) -> PyResult<Bound<'py, PyDict>> {
-    let dict = PyDict::new(py);
-    dict.set_item(intern!(py, "request_pool_idx"), table.request_pool_idx)?;
-    dict.set_item(intern!(py, "group_id"), table.group_id)?;
-    dict.set_item(
-        intern!(py, "page_ids"),
-        u32_list(
-            py,
-            &table.page_ids.iter().map(|page| page.0).collect::<Vec<_>>(),
-        )?,
-    )?;
-    dict.set_item(intern!(py, "allocated_tokens"), table.allocated_tokens)?;
-    Ok(dict)
-}
-
-fn recovery_placement_to_py<'py>(
-    py: Python<'py>,
-    placement: &RecoveryPlacement,
-) -> PyResult<Bound<'py, PyDict>> {
-    let mut context = RequestConversion::new(py);
-    let dict = PyDict::new(py);
-    dict.set_item(
-        intern!(py, "request_key"),
-        context.request_key(placement.request_key)?,
-    )?;
-    dict.set_item(intern!(py, "request_pool_idx"), placement.request_pool_idx)?;
-    dict.set_item(
-        intern!(py, "block_tables"),
-        dict_list(py, &placement.block_tables, |table| {
-            block_table_to_py(py, table)
-        })?,
-    )?;
-    dict.set_item(
-        intern!(py, "latent_page_table"),
-        u32_list(py, &placement.latent_page_table)?,
-    )?;
-    Ok(dict)
-}
-
 fn request_kind_py<'py>(py: Python<'py>, kind: RequestKind) -> &'py Bound<'py, PyString> {
     match kind {
         RequestKind::GetCapabilities => intern!(py, "get_capabilities"),
@@ -1236,7 +1090,26 @@ fn dtype_py<'py>(py: Python<'py>, dtype: DType) -> &'py Bound<'py, PyString> {
 
 pub(crate) fn try_completion_response_from_py(
     response: &Bound<'_, PyAny>,
-) -> Option<WorkerResponse> {
+) -> PyResult<Option<WorkerResponse>> {
+    let py = response.py();
+    let dict = response
+        .cast::<PyDict>()
+        .map_err(|_| PyValueError::new_err("worker response must be a mapping"))?;
+    let kind = dict
+        .get_item(intern!(py, "kind"))?
+        .ok_or_else(|| PyValueError::new_err("worker response has no kind"))?;
+    let kind = kind
+        .extract::<String>()
+        .map_err(|_| PyValueError::new_err("worker response kind must be a string"))?;
+    if kind != "result" {
+        return Ok(None);
+    }
+    decode_completion_response_from_py(response)
+        .map(Some)
+        .ok_or_else(|| PyValueError::new_err("invalid result worker response"))
+}
+
+fn decode_completion_response_from_py(response: &Bound<'_, PyAny>) -> Option<WorkerResponse> {
     let py = response.py();
     let dict = response.cast::<PyDict>().ok()?;
     let kind = str_field(dict, intern!(py, "kind"))?;
@@ -1253,30 +1126,26 @@ pub(crate) fn try_completion_response_from_py(
             return None;
         }
     }
-    let report = match get(dict, intern!(py, "completion_report"))? {
-        value if value.is_none() => None,
-        value => Some(completion_report_from_py(&value)?),
-    };
+    let report = completion_report_from_py(&get(dict, intern!(py, "completion_report"))?)?;
     let operations = get(dict, intern!(py, "operations"))?;
     let operations = operations.cast::<PyList>().ok()?;
     let mut identities = Vec::with_capacity(operations.len());
     for item in operations.iter() {
         identities.push(error_operation_from_py(&item)?);
     }
-    Some(WorkerResponse {
-        kind: ResponseKind::Result,
+    if !identities.is_empty()
+        || opt_string(dict, intern!(py, "message"))?.is_some()
+        || opt_string(dict, intern!(py, "code"))?.is_some()
+        || opt_bool(dict, intern!(py, "retryable"))?.is_some()
+        || opt_bool(dict, intern!(py, "fatal"))?.is_some()
+        || opt_string(dict, intern!(py, "phase"))?.is_some()
+        || opt_string(dict, intern!(py, "route"))?.is_some()
+    {
+        return None;
+    }
+    Some(WorkerResponse::Result {
         call_id: opt_u64(dict, intern!(py, "call_id"))?,
-        capabilities: None,
         completion_report: report,
-        pressure: None,
-        message: opt_string(dict, intern!(py, "message"))?,
-        code: opt_string(dict, intern!(py, "code"))?,
-        retryable: opt_bool(dict, intern!(py, "retryable"))?,
-        fatal: opt_bool(dict, intern!(py, "fatal"))?,
-        phase: opt_string(dict, intern!(py, "phase"))?,
-        route: opt_string(dict, intern!(py, "route"))?,
-        operations: identities,
-        snapshot: None,
     })
 }
 
@@ -1470,7 +1339,11 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<ModelOutput> {
         committed_tokens: u32_vec(&get(dict, intern!(py, "committed_tokens"))?)?,
         finish_flags,
         product_generations: u32_vec(&get(dict, intern!(py, "product_generations"))?)?,
-        semantic_digest: string_of(&get(dict, intern!(py, "semantic_digest"))?)?,
+        semantic_digest: uniserve_core::Digest::try_from(string_of(&get(
+            dict,
+            intern!(py, "semantic_digest"),
+        )?)?)
+        .ok()?,
         error_code,
         timing_counters,
     })
@@ -1754,25 +1627,25 @@ mod tests {
             shape_bound: ShapeBound::default(),
             point_range: PointRange::default(),
         };
-        let operation = Operation::registered(
+        let operation = Operation::registered(uniserve_worker_ipc::OperationSpec {
             request_key,
-            OpId(1),
-            VersionRef::admission_root(request_key, OpId(0), admission.digest.clone()),
-            ForwardMode::TokenExtend,
-            uniserve_worker_ipc::RouteId(0),
-            Domain::Prefill,
-            Bounds {
+            op_id: OpId(1),
+            parent: VersionRef::admission_root(request_key, OpId(0), admission.digest.clone()),
+            work: ForwardMode::TokenExtend,
+            route: uniserve_worker_ipc::RouteId(0),
+            domain: Domain::Prefill,
+            bounds: Bounds {
                 max_points: 1,
                 max_tokens: 2,
                 max_kv_pages: 1,
                 ..Bounds::default()
             },
-            vec![input.clone()],
-            vec![token, finish],
-            None,
-            None,
-            0,
-        );
+            inputs: vec![input.clone()],
+            outputs: vec![token, finish],
+            predicate: None,
+            rng: None,
+            control_seq: 0,
+        });
         let partition = BatchPartition {
             partition_id: 1,
             submission_group: 1,
@@ -1811,7 +1684,7 @@ mod tests {
                 },
             ]),
         );
-        request.call_id = Some(9);
+        request.set_call_id(Some(9));
         request
     }
 
@@ -1837,7 +1710,7 @@ mod tests {
                     committed_tokens: vec![42],
                     finish_flags: FinishFlags::default(),
                     product_generations: vec![5, 6],
-                    semantic_digest: "b".repeat(64),
+                    semantic_digest: uniserve_core::Digest::try_from("b".repeat(64)).unwrap(),
                     error_code: None,
                     timing_counters: TimingCounters::default(),
                 }],
@@ -1847,7 +1720,7 @@ mod tests {
                 forward_stats: None,
             }],
         });
-        response.call_id = Some(9);
+        response.set_call_id(Some(9));
         response
     }
 

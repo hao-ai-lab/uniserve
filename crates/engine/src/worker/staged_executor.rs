@@ -43,10 +43,10 @@ struct PoolSubmission {
 #[derive(Clone)]
 struct ProductRoute {
     pool_index: usize,
-    producer_plan_digest: String,
+    producer_plan_digest: uniserve_core::Digest,
 }
 
-fn transfer_identity(bytes: &[u8]) -> anyhow::Result<(String, String)> {
+fn transfer_identity(bytes: &[u8]) -> anyhow::Result<(String, uniserve_core::Digest)> {
     anyhow::ensure!(
         is_transfer_descriptor(bytes),
         "cross-stage product has no transfer descriptor frame"
@@ -78,18 +78,13 @@ fn transfer_identity(bytes: &[u8]) -> anyhow::Result<(String, String)> {
         .get("producer_plan_digest")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("cross-stage transfer descriptor has no plan digest"))?;
-    anyhow::ensure!(
-        digest.len() == 64
-            && digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-        "cross-stage transfer descriptor plan digest is invalid"
-    );
+    let digest = uniserve_core::Digest::try_from(digest)
+        .map_err(|error| anyhow::anyhow!("invalid transfer descriptor plan digest: {error}"))?;
     anyhow::ensure!(
         serde_json::to_vec(&value)? == encoded,
         "cross-stage transfer descriptor is not canonical JSON"
     );
-    Ok((kind.to_string(), digest.to_string()))
+    Ok((kind.to_string(), digest))
 }
 
 /// Routes a canonical typed batch across the pools of a staged topology.
@@ -210,16 +205,16 @@ impl StagedExecutor {
         kv_pool_indices.dedup();
 
         let seed_index = kv_pool_indices.first().copied().unwrap_or(0);
-        let mut merged = pools[seed_index].exec.caps();
+        let mut merged = pools[seed_index].exec.caps().clone();
         let identities = pools
             .iter()
             .map(|pool| pool.exec.caps())
-            .filter(|caps| !caps.model_identity.is_empty() || !caps.weight_digest.is_empty())
-            .map(|caps| (caps.model_identity, caps.weight_digest))
+            .filter(|caps| caps.model_identity.is_some() || caps.weight_digest.is_some())
+            .map(|caps| (caps.model_identity.clone(), caps.weight_digest.clone()))
             .collect::<Vec<_>>();
         if let Some(identity) = identities.first() {
             anyhow::ensure!(
-                !identity.0.is_empty() && !identity.1.is_empty(),
+                identity.0.is_some() && identity.1.is_some(),
                 "model worker capability identity is incomplete"
             );
             anyhow::ensure!(
@@ -256,7 +251,7 @@ impl StagedExecutor {
             merged.num_layers = first.num_layers;
             merged.num_kv_heads = first.num_kv_heads;
             merged.head_dim = first.head_dim;
-            merged.groups = first.groups;
+            merged.groups = first.groups.clone();
             merged.kv_dtype = first.kv_dtype;
             merged.bytes_per_token = kv_pool_indices
                 .iter()
@@ -273,8 +268,11 @@ impl StagedExecutor {
         merged.resource_classes.clear();
         for pool in pools {
             let caps = pool.exec.caps();
-            extend_unique(&mut merged.supported_controls, caps.supported_controls);
-            extend_unique(&mut merged.resource_classes, caps.resource_classes);
+            extend_unique(
+                &mut merged.supported_controls,
+                caps.supported_controls.clone(),
+            );
+            extend_unique(&mut merged.resource_classes, caps.resource_classes.clone());
         }
         merged.pipeline_depth = pools
             .iter()
@@ -330,9 +328,7 @@ impl StagedExecutor {
         merged.latent_page_units = flow.as_ref().map_or(0, |caps| caps.latent_page_units);
         merged.num_latent_pages = flow.as_ref().map_or(0, |caps| caps.num_latent_pages);
         merged.latent_width = flow.as_ref().map_or(0, |caps| caps.latent_width);
-        merged.latent_dtype = flow
-            .as_ref()
-            .map_or_else(String::new, |caps| caps.latent_dtype.clone());
+        merged.latent_dtype = flow.as_ref().and_then(|caps| caps.latent_dtype);
         merged.latent_downsample = flow.as_ref().map_or(0, |caps| caps.latent_downsample);
         merged.max_cfg_branches = flow.as_ref().map_or(0, |caps| caps.max_cfg_branches);
         merged.max_vae_grid_tokens = routed_caps(ForwardMode::EncodeLatent)
@@ -710,8 +706,8 @@ impl StagedExecutor {
 }
 
 impl Executor for StagedExecutor {
-    fn caps(&self) -> WorkerCapabilities {
-        self.caps.clone()
+    fn caps(&self) -> &WorkerCapabilities {
+        &self.caps
     }
 
     fn pipeline_depth(&self) -> usize {

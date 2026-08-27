@@ -52,7 +52,11 @@ impl Scheduler {
             if !self.can_schedule_next(id) {
                 continue;
             }
-            let cancelled = self.running.get(&id).map(|s| s.cancelled).unwrap_or(true);
+            let cancelled = self
+                .running
+                .get(&id)
+                .map(|state| state.terminal_intent.is_terminal())
+                .unwrap_or(true);
             if cancelled {
                 continue;
             }
@@ -122,9 +126,9 @@ impl Scheduler {
                     .map(|state| canonical_continuation_stop_token_ids(&state.req, &self.ctrl.eos))
                     .unwrap_or_default();
                 if let Some(st) = self.running.get_mut(&id)
-                    && !st.resources.worker_registered
+                    && !st.cursor.resources.worker_registered
                 {
-                    st.resources.worker_registered = true;
+                    st.cursor.resources.worker_registered = true;
                     let request_key = RequestKey::new(self.authority_id, id, st.epoch);
                     let admission = Admission::new(
                         request_key,
@@ -133,7 +137,7 @@ impl Scheduler {
                             sampling: st.req.sampling.clone(),
                             negative_token_ids: st.context.negative_prompt_ids.clone(),
                             finish_token_ids,
-                            initial_position: st.ingest.prompt_cursor,
+                            initial_position: st.cursor.ingest.prompt_cursor,
                         }),
                         st.req.behavior.gen_output.then(|| GenAdmission {
                             image: st.req.image.clone(),
@@ -185,7 +189,12 @@ impl Scheduler {
         let mut committed_decode_ready = false;
         let mut prefill_ready = false;
         for id in ids.iter().copied() {
-            if self.running.get(&id).map(|s| s.cancelled).unwrap_or(true) {
+            if self
+                .running
+                .get(&id)
+                .map(|state| state.terminal_intent.is_terminal())
+                .unwrap_or(true)
+            {
                 continue;
             }
             let Some(operation_type) = self.peek_next_operation_variant(id) else {
@@ -255,18 +264,18 @@ impl Scheduler {
 
     pub(super) fn peek_next_operation_variant(&self, id: RequestId) -> Option<ForwardMode> {
         let st = self.running.get(&id)?;
-        if st.image_gen.branch_pending {
+        if st.cursor.image_gen.branch_pending {
             return None;
         }
         if let Some(variant) = self.projected_inflight_variant(id) {
             return Some(variant);
         }
         if st.has_context_images()
-            && st.lifecycle.phase == Phase::Prefill
+            && st.cursor.lifecycle.phase == Phase::Prefill
             && self.projected_cursor(id).is_some_and(|cursor| {
                 st.context
                     .images
-                    .get(st.ingest.mm_cursor)
+                    .get(st.cursor.ingest.mm_cursor)
                     .is_some_and(|item| item.position as usize == cursor.prompt_cursor as usize)
             })
         {
@@ -275,7 +284,7 @@ impl Scheduler {
                 ImageIngestStep::VitEncode => ForwardMode::EncodeVision,
             });
         }
-        Some(match st.lifecycle.phase {
+        Some(match st.cursor.lifecycle.phase {
             Phase::Encode => match st.pending_image_step()? {
                 ImageIngestStep::VaeEncode => ForwardMode::EncodeLatent,
                 ImageIngestStep::VitEncode => ForwardMode::EncodeVision,
@@ -286,14 +295,14 @@ impl Scheduler {
             Phase::CloseKv => ForwardMode::TokenExtend,
             Phase::PublishKv => ForwardMode::TransferKvPublish,
             Phase::TransitionGen => ForwardMode::GenTransition,
-            Phase::DenoiseGen if st.image_gen.steps_done >= st.req.image.steps => {
+            Phase::DenoiseGen if st.cursor.image_gen.steps_done >= st.req.image.steps => {
                 ForwardMode::Materialize
             }
             Phase::DenoiseGen => ForwardMode::GenFlow,
             Phase::CommitGen => ForwardMode::Materialize,
             Phase::FeedbackEncode => {
                 let feedback = st.req.policy.feedback.as_ref()?;
-                match feedback.ingest.steps.get(st.feedback.ingest_step)? {
+                match feedback.ingest.steps.get(st.cursor.feedback.ingest_step)? {
                     ImageIngestStep::VaeEncode => ForwardMode::EncodeLatent,
                     ImageIngestStep::VitEncode => ForwardMode::EncodeVision,
                 }
@@ -452,7 +461,7 @@ impl Scheduler {
                             self.running
                                 .get(&request_id)
                                 .map(|state| {
-                                    (state.ingest.prompt_cursor as usize)
+                                    (state.cursor.ingest.prompt_cursor as usize)
                                         .div_ceil(self.caps.block_size as usize)
                                 })
                                 .unwrap_or_default()
@@ -643,7 +652,7 @@ impl Scheduler {
                 let phase = self
                     .running
                     .get(&request_id)
-                    .map(|state| phase_str(state.lifecycle.phase));
+                    .map(|state| phase_str(state.cursor.lifecycle.phase));
                 trace_ops.push(json!({
                     "request_id": request_id.0,
                     "op_id": operation.op_id.0,
@@ -1050,7 +1059,7 @@ impl Scheduler {
         st.req
             .policy
             .trigger
-            .matches_generated(&st.replay.generated_ids)
+            .matches_generated(&st.cursor.replay.generated_ids)
     }
 
     pub(super) fn direct_trigger_matches(st: &ReqState, token_id: u32) -> bool {
@@ -1115,15 +1124,16 @@ impl Scheduler {
             return Vec::new();
         };
         let all = st.block_tables[0].page_ids();
-        let sent = st.resources.blocks_sent.min(all.len());
+        let sent = st.cursor.resources.blocks_sent.min(all.len());
         let new = all[sent..].to_vec();
-        st.resources.blocks_sent = all.len();
+        st.cursor.resources.blocks_sent = all.len();
         new
     }
 
     pub(super) fn return_unsent_blocks(&mut self, id: RequestId, transition: &PlannedTransition) {
         if let Some(state) = self.running.get_mut(&id) {
-            state.resources.blocks_sent = state
+            state.cursor.resources.blocks_sent = state
+                .cursor
                 .resources
                 .blocks_sent
                 .saturating_sub(transition.new_blocks.len());
@@ -1169,12 +1179,12 @@ impl Scheduler {
         let projection = self.projected_cursor(id)?;
         let context_pending = self.running.get(&id).is_some_and(|st| {
             projection.prompt_cursor < st.context.prompt_ids.len() as u32
-                || st.ingest.mm_cursor < st.context.images.len()
+                || st.cursor.ingest.mm_cursor < st.context.images.len()
         });
         if context_pending {
             return self.next_context_ingest_transition(id, budget, projection);
         }
-        if self.running.get(&id)?.image_gen.branch_pending
+        if self.running.get(&id)?.cursor.image_gen.branch_pending
             && !self.promote_gen_branch_reservation(id)
         {
             return None;
@@ -1233,7 +1243,7 @@ impl Scheduler {
                 // The prior committed token this decode continues from. It is
                 // attached as a host input only when no exact selected-point
                 // product is eligible for device continuation.
-                let input_token = st.und.next_token;
+                let input_token = st.cursor.und.next_token;
                 let projection = self.projected_cursor(id)?;
                 let pos = projection.logical_pos;
                 let relay_input = projected_successor || self.can_reuse_resolved_token_product(id);
@@ -1256,7 +1266,7 @@ impl Scheduler {
                 )
             }
             Phase::CloseKv => {
-                let token = self.running.get(&id)?.und.next_token;
+                let token = self.running.get(&id)?.cursor.und.next_token;
                 let capacity_target =
                     self.decode_capacity_target(projection.physical_kv_len as usize, 0);
                 if !self.ensure_request_capacity(id, capacity_target) {
@@ -1354,7 +1364,7 @@ impl Scheduler {
                     .then(|| projected_branch.feedback_source.clone())
                     .flatten();
                 let image_b64 = if source.is_none() {
-                    st.feedback.image_b64.clone().unwrap_or_default()
+                    st.cursor.feedback.image_b64.clone().unwrap_or_default()
                 } else {
                     String::new()
                 };
@@ -1421,17 +1431,17 @@ impl Scheduler {
             .get(&id)?
             .context
             .images
-            .get(self.running.get(&id)?.ingest.mm_cursor)
+            .get(self.running.get(&id)?.cursor.ingest.mm_cursor)
             .cloned();
         if let Some(image) = image.as_ref()
             && image.position as usize == cursor
         {
             let state = self.running.get(&id)?;
-            let step_index = state.ingest.pending_image_step;
+            let step_index = state.cursor.ingest.pending_image_step;
             let step = image.ingest.steps.get(step_index).copied()?;
             let is_final_step = step_index + 1 == image.ingest.steps.len();
-            if state.lifecycle.phase == Phase::IngestState {
-                let feature = state.ingest.encoded_product.clone()?;
+            if state.cursor.lifecycle.phase == Phase::IngestState {
+                let feature = state.cursor.ingest.encoded_product.clone()?;
                 let physical_kv_tokens = image.ingest.kv_effect(step_index)?;
                 let physical_bound = match physical_kv_tokens {
                     uniserve_core::ImageKvEffect::Exact { tokens } => tokens,
@@ -1482,12 +1492,16 @@ impl Scheduler {
                     let _ = self.enc_cache.release(cache_key, &product);
                     return None;
                 };
-                state.ingest.acquired_encoder_pins.push(EncoderCachePin {
-                    key: cache_key,
-                    product: product.clone(),
-                });
-                state.ingest.encoded_product = Some(product);
-                state.lifecycle.phase = Phase::IngestState;
+                state
+                    .cursor
+                    .ingest
+                    .acquired_encoder_pins
+                    .push(EncoderCachePin {
+                        key: cache_key,
+                        product: product.clone(),
+                    });
+                state.cursor.ingest.encoded_product = Some(product);
+                state.cursor.lifecycle.phase = Phase::IngestState;
                 return self.next_context_ingest_transition(id, budget, projection);
             }
             let persistent_cache_key = cache_write.then_some(cache_key);
@@ -1553,9 +1567,9 @@ impl Scheduler {
                 st.req
                     .policy
                     .trigger
-                    .matches_round_close(&st.und.round_tokens, close_token),
+                    .matches_round_close(&st.cursor.und.round_tokens, close_token),
                 st.can_open_gen_branch(),
-                st.und.tokens_emitted,
+                st.cursor.und.tokens_emitted,
                 st.req.max_und_tokens,
                 st.req.policy.termination.eos_finishes,
             )
@@ -1565,9 +1579,9 @@ impl Scheduler {
         }
         if n_gen < max_tokens && !eos_finishes {
             if let Some(st) = self.running.get_mut(&id) {
-                st.und.round_tokens.clear();
-                st.und.next_token = close_token;
-                st.lifecycle.phase = Phase::DecodeUnd;
+                st.cursor.und.round_tokens.clear();
+                st.cursor.und.next_token = close_token;
+                st.cursor.lifecycle.phase = Phase::DecodeUnd;
             }
             return;
         }
@@ -1610,11 +1624,12 @@ impl Scheduler {
         let ctx = crate::scheduler::logits::ProcCtx {
             n_generated,
             eos: &self.ctrl.eos,
-            generated: &st.replay.generated_ids,
+            generated: &st.cursor.replay.generated_ids,
             sampling: &st.req.sampling,
         };
-        let (allowed, mut suppress) =
-            crate::scheduler::logits::run_pipeline(&self.logits_pipeline, &ctx);
+        let masks = crate::scheduler::logits::run_pipeline(&self.logits_pipeline, &ctx);
+        let allowed = masks.allowed;
+        let mut suppress = masks.suppress;
         // Image-budget enforcement: once a request has produced max_images, a
         // direct branch-opening token is
         // suppressed, so an eager or positively-biased model must return to
@@ -1642,10 +1657,10 @@ impl Scheduler {
     /// history participates in a successor's penalty input.
     pub(super) fn sampling_state(&mut self, id: RequestId, projected: usize) -> SamplingState {
         let n_generated = self.running.get(&id).map_or(0, |state| {
-            state.und.tokens_emitted.saturating_add(projected)
+            state.cursor.und.tokens_emitted.saturating_add(projected)
         });
         let projected_images_done = self.running.get(&id).map_or(0, |state| {
-            state.image_gen.images_done.saturating_add(
+            state.cursor.image_gen.images_done.saturating_add(
                 self.inflight_ops
                     .get(&id)
                     .into_iter()

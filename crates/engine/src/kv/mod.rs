@@ -251,6 +251,25 @@ impl PartialEq for CacheBlockRef {
 
 impl Eq for CacheBlockRef {}
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BlockPoolConfigError {
+    #[error("physical KV capacity and every cache group must be positive")]
+    EmptyCapacity,
+    #[error("cache group {group} range overflows")]
+    RangeOverflow { group: usize },
+    #[error("cache group {group} range [{first}, {end}) exceeds capacity {capacity}")]
+    RangeExceedsCapacity {
+        group: usize,
+        first: u32,
+        end: u64,
+        capacity: usize,
+    },
+    #[error("cache group {group} page {page} overlaps another group")]
+    Overlap { group: usize, page: usize },
+    #[error("physical KV page {page} is not covered by a cache group")]
+    UncoveredPage { page: usize },
+}
+
 /// Physical KV pages, free capacity, page references, and prefix-cache metadata.
 #[derive(Clone)]
 pub struct BlockPool {
@@ -273,19 +292,22 @@ impl BlockPool {
     pub fn validate_group_specs(
         num_blocks: usize,
         group_specs: &[(KvGroupKind, u32, u32)],
-    ) -> Result<(), String> {
+    ) -> Result<(), BlockPoolConfigError> {
         if num_blocks == 0 || block_size_invalid(group_specs) {
-            return Err("physical KV capacity and every cache group must be positive".into());
+            return Err(BlockPoolConfigError::EmptyCapacity);
         }
         let mut covered = vec![false; num_blocks];
         for (group, (_, first, count)) in group_specs.iter().enumerate() {
             let end = u64::from(*first)
                 .checked_add(u64::from(*count))
-                .ok_or_else(|| format!("group {group}: first+count overflows"))?;
+                .ok_or(BlockPoolConfigError::RangeOverflow { group })?;
             if end > num_blocks as u64 {
-                return Err(format!(
-                    "group {group}: range [{first}, {end}) exceeds capacity"
-                ));
+                return Err(BlockPoolConfigError::RangeExceedsCapacity {
+                    group,
+                    first: *first,
+                    end,
+                    capacity: num_blocks,
+                });
             }
             for (page, occupied) in covered
                 .iter_mut()
@@ -294,15 +316,13 @@ impl BlockPool {
                 .skip(*first as usize)
             {
                 if *occupied {
-                    return Err(format!("group {group}: page {page} overlaps another group"));
+                    return Err(BlockPoolConfigError::Overlap { group, page });
                 }
                 *occupied = true;
             }
         }
         if let Some(page) = covered.iter().position(|occupied| !occupied) {
-            return Err(format!(
-                "physical KV page {page} is not covered by a cache group"
-            ));
+            return Err(BlockPoolConfigError::UncoveredPage { page });
         }
         Ok(())
     }

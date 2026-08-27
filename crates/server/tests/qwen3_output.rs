@@ -6,8 +6,7 @@ use tokenizers::models::bpe::BPE;
 use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 use uniserve_server::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
 use uniserve_server::serving::chat::{
-    AssistantMessageExt as _, ChatEventStream, ChatRequest, ChatToolChoice,
-    Qwen3ChatOutputProcessor, Tool,
+    ChatRequest, ChatToolChoice, CollectedAssistantMessage, Qwen3ChatOutputProcessor, Tool,
 };
 use uniserve_server::serving::text::{DecodedTextEvent, FinishReason, Finished};
 
@@ -81,9 +80,7 @@ async fn qwen3_processor_emits_reasoning_text_and_tool_calls()
     ]);
     let output = processor.process(Box::pin(decoded))?;
 
-    let collected = ChatEventStream::new("qwen3-output".to_string(), output)
-        .collect_message()
-        .await?;
+    let collected = CollectedAssistantMessage::collect("qwen3-output", output).await?;
     assert_eq!(collected.message.reasoning().as_deref(), Some("hidden"));
     assert_eq!(collected.message.text(), "beforebetweenafter");
     let calls = collected.message.tool_calls().collect::<Vec<_>>();
@@ -131,9 +128,7 @@ async fn disabled_reasoning_parsing_streams_delimiters_as_content()
         }),
     ]);
     let output = processor.process(Box::pin(decoded))?;
-    let collected = ChatEventStream::new("qwen3-raw-output".to_string(), output)
-        .collect_message()
-        .await?;
+    let collected = CollectedAssistantMessage::collect("qwen3-raw-output", output).await?;
     assert_eq!(collected.message.reasoning(), None);
     assert_eq!(collected.message.text(), "<think>hi</think>after");
     Ok(())

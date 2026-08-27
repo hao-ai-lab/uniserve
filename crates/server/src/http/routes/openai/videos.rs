@@ -42,7 +42,7 @@ pub(crate) async fn videos_sync(
     let guard = MediaFile { path: path.clone() };
     let input = match lower_video_generation_request(
         body,
-        state.served_model_names(),
+        state.served_model_name(),
         context,
         path.to_string_lossy().into_owned(),
     ) {

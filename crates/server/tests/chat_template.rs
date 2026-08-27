@@ -16,11 +16,11 @@
 
 use std::collections::HashMap;
 
+use uniserve_server::serving::chat::protocol::{
+    ChatContentPart, ChatMessage, ChatRequest, ChatRole, GenerationPromptMode,
+};
 use uniserve_server::serving::chat::template::renderer::hf::{
     ChatTemplateContentFormatOption, HfChatRenderer,
-};
-use uniserve_server::serving::chat::template::request::{
-    ChatContentPart, ChatMessage, ChatRequest, ChatRole, GenerationPromptMode,
 };
 use uniserve_server::serving::chat::template::{AssistantContentBlock, AssistantToolCall};
 

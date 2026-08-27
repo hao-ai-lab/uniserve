@@ -24,7 +24,13 @@ use iceoryx2::port::notifier::Notifier;
 use iceoryx2::prelude::*;
 use iceoryx2::service::port_factory::event::PortFactory as EventFactory;
 
-use super::IxService;
+use super::{IpcError, IpcResult, IxService};
+
+macro_rules! ipc_error {
+    ($($arg:tt)*) => {
+        IpcError::transport(format!($($arg)*))
+    };
+}
 
 /// `evt_host_wake`: the worker signals the host that a response is available.
 pub const EVT_RESULT: usize = 2;
@@ -45,34 +51,31 @@ fn worker_wake_event_name(svc: &str) -> String {
     format!("{svc}/evt_worker_wake")
 }
 
-fn open_event_service(
-    node: &Node<IxService>,
-    name: &str,
-) -> anyhow::Result<EventFactory<IxService>> {
-    let service_name = ServiceName::new(name)
-        .map_err(|e| anyhow::anyhow!("event service name {name:?}: {e:?}"))?;
+fn open_event_service(node: &Node<IxService>, name: &str) -> IpcResult<EventFactory<IxService>> {
+    let service_name =
+        ServiceName::new(name).map_err(|e| ipc_error!("event service name {name:?}: {e:?}"))?;
     node.service_builder(&service_name)
         .event()
         .open_or_create()
-        .map_err(|e| anyhow::anyhow!("opening iceoryx2 event service {name:?}: {e:?}"))
+        .map_err(|e| ipc_error!("opening iceoryx2 event service {name:?}: {e:?}"))
 }
 
 fn make_notifier(
     factory: &EventFactory<IxService>,
     default_id: usize,
-) -> anyhow::Result<Notifier<IxService>> {
+) -> IpcResult<Notifier<IxService>> {
     factory
         .notifier_builder()
         .default_event_id(EventId::new(default_id))
         .create()
-        .map_err(|e| anyhow::anyhow!("creating iceoryx2 notifier: {e:?}"))
+        .map_err(|e| ipc_error!("creating iceoryx2 notifier: {e:?}"))
 }
 
-fn make_listener(factory: &EventFactory<IxService>) -> anyhow::Result<Listener<IxService>> {
+fn make_listener(factory: &EventFactory<IxService>) -> IpcResult<Listener<IxService>> {
     factory
         .listener_builder()
         .create()
-        .map_err(|e| anyhow::anyhow!("creating iceoryx2 listener: {e:?}"))
+        .map_err(|e| ipc_error!("creating iceoryx2 listener: {e:?}"))
 }
 
 /// A cloneable, thread-safe host wake source plus the `EventId` to stamp.
@@ -129,7 +132,7 @@ pub(crate) struct ClientEvents {
 }
 
 impl ClientEvents {
-    pub(crate) fn open(node: &Node<IxService>, service: &str) -> anyhow::Result<Self> {
+    pub(crate) fn open(node: &Node<IxService>, service: &str) -> IpcResult<Self> {
         let wake = open_event_service(node, &host_wake_event_name(service))?;
         let request_wake = open_event_service(node, &worker_wake_event_name(service))?;
         let wake_notifier = Arc::new(make_notifier(&wake, EVT_COMMAND)?);
@@ -148,7 +151,7 @@ impl ClientEvents {
 
     /// Park until a wake fires or `timeout` elapses, draining every pending
     /// event id so a backlog cannot cause an immediate re-wake spin.
-    pub(crate) fn wait(&self, timeout: Duration) -> anyhow::Result<WakeEvents> {
+    pub(crate) fn wait(&self, timeout: Duration) -> IpcResult<WakeEvents> {
         let mut ev = WakeEvents::default();
         self.command_pending.store(false, Ordering::Release);
         self.death_pending.store(false, Ordering::Release);
@@ -162,11 +165,11 @@ impl ClientEvents {
                 },
                 timeout,
             )
-            .map_err(|e| anyhow::anyhow!("waiting on iceoryx2 wake listener: {e:?}"))?;
+            .map_err(|e| ipc_error!("waiting on iceoryx2 wake listener: {e:?}"))?;
         Ok(ev)
     }
 
-    pub(crate) fn drain(&self) -> anyhow::Result<WakeEvents> {
+    pub(crate) fn drain(&self) -> IpcResult<WakeEvents> {
         let mut ev = WakeEvents::default();
         self.command_pending.store(false, Ordering::Release);
         self.death_pending.store(false, Ordering::Release);
@@ -177,7 +180,7 @@ impl ClientEvents {
                 EVT_DEATH => ev.death = true,
                 _ => ev.other = true,
             })
-            .map_err(|e| anyhow::anyhow!("draining iceoryx2 host wake listener: {e:?}"))?;
+            .map_err(|e| ipc_error!("draining iceoryx2 host wake listener: {e:?}"))?;
         Ok(ev)
     }
 
@@ -225,7 +228,7 @@ pub(crate) struct ServerEvents {
 }
 
 impl ServerEvents {
-    pub(crate) fn open(node: &Node<IxService>, service: &str) -> anyhow::Result<Self> {
+    pub(crate) fn open(node: &Node<IxService>, service: &str) -> IpcResult<Self> {
         let wake = open_event_service(node, &host_wake_event_name(service))?;
         let request_wake = open_event_service(node, &worker_wake_event_name(service))?;
         let wake_notifier = make_notifier(&wake, EVT_RESULT)?;
@@ -250,7 +253,7 @@ impl ServerEvents {
     /// every pending event id. The IPC client fires `EVT_REQUEST` after send, so
     /// an idle server wakes immediately. The timeout belongs to the caller's
     /// liveness or shutdown deadline.
-    pub(crate) fn wait_request(&self, timeout: Duration) -> anyhow::Result<()> {
+    pub(crate) fn wait_request(&self, timeout: Duration) -> IpcResult<()> {
         self.wake_listener
             .timed_wait_all(
                 |id| {
@@ -260,21 +263,21 @@ impl ServerEvents {
                 },
                 timeout,
             )
-            .map_err(|e| anyhow::anyhow!("waiting on iceoryx2 server wake listener: {e:?}"))?;
+            .map_err(|e| ipc_error!("waiting on iceoryx2 server wake listener: {e:?}"))?;
         Ok(())
     }
 
     /// Drain wake hints after consuming directly from the request ring. A busy
     /// worker may never need to park, so keeping the listener aligned with ring
     /// consumption prevents bounded event capacity from becoming backpressure.
-    pub(crate) fn drain_worker_wakes(&self) -> anyhow::Result<()> {
+    pub(crate) fn drain_worker_wakes(&self) -> IpcResult<()> {
         self.wake_listener
             .try_wait_all(|id| {
                 if id.as_value() == EVT_COMPLETION {
                     self.completion_pending.store(false, Ordering::Release);
                 }
             })
-            .map_err(|e| anyhow::anyhow!("draining iceoryx2 worker wake listener: {e:?}"))?;
+            .map_err(|e| ipc_error!("draining iceoryx2 worker wake listener: {e:?}"))?;
         Ok(())
     }
 

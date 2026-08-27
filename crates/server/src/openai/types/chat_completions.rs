@@ -88,7 +88,7 @@ fn default_modalities() -> Vec<ChatModality> {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChatImageConfig {
-    pub resolution: Option<String>,
+    pub resolution: Option<crate::profile::omni::resolution::ResolutionName>,
     pub height: Option<u32>,
     pub width: Option<u32>,
     pub steps: Option<u16>,
@@ -96,7 +96,7 @@ pub struct ChatImageConfig {
     pub image_guidance_scale: Option<f32>,
     pub seed: Option<u64>,
     pub num_images: Option<u16>,
-    pub cfg_norm: Option<String>,
+    pub cfg_norm: Option<uniserve_core::CfgRenorm>,
     pub cfg_renorm_min: Option<f32>,
     pub cfg_interval: Option<[f32; 2]>,
     pub timestep_shift: Option<f32>,

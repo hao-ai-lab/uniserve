@@ -25,7 +25,7 @@ pub struct ImageGenerationRequest {
     #[serde(default)]
     pub image_guidance_scale: Option<f32>,
     #[serde(default)]
-    pub cfg_norm: Option<String>,
+    pub cfg_norm: Option<uniserve_core::CfgRenorm>,
     #[serde(default)]
     pub cfg_interval: Option<[f32; 2]>,
     #[serde(default)]
