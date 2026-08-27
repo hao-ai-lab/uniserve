@@ -20,7 +20,6 @@ from ..batch import (
     CachePageAllocation,
     CompletionReport,
     Domain,
-    ExecutionCapability,
     ForwardMode,
     ImageParams,
     LatentPlacement,
@@ -207,11 +206,6 @@ def _warmup_batch(
             ),
             domain=domain,
             route=route,
-            execution=(
-                ExecutionCapability.TENSORIZED_MIXED
-                if tensorized_mixed
-                else ExecutionCapability.DOMAIN_HOMOGENEOUS
-            ),
             attention=AttentionRegime.HYBRID,
             shape_class=0,
             operations=tuple(members),

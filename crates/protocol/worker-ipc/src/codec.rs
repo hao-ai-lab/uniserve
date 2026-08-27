@@ -9,14 +9,13 @@ use crate::schema::uniserve::wire as fbs;
 use crate::{
     Admission, AttentionRegime, Batch, BatchPartition, BlockTable, Bounds, CachePageAllocation,
     CloseReason, CompletionReport, Control, DType, DecodeKind, DecodePlacement, DimBound,
-    Disposition, Domain, DrawLayout, ErrorCode, ErrorOperationIdentity, ExecutionCapability,
-    FinishFlags, ForwardMode, GenAdmission, LatentPlacement, LogicalLengths, MediaAdmission,
-    MediaProfileId, MixedExecutionCapability, ModelOutput, OpId, OpStatus, Operation,
-    PartitionCompletion, Point, PointRange, ProductKind, ProductPayload, ProductRef,
-    RegistrationAck, RequestKey, RequestKind, ResourceClass, ResourcePressure, ResponseKind, Rng,
-    RouteId, RowGeometry, SamplingOwnership, ShapeBound, StorageClass, TimingCounters, TokenSpan,
-    UndAdmission, VersionRef, WorkerCapabilities, WorkerForwardStats, WorkerRequest,
-    WorkerResponse, WorkerResponseError,
+    Disposition, Domain, DrawLayout, ErrorCode, ErrorOperationIdentity, FinishFlags, ForwardMode,
+    GenAdmission, LatentPlacement, LogicalLengths, MediaAdmission, MediaProfileId,
+    MixedExecutionCapability, ModelOutput, OpId, OpStatus, Operation, PartitionCompletion, Point,
+    PointRange, ProductKind, ProductPayload, ProductRef, RegistrationAck, RequestKey, RequestKind,
+    ResourceClass, ResourcePressure, ResponseKind, Rng, RouteId, RowGeometry, SamplingOwnership,
+    ShapeBound, StorageClass, TimingCounters, TokenSpan, UndAdmission, VersionRef,
+    WorkerCapabilities, WorkerForwardStats, WorkerRequest, WorkerResponse, WorkerResponseError,
 };
 
 pub type CodecResult<T> = std::result::Result<T, CodecError>;
@@ -334,7 +333,6 @@ fn partition_from_table(partition: fbs::BatchPartition<'_>) -> CodecResult<Batch
         collective_seq: partition.collective_seq(),
         domain: domain_from_fb(partition.domain())?,
         route: RouteId(partition.route()),
-        execution: execution_capability_from_fb(partition.execution())?,
         attention: attention_regime_from_fb(partition.attention())?,
         shape_class: partition.shape_class(),
         operations: partition
@@ -1101,8 +1099,6 @@ fn kv_group_from_table(group: fbs::KvGroupSpec<'_>) -> CodecResult<KvCacheGroupS
         codec_bail!("unknown KV group kind {}", group.kind().0)
     };
     Ok(KvCacheGroupSpec {
-        group_id: group.group_id(),
-        block_offset: group.block_offset(),
         num_blocks: group.num_blocks(),
         kind,
     })
@@ -1284,7 +1280,6 @@ fn partition_to_fb(partition: &BatchPartition) -> CodecResult<fbs::BatchPartitio
         collective_seq: partition.collective_seq,
         domain: domain_to_fb(partition.domain),
         route: partition.route.0,
-        execution: execution_capability_to_fb(partition.execution),
         attention: attention_regime_to_fb(partition.attention),
         shape_class: partition.shape_class,
         operations: Some(
@@ -1916,16 +1911,12 @@ fn map_to_fb(map: &BTreeMap<String, u64>) -> Vec<fbs::StringU64PairT> {
 fn kv_group_to_fb(group: &KvCacheGroupSpec) -> fbs::KvGroupSpecT {
     match group.kind {
         KvGroupKind::Full => fbs::KvGroupSpecT {
-            group_id: group.group_id,
-            block_offset: group.block_offset,
             num_blocks: group.num_blocks,
             kind: fbs::KvGroupKind::Full,
             window: 0,
             sink: 0,
         },
         KvGroupKind::SlidingWindow { window, sink } => fbs::KvGroupSpecT {
-            group_id: group.group_id,
-            block_offset: group.block_offset,
             num_blocks: group.num_blocks,
             kind: fbs::KvGroupKind::SlidingWindow,
             window,
@@ -2031,23 +2022,6 @@ fn domain_from_fb(domain: fbs::Domain) -> CodecResult<Domain> {
     } else {
         codec_bail!("unknown domain {}", domain.0)
     }
-}
-
-fn execution_capability_to_fb(capability: ExecutionCapability) -> fbs::ExecutionCapability {
-    match capability {
-        ExecutionCapability::DomainHomogeneous => fbs::ExecutionCapability::DomainHomogeneous,
-        ExecutionCapability::TensorizedMixed => fbs::ExecutionCapability::TensorizedMixed,
-    }
-}
-
-fn execution_capability_from_fb(
-    capability: fbs::ExecutionCapability,
-) -> CodecResult<ExecutionCapability> {
-    Ok(match capability {
-        fbs::ExecutionCapability::DomainHomogeneous => ExecutionCapability::DomainHomogeneous,
-        fbs::ExecutionCapability::TensorizedMixed => ExecutionCapability::TensorizedMixed,
-        other => codec_bail!("unknown execution capability {}", other.0),
-    })
 }
 
 fn attention_regime_to_fb(regime: AttentionRegime) -> fbs::AttentionRegime {

@@ -88,10 +88,9 @@ fn generation_request(
     let behavior = GenerationBehaviorDescriptor::resolve(constraint, &policy);
     let cache = Default::default();
     let capabilities = GenerationRuntimeCapabilities {
-        supports_understanding: true,
-        supports_vision_encode: true,
-        supports_latent_encode: false,
-        supports_image_generation: true,
+        features: uniserve_core::GenerationFeatures::UNDERSTANDING
+            | uniserve_core::GenerationFeatures::VISION_ENCODE
+            | uniserve_core::GenerationFeatures::IMAGE_GENERATION,
         max_latent_units: 1_024,
         latent_downsample: 16,
         max_vae_grid_tokens: 1_024,
@@ -823,14 +822,10 @@ fn hybrid_groups_handshake_runs() {
     // Group 0 covers [0, 2048); group 1 covers [2048, 4096).
     sim.set_groups(vec![
         KvCacheGroupSpec {
-            group_id: 0,
-            block_offset: 0,
             num_blocks: 2048,
             kind: KvGroupKind::Full,
         },
         KvCacheGroupSpec {
-            group_id: 1,
-            block_offset: 2048,
             num_blocks: 2048,
             kind: KvGroupKind::SlidingWindow {
                 window: 4096,
@@ -1566,14 +1561,6 @@ fn interleave_c4_generated_images_complete() {
         );
         assert_eq!(result.images, 1, "request {id:?} missed its image branch");
     }
-    let decode = &scheduler.stats.domains.decode;
-    let flow = &scheduler.stats.domains.flow;
-    assert!(decode.co_resident_partitions.load(Ordering::Relaxed) > 0);
-    assert!(flow.co_resident_partitions.load(Ordering::Relaxed) > 0);
-    assert_eq!(
-        decode.co_resident_partitions.load(Ordering::Relaxed),
-        flow.co_resident_partitions.load(Ordering::Relaxed)
-    );
 }
 
 #[test]

@@ -89,7 +89,7 @@ impl Scheduler {
             }
             if let Some(st) = self.running.get_mut(&id) {
                 st.cursor.und.next_token = tok;
-                st.cursor.lifecycle.phase = Phase::DecodeUnd;
+                st.cursor.phase = Phase::DecodeUnd;
                 st.cursor.und.round_tokens.push(tok);
             }
             if can_open_gen_branch
@@ -124,9 +124,9 @@ impl Scheduler {
         match operation_variant {
             ForwardMode::TokenExtend => {
                 self.activate_request_tables(id);
-                match &apply.delta {
-                    crate::scheduler::generation::TransitionDelta::CloseKv { .. } => return,
-                    crate::scheduler::generation::TransitionDelta::IngestImageState {
+                match &apply.intent {
+                    crate::scheduler::generation::TransitionIntent::CloseKv { .. } => return,
+                    crate::scheduler::generation::TransitionIntent::IngestImageState {
                         is_final_step,
                         ..
                     } => {
@@ -144,12 +144,12 @@ impl Scheduler {
                             if let Some(st) = self.running.get_mut(&id) {
                                 st.cursor.und.next_token = bos;
                                 st.cursor.und.round_tokens.clear();
-                                st.cursor.lifecycle.phase = Phase::DecodeUnd;
+                                st.cursor.phase = Phase::DecodeUnd;
                             }
                         }
                         return;
                     }
-                    crate::scheduler::generation::TransitionDelta::FeedbackState {
+                    crate::scheduler::generation::TransitionIntent::FeedbackState {
                         is_final_step,
                         ..
                     } => {
@@ -173,7 +173,7 @@ impl Scheduler {
                             };
                             if let Some(st) = self.running.get_mut(&id) {
                                 st.cursor.und.next_token = next_token;
-                                st.cursor.lifecycle.phase = Phase::DecodeUnd;
+                                st.cursor.phase = Phase::DecodeUnd;
                             }
                             return;
                         }
@@ -214,7 +214,7 @@ impl Scheduler {
                         }
                         if let Some(st) = self.running.get_mut(&id) {
                             st.cursor.und.next_token = tok;
-                            st.cursor.lifecycle.phase = Phase::DecodeUnd;
+                            st.cursor.phase = Phase::DecodeUnd;
                             st.cursor.und.round_tokens.push(tok);
                         }
                         if can_open_gen_branch
@@ -271,11 +271,7 @@ impl Scheduler {
                         .kv
                         .as_ref()
                         .expect("generation scheduling requires worker KV resources");
-                    crate::scheduler::prefix_cache::cache_blocks(
-                        &kv.coordinator,
-                        st,
-                        &kv.block_pool,
-                    );
+                    cache_prompt_blocks(&kv.coordinator, st, &kv.block_pool);
                 }
                 // A description-lowered prefix may already end at a branch trigger.
                 // Treat that boundary exactly like a sampled trigger.
@@ -323,7 +319,7 @@ impl Scheduler {
                 }
                 if let Some(st) = self.running.get_mut(&id) {
                     st.cursor.und.next_token = tok;
-                    st.cursor.lifecycle.phase = Phase::DecodeUnd;
+                    st.cursor.phase = Phase::DecodeUnd;
                 }
                 if can_open_gen_branch
                     && images_done < max_images
@@ -338,8 +334,8 @@ impl Scheduler {
             ForwardMode::GenFlow => {
                 let (image_id, h, w, steps, prev_sd) = {
                     let st = self.running.get_mut(&id).unwrap();
-                    let prev = match apply.delta {
-                        crate::scheduler::generation::TransitionDelta::DenoiseGen {
+                    let prev = match apply.intent {
+                        crate::scheduler::generation::TransitionIntent::DenoiseGen {
                             start_step,
                             ..
                         } => start_step,
@@ -430,7 +426,7 @@ impl Scheduler {
                         st.cursor.feedback.ingest_step = 0;
                         st.cursor.feedback.source_product = source_product;
                         st.cursor.feedback.encoded_product = None;
-                        st.cursor.lifecycle.phase = Phase::FeedbackEncode;
+                        st.cursor.phase = Phase::FeedbackEncode;
                         if let Some(product) = st.cursor.feedback.source_product.clone() {
                             st.cursor.ingest.transient_encoder_products.push(product);
                         }
@@ -443,8 +439,8 @@ impl Scheduler {
                     self.finish(id, FinishReason::ImageDone);
                 }
             }
-            ForwardMode::EncodeVision | ForwardMode::EncodeLatent => match &apply.delta {
-                crate::scheduler::generation::TransitionDelta::EncodeImageStep {
+            ForwardMode::EncodeVision | ForwardMode::EncodeLatent => match &apply.intent {
+                crate::scheduler::generation::TransitionIntent::EncodeImageStep {
                     encoder_cache_key,
                     ..
                 } => {
@@ -497,13 +493,13 @@ impl Scheduler {
                     };
                     if let Some(st) = self.running.get_mut(&id) {
                         st.cursor.ingest.encoded_product = Some(selected_product);
-                        st.cursor.lifecycle.phase = Phase::IngestState;
+                        st.cursor.phase = Phase::IngestState;
                     }
                     if !free_products.is_empty() {
                         self.release_products(free_products);
                     }
                 }
-                crate::scheduler::generation::TransitionDelta::EncodeFeedbackStep { .. } => {
+                crate::scheduler::generation::TransitionIntent::EncodeFeedbackStep { .. } => {
                     let Some(feature) = operation
                         .outputs
                         .iter()
@@ -528,7 +524,7 @@ impl Scheduler {
                             .transient_encoder_products
                             .push(feature.clone());
                         st.cursor.feedback.encoded_product = Some(feature);
-                        st.cursor.lifecycle.phase = Phase::FeedbackState;
+                        st.cursor.phase = Phase::FeedbackState;
                     }
                 }
                 _ => self.finish(id, FinishReason::Error),
@@ -649,7 +645,7 @@ impl Scheduler {
             st.cursor.image_gen.steps_done = 0;
             st.cursor.image_gen.image_id += 1;
             st.cursor.und.text_since_image = 0;
-            st.cursor.lifecycle.phase = Phase::CloseKv;
+            st.cursor.phase = Phase::CloseKv;
             st.cursor.image_gen.branch_pending = true;
         }
         self.promote_gen_branch_reservation(id);
@@ -773,9 +769,9 @@ impl Scheduler {
                     && self
                         .running
                         .get(&id)
-                        .is_some_and(|state| state.public_token_seq == 0);
+                        .is_some_and(|state| state.tokens_sent == 0);
                 if published && let Some(state) = self.running.get_mut(&id) {
-                    state.public_token_seq = state.public_token_seq.saturating_add(1);
+                    state.tokens_sent = state.tokens_sent.saturating_add(1);
                 }
                 if first_token && self.trace_enabled() {
                     self.trace_record(json!({
@@ -957,7 +953,7 @@ impl Scheduler {
         {
             tracing::error!(
                 request_id = id.0,
-                phase = phase_str(state.cursor.lifecycle.phase),
+                phase = ?state.cursor.phase,
                 generated_tokens = state.cursor.und.tokens_emitted,
                 images_done = state.cursor.image_gen.images_done,
                 image_id = state.cursor.image_gen.image_id,
@@ -1068,5 +1064,21 @@ impl Scheduler {
                 self.fatal = true;
             }
         }
+    }
+}
+
+fn cache_prompt_blocks(coordinator: &KvCacheCoordinator, state: &mut ReqState, pool: &BlockPool) {
+    if state.cursor.replay.blocks_cached {
+        return;
+    }
+    let prompt = state.effective_prompt().to_vec();
+    if coordinator.cache_prefix(
+        pool,
+        &state.block_tables,
+        &prompt,
+        &state.cursor.replay.block_hashes,
+        state.req.cache.write,
+    ) {
+        state.cursor.replay.blocks_cached = true;
     }
 }

@@ -12,9 +12,8 @@ use std::path::PathBuf;
 use uniserve_core::{Digest, RequestId};
 use uniserve_worker_ipc::{
     Bounds, DType, DimBound, Domain, DrawLayout, FinishFlags, ForwardMode, LogicalLengths,
-    ModelOutput, OpId, OpStatus, Operation, OperationSpec, Point, PointRange, ProductKind,
-    ProductRef, RequestKey, Rng, RouteId, ShapeBound, StorageClass, TimingCounters, TokenSpan,
-    VersionRef,
+    ModelOutput, OpId, OpStatus, Operation, Point, PointRange, ProductKind, ProductRef, RequestKey,
+    Rng, RouteId, ShapeBound, StorageClass, TimingCounters, TokenSpan, VersionRef,
 };
 
 fn digest_string(seed: u8) -> Digest {
@@ -107,13 +106,14 @@ fn canonical_operation() -> Operation {
             max_points: 1,
         },
     };
-    Operation::registered(OperationSpec {
+    Operation {
         request_key: request_key(),
         op_id: OpId(11),
         parent,
         work: ForwardMode::TokenDecode,
         route: RouteId(9),
         domain: Domain::Decode,
+        advances_state: false,
         bounds: Bounds {
             max_points: 1,
             max_tokens: 1,
@@ -136,7 +136,9 @@ fn canonical_operation() -> Operation {
             draw_layout: DrawLayout::TargetSampling,
         }),
         control_seq: 7,
-    })
+        plan_digest: Digest::zero(),
+    }
+    .sealed()
 }
 
 fn canonical_completion(semantic_digest: Digest) -> ModelOutput {

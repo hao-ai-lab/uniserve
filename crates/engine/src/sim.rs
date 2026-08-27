@@ -825,8 +825,6 @@ impl SimEngine {
     pub fn set_num_blocks(&mut self, count: u32) {
         self.caps.num_blocks = count;
         if self.caps.groups.len() == 1 {
-            self.caps.groups[0].group_id = 0;
-            self.caps.groups[0].block_offset = 0;
             self.caps.groups[0].num_blocks = count;
         }
     }
@@ -1106,9 +1104,8 @@ impl SimEngine {
 mod tests {
     use super::*;
     use uniserve_worker_ipc::{
-        AttentionRegime, BatchPartition, Bounds, DType, Domain, ExecutionCapability, OpId,
-        PointRange, ProductRef, RequestKey, RouteId, ShapeBound, StorageClass, UndAdmission,
-        VersionRef,
+        AttentionRegime, BatchPartition, Bounds, DType, Domain, OpId, PointRange, ProductRef,
+        RequestKey, RouteId, ShapeBound, StorageClass, UndAdmission, VersionRef,
     };
 
     fn request_key() -> RequestKey {
@@ -1158,13 +1155,14 @@ mod tests {
         let request_key = request_key();
         let admission = admission();
         let parent = VersionRef::admission_root(request_key, OpId(1), admission.digest.clone());
-        let operation = Operation::registered(uniserve_worker_ipc::OperationSpec {
+        let operation = Operation {
             request_key,
             op_id: OpId(op_id),
             parent,
             work: ForwardMode::TokenExtend,
             route: RouteId(0),
             domain: Domain::Prefill,
+            advances_state: false,
             bounds: Bounds {
                 max_points: 1,
                 max_tokens: 2,
@@ -1175,7 +1173,9 @@ mod tests {
             predicate: None,
             rng: None,
             control_seq: 0,
-        });
+            plan_digest: uniserve_core::Digest::zero(),
+        }
+        .sealed();
         Batch::new(
             step_id,
             vec![admission],
@@ -1185,7 +1185,6 @@ mod tests {
                 collective_seq: step_id.max(1),
                 domain: Domain::Prefill,
                 route: RouteId(0),
-                execution: ExecutionCapability::DomainHomogeneous,
                 attention: AttentionRegime::Causal,
                 shape_class: 0,
                 operations: vec![operation],

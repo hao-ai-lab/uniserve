@@ -110,7 +110,7 @@ def test_to_wire_emits_canonical_error_context():
         op_kind="decode_und",
         phase="run",
         route="language",
-        operations=((42, 3, 7),),
+        operations=((5, 42, 3, 7),),
         details={"device": 0},
     )
 
@@ -123,7 +123,12 @@ def test_to_wire_emits_canonical_error_context():
     assert wire["fatal"] is False
     assert wire["phase"] == "run"
     assert wire["route"] == "language"
-    assert wire["operations"] == [{"session_id": 42, "epoch": 3, "op_id": 7}]
+    assert wire["operations"] == [
+        {
+            "request_key": {"authority_id": 5, "session_id": 42, "epoch": 3},
+            "op_id": 7,
+        }
+    ]
 
 
 def test_to_wire_coerces_truthy_flags_to_bool():

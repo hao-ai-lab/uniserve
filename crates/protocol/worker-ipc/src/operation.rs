@@ -350,18 +350,6 @@ pub enum Domain {
     Flow = 2,
 }
 
-/// The physical execution contract for one scheduler batch partition.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[repr(u8)]
-pub enum ExecutionCapability {
-    /// The physical submission contains one independently described domain.
-    DomainHomogeneous = 0,
-    /// Multiple independently described domain partitions share only the final
-    /// tensorized runner call under a route-static capability declaration.
-    TensorizedMixed = 1,
-}
-
 /// The attention structure one partition presents to the runner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -430,58 +418,13 @@ pub struct Operation {
     pub plan_digest: Digest,
 }
 
-/// Inputs required to register one immutable operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OperationSpec {
-    pub request_key: RequestKey,
-    pub op_id: OpId,
-    pub parent: VersionRef,
-    pub work: ForwardMode,
-    pub route: RouteId,
-    pub domain: Domain,
-    pub bounds: Bounds,
-    pub inputs: Vec<ProductRef>,
-    pub outputs: Vec<ProductRef>,
-    pub predicate: Option<ProductRef>,
-    pub rng: Option<Rng>,
-    pub control_seq: u64,
-}
-
 impl Operation {
-    /// Build an operation and fill in its plan digest.
-    pub fn registered(spec: OperationSpec) -> Self {
-        let OperationSpec {
-            request_key,
-            op_id,
-            parent,
-            work,
-            route,
-            domain,
-            bounds,
-            inputs,
-            outputs,
-            predicate,
-            rng,
-            control_seq,
-        } = spec;
-        let mut operation = Self {
-            request_key,
-            op_id,
-            parent,
-            work,
-            route,
-            domain,
-            advances_state: work.advances_state(),
-            bounds,
-            inputs,
-            outputs,
-            predicate,
-            rng,
-            control_seq,
-            plan_digest: Digest::zero(),
-        };
-        operation.plan_digest = operation.compute_plan_digest();
-        operation
+    /// Seal a literally constructed operation with its derived state advance
+    /// and registration identity digest.
+    pub fn sealed(mut self) -> Self {
+        self.advances_state = self.work.advances_state();
+        self.plan_digest = self.compute_plan_digest();
+        self
     }
 
     /// The immutable registration identity digest.
@@ -1074,7 +1017,6 @@ pub struct BatchPartition {
     pub collective_seq: u64,
     pub domain: Domain,
     pub route: RouteId,
-    pub execution: ExecutionCapability,
     pub attention: AttentionRegime,
     pub shape_class: u64,
     pub operations: Vec<Operation>,
@@ -1437,45 +1379,33 @@ impl Batch {
                     <= 1,
                 "a physical submission group has multiple latent staging partitions"
             );
-            let execution = partitions[0].execution;
             let collective_seq = partitions[0].collective_seq;
             let attention = partitions[0].attention;
             let shape_class = partitions[0].shape_class;
             protocol_ensure!(
                 partitions.iter().all(|partition| {
-                    partition.execution == execution
-                        && partition.collective_seq == collective_seq
+                    partition.collective_seq == collective_seq
                         && partition.attention == attention
                         && partition.shape_class == shape_class
                 }),
-                "physical submission partitions disagree on execution, attention, shape, or collective order"
+                "physical submission partitions disagree on attention, shape, or collective order"
             );
-            match execution {
-                ExecutionCapability::DomainHomogeneous => protocol_ensure!(
-                    partitions.len() == 1,
-                    "a domain-homogeneous submission group must contain one partition"
-                ),
-                ExecutionCapability::TensorizedMixed => {
-                    protocol_ensure!(
-                        partitions.len() >= 2,
-                        "a tensorized-mixed submission group must contain multiple partitions"
-                    );
-                    protocol_ensure!(
-                        partitions
-                            .iter()
-                            .map(|partition| partition.domain)
-                            .collect::<HashSet<_>>()
-                            .len()
-                            == partitions.len(),
-                        "a tensorized-mixed submission group repeats a domain"
-                    );
-                    protocol_ensure!(
-                        partitions
-                            .iter()
-                            .all(|partition| partition.route == partitions[0].route),
-                        "a tensorized-mixed submission group spans route capabilities"
-                    );
-                }
+            if partitions.len() >= 2 {
+                protocol_ensure!(
+                    partitions
+                        .iter()
+                        .map(|partition| partition.domain)
+                        .collect::<HashSet<_>>()
+                        .len()
+                        == partitions.len(),
+                    "a tensorized-mixed submission group repeats a domain"
+                );
+                protocol_ensure!(
+                    partitions
+                        .iter()
+                        .all(|partition| partition.route == partitions[0].route),
+                    "a tensorized-mixed submission group spans route capabilities"
+                );
             }
         }
         // Depth one: at most one runnable operation per request per batch.

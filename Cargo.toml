@@ -33,6 +33,7 @@ arc-swap = "1.9.0"
 asynk-strim-attr = "0.1.0"
 axum = "0.8.8"
 base64 = "0.22.1"
+bitflags = { version = "2.10.0", features = ["serde"] }
 bytes = "1.11.1"
 clap = { version = "4.5.38", features = ["derive", "env"] }
 criterion = "0.5.1"

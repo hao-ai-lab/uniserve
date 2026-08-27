@@ -146,20 +146,18 @@ impl WorkerCapabilities {
                     && self.kv_dtype.is_some(),
                 "worker capabilities declare incomplete KV geometry"
             );
-            let mut next_offset = 0u64;
-            for (index, group) in self.groups.iter().enumerate() {
+            let mut total_blocks = 0u64;
+            for group in &self.groups {
                 protocol_ensure!(
-                    group.group_id == index as u32
-                        && u64::from(group.block_offset) == next_offset
-                        && group.num_blocks > 0,
+                    group.num_blocks > 0,
                     "worker KV groups are not a canonical physical page partition"
                 );
-                next_offset = next_offset
+                total_blocks = total_blocks
                     .checked_add(u64::from(group.num_blocks))
                     .ok_or_else(|| protocol_error!("worker KV group page range overflows"))?;
             }
             protocol_ensure!(
-                next_offset == u64::from(self.num_blocks),
+                total_blocks == u64::from(self.num_blocks),
                 "worker KV groups do not cover the physical request page pool"
             );
         } else {
@@ -205,15 +203,25 @@ impl WorkerCapabilities {
 
     pub fn generation_runtime_capabilities(&self) -> GenerationRuntimeCapabilities {
         let supports = |variant: ForwardMode| self.supported_work.contains(&variant);
+        let mut features = uniserve_core::GenerationFeatures::empty();
+        if supports(ForwardMode::TokenExtend) && supports(ForwardMode::TokenDecode) {
+            features.insert(uniserve_core::GenerationFeatures::UNDERSTANDING);
+        }
+        if supports(ForwardMode::EncodeVision) {
+            features.insert(uniserve_core::GenerationFeatures::VISION_ENCODE);
+        }
+        if supports(ForwardMode::EncodeLatent) {
+            features.insert(uniserve_core::GenerationFeatures::LATENT_ENCODE);
+        }
+        if supports(ForwardMode::GenFlow)
+            && supports(ForwardMode::Materialize)
+            && supports(ForwardMode::TransferKvPublish)
+            && self.incremental_kv_publication
+        {
+            features.insert(uniserve_core::GenerationFeatures::IMAGE_GENERATION);
+        }
         GenerationRuntimeCapabilities {
-            supports_understanding: supports(ForwardMode::TokenExtend)
-                && supports(ForwardMode::TokenDecode),
-            supports_vision_encode: supports(ForwardMode::EncodeVision),
-            supports_latent_encode: supports(ForwardMode::EncodeLatent),
-            supports_image_generation: supports(ForwardMode::GenFlow)
-                && supports(ForwardMode::Materialize)
-                && supports(ForwardMode::TransferKvPublish)
-                && self.incremental_kv_publication,
+            features,
             max_latent_units: self.latent_capacity_units(),
             latent_downsample: self.latent_downsample,
             max_vae_grid_tokens: if self.max_vae_grid_tokens > 0 {
@@ -254,8 +262,6 @@ impl Default for WorkerCapabilities {
             max_cfg_branches: 3,
             bytes_per_token: 57_344,
             groups: vec![KvCacheGroupSpec {
-                group_id: 0,
-                block_offset: 0,
                 num_blocks: 4096,
                 kind: Default::default(),
             }],

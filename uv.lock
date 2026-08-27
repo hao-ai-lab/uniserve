@@ -730,6 +730,20 @@ wheels = [
 ]
 
 [[package]]
+name = "fastvideo-kernel"
+version = "0.3.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "torch" },
+    { name = "triton", marker = "sys_platform == 'linux'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/88/17/c40e5a4ddb39c1e70b102bf8d3d4a3c7f768a9180d65753ba65953f6bda0/fastvideo_kernel-0.3.4.tar.gz", hash = "sha256:e6c3fb2d4e9615d07ac81de3bc821e3c9224bc21e9d83be734e0cefcb379ef5c", size = 42481496, upload-time = "2026-08-23T09:33:45.88Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0d/c3/6a99fd14a0d2b52edc576e56e3d517395b3ac3e4e18e177650051a6114f6/fastvideo_kernel-0.3.4-cp312-cp312-manylinux_2_34_aarch64.manylinux_2_35_aarch64.whl", hash = "sha256:912ab53270902ece72a0cb6b2e31011e2bf2a697c27feb3fd8553077199d5b6e", size = 21042843, upload-time = "2026-08-23T09:33:37.141Z" },
+    { url = "https://files.pythonhosted.org/packages/a8/89/1d7b2aa6fad8d3215af9305eeefeaff39b9662ad4589810038604bc47348/fastvideo_kernel-0.3.4-cp312-cp312-manylinux_2_34_x86_64.manylinux_2_35_x86_64.whl", hash = "sha256:5f30bcb088dde1de86ddb35e0191f564448235ef2e4c756bc6cd5681422af0c0", size = 23077907, upload-time = "2026-08-23T09:33:41.064Z" },
+]
+
+[[package]]
 name = "filelock"
 version = "3.32.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3113,6 +3127,9 @@ eval-datasets = [
 gpu = [
     { name = "flashinfer-python" },
 ]
+h3 = [
+    { name = "fastvideo-kernel" },
+]
 test = [
     { name = "coverage", extra = ["toml"] },
     { name = "jsonschema" },
@@ -3133,6 +3150,7 @@ requires-dist = [
     { name = "datasets", marker = "extra == 'eval-datasets'", specifier = ">=3" },
     { name = "diffusers", specifier = ">=0.36" },
     { name = "einops" },
+    { name = "fastvideo-kernel", marker = "extra == 'h3'", specifier = "==0.3.4" },
     { name = "flashinfer-python", marker = "extra == 'gpu'" },
     { name = "httpx", marker = "extra == 'bench'", specifier = ">=0.27" },
     { name = "huggingface-hub" },
@@ -3158,7 +3176,7 @@ requires-dist = [
     { name = "tqdm" },
     { name = "transformers", specifier = ">=4.57.1" },
 ]
-provides-extras = ["eval-datasets", "test", "dev", "bench", "gpu"]
+provides-extras = ["eval-datasets", "test", "dev", "bench", "gpu", "h3"]
 
 [[package]]
 name = "urllib3"

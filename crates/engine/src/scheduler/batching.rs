@@ -2,7 +2,7 @@ use super::*;
 
 impl Scheduler {
     /// Assemble the per-step batch: walk the priority order, ask each request for at most one op, clip prefill chunks to the remaining token budget, and pair first-dispatch requests with their typed admission record.
-    pub(super) fn assemble(&mut self) -> (Vec<Admission>, Vec<PlannedTransition>) {
+    pub(super) fn assemble(&mut self) -> (Vec<Admission>, Vec<NextOp>) {
         let ids = self.assembly_order();
         let lane = self.select_assembly_lane(&ids);
         let (new_reqs, ops) = self.assemble_pass(&ids, lane);
@@ -21,9 +21,9 @@ impl Scheduler {
         &mut self,
         ids: &[RequestId],
         lane: Option<AssemblyLane>,
-    ) -> (Vec<Admission>, Vec<PlannedTransition>) {
+    ) -> (Vec<Admission>, Vec<NextOp>) {
         let mut admissions: Vec<Admission> = Vec::new();
-        let mut ops: Vec<PlannedTransition> = Vec::new();
+        let mut ops: Vec<NextOp> = Vec::new();
         let mut selected: HashSet<RequestId> = HashSet::new();
         // vLLM's per-step token budget with the clip rule: the budget, not the
         // chunk threshold, is the binding constraint.
@@ -39,7 +39,7 @@ impl Scheduler {
         } else {
             0
         };
-        let mut mixed_ops: Vec<PlannedTransition> = Vec::new();
+        let mut mixed_ops: Vec<NextOp> = Vec::new();
         let denoise_occupies_decode_pipeline =
             lane == Some(AssemblyLane::Decode) && self.any_denoise_inflight();
         for id in ids.iter().copied() {
@@ -123,7 +123,7 @@ impl Scheduler {
                 let finish_token_ids = self
                     .running
                     .get(&id)
-                    .map(|state| canonical_continuation_stop_token_ids(&state.req, &self.ctrl.eos))
+                    .map(|state| state.finish_token_ids.clone())
                     .unwrap_or_default();
                 if let Some(st) = self.running.get_mut(&id)
                     && !st.cursor.resources.worker_registered
@@ -156,7 +156,7 @@ impl Scheduler {
                     st.admission_digest = Some(admission.digest.clone());
                     st.token_cutoffs.clear();
                     st.token_cutoffs.insert(
-                        st.public_token_seq,
+                        st.tokens_sent,
                         VersionRef {
                             request_key,
                             producer_op_id: OpId(0),
@@ -271,12 +271,14 @@ impl Scheduler {
             return Some(variant);
         }
         if st.has_context_images()
-            && st.cursor.lifecycle.phase == Phase::Prefill
+            && st.cursor.phase == Phase::Prefill
             && self.projected_cursor(id).is_some_and(|cursor| {
                 st.context
                     .images
                     .get(st.cursor.ingest.mm_cursor)
-                    .is_some_and(|item| item.position as usize == cursor.prompt_cursor as usize)
+                    .is_some_and(|item| {
+                        item.position as usize == cursor.ingest.prompt_cursor as usize
+                    })
             })
         {
             return st.pending_image_step().map(|step| match step {
@@ -284,7 +286,7 @@ impl Scheduler {
                 ImageIngestStep::VitEncode => ForwardMode::EncodeVision,
             });
         }
-        Some(match st.cursor.lifecycle.phase {
+        Some(match st.cursor.phase {
             Phase::Encode => match st.pending_image_step()? {
                 ImageIngestStep::VaeEncode => ForwardMode::EncodeLatent,
                 ImageIngestStep::VitEncode => ForwardMode::EncodeVision,
@@ -314,7 +316,7 @@ impl Scheduler {
     pub(super) fn submit_batch(
         &mut self,
         admissions: Vec<Admission>,
-        transitions: Vec<PlannedTransition>,
+        transitions: Vec<NextOp>,
         mut controls: Vec<Control>,
     ) -> bool {
         let _span =
@@ -425,7 +427,7 @@ impl Scheduler {
                 .running
                 .get(&request_id)
                 .map_or(0, |state| state.control_seq);
-            let kv_lengths = transition_kv_lengths(&transition.delta);
+            let kv_lengths = transition_kv_lengths(&transition.intent);
             let new_page_count = transition.new_blocks.len();
             let mut operation_block_tables = Vec::new();
             let mut operation_new_cache_pages = Vec::new();
@@ -520,8 +522,8 @@ impl Scheduler {
             };
             let operation_identity = (operation.request_key, operation.op_id);
             if operation.work == ForwardMode::GenFlow {
-                let conditioning_tokens = match &apply.delta {
-                    TransitionDelta::DenoiseGen {
+                let conditioning_tokens = match &apply.intent {
+                    TransitionIntent::DenoiseGen {
                         physical_kv_len, ..
                     } => *physical_kv_len,
                     _ => unreachable!("generation flow has a non-flow scheduler delta"),
@@ -614,14 +616,14 @@ impl Scheduler {
                 };
                 let page_table = self.latent_pages.pages_for(request_id).to_vec();
                 let latent_units = self.worker_image_latent_units_for(state).max(1);
-                let (start_step, step_count) = match &apply.delta {
-                    TransitionDelta::DenoiseGen {
+                let (start_step, step_count) = match &apply.intent {
+                    TransitionIntent::DenoiseGen {
                         start_step,
                         step_count,
                         ..
                     } => (u32::from(*start_step), u32::from(*step_count)),
-                    TransitionDelta::TransitionGen { .. } => (0, 0),
-                    TransitionDelta::CommitGen { step, .. } => (u32::from(*step), 0),
+                    TransitionIntent::TransitionGen { .. } => (0, 0),
+                    TransitionIntent::CommitGen { step, .. } => (u32::from(*step), 0),
                     _ => {
                         tracing::error!(
                             request_id = request_id.0,
@@ -651,17 +653,17 @@ impl Scheduler {
                 let phase = self
                     .running
                     .get(&request_id)
-                    .map(|state| phase_str(state.cursor.lifecycle.phase));
+                    .map(|state| state.cursor.phase);
                 trace_ops.push(json!({
                     "request_id": request_id.0,
                     "op_id": operation.op_id.0,
                     "operation_type": operation_variant,
                     "phase": phase,
                     "operation": operation_trace(&operation, &apply),
-                    "transition": apply.delta.as_str(),
+                    "transition": &apply.intent,
                     "resources": {
                         "release_on_apply": apply.release_on_apply,
-                        "replayability_after_apply": apply.replayability_after_apply.as_str(),
+                        "replayability_after_apply": apply.replayability_after_apply,
                     },
                     "visibility": {
                         "und_tokens": format!("{:?}", apply.visibility.und_tokens),
@@ -736,7 +738,7 @@ impl Scheduler {
                 "admitted_session_ids": admitted_session_ids,
                 "ops": trace_ops,
                 "scheduler": {
-                    "policy": policy_str(self.config.policy),
+                    "policy": self.config.policy,
                     "max_batch": self.config.max_batch,
                     "max_num_batched_tokens": self.config.max_num_batched_tokens,
                 },
@@ -781,6 +783,12 @@ impl Scheduler {
             &forward_rows,
             &latent_placements,
         );
+        let mut group_sizes = HashMap::new();
+        for partition in &partitions {
+            *group_sizes
+                .entry(partition.submission_group)
+                .or_insert(0_usize) += 1;
+        }
         let partition_accounting = partitions
             .iter()
             .map(|partition| {
@@ -788,7 +796,7 @@ impl Scheduler {
                     partition.partition_id,
                     SubmittedPartitionAccounting {
                         domain: partition.domain,
-                        execution: partition.execution,
+                        mixed: group_sizes[&partition.submission_group] > 1,
                         submission_group: partition.submission_group,
                         operation_count: partition.operations.len(),
                     },
@@ -903,7 +911,6 @@ impl Scheduler {
                         collective_seq,
                         domain,
                         route,
-                        execution: ExecutionCapability::TensorizedMixed,
                         attention,
                         shape_class: 0,
                         operations,
@@ -938,7 +945,6 @@ impl Scheduler {
                     collective_seq,
                     domain,
                     route,
-                    execution: ExecutionCapability::DomainHomogeneous,
                     attention: partition_attention(&operations),
                     shape_class: 0,
                     operations,
@@ -1100,7 +1106,7 @@ impl Scheduler {
         new
     }
 
-    pub(super) fn return_unsent_blocks(&mut self, id: RequestId, transition: &PlannedTransition) {
+    pub(super) fn return_unsent_blocks(&mut self, id: RequestId, transition: &NextOp) {
         if let Some(state) = self.running.get_mut(&id) {
             state.cursor.resources.blocks_sent = state
                 .cursor
@@ -1113,12 +1119,12 @@ impl Scheduler {
     pub(super) fn plan_intent(
         &mut self,
         id: RequestId,
-        cursor: CursorProjection,
+        cursor: &GenerationCursor,
         intent: TransitionIntent,
-    ) -> Option<PlannedTransition> {
+    ) -> Option<NextOp> {
         let planned = {
             let request = &self.running.get(&id)?.req;
-            self.planner.plan(request, cursor, intent)
+            plan(self.latent_dtype, request, cursor, intent)
         };
         match planned {
             Ok(transition) => Some(transition),
@@ -1130,14 +1136,10 @@ impl Scheduler {
         }
     }
 
-    pub(super) fn next_transition(
-        &mut self,
-        id: RequestId,
-        budget: usize,
-    ) -> Option<PlannedTransition> {
+    pub(super) fn next_transition(&mut self, id: RequestId, budget: usize) -> Option<NextOp> {
         let projection = self.projected_cursor(id)?;
         let context_pending = self.running.get(&id).is_some_and(|st| {
-            projection.prompt_cursor < st.context.prompt_ids.len() as u32
+            projection.ingest.prompt_cursor < st.context.prompt_ids.len() as u32
                 || st.cursor.ingest.mm_cursor < st.context.images.len()
         });
         if context_pending {
@@ -1148,7 +1150,7 @@ impl Scheduler {
         {
             return None;
         }
-        let projected_branch = self.projected_branch(id)?;
+        let projected_branch = self.projected_cursor(id)?;
         let phase = projected_branch.phase;
         match phase {
             Phase::Encode => None,
@@ -1157,7 +1159,7 @@ impl Scheduler {
                 let prompt = st.effective_prompt().to_vec();
                 let n = prompt.len();
                 let projection = self.projected_cursor(id)?;
-                let cursor = projection.prompt_cursor as usize;
+                let cursor = projection.ingest.prompt_cursor as usize;
                 let (segment_index, segment_end) =
                     st.context.token_segment_at(cursor).unwrap_or((0, n));
                 // Chunked prefill with the clip rule: the chunk is bounded by
@@ -1176,10 +1178,13 @@ impl Scheduler {
                 let new_blocks = self.take_new_blocks(id);
                 self.plan_intent(
                     id,
-                    projection,
+                    &projection,
                     TransitionIntent::IngestText {
                         segment_index,
-                        prompt_start: cursor as u32,
+                        start: cursor as u32,
+                        end: end as u32,
+                        logical_start: projection.und.logical_pos,
+                        physical_start: projection.und.physical_kv_len,
                         token_ids: chunk,
                         new_blocks,
                         sampling_state,
@@ -1204,7 +1209,7 @@ impl Scheduler {
                 // product is eligible for device continuation.
                 let input_token = st.cursor.und.next_token;
                 let projection = self.projected_cursor(id)?;
-                let pos = projection.logical_pos;
+                let pos = projection.und.logical_pos;
                 let relay_input = projected_successor || self.can_reuse_resolved_token_product(id);
                 let capacity_target = self.decode_capacity_target(pos as usize, 0);
                 if !self.ensure_request_capacity(id, capacity_target) {
@@ -1213,9 +1218,10 @@ impl Scheduler {
                 let new_blocks = self.take_new_blocks(id);
                 self.plan_intent(
                     id,
-                    projection,
+                    &projection,
                     TransitionIntent::DecodeUnd {
-                        position: pos,
+                        logical_position: pos,
+                        physical_position: projection.und.physical_kv_len,
                         new_blocks,
                         spec_token_ids: None,
                         sampling_state,
@@ -1227,20 +1233,20 @@ impl Scheduler {
             Phase::CloseKv => {
                 let token = self.running.get(&id)?.cursor.und.next_token;
                 let capacity_target =
-                    self.decode_capacity_target(projection.physical_kv_len as usize, 0);
+                    self.decode_capacity_target(projection.und.physical_kv_len as usize, 0);
                 if !self.ensure_request_capacity(id, capacity_target) {
                     return None;
                 }
-                let image_id = projected_branch.image_id;
-                let position = projection.logical_pos;
-                let physical_position = projection.physical_kv_len;
+                let image_id = projected_branch.image_gen.image_id;
+                let position = projection.und.logical_pos;
+                let physical_position = projection.und.physical_kv_len;
                 let new_blocks = self.take_new_blocks(id);
                 self.plan_intent(
                     id,
-                    projection,
+                    &projection,
                     TransitionIntent::CloseKv {
                         image_id,
-                        position,
+                        logical_position: position,
                         physical_position,
                         token,
                         relay_input: false,
@@ -1250,21 +1256,23 @@ impl Scheduler {
             }
             Phase::PublishKv => self.plan_intent(
                 id,
-                projection,
+                &projection,
                 TransitionIntent::PublishKv {
-                    image_id: projected_branch.image_id,
+                    image_id: projected_branch.image_gen.image_id,
+                    physical_kv_len: projection.und.physical_kv_len,
                 },
             ),
             Phase::TransitionGen => {
                 let st = self.running.get(&id)?;
-                let conditioning = projected_branch.conditioning.clone()?;
-                let image_id = projected_branch.image_id;
+                let conditioning = projected_branch.image_gen.conditioning.clone()?;
+                let image_id = projected_branch.image_gen.image_id;
                 let latent_units = self.worker_image_latent_units_for(st).max(1);
                 self.plan_intent(
                     id,
-                    projection,
+                    &projection,
                     TransitionIntent::TransitionGen {
                         image_id,
+                        physical_kv_len: projection.und.physical_kv_len,
                         latent_units,
                         conditioning,
                     },
@@ -1277,7 +1285,7 @@ impl Scheduler {
                 // is host-driven off the committed step count, not a worker
                 // completion flag.
                 let st = self.running.get(&id)?;
-                let timestep = projected_branch.steps_done;
+                let timestep = projected_branch.image_gen.steps_done;
                 let remaining = st.req.image.steps.saturating_sub(timestep);
                 if remaining == 0 {
                     return None;
@@ -1285,15 +1293,16 @@ impl Scheduler {
                 let denoise_step_count = self.denoise_step_burst.max(1).min(remaining);
                 let cfg = cfg_params(&st.req.image, cfg_branch_count(&st.req.image));
                 let latent_units = self.worker_image_latent_units_for(st).max(1);
-                let image_id = projected_branch.image_id;
-                let conditioning = projected_branch.conditioning.clone()?;
-                let latent = projected_branch.latent.clone()?;
+                let image_id = projected_branch.image_gen.image_id;
+                let conditioning = projected_branch.image_gen.conditioning.clone()?;
+                let latent = projected_branch.image_gen.latent.clone()?;
                 let projection = self.projected_cursor(id)?;
                 self.plan_intent(
                     id,
-                    projection,
+                    &projection,
                     TransitionIntent::DenoiseGen {
                         image_id,
+                        physical_kv_len: projection.und.physical_kv_len,
                         start_step: timestep,
                         step_count: denoise_step_count,
                         cfg,
@@ -1304,23 +1313,28 @@ impl Scheduler {
                 )
             }
             Phase::CommitGen => {
-                let image_id = projected_branch.image_id;
-                let latent = projected_branch.latent.clone()?;
+                let image_id = projected_branch.image_gen.image_id;
+                let latent = projected_branch.image_gen.latent.clone()?;
+                let step = self.running.get(&id)?.req.image.steps;
                 let projection = self.projected_cursor(id)?;
                 self.plan_intent(
                     id,
-                    projection,
-                    TransitionIntent::CommitGen { image_id, latent },
+                    &projection,
+                    TransitionIntent::CommitGen {
+                        image_id,
+                        step,
+                        latent,
+                    },
                 )
             }
             Phase::FeedbackEncode => {
                 let st = self.running.get(&id)?;
                 let feedback = st.req.policy.feedback.as_ref()?;
-                let step_index = projected_branch.feedback_step;
+                let step_index = projected_branch.feedback.ingest_step;
                 let step = feedback.ingest.steps.get(step_index).copied()?;
-                let image_id = projected_branch.image_id;
+                let image_id = projected_branch.image_gen.image_id;
                 let source = (feedback.source == uniserve_core::FeedbackSource::DeviceProduct)
-                    .then(|| projected_branch.feedback_source.clone())
+                    .then(|| projected_branch.feedback.source_product.clone())
                     .flatten();
                 let image_b64 = if source.is_none() {
                     st.cursor.feedback.image_b64.clone().unwrap_or_default()
@@ -1330,8 +1344,8 @@ impl Scheduler {
                 let projection = self.projected_cursor(id)?;
                 self.plan_intent(
                     id,
-                    projection,
-                    TransitionIntent::EncodeFeedback {
+                    &projection,
+                    TransitionIntent::EncodeFeedbackStep {
                         image_id,
                         step_index,
                         step,
@@ -1343,12 +1357,12 @@ impl Scheduler {
             Phase::FeedbackState => {
                 let st = self.running.get(&id)?;
                 let feedback = st.req.policy.feedback.as_ref()?;
-                let step_index = projected_branch.feedback_step;
+                let step_index = projected_branch.feedback.ingest_step;
                 let is_final_step = step_index + 1 == feedback.ingest.steps.len();
-                let image_id = projected_branch.image_id;
+                let image_id = projected_branch.image_gen.image_id;
                 let logical_positions = feedback.ingest.logical_positions;
                 let physical_kv_tokens = feedback.ingest.kv_effect(step_index)?;
-                let feature = projected_branch.feedback_feature.clone();
+                let feature = projected_branch.feedback.encoded_product.clone();
                 let sample_continuation = is_final_step && feedback.sample_continuation;
                 let Some(feature) = feature else {
                     self.finish(id, FinishReason::Error);
@@ -1359,12 +1373,13 @@ impl Scheduler {
                 let sampling_state = self.sampling_state(id, 0);
                 self.plan_intent(
                     id,
-                    projection,
+                    &projection,
                     TransitionIntent::FeedbackState {
                         image_id,
                         step_index,
                         is_final_step,
-                        position: projection.logical_pos,
+                        position: projection.und.logical_pos,
+                        physical_start: projection.und.physical_kv_len,
                         logical_positions,
                         physical_kv_tokens,
                         feature,
@@ -1382,9 +1397,9 @@ impl Scheduler {
         &mut self,
         id: RequestId,
         budget: usize,
-        projection: CursorProjection,
-    ) -> Option<PlannedTransition> {
-        let cursor = projection.prompt_cursor as usize;
+        projection: GenerationCursor,
+    ) -> Option<NextOp> {
+        let cursor = projection.ingest.prompt_cursor as usize;
         let image = self
             .running
             .get(&id)?
@@ -1399,7 +1414,7 @@ impl Scheduler {
             let step_index = state.cursor.ingest.pending_image_step;
             let step = image.ingest.steps.get(step_index).copied()?;
             let is_final_step = step_index + 1 == image.ingest.steps.len();
-            if state.cursor.lifecycle.phase == Phase::IngestState {
+            if state.cursor.phase == Phase::IngestState {
                 let feature = state.cursor.ingest.encoded_product.clone()?;
                 let physical_kv_tokens = image.ingest.kv_effect(step_index)?;
                 let physical_bound = match physical_kv_tokens {
@@ -1414,19 +1429,23 @@ impl Scheduler {
                 };
                 if !self.ensure_request_capacity(
                     id,
-                    projection.physical_kv_len.saturating_add(physical_bound) as usize,
+                    projection
+                        .und
+                        .physical_kv_len
+                        .saturating_add(physical_bound) as usize,
                 ) {
                     return None;
                 }
                 let new_blocks = self.take_new_blocks(id);
                 return self.plan_intent(
                     id,
-                    projection,
+                    &projection,
                     TransitionIntent::IngestImageState {
                         segment_index: image.segment_index,
                         step_index,
                         is_final_step,
-                        position: projection.logical_pos,
+                        position: projection.und.logical_pos,
+                        physical_start: projection.und.physical_kv_len,
                         logical_positions: image.ingest.logical_positions,
                         physical_kv_tokens,
                         feature,
@@ -1460,14 +1479,14 @@ impl Scheduler {
                         product: product.clone(),
                     });
                 state.cursor.ingest.encoded_product = Some(product);
-                state.cursor.lifecycle.phase = Phase::IngestState;
+                state.cursor.phase = Phase::IngestState;
                 return self.next_context_ingest_transition(id, budget, projection);
             }
             let persistent_cache_key = cache_write.then_some(cache_key);
             return self.plan_intent(
                 id,
-                projection,
-                TransitionIntent::EncodeImage {
+                &projection,
+                TransitionIntent::EncodeImageStep {
                     segment_index: image.segment_index,
                     step_index,
                     step,
@@ -1498,17 +1517,21 @@ impl Scheduler {
             .min(prompt.len())
             .min(segment_end)
             .min(next_image.max(cursor + 1));
-        if !self.ensure_request_capacity(id, projection.physical_kv_len as usize + end - cursor) {
+        if !self.ensure_request_capacity(id, projection.und.physical_kv_len as usize + end - cursor)
+        {
             return None;
         }
         let sampling_state = self.sampling_state(id, 0);
         let new_blocks = self.take_new_blocks(id);
         self.plan_intent(
             id,
-            projection,
+            &projection,
             TransitionIntent::IngestText {
                 segment_index,
-                prompt_start: cursor as u32,
+                start: cursor as u32,
+                end: end as u32,
+                logical_start: projection.und.logical_pos,
+                physical_start: projection.und.physical_kv_len,
                 token_ids: prompt[cursor..end].to_vec(),
                 new_blocks,
                 sampling_state,
@@ -1540,7 +1563,7 @@ impl Scheduler {
             if let Some(st) = self.running.get_mut(&id) {
                 st.cursor.und.round_tokens.clear();
                 st.cursor.und.next_token = close_token;
-                st.cursor.lifecycle.phase = Phase::DecodeUnd;
+                st.cursor.phase = Phase::DecodeUnd;
             }
             return;
         }
@@ -1619,8 +1642,8 @@ impl Scheduler {
                     .flatten()
                     .filter(|inflight| {
                         matches!(
-                            inflight.generation_apply().delta,
-                            TransitionDelta::FeedbackState {
+                            inflight.generation_apply().intent,
+                            TransitionIntent::FeedbackState {
                                 is_final_step: true,
                                 ..
                             }
@@ -1634,7 +1657,7 @@ impl Scheduler {
         let Some(state) = self.running.get(&id) else {
             return SamplingState::default();
         };
-        let finish_token_ids = canonical_continuation_stop_token_ids(&state.req, &self.ctrl.eos);
+        let finish_token_ids = state.finish_token_ids.clone();
         let transition_token_ids = (state.req.behavior.gen_output
             && projected_images_done < state.req.image.max_images as usize)
             .then(|| state.req.policy.trigger.direct_token())

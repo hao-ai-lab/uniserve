@@ -59,10 +59,15 @@ impl Scheduler {
             let block_pool = if caps.groups.is_empty() {
                 BlockPool::new(caps.num_blocks as usize, caps.block_size as usize)
             } else {
+                let mut offset = 0_u32;
                 let specs: Vec<(uniserve_core::KvGroupKind, u32, u32)> = caps
                     .groups
                     .iter()
-                    .map(|g| (g.kind, g.block_offset, g.num_blocks))
+                    .map(|group| {
+                        let spec = (group.kind, offset, group.num_blocks);
+                        offset = offset.saturating_add(group.num_blocks);
+                        spec
+                    })
                     .collect();
                 BlockPool::with_groups(caps.num_blocks as usize, caps.block_size as usize, &specs)
             };
@@ -91,7 +96,7 @@ impl Scheduler {
                 "at_s": now(),
                 "pid": std::process::id(),
                 "scheduler": {
-                    "policy": policy_str(config.policy),
+                    "policy": config.policy,
                     "max_batch": config.max_batch,
                     "max_num_batched_tokens": config.max_num_batched_tokens,
                     "max_num_seqs": config.max_num_seqs,
@@ -127,19 +132,19 @@ impl Scheduler {
             caps,
             kv,
             ctrl,
-            pending: make_queue(config.policy),
+            pending: RequestQueue::new(config.policy),
             config,
             logits_pipeline: crate::scheduler::logits::default_pipeline(),
             enc_cache: EncoderCacheManager::new(caps_encoder_budget),
             reserved_encoder_entries: 0,
             request_slots,
             latent_pages,
-            running: ScheduledRequests::default(),
+            running: HashMap::new(),
+            running_media: HashMap::new(),
             completed_outputs: HashMap::new(),
             retiring_sessions: HashMap::new(),
             order: Vec::new(),
             pending_media: VecDeque::new(),
-            media_planner: MediaPlanner,
             retiring_media: HashMap::new(),
             prefer_media: true,
             reserved_blocks: 0,
@@ -152,7 +157,7 @@ impl Scheduler {
             denoise_step_burst,
             flow_exclusive_batch,
             fatal: false,
-            planner: GenerationPlanner::new(latent_dtype),
+            latent_dtype,
             batch_started: HashMap::new(),
             prefill_steps: HashSet::new(),
             batch_partitions: HashMap::new(),
@@ -233,23 +238,23 @@ impl Scheduler {
     }
 
     pub(super) fn media_state(&self, id: RequestId) -> Option<&MediaFlowState> {
-        self.running.media(id)
+        self.running_media.get(&id)
     }
 
     pub(super) fn media_state_mut(&mut self, id: RequestId) -> Option<&mut MediaFlowState> {
-        self.running.media_mut(id)
+        self.running_media.get_mut(&id)
     }
 
     pub(super) fn media_ids(&self) -> Vec<RequestId> {
-        self.running.media_ids()
+        self.running_media.keys().copied().collect()
     }
 
     pub(super) fn take_media_state(&mut self, id: RequestId) -> Option<MediaFlowState> {
-        self.running.take_media(id)
+        self.running_media.remove(&id)
     }
 
     pub(super) fn running_request_count(&self) -> usize {
-        self.running.total_len()
+        self.running.len().saturating_add(self.running_media.len())
     }
 
     pub(super) fn pending_request_count(&self) -> usize {

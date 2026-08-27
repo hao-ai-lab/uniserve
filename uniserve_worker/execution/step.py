@@ -24,7 +24,6 @@ from uniserve_worker.batch import (
     Domain,
     DType,
     ErrorCode,
-    ExecutionCapability,
     FinishFlags,
     FixedPoint,
     ForwardMode,
@@ -228,9 +227,7 @@ def create_execution_resources(
     h3_model = isinstance(model, MiniMaxH3Model)
     if h3_model != (media_spool is not None):
         raise capability_mismatch("H3 execution resources require one configured media spool")
-    if h3_model and mesh.coord("sp") == 0 and (
-        h3_mux is None or h3_output_ring is None
-    ):
+    if h3_model and mesh.coord("sp") == 0 and (h3_mux is None or h3_output_ring is None):
         raise capability_mismatch("rank-zero H3 execution requires mux and output-ring resources")
     if not h3_model and (h3_mux is not None or h3_output_ring is not None):
         raise capability_mismatch("packed-forward execution cannot own H3 output resources")
@@ -876,6 +873,7 @@ def _classify_partition_failure(
 ) -> WorkerError:
     operations = tuple(
         (
+            int(operation.request_key.authority_id),
             int(operation.request_key.session_id),
             int(operation.request_key.epoch),
             int(operation.op_id),
@@ -904,6 +902,7 @@ def _published_partition_failure(
 ) -> WorkerError:
     operations = tuple(
         (
+            int(operation.request_key.authority_id),
             int(operation.request_key.session_id),
             int(operation.request_key.epoch),
             int(operation.op_id),
@@ -1882,8 +1881,7 @@ def _validate_batch_identity(runtime, batch: Batch) -> None:
     for partition in batch.partitions:
         groups[partition.submission_group].append(partition)
     for partitions in groups.values():
-        first = partitions[0]
-        if first.execution is not ExecutionCapability.TENSORIZED_MIXED:
+        if len(partitions) < 2:
             continue
         variants = {
             operation.work for partition in partitions for operation in partition.operations
@@ -1927,7 +1925,6 @@ def validate_collective_sequence(
             digest.update(int(partition.partition_id).to_bytes(4, "little"))
             digest.update(int(partition.route).to_bytes(4, "little"))
             digest.update(partition.domain.value.encode("ascii"))
-            digest.update(partition.execution.value.encode("ascii"))
             for operation in partition.operations:
                 digest.update(operation.plan_digest.encode("ascii"))
         group_identities.append((int(collective_seq), digest.hexdigest()))
@@ -3261,6 +3258,7 @@ def _trace_envelopes(
 ) -> tuple[OperationTrace, ...]:
     return tuple(
         OperationTrace(
+            authority_id=int(operation.request_key.authority_id),
             session_id=int(operation.request_key.session_id),
             epoch=int(operation.request_key.epoch),
             op_id=int(operation.op_id),

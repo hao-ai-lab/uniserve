@@ -21,12 +21,12 @@ use uniserve_core::{ImageParams, SamplingParams};
 use uniserve_worker_ipc::{
     Admission, AttentionRegime, Batch, BatchPartition, BlockTable, CachePageAllocation,
     CloseReason, CompletionReport, Control, DType, DecodeKind, DecodePlacement, DimBound,
-    Disposition, Domain, DrawLayout, ErrorCode, ErrorOperationIdentity, ExecutionCapability,
-    FinishFlags, ForwardMode, GenAdmission, LatentPlacement, LogicalLengths, MediaAdmission,
-    MediaProfileId, ModelOutput, OpId, OpStatus, Operation, PartitionCompletion, Point, PointRange,
-    ProductKind, ProductPayload, ProductRef, RegistrationAck, RequestKey, RequestKind, RowGeometry,
-    ShapeBound, StorageClass, TimingCounters, TokenSpan, UndAdmission, VersionRef,
-    WorkerForwardStats, WorkerRequest, WorkerResponse,
+    Disposition, Domain, DrawLayout, ErrorCode, ErrorOperationIdentity, FinishFlags, ForwardMode,
+    GenAdmission, LatentPlacement, LogicalLengths, MediaAdmission, MediaProfileId, ModelOutput,
+    OpId, OpStatus, Operation, PartitionCompletion, Point, PointRange, ProductKind, ProductPayload,
+    ProductRef, RegistrationAck, RequestKey, RequestKind, RowGeometry, ShapeBound, StorageClass,
+    TimingCounters, TokenSpan, UndAdmission, VersionRef, WorkerForwardStats, WorkerRequest,
+    WorkerResponse, WorkerResponseError,
 };
 
 #[cfg(test)]
@@ -103,7 +103,6 @@ struct NativeRequestTypes {
     dispositions: [Py<PyAny>; 3],
     close_reasons: [Py<PyAny>; 4],
     draw_layouts: [Py<PyAny>; 3],
-    execution_capabilities: [Py<PyAny>; 2],
     attention_regimes: [Py<PyAny>; 4],
     works: [Py<PyAny>; 13],
 }
@@ -197,11 +196,6 @@ impl NativeRequestTypes {
                 &module,
                 "DrawLayout",
                 ["target_sampling", "speculative_proposal", "flow_noise"],
-            )?,
-            execution_capabilities: enum_members(
-                &module,
-                "ExecutionCapability",
-                ["domain_homogeneous", "tensorized_mixed"],
             )?,
             attention_regimes: enum_members(
                 &module,
@@ -602,10 +596,6 @@ impl<'py> NativeRequestConversion<'py> {
             .iter()
             .map(|row| self.row_geometry(row))
             .collect::<PyResult<Vec<_>>>()?;
-        let execution = match partition.execution {
-            ExecutionCapability::DomainHomogeneous => 0,
-            ExecutionCapability::TensorizedMixed => 1,
-        };
         let attention = match partition.attention {
             AttentionRegime::None => 0,
             AttentionRegime::Causal => 1,
@@ -621,9 +611,6 @@ impl<'py> NativeRequestConversion<'py> {
                 partition.collective_seq.into_pyobject(py)?.into_any(),
                 self.types.domain(py, partition.domain),
                 partition.route.0.into_pyobject(py)?.into_any(),
-                self.types.execution_capabilities[execution]
-                    .bind(py)
-                    .clone(),
                 self.types.attention_regimes[attention].bind(py).clone(),
                 partition.shape_class.into_pyobject(py)?.into_any(),
                 pyo3::types::PyTuple::new(py, operations)?.into_any(),
@@ -1098,12 +1085,15 @@ pub(crate) fn try_completion_response_from_py(
     let kind = kind
         .extract::<String>()
         .map_err(|_| PyValueError::new_err("worker response kind must be a string"))?;
-    if kind != "result" {
-        return Ok(None);
+    match kind.as_str() {
+        "result" => decode_completion_response_from_py(response)
+            .map(Some)
+            .ok_or_else(|| PyValueError::new_err("invalid result worker response")),
+        "error" => decode_error_response_from_py(response)
+            .map(Some)
+            .ok_or_else(|| PyValueError::new_err("invalid error worker response")),
+        _ => Ok(None),
     }
-    decode_completion_response_from_py(response)
-        .map(Some)
-        .ok_or_else(|| PyValueError::new_err("invalid result worker response"))
 }
 
 fn decode_completion_response_from_py(response: &Bound<'_, PyAny>) -> Option<WorkerResponse> {
@@ -1124,12 +1114,7 @@ fn decode_completion_response_from_py(response: &Bound<'_, PyAny>) -> Option<Wor
         }
     }
     let report = completion_report_from_py(&get(dict, intern!(py, "completion_report"))?)?;
-    let operations = get(dict, intern!(py, "operations"))?;
-    let operations = operations.cast::<PyList>().ok()?;
-    let mut identities = Vec::with_capacity(operations.len());
-    for item in operations.iter() {
-        identities.push(error_operation_from_py(&item)?);
-    }
+    let identities = error_operations_from_py(dict)?;
     if !identities.is_empty()
         || opt_string(dict, intern!(py, "message"))?.is_some()
         || opt_string(dict, intern!(py, "code"))?.is_some()
@@ -1143,6 +1128,37 @@ fn decode_completion_response_from_py(response: &Bound<'_, PyAny>) -> Option<Wor
     Some(WorkerResponse::Result {
         call_id: opt_u64(dict, intern!(py, "call_id"))?,
         completion_report: report,
+    })
+}
+
+fn decode_error_response_from_py(response: &Bound<'_, PyAny>) -> Option<WorkerResponse> {
+    let py = response.py();
+    let dict = response.cast::<PyDict>().ok()?;
+    if str_field(dict, intern!(py, "kind"))?.to_str().ok()? != "error" {
+        return None;
+    }
+    for key in [
+        intern!(py, "capabilities"),
+        intern!(py, "completion_report"),
+        intern!(py, "pressure"),
+        intern!(py, "snapshot"),
+    ] {
+        if !absent_or_none(dict, key)? {
+            return None;
+        }
+    }
+    let identities = error_operations_from_py(dict)?;
+    Some(WorkerResponse::Error {
+        call_id: opt_u64(dict, intern!(py, "call_id"))?,
+        error: WorkerResponseError {
+            message: string_of(&get(dict, intern!(py, "message"))?)?,
+            code: opt_string(dict, intern!(py, "code"))?,
+            retryable: bool_of(&get(dict, intern!(py, "retryable"))?)?,
+            fatal: bool_of(&get(dict, intern!(py, "fatal"))?)?,
+            phase: opt_string(dict, intern!(py, "phase"))?,
+            route: opt_string(dict, intern!(py, "route"))?,
+            operations: identities,
+        },
     })
 }
 
@@ -1460,6 +1476,22 @@ fn error_operation_from_py(value: &Bound<'_, PyAny>) -> Option<ErrorOperationIde
     })
 }
 
+fn error_operations_from_py(dict: &Bound<'_, PyDict>) -> Option<Vec<ErrorOperationIdentity>> {
+    let py = dict.py();
+    let Some(operations) = dict.get_item(intern!(py, "operations")).ok()? else {
+        return Some(Vec::new());
+    };
+    if operations.is_none() {
+        return Some(Vec::new());
+    }
+    let operations = operations.cast::<PyList>().ok()?;
+    let mut identities = Vec::with_capacity(operations.len());
+    for item in operations.iter() {
+        identities.push(error_operation_from_py(&item)?);
+    }
+    Some(identities)
+}
+
 // --- extraction primitives -------------------------------------------------
 
 fn get<'py>(dict: &Bound<'py, PyDict>, key: &Bound<'py, PyString>) -> Option<Bound<'py, PyAny>> {
@@ -1624,13 +1656,14 @@ mod tests {
             shape_bound: ShapeBound::default(),
             point_range: PointRange::default(),
         };
-        let operation = Operation::registered(uniserve_worker_ipc::OperationSpec {
+        let operation = Operation {
             request_key,
             op_id: OpId(1),
             parent: VersionRef::admission_root(request_key, OpId(0), admission.digest.clone()),
             work: ForwardMode::TokenExtend,
             route: uniserve_worker_ipc::RouteId(0),
             domain: Domain::Prefill,
+            advances_state: false,
             bounds: Bounds {
                 max_points: 1,
                 max_tokens: 2,
@@ -1642,14 +1675,15 @@ mod tests {
             predicate: None,
             rng: None,
             control_seq: 0,
-        });
+            plan_digest: uniserve_core::Digest::zero(),
+        }
+        .sealed();
         let partition = BatchPartition {
             partition_id: 1,
             submission_group: 1,
             collective_seq: 1,
             domain: Domain::Prefill,
             route: uniserve_worker_ipc::RouteId(0),
-            execution: ExecutionCapability::DomainHomogeneous,
             attention: AttentionRegime::Causal,
             shape_class: 0,
             operations: vec![operation],

@@ -89,7 +89,7 @@ macro_rules! ipc_error {
 }
 
 /// Wire protocol version this build emits on every [`Header`].
-pub const WIRE_VERSION: u16 = 8;
+pub const WIRE_VERSION: u16 = 9;
 
 /// Whether a peer-advertised wire `version` is one this build can decode.
 pub fn is_supported_wire_version(version: u16) -> bool {

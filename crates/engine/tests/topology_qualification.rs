@@ -20,10 +20,10 @@ use uniserve_engine::{
 };
 use uniserve_worker_ipc::{
     Admission, AttentionRegime, Batch, BatchPartition, BlockTable, Bounds, CachePageAllocation,
-    CloseReason, Control, DType, DimBound, Disposition, ErrorCode, ExecutionCapability,
-    ForwardMode, OpId, OpStatus, Operation, Point, PointRange, ProductKind, ProductPayload,
-    ProductRef, RequestKey, RouteId, RowGeometry, SamplingOwnership, ShapeBound, StorageClass,
-    TRANSFER_DESCRIPTOR_PREFIX, UndAdmission, VersionRef, encode_token_product_bytes,
+    CloseReason, Control, DType, DimBound, Disposition, ErrorCode, ForwardMode, OpId, OpStatus,
+    Operation, Point, PointRange, ProductKind, ProductPayload, ProductRef, RequestKey, RouteId,
+    RowGeometry, SamplingOwnership, ShapeBound, StorageClass, TRANSFER_DESCRIPTOR_PREFIX,
+    UndAdmission, VersionRef, encode_token_product_bytes,
 };
 
 const WORLD_SIZE: usize = 2;
@@ -614,7 +614,7 @@ fn spawn_rank_group() -> anyhow::Result<MultiprocExecutor> {
 
 fn worker_python() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../..")
+        .join("../..")
         .join(".venv/bin/python")
 }
 
@@ -716,13 +716,14 @@ fn token_batch(
         shape_bound: ShapeBound::default(),
         point_range: PointRange::default(),
     };
-    let operation = Operation::registered(uniserve_worker_ipc::OperationSpec {
+    let operation = Operation {
         request_key,
         op_id,
         parent,
         work: mode,
         route: RouteId(0),
         domain: mode.domain(),
+        advances_state: false,
         bounds: Bounds {
             max_points: 1,
             max_tokens: tokens.len().max(1) as u32,
@@ -734,7 +735,9 @@ fn token_batch(
         predicate: None,
         rng: None,
         control_seq,
-    });
+        plan_digest: uniserve_core::Digest::zero(),
+    }
+    .sealed();
     let input_length = tokens.len() as u32;
     let partition = BatchPartition {
         partition_id: 1,
@@ -742,7 +745,6 @@ fn token_batch(
         collective_seq,
         domain: operation.domain,
         route: operation.route,
-        execution: ExecutionCapability::DomainHomogeneous,
         attention: AttentionRegime::Causal,
         shape_class: 0,
         operations: vec![operation],

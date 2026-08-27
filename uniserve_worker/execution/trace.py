@@ -25,6 +25,7 @@ class ExecutionPhase(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class OperationTrace:
+    authority_id: int
     session_id: int
     epoch: int
     op_id: int
@@ -48,6 +49,7 @@ class ExecutionEvent:
             "phase": self.phase.value,
             "operations": [
                 {
+                    "authority_id": value.authority_id,
                     "session_id": value.session_id,
                     "epoch": value.epoch,
                     "op_id": value.op_id,

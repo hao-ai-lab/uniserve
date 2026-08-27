@@ -275,7 +275,7 @@ pub fn decode_token_product_bytes(bytes: &[u8]) -> ProtocolResult<Vec<u32>> {
 /// token counts are not carried here: they are a device-resident committed base
 /// plus bounded per-operation deltas the worker folds on commit, so no host
 /// token history participates in a successor's sampling input.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SamplingState {
     pub allowed_token_ids: Option<Vec<u32>>,
     pub suppressed_token_ids: Vec<u32>,

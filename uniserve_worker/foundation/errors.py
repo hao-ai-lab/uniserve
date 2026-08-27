@@ -104,7 +104,7 @@ class WorkerError(Exception):
     op_kind: str | None = None
     phase: str | None = None
     route: str | None = None
-    operations: tuple[tuple[int, int, int], ...] = ()
+    operations: tuple[tuple[int, int, int, int], ...] = ()
     details: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -123,8 +123,15 @@ class WorkerError(Exception):
             "phase": self.phase,
             "route": self.route,
             "operations": [
-                {"session_id": session_id, "epoch": epoch, "op_id": op_id}
-                for session_id, epoch, op_id in self.operations
+                {
+                    "request_key": {
+                        "authority_id": authority_id,
+                        "session_id": session_id,
+                        "epoch": epoch,
+                    },
+                    "op_id": op_id,
+                }
+                for authority_id, session_id, epoch, op_id in self.operations
             ],
         }
 

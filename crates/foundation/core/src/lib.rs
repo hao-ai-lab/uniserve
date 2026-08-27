@@ -22,13 +22,12 @@ pub use events::{
 pub use generation::{
     ContextSegment, FeedbackNextToken, FeedbackSource, GenOnlyStartPolicyDescriptor,
     GeneratedImageFeedbackRecipe, GenerationBehaviorDescriptor, GenerationCachePolicyDescriptor,
-    GenerationCapabilityError, GenerationCapabilityNeeds, GenerationConstraint,
-    GenerationConstraintParseError, GenerationPolicyDescriptor, GenerationRequest,
-    GenerationRequestError, GenerationResourceBounds, GenerationResourceError,
-    GenerationResourceSpec, GenerationRuntimeCapabilities, ImageIngestRecipe, ImageIngestStep,
-    ImageKvEffect, ImageSegment, SegmentPlacement, TerminationPolicyDescriptor,
-    TriggerPolicyDescriptor, UndTokenAction, UndVisibility, VisibilityPolicyDescriptor,
-    encoder_cache_key,
+    GenerationConstraint, GenerationConstraintParseError, GenerationFeatures,
+    GenerationPolicyDescriptor, GenerationRequest, GenerationRequestError,
+    GenerationResourceBounds, GenerationResourceError, GenerationResourceSpec,
+    GenerationRuntimeCapabilities, ImageIngestRecipe, ImageIngestStep, ImageKvEffect, ImageSegment,
+    SegmentPlacement, TerminationPolicyDescriptor, TriggerPolicyDescriptor, UndTokenAction,
+    UndVisibility, VisibilityPolicyDescriptor, encoder_cache_key,
 };
 pub use sampling::{SampleOutput, score_token_logprobs, try_apply_sampling_counts};
 
@@ -708,13 +707,9 @@ pub enum KvGroupKind {
     SlidingWindow { window: u32, sink: u32 },
 }
 
-/// One KV-cache group: a physical page subspace with its own layout and kind.
-/// Reported by the worker at handshake.
+/// One positional KV-cache group reported by the worker at handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KvCacheGroupSpec {
-    pub group_id: u32,
-    /// First physical page id owned by this group (groups partition the id space).
-    pub block_offset: u32,
     /// Number of physical pages in this group's subspace.
     pub num_blocks: u32,
     #[serde(default)]

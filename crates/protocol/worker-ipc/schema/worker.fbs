@@ -22,7 +22,6 @@ enum DecodeKind : ubyte { Video, Audio }
 enum MediaProfileId : ubyte { MinimaxH3T2va }
 
 enum Domain : ubyte { Prefill, Decode, Flow }
-enum ExecutionCapability : ubyte { DomainHomogeneous, TensorizedMixed }
 enum AttentionRegime : ubyte { None, Causal, Bidirectional, Hybrid }
 enum SamplingOwnership : ubyte { DesignatedRank, DeterministicSharded }
 
@@ -130,8 +129,6 @@ table ImageParams {
 }
 
 table KvGroupSpec {
-  group_id:uint;
-  block_offset:uint;
   num_blocks:uint;
   kind:KvGroupKind;
   window:uint;
@@ -421,7 +418,6 @@ table BatchPartition {
   collective_seq:ulong;
   domain:Domain;
   route:uint;
-  execution:ExecutionCapability;
   attention:AttentionRegime;
   shape_class:ulong;
   operations:[Operation];

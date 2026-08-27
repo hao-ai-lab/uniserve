@@ -347,7 +347,8 @@ pub struct ControlAck {
 ///
 /// The typed taxonomy and execution context cross the wire together so failure
 /// policy and diagnostics use the same operation identity.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("worker execute error: {message}")]
 pub struct WorkerExecError {
     /// Physical submission whose response carried this error. Composite
     /// executors use it to join the same terminal outcome across ranks before
@@ -364,40 +365,13 @@ pub struct WorkerExecError {
     pub operations: Vec<uniserve_worker_ipc::ErrorOperationIdentity>,
 }
 
-impl std::fmt::Display for WorkerExecError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "worker execute error [{}{}{}; step={}; phase={}; route={}; operations={}]: {}",
-            self.code.as_deref().unwrap_or("unclassified"),
-            if self.fatal { ", fatal" } else { ", non-fatal" },
-            if self.retryable { ", retryable" } else { "" },
-            self.step_id
-                .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
-            self.phase.as_deref().unwrap_or("unknown"),
-            self.route.as_deref().unwrap_or("unknown"),
-            self.operations.len(),
-            self.message,
-        )
-    }
-}
-
-impl std::error::Error for WorkerExecError {}
-
 /// A worker process was replaced without session snapshots, so every session
 /// assigned to that executor must terminate explicitly before new work begins.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
 pub struct WorkerLossError {
     pub message: String,
 }
-
-impl std::fmt::Display for WorkerLossError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}", self.message)
-    }
-}
-
-impl std::error::Error for WorkerLossError {}
 
 /// The asynchronous, pipelined boundary the scheduler drives.
 pub trait Executor: Send {
@@ -514,20 +488,23 @@ mod tests {
 
     fn op(work: ForwardMode) -> Operation {
         let request_key = RequestKey::new(1, RequestId(1), 1);
-        Operation::registered(uniserve_worker_ipc::OperationSpec {
+        Operation {
             request_key,
             op_id: OpId(1),
             parent: VersionRef::admission_root(request_key, OpId(1), Digest::zero()),
             work,
             route: RouteId(0),
             domain: work.domain(),
+            advances_state: false,
             bounds: Bounds::default(),
             inputs: Vec::new(),
             outputs: Vec::new(),
             predicate: None,
             rng: None,
             control_seq: 0,
-        })
+            plan_digest: Digest::zero(),
+        }
+        .sealed()
     }
 
     #[test]

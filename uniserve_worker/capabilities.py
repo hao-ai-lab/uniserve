@@ -42,8 +42,6 @@ class KvGroupKind(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class KvGroupSpec:
-    group_id: int
-    block_offset: int
     num_blocks: int
     kind: KvGroupKind
     window: int
@@ -54,8 +52,6 @@ class KvGroupSpec:
         data = _map(value, where)
         kind_data = _map(data.get("kind"), f"{where}.kind")
         return cls(
-            group_id=_uint(data.get("group_id"), f"{where}.group_id"),
-            block_offset=_uint(data.get("block_offset"), f"{where}.block_offset"),
             num_blocks=_uint(data.get("num_blocks"), f"{where}.num_blocks"),
             kind=_enum(KvGroupKind, kind_data.get("kind"), f"{where}.kind.kind"),
             window=_uint(kind_data.get("window", 0), f"{where}.kind.window"),
@@ -67,8 +63,6 @@ class KvGroupSpec:
         if self.kind is KvGroupKind.SLIDING_WINDOW:
             kind.update(window=self.window, sink=self.sink)
         return {
-            "group_id": self.group_id,
-            "block_offset": self.block_offset,
             "num_blocks": self.num_blocks,
             "kind": kind,
         }
@@ -227,18 +221,14 @@ class WorkerCapabilities:
         if self.uses_kv:
             if any(value < 1 for value in kv_values) or not self.groups or not self.kv_dtype:
                 raise invalid_descriptor("capabilities declare incomplete KV geometry")
-            next_offset = 0
-            for index, group in enumerate(self.groups):
-                if (
-                    group.group_id != index
-                    or group.block_offset != next_offset
-                    or group.num_blocks < 1
-                ):
+            total_blocks = 0
+            for group in self.groups:
+                if group.num_blocks < 1:
                     raise invalid_descriptor(
                         "capabilities.groups must be a canonical physical page partition"
                     )
-                next_offset += group.num_blocks
-            if next_offset != self.num_blocks:
+                total_blocks += group.num_blocks
+            if total_blocks != self.num_blocks:
                 raise invalid_descriptor(
                     "capabilities.groups must cover the physical request page pool"
                 )

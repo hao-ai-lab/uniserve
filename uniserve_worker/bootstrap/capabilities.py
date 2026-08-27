@@ -173,8 +173,6 @@ def resolve_capabilities(
         groups=(
             (
                 KvGroupSpec(
-                    group_id=0,
-                    block_offset=0,
                     num_blocks=int(capacity.num_blocks),
                     kind=KvGroupKind.FULL,
                     window=0,

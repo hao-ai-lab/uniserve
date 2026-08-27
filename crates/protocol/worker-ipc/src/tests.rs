@@ -96,13 +96,14 @@ fn continuation_product(op: OpId) -> ProductRef {
 }
 
 fn token_decode_operation() -> Operation {
-    Operation::registered(OperationSpec {
+    Operation {
         request_key: request_key(),
         op_id: OpId(11),
         parent: fixed_parent(),
         work: ForwardMode::TokenDecode,
         route: RouteId(1),
         domain: Domain::Decode,
+        advances_state: false,
         bounds: Bounds {
             max_points: 1,
             max_tokens: 1,
@@ -123,17 +124,20 @@ fn token_decode_operation() -> Operation {
             draw_layout: DrawLayout::TargetSampling,
         }),
         control_seq: 0,
-    })
+        plan_digest: Digest::zero(),
+    }
+    .sealed()
 }
 
 fn operation_for(work: ForwardMode, op_id: OpId, advances: bool) -> Operation {
-    Operation::registered(OperationSpec {
+    Operation {
         request_key: request_key(),
         op_id,
         parent: fixed_parent(),
         work,
         route: RouteId(1),
         domain: work.domain(),
+        advances_state: false,
         bounds: Bounds {
             max_points: if advances { 1 } else { 0 },
             ..Bounds::default()
@@ -143,7 +147,9 @@ fn operation_for(work: ForwardMode, op_id: OpId, advances: bool) -> Operation {
         predicate: None,
         rng: None,
         control_seq: 0,
-    })
+        plan_digest: Digest::zero(),
+    }
+    .sealed()
 }
 
 fn completion_record() -> ModelOutput {
@@ -271,7 +277,6 @@ fn partitions_for_operations(operations: Vec<Operation>) -> Vec<BatchPartition> 
                 collective_seq: index as u64 + 1,
                 domain,
                 route,
-                execution: ExecutionCapability::DomainHomogeneous,
                 attention: AttentionRegime::Hybrid,
                 shape_class: 0,
                 operations,
@@ -359,13 +364,14 @@ fn version_ref_device_point_round_trips() {
             producer_plan_digest: digest_string(0xcc),
         },
     };
-    let operation = Operation::registered(OperationSpec {
+    let operation = Operation {
         request_key: request_key(),
         op_id: OpId(12),
         parent: device_parent.clone(),
         work: ForwardMode::TokenDecode,
         route: RouteId(1),
         domain: Domain::Decode,
+        advances_state: false,
         bounds: Bounds {
             max_points: 1,
             ..Bounds::default()
@@ -375,7 +381,9 @@ fn version_ref_device_point_round_trips() {
         predicate: None,
         rng: None,
         control_seq: 0,
-    });
+        plan_digest: Digest::zero(),
+    }
+    .sealed();
     let batch = execute_round_trip(batch_with_operations(2, Vec::new(), vec![operation]));
     assert_eq!(batch.operations().next().unwrap().parent, device_parent);
 }
@@ -834,15 +842,7 @@ fn capabilities_reject_duplicate_set_members() {
 }
 
 #[test]
-fn capabilities_require_a_canonical_physical_group_partition() {
-    let mut caps = full_caps();
-    caps.groups[1].block_offset = 1024;
-    assert!(encode_response(&WorkerResponse::capabilities(caps)).is_err());
-
-    let mut caps = full_caps();
-    caps.groups[1].group_id = 0;
-    assert!(encode_response(&WorkerResponse::capabilities(caps)).is_err());
-
+fn capabilities_require_group_totals_to_match_the_cache() {
     let mut caps = full_caps();
     caps.groups[1].num_blocks = 2047;
     assert!(encode_response(&WorkerResponse::capabilities(caps)).is_err());
@@ -855,13 +855,15 @@ fn image_generation_requires_incremental_kv_publication() {
     assert!(
         !caps
             .generation_runtime_capabilities()
-            .supports_image_generation
+            .features
+            .contains(uniserve_core::GenerationFeatures::IMAGE_GENERATION)
     );
 
     caps.incremental_kv_publication = true;
     assert!(
         caps.generation_runtime_capabilities()
-            .supports_image_generation
+            .features
+            .contains(uniserve_core::GenerationFeatures::IMAGE_GENERATION)
     );
 }
 
@@ -994,38 +996,43 @@ fn comprehensive_batch() -> Batch {
             }
         };
         let domain = work.domain();
-        operations.push(Operation::registered(OperationSpec {
-            request_key: key,
-            op_id,
-            parent,
-            work,
-            route: RouteId(1 + index as u32),
-            domain,
-            bounds: Bounds {
-                max_points: if work.advances_state() { 1 } else { 0 },
-                max_tokens: 7 + index as u32,
-                max_kv_pages: 3,
-                max_latent_bytes: 1 << 20,
-                max_completion_bytes: 4096,
-                max_transfer_bytes: 1 << 16,
-            },
-            inputs: vec![product_for(key, OpId(2), 0, ProductKind::VisionFeature)],
-            outputs: vec![
-                product_for(key, op_id, 0, ProductKind::Token),
-                product_for(key, op_id, 1, ProductKind::Kv),
-            ],
-            predicate: Some(product_for(key, OpId(3), 0, ProductKind::Completion)),
-            rng: Some(Rng {
-                seed: 99 + index as u64,
-                semantic_index_base: 4,
-                draw_layout: match index % 3 {
-                    0 => DrawLayout::TargetSampling,
-                    1 => DrawLayout::SpeculativeProposal,
-                    _ => DrawLayout::FlowNoise,
+        operations.push(
+            Operation {
+                request_key: key,
+                op_id,
+                parent,
+                work,
+                route: RouteId(1 + index as u32),
+                domain,
+                advances_state: false,
+                bounds: Bounds {
+                    max_points: if work.advances_state() { 1 } else { 0 },
+                    max_tokens: 7 + index as u32,
+                    max_kv_pages: 3,
+                    max_latent_bytes: 1 << 20,
+                    max_completion_bytes: 4096,
+                    max_transfer_bytes: 1 << 16,
                 },
-            }),
-            control_seq: index as u64,
-        }));
+                inputs: vec![product_for(key, OpId(2), 0, ProductKind::VisionFeature)],
+                outputs: vec![
+                    product_for(key, op_id, 0, ProductKind::Token),
+                    product_for(key, op_id, 1, ProductKind::Kv),
+                ],
+                predicate: Some(product_for(key, OpId(3), 0, ProductKind::Completion)),
+                rng: Some(Rng {
+                    seed: 99 + index as u64,
+                    semantic_index_base: 4,
+                    draw_layout: match index % 3 {
+                        0 => DrawLayout::TargetSampling,
+                        1 => DrawLayout::SpeculativeProposal,
+                        _ => DrawLayout::FlowNoise,
+                    },
+                }),
+                control_seq: index as u64,
+                plan_digest: Digest::zero(),
+            }
+            .sealed(),
+        );
     }
     let und_admission = Admission::new(
         session_key(100),
@@ -1113,14 +1120,10 @@ fn full_caps() -> WorkerCapabilities {
         supported_work: ForwardMode::ALL.to_vec(),
         groups: vec![
             KvCacheGroupSpec {
-                group_id: 0,
-                block_offset: 0,
                 num_blocks: 2048,
                 kind: KvGroupKind::Full,
             },
             KvCacheGroupSpec {
-                group_id: 1,
-                block_offset: 2048,
                 num_blocks: 2048,
                 kind: KvGroupKind::SlidingWindow {
                     window: 4096,

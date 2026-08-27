@@ -141,8 +141,7 @@ class Worker:
                 tuning=config.execution.flashinfer,
                 block_size=loaded.deployment.block_size,
             )
-            if isinstance(loaded.model, ExecutionModel)
-            and loaded.model.resource_geometry.kv
+            if isinstance(loaded.model, ExecutionModel) and loaded.model.resource_geometry.kv
             else None
         )
         return cls(
@@ -291,6 +290,11 @@ class Worker:
                 1,
                 ceil_div(int(packed_model.text_max_tokens), int(deployment.block_size)),
             )
+            group_ranges: list[tuple[int, int]] = []
+            group_offset = 0
+            for group in self._capabilities.groups:
+                group_ranges.append((group_offset, int(group.num_blocks)))
+                group_offset += int(group.num_blocks)
             self.cache_pool = CachePool(
                 num_layers=int(cache.num_layers),
                 num_pages=int(self._capabilities.num_blocks),
@@ -300,14 +304,7 @@ class Worker:
                 device=deployment.device,
                 dtype=cache_dtype,
                 store_dtype=cache.store_dtype,
-                group_ranges=(
-                    tuple(
-                        (int(group.block_offset), int(group.num_blocks))
-                        for group in self._capabilities.groups
-                    )
-                    if self._capabilities.groups
-                    else None
-                ),
+                group_ranges=tuple(group_ranges) if group_ranges else None,
             )
             assert attention is not None
             if (
@@ -585,7 +582,12 @@ class Worker:
             for text_batch_size in mixed_text_batch_sizes
         )
         flow_prefix_lengths: dict[int, tuple[int, ...]] = {}
-        if flow is not None and packed_model is not None and packed_model.tensorized_mixed and flow_graph_buckets:
+        if (
+            flow is not None
+            and packed_model is not None
+            and packed_model.tensorized_mixed
+            and flow_graph_buckets
+        ):
             for cfg_branches in flow_cfg_branches:
                 image = _startup_image_parameters(
                     cfg_branches,
@@ -762,9 +764,7 @@ class Worker:
                 ),
                 decode_context_blocks=self._decode_context_blocks(),
                 packed_context_blocks=max_blocks_per_row,
-                prefill_token_sizes=(
-                    () if packed_model.tensorized_mixed else lane_prefill_buckets
-                ),
+                prefill_token_sizes=(() if packed_model.tensorized_mixed else lane_prefill_buckets),
                 prefill_row_sizes=lane_prefill_row_sizes,
                 stream=stream,
                 expected_context=expected_context,
@@ -1011,6 +1011,7 @@ class Worker:
                 ExecutionPhase.CLEANUP,
                 (
                     OperationTrace(
+                        authority_id=session.request_key.authority_id,
                         session_id=session.session_id,
                         epoch=session.epoch,
                         op_id=0 if session.last_op_id is None else session.last_op_id,

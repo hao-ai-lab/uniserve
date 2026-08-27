@@ -273,6 +273,7 @@ class ModelRunner:
             raise ValueError("one model call cannot mix unrelated execution phases")
         operations = tuple(
             OperationTrace(
+                task.operation.request_key.authority_id,
                 task.operation.request_key.session_id,
                 task.operation.request_key.epoch,
                 task.operation.op_id,
@@ -286,7 +287,10 @@ class ModelRunner:
                 f"model runner has no {domain.value!r} execution partition for {target}",
                 phase="input_staging",
                 route=phase.value,
-                operations=tuple((item.session_id, item.epoch, item.op_id) for item in operations),
+                operations=tuple(
+                    (item.authority_id, item.session_id, item.epoch, item.op_id)
+                    for item in operations
+                ),
             )
         buffers = partition.buffer
         counts = _kind_counts(tasks)
@@ -467,7 +471,10 @@ class ModelRunner:
                 f"model execution path {path.value!r} made {calls} forward calls",
                 phase="graph_execution",
                 route=phase.value,
-                operations=tuple((item.session_id, item.epoch, item.op_id) for item in operations),
+                operations=tuple(
+                    (item.authority_id, item.session_id, item.epoch, item.op_id)
+                    for item in operations
+                ),
             )
         duration_us = (time.perf_counter_ns() - started) // 1000
         observation = RunObservation(
@@ -547,7 +554,9 @@ def _input_failure(
         str(error) or type(error).__name__,
         phase="input_staging",
         route=phase.value,
-        operations=tuple((item.session_id, item.epoch, item.op_id) for item in operations),
+        operations=tuple(
+            (item.authority_id, item.session_id, item.epoch, item.op_id) for item in operations
+        ),
     )
 
 
@@ -559,7 +568,9 @@ def _execution_failure(
     if isinstance(error, WorkerError):
         return error
     classified = classify(error)
-    identities = tuple((item.session_id, item.epoch, item.op_id) for item in operations)
+    identities = tuple(
+        (item.authority_id, item.session_id, item.epoch, item.op_id) for item in operations
+    )
     if isinstance(error, GraphExecutionError) or classified.code in {
         WorkerErrorCode.RESOURCE_ERROR,
         WorkerErrorCode.FATAL_WORKER_FAILURE,

@@ -413,45 +413,61 @@ impl GenerationBehaviorDescriptor {
         &self,
         policy: &GenerationPolicyDescriptor,
         context_image_steps: impl IntoIterator<Item = ImageIngestStep>,
-    ) -> GenerationCapabilityNeeds {
-        let mut needs = GenerationCapabilityNeeds {
-            understanding: true,
-            ..GenerationCapabilityNeeds::default()
-        };
+    ) -> GenerationFeatures {
+        let mut needs = GenerationFeatures::UNDERSTANDING;
         for step in context_image_steps {
-            needs.mark_encode(step);
+            needs.insert(match step {
+                ImageIngestStep::VaeEncode => GenerationFeatures::LATENT_ENCODE,
+                ImageIngestStep::VitEncode => GenerationFeatures::VISION_ENCODE,
+            });
         }
         if self.gen_output {
-            needs.image_generation = true;
+            needs.insert(GenerationFeatures::IMAGE_GENERATION);
         }
         if self.generated_image_feedback
             && let Some(feedback) = &policy.feedback
         {
             for step in feedback.ingest.steps.iter().copied() {
-                needs.mark_encode(step);
+                needs.insert(match step {
+                    ImageIngestStep::VaeEncode => GenerationFeatures::LATENT_ENCODE,
+                    ImageIngestStep::VitEncode => GenerationFeatures::VISION_ENCODE,
+                });
             }
         }
         needs
     }
 }
 
-/// The generation branches a request needs a runtime to execute. Understanding
-/// (prompt ingestion and decode) is always required; the remaining branches are
-/// set by the resolved behavior, its context image steps, and feedback recipe.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct GenerationCapabilityNeeds {
-    pub understanding: bool,
-    pub vision_encode: bool,
-    pub latent_encode: bool,
-    pub image_generation: bool,
+bitflags::bitflags! {
+    /// Generation branches present in a runtime or required by one request.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+    pub struct GenerationFeatures: u8 {
+        const UNDERSTANDING = 1 << 0;
+        const VISION_ENCODE = 1 << 1;
+        const LATENT_ENCODE = 1 << 2;
+        const IMAGE_GENERATION = 1 << 3;
+    }
 }
 
-impl GenerationCapabilityNeeds {
-    fn mark_encode(&mut self, step: ImageIngestStep) {
-        match step {
-            ImageIngestStep::VaeEncode => self.latent_encode = true,
-            ImageIngestStep::VitEncode => self.vision_encode = true,
+impl GenerationFeatures {
+    pub fn name(self) -> &'static str {
+        if self.contains(Self::UNDERSTANDING) {
+            "runtime_und_execution"
+        } else if self.contains(Self::LATENT_ENCODE) {
+            "runtime_vae_encode"
+        } else if self.contains(Self::VISION_ENCODE) {
+            "runtime_vit_encode"
+        } else if self.contains(Self::IMAGE_GENERATION) {
+            "runtime_gen_denoise"
+        } else {
+            "runtime_generation_features"
         }
+    }
+}
+
+impl std::fmt::Display for GenerationFeatures {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
     }
 }
 
@@ -483,10 +499,7 @@ pub struct GenerationResourceSpec<'a> {
 /// Worker and scheduler limits needed to compile a bounded generation graph.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct GenerationRuntimeCapabilities {
-    pub supports_understanding: bool,
-    pub supports_vision_encode: bool,
-    pub supports_latent_encode: bool,
-    pub supports_image_generation: bool,
+    pub features: GenerationFeatures,
     pub max_latent_units: u64,
     pub latent_downsample: u32,
     pub max_vae_grid_tokens: u32,
@@ -498,47 +511,13 @@ pub struct GenerationRuntimeCapabilities {
     pub encoder_cache_entries: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum GenerationCapabilityError {
-    #[error("runtime_und_execution")]
-    Understanding,
-    #[error("runtime_vae_encode")]
-    LatentEncode,
-    #[error("runtime_vit_encode")]
-    VisionEncode,
-    #[error("runtime_gen_denoise")]
-    ImageGeneration,
-}
-
-impl GenerationCapabilityError {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Understanding => "runtime_und_execution",
-            Self::LatentEncode => "runtime_vae_encode",
-            Self::VisionEncode => "runtime_vit_encode",
-            Self::ImageGeneration => "runtime_gen_denoise",
-        }
-    }
-}
-
 impl GenerationRuntimeCapabilities {
     /// Whether this runtime covers every branch the request needs. On a gap,
     /// returns the admission-capability name of the first missing branch.
-    pub fn covers(
-        &self,
-        needs: &GenerationCapabilityNeeds,
-    ) -> Result<(), GenerationCapabilityError> {
-        if needs.understanding && !self.supports_understanding {
-            return Err(GenerationCapabilityError::Understanding);
-        }
-        if needs.latent_encode && !self.supports_latent_encode {
-            return Err(GenerationCapabilityError::LatentEncode);
-        }
-        if needs.vision_encode && !self.supports_vision_encode {
-            return Err(GenerationCapabilityError::VisionEncode);
-        }
-        if needs.image_generation && !self.supports_image_generation {
-            return Err(GenerationCapabilityError::ImageGeneration);
+    pub fn covers(&self, needs: GenerationFeatures) -> Result<(), GenerationFeatures> {
+        let missing = needs.difference(self.features);
+        if !missing.is_empty() {
+            return Err(missing);
         }
         Ok(())
     }
@@ -1167,10 +1146,7 @@ mod tests {
 
     fn runtime_capabilities() -> GenerationRuntimeCapabilities {
         GenerationRuntimeCapabilities {
-            supports_understanding: true,
-            supports_vision_encode: true,
-            supports_latent_encode: true,
-            supports_image_generation: true,
+            features: GenerationFeatures::all(),
             max_latent_units: 4_096,
             latent_downsample: 16,
             max_vae_grid_tokens: 64,
@@ -1347,11 +1323,7 @@ mod tests {
         assert!(immediate.finish_after_gen_commit);
         assert_eq!(
             immediate.capability_needs(&immediate_policy, []),
-            GenerationCapabilityNeeds {
-                understanding: true,
-                image_generation: true,
-                ..GenerationCapabilityNeeds::default()
-            }
+            GenerationFeatures::UNDERSTANDING | GenerationFeatures::IMAGE_GENERATION
         );
     }
 

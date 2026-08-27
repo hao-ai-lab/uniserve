@@ -68,7 +68,9 @@ impl Scheduler {
         // Context-image requests prefill the text before each image position,
         // then encode the image into that marker gap.
         let phase0 = Phase::Prefill;
+        let finish_token_ids = canonical_continuation_stop_token_ids(&req, &self.ctrl.eos);
         let st = ReqState {
+            finish_token_ids,
             block_tables: (0..self.kv_state().block_pool.num_groups())
                 .map(|group| BlockTable::new(group, self.caps.block_size as usize))
                 .collect(),
@@ -85,8 +87,8 @@ impl Scheduler {
             control_seq: 0,
             public_event_seq: 0,
             public_event_limit: 0,
-            public_token_seq: 0,
-            semantic_token_seq: 0,
+            tokens_sent: 0,
+            tokens_acked: 0,
             output_journal: VecDeque::new(),
             token_cutoffs: BTreeMap::new(),
             pending_commits: VecDeque::new(),
@@ -182,18 +184,21 @@ impl Scheduler {
             )
             .expect("validated media admission");
             let root = VersionRef::admission_root(request_key, OpId(0), admission.digest.clone());
-            self.running.insert_media(MediaFlowState {
-                request: submission.request,
-                event_tx: submission.event_tx,
-                request_pool_idx,
-                admission,
-                admission_sent: false,
-                committed: MediaCursor::default(),
-                projected: MediaCursor::default(),
-                fixed_parent: root.clone(),
-                projected_parent: root,
-                terminal_intent: MediaTerminalIntent::None,
-            });
+            self.running_media.insert(
+                id,
+                MediaFlowState {
+                    request: submission.request,
+                    event_tx: submission.event_tx,
+                    request_pool_idx,
+                    admission,
+                    admission_sent: false,
+                    committed: MediaCursor::default(),
+                    projected: MediaCursor::default(),
+                    fixed_parent: root.clone(),
+                    projected_parent: root,
+                    terminal_intent: MediaTerminalIntent::None,
+                },
+            );
             self.order.push(id);
         }
     }
@@ -214,7 +219,7 @@ impl Scheduler {
     pub(super) fn missing_required_capability(
         &self,
         request: &GenerationRequest,
-    ) -> Option<uniserve_core::GenerationCapabilityError> {
+    ) -> Option<uniserve_core::GenerationFeatures> {
         let context_steps = request.context.iter().flat_map(|segment| match segment {
             uniserve_core::ContextSegment::Image { ingest, .. } => ingest.steps.clone(),
             uniserve_core::ContextSegment::UndTokens { .. } => Vec::new(),
@@ -224,7 +229,7 @@ impl Scheduler {
             .capability_needs(&request.policy, context_steps);
         self.caps
             .generation_runtime_capabilities()
-            .covers(&needs)
+            .covers(needs)
             .err()
     }
 
@@ -324,10 +329,7 @@ impl Scheduler {
         }
     }
 
-    pub(super) fn reserve_transition_resources(
-        &mut self,
-        transition: &mut PlannedTransition,
-    ) -> bool {
+    pub(super) fn reserve_transition_resources(&mut self, transition: &mut NextOp) -> bool {
         let id = transition.request_id;
         if transition.operation_variant == ForwardMode::GenFlow && !self.ensure_flow_prefix(id) {
             return false;
@@ -449,7 +451,7 @@ impl Scheduler {
                         "reason": "too_large",
                         "needed_blocks": need,
                         "usable_blocks": self.usable_kv_blocks(),
-                        "generation": behavior_str(&st.req),
+                        "generation": &st.req.behavior,
                         "prompt_tokens": st.context.prompt_ids.len(),
                     }));
                     let _ = st.event_tx.send(GenerationEvent::Rejected {
@@ -473,7 +475,7 @@ impl Scheduler {
                     .map(|group| self.kv_state().block_pool.group_capacity(group))
                     .min()
                     .unwrap_or_default();
-                let prefix_admission = crate::scheduler::prefix_cache::cached_blocks_for_admission(
+                let prefix_admission = cached_blocks_for_admission(
                     &self.kv_state().coordinator,
                     head,
                     &self.kv_state().block_pool,
@@ -499,7 +501,7 @@ impl Scheduler {
                         "reason": "too_large",
                         "needed_blocks": first_chunk_blocks,
                         "usable_blocks": text_usable_blocks,
-                        "generation": behavior_str(&st.req),
+                        "generation": &st.req.behavior,
                         "prompt_tokens": st.context.prompt_ids.len(),
                     }));
                     let _ = st.event_tx.send(GenerationEvent::Rejected {
@@ -553,8 +555,8 @@ impl Scheduler {
             .timing
             .queue_wait_us_max
             .fetch_max(queue_wait_us, Ordering::Relaxed);
-        let generation = behavior_str(&st.req);
-        let phase = phase_str(st.cursor.lifecycle.phase);
+        let generation = st.req.behavior.clone();
+        let phase = st.cursor.phase;
         let prompt_tokens = st.context.prompt_ids.len();
         let max_tokens = st.req.max_und_tokens;
         let priority = st.req.priority;
@@ -597,12 +599,65 @@ impl Scheduler {
                 .kv
                 .as_ref()
                 .expect("generation admission requires worker KV resources");
-            crate::scheduler::prefix_cache::lookup(
-                &kv.coordinator,
-                st,
-                &kv.block_pool,
-                &self.stats,
-            );
+            acquire_cached_prefix(&kv.coordinator, st, &kv.block_pool, &self.stats);
         }
     }
+}
+
+fn cached_blocks_for_admission(
+    coordinator: &KvCacheCoordinator,
+    state: &ReqState,
+    pool: &BlockPool,
+) -> crate::kv::PrefixAdmission {
+    coordinator.cached_prefix_for_admission(
+        pool,
+        state.effective_prompt(),
+        state.req.cache.read,
+        state.has_context_images(),
+        state.req.cache.isolation_key,
+    )
+}
+
+fn acquire_cached_prefix(
+    coordinator: &KvCacheCoordinator,
+    state: &mut ReqState,
+    pool: &BlockPool,
+    stats: &SchedStats,
+) {
+    let prompt = state.effective_prompt().to_vec();
+    let has_context_images = state.has_context_images();
+    let hit = coordinator
+        .acquire_prefix(
+            pool,
+            &mut state.block_tables,
+            &prompt,
+            state.req.cache.read,
+            has_context_images,
+            state.req.cache.isolation_key,
+        )
+        .expect("request cache groups match the KV coordinator");
+    let block_size = pool.block_size();
+    let full_blocks = prompt.len() / block_size;
+    let query_blocks = if prompt.len().is_multiple_of(block_size) {
+        full_blocks.saturating_sub(1)
+    } else {
+        full_blocks
+    };
+    stats
+        .prefix
+        .queries
+        .fetch_add(query_blocks as u64, Ordering::Relaxed);
+    stats
+        .prefix
+        .hits
+        .fetch_add(hit.cached_blocks as u64, Ordering::Relaxed);
+    stats
+        .prefix
+        .hit_tokens
+        .fetch_add((hit.cached_blocks * block_size) as u64, Ordering::Relaxed);
+    state.cursor.replay.block_hashes = hit.block_hashes;
+    state.cursor.replay.prefix_cached_blocks = hit.cached_blocks;
+    state.cursor.ingest.prompt_cursor = (hit.cached_blocks * block_size) as u32;
+    state.cursor.und.logical_pos = state.cursor.ingest.prompt_cursor;
+    state.cursor.und.physical_kv_len = state.cursor.ingest.prompt_cursor;
 }

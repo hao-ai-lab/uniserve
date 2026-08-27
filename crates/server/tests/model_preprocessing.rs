@@ -125,10 +125,7 @@ fn try_resolved_model(
 
 fn runtime_capabilities() -> GenerationRuntimeCapabilities {
     GenerationRuntimeCapabilities {
-        supports_understanding: true,
-        supports_vision_encode: true,
-        supports_latent_encode: true,
-        supports_image_generation: true,
+        features: uniserve_core::GenerationFeatures::all(),
         max_latent_units: 1_000_000,
         latent_downsample: 16,
         max_vae_grid_tokens: 1_000_000,
@@ -166,7 +163,9 @@ fn model_resolution_requires_every_configured_runtime_branch() {
             "qwen3",
             "runtime_und_execution",
             |capabilities: &mut GenerationRuntimeCapabilities| {
-                capabilities.supports_understanding = false;
+                capabilities
+                    .features
+                    .remove(uniserve_core::GenerationFeatures::UNDERSTANDING);
             },
         ),
         (
@@ -174,7 +173,9 @@ fn model_resolution_requires_every_configured_runtime_branch() {
             "neo_chat",
             "runtime_vit_encode",
             |capabilities: &mut GenerationRuntimeCapabilities| {
-                capabilities.supports_vision_encode = false;
+                capabilities
+                    .features
+                    .remove(uniserve_core::GenerationFeatures::VISION_ENCODE);
             },
         ),
         (
@@ -182,7 +183,9 @@ fn model_resolution_requires_every_configured_runtime_branch() {
             "bagel",
             "runtime_vae_encode",
             |capabilities: &mut GenerationRuntimeCapabilities| {
-                capabilities.supports_latent_encode = false;
+                capabilities
+                    .features
+                    .remove(uniserve_core::GenerationFeatures::LATENT_ENCODE);
             },
         ),
         (
@@ -190,7 +193,9 @@ fn model_resolution_requires_every_configured_runtime_branch() {
             "neo_chat",
             "runtime_gen_denoise",
             |capabilities: &mut GenerationRuntimeCapabilities| {
-                capabilities.supports_image_generation = false;
+                capabilities
+                    .features
+                    .remove(uniserve_core::GenerationFeatures::IMAGE_GENERATION);
             },
         ),
     ];

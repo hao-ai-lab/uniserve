@@ -141,7 +141,7 @@ impl Scheduler {
     }
 
     pub(super) fn acknowledge_semantic(&mut self, id: RequestId, output_token_count: usize) {
-        let Some(current) = self.running.get(&id).map(|state| state.semantic_token_seq) else {
+        let Some(current) = self.running.get(&id).map(|state| state.tokens_acked) else {
             return;
         };
         if current == output_token_count {
@@ -158,7 +158,7 @@ impl Scheduler {
         // count of the commit ahead of it and releases with it.
         let mut ready: Vec<PendingSemanticCommit> = Vec::new();
         if let Some(state) = self.running.get_mut(&id) {
-            state.semantic_token_seq = output_token_count;
+            state.tokens_acked = output_token_count;
             if let Some((&acknowledged_cutoff, _)) =
                 state.token_cutoffs.range(..=output_token_count).next_back()
             {
@@ -239,8 +239,8 @@ impl Scheduler {
             "request_id": st.req.request_id.0,
             "trace_id": st.req.request_id.0,
             "queue": queue,
-            "generation": behavior_str(&st.req),
-            "initial_phase": phase_str(st.cursor.lifecycle.phase),
+            "generation": &st.req.behavior,
+            "initial_phase": st.cursor.phase,
             "prompt_tokens": st.context.prompt_ids.len(),
             "max_tokens": st.req.max_und_tokens,
             "priority": st.req.priority,
@@ -272,7 +272,7 @@ impl Scheduler {
             "event": "request_finished",
             "at_s": now(),
             "request_id": id.0,
-            "reason": finish_reason_str(reason),
+            "reason": reason,
             "stop_reason": stop_reason,
             "queue": queue,
             "prompt_tokens": prompt_tokens,

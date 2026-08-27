@@ -29,7 +29,6 @@ mod execution;
 pub(crate) mod generation;
 pub(crate) mod image_artifact;
 mod logits;
-pub(crate) mod prefix_cache;
 mod publication;
 pub(crate) mod queue;
 mod runtime;
@@ -37,7 +36,7 @@ mod stats;
 pub(crate) mod stats_report;
 
 pub(crate) use crate::executor::{ControlOp, Executor};
-pub(crate) use queue::{FcfsRequestQueue, PriorityRequestQueue, RequestQueue};
+pub(crate) use queue::RequestQueue;
 pub use stats::{
     DomainStats, EncoderStats, ExecutionDomainStats, GeneralStats, KvCacheStats, PrefixStats,
     SchedStats, TimingStats, WorkerStats,
@@ -52,9 +51,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::scheduler::generation::{
-    CursorApplyError, CursorProjection, EncoderCachePin, GenerationCursor,
-    GenerationPhase as Phase, GenerationPlanner, PlannedTransition, SchedulerApply,
-    SchedulerContext, TransitionDelta, TransitionIntent, TransitionValidationError,
+    EncoderCachePin, GenerationCursor, GenerationPhase as Phase, NextOp, SchedulerApply,
+    SchedulerContext, TransitionIntent, plan,
 };
 
 pub const DEFAULT_MAX_BATCH: usize = 128;
@@ -90,10 +88,10 @@ use uniserve_core::{HashAlgo, RequestId};
 use uniserve_worker_ipc::{
     Admission, AttentionRegime, Batch, BatchPartition, BlockTable as WireBlockTable, Bounds,
     CachePageAllocation, CloseReason, CompletionReport, Control, DType, DecodeKind,
-    DecodePlacement, DimBound, Disposition, ExecutionCapability, ForwardMode, GenAdmission,
-    LatentPlacement, MediaAdmission, MediaProfileId, ModelOutput, OpId, OpStatus, Operation, Point,
-    PointRange, ProductKind, ProductPayload, ProductRef, RequestKey, ResourceClass, RouteId,
-    RowGeometry, SamplingState, ShapeBound, StorageClass, TimingCounters, UndAdmission, VersionRef,
+    DecodePlacement, DimBound, Disposition, ForwardMode, GenAdmission, LatentPlacement,
+    MediaAdmission, MediaProfileId, ModelOutput, OpId, OpStatus, Operation, Point, PointRange,
+    ProductKind, ProductPayload, ProductRef, RequestKey, ResourceClass, RouteId, RowGeometry,
+    SamplingState, ShapeBound, StorageClass, TimingCounters, UndAdmission, VersionRef,
     WorkerCapabilities, WorkerForwardStats,
 };
 
@@ -312,6 +310,7 @@ impl Default for SchedulerConfig {
 
 pub(crate) struct ReqState {
     pub req: GenerationRequest,
+    pub(crate) finish_token_ids: Vec<u32>,
     /// The cached sequence mappings. Each table owns its physical page
     /// references and therefore has exactly the request's lifetime.
     pub(crate) block_tables: Vec<BlockTable>,
@@ -337,9 +336,9 @@ pub(crate) struct ReqState {
     pub(crate) public_event_seq: u64,
     /// Monotonic public-event bound carried by the latest semantic commit.
     pub(crate) public_event_limit: u64,
-    pub(crate) public_token_seq: usize,
+    pub(crate) tokens_sent: usize,
     /// Latest frontend-decoder token prefix accepted for semantic commit.
-    pub(crate) semantic_token_seq: usize,
+    pub(crate) tokens_acked: usize,
     /// Ordered public events waiting for immediate-consumer channel capacity.
     pub(crate) output_journal: VecDeque<GenerationEvent>,
     /// Fixed semantic cutoffs indexed by public text-token count.
@@ -590,53 +589,45 @@ enum MediaQuantum {
     Materialize,
 }
 
-#[derive(Default)]
-struct MediaPlanner;
-
-impl MediaPlanner {
-    fn next(&self, cursor: MediaCursor) -> Option<MediaQuantum> {
-        const DENOISE_STEPS: u32 = 4;
-        // The fixed 124-frame profile is 17 * 7 + 5. Each decode unit owns
-        // one finalized 17-frame temporal chunk plus the checkpoint-defined
-        // five-frame tail/overlap geometry.
-        const VIDEO_UNITS: u32 = 7;
-        if !cursor.prepared {
-            Some(MediaQuantum::Transition)
-        } else if cursor.denoise_step < DENOISE_STEPS {
-            Some(MediaQuantum::Flow {
-                step: cursor.denoise_step,
-            })
-        } else if cursor.video_unit < VIDEO_UNITS {
-            Some(MediaQuantum::Video {
-                unit: cursor.video_unit,
-            })
-        } else if !cursor.audio_done {
-            Some(MediaQuantum::Audio)
-        } else if !cursor.materialized {
-            Some(MediaQuantum::Materialize)
-        } else {
-            None
-        }
+fn next_media_quantum(cursor: MediaCursor) -> Option<MediaQuantum> {
+    const DENOISE_STEPS: u32 = 4;
+    const VIDEO_UNITS: u32 = 7;
+    if !cursor.prepared {
+        Some(MediaQuantum::Transition)
+    } else if cursor.denoise_step < DENOISE_STEPS {
+        Some(MediaQuantum::Flow {
+            step: cursor.denoise_step,
+        })
+    } else if cursor.video_unit < VIDEO_UNITS {
+        Some(MediaQuantum::Video {
+            unit: cursor.video_unit,
+        })
+    } else if !cursor.audio_done {
+        Some(MediaQuantum::Audio)
+    } else if !cursor.materialized {
+        Some(MediaQuantum::Materialize)
+    } else {
+        None
     }
+}
 
-    fn advance(&self, mut cursor: MediaCursor, quantum: MediaQuantum) -> MediaCursor {
-        match quantum {
-            MediaQuantum::Transition => cursor.prepared = true,
-            MediaQuantum::Flow { step } => cursor.denoise_step = step.saturating_add(1),
-            MediaQuantum::Video { unit } => cursor.video_unit = unit.saturating_add(1),
-            MediaQuantum::Audio => cursor.audio_done = true,
-            MediaQuantum::Materialize => cursor.materialized = true,
-        }
-        cursor
+fn advance_media_cursor(mut cursor: MediaCursor, quantum: MediaQuantum) -> MediaCursor {
+    match quantum {
+        MediaQuantum::Transition => cursor.prepared = true,
+        MediaQuantum::Flow { step } => cursor.denoise_step = step.saturating_add(1),
+        MediaQuantum::Video { unit } => cursor.video_unit = unit.saturating_add(1),
+        MediaQuantum::Audio => cursor.audio_done = true,
+        MediaQuantum::Materialize => cursor.materialized = true,
     }
+    cursor
+}
 
-    fn work(&self, quantum: MediaQuantum) -> ForwardMode {
-        match quantum {
-            MediaQuantum::Transition => ForwardMode::GenTransition,
-            MediaQuantum::Flow { .. } => ForwardMode::GenFlow,
-            MediaQuantum::Video { .. } | MediaQuantum::Audio => ForwardMode::GenDecode,
-            MediaQuantum::Materialize => ForwardMode::Materialize,
-        }
+fn media_work(quantum: MediaQuantum) -> ForwardMode {
+    match quantum {
+        MediaQuantum::Transition => ForwardMode::GenTransition,
+        MediaQuantum::Flow { .. } => ForwardMode::GenFlow,
+        MediaQuantum::Video { .. } | MediaQuantum::Audio => ForwardMode::GenDecode,
+        MediaQuantum::Materialize => ForwardMode::Materialize,
     }
 }
 
@@ -672,75 +663,6 @@ impl MediaTerminalIntent {
     }
 }
 
-#[derive(Default)]
-struct ScheduledRequests {
-    generation: HashMap<RequestId, ReqState>,
-    media: HashMap<RequestId, MediaFlowState>,
-}
-
-impl ScheduledRequests {
-    fn get(&self, id: &RequestId) -> Option<&ReqState> {
-        self.generation.get(id)
-    }
-
-    fn get_mut(&mut self, id: &RequestId) -> Option<&mut ReqState> {
-        self.generation.get_mut(id)
-    }
-
-    fn insert(&mut self, id: RequestId, state: ReqState) -> Option<ReqState> {
-        self.generation.insert(id, state)
-    }
-
-    fn remove(&mut self, id: &RequestId) -> Option<ReqState> {
-        self.generation.remove(id)
-    }
-
-    fn contains_key(&self, id: &RequestId) -> bool {
-        self.get(id).is_some()
-    }
-
-    fn len(&self) -> usize {
-        self.generation.len()
-    }
-
-    fn total_len(&self) -> usize {
-        self.generation.len().saturating_add(self.media.len())
-    }
-
-    fn keys(&self) -> impl Iterator<Item = &RequestId> {
-        self.generation.keys()
-    }
-
-    fn iter(&self) -> impl Iterator<Item = (&RequestId, &ReqState)> {
-        self.generation.iter()
-    }
-
-    fn values_mut(&mut self) -> impl Iterator<Item = &mut ReqState> {
-        self.generation.values_mut()
-    }
-
-    fn insert_media(&mut self, state: MediaFlowState) {
-        let id = state.request.request_id;
-        self.media.insert(id, state);
-    }
-
-    fn media(&self, id: RequestId) -> Option<&MediaFlowState> {
-        self.media.get(&id)
-    }
-
-    fn media_mut(&mut self, id: RequestId) -> Option<&mut MediaFlowState> {
-        self.media.get_mut(&id)
-    }
-
-    fn media_ids(&self) -> Vec<RequestId> {
-        self.media.keys().copied().collect()
-    }
-
-    fn take_media(&mut self, id: RequestId) -> Option<MediaFlowState> {
-        self.media.remove(&id)
-    }
-}
-
 struct RetiringMedia {
     request_key: RequestKey,
     request_pool_idx: u32,
@@ -765,7 +687,8 @@ pub struct Scheduler {
     reserved_encoder_entries: usize,
     request_slots: RequestSlotPool,
     latent_pages: LatentPagePool,
-    running: ScheduledRequests,
+    running: HashMap<RequestId, ReqState>,
+    running_media: HashMap<RequestId, MediaFlowState>,
     /// Terminal requests retain only their bounded public journal.
     completed_outputs: HashMap<RequestId, RetiredOutput>,
     /// Worker-visible sessions whose close transaction has been submitted but
@@ -775,10 +698,9 @@ pub struct Scheduler {
     retiring_sessions: HashMap<RequestId, RetiringSession>,
     order: Vec<RequestId>, // stable cross-request iteration order
     pending_media: VecDeque<PendingMedia>,
-    media_planner: MediaPlanner,
     retiring_media: HashMap<RequestId, RetiringMedia>,
     prefer_media: bool,
-    pending: Box<dyn RequestQueue>,
+    pending: RequestQueue,
     reserved_blocks: usize,
     transfer_capacity: usize,
     inflight_transfers: usize,
@@ -804,7 +726,7 @@ pub struct Scheduler {
     /// Engine-fatal latch: set when the executor/worker dies;
     /// the control loop exits and the host converts this into engine-dead.
     fatal: bool,
-    planner: GenerationPlanner,
+    latent_dtype: Option<DType>,
     /// Submit timestamp per in-flight batch (for batch round-trip traces).
     batch_started: HashMap<u64, Instant>,
     /// Steps in the execution window that carry prompt work.
@@ -861,27 +783,6 @@ fn add_worker_forward_map(target: &Mutex<BTreeMap<String, u64>>, delta: &BTreeMa
     }
 }
 
-fn make_queue(policy: SchedulingPolicy) -> Box<dyn RequestQueue> {
-    match policy {
-        SchedulingPolicy::Fcfs => Box::new(FcfsRequestQueue::default()),
-        SchedulingPolicy::Priority => Box::new(PriorityRequestQueue::default()),
-    }
-}
-
-/// Stable finish-reason label for lifecycle traces.
-fn finish_reason_str(r: &FinishReason) -> &'static str {
-    match r {
-        FinishReason::Eos => "eos",
-        FinishReason::Stop => "stop",
-        FinishReason::MaxTokens => "max_tokens",
-        FinishReason::ImageDone => "image_done",
-        FinishReason::Cancelled => "cancelled",
-        FinishReason::Aborted => "aborted",
-        FinishReason::Repetition => "repetition",
-        FinishReason::Error => "error",
-    }
-}
-
 fn close_reason(reason: &FinishReason) -> CloseReason {
     match reason {
         FinishReason::Cancelled | FinishReason::Aborted => CloseReason::Cancelled,
@@ -922,91 +823,6 @@ fn ranked_logprobs(entries: Vec<RankedToken>) -> Vec<TokenLogprob> {
         .collect()
 }
 
-fn transition_validation_error_str(error: &TransitionValidationError) -> &'static str {
-    match error {
-        TransitionValidationError::OperationFailed => "operation_failed",
-        TransitionValidationError::OpIdMismatch { .. } => "op_id_mismatch",
-        TransitionValidationError::SessionMismatch { .. } => "session_mismatch",
-        TransitionValidationError::VersionMismatch { .. } => "version_mismatch",
-        TransitionValidationError::DenoiseStepMismatch { .. } => "denoise_step_mismatch",
-        TransitionValidationError::MissingEncoderHandle => "missing_encoder_handle",
-        TransitionValidationError::MissingLatentGeneration => "missing_latent_generation",
-        TransitionValidationError::MissingImageArtifact => "missing_image_artifact",
-        TransitionValidationError::InvalidImageArtifact => "invalid_image_artifact",
-        TransitionValidationError::MissingKvPublication => "missing_kv_publication",
-        TransitionValidationError::MissingImageDimensions => "missing_image_dimensions",
-        TransitionValidationError::ImageDimensionsMismatch { .. } => "image_dimensions_mismatch",
-        TransitionValidationError::ImageKvMismatch { .. } => "image_kv_mismatch",
-        TransitionValidationError::UnexpectedSampledToken { .. } => "unexpected_sampled_token",
-        TransitionValidationError::MissingSampledToken { .. } => "missing_sampled_token",
-        TransitionValidationError::AcceptedDraftCountExceeded { .. } => {
-            "accepted_draft_count_exceeded"
-        }
-        TransitionValidationError::VerifiedDraftPrefixMismatch => "verified_draft_prefix_mismatch",
-        TransitionValidationError::TextTokenCountMismatch { .. } => "text_token_count_mismatch",
-        TransitionValidationError::SampledTokenOutsideAllowedSet { .. } => {
-            "sampled_token_outside_allowed_set"
-        }
-        TransitionValidationError::UnexpectedPromptLogprobs { .. } => "unexpected_prompt_logprobs",
-        TransitionValidationError::PromptLogprobCountMismatch { .. } => {
-            "prompt_logprob_count_mismatch"
-        }
-        TransitionValidationError::EmptyPromptLogprobPosition { .. } => {
-            "empty_prompt_logprob_position"
-        }
-        TransitionValidationError::PromptLogprobTokenMismatch { .. } => {
-            "prompt_logprob_token_mismatch"
-        }
-        TransitionValidationError::InvalidPromptLogprobCandidates { .. } => {
-            "invalid_prompt_logprob_candidates"
-        }
-        TransitionValidationError::UnexpectedGeneratedLogprobs { .. } => {
-            "unexpected_generated_logprobs"
-        }
-        TransitionValidationError::MissingGeneratedLogprobs { .. } => "missing_generated_logprobs",
-        TransitionValidationError::GeneratedLogprobTokenMismatch { .. } => {
-            "generated_logprob_token_mismatch"
-        }
-        TransitionValidationError::InvalidGeneratedLogprobCandidates => {
-            "invalid_generated_logprob_candidates"
-        }
-    }
-}
-
-fn cursor_apply_error_str(error: &CursorApplyError) -> &'static str {
-    match error {
-        CursorApplyError::MissingOperationId => "missing_operation_id",
-        CursorApplyError::MissingLatentProduct => "missing_latent_product",
-        CursorApplyError::DuplicateOperation { .. } => "duplicate_operation",
-    }
-}
-
-fn phase_str(phase: Phase) -> &'static str {
-    match phase {
-        Phase::Encode => "encode",
-        Phase::IngestState => "ingest_state",
-        Phase::Prefill => "prefill",
-        Phase::DecodeUnd => "decode_und",
-        Phase::CloseKv => "close_kv",
-        Phase::PublishKv => "publish_kv",
-        Phase::TransitionGen => "transition_gen",
-        Phase::DenoiseGen => "denoise_gen",
-        Phase::CommitGen => "commit_gen",
-        Phase::FeedbackEncode => "feedback_encode",
-        Phase::FeedbackState => "feedback_state",
-    }
-}
-
-fn behavior_str(request: &GenerationRequest) -> &'static str {
-    if request.behavior.continue_after_gen_commit {
-        "und_gen_continuation"
-    } else if request.behavior.gen_output {
-        "gen_commit_terminal"
-    } else {
-        "und_decode"
-    }
-}
-
 fn assembly_lane(operation_variant: ForwardMode) -> AssemblyLane {
     match operation_variant {
         ForwardMode::TokenExtend | ForwardMode::EncodeVision | ForwardMode::EncodeLatent => {
@@ -1028,28 +844,6 @@ fn completion_priority(operation_variant: ForwardMode) -> u8 {
     match operation_variant {
         ForwardMode::GenFlow | ForwardMode::Materialize | ForwardMode::TransferKvInstall => 0,
         _ => 1,
-    }
-}
-
-fn policy_str(policy: SchedulingPolicy) -> &'static str {
-    match policy {
-        SchedulingPolicy::Fcfs => "fcfs",
-        SchedulingPolicy::Priority => "priority",
-    }
-}
-
-fn domain_str(domain: uniserve_worker_ipc::Domain) -> &'static str {
-    match domain {
-        uniserve_worker_ipc::Domain::Prefill => "prefill",
-        uniserve_worker_ipc::Domain::Decode => "decode",
-        uniserve_worker_ipc::Domain::Flow => "flow",
-    }
-}
-
-fn execution_capability_str(execution: ExecutionCapability) -> &'static str {
-    match execution {
-        ExecutionCapability::DomainHomogeneous => "domain_homogeneous",
-        ExecutionCapability::TensorizedMixed => "tensorized_mixed",
     }
 }
 
@@ -1079,23 +873,9 @@ impl InflightOp {
 #[derive(Clone, Copy)]
 struct SubmittedPartitionAccounting {
     domain: uniserve_worker_ipc::Domain,
-    execution: ExecutionCapability,
+    mixed: bool,
     submission_group: u32,
     operation_count: usize,
-}
-
-#[derive(Clone)]
-struct ProjectedBranch {
-    phase: Phase,
-    image_id: u32,
-    conditioning_position: u32,
-    steps_done: u16,
-    conditioning: Option<ProductRef>,
-    latent: Option<ProductRef>,
-    feedback_source: Option<ProductRef>,
-    feedback_feature: Option<ProductRef>,
-    feedback_step: usize,
-    chainable: bool,
 }
 
 struct PendingCompletion {
@@ -1123,20 +903,20 @@ struct KvLengths {
     visible: u32,
 }
 
-fn transition_kv_lengths(delta: &TransitionDelta) -> Option<KvLengths> {
+fn transition_kv_lengths(delta: &TransitionIntent) -> Option<KvLengths> {
     let (prefix, input) = match delta {
-        TransitionDelta::IngestText {
+        TransitionIntent::IngestText {
             start,
             end,
             physical_start,
             ..
         } => (*physical_start, end.saturating_sub(*start)),
-        TransitionDelta::IngestImageState {
+        TransitionIntent::IngestImageState {
             physical_start,
             physical_kv_tokens,
             ..
         }
-        | TransitionDelta::FeedbackState {
+        | TransitionIntent::FeedbackState {
             physical_start,
             physical_kv_tokens,
             ..
@@ -1148,24 +928,24 @@ fn transition_kv_lengths(delta: &TransitionDelta) -> Option<KvLengths> {
             };
             (*physical_start, input)
         }
-        TransitionDelta::DecodeUnd {
+        TransitionIntent::DecodeUnd {
             physical_position, ..
         }
-        | TransitionDelta::CloseKv {
+        | TransitionIntent::CloseKv {
             physical_position, ..
         } => (*physical_position, 1),
-        TransitionDelta::PublishKv {
+        TransitionIntent::PublishKv {
             physical_kv_len, ..
         }
-        | TransitionDelta::TransitionGen {
+        | TransitionIntent::TransitionGen {
             physical_kv_len, ..
         }
-        | TransitionDelta::DenoiseGen {
+        | TransitionIntent::DenoiseGen {
             physical_kv_len, ..
         } => (*physical_kv_len, 0),
-        TransitionDelta::EncodeImageStep { .. }
-        | TransitionDelta::CommitGen { .. }
-        | TransitionDelta::EncodeFeedbackStep { .. } => return None,
+        TransitionIntent::EncodeImageStep { .. }
+        | TransitionIntent::CommitGen { .. }
+        | TransitionIntent::EncodeFeedbackStep { .. } => return None,
     };
     Some(KvLengths {
         input,
@@ -1217,7 +997,7 @@ fn ceil_div_u64(value: u64, divisor: u64) -> u64 {
 /// step. Denoise executes every latent token once per CFG branch at every
 /// timestep, so its cost multiplies the compiled latent geometry rather than the
 /// scalar per-step token cost.
-fn planned_op_token_cost(transition: &PlannedTransition) -> usize {
+fn planned_op_token_cost(transition: &NextOp) -> usize {
     if transition.operation_variant != ForwardMode::GenFlow {
         return transition.token_cost;
     }
@@ -1341,7 +1121,7 @@ fn partition_attention(operations: &[Operation]) -> AttentionRegime {
     }
 }
 
-fn transition_output_bound(transition: &PlannedTransition) -> usize {
+fn transition_output_bound(transition: &NextOp) -> usize {
     match transition.operation_variant {
         ForwardMode::TokenVerify => transition
             .validation
@@ -1456,7 +1236,6 @@ fn cfg_branch_count(image: &uniserve_core::ImageParams) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scheduler::generation::Replayability;
     use uniserve_core::{
         ContextSegment, GenerationBehaviorDescriptor, GenerationConstraint,
         GenerationPolicyDescriptor, GenerationResourceBounds, ImageParams, SamplingParams,
@@ -1501,70 +1280,5 @@ mod tests {
         let stops = canonical_continuation_stop_token_ids(&req, &[151_643, 151_645]);
 
         assert_eq!(stops, vec![4_242, 151_643, 151_645]);
-    }
-
-    fn cursor(phase: Phase, pos: u32) -> CursorProjection {
-        CursorProjection {
-            phase,
-            prompt_cursor: pos,
-            logical_pos: pos,
-            physical_kv_len: pos,
-            replayability: Replayability::Replayable,
-        }
-    }
-
-    fn plan(
-        req: &GenerationRequest,
-        cursor: CursorProjection,
-        intent: TransitionIntent,
-    ) -> PlannedTransition {
-        GenerationPlanner::new(Some(uniserve_worker_ipc::DType::BF16))
-            .plan(req, cursor, intent)
-            .expect("plan transition")
-    }
-
-    #[test]
-    fn planned_cost_tracks_physical_sequence_work() {
-        let req = request(1, 11);
-        let extend = plan(
-            &req,
-            cursor(Phase::Prefill, 3),
-            TransitionIntent::IngestText {
-                segment_index: 0,
-                prompt_start: 3,
-                token_ids: vec![7; 8],
-                new_blocks: Vec::new(),
-                sampling_state: SamplingState::default(),
-            },
-        );
-        assert_eq!(planned_op_token_cost(&extend), 8);
-
-        let decode = plan(
-            &req,
-            cursor(Phase::DecodeUnd, 11),
-            TransitionIntent::DecodeUnd {
-                position: 11,
-                new_blocks: Vec::new(),
-                spec_token_ids: None,
-                sampling_state: SamplingState::default(),
-                input_token: 5,
-                relay_input: false,
-            },
-        );
-        assert_eq!(planned_op_token_cost(&decode), 1);
-
-        let verify = plan(
-            &req,
-            cursor(Phase::DecodeUnd, 11),
-            TransitionIntent::DecodeUnd {
-                position: 11,
-                new_blocks: Vec::new(),
-                spec_token_ids: Some(vec![8, 9, 10]),
-                sampling_state: SamplingState::default(),
-                input_token: 5,
-                relay_input: false,
-            },
-        );
-        assert_eq!(planned_op_token_cost(&verify), 4);
     }
 }

@@ -157,7 +157,7 @@ impl Scheduler {
                     let inflight = self.inflight_len(*id);
                     (!state.terminal_intent.is_terminal()
                         && inflight < max_unresolved
-                        && self.media_planner.next(state.projected).is_some())
+                        && next_media_quantum(state.projected).is_some())
                     .then_some((inflight, index, *id))
                 })
             })
@@ -182,10 +182,8 @@ impl Scheduler {
         for (_, _, id) in candidates {
             let (request_key, parent, predicate, quantum, cursor_after) = {
                 let state = self.media_state(id).expect("media candidate exists");
-                let quantum = self
-                    .media_planner
-                    .next(state.projected)
-                    .expect("media candidate is runnable");
+                let quantum =
+                    next_media_quantum(state.projected).expect("media candidate is runnable");
                 let predicate = self
                     .inflight_ops
                     .get(&id)
@@ -196,24 +194,25 @@ impl Scheduler {
                     state.projected_parent.clone(),
                     predicate,
                     quantum,
-                    self.media_planner.advance(state.projected, quantum),
+                    advance_media_cursor(state.projected, quantum),
                 )
             };
             let op_id = OpId(self.next_op_id.max(1));
             self.next_op_id = self.next_op_id.saturating_add(1);
-            let work = self.media_planner.work(quantum);
+            let work = media_work(quantum);
             let outputs = if matches!(quantum, MediaQuantum::Materialize) {
                 Vec::new()
             } else {
                 vec![self.media_completion_product(request_key, op_id)]
             };
-            let operation = Operation::registered(uniserve_worker_ipc::OperationSpec {
+            let operation = Operation {
                 request_key,
                 op_id,
                 parent,
                 work,
                 route: RouteId(0),
                 domain: uniserve_worker_ipc::Domain::Flow,
+                advances_state: false,
                 bounds: Bounds {
                     max_points: 1,
                     ..Bounds::default()
@@ -223,7 +222,9 @@ impl Scheduler {
                 predicate,
                 rng: None,
                 control_seq: 0,
-            });
+                plan_digest: uniserve_core::Digest::zero(),
+            }
+            .sealed();
             if matches!(
                 quantum,
                 MediaQuantum::Transition | MediaQuantum::Flow { .. }
@@ -293,7 +294,6 @@ impl Scheduler {
             collective_seq,
             domain: uniserve_worker_ipc::Domain::Flow,
             route: RouteId(0),
-            execution: ExecutionCapability::DomainHomogeneous,
             attention: AttentionRegime::None,
             shape_class: 0,
             operations,
@@ -310,7 +310,7 @@ impl Scheduler {
                 1,
                 SubmittedPartitionAccounting {
                     domain: uniserve_worker_ipc::Domain::Flow,
-                    execution: ExecutionCapability::DomainHomogeneous,
+                    mixed: false,
                     submission_group: 1,
                     operation_count: partition.operations.len(),
                 },
@@ -430,152 +430,23 @@ impl Scheduler {
         self.inflight_ops.get(&id).map_or(0, VecDeque::len)
     }
 
-    pub(super) fn projected_cursor(&self, id: RequestId) -> Option<CursorProjection> {
+    pub(super) fn projected_cursor(&self, id: RequestId) -> Option<GenerationCursor> {
         let st = self.running.get(&id)?;
-        let applies = self
+        let inflight = self
             .inflight_ops
             .get(&id)
             .into_iter()
             .flatten()
-            .map(InflightOp::generation_apply);
-        st.cursor.project(applies)
-    }
-
-    pub(super) fn projected_branch(&self, id: RequestId) -> Option<ProjectedBranch> {
-        let state = self.running.get(&id)?;
-        let cursor = self.projected_cursor(id)?;
-        let mut projected = ProjectedBranch {
-            phase: state.cursor.lifecycle.phase,
-            image_id: state.cursor.image_gen.image_id,
-            conditioning_position: state.cursor.image_gen.cond_pos,
-            steps_done: state.cursor.image_gen.steps_done,
-            conditioning: state.cursor.image_gen.conditioning.clone(),
-            latent: state.cursor.image_gen.latent.clone(),
-            feedback_source: state.cursor.feedback.source_product.clone(),
-            feedback_feature: state.cursor.feedback.encoded_product.clone(),
-            feedback_step: state.cursor.feedback.ingest_step,
-            chainable: true,
-        };
-        if projected.phase == Phase::DenoiseGen && projected.steps_done >= state.req.image.steps {
+            .map(|inflight| (&inflight.operation, inflight.generation_apply()));
+        let mut projected = st.cursor.project(inflight)?;
+        if projected.phase == Phase::DenoiseGen
+            && projected.image_gen.steps_done >= st.req.image.steps
+        {
             projected.phase = Phase::CommitGen;
         }
-        for inflight in self.inflight_ops.get(&id).into_iter().flatten() {
-            match &inflight.generation_apply().delta {
-                TransitionDelta::CloseKv {
-                    image_id,
-                    logical_position,
-                    ..
-                } => {
-                    projected.phase = Phase::PublishKv;
-                    projected.image_id = *image_id;
-                    projected.conditioning_position = *logical_position;
-                }
-                TransitionDelta::PublishKv { image_id, .. } => {
-                    projected.phase = Phase::TransitionGen;
-                    projected.image_id = *image_id;
-                    projected.conditioning = inflight
-                        .operation
-                        .outputs
-                        .iter()
-                        .find(|output| output.kind == ProductKind::Kv)
-                        .cloned();
-                }
-                TransitionDelta::TransitionGen { image_id, .. } => {
-                    projected.phase = Phase::DenoiseGen;
-                    projected.image_id = *image_id;
-                    projected.steps_done = 0;
-                    projected.latent = inflight
-                        .operation
-                        .outputs
-                        .iter()
-                        .find(|output| output.kind == ProductKind::Latent)
-                        .cloned();
-                }
-                TransitionDelta::DenoiseGen {
-                    image_id,
-                    start_step,
-                    step_count,
-                    ..
-                } => {
-                    projected.image_id = *image_id;
-                    projected.steps_done = projected
-                        .steps_done
-                        .max(start_step.saturating_add(*step_count));
-                    projected.latent = inflight
-                        .operation
-                        .outputs
-                        .iter()
-                        .find(|output| output.kind == ProductKind::Latent)
-                        .cloned();
-                    projected.phase = if projected.steps_done >= state.req.image.steps {
-                        Phase::CommitGen
-                    } else {
-                        Phase::DenoiseGen
-                    };
-                }
-                TransitionDelta::CommitGen { image_id, .. } => {
-                    projected.image_id = *image_id;
-                    projected.feedback_source = inflight
-                        .operation
-                        .outputs
-                        .iter()
-                        .find(|output| {
-                            output.kind == ProductKind::Artifact
-                                && output.storage_class
-                                    == uniserve_worker_ipc::StorageClass::LatentArena
-                        })
-                        .cloned();
-                    projected.feedback_step = 0;
-                    projected.phase = Phase::FeedbackEncode;
-                    projected.chainable = state.req.behavior.generated_image_feedback
-                        && state.req.policy.feedback.as_ref().is_some_and(|feedback| {
-                            feedback.source == uniserve_core::FeedbackSource::DeviceProduct
-                        });
-                }
-                TransitionDelta::EncodeFeedbackStep {
-                    image_id,
-                    step_index,
-                } => {
-                    projected.image_id = *image_id;
-                    projected.feedback_step = *step_index;
-                    projected.feedback_feature = inflight
-                        .operation
-                        .outputs
-                        .iter()
-                        .find(|output| {
-                            matches!(
-                                output.kind,
-                                ProductKind::VisionFeature | ProductKind::LatentFeature
-                            )
-                        })
-                        .cloned();
-                    projected.phase = Phase::FeedbackState;
-                }
-                TransitionDelta::FeedbackState {
-                    step_index,
-                    is_final_step,
-                    ..
-                } => {
-                    projected.feedback_step = step_index.saturating_add(1);
-                    projected.feedback_feature = None;
-                    if *is_final_step {
-                        projected.phase = Phase::DecodeUnd;
-                        projected.chainable = state
-                            .req
-                            .policy
-                            .feedback
-                            .as_ref()
-                            .is_some_and(|feedback| feedback.sample_continuation);
-                    } else {
-                        projected.phase = Phase::FeedbackEncode;
-                    }
-                }
-                _ => {}
-            }
-        }
         if projected.phase == Phase::Prefill
-            && cursor.prompt_cursor >= state.context.prompt_ids.len() as u32
-            && state.cursor.ingest.mm_cursor >= state.context.images.len()
+            && projected.ingest.prompt_cursor >= st.context.prompt_ids.len() as u32
+            && projected.ingest.mm_cursor >= st.context.images.len()
         {
             projected.phase = Phase::DecodeUnd;
         }
@@ -806,8 +677,8 @@ impl Scheduler {
         }
         if target == ForwardMode::TokenDecode {
             let feedback_continuation = matches!(
-                predecessor.generation_apply().delta,
-                TransitionDelta::FeedbackState {
+                predecessor.generation_apply().intent,
+                TransitionIntent::FeedbackState {
                     is_final_step: true,
                     ..
                 }
@@ -829,11 +700,8 @@ impl Scheduler {
                     && state.cursor.und.tokens_emitted.saturating_add(1)
                         < state.req.max_und_tokens;
             }
-            if !matches!(
-                state.cursor.lifecycle.phase,
-                Phase::Prefill | Phase::DecodeUnd
-            ) || (state.cursor.lifecycle.phase == Phase::Prefill
-                && state.starts_gen_after_context())
+            if !matches!(state.cursor.phase, Phase::Prefill | Phase::DecodeUnd)
+                || (state.cursor.phase == Phase::Prefill && state.starts_gen_after_context())
                 || queue.iter().any(|op| {
                     !matches!(
                         op.operation.work,
@@ -846,7 +714,7 @@ impl Scheduler {
             let Some(projected) = self.projected_cursor(id) else {
                 return false;
             };
-            return projected.prompt_cursor as usize >= state.effective_prompt().len()
+            return projected.ingest.prompt_cursor as usize >= state.effective_prompt().len()
                 && state.cursor.ingest.mm_cursor >= state.context.images.len()
                 && state.cursor.und.tokens_emitted.saturating_add(queue.len())
                     < state.req.max_und_tokens;
@@ -867,16 +735,38 @@ impl Scheduler {
         }
         let state = self.running.get(&id)?;
         let cursor = self.projected_cursor(id)?;
-        if cursor.prompt_cursor < state.context.prompt_ids.len() as u32
-            || state.cursor.ingest.mm_cursor < state.context.images.len()
+        if cursor.ingest.prompt_cursor < state.context.prompt_ids.len() as u32
+            || cursor.ingest.mm_cursor < state.context.images.len()
         {
             return None;
         }
-        let branch = self.projected_branch(id)?;
-        if !branch.chainable {
+        let last_intent = self
+            .inflight_ops
+            .get(&id)
+            .and_then(|ops| ops.back())
+            .map(|inflight| &inflight.generation_apply().intent);
+        let chainable = match last_intent {
+            Some(TransitionIntent::CommitGen { .. }) => {
+                state.req.behavior.generated_image_feedback
+                    && state.req.policy.feedback.as_ref().is_some_and(|feedback| {
+                        feedback.source == uniserve_core::FeedbackSource::DeviceProduct
+                    })
+            }
+            Some(TransitionIntent::FeedbackState {
+                is_final_step: true,
+                ..
+            }) => state
+                .req
+                .policy
+                .feedback
+                .as_ref()
+                .is_some_and(|feedback| feedback.sample_continuation),
+            _ => true,
+        };
+        if !chainable {
             return None;
         }
-        Some(match branch.phase {
+        Some(match cursor.phase {
             Phase::Prefill | Phase::DecodeUnd => ForwardMode::TokenDecode,
             Phase::CloseKv | Phase::FeedbackState => ForwardMode::TokenExtend,
             Phase::PublishKv => ForwardMode::TransferKvPublish,
@@ -885,7 +775,7 @@ impl Scheduler {
             Phase::CommitGen => ForwardMode::Materialize,
             Phase::FeedbackEncode => {
                 let feedback = state.req.policy.feedback.as_ref()?;
-                match feedback.ingest.steps.get(branch.feedback_step)? {
+                match feedback.ingest.steps.get(cursor.feedback.ingest_step)? {
                     ImageIngestStep::VaeEncode => ForwardMode::EncodeLatent,
                     ImageIngestStep::VitEncode => ForwardMode::EncodeVision,
                 }
@@ -930,7 +820,7 @@ impl Scheduler {
                             .device_products_reachable(resident.producer, ForwardMode::TokenDecode)
                     })
                 && state.is_replayable_text()
-                && state.cursor.lifecycle.phase == Phase::DecodeUnd
+                && state.cursor.phase == Phase::DecodeUnd
                 && !state.cursor.ingest.round_closing
                 && (!state.req.behavior.gen_output
                     || state.req.policy.trigger.direct_token().is_some())
@@ -1065,7 +955,7 @@ impl Scheduler {
             timing.copy_us.saturating_add(timing.host_us),
             Ordering::Relaxed,
         );
-        if accounting.execution == ExecutionCapability::TensorizedMixed {
+        if accounting.mixed {
             stats.co_resident_partitions.fetch_add(1, Ordering::Relaxed);
             stats
                 .co_resident_us
@@ -1472,13 +1362,13 @@ impl Scheduler {
                 trace.push(json!({
                     "partition_id": partition.partition_id,
                     "submission_group": accounting.submission_group,
-                    "domain": domain_str(accounting.domain),
+                    "domain": accounting.domain,
                     "operations": accounting.operation_count,
-                    "execution": execution_capability_str(accounting.execution),
+                    "execution": if accounting.mixed { "tensorized_mixed" } else { "domain_homogeneous" },
                     "queue_us": timing.queued_us,
                     "device_us": timing.device_us,
                     "completion_us": timing.copy_us.saturating_add(timing.host_us),
-                    "co_resident_us": if accounting.execution == ExecutionCapability::TensorizedMixed {
+                    "co_resident_us": if accounting.mixed {
                         timing.device_us
                     } else {
                         0
@@ -1601,9 +1491,9 @@ impl Scheduler {
                         "request_id": id.0,
                         "op_id": op_id,
                         "operation_type": operation_variant.as_wire_str(),
-                        "domain": domain_str(operation.domain),
-                        "transition_delta": apply.delta.as_str(),
-                        "transition_replayability": apply.replayability_after_apply.as_str(),
+                        "domain": operation.domain,
+                        "transition_delta": &apply.intent,
+                        "transition_replayability": apply.replayability_after_apply,
                         "roundtrip_us": roundtrip_us,
                         "worker_queue_us": record.timing_counters.queued_us,
                         "device_us": record.timing_counters.device_us,
@@ -1637,7 +1527,7 @@ impl Scheduler {
                         "request_id": id.0,
                         "op_id": op_id,
                         "operation_type": operation_variant.as_wire_str(),
-                        "error": transition_validation_error_str(&error),
+                        "error": error.detail(),
                     }));
                     if self.running.contains_key(&id) {
                         self.finish_after_inflight(id, FinishReason::Error, None);
@@ -1682,12 +1572,9 @@ impl Scheduler {
                     token_prefix_versions(Some(&operation), &record, expected_parent.as_ref());
                 let cursor_result = if record.status == OpStatus::Ok {
                     self.running.get_mut(&id).map(|state| {
-                        state.cursor.apply_transition(
-                            &operation,
-                            &apply,
-                            &record,
-                            products.as_ref(),
-                        )
+                        state
+                            .cursor
+                            .apply(&operation, &apply, Some((&record, products.as_ref())))
                     })
                 } else {
                     None
@@ -1699,7 +1586,7 @@ impl Scheduler {
                         "request_id": id.0,
                         "op_id": op_id,
                         "operation_type": operation_variant.as_wire_str(),
-                        "error": cursor_apply_error_str(&error),
+                        "error": error.to_string(),
                     }));
                     if self.running.contains_key(&id) {
                         self.finish_after_inflight(id, FinishReason::Error, None);
@@ -1780,8 +1667,8 @@ impl Scheduler {
                 }
                 let release_flow_prefix = operation_variant == ForwardMode::GenFlow
                     && record.status == OpStatus::Ok
-                    && match &apply.delta {
-                        TransitionDelta::DenoiseGen {
+                    && match &apply.intent {
+                        TransitionIntent::DenoiseGen {
                             start_step,
                             step_count,
                             ..
@@ -1818,10 +1705,8 @@ impl Scheduler {
                     }
                 }
                 let priority = completion_priority(operation_variant);
-                let public_tokens_before = self
-                    .running
-                    .get(&id)
-                    .map_or(0, |state| state.public_token_seq);
+                let public_tokens_before =
+                    self.running.get(&id).map_or(0, |state| state.tokens_sent);
                 if record.status == OpStatus::Predicated {
                     if let Some(state) = self.running.get_mut(&id) {
                         state.cursor.resources.blocks_sent = state
@@ -1872,9 +1757,9 @@ impl Scheduler {
                 if token_operation {
                     let mut immediate_commit: Option<(VersionRef, VersionRef, u64)> = None;
                     if let Some(state) = self.running.get_mut(&id) {
-                        let emitted_public = state.public_token_seq > public_tokens_before;
+                        let emitted_public = state.tokens_sent > public_tokens_before;
                         if emitted_public {
-                            let emitted = state.public_token_seq - public_tokens_before;
+                            let emitted = state.tokens_sent - public_tokens_before;
                             for (offset, selected) in
                                 prefix_versions.into_iter().take(emitted).enumerate()
                             {
@@ -1883,10 +1768,10 @@ impl Scheduler {
                                     .insert(public_tokens_before + offset + 1, selected);
                             }
                             if emitted > 0
-                                && !state.token_cutoffs.contains_key(&state.public_token_seq)
+                                && !state.token_cutoffs.contains_key(&state.tokens_sent)
                                 && let Some(selected) = selected_fixed
                             {
-                                state.token_cutoffs.insert(state.public_token_seq, selected);
+                                state.token_cutoffs.insert(state.tokens_sent, selected);
                             }
                         }
                         if let Some((expected_parent, selected, public_event_limit)) =
@@ -1904,7 +1789,7 @@ impl Scheduler {
                                 .map(|pending| pending.selected.clone())
                                 .unwrap_or(expected_parent);
                             let token_count = if emitted_public {
-                                Some(state.public_token_seq)
+                                Some(state.tokens_sent)
                             } else {
                                 state
                                     .pending_commits
@@ -1935,7 +1820,7 @@ impl Scheduler {
                 {
                     progress_ops.push(json!({
                         "request_id": id.0,
-                        "phase": phase_str(st.cursor.lifecycle.phase),
+                        "phase": st.cursor.phase,
                         "generated_tokens": st.cursor.und.tokens_emitted,
                         "images_done": st.cursor.image_gen.images_done,
                         "image_id": st.cursor.image_gen.image_id,

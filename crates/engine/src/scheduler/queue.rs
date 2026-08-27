@@ -1,99 +1,65 @@
-//! The waiting-request queue abstraction, mirroring vLLM's `request_queue.py`:
-//! admission code consumes the queue; ordering policy lives in the queue
-//! implementation.
+//! Waiting requests ordered by the configured closed scheduling policy.
 
 use std::collections::VecDeque;
 
 use uniserve_core::RequestId;
 
-use crate::scheduler::ReqState;
+use crate::scheduler::{ReqState, SchedulingPolicy};
 
-/// Ordering policy for waiting requests.
-pub(crate) trait RequestQueue: Send {
-    /// Append a newly arrived request.
-    fn add_request(&mut self, st: ReqState);
-    /// The next request admission would consider.
-    fn peek_request(&self) -> Option<&ReqState>;
-    /// Remove and return the next request.
-    fn pop_request(&mut self) -> Option<ReqState>;
-    /// Remove a specific waiting request (cancellation before admission).
-    fn remove_request(&mut self, id: RequestId) -> Option<ReqState>;
-    fn len(&self) -> usize;
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
+pub(crate) enum RequestQueue {
+    Fcfs(VecDeque<ReqState>),
+    Priority(VecDeque<ReqState>),
 }
 
-/// First-come-first-served: a plain deque.
-#[derive(Default)]
-pub(crate) struct FcfsRequestQueue {
-    queue: VecDeque<ReqState>,
-}
-
-impl RequestQueue for FcfsRequestQueue {
-    fn add_request(&mut self, st: ReqState) {
-        self.queue.push_back(st);
+impl RequestQueue {
+    pub(crate) fn new(policy: SchedulingPolicy) -> Self {
+        match policy {
+            SchedulingPolicy::Fcfs => Self::Fcfs(VecDeque::new()),
+            SchedulingPolicy::Priority => Self::Priority(VecDeque::new()),
+        }
     }
 
-    fn peek_request(&self) -> Option<&ReqState> {
-        self.queue.front()
+    fn queue(&self) -> &VecDeque<ReqState> {
+        match self {
+            Self::Fcfs(queue) | Self::Priority(queue) => queue,
+        }
     }
 
-    fn pop_request(&mut self) -> Option<ReqState> {
-        self.queue.pop_front()
+    fn queue_mut(&mut self) -> &mut VecDeque<ReqState> {
+        match self {
+            Self::Fcfs(queue) | Self::Priority(queue) => queue,
+        }
     }
 
-    fn remove_request(&mut self, id: RequestId) -> Option<ReqState> {
-        let pos = self.queue.iter().position(|s| s.req.request_id == id)?;
-        self.queue.remove(pos)
+    pub(crate) fn add_request(&mut self, state: ReqState) {
+        match self {
+            Self::Fcfs(queue) => queue.push_back(state),
+            Self::Priority(queue) => {
+                let key = (state.req.priority, state.queued_at);
+                let index =
+                    queue.partition_point(|item| (item.req.priority, item.queued_at) <= key);
+                queue.insert(index, state);
+            }
+        }
     }
 
-    fn len(&self) -> usize {
-        self.queue.len()
-    }
-}
-
-/// Priority ordering: lower `priority` value first, ties broken by arrival
-/// time (vLLM's `(priority, arrival_time)` heap). Kept as an ordered vector
-/// rather than a binary heap because removal-by-id must be supported anyway;
-/// the sorted invariant lets the insertion point be located by binary search.
-#[derive(Default)]
-pub(crate) struct PriorityRequestQueue {
-    /// Sorted ascending by `(priority, queued_at)`.
-    queue: VecDeque<ReqState>,
-}
-
-impl PriorityRequestQueue {
-    /// Index at which `st` should be inserted to preserve the ascending
-    /// `(priority, queued_at)` order. `O(log n)` comparisons via binary search
-    /// over the sorted queue (binary search; insertion is still `O(n)` shifts).
-    fn insertion_index(&self, st: &ReqState) -> usize {
-        let key = (st.req.priority, st.queued_at);
-        self.queue
-            .partition_point(|s| (s.req.priority, s.queued_at) <= key)
-    }
-}
-
-impl RequestQueue for PriorityRequestQueue {
-    fn add_request(&mut self, st: ReqState) {
-        let idx = self.insertion_index(&st);
-        self.queue.insert(idx, st);
+    pub(crate) fn peek_request(&self) -> Option<&ReqState> {
+        self.queue().front()
     }
 
-    fn peek_request(&self) -> Option<&ReqState> {
-        self.queue.front()
+    pub(crate) fn pop_request(&mut self) -> Option<ReqState> {
+        self.queue_mut().pop_front()
     }
 
-    fn pop_request(&mut self) -> Option<ReqState> {
-        self.queue.pop_front()
+    pub(crate) fn remove_request(&mut self, id: RequestId) -> Option<ReqState> {
+        let position = self
+            .queue()
+            .iter()
+            .position(|state| state.req.request_id == id)?;
+        self.queue_mut().remove(position)
     }
 
-    fn remove_request(&mut self, id: RequestId) -> Option<ReqState> {
-        let pos = self.queue.iter().position(|s| s.req.request_id == id)?;
-        self.queue.remove(pos)
-    }
-
-    fn len(&self) -> usize {
-        self.queue.len()
+    pub(crate) fn len(&self) -> usize {
+        self.queue().len()
     }
 }

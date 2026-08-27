@@ -57,10 +57,8 @@ fn main() {
                 max_und_tokens: 20,
                 cache: &cache,
                 capabilities: &GenerationRuntimeCapabilities {
-                    supports_understanding: true,
-                    supports_vision_encode: false,
-                    supports_latent_encode: false,
-                    supports_image_generation: true,
+                    features: uniserve_core::GenerationFeatures::UNDERSTANDING
+                        | uniserve_core::GenerationFeatures::IMAGE_GENERATION,
                     max_latent_units: 64,
                     latent_downsample: 16,
                     max_vae_grid_tokens: 64,

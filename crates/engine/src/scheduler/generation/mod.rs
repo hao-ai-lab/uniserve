@@ -20,7 +20,7 @@ const ROUTE: RouteId = RouteId(0);
 
 /// A product reference minted by the planner for an operation output. The
 /// owning `request_key` and `producer_op_id` are placeholder until
-/// [`PlannedTransition::register`] stamps the real identity. The shape
+/// [`NextOp::register`] stamps the real identity. The shape
 /// bound is empty (it carries identity, not a device geometry).
 fn output_product(
     output_index: u16,
@@ -424,22 +424,17 @@ impl SchedulerContext {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum ContextLoweringError {
+    #[error("invalid generation request: {0}")]
     InvalidRequest(String),
+    #[error("image position {position} exceeds context length {token_count}")]
     ImagePositionBeyondContext { position: u32, token_count: usize },
 }
 
-impl std::fmt::Display for ContextLoweringError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "context lowering failed: {self:?}")
-    }
-}
-
-impl std::error::Error for ContextLoweringError {}
-
 /// Lifecycle phase for a canonical generation request.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum GenerationPhase {
     /// Encode staged input images before continuing text prefill.
     Encode,
@@ -460,7 +455,7 @@ pub(crate) enum GenerationPhase {
 /// commits worker-derived lifecycle progress.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct GenerationCursor {
-    pub(crate) lifecycle: LifecycleCursor,
+    pub(crate) phase: GenerationPhase,
     pub(crate) ingest: ContextCursor,
     pub(crate) und: UndCursor,
     pub(crate) image_gen: GenCursor,
@@ -477,7 +472,7 @@ impl GenerationCursor {
         reserve_worstcase: bool,
     ) -> Self {
         Self {
-            lifecycle: LifecycleCursor { phase },
+            phase,
             ingest: ContextCursor {
                 prompt_cursor: 0,
                 prompt_logprobs_processed: 0,
@@ -529,35 +524,36 @@ impl GenerationCursor {
         }
     }
 
-    /// Apply one validated result exactly once. Planning and projection never
-    /// mutate the committed cursor; this is the sole cursor-delta commit path.
-    pub(crate) fn apply_transition(
+    /// Apply one transition to either the committed cursor (with a worker
+    /// result) or a lookahead clone (without one).
+    pub(crate) fn apply(
         &mut self,
         operation: &Operation,
         apply: &SchedulerApply,
-        record: &ModelOutput,
-        products: &[ProductPayload],
+        outcome: Option<(&ModelOutput, &[ProductPayload])>,
     ) -> Result<(), CursorApplyError> {
-        let op_id = operation.op_id.0;
-        if op_id == 0 {
-            return Err(CursorApplyError::MissingOperationId);
+        if let Some((record, _)) = outcome {
+            let op_id = operation.op_id.0;
+            if op_id == 0 {
+                return Err(CursorApplyError::MissingOperationId);
+            }
+            if !self.applied_op_ids.insert(op_id) {
+                return Err(CursorApplyError::DuplicateOperation { op_id });
+            }
+            if record.status == OpStatus::Predicated {
+                return Ok(());
+            }
         }
-        if !self.applied_op_ids.insert(op_id) {
-            return Err(CursorApplyError::DuplicateOperation { op_id });
-        }
-        if record.status == OpStatus::Predicated {
-            return Ok(());
-        }
-        match apply.delta {
-            TransitionDelta::IngestText {
+        match &apply.intent {
+            TransitionIntent::IngestText {
                 start,
                 end,
                 logical_start,
                 physical_start,
                 ..
             } => {
-                let count = end.saturating_sub(start);
-                self.ingest.prompt_cursor = self.ingest.prompt_cursor.max(end);
+                let count = end.saturating_sub(*start);
+                self.ingest.prompt_cursor = self.ingest.prompt_cursor.max(*end);
                 self.und.logical_pos = self
                     .und
                     .logical_pos
@@ -567,35 +563,43 @@ impl GenerationCursor {
                     .physical_kv_len
                     .max(physical_start.saturating_add(count));
             }
-            TransitionDelta::EncodeImageStep { .. } => {}
-            TransitionDelta::IngestImageState {
+            TransitionIntent::EncodeImageStep { .. } => {}
+            TransitionIntent::IngestImageState {
                 step_index,
                 is_final_step,
                 position,
                 logical_positions,
+                physical_start,
+                physical_kv_tokens,
                 ..
             } => {
-                self.und.physical_kv_len = record.logical_lengths.kv_visible_len;
-                if is_final_step {
+                self.und.physical_kv_len = outcome.map_or_else(
+                    || projected_kv_len(*physical_start, *physical_kv_tokens),
+                    |(record, _)| Ok(record.logical_lengths.kv_visible_len),
+                )?;
+                if *is_final_step {
                     self.und.logical_pos = self
                         .und
                         .logical_pos
-                        .max(position.saturating_add(logical_positions));
+                        .max(position.saturating_add(*logical_positions));
                     self.ingest.mm_cursor = self.ingest.mm_cursor.saturating_add(1);
                     self.ingest.pending_image_step = 0;
                     self.ingest.encoded_product = None;
-                    self.lifecycle.phase = GenerationPhase::Prefill;
+                    self.phase = GenerationPhase::Prefill;
                 } else {
                     self.ingest.pending_image_step = step_index.saturating_add(1);
                     self.ingest.encoded_product = None;
-                    self.lifecycle.phase = GenerationPhase::Encode;
+                    self.phase = GenerationPhase::Encode;
                 }
             }
-            TransitionDelta::DecodeUnd {
+            TransitionIntent::DecodeUnd {
                 logical_position,
                 physical_position,
+                ..
             } => {
-                let actual_count = record.committed_tokens.len().max(1) as u32;
+                let actual_count = outcome.map_or(1, |(record, _)| {
+                    record.committed_tokens.len().max(1).min(u32::MAX as usize) as u32
+                });
                 self.und.logical_pos = self
                     .und
                     .logical_pos
@@ -605,24 +609,44 @@ impl GenerationCursor {
                     .physical_kv_len
                     .max(physical_position.saturating_add(actual_count));
             }
-            TransitionDelta::CloseKv { .. } => {
-                self.und.physical_kv_len = record.logical_lengths.kv_visible_len;
-                self.lifecycle.phase = GenerationPhase::PublishKv;
+            TransitionIntent::CloseKv {
+                image_id,
+                logical_position,
+                physical_position,
+                ..
+            } => {
+                self.und.physical_kv_len = outcome.map_or_else(
+                    || Ok(physical_position.saturating_add(1)),
+                    |(record, _)| Ok(record.logical_lengths.kv_visible_len),
+                )?;
+                self.image_gen.image_id = *image_id;
+                self.image_gen.cond_pos = *logical_position;
+                self.phase = GenerationPhase::PublishKv;
             }
-            TransitionDelta::PublishKv { .. } => {
-                self.image_gen.conditioning = products
-                    .iter()
-                    .find(|payload| {
-                        payload.product.producer_op_id == operation.op_id
-                            && payload.product.kind == ProductKind::Kv
+            TransitionIntent::PublishKv { .. } => {
+                self.image_gen.conditioning = outcome
+                    .and_then(|(_, products)| {
+                        products
+                            .iter()
+                            .find(|payload| {
+                                payload.product.producer_op_id == operation.op_id
+                                    && payload.product.kind == ProductKind::Kv
+                            })
+                            .map(|payload| payload.product.clone())
                     })
-                    .map(|payload| payload.product.clone());
+                    .or_else(|| {
+                        operation
+                            .outputs
+                            .iter()
+                            .find(|product| product.kind == ProductKind::Kv)
+                            .cloned()
+                    });
                 if self.image_gen.conditioning.is_none() {
-                    return Err(CursorApplyError::MissingOperationId);
+                    return Err(CursorApplyError::MissingKvProduct);
                 }
-                self.lifecycle.phase = GenerationPhase::TransitionGen;
+                self.phase = GenerationPhase::TransitionGen;
             }
-            TransitionDelta::TransitionGen { .. } => {
+            TransitionIntent::TransitionGen { .. } => {
                 self.image_gen.latent = operation
                     .outputs
                     .iter()
@@ -632,19 +656,21 @@ impl GenerationCursor {
                     return Err(CursorApplyError::MissingLatentProduct);
                 }
                 self.image_gen.steps_done = 0;
-                self.lifecycle.phase = GenerationPhase::DenoiseGen;
+                self.phase = GenerationPhase::DenoiseGen;
             }
-            TransitionDelta::DenoiseGen {
+            TransitionIntent::DenoiseGen {
                 start_step,
                 step_count,
                 ..
             } => {
-                let steps_completed =
-                    record.logical_lengths.latent_len.min(u32::from(u16::MAX)) as u16;
+                let steps_completed = outcome
+                    .map_or(start_step.saturating_add(*step_count), |(record, _)| {
+                        record.logical_lengths.latent_len.min(u32::from(u16::MAX)) as u16
+                    });
                 self.image_gen.steps_done = self
                     .image_gen
                     .steps_done
-                    .max(steps_completed.max(start_step.saturating_add(step_count)));
+                    .max(steps_completed.max(start_step.saturating_add(*step_count)));
                 self.image_gen.latent = operation
                     .outputs
                     .iter()
@@ -654,29 +680,66 @@ impl GenerationCursor {
                     return Err(CursorApplyError::MissingLatentProduct);
                 }
             }
-            TransitionDelta::CommitGen { .. } | TransitionDelta::EncodeFeedbackStep { .. } => {}
-            TransitionDelta::FeedbackState {
+            TransitionIntent::CommitGen { image_id, .. } => {
+                self.image_gen.image_id = *image_id;
+                self.feedback.source_product = operation
+                    .outputs
+                    .iter()
+                    .find(|output| {
+                        output.kind == ProductKind::Artifact
+                            && output.storage_class == StorageClass::LatentArena
+                    })
+                    .cloned();
+                self.feedback.ingest_step = 0;
+                self.feedback.encoded_product = None;
+                self.phase = GenerationPhase::FeedbackEncode;
+            }
+            TransitionIntent::EncodeFeedbackStep {
+                image_id,
+                step_index,
+                ..
+            } => {
+                self.image_gen.image_id = *image_id;
+                self.feedback.ingest_step = *step_index;
+                self.feedback.encoded_product = operation
+                    .outputs
+                    .iter()
+                    .find(|output| {
+                        matches!(
+                            output.kind,
+                            ProductKind::VisionFeature | ProductKind::LatentFeature
+                        )
+                    })
+                    .cloned();
+                self.phase = GenerationPhase::FeedbackState;
+            }
+            TransitionIntent::FeedbackState {
                 step_index,
                 is_final_step,
                 position,
                 logical_positions,
+                physical_start,
+                physical_kv_tokens,
                 ..
             } => {
-                self.und.physical_kv_len = record.logical_lengths.kv_visible_len;
-                if is_final_step {
+                self.und.physical_kv_len = outcome.map_or_else(
+                    || projected_kv_len(*physical_start, *physical_kv_tokens),
+                    |(record, _)| Ok(record.logical_lengths.kv_visible_len),
+                )?;
+                if *is_final_step {
                     self.und.logical_pos = self
                         .und
                         .logical_pos
-                        .max(position.saturating_add(logical_positions));
+                        .max(position.saturating_add(*logical_positions));
                     self.feedback.image_b64 = None;
                     self.feedback.ingest_step = 0;
                     self.feedback.source_product = None;
                     self.feedback.encoded_product = None;
-                    self.lifecycle.phase = GenerationPhase::DecodeUnd;
+                    self.phase = GenerationPhase::DecodeUnd;
                 } else {
                     self.feedback.ingest_step = step_index.saturating_add(1);
                     self.feedback.encoded_product = None;
-                    self.lifecycle.phase = GenerationPhase::FeedbackEncode;
+                    self.phase = GenerationPhase::FeedbackEncode;
                 }
             }
         }
@@ -692,36 +755,37 @@ impl GenerationCursor {
 
     pub(crate) fn project<'a>(
         &self,
-        applies: impl IntoIterator<Item = &'a SchedulerApply>,
-    ) -> Option<CursorProjection> {
-        let mut projection = CursorProjection {
-            phase: self.lifecycle.phase,
-            prompt_cursor: self.ingest.prompt_cursor,
-            logical_pos: self.und.logical_pos,
-            physical_kv_len: self.und.physical_kv_len,
-            replayability: self.replay.replayability,
-        };
-        for apply in applies {
-            projection.apply(apply)?;
+        inflight: impl IntoIterator<Item = (&'a Operation, &'a SchedulerApply)>,
+    ) -> Option<Self> {
+        let mut projection = self.clone();
+        for (operation, apply) in inflight {
+            projection.apply(operation, apply, None).ok()?;
         }
         Some(projection)
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum CursorApplyError {
-    MissingOperationId,
-    MissingLatentProduct,
-    DuplicateOperation { op_id: u64 },
-}
-
-impl std::fmt::Display for CursorApplyError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "cursor transition failed: {self:?}")
+fn projected_kv_len(base: u32, effect: ImageKvEffect) -> Result<u32, CursorApplyError> {
+    match effect {
+        ImageKvEffect::Exact { tokens } => Ok(base.saturating_add(tokens)),
+        ImageKvEffect::Bounded { max_tokens } => Ok(base.saturating_add(max_tokens)),
+        ImageKvEffect::WorkerDefined => Err(CursorApplyError::UnprojectableKvEffect),
     }
 }
 
-impl std::error::Error for CursorApplyError {}
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum CursorApplyError {
+    #[error("operation has no registered identity")]
+    MissingOperationId,
+    #[error("KV publication produced no KV product")]
+    MissingKvProduct,
+    #[error("generation operation produced no latent product")]
+    MissingLatentProduct,
+    #[error("worker-defined KV effect cannot be projected")]
+    UnprojectableKvEffect,
+    #[error("operation {op_id} was already applied")]
+    DuplicateOperation { op_id: u64 },
+}
 
 /// Locate the completion product a given operation produced for `kind`.
 fn find_product(
@@ -732,11 +796,6 @@ fn find_product(
     products
         .iter()
         .find(|payload| payload.product.producer_op_id == op_id && payload.product.kind == kind)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LifecycleCursor {
-    pub(crate) phase: GenerationPhase,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -808,115 +867,23 @@ pub(crate) struct ReplayCursor {
     pub(crate) replayability: Replayability,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CursorProjection {
-    pub(crate) phase: GenerationPhase,
-    pub(crate) prompt_cursor: u32,
-    pub(crate) logical_pos: u32,
-    pub(crate) physical_kv_len: u32,
-    pub(crate) replayability: Replayability,
-}
-
-impl CursorProjection {
-    fn apply(&mut self, apply: &SchedulerApply) -> Option<()> {
-        match apply.delta {
-            TransitionDelta::IngestText {
-                start,
-                end,
-                logical_start,
-                physical_start,
-                ..
-            } => {
-                let count = end.saturating_sub(start);
-                self.prompt_cursor = self.prompt_cursor.max(end);
-                self.logical_pos = self.logical_pos.max(logical_start.saturating_add(count));
-                self.physical_kv_len = self
-                    .physical_kv_len
-                    .max(physical_start.saturating_add(count));
-            }
-            TransitionDelta::EncodeImageStep { .. } => {}
-            TransitionDelta::IngestImageState {
-                position,
-                logical_positions,
-                physical_kv_tokens,
-                is_final_step,
-                ..
-            } => {
-                let physical = match physical_kv_tokens {
-                    ImageKvEffect::Exact { tokens } => tokens,
-                    ImageKvEffect::Bounded { .. } | ImageKvEffect::WorkerDefined => return None,
-                };
-                self.physical_kv_len = self.physical_kv_len.saturating_add(physical);
-                if is_final_step {
-                    self.logical_pos = self
-                        .logical_pos
-                        .max(position.saturating_add(logical_positions));
-                }
-            }
-            TransitionDelta::DecodeUnd {
-                logical_position,
-                physical_position,
-            } => {
-                self.logical_pos = self.logical_pos.max(logical_position.saturating_add(1));
-                self.physical_kv_len = self
-                    .physical_kv_len
-                    .max(physical_position.saturating_add(1));
-            }
-            TransitionDelta::CloseKv {
-                physical_position, ..
-            } => {
-                self.physical_kv_len = self
-                    .physical_kv_len
-                    .max(physical_position.saturating_add(1));
-                self.phase = GenerationPhase::PublishKv;
-            }
-            TransitionDelta::PublishKv { .. } => {
-                self.phase = GenerationPhase::TransitionGen;
-            }
-            TransitionDelta::TransitionGen { .. } => {
-                self.phase = GenerationPhase::DenoiseGen;
-            }
-            TransitionDelta::DenoiseGen { .. } => {}
-            TransitionDelta::CommitGen { .. } | TransitionDelta::EncodeFeedbackStep { .. } => {}
-            TransitionDelta::FeedbackState {
-                position,
-                logical_positions,
-                physical_kv_tokens,
-                is_final_step,
-                ..
-            } => {
-                let physical = match physical_kv_tokens {
-                    ImageKvEffect::Exact { tokens } => tokens,
-                    ImageKvEffect::Bounded { .. } | ImageKvEffect::WorkerDefined => return None,
-                };
-                self.physical_kv_len = self.physical_kv_len.saturating_add(physical);
-                if is_final_step {
-                    self.logical_pos = self
-                        .logical_pos
-                        .max(position.saturating_add(logical_positions));
-                }
-            }
-        }
-        if apply.replayability_after_apply == Replayability::NotReplayable {
-            self.replayability = Replayability::NotReplayable;
-        }
-        Some(())
-    }
-}
-
 /// Execution payload and scheduler-issued resources for one requested
 /// lifecycle transition. The planner is the only code that turns these intents
 /// into worker operations.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum TransitionIntent {
     IngestText {
         segment_index: usize,
-        prompt_start: u32,
+        start: u32,
+        end: u32,
+        logical_start: u32,
+        physical_start: u32,
         token_ids: Vec<u32>,
         new_blocks: Vec<BlockId>,
         sampling_state: SamplingState,
     },
-    EncodeImage {
+    EncodeImageStep {
         segment_index: usize,
         step_index: usize,
         step: ImageIngestStep,
@@ -929,13 +896,15 @@ pub(crate) enum TransitionIntent {
         step_index: usize,
         is_final_step: bool,
         position: u32,
+        physical_start: u32,
         logical_positions: u32,
         physical_kv_tokens: ImageKvEffect,
         feature: ProductRef,
         new_blocks: Vec<BlockId>,
     },
     DecodeUnd {
-        position: u32,
+        logical_position: u32,
+        physical_position: u32,
         new_blocks: Vec<BlockId>,
         spec_token_ids: Option<Vec<u32>>,
         sampling_state: SamplingState,
@@ -950,15 +919,17 @@ pub(crate) enum TransitionIntent {
     },
     PublishKv {
         image_id: u32,
+        physical_kv_len: u32,
     },
     TransitionGen {
         image_id: u32,
+        physical_kv_len: u32,
         latent_units: u64,
         conditioning: ProductRef,
     },
     CloseKv {
         image_id: u32,
-        position: u32,
+        logical_position: u32,
         physical_position: u32,
         token: u32,
         relay_input: bool,
@@ -972,12 +943,14 @@ pub(crate) enum TransitionIntent {
         latent_units: u64,
         conditioning: ProductRef,
         latent: ProductRef,
+        physical_kv_len: u32,
     },
     CommitGen {
         image_id: u32,
+        step: u16,
         latent: ProductRef,
     },
-    EncodeFeedback {
+    EncodeFeedbackStep {
         image_id: u32,
         step_index: usize,
         step: ImageIngestStep,
@@ -989,6 +962,7 @@ pub(crate) enum TransitionIntent {
         step_index: usize,
         is_final_step: bool,
         position: u32,
+        physical_start: u32,
         logical_positions: u32,
         physical_kv_tokens: ImageKvEffect,
         feature: ProductRef,
@@ -996,29 +970,6 @@ pub(crate) enum TransitionIntent {
         new_blocks: Vec<BlockId>,
         sampling_state: SamplingState,
     },
-}
-
-/// The wire-operation ingredients a planned intent lowers to. The host-side
-/// bookkeeping (`cfg_branches`, `allowed_text_tokens`, `expected_prompt_token_ids`)
-/// rides alongside because guidance, token policy, and scored prompt tokens are
-/// scheduler-owned rather than flat-wire fields.
-struct Wire {
-    work: ForwardMode,
-    inputs: Vec<ProductRef>,
-    outputs: Vec<ProductRef>,
-    new_blocks: Vec<BlockId>,
-    draft_token_ids: Vec<u32>,
-    token_cost: usize,
-    cfg_branches: usize,
-    allowed_text_tokens: Option<Vec<u32>>,
-    expected_prompt_token_ids: Option<Vec<u32>>,
-    /// Host-known input token values a token operation's forward consumes, when
-    /// the host supplies them (prompt/forced tokens, the prior committed token,
-    /// or a verified draft). Empty for operations with no host token input.
-    input_tokens: Vec<u32>,
-    /// Host-supplied input image bytes an encode operation's forward consumes.
-    input_image_bytes: Option<Vec<u8>>,
-    sampling_state: Option<SamplingState>,
 }
 
 /// The reserved output index of a host-supplied input product, kept clear of an
@@ -1071,781 +1022,675 @@ fn latent_output(
     ))
 }
 
-/// Side-effect-free planner for scheduler-local worker transitions.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct GenerationPlanner {
+/// Side-effect-free lowering from one scheduler decision to its next operation.
+pub(crate) fn plan(
     latent_dtype: Option<DType>,
+    request: &GenerationRequest,
+    cursor: &GenerationCursor,
+    mut intent: TransitionIntent,
+) -> Result<NextOp, PlanningError> {
+    match &mut intent {
+        TransitionIntent::IngestImageState {
+            physical_kv_tokens, ..
+        }
+        | TransitionIntent::FeedbackState {
+            physical_kv_tokens, ..
+        } => {
+            *physical_kv_tokens = bounded_worker_kv(
+                *physical_kv_tokens,
+                request.resources.max_kv_tokens,
+                cursor.und.physical_kv_len,
+            );
+        }
+        TransitionIntent::DenoiseGen { step_count, .. } => {
+            *step_count = (*step_count).max(1);
+        }
+        _ => {}
+    }
+    match intent {
+        intent @ TransitionIntent::IngestText { .. }
+        | intent @ TransitionIntent::IngestImageState { .. }
+        | intent @ TransitionIntent::CloseKv { .. }
+        | intent @ TransitionIntent::FeedbackState { .. } => {
+            plan_token_extend(request, cursor, intent)
+        }
+        intent @ TransitionIntent::DecodeUnd { .. } => plan_token_decode(request, cursor, intent),
+        intent @ TransitionIntent::EncodeImageStep { .. }
+        | intent @ TransitionIntent::EncodeFeedbackStep { .. } => {
+            plan_encode(request, cursor, intent)
+        }
+        intent @ TransitionIntent::PublishKv { .. } => plan_kv_publish(request, cursor, intent),
+        intent @ TransitionIntent::TransitionGen { .. } => {
+            plan_gen_transition(latent_dtype, request, cursor, intent)
+        }
+        intent @ TransitionIntent::DenoiseGen { .. } => {
+            plan_gen_flow(latent_dtype, request, cursor, intent)
+        }
+        intent @ TransitionIntent::CommitGen { .. } => plan_materialize(request, cursor, intent),
+    }
 }
 
-impl GenerationPlanner {
-    pub(crate) fn new(latent_dtype: Option<DType>) -> Self {
-        Self { latent_dtype }
-    }
-
-    fn latent_output(
-        self,
-        output_index: u16,
-        resources: &uniserve_core::GenerationResourceBounds,
-    ) -> Result<ProductRef, PlanningError> {
-        latent_output(
-            output_index,
-            resources,
-            self.latent_dtype.ok_or(PlanningError::MissingLatentDType)?,
-        )
-    }
-
-    pub(crate) fn plan(
-        &self,
-        request: &GenerationRequest,
-        cursor: CursorProjection,
-        intent: TransitionIntent,
-    ) -> Result<PlannedTransition, PlanningError> {
-        let und_visibility = request.behavior.und_tokens;
-        let image_visible = request.behavior.gen_output;
-        let (wire, delta, encoder_pins, replayability_after_apply, latent_units, _) = match intent {
-            TransitionIntent::IngestText {
-                segment_index,
-                prompt_start,
-                token_ids,
-                new_blocks,
-                sampling_state,
-            } => {
-                if prompt_start != cursor.prompt_cursor {
-                    return Err(PlanningError::PromptCursorMismatch {
-                        expected: cursor.prompt_cursor,
-                        actual: prompt_start,
-                    });
-                }
-                let token_count = token_ids.len() as u32;
-                let end = prompt_start.saturating_add(token_count);
-                let scores_prompt = request.sampling.prompt_logprobs_requested();
-                // The scored prompt positions the worker reports logprobs for
-                // exclude the first position when the prefill starts at zero.
-                let expected_prompt_token_ids = scores_prompt.then(|| {
-                    let mut tokens = token_ids.clone();
-                    if prompt_start == 0 && !tokens.is_empty() {
-                        tokens.remove(0);
-                    }
-                    tokens
+fn plan_token_extend(
+    request: &GenerationRequest,
+    cursor: &GenerationCursor,
+    intent: TransitionIntent,
+) -> Result<NextOp, PlanningError> {
+    match &intent {
+        TransitionIntent::IngestText {
+            start,
+            end,
+            token_ids,
+            sampling_state,
+            ..
+        } => {
+            if *start != cursor.ingest.prompt_cursor {
+                return Err(PlanningError::PromptCursorMismatch {
+                    expected: cursor.ingest.prompt_cursor,
+                    actual: *start,
                 });
-                let finish_candidate = produces_finish_candidate(&sampling_state);
-                let allowed_text_tokens = sampling_state.allowed_token_ids.clone();
-                let sampling_delta = operation_sampling_delta(&request.sampling, &sampling_state);
-                (
-                    Wire {
-                        work: ForwardMode::TokenExtend,
-                        inputs: Vec::new(),
-                        outputs: token_outputs(
-                            logprob_blob_bound(
-                                &request.sampling,
-                                expected_prompt_token_ids
-                                    .as_ref()
-                                    .map_or(0, |tokens| tokens.len().min(u32::MAX as usize) as u32),
-                            )?,
-                            finish_candidate,
-                            !sampling_state.transition_token_ids.is_empty(),
-                            1,
-                        )?,
-                        new_blocks,
-                        draft_token_ids: Vec::new(),
-                        token_cost: token_count as usize,
-                        cfg_branches: 1,
-                        allowed_text_tokens,
-                        expected_prompt_token_ids,
-                        input_tokens: token_ids,
-                        input_image_bytes: None,
-                        sampling_state: sampling_delta,
-                    },
-                    TransitionDelta::IngestText {
-                        segment_index,
-                        start: prompt_start,
-                        end,
-                        logical_start: cursor.logical_pos,
-                        physical_start: cursor.physical_kv_len,
-                    },
-                    Vec::new(),
-                    cursor.replayability,
-                    0,
-                    0,
-                )
             }
-            TransitionIntent::EncodeImage {
-                segment_index,
-                step_index,
-                step,
-                encoder_cache_key,
-                image_b64,
-                source_product,
-            } => {
-                if source_product.is_none() && image_b64.is_empty() {
-                    return Err(PlanningError::MissingImageInput);
-                }
-                let work = match step {
-                    ImageIngestStep::VaeEncode => ForwardMode::EncodeLatent,
-                    ImageIngestStep::VitEncode => ForwardMode::EncodeVision,
-                };
-                let has_source_product = source_product.is_some();
-                (
-                    Wire {
-                        work,
-                        inputs: source_product.into_iter().collect(),
-                        outputs: encode_outputs(step, 0, &request.resources)?,
-                        new_blocks: Vec::new(),
-                        draft_token_ids: Vec::new(),
-                        token_cost: 1,
-                        cfg_branches: 1,
-                        allowed_text_tokens: None,
-                        expected_prompt_token_ids: None,
-                        input_tokens: Vec::new(),
-                        input_image_bytes: (!has_source_product && !image_b64.is_empty())
-                            .then(|| image_b64.clone().into_bytes()),
-                        sampling_state: None,
-                    },
-                    TransitionDelta::EncodeImageStep {
-                        segment_index,
-                        step_index,
-                        encoder_cache_key,
-                    },
-                    encoder_cache_key.into_iter().collect(),
-                    cursor.replayability,
-                    0,
-                    0,
-                )
+            let token_count = token_ids.len().min(u32::MAX as usize) as u32;
+            if *end != start.saturating_add(token_count) {
+                return Err(PlanningError::PromptCursorMismatch {
+                    expected: start.saturating_add(token_count),
+                    actual: *end,
+                });
             }
-            TransitionIntent::IngestImageState {
-                segment_index,
-                step_index,
-                is_final_step,
-                position,
-                logical_positions,
-                physical_kv_tokens,
-                feature,
-                new_blocks,
-            } => {
-                if position != cursor.logical_pos {
-                    return Err(PlanningError::LogicalCursorMismatch {
-                        expected: cursor.logical_pos,
-                        actual: position,
-                    });
-                }
-                let token_cost = image_kv_token_bound(
-                    physical_kv_tokens,
-                    request.resources.max_kv_tokens,
-                    cursor.physical_kv_len,
-                );
-                (
-                    Wire {
-                        work: ForwardMode::TokenExtend,
-                        inputs: vec![feature],
-                        outputs: Vec::new(),
-                        new_blocks,
-                        draft_token_ids: Vec::new(),
-                        token_cost,
-                        cfg_branches: 1,
-                        allowed_text_tokens: None,
-                        expected_prompt_token_ids: None,
-                        input_tokens: Vec::new(),
-                        input_image_bytes: None,
-                        sampling_state: None,
-                    },
-                    TransitionDelta::IngestImageState {
-                        segment_index,
-                        step_index,
-                        is_final_step,
-                        position,
-                        physical_start: cursor.physical_kv_len,
-                        logical_positions,
-                        physical_kv_tokens: bounded_worker_kv(
-                            physical_kv_tokens,
-                            request.resources.max_kv_tokens,
-                            cursor.physical_kv_len,
-                        ),
-                    },
-                    Vec::new(),
-                    cursor.replayability,
-                    0,
-                    0,
-                )
-            }
-            TransitionIntent::DecodeUnd {
-                position,
-                new_blocks,
-                spec_token_ids,
-                sampling_state,
-                input_token,
-                relay_input,
-            } => {
-                if position != cursor.logical_pos {
-                    return Err(PlanningError::LogicalCursorMismatch {
-                        expected: cursor.logical_pos,
-                        actual: position,
-                    });
-                }
-                let draft_token_ids = spec_token_ids.unwrap_or_default();
-                let work = if draft_token_ids.is_empty() {
-                    ForwardMode::TokenDecode
-                } else {
-                    ForwardMode::TokenVerify
-                };
-                let token_cost = 1 + draft_token_ids.len();
-                // A verify supplies the drafts it checks. A device-relay
-                // successor attaches no host token so the worker consumes the
-                // predecessor's on-device sampled token. A plain decode
-                // continues from the prior committed host token.
-                let input_tokens = if !draft_token_ids.is_empty() {
-                    draft_token_ids.clone()
-                } else if relay_input {
-                    Vec::new()
-                } else {
-                    vec![input_token]
-                };
-                let finish_candidate = produces_finish_candidate(&sampling_state);
-                let allowed_text_tokens = sampling_state.allowed_token_ids.clone();
-                let sampling_delta = operation_sampling_delta(&request.sampling, &sampling_state);
-                (
-                    Wire {
-                        work,
-                        inputs: Vec::new(),
-                        outputs: token_outputs(
-                            logprob_blob_bound(&request.sampling, 0)?,
-                            finish_candidate,
-                            !sampling_state.transition_token_ids.is_empty(),
-                            token_cost.min(u32::MAX as usize) as u32,
-                        )?,
-                        new_blocks,
-                        draft_token_ids,
-                        token_cost,
-                        cfg_branches: 1,
-                        allowed_text_tokens,
-                        expected_prompt_token_ids: None,
-                        input_tokens,
-                        input_image_bytes: None,
-                        sampling_state: sampling_delta,
-                    },
-                    TransitionDelta::DecodeUnd {
-                        logical_position: position,
-                        physical_position: cursor.physical_kv_len,
-                    },
-                    Vec::new(),
-                    cursor.replayability,
-                    0,
-                    0,
-                )
-            }
-            TransitionIntent::PublishKv { image_id } => {
-                let output = bounded_product(
-                    0,
-                    ProductKind::Kv,
-                    StorageClass::PagedKv,
-                    DType::U8,
-                    dynamic_element_bound(KV_PUBLICATION_DESCRIPTOR_BYTES, DType::U8)?,
-                );
-                (
-                    Wire {
-                        work: ForwardMode::TransferKvPublish,
-                        inputs: Vec::new(),
-                        outputs: vec![
-                            output,
-                            output_product(
-                                1,
-                                ProductKind::Completion,
-                                StorageClass::DeviceTensor,
-                                DType::U8,
-                            ),
-                        ],
-                        new_blocks: Vec::new(),
-                        draft_token_ids: Vec::new(),
-                        token_cost: 0,
-                        cfg_branches: 1,
-                        allowed_text_tokens: None,
-                        expected_prompt_token_ids: None,
-                        input_tokens: Vec::new(),
-                        input_image_bytes: None,
-                        sampling_state: None,
-                    },
-                    TransitionDelta::PublishKv {
-                        image_id,
-                        physical_kv_len: cursor.physical_kv_len,
-                    },
-                    Vec::new(),
-                    cursor.replayability,
-                    0,
-                    0,
-                )
-            }
-            TransitionIntent::TransitionGen {
-                image_id,
-                latent_units,
-                conditioning,
-            } => {
-                if !request.behavior.gen_output {
-                    return Err(PlanningError::GenerationBranchDisabled);
-                }
-                (
-                    Wire {
-                        work: ForwardMode::GenTransition,
-                        inputs: vec![conditioning],
-                        outputs: vec![
-                            self.latent_output(0, &request.resources)?,
-                            output_product(
-                                1,
-                                ProductKind::Completion,
-                                StorageClass::DeviceTensor,
-                                DType::U8,
-                            ),
-                        ],
-                        new_blocks: Vec::new(),
-                        draft_token_ids: Vec::new(),
-                        token_cost: 1,
-                        cfg_branches: 1,
-                        allowed_text_tokens: None,
-                        expected_prompt_token_ids: None,
-                        input_tokens: Vec::new(),
-                        input_image_bytes: None,
-                        sampling_state: None,
-                    },
-                    TransitionDelta::TransitionGen {
-                        image_id,
-                        physical_kv_len: cursor.physical_kv_len,
-                    },
-                    Vec::new(),
-                    cursor.replayability,
-                    latent_units,
-                    0,
-                )
-            }
-            TransitionIntent::CloseKv {
-                image_id,
-                position,
-                physical_position,
-                token,
-                relay_input,
-                new_blocks,
-            } => (
-                Wire {
-                    work: ForwardMode::TokenExtend,
-                    inputs: Vec::new(),
-                    outputs: vec![output_product(
-                        0,
-                        ProductKind::Completion,
-                        StorageClass::DeviceTensor,
-                        DType::U8,
-                    )],
-                    new_blocks,
-                    draft_token_ids: Vec::new(),
-                    token_cost: 1,
-                    cfg_branches: 1,
-                    allowed_text_tokens: None,
-                    expected_prompt_token_ids: None,
-                    input_tokens: if relay_input { Vec::new() } else { vec![token] },
-                    input_image_bytes: None,
-                    sampling_state: None,
-                },
-                TransitionDelta::CloseKv {
-                    image_id,
-                    logical_position: position,
-                    physical_position,
-                },
+            let prompt_positions = request
+                .sampling
+                .prompt_logprobs_requested()
+                .then_some(token_ids.len().saturating_sub(usize::from(*start == 0)))
+                .unwrap_or(0)
+                .min(u32::MAX as usize) as u32;
+            let outputs = token_outputs(
+                logprob_blob_bound(&request.sampling, prompt_positions)?,
+                produces_finish_candidate(sampling_state),
+                !sampling_state.transition_token_ids.is_empty(),
+                1,
+            )?;
+            finish_plan(
+                request,
+                cursor,
+                intent,
+                ForwardMode::TokenExtend,
                 Vec::new(),
-                Replayability::NotReplayable,
+                outputs,
+            )
+        }
+        TransitionIntent::IngestImageState {
+            position, feature, ..
+        } => {
+            if *position != cursor.und.logical_pos {
+                return Err(PlanningError::LogicalCursorMismatch {
+                    expected: cursor.und.logical_pos,
+                    actual: *position,
+                });
+            }
+            let inputs = vec![feature.clone()];
+            finish_plan(
+                request,
+                cursor,
+                intent,
+                ForwardMode::TokenExtend,
+                inputs,
+                Vec::new(),
+            )
+        }
+        TransitionIntent::CloseKv { .. } => finish_plan(
+            request,
+            cursor,
+            intent,
+            ForwardMode::TokenExtend,
+            Vec::new(),
+            vec![output_product(
                 0,
-                0,
+                ProductKind::Completion,
+                StorageClass::DeviceTensor,
+                DType::U8,
+            )],
+        ),
+        TransitionIntent::FeedbackState {
+            position,
+            feature,
+            sample_continuation,
+            sampling_state,
+            ..
+        } => {
+            if request.policy.feedback.is_none() {
+                return Err(PlanningError::FeedbackDisabled);
+            }
+            if *position != cursor.und.logical_pos {
+                return Err(PlanningError::LogicalCursorMismatch {
+                    expected: cursor.und.logical_pos,
+                    actual: *position,
+                });
+            }
+            let outputs = feedback_state_outputs(
+                sample_continuation
+                    .then(|| logprob_blob_bound(&request.sampling, 0))
+                    .transpose()?
+                    .flatten(),
+                *sample_continuation,
+                *sample_continuation && produces_finish_candidate(sampling_state),
+                *sample_continuation && !sampling_state.transition_token_ids.is_empty(),
+            )?;
+            let inputs = vec![feature.clone()];
+            finish_plan(
+                request,
+                cursor,
+                intent,
+                ForwardMode::TokenExtend,
+                inputs,
+                outputs,
+            )
+        }
+        _ => unreachable!("token-extend planner received another forward mode"),
+    }
+}
+
+fn plan_token_decode(
+    request: &GenerationRequest,
+    cursor: &GenerationCursor,
+    intent: TransitionIntent,
+) -> Result<NextOp, PlanningError> {
+    let TransitionIntent::DecodeUnd {
+        logical_position,
+        spec_token_ids,
+        sampling_state,
+        ..
+    } = &intent
+    else {
+        unreachable!("token-decode planner received another forward mode")
+    };
+    if *logical_position != cursor.und.logical_pos {
+        return Err(PlanningError::LogicalCursorMismatch {
+            expected: cursor.und.logical_pos,
+            actual: *logical_position,
+        });
+    }
+    let draft_count = spec_token_ids.as_ref().map_or(0, Vec::len);
+    let work = if draft_count == 0 {
+        ForwardMode::TokenDecode
+    } else {
+        ForwardMode::TokenVerify
+    };
+    let max_points = 1_usize.saturating_add(draft_count).min(u32::MAX as usize) as u32;
+    let outputs = token_outputs(
+        logprob_blob_bound(&request.sampling, 0)?,
+        produces_finish_candidate(sampling_state),
+        !sampling_state.transition_token_ids.is_empty(),
+        max_points,
+    )?;
+    finish_plan(request, cursor, intent, work, Vec::new(), outputs)
+}
+
+fn plan_encode(
+    request: &GenerationRequest,
+    cursor: &GenerationCursor,
+    intent: TransitionIntent,
+) -> Result<NextOp, PlanningError> {
+    let (step, inputs, adds_completion) = match &intent {
+        TransitionIntent::EncodeImageStep {
+            step,
+            image_b64,
+            source_product,
+            ..
+        } => {
+            if source_product.is_none() && image_b64.is_empty() {
+                return Err(PlanningError::MissingImageInput);
+            }
+            (*step, source_product.clone().into_iter().collect(), false)
+        }
+        TransitionIntent::EncodeFeedbackStep { step, source, .. } => {
+            if !request.behavior.generated_image_feedback || request.policy.feedback.is_none() {
+                return Err(PlanningError::FeedbackDisabled);
+            }
+            (*step, source.clone().into_iter().collect(), true)
+        }
+        _ => unreachable!("encode planner received another forward mode"),
+    };
+    let work = match step {
+        ImageIngestStep::VaeEncode => ForwardMode::EncodeLatent,
+        ImageIngestStep::VitEncode => ForwardMode::EncodeVision,
+    };
+    let mut outputs = encode_outputs(step, 0, &request.resources)?;
+    if adds_completion {
+        outputs.push(output_product(
+            1,
+            ProductKind::Completion,
+            StorageClass::DeviceTensor,
+            DType::U8,
+        ));
+    }
+    finish_plan(request, cursor, intent, work, inputs, outputs)
+}
+
+fn plan_kv_publish(
+    request: &GenerationRequest,
+    cursor: &GenerationCursor,
+    intent: TransitionIntent,
+) -> Result<NextOp, PlanningError> {
+    let kv = bounded_product(
+        0,
+        ProductKind::Kv,
+        StorageClass::PagedKv,
+        DType::U8,
+        dynamic_element_bound(KV_PUBLICATION_DESCRIPTOR_BYTES, DType::U8)?,
+    );
+    finish_plan(
+        request,
+        cursor,
+        intent,
+        ForwardMode::TransferKvPublish,
+        Vec::new(),
+        vec![
+            kv,
+            output_product(
+                1,
+                ProductKind::Completion,
+                StorageClass::DeviceTensor,
+                DType::U8,
             ),
+        ],
+    )
+}
+
+fn plan_gen_transition(
+    latent_dtype: Option<DType>,
+    request: &GenerationRequest,
+    cursor: &GenerationCursor,
+    intent: TransitionIntent,
+) -> Result<NextOp, PlanningError> {
+    if !request.behavior.gen_output {
+        return Err(PlanningError::GenerationBranchDisabled);
+    }
+    let TransitionIntent::TransitionGen { conditioning, .. } = &intent else {
+        unreachable!("generation-transition planner received another forward mode")
+    };
+    let inputs = vec![conditioning.clone()];
+    finish_plan(
+        request,
+        cursor,
+        intent,
+        ForwardMode::GenTransition,
+        inputs,
+        vec![
+            latent_output(
+                0,
+                &request.resources,
+                latent_dtype.ok_or(PlanningError::MissingLatentDType)?,
+            )?,
+            output_product(
+                1,
+                ProductKind::Completion,
+                StorageClass::DeviceTensor,
+                DType::U8,
+            ),
+        ],
+    )
+}
+
+fn plan_gen_flow(
+    latent_dtype: Option<DType>,
+    request: &GenerationRequest,
+    cursor: &GenerationCursor,
+    intent: TransitionIntent,
+) -> Result<NextOp, PlanningError> {
+    if !request.behavior.gen_output {
+        return Err(PlanningError::GenerationBranchDisabled);
+    }
+    let TransitionIntent::DenoiseGen {
+        conditioning,
+        latent,
+        ..
+    } = &intent
+    else {
+        unreachable!("generation-flow planner received another forward mode")
+    };
+    let inputs = vec![conditioning.clone(), latent.clone()];
+    finish_plan(
+        request,
+        cursor,
+        intent,
+        ForwardMode::GenFlow,
+        inputs,
+        vec![
+            latent_output(
+                0,
+                &request.resources,
+                latent_dtype.ok_or(PlanningError::MissingLatentDType)?,
+            )?,
+            output_product(
+                1,
+                ProductKind::Completion,
+                StorageClass::DeviceTensor,
+                DType::U8,
+            ),
+        ],
+    )
+}
+
+fn plan_materialize(
+    request: &GenerationRequest,
+    cursor: &GenerationCursor,
+    intent: TransitionIntent,
+) -> Result<NextOp, PlanningError> {
+    if !request.behavior.gen_output {
+        return Err(PlanningError::GenerationBranchDisabled);
+    }
+    let TransitionIntent::CommitGen { latent, .. } = &intent else {
+        unreachable!("materialize planner received another forward mode")
+    };
+    let inputs = vec![latent.clone()];
+    let feedback = request
+        .behavior
+        .generated_image_feedback
+        .then_some(request.policy.feedback.as_ref())
+        .flatten();
+    let mut outputs = materialize_outputs(request, feedback)?;
+    outputs.push(output_product(
+        2,
+        ProductKind::Completion,
+        StorageClass::DeviceTensor,
+        DType::U8,
+    ));
+    finish_plan(
+        request,
+        cursor,
+        intent,
+        ForwardMode::Materialize,
+        inputs,
+        outputs,
+    )
+}
+
+fn finish_plan(
+    request: &GenerationRequest,
+    cursor: &GenerationCursor,
+    intent: TransitionIntent,
+    work: ForwardMode,
+    inputs: Vec<ProductRef>,
+    outputs: Vec<ProductRef>,
+) -> Result<NextOp, PlanningError> {
+    let operation_variant = work;
+    let produces_latent = matches!(
+        operation_variant,
+        ForwardMode::GenTransition | ForwardMode::GenFlow
+    );
+    let is_materialize = operation_variant == ForwardMode::Materialize;
+    let produces_token = outputs
+        .iter()
+        .any(|output| output.kind == ProductKind::Token);
+    let new_blocks = match &intent {
+        TransitionIntent::IngestText { new_blocks, .. }
+        | TransitionIntent::IngestImageState { new_blocks, .. }
+        | TransitionIntent::DecodeUnd { new_blocks, .. }
+        | TransitionIntent::CloseKv { new_blocks, .. }
+        | TransitionIntent::FeedbackState { new_blocks, .. } => new_blocks.clone(),
+        _ => Vec::new(),
+    };
+    let draft_token_ids = match &intent {
+        TransitionIntent::DecodeUnd { spec_token_ids, .. } => {
+            spec_token_ids.clone().unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
+    let draft_count =
+        (!draft_token_ids.is_empty()).then(|| draft_token_ids.len().min(u32::MAX as usize) as u32);
+    let token_cost = match &intent {
+        TransitionIntent::IngestText { token_ids, .. } => token_ids.len(),
+        TransitionIntent::IngestImageState {
+            physical_kv_tokens, ..
+        }
+        | TransitionIntent::FeedbackState {
+            physical_kv_tokens, ..
+        } => image_kv_token_bound(
+            *physical_kv_tokens,
+            request.resources.max_kv_tokens,
+            cursor.und.physical_kv_len,
+        ),
+        TransitionIntent::DecodeUnd { .. } => 1 + draft_token_ids.len(),
+        TransitionIntent::PublishKv { .. } => 0,
+        TransitionIntent::DenoiseGen { step_count, .. } => usize::from((*step_count).max(1)),
+        TransitionIntent::EncodeImageStep { .. }
+        | TransitionIntent::TransitionGen { .. }
+        | TransitionIntent::CloseKv { .. }
+        | TransitionIntent::CommitGen { .. }
+        | TransitionIntent::EncodeFeedbackStep { .. } => 1,
+    };
+    let cfg_branches = match &intent {
+        TransitionIntent::DenoiseGen { cfg, .. } => usize::from(cfg.branch_count.max(1)),
+        _ => 1,
+    };
+    let input_tokens = match &intent {
+        TransitionIntent::IngestText { token_ids, .. } => token_ids.clone(),
+        TransitionIntent::DecodeUnd {
+            spec_token_ids,
+            input_token,
+            relay_input,
+            ..
+        } => match spec_token_ids {
+            Some(drafts) if !drafts.is_empty() => drafts.clone(),
+            _ if *relay_input => Vec::new(),
+            _ => vec![*input_token],
+        },
+        TransitionIntent::CloseKv {
+            token, relay_input, ..
+        } if !relay_input => vec![*token],
+        _ => Vec::new(),
+    };
+    let input_image_bytes = match &intent {
+        TransitionIntent::EncodeImageStep {
+            source_product,
+            image_b64,
+            ..
+        } if source_product.is_none() && !image_b64.is_empty() => {
+            Some(image_b64.clone().into_bytes())
+        }
+        TransitionIntent::EncodeFeedbackStep {
+            source, image_b64, ..
+        } if source.is_none() && !image_b64.is_empty() => Some(image_b64.clone().into_bytes()),
+        _ => None,
+    };
+    let source_sampling = match &intent {
+        TransitionIntent::IngestText { sampling_state, .. }
+        | TransitionIntent::DecodeUnd { sampling_state, .. } => Some(sampling_state),
+        TransitionIntent::FeedbackState {
+            sample_continuation: true,
+            sampling_state,
+            ..
+        } => Some(sampling_state),
+        _ => None,
+    };
+    let sampling_state =
+        source_sampling.and_then(|state| operation_sampling_delta(&request.sampling, state));
+    let allowed_text_tokens = source_sampling.and_then(|state| state.allowed_token_ids.clone());
+    let expected_prompt_token_ids = match &intent {
+        TransitionIntent::IngestText {
+            start, token_ids, ..
+        } if request.sampling.prompt_logprobs_requested() => {
+            let mut tokens = token_ids.clone();
+            if *start == 0 && !tokens.is_empty() {
+                tokens.remove(0);
+            }
+            Some(tokens)
+        }
+        _ => None,
+    };
+    let encoder_pins = match &intent {
+        TransitionIntent::EncodeImageStep {
+            encoder_cache_key, ..
+        } => encoder_cache_key.iter().copied().collect(),
+        _ => Vec::new(),
+    };
+    let replayability_after_apply = match &intent {
+        TransitionIntent::CloseKv { .. }
+        | TransitionIntent::DenoiseGen { .. }
+        | TransitionIntent::CommitGen { .. }
+        | TransitionIntent::EncodeFeedbackStep { .. }
+        | TransitionIntent::FeedbackState { .. } => Replayability::NotReplayable,
+        _ => cursor.replay.replayability,
+    };
+    let latent_units = match &intent {
+        TransitionIntent::TransitionGen { latent_units, .. }
+        | TransitionIntent::DenoiseGen { latent_units, .. } => *latent_units,
+        _ => 0,
+    };
+    let kv_target_tokens = transition_kv_target(&intent).or_else(|| {
+        transition_may_write_worker_defined_kv(&intent).then_some(request.resources.max_kv_tokens)
+    });
+    let new_blocks_len = new_blocks.len();
+    let max_latent_bytes = if produces_latent {
+        request.resources.max_image_latent_bytes
+    } else {
+        outputs
+            .iter()
+            .filter(|output| output.storage_class == StorageClass::LatentArena)
+            .map(product_bound_bytes)
+            .max()
+            .unwrap_or(0)
+    };
+    let max_completion_bytes = outputs
+        .iter()
+        .filter(|output| {
+            matches!(
+                output.storage_class,
+                StorageClass::PinnedOutput | StorageClass::HostStaging
+            )
+        })
+        .map(product_bound_bytes)
+        .fold(0_u64, u64::saturating_add);
+    let max_transfer_bytes = outputs
+        .iter()
+        .filter(|output| output.storage_class == StorageClass::PagedKv)
+        .map(product_bound_bytes)
+        .fold(0_u64, u64::saturating_add);
+    let resources = TransitionResources {
+        new_blocks: new_blocks_len,
+        kv_target_tokens,
+        latent_units: if produces_latent { latent_units } else { 0 },
+        cfg_branches,
+        encoder_pins,
+        replayability_after_apply,
+        release_on_apply: if is_materialize {
+            vec![ResourceClass::ImageLatent]
+        } else {
+            Vec::new()
+        },
+    };
+    let validation = TransitionValidation {
+        expected_denoise_step: match &intent {
             TransitionIntent::DenoiseGen {
-                image_id,
                 start_step,
                 step_count,
-                cfg,
-                latent_units,
-                conditioning,
-                latent,
-            } => {
-                if !request.behavior.gen_output {
-                    return Err(PlanningError::GenerationBranchDisabled);
-                }
-                let step_count = step_count.max(1);
-                (
-                    Wire {
-                        work: ForwardMode::GenFlow,
-                        inputs: vec![conditioning, latent],
-                        outputs: vec![
-                            self.latent_output(0, &request.resources)?,
-                            output_product(
-                                1,
-                                ProductKind::Completion,
-                                StorageClass::DeviceTensor,
-                                DType::U8,
-                            ),
-                        ],
-                        new_blocks: Vec::new(),
-                        draft_token_ids: Vec::new(),
-                        token_cost: usize::from(step_count),
-                        cfg_branches: usize::from(cfg.branch_count.max(1)),
-                        allowed_text_tokens: None,
-                        expected_prompt_token_ids: None,
-                        input_tokens: Vec::new(),
-                        input_image_bytes: None,
-                        sampling_state: None,
-                    },
-                    TransitionDelta::DenoiseGen {
-                        image_id,
-                        start_step,
-                        step_count,
-                        physical_kv_len: cursor.physical_kv_len,
-                    },
-                    Vec::new(),
-                    Replayability::NotReplayable,
-                    latent_units,
-                    0,
-                )
-            }
-            TransitionIntent::CommitGen { image_id, latent } => {
-                if !request.behavior.gen_output {
-                    return Err(PlanningError::GenerationBranchDisabled);
-                }
-                let feedback = request
-                    .behavior
-                    .generated_image_feedback
-                    .then_some(request.policy.feedback.as_ref())
-                    .flatten();
-                let mut outputs = materialize_outputs(request, feedback)?;
-                outputs.push(output_product(
-                    2,
-                    ProductKind::Completion,
-                    StorageClass::DeviceTensor,
-                    DType::U8,
-                ));
-                (
-                    Wire {
-                        work: ForwardMode::Materialize,
-                        inputs: vec![latent],
-                        outputs,
-                        new_blocks: Vec::new(),
-                        draft_token_ids: Vec::new(),
-                        token_cost: 1,
-                        cfg_branches: 1,
-                        allowed_text_tokens: None,
-                        expected_prompt_token_ids: None,
-                        input_tokens: Vec::new(),
-                        input_image_bytes: None,
-                        sampling_state: None,
-                    },
-                    TransitionDelta::CommitGen {
-                        image_id,
-                        step: request.image.steps,
-                    },
-                    Vec::new(),
-                    Replayability::NotReplayable,
-                    0,
-                    0,
-                )
-            }
-            TransitionIntent::EncodeFeedback {
-                image_id,
-                step_index,
-                step,
-                source,
-                image_b64,
-            } => {
-                if !request.behavior.generated_image_feedback || request.policy.feedback.is_none() {
-                    return Err(PlanningError::FeedbackDisabled);
-                }
-                let work = match step {
-                    ImageIngestStep::VaeEncode => ForwardMode::EncodeLatent,
-                    ImageIngestStep::VitEncode => ForwardMode::EncodeVision,
-                };
-                let mut outputs = encode_outputs(step, 0, &request.resources)?;
-                outputs.push(output_product(
-                    1,
-                    ProductKind::Completion,
-                    StorageClass::DeviceTensor,
-                    DType::U8,
-                ));
-                (
-                    Wire {
-                        work,
-                        inputs: source.clone().into_iter().collect(),
-                        outputs,
-                        new_blocks: Vec::new(),
-                        draft_token_ids: Vec::new(),
-                        token_cost: 1,
-                        cfg_branches: 1,
-                        allowed_text_tokens: None,
-                        expected_prompt_token_ids: None,
-                        input_tokens: Vec::new(),
-                        input_image_bytes: (source.is_none() && !image_b64.is_empty())
-                            .then(|| image_b64.clone().into_bytes()),
-                        sampling_state: None,
-                    },
-                    TransitionDelta::EncodeFeedbackStep {
-                        image_id,
-                        step_index,
-                    },
-                    Vec::new(),
-                    Replayability::NotReplayable,
-                    0,
-                    0,
-                )
-            }
-            TransitionIntent::FeedbackState {
-                image_id,
-                step_index,
-                is_final_step,
-                position,
-                logical_positions,
-                physical_kv_tokens,
-                feature,
-                sample_continuation,
-                new_blocks,
-                sampling_state,
-            } => {
-                if request.policy.feedback.is_none() {
-                    return Err(PlanningError::FeedbackDisabled);
-                }
-                if position != cursor.logical_pos {
-                    return Err(PlanningError::LogicalCursorMismatch {
-                        expected: cursor.logical_pos,
-                        actual: position,
-                    });
-                }
-                let finish_candidate =
-                    sample_continuation && produces_finish_candidate(&sampling_state);
-                let allowed_text_tokens = sample_continuation
-                    .then(|| sampling_state.allowed_token_ids.clone())
-                    .flatten();
-                let sampling_delta = sample_continuation
-                    .then(|| operation_sampling_delta(&request.sampling, &sampling_state))
-                    .flatten();
-                let token_cost = image_kv_token_bound(
-                    physical_kv_tokens,
-                    request.resources.max_kv_tokens,
-                    cursor.physical_kv_len,
-                );
-                let outputs = feedback_state_outputs(
-                    sample_continuation
-                        .then(|| logprob_blob_bound(&request.sampling, 0))
-                        .transpose()?
-                        .flatten(),
-                    sample_continuation,
-                    finish_candidate,
-                    sample_continuation && !sampling_state.transition_token_ids.is_empty(),
-                )?;
-                (
-                    Wire {
-                        work: ForwardMode::TokenExtend,
-                        inputs: vec![feature],
-                        outputs,
-                        new_blocks,
-                        draft_token_ids: Vec::new(),
-                        token_cost,
-                        cfg_branches: 1,
-                        allowed_text_tokens,
-                        expected_prompt_token_ids: None,
-                        input_tokens: Vec::new(),
-                        input_image_bytes: None,
-                        sampling_state: sampling_delta,
-                    },
-                    TransitionDelta::FeedbackState {
-                        image_id,
-                        step_index,
-                        is_final_step,
-                        position,
-                        physical_start: cursor.physical_kv_len,
-                        logical_positions,
-                        physical_kv_tokens: bounded_worker_kv(
-                            physical_kv_tokens,
-                            request.resources.max_kv_tokens,
-                            cursor.physical_kv_len,
-                        ),
-                    },
-                    Vec::new(),
-                    Replayability::NotReplayable,
-                    0,
-                    0,
-                )
-            }
-        };
-        let operation_variant = wire.work;
-        let produces_latent = matches!(
+                ..
+            } => Some(start_step.saturating_add(*step_count)),
+            _ => None,
+        },
+        expects_encoder_handle: matches!(
             operation_variant,
-            ForwardMode::GenTransition | ForwardMode::GenFlow
-        );
-        let is_materialize = operation_variant == ForwardMode::Materialize;
-        let produces_token = wire
-            .outputs
-            .iter()
-            .any(|output| output.kind == ProductKind::Token);
-        let draft_count = (!wire.draft_token_ids.is_empty())
-            .then(|| wire.draft_token_ids.len().min(u32::MAX as usize) as u32);
-        let kv_target_tokens = transition_kv_target(&delta).or_else(|| {
-            transition_may_write_worker_defined_kv(&delta)
-                .then_some(request.resources.max_kv_tokens)
-        });
-        let new_blocks_len = wire.new_blocks.len();
-        let max_latent_bytes = if produces_latent {
-            request.resources.max_image_latent_bytes
-        } else {
-            wire.outputs
-                .iter()
-                .filter(|output| output.storage_class == StorageClass::LatentArena)
-                .map(product_bound_bytes)
-                .max()
-                .unwrap_or(0)
-        };
-        let max_completion_bytes = wire
-            .outputs
-            .iter()
-            .filter(|output| {
-                matches!(
-                    output.storage_class,
-                    StorageClass::PinnedOutput | StorageClass::HostStaging
-                )
-            })
-            .map(product_bound_bytes)
-            .fold(0_u64, u64::saturating_add);
-        let max_transfer_bytes = wire
-            .outputs
-            .iter()
-            .filter(|output| output.storage_class == StorageClass::PagedKv)
-            .map(product_bound_bytes)
-            .fold(0_u64, u64::saturating_add);
-        let resources = TransitionResources {
-            new_blocks: new_blocks_len,
-            kv_target_tokens,
-            latent_units: if produces_latent { latent_units } else { 0 },
-            cfg_branches: wire.cfg_branches,
-            encoder_pins,
-            replayability_after_apply,
-            release_on_apply: if is_materialize {
-                vec![ResourceClass::ImageLatent]
-            } else {
-                Vec::new()
-            },
-        };
-        let validation = TransitionValidation {
-            expected_denoise_step: match delta {
-                TransitionDelta::DenoiseGen {
-                    start_step,
-                    step_count,
-                    ..
-                } => Some(start_step.saturating_add(step_count)),
-                _ => None,
-            },
-            expects_encoder_handle: matches!(
-                operation_variant,
-                ForwardMode::EncodeLatent | ForwardMode::EncodeVision
-            ),
-            expects_latent_generation: produces_latent,
-            expects_image_artifact: is_materialize,
-            expected_image_hw: is_materialize
-                .then_some((request.image.height, request.image.width)),
-            requires_kv_publication: operation_variant == ForwardMode::TransferKvPublish,
-            expected_image_kv: match delta {
-                TransitionDelta::IngestImageState {
-                    physical_start,
-                    physical_kv_tokens,
-                    ..
-                }
-                | TransitionDelta::FeedbackState {
-                    physical_start,
-                    physical_kv_tokens,
-                    ..
-                } => Some(ImageKvExpectation {
-                    base: physical_start,
-                    effect: bounded_worker_kv(
-                        physical_kv_tokens,
-                        request.resources.max_kv_tokens,
-                        physical_start,
-                    ),
-                }),
-                _ => None,
-            },
-            allows_sampled_tokens: produces_token,
-            expects_sampled_token: produces_token,
-            expected_text_tokens: match &delta {
-                TransitionDelta::IngestText { .. } => Some(TextTokenCountRange { min: 1, max: 1 }),
-                TransitionDelta::DecodeUnd { .. } => {
-                    let max = draft_count.map_or(1, |count| count.saturating_add(1));
-                    Some(TextTokenCountRange { min: 1, max })
-                }
-                TransitionDelta::CloseKv { .. } => Some(TextTokenCountRange { min: 0, max: 0 }),
-                TransitionDelta::FeedbackState { .. } if produces_token => {
-                    Some(TextTokenCountRange { min: 1, max: 1 })
-                }
-                _ => None,
-            },
-            max_accepted_draft_tokens: draft_count,
-            draft_token_ids: (!wire.draft_token_ids.is_empty())
-                .then(|| wire.draft_token_ids.clone()),
-            finish_token_ids: wire
-                .sampling_state
-                .as_ref()
-                .map(|state| state.finish_token_ids.clone())
-                .unwrap_or_default(),
-            allowed_text_tokens: wire.allowed_text_tokens,
-            generated_logprobs_requested: produces_token
-                && request.sampling.generated_logprobs_requested()
-                && matches!(
-                    operation_variant,
-                    ForwardMode::TokenExtend | ForwardMode::TokenDecode | ForwardMode::TokenVerify
-                ),
-            expected_prompt_token_ids: wire.expected_prompt_token_ids,
-        };
-        let bounds = Bounds {
-            max_points: if operation_variant == ForwardMode::TokenVerify {
-                wire.token_cost.min(u32::MAX as usize) as u32
-            } else {
-                1
-            },
-            max_tokens: wire.token_cost.min(u32::MAX as usize) as u32,
-            max_kv_pages: new_blocks_len.min(u32::MAX as usize) as u32,
-            max_latent_bytes,
-            max_completion_bytes,
-            max_transfer_bytes,
-        };
-        let rng = match &delta {
-            TransitionDelta::TransitionGen { image_id, .. } => Some(Rng {
-                seed: request.image.seed.unwrap_or(0),
-                semantic_index_base: u64::from(*image_id),
-                draw_layout: DrawLayout::FlowNoise,
+            ForwardMode::EncodeLatent | ForwardMode::EncodeVision
+        ),
+        expects_latent_generation: produces_latent,
+        expects_image_artifact: is_materialize,
+        expected_image_hw: is_materialize.then_some((request.image.height, request.image.width)),
+        requires_kv_publication: operation_variant == ForwardMode::TransferKvPublish,
+        expected_image_kv: match &intent {
+            TransitionIntent::IngestImageState {
+                physical_start,
+                physical_kv_tokens,
+                ..
+            }
+            | TransitionIntent::FeedbackState {
+                physical_start,
+                physical_kv_tokens,
+                ..
+            } => Some(ImageKvExpectation {
+                base: *physical_start,
+                effect: *physical_kv_tokens,
             }),
-            _ if produces_token => {
-                transition_sampling_index(&delta).map(|semantic_index_base| Rng {
-                    seed: request.sampling.seed.unwrap_or(0),
-                    semantic_index_base,
-                    draw_layout: DrawLayout::TargetSampling,
-                })
+            _ => None,
+        },
+        allows_sampled_tokens: produces_token,
+        expects_sampled_token: produces_token,
+        expected_text_tokens: match &intent {
+            TransitionIntent::IngestText { .. } => Some(TextTokenCountRange { min: 1, max: 1 }),
+            TransitionIntent::DecodeUnd { .. } => {
+                let max = draft_count.map_or(1, |count| count.saturating_add(1));
+                Some(TextTokenCountRange { min: 1, max })
+            }
+            TransitionIntent::CloseKv { .. } => Some(TextTokenCountRange { min: 0, max: 0 }),
+            TransitionIntent::FeedbackState { .. } if produces_token => {
+                Some(TextTokenCountRange { min: 1, max: 1 })
             }
             _ => None,
-        };
-        Ok(PlannedTransition {
-            work: wire.work,
-            route: ROUTE,
-            domain: operation_variant.domain(),
-            bounds,
-            inputs: wire.inputs,
-            outputs: wire.outputs,
-            predicate: None,
-            rng,
-            control_seq: 0,
-            operation_variant,
-            request_id: request.request_id,
-            planned_us: uniserve_core::now_monotonic_us(),
-            reserved_us: 0,
-            new_blocks: wire.new_blocks,
-            token_cost: wire.token_cost,
-            input_tokens: wire.input_tokens,
-            input_image_bytes: wire.input_image_bytes,
-            sampling_state: wire.sampling_state,
-            delta,
-            resources,
-            validation,
-            visibility: OutputVisibilityPlan {
-                und_tokens: und_visibility,
-                generated_image: image_visible,
-            },
-        })
-    }
+        },
+        max_accepted_draft_tokens: draft_count,
+        draft_token_ids: (!draft_token_ids.is_empty()).then_some(draft_token_ids),
+        finish_token_ids: source_sampling
+            .map(|state| state.finish_token_ids.clone())
+            .unwrap_or_default(),
+        allowed_text_tokens,
+        generated_logprobs_requested: produces_token
+            && request.sampling.generated_logprobs_requested()
+            && matches!(
+                operation_variant,
+                ForwardMode::TokenExtend | ForwardMode::TokenDecode | ForwardMode::TokenVerify
+            ),
+        expected_prompt_token_ids,
+    };
+    let bounds = Bounds {
+        max_points: if operation_variant == ForwardMode::TokenVerify {
+            token_cost.min(u32::MAX as usize) as u32
+        } else {
+            1
+        },
+        max_tokens: token_cost.min(u32::MAX as usize) as u32,
+        max_kv_pages: new_blocks_len.min(u32::MAX as usize) as u32,
+        max_latent_bytes,
+        max_completion_bytes,
+        max_transfer_bytes,
+    };
+    let rng = match &intent {
+        TransitionIntent::TransitionGen { image_id, .. } => Some(Rng {
+            seed: request.image.seed.unwrap_or(0),
+            semantic_index_base: u64::from(*image_id),
+            draw_layout: DrawLayout::FlowNoise,
+        }),
+        _ if produces_token => transition_sampling_index(&intent).map(|semantic_index_base| Rng {
+            seed: request.sampling.seed.unwrap_or(0),
+            semantic_index_base,
+            draw_layout: DrawLayout::TargetSampling,
+        }),
+        _ => None,
+    };
+    Ok(NextOp {
+        work,
+        route: ROUTE,
+        domain: work.domain(),
+        bounds,
+        inputs,
+        outputs,
+        predicate: None,
+        rng,
+        control_seq: 0,
+        operation_variant,
+        request_id: request.request_id,
+        planned_us: uniserve_core::now_monotonic_us(),
+        reserved_us: 0,
+        new_blocks,
+        token_cost,
+        input_tokens,
+        input_image_bytes,
+        sampling_state,
+        intent,
+        resources,
+        validation,
+        visibility: OutputVisibilityPlan {
+            und_tokens: request.behavior.und_tokens,
+            generated_image: request.behavior.gen_output,
+        },
+    })
 }
 
 /// The immutable products of image materialization.
@@ -1885,15 +1730,15 @@ fn materialize_outputs(
     Ok(outputs)
 }
 
-fn transition_kv_target(delta: &TransitionDelta) -> Option<usize> {
-    let target = match delta {
-        TransitionDelta::IngestText {
+fn transition_kv_target(intent: &TransitionIntent) -> Option<usize> {
+    let target = match intent {
+        TransitionIntent::IngestText {
             end,
             start,
             physical_start,
             ..
         } => physical_start.saturating_add(end.saturating_sub(*start)),
-        TransitionDelta::IngestImageState {
+        TransitionIntent::IngestImageState {
             physical_start,
             physical_kv_tokens,
             ..
@@ -1902,7 +1747,7 @@ fn transition_kv_target(delta: &TransitionDelta) -> Option<usize> {
             ImageKvEffect::Bounded { max_tokens } => *max_tokens,
             ImageKvEffect::WorkerDefined => return None,
         }),
-        TransitionDelta::FeedbackState {
+        TransitionIntent::FeedbackState {
             physical_start,
             physical_kv_tokens,
             ..
@@ -1911,26 +1756,26 @@ fn transition_kv_target(delta: &TransitionDelta) -> Option<usize> {
             ImageKvEffect::Bounded { max_tokens } => *max_tokens,
             ImageKvEffect::WorkerDefined => return None,
         }),
-        TransitionDelta::DecodeUnd {
+        TransitionIntent::DecodeUnd {
             physical_position, ..
         } => physical_position.saturating_add(1),
-        TransitionDelta::CloseKv {
+        TransitionIntent::CloseKv {
             physical_position, ..
         } => physical_position.saturating_add(1),
-        TransitionDelta::EncodeImageStep { .. }
-        | TransitionDelta::PublishKv { .. }
-        | TransitionDelta::TransitionGen { .. }
-        | TransitionDelta::DenoiseGen { .. }
-        | TransitionDelta::CommitGen { .. }
-        | TransitionDelta::EncodeFeedbackStep { .. } => return None,
+        TransitionIntent::EncodeImageStep { .. }
+        | TransitionIntent::PublishKv { .. }
+        | TransitionIntent::TransitionGen { .. }
+        | TransitionIntent::DenoiseGen { .. }
+        | TransitionIntent::CommitGen { .. }
+        | TransitionIntent::EncodeFeedbackStep { .. } => return None,
     };
     Some(target as usize)
 }
 
-fn transition_may_write_worker_defined_kv(delta: &TransitionDelta) -> bool {
+fn transition_may_write_worker_defined_kv(intent: &TransitionIntent) -> bool {
     matches!(
-        delta,
-        TransitionDelta::IngestImageState { .. } | TransitionDelta::FeedbackState { .. }
+        intent,
+        TransitionIntent::IngestImageState { .. } | TransitionIntent::FeedbackState { .. }
     )
 }
 
@@ -1961,14 +1806,14 @@ fn image_kv_token_bound(
     }
 }
 
-fn transition_sampling_index(delta: &TransitionDelta) -> Option<u64> {
-    match delta {
-        TransitionDelta::IngestText { end, .. } => Some(u64::from(*end)),
-        TransitionDelta::DecodeUnd {
+fn transition_sampling_index(intent: &TransitionIntent) -> Option<u64> {
+    match intent {
+        TransitionIntent::IngestText { end, .. } => Some(u64::from(*end)),
+        TransitionIntent::DecodeUnd {
             logical_position, ..
         } => Some(u64::from(logical_position.saturating_add(1))),
-        TransitionDelta::CloseKv { .. } => None,
-        TransitionDelta::FeedbackState {
+        TransitionIntent::CloseKv { .. } => None,
+        TransitionIntent::FeedbackState {
             position,
             logical_positions,
             ..
@@ -1979,30 +1824,31 @@ fn transition_sampling_index(delta: &TransitionDelta) -> Option<u64> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum PlanningError {
+    #[error("prompt cursor mismatch: expected {expected}, got {actual}")]
     PromptCursorMismatch { expected: u32, actual: u32 },
+    #[error("logical cursor mismatch: expected {expected}, got {actual}")]
     LogicalCursorMismatch { expected: u32, actual: u32 },
+    #[error("image generation branch is disabled")]
     GenerationBranchDisabled,
+    #[error("generated-image feedback is disabled")]
     FeedbackDisabled,
+    #[error("image encoding requires image bytes or a source product")]
     MissingImageInput,
+    #[error("product bound must be nonzero")]
     MissingProductBound,
+    #[error("worker did not report a latent dtype")]
     MissingLatentDType,
+    #[error("product bound {bytes} bytes exceeds the wire representation")]
     ProductBoundExceedsProtocol { bytes: u64 },
+    #[error("product generation counter exhausted")]
     ProductGenerationExhausted,
 }
 
-impl std::fmt::Display for PlanningError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "generation planning failed: {self:?}")
-    }
-}
-
-impl std::error::Error for PlanningError {}
-
 /// Ephemeral scheduler builder consumed when an operation is registered.
 #[derive(Debug)]
-pub(crate) struct PlannedTransition {
+pub(crate) struct NextOp {
     pub(crate) work: ForwardMode,
     pub(crate) route: RouteId,
     pub(crate) domain: Domain,
@@ -2028,7 +1874,7 @@ pub(crate) struct PlannedTransition {
     pub(crate) input_image_bytes: Option<Vec<u8>>,
     /// Branch-local processor state consumed by this operation's sampler.
     pub(crate) sampling_state: Option<SamplingState>,
-    pub(crate) delta: TransitionDelta,
+    pub(crate) intent: TransitionIntent,
     pub(crate) resources: TransitionResources,
     pub(crate) validation: TransitionValidation,
     pub(crate) visibility: OutputVisibilityPlan,
@@ -2038,7 +1884,7 @@ pub(crate) struct PlannedTransition {
 /// immutable registered operation.
 #[derive(Debug)]
 pub(crate) struct SchedulerApply {
-    pub(crate) delta: TransitionDelta,
+    pub(crate) intent: TransitionIntent,
     pub(crate) validation: TransitionValidation,
     pub(crate) visibility: OutputVisibilityPlan,
     pub(crate) replayability_after_apply: Replayability,
@@ -2047,7 +1893,7 @@ pub(crate) struct SchedulerApply {
     pub(crate) output_event_bound: usize,
 }
 
-impl PlannedTransition {
+impl NextOp {
     /// Consume this builder into the immutable operation, its scheduler apply
     /// record, and the exact host input payloads carried by the submission.
     pub(crate) fn register(
@@ -2141,20 +1987,23 @@ impl PlannedTransition {
         });
         inputs.extend(host_input.iter().cloned());
         inputs.extend(sampling_input.iter().cloned());
-        let operation = Operation::registered(uniserve_worker_ipc::OperationSpec {
+        let operation = Operation {
             request_key,
             op_id,
             parent,
             work: self.work,
             route: self.route,
             domain: self.domain,
+            advances_state: false,
             bounds: self.bounds,
             inputs,
             outputs,
             predicate: self.predicate,
             rng: self.rng,
             control_seq: self.control_seq,
-        });
+            plan_digest: uniserve_core::Digest::zero(),
+        }
+        .sealed();
         let mut input_products = Vec::with_capacity(2);
         if let Some(product) = host_input {
             let bytes = if !self.input_tokens.is_empty() {
@@ -2168,7 +2017,7 @@ impl PlannedTransition {
             input_products.push(ProductPayload { product, bytes });
         }
         let apply = SchedulerApply {
-            delta: self.delta,
+            intent: self.intent,
             validation: self.validation,
             visibility: self.visibility,
             replayability_after_apply: self.resources.replayability_after_apply,
@@ -2189,15 +2038,13 @@ impl SchedulerApply {
         predicated_parent_point: Option<u32>,
     ) -> Result<(), TransitionValidationError> {
         if record.request_key != operation.request_key {
-            return Err(TransitionValidationError::SessionMismatch {
-                expected: operation.request_key.session_id.0,
-                actual: record.request_key.session_id.0,
+            return Err(TransitionValidationError::Identity {
+                detail: "session_mismatch",
             });
         }
         if operation.op_id.0 == 0 || record.op_id != operation.op_id {
-            return Err(TransitionValidationError::OpIdMismatch {
-                expected: operation.op_id.0,
-                actual: record.op_id.0,
+            return Err(TransitionValidationError::Identity {
+                detail: "operation_id_mismatch",
             });
         }
         if record.status == OpStatus::Predicated {
@@ -2214,7 +2061,9 @@ impl SchedulerApply {
                     .iter()
                     .any(|product| product.product.producer_op_id == operation.op_id)
             {
-                return Err(TransitionValidationError::OperationFailed);
+                return Err(TransitionValidationError::Status {
+                    detail: "invalid_predicated_result",
+                });
             }
             return Ok(());
         }
@@ -2224,10 +2073,8 @@ impl SchedulerApply {
             record.selected_point == 0
         };
         if !point_valid {
-            return Err(TransitionValidationError::VersionMismatch {
-                expected_base: 0,
-                actual_base: 0,
-                actual_result: u64::from(record.selected_point),
+            return Err(TransitionValidationError::Identity {
+                detail: "selected_point_mismatch",
             });
         }
         self.validation.validate(operation.work, record, products)
@@ -2238,89 +2085,6 @@ impl SchedulerApply {
 pub(crate) struct OutputVisibilityPlan {
     pub(crate) und_tokens: UndTokenAction,
     pub(crate) generated_image: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum TransitionDelta {
-    IngestText {
-        segment_index: usize,
-        start: u32,
-        end: u32,
-        logical_start: u32,
-        physical_start: u32,
-    },
-    EncodeImageStep {
-        segment_index: usize,
-        step_index: usize,
-        encoder_cache_key: Option<u64>,
-    },
-    IngestImageState {
-        segment_index: usize,
-        step_index: usize,
-        is_final_step: bool,
-        position: u32,
-        physical_start: u32,
-        logical_positions: u32,
-        physical_kv_tokens: ImageKvEffect,
-    },
-    DecodeUnd {
-        logical_position: u32,
-        physical_position: u32,
-    },
-    CloseKv {
-        image_id: u32,
-        logical_position: u32,
-        physical_position: u32,
-    },
-    PublishKv {
-        image_id: u32,
-        physical_kv_len: u32,
-    },
-    TransitionGen {
-        image_id: u32,
-        physical_kv_len: u32,
-    },
-    DenoiseGen {
-        image_id: u32,
-        start_step: u16,
-        step_count: u16,
-        physical_kv_len: u32,
-    },
-    CommitGen {
-        image_id: u32,
-        step: u16,
-    },
-    EncodeFeedbackStep {
-        image_id: u32,
-        step_index: usize,
-    },
-    FeedbackState {
-        image_id: u32,
-        step_index: usize,
-        is_final_step: bool,
-        position: u32,
-        physical_start: u32,
-        logical_positions: u32,
-        physical_kv_tokens: ImageKvEffect,
-    },
-}
-
-impl TransitionDelta {
-    pub(crate) fn as_str(&self) -> &'static str {
-        match self {
-            Self::IngestText { .. } => "ingest_text",
-            Self::EncodeImageStep { .. } => "encode_image_step",
-            Self::IngestImageState { .. } => "ingest_image_state",
-            Self::DecodeUnd { .. } => "decode_und",
-            Self::CloseKv { .. } => "close_kv",
-            Self::PublishKv { .. } => "publish_kv",
-            Self::TransitionGen { .. } => "transition_gen",
-            Self::DenoiseGen { .. } => "denoise_gen",
-            Self::CommitGen { .. } => "commit_gen",
-            Self::EncodeFeedbackStep { .. } => "encode_feedback_step",
-            Self::FeedbackState { .. } => "feedback_state",
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2336,19 +2100,11 @@ pub(crate) struct TransitionResources {
     pub(crate) release_on_apply: Vec<ResourceClass>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum Replayability {
     Replayable,
     NotReplayable,
-}
-
-impl Replayability {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Replayable => "replayable",
-            Self::NotReplayable => "not_replayable",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2391,14 +2147,15 @@ impl TransitionValidation {
         products: &[ProductPayload],
     ) -> Result<(), TransitionValidationError> {
         if record.status != OpStatus::Ok {
-            return Err(TransitionValidationError::OperationFailed);
+            return Err(TransitionValidationError::Status {
+                detail: "operation_failed",
+            });
         }
         if let Some(expected_step) = self.expected_denoise_step {
             let steps_done = record.logical_lengths.latent_len.min(u32::from(u16::MAX)) as u16;
             if steps_done != expected_step {
-                return Err(TransitionValidationError::DenoiseStepMismatch {
-                    expected: expected_step,
-                    actual: steps_done,
+                return Err(TransitionValidationError::Progress {
+                    detail: "denoise_step_mismatch",
                 });
             }
         }
@@ -2406,7 +2163,9 @@ impl TransitionValidation {
         // its completion reports; other work variants carry no encoder handle.
         let encoder_handle = record.product_generations.first().map(|g| u64::from(*g));
         if self.expects_encoder_handle && encoder_handle.filter(|handle| *handle != 0).is_none() {
-            return Err(TransitionValidationError::MissingEncoderHandle);
+            return Err(TransitionValidationError::Product {
+                detail: "missing_encoder_handle",
+            });
         }
         if self.expects_latent_generation
             && record
@@ -2416,7 +2175,9 @@ impl TransitionValidation {
                 .filter(|generation| *generation != 0)
                 .is_none()
         {
-            return Err(TransitionValidationError::MissingLatentGeneration);
+            return Err(TransitionValidationError::Product {
+                detail: "missing_latent_generation",
+            });
         }
         // The artifact rides as a base64 PNG string; dimension validation reads
         // only the IHDR header from the base64 prefix. Decoding the full frame
@@ -2425,32 +2186,40 @@ impl TransitionValidation {
         let image_png = find_product(products, record.op_id, ProductKind::Artifact)
             .and_then(|payload| std::str::from_utf8(&payload.bytes).ok());
         if let Some(expected) = self.expected_image_hw {
-            let actual = image_png
-                .and_then(png_artifact_dims_b64)
-                .ok_or(TransitionValidationError::MissingImageDimensions)?;
+            let actual = image_png.and_then(png_artifact_dims_b64).ok_or(
+                TransitionValidationError::Product {
+                    detail: "missing_image_dimensions",
+                },
+            )?;
             if actual != expected {
-                return Err(TransitionValidationError::ImageDimensionsMismatch {
-                    expected,
-                    actual,
+                return Err(TransitionValidationError::Product {
+                    detail: "image_dimensions_mismatch",
                 });
             }
         }
         if self.expects_image_artifact {
-            let png = image_png
-                .filter(|png| !png.is_empty())
-                .ok_or(TransitionValidationError::MissingImageArtifact)?;
-            let dims = png_artifact_dims_b64(png)
-                .ok_or(TransitionValidationError::InvalidImageArtifact)?;
+            let png = image_png.filter(|png| !png.is_empty()).ok_or(
+                TransitionValidationError::Product {
+                    detail: "missing_image_artifact",
+                },
+            )?;
+            let dims = png_artifact_dims_b64(png).ok_or(TransitionValidationError::Product {
+                detail: "invalid_image_artifact",
+            })?;
             if let Some(expected) = self.expected_image_hw
                 && dims != expected
             {
-                return Err(TransitionValidationError::InvalidImageArtifact);
+                return Err(TransitionValidationError::Product {
+                    detail: "invalid_image_artifact",
+                });
             }
         }
         if self.requires_kv_publication
             && find_product(products, record.op_id, ProductKind::Kv).is_none()
         {
-            return Err(TransitionValidationError::MissingKvPublication);
+            return Err(TransitionValidationError::Product {
+                detail: "missing_kv_publication",
+            });
         }
         if let Some(expected) = self.expected_image_kv
             && !self.requires_kv_publication
@@ -2460,18 +2229,16 @@ impl TransitionValidation {
                 ImageKvEffect::Exact { tokens }
                     if actual != expected.base.saturating_add(tokens) =>
                 {
-                    return Err(TransitionValidationError::ImageKvMismatch {
-                        expected_max: expected.base.saturating_add(tokens),
-                        actual,
+                    return Err(TransitionValidationError::Progress {
+                        detail: "image_kv_mismatch",
                     });
                 }
                 ImageKvEffect::Bounded { max_tokens }
                     if actual < expected.base
                         || actual > expected.base.saturating_add(max_tokens) =>
                 {
-                    return Err(TransitionValidationError::ImageKvMismatch {
-                        expected_max: expected.base.saturating_add(max_tokens),
-                        actual,
+                    return Err(TransitionValidationError::Progress {
+                        detail: "image_kv_mismatch",
                     });
                 }
                 ImageKvEffect::WorkerDefined
@@ -2481,10 +2248,14 @@ impl TransitionValidation {
         }
         let sampled_tokens = record.committed_tokens.as_slice();
         if !self.allows_sampled_tokens && !sampled_tokens.is_empty() {
-            return Err(TransitionValidationError::UnexpectedSampledToken { operation_variant });
+            return Err(TransitionValidationError::Token {
+                detail: "unexpected_sampled_token",
+            });
         }
         if self.expects_sampled_token && sampled_tokens.is_empty() {
-            return Err(TransitionValidationError::MissingSampledToken { operation_variant });
+            return Err(TransitionValidationError::Token {
+                detail: "missing_sampled_token",
+            });
         }
         let accepted_draft_tokens = if operation_variant == ForwardMode::TokenVerify {
             let drafts = self.draft_token_ids.as_deref().unwrap_or_default();
@@ -2503,7 +2274,9 @@ impl TransitionValidation {
                     || accepted > drafts.len()
                     || listed[..accepted] != drafts[..accepted]
                 {
-                    return Err(TransitionValidationError::VerifiedDraftPrefixMismatch);
+                    return Err(TransitionValidationError::Token {
+                        detail: "verified_draft_prefix_mismatch",
+                    });
                 }
                 accepted
             };
@@ -2514,28 +2287,27 @@ impl TransitionValidation {
         if let Some(max_accepted) = self.max_accepted_draft_tokens
             && accepted_draft_tokens.is_some_and(|accepted| accepted > max_accepted)
         {
-            return Err(TransitionValidationError::AcceptedDraftCountExceeded {
-                max: max_accepted,
-                actual: accepted_draft_tokens.unwrap_or_default(),
+            return Err(TransitionValidationError::Token {
+                detail: "accepted_draft_count_exceeded",
             });
         }
         if let Some(expected) = self.expected_text_tokens {
             let listed = sampled_tokens.len().min(u32::MAX as usize) as u32;
             let actual = listed;
             if actual < expected.min || actual > expected.max {
-                return Err(TransitionValidationError::TextTokenCountMismatch {
-                    min: expected.min,
-                    max: expected.max,
-                    actual,
+                return Err(TransitionValidationError::Token {
+                    detail: "text_token_count_mismatch",
                 });
             }
         }
         if let Some(allowed) = self.allowed_text_tokens.as_deref()
-            && let Some(&token_id) = sampled_tokens
+            && sampled_tokens
                 .iter()
-                .find(|token_id| !allowed.contains(token_id))
+                .any(|token_id| !allowed.contains(token_id))
         {
-            return Err(TransitionValidationError::SampledTokenOutsideAllowedSet { token_id });
+            return Err(TransitionValidationError::Token {
+                detail: "sampled_token_outside_allowed_set",
+            });
         }
         let logprobs = find_product(products, record.op_id, ProductKind::Logprob)
             .and_then(|payload| LogprobBlob::decode(&payload.bytes).ok())
@@ -2548,18 +2320,19 @@ impl TransitionValidation {
             generated_candidates.is_empty(),
         ) {
             (false, _, false) | (true, None, false) => {
-                return Err(TransitionValidationError::UnexpectedGeneratedLogprobs {
-                    operation_variant,
+                return Err(TransitionValidationError::Logprob {
+                    detail: "unexpected_generated_logprobs",
                 });
             }
-            (true, Some(token_id), true) => {
-                return Err(TransitionValidationError::MissingGeneratedLogprobs { token_id });
+            (true, Some(_), true) => {
+                return Err(TransitionValidationError::Logprob {
+                    detail: "missing_generated_logprobs",
+                });
             }
             (true, Some(token_id), false) => {
                 if generated_candidates[0].token_id != token_id {
-                    return Err(TransitionValidationError::GeneratedLogprobTokenMismatch {
-                        expected: token_id,
-                        actual: generated_candidates[0].token_id,
+                    return Err(TransitionValidationError::Logprob {
+                        detail: "generated_logprob_token_mismatch",
                     });
                 }
                 let mut token_ids = std::collections::HashSet::new();
@@ -2568,7 +2341,9 @@ impl TransitionValidation {
                         || !candidate.logprob.is_finite()
                         || !token_ids.insert(candidate.token_id)
                 }) {
-                    return Err(TransitionValidationError::InvalidGeneratedLogprobCandidates);
+                    return Err(TransitionValidationError::Logprob {
+                        detail: "invalid_generated_logprob_candidates",
+                    });
                 }
             }
             (false, _, true) | (true, None, true) => {}
@@ -2578,31 +2353,26 @@ impl TransitionValidation {
             (!logprobs.prompt_logprobs.is_empty()).then_some(logprobs.prompt_logprobs.as_slice()),
         ) {
             (None, Some(positions)) if !positions.is_empty() => {
-                return Err(TransitionValidationError::UnexpectedPromptLogprobs {
-                    operation_variant,
+                return Err(TransitionValidationError::Logprob {
+                    detail: "unexpected_prompt_logprobs",
                 });
             }
             (Some(expected), actual) => {
                 let actual = actual.unwrap_or_default();
                 if actual.len() != expected.len() {
-                    return Err(TransitionValidationError::PromptLogprobCountMismatch {
-                        expected: expected.len(),
-                        actual: actual.len(),
+                    return Err(TransitionValidationError::Logprob {
+                        detail: "prompt_logprob_count_mismatch",
                     });
                 }
-                for (position, (&expected_token, candidates)) in
-                    expected.iter().zip(actual).enumerate()
-                {
+                for (&expected_token, candidates) in expected.iter().zip(actual) {
                     let Some(first) = candidates.first() else {
-                        return Err(TransitionValidationError::EmptyPromptLogprobPosition {
-                            position,
+                        return Err(TransitionValidationError::Logprob {
+                            detail: "empty_prompt_logprob_position",
                         });
                     };
                     if first.token_id != expected_token {
-                        return Err(TransitionValidationError::PromptLogprobTokenMismatch {
-                            position,
-                            expected: expected_token,
-                            actual: first.token_id,
+                        return Err(TransitionValidationError::Logprob {
+                            detail: "prompt_logprob_token_mismatch",
                         });
                     }
                     let mut seen = std::collections::HashSet::new();
@@ -2610,8 +2380,8 @@ impl TransitionValidation {
                         .iter()
                         .any(|candidate| candidate.rank == 0 || !seen.insert(candidate.token_id))
                     {
-                        return Err(TransitionValidationError::InvalidPromptLogprobCandidates {
-                            position,
+                        return Err(TransitionValidationError::Logprob {
+                            detail: "invalid_prompt_logprob_candidates",
                         });
                     }
                 }
@@ -2622,684 +2392,31 @@ impl TransitionValidation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum TransitionValidationError {
-    OperationFailed,
-    SessionMismatch {
-        expected: u64,
-        actual: u64,
-    },
-    OpIdMismatch {
-        expected: u64,
-        actual: u64,
-    },
-    VersionMismatch {
-        expected_base: u64,
-        actual_base: u64,
-        actual_result: u64,
-    },
-    DenoiseStepMismatch {
-        expected: u16,
-        actual: u16,
-    },
-    MissingEncoderHandle,
-    MissingLatentGeneration,
-    MissingImageArtifact,
-    InvalidImageArtifact,
-    MissingKvPublication,
-    MissingImageDimensions,
-    ImageDimensionsMismatch {
-        expected: (u32, u32),
-        actual: (u32, u32),
-    },
-    ImageKvMismatch {
-        expected_max: u32,
-        actual: u32,
-    },
-    UnexpectedSampledToken {
-        operation_variant: ForwardMode,
-    },
-    MissingSampledToken {
-        operation_variant: ForwardMode,
-    },
-    AcceptedDraftCountExceeded {
-        max: u32,
-        actual: u32,
-    },
-    VerifiedDraftPrefixMismatch,
-    TextTokenCountMismatch {
-        min: u32,
-        max: u32,
-        actual: u32,
-    },
-    SampledTokenOutsideAllowedSet {
-        token_id: u32,
-    },
-    UnexpectedPromptLogprobs {
-        operation_variant: ForwardMode,
-    },
-    PromptLogprobCountMismatch {
-        expected: usize,
-        actual: usize,
-    },
-    EmptyPromptLogprobPosition {
-        position: usize,
-    },
-    PromptLogprobTokenMismatch {
-        position: usize,
-        expected: u32,
-        actual: u32,
-    },
-    InvalidPromptLogprobCandidates {
-        position: usize,
-    },
-    UnexpectedGeneratedLogprobs {
-        operation_variant: ForwardMode,
-    },
-    MissingGeneratedLogprobs {
-        token_id: u32,
-    },
-    GeneratedLogprobTokenMismatch {
-        expected: u32,
-        actual: u32,
-    },
-    InvalidGeneratedLogprobCandidates,
+    #[error("worker status invalid: {detail}")]
+    Status { detail: &'static str },
+    #[error("worker identity invalid: {detail}")]
+    Identity { detail: &'static str },
+    #[error("worker progress invalid: {detail}")]
+    Progress { detail: &'static str },
+    #[error("worker product invalid: {detail}")]
+    Product { detail: &'static str },
+    #[error("worker token result invalid: {detail}")]
+    Token { detail: &'static str },
+    #[error("worker logprob result invalid: {detail}")]
+    Logprob { detail: &'static str },
 }
 
-impl std::fmt::Display for TransitionValidationError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "worker transition validation failed: {self:?}")
-    }
-}
-
-impl std::error::Error for TransitionValidationError {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use uniserve_core::{
-        GenerationBehaviorDescriptor, GenerationConstraint, GenerationPolicyDescriptor,
-        GenerationResourceBounds, ImageParams, RequestId, SamplingParams, UndVisibility,
-    };
-    use uniserve_worker_ipc::{FinishFlags, LogicalLengths, OpStatus, TimingCounters, TokenSpan};
-
-    fn request(id: u64, tokens: Vec<u32>) -> GenerationRequest {
-        let policy = GenerationPolicyDescriptor::default();
-        let constraint = GenerationConstraint::UndOnly;
-        GenerationRequest {
-            request_id: RequestId(id),
-            context: vec![ContextSegment::UndTokens {
-                token_ids: tokens.clone(),
-                visibility: UndVisibility::Internal,
-            }],
-            negative_context: Vec::new(),
-            constraint,
-            behavior: GenerationBehaviorDescriptor::resolve(constraint, &policy),
-            sampling: SamplingParams::default(),
-            image: ImageParams::default(),
-            max_und_tokens: 32,
-            stop_strings: Vec::new(),
-            stop_token_ids: Vec::new(),
-            priority: 0,
-            cache: Default::default(),
-            policy,
-            resources: GenerationResourceBounds {
-                context_tokens: tokens.len(),
-                max_kv_tokens: tokens.len() + 32,
-                ..GenerationResourceBounds::default()
-            },
+impl TransitionValidationError {
+    pub(crate) fn detail(&self) -> &'static str {
+        match self {
+            Self::Status { detail }
+            | Self::Identity { detail }
+            | Self::Progress { detail }
+            | Self::Product { detail }
+            | Self::Token { detail }
+            | Self::Logprob { detail } => detail,
         }
-    }
-
-    fn prefill_transition() -> PlannedTransition {
-        GenerationPlanner::new(Some(DType::BF16))
-            .plan(
-                &request(9, vec![11, 12]),
-                CursorProjection {
-                    phase: GenerationPhase::Prefill,
-                    prompt_cursor: 0,
-                    logical_pos: 0,
-                    physical_kv_len: 0,
-                    replayability: Replayability::Replayable,
-                },
-                TransitionIntent::IngestText {
-                    segment_index: 0,
-                    prompt_start: 0,
-                    token_ids: vec![11, 12],
-                    new_blocks: Vec::new(),
-                    sampling_state: SamplingState::default(),
-                },
-            )
-            .expect("plan sequence extension")
-    }
-
-    fn digest() -> uniserve_core::Digest {
-        uniserve_core::Digest::try_from("ab".repeat(32)).expect("canonical digest fixture")
-    }
-
-    fn completion(request_key: RequestKey, op_id: u64, selected_point: u32) -> ModelOutput {
-        ModelOutput {
-            request_key,
-            op_id: OpId(op_id),
-            completion_slot_generation: 1,
-            status: OpStatus::Ok,
-            selected_point,
-            logical_lengths: LogicalLengths {
-                token_len: 1,
-                kv_visible_len: 2,
-                kv_computed_len: 2,
-                latent_len: 0,
-                ..LogicalLengths::default()
-            },
-            token_span: TokenSpan::default(),
-            committed_tokens: vec![13],
-            finish_flags: FinishFlags::default(),
-            product_generations: Vec::new(),
-            semantic_digest: digest(),
-            error_code: None,
-            timing_counters: TimingCounters::default(),
-        }
-    }
-
-    #[test]
-    fn planner_emits_the_closed_token_variant() {
-        let transition = prefill_transition();
-        assert_eq!(transition.operation_variant, ForwardMode::TokenExtend);
-        assert_eq!(transition.work, ForwardMode::TokenExtend);
-        let TransitionDelta::IngestText { start, end, .. } = transition.delta else {
-            panic!("expected an ingest-text transition");
-        };
-        assert_eq!((start, end), (0, 2));
-        assert_eq!(transition.token_cost, 2);
-        assert_eq!(
-            transition.rng,
-            Some(Rng {
-                seed: 0,
-                semantic_index_base: 2,
-                draw_layout: DrawLayout::TargetSampling,
-            })
-        );
-    }
-
-    #[test]
-    fn image_state_transition_bounds_the_declared_physical_span() {
-        let mut request = request(10, vec![11, 12]);
-        request.resources.max_kv_tokens = 128;
-        request.resources.max_vision_feature_bytes = 128;
-        let feature = encode_outputs(ImageIngestStep::VitEncode, 0, &request.resources)
-            .expect("bounded vision feature")
-            .remove(0);
-        let transition = GenerationPlanner::new(Some(DType::BF16))
-            .plan(
-                &request,
-                CursorProjection {
-                    phase: GenerationPhase::IngestState,
-                    prompt_cursor: 2,
-                    logical_pos: 2,
-                    physical_kv_len: 2,
-                    replayability: Replayability::Replayable,
-                },
-                TransitionIntent::IngestImageState {
-                    segment_index: 1,
-                    step_index: 0,
-                    is_final_step: true,
-                    position: 2,
-                    logical_positions: 1,
-                    physical_kv_tokens: ImageKvEffect::Exact { tokens: 17 },
-                    feature,
-                    new_blocks: Vec::new(),
-                },
-            )
-            .expect("plan exact image state transition");
-
-        assert_eq!(transition.token_cost, 17);
-        assert_eq!(transition.bounds.max_tokens, 17);
-        assert_eq!(transition.resources.kv_target_tokens, Some(19));
-    }
-
-    #[test]
-    fn planner_coordinates_transition_noise_by_semantic_image() {
-        let mut request = request(19, vec![11, 12]);
-        request.constraint = GenerationConstraint::Default;
-        request.policy.trigger = uniserve_core::TriggerPolicyDescriptor::Token { token_id: 42 };
-        request.behavior =
-            GenerationBehaviorDescriptor::resolve(request.constraint, &request.policy);
-        request.image.seed = Some(29);
-        request.resources.max_image_latent_bytes = 128;
-        let mut conditioning = bounded_product(
-            0,
-            ProductKind::Kv,
-            StorageClass::PagedKv,
-            DType::U8,
-            dynamic_element_bound(128, DType::U8).unwrap(),
-        );
-        conditioning.generation = 7;
-
-        let transition = GenerationPlanner::new(Some(DType::BF16))
-            .plan(
-                &request,
-                CursorProjection {
-                    phase: GenerationPhase::TransitionGen,
-                    prompt_cursor: 2,
-                    logical_pos: 2,
-                    physical_kv_len: 2,
-                    replayability: Replayability::NotReplayable,
-                },
-                TransitionIntent::TransitionGen {
-                    image_id: 3,
-                    latent_units: 64,
-                    conditioning,
-                },
-            )
-            .expect("plan generation transition");
-
-        assert_eq!(
-            transition.rng,
-            Some(Rng {
-                seed: 29,
-                semantic_index_base: 3,
-                draw_layout: DrawLayout::FlowNoise,
-            })
-        );
-    }
-
-    #[test]
-    fn planner_declares_a_device_finish_product_for_a_finish_candidate() {
-        let transition = GenerationPlanner::new(Some(DType::BF16))
-            .plan(
-                &request(15, vec![11, 12]),
-                CursorProjection {
-                    phase: GenerationPhase::Prefill,
-                    prompt_cursor: 0,
-                    logical_pos: 0,
-                    physical_kv_len: 0,
-                    replayability: Replayability::Replayable,
-                },
-                TransitionIntent::IngestText {
-                    segment_index: 0,
-                    prompt_start: 0,
-                    token_ids: vec![11, 12],
-                    new_blocks: Vec::new(),
-                    sampling_state: SamplingState {
-                        finish_token_ids: vec![2, 7],
-                        ..SamplingState::default()
-                    },
-                },
-            )
-            .expect("plan finish-aware extension");
-
-        let finish = transition
-            .outputs
-            .iter()
-            .find(|output| output.kind == ProductKind::Finish)
-            .expect("device finish output");
-        assert_eq!(finish.storage_class, StorageClass::DeviceTensor);
-        assert_eq!(finish.dtype, DType::U8);
-    }
-
-    #[test]
-    fn planner_registers_the_exact_logprob_blob_bound() {
-        let mut request = request(14, vec![11, 12, 13]);
-        request.sampling.return_logprobs = true;
-        request.sampling.n_logprobs = 3;
-        request.sampling.return_prompt_logprobs = true;
-        request.sampling.n_prompt_logprobs = 4;
-        request.sampling.logprob_token_ids = vec![17, 19, 17];
-        let transition = GenerationPlanner::new(Some(DType::BF16))
-            .plan(
-                &request,
-                CursorProjection {
-                    phase: GenerationPhase::Prefill,
-                    prompt_cursor: 0,
-                    logical_pos: 0,
-                    physical_kv_len: 0,
-                    replayability: Replayability::Replayable,
-                },
-                TransitionIntent::IngestText {
-                    segment_index: 0,
-                    prompt_start: 0,
-                    token_ids: vec![11, 12, 13],
-                    new_blocks: Vec::new(),
-                    sampling_state: SamplingState::default(),
-                },
-            )
-            .expect("plan scored prefill");
-        let logprob = transition
-            .outputs
-            .iter()
-            .find(|output| output.kind == ProductKind::Logprob)
-            .expect("bounded logprob output");
-        // One sampled value, six generated candidates, and two prompt positions
-        // with seven candidates each in the canonical LogprobBlob layout.
-        assert_eq!(product_bound_bytes(logprob), 261);
-        assert_eq!(transition.bounds.max_completion_bytes, 261);
-
-        let request_key = RequestKey::new(1, RequestId(14), 3);
-        let parent = VersionRef {
-            request_key,
-            producer_op_id: OpId(1),
-            point: Point::Fixed {
-                point_index: 0,
-                semantic_digest: digest(),
-            },
-        };
-        let mut next_generation = 1;
-        let (operation, _, _) = transition
-            .register(request_key, OpId(21), parent, &mut next_generation, 0)
-            .expect("register scored prefill");
-        operation.validate().expect("bounded operation");
-    }
-
-    #[test]
-    fn transition_validates_the_token_selected_under_its_branch_state() {
-        let transition = GenerationPlanner::new(Some(DType::BF16))
-            .plan(
-                &request(13, vec![11, 12]),
-                CursorProjection {
-                    phase: GenerationPhase::Prefill,
-                    prompt_cursor: 0,
-                    logical_pos: 0,
-                    physical_kv_len: 0,
-                    replayability: Replayability::Replayable,
-                },
-                TransitionIntent::IngestText {
-                    segment_index: 0,
-                    prompt_start: 0,
-                    token_ids: vec![11, 12],
-                    new_blocks: Vec::new(),
-                    sampling_state: SamplingState {
-                        allowed_token_ids: Some(vec![7]),
-                        ..SamplingState::default()
-                    },
-                },
-            )
-            .expect("plan constrained extension");
-        let request_key = RequestKey::new(1, RequestId(13), 3);
-        let parent = VersionRef {
-            request_key,
-            producer_op_id: OpId(1),
-            point: Point::Fixed {
-                point_index: 0,
-                semantic_digest: digest(),
-            },
-        };
-        let mut next_generation = 1;
-        let (operation, apply, input_products) = transition
-            .register(request_key, OpId(19), parent, &mut next_generation, 0)
-            .expect("register constrained operation");
-        let sampling_payload = input_products
-            .into_iter()
-            .find(|payload| payload.product.kind == ProductKind::SamplingState)
-            .expect("branch-local sampling input");
-        assert_eq!(
-            uniserve_worker_ipc::decode_sampling_state_bytes(&sampling_payload.bytes)
-                .expect("decode sampling input")
-                .allowed_token_ids,
-            Some(vec![7])
-        );
-        assert!(operation.inputs.contains(&sampling_payload.product));
-        let record = completion(request_key, 19, 1);
-
-        assert!(matches!(
-            apply.validate_result(&operation, &record, &[], None),
-            Err(TransitionValidationError::SampledTokenOutsideAllowedSet { token_id: 13 })
-        ));
-    }
-
-    #[test]
-    fn predicated_completion_selects_its_actual_parent_and_preserves_cursor_state() {
-        let mut transition = prefill_transition();
-        let request_key = RequestKey::new(1, RequestId(15), 3);
-        let parent = VersionRef {
-            request_key,
-            producer_op_id: OpId(1),
-            point: Point::Fixed {
-                point_index: 0,
-                semantic_digest: digest(),
-            },
-        };
-        let mut predicate = transition
-            .outputs
-            .iter()
-            .find(|output| output.kind == ProductKind::Token)
-            .expect("token operation decision predicate")
-            .clone();
-        predicate.request_key = request_key;
-        predicate.producer_op_id = OpId(19);
-        predicate.generation = 1;
-        transition.predicate = Some(predicate);
-        let mut next_generation = 1;
-        let (operation, apply, _) = transition
-            .register(request_key, OpId(20), parent, &mut next_generation, 0)
-            .expect("register predicated operation");
-        let mut record = completion(request_key, 20, 0);
-        record.status = OpStatus::Predicated;
-        record.token_span.len = 0;
-        record.committed_tokens.clear();
-        record.product_generations.clear();
-        record.finish_flags = FinishFlags::default();
-
-        assert_eq!(
-            apply.validate_result(&operation, &record, &[], Some(0)),
-            Ok(())
-        );
-        let mut cursor = GenerationCursor::new(GenerationPhase::Prefill, 8, false);
-        let mut expected = cursor.clone();
-        expected.applied_op_ids.insert(20);
-        cursor
-            .apply_transition(&operation, &apply, &record, &[])
-            .expect("apply predicated completion");
-        assert_eq!(cursor, expected);
-    }
-
-    #[test]
-    fn planner_closes_the_semantic_tail_before_bounded_kv_publication() {
-        let request = request(10, vec![11, 12]);
-        let cursor = CursorProjection {
-            phase: GenerationPhase::CloseKv,
-            prompt_cursor: 2,
-            logical_pos: 3,
-            physical_kv_len: 2,
-            replayability: Replayability::Replayable,
-        };
-        let closure = GenerationPlanner::new(Some(DType::BF16))
-            .plan(
-                &request,
-                cursor,
-                TransitionIntent::CloseKv {
-                    image_id: 1,
-                    position: 3,
-                    physical_position: 2,
-                    token: 42,
-                    relay_input: false,
-                    new_blocks: vec![BlockId(9)],
-                },
-            )
-            .expect("plan KV closure");
-        assert_eq!(closure.work, ForwardMode::TokenExtend);
-        assert_eq!(closure.input_tokens, vec![42]);
-        assert_eq!(closure.outputs[0].kind, ProductKind::Completion);
-        assert_eq!(closure.resources.kv_target_tokens, Some(3));
-
-        let publication = GenerationPlanner::new(Some(DType::BF16))
-            .plan(
-                &request,
-                CursorProjection {
-                    phase: GenerationPhase::PublishKv,
-                    physical_kv_len: 3,
-                    replayability: Replayability::NotReplayable,
-                    ..cursor
-                },
-                TransitionIntent::PublishKv { image_id: 1 },
-            )
-            .expect("plan KV publication");
-        assert_eq!(publication.work, ForwardMode::TransferKvPublish);
-        assert!(publication.inputs.is_empty());
-        assert_eq!(publication.outputs[0].kind, ProductKind::Kv);
-        assert_eq!(publication.outputs[0].storage_class, StorageClass::PagedKv);
-        assert_eq!(
-            publication.bounds.max_transfer_bytes,
-            KV_PUBLICATION_DESCRIPTOR_BYTES
-        );
-    }
-
-    #[test]
-    fn materialize_declares_public_and_resident_immutable_products() {
-        let mut request = request(12, vec![11, 12]);
-        request.constraint = GenerationConstraint::Default;
-        request.policy.trigger = uniserve_core::TriggerPolicyDescriptor::Token { token_id: 42 };
-        request.policy.feedback = Some(uniserve_core::GeneratedImageFeedbackRecipe {
-            source: uniserve_core::FeedbackSource::DeviceProduct,
-            next_und_token: uniserve_core::FeedbackNextToken::EndOfImage,
-            ingest: ImageIngestRecipe::vit_only(2, ImageKvEffect::WorkerDefined),
-            sample_continuation: true,
-        });
-        request.behavior =
-            GenerationBehaviorDescriptor::resolve(request.constraint, &request.policy);
-        request.resources.max_image_latent_bytes = 128;
-        let latent = latent_output(0, &request.resources, DType::BF16).expect("bounded latent");
-
-        let transition = GenerationPlanner::new(Some(DType::BF16))
-            .plan(
-                &request,
-                CursorProjection {
-                    phase: GenerationPhase::CommitGen,
-                    prompt_cursor: 2,
-                    logical_pos: 2,
-                    physical_kv_len: 2,
-                    replayability: Replayability::NotReplayable,
-                },
-                TransitionIntent::CommitGen {
-                    image_id: 1,
-                    latent,
-                },
-            )
-            .expect("plan image materialization");
-        assert_eq!(transition.outputs.len(), 3);
-        assert_eq!(
-            (
-                transition.outputs[0].kind,
-                transition.outputs[0].storage_class,
-                transition.outputs[0].dtype,
-            ),
-            (ProductKind::Artifact, StorageClass::PinnedOutput, DType::U8,)
-        );
-        assert_eq!(
-            (
-                transition.outputs[2].kind,
-                transition.outputs[2].storage_class,
-                transition.outputs[2].dtype,
-            ),
-            (
-                ProductKind::Completion,
-                StorageClass::DeviceTensor,
-                DType::U8,
-            )
-        );
-        assert_eq!(
-            (
-                transition.outputs[1].kind,
-                transition.outputs[1].storage_class,
-                transition.outputs[1].dtype,
-            ),
-            (
-                ProductKind::Artifact,
-                StorageClass::LatentArena,
-                DType::BF16,
-            )
-        );
-    }
-
-    #[test]
-    fn transition_accepts_only_the_registered_completion() {
-        let transition = prefill_transition();
-        let request_key = RequestKey::new(1, RequestId(9), 3);
-        let parent = VersionRef {
-            request_key,
-            producer_op_id: OpId(1),
-            point: Point::Fixed {
-                point_index: 5,
-                semantic_digest: digest(),
-            },
-        };
-        let mut next_product_generation = 1_u64;
-        let (operation, apply, _) = transition
-            .register(
-                request_key,
-                OpId(17),
-                parent,
-                &mut next_product_generation,
-                0,
-            )
-            .expect("generation space");
-        let mut generations = operation
-            .outputs
-            .iter()
-            .chain(operation.inputs.iter())
-            .map(|product| product.generation)
-            .collect::<Vec<_>>();
-        assert!(generations.iter().all(|generation| *generation > 0));
-        let generation_count = generations.len();
-        generations.sort_unstable();
-        generations.dedup();
-        assert_eq!(generations.len(), generation_count);
-
-        let record = completion(request_key, 17, 1);
-        assert_eq!(
-            apply.validate_result(&operation, &record, &[], None),
-            Ok(())
-        );
-
-        let stale = completion(request_key, 17, 2);
-        assert!(matches!(
-            apply.validate_result(&operation, &stale, &[], None),
-            Err(TransitionValidationError::VersionMismatch { .. })
-        ));
-    }
-
-    #[test]
-    fn product_generation_space_exhausts_without_reusing_an_identity() {
-        let mut transition = prefill_transition();
-        transition.outputs.truncate(1);
-        transition.input_tokens.clear();
-        transition.sampling_state = None;
-        let request_key = RequestKey::new(1, RequestId(9), 3);
-        let parent = VersionRef {
-            request_key,
-            producer_op_id: OpId(1),
-            point: Point::Fixed {
-                point_index: 5,
-                semantic_digest: digest(),
-            },
-        };
-        let mut next_product_generation = u64::from(u32::MAX);
-        let (operation, _, _) = transition
-            .register(
-                request_key,
-                OpId(17),
-                parent.clone(),
-                &mut next_product_generation,
-                0,
-            )
-            .expect("last generation");
-        assert_eq!(operation.outputs[0].generation, u32::MAX);
-
-        let mut exhausted = prefill_transition();
-        exhausted.outputs.truncate(1);
-        exhausted.input_tokens.clear();
-        exhausted.sampling_state = None;
-        assert_eq!(
-            exhausted
-                .register(
-                    request_key,
-                    OpId(18),
-                    parent,
-                    &mut next_product_generation,
-                    0,
-                )
-                .map(|_| ()),
-            Err(PlanningError::ProductGenerationExhausted)
-        );
-        assert_eq!(next_product_generation, u64::from(u32::MAX) + 1);
     }
 }

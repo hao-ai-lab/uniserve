@@ -205,11 +205,6 @@ def execution_domain(work: ForwardMode) -> Domain:
     return _DOMAIN_BY_WORK_VARIANT[work]
 
 
-class ExecutionCapability(StrEnum):
-    DOMAIN_HOMOGENEOUS = "domain_homogeneous"
-    TENSORIZED_MIXED = "tensorized_mixed"
-
-
 class AttentionRegime(StrEnum):
     NONE = "none"
     CAUSAL = "causal"
@@ -329,7 +324,6 @@ def native_partition(
     collective_seq: int,
     domain: Domain,
     route: int,
-    execution: ExecutionCapability,
     attention: AttentionRegime,
     shape_class: int,
     operations: tuple[Operation, ...],
@@ -353,7 +347,6 @@ def native_partition(
     set_field(partition, "collective_seq", collective_seq)
     set_field(partition, "domain", domain)
     set_field(partition, "route", route)
-    set_field(partition, "execution", execution)
     set_field(partition, "attention", attention)
     set_field(partition, "shape_class", shape_class)
     set_field(partition, "operations", operations)
@@ -2177,7 +2170,6 @@ class BatchPartition:
     collective_seq: int
     domain: Domain
     route: int
-    execution: ExecutionCapability
     attention: AttentionRegime
     shape_class: int
     operations: tuple[Operation, ...]
@@ -2289,7 +2281,6 @@ class BatchPartition:
             collective_seq=_uint(data.get("collective_seq"), f"{where}.collective_seq"),
             domain=Domain(_str(data.get("domain"), f"{where}.domain")),
             route=_uint(data.get("route"), f"{where}.route"),
-            execution=ExecutionCapability(_str(data.get("execution"), f"{where}.execution")),
             attention=AttentionRegime(_str(data.get("attention"), f"{where}.attention")),
             shape_class=_uint(data.get("shape_class"), f"{where}.shape_class"),
             operations=tuple(
@@ -2355,7 +2346,6 @@ class BatchPartition:
             "collective_seq": self.collective_seq,
             "domain": self.domain.value,
             "route": self.route,
-            "execution": self.execution.value,
             "attention": self.attention.value,
             "shape_class": self.shape_class,
             "operations": [operation.to_mapping() for operation in self.operations],
@@ -2400,29 +2390,22 @@ class Batch:
                 raise invalid_descriptor(
                     "a physical submission group has multiple latent staging partitions"
                 )
-            execution = partitions[0].execution
             collective_seq = partitions[0].collective_seq
             attention = partitions[0].attention
             shape_class = partitions[0].shape_class
             if any(
-                partition.execution is not execution
-                or partition.collective_seq != collective_seq
+                partition.collective_seq != collective_seq
                 or partition.attention is not attention
                 or partition.shape_class != shape_class
                 for partition in partitions
             ):
                 raise invalid_descriptor(
-                    "physical submission partitions disagree on execution, attention, shape, or collective order"
+                    "physical submission partitions disagree on attention, shape, or collective order"
                 )
-            if execution is ExecutionCapability.DOMAIN_HOMOGENEOUS:
-                if len(partitions) != 1:
-                    raise invalid_descriptor(
-                        "a domain-homogeneous submission group must contain one partition"
-                    )
-            else:
+            if len(partitions) >= 2:
                 domains = {partition.domain for partition in partitions}
                 routes = {partition.route for partition in partitions}
-                if len(partitions) < 2 or len(domains) != len(partitions):
+                if len(domains) != len(partitions):
                     raise invalid_descriptor(
                         "a tensorized-mixed submission group must contain distinct domains"
                     )

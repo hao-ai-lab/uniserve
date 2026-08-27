@@ -22,7 +22,7 @@ use crate::profile::{
 use thiserror::Error;
 use uniserve_core::{
     ContextSegment as CoreContextSegment, GenerationBehaviorDescriptor,
-    GenerationCachePolicyDescriptor, GenerationCapabilityNeeds, GenerationConstraint,
+    GenerationCachePolicyDescriptor, GenerationConstraint, GenerationFeatures,
     GenerationPolicyDescriptor, GenerationRequest, GenerationResourceBounds,
     GenerationRuntimeCapabilities, ImageParams, RequestId, SamplingParams, UndVisibility,
 };
@@ -186,7 +186,7 @@ pub enum ModelResolutionError {
     )]
     MissingCapability {
         description: &'static str,
-        capability: uniserve_core::GenerationCapabilityError,
+        capability: GenerationFeatures,
     },
 }
 
@@ -431,10 +431,7 @@ impl ResolvedModel {
                 validate_runtime_capabilities(
                     &profile.identity,
                     &capabilities,
-                    GenerationCapabilityNeeds {
-                        understanding: true,
-                        ..GenerationCapabilityNeeds::default()
-                    },
+                    GenerationFeatures::UNDERSTANDING,
                 )?;
                 let hints = sampling_hints(&profile, max_model_tokens);
                 let logprobs_supported =
@@ -615,13 +612,7 @@ impl ResolvedModel {
             return Err(reject("reasoning"));
         }
         let (capabilities, needs) = match self {
-            Self::Text(d) => (
-                &d.capabilities,
-                GenerationCapabilityNeeds {
-                    understanding: true,
-                    ..Default::default()
-                },
-            ),
+            Self::Text(d) => (&d.capabilities, GenerationFeatures::UNDERSTANDING),
             Self::Omni(OmniDesc::SenseNova(d)) => (
                 &d.capabilities,
                 omni_capability_needs(
@@ -640,8 +631,8 @@ impl ResolvedModel {
             ),
             Self::Media(_) => unreachable!("media generation was rejected above"),
         };
-        if let Err(capability) = capabilities.covers(&needs) {
-            return Err(reject(capability.as_str()));
+        if let Err(capability) = capabilities.covers(needs) {
+            return Err(reject(capability.name()));
         }
         Ok(())
     }
@@ -664,7 +655,7 @@ impl ResolvedModel {
 fn configured_omni_needs(
     policy: &GenerationPolicyDescriptor,
     image_ingest: &uniserve_core::ImageIngestRecipe,
-) -> GenerationCapabilityNeeds {
+) -> GenerationFeatures {
     GenerationBehaviorDescriptor::resolve(GenerationConstraint::Default, policy)
         .capability_needs(policy, image_ingest.steps.iter().copied())
 }
@@ -672,9 +663,9 @@ fn configured_omni_needs(
 fn validate_runtime_capabilities(
     identity: &ModelIdentity,
     capabilities: &GenerationRuntimeCapabilities,
-    needs: GenerationCapabilityNeeds,
+    needs: GenerationFeatures,
 ) -> Result<()> {
-    capabilities.covers(&needs).map_err(|capability| {
+    capabilities.covers(needs).map_err(|capability| {
         ServeError::ModelResolution(ModelResolutionError::MissingCapability {
             description: identity.description.id(),
             capability,
@@ -686,7 +677,7 @@ fn omni_capability_needs(
     policy: &GenerationPolicyDescriptor,
     image_ingest: &uniserve_core::ImageIngestRecipe,
     request: &GenerateReqInput,
-) -> GenerationCapabilityNeeds {
+) -> GenerationFeatures {
     let has_input_image = request.has_input_image();
     let constraint = crate::serving::omni::generation_constraint(request);
     let behavior = GenerationBehaviorDescriptor::resolve(constraint, policy);
