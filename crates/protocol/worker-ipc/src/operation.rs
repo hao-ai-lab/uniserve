@@ -1083,7 +1083,7 @@ pub struct BatchPartition {
     /// Newly acquired physical pages that require worker-side initialization.
     pub new_cache_pages: Vec<CachePageAllocation>,
     /// CPU row-packing metadata. One operation may contribute multiple rows.
-    pub forward_rows: Vec<ForwardRow>,
+    pub forward_rows: Vec<RowGeometry>,
     /// Complete scheduler-owned latent mappings for operations that address a
     /// generation trajectory.
     pub latent_placements: Vec<LatentPlacement>,
@@ -1145,14 +1145,14 @@ impl CachePageAllocation {
 
 /// Row-aligned model-forward metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ForwardRow {
+pub struct RowGeometry {
     pub operation_index: u32,
     pub request_pool_index: u32,
     pub seq_len: u32,
     pub query_len: u32,
 }
 
-impl ForwardRow {
+impl RowGeometry {
     pub fn validate(self, operation_count: usize) -> ProtocolResult<()> {
         protocol_ensure!(
             (self.operation_index as usize) < operation_count,

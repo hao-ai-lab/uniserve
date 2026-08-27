@@ -11,6 +11,7 @@ from ..bootstrap.capacity import (
     DEFAULT_MAX_REQUEST_POOL_SIZE,
 )
 from ..execution.forward_batch import (
+    AttentionSelection,
     ForwardBatch,
     ForwardOutput,
     TokenSelection,
@@ -147,7 +148,12 @@ class StubModel(ExecutionModel):
         self.tensorized_mixed = True
         self._cache_pool: CachePool | None = None
 
-    def bind_cache_pool(self, cache_pool: CachePool) -> None:
+    def bind_cache_pool(
+        self,
+        cache_pool: CachePool,
+        selection: AttentionSelection,
+    ) -> None:
+        del selection
         self._cache_pool = cache_pool
 
     @torch.inference_mode()
@@ -223,8 +229,7 @@ class StubModel(ExecutionModel):
             for row_index, count in zip(
                 forward_batch.token_row_indices,
                 tuple(
-                    forward_batch.query_lens_cpu[index]
-                    for index in forward_batch.token_row_indices
+                    forward_batch.query_lens_cpu[index] for index in forward_batch.token_row_indices
                 ),
                 strict=True,
             ):

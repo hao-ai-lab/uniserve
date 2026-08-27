@@ -730,7 +730,7 @@ class WorkerServer:
         *,
         unexpected: bool = False,
     ) -> None:
-        include_trace = unexpected or should_capture_trace(str(error.code))
+        include_trace = unexpected or should_capture_trace(error.code)
         log = logger.exception if include_trace else logger.warning
         log(
             "worker request %r failed: %s [code=%s session_id=%s op_id=%s operation=%s]",

@@ -2,34 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, TypeVar, cast
 
 from .batch import Domain, ForwardMode, SamplingOwnership, protocol_layout_digest
 from .foundation.errors import invalid_descriptor
-
-# Two work variants are never admitted onto a configured serving route:
-# ``TOKEN_VERIFY`` is speculative acceptance the scheduler drives inside token
-# decode, and ``DRAFT`` has no depth-one route. Both are folded out of every
-# advertised capability.
-_UNCONFIGURED_WORK = frozenset({ForwardMode.TOKEN_VERIFY, ForwardMode.DRAFT})
-
-
-def configured_work_variants(variants: Iterable[ForwardMode]) -> tuple[ForwardMode, ...]:
-    """The admitted work leaves among ``variants``.
-
-    The result excludes the unconfigured work and follows canonical
-    ``ForwardMode`` order.
-    """
-
-    selected = set(variants)
-    return tuple(
-        variant
-        for variant in ForwardMode
-        if variant in selected and variant not in _UNCONFIGURED_WORK
-    )
 
 
 class RequestKind(StrEnum):
@@ -178,13 +157,16 @@ class MixedExecutionCapability:
     cfg_branches: int
 
     def __post_init__(self) -> None:
-        if min(
-            self.decode_rows,
-            self.flow_rows,
-            self.height,
-            self.width,
-            self.cfg_branches,
-        ) < 1:
+        if (
+            min(
+                self.decode_rows,
+                self.flow_rows,
+                self.height,
+                self.width,
+                self.cfg_branches,
+            )
+            < 1
+        ):
             raise invalid_descriptor("mixed execution capability dimensions must be positive")
 
     @classmethod

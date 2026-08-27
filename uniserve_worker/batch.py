@@ -17,6 +17,7 @@ import hashlib
 import math
 import re
 import struct
+from abc import ABC, abstractmethod
 from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
@@ -27,6 +28,18 @@ from .foundation.errors import invalid_descriptor
 
 TRANSFER_DESCRIPTOR_PREFIX = b"uniserve-transfer\0"
 MAX_TRANSFER_DESCRIPTOR_BYTES = 64 * 1024
+
+
+class DeferredSemanticDigest(ABC):
+    """A query-ready semantic digest awaiting host finalization."""
+
+    @abstractmethod
+    def ready(self) -> bool:
+        """Return whether finalization can proceed without blocking."""
+
+    @abstractmethod
+    def finalize(self) -> str:
+        """Resolve and return the semantic digest."""
 
 
 def is_transfer_descriptor(value: bytes) -> bool:
@@ -322,7 +335,7 @@ def native_partition(
     operations: tuple[Operation, ...],
     block_tables: tuple[BlockTable, ...],
     new_cache_pages: tuple[CachePageAllocation, ...],
-    forward_rows: tuple[ForwardRow, ...],
+    forward_rows: tuple[RowGeometry, ...],
     latent_placements: Sequence[object],
     decode_placements: Sequence[object],
 ) -> BatchPartition:
@@ -409,6 +422,7 @@ def mark_typed_wire(batch: MutableMapping[str, object]) -> None:
     """
 
     batch[_WIRE_VALIDATION_KEY] = _WIRE_VALIDATION_TOKEN
+
 
 # Precompiled little-endian packers. Multi-field formats fuse the fixed-width
 # runs of the record digests into single calls; `<` guarantees no padding, so
@@ -1049,7 +1063,7 @@ class ProductRef:
 @dataclass(frozen=True, slots=True)
 class FixedPoint:
     point_index: int
-    semantic_digest: str
+    semantic_digest: str | DeferredSemanticDigest
 
 
 @dataclass(frozen=True, slots=True)
@@ -1112,6 +1126,8 @@ class VersionRef:
 
     def to_mapping(self) -> dict[str, object]:
         if isinstance(self.point, FixedPoint):
+            if not isinstance(self.point.semantic_digest, str):
+                raise invalid_descriptor("fixed-point semantic digest is not finalized")
             point = {
                 "kind": "fixed",
                 "value": {
@@ -1148,7 +1164,9 @@ class SnapshotRef:
     def __post_init__(self) -> None:
         if not isinstance(self.version.point, FixedPoint):
             raise invalid_descriptor("snapshot reference version must be fixed")
-        if not _is_digest(self.version.point.semantic_digest):
+        if not isinstance(self.version.point.semantic_digest, str) or not _is_digest(
+            self.version.point.semantic_digest
+        ):
             raise invalid_descriptor("snapshot reference semantic digest is invalid")
         if not _is_digest(self.digest) or self.locator != self.digest:
             raise invalid_descriptor("snapshot reference artifact digest or locator is invalid")
@@ -1652,7 +1670,7 @@ class ModelOutput:
     committed_tokens: tuple[int, ...]
     finish_flags: FinishFlags
     product_generations: tuple[int, ...]
-    semantic_digest: str
+    semantic_digest: str | DeferredSemanticDigest
     error_code: ErrorCode | None
     timing_counters: TimingCounters
 
@@ -1684,7 +1702,11 @@ class ModelOutput:
             raise invalid_descriptor("completion selected KV length exceeds computed length")
         if self.completion_slot_generation < 1:
             raise invalid_descriptor("completion slot generation must be positive")
-        if not _is_digest(self.semantic_digest):
+        if isinstance(self.semantic_digest, str):
+            digest_valid = _is_digest(self.semantic_digest)
+        else:
+            digest_valid = isinstance(self.semantic_digest, DeferredSemanticDigest)
+        if not digest_valid:
             raise invalid_descriptor("completion semantic digest is not a lowercase SHA-256 digest")
         if self.status is OpStatus.ERROR:
             if self.error_code is None:
@@ -1719,7 +1741,9 @@ class ModelOutput:
             ),
             token_span=TokenSpan.from_mapping(data.get("token_span"), f"{where}.token_span"),
             committed_tokens=_uints(data.get("committed_tokens", ()), f"{where}.committed_tokens"),
-            finish_flags=FinishFlags.from_mapping(data.get("finish_flags"), f"{where}.finish_flags"),
+            finish_flags=FinishFlags.from_mapping(
+                data.get("finish_flags"), f"{where}.finish_flags"
+            ),
             product_generations=_uints(
                 data.get("product_generations", ()), f"{where}.product_generations"
             ),
@@ -1737,6 +1761,8 @@ class ModelOutput:
         return record
 
     def to_mapping(self) -> dict[str, object]:
+        if not isinstance(self.semantic_digest, str):
+            raise invalid_descriptor("completion semantic digest is not finalized")
         key = self.request_key
         lengths = self.logical_lengths
         span = self.token_span
@@ -1952,9 +1978,7 @@ class UndAdmission:
                 data.get("negative_token_ids", ()), f"{where}.negative_token_ids"
             ),
             finish_token_ids=_uints(data.get("finish_token_ids", ()), f"{where}.finish_token_ids"),
-            initial_position=_uint(
-                data.get("initial_position", 0), f"{where}.initial_position"
-            ),
+            initial_position=_uint(data.get("initial_position", 0), f"{where}.initial_position"),
         )
 
     def to_mapping(self) -> dict[str, object]:
@@ -2098,7 +2122,9 @@ class Admission:
             "request_pool_idx": self.request_pool_idx,
             "digest": self.digest,
             "und": None if self.und is None else self.und.to_mapping(),
-            "gen_admission": None if self.gen_admission is None else self.gen_admission.to_mapping(),
+            "gen_admission": None
+            if self.gen_admission is None
+            else self.gen_admission.to_mapping(),
             "media": None if self.media is None else self.media.to_mapping(),
         }
 
@@ -2130,6 +2156,7 @@ class BlockTable:
         _validated_wire: bool = False,
     ) -> BlockTable:
         data = _map(value, where)
+
         def uint_field(name: str) -> int:
             raw = data.get(name)
             return raw if type(raw) is int and raw >= 0 else _uint(raw, f"{where}.{name}")
@@ -2184,6 +2211,7 @@ class CachePageAllocation:
         _validated_wire: bool = False,
     ) -> CachePageAllocation:
         data = _map(value, where)
+
         def uint_field(name: str) -> int:
             raw = data.get(name)
             return raw if type(raw) is int and raw >= 0 else _uint(raw, f"{where}.{name}")
@@ -2212,7 +2240,7 @@ class CachePageAllocation:
 
 
 @dataclass(frozen=True, slots=True)
-class ForwardRow:
+class RowGeometry:
     operation_index: int
     request_pool_index: int
     seq_len: int
@@ -2232,13 +2260,11 @@ class ForwardRow:
         cls,
         value: object,
         where: str = "forward row",
-    ) -> ForwardRow:
+    ) -> RowGeometry:
         data = _map(value, where)
         return cls(
             operation_index=_uint(data.get("operation_index"), f"{where}.operation_index"),
-            request_pool_index=_uint(
-                data.get("request_pool_index"), f"{where}.request_pool_index"
-            ),
+            request_pool_index=_uint(data.get("request_pool_index"), f"{where}.request_pool_index"),
             seq_len=_uint(data.get("seq_len"), f"{where}.seq_len"),
             query_len=_uint(data.get("query_len"), f"{where}.query_len"),
         )
@@ -2433,7 +2459,7 @@ class BatchPartition:
     operations: tuple[Operation, ...]
     block_tables: tuple[BlockTable, ...] = ()
     new_cache_pages: tuple[CachePageAllocation, ...] = ()
-    forward_rows: tuple[ForwardRow, ...] = ()
+    forward_rows: tuple[RowGeometry, ...] = ()
     latent_placements: tuple[LatentPlacement, ...] = ()
     decode_placements: tuple[DecodePlacement, ...] = ()
 
@@ -2470,14 +2496,10 @@ class BatchPartition:
             allocation_ids.add(identity)
             table = tables.get(identity)
             if table is None or not set(allocation.page_ids).issubset(table.page_ids):
-                raise invalid_descriptor(
-                    "cache-page allocation has no matching block table"
-                )
+                raise invalid_descriptor("cache-page allocation has no matching block table")
         for row in self.forward_rows:
             if row.operation_index >= len(self.operations):
-                raise invalid_descriptor(
-                    "forward row operation index is outside its partition"
-                )
+                raise invalid_descriptor("forward row operation index is outside its partition")
         latent_ids: set[tuple[RequestKey, int]] = set()
         latent_pages: set[int] = set()
 
@@ -2577,7 +2599,7 @@ class BatchPartition:
                 )
             ),
             forward_rows=tuple(
-                ForwardRow.from_mapping(item, f"{where}.forward_rows[{index}]")
+                RowGeometry.from_mapping(item, f"{where}.forward_rows[{index}]")
                 for index, item in enumerate(
                     _seq(data.get("forward_rows", ()), f"{where}.forward_rows")
                 )
@@ -3133,7 +3155,9 @@ class PartitionCompletion:
             forward_stats=(
                 None
                 if data.get("forward_stats") is None
-                else WorkerForwardStats.from_mapping(data["forward_stats"], f"{where}.forward_stats")
+                else WorkerForwardStats.from_mapping(
+                    data["forward_stats"], f"{where}.forward_stats"
+                )
             ),
         )
 
@@ -3144,7 +3168,9 @@ class PartitionCompletion:
             "products": [value.to_mapping() for value in self.products],
             "registration": self.registration.to_mapping(),
             "worker_exec_us": self.worker_exec_us,
-            "forward_stats": None if self.forward_stats is None else self.forward_stats.to_mapping(),
+            "forward_stats": None
+            if self.forward_stats is None
+            else self.forward_stats.to_mapping(),
         }
 
 

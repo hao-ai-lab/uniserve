@@ -8,11 +8,11 @@ from uniserve_worker.ops.staging import gather_request_decode_inputs
 from uniserve_worker.runtime.device import HostStagingRing, fill_cpu_bools, fill_cpu_ints
 
 from .forward_batch import (
+    AttentionMode,
     EmptyMeshView,
     EmptyOutputView,
     FlowPatches,
     ForwardBatch,
-    ForwardMode,
     MeshView,
     ModelPhase,
     OutputView,
@@ -163,7 +163,7 @@ class InputBuffers:
             )
         ):
             raise ValueError("forward token columns are not aligned")
-        if attention.get("forward_mode") is ForwardMode.REQUEST_INDEXED_DECODE:
+        if attention.get("forward_mode") is AttentionMode.REQUEST_INDEXED_DECODE:
             if any(
                 (
                     flow_row_indices,
@@ -450,7 +450,7 @@ class InputBuffers:
         return ForwardBatch(
             phase=phase,
             row_count=row_count,
-            forward_mode=ForwardMode.PAGED_DECODE,
+            forward_mode=AttentionMode.PAGED_DECODE,
             req_pool_indices=self.request_pool_indices[:row_count],
             seq_lens=self.cache_lengths[:row_count],
             query_lens=self.query_lengths[:row_count],
@@ -477,23 +477,15 @@ class InputBuffers:
 
     def stage_attention(self, attention: dict[str, object]) -> dict[str, object]:
         mode = attention["forward_mode"]
-        if mode is ForwardMode.REQUEST_INDEXED_DECODE:
+        if mode is AttentionMode.REQUEST_INDEXED_DECODE:
             raise ValueError("request-indexed decode must use fused input staging")
         staged = dict(attention)
-        staged["seq_lens"] = self._copy_vector(
-            self.cache_lengths, attention["seq_lens"]
-        )
-        staged["query_lens"] = self._copy_vector(
-            self.query_lengths, attention["query_lens"]
-        )
-        staged["out_cache_loc"] = self._copy_vector(
-            self.write_page_ids, attention["out_cache_loc"]
-        )
+        staged["seq_lens"] = self._copy_vector(self.cache_lengths, attention["seq_lens"])
+        staged["query_lens"] = self._copy_vector(self.query_lengths, attention["query_lens"])
+        staged["out_cache_loc"] = self._copy_vector(self.write_page_ids, attention["out_cache_loc"])
         block_table = attention.get("block_table")
         staged["block_table"] = (
-            None
-            if block_table is None
-            else self._copy_matrix(self.block_tables, block_table)
+            None if block_table is None else self._copy_matrix(self.block_tables, block_table)
         )
         for key, target in (
             ("kv_lens", self.kv_lengths),
@@ -514,7 +506,7 @@ class InputBuffers:
         return staged
 
     def _scrub(self, mode: object, *, embeddings: bool) -> None:
-        if mode is ForwardMode.REQUEST_INDEXED_DECODE:
+        if mode is AttentionMode.REQUEST_INDEXED_DECODE:
             raise ValueError("request-indexed decode must use fused input staging")
         self.input_ids.fill_(1)
         self.positions.zero_()
@@ -522,17 +514,17 @@ class InputBuffers:
             self.input_embeddings.zero_()
             self.embedding_mask.zero_()
         self.request_pool_indices.zero_()
-        if mode is not ForwardMode.DENSE:
+        if mode is not AttentionMode.DENSE:
             self.block_tables.zero_()
         self.cache_lengths.zero_()
         self.kv_lengths.fill_(1)
         self.query_lengths.fill_(1)
         self.write_page_ids.zero_()
-        if mode is ForwardMode.PAGED_VARLEN:
+        if mode is AttentionMode.PAGED_VARLEN:
             self.cumulative_query_lengths.zero_()
             self.cumulative_kv_lengths.zero_()
             self.output_indices.zero_()
-        elif mode is ForwardMode.PACKED:
+        elif mode is AttentionMode.PACKED:
             self.attention_indexes.zero_()
             self.visible_end.zero_()
             self.cumulative_query_lengths.zero_()

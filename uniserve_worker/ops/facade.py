@@ -112,9 +112,9 @@ def rope(x, cos, sin, *, override: str | None = None):
     return rope_dispatcher().run(PackedRopeReq(x, cos, sin), override=override)
 
 
-def attention(req: AttentionReq, *, selection):
-    return run_attention(selection, req)
+def attention(req: AttentionReq, *, provider):
+    return run_attention(provider, req)
 
 
-def can_run_attention(req: AttentionReq, *, selection) -> bool:
-    return _can_run_attention(selection, req)
+def can_run_attention(req: AttentionReq, *, provider) -> bool:
+    return _can_run_attention(provider, req)

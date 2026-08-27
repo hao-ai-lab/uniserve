@@ -6,12 +6,15 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
+import torch
 from torch import nn
 
-from ..batch import ForwardMode as WorkMode
+from ..batch import ForwardMode
+from ..execution.forward_batch import AttentionSelection, ForwardBatch, ForwardOutput
 from ..foundation.errors import invalid_descriptor
 
 if TYPE_CHECKING:
+    from ..runtime.cache_pool import CachePool
     from .generation import GenerationPipeline
     from .inputs import ImageProcessor
 
@@ -110,7 +113,7 @@ class ExecutionModel(nn.Module):
     serving_dtype: str = "bfloat16"
     cache_geometry: CacheGeometry
     resource_geometry: ResourceGeometry
-    supported_work: frozenset[WorkMode]
+    supported_work: frozenset[ForwardMode]
     vocab_size: int
     hidden_size: int
     text_max_tokens: int
@@ -119,8 +122,48 @@ class ExecutionModel(nn.Module):
     image_processor: ImageProcessor | None = None
     generation: GenerationPipeline | None = None
 
-    def bind_cache_pool(self, cache_pool: object) -> None:
-        """Bind model-owned attention state to its process KV allocation."""
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        batch: ForwardBatch,
+    ) -> torch.Tensor:
+        raise NotImplementedError("model does not implement packed forward execution")
+
+    def project(self, hidden: torch.Tensor, batch: ForwardBatch) -> ForwardOutput:
+        raise NotImplementedError("model does not implement output projection")
+
+    def encode(
+        self,
+        pixels: tuple[torch.Tensor, ...],
+        batch: ForwardBatch,
+    ) -> ForwardOutput:
+        raise NotImplementedError("model does not implement vision encoding")
+
+    def encode_latent(
+        self,
+        pixels: tuple[torch.Tensor, ...],
+        batch: ForwardBatch,
+    ) -> ForwardOutput:
+        raise NotImplementedError("model does not implement latent encoding")
+
+    def decode_latent(
+        self,
+        latents: tuple[torch.Tensor, ...],
+        batch: ForwardBatch,
+    ) -> ForwardOutput:
+        raise NotImplementedError("model does not implement latent decoding")
+
+    def bind_cache_pool(
+        self,
+        cache_pool: CachePool,
+        selection: AttentionSelection,
+    ) -> None:
+        """Bind every model-owned attention layer to its process KV allocation."""
+
+        from ..nn.attention import bind_attention_modules
+
+        bind_attention_modules(self, cache_pool, selection)
 
 
 def active_latent_capacity_tokens(

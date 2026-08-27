@@ -1,9 +1,10 @@
 """Canonical worker error classification and wire behavior."""
+
 from __future__ import annotations
 
 import pytest
 
-from uniserve_worker.foundation.errors import ErrorCode, WorkerError, classify
+from uniserve_worker.foundation.errors import WorkerError, WorkerErrorCode, classify
 
 pytestmark = pytest.mark.unit
 
@@ -29,7 +30,7 @@ OOM_MESSAGE_VARIANTS = [
 def test_runtime_error_with_oom_marker_classifies_as_resource_error(message):
     err = classify(RuntimeError(message))
 
-    assert err.code == ErrorCode.RESOURCE_ERROR
+    assert err.code == WorkerErrorCode.RESOURCE_ERROR
     assert err.code == "ResourceError"
     assert err.retryable is True
     assert err.fatal is False
@@ -43,7 +44,7 @@ def test_out_of_memory_error_type_classifies_as_oom_without_message_marker():
 
     err = classify(OutOfMemoryError("workspace allocation request denied"))
 
-    assert err.code == ErrorCode.RESOURCE_ERROR
+    assert err.code == WorkerErrorCode.RESOURCE_ERROR
     assert err.retryable is True
     assert err.fatal is False
 
@@ -59,13 +60,13 @@ def test_oom_detection_walks_class_hierarchy_for_subclasses():
 
     err = classify(DeviceAllocFailure("alloc denied"))
 
-    assert err.code == ErrorCode.RESOURCE_ERROR
+    assert err.code == WorkerErrorCode.RESOURCE_ERROR
 
 
 def test_generic_runtime_error_classifies_as_compute_error():
     err = classify(RuntimeError("kaboom: tensor shape mismatch in layer 3"))
 
-    assert err.code == ErrorCode.COMPUTE_ERROR
+    assert err.code == WorkerErrorCode.COMPUTE_ERROR
     assert err.code == "ComputeError"
     assert err.retryable is False
     assert err.fatal is False
@@ -84,25 +85,23 @@ def test_generic_runtime_error_classifies_as_compute_error():
 def test_non_matching_allocation_messages_are_compute_error(message):
     err = classify(RuntimeError(message))
 
-    assert err.code == ErrorCode.COMPUTE_ERROR
+    assert err.code == WorkerErrorCode.COMPUTE_ERROR
     assert err.retryable is False
 
 
 def test_fatal_cuda_marker_takes_precedence_over_oom_in_same_message():
     # Rule ordering is load-bearing: a context-corrupting CUDA fault is FATAL
     # even when the same message also mentions "out of memory".
-    err = classify(
-        RuntimeError("an illegal memory access was encountered; CUDA out of memory")
-    )
+    err = classify(RuntimeError("an illegal memory access was encountered; CUDA out of memory"))
 
-    assert err.code == ErrorCode.FATAL_WORKER_FAILURE
+    assert err.code == WorkerErrorCode.FATAL_WORKER_FAILURE
     assert err.fatal is True
     assert err.retryable is False
 
 
 def test_to_wire_emits_canonical_error_context():
     err = WorkerError(
-        code=ErrorCode.RESOURCE_ERROR,
+        code=WorkerErrorCode.RESOURCE_ERROR,
         message="CUDA out of memory",
         retryable=True,
         fatal=False,
@@ -130,7 +129,12 @@ def test_to_wire_emits_canonical_error_context():
 def test_to_wire_coerces_truthy_flags_to_bool():
     # to_wire normalizes retryable/fatal through bool(): non-bool truthy/falsey
     # inputs surface on the wire as real booleans.
-    wire = WorkerError(code="ResourceError", message="m", retryable=1, fatal=0).to_mapping()
+    wire = WorkerError(
+        code=WorkerErrorCode.RESOURCE_ERROR,
+        message="m",
+        retryable=1,
+        fatal=0,
+    ).to_mapping()
 
     assert wire["retryable"] is True
     assert wire["fatal"] is False

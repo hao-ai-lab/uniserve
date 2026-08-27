@@ -12,6 +12,7 @@ from ..batch import (
     Close,
     Commit,
     Control,
+    DeferredSemanticDigest,
     FixedPoint,
     ImageParams,
     Operation,
@@ -85,10 +86,10 @@ class RequestRow:
     finish_token_ids: tuple[int, ...]
     version: int = 0
     resolved_op_id: int = 0
-    resolved_digest: str = ""
+    resolved_digest: str | DeferredSemanticDigest = ""
     committed_point: int = 0
     committed_op_id: int = 0
-    committed_digest: str = ""
+    committed_digest: str | DeferredSemanticDigest = ""
     public_event_limit: int = 0
     applied_control_seq: int = 0
     control_digests: dict[tuple[int, str], str] = field(default_factory=dict)

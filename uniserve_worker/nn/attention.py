@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 from torch import nn
 
 import uniserve_worker.ops as ops
 
-from ..execution.forward_batch import AttentionSelection, ForwardBatch, ForwardMode
+from ..backends.attention.base import AttentionBackend, AttentionCapabilities
+from ..execution.forward_batch import AttentionMode, AttentionSelection, ForwardBatch
 from ..runtime.cache_pool import CachePool
 
 
@@ -32,16 +35,72 @@ class RadixAttention(nn.Module):
         self.scale = self.head_dim**-0.5
         self._cache_pool: CachePool | None = None
         self._selection: AttentionSelection | None = None
+        self._providers: dict[AttentionMode, AttentionBackend] = {}
+        self._varlen_provider: AttentionBackend | None = None
 
     def bind(self, cache_pool: CachePool, selection: AttentionSelection) -> None:
         self._cache_pool = cache_pool
         self._selection = selection
+        common = dict(
+            head_dim=self.head_dim,
+            block_size=cache_pool.block_size,
+            device=cache_pool.k.device,
+        )
+        candidates = {
+            AttentionMode.DENSE: _select_provider(
+                selection,
+                lambda caps: bool(caps.dense_ranks),
+                **common,
+            ),
+            AttentionMode.PAGED_DECODE: _select_provider(
+                selection,
+                lambda caps: caps.paged_kv,
+                **common,
+            ),
+            AttentionMode.PAGED_VARLEN: _select_provider(
+                selection,
+                lambda caps: caps.varlen_attention and caps.varlen_paged_kv,
+                **common,
+            ),
+            AttentionMode.PACKED: (
+                _select_provider(
+                    selection,
+                    lambda caps: caps.segmented_attention and caps.segmented_attention_cuda_graph,
+                    **common,
+                )
+                or _select_provider(
+                    selection,
+                    lambda caps: caps.segmented_attention,
+                    **common,
+                )
+            ),
+        }
+        self._providers = {
+            mode: provider for mode, provider in candidates.items() if provider is not None
+        }
+        self._varlen_provider = _select_provider(
+            selection,
+            lambda caps: caps.varlen_attention and not caps.requires_paged_varlen,
+            **common,
+        )
 
     @property
     def selection(self) -> AttentionSelection:
         if self._selection is None:
             raise RuntimeError("attention module has not been bound to a startup backend")
         return self._selection
+
+    def provider(self, mode: AttentionMode) -> AttentionBackend:
+        try:
+            return self._providers[mode]
+        except KeyError:
+            raise RuntimeError(
+                f"attention module has no bound provider for {mode.value!r}"
+            ) from None
+
+    @property
+    def varlen_provider(self) -> AttentionBackend | None:
+        return self._varlen_provider
 
     def forward(
         self,
@@ -55,10 +114,9 @@ class RadixAttention(nn.Module):
         attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         effective_scale = self.scale if scale is None else float(scale)
-        selection = self._selection
-        if selection is None:
+        if self._selection is None:
             raise RuntimeError("attention module has not been bound to a startup backend")
-        if context.forward_mode is ForwardMode.DENSE:
+        if context.forward_mode is AttentionMode.DENSE:
             return ops.attention(
                 ops.DenseAttention(
                     q=q,
@@ -69,20 +127,20 @@ class RadixAttention(nn.Module):
                     attn_mask=attn_mask,
                     ctx=context,
                 ),
-                selection=selection,
+                provider=self.provider(AttentionMode.DENSE),
             )
         if attn_mask is not None:
             raise ValueError("paged attention does not accept a dense attention mask")
         pool = self._cache_pool
         if pool is None or context.block_table is None:
             raise RuntimeError("paged attention has no bound physical cache")
-        if context.forward_mode is ForwardMode.PAGED_DECODE:
-            return self._decode(q, k, v, context, causal, effective_scale, selection, pool)
-        if context.forward_mode is ForwardMode.PAGED_VARLEN:
-            return self._varlen(q, k, v, context, causal, effective_scale, selection, pool)
-        if context.forward_mode is ForwardMode.REQUEST_INDEXED_DECODE:
+        if context.forward_mode is AttentionMode.PAGED_DECODE:
+            return self._decode(q, k, v, context, causal, effective_scale, pool)
+        if context.forward_mode is AttentionMode.PAGED_VARLEN:
+            return self._varlen(q, k, v, context, causal, effective_scale, pool)
+        if context.forward_mode is AttentionMode.REQUEST_INDEXED_DECODE:
             raise ValueError("request-indexed decode metadata was not staged")
-        return self._packed(q, k, v, context, effective_scale, selection, pool)
+        return self._packed(q, k, v, context, effective_scale, pool)
 
     def _decode(
         self,
@@ -92,7 +150,6 @@ class RadixAttention(nn.Module):
         context: ForwardBatch,
         causal: bool,
         scale: float,
-        selection: AttentionSelection,
         pool: CachePool,
     ) -> torch.Tensor:
         if q.ndim != 3 or int(q.shape[0]) != int(context.block_table.shape[0]):
@@ -113,7 +170,7 @@ class RadixAttention(nn.Module):
                 scale=scale,
                 ctx=context,
             ),
-            selection=selection,
+            provider=self.provider(AttentionMode.PAGED_DECODE),
         )
         return out.squeeze(2) if out.ndim == 4 else out
 
@@ -125,7 +182,6 @@ class RadixAttention(nn.Module):
         context: ForwardBatch,
         causal: bool,
         scale: float,
-        selection: AttentionSelection,
         pool: CachePool,
     ) -> torch.Tensor:
         raw_tokens = sum(context.query_lens_cpu)
@@ -155,7 +211,7 @@ class RadixAttention(nn.Module):
                 block_table=context.block_table,
                 ctx=context,
             ),
-            selection=selection,
+            provider=self.provider(AttentionMode.PAGED_VARLEN),
         )
         if raw_tokens == int(q.shape[0]):
             return out
@@ -170,14 +226,9 @@ class RadixAttention(nn.Module):
         v: torch.Tensor,
         context: ForwardBatch,
         scale: float,
-        selection: AttentionSelection,
         pool: CachePool,
     ) -> torch.Tensor:
-        if (
-            q.ndim != 3
-            or context.cu_seqlens_q is None
-            or context.visible_end is None
-        ):
+        if q.ndim != 3 or context.cu_seqlens_q is None or context.visible_end is None:
             raise ValueError("packed attention geometry is invalid")
         if context.has_cache_writes:
             pool.write_locations(self.layer_id, context.out_cache_loc, k, v)
@@ -197,8 +248,39 @@ class RadixAttention(nn.Module):
                 prefix_lens=context.seq_lens,
                 ctx=context,
             ),
-            selection=selection,
+            provider=self.provider(AttentionMode.PACKED),
         )
+
+
+def _select_provider(
+    selection: AttentionSelection,
+    supports: Callable[[AttentionCapabilities], bool],
+    *,
+    head_dim: int,
+    block_size: int,
+    device: torch.device,
+) -> AttentionBackend | None:
+    for provider in selection.providers:
+        capabilities = provider.capabilities()
+        if not capabilities.available or not supports(capabilities):
+            continue
+        if head_dim < int(capabilities.min_head_dim):
+            continue
+        if not capabilities.supports_trunk_geometry(head_dim, head_dim, head_dim):
+            continue
+        multiple = max(1, int(capabilities.paged_block_size_multiple))
+        if block_size % multiple != 0:
+            continue
+        if capabilities.cuda_only and device.type != "cuda":
+            continue
+        minimum = capabilities.min_cuda_capability
+        if minimum is not None:
+            if device.type != "cuda":
+                continue
+            if torch.cuda.get_device_capability(device) < minimum:
+                continue
+        return provider
+    return None
 
 
 def bind_attention_modules(

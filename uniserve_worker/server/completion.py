@@ -7,23 +7,24 @@ import time
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
-from typing import Any, Final, cast, overload
+from typing import TYPE_CHECKING, Any, Final, cast, overload
 
 import torch
 
 from ..batch import (
-    ModelOutput,
     CompletionReport,
+    DeferredSemanticDigest,
+    ErrorCode,
     FinishFlags,
     FixedPoint,
     LogicalLengths,
+    ModelOutput,
     OpStatus,
     PartitionCompletion,
     TokenSpan,
     VersionRef,
 )
-from ..batch import ErrorCode as ProtocolErrorCode
-from ..foundation.errors import ErrorCode, WorkerError, invalid_descriptor, resource_error
+from ..foundation.errors import WorkerError, WorkerErrorCode, invalid_descriptor, resource_error
 from ..runtime.device import canonical_device
 from ..runtime.device_events import DeviceEventPool
 from ..transfer.tickets import (
@@ -36,7 +37,26 @@ from .cpu_tasks import CpuTaskReservation
 from .image_codec import uint8_image_to_png_base64_bytes
 from .request_state import RequestRuntime
 
+if TYPE_CHECKING:
+    from .app import InflightStep, TerminalStep
+
 __all__ = [
+    "DeferredDerivedInteger",
+    "DeferredDigest",
+    "DeferredErrorDigest",
+    "DeferredImagePayload",
+    "DeferredInteger",
+    "DeferredLogprobBatch",
+    "DeferredLogprobPayload",
+    "DeferredLogprobValue",
+    "DeferredSampleSpan",
+    "DeferredSampleToken",
+    "DeferredSpeculativePoint",
+    "DeferredSpeculativeTokens",
+    "DeferredToken",
+    "DeferredTokenSpan",
+    "DeferredTopLogprobs",
+    "DeferredTransferPayload",
     "CompletedStepCache",
     "PinnedByteCapture",
     "PinnedOutputBuffer",
@@ -53,7 +73,7 @@ _next_buffer_generation = 1
 
 def _invariant(message: str) -> WorkerError:
     return WorkerError(
-        code=ErrorCode.INVARIANT_VIOLATION,
+        code=WorkerErrorCode.INVARIANT_VIOLATION,
         message=message,
         fatal=True,
     )
@@ -67,13 +87,13 @@ class CompletedStepCache:
         if value < 1:
             raise ValueError("completed step cache capacity must be positive")
         self.capacity = value
-        self._steps: OrderedDict[int, Any] = OrderedDict()
+        self._steps: OrderedDict[int, InflightStep | TerminalStep] = OrderedDict()
         self._weight = 0
 
     def __contains__(self, step_id: object) -> bool:
         return step_id in self._steps
 
-    def take(self, step_id: int) -> Any | None:
+    def take(self, step_id: int) -> InflightStep | TerminalStep | None:
         step = self._steps.pop(int(step_id), None)
         if step is not None:
             self._weight -= int(step.weight)
@@ -84,24 +104,27 @@ class CompletedStepCache:
         if key in self._steps:
             self._steps.move_to_end(key)
 
-    def put(self, step: Any) -> tuple[Any, ...]:
+    def put(
+        self,
+        step: InflightStep | TerminalStep,
+    ) -> tuple[InflightStep | TerminalStep, ...]:
         key = int(step.step_id)
         existing = self._steps.pop(key, None)
         if existing is not None:
             self._weight -= int(existing.weight)
         self._steps[key] = step
         self._weight += int(step.weight)
-        evicted: list[Any] = []
+        evicted: list[InflightStep | TerminalStep] = []
         while self._weight > self.capacity:
             _key, victim = self._steps.popitem(last=False)
             self._weight -= int(victim.weight)
             evicted.append(victim)
         return tuple(evicted)
 
-    def remove(self, step_id: int) -> Any | None:
+    def remove(self, step_id: int) -> InflightStep | TerminalStep | None:
         return self.take(step_id)
 
-    def values(self) -> tuple[Any, ...]:
+    def values(self) -> tuple[InflightStep | TerminalStep, ...]:
         return tuple(self._steps.values())
 
 
@@ -117,7 +140,11 @@ class StepOutputs:
         "_on_close",
     )
 
-    def __init__(self, step: Any, on_close: Callable[[StepOutputs], None]) -> None:
+    def __init__(
+        self,
+        step: InflightStep | TerminalStep,
+        on_close: Callable[[StepOutputs], None],
+    ) -> None:
         self._step = step
         self._sent_partitions: set[int] = set()
         self._empty_sent = False
@@ -135,17 +162,17 @@ class StepOutputs:
 
     @property
     def source(self) -> object | None:
-        return getattr(self._current(), "source", None)
+        return self._current().source
 
     @property
     def error(self) -> WorkerError | None:
-        return getattr(self._current(), "error", None)
+        return self._current().error
 
     @property
     def complete(self) -> bool:
         return bool(self._current().complete)
 
-    def _current(self) -> Any:
+    def _current(self) -> InflightStep | TerminalStep:
         current = self._step.current()
         if current is not self._step:
             self._step = current
@@ -159,8 +186,7 @@ class StepOutputs:
             return not self._error_sent
         partitions = current.materialized_partitions()
         if any(
-            int(partition.partition_id) not in self._sent_partitions
-            for partition in partitions
+            int(partition.partition_id) not in self._sent_partitions for partition in partitions
         ):
             return True
         return bool(current.complete and not current.partition_order and not self._empty_sent)
@@ -183,9 +209,7 @@ class StepOutputs:
             if int(partition.partition_id) not in self._sent_partitions
         )
         if partitions:
-            self._sent_partitions.update(
-                int(partition.partition_id) for partition in partitions
-            )
+            self._sent_partitions.update(int(partition.partition_id) for partition in partitions)
             return CompletionReport(step_id=int(current.step_id), partitions=partitions)
         if current.complete and not current.partition_order and not self._empty_sent:
             self._empty_sent = True
@@ -526,7 +550,7 @@ class PinnedOutputBuffer:
         end = capture.offset + capture.count
         if capture.offset < 0 or end > self._token_cursor:
             raise _invariant("completion capture range is outside its registered token extent")
-        values = tuple(int(value) for value in self._host[capture.offset:end].tolist())
+        values = tuple(int(value) for value in self._host[capture.offset : end].tolist())
         self._token_cache[key] = values
         return values
 
@@ -543,7 +567,7 @@ class PinnedOutputBuffer:
         total = int(self._host.numel()) * int(self._host.element_size())
         if capture.offset < 0 or end > total:
             raise _invariant("completion byte range is outside its registered extent")
-        return self._host.view(torch.uint8)[capture.offset:end].view(capture.shape)
+        return self._host.view(torch.uint8)[capture.offset : end].view(capture.shape)
 
     def observe(self, row: int, generation: int) -> tuple[int, int]:
         index = int(row)
@@ -639,7 +663,8 @@ class PinnedOutputBuffer:
         else:
             self._events_released = True
 
-class _CompletionTokenSpan:
+
+class DeferredTokenSpan:
     """One token vector backed exclusively by host-observation storage."""
 
     __slots__ = ("capture", "count", "_values")
@@ -658,12 +683,12 @@ class _CompletionTokenSpan:
         return self._values
 
 
-class _CompletionToken:
+class DeferredToken:
     """A protocol integer finalized only when the worker serializes its result."""
 
     __slots__ = ("span", "index")
 
-    def __init__(self, span: _CompletionTokenSpan, index: int) -> None:
+    def __init__(self, span: DeferredTokenSpan, index: int) -> None:
         self.span = span
         self.index = int(index)
 
@@ -680,7 +705,7 @@ class _CompletionToken:
         return self.finalize()
 
     def __eq__(self, other: object) -> bool:
-        if isinstance(other, _CompletionToken):
+        if isinstance(other, DeferredToken):
             return self.finalize() == other.finalize()
         if isinstance(other, int):
             return self.finalize() == other
@@ -698,7 +723,7 @@ class _PredicatedOperation(RuntimeError):
     pass
 
 
-class _CompletionSampleSpan:
+class DeferredSampleSpan:
     """Selected tokens, row validity, predicates, and accepted counts."""
 
     __slots__ = ("capture", "count", "_values")
@@ -743,12 +768,12 @@ class _CompletionSampleSpan:
         return values[self.count * 3 + index]
 
 
-class _CompletionSampleToken(_CompletionToken):
+class DeferredSampleToken(DeferredToken):
     __slots__ = ("sample_span",)
 
-    def __init__(self, span: _CompletionSampleSpan, index: int) -> None:
+    def __init__(self, span: DeferredSampleSpan, index: int) -> None:
         self.sample_span = span
-        self.span = cast(_CompletionTokenSpan, span)
+        self.span = cast(DeferredTokenSpan, span)
         self.index = int(index)
 
     def ready(self) -> bool:
@@ -758,10 +783,10 @@ class _CompletionSampleToken(_CompletionToken):
         return self.sample_span.token(self.index)
 
 
-class _CompletionInteger:
+class DeferredInteger:
     __slots__ = ("span", "index")
 
-    def __init__(self, span: _CompletionSampleSpan, index: int) -> None:
+    def __init__(self, span: DeferredSampleSpan, index: int) -> None:
         self.span = span
         self.index = int(index)
 
@@ -778,17 +803,17 @@ class _CompletionInteger:
         return self.finalize()
 
     def __eq__(self, other: object) -> bool:
-        if isinstance(other, _CompletionInteger):
+        if isinstance(other, DeferredInteger):
             return self.finalize() == other.finalize()
         if isinstance(other, int):
             return self.finalize() == other
         return NotImplemented
 
 
-class _CompletionDerivedInteger:
+class DeferredDerivedInteger:
     __slots__ = ("source", "offset")
 
-    def __init__(self, source: _CompletionInteger, offset: int) -> None:
+    def __init__(self, source: DeferredInteger, offset: int) -> None:
         self.source = source
         self.offset = int(offset)
 
@@ -805,10 +830,10 @@ class _CompletionDerivedInteger:
         return self.finalize()
 
 
-class _CompletionSpeculativePoint:
+class DeferredSpeculativePoint:
     __slots__ = ("accepted", "terminal_prefix")
 
-    def __init__(self, accepted: _CompletionInteger, terminal_prefix: int | None) -> None:
+    def __init__(self, accepted: DeferredInteger, terminal_prefix: int | None) -> None:
         self.accepted = accepted
         self.terminal_prefix = terminal_prefix
 
@@ -828,14 +853,14 @@ class _CompletionSpeculativePoint:
         return self.finalize()
 
 
-class _CompletionSpeculativeTokens(Sequence[int]):
+class DeferredSpeculativeTokens(Sequence[int]):
     __slots__ = ("draft", "accepted", "continuation", "terminal_prefix", "_value")
 
     def __init__(
         self,
         draft: tuple[int, ...],
-        accepted: _CompletionInteger,
-        continuation: int | _CompletionToken,
+        accepted: DeferredInteger,
+        continuation: int | DeferredToken,
         terminal_prefix: int | None,
     ) -> None:
         self.draft = tuple(int(value) for value in draft)
@@ -847,7 +872,7 @@ class _CompletionSpeculativeTokens(Sequence[int]):
     def ready(self) -> bool:
         continuation = self.continuation
         return self.accepted.ready() and (
-            not isinstance(continuation, _CompletionToken) or continuation.ready()
+            not isinstance(continuation, DeferredToken) or continuation.ready()
         )
 
     def finalize(self) -> tuple[int, ...]:
@@ -874,7 +899,7 @@ class _CompletionSpeculativeTokens(Sequence[int]):
         return self.finalize()[index]
 
 
-class _CompletionLogprobBatch:
+class DeferredLogprobBatch:
     """Packed query-ready logprob tensors shared by a sampling group."""
 
     __slots__ = (
@@ -981,10 +1006,10 @@ class _CompletionLogprobBatch:
         return details
 
 
-class _CompletionLogprobValue:
+class DeferredLogprobValue:
     __slots__ = ("batch", "index")
 
-    def __init__(self, batch: _CompletionLogprobBatch, index: int) -> None:
+    def __init__(self, batch: DeferredLogprobBatch, index: int) -> None:
         self.batch = batch
         self.index = int(index)
 
@@ -998,10 +1023,10 @@ class _CompletionLogprobValue:
         return self.finalize()
 
 
-class _CompletionTopLogprobs:
+class DeferredTopLogprobs:
     __slots__ = ("batch", "index")
 
-    def __init__(self, batch: _CompletionLogprobBatch, index: int) -> None:
+    def __init__(self, batch: DeferredLogprobBatch, index: int) -> None:
         self.batch = batch
         self.index = int(index)
 
@@ -1016,15 +1041,15 @@ class _CompletionTopLogprobs:
         return 1 + int(self.batch.counts[local]) + len(self.batch.requested_ids[local])
 
 
-class _CompletionLogprobPayload:
+class DeferredLogprobPayload:
     __slots__ = ("logprob", "top_logprobs", "prompt_logprobs", "_value")
 
     def __init__(
         self,
-        logprob: float | _CompletionLogprobValue | None,
-        top_logprobs: tuple[tuple[int, float, int], ...] | _CompletionTopLogprobs | None,
+        logprob: float | DeferredLogprobValue | None,
+        top_logprobs: tuple[tuple[int, float, int], ...] | DeferredTopLogprobs | None,
         prompt_logprobs: tuple[
-            tuple[tuple[int, float, int], ...] | _CompletionTopLogprobs,
+            tuple[tuple[int, float, int], ...] | DeferredTopLogprobs,
             ...,
         ] = (),
     ) -> None:
@@ -1037,22 +1062,21 @@ class _CompletionLogprobPayload:
         if self._value is not None:
             return True
         return (
-            (not isinstance(self.logprob, _CompletionLogprobValue) or self.logprob.ready())
+            (not isinstance(self.logprob, DeferredLogprobValue) or self.logprob.ready())
             and (
-                not isinstance(self.top_logprobs, _CompletionTopLogprobs)
-                or self.top_logprobs.ready()
+                not isinstance(self.top_logprobs, DeferredTopLogprobs) or self.top_logprobs.ready()
             )
             and all(
-                not isinstance(position, _CompletionTopLogprobs) or position.ready()
+                not isinstance(position, DeferredTopLogprobs) or position.ready()
                 for position in self.prompt_logprobs
             )
         )
 
     def max_encoded_bytes(self) -> int:
         def entry_bound(
-            entries: tuple[tuple[int, float, int], ...] | _CompletionTopLogprobs | None,
+            entries: tuple[tuple[int, float, int], ...] | DeferredTopLogprobs | None,
         ) -> int:
-            if isinstance(entries, _CompletionTopLogprobs):
+            if isinstance(entries, DeferredTopLogprobs):
                 return entries.max_entries()
             return len(entries or ())
 
@@ -1072,7 +1096,7 @@ class _CompletionLogprobPayload:
         logprob = None if self.logprob is None else float(self.logprob)
         top = (
             self.top_logprobs.finalize()
-            if isinstance(self.top_logprobs, _CompletionTopLogprobs)
+            if isinstance(self.top_logprobs, DeferredTopLogprobs)
             else self.top_logprobs or ()
         )
         out = bytearray(b"\x00" if logprob is None else b"\x01" + struct.pack("<f", logprob))
@@ -1081,9 +1105,7 @@ class _CompletionLogprobPayload:
             out += struct.pack("<IfI", int(token_id), float(value), int(rank))
         out += struct.pack("<I", len(self.prompt_logprobs))
         for position in self.prompt_logprobs:
-            entries = (
-                position.finalize() if isinstance(position, _CompletionTopLogprobs) else position
-            )
+            entries = position.finalize() if isinstance(position, DeferredTopLogprobs) else position
             out += struct.pack("<I", len(entries))
             for token_id, value, rank in entries:
                 out += struct.pack("<IfI", int(token_id), float(value), int(rank))
@@ -1094,7 +1116,7 @@ class _CompletionLogprobPayload:
         return self.finalize()
 
 
-class _CompletionTransferPayload:
+class DeferredTransferPayload:
     __slots__ = (
         "kind",
         "descriptor_value",
@@ -1148,7 +1170,7 @@ class _CompletionTransferPayload:
         return self.finalize()
 
 
-class _CompletionImagePayload:
+class DeferredImagePayload:
     """Pinned D2H image capture followed by bounded asynchronous PNG encoding."""
 
     __slots__ = (
@@ -1216,14 +1238,14 @@ class _CompletionImagePayload:
         self.reservation.abandon()
 
 
-class _PendingDigest:
+class DeferredDigest(DeferredSemanticDigest):
     """A semantic digest finalized from a query-ready completion generation.
 
     The digest includes committed tokens copied asynchronously into the pinned
-    output buffer. Resolution reads that host storage only after every copy
+    output buffer. Finalization reads that host storage only after every copy
     event reports ready, validates the buffer generation, and releases the
     observed row. A device-parent successor may retain its predecessor's
-    pending digest, so resolution follows the request lineage while unrelated
+    pending digest, so finalization follows the request lineage while unrelated
     completions remain independently dispatchable.
     """
 
@@ -1249,39 +1271,59 @@ class _PendingDigest:
 
     def __init__(
         self,
-        record: ModelOutput,
-        parent: object,
+        parent: str | DeferredSemanticDigest,
         plan_digest: str,
         buffer: PinnedOutputBuffer,
         row: int,
         predicated_parent: Callable[[], tuple[VersionRef, RequestRuntime]],
+        *,
+        status: OpStatus,
+        selected_point: int,
         resolved_callback: Callable[[ModelOutput, str, str], None] | None = None,
-        completion_tasks: tuple[_CompletionImagePayload | _CompletionLogprobPayload, ...] = (),
+        completion_tasks: tuple[DeferredImagePayload | DeferredLogprobPayload, ...] = (),
     ) -> None:
-        self._record = record
+        self._record: ModelOutput | None = None
         self._parent = parent
         self._plan_digest = plan_digest
         self._buffer: PinnedOutputBuffer | None = buffer
         self._row = int(row)
-        self._generation = int(record.completion_slot_generation)
+        self._generation = int(buffer.generation)
         self._completion_timing: tuple[int, int, int, int] | None = None
         self._value: str | None = None
         self._observed = False
         self._invalid_sampling = False
-        self._predicated = record.status is OpStatus.PREDICATED
+        self._predicated = status is OpStatus.PREDICATED
         self._predicated_parent: Callable[[], tuple[VersionRef, RequestRuntime]] | None = (
             predicated_parent
         )
-        self._selected_point = record.selected_point
+        self._selected_point = int(selected_point)
         self._selected_runtime: RequestRuntime | None = None
         self._resolved_callback = resolved_callback
         self._completion_tasks = completion_tasks
         self._completion_error = False
 
+    def bind_record(self, record: ModelOutput) -> ModelOutput:
+        """Bind the one final record that carries this deferred digest."""
+
+        if self._record is not None:
+            raise RuntimeError("completion digest record was bound more than once")
+        if record.semantic_digest is not self:
+            raise RuntimeError("completion record does not carry its bound digest")
+        if int(record.completion_slot_generation) != self._generation:
+            raise RuntimeError("completion record generation does not match its output buffer")
+        if (record.status is OpStatus.PREDICATED) != self._predicated:
+            raise RuntimeError("completion record status changed during digest binding")
+        if int(record.selected_point) != int(self._selected_point):
+            raise RuntimeError("completion selected point changed during digest binding")
+        self._record = record
+        return record
+
     def ready(self) -> bool:
+        if self._record is None:
+            raise RuntimeError("completion digest has no bound record")
         if self._value is not None:
             return True
-        if isinstance(self._parent, _PendingDigest) and not self._parent.ready():
+        if isinstance(self._parent, DeferredSemanticDigest) and not self._parent.ready():
             return False
         if self._buffer is None or not self._buffer.ready():
             return False
@@ -1290,12 +1332,17 @@ class _PendingDigest:
                 return False
         return True
 
-    def resolve(self) -> str:
+    def finalize(self) -> str:
         if self._value is None:
             if not self.ready():
                 raise RuntimeError("completion digest was resolved before query-ready")
+            record = self._record
+            if record is None:
+                raise RuntimeError("completion digest has no bound record")
             parent = (
-                self._parent.resolve() if isinstance(self._parent, _PendingDigest) else self._parent
+                self._parent.finalize()
+                if isinstance(self._parent, DeferredSemanticDigest)
+                else self._parent
             )
             if self._predicated:
                 self._resolve_predicated(cast(str, parent))
@@ -1305,7 +1352,7 @@ class _PendingDigest:
                         task.finalize()
                 except Exception:
                     self._completion_error = True
-                    self._value = _completion_error_record(self._record).compute_semantic_digest(
+                    self._value = _completion_error_record(record).compute_semantic_digest(
                         parent_semantic=cast(str, parent),
                         plan_digest=self._plan_digest,
                     )
@@ -1314,19 +1361,19 @@ class _PendingDigest:
                         # The digest packs each committed token via ``__index__``, which
                         # finalizes a deferred token exactly as ``int(value)`` would, so
                         # the record is hashed in place without a concrete-token copy.
-                        digest = self._record.compute_semantic_digest(
+                        digest = record.compute_semantic_digest(
                             parent_semantic=cast(str, parent),
                             plan_digest=self._plan_digest,
                         )
                         if self._resolved_callback is not None:
-                            self._resolved_callback(self._record, digest, cast(str, parent))
+                            self._resolved_callback(record, digest, cast(str, parent))
                         self._value = digest
                     except _PredicatedOperation:
                         self._predicated = True
                         self._resolve_predicated(cast(str, parent))
                     except _InvalidSamplingDistribution:
                         self._invalid_sampling = True
-                        self._value = _invalid_sampling_record(self._record).compute_semantic_digest(
+                        self._value = _invalid_sampling_record(record).compute_semantic_digest(
                             parent_semantic=cast(str, parent),
                             plan_digest=self._plan_digest,
                         )
@@ -1355,50 +1402,50 @@ class _PendingDigest:
         self._selected_runtime = runtime
 
     def __str__(self) -> str:
-        return self.resolve()
+        return self.finalize()
 
     def completion_timing(self) -> tuple[int, int, int, int]:
-        self.resolve()
+        self.finalize()
         return self._completion_timing or (0, 0, 0, 0)
 
     @property
     def invalid_sampling(self) -> bool:
-        self.resolve()
+        self.finalize()
         return self._invalid_sampling
 
     @property
     def predicated(self) -> bool:
-        self.resolve()
+        self.finalize()
         return self._predicated
 
     @property
     def completion_error(self) -> bool:
-        self.resolve()
+        self.finalize()
         return self._completion_error
 
     @property
     def selected_point(self) -> int:
-        self.resolve()
+        self.finalize()
         return int(self._selected_point)
 
     @property
     def selected_runtime(self) -> RequestRuntime:
-        self.resolve()
+        self.finalize()
         if self._selected_runtime is None:
             raise RuntimeError("predicated operation lost its selected runtime state")
         return self._selected_runtime
 
     def __eq__(self, other: object) -> bool:
-        if isinstance(other, _PendingDigest):
-            return self.resolve() == other.resolve()
+        if isinstance(other, DeferredDigest):
+            return self.finalize() == other.finalize()
         if isinstance(other, str):
-            return self.resolve() == other
+            return self.finalize() == other
         return NotImplemented
 
     def __hash__(self) -> int:
-        return hash(self.resolve())
+        return hash(self.finalize())
 
-    def __deepcopy__(self, memo: dict[int, object]) -> _PendingDigest:
+    def __deepcopy__(self, memo: dict[int, object]) -> DeferredDigest:
         # A committed session snapshot shares ownership of the exact pinned
         # completion generation and its lineage digest.
         memo[id(self)] = self
@@ -1410,14 +1457,14 @@ class _PendingDigest:
             buffer.discard(self._row, self._generation)
 
 
-class _PendingErrorDigest:
+class DeferredErrorDigest(DeferredSemanticDigest):
     """An error digest causally chained to an unobserved parent completion."""
 
     __slots__ = ("_parent", "_plan_digest", "_record", "_value")
 
     def __init__(
         self,
-        parent: _PendingDigest | _PendingErrorDigest,
+        parent: DeferredSemanticDigest,
         record: ModelOutput,
         plan_digest: str,
     ) -> None:
@@ -1429,30 +1476,30 @@ class _PendingErrorDigest:
     def ready(self) -> bool:
         return self._value is not None or self._parent.ready()
 
-    def resolve(self) -> str:
+    def finalize(self) -> str:
         if self._value is None:
             if not self.ready():
                 raise RuntimeError("error digest was resolved before its parent was query-ready")
             self._value = self._record.compute_semantic_digest(
-                self._parent.resolve(),
+                self._parent.finalize(),
                 self._plan_digest,
             )
         return self._value
 
     def __str__(self) -> str:
-        return self.resolve()
+        return self.finalize()
 
     def __eq__(self, other: object) -> bool:
-        if isinstance(other, (_PendingDigest, _PendingErrorDigest)):
-            return self.resolve() == other.resolve()
+        if isinstance(other, (DeferredDigest, DeferredErrorDigest)):
+            return self.finalize() == other.finalize()
         if isinstance(other, str):
-            return self.resolve() == other
+            return self.finalize() == other
         return NotImplemented
 
     def __hash__(self) -> int:
-        return hash(self.resolve())
+        return hash(self.finalize())
 
-    def __deepcopy__(self, memo: dict[int, object]) -> _PendingErrorDigest:
+    def __deepcopy__(self, memo: dict[int, object]) -> DeferredErrorDigest:
         memo[id(self)] = self
         return self
 
@@ -1461,22 +1508,22 @@ def _record_ready(record: ModelOutput) -> bool:
     """Whether a completion's deferred token copy and digest chain have landed."""
 
     digest = record.semantic_digest
-    if isinstance(digest, _PendingDigest):
+    if isinstance(digest, DeferredDigest):
         return digest.ready()
-    if isinstance(digest, _PendingErrorDigest):
+    if isinstance(digest, DeferredErrorDigest):
         return digest.ready()
     for value in cast(tuple[object, ...], record.committed_tokens):
-        if isinstance(value, _CompletionToken) and not value.ready():
+        if isinstance(value, DeferredToken) and not value.ready():
             return False
     return True
 
 
 def _finalized_record(record: ModelOutput) -> ModelOutput:
     digest = record.semantic_digest
-    if isinstance(digest, _PendingErrorDigest):
-        return replace(record, semantic_digest=digest.resolve())
-    if isinstance(digest, _PendingDigest):
-        resolved = digest.resolve()
+    if isinstance(digest, DeferredErrorDigest):
+        return replace(record, semantic_digest=digest.finalize())
+    if isinstance(digest, DeferredDigest):
+        resolved = digest.finalize()
         queued_us, device_us, copy_us, host_us = digest.completion_timing()
         timing = replace(
             record.timing_counters,
@@ -1547,7 +1594,7 @@ def _invalid_sampling_record(record: ModelOutput) -> ModelOutput:
         committed_tokens=(),
         finish_flags=FinishFlags(),
         product_generations=(),
-        error_code=ProtocolErrorCode.INVALID_OPERATION,
+        error_code=ErrorCode.INVALID_OPERATION,
     )
 
 
@@ -1559,7 +1606,7 @@ def _completion_error_record(record: ModelOutput) -> ModelOutput:
         committed_tokens=(),
         finish_flags=FinishFlags(),
         product_generations=(),
-        error_code=ProtocolErrorCode.COMPUTE_ERROR,
+        error_code=ErrorCode.COMPUTE_ERROR,
     )
 
 
@@ -1613,7 +1660,7 @@ def _completion_payload_ready(payload: object) -> bool:
     return (
         not isinstance(
             payload,
-            (_CompletionImagePayload, _CompletionLogprobPayload, _CompletionTransferPayload),
+            (DeferredImagePayload, DeferredLogprobPayload, DeferredTransferPayload),
         )
         or payload.ready()
     )
@@ -1640,9 +1687,9 @@ def finalize_completion_report(report: CompletionReport) -> CompletionReport:
             if isinstance(
                 product.payload,
                 (
-                    _CompletionImagePayload,
-                    _CompletionLogprobPayload,
-                    _CompletionTransferPayload,
+                    DeferredImagePayload,
+                    DeferredLogprobPayload,
+                    DeferredTransferPayload,
                 ),
             )
             and product.payload.ready()

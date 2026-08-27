@@ -20,13 +20,13 @@ from uniserve_worker.runtime.device_products import (
     DeviceProductWrite,
 )
 from uniserve_worker.server.completion import (
+    DeferredInteger,
+    DeferredLogprobBatch,
+    DeferredLogprobValue,
+    DeferredSampleSpan,
+    DeferredSampleToken,
+    DeferredTopLogprobs,
     PinnedOutputBuffer,
-    _CompletionInteger,
-    _CompletionLogprobBatch,
-    _CompletionLogprobValue,
-    _CompletionSampleSpan,
-    _CompletionSampleToken,
-    _CompletionTopLogprobs,
 )
 
 from .cuda_graph import GraphGreedyOutput
@@ -523,7 +523,7 @@ def sample_device_greedy_group(
     )
     return tuple(
         SampleResult(
-            token_id=_CompletionSampleToken(span, index),
+            token_id=DeferredSampleToken(span, index),
             device_token=device_tokens[index : index + 1],
             logprob=None,
             top_logprobs=None,
@@ -629,7 +629,7 @@ def _sample_fused_top_k_group(
     span = _capture_sample_span(valid, active, tokens, torch.zeros_like(tokens), completion)
     return tuple(
         SampleResult(
-            _CompletionSampleToken(span, index),
+            DeferredSampleToken(span, index),
             tokens[index : index + 1],
             None,
             None,
@@ -793,11 +793,11 @@ def _sample_task_group(
     )
     return tuple(
         SampleResult(
-            token_id=(_CompletionSampleToken(span, index)),
+            token_id=(DeferredSampleToken(span, index)),
             device_token=task_tokens[index : index + 1],
             logprob=None if index not in details else details[index][0],
             top_logprobs=None if index not in details else details[index][1],
-            num_accepted_tokens=(_CompletionInteger(span, index)),
+            num_accepted_tokens=(DeferredInteger(span, index)),
             device_accepted_tokens=counts[index : index + 1],
             device_selected_point=points[index : index + 1],
             device_valid=task_valid[index : index + 1],
@@ -816,7 +816,7 @@ def _capture_sample_span(
     tokens: torch.Tensor,
     accepted: torch.Tensor,
     completion: PinnedOutputBuffer | None,
-) -> _CompletionSampleSpan:
+) -> DeferredSampleSpan:
     count = int(tokens.numel())
     if (
         int(valid.numel()) != count
@@ -841,26 +841,26 @@ def _capture_sample_span(
             bool(values[index]) or not bool(values[count + index]) for index in range(count)
         ):
             raise invalid_descriptor("sampling policy masked every vocabulary entry")
-        return _CompletionSampleSpan(None, count, values)
+        return DeferredSampleSpan(None, count, values)
     if completion is None:
         raise RuntimeError("CUDA sampling requires a server completion lease")
-    span = _CompletionSampleSpan(completion.capture(metadata), count)
+    span = DeferredSampleSpan(completion.capture(metadata), count)
     return span
 
 
 def capture_preselected_span(
     output: GraphGreedyOutput,
     completion: PinnedOutputBuffer | None,
-) -> _CompletionSampleSpan:
+) -> DeferredSampleSpan:
     count = int(output.tokens.numel())
     if int(output.completion.numel()) != SAMPLING_COMPLETION_FIELDS * count:
         raise RuntimeError("graph sampling completion vectors do not align")
     if output.completion.device.type != "cuda":
         values = tuple(int(value) for value in output.completion.tolist())
-        return _CompletionSampleSpan(None, count, values)
+        return DeferredSampleSpan(None, count, values)
     if completion is None:
         raise RuntimeError("CUDA graph sampling requires a server completion lease")
-    return _CompletionSampleSpan(completion.capture(output.completion), count)
+    return DeferredSampleSpan(completion.capture(output.completion), count)
 
 
 def _device_finish_values(
@@ -1448,8 +1448,8 @@ def logprob_details(
 ) -> Mapping[
     int,
     tuple[
-        float | _CompletionLogprobValue,
-        tuple[tuple[int, float, int], ...] | _CompletionTopLogprobs,
+        float | DeferredLogprobValue,
+        tuple[tuple[int, float, int], ...] | DeferredTopLogprobs,
     ],
 ]:
     vocab = int(work.shape[1])
@@ -1569,7 +1569,7 @@ def logprob_details(
     )
     if packed.device.type != "cuda":
         values = tuple(int(value) for value in packed.tolist())
-        batch = _CompletionLogprobBatch(
+        batch = DeferredLogprobBatch(
             None,
             requested_rows,
             counts,
@@ -1581,7 +1581,7 @@ def logprob_details(
     else:
         if completion is None:
             raise RuntimeError("CUDA logprob materialization requires a server completion lease")
-        batch = _CompletionLogprobBatch(
+        batch = DeferredLogprobBatch(
             completion.capture(packed),
             requested_rows,
             counts,
@@ -1593,8 +1593,8 @@ def logprob_details(
         return batch.finalize()
     return {
         result_index: (
-            _CompletionLogprobValue(batch, result_index),
-            _CompletionTopLogprobs(batch, result_index),
+            DeferredLogprobValue(batch, result_index),
+            DeferredTopLogprobs(batch, result_index),
         )
         for result_index in requested_rows
     }

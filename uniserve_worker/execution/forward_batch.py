@@ -11,11 +11,14 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import torch
 
 from ..nn.mesh import CollectiveAxisTransport, DeviceMesh, PeerAxisTransport
+
+if TYPE_CHECKING:
+    from ..backends.attention.base import AttentionBackend
 
 
 @runtime_checkable
@@ -170,15 +173,6 @@ class EmptyOutputView:
         raise RuntimeError("this forward route has no output view")
 
 
-@runtime_checkable
-class AttentionBackend(Protocol):
-    """One explicitly provisioned attention implementation."""
-
-    name: str
-
-    def capabilities(self) -> object: ...
-
-
 @dataclass(frozen=True, slots=True)
 class AttentionSelection:
     """Immutable ordered backend set resolved at worker startup."""
@@ -194,7 +188,7 @@ class AttentionSelection:
             raise ValueError("attention selection contains duplicate providers")
 
 
-class ForwardMode(StrEnum):
+class AttentionMode(StrEnum):
     DENSE = "dense"
     PAGED_DECODE = "paged_decode"
     PAGED_VARLEN = "paged_varlen"
@@ -270,11 +264,6 @@ class FlowPatches:
             raise ValueError("flow noise scale must be scalar")
 
 
-class EncodeKind(StrEnum):
-    VISION = "vision"
-    LATENT = "latent"
-
-
 class ModelPhase(StrEnum):
     TEXT = "text"
     DENOISE = "denoise"
@@ -289,7 +278,7 @@ class ForwardBatch:
 
     phase: ModelPhase
     row_count: int
-    forward_mode: ForwardMode
+    forward_mode: AttentionMode
     req_pool_indices: torch.Tensor
     seq_lens: torch.Tensor
     query_lens: torch.Tensor
@@ -343,7 +332,10 @@ class ForwardBatch:
             raise ValueError("forward batch must contain at least one row")
         if int(self.req_pool_indices.numel()) != self.row_count:
             raise ValueError("forward request indices do not align with rows")
-        if int(self.seq_lens.numel()) != self.row_count or int(self.query_lens.numel()) != self.row_count:
+        if (
+            int(self.seq_lens.numel()) != self.row_count
+            or int(self.query_lens.numel()) != self.row_count
+        ):
             raise ValueError("forward KV lengths do not align with rows")
         if self.decode_force_finish is not None and (
             int(self.decode_force_finish.numel()) != self.row_count
@@ -403,14 +395,13 @@ class ForwardOutput:
 
 
 __all__ = [
+    "AttentionMode",
     "EmptyLatentView",
     "EmptyMeshView",
     "EmptyOutputView",
-    "EncodeKind",
     "ExpertRoute",
     "FlowPatches",
     "ForwardBatch",
-    "ForwardMode",
     "ForwardOutput",
     "LatentView",
     "MeshView",

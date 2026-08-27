@@ -10,13 +10,13 @@ use crate::{
     Admission, AttentionRegime, Batch, BatchPartition, BlockTable, Bounds, CacheCopy,
     CachePageAllocation, CloseReason, CompletionReport, Control, DType, DecodeKind,
     DecodePlacement, DimBound, Disposition, Domain, DrawLayout, ErrorCode, ErrorOperationIdentity,
-    ExecutionCapability, FinishFlags, ForwardMode, ForwardRow, GenAdmission, GraphBucketCapability,
+    ExecutionCapability, FinishFlags, ForwardMode, GenAdmission, GraphBucketCapability,
     LaneCapabilities, LatentPlacement, LogicalLengths, MediaAdmission, MediaProfileId,
     MixedExecutionCapability, ModelOutput, OpId, OpStatus, Operation, PartitionCompletion, Point,
     PointRange, ProductKind, ProductPayload, ProductRef, RecoveryPlacement, RegistrationAck,
     RequestKey, RequestKind, ResourceClass, ResourcePressure, ResponseKind, Rng, RouteId,
-    SamplingOwnership, ShapeBound, SnapshotRef, StorageClass, TimingCounters, TokenSpan,
-    UndAdmission, VersionRef, WorkerCapabilities, WorkerForwardStats, WorkerRequest,
+    RowGeometry, SamplingOwnership, ShapeBound, SnapshotRef, StorageClass, TimingCounters,
+    TokenSpan, UndAdmission, VersionRef, WorkerCapabilities, WorkerForwardStats, WorkerRequest,
     WorkerResponse, WorkerResponseError,
 };
 
@@ -421,7 +421,7 @@ fn partition_from_table(partition: fbs::BatchPartition<'_>) -> CodecResult<Batch
             .unwrap_or_default(),
         forward_rows: partition
             .forward_rows()
-            .map(|items| items.iter().map(forward_row_from_table).collect())
+            .map(|items| items.iter().map(row_geometry_from_table).collect())
             .unwrap_or_default(),
         latent_placements: partition
             .latent_placements()
@@ -530,8 +530,8 @@ fn cache_page_allocation_from_table(
     }
 }
 
-fn forward_row_from_table(row: fbs::ForwardRow<'_>) -> ForwardRow {
-    ForwardRow {
+fn row_geometry_from_table(row: fbs::RowGeometry<'_>) -> RowGeometry {
+    RowGeometry {
         operation_index: row.operation_index(),
         request_pool_index: row.request_pool_index(),
         seq_len: row.seq_len(),
@@ -1479,7 +1479,7 @@ fn partition_to_fb(partition: &BatchPartition) -> CodecResult<fbs::BatchPartitio
             partition
                 .forward_rows
                 .iter()
-                .map(forward_row_to_fb)
+                .map(row_geometry_to_fb)
                 .collect(),
         ),
         latent_placements: Some(
@@ -1580,8 +1580,8 @@ fn cache_page_allocation_to_fb(allocation: &CachePageAllocation) -> fbs::CachePa
     }
 }
 
-fn forward_row_to_fb(row: &ForwardRow) -> fbs::ForwardRowT {
-    fbs::ForwardRowT {
+fn row_geometry_to_fb(row: &RowGeometry) -> fbs::RowGeometryT {
+    fbs::RowGeometryT {
         operation_index: row.operation_index,
         request_pool_index: row.request_pool_index,
         seq_len: row.seq_len,

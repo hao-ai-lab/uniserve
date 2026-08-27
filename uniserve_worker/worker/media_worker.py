@@ -5,28 +5,27 @@ from __future__ import annotations
 import os
 import tempfile
 import time
-from dataclasses import replace
 from pathlib import Path
 from typing import Callable, cast
 
 import torch
 
 from ..batch import (
-    Admission,
     Batch,
     BatchPartition,
     Close,
     Commit,
-    ModelOutput,
     CompletionReport,
     DecodeKind,
     DecodePlacement,
     DevicePoint,
     FinishFlags,
     FixedPoint,
+    ForwardMode,
     LogicalLengths,
-    OpStatus,
+    ModelOutput,
     Operation,
+    OpStatus,
     PartitionCompletion,
     ProductKind,
     RegistrationAck,
@@ -34,7 +33,6 @@ from ..batch import (
     SamplingOwnership,
     TimingCounters,
     TokenSpan,
-    ForwardMode,
 )
 from ..capabilities import (
     LaneCapabilities,
@@ -54,8 +52,8 @@ from ..models.minimax_h3.execution import (
 )
 from ..models.minimax_h3.state import H3StateSlot
 from ..runtime.device_events import DeviceEventPool
-from ..runtime.device_products import DeviceProductRead, DeviceProductWrite, DeviceProducts
-from ..server.completion import PinnedOutputBuffer, _PendingDigest
+from ..runtime.device_products import DeviceProductRead, DeviceProducts, DeviceProductWrite
+from ..server.completion import DeferredDigest, PinnedOutputBuffer
 from ..server.cpu_tasks import BoundedCpuTaskPool, CpuTaskReservation
 from ..server.profiler import profile_range
 
@@ -67,6 +65,8 @@ _MEDIA_WORK = (
     ForwardMode.GEN_DECODE,
     ForwardMode.MATERIALIZE,
 )
+
+
 def is_h3_checkpoint(model_path: str) -> bool:
     """Identify the modular H3 composition root without loading its weights."""
 
@@ -306,9 +306,7 @@ class MediaWorker:
         return selected[0]
 
     @staticmethod
-    def _decode_placement(
-        partition: BatchPartition, operation: Operation
-    ) -> DecodePlacement:
+    def _decode_placement(partition: BatchPartition, operation: Operation) -> DecodePlacement:
         selected = [
             placement
             for placement in partition.decode_placements
@@ -378,9 +376,7 @@ class MediaWorker:
             device=self.device,
         )
 
-    def _bind_outputs(
-        self, partition: BatchPartition
-    ) -> tuple[DeviceProductWrite, ...]:
+    def _bind_outputs(self, partition: BatchPartition) -> tuple[DeviceProductWrite, ...]:
         bindings = []
         for operation in partition.operations:
             if operation.work is ForwardMode.MATERIALIZE:
@@ -450,9 +446,7 @@ class MediaWorker:
                     f"uniserve.h3.decode_copy request={_request_label(operation)} "
                     f"op={operation.op_id} kind=audio rank={self.mesh.coord('sp')}"
                 ):
-                    capture = buffer.capture_bytes_into(
-                        pcm.view(torch.uint8), ring_lease.storage
-                    )
+                    capture = buffer.capture_bytes_into(pcm.view(torch.uint8), ring_lease.storage)
                 try:
                     return (
                         self.mux.audio(
@@ -471,17 +465,11 @@ class MediaWorker:
             if self.mesh.coord("sp") == 0:
                 if reservation is None:
                     raise RuntimeError("rank zero lost its H3 materialize reservation")
-                return (
-                    self.mux.materialize(
-                        operation.request_key, reservation, operation.op_id
-                    ),
-                )
+                return (self.mux.materialize(operation.request_key, reservation, operation.op_id),)
             return ()
         raise invalid_descriptor(f"unsupported H3 work variant {variant.value!r}")
 
-    def _execute_partition(
-        self, step_id: int, partition: BatchPartition
-    ) -> PartitionCompletion:
+    def _execute_partition(self, step_id: int, partition: BatchPartition) -> PartitionCompletion:
         started = time.perf_counter_ns()
         reservations = self._reserve_tasks(partition)
         buffer = PinnedOutputBuffer(
@@ -496,15 +484,11 @@ class MediaWorker:
         write_by_operation: dict[int, DeviceProductWrite] = {}
         try:
             writes = self._bind_outputs(partition)
-            write_by_operation = {
-                int(write.reference.producer_op_id): write for write in writes
-            }
+            write_by_operation = {int(write.reference.producer_op_id): write for write in writes}
             buffer.begin_device(self.device)
             for row, operation in enumerate(partition.operations):
                 reservation_key = (operation.request_key, operation.op_id)
-                reservation, ring_lease = reservations.get(
-                    reservation_key, (None, None)
-                )
+                reservation, ring_lease = reservations.get(reservation_key, (None, None))
                 with profile_range(
                     f"uniserve.h3.quantum step={step_id} "
                     f"partition={partition.partition_id} "
@@ -529,25 +513,7 @@ class MediaWorker:
                     write = write_by_operation.get(int(operation.op_id))
                     if write is not None:
                         self.device_products.publish_scalar_write(write, True)
-                placeholder = ModelOutput(
-                    request_key=operation.request_key,
-                    op_id=operation.op_id,
-                    completion_slot_generation=buffer.generation,
-                    status=OpStatus.OK,
-                    selected_point=1,
-                    logical_lengths=LogicalLengths(),
-                    token_span=TokenSpan(),
-                    committed_tokens=(),
-                    finish_flags=FinishFlags(),
-                    product_generations=tuple(
-                        int(output.generation) for output in operation.outputs
-                    ),
-                    semantic_digest="0" * 64,
-                    error_code=None,
-                    timing_counters=TimingCounters(),
-                )
-                pending = _PendingDigest(
-                    placeholder,
+                pending = DeferredDigest(
                     parent,
                     operation.plan_digest,
                     buffer,
@@ -555,20 +521,37 @@ class MediaWorker:
                     lambda: (_ for _ in ()).throw(
                         RuntimeError("H3 completion was unexpectedly predicated")
                     ),
+                    status=OpStatus.OK,
+                    selected_point=1,
                     completion_tasks=cast(tuple, tasks),
                 )
-                object.__setattr__(placeholder, "semantic_digest", pending)
-                slot.semantic_digest = cast(str, pending)
+                record = pending.bind_record(
+                    ModelOutput(
+                        request_key=operation.request_key,
+                        op_id=operation.op_id,
+                        completion_slot_generation=buffer.generation,
+                        status=OpStatus.OK,
+                        selected_point=1,
+                        logical_lengths=LogicalLengths(),
+                        token_span=TokenSpan(),
+                        committed_tokens=(),
+                        finish_flags=FinishFlags(),
+                        product_generations=tuple(
+                            int(output.generation) for output in operation.outputs
+                        ),
+                        semantic_digest=pending,
+                        error_code=None,
+                        timing_counters=TimingCounters(),
+                    )
+                )
+                slot.semantic_digest = pending
                 slot.producer_op_id = int(operation.op_id)
                 slot.producer_plan_digest = operation.plan_digest
-                records.append(placeholder)
+                records.append(record)
             buffer.seal()
             self.device_products.commit_writes(writes)
             if reads:
-                after = tuple(
-                    write_by_operation.get(int(read.consumer_op_id))
-                    for read in reads
-                )
+                after = tuple(write_by_operation.get(int(read.consumer_op_id)) for read in reads)
                 if all(write is not None for write in after):
                     self.device_products.record_readers(
                         tuple(reads),
@@ -647,8 +630,7 @@ class MediaWorker:
     def execute(self, batch: Batch) -> CompletionReport:
         self._apply_admissions(batch)
         reports = tuple(
-            self._execute_partition(batch.step_id, partition)
-            for partition in batch.partitions
+            self._execute_partition(batch.step_id, partition) for partition in batch.partitions
         )
         self._apply_controls(batch)
         return CompletionReport(step_id=batch.step_id, partitions=reports)
@@ -673,15 +655,12 @@ class MediaWorker:
 
     def resource_pressure(self) -> list[dict[str, object]]:
         used = sum(slot.active for slot in self.model.states.slots)
-        video_ring, audio_ring = (
-            self.output_ring.used if self.output_ring is not None else (0, 0)
-        )
+        video_ring, audio_ring = self.output_ring.used if self.output_ring is not None else (0, 0)
         return [
             {
                 "resource": ResourceClass.IMAGE_LATENT.value,
                 "used": used * self.model.layout.persistent_units,
-                "capacity": self.model.states.slot_count
-                * self.model.layout.persistent_units,
+                "capacity": self.model.states.slot_count * self.model.layout.persistent_units,
                 "video_ring_used": video_ring,
                 "audio_ring_used": audio_ring,
             }

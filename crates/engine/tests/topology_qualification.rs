@@ -29,8 +29,8 @@ use uniserve_engine::worker::{MultiprocExecutor, WorkerLaunchConfig, WorkerSpawn
 use uniserve_worker_ipc::{
     Admission, AttentionRegime, Batch, BatchPartition, BlockTable, Bounds, CachePageAllocation,
     CloseReason, Control, DType, DimBound, Disposition, ErrorCode, ExecutionCapability,
-    ForwardMode, ForwardRow, OpId, OpStatus, Operation, Point, PointRange, ProductKind,
-    ProductPayload, ProductRef, RequestKey, RouteId, SamplingOwnership, ShapeBound, StorageClass,
+    ForwardMode, OpId, OpStatus, Operation, Point, PointRange, ProductKind, ProductPayload,
+    ProductRef, RequestKey, RouteId, RowGeometry, SamplingOwnership, ShapeBound, StorageClass,
     TRANSFER_DESCRIPTOR_PREFIX, UndAdmission, VersionRef, encode_token_product_bytes,
 };
 
@@ -913,7 +913,7 @@ fn token_batch(
         } else {
             Vec::new()
         },
-        forward_rows: vec![ForwardRow {
+        forward_rows: vec![RowGeometry {
             operation_index: 0,
             request_pool_index: request_pool_idx,
             seq_len: prefix_length,

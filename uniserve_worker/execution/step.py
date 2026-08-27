@@ -6,9 +6,9 @@ import hashlib
 import logging
 import math
 import time
-from collections import OrderedDict, defaultdict
+from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import replace
 from functools import partial
 from typing import Any, cast
 
@@ -18,9 +18,11 @@ from uniserve_worker.batch import (
     Batch,
     BatchPartition,
     CompletionReport,
+    DeferredSemanticDigest,
     DevicePoint,
     Domain,
     DType,
+    ErrorCode,
     ExecutionCapability,
     FinishFlags,
     FixedPoint,
@@ -46,9 +48,6 @@ from uniserve_worker.batch import (
     decode_sampling_state_bytes,
     decode_token_product_bytes,
 )
-from uniserve_worker.batch import (
-    ErrorCode as ProtocolErrorCode,
-)
 from uniserve_worker.capabilities import MixedExecutionCapability
 from uniserve_worker.execution.forward_batch import (
     AttentionSelection,
@@ -61,10 +60,8 @@ from uniserve_worker.execution.trace import (
     OperationTrace,
 )
 from uniserve_worker.foundation.errors import (
-    ErrorCode as WorkerErrorCode,
-)
-from uniserve_worker.foundation.errors import (
     WorkerError,
+    WorkerErrorCode,
     capability_mismatch,
     classify,
     invalid_descriptor,
@@ -108,13 +105,13 @@ from uniserve_worker.runtime.latent_pool import (
 from uniserve_worker.runtime.req_to_token_pool import ReqToTokenPool
 from uniserve_worker.runtime.runtime_states import RuntimeStates
 from uniserve_worker.server.completion import (
+    DeferredDigest,
+    DeferredErrorDigest,
+    DeferredImagePayload,
+    DeferredLogprobPayload,
+    DeferredTransferPayload,
     PinnedOutputBuffer,
     PinnedTokenCapture,
-    _CompletionImagePayload,
-    _CompletionLogprobPayload,
-    _CompletionTransferPayload,
-    _PendingDigest,
-    _PendingErrorDigest,
 )
 from uniserve_worker.server.cpu_tasks import BoundedCpuTaskPool
 from uniserve_worker.server.profiler import profile_range
@@ -135,6 +132,7 @@ from .attention import columns as _attention_columns
 from .attention import dense_columns as _dense_attention_columns
 from .cuda_graph import GraphExecutionError
 from .model_runner import ForwardResult, ModelRunner, RunObservation, RunPath
+from .resources import ExecutionResources
 from .rows import (
     DecodeRuntimePublication,
     ForwardRow,
@@ -172,41 +170,6 @@ _GENERATION_WORK_VARIANTS = frozenset(
 )
 MIXED_SERVICE_SERIAL_NUMERATOR = 5
 MIXED_SERVICE_SERIAL_DENOMINATOR = 4
-
-
-@dataclass(slots=True)
-class ExecutionResources:
-    runner: ModelRunner | None
-    model: ExecutionModel
-    deployment: WorkerDeployment
-    attention: AttentionSelection
-    requests: RequestTable
-    runtime_states: RuntimeStates | None
-    cache_pool: CachePool | None
-    req_to_token_pool: ReqToTokenPool | None
-    cache_publications: CachePublications | None
-    latent_pool: LatentPool | None
-    device_products: DeviceProducts
-    encoder_cache: EncoderCache
-    _device_events: DeviceEventPool
-    _cpu_tasks: BoundedCpuTaskPool
-    weights: WeightSet
-    mesh: DeviceMesh
-    transport: Transport | None
-    tokenizer: Any | None
-    architecture_digest: str
-    weight_digest: str
-    allowed_work_variants: frozenset[ForwardMode]
-    mixed_buckets: frozenset[MixedExecutionCapability]
-    trace: ExecutionTrace
-    _device: torch.device
-    _generation_device: torch.device
-    _qualified_mixed_buckets: set[MixedExecutionCapability] = field(default_factory=set)
-    _collective_history: OrderedDict[int, str] = field(default_factory=OrderedDict)
-    _transport_publications: dict[OperationIdentity, tuple[Locator, ...]] = field(
-        default_factory=dict
-    )
-    _flow_prefix_slots: dict[RequestKey, set[int]] = field(default_factory=dict)
 
 
 def create_execution_resources(
@@ -327,14 +290,14 @@ def _unique_scopes(scopes: Sequence[PartitionState]) -> tuple[PartitionState, ..
     return tuple(unique)
 
 
-def _protocol_error_code(code: str) -> ProtocolErrorCode:
+def _protocol_error_code(code: WorkerErrorCode) -> ErrorCode:
     if code == WorkerErrorCode.RESOURCE_ERROR:
-        return ProtocolErrorCode.RESOURCE_EXHAUSTED
+        return ErrorCode.RESOURCE_EXHAUSTED
     if code == WorkerErrorCode.COMPUTE_ERROR:
-        return ProtocolErrorCode.COMPUTE_ERROR
+        return ErrorCode.COMPUTE_ERROR
     if code in {WorkerErrorCode.INVARIANT_VIOLATION, WorkerErrorCode.FATAL_WORKER_FAILURE}:
-        return ProtocolErrorCode.INTERNAL
-    return ProtocolErrorCode.INVALID_OPERATION
+        return ErrorCode.INTERNAL
+    return ErrorCode.INVALID_OPERATION
 
 
 def prepare_batch(runtime, batch: Batch) -> PreparedExecution | None:
@@ -945,7 +908,7 @@ def _log_partition_failure(
     *,
     cause: BaseException | None = None,
 ) -> None:
-    capture_trace = should_capture_trace(str(error.code))
+    capture_trace = should_capture_trace(error.code)
     log = logger.error if capture_trace else logger.warning
     log(
         "partition failed: %s [code=%s partition_id=%s route=%s operations=%s]",
@@ -1414,7 +1377,7 @@ def _commit_partition(
     records: list[ModelOutput] = []
     selected_versions: dict[int, VersionRef] = {}
     report_products: list[ProductPayload] = []
-    pending_by_session: dict[int, _PendingDigest] = {}
+    pending_by_session: dict[int, DeferredDigest] = {}
     resolved_runtime: dict[int, RequestRuntime] = {}
     layout = scope.layout
     if layout is None or layout.operations != operations:
@@ -1431,29 +1394,15 @@ def _commit_partition(
         if int(runtime.deployment.tp_rank) == 0:
             report_products.extend(outcome.products)
         parent_semantic = _parent_semantic(operation, request)
-        placeholder = ModelOutput(
-            request_key=operation.request_key,
-            op_id=operation.op_id,
-            completion_slot_generation=scope.completion.generation,
-            status=outcome.status,
-            selected_point=cast(int, outcome.selected_point),
-            logical_lengths=outcome.logical_lengths,
-            token_span=outcome.token_span,
-            committed_tokens=cast(tuple[int, ...], outcome.committed_tokens),
-            finish_flags=outcome.finish_flags,
-            product_generations=outcome.product_generations,
-            semantic_digest="0" * 64,
-            error_code=None,
-            timing_counters=TimingCounters(),
-        )
-        pending = _PendingDigest(
-            placeholder,
+        pending = DeferredDigest(
             parent_semantic,
             operation.plan_digest,
             scope.completion,
             row,
             partial(_finalize_predicated_runtime, runtime, operation),
-            (
+            status=outcome.status,
+            selected_point=cast(int, outcome.selected_point),
+            resolved_callback=(
                 partial(_finalize_speculative_runtime, runtime, operation, outcome.selection)
                 if outcome.selection is not None
                 else None
@@ -1461,19 +1410,35 @@ def _commit_partition(
             completion_tasks=(
                 *outcome.completion_tasks,
                 *(
-                    cast(_CompletionLogprobPayload, product.payload)
+                    cast(DeferredLogprobPayload, product.payload)
                     for product in outcome.products
-                    if isinstance(product.payload, _CompletionLogprobPayload)
+                    if isinstance(product.payload, DeferredLogprobPayload)
                 ),
             ),
         )
-        object.__setattr__(placeholder, "semantic_digest", pending)
-        records.append(placeholder)
+        record = pending.bind_record(
+            ModelOutput(
+                request_key=operation.request_key,
+                op_id=operation.op_id,
+                completion_slot_generation=scope.completion.generation,
+                status=outcome.status,
+                selected_point=cast(int, outcome.selected_point),
+                logical_lengths=outcome.logical_lengths,
+                token_span=outcome.token_span,
+                committed_tokens=cast(tuple[int, ...], outcome.committed_tokens),
+                finish_flags=outcome.finish_flags,
+                product_generations=outcome.product_generations,
+                semantic_digest=pending,
+                error_code=None,
+                timing_counters=TimingCounters(),
+            )
+        )
+        records.append(record)
         if operation.advances_state:
             selected_versions[operation.request_key.session_id] = VersionRef(
                 request_key=operation.request_key,
                 producer_op_id=operation.op_id,
-                point=FixedPoint(cast(int, outcome.selected_point), cast(str, pending)),
+                point=FixedPoint(cast(int, outcome.selected_point), pending),
             )
             pending_by_session[operation.request_key.session_id] = pending
         else:
@@ -1537,7 +1502,7 @@ def _commit_partition(
     runtime.requests.publish(request_publication)
     for session_id, pending in pending_by_session.items():
         if pending.ready():
-            runtime.requests.get(session_id).resolved_digest = pending.resolve()
+            runtime.requests.get(session_id).resolved_digest = pending.finalize()
     return partition_report
 
 
@@ -1729,9 +1694,8 @@ def _build_error_partition(
             error_code=protocol_code,
             timing_counters=TimingCounters(),
         )
-        semantic_digest: object
-        if isinstance(parent_semantic, (_PendingDigest, _PendingErrorDigest)):
-            semantic_digest = _PendingErrorDigest(
+        if isinstance(parent_semantic, (DeferredDigest, DeferredErrorDigest)):
+            semantic_digest = DeferredErrorDigest(
                 parent_semantic,
                 placeholder,
                 operation.plan_digest,
@@ -1744,7 +1708,7 @@ def _build_error_partition(
         records.append(
             replace(
                 placeholder,
-                semantic_digest=cast(str, semantic_digest),
+                semantic_digest=semantic_digest,
             )
         )
     return PartitionCompletion(
@@ -2103,14 +2067,14 @@ def _validate_completion_products(
             if isinstance(
                 product.payload,
                 (
-                    _CompletionImagePayload,
-                    _CompletionLogprobPayload,
-                    _CompletionTransferPayload,
+                    DeferredImagePayload,
+                    DeferredLogprobPayload,
+                    DeferredTransferPayload,
                 ),
             )
             else len(product.payload)
         )
-        transferred = isinstance(product.payload, _CompletionTransferPayload)
+        transferred = isinstance(product.payload, DeferredTransferPayload)
         if transferred and reference.storage_class in {
             StorageClass.HOST_STAGING,
             StorageClass.PINNED_OUTPUT,
@@ -3244,7 +3208,10 @@ def _fixed_parent(operation: Operation) -> FixedPoint:
     return point
 
 
-def _parent_semantic(operation: Operation, session: RequestRow) -> str:
+def _parent_semantic(
+    operation: Operation,
+    session: RequestRow,
+) -> str | DeferredSemanticDigest:
     """The parent semantic digest a completion's own semantic digest chains from.
 
     A fixed parent names it directly; a device parent chains from the session's

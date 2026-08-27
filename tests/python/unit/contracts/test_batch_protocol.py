@@ -25,7 +25,6 @@ from uniserve_worker.batch import (
     Bounds,
     CachePageAllocation,
     Commit,
-    ModelOutput,
     DevicePoint,
     Disposition,
     Domain,
@@ -35,9 +34,10 @@ from uniserve_worker.batch import (
     ExecutionCapability,
     FinishFlags,
     FixedPoint,
-    ForwardRow,
+    ForwardMode,
     LatentPlacement,
     LogicalLengths,
+    ModelOutput,
     Operation,
     OpStatus,
     PointRange,
@@ -47,6 +47,7 @@ from uniserve_worker.batch import (
     RecoveryPlacement,
     RequestKey,
     Rng,
+    RowGeometry,
     SamplingState,
     ShapeBound,
     StaticDim,
@@ -56,7 +57,6 @@ from uniserve_worker.batch import (
     TokenSpan,
     UndAdmission,
     VersionRef,
-    ForwardMode,
     control_from_wire,
     control_to_wire,
     decode_sampling_state_bytes,
@@ -139,7 +139,7 @@ def _partition(*operations: Operation) -> BatchPartition:
         block_tables=(BlockTable(8, 0, (7,), 1),),
         new_cache_pages=(CachePageAllocation(8, 0, (7,)),),
         forward_rows=tuple(
-            ForwardRow(index, 8, 0, 1) for index, _operation in enumerate(operations)
+            RowGeometry(index, 8, 0, 1) for index, _operation in enumerate(operations)
         ),
     )
 
@@ -300,8 +300,7 @@ def test_identity_is_invariant_to_batch_allocation_topology_and_completion_order
                         for position, slot in enumerate(slots)
                     ),
                     forward_rows=tuple(
-                        ForwardRow(position, slot, 0, 1)
-                        for position, slot in enumerate(slots)
+                        RowGeometry(position, slot, 0, 1) for position, slot in enumerate(slots)
                     ),
                 ),
             ),

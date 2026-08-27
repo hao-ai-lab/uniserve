@@ -11,11 +11,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ...batch import ForwardMode as WorkMode
+from ...batch import ForwardMode
 from ...execution.forward_batch import (
+    AttentionMode,
     ExpertRoute,
     ForwardBatch,
-    ForwardMode,
     ForwardOutput,
     RouteSpan,
     TokenSelection,
@@ -568,13 +568,16 @@ class _SenseDecoder(nn.Module):
         spans: tuple[RouteSpan, ...]
         indexes: torch.Tensor
         causal: bool
-        if context.forward_mode is ForwardMode.PACKED:
-            if context.attention_indexes is None or tuple(context.attention_indexes.shape) != (3, token_count):
+        if context.forward_mode is AttentionMode.PACKED:
+            if context.attention_indexes is None or tuple(context.attention_indexes.shape) != (
+                3,
+                token_count,
+            ):
                 raise ValueError("SenseNova positions must have shape [3, tokens]")
             spans = context.route_spans
             indexes = context.attention_indexes
             causal = False
-        elif context.forward_mode is ForwardMode.PAGED_DECODE:
+        elif context.forward_mode is AttentionMode.PAGED_DECODE:
             if positions is None or tuple(positions.shape) != (token_count,):
                 raise ValueError("SenseNova paged decode positions must align with text tokens")
             spans = (RouteSpan(ExpertRoute.TEXT, 0, token_count),)
@@ -634,9 +637,7 @@ class NEOChatModel(ExecutionModel):
         """Stream checkpoint tensors into the selected SenseNova tower scope."""
 
         parameter_names = set(dict(self.named_parameters()))
-        included = {
-            name for name in parameter_names if _scope_includes(name, self._load_scope)
-        }
+        included = {name for name in parameter_names if _scope_includes(name, self._load_scope)}
         report = LoadReport()
         for handle in weights:
             source_name = handle.name
@@ -656,9 +657,7 @@ class NEOChatModel(ExecutionModel):
 
     def checkpoint_parameter_names(self) -> set[str]:
         return {
-            name
-            for name, _ in self.named_parameters()
-            if _scope_includes(name, self._load_scope)
+            name for name, _ in self.named_parameters() if _scope_includes(name, self._load_scope)
         }
 
     def __init__(
@@ -800,16 +799,16 @@ class NEOChatModel(ExecutionModel):
         )
         self.supported_work = frozenset(
             {
-                WorkMode.TOKEN_EXTEND,
-                WorkMode.TOKEN_DECODE,
-                WorkMode.TOKEN_VERIFY,
-                WorkMode.GEN_TRANSITION,
-                WorkMode.GEN_FLOW,
-                WorkMode.ENCODE_VISION,
-                WorkMode.MATERIALIZE,
-                WorkMode.TRANSFER_PRODUCT,
-                WorkMode.TRANSFER_KV_PUBLISH,
-                WorkMode.TRANSFER_KV_INSTALL,
+                ForwardMode.TOKEN_EXTEND,
+                ForwardMode.TOKEN_DECODE,
+                ForwardMode.TOKEN_VERIFY,
+                ForwardMode.GEN_TRANSITION,
+                ForwardMode.GEN_FLOW,
+                ForwardMode.ENCODE_VISION,
+                ForwardMode.MATERIALIZE,
+                ForwardMode.TRANSFER_PRODUCT,
+                ForwardMode.TRANSFER_KV_PUBLISH,
+                ForwardMode.TRANSFER_KV_INSTALL,
             }
         )
         self.max_vit_grid_tokens = _MAX_VISION_TOKENS
@@ -909,7 +908,7 @@ class NEOChatModel(ExecutionModel):
         batch: ForwardBatch,
     ) -> torch.Tensor:
         decode_positions: torch.Tensor | None = None
-        if batch.forward_mode is ForwardMode.PAGED_DECODE:
+        if batch.forward_mode is AttentionMode.PAGED_DECODE:
             if batch.flow_row_indices:
                 raise TypeError("SenseNova paged decode accepts token rows only")
             decode_positions = positions

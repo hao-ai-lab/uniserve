@@ -25,7 +25,6 @@ from ..batch import (
     Domain,
     ExecutionCapability,
     ForwardMode,
-    ForwardRow,
     ImageParams,
     LatentPlacement,
     Operation,
@@ -35,6 +34,7 @@ from ..batch import (
     ProductRef,
     RecoveryPlacement,
     RequestKey,
+    RowGeometry,
     SnapshotRef,
     StorageClass,
 )
@@ -225,7 +225,7 @@ def _warmup_batch(
     operations: tuple[Operation, ...],
     block_tables: dict[tuple[RequestKey, int], tuple[BlockTable, ...]],
     new_cache_pages: dict[tuple[RequestKey, int], tuple[CachePageAllocation, ...]],
-    forward_rows: dict[tuple[RequestKey, int], tuple[ForwardRow, ...]],
+    forward_rows: dict[tuple[RequestKey, int], tuple[RowGeometry, ...]],
     latent_placements: dict[tuple[RequestKey, int], LatentPlacement],
     input_products: tuple[ProductPayload, ...] = (),
     tensorized_mixed: bool = False,
@@ -423,10 +423,6 @@ class Worker:
     ) -> None:
         if not isinstance(model, ExecutionModel):
             raise capability_mismatch("worker model must implement ExecutionModel")
-        if model.resource_geometry.kv and type(model).forward is ExecutionModel.forward:
-            raise capability_mismatch(
-                "KV-backed model requires forward(input_ids, positions, forward_batch)"
-            )
         if not isinstance(deployment, WorkerDeployment):
             raise capability_mismatch("model worker requires a worker deployment")
         self.model = model
@@ -491,7 +487,7 @@ class Worker:
                 f"{type(self).__name__} implements none of the requested work variants "
                 f"{sorted(value.value for value in allowed_work_variants)!r}"
             )
-        advertised_work = self._effective_work_variants.intersection(declared.supported_work)
+        advertised_work = self._effective_work_variants
         if not advertised_work:
             raise capability_mismatch(f"{type(self).__name__} advertises no executable work")
         self._capabilities = replace(
@@ -550,10 +546,7 @@ class Worker:
                 device=deployment.device,
                 staging_depth=int(pipeline_depth),
             )
-            from ..nn.attention import bind_attention_modules
-
-            bind_attention_modules(model, self.cache_pool, attention)
-            model.bind_cache_pool(self.cache_pool)
+            model.bind_cache_pool(self.cache_pool, attention)
         self.requests = RequestTable(int(self._capabilities.max_request_pool_size))
         torch_dtype = getattr(
             torch,
@@ -1371,7 +1364,7 @@ class Worker:
         request_pool_indices: dict[RequestKey, int] = {}
         block_tables: dict[tuple[RequestKey, int], tuple[BlockTable, ...]] = {}
         new_cache_pages: dict[tuple[RequestKey, int], tuple[CachePageAllocation, ...]] = {}
-        forward_rows: dict[tuple[RequestKey, int], tuple[ForwardRow, ...]] = {}
+        forward_rows: dict[tuple[RequestKey, int], tuple[RowGeometry, ...]] = {}
         latent_placements: dict[tuple[RequestKey, int], LatentPlacement] = {}
         for operation in operations:
             session = self.requests.peek(int(operation.request_key.session_id))
@@ -1458,7 +1451,7 @@ class Worker:
             new_cache_pages[identity] = tuple(allocations)
             if input_length > 0:
                 forward_rows[identity] = (
-                    ForwardRow(
+                    RowGeometry(
                         operation_index=0,
                         request_pool_index=request_pool_indices[operation.request_key],
                         seq_len=visible,
@@ -1546,7 +1539,7 @@ class Worker:
     ) -> tuple[
         tuple[BlockTable, ...],
         tuple[CachePageAllocation, ...],
-        tuple[ForwardRow, ...],
+        tuple[RowGeometry, ...],
     ]:
         session = self.requests.get(operation.request_key.session_id)
         image = session.image
@@ -1599,7 +1592,7 @@ class Worker:
         tables: tuple[BlockTable, ...] = ()
         allocations: tuple[CachePageAllocation, ...] = ()
         alternative_slot = main_slot
-        rows: list[ForwardRow] = []
+        rows: list[RowGeometry] = []
         if alternative:
             alternative_slot = self._warmup_prefix_slots.setdefault(
                 operation.request_key,
@@ -1624,7 +1617,7 @@ class Worker:
                     ),
                 )
             rows.append(
-                ForwardRow(
+                RowGeometry(
                     operation_index=0,
                     request_pool_index=alternative_slot,
                     seq_len=0,
@@ -1633,7 +1626,7 @@ class Worker:
             )
         for prefix, copy_conditioning in branch_prefixes:
             rows.append(
-                ForwardRow(
+                RowGeometry(
                     operation_index=0,
                     request_pool_index=main_slot if copy_conditioning else alternative_slot,
                     seq_len=int(runtime.kv_visible_len) if copy_conditioning else len(prefix),
@@ -2561,21 +2554,18 @@ def _supports_flow_attention(
     head_dim = int(getattr(geometry, "head_dim"))
     for provider in selection.providers:
         capabilities = provider.capabilities()
-        if not bool(getattr(capabilities, "available", True)) or not bool(
-            getattr(capabilities, "segmented_attention", False)
-        ):
+        if not capabilities.available or not capabilities.segmented_attention:
             continue
-        if head_dim < int(getattr(capabilities, "min_head_dim", 1) or 1):
+        if head_dim < int(capabilities.min_head_dim):
             continue
-        multiple = int(getattr(capabilities, "paged_block_size_multiple", 1) or 1)
+        multiple = max(1, int(capabilities.paged_block_size_multiple))
         if pool.block_size % max(1, multiple) != 0:
             continue
-        supports_geometry = getattr(capabilities, "supports_trunk_geometry", None)
-        if callable(supports_geometry) and not supports_geometry(head_dim, head_dim, head_dim):
+        if not capabilities.supports_trunk_geometry(head_dim, head_dim, head_dim):
             continue
-        if bool(getattr(capabilities, "cuda_only", False)) and device.type != "cuda":
+        if capabilities.cuda_only and device.type != "cuda":
             continue
-        minimum = getattr(capabilities, "min_cuda_capability", None)
+        minimum = capabilities.min_cuda_capability
         if minimum is not None:
             if device.type != "cuda":
                 continue

@@ -11,8 +11,8 @@ from typing import Final
 import torch
 
 from ..batch import DType, ProductKind, ProductRef, RequestKey, StaticDim, StorageClass
+from ..foundation.errors import WorkerError, WorkerErrorCode, invalid_descriptor, resource_error
 from .device import canonical_device
-from ..foundation.errors import ErrorCode, WorkerError, invalid_descriptor, resource_error
 from .device_events import DeviceEventPool
 
 _MAX_GENERATION: Final[int] = (1 << 32) - 1
@@ -26,7 +26,7 @@ _OperationKey = tuple[RequestKey, int]
 
 
 def _invariant(message: str) -> WorkerError:
-    return WorkerError(code=ErrorCode.INVARIANT_VIOLATION, message=message, fatal=True)
+    return WorkerError(code=WorkerErrorCode.INVARIANT_VIOLATION, message=message, fatal=True)
 
 
 def _reference_key(reference: ProductRef) -> _ReferenceKey:
@@ -140,14 +140,11 @@ class EncoderCache:
         }
         self._slots = {
             str(device): tuple(
-                _EncoderSlot(index=index, device=device)
-                for index in range(self.entry_capacity)
+                _EncoderSlot(index=index, device=device) for index in range(self.entry_capacity)
             )
             for device in self.devices
         }
-        self._free = {
-            str(device): deque(range(self.entry_capacity)) for device in self.devices
-        }
+        self._free = {str(device): deque(range(self.entry_capacity)) for device in self.devices}
         self._entries: dict[_ReferenceKey, EncoderWrite] = {}
         self._candidates: dict[int, EncoderWrite] = {}
         self._operations: dict[_OperationKey, list[EncoderWrite]] = {}
@@ -270,7 +267,9 @@ class EncoderCache:
             if int(flat.numel()) > int(target.numel()):
                 raise _invariant("encoder feature exceeds its registered shape bound")
             resident = target.reshape(-1)[: int(flat.numel())].reshape(value.shape)
-            resident.copy_(flat.reshape(value.shape).to(dtype=dtype), non_blocking=value.device.type == "cuda")
+            resident.copy_(
+                flat.reshape(value.shape).to(dtype=dtype), non_blocking=value.device.type == "cuda"
+            )
             if resident.device.type == "cuda":
                 event = self.event_pool.acquire(resident.device)
                 entry.producer_stream = self.event_pool.record(event, resident.device)
@@ -295,7 +294,10 @@ class EncoderCache:
                 raise invalid_descriptor("encoder feature was consumed after release")
             if not entry.published or entry.tensor is None or entry.metadata is None:
                 raise invalid_descriptor("encoder feature was consumed before publication")
-            if producer_plan_digest is not None and entry.producer_plan_digest != producer_plan_digest:
+            if (
+                producer_plan_digest is not None
+                and entry.producer_plan_digest != producer_plan_digest
+            ):
                 raise invalid_descriptor("encoder feature plan digest does not match its producer")
             target = entry.tensor.device if device is None else canonical_device(device)
             if target != entry.tensor.device:
@@ -483,10 +485,7 @@ class EncoderCache:
                     self._detach_locked(entry)
             self._reclaim_ready_locked()
         writes = self.bind_outputs(
-            tuple(
-                (item.reference, item.producer_plan_digest, item.device)
-                for item in snapshots
-            )
+            tuple((item.reference, item.producer_plan_digest, item.device) for item in snapshots)
         )
         try:
             for write, item in zip(writes, snapshots, strict=True):
@@ -549,8 +548,10 @@ class EncoderCache:
             event_releases[id(event)] = (event, 1 if existing is None else existing[1] + 1)
 
         for key, entry in tuple(self._entries.items()):
-            if not entry.released or not ready(entry.producer_event) or not all(
-                ready(event) for event in entry.reader_events
+            if (
+                not entry.released
+                or not ready(entry.producer_event)
+                or not all(ready(event) for event in entry.reader_events)
             ):
                 continue
             self._entries.pop(key)
@@ -563,8 +564,10 @@ class EncoderCache:
             self._free[str(entry.slot.device)].append(entry.slot.index)
             reclaimed += 1
         for binding_id, entry in tuple(self._candidates.items()):
-            if not entry.released or not ready(entry.producer_event) or not all(
-                ready(event) for event in entry.reader_events
+            if (
+                not entry.released
+                or not ready(entry.producer_event)
+                or not all(ready(event) for event in entry.reader_events)
             ):
                 continue
             self._candidates.pop(binding_id)

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ..batch import SamplingOwnership
+from ..batch import ForwardMode, SamplingOwnership
 from ..capabilities import (
     KvGroupKind,
     KvGroupSpec,
@@ -10,7 +10,6 @@ from ..capabilities import (
     RequestKind,
     ResourceClass,
     WorkerCapabilities,
-    configured_work_variants,
 )
 from ..foundation.errors import invalid_descriptor
 from ..foundation.math import ceil_div
@@ -122,7 +121,7 @@ def resolve_capabilities(
     ]
     if owns_kv:
         controls.insert(1, RequestKind.COPY_KV)
-    supported_work = configured_work_variants(model.supported_work)
+    supported_work = tuple(variant for variant in ForwardMode if variant in model.supported_work)
     sampling_ownership = SamplingOwnership.DESIGNATED_RANK
     return WorkerCapabilities(
         block_size=int(deployment.block_size) if owns_kv else 0,

@@ -11,13 +11,14 @@ import torch
 from uniserve_worker.batch import (
     DrawLayout,
     FinishFlags,
+    ForwardMode,
     ImageParams,
     Operation,
+    OpStatus,
     ProductKind,
     ProductPayload,
     ProductRef,
     TokenSpan,
-    ForwardMode,
 )
 from uniserve_worker.foundation.errors import invalid_descriptor
 from uniserve_worker.models.generation import BranchSource, LatentLayout
@@ -27,17 +28,17 @@ from uniserve_worker.nn.diffusion.integrator import euler_step
 from uniserve_worker.nn.diffusion.schedule import x_pred_to_velocity
 from uniserve_worker.nn.vision import get_flattened_position_ids_extrapolate
 from uniserve_worker.runtime.latent_pool import LatentPublication
-from uniserve_worker.server.completion import _CompletionTransferPayload
+from uniserve_worker.server.completion import DeferredTransferPayload
 from uniserve_worker.server.request_state import RequestRow
 
-from . import step as ops
 from . import token
 from .forward_batch import FlowPatches, ModelPhase, TokenSelection
+from .resources import ExecutionResources
 from .rng import flow_noise_seed, normal_noise
-from .rows import ForwardRow, LatentExecution, OperationState, PartitionState
+from .rows import ForwardRow, LatentExecution, OperationState, Outcome, PartitionState
 
 
-def pack_forward(runtime: object, state: OperationState) -> tuple[object, ...]:
+def pack_forward(runtime: ExecutionResources, state: OperationState) -> tuple[object, ...]:
     if state.operation.work is not ForwardMode.GEN_FLOW:
         return ()
     if state.phase == "initial":
@@ -55,7 +56,7 @@ def pack_forward(runtime: object, state: OperationState) -> tuple[object, ...]:
 
 
 def consume_forward(
-    runtime: object,
+    runtime: ExecutionResources,
     state: OperationState,
     outputs: tuple[torch.Tensor, ...],
 ) -> None:
@@ -93,7 +94,7 @@ def consume_forward(
     state.phase = "integrate"
 
 
-def integrate(runtime: object, state: OperationState) -> bool:
+def integrate(runtime: ExecutionResources, state: OperationState) -> bool:
     if state.phase != "integrate":
         return False
 
@@ -116,12 +117,11 @@ def integrate(runtime: object, state: OperationState) -> bool:
     return True
 
 
-def _initialize(runtime: object, state: OperationState) -> None:
-    from . import step as ops
+def _initialize(runtime: ExecutionResources, state: OperationState) -> None:
 
     operation = state.operation
     partition = state.partition
-    flow = ops._generation(runtime)
+    flow = runtime.generation()
     session_id = operation.request_key.session_id
     conditioning = tuple(
         reference for reference in operation.inputs if reference.kind is ProductKind.KV
@@ -136,8 +136,8 @@ def _initialize(runtime: object, state: OperationState) -> None:
         raise invalid_descriptor(
             "flow operation requires exact conditioning and one latent input/output generation"
         )
-    cache = ops._cache_coordinates(runtime, operation, partition)
-    session = ops._request_row(runtime, partition, session_id)
+    cache = runtime.cache_coordinates(operation, partition)
+    session = runtime.request_row(partition, session_id)
     runtime.cache_publications.validate_conditioning(
         session_id,
         conditioning[0],
@@ -161,8 +161,8 @@ def _initialize(runtime: object, state: OperationState) -> None:
         raise invalid_descriptor("flow latent generations are invalid")
     if session.latent_product != latent_input:
         raise invalid_descriptor("flow operation does not name the current latent generation")
-    row = ops._latent_row(runtime, operation, partition)
-    pool = ops._latent_pool(runtime)
+    row = runtime.latent_row(operation, partition)
+    pool = runtime.require_latent_pool()
     start_step = int(row.placement.start_step)
     end_step = start_step + int(row.placement.step_count)
     current = pool.gather_current(
@@ -194,7 +194,7 @@ def _initialize(runtime: object, state: OperationState) -> None:
     state.phase = "step"
 
 
-def _prepare_step(runtime: object, state: OperationState) -> None:
+def _prepare_step(runtime: ExecutionResources, state: OperationState) -> None:
 
     operation = state.operation
     partition = state.partition
@@ -218,7 +218,7 @@ def _prepare_step(runtime: object, state: OperationState) -> None:
     prefix_rows = []
     prefix_branches = []
     entries = data["entries"]
-    descriptors = partition.forward_rows.get(ops._operation_identity(operation), ())
+    descriptors = partition.forward_rows.get(runtime.operation_identity(operation), ())
     if len(descriptors) < len(guide.branches):
         raise invalid_descriptor("generation flow has incomplete forward-row metadata")
     denoise_descriptors = descriptors[-len(guide.branches) :]
@@ -264,7 +264,7 @@ def _prepare_step(runtime: object, state: OperationState) -> None:
         state.phase = "denoise"
 
 
-def _pack_denoise(runtime: object, state: OperationState) -> None:
+def _pack_denoise(runtime: ExecutionResources, state: OperationState) -> None:
 
     data = state.data
     row = data["row"]
@@ -285,8 +285,7 @@ def _pack_denoise(runtime: object, state: OperationState) -> None:
     )
 
 
-def _finish(runtime: object, state: OperationState) -> None:
-    from . import step as ops
+def _finish(runtime: ExecutionResources, state: OperationState) -> None:
 
     operation = state.operation
     partition = state.partition
@@ -325,11 +324,10 @@ def _finish(runtime: object, state: OperationState) -> None:
         step=final_step,
         scope=partition,
     )
-    state.outcome = ops.Outcome(
-        status=ops.OpStatus.OK,
+    state.outcome = Outcome(
+        status=OpStatus.OK,
         selected_point=1,
-        logical_lengths=ops._logical_lengths(
-            runtime,
+        logical_lengths=runtime.logical_lengths(
             operation,
             data["session"],
             data["cache"],
@@ -337,7 +335,7 @@ def _finish(runtime: object, state: OperationState) -> None:
         ),
         token_span=TokenSpan(base=data["session"].logical_position, len=0),
         finish_flags=FinishFlags(),
-        product_generations=ops._output_generations(operation),
+        product_generations=runtime.output_generations(operation),
         products=products,
     )
     main_slot = int(data["session"].request_pool_idx)
@@ -358,7 +356,7 @@ def _finish(runtime: object, state: OperationState) -> None:
 
 
 def publish_latent_transfer(
-    runtime,
+    runtime: ExecutionResources,
     operation: Operation,
     product: ProductRef,
     value: torch.Tensor,
@@ -386,8 +384,8 @@ def publish_latent_transfer(
     }
     locator = replace(locator, meta={**locator.meta, **metadata})
     scope.published.append(locator)
-    scope.stage_publications[ops._operation_identity(operation)] = (locator,)
-    descriptor = _CompletionTransferPayload(
+    scope.stage_publications[runtime.operation_identity(operation)] = (locator,)
+    descriptor = DeferredTransferPayload(
         "latent",
         {"locator": locator.to_mapping(), **metadata},
         (locator,),
@@ -398,15 +396,13 @@ def publish_latent_transfer(
 
 
 def initial_latent(
-    runtime,
+    runtime: ExecutionResources,
     operation: Operation,
     height: int,
     width: int,
     target: torch.Tensor,
 ) -> None:
-    flow = ops._generation(
-        runtime,
-    )
+    flow = runtime.generation()
     rng = operation.rng
     assert rng is not None and rng.draw_layout is DrawLayout.FLOW_NOISE
     seed = flow_noise_seed(int(rng.seed), int(rng.semantic_index_base))
@@ -424,21 +420,17 @@ def initial_latent(
         target.copy_(neural.reshape_as(target))
 
 
-def branch_source(runtime, branch: Branch) -> BranchSource:
-    return ops._generation(
-        runtime,
-    ).branch_source(branch)
+def branch_source(runtime: ExecutionResources, branch: Branch) -> BranchSource:
+    return runtime.generation().branch_source(branch)
 
 
 def flow_prefix(
-    runtime,
+    runtime: ExecutionResources,
     source: BranchSource,
     image_prompt: str,
     session: RequestRow,
 ) -> tuple[tuple[int, ...], bool]:
-    return ops._generation(
-        runtime,
-    ).prefix(
+    return runtime.generation().prefix(
         source,
         image_prompt=image_prompt,
         negative_prompt=require_image(session).negative_prompt,
@@ -448,21 +440,19 @@ def flow_prefix(
 
 
 def prefix_row(
-    runtime,
+    runtime: ExecutionResources,
     operation: Operation,
     tokens: tuple[int, ...],
     entry: tuple[int, int, int, int],
     branch: Branch,
     scope: PartitionState,
 ) -> ForwardRow:
-    session = ops._request_row(runtime, scope, operation.request_key.session_id)
+    session = runtime.request_row(scope, operation.request_key.session_id)
     positions = torch.arange(entry[2], entry[2] + len(tokens), dtype=torch.long)
     return ForwardRow(
         operation=operation,
         request=session,
-        weights=ops._weights(
-            runtime,
-        ),
+        weights=runtime.weights,
         phase=ModelPhase.TEXT,
         token_ids=torch.tensor(tokens, dtype=torch.long),
         positions=positions,
@@ -479,7 +469,7 @@ def prefix_row(
 
 
 def denoise_row(
-    runtime,
+    runtime: ExecutionResources,
     operation: Operation,
     conditioning_position: int,
     branch: Branch,
@@ -490,10 +480,8 @@ def denoise_row(
     width: int,
     scope: PartitionState,
 ) -> ForwardRow:
-    session = ops._request_row(runtime, scope, operation.request_key.session_id)
-    flow = ops._generation(
-        runtime,
-    )
+    session = runtime.request_row(scope, operation.request_key.session_id)
+    flow = runtime.generation()
     image_tokens = image_token_count(runtime, latent, height, width)
     text_local: tuple[int, ...]
     if flow.latent_layout is LatentLayout.PATCH_TOKENS:
@@ -529,9 +517,7 @@ def denoise_row(
     return ForwardRow(
         operation=operation,
         request=session,
-        weights=ops._weights(
-            runtime,
-        ),
+        weights=runtime.weights,
         phase=ModelPhase.DENOISE,
         flow_conditioning=conditioning,
         positions=latent_positions,
@@ -551,7 +537,7 @@ def denoise_row(
 
 
 def _temporal_position(
-    runtime,
+    runtime: ExecutionResources,
     branch: Branch,
     conditioning_position: int,
     entry: tuple[int, int, int, int],
@@ -561,11 +547,11 @@ def _temporal_position(
     return int(entry[2])
 
 
-def image_token_count(runtime, latent: torch.Tensor, height: int, width: int) -> int:
+def image_token_count(
+    runtime: ExecutionResources, latent: torch.Tensor, height: int, width: int
+) -> int:
     del latent
-    return ops._generation(
-        runtime,
-    ).image_tokens(height, width)
+    return runtime.generation().image_tokens(height, width)
 
 
 def require_image(session: RequestRow) -> ImageParams:
@@ -580,24 +566,18 @@ def prediction(output: torch.Tensor) -> torch.Tensor:
     return output
 
 
-def physical_tokens(runtime, height: int, width: int) -> int:
-    return ops._generation(
-        runtime,
-    ).physical_tokens(height, width)
+def physical_tokens(runtime: ExecutionResources, height: int, width: int) -> int:
+    return runtime.generation().physical_tokens(height, width)
 
 
 def _conditioning(
-    runtime,
+    runtime: ExecutionResources,
     latent: torch.Tensor,
     height: int,
     width: int,
 ) -> FlowPatches | None:
-    transform = ops._image_processor(
-        runtime,
-    ).vit
-    generation = ops._generation(
-        runtime,
-    )
+    transform = runtime.image_processor().vit
+    generation = runtime.generation()
     return generation.conditioning(
         generation.materialization_latent(latent, height, width),
         height,
@@ -607,7 +587,7 @@ def _conditioning(
 
 
 def _spatial_positions(
-    runtime,
+    runtime: ExecutionResources,
     height: int,
     width: int,
     patch: int,

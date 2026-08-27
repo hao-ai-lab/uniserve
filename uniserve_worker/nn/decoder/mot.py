@@ -10,9 +10,9 @@ import torch
 import torch.nn as nn
 
 from ...execution.forward_batch import (
+    AttentionMode,
     ExpertRoute,
     ForwardBatch,
-    ForwardMode,
     RouteSpan,
 )
 from ..attention import RadixAttention
@@ -395,14 +395,14 @@ class MoTModel(nn.Module):
         spans: tuple[RouteSpan, ...]
         temporal_positions: torch.Tensor
         causal: bool
-        if context.forward_mode is ForwardMode.PACKED:
+        if context.forward_mode is AttentionMode.PACKED:
             indexes = context.attention_indexes
             if indexes is None or indexes.ndim != 2 or int(indexes.shape[1]) != token_count:
                 raise ValueError("MoT positions must align with input tokens")
             spans = context.route_spans
             temporal_positions = indexes[0].reshape(-1)
             causal = False
-        elif context.forward_mode is ForwardMode.PAGED_DECODE:
+        elif context.forward_mode is AttentionMode.PAGED_DECODE:
             if positions is None or tuple(positions.shape) != (token_count,):
                 raise ValueError("MoT paged decode positions must align with text tokens")
             spans = (RouteSpan(ExpertRoute.TEXT, 0, token_count),)

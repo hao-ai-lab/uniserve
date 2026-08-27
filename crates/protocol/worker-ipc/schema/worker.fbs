@@ -334,7 +334,7 @@ table CachePageAllocation {
   page_ids:[uint];
 }
 
-table ForwardRow {
+table RowGeometry {
   operation_index:uint;
   request_pool_index:uint;
   seq_len:uint;
@@ -465,7 +465,7 @@ table BatchPartition {
   operations:[Operation];
   block_tables:[BlockTable];
   new_cache_pages:[CachePageAllocation];
-  forward_rows:[ForwardRow];
+  forward_rows:[RowGeometry];
   latent_placements:[LatentPlacement];
   decode_placements:[DecodePlacement];
 }

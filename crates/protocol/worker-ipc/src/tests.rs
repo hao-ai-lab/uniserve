@@ -236,7 +236,7 @@ fn partitions_for_operations(operations: Vec<Operation>) -> Vec<BatchPartition> 
                         page_ids,
                     });
                 }
-                forward_rows.push(ForwardRow {
+                forward_rows.push(RowGeometry {
                     operation_index: operation_index as u32,
                     request_pool_index: request_pool_idx,
                     seq_len: 0,

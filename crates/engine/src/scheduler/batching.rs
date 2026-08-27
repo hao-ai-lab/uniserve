@@ -484,7 +484,7 @@ impl Scheduler {
                     }
                 }
                 if lengths.input > 0 {
-                    operation_forward_rows.push(WireForwardRow {
+                    operation_forward_rows.push(RowGeometry {
                         operation_index: 0,
                         request_pool_index: self
                             .running
@@ -569,7 +569,7 @@ impl Scheduler {
                     }
                     let prefix_len = state.context.negative_prompt_ids.len() as u32;
                     if prefix_len > 0 && !prefix.materialized {
-                        operation_forward_rows.push(WireForwardRow {
+                        operation_forward_rows.push(RowGeometry {
                             operation_index: 0,
                             request_pool_index: prefix.request_pool_idx,
                             seq_len: 0,
@@ -584,7 +584,7 @@ impl Scheduler {
                     } else {
                         alternative.unwrap_or((main_slot, conditioning_tokens))
                     };
-                    operation_forward_rows.push(WireForwardRow {
+                    operation_forward_rows.push(RowGeometry {
                         operation_index: 0,
                         request_pool_index,
                         seq_len,
@@ -858,7 +858,7 @@ impl Scheduler {
         operations: Vec<Operation>,
         block_tables: &HashMap<(RequestKey, OpId), Vec<WireBlockTable>>,
         new_cache_pages: &HashMap<(RequestKey, OpId), Vec<CachePageAllocation>>,
-        forward_rows: &HashMap<(RequestKey, OpId), Vec<WireForwardRow>>,
+        forward_rows: &HashMap<(RequestKey, OpId), Vec<RowGeometry>>,
         latent_placements: &HashMap<(RequestKey, OpId), LatentPlacement>,
     ) -> Vec<BatchPartition> {
         let mut routes: RouteDomainOperations = Vec::new();
@@ -1022,8 +1022,8 @@ impl Scheduler {
     pub(super) fn forward_rows(
         &self,
         operations: &[Operation],
-        rows: &HashMap<(RequestKey, OpId), Vec<WireForwardRow>>,
-    ) -> Vec<WireForwardRow> {
+        rows: &HashMap<(RequestKey, OpId), Vec<RowGeometry>>,
+    ) -> Vec<RowGeometry> {
         operations
             .iter()
             .enumerate()

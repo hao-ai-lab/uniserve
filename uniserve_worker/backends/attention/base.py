@@ -21,6 +21,7 @@ __all__ = [
     "AttentionCapabilities",
     "AttentionBackend",
     "PagedAttentionBackend",
+    "SegmentedAttentionBackend",
     "VarlenAttentionBackend",
     "VisibleEndAttentionBackend",
     "merge_attention_states",
@@ -187,6 +188,7 @@ class AttentionCapabilities:
         if not self.trunk_geometries:
             return True
         return (int(q_head_dim), int(k_head_dim), int(v_head_dim)) in self.trunk_geometries
+
 
 class AttentionBackend(Protocol):
     """Universal attention-backend contract.

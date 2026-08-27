@@ -29,7 +29,7 @@ from uniserve_worker.batch import (
     EncodeMode,
     ExecutionCapability,
     FixedPoint,
-    ForwardRow,
+    ForwardMode,
     GenAdmission,
     ImageParams,
     LatentPlacement,
@@ -41,6 +41,7 @@ from uniserve_worker.batch import (
     ProductRef,
     RequestKey,
     Rng,
+    RowGeometry,
     SamplingParams,
     ShapeBound,
     StaticDim,
@@ -48,7 +49,6 @@ from uniserve_worker.batch import (
     TokenMode,
     UndAdmission,
     VersionRef,
-    ForwardMode,
     encode_token_product_bytes,
     execution_domain,
 )
@@ -139,9 +139,7 @@ def _latent_placement(operation: Operation) -> LatentPlacement:
         width=int(image.width),
         start_step=start_step,
         step_count=(
-            int(operation.bounds.max_tokens)
-            if operation.work is ForwardMode.GEN_FLOW
-            else 0
+            int(operation.bounds.max_tokens) if operation.work is ForwardMode.GEN_FLOW else 0
         ),
     )
 
@@ -208,14 +206,10 @@ def _alternative_pages(rk: RequestKey, tokens: int) -> tuple[int, ...]:
     if len(existing) >= needed:
         return existing[:needed]
     occupied = {
-        page
-        for pages in (*_BLOCK_TABLES.values(), *_ALTERNATIVE_PAGES.values())
-        for page in pages
+        page for pages in (*_BLOCK_TABLES.values(), *_ALTERNATIVE_PAGES.values()) for page in pages
     }
     selected = tuple(
-        candidate
-        for candidate in range(_CACHE_PAGES - 1, 0, -1)
-        if candidate not in occupied
+        candidate for candidate in range(_CACHE_PAGES - 1, 0, -1) if candidate not in occupied
     )[:needed]
     if len(selected) != needed:
         raise RuntimeError("test scheduler has no ordinary KV pages for a flow prefix")
@@ -286,7 +280,7 @@ def execution_batch(
             )
             tables: dict[tuple[int, int], BlockTable] = {}
             allocations: dict[tuple[int, int], set[int]] = {}
-            forward_rows: list[ForwardRow] = []
+            forward_rows: list[RowGeometry] = []
             for operation_index, operation in enumerate(domain_operations):
                 table = table_for(operation)
                 if table is not None:
@@ -298,7 +292,7 @@ def execution_batch(
                 lengths = _OP_KV_LENGTHS.get((operation.request_key, operation.op_id))
                 if lengths is not None and lengths[1] > 0:
                     forward_rows.append(
-                        ForwardRow(
+                        RowGeometry(
                             operation_index,
                             _REQUEST_POOL_INDICES[operation.request_key],
                             lengths[2],
@@ -342,7 +336,7 @@ def execution_batch(
                             allocations.setdefault((alt_slot, 0), set()).update(alt_pages)
                         if negative:
                             forward_rows.append(
-                                ForwardRow(operation_index, alt_slot, 0, len(negative))
+                                RowGeometry(operation_index, alt_slot, 0, len(negative))
                             )
                         alternative = (alt_slot, len(negative))
                     for branch in range(branches):
@@ -351,9 +345,7 @@ def execution_batch(
                             if branch == 0 or alternative is None
                             else alternative
                         )
-                        forward_rows.append(
-                            ForwardRow(operation_index, slot, seq_len, query_len)
-                        )
+                        forward_rows.append(RowGeometry(operation_index, slot, seq_len, query_len))
             for allocation in new_cache_pages:
                 identity = (allocation.request_pool_idx, allocation.group_id)
                 allocations.setdefault(identity, set()).update(allocation.page_ids)
@@ -378,8 +370,7 @@ def execution_batch(
                     latent_placements=tuple(
                         _latent_placement(operation)
                         for operation in domain_operations
-                        if operation.work
-                        in {ForwardMode.GEN_TRANSITION, ForwardMode.GEN_FLOW}
+                        if operation.work in {ForwardMode.GEN_TRANSITION, ForwardMode.GEN_FLOW}
                         or any(product.kind is ProductKind.LATENT for product in operation.inputs)
                     ),
                 )

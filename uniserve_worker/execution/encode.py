@@ -11,6 +11,7 @@ import torch
 from uniserve_worker.batch import (
     EncodeMode,
     FinishFlags,
+    ForwardMode,
     Operation,
     OpStatus,
     ProductKind,
@@ -18,7 +19,6 @@ from uniserve_worker.batch import (
     ProductRef,
     StorageClass,
     TokenSpan,
-    ForwardMode,
 )
 from uniserve_worker.foundation.errors import capability_mismatch, invalid_descriptor
 from uniserve_worker.models.generation import LatentLayout, Materialization
@@ -33,15 +33,15 @@ from uniserve_worker.runtime.device_products import (
 from uniserve_worker.runtime.encoder_cache import EncoderMetadata, EncoderWrite
 from uniserve_worker.runtime.latent_pool import LatentRelease
 from uniserve_worker.server.completion import (
-    _CompletionImagePayload,
-    _CompletionTransferPayload,
+    DeferredImagePayload,
+    DeferredTransferPayload,
 )
 from uniserve_worker.server.image_codec import quantize_image_hwc
 
-from . import step as ops
 from . import transfer
-from ._inputs import PreparedImage, patch_grid_shape, prepare_image, prepare_tensor_image
 from .forward_batch import ModelPhase, TokenSelection
+from .image_input import PreparedImage, patch_grid_shape, prepare_image, prepare_tensor_image
+from .resources import ExecutionResources
 from .rows import (
     ForwardRow,
     OperationState,
@@ -51,7 +51,7 @@ from .rows import (
 )
 
 
-def pack_forward(runtime: object, state: OperationState) -> tuple[object, ...]:
+def pack_forward(runtime: ExecutionResources, state: OperationState) -> tuple[object, ...]:
     if state.phase != "initial":
         return ()
     if state.operation.work.encode_mode is not None:
@@ -62,7 +62,7 @@ def pack_forward(runtime: object, state: OperationState) -> tuple[object, ...]:
 
 
 def consume_forward(
-    runtime: object,
+    runtime: ExecutionResources,
     state: OperationState,
     outputs: tuple[torch.Tensor, ...],
 ) -> None:
@@ -76,7 +76,7 @@ def consume_forward(
         _finish_materialize(runtime, state)
 
 
-def run_action(runtime: object, state: OperationState) -> bool:
+def run_action(runtime: ExecutionResources, state: OperationState) -> bool:
     if state.phase != "action":
         return False
     if state.data["mode"] == "frames":
@@ -87,12 +87,11 @@ def run_action(runtime: object, state: OperationState) -> bool:
     return True
 
 
-def _pack_encode(runtime: object, state: OperationState) -> tuple[object, ...]:
-    from . import step as ops
+def _pack_encode(runtime: ExecutionResources, state: OperationState) -> tuple[object, ...]:
 
     operation = state.operation
     partition = state.partition
-    image_spec = ops._image_processor(runtime)
+    image_spec = runtime.image_processor()
     mode = operation.work.encode_mode
     if mode is None:
         raise invalid_descriptor("encode operation is missing an encode mode")
@@ -132,8 +131,9 @@ def _pack_encode(runtime: object, state: OperationState) -> tuple[object, ...]:
     return state.rows
 
 
-def _consume_encode(runtime: object, state: OperationState, output: torch.Tensor) -> None:
-    from . import step as ops
+def _consume_encode(
+    runtime: ExecutionResources, state: OperationState, output: torch.Tensor
+) -> None:
 
     operation = state.operation
     partition = state.partition
@@ -164,8 +164,8 @@ def _consume_encode(runtime: object, state: OperationState, output: torch.Tensor
             },
         )
         partition.published.append(locator)
-        partition.stage_publications[ops._operation_identity(operation)] = (locator,)
-        descriptor = _CompletionTransferPayload(
+        partition.stage_publications[runtime.operation_identity(operation)] = (locator,)
+        descriptor = DeferredTransferPayload(
             "encoder",
             {
                 "generation": int(feature_output.generation),
@@ -183,12 +183,11 @@ def _consume_encode(runtime: object, state: OperationState, output: torch.Tensor
     state.phase = "done"
 
 
-def _pack_materialize(runtime: object, state: OperationState) -> tuple[object, ...]:
-    from . import step as ops
+def _pack_materialize(runtime: ExecutionResources, state: OperationState) -> tuple[object, ...]:
 
     operation = state.operation
     partition = state.partition
-    session = ops._request_row(runtime, partition, operation.request_key.session_id)
+    session = runtime.request_row(partition, operation.request_key.session_id)
     latent_inputs = tuple(
         reference for reference in operation.inputs if reference.kind is ProductKind.LATENT
     )
@@ -201,14 +200,14 @@ def _pack_materialize(runtime: object, state: OperationState) -> tuple[object, .
     latent_input = latent_inputs[0]
     if int(latent_input.generation) < 1 or session.latent_product != latent_input:
         raise invalid_descriptor("materialization does not name the current latent generation")
-    flow = ops._generation(runtime)
+    flow = runtime.generation()
     image_params = session.image
     if image_params is None:
         raise invalid_descriptor("image materialization has no admitted image parameters")
-    row = ops._latent_row(runtime, operation, partition)
+    row = runtime.latent_row(operation, partition)
     if int(row.placement.start_step) != int(image_params.steps):
         raise invalid_descriptor("image materialization requires a completed latent trajectory")
-    current = ops._latent_pool(runtime).gather_current(
+    current = runtime.require_latent_pool().gather_current(
         row.request_pool_idx,
         row.staging,
         step=int(row.placement.start_step),
@@ -227,10 +226,10 @@ def _pack_materialize(runtime: object, state: OperationState) -> tuple[object, .
         row=row,
     )
     if flow.materialization is Materialization.DECODE_ROUTE:
-        task = ops.ForwardRow(
+        task = ForwardRow(
             operation=operation,
             request=session,
-            weights=ops._weights(runtime),
+            weights=runtime.weights,
             phase=ModelPhase.DECODE_LATENT,
             latent=latent,
             image_height=int(row.placement.height),
@@ -248,8 +247,7 @@ def _pack_materialize(runtime: object, state: OperationState) -> tuple[object, .
     return ()
 
 
-def _finish_materialize(runtime: object, state: OperationState) -> None:
-    from . import step as ops
+def _finish_materialize(runtime: ExecutionResources, state: OperationState) -> None:
 
     operation = state.operation
     partition = state.partition
@@ -280,7 +278,7 @@ def _finish_materialize(runtime: object, state: OperationState) -> None:
                 value_range=image_range,
             ),
         )
-        partition.operation_writes.setdefault(ops._operation_identity(operation), write)
+        partition.operation_writes.setdefault(runtime.operation_identity(operation), write)
     image_task = defer_image_encoding(
         runtime,
         operation,
@@ -314,7 +312,7 @@ def _finish_materialize(runtime: object, state: OperationState) -> None:
 
 
 def state_outcome(
-    runtime,
+    runtime: ExecutionResources,
     operation: Operation,
     outcome: StateOutcome,
     scope: PartitionState,
@@ -322,8 +320,8 @@ def state_outcome(
     base: int | None = None,
     products: tuple[ProductPayload, ...] = (),
 ) -> Outcome:
-    session = ops._request_row(runtime, scope, operation.request_key.session_id)
-    cache = ops._cache_coordinates(runtime, operation, scope)
+    session = runtime.request_row(scope, operation.request_key.session_id)
+    cache = runtime.cache_coordinates(operation, scope)
     selected = scope.runtime_cache_lengths.get(cache[0], cache[2])
     if not isinstance(selected, int):
         raise RuntimeError("visual state completion has a dynamic KV length")
@@ -332,39 +330,39 @@ def state_outcome(
     return Outcome(
         status=OpStatus.OK,
         selected_point=1 if operation.advances_state else 0,
-        logical_lengths=ops._logical_lengths(runtime, operation, session, cache),
+        logical_lengths=runtime.logical_lengths(operation, session, cache),
         token_span=TokenSpan(base=span_base, len=outcome.sampled_tokens),
         finish_flags=FinishFlags(),
-        product_generations=ops._output_generations(operation),
+        product_generations=runtime.output_generations(operation),
         committed_tokens=outcome.committed_tokens,
         products=(*products, *outcome.products),
     )
 
 
 def non_state_outcome(
-    runtime,
+    runtime: ExecutionResources,
     operation: Operation,
     scope: PartitionState,
     *,
     products: tuple[ProductPayload, ...] = (),
-    completion_tasks: tuple[_CompletionImagePayload, ...] = (),
+    completion_tasks: tuple[DeferredImagePayload, ...] = (),
 ) -> Outcome:
-    session = ops._request_row(runtime, scope, operation.request_key.session_id)
+    session = runtime.request_row(scope, operation.request_key.session_id)
     base = session.logical_position
     return Outcome(
         status=OpStatus.OK,
         selected_point=1 if operation.advances_state else 0,
-        logical_lengths=ops._logical_lengths(runtime, operation, session, None),
+        logical_lengths=runtime.logical_lengths(operation, session, None),
         token_span=TokenSpan(base=base, len=0),
         finish_flags=FinishFlags(),
-        product_generations=ops._output_generations(operation),
+        product_generations=runtime.output_generations(operation),
         products=products,
         completion_tasks=completion_tasks,
     )
 
 
 def encode_source(
-    runtime,
+    runtime: ExecutionResources,
     operation: Operation,
     scope: PartitionState,
 ) -> str | tuple[torch.Tensor, DeviceProductMetadata]:
@@ -374,12 +372,11 @@ def encode_source(
             return inline
         if reference.kind is not ProductKind.ARTIFACT:
             continue
-        read = ops._consume_device_product(
-            runtime,
+        read = runtime.consume_device_product(
             reference,
             scope,
             consumer_op_id=operation.op_id,
-            device=ops._operation_device(runtime, operation),
+            device=runtime.operation_device(operation),
         )
         metadata = read.metadata
         if (
@@ -395,19 +392,17 @@ def encode_source(
 
 
 def encode_row(
-    runtime,
+    runtime: ExecutionResources,
     operation: Operation,
     mode: EncodeMode,
     prepared: PreparedImage,
     scope: PartitionState,
 ) -> ForwardRow:
-    session = ops._request_row(runtime, scope, operation.request_key.session_id)
+    session = runtime.request_row(scope, operation.request_key.session_id)
     return ForwardRow(
         operation=operation,
         request=session,
-        weights=ops._weights(
-            runtime,
-        ),
+        weights=runtime.weights,
         phase=(ModelPhase.ENCODE_VISION if mode is EncodeMode.VISION else ModelPhase.ENCODE_LATENT),
         encode_pixels=prepared.pixels,
         encode_grid=prepared.grid,
@@ -416,7 +411,7 @@ def encode_row(
 
 
 def vision_state_row(
-    runtime,
+    runtime: ExecutionResources,
     operation: Operation,
     features: torch.Tensor,
     height: int,
@@ -427,11 +422,9 @@ def vision_state_row(
     close_image: bool,
     logits: bool,
 ) -> ForwardRow:
-    session = ops._request_row(runtime, scope, operation.request_key.session_id)
-    cache = ops._cache_coordinates(runtime, operation, scope)
-    injection = ops._image_processor(
-        runtime,
-    ).feature_injection
+    session = runtime.request_row(scope, operation.request_key.session_id)
+    cache = runtime.cache_coordinates(operation, scope)
+    injection = runtime.image_processor().feature_injection
     if injection is None:
         raise invalid_descriptor("vision state stage requires declared feature injection")
     embeddings = (
@@ -466,9 +459,7 @@ def vision_state_row(
     return ForwardRow(
         operation=operation,
         request=session,
-        weights=ops._weights(
-            runtime,
-        ),
+        weights=runtime.weights,
         phase=ModelPhase.TEXT,
         token_ids=token_ids,
         token_embeddings=token_embeddings,
@@ -484,7 +475,7 @@ def vision_state_row(
     )
 
 
-def _feature_token_id(runtime, injection: Any, *, start: bool) -> int:
+def _feature_token_id(runtime: ExecutionResources, injection: Any, *, start: bool) -> int:
     value = injection.start_token_id if start else injection.end_token_id
     text = injection.start_token if start else injection.end_token
     if value is not None:
@@ -498,7 +489,7 @@ def _feature_token_id(runtime, injection: Any, *, start: bool) -> int:
 
 
 def _vision_positions(
-    runtime,
+    runtime: ExecutionResources,
     layout: PositionLayout,
     feature_tokens: int,
     conditioning_position: int,
@@ -512,9 +503,7 @@ def _vision_positions(
     query = int(leading) + feature_tokens + int(trailing)
     if layout is PositionLayout.TEMPORAL:
         return torch.full((query,), int(conditioning_position), dtype=torch.long)
-    transform = ops._image_processor(
-        runtime,
-    ).vit
+    transform = runtime.image_processor().vit
     if not isinstance(transform, PatchTransform):
         raise invalid_descriptor(
             "temporal-spatial feature injection requires a patch image transform"
@@ -545,7 +534,7 @@ def _vision_positions(
 
 
 def latent_state_row(
-    runtime,
+    runtime: ExecutionResources,
     operation: Operation,
     latent: torch.Tensor,
     height: int,
@@ -553,10 +542,8 @@ def latent_state_row(
     conditioning_position: int,
     scope: PartitionState,
 ) -> ForwardRow:
-    session = ops._request_row(runtime, scope, operation.request_key.session_id)
-    flow = ops._generation(
-        runtime,
-    )
+    session = runtime.request_row(scope, operation.request_key.session_id)
+    flow = runtime.generation()
     if flow.latent_layout is not LatentLayout.PATCH_TOKENS:
         raise invalid_descriptor("flow state publication requires patch-token latents")
     image_tokens = (height // int(flow.latent_downsample)) * (width // int(flow.latent_downsample))
@@ -573,13 +560,11 @@ def latent_state_row(
     temporal[0] = conditioning_position
     temporal[-1] = conditioning_position + int(flow.rope_advance)
     indexes = torch.stack((temporal, torch.zeros_like(temporal), torch.zeros_like(temporal)))
-    cache = ops._cache_coordinates(runtime, operation, scope)
+    cache = runtime.cache_coordinates(operation, scope)
     return ForwardRow(
         operation=operation,
         request=session,
-        weights=ops._weights(
-            runtime,
-        ),
+        weights=runtime.weights,
         phase=ModelPhase.DENOISE,
         positions=positions,
         timestep=latent.new_zeros(1),
@@ -598,7 +583,7 @@ def latent_state_row(
 
 
 def materialize_frames(
-    runtime,
+    runtime: ExecutionResources,
     operation: Operation,
     scope: PartitionState,
 ) -> Outcome:
@@ -620,14 +605,14 @@ def materialize_frames(
 
 
 def defer_image_encoding(
-    runtime,
+    runtime: ExecutionResources,
     operation: Operation,
     image: torch.Tensor,
     value_range: ImageRange,
     scope: PartitionState,
     *,
     max_bytes: int,
-) -> _CompletionImagePayload:
+) -> DeferredImagePayload:
     if max_bytes < 1:
         raise invalid_descriptor("image materialization requires a positive completion bound")
     quantized = quantize_image_hwc(
@@ -637,11 +622,11 @@ def defer_image_encoding(
     if int(quantized.numel()) > max_bytes:
         raise invalid_descriptor("image staging exceeds its registered completion byte bound")
     capture = scope.completion.capture_bytes(quantized)
-    identity = ops._operation_identity(operation)
+    identity = runtime.operation_identity(operation)
     reservation = scope.cpu_tasks.get(identity)
     if reservation is None:
         raise RuntimeError("materialization has no registered CPU task slot")
-    return _CompletionImagePayload(
+    return DeferredImagePayload(
         capture,
         reservation,
         max_bytes,

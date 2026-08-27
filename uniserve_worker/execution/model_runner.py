@@ -8,12 +8,10 @@ from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any
 
 import torch
-from torch import nn
 
-from uniserve_worker.batch import Domain
+from uniserve_worker.batch import Domain, Operation
 from uniserve_worker.execution.cuda_graph import (
     CudaGraphRunner,
     GraphExecutionError,
@@ -34,13 +32,13 @@ from uniserve_worker.execution.trace import (
 )
 from uniserve_worker.foundation.errors import (
     ComputeError,
-    ErrorCode,
     InputError,
     ResourceError,
     WorkerError,
+    WorkerErrorCode,
     classify,
 )
-from uniserve_worker.models.runtime import WorkerDeployment
+from uniserve_worker.models.runtime import ExecutionModel, WorkerDeployment
 
 from .input_buffers import InputBuffers
 from .lane import ExecutionPartitionRuntime, LaneConfig, create_green_contexts
@@ -78,23 +76,22 @@ class ForwardResult:
 
 
 def _invoke(
-    model: nn.Module,
+    model: ExecutionModel,
     ids: torch.Tensor,
     positions: torch.Tensor,
     batch: ForwardBatch,
 ) -> ForwardOutput:
-    concrete: Any = model
     if batch.phase in {ModelPhase.TEXT, ModelPhase.DENOISE}:
-        hidden = concrete(ids, positions, batch)
+        hidden = model.forward(ids, positions, batch)
         if not isinstance(hidden, torch.Tensor):
             raise TypeError("model text/denoise forward must return a tensor")
-        result = concrete.project(hidden, batch)
+        result = model.project(hidden, batch)
     elif batch.phase is ModelPhase.ENCODE_VISION:
-        result = concrete.encode(batch.encode_pixels, batch)
+        result = model.encode(batch.encode_pixels, batch)
     elif batch.phase is ModelPhase.ENCODE_LATENT:
-        result = concrete.encode_latent(batch.encode_pixels, batch)
+        result = model.encode_latent(batch.encode_pixels, batch)
     elif batch.phase is ModelPhase.DECODE_LATENT:
-        result = concrete.decode_latent(batch.decode_latents, batch)
+        result = model.decode_latent(batch.decode_latents, batch)
     else:
         raise TypeError(f"unsupported model phase {batch.phase.value!r}")
     if not isinstance(result, ForwardOutput):
@@ -107,7 +104,7 @@ class ModelRunner:
 
     def __init__(
         self,
-        model: nn.Module,
+        model: ExecutionModel,
         deployment: WorkerDeployment,
         trace: ExecutionTrace,
         *,
@@ -124,8 +121,6 @@ class ModelRunner:
         lanes: tuple[LaneConfig, ...] = (),
         max_inflight: int = 1,
     ) -> None:
-        if type(model).forward is nn.Module.forward:
-            raise TypeError("runner model must implement forward(input_ids, positions, batch)")
         canonical = tuple(dict.fromkeys(str(torch.device(device)) for device in devices))
         if not canonical:
             raise ValueError("model runner requires an execution device")
@@ -504,14 +499,14 @@ class ModelRunner:
         )
 
 
-def _kind_counts(tasks: tuple[Any, ...]) -> dict[str, int]:
+def _kind_counts(tasks: tuple[ForwardRow, ...]) -> dict[str, int]:
     result: dict[str, int] = {}
     for task in tasks:
         result[task.kind] = result.get(task.kind, 0) + 1
     return result
 
 
-def _base_version(operation: Any) -> int:
+def _base_version(operation: Operation) -> int:
     point = operation.parent.point
     value = getattr(point, "point_index", 0)
     return int(value)
@@ -519,7 +514,7 @@ def _base_version(operation: Any) -> int:
 
 def _validate_outputs(
     values: tuple[torch.Tensor, ...],
-    tasks: tuple[Any, ...],
+    tasks: tuple[ForwardRow, ...],
     device: torch.device,
 ) -> None:
     for value, task in zip(values, tasks, strict=True):
@@ -566,8 +561,8 @@ def _execution_failure(
     classified = classify(error)
     identities = tuple((item.session_id, item.epoch, item.op_id) for item in operations)
     if isinstance(error, GraphExecutionError) or classified.code in {
-        ErrorCode.RESOURCE_ERROR,
-        ErrorCode.FATAL_WORKER_FAILURE,
+        WorkerErrorCode.RESOURCE_ERROR,
+        WorkerErrorCode.FATAL_WORKER_FAILURE,
     }:
         return ResourceError(
             str(error) or type(error).__name__,

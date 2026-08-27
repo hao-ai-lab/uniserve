@@ -21,12 +21,10 @@ from uniserve_worker.batch import (
     ProductPayload,
     ProductRef,
     RequestKey,
+    RowGeometry,
     SamplingParams,
     SamplingState,
     TokenSpan,
-)
-from uniserve_worker.batch import (
-    ForwardRow as WireForwardRow,
 )
 from uniserve_worker.execution.forward_batch import FlowPatches, ModelPhase, TokenSelection
 from uniserve_worker.foundation.errors import WorkerError, classify, invalid_descriptor
@@ -39,14 +37,14 @@ from uniserve_worker.runtime.device_products import (
 from uniserve_worker.runtime.encoder_cache import EncoderRead, EncoderWrite
 from uniserve_worker.runtime.latent_pool import LatentPublication, LatentRelease, LatentStaging
 from uniserve_worker.server.completion import (
+    DeferredImagePayload,
+    DeferredInteger,
+    DeferredLogprobValue,
+    DeferredSpeculativePoint,
+    DeferredToken,
+    DeferredTopLogprobs,
     PinnedOutputBuffer,
     PinnedTokenCapture,
-    _CompletionImagePayload,
-    _CompletionInteger,
-    _CompletionLogprobValue,
-    _CompletionSpeculativePoint,
-    _CompletionToken,
-    _CompletionTopLogprobs,
 )
 from uniserve_worker.server.cpu_tasks import CpuTaskReservation
 from uniserve_worker.server.request_state import RequestRow
@@ -163,17 +161,17 @@ class SampleBatchVectors:
 
 @dataclass(frozen=True, slots=True)
 class SampleResult:
-    token_id: int | _CompletionToken
+    token_id: int | DeferredToken
     device_token: torch.Tensor | None
-    logprob: float | _CompletionLogprobValue | None
-    top_logprobs: tuple[tuple[int, float, int], ...] | _CompletionTopLogprobs | None
-    num_accepted_tokens: int | _CompletionInteger = 0
+    logprob: float | DeferredLogprobValue | None
+    top_logprobs: tuple[tuple[int, float, int], ...] | DeferredTopLogprobs | None
+    num_accepted_tokens: int | DeferredInteger = 0
     device_accepted_tokens: torch.Tensor | None = None
     device_selected_point: torch.Tensor | None = None
     device_valid: torch.Tensor | None = None
     device_active: torch.Tensor | None = None
     prompt_logprobs: tuple[
-        tuple[tuple[int, float, int], ...] | _CompletionTopLogprobs,
+        tuple[tuple[int, float, int], ...] | DeferredTopLogprobs,
         ...,
     ] = ()
     device_finish: torch.Tensor | None = None
@@ -413,7 +411,7 @@ class PartitionState:
     completion: PinnedOutputBuffer
     input_tokens: dict[ProductRef, tuple[int, ...]] = field(default_factory=dict)
     input_images: dict[ProductRef, str] = field(default_factory=dict)
-    forward_rows: dict[OperationIdentity, tuple[WireForwardRow, ...]] = field(default_factory=dict)
+    forward_rows: dict[OperationIdentity, tuple[RowGeometry, ...]] = field(default_factory=dict)
     layout: PartitionLayout | None = None
     prepared_transfers: dict[ProductRef, PreparedTransferInput] = field(default_factory=dict)
     transferred_device_products: dict[ProductRef, DeviceProductWrite] = field(default_factory=dict)
@@ -464,8 +462,8 @@ class PartitionState:
 
 @dataclass(frozen=True, slots=True)
 class SpeculativeSelection:
-    accepted: _CompletionInteger
-    selected_point: _CompletionSpeculativePoint
+    accepted: DeferredInteger
+    selected_point: DeferredSpeculativePoint
     draft_tokens: tuple[int, ...]
     terminal_prefix: int | None
     base_logical_position: int
@@ -486,22 +484,22 @@ class Outcome:
     """
 
     status: OpStatus
-    selected_point: int | _CompletionSpeculativePoint
+    selected_point: int | DeferredSpeculativePoint
     logical_lengths: LogicalLengths
     token_span: TokenSpan
     finish_flags: FinishFlags
     product_generations: tuple[int, ...]
-    committed_tokens: tuple[int | _CompletionToken, ...] = ()
+    committed_tokens: tuple[int | DeferredToken, ...] = ()
     products: tuple[ProductPayload, ...] = ()
     selection: SpeculativeSelection | None = None
-    completion_tasks: tuple[_CompletionImagePayload, ...] = ()
+    completion_tasks: tuple[DeferredImagePayload, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
 class StateOutcome:
     """Semantic tokens and products committed while publishing image state."""
 
-    committed_tokens: tuple[int | _CompletionToken, ...] = ()
+    committed_tokens: tuple[int | DeferredToken, ...] = ()
     products: tuple[ProductPayload, ...] = ()
 
     @property

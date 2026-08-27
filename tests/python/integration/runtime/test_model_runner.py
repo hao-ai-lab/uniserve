@@ -38,6 +38,7 @@ from uniserve_worker.batch import (
     Domain,
     DType,
     ErrorCode,
+    ForwardMode,
     GenAdmission,
     ImageParams,
     Operation,
@@ -56,14 +57,12 @@ from uniserve_worker.batch import (
     UndAdmission,
     VersionRef,
     encode_sampling_state_bytes,
-    ForwardMode,
 )
 from uniserve_worker.execution.forward_batch import (
     ForwardBatch,
     ForwardOutput,
 )
-from uniserve_worker.foundation.errors import ErrorCode as HostErrorCode
-from uniserve_worker.foundation.errors import WorkerError
+from uniserve_worker.foundation.errors import WorkerError, WorkerErrorCode
 from uniserve_worker.server.completion import completion_report_ready, finalize_completion_report
 from uniserve_worker.server.stub import StubModel, _next_token
 from uniserve_worker.transfer.tickets import (
@@ -208,11 +207,16 @@ def test_extend_then_decode_commit_the_serial_oracle_tokens():
         mode=TokenMode.EXTEND,
         tokens=(3, 4),
     )
-    extended = finalized_report(worker.execute(
-        execution_batch(
-            step_id=1, admissions=(admission,), operations=(extend,), input_products=(extend_input,)
+    extended = finalized_report(
+        worker.execute(
+            execution_batch(
+                step_id=1,
+                admissions=(admission,),
+                operations=(extend,),
+                input_products=(extend_input,),
+            )
         )
-    ))
+    )
 
     assert extended.completions[0].committed_tokens == (_next_token(4),)
     assert extended.completions[0].logical_lengths.kv_visible_len == 2
@@ -254,14 +258,16 @@ def test_prefix_reuse_continues_from_the_admitted_logical_position():
         tokens=(4,),
     )
 
-    report = finalized_report(worker.execute(
-        execution_batch(
-            step_id=1,
-            admissions=(admission,),
-            operations=(extend,),
-            input_products=(extend_input,),
+    report = finalized_report(
+        worker.execute(
+            execution_batch(
+                step_id=1,
+                admissions=(admission,),
+                operations=(extend,),
+                input_products=(extend_input,),
+            )
         )
-    ))
+    )
 
     assert report.completions[0].logical_lengths.kv_visible_len == 3
     assert report.completions[0].logical_lengths.token_len == 3
@@ -537,7 +543,7 @@ def test_mixed_submission_requires_tensorized_model_capability():
             )
         )
 
-    assert rejected.value.code is HostErrorCode.INVALID_DESCRIPTOR
+    assert rejected.value.code is WorkerErrorCode.INVALID_DESCRIPTOR
 
 
 def test_request_scoped_operation_identity_preserves_homogeneous_decode():

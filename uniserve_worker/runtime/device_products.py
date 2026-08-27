@@ -20,8 +20,8 @@ from ..batch import (
     StaticDim,
     StorageClass,
 )
+from ..foundation.errors import WorkerError, WorkerErrorCode, invalid_descriptor, resource_error
 from .device import canonical_device
-from ..foundation.errors import ErrorCode, WorkerError, invalid_descriptor, resource_error
 from .device_events import DeviceEventPool
 
 _MAX_GENERATION: Final[int] = (1 << 32) - 1
@@ -35,9 +35,7 @@ _DEVICE_DTYPES: Final[dict[DType, torch.dtype]] = {
     DType.BF16: torch.bfloat16,
     DType.F32: torch.float32,
 }
-_DEVICE_TORCH_DTYPES: Final[tuple[torch.dtype, ...]] = tuple(
-    dict.fromkeys(_DEVICE_DTYPES.values())
-)
+_DEVICE_TORCH_DTYPES: Final[tuple[torch.dtype, ...]] = tuple(dict.fromkeys(_DEVICE_DTYPES.values()))
 _PROTOCOL_STORAGE: Final[dict[DType, tuple[str, int]]] = {
     dtype: (
         str(torch_dtype).removeprefix("torch."),
@@ -84,9 +82,7 @@ def device_product_capacity_bytes(
     value_bytes = int(max_value_bytes)
     if min(slots, devices, points, value_bytes) < 1:
         raise ValueError("device-product geometry must be positive")
-    scalar_bytes = slots * devices * sum(
-        dict(_PROTOCOL_STORAGE.values()).values()
-    )
+    scalar_bytes = slots * devices * sum(dict(_PROTOCOL_STORAGE.values()).values())
     accepted_span_bytes = (points + 1) * device_product_storage(DType.U32)[1]
     continuation_bytes = 4 * device_product_storage(DType.I64)[1]
     return scalar_bytes + slots * devices * max(
@@ -98,7 +94,7 @@ def device_product_capacity_bytes(
 
 def _invariant(message: str) -> WorkerError:
     return WorkerError(
-        code=ErrorCode.INVARIANT_VIOLATION,
+        code=WorkerErrorCode.INVARIANT_VIOLATION,
         message=message,
         fatal=True,
     )
@@ -399,10 +395,7 @@ class DeviceProducts:
         for session_id in selected:
             self.drop_session(session_id)
         batch = self.bind_output_batch(
-            tuple(
-                (item.reference, item.producer_plan_digest, item.device)
-                for item in snapshots
-            )
+            tuple((item.reference, item.producer_plan_digest, item.device) for item in snapshots)
         )
         try:
             for write, item in zip(batch.writes, snapshots, strict=True):
@@ -550,9 +543,7 @@ class DeviceProducts:
                     self._candidates.pop(entry.binding_id, None)
                     self._return_slot_locked(entry.slot)
                 self._restore_planned_slots_locked(
-                    slot
-                    for slot in planned_slots[len(writes) :]
-                    if slot is not None
+                    slot for slot in planned_slots[len(writes) :] if slot is not None
                 )
                 raise
             return DeviceProductBindingBatch(tuple(writes))

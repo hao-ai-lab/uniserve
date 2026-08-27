@@ -9,10 +9,10 @@ from typing import Any, Mapping
 import torch
 import torch.nn as nn
 
-from ..batch import ForwardMode as WorkMode
+from ..batch import ForwardMode
 from ..execution.forward_batch import (
+    AttentionMode,
     ForwardBatch,
-    ForwardMode,
     ForwardOutput,
     TokenSelection,
 )
@@ -405,8 +405,10 @@ def _bagel_checkpoint_name(name: str) -> str | None:
         return "vit_model." + name.removeprefix("vit_model.vision_model.embeddings.")
     if name.startswith("vit_model.vision_model.encoder."):
         return (
-            "vit_model.encoder." + name.removeprefix("vit_model.vision_model.encoder.")
-        ).replace(".mlp.fc1.", ".mlp.0.").replace(".mlp.fc2.", ".mlp.2.")
+            ("vit_model.encoder." + name.removeprefix("vit_model.vision_model.encoder."))
+            .replace(".mlp.fc1.", ".mlp.0.")
+            .replace(".mlp.fc2.", ".mlp.2.")
+        )
     if name.startswith("vit_model.vision_model.post_layernorm."):
         return "vit_model.encoder.post_layernorm." + name.removeprefix(
             "vit_model.vision_model.post_layernorm."
@@ -461,11 +463,7 @@ class BagelForConditionalGeneration(ExecutionModel):
         return report
 
     def checkpoint_parameter_names(self) -> set[str]:
-        return {
-            name
-            for name, _ in self.model.named_parameters()
-            if not name.startswith("vae.")
-        }
+        return {name for name, _ in self.model.named_parameters() if not name.startswith("vae.")}
 
     def __init__(
         self,
@@ -543,17 +541,17 @@ class BagelForConditionalGeneration(ExecutionModel):
         )
         self.supported_work = frozenset(
             {
-                WorkMode.TOKEN_EXTEND,
-                WorkMode.TOKEN_DECODE,
-                WorkMode.TOKEN_VERIFY,
-                WorkMode.GEN_TRANSITION,
-                WorkMode.GEN_FLOW,
-                WorkMode.ENCODE_VISION,
-                WorkMode.ENCODE_LATENT,
-                WorkMode.MATERIALIZE,
-                WorkMode.TRANSFER_PRODUCT,
-                WorkMode.TRANSFER_KV_PUBLISH,
-                WorkMode.TRANSFER_KV_INSTALL,
+                ForwardMode.TOKEN_EXTEND,
+                ForwardMode.TOKEN_DECODE,
+                ForwardMode.TOKEN_VERIFY,
+                ForwardMode.GEN_TRANSITION,
+                ForwardMode.GEN_FLOW,
+                ForwardMode.ENCODE_VISION,
+                ForwardMode.ENCODE_LATENT,
+                ForwardMode.MATERIALIZE,
+                ForwardMode.TRANSFER_PRODUCT,
+                ForwardMode.TRANSFER_KV_PUBLISH,
+                ForwardMode.TRANSFER_KV_INSTALL,
             }
         )
         self.max_vit_grid_tokens = int(self.cfg.vit_token_capacity) + _BAGEL_IMAGE_MARKER_TOKENS
@@ -575,7 +573,7 @@ class BagelForConditionalGeneration(ExecutionModel):
     ) -> torch.Tensor:
         batch = forward_batch
         decode_positions: torch.Tensor | None = None
-        if batch.forward_mode is ForwardMode.PAGED_DECODE:
+        if batch.forward_mode is AttentionMode.PAGED_DECODE:
             if batch.flow_row_indices:
                 raise TypeError("BAGEL paged decode accepts token rows only")
             decode_positions = positions

@@ -72,11 +72,12 @@ class VisionSelfAttention(nn.Module):
             scale=self.scale,
             ctx=context,
         )
-        if ops.can_run_attention(varlen, selection=self.attn.selection):
+        provider = self.attn.varlen_provider
+        if provider is not None and ops.can_run_attention(varlen, provider=provider):
             # Single varlen attention call over the whole packed batch; the
             # per-image isolation is enforced by ``cu_seqlens`` instead of a
             # Python loop with one dense kernel launch per image.
-            out = ops.attention(varlen, selection=self.attn.selection)
+            out = ops.attention(varlen, provider=provider)
             return self.out_proj(out.reshape(n_tokens, -1))
         # Portable fallback (e.g. CPU / SDPA-only backends without a varlen
         # kernel): attend each packed image segment independently, walking the

@@ -11,9 +11,9 @@ from typing import Any, cast
 import torch
 
 from uniserve_worker.execution.forward_batch import (
+    AttentionMode,
     AttentionSelection,
     ForwardBatch,
-    ForwardMode,
     ForwardOutput,
     TokenSelection,
     packed_tensor_views,
@@ -249,16 +249,16 @@ class CudaGraphRunner:
         rows = batch.row_count
         if not eligible or not self.enabled or not _cuda_batch(batch):
             return GraphRun(self._eager(batch, forward), "eager", rows, rows)
-        if batch.forward_mode is ForwardMode.PAGED_VARLEN and (
+        if batch.forward_mode is AttentionMode.PAGED_VARLEN and (
             not self.prefill_enabled
             or any(
                 selection is not TokenSelection.LAST_LOGITS for selection in batch.token_selections
             )
         ):
             return GraphRun(self._eager(batch, forward), "eager", rows, rows)
-        if batch.forward_mode is ForwardMode.PACKED and not self.prefill_enabled:
+        if batch.forward_mode is AttentionMode.PACKED and not self.prefill_enabled:
             return GraphRun(self._eager(batch, forward), "eager", rows, rows)
-        if batch.forward_mode is ForwardMode.PACKED and _quantized_kv(self):
+        if batch.forward_mode is AttentionMode.PACKED and _quantized_kv(self):
             return GraphRun(self._eager(batch, forward), "eager", rows, rows)
         try:
             _graph_provider(self.attention, batch.forward_mode)
@@ -580,9 +580,9 @@ class CudaGraphRunner:
         live = live_batch
         if static.forward_mode is not live.forward_mode:
             raise _GraphMiss("attention form changed for a graph bucket")
-        if static.forward_mode in {ForwardMode.DENSE, ForwardMode.PACKED}:
+        if static.forward_mode in {AttentionMode.DENSE, AttentionMode.PACKED}:
             return ()
-        if static.forward_mode not in {ForwardMode.PAGED_DECODE, ForwardMode.PAGED_VARLEN}:
+        if static.forward_mode not in {AttentionMode.PAGED_DECODE, AttentionMode.PAGED_VARLEN}:
             return ()
         prepared = _live_attention(static, live)
         backend = _graph_provider(self.attention, static.forward_mode)
@@ -590,7 +590,7 @@ class CudaGraphRunner:
         q_dtype = key_cache.dtype
         kv_dtype = key_cache.dtype
         releases: list[Callable[[], None]] = []
-        if static.forward_mode is ForwardMode.PAGED_DECODE:
+        if static.forward_mode is AttentionMode.PAGED_DECODE:
             prepare = getattr(backend, "prepare_paged_decode_cuda_graph", None)
             if callable(prepare):
                 prepare(
@@ -610,7 +610,7 @@ class CudaGraphRunner:
                     if callable(release):
                         releases.append(_release_call(release, static.binding))
             return tuple(releases)
-        if static.forward_mode is not ForwardMode.PAGED_VARLEN:
+        if static.forward_mode is not AttentionMode.PAGED_VARLEN:
             return ()
         bind = getattr(backend, "bind_paged_prefill_graph_wrapper", None)
         prepare = getattr(backend, "prepare_paged_prefill_cuda_graph", None)
@@ -644,7 +644,7 @@ def _decode_geometry(
     block_size: int,
     context_blocks: int,
 ) -> _DecodeGeometry | None:
-    if batch.forward_mode is not ForwardMode.PAGED_DECODE or not batch_sizes:
+    if batch.forward_mode is not AttentionMode.PAGED_DECODE or not batch_sizes:
         return None
     rows = batch.row_count
     bucket = next((value for value in batch_sizes if value >= rows), None)
@@ -678,7 +678,7 @@ def _prefill_geometry(
     row_sizes: tuple[int, ...],
     context_blocks: int,
 ) -> _PrefillGeometry | None:
-    if batch.forward_mode is not ForwardMode.PAGED_VARLEN or not token_sizes:
+    if batch.forward_mode is not AttentionMode.PAGED_VARLEN or not token_sizes:
         return None
     rows = batch.row_count
     row_bucket = next((value for value in row_sizes if value > rows), None)
@@ -941,7 +941,7 @@ def _normalize_exact_batch(
     staged tensors carry the live lengths on every replay.
     """
 
-    if batch.forward_mode is not ForwardMode.PACKED or context_blocks <= 0:
+    if batch.forward_mode is not AttentionMode.PACKED or context_blocks <= 0:
         return batch
     if batch.block_table is None:
         raise _GraphMiss("packed attention has no block table")
@@ -974,7 +974,7 @@ def _graph_batch(
     graph_batch = _clone_value(batch) if own_inputs else batch
     if not isinstance(graph_batch, ForwardBatch):
         raise TypeError("graph input cloning did not preserve ForwardBatch")
-    if graph_batch.forward_mode is ForwardMode.REQUEST_INDEXED_DECODE:
+    if graph_batch.forward_mode is AttentionMode.REQUEST_INDEXED_DECODE:
         raise _GraphMiss("request-indexed decode metadata was not staged")
     return replace(
         graph_batch,
@@ -1053,36 +1053,30 @@ def _copy_into_leaves(
         raise _GraphMiss(f"{structure} tensor structure changed")
 
 
-def _graph_provider(selection: AttentionSelection, mode: ForwardMode):
-    capable_provider = False
+def _graph_provider(selection: AttentionSelection, mode: AttentionMode):
     for provider in selection.providers:
         capabilities = provider.capabilities()
-        available = bool(getattr(capabilities, "available", True))
-        if mode is ForwardMode.PACKED:
-            capable = bool(getattr(capabilities, "segmented_attention", False))
-            safe = bool(getattr(capabilities, "segmented_attention_cuda_graph", False))
-        elif mode is ForwardMode.PAGED_VARLEN:
-            capable = bool(getattr(capabilities, "varlen_attention", False)) and bool(
-                getattr(capabilities, "varlen_paged_kv", False)
-            )
-            safe = bool(getattr(capabilities, "paged_varlen_cuda_graph", False)) or (
+        available = capabilities.available
+        if mode is AttentionMode.PACKED:
+            capable = capabilities.segmented_attention
+            safe = capabilities.segmented_attention_cuda_graph
+        elif mode is AttentionMode.PAGED_VARLEN:
+            capable = capabilities.varlen_attention and capabilities.varlen_paged_kv
+            safe = capabilities.paged_varlen_cuda_graph or (
                 callable(getattr(provider, "bind_paged_prefill_graph_wrapper", None))
                 and callable(getattr(provider, "prepare_paged_prefill_cuda_graph", None))
             )
-        elif mode is ForwardMode.PAGED_DECODE:
-            capable = bool(getattr(capabilities, "paged_kv", False))
-            safe = bool(getattr(capabilities, "paged_kv", False))
+        elif mode is AttentionMode.PAGED_DECODE:
+            capable = capabilities.paged_kv
+            safe = capabilities.paged_kv
         else:
-            capable = True
+            capable = bool(capabilities.dense_ranks)
             safe = True
         if not available or not capable:
             continue
-        capable_provider = True
         if not safe:
             continue
         return provider
-    if capable_provider:
-        raise _GraphMiss("provisioned attention providers are not graph-safe")
     raise _GraphMiss("no provisioned attention provider is graph-safe")
 
 
@@ -1210,7 +1204,7 @@ def _greedy_decode_values(
     clear_force_finish: bool,
 ) -> GraphGreedyOutput | None:
     if (
-        batch.forward_mode is not ForwardMode.PAGED_DECODE
+        batch.forward_mode is not AttentionMode.PAGED_DECODE
         or predicate_state is None
         or force_finish is None
         or len(output.values) != batch.row_count

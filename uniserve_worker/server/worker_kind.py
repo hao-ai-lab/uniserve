@@ -27,17 +27,13 @@ class WorkerKind(StrEnum):
 
 
 _ROUTES = {
-    WorkerKind.FULL: frozenset(ForwardMode),
+    WorkerKind.FULL: frozenset(ForwardMode) - {ForwardMode.DRAFT},
     WorkerKind.ENCODER: frozenset({ForwardMode.ENCODE_VISION, ForwardMode.ENCODE_LATENT}),
     WorkerKind.PREFILL: frozenset({ForwardMode.TOKEN_EXTEND}),
     WorkerKind.DECODE: frozenset(
         {
             ForwardMode.TOKEN_DECODE,
             ForwardMode.TOKEN_VERIFY,
-            ForwardMode.GEN_TRANSITION,
-            ForwardMode.GEN_FLOW,
-            ForwardMode.GEN_DECODE,
-            ForwardMode.MATERIALIZE,
             ForwardMode.TRANSFER_KV_PUBLISH,
             ForwardMode.TRANSFER_KV_INSTALL,
         }

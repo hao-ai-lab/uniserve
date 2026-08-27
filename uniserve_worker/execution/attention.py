@@ -7,8 +7,8 @@ from collections.abc import Sequence
 
 import torch
 
-from uniserve_worker.batch import ForwardMode as WorkMode
-from uniserve_worker.execution.forward_batch import ExpertRoute, ForwardMode, RouteSpan
+from uniserve_worker.batch import ForwardMode
+from uniserve_worker.execution.forward_batch import AttentionMode, ExpertRoute, RouteSpan
 from uniserve_worker.foundation.errors import invalid_descriptor
 from uniserve_worker.foundation.math import bucketed_length
 
@@ -28,7 +28,7 @@ def columns(runtime, tasks: tuple[ForwardRow, ...]) -> dict[str, object]:
         raise invalid_descriptor("forward attention lengths are invalid")
     causal_rows = tuple(bool(task.causal) for task in tasks)
     pure_decode = all(
-        task.operation.work is WorkMode.TOKEN_DECODE
+        task.operation.work is ForwardMode.TOKEN_DECODE
         and task.token_ids is not None
         and task.query_tokens == 1
         for task in tasks
@@ -53,7 +53,7 @@ def columns(runtime, tasks: tuple[ForwardRow, ...]) -> dict[str, object]:
             and runtime.req_to_token_pool.page_tables.device == states.device
         ):
             return {
-                "forward_mode": ForwardMode.REQUEST_INDEXED_DECODE,
+                "forward_mode": AttentionMode.REQUEST_INDEXED_DECODE,
                 "seq_lens_cpu": seq_lens,
                 "query_lens_cpu": query_lens,
                 "kv_lens_cpu": tuple(length + 1 for length in seq_lens),
@@ -99,10 +99,10 @@ def columns(runtime, tasks: tuple[ForwardRow, ...]) -> dict[str, object]:
     common["kv_lens_cpu"] = kv_lens
     common["max_seqlen_k"] = width * runtime.cache_pool.block_size
     if pure_decode:
-        common["forward_mode"] = ForwardMode.PAGED_DECODE
+        common["forward_mode"] = AttentionMode.PAGED_DECODE
         return common
     common.update(
-        forward_mode=ForwardMode.PAGED_VARLEN,
+        forward_mode=AttentionMode.PAGED_VARLEN,
         cu_seqlens_q=_cumulative(query_lens),
         cu_seqlens_k=_cumulative(kv_lens),
         output_indices=torch.tensor(
@@ -117,7 +117,7 @@ def columns(runtime, tasks: tuple[ForwardRow, ...]) -> dict[str, object]:
 def dense_columns(row_count: int, query_lens: Sequence[int]) -> dict[str, object]:
     lengths = tuple(int(value) for value in query_lens)
     return {
-        "forward_mode": ForwardMode.DENSE,
+        "forward_mode": AttentionMode.DENSE,
         "seq_lens": torch.zeros(row_count, dtype=torch.int32),
         "query_lens": torch.tensor(lengths, dtype=torch.int32),
         "out_cache_loc": torch.zeros(sum(lengths), dtype=torch.int64),
@@ -185,7 +185,7 @@ def _packed_columns(
             cursor = run_end
         append_span(ExpertRoute.FLOW, query - cursor)
     return {
-        "forward_mode": ForwardMode.PACKED,
+        "forward_mode": AttentionMode.PACKED,
         "attention_indexes": torch.cat(indexes, dim=1),
         "route_spans": tuple(spans),
         "visible_end": visible,

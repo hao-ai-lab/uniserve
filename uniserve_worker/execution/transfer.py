@@ -13,7 +13,9 @@ from uniserve_worker.batch import (
     DeviceDim,
     DrawLayout,
     FinishFlags,
+    ForwardMode,
     Operation,
+    OpStatus,
     ProductKind,
     ProductPayload,
     ProductRef,
@@ -21,20 +23,19 @@ from uniserve_worker.batch import (
     StorageClass,
     TokenSpan,
     TransferMode,
-    ForwardMode,
 )
 from uniserve_worker.foundation.errors import capability_mismatch, invalid_descriptor
 from uniserve_worker.runtime.device_products import ImageRange, device_product_storage
 from uniserve_worker.runtime.latent_pool import LatentPublication
-from uniserve_worker.server.completion import _CompletionTransferPayload
+from uniserve_worker.server.completion import DeferredTransferPayload
 from uniserve_worker.transfer.tickets import Locator
 
 from . import flow
-from . import step as ops
-from .rows import OperationState, PartitionState
+from .resources import ExecutionResources
+from .rows import OperationState, Outcome, PartitionState
 
 
-def run_action(runtime: object, state: OperationState) -> bool:
+def run_action(runtime: ExecutionResources, state: OperationState) -> bool:
     if state.phase != "initial":
         return False
     work = state.operation.work
@@ -47,12 +48,11 @@ def run_action(runtime: object, state: OperationState) -> bool:
     return False
 
 
-def _transition(runtime: object, state: OperationState) -> None:
-    from . import step as ops
+def _transition(runtime: ExecutionResources, state: OperationState) -> None:
 
     operation = state.operation
     partition = state.partition
-    ops._generation(runtime)
+    runtime.generation()
     session_id = operation.request_key.session_id
     conditioning = tuple(
         reference for reference in operation.inputs if reference.kind is ProductKind.KV
@@ -64,8 +64,8 @@ def _transition(runtime: object, state: OperationState) -> None:
         raise invalid_descriptor(
             "generation transition requires one exact conditioning input and latent output"
         )
-    cache = ops._cache_coordinates(runtime, operation, partition)
-    session = ops._request_row(runtime, partition, session_id)
+    cache = runtime.cache_coordinates(operation, partition)
+    session = runtime.request_row(partition, session_id)
     runtime.cache_publications.validate_conditioning(
         session_id,
         conditioning[0],
@@ -91,8 +91,8 @@ def _transition(runtime: object, state: OperationState) -> None:
     output = latent_outputs[0]
     if int(output.generation) < 1:
         raise invalid_descriptor("generation transition latent has no logical generation")
-    row = ops._latent_row(runtime, operation, partition)
-    pool = ops._latent_pool(runtime)
+    row = runtime.latent_row(operation, partition)
+    pool = runtime.require_latent_pool()
     row.staging.value.zero_()
     initial = row.staging.value[: int(row.placement.latent_units)]
     flow.initial_latent(
@@ -124,21 +124,20 @@ def _transition(runtime: object, state: OperationState) -> None:
     products = flow.publish_latent_transfer(
         runtime, operation, output, initial, row, step=0, scope=partition
     )
-    state.outcome = ops.Outcome(
-        status=ops.OpStatus.OK,
+    state.outcome = Outcome(
+        status=OpStatus.OK,
         selected_point=1,
-        logical_lengths=ops._logical_lengths(runtime, operation, session, cache, latent_len=0),
+        logical_lengths=runtime.logical_lengths(operation, session, cache, latent_len=0),
         token_span=TokenSpan(base=session.logical_position, len=0),
         finish_flags=FinishFlags(),
-        product_generations=ops._output_generations(operation),
+        product_generations=runtime.output_generations(operation),
         products=products,
     )
     state.phase = "done"
 
 
-def _transfer(runtime: object, state: OperationState) -> None:
+def _transfer(runtime: ExecutionResources, state: OperationState) -> None:
     from . import encode
-    from . import step as ops
 
     operation = state.operation
     partition = state.partition
@@ -148,14 +147,14 @@ def _transfer(runtime: object, state: OperationState) -> None:
     session_id = operation.request_key.session_id
     mode = operation.work.transfer_mode
     if mode is TransferMode.KV_PUBLISH:
-        point = ops._fixed_parent(operation)
+        point = runtime.fixed_parent(operation)
         outputs = tuple(output for output in operation.outputs if output.kind is ProductKind.KV)
         if len(outputs) != 1:
             raise invalid_descriptor("KV publication requires one KV output product")
         if any(reference.kind is ProductKind.KV for reference in operation.inputs):
             raise invalid_descriptor("KV publication is rooted only by its fixed parent")
-        cache = ops._cache_coordinates(runtime, operation, partition)
-        request = ops._request_row(runtime, partition, session_id)
+        cache = runtime.cache_coordinates(operation, partition)
+        request = runtime.request_row(partition, session_id)
         expected_base = runtime.cache_publications.destination_base(session_id, "gen")
         snapshot = runtime.cache_publications.publish(
             request_pool_idx=request.request_pool_idx,
@@ -171,7 +170,7 @@ def _transfer(runtime: object, state: OperationState) -> None:
         partition.cache_publications.append((outputs[0], snapshot))
         for encoded in snapshot.locators:
             partition.published.append(Locator.from_wire_json(encoded))
-        payload = _CompletionTransferPayload(
+        payload = DeferredTransferPayload(
             "kv",
             {"generation": int(outputs[0].generation), "snapshot": snapshot.to_mapping()},
             tuple(Locator.from_wire_json(encoded) for encoded in snapshot.locators),
@@ -191,8 +190,8 @@ def _transfer(runtime: object, state: OperationState) -> None:
         outputs = tuple(output for output in operation.outputs if output.kind is ProductKind.KV)
         if len(inputs) != 1 or len(outputs) != 1:
             raise invalid_descriptor("KV installation requires one input and one output")
-        cache = ops._cache_coordinates(runtime, operation, partition)
-        request = ops._request_row(runtime, partition, session_id)
+        cache = runtime.cache_coordinates(operation, partition)
+        request = runtime.request_row(partition, session_id)
         prepared = partition.prepared_transfers.get(inputs[0])
         installed = runtime.cache_publications.install(
             request_pool_idx=request.request_pool_idx,
@@ -235,7 +234,7 @@ def _transfer(runtime: object, state: OperationState) -> None:
 
 
 def publish_product(
-    runtime,
+    runtime: ExecutionResources,
     operation: Operation,
     product: ProductRef,
     value: torch.Tensor,
@@ -304,9 +303,9 @@ def publish_product(
         transport.release(locator)
         raise invalid_descriptor("product transfer value disagrees with its output bound")
     scope.published.append(locator)
-    scope.stage_publications[ops._operation_identity(operation)] = (locator,)
+    scope.stage_publications[runtime.operation_identity(operation)] = (locator,)
     descriptor_value["locator"] = locator.to_mapping()
-    descriptor = _CompletionTransferPayload(
+    descriptor = DeferredTransferPayload(
         descriptor_kind,
         descriptor_value,
         (locator,),
@@ -317,19 +316,17 @@ def publish_product(
 
 
 def fetch_product(
-    runtime,
+    runtime: ExecutionResources,
     operation: Operation,
     scope: PartitionState,
 ) -> tuple[torch.Tensor, Mapping[str, object]]:
     for reference in operation.inputs:
         if reference.kind is ProductKind.LATENT:
-            session = ops._request_row(runtime, scope, operation.request_key.session_id)
+            session = runtime.request_row(scope, operation.request_key.session_id)
             if session.latent_product != reference:
                 raise invalid_descriptor("latent transfer does not name the committed trajectory")
-            row = ops._latent_row(runtime, operation, scope)
-            value = ops._latent_pool(
-                runtime,
-            ).gather_current(
+            row = runtime.latent_row(operation, scope)
+            value = runtime.require_latent_pool().gather_current(
                 row.request_pool_idx,
                 row.staging,
                 step=int(row.placement.start_step),
@@ -347,12 +344,11 @@ def fetch_product(
                 "generation": int(reference.generation),
             }
         if reference.storage_class is StorageClass.DEVICE_TENSOR:
-            device_read = ops._consume_device_product(
-                runtime,
+            device_read = runtime.consume_device_product(
                 reference,
                 scope,
                 consumer_op_id=operation.op_id,
-                device=ops._operation_device(runtime, operation),
+                device=runtime.operation_device(operation),
             )
             scope.device_reads.append(device_read)
             metadata = device_read.metadata
@@ -373,12 +369,11 @@ def fetch_product(
             ProductKind.VISION_FEATURE,
             ProductKind.LATENT_FEATURE,
         }:
-            encoder_read = ops._consume_encoder_feature(
-                runtime,
+            encoder_read = runtime.consume_encoder_feature(
                 reference,
                 scope,
                 consumer_op_id=operation.op_id,
-                device=ops._operation_device(runtime, operation),
+                device=runtime.operation_device(operation),
             )
             scope.encoder_reads.append(encoder_read)
             return encoder_read.tensor, {

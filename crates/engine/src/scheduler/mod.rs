@@ -100,11 +100,11 @@ use uniserve_core::{HashAlgo, RequestId};
 use uniserve_worker_ipc::{
     Admission, AttentionRegime, Batch, BatchPartition, BlockTable as WireBlockTable, Bounds,
     CachePageAllocation, CloseReason, CompletionReport, Control, DType, DecodeKind,
-    DecodePlacement, DimBound, Disposition, ExecutionCapability, ForwardMode,
-    ForwardRow as WireForwardRow, GenAdmission, LatentPlacement, MediaAdmission, MediaProfileId,
-    ModelOutput, OpId, OpStatus, Operation, Point, PointRange, ProductKind, ProductPayload,
-    ProductRef, RequestKey, ResourceClass, RouteId, SamplingState, ShapeBound, StorageClass,
-    TimingCounters, UndAdmission, VersionRef, WorkerCapabilities, WorkerForwardStats,
+    DecodePlacement, DimBound, Disposition, ExecutionCapability, ForwardMode, GenAdmission,
+    LatentPlacement, MediaAdmission, MediaProfileId, ModelOutput, OpId, OpStatus, Operation, Point,
+    PointRange, ProductKind, ProductPayload, ProductRef, RequestKey, ResourceClass, RouteId,
+    RowGeometry, SamplingState, ShapeBound, StorageClass, TimingCounters, UndAdmission, VersionRef,
+    WorkerCapabilities, WorkerForwardStats,
 };
 
 use crate::executor::{WorkerExecError, WorkerLossError};
@@ -1357,7 +1357,7 @@ fn tensorized_mixed_runner_work(variant: ForwardMode) -> bool {
 
 fn flow_matches_mixed_bucket(
     operation: &Operation,
-    forward_rows: &HashMap<(RequestKey, OpId), Vec<WireForwardRow>>,
+    forward_rows: &HashMap<(RequestKey, OpId), Vec<RowGeometry>>,
     latent_placements: &HashMap<(RequestKey, OpId), LatentPlacement>,
     bucket: &uniserve_worker_ipc::MixedExecutionCapability,
 ) -> bool {
@@ -1377,7 +1377,7 @@ fn flow_matches_mixed_bucket(
 fn extract_mixed_group(
     candidates: &mut [(uniserve_worker_ipc::Domain, Vec<Operation>)],
     buckets: &[uniserve_worker_ipc::MixedExecutionCapability],
-    forward_rows: &HashMap<(RequestKey, OpId), Vec<WireForwardRow>>,
+    forward_rows: &HashMap<(RequestKey, OpId), Vec<RowGeometry>>,
     latent_placements: &HashMap<(RequestKey, OpId), LatentPlacement>,
 ) -> Option<Vec<(uniserve_worker_ipc::Domain, Vec<Operation>)>> {
     let decode_index = candidates

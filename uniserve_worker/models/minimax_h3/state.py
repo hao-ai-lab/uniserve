@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 
-from ...batch import RequestKey
+from ...batch import DeferredSemanticDigest, RequestKey
 from ...nn.mesh import DeviceMesh
 from .packing import H3PackedLayout, build_packed_layout
 from .schedule import H3Schedule
@@ -112,7 +112,7 @@ class H3StateSlot:
     rotary_sine: torch.Tensor
     request_key: RequestKey | None = None
     output_path: Path | None = None
-    semantic_digest: object = ""
+    semantic_digest: str | DeferredSemanticDigest = ""
     producer_op_id: int = 0
     producer_plan_digest: str = ""
     denoise_step: int = 0
@@ -172,9 +172,7 @@ class H3StatePool:
                 rotary_sine=torch.empty(
                     (layout.packed.padded_rows, 96), dtype=torch.float32, device=device
                 ),
-                video_overlap=torch.empty(
-                    (1, 3, 5, 768, 1344), dtype=torch.float16, device=device
-                ),
+                video_overlap=torch.empty((1, 3, 5, 768, 1344), dtype=torch.float16, device=device),
             )
             for index in range(1, slot_count + 1)
         )
@@ -262,12 +260,8 @@ class H3Scratch:
             local_audio_hidden=torch.empty(
                 (local_audio, 5376), dtype=torch.bfloat16, device=device
             ),
-            video_velocity=torch.empty(
-                (local_video, 96), dtype=torch.float32, device=device
-            ),
-            audio_velocity=torch.empty(
-                (local_audio, 32), dtype=torch.float32, device=device
-            ),
+            video_velocity=torch.empty((local_video, 96), dtype=torch.float32, device=device),
+            audio_velocity=torch.empty((local_audio, 32), dtype=torch.float32, device=device),
             projection_buffer=torch.empty(
                 (local_rows, 56, 128), dtype=torch.bfloat16, device=device
             ),
@@ -282,7 +276,9 @@ class H3Scratch:
             attention_output=torch.empty(
                 (global_rows, local_heads, 128), dtype=torch.bfloat16, device=device
             ),
-            tile_scores=torch.empty((local_heads, tile_count, tile_count), dtype=torch.float32, device=device),
+            tile_scores=torch.empty(
+                (local_heads, tile_count, tile_count), dtype=torch.float32, device=device
+            ),
             block_indices=torch.empty(
                 (
                     local_heads,
@@ -292,9 +288,7 @@ class H3Scratch:
                 dtype=torch.int32,
                 device=device,
             ),
-            block_counts=torch.empty(
-                (local_heads, tile_count), dtype=torch.int32, device=device
-            ),
+            block_counts=torch.empty((local_heads, tile_count), dtype=torch.int32, device=device),
             pooled_query=torch.empty(
                 (tile_count, local_heads, 128), dtype=torch.float32, device=device
             ),
@@ -325,21 +319,15 @@ class H3Scratch:
             gather=torch.empty((layout.sp_size, 24, 7, 48, 84), dtype=torch.float32, device=device),
             gather_input=torch.empty((24, 7, 48, 84), dtype=torch.float32, device=device),
             decode_rows=torch.empty((7 * 24 * 42, 96), dtype=torch.float32, device=device),
-            audio_gather=torch.empty(
-                (layout.sp_size, 414, 32), dtype=torch.float32, device=device
-            ),
+            audio_gather=torch.empty((layout.sp_size, 414, 32), dtype=torch.float32, device=device),
             audio_input=torch.empty((414, 32), dtype=torch.float32, device=device),
-            rgb_send=torch.empty(
-                (22, 768, 1344, 3), dtype=torch.uint8, device=device
-            ),
+            rgb_send=torch.empty((22, 768, 1344, 3), dtype=torch.uint8, device=device),
             rgb_gather=torch.empty(
                 (layout.sp_size, 22, 768, 1344, 3),
                 dtype=torch.uint8,
                 device=device,
             ),
-            overlap_send=torch.empty(
-                (1, 3, 5, 768, 1344), dtype=torch.float16, device=device
-            ),
+            overlap_send=torch.empty((1, 3, 5, 768, 1344), dtype=torch.float16, device=device),
             overlap_gather=torch.empty(
                 (layout.sp_size, 1, 3, 5, 768, 1344),
                 dtype=torch.float16,
@@ -349,9 +337,7 @@ class H3Scratch:
             local_audio_raster=layout.local_audio_raster_indices.to(device),
             audio_latents=torch.empty((2, 32, 207), dtype=torch.float32, device=device),
             time_values=torch.empty((2,), dtype=torch.float32, device=device),
-            rotary_positions=torch.empty(
-                (global_rows, 3), dtype=torch.float32, device=device
-            ),
+            rotary_positions=torch.empty((global_rows, 3), dtype=torch.float32, device=device),
             rotary_frequencies=torch.empty(
                 (global_rows, 3, 16), dtype=torch.float32, device=device
             ),

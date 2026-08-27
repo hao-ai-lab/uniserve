@@ -18,10 +18,10 @@ from typing import cast
 import torch
 import torch.nn as nn
 
-from ..batch import ForwardMode as WorkMode
+from ..batch import ForwardMode
 from ..execution.forward_batch import (
+    AttentionMode,
     ForwardBatch,
-    ForwardMode,
     ForwardOutput,
     TokenSelection,
 )
@@ -501,11 +501,7 @@ class Qwen3ForCausalLM(ExecutionModel):
         report = LoadReport()
         for handle in weights:
             source_name = handle.name
-            repaired = (
-                f"model.{source_name}"
-                if source_name.startswith("layers.")
-                else source_name
-            )
+            repaired = f"model.{source_name}" if source_name.startswith("layers.") else source_name
             target_name, shard_id = stacked_weight_name(repaired, _QWEN_STACKED_WEIGHTS)
             if target_name not in parameter_names:
                 if repaired in parameter_names:
@@ -546,9 +542,9 @@ class Qwen3ForCausalLM(ExecutionModel):
         self.architecture = "Qwen3ForCausalLM"
         self.supported_work = frozenset(
             {
-                WorkMode.TOKEN_EXTEND,
-                WorkMode.TOKEN_DECODE,
-                WorkMode.TOKEN_VERIFY,
+                ForwardMode.TOKEN_EXTEND,
+                ForwardMode.TOKEN_DECODE,
+                ForwardMode.TOKEN_VERIFY,
             }
         )
         self.cache_geometry = CacheGeometry(
@@ -601,7 +597,7 @@ class Qwen3ForCausalLM(ExecutionModel):
         query_lens = forward_batch.query_lens_cpu
         dynamic_last = (
             forward_batch.output_indices
-            if forward_batch.forward_mode is ForwardMode.PAGED_VARLEN
+            if forward_batch.forward_mode is AttentionMode.PAGED_VARLEN
             and all(selection is TokenSelection.LAST_LOGITS for selection in selections)
             else None
         )

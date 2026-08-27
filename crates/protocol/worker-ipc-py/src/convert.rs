@@ -22,10 +22,10 @@ use uniserve_worker_ipc::{
     Admission, AttentionRegime, Batch, BatchPartition, BlockTable, CachePageAllocation,
     CloseReason, CompletionReport, Control, DType, DecodeKind, DecodePlacement, DimBound,
     Disposition, Domain, DrawLayout, ErrorCode, ErrorOperationIdentity, ExecutionCapability,
-    FinishFlags, ForwardMode, ForwardRow, GenAdmission, LatentPlacement, LogicalLengths,
-    MediaAdmission, MediaProfileId, ModelOutput, OpId, OpStatus, Operation, PartitionCompletion,
-    Point, PointRange, ProductKind, ProductPayload, ProductRef, RegistrationAck, RequestKey,
-    RequestKind, ShapeBound, StorageClass, TimingCounters, TokenSpan, UndAdmission, VersionRef,
+    FinishFlags, ForwardMode, GenAdmission, LatentPlacement, LogicalLengths, MediaAdmission,
+    MediaProfileId, ModelOutput, OpId, OpStatus, Operation, PartitionCompletion, Point, PointRange,
+    ProductKind, ProductPayload, ProductRef, RegistrationAck, RequestKey, RequestKind, RowGeometry,
+    ShapeBound, StorageClass, TimingCounters, TokenSpan, UndAdmission, VersionRef,
     WorkerForwardStats, WorkerRequest, WorkerResponse,
 };
 
@@ -90,7 +90,7 @@ struct NativeRequestTypes {
     rng: Py<PyAny>,
     block_table: Py<PyAny>,
     cache_page_allocation: Py<PyAny>,
-    forward_row: Py<PyAny>,
+    row_geometry: Py<PyAny>,
     commit: Py<PyAny>,
     close: Py<PyAny>,
     release: Py<PyAny>,
@@ -144,7 +144,7 @@ impl NativeRequestTypes {
             rng: class("Rng")?,
             block_table: class("BlockTable")?,
             cache_page_allocation: class("CachePageAllocation")?,
-            forward_row: class("ForwardRow")?,
+            row_geometry: class("RowGeometry")?,
             commit: class("Commit")?,
             close: class("Close")?,
             release: class("Release")?,
@@ -507,8 +507,8 @@ impl<'py> NativeRequestConversion<'py> {
         ))
     }
 
-    fn forward_row(&self, row: &ForwardRow) -> PyResult<Bound<'py, PyAny>> {
-        self.types.forward_row.bind(self.py).call1((
+    fn row_geometry(&self, row: &RowGeometry) -> PyResult<Bound<'py, PyAny>> {
+        self.types.row_geometry.bind(self.py).call1((
             row.operation_index,
             row.request_pool_index,
             row.seq_len,
@@ -600,7 +600,7 @@ impl<'py> NativeRequestConversion<'py> {
         let forward_rows = partition
             .forward_rows
             .iter()
-            .map(|row| self.forward_row(row))
+            .map(|row| self.row_geometry(row))
             .collect::<PyResult<Vec<_>>>()?;
         let execution = match partition.execution {
             ExecutionCapability::DomainHomogeneous => 0,
@@ -1667,7 +1667,7 @@ mod tests {
                 group_id: 0,
                 page_ids: vec![BlockId(1)],
             }],
-            forward_rows: vec![ForwardRow {
+            forward_rows: vec![RowGeometry {
                 operation_index: 0,
                 request_pool_index: 1,
                 seq_len: 0,

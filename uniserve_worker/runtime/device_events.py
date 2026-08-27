@@ -9,8 +9,8 @@ from threading import RLock
 
 import torch
 
+from ..foundation.errors import WorkerError, WorkerErrorCode
 from .device import canonical_device
-from ..foundation.errors import ErrorCode, WorkerError
 
 
 def _resolved_device(device: torch.device | str) -> torch.device:
@@ -21,7 +21,7 @@ def _resolved_device(device: torch.device | str) -> torch.device:
 
 def _invariant(message: str) -> WorkerError:
     return WorkerError(
-        code=ErrorCode.INVARIANT_VIOLATION,
+        code=WorkerErrorCode.INVARIANT_VIOLATION,
         message=message,
         fatal=True,
     )
@@ -162,11 +162,7 @@ class DeviceEventPool:
             raise _invariant("device event release count must be positive")
         with self._lock:
             state = self._active.get(id(event))
-            if (
-                state is None
-                or state.event is not event
-                or state.references < references
-            ):
+            if state is None or state.event is not event or state.references < references:
                 raise _invariant("device event reference accounting is invalid")
             state.references -= references
             if state.references != 0:
@@ -220,9 +216,7 @@ class DeviceEventPool:
 
     def _recycle_locked(self, state: _EventState) -> None:
         self._active.pop(id(state.event))
-        self._available.setdefault((state.device_name, state.timing), deque()).append(
-            state.event
-        )
+        self._available.setdefault((state.device_name, state.timing), deque()).append(state.event)
 
     def _require_locked(
         self,
@@ -230,11 +224,7 @@ class DeviceEventPool:
         device: torch.device,
     ) -> _EventState:
         state = self._active.get(id(event))
-        if (
-            state is None
-            or state.event is not event
-            or state.device_name != str(device)
-        ):
+        if state is None or state.event is not event or state.device_name != str(device):
             raise _invariant("device event is not owned by its declared device")
         return state
 
