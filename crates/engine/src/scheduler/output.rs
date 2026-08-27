@@ -2,6 +2,120 @@
 
 use super::*;
 
+fn flush_public_journal(event_tx: &EventTx, journal: &mut VecDeque<GenerationEvent>) -> bool {
+    while let Some(event) = journal.pop_front() {
+        match event_tx.send(event) {
+            Ok(()) => {}
+            Err(EventSendError::Full(event)) => {
+                journal.push_front(*event);
+                return false;
+            }
+            Err(EventSendError::Closed(_)) => {
+                journal.clear();
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub(super) struct RequestOutput {
+    pub(super) event_tx: EventTx,
+    pub(super) event_seq: u64,
+    pub(super) tokens_sent: usize,
+    pub(super) tokens_acked: usize,
+    journal: VecDeque<GenerationEvent>,
+}
+
+impl RequestOutput {
+    pub(super) fn new(event_tx: EventTx) -> Self {
+        Self {
+            event_tx,
+            event_seq: 0,
+            tokens_sent: 0,
+            tokens_acked: 0,
+            journal: VecDeque::new(),
+        }
+    }
+
+    pub(super) fn is_closed(&self) -> bool {
+        self.event_tx.is_closed()
+    }
+
+    pub(super) fn available_capacity(&self) -> usize {
+        self.event_tx
+            .capacity()
+            .saturating_add(OUTPUT_JOURNAL_CAPACITY.saturating_sub(self.journal.len()))
+    }
+
+    fn flush(&mut self) -> bool {
+        flush_public_journal(&self.event_tx, &mut self.journal)
+    }
+
+    pub(super) fn enqueue(&mut self, event: GenerationEvent) -> bool {
+        if self.flush() {
+            return true;
+        }
+        if self.journal.is_empty() {
+            match self.event_tx.send(event) {
+                Ok(()) => {
+                    self.event_seq = self.event_seq.saturating_add(1);
+                    return false;
+                }
+                Err(EventSendError::Closed(_)) => return true,
+                Err(EventSendError::Full(event)) => self.journal.push_back(*event),
+            }
+        } else {
+            self.journal.push_back(event);
+        }
+        assert!(
+            self.journal.len() <= OUTPUT_JOURNAL_CAPACITY,
+            "scheduler exceeded the bounded public output journal"
+        );
+        self.event_seq = self.event_seq.saturating_add(1);
+        false
+    }
+}
+
+struct RetiredOutput {
+    event_tx: EventTx,
+    journal: VecDeque<GenerationEvent>,
+}
+
+#[derive(Default)]
+pub(super) struct OutputSender {
+    retired: HashMap<RequestId, RetiredOutput>,
+}
+
+impl OutputSender {
+    pub(super) fn retained_len(&self) -> usize {
+        self.retired.len()
+    }
+
+    pub(super) fn retire(&mut self, id: RequestId, output: RequestOutput) {
+        if !output.journal.is_empty() {
+            self.retired.insert(
+                id,
+                RetiredOutput {
+                    event_tx: output.event_tx,
+                    journal: output.journal,
+                },
+            );
+        }
+    }
+
+    pub(super) fn flush_retired(&mut self) -> bool {
+        let mut progressed = false;
+        self.retired.retain(|_, output| {
+            let before = output.journal.len();
+            let closed = flush_public_journal(&output.event_tx, &mut output.journal);
+            progressed |= output.journal.len() != before;
+            !closed && !output.event_tx.is_closed() && !output.journal.is_empty()
+        });
+        progressed
+    }
+}
+
 impl Scheduler {
     pub(super) fn resolve_decode_text(
         &mut self,
@@ -269,10 +383,7 @@ impl Scheduler {
                 // the prompt is fully prefilled now — publish its full
                 // blocks to the prefix cache for later requests to reuse.
                 if let Some(st) = self.running.get_mut(&id) {
-                    let kv = self
-                        .kv
-                        .as_ref()
-                        .expect("generation scheduling requires worker KV resources");
+                    let kv = self.kv_budget.cache();
                     cache_prompt_blocks(&kv.coordinator, st, &kv.block_pool);
                 }
                 // A description-lowered prefix may already end at a branch trigger.
@@ -468,10 +579,14 @@ impl Scheduler {
                     }
                     let mut free_products = Vec::new();
                     let selected_product = if let Some(cache_key) = encoder_cache_key {
-                        if let Some(freed) = self.enc_cache.insert(*cache_key, feature.clone()) {
+                        if let Some(freed) = self
+                            .kv_budget
+                            .encoder_cache
+                            .insert(*cache_key, feature.clone())
+                        {
                             free_products.push(freed);
                         }
-                        let Some(product) = self.enc_cache.acquire(*cache_key) else {
+                        let Some(product) = self.kv_budget.encoder_cache.acquire(*cache_key) else {
                             return self.finish(id, FinishReason::Error);
                         };
                         if let Some(st) = self.running.get_mut(&id) {
@@ -634,8 +749,8 @@ impl Scheduler {
             "request_id": id.0,
             "required_blocks": required_blocks,
             "allocated_blocks": allocated_blocks,
-            "free_blocks": self.free_kv_blocks(),
-            "reserved_blocks": self.reserved_blocks,
+            "free_blocks": self.kv_budget.free_blocks(),
+            "reserved_blocks": self.kv_budget.reserved_blocks,
         }));
         true
     }
@@ -656,31 +771,24 @@ impl Scheduler {
     pub(super) fn flush_output_journals(&mut self) -> bool {
         let mut progressed = false;
         for state in self.running.values_mut() {
-            if state.event_tx.is_closed() {
+            if state.output.is_closed() {
                 state.terminal_intent = TerminalIntent::Cancel;
                 continue;
             }
-            let before = state.output_journal.len();
-            if flush_public_journal(&state.event_tx, &mut state.output_journal) {
+            let before = state.output.journal.len();
+            if state.output.flush() {
                 state.terminal_intent = TerminalIntent::Cancel;
             }
-            progressed |= state.output_journal.len() != before;
+            progressed |= state.output.journal.len() != before;
         }
-        self.completed_outputs.retain(|_, output| {
-            let before = output.journal.len();
-            let closed = flush_public_journal(&output.event_tx, &mut output.journal);
-            progressed |= output.journal.len() != before;
-            !closed && !output.event_tx.is_closed() && !output.journal.is_empty()
-        });
+        progressed |= self.output.flush_retired();
         progressed
     }
 
     pub(super) fn emit(&mut self, id: RequestId, ev: GenerationEvent) {
         if let Some(st) = self.running.get_mut(&id) {
-            if enqueue_public_event(&st.event_tx, &mut st.output_journal, ev) {
+            if st.output.enqueue(ev) {
                 st.terminal_intent = TerminalIntent::Cancel;
-            } else {
-                st.public_event_seq = st.public_event_seq.saturating_add(1);
             }
         }
     }
@@ -709,7 +817,7 @@ impl Scheduler {
         let event_seq = self
             .running
             .get(&id)
-            .map_or(1, |state| state.public_event_seq.saturating_add(1));
+            .map_or(1, |state| state.output.event_seq.saturating_add(1));
         let commit = PublicCommit {
             event_seq,
             modality,
@@ -731,12 +839,12 @@ impl Scheduler {
         let before = self
             .running
             .get(&id)
-            .map_or(0, |state| state.public_event_seq);
+            .map_or(0, |state| state.output.event_seq);
         self.emit(id, event);
         let published = self
             .running
             .get(&id)
-            .is_some_and(|state| state.public_event_seq > before);
+            .is_some_and(|state| state.output.event_seq > before);
         published
     }
 
@@ -771,9 +879,9 @@ impl Scheduler {
                     && self
                         .running
                         .get(&id)
-                        .is_some_and(|state| state.tokens_sent == 0);
+                        .is_some_and(|state| state.output.tokens_sent == 0);
                 if published && let Some(state) = self.running.get_mut(&id) {
-                    state.tokens_sent = state.tokens_sent.saturating_add(1);
+                    state.output.tokens_sent = state.output.tokens_sent.saturating_add(1);
                 }
                 if first_token && self.trace_enabled() {
                     self.trace_record(json!({
@@ -891,14 +999,6 @@ impl Scheduler {
         !self.running.contains_key(&id)
     }
 
-    pub(super) fn emit_st(&self, st: &mut ReqState, ev: GenerationEvent) {
-        if enqueue_public_event(&st.event_tx, &mut st.output_journal, ev) {
-            st.terminal_intent = TerminalIntent::Cancel;
-        } else {
-            st.public_event_seq = st.public_event_seq.saturating_add(1);
-        }
-    }
-
     pub(super) fn finish(&mut self, id: RequestId, reason: FinishReason) {
         self.finish_with(id, reason, None);
     }
@@ -914,12 +1014,12 @@ impl Scheduler {
                 .running
                 .get(&id)
                 .is_some_and(|state| !state.pending_commits.is_empty());
-        if !self.has_inflight(id) && !semantic_pending {
+        if !self.inflight.contains(id) && !semantic_pending {
             self.finish_with(id, reason, stop_reason);
             return;
         }
-        if !self.pending_finishes.contains_key(&id) || matches!(reason, FinishReason::Error) {
-            self.pending_finishes.insert(
+        if !self.inflight.finishes.contains_key(&id) || matches!(reason, FinishReason::Error) {
+            self.inflight.finishes.insert(
                 id,
                 PendingFinish {
                     reason,
@@ -930,7 +1030,7 @@ impl Scheduler {
     }
 
     pub(super) fn finish_pending_if_idle(&mut self, id: RequestId) {
-        if self.has_inflight(id)
+        if self.inflight.contains(id)
             || self
                 .running
                 .get(&id)
@@ -938,7 +1038,7 @@ impl Scheduler {
         {
             return;
         }
-        if let Some(pending) = self.pending_finishes.remove(&id) {
+        if let Some(pending) = self.inflight.finishes.remove(&id) {
             self.finish_with(id, pending.reason, pending.stop_reason);
         }
     }
@@ -949,7 +1049,7 @@ impl Scheduler {
         reason: FinishReason,
         stop_reason: Option<uniserve_core::StopReason>,
     ) {
-        self.pending_finishes.remove(&id);
+        self.inflight.finishes.remove(&id);
         if reason == FinishReason::Error
             && let Some(state) = self.running.get(&id)
         {
@@ -1003,18 +1103,20 @@ impl Scheduler {
                 awaits_close = true;
             }
             self.order.retain(|request| *request != id);
-            self.reserved_encoder_entries = self
+            self.kv_budget.reserved_encoder_entries = self
+                .kv_budget
                 .reserved_encoder_entries
                 .saturating_sub(st.req.resources.encoder_cache_keys.len());
             if st.cursor.resources.reserve_worstcase {
-                self.reserved_blocks = self
+                self.kv_budget.reserved_blocks = self
+                    .kv_budget
                     .reserved_blocks
                     .saturating_sub(st.cursor.resources.worstcase_blocks);
             }
             let mut free_encoder_products =
                 std::mem::take(&mut st.cursor.ingest.transient_encoder_products);
             for pin in &st.cursor.ingest.acquired_encoder_pins {
-                if let Some(product) = self.enc_cache.release(pin.key, &pin.product) {
+                if let Some(product) = self.kv_budget.encoder_cache.release(pin.key, &pin.product) {
                     free_encoder_products.push(product);
                 }
             }
@@ -1035,27 +1137,18 @@ impl Scheduler {
                 completion_tokens: st.cursor.und.tokens_emitted,
                 images: st.cursor.image_gen.images_done,
             };
-            let closed = enqueue_public_event(&st.event_tx, &mut st.output_journal, terminal);
+            let closed = st.output.enqueue(terminal);
             if !closed {
-                st.public_event_seq = st.public_event_seq.saturating_add(1);
-                if !st.output_journal.is_empty() {
-                    self.completed_outputs.insert(
-                        id,
-                        RetiredOutput {
-                            event_tx: st.event_tx,
-                            journal: st.output_journal,
-                        },
-                    );
-                }
+                self.output.retire(id, st.output);
             }
         }
         if !awaits_close {
-            self.latent_pages.release(id);
+            self.kv_budget.latent_pages.release(id);
             if let Some(index) = flow_pool_idx {
-                let _ = self.request_slots.release(index);
+                let _ = self.kv_budget.request_slots.release(index);
             }
             if let Some(index) = request_pool_idx
-                && let Err(error) = self.request_slots.release(index)
+                && let Err(error) = self.kv_budget.request_slots.release(index)
             {
                 tracing::error!(
                     request_id = id.0,

@@ -24,7 +24,7 @@ impl Scheduler {
             let mut ids = Vec::new();
             while let Some(st) = self.pending.pop_request() {
                 ids.push(st.req.request_id);
-                let _ = st.event_tx.send(GenerationEvent::Finished {
+                let _ = st.output.event_tx.send(GenerationEvent::Finished {
                     reason: FinishReason::Aborted,
                     stop_reason: None,
                     prompt_tokens: st.context.prompt_ids.len(),
@@ -94,7 +94,7 @@ impl Scheduler {
                 .expect("media state exists")
                 .terminal_intent
                 .cancel();
-            let drained = !self.has_inflight(id);
+            let drained = !self.inflight.contains(id);
             if drained {
                 self.finish_media(id, MediaEvent::Aborted, CloseReason::Cancelled, None);
             }
@@ -130,7 +130,7 @@ impl Scheduler {
                 images: 0,
                 queue: "pending",
             });
-            let _ = st.event_tx.send(GenerationEvent::Finished {
+            let _ = st.output.event_tx.send(GenerationEvent::Finished {
                 reason,
                 stop_reason: None,
                 prompt_tokens: st.context.prompt_ids.len(),
@@ -141,7 +141,7 @@ impl Scheduler {
     }
 
     pub(super) fn acknowledge_semantic(&mut self, id: RequestId, output_token_count: usize) {
-        let Some(current) = self.running.get(&id).map(|state| state.tokens_acked) else {
+        let Some(current) = self.running.get(&id).map(|state| state.output.tokens_acked) else {
             return;
         };
         if current == output_token_count {
@@ -158,7 +158,7 @@ impl Scheduler {
         // count of the commit ahead of it and releases with it.
         let mut ready: Vec<PendingSemanticCommit> = Vec::new();
         if let Some(state) = self.running.get_mut(&id) {
-            state.tokens_acked = output_token_count;
+            state.output.tokens_acked = output_token_count;
             if let Some((&acknowledged_cutoff, _)) =
                 state.token_cutoffs.range(..=output_token_count).next_back()
             {

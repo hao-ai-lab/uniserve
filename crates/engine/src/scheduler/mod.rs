@@ -28,6 +28,8 @@ mod control;
 mod execution;
 pub(crate) mod generation;
 pub(crate) mod image_artifact;
+mod inflight;
+mod kv_budget;
 mod logits;
 mod output;
 pub(crate) mod queue;
@@ -97,6 +99,12 @@ use uniserve_worker_ipc::{
 
 use crate::executor::{WorkerExecError, WorkerLossError};
 use crate::scheduler::image_artifact::validate_png_artifact;
+use inflight::{
+    InflightApply, InflightOp, InflightWindow, PendingCompletion, PendingFinish,
+    SubmittedPartitionAccounting,
+};
+use kv_budget::{KvBudget, KvSchedulerState};
+use output::{OutputSender, RequestOutput};
 use serde_json::json;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -332,15 +340,8 @@ pub(crate) struct ReqState {
     pub(crate) committed_producer_op_id: u64,
     /// Last ordered semantic control emitted for this request.
     pub(crate) control_seq: u64,
-    /// Number of public events accepted by the request's output journal.
-    pub(crate) public_event_seq: u64,
     /// Monotonic public-event bound carried by the latest semantic commit.
     pub(crate) public_event_limit: u64,
-    pub(crate) tokens_sent: usize,
-    /// Latest frontend-decoder token prefix accepted for semantic commit.
-    pub(crate) tokens_acked: usize,
-    /// Ordered public events waiting for immediate-consumer channel capacity.
-    pub(crate) output_journal: VecDeque<GenerationEvent>,
     /// Fixed semantic cutoffs indexed by public text-token count.
     pub(crate) token_cutoffs: BTreeMap<usize, VersionRef>,
     /// Ordered semantic commits held for the frontend decoder's exact-prefix
@@ -357,7 +358,7 @@ pub(crate) struct ReqState {
     /// retains this logical ownership until it submits a reachable consumer.
     pub(crate) latest_device_version: Option<ResidentDeviceVersion>,
     pub(crate) context: SchedulerContext,
-    pub(crate) event_tx: EventTx,
+    output: RequestOutput,
     pub(crate) cursor: GenerationCursor,
     pub queued_at: f64,
     pub(crate) terminal_intent: TerminalIntent,
@@ -383,127 +384,6 @@ struct FlowPrefixState {
     block_tables: Vec<BlockTable>,
     new_pages: Vec<(u32, Vec<BlockId>)>,
     materialized: bool,
-}
-
-struct RequestSlotPool {
-    free: Vec<u32>,
-    live: Vec<bool>,
-}
-
-struct LatentPagePool {
-    page_units: u32,
-    free: Vec<u32>,
-    owners: Vec<Option<RequestId>>,
-    allocations: HashMap<RequestId, Vec<u32>>,
-}
-
-impl LatentPagePool {
-    fn new(num_pages: u32, page_units: u32) -> Self {
-        Self {
-            page_units,
-            free: (1..num_pages).rev().collect(),
-            owners: vec![None; num_pages as usize],
-            allocations: HashMap::new(),
-        }
-    }
-
-    fn pages_needed(&self, units: u64) -> Option<usize> {
-        if units == 0 {
-            return Some(0);
-        }
-        let page_units = u64::from(self.page_units);
-        if page_units == 0 {
-            return None;
-        }
-        usize::try_from(units.div_ceil(page_units)).ok()
-    }
-
-    fn can_reserve(&self, request_id: RequestId, units: u64) -> bool {
-        let Some(needed) = self.pages_needed(units) else {
-            return false;
-        };
-        let held = self.allocations.get(&request_id).map_or(0, Vec::len);
-        needed.saturating_sub(held) <= self.free.len()
-    }
-
-    fn reserve(&mut self, request_id: RequestId, units: u64) -> bool {
-        if !self.can_reserve(request_id, units) {
-            return false;
-        }
-        let needed = self.pages_needed(units).unwrap_or_default();
-        let held = self.allocations.get(&request_id).map_or(0, Vec::len);
-        let mut pages = Vec::with_capacity(needed.saturating_sub(held));
-        for _ in held..needed {
-            let page = self.free.pop().expect("latent free-page invariant");
-            self.owners[page as usize] = Some(request_id);
-            pages.push(page);
-        }
-        self.allocations
-            .entry(request_id)
-            .or_default()
-            .extend(pages);
-        true
-    }
-
-    fn pages_for(&self, request_id: RequestId) -> &[u32] {
-        self.allocations
-            .get(&request_id)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
-    }
-
-    fn release(&mut self, request_id: RequestId) {
-        if let Some(pages) = self.allocations.remove(&request_id) {
-            for page in pages.into_iter().rev() {
-                self.owners[page as usize] = None;
-                self.free.push(page);
-            }
-        }
-    }
-
-    fn used_pages(&self) -> usize {
-        self.owners
-            .iter()
-            .skip(1)
-            .filter(|owner| owner.is_some())
-            .count()
-    }
-}
-
-impl RequestSlotPool {
-    fn new(capacity: usize) -> Self {
-        let capacity = capacity.clamp(1, u32::MAX as usize);
-        Self {
-            free: (1..=capacity as u32).rev().collect(),
-            live: vec![false; capacity + 1],
-        }
-    }
-
-    fn capacity(&self) -> usize {
-        self.live.len().saturating_sub(1)
-    }
-
-    fn is_empty(&self) -> bool {
-        self.free.is_empty()
-    }
-
-    fn acquire(&mut self) -> Option<u32> {
-        let index = self.free.pop()?;
-        self.live[index as usize] = true;
-        Some(index)
-    }
-
-    fn release(&mut self, index: u32) -> Result<(), &'static str> {
-        let Some(live) = self.live.get_mut(index as usize) else {
-            return Err("request-pool index is outside scheduler capacity");
-        };
-        if index == 0 || !*live {
-            return Err("request-pool index is not live");
-        }
-        *live = false;
-        self.free.push(index);
-        Ok(())
-    }
 }
 
 struct RetiringSession {
@@ -563,12 +443,6 @@ impl ReqState {
             .get(self.cursor.ingest.pending_image_step)
             .copied()
     }
-}
-
-struct KvSchedulerState {
-    block_pool: BlockPool,
-    coordinator: KvCacheCoordinator,
-    usable_blocks: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -676,21 +550,17 @@ struct PendingMedia {
 pub struct Scheduler {
     executor: Box<dyn Executor>,
     caps: WorkerInfo,
-    kv: Option<KvSchedulerState>,
+    /// Resident resource ownership and reservation accounting.
+    kv_budget: KvBudget,
     ctrl: ControlTokens,
     config: SchedulerConfig,
     /// Pluggable host-side logits-processor pipeline.
     logits_pipeline: Vec<crate::scheduler::logits::BuiltinLogitsProcessor>,
-    /// Encoder-output cache (hashed, LRU, budgeted).
-    enc_cache: EncoderCacheManager,
-    /// Encoder-cache entries reserved by admitted image requests.
-    reserved_encoder_entries: usize,
-    request_slots: RequestSlotPool,
-    latent_pages: LatentPagePool,
+    /// Active generation and standalone media request state.
     running: HashMap<RequestId, ReqState>,
     running_media: HashMap<RequestId, MediaFlowState>,
     /// Terminal requests retain only their bounded public journal.
-    completed_outputs: HashMap<RequestId, RetiredOutput>,
+    output: OutputSender,
     /// Worker-visible sessions whose close transaction has been submitted but
     /// not yet acknowledged. Their worker page holdings and logical leases remain
     /// owned until the close report establishes the worker-side retirement
@@ -701,23 +571,8 @@ pub struct Scheduler {
     retiring_media: HashMap<RequestId, RetiringMedia>,
     prefer_media: bool,
     pending: RequestQueue,
-    reserved_blocks: usize,
-    transfer_capacity: usize,
-    inflight_transfers: usize,
-    step_id: u64,
-    /// Ordered submitted-but-unresolved operations for each request. The front
-    /// owns the committed lease; later entries are bounded projected successors
-    /// whose versions and cursor deltas are resolved strictly in order.
-    inflight_ops: HashMap<RequestId, VecDeque<InflightOp>>,
-    /// Worker-ready completions waiting for their request-local predecessors.
-    /// Independent batch partitions may publish a successor before the host
-    /// observes its predecessor, while semantic cursor application remains
-    /// strictly request-ordered.
-    pending_completions: HashMap<RequestId, BTreeMap<u64, PendingCompletion>>,
-    /// Terminal outcomes whose projected successors still own worker-visible
-    /// request state. The scheduler retains all leases until those successors
-    /// drain, then publishes the terminal event exactly once.
-    pending_finishes: HashMap<RequestId, PendingFinish>,
+    /// Submitted operations, ordered completions, and per-batch timing state.
+    inflight: InflightWindow,
     /// Sequential denoise timesteps to execute per denoise op. The worker runs
     /// the exact same Euler steps and reports the cumulative step cursor.
     denoise_step_burst: u16,
@@ -727,23 +582,12 @@ pub struct Scheduler {
     /// the control loop exits and the host converts this into engine-dead.
     fatal: bool,
     latent_dtype: Option<DType>,
-    /// Submit timestamp per in-flight batch (for batch round-trip traces).
-    batch_started: HashMap<u64, Instant>,
-    /// Steps in the execution window that carry prompt work.
-    prefill_steps: HashSet<u64>,
-    /// Domain and physical-call identity for partitions still expected from each batch.
-    batch_partitions: HashMap<u64, HashMap<u32, SubmittedPartitionAccounting>>,
-    /// Worker duration per physical submission group across returned partitions.
-    batch_group_worker_exec_us: HashMap<u64, HashMap<u32, u64>>,
     /// Ordered semantic controls waiting to cross the worker boundary.
     pending_controls: VecDeque<Control>,
-    /// Controls attached to an in-flight batch, retained until its ack report.
-    control_batches: HashMap<u64, Vec<Control>>,
     /// The scheduler-authority identity stamped into every request key.
     authority_id: u64,
     /// Monotonic operation and request epochs.
     next_op_id: u64,
-    next_completion_seq: u64,
     next_product_generation: u64,
     next_collective_seq: u64,
     next_epoch: u64,
@@ -845,53 +689,6 @@ fn completion_priority(operation_variant: ForwardMode) -> u8 {
         ForwardMode::GenFlow | ForwardMode::Materialize | ForwardMode::TransferKvInstall => 0,
         _ => 1,
     }
-}
-
-/// One submitted-but-unresolved operation tracked in a request's ordered queue.
-/// Its apply record is paired by `(operation.request_key, operation.op_id)`.
-enum InflightApply {
-    Generation(SchedulerApply),
-    Media(MediaCursor),
-}
-
-struct InflightOp {
-    operation: Operation,
-    apply: InflightApply,
-    /// Submit timestamp, for the op's host round-trip latency history.
-    started: Instant,
-}
-
-impl InflightOp {
-    fn generation_apply(&self) -> &SchedulerApply {
-        match &self.apply {
-            InflightApply::Generation(apply) => apply,
-            InflightApply::Media(_) => unreachable!("media operation entered generation planning"),
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct SubmittedPartitionAccounting {
-    domain: uniserve_worker_ipc::Domain,
-    mixed: bool,
-    submission_group: u32,
-    operation_count: usize,
-}
-
-struct PendingCompletion {
-    record: ModelOutput,
-    products: Arc<[ProductPayload]>,
-    arrival_seq: u64,
-}
-
-struct PendingFinish {
-    reason: FinishReason,
-    stop_reason: Option<uniserve_core::StopReason>,
-}
-
-struct RetiredOutput {
-    event_tx: EventTx,
-    journal: VecDeque<GenerationEvent>,
 }
 
 const OUTPUT_JOURNAL_CAPACITY: usize = EVENT_BUFFER_CAPACITY;
@@ -1138,53 +935,6 @@ fn transition_output_bound(transition: &NextOp) -> usize {
         ForwardMode::Materialize => 3,
         _ => 2,
     }
-}
-
-/// Flush as many ordered journal entries as the immediate consumer can accept.
-/// Returns true when the consumer has closed.
-fn flush_public_journal(event_tx: &EventTx, journal: &mut VecDeque<GenerationEvent>) -> bool {
-    while let Some(event) = journal.pop_front() {
-        match event_tx.send(event) {
-            Ok(()) => {}
-            Err(EventSendError::Full(event)) => {
-                journal.push_front(*event);
-                return false;
-            }
-            Err(EventSendError::Closed(_)) => {
-                journal.clear();
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Append one event to the bounded public journal without changing its order.
-/// Returns true when the consumer has closed.
-fn enqueue_public_event(
-    event_tx: &EventTx,
-    journal: &mut VecDeque<GenerationEvent>,
-    event: GenerationEvent,
-) -> bool {
-    if flush_public_journal(event_tx, journal) {
-        return true;
-    }
-    if journal.is_empty() {
-        match event_tx.send(event) {
-            Ok(()) => return false,
-            Err(EventSendError::Closed(_)) => return true,
-            Err(EventSendError::Full(event)) => {
-                journal.push_back(*event);
-            }
-        }
-    } else {
-        journal.push_back(event);
-    }
-    assert!(
-        journal.len() <= OUTPUT_JOURNAL_CAPACITY,
-        "scheduler exceeded the bounded public output journal"
-    );
-    false
 }
 
 fn operation_trace(operation: &Operation, apply: &SchedulerApply) -> serde_json::Value {

@@ -154,7 +154,7 @@ impl Scheduler {
             .enumerate()
             .filter_map(|(index, id)| {
                 self.media_state(*id).and_then(|state| {
-                    let inflight = self.inflight_len(*id);
+                    let inflight = self.inflight.len(*id);
                     (!state.terminal_intent.is_terminal()
                         && inflight < max_unresolved
                         && next_media_quantum(state.projected).is_some())
@@ -168,8 +168,7 @@ impl Scheduler {
             return false;
         }
 
-        let step = self.step_id.saturating_add(1);
-        self.step_id = step;
+        let step = self.inflight.next_step();
         let submit_at = Instant::now();
         let collective_seq = self.next_collective_seq.max(1);
         self.next_collective_seq = collective_seq.saturating_add(1);
@@ -185,7 +184,8 @@ impl Scheduler {
                 let quantum =
                     next_media_quantum(state.projected).expect("media candidate is runnable");
                 let predicate = self
-                    .inflight_ops
+                    .inflight
+                    .operations
                     .get(&id)
                     .and_then(|inflight| inflight.back())
                     .and_then(|inflight| inflight.operation.outputs.first().cloned());
@@ -236,7 +236,7 @@ impl Scheduler {
                 latent_placements.push(LatentPlacement {
                     request_key,
                     op_id,
-                    page_table: self.latent_pages.pages_for(id).to_vec(),
+                    page_table: self.kv_budget.latent_pages.pages_for(id).to_vec(),
                     latent_units: self.caps.latent_page_units,
                     height: 768,
                     width: 1344,
@@ -303,8 +303,8 @@ impl Scheduler {
             latent_placements,
             decode_placements,
         };
-        self.batch_started.insert(step, submit_at);
-        self.batch_partitions.insert(
+        self.inflight.batch_started.insert(step, submit_at);
+        self.inflight.batch_partitions.insert(
             step,
             HashMap::from([(
                 1,
@@ -316,18 +316,20 @@ impl Scheduler {
                 },
             )]),
         );
-        self.batch_group_worker_exec_us.insert(step, HashMap::new());
+        self.inflight
+            .batch_group_worker_exec_us
+            .insert(step, HashMap::new());
         let batch = Batch::new(step, admissions, vec![partition]).with_controls(controls.clone());
         if let Err(error) = self.executor.submit(batch) {
-            self.batch_started.remove(&step);
-            self.batch_partitions.remove(&step);
-            self.batch_group_worker_exec_us.remove(&step);
+            self.inflight.batch_started.remove(&step);
+            self.inflight.batch_partitions.remove(&step);
+            self.inflight.batch_group_worker_exec_us.remove(&step);
             self.fatal = true;
             self.fail_all_running(&error.to_string());
             return false;
         }
         if !controls.is_empty() {
-            self.control_batches.insert(step, controls);
+            self.inflight.control_batches.insert(step, controls);
         }
         true
     }
@@ -345,14 +347,14 @@ impl Scheduler {
         self.stats
             .kv_cache
             .free_blocks
-            .store(self.free_kv_blocks(), Ordering::Relaxed);
+            .store(self.kv_budget.free_blocks(), Ordering::Relaxed);
         self.stats
             .general
             .in_flight
             .store(self.executor.in_flight(), Ordering::Relaxed);
         // drain the manager's event ring so it doesn't grow unbounded; the
         // counters below already aggregate it, but draining keeps memory bounded.
-        if let Some(kv) = self.kv.as_ref() {
+        if let Some(kv) = self.kv_budget.cache.as_ref() {
             let _ = kv.block_pool.drain_events();
             self.stats
                 .kv_cache
@@ -367,18 +369,18 @@ impl Scheduler {
                 .cached_blocks
                 .store(kv.block_pool.cached_blocks(), Ordering::Relaxed);
         }
-        self.stats
-            .encoder
-            .cache_queries
-            .store(self.enc_cache.stats.queries, Ordering::Relaxed);
+        self.stats.encoder.cache_queries.store(
+            self.kv_budget.encoder_cache.stats.queries,
+            Ordering::Relaxed,
+        );
         self.stats
             .encoder
             .cache_hits
-            .store(self.enc_cache.stats.hits, Ordering::Relaxed);
+            .store(self.kv_budget.encoder_cache.stats.hits, Ordering::Relaxed);
         self.stats
             .encoder
             .cached
-            .store(self.enc_cache.len(), Ordering::Relaxed);
+            .store(self.kv_budget.encoder_cache.len(), Ordering::Relaxed);
     }
 
     /// Resolve at most one ready result so assembly can refill the freed slot
@@ -398,13 +400,6 @@ impl Scheduler {
         }
     }
 
-    pub(super) fn any_denoise_inflight(&self) -> bool {
-        self.inflight_ops
-            .values()
-            .flatten()
-            .any(|op| op.operation.work == ForwardMode::GenFlow)
-    }
-
     pub(super) fn flow_prefix_is_schedulable(&self, id: RequestId) -> bool {
         let prefix_is_pending = self
             .running
@@ -413,27 +408,19 @@ impl Scheduler {
             .is_some_and(|prefix| !prefix.materialized);
         !prefix_is_pending
             || !self
-                .inflight_ops
+                .inflight
+                .operations
                 .get(&id)
                 .into_iter()
                 .flatten()
                 .any(|op| op.operation.work == ForwardMode::GenFlow)
     }
 
-    pub(super) fn has_inflight(&self, id: RequestId) -> bool {
-        self.inflight_ops
-            .get(&id)
-            .is_some_and(|queue| !queue.is_empty())
-    }
-
-    pub(super) fn inflight_len(&self, id: RequestId) -> usize {
-        self.inflight_ops.get(&id).map_or(0, VecDeque::len)
-    }
-
     pub(super) fn projected_cursor(&self, id: RequestId) -> Option<GenerationCursor> {
         let st = self.running.get(&id)?;
         let inflight = self
-            .inflight_ops
+            .inflight
+            .operations
             .get(&id)
             .into_iter()
             .flatten()
@@ -468,7 +455,8 @@ impl Scheduler {
 
     pub(super) fn projected_parent(&self, id: RequestId) -> Option<VersionRef> {
         let operation = self
-            .inflight_ops
+            .inflight
+            .operations
             .get(&id)?
             .iter()
             .rev()
@@ -504,7 +492,8 @@ impl Scheduler {
         self.running.get(&id).map_or(0, |state| {
             state.public_event_limit.max(
                 state
-                    .public_event_seq
+                    .output
+                    .event_seq
                     .saturating_add(apply.output_event_bound as u64),
             )
         })
@@ -560,8 +549,10 @@ impl Scheduler {
                     match self.executor.control_wait(ControlOp::DropSession(id), None) {
                         Ok(_) => {
                             self.retiring_media.remove(&id);
-                            self.latent_pages.release(id);
-                            if let Err(error) = self.request_slots.release(request_pool_idx) {
+                            self.kv_budget.latent_pages.release(id);
+                            if let Err(error) =
+                                self.kv_budget.request_slots.release(request_pool_idx)
+                            {
                                 tracing::error!(
                                     request_id = id.0,
                                     error,
@@ -603,9 +594,9 @@ impl Scheduler {
                 match self.executor.control_wait(ControlOp::DropSession(id), None) {
                     Ok(_) => {
                         self.retiring_sessions.remove(&id);
-                        self.latent_pages.release(id);
+                        self.kv_budget.latent_pages.release(id);
                         if let Some(index) = flow_pool_idx
-                            && let Err(error) = self.request_slots.release(index)
+                            && let Err(error) = self.kv_budget.request_slots.release(index)
                         {
                             tracing::error!(
                                 request_id = id.0,
@@ -615,7 +606,7 @@ impl Scheduler {
                             );
                             self.fatal = true;
                         }
-                        if let Err(error) = self.request_slots.release(request_pool_idx) {
+                        if let Err(error) = self.kv_budget.request_slots.release(request_pool_idx) {
                             tracing::error!(
                                 request_id = id.0,
                                 request_pool_idx,
@@ -646,13 +637,18 @@ impl Scheduler {
         let Some(state) = self.running.get(&id) else {
             return false;
         };
-        let Some(queue) = self.inflight_ops.get(&id).filter(|queue| !queue.is_empty()) else {
+        let Some(queue) = self
+            .inflight
+            .operations
+            .get(&id)
+            .filter(|queue| !queue.is_empty())
+        else {
             return false;
         };
         if queue.len() >= self.executor.pipeline_depth().max(1)
             || queue.len() >= self.caps.max_unresolved_window as usize
             || state.terminal_intent.is_terminal()
-            || self.pending_finishes.contains_key(&id)
+            || self.inflight.finishes.contains_key(&id)
             || !Self::device_token_relay_eligible(state)
         {
             return false;
@@ -730,7 +726,7 @@ impl Scheduler {
     }
 
     pub(super) fn projected_inflight_variant(&self, id: RequestId) -> Option<ForwardMode> {
-        if !self.has_inflight(id) {
+        if !self.inflight.contains(id) {
             return None;
         }
         let state = self.running.get(&id)?;
@@ -741,7 +737,8 @@ impl Scheduler {
             return None;
         }
         let last_intent = self
-            .inflight_ops
+            .inflight
+            .operations
             .get(&id)
             .and_then(|ops| ops.back())
             .map(|inflight| &inflight.generation_apply().intent);
@@ -828,13 +825,13 @@ impl Scheduler {
     }
 
     pub(super) fn can_schedule_next(&self, id: RequestId) -> bool {
-        !self.pending_finishes.contains_key(&id)
+        !self.inflight.finishes.contains_key(&id)
             && self.output_window_ready(id)
             && self
                 .running
                 .get(&id)
                 .is_some_and(|state| self.pending_commit_horizon_open(state))
-            && (!self.has_inflight(id)
+            && (!self.inflight.contains(id)
                 || self
                     .projected_inflight_variant(id)
                     .is_some_and(|target| self.can_queue_successor(id, target)))
@@ -854,15 +851,13 @@ impl Scheduler {
         let Some(state) = self.running.get(&id) else {
             return false;
         };
-        if state.event_tx.is_closed() {
+        if state.output.is_closed() {
             return false;
         }
-        let available = state
-            .event_tx
-            .capacity()
-            .saturating_add(OUTPUT_JOURNAL_CAPACITY.saturating_sub(state.output_journal.len()));
+        let available = state.output.available_capacity();
         let reserved = self
-            .inflight_ops
+            .inflight
+            .operations
             .get(&id)
             .into_iter()
             .flatten()
@@ -920,7 +915,8 @@ impl Scheduler {
         domain.peak_credits.fetch_max(active, Ordering::Relaxed);
         domain.launched_operations.fetch_add(1, Ordering::Relaxed);
         domain.queue_us.fetch_add(queue_us, Ordering::Relaxed);
-        self.inflight_ops
+        self.inflight
+            .operations
             .entry(request_id)
             .or_default()
             .push_back(InflightOp {
@@ -996,7 +992,7 @@ impl Scheduler {
     }
 
     pub(super) fn fail_inflight_domain_credits(&self) {
-        for inflight in self.inflight_ops.values().flatten() {
+        for inflight in self.inflight.operations.values().flatten() {
             self.reclaim_domain_credit(inflight.operation.domain, true);
         }
     }
@@ -1008,14 +1004,15 @@ impl Scheduler {
     ) {
         let id = record.request_key.session_id;
         let op_id = record.op_id.0;
-        let known = self.inflight_ops.get(&id).is_some_and(|queue| {
+        let known = self.inflight.operations.get(&id).is_some_and(|queue| {
             queue.iter().any(|inflight| {
                 inflight.operation.request_key == record.request_key
                     && inflight.operation.op_id.0 == op_id
             })
         });
         let duplicate = self
-            .pending_completions
+            .inflight
+            .completions
             .get(&id)
             .is_some_and(|pending| pending.contains_key(&op_id));
         if !known || duplicate {
@@ -1034,9 +1031,8 @@ impl Scheduler {
             }
             return;
         }
-        let arrival_seq = self.next_completion_seq;
-        self.next_completion_seq = self.next_completion_seq.saturating_add(1);
-        self.pending_completions.entry(id).or_default().insert(
+        let arrival_seq = self.inflight.next_arrival();
+        self.inflight.completions.entry(id).or_default().insert(
             op_id,
             PendingCompletion {
                 record,
@@ -1083,7 +1079,7 @@ impl Scheduler {
         }
 
         let terminal = self.media_state(id).and_then(|state| {
-            if self.has_inflight(id) {
+            if self.inflight.contains(id) {
                 return None;
             }
             if let MediaTerminalIntent::Failure(message) = &state.terminal_intent {
@@ -1134,8 +1130,8 @@ impl Scheduler {
         self.order.retain(|candidate| *candidate != id);
         let _ = state.event_tx.send(event);
         if !state.admission_sent {
-            self.latent_pages.release(id);
-            let _ = self.request_slots.release(state.request_pool_idx);
+            self.kv_budget.latent_pages.release(id);
+            let _ = self.kv_budget.request_slots.release(state.request_pool_idx);
             return;
         }
         let request_key = state.admission.request_key;
@@ -1154,64 +1150,13 @@ impl Scheduler {
         );
     }
 
-    pub(super) fn take_ready_completions(&mut self) -> Vec<PendingCompletion> {
-        let mut ready = self
-            .pending_completions
-            .iter()
-            .filter_map(|(id, pending)| {
-                let inflight = self.inflight_ops.get(id)?.front()?;
-                let op_id = inflight.operation.op_id.0;
-                let completion = pending.get(&op_id)?;
-                Some((
-                    completion_priority(inflight.operation.work),
-                    completion.arrival_seq,
-                    *id,
-                    op_id,
-                ))
-            })
-            .collect::<Vec<_>>();
-        ready.sort_unstable_by_key(|(priority, arrival_seq, ..)| (*priority, *arrival_seq));
-        let mut completions = Vec::with_capacity(ready.len());
-        for (_, _, id, op_id) in ready {
-            let Some(pending) = self.pending_completions.get_mut(&id) else {
-                continue;
-            };
-            if let Some(completion) = pending.remove(&op_id) {
-                completions.push(completion);
-            }
-            if pending.is_empty() {
-                self.pending_completions.remove(&id);
-            }
-        }
-        completions
-    }
-
     /// Resolve the front in-flight op for `id` by the worker's echoed `op_id`.
     pub(super) fn pop_inflight(
         &mut self,
         request_key: RequestKey,
         op_id: u64,
     ) -> Option<(Operation, InflightApply, Instant)> {
-        let id = request_key.session_id;
-        let queue = self.inflight_ops.get_mut(&id)?;
-        if op_id == 0
-            || queue.front().is_none_or(|inflight| {
-                inflight.operation.request_key != request_key || inflight.operation.op_id.0 != op_id
-            })
-        {
-            return None;
-        }
-        let inflight = queue.pop_front().expect("front checked above");
-        let empty = queue.is_empty();
-        if inflight.operation.bounds.max_transfer_bytes > 0 {
-            self.inflight_transfers = self
-                .inflight_transfers
-                .checked_sub(1)
-                .expect("completed transfer operation owns one reservation");
-        }
-        if empty {
-            self.inflight_ops.remove(&id);
-        }
+        let inflight = self.inflight.pop(request_key, op_id)?;
         self.reclaim_domain_credit(inflight.operation.domain, false);
         Some((inflight.operation, inflight.apply, inflight.started))
     }
@@ -1283,38 +1228,39 @@ impl Scheduler {
         let result_step_id = report.step_id;
         let mut returned_accounting = HashMap::with_capacity(report.partitions.len());
         let mut invalid_partition = false;
-        let batch_complete = if let Some(pending) = self.batch_partitions.get_mut(&result_step_id) {
-            for partition in &report.partitions {
-                if let Some(accounting) = pending.remove(&partition.partition_id) {
-                    if accounting.operation_count != partition.completions.len() {
+        let batch_complete =
+            if let Some(pending) = self.inflight.batch_partitions.get_mut(&result_step_id) {
+                for partition in &report.partitions {
+                    if let Some(accounting) = pending.remove(&partition.partition_id) {
+                        if accounting.operation_count != partition.completions.len() {
+                            tracing::error!(
+                                step_id = result_step_id,
+                                partition_id = partition.partition_id,
+                                expected_operations = accounting.operation_count,
+                                actual_completions = partition.completions.len(),
+                                "executor returned an incomplete partition"
+                            );
+                            invalid_partition = true;
+                        }
+                        returned_accounting.insert(partition.partition_id, accounting);
+                    } else {
                         tracing::error!(
                             step_id = result_step_id,
                             partition_id = partition.partition_id,
-                            expected_operations = accounting.operation_count,
-                            actual_completions = partition.completions.len(),
-                            "executor returned an incomplete partition"
+                            "executor returned a duplicate or unknown partition"
                         );
                         invalid_partition = true;
                     }
-                    returned_accounting.insert(partition.partition_id, accounting);
-                } else {
-                    tracing::error!(
-                        step_id = result_step_id,
-                        partition_id = partition.partition_id,
-                        "executor returned a duplicate or unknown partition"
-                    );
-                    invalid_partition = true;
                 }
-            }
-            pending.is_empty()
-        } else {
-            tracing::error!(
-                step_id = result_step_id,
-                "executor returned a result for an unknown batch"
-            );
-            invalid_partition = true;
-            false
-        };
+                pending.is_empty()
+            } else {
+                tracing::error!(
+                    step_id = result_step_id,
+                    "executor returned a result for an unknown batch"
+                );
+                invalid_partition = true;
+                false
+            };
         if invalid_partition {
             self.fatal = true;
             self.fail_all_running("executor returned an invalid completion partition");
@@ -1350,6 +1296,7 @@ impl Scheduler {
             }
             if let Some(worker_exec_us) = partition.worker_exec_us {
                 let groups = self
+                    .inflight
                     .batch_group_worker_exec_us
                     .get_mut(&result_step_id)
                     .expect("known batch has worker timing state");
@@ -1377,22 +1324,24 @@ impl Scheduler {
             }
         }
         if batch_complete {
-            self.batch_partitions.remove(&result_step_id);
-            if let Some(controls) = self.control_batches.remove(&result_step_id) {
+            self.inflight.batch_partitions.remove(&result_step_id);
+            if let Some(controls) = self.inflight.control_batches.remove(&result_step_id) {
                 self.acknowledge_controls(&controls);
             }
         }
         let batch_roundtrip_us = self
+            .inflight
             .batch_started
             .get(&result_step_id)
             .map(|start| start.elapsed().as_micros() as u64)
             .unwrap_or(0);
         if batch_complete {
-            self.batch_started.remove(&result_step_id);
-            self.prefill_steps.remove(&result_step_id);
+            self.inflight.batch_started.remove(&result_step_id);
+            self.inflight.prefill_steps.remove(&result_step_id);
         }
         let worker_us = if batch_complete {
-            self.batch_group_worker_exec_us
+            self.inflight
+                .batch_group_worker_exec_us
                 .remove(&result_step_id)
                 .into_iter()
                 .flat_map(|groups| groups.into_values())
@@ -1438,7 +1387,7 @@ impl Scheduler {
         let mut resolved_ops = trace_enabled.then(|| Vec::with_capacity(completion_count));
         let mut progress_ops = trace_enabled.then(|| Vec::with_capacity(completion_count));
         loop {
-            let completions = self.take_ready_completions();
+            let completions = self.inflight.take_ready();
             if completions.is_empty() {
                 break;
             }
@@ -1536,7 +1485,7 @@ impl Scheduler {
                 }
                 if record.status == OpStatus::Ok && !operation.advances_state {
                     let completion_has_device_consumer =
-                        self.inflight_ops.get(&id).is_some_and(|queue| {
+                        self.inflight.operations.get(&id).is_some_and(|queue| {
                             queue.iter().any(|inflight| {
                                 inflight
                                     .operation
@@ -1561,9 +1510,9 @@ impl Scheduler {
                     .running
                     .get(&id)
                     .is_some_and(|state| state.terminal_intent.is_terminal())
-                    || self.pending_finishes.contains_key(&id);
+                    || self.inflight.finishes.contains_key(&id);
                 if semantic_blocked {
-                    self.release_transition_resources(id, &apply);
+                    self.kv_budget.release_transition(id, &apply);
                     self.finish_pending_if_idle(id);
                     continue;
                 }
@@ -1624,7 +1573,7 @@ impl Scheduler {
                 } else {
                     None
                 };
-                let retain_device_version = !self.has_inflight(id);
+                let retain_device_version = !self.inflight.contains(id);
                 if let Some(state) = self.running.get_mut(&id)
                     && advanced
                 {
@@ -1686,7 +1635,7 @@ impl Scheduler {
                 {
                     prefix.materialized = true;
                 }
-                self.release_transition_resources(id, &apply);
+                self.kv_budget.release_transition(id, &apply);
                 if release_flow_prefix {
                     self.release_flow_prefix(id);
                 }
@@ -1705,8 +1654,10 @@ impl Scheduler {
                     }
                 }
                 let priority = completion_priority(operation_variant);
-                let public_tokens_before =
-                    self.running.get(&id).map_or(0, |state| state.tokens_sent);
+                let public_tokens_before = self
+                    .running
+                    .get(&id)
+                    .map_or(0, |state| state.output.tokens_sent);
                 if record.status == OpStatus::Predicated {
                     if let Some(state) = self.running.get_mut(&id) {
                         state.cursor.resources.blocks_sent = state
@@ -1751,15 +1702,15 @@ impl Scheduler {
                     operation.work,
                     ForwardMode::TokenExtend | ForwardMode::TokenDecode | ForwardMode::TokenVerify
                 );
-                if self.running.contains_key(&id) && !self.pending_finishes.contains_key(&id) {
+                if self.running.contains_key(&id) && !self.inflight.finishes.contains_key(&id) {
                     self.resolve(id, operation, apply, view, prefix_versions.clone());
                 }
                 if token_operation {
                     let mut immediate_commit: Option<(VersionRef, VersionRef, u64)> = None;
                     if let Some(state) = self.running.get_mut(&id) {
-                        let emitted_public = state.tokens_sent > public_tokens_before;
+                        let emitted_public = state.output.tokens_sent > public_tokens_before;
                         if emitted_public {
-                            let emitted = state.tokens_sent - public_tokens_before;
+                            let emitted = state.output.tokens_sent - public_tokens_before;
                             for (offset, selected) in
                                 prefix_versions.into_iter().take(emitted).enumerate()
                             {
@@ -1768,10 +1719,12 @@ impl Scheduler {
                                     .insert(public_tokens_before + offset + 1, selected);
                             }
                             if emitted > 0
-                                && !state.token_cutoffs.contains_key(&state.tokens_sent)
+                                && !state.token_cutoffs.contains_key(&state.output.tokens_sent)
                                 && let Some(selected) = selected_fixed
                             {
-                                state.token_cutoffs.insert(state.tokens_sent, selected);
+                                state
+                                    .token_cutoffs
+                                    .insert(state.output.tokens_sent, selected);
                             }
                         }
                         if let Some((expected_parent, selected, public_event_limit)) =
@@ -1789,7 +1742,7 @@ impl Scheduler {
                                 .map(|pending| pending.selected.clone())
                                 .unwrap_or(expected_parent);
                             let token_count = if emitted_public {
-                                Some(state.tokens_sent)
+                                Some(state.output.tokens_sent)
                             } else {
                                 state
                                     .pending_commits
@@ -1978,18 +1931,11 @@ impl Scheduler {
     }
 
     pub(super) fn fail_all_inflight(&mut self, msg: &str) {
-        let ids: Vec<RequestId> = self.inflight_ops.keys().copied().collect();
         self.fail_inflight_domain_credits();
-        self.inflight_ops.clear();
-        self.inflight_transfers = 0;
-        self.pending_completions.clear();
         // the submitted batches whose results will now never return are
         // failed here, so drop their pending submit-timestamps too — otherwise
         // `batch_started` accumulates orphaned entries for every failed batch.
-        self.batch_started.clear();
-        self.prefill_steps.clear();
-        self.batch_partitions.clear();
-        self.batch_group_worker_exec_us.clear();
+        let ids = self.inflight.clear_failed();
         for id in ids {
             if self.running.contains_key(&id) {
                 self.emit(
@@ -2005,13 +1951,7 @@ impl Scheduler {
 
     pub(super) fn fail_all_running(&mut self, message: &str) {
         self.fail_inflight_domain_credits();
-        self.inflight_ops.clear();
-        self.inflight_transfers = 0;
-        self.pending_completions.clear();
-        self.batch_started.clear();
-        self.prefill_steps.clear();
-        self.batch_partitions.clear();
-        self.batch_group_worker_exec_us.clear();
+        self.inflight.clear_failed();
         while let Some(submission) = self.pending_media.pop_front() {
             let _ = submission.event_tx.send(MediaEvent::Failed {
                 message: message.to_string(),

@@ -2,7 +2,7 @@ use super::*;
 
 impl Scheduler {
     pub(super) fn enqueue(&mut self, req: GenerationRequest, event_tx: EventTx) {
-        if self.kv.is_none() {
+        if self.kv_budget.cache.is_none() {
             let _ = event_tx.send(GenerationEvent::Rejected {
                 message: "generation request requires worker KV resources".into(),
             });
@@ -35,7 +35,7 @@ impl Scheduler {
         // queue grow without bound under overload —
         // an unbounded burst would otherwise OOM the process and take down every
         // in-flight request. Reject the new submit with a typed event.
-        let waiting = self.pending_request_count() + self.completed_outputs.len();
+        let waiting = self.pending_request_count() + self.output.retained_len();
         if waiting >= self.config.max_num_waiting {
             self.trace_record(json!({
                 "event": "request_rejected",
@@ -71,7 +71,7 @@ impl Scheduler {
         let finish_token_ids = finish_token_ids(&req, &self.ctrl.eos);
         let st = ReqState {
             finish_token_ids,
-            block_tables: (0..self.kv_state().block_pool.num_groups())
+            block_tables: (0..self.kv_budget.cache().block_pool.num_groups())
                 .map(|group| BlockTable::new(group, self.caps.block_size as usize))
                 .collect(),
             flow_prefix: None,
@@ -85,18 +85,14 @@ impl Scheduler {
             committed_semantic: uniserve_core::Digest::zero(),
             committed_producer_op_id: 0,
             control_seq: 0,
-            public_event_seq: 0,
             public_event_limit: 0,
-            tokens_sent: 0,
-            tokens_acked: 0,
-            output_journal: VecDeque::new(),
             token_cutoffs: BTreeMap::new(),
             pending_commits: VecDeque::new(),
             cancel_cutoff: None,
             latest_device_version: None,
             cursor: GenerationCursor::new(phase0, worst, reserve_worstcase),
             context,
-            event_tx,
+            output: RequestOutput::new(event_tx),
             queued_at: now(),
             terminal_intent: super::TerminalIntent::None,
             req,
@@ -138,7 +134,7 @@ impl Scheduler {
             });
             return;
         }
-        if self.pending.len() + self.pending_media.len() + self.completed_outputs.len()
+        if self.pending.len() + self.pending_media.len() + self.output.retained_len()
             >= self.config.max_num_waiting
         {
             let _ = submission.event_tx.send(MediaEvent::Rejected {
@@ -150,22 +146,23 @@ impl Scheduler {
     }
 
     pub(super) fn admit_media(&mut self) {
-        while !self.request_slots.is_empty()
+        while !self.kv_budget.request_slots.is_empty()
             && self.running_request_count() < self.config.max_num_seqs
         {
             let Some(submission) = self.pending_media.pop_front() else {
                 break;
             };
             let id = submission.request.request_id;
-            let Some(request_pool_idx) = self.request_slots.acquire() else {
+            let Some(request_pool_idx) = self.kv_budget.request_slots.acquire() else {
                 self.pending_media.push_front(submission);
                 break;
             };
             if !self
+                .kv_budget
                 .latent_pages
                 .reserve(id, u64::from(self.caps.latent_page_units))
             {
-                let _ = self.request_slots.release(request_pool_idx);
+                let _ = self.kv_budget.request_slots.release(request_pool_idx);
                 self.pending_media.push_front(submission);
                 break;
             }
@@ -243,7 +240,7 @@ impl Scheduler {
     }
 
     pub(super) fn worker_image_latent_used(&self) -> u64 {
-        (self.latent_pages.used_pages() as u64)
+        (self.kv_budget.latent_pages.used_pages() as u64)
             .saturating_mul(u64::from(self.caps.latent_page_units))
     }
 
@@ -261,7 +258,7 @@ impl Scheduler {
             .map(|st| self.worker_image_latent_units_for(st).max(1))
             .unwrap_or(0);
         let worker_capacity_ok = !self.worker_tracks_image_latent()
-            || self.latent_pages.can_reserve(id, requested_units);
+            || self.kv_budget.latent_pages.can_reserve(id, requested_units);
         worker_capacity_ok
     }
 
@@ -284,22 +281,22 @@ impl Scheduler {
         {
             return true;
         }
-        let Some(request_pool_idx) = self.request_slots.acquire() else {
+        let Some(request_pool_idx) = self.kv_budget.request_slots.acquire() else {
             return false;
         };
-        let mut block_tables = (0..self.kv_state().block_pool.num_groups())
+        let mut block_tables = (0..self.kv_budget.cache().block_pool.num_groups())
             .map(|group| BlockTable::new(group, self.caps.block_size as usize))
             .collect::<Vec<_>>();
-        let Some(new_pages) = self.kv_state().coordinator.ensure_capacity(
-            &self.kv_state().block_pool,
+        let Some(new_pages) = self.kv_budget.cache().coordinator.ensure_capacity(
+            &self.kv_budget.cache().block_pool,
             &mut block_tables,
             prefix_tokens,
         ) else {
-            let _ = self.request_slots.release(request_pool_idx);
+            let _ = self.kv_budget.request_slots.release(request_pool_idx);
             return false;
         };
         let Some(state) = self.running.get_mut(&id) else {
-            let _ = self.request_slots.release(request_pool_idx);
+            let _ = self.kv_budget.request_slots.release(request_pool_idx);
             return false;
         };
         state.flow_prefix = Some(FlowPrefixState {
@@ -317,7 +314,10 @@ impl Scheduler {
             .get_mut(&id)
             .and_then(|state| state.flow_prefix.take());
         if let Some(prefix) = prefix
-            && let Err(error) = self.request_slots.release(prefix.request_pool_idx)
+            && let Err(error) = self
+                .kv_budget
+                .request_slots
+                .release(prefix.request_pool_idx)
         {
             tracing::error!(
                 request_id = id.0,
@@ -329,52 +329,6 @@ impl Scheduler {
         }
     }
 
-    pub(super) fn reserve_transition_resources(&mut self, transition: &mut NextOp) -> bool {
-        let id = transition.request_id;
-        if transition.operation_variant == ForwardMode::GenFlow && !self.ensure_flow_prefix(id) {
-            return false;
-        }
-        let resources = &transition.resources;
-        if resources.latent_units > 0
-            && self.worker_tracks_image_latent()
-            && !self.latent_pages.can_reserve(id, resources.latent_units)
-        {
-            return false;
-        }
-        let uses_transfer = transition.bounds.max_transfer_bytes > 0;
-        if uses_transfer && self.inflight_transfers >= self.transfer_capacity {
-            return false;
-        }
-        if resources.latent_units > 0
-            && self.worker_tracks_image_latent()
-            && !self.latent_pages.reserve(id, resources.latent_units)
-        {
-            return false;
-        }
-        if uses_transfer {
-            self.inflight_transfers += 1;
-        }
-        transition.reserved_us = uniserve_core::now_monotonic_us();
-        true
-    }
-
-    pub(super) fn release_transition_resources(&mut self, id: RequestId, apply: &SchedulerApply) {
-        for class in &apply.release_on_apply {
-            match class {
-                uniserve_worker_ipc::ResourceClass::ImageLatent => {
-                    self.latent_pages.release(id);
-                }
-                _ => {}
-            }
-        }
-    }
-
-    /// KV tokens a decode op must have room for: the sampled token plus any
-    /// speculative draft the worker verifies alongside it.
-    pub(super) fn decode_capacity_target(&self, pos: usize, spec_len: usize) -> usize {
-        pos.saturating_add(1).saturating_add(spec_len)
-    }
-
     /// One loop iteration of the schedule-ahead loop. Returns true if any work
     /// was submitted or any result resolved.
     pub(super) fn reap_cancellations(&mut self) {
@@ -384,7 +338,9 @@ impl Scheduler {
         let cancelled: Vec<(RequestId, TerminalIntent)> = self
             .running
             .iter()
-            .filter(|(id, state)| state.terminal_intent.is_terminal() && !self.has_inflight(**id))
+            .filter(|(id, state)| {
+                state.terminal_intent.is_terminal() && !self.inflight.contains(**id)
+            })
             .map(|(id, state)| (*id, state.terminal_intent))
             .collect();
         for (id, intent) in cancelled {
@@ -403,7 +359,7 @@ impl Scheduler {
                 self.media_state(*id)
                     .filter(|state| {
                         state.terminal_intent.is_terminal()
-                            && !self.has_inflight(state.request.request_id)
+                            && !self.inflight.contains(state.request.request_id)
                     })
                     .map(|state| (state.request.request_id, state.terminal_intent.clone()))
             })
@@ -428,7 +384,7 @@ impl Scheduler {
         let bs = self.caps.block_size as usize;
         loop {
             if self.running_request_count() >= self.config.max_num_seqs
-                || self.request_slots.is_empty()
+                || self.kv_budget.request_slots.is_empty()
             {
                 break;
             }
@@ -439,10 +395,11 @@ impl Scheduler {
                 let need = head.cursor.resources.worstcase_blocks;
                 let encoder_entries = head.req.resources.encoder_cache_keys.len();
                 let encoder_ok = self
+                    .kv_budget
                     .reserved_encoder_entries
                     .saturating_add(encoder_entries)
-                    <= self.enc_cache.budget();
-                if need > self.usable_kv_blocks() {
+                    <= self.kv_budget.encoder_cache.budget();
+                if need > self.kv_budget.usable_blocks() {
                     let st = self.pending.pop_request().unwrap();
                     self.trace_record(json!({
                         "event": "request_rejected",
@@ -450,35 +407,35 @@ impl Scheduler {
                         "request_id": st.req.request_id.0,
                         "reason": "too_large",
                         "needed_blocks": need,
-                        "usable_blocks": self.usable_kv_blocks(),
+                        "usable_blocks": self.kv_budget.usable_blocks(),
                         "generation": &st.req.behavior,
                         "prompt_tokens": st.context.prompt_ids.len(),
                     }));
-                    let _ = st.event_tx.send(GenerationEvent::Rejected {
+                    let _ = st.output.event_tx.send(GenerationEvent::Rejected {
                         message: "request exceeds total KV capacity".into(),
                     });
                     continue;
                 }
-                if self.free_kv_blocks() >= need && encoder_ok {
+                if self.kv_budget.free_blocks() >= need && encoder_ok {
                     let st = self.pending.pop_request().unwrap();
                     let id = st.req.request_id;
                     self.admit_running(st);
                     // Physically allocate the worst case now: nothing can take
                     // these blocks, so this request can never fail mid-flight.
                     self.ensure_request_capacity(id, need * bs);
-                    self.reserved_blocks += need;
+                    self.kv_budget.reserved_blocks += need;
                     continue;
                 }
             } else {
                 let n = head.context.prompt_ids.len();
-                let text_usable_blocks = (0..self.kv_state().block_pool.num_groups())
-                    .map(|group| self.kv_state().block_pool.group_capacity(group))
+                let text_usable_blocks = (0..self.kv_budget.cache().block_pool.num_groups())
+                    .map(|group| self.kv_budget.cache().block_pool.group_capacity(group))
                     .min()
                     .unwrap_or_default();
                 let prefix_hit = prefix_hit(
-                    &self.kv_state().coordinator,
+                    &self.kv_budget.cache().coordinator,
                     head,
-                    &self.kv_state().block_pool,
+                    &self.kv_budget.cache().block_pool,
                 );
                 let cached_prefix_blocks = prefix_hit.cached_blocks;
                 let cached_prefix_blocks = cached_prefix_blocks.min(n.div_ceil(bs));
@@ -504,16 +461,17 @@ impl Scheduler {
                         "generation": &st.req.behavior,
                         "prompt_tokens": st.context.prompt_ids.len(),
                     }));
-                    let _ = st.event_tx.send(GenerationEvent::Rejected {
+                    let _ = st.output.event_tx.send(GenerationEvent::Rejected {
                         message: "request exceeds total KV capacity".into(),
                     });
                     continue;
                 }
                 let capacity_available = prefix_hit.cached_free_blocks.len()
-                    == self.kv_state().block_pool.num_groups()
+                    == self.kv_budget.cache().block_pool.num_groups()
                     && prefix_hit.cached_free_blocks.iter().enumerate().all(
                         |(group, cached_free)| {
-                            self.kv_state()
+                            self.kv_budget
+                                .cache()
                                 .block_pool
                                 .free_blocks_in_group(group)
                                 .saturating_sub(*cached_free)
@@ -536,6 +494,7 @@ impl Scheduler {
 
     pub(super) fn admit_running(&mut self, mut st: ReqState) {
         st.request_pool_idx = self
+            .kv_budget
             .request_slots
             .acquire()
             .expect("admission checked request-slot capacity");
@@ -563,16 +522,16 @@ impl Scheduler {
         let reserve_worstcase = st.cursor.resources.reserve_worstcase;
         let worstcase_blocks = st.cursor.resources.worstcase_blocks;
         let encoder_entries = st.req.resources.encoder_cache_keys.len();
-        self.emit_st(
-            &mut st,
-            GenerationEvent::Scheduled {
-                queued_at: q,
-                scheduled_at,
-            },
-        );
+        if st.output.enqueue(GenerationEvent::Scheduled {
+            queued_at: q,
+            scheduled_at,
+        }) {
+            st.terminal_intent = TerminalIntent::Cancel;
+        }
         self.running.insert(id, st);
         self.order.push(id);
-        self.reserved_encoder_entries = self
+        self.kv_budget.reserved_encoder_entries = self
+            .kv_budget
             .reserved_encoder_entries
             .saturating_add(encoder_entries);
         self.trace_record(json!({
@@ -590,15 +549,12 @@ impl Scheduler {
             "worstcase_blocks": worstcase_blocks,
             "running": self.running.len(),
             "pending": self.pending.len(),
-            "free_blocks": self.free_kv_blocks(),
-            "reserved_blocks": self.reserved_blocks,
-            "reserved_encoder_entries": self.reserved_encoder_entries,
+            "free_blocks": self.kv_budget.free_blocks(),
+            "reserved_blocks": self.kv_budget.reserved_blocks,
+            "reserved_encoder_entries": self.kv_budget.reserved_encoder_entries,
         }));
         if let Some(st) = self.running.get_mut(&id) {
-            let kv = self
-                .kv
-                .as_ref()
-                .expect("generation admission requires worker KV resources");
+            let kv = self.kv_budget.cache();
             acquire_cached_prefix(&kv.coordinator, st, &kv.block_pool, &self.stats);
         }
     }

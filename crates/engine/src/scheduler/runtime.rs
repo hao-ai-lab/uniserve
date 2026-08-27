@@ -84,8 +84,13 @@ impl Scheduler {
             Ordering::Relaxed,
         );
         let caps_encoder_budget = caps.encoder_cache_budget as usize;
-        let request_slots = RequestSlotPool::new(request_pool_capacity);
-        let latent_pages = LatentPagePool::new(caps.num_latent_pages, caps.latent_page_units);
+        let kv_budget = KvBudget::new(
+            kv,
+            caps_encoder_budget,
+            request_pool_capacity,
+            caps.num_latent_pages,
+            caps.latent_page_units,
+        );
         let denoise_step_burst = denoise_step_burst_from_env();
         let flow_exclusive_batch = env::var(FLOW_EXCLUSIVE_BATCH_ENV)
             .is_ok_and(|raw| matches!(raw.trim(), "1" | "true" | "TRUE"));
@@ -130,43 +135,27 @@ impl Scheduler {
         Self {
             executor,
             caps,
-            kv,
+            kv_budget,
             ctrl,
             pending: RequestQueue::new(config.policy),
             config,
             logits_pipeline: crate::scheduler::logits::default_pipeline(),
-            enc_cache: EncoderCacheManager::new(caps_encoder_budget),
-            reserved_encoder_entries: 0,
-            request_slots,
-            latent_pages,
             running: HashMap::new(),
             running_media: HashMap::new(),
-            completed_outputs: HashMap::new(),
+            output: OutputSender::default(),
             retiring_sessions: HashMap::new(),
             order: Vec::new(),
             pending_media: VecDeque::new(),
             retiring_media: HashMap::new(),
             prefer_media: true,
-            reserved_blocks: 0,
-            transfer_capacity,
-            inflight_transfers: 0,
-            step_id: 0,
-            inflight_ops: HashMap::new(),
-            pending_completions: HashMap::new(),
-            pending_finishes: HashMap::new(),
+            inflight: InflightWindow::new(transfer_capacity),
             denoise_step_burst,
             flow_exclusive_batch,
             fatal: false,
             latent_dtype,
-            batch_started: HashMap::new(),
-            prefill_steps: HashSet::new(),
-            batch_partitions: HashMap::new(),
-            batch_group_worker_exec_us: HashMap::new(),
             pending_controls: VecDeque::new(),
-            control_batches: HashMap::new(),
             authority_id: 1,
             next_op_id: 1,
-            next_completion_seq: 1,
             next_product_generation: 1,
             next_collective_seq: 1,
             next_epoch: 1,
@@ -183,14 +172,10 @@ impl Scheduler {
         &self.config
     }
     pub fn set_prefix_cache(&mut self, on: bool) {
-        if let Some(kv) = self.kv.as_mut() {
-            kv.coordinator.set_prefix_enabled(on);
-        }
+        self.kv_budget.set_prefix_cache(on);
     }
     pub fn set_hash_algo(&mut self, algo: HashAlgo) {
-        if let Some(kv) = self.kv.as_mut() {
-            kv.coordinator.set_hash_algo(algo);
-        }
+        self.kv_budget.set_hash_algo(algo);
     }
     /// Configure the per-step token budget.
     pub fn set_token_budget(&mut self, tokens: usize) {
@@ -204,6 +189,7 @@ impl Scheduler {
             self.caps.uses_kv() && self.caps.supported_work.contains(&ForwardMode::GenFlow),
         );
         let capacity = self
+            .kv_budget
             .request_slots
             .capacity()
             .saturating_sub(flow_slot_reserve)
@@ -219,22 +205,6 @@ impl Scheduler {
     }
     pub fn stats_handle(&self) -> Arc<SchedStats> {
         self.stats.clone()
-    }
-
-    pub(super) fn kv_state(&self) -> &KvSchedulerState {
-        self.kv
-            .as_ref()
-            .expect("generation scheduling requires worker KV resources")
-    }
-
-    pub(super) fn free_kv_blocks(&self) -> usize {
-        self.kv
-            .as_ref()
-            .map_or(0, |state| state.block_pool.free_request_pages())
-    }
-
-    pub(super) fn usable_kv_blocks(&self) -> usize {
-        self.kv.as_ref().map_or(0, |state| state.usable_blocks)
     }
 
     pub(super) fn media_state(&self, id: RequestId) -> Option<&MediaFlowState> {

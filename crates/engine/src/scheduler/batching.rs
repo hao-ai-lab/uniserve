@@ -1,5 +1,9 @@
 use super::*;
 
+fn decode_capacity_target(pos: usize, spec_len: usize) -> usize {
+    pos.saturating_add(1).saturating_add(spec_len)
+}
+
 impl Scheduler {
     /// Assemble the per-step batch: walk the priority order, ask each request for at most one op, clip prefill chunks to the remaining token budget, and pair first-dispatch requests with their typed admission record.
     pub(super) fn assemble(&mut self) -> (Vec<NewRequest>, Vec<NextOp>) {
@@ -15,6 +19,41 @@ impl Scheduler {
             return self.assemble_pass(&ids, Some(BatchKind::Decode));
         }
         (new_reqs, ops)
+    }
+
+    fn reserve_transition_resources(&mut self, transition: &mut NextOp) -> bool {
+        let id = transition.request_id;
+        if transition.operation_variant == ForwardMode::GenFlow && !self.ensure_flow_prefix(id) {
+            return false;
+        }
+        let resources = &transition.resources;
+        if resources.latent_units > 0
+            && self.worker_tracks_image_latent()
+            && !self
+                .kv_budget
+                .latent_pages
+                .can_reserve(id, resources.latent_units)
+        {
+            return false;
+        }
+        let uses_transfer = transition.bounds.max_transfer_bytes > 0;
+        if uses_transfer && self.inflight.inflight_transfers >= self.inflight.transfer_capacity {
+            return false;
+        }
+        if resources.latent_units > 0
+            && self.worker_tracks_image_latent()
+            && !self
+                .kv_budget
+                .latent_pages
+                .reserve(id, resources.latent_units)
+        {
+            return false;
+        }
+        if uses_transfer {
+            self.inflight.inflight_transfers += 1;
+        }
+        transition.reserved_us = uniserve_core::now_monotonic_us();
+        true
     }
 
     pub(super) fn assemble_pass(
@@ -41,7 +80,7 @@ impl Scheduler {
         };
         let mut mixed_ops: Vec<NextOp> = Vec::new();
         let denoise_occupies_decode_pipeline =
-            lane == Some(BatchKind::Decode) && self.any_denoise_inflight();
+            lane == Some(BatchKind::Decode) && self.inflight.any_denoise();
         for id in ids.iter().copied() {
             if ops.len() + mixed_ops.len() >= self.config.max_batch {
                 break;
@@ -156,7 +195,7 @@ impl Scheduler {
                     st.admission_digest = Some(admission.digest.clone());
                     st.token_cutoffs.clear();
                     st.token_cutoffs.insert(
-                        st.tokens_sent,
+                        st.output.tokens_sent,
                         VersionRef {
                             request_key,
                             producer_op_id: OpId(0),
@@ -203,7 +242,7 @@ impl Scheduler {
             match batch_kind(operation_type) {
                 BatchKind::Decode => {
                     if self.can_schedule_next(id) {
-                        if self.has_inflight(id) {
+                        if self.inflight.contains(id) {
                             projected_decode_ready = true;
                         } else {
                             committed_decode_ready = true;
@@ -218,7 +257,7 @@ impl Scheduler {
                 BatchKind::Media => {}
             }
         }
-        if prefill_ready && self.prefill_steps.len() < PREFILL_WINDOW_CREDITS {
+        if prefill_ready && self.inflight.prefill_steps.len() < PREFILL_WINDOW_CREDITS {
             Some(BatchKind::Prefill)
         } else if committed_decode_ready || projected_decode_ready {
             Some(BatchKind::Decode)
@@ -321,8 +360,7 @@ impl Scheduler {
     ) -> bool {
         let _span =
             tracing::trace_span!("scheduler.submit_batch", ops = transitions.len()).entered();
-        self.step_id += 1;
-        let step = self.step_id;
+        let step = self.inflight.next_step();
         let submit_at = Instant::now();
         let mut wire_ops = Vec::with_capacity(transitions.len());
         let mut input_products = Vec::new();
@@ -356,7 +394,7 @@ impl Scheduler {
                 self.fatal = true;
                 return false;
             };
-            if self.has_inflight(request_id)
+            if self.inflight.contains(request_id)
                 && !self.can_queue_successor(request_id, transition.operation_variant)
             {
                 tracing::error!(
@@ -371,7 +409,7 @@ impl Scheduler {
             // either its in-flight predecessor or the latest resolved operation.
             // The first operation and CPU-gated transitions use the fixed
             // semantically committed parent.
-            let projected_successor = self.has_inflight(request_id);
+            let projected_successor = self.inflight.contains(request_id);
             let reusable_device_version =
                 if !projected_successor && self.can_reuse_resolved_token_product(request_id) {
                     latest_device_version
@@ -388,7 +426,8 @@ impl Scheduler {
                     return false;
                 };
                 let Some(predecessor) = self
-                    .inflight_ops
+                    .inflight
+                    .operations
                     .get(&request_id)
                     .and_then(|queue| queue.back())
                     .map(|op| &op.operation)
@@ -435,7 +474,7 @@ impl Scheduler {
             if let Some(lengths) = kv_lengths {
                 let table_changed =
                     admitted_request_keys.contains(&request_key) || new_page_count > 0;
-                for group_id in 0..self.kv_state().block_pool.num_groups() {
+                for group_id in 0..self.kv_budget.cache().block_pool.num_groups() {
                     let page_ids = self
                         .running
                         .get(&request_id)
@@ -614,7 +653,7 @@ impl Scheduler {
                     self.fatal = true;
                     return false;
                 };
-                let page_table = self.latent_pages.pages_for(request_id).to_vec();
+                let page_table = self.kv_budget.latent_pages.pages_for(request_id).to_vec();
                 let latent_units = self.worker_image_latent_units_for(state).max(1);
                 let (start_step, step_count) = match &apply.intent {
                     TransitionIntent::DenoiseGen {
@@ -701,18 +740,18 @@ impl Scheduler {
         self.stats
             .kv_cache
             .free_blocks
-            .store(self.free_kv_blocks(), Ordering::Relaxed);
+            .store(self.kv_budget.free_blocks(), Ordering::Relaxed);
         let mixed = wire_ops.first().is_some_and(|first| {
             wire_ops
                 .iter()
                 .any(|operation| operation.work != first.work)
         });
-        self.batch_started.insert(step, submit_at);
+        self.inflight.batch_started.insert(step, submit_at);
         if wire_ops
             .iter()
             .any(|operation| batch_kind(operation.work) == BatchKind::Prefill)
         {
-            self.prefill_steps.insert(step);
+            self.inflight.prefill_steps.insert(step);
         }
         if let Some(trace_ops) = trace_ops {
             let operation_types: Vec<&'static str> = wire_ops
@@ -745,8 +784,8 @@ impl Scheduler {
                 "running": self.running.len(),
                 "pending": self.pending.len(),
                 "in_flight_before_submit": self.executor.in_flight(),
-                "free_blocks": self.free_kv_blocks(),
-                "reserved_blocks": self.reserved_blocks,
+                "free_blocks": self.kv_budget.free_blocks(),
+                "reserved_blocks": self.kv_budget.reserved_blocks,
                 "worker_image_latent_active": self.worker_image_latent_used(),
                 "worker_image_latent_capacity": self.caps.latent_capacity_units(),
             }));
@@ -761,7 +800,7 @@ impl Scheduler {
                 .map(|operation| operation.request_key.session_id.0)
                 .collect();
             tracing::debug!(
-                step_id = self.step_id,
+                step_id = step,
                 ?operation_types,
                 ?req_ids,
                 "submitting mixed forward batch"
@@ -803,16 +842,20 @@ impl Scheduler {
                 )
             })
             .collect::<HashMap<_, _>>();
-        self.batch_partitions.insert(step, partition_accounting);
-        self.batch_group_worker_exec_us.insert(step, HashMap::new());
+        self.inflight
+            .batch_partitions
+            .insert(step, partition_accounting);
+        self.inflight
+            .batch_group_worker_exec_us
+            .insert(step, HashMap::new());
         let batch = Batch::new(step, admissions, partitions)
             .with_controls(controls.clone())
             .with_input_products(input_products);
         if let Err(e) = self.executor.submit(batch) {
-            self.batch_started.remove(&step);
-            self.prefill_steps.remove(&step);
-            self.batch_partitions.remove(&step);
-            self.batch_group_worker_exec_us.remove(&step);
+            self.inflight.batch_started.remove(&step);
+            self.inflight.prefill_steps.remove(&step);
+            self.inflight.batch_partitions.remove(&step);
+            self.inflight.batch_group_worker_exec_us.remove(&step);
             self.trace_record(json!({
                 "event": "batch_submit_failed",
                 "at_s": now(),
@@ -825,7 +868,7 @@ impl Scheduler {
             false
         } else {
             if !controls.is_empty() {
-                self.control_batches.insert(step, controls);
+                self.inflight.control_batches.insert(step, controls);
             }
             true
         }
@@ -1072,10 +1115,7 @@ impl Scheduler {
     }
 
     pub(super) fn ensure_request_capacity(&mut self, id: RequestId, total_tokens: usize) -> bool {
-        let kv = self
-            .kv
-            .as_ref()
-            .expect("generation scheduling requires worker KV resources");
+        let kv = self.kv_budget.cache();
         let Some(state) = self.running.get_mut(&id) else {
             return false;
         };
@@ -1085,7 +1125,7 @@ impl Scheduler {
     }
 
     pub(super) fn activate_request_tables(&self, id: RequestId) {
-        let kv = self.kv_state();
+        let kv = self.kv_budget.cache();
         if let Some(state) = self.running.get(&id) {
             for table in &state.block_tables {
                 table.activate(&kv.block_pool);
@@ -1192,13 +1232,13 @@ impl Scheduler {
                 )
             }
             Phase::DecodeUnd => {
-                let projected_successor = self.has_inflight(id);
+                let projected_successor = self.inflight.contains(id);
                 // A successor registered before its predecessors resolve is
                 // `inflight_len` unresolved points ahead of the committed cursor;
                 // its minimum-token floor and force-finish flag are staged at
                 // that exact projected point.
                 let projected = if projected_successor {
-                    self.inflight_len(id)
+                    self.inflight.len(id)
                 } else {
                     0
                 };
@@ -1211,7 +1251,7 @@ impl Scheduler {
                 let projection = self.projected_cursor(id)?;
                 let pos = projection.und.logical_pos;
                 let relay_input = projected_successor || self.can_reuse_resolved_token_product(id);
-                let capacity_target = self.decode_capacity_target(pos as usize, 0);
+                let capacity_target = decode_capacity_target(pos as usize, 0);
                 if !self.ensure_request_capacity(id, capacity_target) {
                     return None;
                 }
@@ -1233,7 +1273,7 @@ impl Scheduler {
             Phase::CloseKv => {
                 let token = self.running.get(&id)?.cursor.und.next_token;
                 let capacity_target =
-                    self.decode_capacity_target(projection.und.physical_kv_len as usize, 0);
+                    decode_capacity_target(projection.und.physical_kv_len as usize, 0);
                 if !self.ensure_request_capacity(id, capacity_target) {
                     return None;
                 }
@@ -1457,17 +1497,17 @@ impl Scheduler {
             let cache_write = state.req.cache.write;
             let cache_key = encoder_cache_key(image.hash, step_index, step);
             let cached = if cache_read {
-                self.enc_cache.lookup_product(cache_key)
+                self.kv_budget.encoder_cache.lookup_product(cache_key)
             } else {
                 None
             };
             if let Some(cached_product) = cached {
-                let product = self.enc_cache.acquire(cache_key)?;
+                let product = self.kv_budget.encoder_cache.acquire(cache_key)?;
                 if product != cached_product {
                     return None;
                 }
                 let Some(state) = self.running.get_mut(&id) else {
-                    let _ = self.enc_cache.release(cache_key, &product);
+                    let _ = self.kv_budget.encoder_cache.release(cache_key, &product);
                     return None;
                 };
                 state
@@ -1636,7 +1676,8 @@ impl Scheduler {
         });
         let projected_images_done = self.running.get(&id).map_or(0, |state| {
             state.cursor.image_gen.images_done.saturating_add(
-                self.inflight_ops
+                self.inflight
+                    .operations
                     .get(&id)
                     .into_iter()
                     .flatten()
