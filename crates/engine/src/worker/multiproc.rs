@@ -1,3 +1,5 @@
+//! Tensor-parallel rank fan-out, completion merge, failure detection, and respawn.
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::TcpListener;
 use std::time::{Duration, Instant};
@@ -5,11 +7,9 @@ use std::time::{Duration, Instant};
 use crate::executor::{ControlAck, ControlOp, Executor, WorkerExecError, WorkerLossError};
 use anyhow::Context;
 use uniserve_core::{CommandWaker, RequestId};
-use uniserve_worker_ipc::{
-    Batch, CompletionReport, ModelOutput, SamplingOwnership, WorkerCapabilities,
-};
+use uniserve_worker_ipc::{Batch, CompletionReport, ModelOutput, SamplingOwnership, WorkerInfo};
 
-use crate::worker::WorkerSpawnSpec;
+use crate::worker::WorkerProcessArgs;
 
 /// How long a single rank may go without producing output, while batches are in
 /// flight, before `next_result` treats it as dead and bails. Generous so a
@@ -17,7 +17,7 @@ use crate::worker::WorkerSpawnSpec;
 /// rank does not wedge the scheduler loop forever.
 const NEXT_RESULT_DEADLINE: Duration = Duration::from_secs(300);
 
-impl WorkerSpawnSpec {
+impl WorkerProcessArgs {
     fn launch(&self) -> anyhow::Result<Vec<Box<dyn Executor>>> {
         let tp_init_method = if self.world_size > 1 {
             Some(allocate_tp_init_method()?)
@@ -27,14 +27,12 @@ impl WorkerSpawnSpec {
         let mut launched = Vec::with_capacity(self.world_size);
         for rank in 0..self.world_size {
             let rank_device = device_for_rank(&self.device, rank, self.world_size);
-            let rank_config = self.launch.clone();
             launched.push(crate::UniprocExecutor::spawn_rank_deferred(
                 self,
                 &rank_device,
                 rank as u32,
                 self.world_size as u32,
                 tp_init_method.as_deref(),
-                &rank_config,
             )?);
         }
         let mut workers: Vec<Box<dyn Executor>> = Vec::with_capacity(self.world_size);
@@ -50,7 +48,7 @@ impl WorkerSpawnSpec {
 pub struct MultiprocExecutor {
     workers: Vec<Box<dyn Executor>>,
     buffers: Vec<VecDeque<CompletionReport>>,
-    caps: WorkerCapabilities,
+    caps: WorkerInfo,
     depth: usize,
     inflight: usize,
     next_call_id: u64,
@@ -59,7 +57,7 @@ pub struct MultiprocExecutor {
     rank_errors: Vec<BTreeMap<u64, WorkerExecError>>,
     rank_returned_partitions: Vec<BTreeMap<u64, BTreeSet<u32>>>,
     rank_successes: Vec<BTreeSet<u64>>,
-    spawn_spec: Option<WorkerSpawnSpec>,
+    spawn_spec: Option<WorkerProcessArgs>,
     known_sessions: BTreeSet<RequestId>,
     dirty_sessions: BTreeSet<RequestId>,
 }
@@ -71,7 +69,7 @@ impl MultiprocExecutor {
 
     fn from_workers(
         workers: Vec<Box<dyn Executor>>,
-        spawn_spec: Option<WorkerSpawnSpec>,
+        spawn_spec: Option<WorkerProcessArgs>,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(!workers.is_empty(), "need >= 1 worker");
         let n = workers.len();
@@ -123,7 +121,7 @@ impl MultiprocExecutor {
         })
     }
 
-    pub fn spawn(spec: WorkerSpawnSpec) -> anyhow::Result<Self> {
+    pub fn spawn(spec: WorkerProcessArgs) -> anyhow::Result<Self> {
         anyhow::ensure!(spec.world_size > 0, "worker world size must be positive");
         let workers = spec.launch()?;
         Self::from_workers(workers, Some(spec))
@@ -215,7 +213,7 @@ impl MultiprocExecutor {
     fn install_replacement(
         &mut self,
         workers: Vec<Box<dyn Executor>>,
-        spec: &WorkerSpawnSpec,
+        spec: &WorkerProcessArgs,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
             workers.len() == spec.world_size,
@@ -433,7 +431,7 @@ fn report_partition_ids(report: &CompletionReport) -> Vec<u32> {
 /// semantic completion for each operation; only the per-rank product shards
 /// differ and are concatenated in rank order.
 fn merge_rank_report(
-    caps: &WorkerCapabilities,
+    caps: &WorkerInfo,
     batch: &Batch,
     rank0: &mut CompletionReport,
     rankn: &CompletionReport,
@@ -613,8 +611,8 @@ fn merge_completion_record(
 }
 
 fn validate_replacement_caps(
-    expected: &WorkerCapabilities,
-    actual: &WorkerCapabilities,
+    expected: &WorkerInfo,
+    actual: &WorkerInfo,
     rank: usize,
 ) -> anyhow::Result<()> {
     actual
@@ -645,7 +643,7 @@ fn device_for_rank(device: &str, rank: usize, world_size: usize) -> String {
 }
 
 impl Executor for MultiprocExecutor {
-    fn caps(&self) -> &WorkerCapabilities {
+    fn caps(&self) -> &WorkerInfo {
         &self.caps
     }
 

@@ -29,7 +29,6 @@ from tests.python.fixtures.depth_one import (
 )
 from tests.python.fixtures.execution_worker import execution_worker
 from uniserve_worker.batch import (
-    Admission,
     BlockTable,
     Bounds,
     Commit,
@@ -41,6 +40,7 @@ from uniserve_worker.batch import (
     ForwardMode,
     GenAdmission,
     ImageParams,
+    NewRequest,
     Operation,
     OpStatus,
     PointRange,
@@ -92,7 +92,7 @@ class _SeparatePhaseModel(StubModel):
         self.tensorized_mixed = False
 
 
-def _publish_conditioning(worker: object, admission: Admission, *, op_id: int, step_id: int):
+def _publish_conditioning(worker: object, admission: NewRequest, *, op_id: int, step_id: int):
     publication, product = kv_publication_operation(
         admission.request_key,
         op_id=op_id,
@@ -106,7 +106,7 @@ def _publish_conditioning(worker: object, admission: Admission, *, op_id: int, s
 
 def _transition_generation(
     worker: object,
-    admission: Admission,
+    admission: NewRequest,
     conditioning: object,
     *,
     op_id: int,
@@ -132,7 +132,7 @@ def _transition_generation(
 
 def _prepare_decode(
     worker: object,
-    admission: Admission,
+    admission: NewRequest,
     *,
     op_id: int,
     step_id: int,
@@ -168,7 +168,7 @@ def _prepare_decode(
 
 def _materialized_artifact(
     worker: object,
-    admission: Admission,
+    admission: NewRequest,
     latent: ProductRef,
     commit: Commit,
     *,
@@ -1304,7 +1304,7 @@ def test_cross_stage_completion_predicate_preserves_device_continuation() -> Non
     producer = execution_worker(transfer_backend="shm")
     consumer = execution_worker(transfer_backend="shm")
     generation = gen_admission(79, ImageParams(steps=1, height=16, width=16, seed=31))
-    admission = Admission.create(
+    admission = NewRequest.create(
         generation.request_key,
         request_pool_idx=generation.request_pool_idx,
         und=UndAdmission(),
@@ -1519,7 +1519,7 @@ def test_encode_publishes_an_immutable_feature_without_advancing_state():
 def test_generated_feedback_commits_absolute_visual_token_state():
     worker = execution_worker()
     understanding = und_admission(6, block_ids=(0,))
-    admission = Admission.create(
+    admission = NewRequest.create(
         understanding.request_key,
         request_pool_idx=understanding.request_pool_idx,
         und=understanding.und,

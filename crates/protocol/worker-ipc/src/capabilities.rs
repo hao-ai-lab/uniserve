@@ -1,22 +1,23 @@
+//! `WorkerInfo` handshake data and mixed graph-bucket validation.
+
 use super::*;
 
 // ---------------------------------------------------------------------------
-// Capabilities and startup agreement
+// Worker handshake and startup agreement
 // ---------------------------------------------------------------------------
 
 /// One exact decode-and-flow row combination qualified for a single physical call.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct MixedExecutionCapability {
+pub struct GraphBucket {
     pub decode_rows: u32,
     pub flow_rows: u32,
     pub height: u32,
     pub width: u32,
     pub cfg_branches: u32,
 }
-/// A worker's advertised capabilities. Admission requires every rank, worker,
-/// and frontend to agree on the protocol layout.
+/// Post-load worker geometry, limits, supported work, and model identity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct WorkerCapabilities {
+pub struct WorkerInfo {
     pub block_size: u32,
     pub num_blocks: u32,
     pub num_layers: u32,
@@ -48,14 +49,14 @@ pub struct WorkerCapabilities {
     pub max_request_pool_size: u32,
     pub max_unresolved_window: u32,
     pub incremental_kv_publication: bool,
-    pub mixed_buckets: Vec<MixedExecutionCapability>,
+    pub mixed_buckets: Vec<GraphBucket>,
     pub sampling_ownership: SamplingOwnership,
     pub resource_classes: Vec<ResourceClass>,
     pub model_identity: Option<Digest>,
     pub weight_digest: Option<Digest>,
 }
 
-impl WorkerCapabilities {
+impl WorkerInfo {
     pub fn latent_capacity_units(&self) -> u64 {
         u64::from(self.num_latent_pages.saturating_sub(1))
             .saturating_mul(u64::from(self.latent_page_units))
@@ -76,11 +77,11 @@ impl WorkerCapabilities {
     }
 
     pub fn validate(&self) -> ProtocolResult<()> {
-        protocol_ensure!(
+        wire_ensure!(
             !self.supported_work.is_empty(),
             "worker capabilities declare no work variants"
         );
-        protocol_ensure!(
+        wire_ensure!(
             self.supported_work
                 .iter()
                 .copied()
@@ -89,7 +90,7 @@ impl WorkerCapabilities {
                 == self.supported_work.len(),
             "worker capabilities repeat a work variant"
         );
-        protocol_ensure!(
+        wire_ensure!(
             self.supported_controls
                 .iter()
                 .copied()
@@ -98,7 +99,7 @@ impl WorkerCapabilities {
                 == self.supported_controls.len(),
             "worker capabilities repeat a control"
         );
-        protocol_ensure!(
+        wire_ensure!(
             self.resource_classes
                 .iter()
                 .copied()
@@ -107,19 +108,19 @@ impl WorkerCapabilities {
                 == self.resource_classes.len(),
             "worker capabilities repeat a resource class"
         );
-        protocol_ensure!(
+        wire_ensure!(
             self.max_batch_operations > 0
                 && self.max_batch_tokens > 0
                 && self.max_request_pool_size > 0
                 && self.max_unresolved_window > 0,
             "worker capabilities declare a zero scheduling bound"
         );
-        protocol_ensure!(
+        wire_ensure!(
             self.mixed_buckets.iter().collect::<HashSet<_>>().len() == self.mixed_buckets.len(),
             "worker capabilities repeat a mixed-execution bucket"
         );
         for bucket in &self.mixed_buckets {
-            protocol_ensure!(
+            wire_ensure!(
                 bucket.decode_rows > 0
                     && bucket.flow_rows > 0
                     && bucket.height > 0
@@ -130,12 +131,12 @@ impl WorkerCapabilities {
                 "worker capabilities declare an invalid mixed-execution bucket"
             );
         }
-        protocol_ensure!(
+        wire_ensure!(
             self.pipeline_depth > 0,
             "worker pipeline depth must be positive"
         );
         if self.uses_kv() {
-            protocol_ensure!(
+            wire_ensure!(
                 self.block_size > 0
                     && self.num_blocks > 0
                     && self.num_layers > 0
@@ -148,20 +149,20 @@ impl WorkerCapabilities {
             );
             let mut total_blocks = 0u64;
             for group in &self.groups {
-                protocol_ensure!(
+                wire_ensure!(
                     group.num_blocks > 0,
                     "worker KV groups are not a canonical physical page partition"
                 );
                 total_blocks = total_blocks
                     .checked_add(u64::from(group.num_blocks))
-                    .ok_or_else(|| protocol_error!("worker KV group page range overflows"))?;
+                    .ok_or_else(|| wire_error!("worker KV group page range overflows"))?;
             }
-            protocol_ensure!(
+            wire_ensure!(
                 total_blocks == u64::from(self.num_blocks),
                 "worker KV groups do not cover the physical request page pool"
             );
         } else {
-            protocol_ensure!(
+            wire_ensure!(
                 self.block_size == 0
                     && self.num_blocks == 0
                     && self.num_layers == 0
@@ -178,7 +179,7 @@ impl WorkerCapabilities {
             || self.latent_width > 0
             || self.latent_dtype.is_some();
         if has_latent_geometry || self.resource_classes.contains(&ResourceClass::ImageLatent) {
-            protocol_ensure!(
+            wire_ensure!(
                 self.latent_page_units > 0
                     && self.num_latent_pages > 1
                     && self.latent_width > 0
@@ -190,11 +191,11 @@ impl WorkerCapabilities {
             .supported_work
             .iter()
             .any(|variant| matches!(variant, ForwardMode::GenTransition | ForwardMode::GenFlow));
-        protocol_ensure!(
+        wire_ensure!(
             !addresses_latent || self.resource_classes.contains(&ResourceClass::ImageLatent),
             "worker capabilities advertise latent work without a latent page pool"
         );
-        protocol_ensure!(
+        wire_ensure!(
             self.model_identity.is_some() == self.weight_digest.is_some(),
             "worker capability model and weight identities are incomplete"
         );
@@ -239,7 +240,7 @@ impl WorkerCapabilities {
     }
 }
 
-impl Default for WorkerCapabilities {
+impl Default for WorkerInfo {
     fn default() -> Self {
         Self {
             block_size: 64,

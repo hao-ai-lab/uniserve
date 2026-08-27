@@ -15,7 +15,6 @@ from tests.python.fixtures.depth_one import (
 )
 from tests.python.fixtures.execution_worker import execution_worker
 from uniserve_worker.batch import (
-    Admission,
     Close,
     CloseReason,
     Commit,
@@ -24,6 +23,7 @@ from uniserve_worker.batch import (
     DType,
     FixedPoint,
     ImageParams,
+    NewRequest,
     Operation,
     OpStatus,
     PointRange,
@@ -92,7 +92,7 @@ def _with_transition_predicate(
 def test_false_device_predicate_preserves_parent_cutoff_across_registered_descendants() -> None:
     worker = execution_worker(device="cpu", pipeline_depth=2)
     base = und_admission(51, block_ids=(0,))
-    admission = Admission.create(
+    admission = NewRequest.create(
         base.request_key,
         request_pool_idx=base.request_pool_idx,
         und=replace(base.und, finish_token_ids=(_next_token(4),)),
@@ -253,7 +253,7 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
     worker = execution_worker(device="cpu", pipeline_depth=2)
     generation = gen_admission(52, ImageParams(steps=2, height=16, width=16, seed=29))
     understanding = und_admission(52, block_ids=(0,))
-    admission = Admission.create(
+    admission = NewRequest.create(
         understanding.request_key,
         request_pool_idx=understanding.request_pool_idx,
         und=understanding.und,

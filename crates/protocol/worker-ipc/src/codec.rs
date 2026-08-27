@@ -7,15 +7,15 @@ use uniserve_core::{BlockId, KvCacheGroupSpec, KvGroupKind, RankInfo, RequestId,
 
 use crate::schema::uniserve::wire as fbs;
 use crate::{
-    Admission, AttentionRegime, Batch, BatchPartition, BlockTable, Bounds, CachePageAllocation,
-    CloseReason, CompletionReport, Control, DType, DecodeKind, DecodePlacement, DimBound,
-    Disposition, Domain, DrawLayout, ErrorCode, ErrorOperationIdentity, FinishFlags, ForwardMode,
-    GenAdmission, LatentPlacement, LogicalLengths, MediaAdmission, MediaProfileId,
-    MixedExecutionCapability, ModelOutput, OpId, OpStatus, Operation, PartitionCompletion, Point,
-    PointRange, ProductKind, ProductPayload, ProductRef, RegistrationAck, RequestKey, RequestKind,
-    ResourceClass, ResourcePressure, ResponseKind, Rng, RouteId, RowGeometry, SamplingOwnership,
-    ShapeBound, StorageClass, TimingCounters, TokenSpan, UndAdmission, VersionRef,
-    WorkerCapabilities, WorkerForwardStats, WorkerRequest, WorkerResponse, WorkerResponseError,
+    AttentionRegime, Batch, BatchPartition, BlockTable, Bounds, CachePageAllocation, CloseReason,
+    CompletionReport, Control, DType, DecodeKind, DecodePlacement, DimBound, Disposition, Domain,
+    DrawLayout, ErrorCode, ErrorOperationIdentity, FinishFlags, ForwardMode, GenAdmission,
+    GraphBucket, LatentPlacement, LogicalLengths, MediaAdmission, MediaProfileId, ModelOutput,
+    NewRequest, OpId, OpStatus, Operation, PartitionCompletion, Point, PointRange, ProductKind,
+    ProductPayload, ProductRef, RegistrationAck, RequestKey, RequestKind, ResourceClass,
+    ResourcePressure, ResponseKind, Rng, RouteId, RowGeometry, SamplingOwnership, ShapeBound,
+    StorageClass, TimingCounters, TokenSpan, UndAdmission, VersionRef, WorkerForwardStats,
+    WorkerInfo, WorkerRequest, WorkerResponse, WorkerResponseError,
 };
 
 pub type CodecResult<T> = std::result::Result<T, CodecError>;
@@ -25,7 +25,7 @@ pub enum CodecError {
     #[error("worker codec error: {0}")]
     Invalid(String),
     #[error(transparent)]
-    Protocol(#[from] crate::ProtocolError),
+    Protocol(#[from] crate::WireError),
 }
 
 impl CodecError {
@@ -382,8 +382,8 @@ fn partition_from_table(partition: fbs::BatchPartition<'_>) -> CodecResult<Batch
     Ok(partition)
 }
 
-fn admission_from_table(admission: fbs::Admission<'_>) -> CodecResult<Admission> {
-    let admission = Admission {
+fn admission_from_table(admission: fbs::NewRequest<'_>) -> CodecResult<NewRequest> {
+    let admission = NewRequest {
         request_key: request_key_from_table(admission.request_key(), "admission.request_key")?,
         request_pool_idx: admission.request_pool_idx(),
         digest: required_digest(admission.digest(), "admission.digest")?,
@@ -868,8 +868,8 @@ fn error_operation_from_table(
     })
 }
 
-fn capabilities_from_table(caps: fbs::WorkerCapabilities<'_>) -> CodecResult<WorkerCapabilities> {
-    let caps = WorkerCapabilities {
+fn capabilities_from_table(caps: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
+    let caps = WorkerInfo {
         block_size: caps.block_size(),
         num_blocks: caps.num_blocks(),
         num_layers: caps.num_layers(),
@@ -1327,9 +1327,9 @@ fn partition_to_fb(partition: &BatchPartition) -> CodecResult<fbs::BatchPartitio
     })
 }
 
-fn admission_to_fb(admission: &Admission) -> CodecResult<fbs::AdmissionT> {
+fn admission_to_fb(admission: &NewRequest) -> CodecResult<fbs::NewRequestT> {
     admission.validate()?;
-    Ok(fbs::AdmissionT {
+    Ok(fbs::NewRequestT {
         request_key: Some(Box::new(request_key_to_fb(admission.request_key))),
         request_pool_idx: admission.request_pool_idx,
         digest: Some(admission.digest.to_string()),
@@ -1676,8 +1676,8 @@ fn error_operation_to_fb(operation: &ErrorOperationIdentity) -> fbs::ErrorOperat
 // Capabilities
 // ---------------------------------------------------------------------------
 
-fn mixed_bucket_from_table(bucket: fbs::MixedExecutionCapability<'_>) -> MixedExecutionCapability {
-    MixedExecutionCapability {
+fn mixed_bucket_from_table(bucket: fbs::GraphBucket<'_>) -> GraphBucket {
+    GraphBucket {
         decode_rows: bucket.decode_rows(),
         flow_rows: bucket.flow_rows(),
         height: bucket.height(),
@@ -1686,8 +1686,8 @@ fn mixed_bucket_from_table(bucket: fbs::MixedExecutionCapability<'_>) -> MixedEx
     }
 }
 
-fn mixed_bucket_to_fb(bucket: &MixedExecutionCapability) -> fbs::MixedExecutionCapabilityT {
-    fbs::MixedExecutionCapabilityT {
+fn mixed_bucket_to_fb(bucket: &GraphBucket) -> fbs::GraphBucketT {
+    fbs::GraphBucketT {
         decode_rows: bucket.decode_rows,
         flow_rows: bucket.flow_rows,
         height: bucket.height,
@@ -1696,9 +1696,9 @@ fn mixed_bucket_to_fb(bucket: &MixedExecutionCapability) -> fbs::MixedExecutionC
     }
 }
 
-fn capabilities_to_fb(caps: &WorkerCapabilities) -> CodecResult<fbs::WorkerCapabilitiesT> {
+fn capabilities_to_fb(caps: &WorkerInfo) -> CodecResult<fbs::WorkerInfoT> {
     caps.validate()?;
-    Ok(fbs::WorkerCapabilitiesT {
+    Ok(fbs::WorkerInfoT {
         block_size: caps.block_size,
         num_blocks: caps.num_blocks,
         num_layers: caps.num_layers,

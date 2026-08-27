@@ -12,7 +12,7 @@ from tests.python.fixtures.depth_one import (
     und_admission,
 )
 from tests.python.fixtures.execution_worker import execution_worker
-from uniserve_worker.batch import Admission, Close, CloseReason, ErrorCode, OpStatus, TokenMode
+from uniserve_worker.batch import Close, CloseReason, ErrorCode, NewRequest, OpStatus, TokenMode
 
 pytestmark = pytest.mark.integration
 
@@ -119,7 +119,7 @@ def test_drop_reuses_the_slot_and_rejects_the_retired_request_key() -> None:
     worker.drop_session(retired.request_key.session_id)
 
     replacement_template = und_admission(84, block_ids=(1,))
-    replacement = Admission.create(
+    replacement = NewRequest.create(
         replacement_template.request_key,
         request_pool_idx=retired.request_pool_idx,
         und=replacement_template.und,

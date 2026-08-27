@@ -1,3 +1,5 @@
+//! Client-visible event production and per-request output accounting.
+
 use super::*;
 
 impl Scheduler {

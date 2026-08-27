@@ -7,7 +7,6 @@ from pathlib import Path
 import torch
 
 from uniserve_worker.batch import (
-    Admission,
     Batch,
     BatchPartition,
     DecodeKind,
@@ -15,6 +14,7 @@ from uniserve_worker.batch import (
     FinishFlags,
     FixedPoint,
     ForwardMode,
+    NewRequest,
     Operation,
     OpStatus,
     TokenSpan,
@@ -237,7 +237,7 @@ def run_action(runtime: ExecutionResources, state: OperationState) -> bool:
     return True
 
 
-def _output_path(runtime: ExecutionResources, admission: Admission) -> Path:
+def _output_path(runtime: ExecutionResources, admission: NewRequest) -> Path:
     media = admission.media
     spool = runtime._media_spool
     if media is None or spool is None:

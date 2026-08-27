@@ -5,13 +5,13 @@ from __future__ import annotations
 import pytest
 
 from uniserve_worker.batch import Domain
-from uniserve_worker.bootstrap.cli import parse_worker_launch
+from uniserve_worker.bootstrap.cli import parse_worker_args
 
 pytestmark = pytest.mark.unit
 
 
 def test_engine_batch_capacity_reaches_worker_resources() -> None:
-    config = parse_worker_launch(
+    config = parse_worker_args(
         [
             "--service-name",
             "capacity-contract",
@@ -33,7 +33,7 @@ def test_engine_batch_capacity_reaches_worker_resources() -> None:
 
 
 def test_execution_lanes_are_typed_and_domain_disjoint() -> None:
-    config = parse_worker_launch(
+    config = parse_worker_args(
         [
             "--service-name",
             "lane-contract",
@@ -59,7 +59,7 @@ def test_execution_lanes_are_typed_and_domain_disjoint() -> None:
 
 def test_execution_lanes_reject_duplicate_domain_bindings() -> None:
     with pytest.raises(SystemExit):
-        parse_worker_launch(
+        parse_worker_args(
             [
                 "--service-name",
                 "lane-contract",

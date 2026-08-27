@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import logging
 
-from .config import WorkerLaunchConfig
+from .config import WorkerProcessArgs
 
 logger = logging.getLogger(__name__)
 
 
-def run_worker(config: WorkerLaunchConfig) -> None:
+def run_worker(config: WorkerProcessArgs) -> None:
     """Open the IPC endpoint, create the worker, and serve until shutdown."""
 
     from ..server.app import WorkerServer
@@ -31,7 +31,7 @@ def run_worker(config: WorkerLaunchConfig) -> None:
         },
     )
     worker = Worker.from_config(config)
-    # Admission begins only after the configured first-use kernel work succeeds
+    # Request admission begins only after the configured first-use kernel work succeeds
     # and the worker opens a clean serving collective epoch.
     worker.warmup()
     WorkerServer(worker, endpoint).serve()

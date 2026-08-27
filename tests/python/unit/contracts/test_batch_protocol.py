@@ -17,7 +17,6 @@ from pathlib import Path
 import pytest
 
 from uniserve_worker.batch import (
-    Admission,
     AttentionRegime,
     Batch,
     BatchPartition,
@@ -37,6 +36,7 @@ from uniserve_worker.batch import (
     LatentPlacement,
     LogicalLengths,
     ModelOutput,
+    NewRequest,
     Operation,
     OpStatus,
     PointRange,
@@ -520,7 +520,7 @@ def test_batch_rejects_conflicting_control_identity() -> None:
             disposition=Disposition.PUBLISH,
         )
 
-    admission = Admission.create(_request_key(), request_pool_idx=8, und=UndAdmission())
+    admission = NewRequest.create(_request_key(), request_pool_idx=8, und=UndAdmission())
     with pytest.raises(WorkerError):
         Batch(
             step_id=1,
@@ -561,7 +561,7 @@ def test_operation_accepts_shared_encoder_features_but_not_foreign_lineage_state
 
 
 def test_admission_payload_digest_is_invariant_to_pool_index() -> None:
-    admission = Admission.create(_request_key(), request_pool_idx=8, und=UndAdmission())
+    admission = NewRequest.create(_request_key(), request_pool_idx=8, und=UndAdmission())
     relocated = replace(admission, request_pool_idx=19)
     assert relocated.payload_digest() == admission.digest
 
@@ -609,7 +609,7 @@ def test_batch_carries_host_supplied_input_products() -> None:
         point_range=PointRange(base_point=0, max_points=1),
     )
     payload = ProductPayload(product=token_input, payload=encode_token_product_bytes([7, 8, 9]))
-    admission = Admission.create(_request_key(), request_pool_idx=8, und=UndAdmission())
+    admission = NewRequest.create(_request_key(), request_pool_idx=8, und=UndAdmission())
     batch = Batch(
         step_id=1,
         admissions=(admission,),

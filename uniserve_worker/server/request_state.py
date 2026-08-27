@@ -8,13 +8,13 @@ from dataclasses import dataclass, field
 from typing import cast
 
 from ..batch import (
-    Admission,
     Close,
     Commit,
     Control,
     DeferredSemanticDigest,
     FixedPoint,
     ImageParams,
+    NewRequest,
     Operation,
     ProductRef,
     RequestKey,
@@ -210,7 +210,7 @@ class RequestTable:
     def stage_partition(
         self,
         operations: Sequence[Operation],
-        admissions: Sequence[Admission],
+        admissions: Sequence[NewRequest],
         request_pool_indices: Sequence[int],
     ) -> tuple[tuple[RequestRow, ...], tuple[RequestRow | None, ...]]:
         """Build isolated row candidates without changing the live table."""
@@ -505,7 +505,7 @@ class RequestTable:
             )
         return slot
 
-    def _admission_row(self, admission: Admission) -> RequestRow:
+    def _admission_row(self, admission: NewRequest) -> RequestRow:
         slot = self._validate_slot(admission.request_pool_idx)
         prefix_len = 0 if admission.und is None else int(admission.und.initial_position)
         row = RequestRow(

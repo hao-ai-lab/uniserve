@@ -19,11 +19,11 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyString};
 use uniserve_core::{ImageParams, SamplingParams};
 use uniserve_worker_ipc::{
-    Admission, AttentionRegime, Batch, BatchPartition, BlockTable, CachePageAllocation,
-    CloseReason, CompletionReport, Control, DType, DecodeKind, DecodePlacement, DimBound,
-    Disposition, Domain, DrawLayout, ErrorCode, ErrorOperationIdentity, FinishFlags, ForwardMode,
-    GenAdmission, LatentPlacement, LogicalLengths, MediaAdmission, MediaProfileId, ModelOutput,
-    OpId, OpStatus, Operation, PartitionCompletion, Point, PointRange, ProductKind, ProductPayload,
+    AttentionRegime, Batch, BatchPartition, BlockTable, CachePageAllocation, CloseReason,
+    CompletionReport, Control, DType, DecodeKind, DecodePlacement, DimBound, Disposition, Domain,
+    DrawLayout, ErrorCode, ErrorOperationIdentity, FinishFlags, ForwardMode, GenAdmission,
+    LatentPlacement, LogicalLengths, MediaAdmission, MediaProfileId, ModelOutput, NewRequest, OpId,
+    OpStatus, Operation, PartitionCompletion, Point, PointRange, ProductKind, ProductPayload,
     ProductRef, RegistrationAck, RequestKey, RequestKind, RowGeometry, ShapeBound, StorageClass,
     TimingCounters, TokenSpan, UndAdmission, VersionRef, WorkerForwardStats, WorkerRequest,
     WorkerResponse, WorkerResponseError,
@@ -774,7 +774,7 @@ fn u32_list<'py>(py: Python<'py>, values: &[u32]) -> PyResult<Bound<'py, PyList>
 
 fn admission_to_py<'py>(
     py: Python<'py>,
-    admission: &Admission,
+    admission: &NewRequest,
     context: &mut RequestConversion<'py>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
@@ -1602,7 +1602,7 @@ mod tests {
 
     fn execute_request() -> WorkerRequest {
         let request_key = RequestKey::new(1, RequestId(2), 1);
-        let admission = Admission::new(
+        let admission = NewRequest::new(
             request_key,
             1,
             Some(UndAdmission {

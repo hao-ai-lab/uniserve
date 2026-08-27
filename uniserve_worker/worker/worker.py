@@ -33,9 +33,9 @@ from ..bootstrap.execution_config import (
     graph_memory_budget_bytes,
 )
 from ..capabilities import (
-    MixedExecutionCapability,
+    GraphBucket,
     ResourceClass,
-    WorkerCapabilities,
+    WorkerInfo,
 )
 from ..execution.cuda_graph import CudaGraphRunner
 from ..execution.forward_batch import AttentionSelection
@@ -91,7 +91,7 @@ from .warmup import (
 )
 
 if TYPE_CHECKING:
-    from ..bootstrap.config import WorkerLaunchConfig
+    from ..bootstrap.config import WorkerProcessArgs
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +113,7 @@ class Worker:
     _warmup_latent_pages: dict[RequestKey, list[int]]
 
     @classmethod
-    def from_config(cls, config: WorkerLaunchConfig) -> Worker:
+    def from_config(cls, config: WorkerProcessArgs) -> Worker:
         from ..backends.attention import resolve_attention_selection
         from ..backends.triton import configure_triton_toolchain
         from ..bootstrap.model_loader import materialize_worker_model
@@ -570,7 +570,7 @@ class Worker:
             )
         )
         mixed_flow_graph_buckets = tuple(
-            MixedExecutionCapability(
+            GraphBucket(
                 decode_rows=text_batch_size,
                 flow_rows=1,
                 height=bucket.height,
@@ -859,7 +859,7 @@ class Worker:
         )
 
     @property
-    def capabilities(self) -> WorkerCapabilities:
+    def capabilities(self) -> WorkerInfo:
         return self._capabilities
 
     def _decode_context_blocks(self) -> int:

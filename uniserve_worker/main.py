@@ -7,8 +7,8 @@ import logging
 import signal
 import sys
 
+from .bootstrap.cli import parse_worker_args
 from .bootstrap.launch import run_worker
-from .bootstrap.cli import parse_worker_launch
 
 logger = logging.getLogger(__name__)
 
@@ -19,10 +19,10 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     _install_fault_dump_handlers()
-    launch_config = parse_worker_launch()
+    process_args = parse_worker_args()
 
     try:
-        run_worker(launch_config)
+        run_worker(process_args)
     except KeyboardInterrupt:
         logger.info("worker interrupted; shutting down")
     finally:

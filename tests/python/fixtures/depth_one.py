@@ -1,7 +1,7 @@
 """Depth-one ``Operation``/``Batch`` builders for worker forward-behavior tests.
 
 Each builder produces the records the scheduler supplies at depth one: an
-:class:`Admission`, an :class:`Operation` whose ``parent`` names committed state,
+:class:`NewRequest`, an :class:`Operation` whose ``parent`` names committed state,
 and the host-staged token payload consumed by token work.
 """
 
@@ -11,7 +11,6 @@ import time
 from collections.abc import Sequence
 
 from uniserve_worker.batch import (
-    Admission,
     AttentionRegime,
     Batch,
     BatchPartition,
@@ -27,12 +26,12 @@ from uniserve_worker.batch import (
     DrawLayout,
     DType,
     EncodeMode,
-    ExecutionCapability,
     FixedPoint,
     ForwardMode,
     GenAdmission,
     ImageParams,
     LatentPlacement,
+    NewRequest,
     Operation,
     OpStatus,
     PointRange,
@@ -220,7 +219,7 @@ def _alternative_pages(rk: RequestKey, tokens: int) -> tuple[int, ...]:
 def execution_batch(
     *,
     step_id: int,
-    admissions: Sequence[Admission] = (),
+    admissions: Sequence[NewRequest] = (),
     operations: Sequence[Operation] = (),
     input_products: Sequence[ProductPayload] = (),
     controls: Sequence[Control] = (),
@@ -258,11 +257,6 @@ def execution_batch(
     partition_id = 1
     for group_id, (route, routed) in enumerate(sorted(by_route.items()), start=1):
         domains = tuple(domain for domain in Domain if any(op.domain is domain for op in routed))
-        execution = (
-            ExecutionCapability.TENSORIZED_MIXED
-            if len(domains) > 1
-            else ExecutionCapability.DOMAIN_HOMOGENEOUS
-        )
         variants = {operation.work for operation in routed}
         attention = (
             AttentionRegime.HYBRID
@@ -356,7 +350,6 @@ def execution_batch(
                     collective_seq=int(step_id) * 1024 + group_id + 1,
                     domain=domain,
                     route=route,
-                    execution=execution,
                     attention=attention,
                     shape_class=0,
                     operations=domain_operations,
@@ -396,14 +389,14 @@ def und_admission(
     prefix_len: int = 0,
     epoch: int = 1,
     sampling: SamplingParams | None = None,
-) -> Admission:
+) -> NewRequest:
     rk = request_key(session_id, epoch)
     _reset_request(rk)
     _BLOCK_TABLES[rk] = [_kv_page(value) for value in block_ids]
     _UNBOUND_PAGES[rk] = list(_BLOCK_TABLES[rk])
     _REQUEST_POOL_INDICES[rk] = session_id + 1
     _OP_KV_RESULTS[(rk, 0)] = int(prefix_len)
-    return Admission.create(
+    return NewRequest.create(
         rk,
         request_pool_idx=session_id + 1,
         und=UndAdmission(
@@ -417,19 +410,19 @@ def und_admission(
     )
 
 
-def gen_admission(session_id: int, image: ImageParams, *, epoch: int = 1) -> Admission:
+def gen_admission(session_id: int, image: ImageParams, *, epoch: int = 1) -> NewRequest:
     rk = request_key(session_id, epoch)
     _reset_request(rk)
     _IMAGE_PARAMS[rk] = image
     _REQUEST_POOL_INDICES[rk] = session_id + 1
-    return Admission.create(
+    return NewRequest.create(
         rk,
         request_pool_idx=session_id + 1,
         gen_admission=GenAdmission(image=image),
     )
 
 
-def root_parent(admission: Admission) -> VersionRef:
+def root_parent(admission: NewRequest) -> VersionRef:
     """The admission-root fixed version a request's first operation parents on."""
 
     return VersionRef(admission.request_key, 0, FixedPoint(0, admission.digest))

@@ -1,4 +1,4 @@
-"""Resolve scheduler capabilities from one loaded model and worker geometry."""
+"""Resolve WorkerInfo from one loaded model and worker geometry."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from ..capabilities import (
     RankInfo,
     RequestKind,
     ResourceClass,
-    WorkerCapabilities,
+    WorkerInfo,
 )
 from ..foundation.errors import invalid_descriptor
 from ..foundation.math import ceil_div
@@ -35,8 +35,8 @@ def resolve_capabilities(
     weight_digest: str | None = None,
     pipeline_depth: int = 1,
     completion_payload_bytes: int = 1 << 20,
-) -> WorkerCapabilities:
-    """Build the complete capability snapshot from model-owned behavior."""
+) -> WorkerInfo:
+    """Build the post-load worker handshake from model-owned behavior."""
 
     if isinstance(model, MiniMaxH3Model):
         return _h3_capabilities(
@@ -132,7 +132,7 @@ def resolve_capabilities(
     ]
     supported_work = tuple(variant for variant in ForwardMode if variant in model.supported_work)
     sampling_ownership = SamplingOwnership.DESIGNATED_RANK
-    return WorkerCapabilities(
+    return WorkerInfo(
         block_size=int(deployment.block_size) if owns_kv else 0,
         num_blocks=int(capacity.num_blocks) if capacity is not None else 0,
         num_layers=int(cache.num_layers) if cache is not None else 0,
@@ -195,7 +195,7 @@ def _h3_capabilities(
     weight_digest: str | None,
     pipeline_depth: int,
     completion_payload_bytes: int,
-) -> WorkerCapabilities:
+) -> WorkerInfo:
     if int(completion_payload_bytes) < 1:
         raise ValueError("completion payload capacity must be positive")
     slots = int(model.states.slot_count)
@@ -207,7 +207,7 @@ def _h3_capabilities(
         )
     max_operations = min(slots, int(deployment.max_batch_operations))
     layout = model.layout
-    return WorkerCapabilities(
+    return WorkerInfo(
         block_size=0,
         num_blocks=0,
         num_layers=0,

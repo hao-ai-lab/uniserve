@@ -10,7 +10,7 @@ use uniserve_core::{
 };
 use uniserve_engine::{
     AttentionBackend, ControlTokens, Executor, Scheduler, TransferBackend, UniprocExecutor,
-    WorkerLaunchConfig, WorkerSpawnSpec,
+    WorkerProcessArgs,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -18,11 +18,11 @@ fn main() -> anyhow::Result<()> {
         .with_max_level(tracing::Level::INFO)
         .init();
     // pipeline_depth=2 exercises the descriptor ring with batches in flight.
-    let worker_config = WorkerLaunchConfig {
+    let worker_config = WorkerProcessArgs {
         stub: true,
-        ..WorkerLaunchConfig::default()
+        ..WorkerProcessArgs::default()
     };
-    let engine = UniprocExecutor::spawn(WorkerSpawnSpec {
+    let engine = UniprocExecutor::spawn(WorkerProcessArgs {
         python: "python3".into(),
         model: String::new(),
         device: "cpu".into(),
@@ -37,7 +37,7 @@ fn main() -> anyhow::Result<()> {
         attention_backend: AttentionBackend::Auto,
         worker_kind: None,
         transfer_backend: TransferBackend::Inproc,
-        launch: worker_config,
+        ..worker_config
     })?;
     println!("caps from worker: {:?}", engine.caps());
 

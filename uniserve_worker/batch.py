@@ -388,7 +388,7 @@ def native_batch(
         batch,
         "admissions",
         tuple(
-            Admission.from_mapping(item, f"batch.admissions[{index}]")
+            NewRequest.from_mapping(item, f"batch.admissions[{index}]")
             for index, item in enumerate(admissions)
         ),
     )
@@ -1835,7 +1835,7 @@ class MediaAdmission:
 
 
 @dataclass(frozen=True, slots=True)
-class Admission:
+class NewRequest:
     request_key: RequestKey
     request_pool_idx: int
     digest: str
@@ -1860,12 +1860,12 @@ class Admission:
         und: UndAdmission | None = None,
         gen_admission: GenAdmission | None = None,
         media: MediaAdmission | None = None,
-    ) -> Admission:
+    ) -> NewRequest:
         value = cls(request_key, request_pool_idx, "", und, gen_admission, media)
         return replace(value, digest=value.payload_digest())
 
     @classmethod
-    def from_mapping(cls, value: object, where: str = "admission") -> Admission:
+    def from_mapping(cls, value: object, where: str = "admission") -> NewRequest:
         data = _map(value, where)
         admission = cls(
             request_key=RequestKey.from_mapping(data.get("request_key"), f"{where}.request_key"),
@@ -2360,7 +2360,7 @@ class BatchPartition:
 @dataclass(frozen=True, slots=True)
 class Batch:
     step_id: int
-    admissions: tuple[Admission, ...] = ()
+    admissions: tuple[NewRequest, ...] = ()
     partitions: tuple[BatchPartition, ...] = ()
     controls: tuple[Control, ...] = ()
     input_products: tuple[ProductPayload, ...] = ()
@@ -2493,7 +2493,7 @@ class Batch:
         validated_wire = data.get(_WIRE_VALIDATION_KEY) is _WIRE_VALIDATION_TOKEN
         step_id = _uint(data.get("step_id"), "execute batch.step_id")
         admissions = tuple(
-            Admission.from_mapping(item, f"execute batch.admissions[{index}]")
+            NewRequest.from_mapping(item, f"execute batch.admissions[{index}]")
             for index, item in enumerate(
                 _seq(data.get("admissions", ()), "execute batch.admissions")
             )

@@ -1,3 +1,5 @@
+//! Administrative request/response framing around batches and worker information.
+
 use super::*;
 
 // ---------------------------------------------------------------------------
@@ -153,7 +155,7 @@ pub struct WorkerResponseError {
 pub enum WorkerResponse {
     Capabilities {
         call_id: Option<u64>,
-        capabilities: WorkerCapabilities,
+        capabilities: WorkerInfo,
     },
     Result {
         call_id: Option<u64>,
@@ -212,7 +214,7 @@ impl WorkerResponse {
         }
     }
 
-    pub fn capabilities(capabilities: WorkerCapabilities) -> Self {
+    pub fn capabilities(capabilities: WorkerInfo) -> Self {
         Self::Capabilities {
             call_id: None,
             capabilities,

@@ -180,8 +180,8 @@ fn completion_record() -> ModelOutput {
     }
 }
 
-fn admission() -> Admission {
-    Admission::new(
+fn admission() -> NewRequest {
+    NewRequest::new(
         request_key(),
         u32::try_from(request_key().session_id.0).unwrap(),
         Some(UndAdmission {
@@ -292,7 +292,7 @@ fn partitions_for_operations(operations: Vec<Operation>) -> Vec<BatchPartition> 
 
 fn batch_with_operations(
     step_id: u64,
-    admissions: Vec<Admission>,
+    admissions: Vec<NewRequest>,
     operations: Vec<Operation>,
 ) -> Batch {
     Batch::new(step_id, admissions, partitions_for_operations(operations))
@@ -494,7 +494,7 @@ fn every_control_variant_round_trips_through_the_wire() {
 }
 
 #[test]
-fn admission_round_trips_and_binds_its_operation() {
+fn new_request_round_trips_and_binds_its_operation() {
     let batch = execute_round_trip(batch_with_operations(
         4,
         vec![admission()],
@@ -772,7 +772,7 @@ fn commit_control_requires_a_fixed_selected_version() {
 
 #[test]
 fn capabilities_round_trip_with_the_canonical_layout() {
-    let caps = WorkerCapabilities::default();
+    let caps = WorkerInfo::default();
     let response = WorkerResponse::capabilities(caps.clone());
     let decoded = decode_response(&encode_response(&response).unwrap()).unwrap();
     let WorkerResponse::Capabilities {
@@ -787,7 +787,7 @@ fn capabilities_round_trip_with_the_canonical_layout() {
 
 #[test]
 fn kv_free_capabilities_round_trip_without_kv_geometry() {
-    let caps = WorkerCapabilities {
+    let caps = WorkerInfo {
         block_size: 0,
         num_blocks: 0,
         num_layers: 0,
@@ -802,7 +802,7 @@ fn kv_free_capabilities_round_trip_without_kv_geometry() {
         groups: Vec::new(),
         kv_dtype: None,
         resource_classes: vec![ResourceClass::ImageLatent],
-        ..WorkerCapabilities::default()
+        ..WorkerInfo::default()
     };
     let response = WorkerResponse::capabilities(caps.clone());
     let decoded = decode_response(&encode_response(&response).unwrap()).unwrap();
@@ -818,7 +818,7 @@ fn kv_free_capabilities_round_trip_without_kv_geometry() {
 
 #[test]
 fn capabilities_reject_duplicate_set_members() {
-    let caps = WorkerCapabilities {
+    let caps = WorkerInfo {
         supported_work: vec![
             ForwardMode::TokenExtend,
             ForwardMode::TokenDecode,
@@ -828,13 +828,13 @@ fn capabilities_reject_duplicate_set_members() {
     };
     assert!(encode_response(&WorkerResponse::capabilities(caps)).is_err());
 
-    let caps = WorkerCapabilities {
+    let caps = WorkerInfo {
         supported_controls: vec![RequestKind::Execute, RequestKind::Execute],
         ..Default::default()
     };
     assert!(encode_response(&WorkerResponse::capabilities(caps)).is_err());
 
-    let caps = WorkerCapabilities {
+    let caps = WorkerInfo {
         resource_classes: vec![ResourceClass::KvBlock, ResourceClass::KvBlock],
         ..Default::default()
     };
@@ -1034,7 +1034,7 @@ fn comprehensive_batch() -> Batch {
             .sealed(),
         );
     }
-    let und_admission = Admission::new(
+    let und_admission = NewRequest::new(
         session_key(100),
         100,
         Some(UndAdmission {
@@ -1046,7 +1046,7 @@ fn comprehensive_batch() -> Batch {
         None,
     )
     .unwrap();
-    let gen_admission = Admission::new(
+    let gen_admission = NewRequest::new(
         session_key(110),
         110,
         None,
@@ -1115,8 +1115,8 @@ fn request_fixtures() -> Vec<WorkerRequest> {
     ]
 }
 
-fn full_caps() -> WorkerCapabilities {
-    WorkerCapabilities {
+fn full_caps() -> WorkerInfo {
+    WorkerInfo {
         supported_work: ForwardMode::ALL.to_vec(),
         groups: vec![
             KvCacheGroupSpec {
@@ -1142,7 +1142,7 @@ fn full_caps() -> WorkerCapabilities {
         max_batch_tokens: 4096,
         max_request_pool_size: 96,
         max_unresolved_window: 3,
-        mixed_buckets: vec![MixedExecutionCapability {
+        mixed_buckets: vec![GraphBucket {
             decode_rows: 1,
             flow_rows: 1,
             height: 1152,
@@ -1157,7 +1157,7 @@ fn full_caps() -> WorkerCapabilities {
         latent_dtype: Some(ModelDtype::BFloat16),
         model_identity: Some(digest_string(0x21)),
         weight_digest: Some(digest_string(0x22)),
-        ..WorkerCapabilities::default()
+        ..WorkerInfo::default()
     }
 }
 
@@ -1282,7 +1282,7 @@ fn response_fixtures() -> Vec<WorkerResponse> {
     vec![
         WorkerResponse::Capabilities {
             call_id: None,
-            capabilities: WorkerCapabilities::default(),
+            capabilities: WorkerInfo::default(),
         },
         WorkerResponse::Capabilities {
             call_id: Some(17),

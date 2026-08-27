@@ -15,7 +15,7 @@ use uniserve_core::{KvCacheDtype, ModelDtype};
 use uniserve_engine::{
     AttentionBackend, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
     DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS,
-    FlashInferBackend, LaneConfig, TransferSpec, WorkerLaunchConfig, WorkersSpec,
+    FlashInferBackend, LaneConfig, TransportMap, WorkerProcessArgs, WorkerTopology,
 };
 use uniserve_server::{
     ChatTemplateContentFormatOption, Config, EngineBackendKind, EngineSettings, HttpListenerMode,
@@ -153,17 +153,17 @@ pub(crate) struct SharedRuntimeArgs {
     /// Unset = a single Full pool; a multi-stage spec composes local pools
     /// behind a StagedExecutor.
     #[arg(long, hide = true)]
-    pub workers: Option<WorkersSpec>,
+    pub workers: Option<WorkerTopology>,
     /// Per-edge data-plane transfer backend, e.g.
     /// `encoder->prefill=shm,prefill->decode=cuda_ipc`.
     #[arg(long, hide = true)]
-    pub transfer: Option<TransferSpec>,
+    pub transfer: Option<TransportMap>,
     /// KV block size in tokens (the page size).
     #[arg(long = "page-size", default_value_t = 64, value_parser = clap::builder::RangedU64ValueParser::<u32>::new().range(1..))]
     pub block_size: u32,
     /// Explicit Python worker launch/runtime arguments.
     #[command(flatten)]
-    pub worker_launch: WorkerLaunchArgs,
+    pub worker_process: WorkerProcessOptions,
     /// How many op-batches the scheduler keeps in flight against the worker.
     #[arg(long, default_value_t = 2, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..), hide = true)]
     pub pipeline_depth: usize,
@@ -253,18 +253,27 @@ impl SharedRuntimeArgs {
     /// Build the UniServe Rust-engine settings from these CLI arguments.
     pub(crate) fn engine_settings(&self) -> EngineSettings {
         let is_media = self.model_description == ModelDescription::MiniMaxH3;
-        let mut worker_launch = self.worker_launch.to_config();
-        worker_launch.media_spool = is_media.then(|| self.media_spool.clone());
+        let mut worker_process = self.worker_process.to_args();
+        worker_process.media_spool = is_media.then(|| self.media_spool.clone());
+        worker_process.python = self.worker_python.clone();
+        worker_process.model = self.model.clone();
+        worker_process.device = self.device.clone();
+        worker_process.world_size = self.worker_ranks;
+        worker_process.pipeline_depth = self.pipeline_depth;
+        worker_process.resp_slot_cap = if is_media {
+            EngineSettings::MEDIA_IPC_SLOT_CAP
+        } else {
+            self.resp_slot_cap
+        };
+        worker_process.kv_token_capacity = self.kv_token_capacity;
+        worker_process.block_size = self.block_size;
+        worker_process.attention_backend = self.attention_backend.clone();
         EngineSettings {
             backend: if self.sim {
                 EngineBackendKind::Sim
             } else {
                 EngineBackendKind::Worker
             },
-            device: self.device.clone(),
-            attention_backend: self.attention_backend.clone(),
-            block_size: self.block_size,
-            pipeline_depth: self.pipeline_depth,
             max_batch: self.max_batch,
             max_num_batched_tokens: self.max_num_batched_tokens,
             max_num_seqs: self.max_num_seqs,
@@ -274,19 +283,12 @@ impl SharedRuntimeArgs {
             // `None` lets `build_state` derive the model's real context length;
             // an explicit `--max-model-len` overrides it.
             max_model_len: self.max_model_len,
-            kv_token_capacity: self.kv_token_capacity,
-            resp_slot_cap: if is_media {
-                EngineSettings::MEDIA_IPC_SLOT_CAP
-            } else {
-                self.resp_slot_cap
-            },
-            worker_python: self.worker_python.clone(),
             workers: self
                 .workers
                 .clone()
-                .unwrap_or_else(|| WorkersSpec::single_full(self.worker_ranks)),
+                .unwrap_or_else(|| WorkerTopology::single_full(self.worker_ranks)),
             transfer: self.transfer.clone().unwrap_or_default(),
-            worker_launch,
+            worker_process,
         }
     }
 
@@ -321,7 +323,7 @@ impl SharedRuntimeArgs {
 /// Worker-runtime arguments forwarded to the Python worker process.
 #[derive(Educe, Clone, Args)]
 #[educe(Debug)]
-pub(crate) struct WorkerLaunchArgs {
+pub(crate) struct WorkerProcessOptions {
     #[arg(long, hide = true)]
     pub worker_stub: bool,
     /// Checkpoint loader format used by every model worker.
@@ -381,9 +383,9 @@ pub(crate) struct WorkerLaunchArgs {
     pub flashinfer_fast_decode_plan: bool,
 }
 
-impl WorkerLaunchArgs {
-    fn to_config(&self) -> WorkerLaunchConfig {
-        WorkerLaunchConfig {
+impl WorkerProcessOptions {
+    fn to_args(&self) -> WorkerProcessArgs {
+        WorkerProcessArgs {
             stub: self.worker_stub,
             load_format: self.load_format.clone(),
             download_dir: self.download_dir.clone(),
@@ -410,6 +412,7 @@ impl WorkerLaunchArgs {
             flashinfer_disable_split_kv: self.flashinfer_disable_split_kv,
             flashinfer_fast_decode_plan: self.flashinfer_fast_decode_plan,
             media_spool: None,
+            ..WorkerProcessArgs::default()
         }
     }
 }

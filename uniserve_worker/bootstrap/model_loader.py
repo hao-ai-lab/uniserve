@@ -18,7 +18,7 @@ from ..models.runtime import ExecutionModel, WorkerDeployment
 from ..nn.mesh import DeviceMesh, TensorParallelSpec
 from .capacity import DEFAULT_MAX_REQUEST_POOL_SIZE
 from .catalog import CatalogEntry, resolve_catalog_entry
-from .config import WorkerLaunchConfig
+from .config import WorkerProcessArgs
 from .execution_config import ExecutionConfig
 from .plan import ModelLoadScope, WorkerPlan
 
@@ -117,7 +117,7 @@ def load_worker_model(
 
 
 def materialize_worker_model(
-    config: WorkerLaunchConfig,
+    config: WorkerProcessArgs,
     plan: WorkerPlan,
     mesh: DeviceMesh,
 ) -> LoadedWorkerModel:
@@ -210,7 +210,7 @@ def _load_h3_worker_model(
 
 
 def _checkpoint_request(
-    config: WorkerLaunchConfig,
+    config: WorkerProcessArgs,
     plan: WorkerPlan,
     mesh: DeviceMesh,
 ) -> WorkerModelLoadRequest:
@@ -233,7 +233,7 @@ def _checkpoint_request(
     )
 
 
-def _stub_worker_model(config: WorkerLaunchConfig, plan: WorkerPlan) -> LoadedWorkerModel:
+def _stub_worker_model(config: WorkerProcessArgs, plan: WorkerPlan) -> LoadedWorkerModel:
     from ..server.stub import StubModel, stub_deployment
 
     stub = StubModel()

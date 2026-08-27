@@ -1,13 +1,9 @@
-//! Worker execution protocol.
+//! Versioned scheduler-to-worker protocol and FlatBuffers transport types.
 //!
-//! The scheduler and worker exchange four cross-layer records — [`Operation`],
-//! [`VersionRef`], [`ProductRef`], and [`ModelOutput`] — plus a request
-//! [`Control`] command. Every operation names one closed [`ForwardMode`] variant, one
-//! exact parent version, and its declared input and output products. The worker
-//! returns exactly one [`ModelOutput`] per operation. Two host-computed
-//! digests fix identity: an operation [`Operation::plan_digest`] over immutable
-//! registration fields, and a [`ModelOutput::compute_semantic_digest`] over
-//! the selected result.
+//! A [`NewRequest`] carries static request state once, [`Batch`] carries planned
+//! operations, and [`CompletionReport`] returns resolved outputs. [`WorkerInfo`]
+//! is the post-load handshake. Semantic identity is anchored by operation and
+//! model-output digests rather than transport-local representation.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -20,40 +16,46 @@ use uniserve_core::{
 };
 pub use uniserve_core::{Digest, OpId, WorkerForwardStats};
 
-pub type ProtocolResult<T> = std::result::Result<T, ProtocolError>;
+pub type ProtocolResult<T> = std::result::Result<T, WireError>;
 
 #[derive(Debug, thiserror::Error)]
-pub enum ProtocolError {
-    #[error("worker protocol violation: {0}")]
-    Violation(String),
-    #[error(transparent)]
-    Sampling(#[from] uniserve_core::SamplingParamsError),
-    #[error(transparent)]
-    Image(#[from] uniserve_core::ImageParamsError),
-}
+#[error("worker protocol violation: {0}")]
+pub struct WireError(String);
 
-impl ProtocolError {
+impl WireError {
     pub(crate) fn message(message: impl Into<String>) -> Self {
-        Self::Violation(message.into())
+        Self(message.into())
     }
 }
 
-macro_rules! protocol_error {
+impl From<uniserve_core::SamplingParamsError> for WireError {
+    fn from(error: uniserve_core::SamplingParamsError) -> Self {
+        Self::message(error.to_string())
+    }
+}
+
+impl From<uniserve_core::ImageParamsError> for WireError {
+    fn from(error: uniserve_core::ImageParamsError) -> Self {
+        Self::message(error.to_string())
+    }
+}
+
+macro_rules! wire_error {
     ($($arg:tt)*) => {
-        ProtocolError::message(format!($($arg)*))
+        WireError::message(format!($($arg)*))
     };
 }
 
-macro_rules! protocol_bail {
+macro_rules! wire_bail {
     ($($arg:tt)*) => {
-        return Err(protocol_error!($($arg)*))
+        return Err(wire_error!($($arg)*))
     };
 }
 
-macro_rules! protocol_ensure {
+macro_rules! wire_ensure {
     ($condition:expr, $($arg:tt)*) => {
         if !$condition {
-            protocol_bail!($($arg)*);
+            wire_bail!($($arg)*);
         }
     };
 }

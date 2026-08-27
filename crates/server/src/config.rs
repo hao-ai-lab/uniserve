@@ -8,9 +8,9 @@ use anyhow::Result;
 use serde::Serialize;
 use serde_json::Value;
 use uniserve_engine::{
-    AttentionBackend, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
-    DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS,
-    SchedulingPolicy, TransferSpec, WorkerLaunchConfig, WorkersSpec,
+    DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
+    DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS, SchedulingPolicy, TransportMap,
+    WorkerProcessArgs, WorkerTopology,
 };
 
 /// How the HTTP server obtains its listening socket.
@@ -41,14 +41,6 @@ pub enum EngineBackendKind {
 pub struct EngineSettings {
     /// Which forward-only worker to drive.
     pub backend: EngineBackendKind,
-    /// Compute device for the worker.
-    pub device: String,
-    /// Attention backend preference forwarded to the Python worker.
-    pub attention_backend: AttentionBackend,
-    /// KV block size in tokens.
-    pub block_size: u32,
-    /// Op-batches kept in flight against the worker.
-    pub pipeline_depth: usize,
     /// Maximum ops assembled into one forward batch.
     pub max_batch: usize,
     /// Per-step scheduling token budget (vLLM's `max_num_batched_tokens`).
@@ -67,33 +59,23 @@ pub struct EngineSettings {
     /// [`EngineSettings::DEFAULT_MAX_MODEL_LEN`] for the final fallback when the
     /// model exposes no value).
     pub max_model_len: Option<u32>,
-    /// Optional KV token-capacity override for the worker.
-    pub kv_token_capacity: Option<u64>,
-    /// Response-ring slot capacity in bytes for the worker IPC transport.
-    pub resp_slot_cap: usize,
-    /// Python interpreter used to launch the worker.
-    pub worker_python: PathBuf,
     /// Number of tensor-parallel worker rank processes (tp size of the single
     /// Full pool in the default topology).
     /// Staged-worker topology, e.g. `encoder:2,prefill:1:tp=4,decode:1:tp=4`.
     /// `None` selects one Full pool. A multi-stage spec
     /// composes pools behind a `StagedExecutor`.
-    pub workers: WorkersSpec,
+    pub workers: WorkerTopology,
     /// Per-edge data-plane transfer backend (`--transfer`), e.g.
     /// `encoder->prefill=shm,prefill->decode=cuda_ipc`.
-    pub transfer: TransferSpec,
-    /// Explicit Python worker launch/runtime configuration.
-    pub worker_launch: WorkerLaunchConfig,
+    pub transfer: TransportMap,
+    /// Worker process arguments completed with resolved model assets before spawn.
+    pub worker_process: WorkerProcessArgs,
 }
 
 impl Default for EngineSettings {
     fn default() -> Self {
         Self {
             backend: EngineBackendKind::Worker,
-            device: "cuda".to_string(),
-            attention_backend: AttentionBackend::Auto,
-            block_size: 64,
-            pipeline_depth: 2,
             max_batch: DEFAULT_MAX_BATCH,
             max_num_batched_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS,
             max_num_seqs: DEFAULT_MAX_NUM_SEQS,
@@ -101,12 +83,12 @@ impl Default for EngineSettings {
             mixed_prefill_tokens: DEFAULT_MIXED_PREFILL_TOKENS,
             scheduler_policy: SchedulingPolicy::Fcfs,
             max_model_len: None,
-            kv_token_capacity: None,
-            resp_slot_cap: EngineSettings::DEFAULT_RESP_SLOT_CAP,
-            worker_python: "python3".into(),
-            workers: WorkersSpec::single_full(1),
-            transfer: TransferSpec::default(),
-            worker_launch: WorkerLaunchConfig::default(),
+            workers: WorkerTopology::single_full(1),
+            transfer: TransportMap::default(),
+            worker_process: WorkerProcessArgs {
+                resp_slot_cap: EngineSettings::DEFAULT_RESP_SLOT_CAP,
+                ..WorkerProcessArgs::default()
+            },
         }
     }
 }
@@ -235,9 +217,12 @@ impl EngineSettings {
     /// positive (they index, divide, or bound scheduling). This catches a `0`
     /// override before it reaches the scheduler or KV sizing math.
     pub fn validate(&self) -> Result<()> {
-        anyhow::ensure!(self.block_size > 0, "block_size must be greater than 0");
         anyhow::ensure!(
-            self.pipeline_depth > 0,
+            self.worker_process.block_size > 0,
+            "block_size must be greater than 0"
+        );
+        anyhow::ensure!(
+            self.worker_process.pipeline_depth > 0,
             "pipeline_depth must be greater than 0"
         );
         anyhow::ensure!(self.max_batch > 0, "max_batch must be greater than 0");
@@ -251,7 +236,7 @@ impl EngineSettings {
             "max_model_len must be greater than 0"
         );
         anyhow::ensure!(
-            self.resp_slot_cap > 0,
+            self.worker_process.resp_slot_cap > 0,
             "resp_slot_cap must be greater than 0"
         );
         anyhow::ensure!(
@@ -281,7 +266,7 @@ mod tests {
     #[test]
     fn zero_block_size_is_rejected() {
         let mut config = Config::default();
-        config.engine.block_size = 0;
+        config.engine.worker_process.block_size = 0;
         assert!(config.validate().is_err());
     }
 
@@ -302,7 +287,7 @@ mod tests {
     #[test]
     fn zero_resp_slot_cap_is_rejected() {
         let mut config = Config::default();
-        config.engine.resp_slot_cap = 0;
+        config.engine.worker_process.resp_slot_cap = 0;
         assert!(config.validate().is_err());
     }
 

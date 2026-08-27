@@ -31,7 +31,7 @@ impl Scheduler {
             });
             return;
         }
-        // Admission backpressure sheds load instead of letting the waiting
+        // Waiting-queue backpressure sheds load instead of letting the waiting
         // queue grow without bound under overload —
         // an unbounded burst would otherwise OOM the process and take down every
         // in-flight request. Reject the new submit with a typed event.
@@ -68,7 +68,7 @@ impl Scheduler {
         // Context-image requests prefill the text before each image position,
         // then encode the image into that marker gap.
         let phase0 = Phase::Prefill;
-        let finish_token_ids = canonical_continuation_stop_token_ids(&req, &self.ctrl.eos);
+        let finish_token_ids = finish_token_ids(&req, &self.ctrl.eos);
         let st = ReqState {
             finish_token_ids,
             block_tables: (0..self.kv_state().block_pool.num_groups())
@@ -172,7 +172,7 @@ impl Scheduler {
             let epoch = self.next_epoch;
             self.next_epoch = self.next_epoch.saturating_add(1);
             let request_key = RequestKey::new(self.authority_id, id, epoch);
-            let admission = Admission::new_media(
+            let admission = NewRequest::new_media(
                 request_key,
                 request_pool_idx,
                 MediaAdmission {
@@ -420,7 +420,7 @@ impl Scheduler {
         }
     }
 
-    /// Admission: consume the waiting-queue head while budgets allow (vLLM's
+    /// Admit: consume the waiting-queue head while budgets allow (vLLM's
     /// posture — head-of-line, `max_num_seqs`-capped). Reserving requests
     /// allocate their full worst-case KV here, which is what makes them
     /// resident for its complete lifetime.
@@ -475,12 +475,12 @@ impl Scheduler {
                     .map(|group| self.kv_state().block_pool.group_capacity(group))
                     .min()
                     .unwrap_or_default();
-                let prefix_admission = cached_blocks_for_admission(
+                let prefix_hit = prefix_hit(
                     &self.kv_state().coordinator,
                     head,
                     &self.kv_state().block_pool,
                 );
-                let cached_prefix_blocks = prefix_admission.cached_blocks;
+                let cached_prefix_blocks = prefix_hit.cached_blocks;
                 let cached_prefix_blocks = cached_prefix_blocks.min(n.div_ceil(bs));
                 let cached_prefix_tokens = cached_prefix_blocks.saturating_mul(bs);
                 let uncached_remaining = n.saturating_sub(cached_prefix_tokens);
@@ -509,9 +509,9 @@ impl Scheduler {
                     });
                     continue;
                 }
-                let capacity_available = prefix_admission.cached_free_blocks.len()
+                let capacity_available = prefix_hit.cached_free_blocks.len()
                     == self.kv_state().block_pool.num_groups()
-                    && prefix_admission.cached_free_blocks.iter().enumerate().all(
+                    && prefix_hit.cached_free_blocks.iter().enumerate().all(
                         |(group, cached_free)| {
                             self.kv_state()
                                 .block_pool
@@ -604,12 +604,12 @@ impl Scheduler {
     }
 }
 
-fn cached_blocks_for_admission(
+fn prefix_hit(
     coordinator: &KvCacheCoordinator,
     state: &ReqState,
     pool: &BlockPool,
-) -> crate::kv::PrefixAdmission {
-    coordinator.cached_prefix_for_admission(
+) -> crate::kv::PrefixHit {
+    coordinator.probe_prefix(
         pool,
         state.effective_prompt(),
         state.req.cache.read,

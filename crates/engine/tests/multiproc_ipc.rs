@@ -1,3 +1,5 @@
+//! Multiprocess IPC framing, replay/control idempotency, and rank-respawn qualification.
+
 #![cfg(target_os = "linux")]
 
 use std::collections::BTreeMap;
@@ -16,11 +18,11 @@ use uniserve_core::Digest as SemanticDigest;
 use uniserve_core::{BlockId, RequestId, SamplingParams};
 use uniserve_engine::{
     ControlOp, Executor, MultiprocExecutor, TransferBackend, WorkerExecError, WorkerKind,
-    WorkerLaunchConfig, WorkerLossError, WorkerSpawnSpec,
+    WorkerLossError, WorkerProcessArgs,
 };
 use uniserve_worker_ipc::{
-    Admission, AttentionRegime, Batch, BatchPartition, BlockTable, Bounds, CachePageAllocation,
-    CloseReason, Control, DType, DimBound, Disposition, ErrorCode, ForwardMode, OpId, OpStatus,
+    AttentionRegime, Batch, BatchPartition, BlockTable, Bounds, CachePageAllocation, CloseReason,
+    Control, DType, DimBound, Disposition, ErrorCode, ForwardMode, NewRequest, OpId, OpStatus,
     Operation, Point, PointRange, ProductKind, ProductPayload, ProductRef, RequestKey, RouteId,
     RowGeometry, SamplingOwnership, ShapeBound, StorageClass, TRANSFER_DESCRIPTOR_PREFIX,
     UndAdmission, VersionRef, encode_token_product_bytes,
@@ -292,13 +294,13 @@ fn qualify_peer_replacement() -> anyhow::Result<()> {
 
 fn qualify_slow_transfer() -> anyhow::Result<()> {
     let worker = worker_python();
-    let config = WorkerLaunchConfig {
+    let config = WorkerProcessArgs {
         stub: true,
         cuda_graph: false,
         prefill_cuda_graph: false,
-        ..WorkerLaunchConfig::default()
+        ..WorkerProcessArgs::default()
     };
-    let mut executor = MultiprocExecutor::spawn(WorkerSpawnSpec {
+    let mut executor = MultiprocExecutor::spawn(WorkerProcessArgs {
         python: worker,
         model: String::new(),
         device: "cpu".into(),
@@ -313,7 +315,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         attention_backend: uniserve_worker_ipc::AttentionBackend::TorchSdpa,
         worker_kind: Some(WorkerKind::Full),
         transfer_backend: TransferBackend::Shm,
-        launch: config,
+        ..config
     })?;
 
     let slow_admission = text_admission(31, 1, 1)?;
@@ -587,13 +589,13 @@ fn post_named_semaphore(name: &CString) -> anyhow::Result<()> {
 
 fn spawn_rank_group() -> anyhow::Result<MultiprocExecutor> {
     let worker = worker_python();
-    let config = WorkerLaunchConfig {
+    let config = WorkerProcessArgs {
         stub: true,
         cuda_graph: false,
         prefill_cuda_graph: false,
-        ..WorkerLaunchConfig::default()
+        ..WorkerProcessArgs::default()
     };
-    MultiprocExecutor::spawn(WorkerSpawnSpec {
+    MultiprocExecutor::spawn(WorkerProcessArgs {
         python: worker,
         model: String::new(),
         device: "cpu".into(),
@@ -608,7 +610,7 @@ fn spawn_rank_group() -> anyhow::Result<MultiprocExecutor> {
         attention_backend: uniserve_worker_ipc::AttentionBackend::TorchSdpa,
         worker_kind: None,
         transfer_backend: TransferBackend::Inproc,
-        launch: config,
+        ..config
     })
 }
 
@@ -646,8 +648,12 @@ fn assert_execution_error(
     Ok(())
 }
 
-fn text_admission(session_id: u64, epoch: u64, request_pool_idx: u32) -> anyhow::Result<Admission> {
-    Ok(Admission::new(
+fn text_admission(
+    session_id: u64,
+    epoch: u64,
+    request_pool_idx: u32,
+) -> anyhow::Result<NewRequest> {
+    Ok(NewRequest::new(
         RequestKey::new(1, RequestId(session_id), epoch),
         request_pool_idx,
         Some(UndAdmission {
@@ -667,7 +673,7 @@ fn text_admission(session_id: u64, epoch: u64, request_pool_idx: u32) -> anyhow:
 fn token_batch(
     step_id: u64,
     collective_seq: u64,
-    admission: Option<Admission>,
+    admission: Option<NewRequest>,
     op_id: OpId,
     parent: VersionRef,
     mode: ForwardMode,

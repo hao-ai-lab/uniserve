@@ -57,7 +57,7 @@ impl Scheduler {
         // 2. reap cancellations before assembling.
         self.reap_cancellations();
 
-        // 3. Admission owns request/resource residency and progresses even
+        // 3. Admit request/resource residency even
         // while every execution slot is occupied. This lets the next batch see
         // the complete resident cohort instead of admitting only when a slot
         // happens to open.
@@ -89,7 +89,7 @@ impl Scheduler {
             // worker may launch it ahead of queued decode submissions.
             let prompt_batch = ops
                 .iter()
-                .all(|op| assembly_lane(op.operation_variant) == AssemblyLane::Prefill);
+                .all(|op| batch_kind(op.operation_variant) == BatchKind::Prefill);
             let controls: Vec<Control> = if prompt_batch {
                 let sessions: HashSet<RequestId> = ops.iter().map(|op| op.request_id).collect();
                 let (own, foreign): (VecDeque<Control>, VecDeque<Control>) = self

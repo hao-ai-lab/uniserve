@@ -20,7 +20,7 @@ use anyhow::{Context as _, Result};
 pub use config::{Config, EngineBackendKind, EngineSettings, HttpListenerMode};
 use tracing::info;
 pub use uniserve_engine::SchedulingPolicy;
-use uniserve_engine::{EngineCoreConfig, SimEngine, SimExecutor};
+use uniserve_engine::{EngineCoreConfig, SimEngine, SimExecutor, WorkerProcessArgs};
 
 pub use crate::http::{ApiError, build_router, serve};
 pub use crate::state::AppState;
@@ -79,17 +79,29 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     let eos = control_tokens.eos.clone();
     info!(
         backend = ?config.engine.backend,
-        device = %config.engine.device,
-        block_size = config.engine.block_size,
-        pipeline_depth = config.engine.pipeline_depth,
+        device = %config.engine.worker_process.device,
+        block_size = config.engine.worker_process.block_size,
+        pipeline_depth = config.engine.worker_process.pipeline_depth,
         "starting UniServe Rust engine"
     );
-    let engine_config = EngineCoreConfig {
+    let max_batch_operations = u32::try_from(
+        config
+            .engine
+            .max_batch
+            .max(1)
+            .min(config.engine.max_num_seqs.max(1)),
+    )
+    .context("max_batch exceeds the worker capability representation")?;
+    let max_batch_tokens = u32::try_from(config.engine.max_num_batched_tokens)
+        .context("max_num_batched_tokens exceeds the worker capability representation")?;
+    let worker_process = WorkerProcessArgs {
         model: config.model.clone(),
-        device: config.engine.device.clone(),
-        attention_backend: config.engine.attention_backend.clone(),
-        block_size: config.engine.block_size,
-        pipeline_depth: config.engine.pipeline_depth,
+        req_slot_cap: request_slot_capacity,
+        max_batch_operations,
+        max_batch_tokens,
+        ..config.engine.worker_process.clone()
+    };
+    let engine_config = EngineCoreConfig {
         max_batch: config.engine.max_batch,
         max_num_batched_tokens: config.engine.max_num_batched_tokens,
         max_num_seqs: config.engine.max_num_seqs,
@@ -97,13 +109,9 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         mixed_prefill_tokens: config.engine.mixed_prefill_tokens,
         scheduler_policy: config.engine.scheduler_policy,
         max_model_len: effective_max_model_len,
-        kv_token_capacity: config.engine.kv_token_capacity,
-        worker_python: config.engine.worker_python.clone(),
         workers: config.engine.workers.clone(),
         transfer: config.engine.transfer.clone(),
-        worker_launch: config.engine.worker_launch.clone(),
-        req_slot_cap: request_slot_capacity,
-        resp_slot_cap: config.engine.resp_slot_cap,
+        worker_process,
         bos: control_tokens.bos,
         eos,
         end_of_image: control_tokens.end_of_image,

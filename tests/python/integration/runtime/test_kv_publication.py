@@ -16,13 +16,14 @@ from tests.python.fixtures.depth_one import (
 )
 from tests.python.fixtures.execution_worker import execution_worker
 from uniserve_worker.batch import (
-    Admission,
     BlockTable,
     Bounds,
     CachePageAllocation,
     DeviceDim,
     Domain,
     DType,
+    ForwardMode,
+    NewRequest,
     Operation,
     PointRange,
     ProductKind,
@@ -33,7 +34,6 @@ from uniserve_worker.batch import (
     StorageClass,
     TokenMode,
     VersionRef,
-    ForwardMode,
 )
 from uniserve_worker.transfer.connector import CachePublication
 from uniserve_worker.transfer.tickets import (
@@ -44,7 +44,7 @@ from uniserve_worker.transfer.tickets import (
 
 
 def _installation_operation(
-    admission: Admission,
+    admission: NewRequest,
     *,
     op_id: int,
     parent: VersionRef,

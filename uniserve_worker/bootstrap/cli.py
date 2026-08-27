@@ -1,4 +1,4 @@
-"""Command-line adapter for :class:`WorkerLaunchConfig`."""
+"""Command-line adapter for :class:`WorkerProcessArgs`."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from collections.abc import Sequence
 
 from ..server.worker_kind import WorkerKind
 from .capacity import DEFAULT_BLOCK_SIZE, DEFAULT_MAX_BATCH_OPS
-from .config import WorkerLaunchConfig
+from .config import WorkerProcessArgs
 
 
 def create_worker_cli_parser() -> argparse.ArgumentParser:
@@ -122,12 +122,12 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def parse_worker_launch(
+def parse_worker_args(
     arguments: Sequence[str] | None = None,
-) -> WorkerLaunchConfig:
+) -> WorkerProcessArgs:
     parser = create_worker_cli_parser()
     namespace = parser.parse_args(arguments)
     try:
-        return WorkerLaunchConfig.from_namespace(namespace)
+        return WorkerProcessArgs.from_namespace(namespace)
     except ValueError as error:
         parser.error(str(error))

@@ -1,9 +1,9 @@
 //! Scheduler control loop: one owner thread drives the whole loop (single-owner,
 //! no locks on engine state) — drain commands, advance each running request's
 //! generation lifecycle, admit pending requests against the block budget,
-//! assemble a `ForwardBatch`, submit it asynchronously through the `Executor`,
-//! and resolve completed `ForwardResult`s into `GenerationEvent`s and cursor transitions.
-//! `ForwardBatch` assembly is lane-aware for text prefill/decode and may still
+//! assemble a `Batch`, submit it asynchronously through the `Executor`, and
+//! resolve completed reports into `GenerationEvent`s and cursor transitions.
+//! Batch assembly chooses text prefill, text decode, or media work and may still
 //! mix compatible non-text ops; workers preserve one result per submitted op.
 //!
 //! Scheduling uses budgeted, chunked-prefill admission with exact resident state:
@@ -16,7 +16,7 @@
 //!   backpressure when capacity is exhausted.
 //!
 //! The worker contract is a stateful diff: a request's static state crosses once
-//! as [`NewRequestData`]; per-step ops carry only deltas (new block ids, new
+//! as [`NewRequest`]; per-step ops carry only deltas (new block ids, new
 //! tokens, and per-step masks).
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
@@ -29,7 +29,7 @@ mod execution;
 pub(crate) mod generation;
 pub(crate) mod image_artifact;
 mod logits;
-mod publication;
+mod output;
 pub(crate) mod queue;
 mod runtime;
 mod stats;
@@ -86,13 +86,13 @@ use uniserve_core::{
 };
 use uniserve_core::{HashAlgo, RequestId};
 use uniserve_worker_ipc::{
-    Admission, AttentionRegime, Batch, BatchPartition, BlockTable as WireBlockTable, Bounds,
+    AttentionRegime, Batch, BatchPartition, BlockTable as WireBlockTable, Bounds,
     CachePageAllocation, CloseReason, CompletionReport, Control, DType, DecodeKind,
     DecodePlacement, DimBound, Disposition, ForwardMode, GenAdmission, LatentPlacement,
-    MediaAdmission, MediaProfileId, ModelOutput, OpId, OpStatus, Operation, Point, PointRange,
-    ProductKind, ProductPayload, ProductRef, RequestKey, ResourceClass, RouteId, RowGeometry,
-    SamplingState, ShapeBound, StorageClass, TimingCounters, UndAdmission, VersionRef,
-    WorkerCapabilities, WorkerForwardStats,
+    MediaAdmission, MediaProfileId, ModelOutput, NewRequest, OpId, OpStatus, Operation, Point,
+    PointRange, ProductKind, ProductPayload, ProductRef, RequestKey, ResourceClass, RouteId,
+    RowGeometry, SamplingState, ShapeBound, StorageClass, TimingCounters, UndAdmission, VersionRef,
+    WorkerForwardStats, WorkerInfo,
 };
 
 use crate::executor::{WorkerExecError, WorkerLossError};
@@ -100,10 +100,10 @@ use crate::scheduler::image_artifact::validate_png_artifact;
 use serde_json::json;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AssemblyLane {
+enum BatchKind {
     Prefill,
     Decode,
-    Other,
+    Media,
 }
 
 type RouteDomainOperations = Vec<(
@@ -285,7 +285,7 @@ pub struct SchedulerConfig {
     /// prompt cannot monopolize a step even within the budget. `usize::MAX`
     /// disables it (the budget binds).
     pub long_prefill_threshold: usize,
-    /// Admission backpressure — maximum waiting requests buffered before new
+    /// Waiting-queue backpressure — maximum requests buffered before new
     /// submits are rejected at enqueue.
     pub max_num_waiting: usize,
     /// Per-step budget of text prefill tokens allowed to join a decode batch
@@ -635,7 +635,7 @@ struct MediaFlowState {
     request: MediaRequest,
     event_tx: MediaEventTx,
     request_pool_idx: u32,
-    admission: Admission,
+    admission: NewRequest,
     admission_sent: bool,
     committed: MediaCursor,
     projected: MediaCursor,
@@ -675,7 +675,7 @@ struct PendingMedia {
 
 pub struct Scheduler {
     executor: Box<dyn Executor>,
-    caps: WorkerCapabilities,
+    caps: WorkerInfo,
     kv: Option<KvSchedulerState>,
     ctrl: ControlTokens,
     config: SchedulerConfig,
@@ -797,7 +797,7 @@ fn close_reason(reason: &FinishReason) -> CloseReason {
 /// the current Und continuation window: the sampled trigger remains
 /// host-visible and opens the image branch, while an already registered text
 /// successor resolves as a predicate no-op.
-fn canonical_continuation_stop_token_ids(request: &GenerationRequest, eos: &[u32]) -> Vec<u32> {
+fn finish_token_ids(request: &GenerationRequest, eos: &[u32]) -> Vec<u32> {
     let mut finish_token_ids = request.stop_token_ids.clone();
     if !request.sampling.ignore_eos {
         finish_token_ids.extend(eos.iter().copied());
@@ -823,12 +823,12 @@ fn ranked_logprobs(entries: Vec<RankedToken>) -> Vec<TokenLogprob> {
         .collect()
 }
 
-fn assembly_lane(operation_variant: ForwardMode) -> AssemblyLane {
+fn batch_kind(operation_variant: ForwardMode) -> BatchKind {
     match operation_variant {
         ForwardMode::TokenExtend | ForwardMode::EncodeVision | ForwardMode::EncodeLatent => {
-            AssemblyLane::Prefill
+            BatchKind::Prefill
         }
-        ForwardMode::TokenDecode | ForwardMode::TokenVerify => AssemblyLane::Decode,
+        ForwardMode::TokenDecode | ForwardMode::TokenVerify => BatchKind::Decode,
         ForwardMode::Draft
         | ForwardMode::GenFlow
         | ForwardMode::GenDecode
@@ -836,7 +836,7 @@ fn assembly_lane(operation_variant: ForwardMode) -> AssemblyLane {
         | ForwardMode::Materialize
         | ForwardMode::TransferProduct
         | ForwardMode::TransferKvPublish
-        | ForwardMode::TransferKvInstall => AssemblyLane::Other,
+        | ForwardMode::TransferKvInstall => BatchKind::Media,
     }
 }
 
@@ -1019,7 +1019,7 @@ fn flow_matches_mixed_bucket(
     operation: &Operation,
     forward_rows: &HashMap<(RequestKey, OpId), Vec<RowGeometry>>,
     latent_placements: &HashMap<(RequestKey, OpId), LatentPlacement>,
-    bucket: &uniserve_worker_ipc::MixedExecutionCapability,
+    bucket: &uniserve_worker_ipc::GraphBucket,
 ) -> bool {
     if operation.work != ForwardMode::GenFlow {
         return false;
@@ -1036,7 +1036,7 @@ fn flow_matches_mixed_bucket(
 
 fn extract_mixed_group(
     candidates: &mut [(uniserve_worker_ipc::Domain, Vec<Operation>)],
-    buckets: &[uniserve_worker_ipc::MixedExecutionCapability],
+    buckets: &[uniserve_worker_ipc::GraphBucket],
     forward_rows: &HashMap<(RequestKey, OpId), Vec<RowGeometry>>,
     latent_placements: &HashMap<(RequestKey, OpId), LatentPlacement>,
 ) -> Option<Vec<(uniserve_worker_ipc::Domain, Vec<Operation>)>> {
@@ -1277,7 +1277,7 @@ mod tests {
         req.policy.trigger = uniserve_core::TriggerPolicyDescriptor::Token { token_id: 4_242 };
         req.behavior = GenerationBehaviorDescriptor::resolve(req.constraint, &req.policy);
 
-        let stops = canonical_continuation_stop_token_ids(&req, &[151_643, 151_645]);
+        let stops = finish_token_ids(&req, &[151_643, 151_645]);
 
         assert_eq!(stops, vec![4_242, 151_643, 151_645]);
     }

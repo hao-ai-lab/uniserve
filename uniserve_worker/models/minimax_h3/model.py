@@ -7,7 +7,7 @@ from typing import Any, Literal
 import torch
 from torch import nn
 
-from ...batch import Admission, DecodeKind, DecodePlacement, ForwardMode, MediaProfileId
+from ...batch import DecodeKind, DecodePlacement, ForwardMode, MediaProfileId, NewRequest
 from ...nn.mesh import DeviceMesh
 from ...server.profiler import profile_range
 from ..runtime import ResourceGeometry
@@ -237,7 +237,7 @@ class MiniMaxH3Model(nn.Module):
         )
 
     @torch.inference_mode()
-    def prepare(self, slot: H3StateSlot, admission: Admission) -> None:
+    def prepare(self, slot: H3StateSlot, admission: NewRequest) -> None:
         if slot.active:
             raise RuntimeError("H3 state slot is already active")
         media = admission.media

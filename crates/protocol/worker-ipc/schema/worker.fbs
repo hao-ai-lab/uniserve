@@ -148,7 +148,7 @@ table ResourcePressure {
   free:ulong;
 }
 
-table MixedExecutionCapability {
+table GraphBucket {
   decode_rows:uint;
   flow_rows:uint;
   height:uint;
@@ -156,7 +156,7 @@ table MixedExecutionCapability {
   cfg_branches:uint;
 }
 
-table WorkerCapabilities {
+table WorkerInfo {
   block_size:uint;
   num_blocks:uint;
   num_layers:uint;
@@ -188,7 +188,7 @@ table WorkerCapabilities {
   max_request_pool_size:uint;
   max_unresolved_window:uint = 1;
   incremental_kv_publication:bool;
-  mixed_buckets:[MixedExecutionCapability];
+  mixed_buckets:[GraphBucket];
   sampling_ownership:SamplingOwnership;
   resource_classes:[ResourceClass];
   model_identity:string;
@@ -385,7 +385,7 @@ union Control { ControlCommit, ControlClose, ControlRelease }
 
 table ControlEnvelope { control:Control; }
 
-// ---- Admission framing (session establishment) ----------------------------
+// ---- NewRequest framing (session establishment) ----------------------------
 
 table UndAdmission {
   sampling:SamplingParams;
@@ -403,7 +403,7 @@ table MediaAdmission {
   output_path:string;
 }
 
-table Admission {
+table NewRequest {
   request_key:RequestKey;
   request_pool_idx:uint;
   digest:string;
@@ -430,7 +430,7 @@ table BatchPartition {
 
 table Batch {
   step_id:ulong;
-  admissions:[Admission];
+  admissions:[NewRequest];
   partitions:[BatchPartition];
   controls:[ControlEnvelope];
   input_products:[ProductPayload];
@@ -512,7 +512,7 @@ table ErrorOperationIdentity {
 table WorkerResponse {
   kind:RespKind;
   call_id:ulong = null;
-  capabilities:WorkerCapabilities;
+  capabilities:WorkerInfo;
   completion_report:CompletionReport;
   pressure:[ResourcePressure];
   message:string;

@@ -77,11 +77,11 @@ impl ShapeBound {
             .iter()
             .filter(|dim| matches!(dim, DimBound::Device { .. }))
             .count();
-        protocol_ensure!(
+        wire_ensure!(
             device_dims <= 1,
             "a shape bound carries more than one device-actual dimension"
         );
-        protocol_ensure!(
+        wire_ensure!(
             self.dims.iter().all(|dim| match dim {
                 DimBound::Static(value) => *value > 0,
                 DimBound::Device { max } => *max > 0,
@@ -125,7 +125,7 @@ pub struct ProductRef {
 
 impl ProductRef {
     pub fn validate(&self) -> ProtocolResult<()> {
-        protocol_ensure!(
+        wire_ensure!(
             self.generation > 0,
             "product reference has no logical generation"
         );
@@ -180,7 +180,7 @@ impl ProductPayload {
 
     pub(crate) fn validate_input_value(&self) -> ProtocolResult<()> {
         if is_transfer_descriptor(&self.bytes) {
-            protocol_ensure!(
+            wire_ensure!(
                 self.product.storage_class != StorageClass::HostStaging
                     && self.bytes.len() <= MAX_TRANSFER_DESCRIPTOR_BYTES,
                 "cross-stage product input has an invalid transfer descriptor frame"
@@ -190,19 +190,19 @@ impl ProductPayload {
         match self.product.kind {
             ProductKind::Token => {
                 let tokens = decode_token_product_bytes(&self.bytes)?;
-                protocol_ensure!(
+                wire_ensure!(
                     tokens.len() as u64 <= self.product.shape_bound.max_elements(),
                     "token input product exceeds its registered element bound"
                 );
             }
             ProductKind::SamplingState => {
                 decode_sampling_state_bytes(&self.bytes)?;
-                protocol_ensure!(
+                wire_ensure!(
                     self.bytes.len() as u64 <= self.product.max_bytes(),
                     "sampling-state input exceeds its registered byte bound"
                 );
             }
-            _ => protocol_ensure!(
+            _ => wire_ensure!(
                 self.bytes.len() as u64 <= self.product.max_bytes(),
                 "input product payload exceeds its registered byte bound"
             ),
@@ -213,7 +213,7 @@ impl ProductPayload {
     pub(crate) fn validate_output_value(&self) -> ProtocolResult<()> {
         self.validate()?;
         if is_transfer_descriptor(&self.bytes) {
-            protocol_ensure!(
+            wire_ensure!(
                 self.product.storage_class != StorageClass::HostStaging
                     && self.product.storage_class != StorageClass::PinnedOutput
                     && self.bytes.len() <= MAX_TRANSFER_DESCRIPTOR_BYTES,
@@ -221,7 +221,7 @@ impl ProductPayload {
             );
             return Ok(());
         }
-        protocol_ensure!(
+        wire_ensure!(
             self.bytes.len() as u64 <= self.product.max_bytes(),
             "output product payload exceeds its registered byte bound"
         );
@@ -250,13 +250,13 @@ pub fn encode_token_product_bytes(tokens: &[u32]) -> Vec<u8> {
 /// Decode a `ProductKind::Token` product value produced by
 /// [`encode_token_product_bytes`].
 pub fn decode_token_product_bytes(bytes: &[u8]) -> ProtocolResult<Vec<u32>> {
-    protocol_ensure!(
+    wire_ensure!(
         bytes.len() >= 4,
         "token product bytes are too short to carry a count"
     );
     let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
     let expected = 4 + count * 4;
-    protocol_ensure!(
+    wire_ensure!(
         bytes.len() == expected,
         "token product byte length {} does not match declared count {count}",
         bytes.len()
@@ -349,8 +349,8 @@ pub fn decode_sampling_state_bytes(bytes: &[u8]) -> ProtocolResult<SamplingState
     fn take_u32(bytes: &[u8], offset: &mut usize) -> ProtocolResult<u32> {
         let end = offset
             .checked_add(4)
-            .ok_or_else(|| protocol_error!("sampling-state offset overflow"))?;
-        protocol_ensure!(end <= bytes.len(), "sampling-state bytes are truncated");
+            .ok_or_else(|| wire_error!("sampling-state offset overflow"))?;
+        wire_ensure!(end <= bytes.len(), "sampling-state bytes are truncated");
         let value = u32::from_le_bytes(bytes[*offset..end].try_into().unwrap());
         *offset = end;
         Ok(value)
@@ -360,7 +360,7 @@ pub fn decode_sampling_state_bytes(bytes: &[u8]) -> ProtocolResult<SamplingState
         for _ in 0..count {
             values.push(take_u32(bytes, offset)?);
         }
-        protocol_ensure!(
+        wire_ensure!(
             values.windows(2).all(|pair| pair[0] < pair[1]),
             "sampling-state token ids are not canonical"
         );
@@ -368,7 +368,7 @@ pub fn decode_sampling_state_bytes(bytes: &[u8]) -> ProtocolResult<SamplingState
     }
 
     let mut offset = 0;
-    protocol_ensure!(
+    wire_ensure!(
         offset < bytes.len(),
         "sampling-state bytes omit allowed presence"
     );
@@ -382,7 +382,7 @@ pub fn decode_sampling_state_bytes(bytes: &[u8]) -> ProtocolResult<SamplingState
             let count = take_u32(bytes, &mut offset)?;
             Some(take_ids(bytes, &mut offset, count)?)
         }
-        other => protocol_bail!("sampling-state allowed presence {other} is invalid"),
+        other => wire_bail!("sampling-state allowed presence {other} is invalid"),
     };
     let suppressed_len = take_u32(bytes, &mut offset)?;
     let suppressed_token_ids = take_ids(bytes, &mut offset, suppressed_len)?;
@@ -390,17 +390,17 @@ pub fn decode_sampling_state_bytes(bytes: &[u8]) -> ProtocolResult<SamplingState
     let finish_token_ids = take_ids(bytes, &mut offset, finish_len)?;
     let transition_len = take_u32(bytes, &mut offset)?;
     let transition_token_ids = take_ids(bytes, &mut offset, transition_len)?;
-    protocol_ensure!(
+    wire_ensure!(
         offset < bytes.len(),
         "sampling-state bytes omit force-finish"
     );
     let force_finish = match bytes[offset] {
         0 => false,
         1 => true,
-        other => protocol_bail!("sampling-state force-finish {other} is invalid"),
+        other => wire_bail!("sampling-state force-finish {other} is invalid"),
     };
     offset += 1;
-    protocol_ensure!(
+    wire_ensure!(
         offset == bytes.len(),
         "sampling-state bytes contain trailing data"
     );

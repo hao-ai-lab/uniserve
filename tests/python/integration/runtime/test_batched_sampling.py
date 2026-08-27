@@ -24,11 +24,11 @@ from tests.python.fixtures.depth_one import (
 )
 from tests.python.fixtures.execution_worker import execution_worker
 from uniserve_worker.batch import (
-    Admission,
     CompletionReport,
     DrawLayout,
     DType,
     ErrorCode,
+    NewRequest,
     Operation,
     OpStatus,
     PointRange,
@@ -222,7 +222,7 @@ def test_sampling_batch_returns_serial_tokens_for_mixed_finish_policies() -> Non
     second_base = und_admission(25, block_ids=(4,))
     expected = _next_token(4)
     assert second_base.und is not None
-    second = Admission.create(
+    second = NewRequest.create(
         second_base.request_key,
         request_pool_idx=second_base.request_pool_idx,
         und=replace(second_base.und, finish_token_ids=(expected,)),
@@ -361,7 +361,7 @@ def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span() -
 def test_verify_commits_the_accepted_terminal_draft_as_its_exact_prefix() -> None:
     worker = execution_worker()
     base = und_admission(6, block_ids=(5,))
-    admission = Admission.create(
+    admission = NewRequest.create(
         base.request_key,
         request_pool_idx=base.request_pool_idx,
         und=replace(cast(UndAdmission, base.und), finish_token_ids=(1001,)),

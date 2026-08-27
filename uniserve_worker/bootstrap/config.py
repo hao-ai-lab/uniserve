@@ -1,4 +1,4 @@
-"""Typed worker launch configuration at the CLI boundary."""
+"""Typed process arguments for one Python worker rank."""
 
 from __future__ import annotations
 
@@ -56,7 +56,7 @@ class DataPlaneConfig:
 
 
 @dataclass(frozen=True)
-class WorkerLaunchConfig:
+class WorkerProcessArgs:
     worker_kind: WorkerKind
     ipc: WorkerIpcConfig
     placement: WorkerPlacement
@@ -69,7 +69,7 @@ class WorkerLaunchConfig:
     media_spool: str | None
 
     @classmethod
-    def from_namespace(cls, namespace: argparse.Namespace) -> "WorkerLaunchConfig":
+    def from_namespace(cls, namespace: argparse.Namespace) -> "WorkerProcessArgs":
         worker_kind = WorkerKind(str(namespace.worker_kind))
         plan = resolve_worker_plan(worker_kind)
         device = _normalize_device(namespace.device)

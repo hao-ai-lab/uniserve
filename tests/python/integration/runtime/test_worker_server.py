@@ -14,8 +14,8 @@ from tests.python.fixtures.depth_one import (
 )
 from tests.python.fixtures.execution_worker import execution_worker
 from uniserve_worker.batch import (
-    Admission,
     Batch,
+    NewRequest,
     Operation,
     ProductPayload,
     TokenMode,
@@ -53,7 +53,7 @@ def _token_batch(
     op_id: int,
     step_id: int,
     tokens: tuple[int, ...],
-) -> tuple[Admission, Operation, ProductPayload, Batch]:
+) -> tuple[NewRequest, Operation, ProductPayload, Batch]:
     admission = und_admission(session_id, block_ids=(session_id,))
     operation, payload = token_operation(
         admission.request_key,

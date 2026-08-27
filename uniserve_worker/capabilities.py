@@ -1,4 +1,4 @@
-"""Typed worker capability declaration and wire projection."""
+"""WorkerInfo handshake types, validation, and wire projection."""
 
 from __future__ import annotations
 
@@ -93,7 +93,7 @@ class RankInfo:
 
 
 @dataclass(frozen=True, slots=True)
-class MixedExecutionCapability:
+class GraphBucket:
     decode_rows: int
     flow_rows: int
     height: int
@@ -114,7 +114,7 @@ class MixedExecutionCapability:
             raise invalid_descriptor("mixed execution capability dimensions must be positive")
 
     @classmethod
-    def from_mapping(cls, value: object, where: str) -> MixedExecutionCapability:
+    def from_mapping(cls, value: object, where: str) -> GraphBucket:
         data = _map(value, where)
         return cls(
             decode_rows=_uint(data.get("decode_rows"), f"{where}.decode_rows"),
@@ -135,7 +135,7 @@ class MixedExecutionCapability:
 
 
 @dataclass(frozen=True, slots=True)
-class WorkerCapabilities:
+class WorkerInfo:
     block_size: int
     num_blocks: int
     num_layers: int
@@ -167,7 +167,7 @@ class WorkerCapabilities:
     max_request_pool_size: int
     max_unresolved_window: int
     incremental_kv_publication: bool
-    mixed_buckets: tuple[MixedExecutionCapability, ...]
+    mixed_buckets: tuple[GraphBucket, ...]
     sampling_ownership: SamplingOwnership
     resource_classes: tuple[ResourceClass, ...]
     model_identity: str
@@ -299,7 +299,7 @@ class WorkerCapabilities:
             )
 
     @classmethod
-    def from_mapping(cls, value: object, where: str = "capabilities") -> WorkerCapabilities:
+    def from_mapping(cls, value: object, where: str = "capabilities") -> WorkerInfo:
         data = _map(value, where)
         return cls(
             block_size=_uint(data.get("block_size"), f"{where}.block_size"),
@@ -367,7 +367,7 @@ class WorkerCapabilities:
                 data.get("incremental_kv_publication"), f"{where}.incremental_kv_publication"
             ),
             mixed_buckets=tuple(
-                MixedExecutionCapability.from_mapping(item, f"{where}.mixed_buckets[{index}]")
+                GraphBucket.from_mapping(item, f"{where}.mixed_buckets[{index}]")
                 for index, item in enumerate(
                     _seq(data.get("mixed_buckets", ()), f"{where}.mixed_buckets")
                 )

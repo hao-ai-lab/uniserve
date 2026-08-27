@@ -9,13 +9,13 @@ from typing import TYPE_CHECKING, Any, TypeAlias
 import torch
 
 from uniserve_worker.batch import (
-    Admission,
     Batch,
     BatchPartition,
     CompletionReport,
     FinishFlags,
     LatentPlacement,
     LogicalLengths,
+    NewRequest,
     Operation,
     OpStatus,
     ProductKind,
@@ -412,7 +412,7 @@ class PartitionState:
     request_bases: tuple[RequestRow | None, ...]
     request_rows: dict[int, RequestRow]
     completion: PinnedOutputBuffer
-    admissions: dict[RequestKey, Admission] = field(default_factory=dict)
+    admissions: dict[RequestKey, NewRequest] = field(default_factory=dict)
     input_tokens: dict[ProductRef, tuple[int, ...]] = field(default_factory=dict)
     input_images: dict[ProductRef, str] = field(default_factory=dict)
     forward_rows: dict[OperationIdentity, tuple[RowGeometry, ...]] = field(default_factory=dict)

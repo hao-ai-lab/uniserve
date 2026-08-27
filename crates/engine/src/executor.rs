@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use uniserve_core::{CommandWaker, RequestId};
 use uniserve_worker_ipc::{
-    Batch, CompletionReport, ForwardMode, Operation, RequestKind, WorkerCapabilities, WorkerRequest,
+    Batch, CompletionReport, ForwardMode, Operation, RequestKind, WorkerInfo, WorkerRequest,
 };
 
 /// Which pipeline stage a worker pool serves.
@@ -116,7 +116,7 @@ impl WorkerKind {
 /// One pool in a staged topology: `count` instances of `kind`, each with the
 /// given tensor-parallel size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PoolSpec {
+pub struct Pool {
     pub kind: WorkerKind,
     /// Number of data-parallel pool instances of this kind (e.g. `encoder:2`).
     pub count: usize,
@@ -127,15 +127,15 @@ pub struct PoolSpec {
 /// The `--workers` topology: an ordered list of pool specs. `full:1` (one Full
 /// pool, tp = `--worker-ranks`) is the default.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkersSpec {
-    pub pools: Vec<PoolSpec>,
+pub struct WorkerTopology {
+    pub pools: Vec<Pool>,
 }
 
-impl WorkersSpec {
+impl WorkerTopology {
     /// The default single-Full-pool topology with the given tp size.
     pub fn single_full(tp: usize) -> Self {
         Self {
-            pools: vec![PoolSpec {
+            pools: vec![Pool {
                 kind: WorkerKind::Full,
                 count: 1,
                 tp: tp.max(1),
@@ -145,13 +145,14 @@ impl WorkersSpec {
 
     /// Parse `--workers`, e.g. `encoder:2,prefill:1:tp=4,decode:1:tp=4`.
     /// Each entry is `kind[:count[:tp=N]]`; `count` and `tp` default to 1.
-    pub fn parse(s: &str) -> Result<Self, WorkersSpecError> {
+    pub fn parse(s: &str) -> Result<Self, WorkerTopologyError> {
         let mut pools = Vec::new();
         for entry in s.split(',').map(str::trim).filter(|e| !e.is_empty()) {
             let mut parts = entry.split(':');
             let kind_str = parts.next().unwrap_or("").trim();
-            let kind = WorkerKind::from_token(kind_str)
-                .ok_or_else(|| WorkersSpecError::UnknownWorkerKind(kind_str.to_owned()))?;
+            let kind = WorkerKind::from_token(kind_str).ok_or_else(|| {
+                WorkerTopologyError::message(format!("unknown worker kind {kind_str:?}"))
+            })?;
             let mut count = 1usize;
             let mut tp = 1usize;
             for part in parts {
@@ -159,19 +160,29 @@ impl WorkersSpec {
                 if let Some(tp_str) = part.strip_prefix("tp=") {
                     tp = tp_str
                         .parse::<usize>()
-                        .map_err(|_| WorkersSpecError::InvalidTensorParallel(entry.to_owned()))?
+                        .map_err(|_| {
+                            WorkerTopologyError::message(format!(
+                                "invalid tensor-parallel size in entry {entry:?}"
+                            ))
+                        })?
                         .max(1);
                 } else {
                     count = part
                         .parse::<usize>()
-                        .map_err(|_| WorkersSpecError::InvalidCount(entry.to_owned()))?
+                        .map_err(|_| {
+                            WorkerTopologyError::message(format!(
+                                "invalid worker count in entry {entry:?}"
+                            ))
+                        })?
                         .max(1);
                 }
             }
-            pools.push(PoolSpec { kind, count, tp });
+            pools.push(Pool { kind, count, tp });
         }
         if pools.is_empty() {
-            return Err(WorkersSpecError::Empty);
+            return Err(WorkerTopologyError::message(
+                "workers must list at least one pool",
+            ));
         }
         Ok(Self { pools })
     }
@@ -188,8 +199,8 @@ impl WorkersSpec {
     }
 }
 
-impl FromStr for WorkersSpec {
-    type Err = WorkersSpecError;
+impl FromStr for WorkerTopology {
+    type Err = WorkerTopologyError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         Self::parse(value)
@@ -197,15 +208,13 @@ impl FromStr for WorkersSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum WorkersSpecError {
-    #[error("workers must list at least one pool")]
-    Empty,
-    #[error("unknown worker kind {0:?}")]
-    UnknownWorkerKind(String),
-    #[error("invalid worker count in entry {0:?}")]
-    InvalidCount(String),
-    #[error("invalid tensor-parallel size in entry {0:?}")]
-    InvalidTensorParallel(String),
+#[error("{0}")]
+pub struct WorkerTopologyError(String);
+
+impl WorkerTopologyError {
+    fn message(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -234,14 +243,16 @@ impl std::fmt::Display for TransferBackend {
 }
 
 impl FromStr for TransferBackend {
-    type Err = TransferSpecError;
+    type Err = TransportMapError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "inproc" => Ok(Self::Inproc),
             "shm" => Ok(Self::Shm),
             "cuda_ipc" => Ok(Self::CudaIpc),
-            _ => Err(TransferSpecError::UnsupportedBackend(value.to_owned())),
+            _ => Err(TransportMapError::message(format!(
+                "unsupported transfer backend {value:?}"
+            ))),
         }
     }
 }
@@ -249,39 +260,51 @@ impl FromStr for TransferBackend {
 /// Per-edge local data-plane transfer selection (`--transfer`), e.g.
 /// `encoder->prefill=shm,prefill->decode=cuda_ipc`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TransferSpec {
+pub struct TransportMap {
     /// (producer kind, consumer kind) → backend name.
     pub edges: std::collections::BTreeMap<(WorkerKind, WorkerKind), TransferBackend>,
 }
 
-impl TransferSpec {
-    pub fn parse(s: &str) -> Result<Self, TransferSpecError> {
+impl TransportMap {
+    pub fn parse(s: &str) -> Result<Self, TransportMapError> {
         let mut edges = std::collections::BTreeMap::new();
         for entry in s.split(',').map(str::trim).filter(|e| !e.is_empty()) {
-            let (edge, backend) = entry
-                .split_once('=')
-                .ok_or_else(|| TransferSpecError::InvalidEntry(entry.to_owned()))?;
-            let (src, dst) = edge
-                .split_once("->")
-                .ok_or_else(|| TransferSpecError::InvalidEdge(edge.to_owned()))?;
-            let src = WorkerKind::from_token(src.trim())
-                .ok_or_else(|| TransferSpecError::UnknownWorkerKind(src.trim().to_owned()))?;
-            let dst = WorkerKind::from_token(dst.trim())
-                .ok_or_else(|| TransferSpecError::UnknownWorkerKind(dst.trim().to_owned()))?;
+            let (edge, backend) = entry.split_once('=').ok_or_else(|| {
+                TransportMapError::message(format!("transfer entry {entry:?} must be edge=backend"))
+            })?;
+            let (src, dst) = edge.split_once("->").ok_or_else(|| {
+                TransportMapError::message(format!("transfer edge {edge:?} must be src->dst"))
+            })?;
+            let src = WorkerKind::from_token(src.trim()).ok_or_else(|| {
+                TransportMapError::message(format!(
+                    "unknown worker kind {:?} in transfer edge",
+                    src.trim()
+                ))
+            })?;
+            let dst = WorkerKind::from_token(dst.trim()).ok_or_else(|| {
+                TransportMapError::message(format!(
+                    "unknown worker kind {:?} in transfer edge",
+                    dst.trim()
+                ))
+            })?;
             let backend = TransferBackend::from_str(backend.trim())?;
             if backend == TransferBackend::Inproc {
-                return Err(TransferSpecError::ExplicitInproc);
+                return Err(TransportMapError::message(
+                    "inproc is the implicit backend and cannot be assigned to an edge",
+                ));
             }
             if edges.insert((src, dst), backend).is_some() {
-                return Err(TransferSpecError::DuplicateEdge(edge.to_owned()));
+                return Err(TransportMapError::message(format!(
+                    "duplicate transfer edge {edge:?}"
+                )));
             }
         }
         Ok(Self { edges })
     }
 }
 
-impl FromStr for TransferSpec {
-    type Err = TransferSpecError;
+impl FromStr for TransportMap {
+    type Err = TransportMapError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         Self::parse(value)
@@ -289,19 +312,13 @@ impl FromStr for TransferSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum TransferSpecError {
-    #[error("transfer entry {0:?} must be edge=backend")]
-    InvalidEntry(String),
-    #[error("transfer edge {0:?} must be src->dst")]
-    InvalidEdge(String),
-    #[error("unknown worker kind {0:?} in transfer edge")]
-    UnknownWorkerKind(String),
-    #[error("unsupported transfer backend {0:?}")]
-    UnsupportedBackend(String),
-    #[error("inproc is the implicit backend and cannot be assigned to an edge")]
-    ExplicitInproc,
-    #[error("duplicate transfer edge {0:?}")]
-    DuplicateEdge(String),
+#[error("{0}")]
+pub struct TransportMapError(String);
+
+impl TransportMapError {
+    fn message(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
 }
 
 /// One typed control operation carried over the executor control plane.
@@ -375,7 +392,7 @@ pub struct WorkerLossError {
 
 /// The asynchronous, pipelined boundary the scheduler drives.
 pub trait Executor: Send {
-    fn caps(&self) -> &WorkerCapabilities;
+    fn caps(&self) -> &WorkerInfo;
     fn pipeline_depth(&self) -> usize;
     fn in_flight(&self) -> usize;
 
@@ -508,13 +525,13 @@ mod tests {
     }
 
     #[test]
-    fn workers_spec_parses_topologies() {
-        assert!(WorkersSpec::single_full(4).is_single_full());
-        let epd = WorkersSpec::parse("encoder:2,prefill:1:tp=4,decode:1:tp=4").unwrap();
+    fn worker_topology_parses_pool_layouts() {
+        assert!(WorkerTopology::single_full(4).is_single_full());
+        let epd = WorkerTopology::parse("encoder:2,prefill:1:tp=4,decode:1:tp=4").unwrap();
         assert_eq!(epd.pools.len(), 3);
         assert_eq!(
             epd.pools[0],
-            PoolSpec {
+            Pool {
                 kind: WorkerKind::Encoder,
                 count: 2,
                 tp: 1
@@ -522,7 +539,7 @@ mod tests {
         );
         assert_eq!(
             epd.pools[1],
-            PoolSpec {
+            Pool {
                 kind: WorkerKind::Prefill,
                 count: 1,
                 tp: 4
@@ -530,7 +547,7 @@ mod tests {
         );
         assert_eq!(
             epd.pools[2],
-            PoolSpec {
+            Pool {
                 kind: WorkerKind::Decode,
                 count: 1,
                 tp: 4
@@ -538,11 +555,11 @@ mod tests {
         );
         assert_eq!(epd.total_pools(), 4);
         assert!(!epd.is_single_full());
-        assert!(WorkersSpec::parse("full:1").unwrap().is_single_full());
-        assert!(WorkersSpec::parse("bogus:1").is_err());
-        assert!(WorkersSpec::parse("").is_err());
+        assert!(WorkerTopology::parse("full:1").unwrap().is_single_full());
+        assert!(WorkerTopology::parse("bogus:1").is_err());
+        assert!(WorkerTopology::parse("").is_err());
         // The Und/Gen topology composes through the general staged path.
-        let und_gen = WorkersSpec::parse("und:1,gen:1").unwrap();
+        let und_gen = WorkerTopology::parse("und:1,gen:1").unwrap();
         assert_eq!(und_gen.pools.len(), 2);
         assert_eq!(und_gen.pools[0].kind, WorkerKind::Und);
         assert_eq!(und_gen.pools[1].kind, WorkerKind::Gen);
@@ -550,8 +567,8 @@ mod tests {
     }
 
     #[test]
-    fn transfer_spec_parses_edges() {
-        let t = TransferSpec::parse("encoder->prefill=cuda_ipc,prefill->decode=shm").unwrap();
+    fn transport_map_parses_edges() {
+        let t = TransportMap::parse("encoder->prefill=cuda_ipc,prefill->decode=shm").unwrap();
         assert_eq!(
             t.edges.get(&(WorkerKind::Encoder, WorkerKind::Prefill)),
             Some(&TransferBackend::CudaIpc)
@@ -560,8 +577,8 @@ mod tests {
             t.edges.get(&(WorkerKind::Prefill, WorkerKind::Decode)),
             Some(&TransferBackend::Shm)
         );
-        assert!(TransferSpec::parse("bad-entry").is_err());
-        assert!(TransferSpec::parse("prefill->decode=tcp").is_err());
-        assert!(TransferSpec::parse("prefill->decode=shm,prefill->decode=cuda_ipc").is_err());
+        assert!(TransportMap::parse("bad-entry").is_err());
+        assert!(TransportMap::parse("prefill->decode=tcp").is_err());
+        assert!(TransportMap::parse("prefill->decode=shm,prefill->decode=cuda_ipc").is_err());
     }
 }

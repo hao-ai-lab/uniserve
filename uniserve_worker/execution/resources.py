@@ -19,7 +19,7 @@ from uniserve_worker.batch import (
     ProductRef,
     RequestKey,
 )
-from uniserve_worker.capabilities import MixedExecutionCapability
+from uniserve_worker.capabilities import GraphBucket
 from uniserve_worker.execution.forward_batch import AttentionSelection, ModelPhase
 from uniserve_worker.execution.model_runner import ForwardResult, ModelRunner
 from uniserve_worker.execution.rows import (
@@ -76,11 +76,11 @@ class ExecutionResources:
     architecture_digest: str
     weight_digest: str
     allowed_work_variants: frozenset[ForwardMode]
-    mixed_buckets: frozenset[MixedExecutionCapability]
+    mixed_buckets: frozenset[GraphBucket]
     trace: ExecutionTrace
     _device: torch.device
     _generation_device: torch.device
-    _qualified_mixed_buckets: set[MixedExecutionCapability] = field(default_factory=set)
+    _qualified_mixed_buckets: set[GraphBucket] = field(default_factory=set)
     _collective_history: OrderedDict[int, str] = field(default_factory=OrderedDict)
     _transport_publications: dict[OperationIdentity, tuple[Locator, ...]] = field(
         default_factory=dict

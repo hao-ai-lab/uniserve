@@ -673,9 +673,9 @@ pub(crate) struct PrefixLookup {
     pub(crate) cached_blocks: usize,
 }
 
-/// Admission facts for a prefix shared across every physical cache group.
+/// Read-only prefix-cache probe result across every physical cache group.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub(crate) struct PrefixAdmission {
+pub(crate) struct PrefixHit {
     pub(crate) cached_blocks: usize,
     pub(crate) cached_free_blocks: Vec<usize>,
 }
@@ -743,26 +743,26 @@ impl KvCacheCoordinator {
         Some(updates)
     }
 
-    pub(crate) fn cached_prefix_for_admission(
+    pub(crate) fn probe_prefix(
         &self,
         pool: &BlockPool,
         prompt: &[u32],
         cache_read: bool,
         has_images: bool,
         isolation_key: Option<u64>,
-    ) -> PrefixAdmission {
+    ) -> PrefixHit {
         let groups = pool.num_groups();
-        let mut admission = PrefixAdmission {
+        let mut hit = PrefixHit {
             cached_free_blocks: vec![0; groups],
-            ..PrefixAdmission::default()
+            ..PrefixHit::default()
         };
         if !self.prefix_enabled || !cache_read || has_images {
-            return admission;
+            return hit;
         }
         let block_size = pool.block_size();
         let limit = prefix_lookup_limit(prompt.len(), block_size);
         if limit == 0 {
-            return admission;
+            return hit;
         }
         let hashes = self.prefix_hashes(prompt, groups, block_size, isolation_key);
         for index in 0..limit {
@@ -770,21 +770,21 @@ impl KvCacheCoordinator {
             let mut blocks = Vec::with_capacity(groups);
             for (group, group_hashes) in hashes.iter().enumerate() {
                 let Some(block) = pool.lookup_cached(group_hashes[index], tokens) else {
-                    return admission;
+                    return hit;
                 };
                 if pool.block_group(block) != Some(group) {
-                    return admission;
+                    return hit;
                 }
                 blocks.push(block);
             }
             for (group, block) in blocks.into_iter().enumerate() {
                 if pool.block_state(block) == BlockState::Cached {
-                    admission.cached_free_blocks[group] += 1;
+                    hit.cached_free_blocks[group] += 1;
                 }
             }
-            admission.cached_blocks += 1;
+            hit.cached_blocks += 1;
         }
-        admission
+        hit
     }
 
     pub(crate) fn acquire_prefix(
@@ -1006,9 +1006,9 @@ mod tests {
         let hashes = coordinator.prefix_hashes(&prompt, 2, 4, None);
         assert!(coordinator.cache_prefix(&pool, &source, &prompt, &hashes, true));
 
-        let admission = coordinator.cached_prefix_for_admission(&pool, &prompt, true, false, None);
-        assert_eq!(admission.cached_blocks, 1);
-        assert_eq!(admission.cached_free_blocks, vec![0, 0]);
+        let hit = coordinator.probe_prefix(&pool, &prompt, true, false, None);
+        assert_eq!(hit.cached_blocks, 1);
+        assert_eq!(hit.cached_free_blocks, vec![0, 0]);
 
         let mut target = vec![BlockTable::new(0, 4), BlockTable::new(1, 4)];
         let lookup = coordinator

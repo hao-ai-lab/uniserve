@@ -5,20 +5,19 @@
 //! boundary.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use crate::executor::{ControlAck, ControlOp, Executor, WorkerExecError};
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
-use uniserve_core::{CommandWaker, KvCacheDtype, ModelDtype};
+use uniserve_core::CommandWaker;
 use uniserve_worker_ipc::{
-    Batch, CompletionReport, Domain, WorkerCapabilities, WorkerRequest, WorkerResponse,
+    Batch, CompletionReport, Domain, WorkerInfo, WorkerRequest, WorkerResponse,
 };
 use uniserve_worker_ipc::{ClientEndpoint, Frame, Pending, service_name};
 
-use crate::worker::WorkerSpawnSpec;
+use crate::worker::WorkerProcessArgs;
 use crate::worker::death_watch::DeathWatcher;
 
 fn enqueue_ready(ready: &mut VecDeque<CompletionReport>, report: CompletionReport) {
@@ -40,7 +39,7 @@ const WORKER_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 const STARTUP_LOG_INTERVAL: Duration = Duration::from_secs(30);
 const WORKER_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Explicit Python worker launch configuration.
+/// One configured model-execution lane passed in [`WorkerProcessArgs`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaneConfig {
     pub lane_id: String,
@@ -86,7 +85,7 @@ impl LaneConfig {
     }
 }
 
-/// Explicit Python worker launch configuration.
+/// FlashInfer implementation selected in [`WorkerProcessArgs`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FlashInferBackend {
@@ -123,45 +122,29 @@ impl std::str::FromStr for FlashInferBackend {
 #[error("unsupported FlashInfer backend {0:?}")]
 pub struct FlashInferBackendParseError(String);
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct WorkerLaunchConfig {
-    pub stub: bool,
-    pub load_format: String,
-    pub download_dir: Option<PathBuf>,
-    pub load_threads: Option<u32>,
-    pub checksum_manifest: Option<PathBuf>,
-    pub model_dtype: ModelDtype,
-    pub kv_cache_dtype: Option<KvCacheDtype>,
-    pub kv_memory_fraction: f64,
-    pub mesh: Option<String>,
-    pub tp_backend: Option<String>,
-    pub lanes: Vec<LaneConfig>,
-    pub cuda_graph: bool,
-    pub decode_graph_batch_sizes: Option<String>,
-    pub prefill_cuda_graph: bool,
-    pub prefill_graph_token_sizes: Option<String>,
-    pub flow_graph_batch_sizes: Option<String>,
-    pub flow_graph_shapes: Option<String>,
-    pub flashinfer_workspace_size: u64,
-    pub flashinfer_use_tensor_core: Option<String>,
-    pub flashinfer_decode_backend: FlashInferBackend,
-    pub flashinfer_prefill_backend: FlashInferBackend,
-    pub flashinfer_decode_split_tile_size: Option<u32>,
-    pub flashinfer_prefill_split_tile_size: Option<u32>,
-    pub flashinfer_disable_split_kv: bool,
-    pub flashinfer_fast_decode_plan: bool,
-    pub media_spool: Option<PathBuf>,
-}
-
-impl Default for WorkerLaunchConfig {
+impl Default for WorkerProcessArgs {
     fn default() -> Self {
         Self {
+            python: "python3".into(),
+            model: String::new(),
+            device: "cuda".into(),
+            world_size: 1,
+            pipeline_depth: 2,
+            req_slot_cap: 1 << 20,
+            resp_slot_cap: 8 << 20,
+            kv_token_capacity: None,
+            block_size: 64,
+            max_batch_operations: 128,
+            max_batch_tokens: 16_384,
+            attention_backend: uniserve_worker_ipc::AttentionBackend::Auto,
+            worker_kind: None,
+            transfer_backend: crate::executor::TransferBackend::Inproc,
             stub: false,
             load_format: "auto".to_string(),
             download_dir: None,
             load_threads: None,
             checksum_manifest: None,
-            model_dtype: ModelDtype::BFloat16,
+            model_dtype: uniserve_core::ModelDtype::BFloat16,
             kv_cache_dtype: None,
             kv_memory_fraction: 0.70,
             mesh: None,
@@ -186,7 +169,7 @@ impl Default for WorkerLaunchConfig {
     }
 }
 
-impl WorkerLaunchConfig {
+impl WorkerProcessArgs {
     fn append_worker_args(&self, cmd: &mut Command) {
         if self.stub {
             cmd.arg("--no-model").arg("--allow-stub");
@@ -268,7 +251,7 @@ impl WorkerLaunchConfig {
 /// Single-process worker executor over iceoryx2 IPC.
 pub struct UniprocExecutor {
     client: ClientEndpoint,
-    caps: WorkerCapabilities,
+    caps: WorkerInfo,
     child: Child,
     depth: usize,
     rank: u32,
@@ -305,23 +288,22 @@ enum OutstandingKind {
 }
 
 impl UniprocExecutor {
-    pub fn spawn(spec: WorkerSpawnSpec) -> anyhow::Result<Self> {
+    pub fn spawn(spec: WorkerProcessArgs) -> anyhow::Result<Self> {
         anyhow::ensure!(
             spec.world_size == 1,
             "uniproc worker world size must be one"
         );
-        let mut me = Self::spawn_rank_deferred(&spec, &spec.device, 0, 1, None, &spec.launch)?;
+        let mut me = Self::spawn_rank_deferred(&spec, &spec.device, 0, 1, None)?;
         me.finish_startup()?;
         Ok(me)
     }
 
     pub(crate) fn spawn_rank_deferred(
-        spec: &WorkerSpawnSpec,
+        spec: &WorkerProcessArgs,
         device: &str,
         tp_rank: u32,
         tp_size: u32,
         tp_init_method: Option<&str>,
-        worker_config: &WorkerLaunchConfig,
     ) -> anyhow::Result<Self> {
         let depth = spec.pipeline_depth.max(1);
         let max_payload = spec.req_slot_cap.max(spec.resp_slot_cap).max(1);
@@ -386,7 +368,7 @@ impl UniprocExecutor {
         if let Some(c) = spec.kv_token_capacity {
             cmd.arg("--kv-token-capacity").arg(c.to_string());
         }
-        worker_config.append_worker_args(&mut cmd);
+        spec.append_worker_args(&mut cmd);
         if let Ok(cwd) = std::env::current_dir() {
             let pp = std::env::var("PYTHONPATH").unwrap_or_default();
             cmd.env("PYTHONPATH", format!("{}:{}", cwd.display(), pp));
@@ -398,7 +380,7 @@ impl UniprocExecutor {
         let death_watcher = DeathWatcher::spawn(child.id(), client.death_wake());
         Ok(Self {
             client,
-            caps: WorkerCapabilities::default(),
+            caps: WorkerInfo::default(),
             child,
             depth,
             rank: tp_rank,
@@ -714,7 +696,7 @@ impl UniprocExecutor {
 }
 
 impl Executor for UniprocExecutor {
-    fn caps(&self) -> &WorkerCapabilities {
+    fn caps(&self) -> &WorkerInfo {
         &self.caps
     }
 

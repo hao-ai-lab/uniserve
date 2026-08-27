@@ -214,7 +214,7 @@ impl Scheduler {
     pub fn set_max_num_waiting(&mut self, n: usize) {
         self.config.max_num_waiting = n.clamp(1, MAX_NUM_WAITING);
     }
-    pub fn caps(&self) -> &WorkerCapabilities {
+    pub fn caps(&self) -> &WorkerInfo {
         &self.caps
     }
     pub fn stats_handle(&self) -> Arc<SchedStats> {

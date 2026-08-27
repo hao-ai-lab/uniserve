@@ -60,7 +60,7 @@ pub(crate) async fn track_server_load(
         return next.run(req).await;
     }
 
-    // Admission control: shed load before admitting a new request when the
+    // Front-door admission control sheds load when the
     // configured in-flight limit has been reached. The check-then-increment is
     // intentionally not a single atomic compare-and-set; a brief overshoot of a
     // request or two under contention is acceptable for load shedding and keeps

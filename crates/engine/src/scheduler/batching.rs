@@ -2,17 +2,17 @@ use super::*;
 
 impl Scheduler {
     /// Assemble the per-step batch: walk the priority order, ask each request for at most one op, clip prefill chunks to the remaining token budget, and pair first-dispatch requests with their typed admission record.
-    pub(super) fn assemble(&mut self) -> (Vec<Admission>, Vec<NextOp>) {
+    pub(super) fn assemble(&mut self) -> (Vec<NewRequest>, Vec<NextOp>) {
         let ids = self.assembly_order();
-        let lane = self.select_assembly_lane(&ids);
+        let lane = self.select_batch_kind(&ids);
         let (new_reqs, ops) = self.assemble_pass(&ids, lane);
-        if ops.is_empty() && lane == Some(AssemblyLane::Prefill) {
+        if ops.is_empty() && lane == Some(BatchKind::Prefill) {
             // Prefill runs first *if possible* (SGLang's order). When no
             // prefill op could actually be built (e.g. blocked on KV memory
             // it cannot displace), fall through to the decode lane instead of
             // idling — otherwise a starved waiting prompt would stall ready
             // decodes forever.
-            return self.assemble_pass(&ids, Some(AssemblyLane::Decode));
+            return self.assemble_pass(&ids, Some(BatchKind::Decode));
         }
         (new_reqs, ops)
     }
@@ -20,9 +20,9 @@ impl Scheduler {
     pub(super) fn assemble_pass(
         &mut self,
         ids: &[RequestId],
-        lane: Option<AssemblyLane>,
-    ) -> (Vec<Admission>, Vec<NextOp>) {
-        let mut admissions: Vec<Admission> = Vec::new();
+        lane: Option<BatchKind>,
+    ) -> (Vec<NewRequest>, Vec<NextOp>) {
+        let mut admissions: Vec<NewRequest> = Vec::new();
         let mut ops: Vec<NextOp> = Vec::new();
         let mut selected: HashSet<RequestId> = HashSet::new();
         // vLLM's per-step token budget with the clip rule: the budget, not the
@@ -34,14 +34,14 @@ impl Scheduler {
         // Mixed prefill rows are appended after the decode rows so the batch
         // keeps an extend row last (graph token-bucket padding extends the
         // last row).
-        let mut mixed_left: usize = if lane == Some(AssemblyLane::Decode) {
+        let mut mixed_left: usize = if lane == Some(BatchKind::Decode) {
             self.config.mixed_prefill_tokens
         } else {
             0
         };
         let mut mixed_ops: Vec<NextOp> = Vec::new();
         let denoise_occupies_decode_pipeline =
-            lane == Some(AssemblyLane::Decode) && self.any_denoise_inflight();
+            lane == Some(BatchKind::Decode) && self.any_denoise_inflight();
         for id in ids.iter().copied() {
             if ops.len() + mixed_ops.len() >= self.config.max_batch {
                 break;
@@ -68,12 +68,12 @@ impl Scheduler {
             let mut mixed_prefill = false;
             if let (Some(target), Some(operation_variant)) = (lane, next_type)
                 && {
-                    let candidate_lane = assembly_lane(operation_variant);
-                    matches!(candidate_lane, AssemblyLane::Prefill | AssemblyLane::Decode)
+                    let candidate_lane = batch_kind(operation_variant);
+                    matches!(candidate_lane, BatchKind::Prefill | BatchKind::Decode)
                         && candidate_lane != target
                 }
             {
-                mixed_prefill = target == AssemblyLane::Decode
+                mixed_prefill = target == BatchKind::Decode
                     && operation_variant == ForwardMode::TokenExtend
                     && mixed_left > 0
                     && self.running.get(&id).is_some_and(|st| {
@@ -130,7 +130,7 @@ impl Scheduler {
                 {
                     st.cursor.resources.worker_registered = true;
                     let request_key = RequestKey::new(self.authority_id, id, st.epoch);
-                    let admission = Admission::new(
+                    let admission = NewRequest::new(
                         request_key,
                         st.request_pool_idx,
                         Some(UndAdmission {
@@ -184,7 +184,7 @@ impl Scheduler {
         (admissions, ops)
     }
 
-    pub(super) fn select_assembly_lane(&self, ids: &[RequestId]) -> Option<AssemblyLane> {
+    pub(super) fn select_batch_kind(&self, ids: &[RequestId]) -> Option<BatchKind> {
         let mut projected_decode_ready = false;
         let mut committed_decode_ready = false;
         let mut prefill_ready = false;
@@ -200,8 +200,8 @@ impl Scheduler {
             let Some(operation_type) = self.peek_next_operation_variant(id) else {
                 continue;
             };
-            match assembly_lane(operation_type) {
-                AssemblyLane::Decode => {
+            match batch_kind(operation_type) {
+                BatchKind::Decode => {
                     if self.can_schedule_next(id) {
                         if self.has_inflight(id) {
                             projected_decode_ready = true;
@@ -210,20 +210,20 @@ impl Scheduler {
                         }
                     }
                 }
-                AssemblyLane::Prefill => {
+                BatchKind::Prefill => {
                     if self.can_schedule_next(id) {
                         prefill_ready = true;
                     }
                 }
-                AssemblyLane::Other => {}
+                BatchKind::Media => {}
             }
         }
         if prefill_ready && self.prefill_steps.len() < PREFILL_WINDOW_CREDITS {
-            Some(AssemblyLane::Prefill)
+            Some(BatchKind::Prefill)
         } else if committed_decode_ready || projected_decode_ready {
-            Some(AssemblyLane::Decode)
+            Some(BatchKind::Decode)
         } else if prefill_ready {
-            Some(AssemblyLane::Prefill)
+            Some(BatchKind::Prefill)
         } else {
             None
         }
@@ -315,7 +315,7 @@ impl Scheduler {
 
     pub(super) fn submit_batch(
         &mut self,
-        admissions: Vec<Admission>,
+        admissions: Vec<NewRequest>,
         transitions: Vec<NextOp>,
         mut controls: Vec<Control>,
     ) -> bool {
@@ -710,7 +710,7 @@ impl Scheduler {
         self.batch_started.insert(step, submit_at);
         if wire_ops
             .iter()
-            .any(|operation| assembly_lane(operation.work) == AssemblyLane::Prefill)
+            .any(|operation| batch_kind(operation.work) == BatchKind::Prefill)
         {
             self.prefill_steps.insert(step);
         }

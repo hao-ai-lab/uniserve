@@ -1,4 +1,4 @@
-//! Worker IPC implementations over iceoryx2 request-response services.
+//! Worker process construction, IPC execution, rank aggregation, and respawn.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 mod death_watch;
@@ -8,13 +8,11 @@ mod uniproc;
 
 pub use multiproc::MultiprocExecutor;
 pub use staged_executor::StagedExecutor;
-pub use uniproc::{
-    FlashInferBackend, FlashInferBackendParseError, LaneConfig, UniprocExecutor, WorkerLaunchConfig,
-};
+pub use uniproc::{FlashInferBackend, FlashInferBackendParseError, LaneConfig, UniprocExecutor};
 
-/// Complete context required to spawn one worker pool.
-#[derive(Debug, Clone, PartialEq)]
-pub struct WorkerSpawnSpec {
+/// Everything required to create or recreate one worker rank process.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct WorkerProcessArgs {
     pub python: std::path::PathBuf,
     pub model: String,
     pub device: String,
@@ -29,7 +27,32 @@ pub struct WorkerSpawnSpec {
     pub attention_backend: uniserve_worker_ipc::AttentionBackend,
     pub worker_kind: Option<crate::executor::WorkerKind>,
     pub transfer_backend: crate::executor::TransferBackend,
-    pub launch: WorkerLaunchConfig,
+    pub stub: bool,
+    pub load_format: String,
+    pub download_dir: Option<std::path::PathBuf>,
+    pub load_threads: Option<u32>,
+    pub checksum_manifest: Option<std::path::PathBuf>,
+    pub model_dtype: uniserve_core::ModelDtype,
+    pub kv_cache_dtype: Option<uniserve_core::KvCacheDtype>,
+    pub kv_memory_fraction: f64,
+    pub mesh: Option<String>,
+    pub tp_backend: Option<String>,
+    pub lanes: Vec<LaneConfig>,
+    pub cuda_graph: bool,
+    pub decode_graph_batch_sizes: Option<String>,
+    pub prefill_cuda_graph: bool,
+    pub prefill_graph_token_sizes: Option<String>,
+    pub flow_graph_batch_sizes: Option<String>,
+    pub flow_graph_shapes: Option<String>,
+    pub flashinfer_workspace_size: u64,
+    pub flashinfer_use_tensor_core: Option<String>,
+    pub flashinfer_decode_backend: FlashInferBackend,
+    pub flashinfer_prefill_backend: FlashInferBackend,
+    pub flashinfer_decode_split_tile_size: Option<u32>,
+    pub flashinfer_prefill_split_tile_size: Option<u32>,
+    pub flashinfer_disable_split_kv: bool,
+    pub flashinfer_fast_decode_plan: bool,
+    pub media_spool: Option<std::path::PathBuf>,
 }
 
 pub(crate) fn park_descriptors(fds: &[i32], timeout: std::time::Duration) -> anyhow::Result<()> {

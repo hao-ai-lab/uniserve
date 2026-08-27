@@ -48,7 +48,7 @@ from uniserve_worker.batch import (
     decode_sampling_state_bytes,
     decode_token_product_bytes,
 )
-from uniserve_worker.capabilities import MixedExecutionCapability
+from uniserve_worker.capabilities import GraphBucket
 from uniserve_worker.execution.forward_batch import (
     AttentionSelection,
     ModelPhase,
@@ -197,7 +197,7 @@ def create_execution_resources(
     architecture_digest: str,
     weight_digest: str,
     allowed_work_variants: frozenset[ForwardMode],
-    mixed_buckets: tuple[MixedExecutionCapability, ...],
+    mixed_buckets: tuple[GraphBucket, ...],
     trace: ExecutionTrace,
     h3_mux: H3MuxCoordinator | None = None,
     h3_output_ring: H3OutputRing | None = None,
@@ -1964,7 +1964,7 @@ def _completion_devices(runtime, operations: tuple[Operation, ...]) -> tuple[str
 def _mixed_capability(
     runtime,
     partitions: tuple[BatchPartition, ...],
-) -> MixedExecutionCapability:
+) -> GraphBucket:
     decode_rows = sum(
         operation.work is ForwardMode.TOKEN_DECODE
         for partition in partitions
@@ -2013,7 +2013,7 @@ def _mixed_capability(
     if len(geometries) != 1 or len(flow_placements) != len(flow_operations):
         raise invalid_descriptor("tensorized mixed flow rows disagree on physical geometry")
     height, width, cfg_branches = next(iter(geometries))
-    return MixedExecutionCapability(
+    return GraphBucket(
         decode_rows=decode_rows,
         flow_rows=len(flow_operations),
         height=height,

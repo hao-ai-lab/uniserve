@@ -21,11 +21,10 @@ use uniserve_core::{
     CommandWaker, ImageParams, RequestId, SampleOutput, SamplingParams, try_apply_sampling_counts,
 };
 use uniserve_worker_ipc::{
-    Admission, Batch, CompletionReport, Digest, DrawLayout, ErrorCode, FinishFlags, ForwardMode,
-    LogicalLengths, MixedExecutionCapability, ModelOutput, OpStatus, Operation,
-    PartitionCompletion, Point, ProductKind, ProductPayload, ProductRef, RegistrationAck,
-    RequestKind, ResourceClass, SamplingState, TimingCounters, TokenSpan, WorkerCapabilities,
-    decode_sampling_state_bytes,
+    Batch, CompletionReport, Digest, DrawLayout, ErrorCode, FinishFlags, ForwardMode, GraphBucket,
+    LogicalLengths, ModelOutput, NewRequest, OpStatus, Operation, PartitionCompletion, Point,
+    ProductKind, ProductPayload, ProductRef, RegistrationAck, RequestKind, ResourceClass,
+    SamplingState, TimingCounters, TokenSpan, WorkerInfo, decode_sampling_state_bytes,
 };
 
 const DEFAULT_TEXT_LEN: usize = 8;
@@ -42,7 +41,7 @@ enum Job {
 
 /// Runs the deterministic model simulator on a bounded asynchronous executor seam.
 pub struct SimExecutor {
-    caps: WorkerCapabilities,
+    caps: WorkerInfo,
     depth: usize,
     to_worker: Sender<Job>,
     from_worker: Receiver<anyhow::Result<CompletionReport>>,
@@ -119,7 +118,7 @@ impl SimExecutor {
 }
 
 impl Executor for SimExecutor {
-    fn caps(&self) -> &WorkerCapabilities {
+    fn caps(&self) -> &WorkerInfo {
         &self.caps
     }
 
@@ -241,7 +240,7 @@ struct RecordedCompletion {
 /// committed operation for replay.
 #[derive(Clone)]
 struct SimSession {
-    admission: Admission,
+    admission: NewRequest,
     point_index: u32,
     committed_semantic: Digest,
     logical_position: u32,
@@ -260,7 +259,7 @@ struct SimSession {
 }
 
 impl SimSession {
-    fn new(admission: Admission) -> Self {
+    fn new(admission: NewRequest) -> Self {
         let committed_semantic = admission.digest.clone();
         let prefix_len = admission
             .und
@@ -312,7 +311,7 @@ impl SimSession {
 
 /// Deterministic local model engine with protocol-faithful lifecycle state.
 pub struct SimEngine {
-    caps: WorkerCapabilities,
+    caps: WorkerInfo,
     text_len: usize,
     fake_eos: u32,
     vocab: usize,
@@ -321,7 +320,7 @@ pub struct SimEngine {
 
 impl SimEngine {
     pub fn new() -> Self {
-        let caps = WorkerCapabilities {
+        let caps = WorkerInfo {
             supported_work: vec![
                 ForwardMode::TokenExtend,
                 ForwardMode::TokenDecode,
@@ -349,7 +348,7 @@ impl SimEngine {
             max_unresolved_window: 2,
             mixed_buckets: (1..=128)
                 .flat_map(|decode_rows| {
-                    (1..=3).map(move |cfg_branches| MixedExecutionCapability {
+                    (1..=3).map(move |cfg_branches| GraphBucket {
                         decode_rows,
                         flow_rows: 1,
                         height: DEFAULT_IMAGE_HW.0,
@@ -366,7 +365,7 @@ impl SimEngine {
                 )
                 .expect("constant digest"),
             ),
-            ..WorkerCapabilities::default()
+            ..WorkerInfo::default()
         };
         Self {
             caps,
@@ -833,7 +832,7 @@ impl SimEngine {
         self.caps.block_size = size;
     }
 
-    pub fn mut_caps_for_test(&mut self) -> &mut WorkerCapabilities {
+    pub fn mut_caps_for_test(&mut self) -> &mut WorkerInfo {
         &mut self.caps
     }
 }
@@ -910,7 +909,7 @@ impl Default for SimEngine {
 }
 
 impl SimEngine {
-    fn caps(&self) -> &WorkerCapabilities {
+    fn caps(&self) -> &WorkerInfo {
         &self.caps
     }
 
@@ -1112,8 +1111,8 @@ mod tests {
         RequestKey::new(0, RequestId(9), 1)
     }
 
-    fn admission() -> Admission {
-        Admission::new(
+    fn admission() -> NewRequest {
+        NewRequest::new(
             request_key(),
             1,
             Some(UndAdmission {

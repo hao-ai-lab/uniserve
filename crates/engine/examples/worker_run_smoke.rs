@@ -19,7 +19,7 @@ use uniserve_core::{
     UndVisibility,
 };
 use uniserve_engine::{
-    Command, ControlTokens, EngineHandle, Executor, Scheduler, UniprocExecutor, WorkerLaunchConfig,
+    Command, ControlTokens, EngineHandle, Executor, Scheduler, UniprocExecutor, WorkerProcessArgs,
 };
 
 type Rxs = HashMap<RequestId, uniserve_engine::EventRx>;
@@ -87,11 +87,11 @@ fn main() -> anyhow::Result<()> {
         .with_max_level(tracing::Level::WARN)
         .init();
 
-    let worker_config = WorkerLaunchConfig {
+    let worker_config = WorkerProcessArgs {
         stub: true,
-        ..WorkerLaunchConfig::default()
+        ..WorkerProcessArgs::default()
     };
-    let engine = UniprocExecutor::spawn(uniserve_engine::WorkerSpawnSpec {
+    let engine = UniprocExecutor::spawn(uniserve_engine::WorkerProcessArgs {
         python: "python3".into(),
         model: String::new(),
         device: "cpu".into(),
@@ -106,7 +106,7 @@ fn main() -> anyhow::Result<()> {
         attention_backend: uniserve_engine::AttentionBackend::Auto,
         worker_kind: None,
         transfer_backend: uniserve_engine::TransferBackend::Inproc,
-        launch: worker_config,
+        ..worker_config
     })?;
     let waker = engine.command_waker();
     let sched = Scheduler::new(Box::new(engine), ControlTokens::default(), 32);

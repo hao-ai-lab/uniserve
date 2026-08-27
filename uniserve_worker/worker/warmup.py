@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING
 import torch
 
 from ..batch import (
-    Admission,
     AttentionRegime,
     Batch,
     BatchPartition,
@@ -23,6 +22,7 @@ from ..batch import (
     ForwardMode,
     ImageParams,
     LatentPlacement,
+    NewRequest,
     Operation,
     OpStatus,
     ProductKind,
@@ -36,7 +36,7 @@ from ..bootstrap.execution_config import (
     LaneConfig,
 )
 from ..capabilities import (
-    MixedExecutionCapability,
+    GraphBucket,
 )
 from ..execution.step import (
     complete_startup,
@@ -97,7 +97,7 @@ def _flow_prefix_graph_executable(bucket: _FlowPrefixGraphBucket) -> tuple[objec
 
 
 def _mixed_flow_graph_executable(
-    bucket: MixedExecutionCapability,
+    bucket: GraphBucket,
 ) -> tuple[object, ...]:
     return (
         "decode_flow",
@@ -173,7 +173,7 @@ def _has_decode_flow_partition(lanes: tuple[LaneConfig, ...]) -> bool:
 def _warmup_batch(
     *,
     step_id: int,
-    admissions: tuple[Admission, ...],
+    admissions: tuple[NewRequest, ...],
     operations: tuple[Operation, ...],
     block_tables: dict[tuple[RequestKey, int], tuple[BlockTable, ...]],
     new_cache_pages: dict[tuple[RequestKey, int], tuple[CachePageAllocation, ...]],
@@ -320,7 +320,7 @@ def _execute_warmup(
 def _build_warmup_batch(
     self: Worker,
     *,
-    admissions: tuple[Admission, ...],
+    admissions: tuple[NewRequest, ...],
     operations: tuple[Operation, ...],
     input_products: tuple[ProductPayload, ...] = (),
     tensorized_mixed: bool = False,
@@ -653,12 +653,12 @@ def _warmup_sequence(self: Worker) -> None:
     """
 
     from ..batch import (
-        Admission,
         Bounds,
         DevicePoint,
         Domain,
         DType,
         FixedPoint,
+        NewRequest,
         Operation,
         PointRange,
         ProductKind,
@@ -708,7 +708,7 @@ def _warmup_sequence(self: Worker) -> None:
     session_ids = tuple(range(1, max(batch_sizes) + 1))
     keys = {sid: RequestKey(0, sid, 1) for sid in session_ids}
     admissions = {
-        sid: Admission.create(
+        sid: NewRequest.create(
             keys[sid],
             request_pool_idx=sid,
             und=UndAdmission(
@@ -841,11 +841,11 @@ def _warmup_prefill_graphs(self: Worker) -> None:
     """Capture the paged-prefill CUDA graph for every configured token bucket."""
 
     from ..batch import (
-        Admission,
         Bounds,
         Domain,
         DType,
         FixedPoint,
+        NewRequest,
         Operation,
         PointRange,
         ProductKind,
@@ -905,7 +905,7 @@ def _warmup_prefill_graphs(self: Worker) -> None:
                 bucket.token_bucket - live_rows + 1,
                 *(1 for _ in range(live_rows - 1)),
             )
-            admissions: list[Admission] = []
+            admissions: list[NewRequest] = []
             operations: list[Operation] = []
             input_products: list[ProductPayload] = []
             active_sessions: list[int] = []
@@ -914,7 +914,7 @@ def _warmup_prefill_graphs(self: Worker) -> None:
                 session_id += 1
                 active_sessions.append(session_id)
                 rk = RequestKey(0, session_id, 1)
-                admission = Admission.create(
+                admission = NewRequest.create(
                     rk,
                     request_pool_idx=row + 1,
                     und=UndAdmission(
@@ -972,7 +972,6 @@ def _warmup_flow(self: Worker) -> None:
     """Drive one denoise quantum through the real flow forward path."""
 
     from ..batch import (
-        Admission,
         Bounds,
         DeviceDim,
         DevicePoint,
@@ -981,6 +980,7 @@ def _warmup_flow(self: Worker) -> None:
         DType,
         FixedPoint,
         GenAdmission,
+        NewRequest,
         Operation,
         PointRange,
         ProductKind,
@@ -1049,7 +1049,7 @@ def _warmup_flow(self: Worker) -> None:
         next_session_id += batch_size
         keys = tuple(RequestKey(0, session_id, 1) for session_id in session_ids)
         admissions = tuple(
-            Admission.create(
+            NewRequest.create(
                 key,
                 request_pool_idx=index,
                 gen_admission=GenAdmission(
@@ -1068,7 +1068,7 @@ def _warmup_flow(self: Worker) -> None:
         next_session_id += text_session_count
         text_keys = {session_id: RequestKey(0, session_id, 1) for session_id in text_session_ids}
         text_admissions = {
-            session_id: Admission.create(
+            session_id: NewRequest.create(
                 text_keys[session_id],
                 request_pool_idx=batch_size + index,
                 und=UndAdmission(

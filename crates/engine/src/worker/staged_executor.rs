@@ -1,7 +1,7 @@
 //! Typed control-plane routing across heterogeneous worker pools.
 //!
 //! A staged topology partitions each execution batch by exact [`ForwardMode`],
-//! sends every session admission to a pool before that pool's first operation
+//! sends each session's `NewRequest` before that pool's first operation
 //! for the session, and publishes each independently ready partition by identity.
 //! A worker-local device product remains resident within its producing pool.
 //! The executor retains a cross-pool consumer by exact product identity until the
@@ -15,8 +15,8 @@ use crate::executor::{ControlAck, ControlOp, Executor, WorkerKind};
 use anyhow::Context;
 use uniserve_core::{CommandWaker, RequestId};
 use uniserve_worker_ipc::{
-    Admission, Batch, BatchPartition, CompletionReport, Control, ForwardMode, Operation,
-    ProductPayload, ProductRef, RequestKey, TRANSFER_DESCRIPTOR_PREFIX, WorkerCapabilities,
+    Batch, BatchPartition, CompletionReport, Control, ForwardMode, NewRequest, Operation,
+    ProductPayload, ProductRef, RequestKey, TRANSFER_DESCRIPTOR_PREFIX, WorkerInfo,
     is_transfer_descriptor,
 };
 
@@ -91,11 +91,11 @@ fn transfer_identity(bytes: &[u8]) -> anyhow::Result<(String, uniserve_core::Dig
 pub struct StagedExecutor {
     routing: HashMap<ForwardMode, usize>,
     pools: Vec<PoolEntry>,
-    caps: WorkerCapabilities,
+    caps: WorkerInfo,
     depth: usize,
     pending: BTreeMap<u64, PendingStep>,
     ready: VecDeque<CompletionReport>,
-    admissions: HashMap<RequestKey, Admission>,
+    admissions: HashMap<RequestKey, NewRequest>,
     admitted_pools: HashSet<(usize, RequestKey)>,
     operation_routes: HashMap<(RequestKey, uniserve_worker_ipc::OpId), usize>,
     product_routes: HashMap<ProductRef, ProductRoute>,
@@ -187,7 +187,7 @@ impl StagedExecutor {
     fn merge_caps(
         pools: &[PoolEntry],
         routing: &HashMap<ForwardMode, usize>,
-    ) -> anyhow::Result<WorkerCapabilities> {
+    ) -> anyhow::Result<WorkerInfo> {
         let routed_caps =
             |variant: ForwardMode| routing.get(&variant).map(|index| pools[*index].exec.caps());
         let mut kv_pool_indices = [
@@ -360,7 +360,7 @@ impl StagedExecutor {
         1u64 << index
     }
 
-    fn cache_admissions(&mut self, admissions: &[Admission]) -> anyhow::Result<()> {
+    fn cache_admissions(&mut self, admissions: &[NewRequest]) -> anyhow::Result<()> {
         for admission in admissions {
             if let Some(existing) = self.admissions.get(&admission.request_key) {
                 anyhow::ensure!(
@@ -380,7 +380,7 @@ impl StagedExecutor {
         &self,
         pool_index: usize,
         operations: &[Operation],
-    ) -> anyhow::Result<Vec<Admission>> {
+    ) -> anyhow::Result<Vec<NewRequest>> {
         let mut admissions = Vec::new();
         for operation in operations {
             if self
@@ -706,7 +706,7 @@ impl StagedExecutor {
 }
 
 impl Executor for StagedExecutor {
-    fn caps(&self) -> &WorkerCapabilities {
+    fn caps(&self) -> &WorkerInfo {
         &self.caps
     }
 

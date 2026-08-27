@@ -1,24 +1,21 @@
-//! The reified `EngineCore`: scheduler + executor + worker lifecycle, behind a
-//! transport-free surface (queues + an [`EngineHandle`]). The HTTP process
-//! hosts one in-process core.
+//! In-process engine composition: worker lifecycle, scheduler ownership, and the
+//! transport-free [`EngineHandle`] surface used by the server.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use crate::executor::{Executor, TransferBackend, TransferSpec, WorkerKind, WorkersSpec};
+use crate::executor::{Executor, TransferBackend, TransportMap, WorkerKind, WorkerTopology};
 use crate::handle::{EngineHandle, EventRx, SubmitError};
 use crate::scheduler::{
     ControlTokens, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
     DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS, SchedStats,
     Scheduler, SchedulingPolicy,
 };
-use crate::worker::{
-    MultiprocExecutor, StagedExecutor, UniprocExecutor, WorkerLaunchConfig, WorkerSpawnSpec,
-};
+use crate::worker::{MultiprocExecutor, StagedExecutor, UniprocExecutor, WorkerProcessArgs};
 use anyhow::Context as _;
 use uniserve_core::{GenerationRequest, GenerationRuntimeCapabilities, ModelDtype, RequestId};
-use uniserve_worker_ipc::{AttentionBackend, WorkerCapabilities};
+use uniserve_worker_ipc::WorkerInfo;
 
 /// Place a staged pool on GPU `gpu`. A plain `cuda`/`gpu`
 /// device becomes `cuda:{gpu}` (distinct GPU per pool); an explicit device
@@ -33,14 +30,6 @@ fn assign_pool_device(device: &str, gpu: usize) -> String {
 /// Configuration for one in-process engine core.
 #[derive(Debug, Clone)]
 pub struct EngineCoreConfig {
-    /// Model directory / identifier passed to the worker and used for metrics.
-    pub model: String,
-    /// Compute device for the worker (e.g. `cuda`, `cpu`).
-    pub device: String,
-    /// KV block size in tokens (the page size).
-    pub block_size: u32,
-    /// How many op-batches the scheduler keeps in flight against the worker.
-    pub pipeline_depth: usize,
     /// Maximum number of ops assembled into a single forward batch.
     pub max_batch: usize,
     /// Per-step scheduling token budget (vLLM's `max_num_batched_tokens`).
@@ -56,25 +45,15 @@ pub struct EngineCoreConfig {
     pub scheduler_policy: SchedulingPolicy,
     /// Maximum model context length reported to the frontend.
     pub max_model_len: u32,
-    /// Optional explicit KV token capacity override for the worker.
-    pub kv_token_capacity: Option<u64>,
-    /// Attention backend preference forwarded to the Python worker.
-    pub attention_backend: AttentionBackend,
-    /// Python interpreter used to launch the worker.
-    pub worker_python: std::path::PathBuf,
     /// Parsed worker topology.
-    pub workers: WorkersSpec,
+    pub workers: WorkerTopology,
     /// Per-edge data-plane transfer backend selection (`--transfer`), e.g.
     /// `encoder->prefill=shm,prefill->decode=cuda_ipc`. Participating worker
     /// pools receive the selected transport; unconfigured edges use local
     /// worker-resident products.
-    pub transfer: TransferSpec,
-    /// Explicit Python worker launch/runtime configuration.
-    pub worker_launch: WorkerLaunchConfig,
-    /// Request-ring slot capacity in bytes.
-    pub req_slot_cap: usize,
-    /// Response-ring slot capacity in bytes.
-    pub resp_slot_cap: usize,
+    pub transfer: TransportMap,
+    /// Complete process arguments; staged pools override placement and role.
+    pub worker_process: WorkerProcessArgs,
     /// Control-token ids resolved from the tokenizer for EOS and feedback continuation.
     pub bos: u32,
     pub eos: Vec<u32>,
@@ -87,11 +66,16 @@ impl EngineCoreConfig {
     /// Pair this with [`EngineCore::with_executor`]: [`EngineCore::new`] cannot
     /// build a `Sim` backend because it has no spawnable worker process.
     pub fn sim(model: impl Into<String>) -> Self {
-        Self {
+        let worker_process = WorkerProcessArgs {
             model: model.into(),
             device: "cpu".into(),
             block_size: 64,
             pipeline_depth: 2,
+            max_batch_operations: DEFAULT_MAX_BATCH as u32,
+            max_batch_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS as u32,
+            ..WorkerProcessArgs::default()
+        };
+        Self {
             max_batch: DEFAULT_MAX_BATCH,
             max_num_batched_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS,
             max_num_seqs: DEFAULT_MAX_NUM_SEQS,
@@ -99,14 +83,9 @@ impl EngineCoreConfig {
             mixed_prefill_tokens: DEFAULT_MIXED_PREFILL_TOKENS,
             scheduler_policy: SchedulingPolicy::Fcfs,
             max_model_len: 8192,
-            kv_token_capacity: None,
-            attention_backend: AttentionBackend::Auto,
-            worker_python: "python3".into(),
-            workers: WorkersSpec::single_full(1),
-            transfer: TransferSpec::default(),
-            worker_launch: WorkerLaunchConfig::default(),
-            req_slot_cap: 1 << 20,
-            resp_slot_cap: 8 << 20,
+            workers: WorkerTopology::single_full(1),
+            transfer: TransportMap::default(),
+            worker_process,
             // `SimEngine` fabricates this fake EOS id after `text_len` tokens; the
             // scheduler must recognize it to finish a sim request.
             bos: 0,
@@ -128,7 +107,7 @@ impl EngineCoreConfig {
 /// transport-free object.
 pub struct EngineCore {
     handle: EngineHandle,
-    caps: WorkerCapabilities,
+    caps: WorkerInfo,
     stats: Arc<SchedStats>,
     model_name: String,
     model_dtype: ModelDtype,
@@ -160,28 +139,11 @@ impl EngineCore {
     /// is a `UniprocExecutor`; `tp > 1` a `MultiprocExecutor`. No `--worker-kind`
     /// is passed because the worker starts in Full mode by default.
     fn spawn_full_pool(config: &EngineCoreConfig, tp: usize) -> anyhow::Result<Box<dyn Executor>> {
-        let kv_token_capacity = config.kv_token_capacity;
-        let max_batch_operations =
-            u32::try_from(config.max_batch.max(1).min(config.max_num_seqs.max(1)))
-                .context("max_batch exceeds the worker capability representation")?;
-        let max_batch_tokens = u32::try_from(config.max_num_batched_tokens)
-            .context("max_num_batched_tokens exceeds the worker capability representation")?;
-        let spec = WorkerSpawnSpec {
-            python: config.worker_python.clone(),
-            model: config.model.clone(),
-            device: config.device.clone(),
+        let spec = WorkerProcessArgs {
             world_size: tp,
-            pipeline_depth: config.pipeline_depth,
-            req_slot_cap: config.req_slot_cap,
-            resp_slot_cap: config.resp_slot_cap,
-            kv_token_capacity,
-            block_size: config.block_size,
-            max_batch_operations,
-            max_batch_tokens,
-            attention_backend: config.attention_backend.clone(),
             worker_kind: None,
             transfer_backend: TransferBackend::Inproc,
-            launch: config.worker_launch.clone(),
+            ..config.worker_process.clone()
         };
         if tp > 1 {
             let workers = MultiprocExecutor::spawn(spec)
@@ -200,14 +162,8 @@ impl EngineCore {
     /// exact operation type and merges the results.
     fn spawn_staged(
         config: &EngineCoreConfig,
-        workers: &WorkersSpec,
+        workers: &WorkerTopology,
     ) -> anyhow::Result<Box<dyn Executor>> {
-        let kv_token_capacity = config.kv_token_capacity;
-        let max_batch_operations =
-            u32::try_from(config.max_batch.max(1).min(config.max_num_seqs.max(1)))
-                .context("max_batch exceeds the worker capability representation")?;
-        let max_batch_tokens = u32::try_from(config.max_num_batched_tokens)
-            .context("max_num_batched_tokens exceeds the worker capability representation")?;
         // Per-edge transfer backends (validated up front so a typo fails at
         // startup). A pool's worker uses the backend of its incoming edge for
         // the worker-side data plane (read-driven fetch).
@@ -241,28 +197,17 @@ impl EngineCore {
             });
             for instance in 0..pool.count {
                 let pool_device = if is_tower {
-                    assign_pool_device(&config.device, next_gpu)
+                    assign_pool_device(&config.worker_process.device, next_gpu)
                 } else {
-                    config.device.clone()
+                    config.worker_process.device.clone()
                 };
                 next_gpu += pool.tp.max(1);
-                let pool_worker_launch = config.worker_launch.clone();
-                let exec = MultiprocExecutor::spawn(WorkerSpawnSpec {
-                    python: config.worker_python.clone(),
-                    model: config.model.clone(),
+                let exec = MultiprocExecutor::spawn(WorkerProcessArgs {
                     device: pool_device,
                     world_size: pool.tp.max(1),
-                    pipeline_depth: config.pipeline_depth,
-                    req_slot_cap: config.req_slot_cap,
-                    resp_slot_cap: config.resp_slot_cap,
-                    kv_token_capacity,
-                    block_size: config.block_size,
-                    max_batch_operations,
-                    max_batch_tokens,
-                    attention_backend: config.attention_backend.clone(),
                     worker_kind: Some(pool.kind),
                     transfer_backend: backend.unwrap_or_default(),
-                    launch: pool_worker_launch,
+                    ..config.worker_process.clone()
                 })
                 .with_context(|| {
                     format!(
@@ -328,7 +273,7 @@ impl EngineCore {
             handle,
             caps,
             stats,
-            model_name: config.model,
+            model_name: config.worker_process.model,
             model_dtype,
             max_model_len: config.max_model_len,
             dead,
@@ -343,7 +288,7 @@ impl EngineCore {
     }
 
     /// Worker-reported capabilities (the post-load truth).
-    pub fn caps(&self) -> &WorkerCapabilities {
+    pub fn caps(&self) -> &WorkerInfo {
         &self.caps
     }
 
