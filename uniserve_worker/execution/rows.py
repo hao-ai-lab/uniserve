@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, TypeAlias
 import torch
 
 from uniserve_worker.batch import (
+    Admission,
     Batch,
     BatchPartition,
     CompletionReport,
@@ -37,7 +38,7 @@ from uniserve_worker.runtime.device_products import (
 from uniserve_worker.runtime.encoder_cache import EncoderRead, EncoderWrite
 from uniserve_worker.runtime.latent_pool import LatentPublication, LatentRelease, LatentStaging
 from uniserve_worker.server.completion import (
-    DeferredImagePayload,
+    DeferredCompletionTask,
     DeferredInteger,
     DeferredLogprobValue,
     DeferredSpeculativePoint,
@@ -52,6 +53,8 @@ from uniserve_worker.transfer.connector import CachePublication
 from uniserve_worker.transfer.tickets import Locator, TransferTicket
 
 if TYPE_CHECKING:
+    from uniserve_worker.models.minimax_h3.execution import H3OutputRingLease
+
     from .model_runner import RunObservation
 
 OperationIdentity: TypeAlias = tuple[RequestKey, int]
@@ -409,6 +412,7 @@ class PartitionState:
     request_bases: tuple[RequestRow | None, ...]
     request_rows: dict[int, RequestRow]
     completion: PinnedOutputBuffer
+    admissions: dict[RequestKey, Admission] = field(default_factory=dict)
     input_tokens: dict[ProductRef, tuple[int, ...]] = field(default_factory=dict)
     input_images: dict[ProductRef, str] = field(default_factory=dict)
     forward_rows: dict[OperationIdentity, tuple[RowGeometry, ...]] = field(default_factory=dict)
@@ -453,6 +457,7 @@ class PartitionState:
     runtime_cache_lengths: dict[int, int | torch.Tensor] = field(default_factory=dict)
     registration_visible: bool = False
     cpu_tasks: dict[OperationIdentity, CpuTaskReservation] = field(default_factory=dict)
+    h3_output_leases: dict[OperationIdentity, H3OutputRingLease] = field(default_factory=dict)
     latent_rows: dict[OperationIdentity, LatentExecution] = field(default_factory=dict)
     latent_publications: list[LatentPublication] = field(default_factory=list)
     latent_releases: list[LatentRelease] = field(default_factory=list)
@@ -492,7 +497,7 @@ class Outcome:
     committed_tokens: tuple[int | DeferredToken, ...] = ()
     products: tuple[ProductPayload, ...] = ()
     selection: SpeculativeSelection | None = None
-    completion_tasks: tuple[DeferredImagePayload, ...] = ()
+    completion_tasks: tuple[DeferredCompletionTask, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

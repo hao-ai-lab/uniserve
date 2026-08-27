@@ -12,10 +12,10 @@ import numpy as np
 import torch
 
 from ...batch import RequestKey
-from ...server.completion import PinnedByteCapture
+from ...foundation.errors import resource_error
+from ...server.completion import DeferredCompletionTask, PinnedByteCapture
 from ...server.cpu_tasks import CpuTaskReservation
 from ...server.profiler import profile_range
-from ...foundation.errors import resource_error
 
 __all__ = [
     "DeferredH3Task",
@@ -249,9 +249,7 @@ class H3OutputRingLease:
             self.release()
             return
         self._released = True
-        capture.buffer.retain_until_ready(
-            _DeferredRingRelease(self._ring, self.kind, self.index)
-        )
+        capture.buffer.retain_until_ready(_DeferredRingRelease(self._ring, self.kind, self.index))
 
     def __del__(self) -> None:
         self.release()
@@ -269,7 +267,7 @@ class _DeferredRingRelease:
         self._ring._release(self._kind, self._index)
 
 
-class DeferredH3Task:
+class DeferredH3Task(DeferredCompletionTask):
     """One completion-owned CPU action submitted after its D2H capture lands."""
 
     __slots__ = (
@@ -466,7 +464,4 @@ class H3MuxCoordinator:
 
 
 def _request_label(request_key: RequestKey) -> str:
-    return (
-        f"{request_key.authority_id}:{request_key.session_id}:"
-        f"{request_key.epoch}"
-    )
+    return f"{request_key.authority_id}:{request_key.session_id}:{request_key.epoch}"

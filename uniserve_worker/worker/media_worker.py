@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import tempfile
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Callable, cast
 
@@ -16,7 +17,6 @@ from ..batch import (
     Close,
     Commit,
     CompletionReport,
-    DecodeKind,
     DecodePlacement,
     DevicePoint,
     FinishFlags,
@@ -41,6 +41,8 @@ from ..capabilities import (
     ResourceClass,
     WorkerCapabilities,
 )
+from ..execution.h3 import decode_placement, execute_action, trajectory_placement
+from ..execution.step import validate_collective_sequence
 from ..foundation.errors import capability_mismatch, invalid_descriptor
 from ..models.identity import architecture_identity
 from ..models.minimax_h3 import MiniMaxH3Model
@@ -179,6 +181,7 @@ class MediaWorker:
             if self.mesh.coord("sp") == 0
             else None
         )
+        self._collective_history: OrderedDict[int, str] = OrderedDict()
         self.capabilities = self._build_capabilities(
             pipeline_depth=int(pipeline_depth),
             unresolved_window=int(unresolved_window),
@@ -296,25 +299,11 @@ class MediaWorker:
 
     @staticmethod
     def _placement(partition: BatchPartition, operation: Operation):
-        selected = [
-            placement
-            for placement in partition.latent_placements
-            if placement.request_key == operation.request_key and placement.op_id == operation.op_id
-        ]
-        if len(selected) != 1:
-            raise invalid_descriptor("H3 trajectory operation has no exact latent placement")
-        return selected[0]
+        return trajectory_placement(partition, operation)
 
     @staticmethod
     def _decode_placement(partition: BatchPartition, operation: Operation) -> DecodePlacement:
-        selected = [
-            placement
-            for placement in partition.decode_placements
-            if placement.request_key == operation.request_key and placement.op_id == operation.op_id
-        ]
-        if len(selected) != 1:
-            raise invalid_descriptor("H3 decode operation has no exact decode placement")
-        return selected[0]
+        return decode_placement(partition, operation)
 
     def _capture_capacity(self, partition: BatchPartition) -> int:
         return len(partition.operations)
@@ -400,74 +389,17 @@ class MediaWorker:
         reservation: CpuTaskReservation | None,
         ring_lease: H3OutputRingLease | None,
     ) -> tuple[object, ...]:
-        variant = operation.work
-        if variant is ForwardMode.GEN_TRANSITION:
-            placement = self._placement(partition, operation)
-            if placement.start_step != 0 or placement.step_count != 0:
-                raise invalid_descriptor("H3 transition placement must carry zero denoise steps")
-            return ()
-        if variant is ForwardMode.GEN_FLOW:
-            placement = self._placement(partition, operation)
-            self.model.denoise(slot, placement.start_step, placement.step_count)
-            return ()
-        if variant is ForwardMode.GEN_DECODE:
-            placement = self._decode_placement(partition, operation)
-            if placement.kind is DecodeKind.VIDEO:
-                rgb = self.model.decode_video(slot, placement)
-                if self.mesh.coord("sp") == 0:
-                    if rgb is None or reservation is None or ring_lease is None:
-                        raise RuntimeError("rank zero lost its H3 video capture resources")
-                    with profile_range(
-                        f"uniserve.h3.decode_copy request={_request_label(operation)} "
-                        f"op={operation.op_id} kind=video unit={placement.start_unit} "
-                        f"rank={self.mesh.coord('sp')}"
-                    ):
-                        capture = buffer.capture_bytes_into(rgb, ring_lease.storage)
-                    try:
-                        return (
-                            self.mux.video(
-                                operation.request_key,
-                                placement.start_unit,
-                                capture,
-                                reservation,
-                                ring_lease,
-                                operation.op_id,
-                            ),
-                        )
-                    except BaseException:
-                        ring_lease.defer_until_capture_ready(capture)
-                        raise
-                return ()
-            pcm = self.model.decode_audio(slot, placement)
-            if self.mesh.coord("sp") == 0:
-                if pcm is None or reservation is None or ring_lease is None:
-                    raise RuntimeError("rank zero lost its H3 audio capture resources")
-                with profile_range(
-                    f"uniserve.h3.decode_copy request={_request_label(operation)} "
-                    f"op={operation.op_id} kind=audio rank={self.mesh.coord('sp')}"
-                ):
-                    capture = buffer.capture_bytes_into(pcm.view(torch.uint8), ring_lease.storage)
-                try:
-                    return (
-                        self.mux.audio(
-                            operation.request_key,
-                            capture,
-                            reservation,
-                            ring_lease,
-                            operation.op_id,
-                        ),
-                    )
-                except BaseException:
-                    ring_lease.defer_until_capture_ready(capture)
-                    raise
-            return ()
-        if variant is ForwardMode.MATERIALIZE:
-            if self.mesh.coord("sp") == 0:
-                if reservation is None:
-                    raise RuntimeError("rank zero lost its H3 materialize reservation")
-                return (self.mux.materialize(operation.request_key, reservation, operation.op_id),)
-            return ()
-        raise invalid_descriptor(f"unsupported H3 work variant {variant.value!r}")
+        return execute_action(
+            self.model,
+            self.mesh,
+            self.mux,
+            operation,
+            partition,
+            slot,
+            buffer,
+            reservation,
+            ring_lease,
+        )
 
     def _execute_partition(self, step_id: int, partition: BatchPartition) -> PartitionCompletion:
         started = time.perf_counter_ns()
@@ -628,6 +560,7 @@ class MediaWorker:
                 self.drop_session(control.request_key.session_id)
 
     def execute(self, batch: Batch) -> CompletionReport:
+        validate_collective_sequence(self.mesh, self._collective_history, batch)
         self._apply_admissions(batch)
         reports = tuple(
             self._execute_partition(batch.step_id, partition) for partition in batch.partitions

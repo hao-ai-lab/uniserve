@@ -6,7 +6,7 @@ import hashlib
 import logging
 import math
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
 from functools import partial
@@ -165,6 +165,7 @@ _GENERATION_WORK_VARIANTS = frozenset(
     {
         ForwardMode.GEN_TRANSITION,
         ForwardMode.GEN_FLOW,
+        ForwardMode.GEN_DECODE,
         ForwardMode.MATERIALIZE,
     }
 )
@@ -237,6 +238,8 @@ def create_execution_resources(
             else None
         ),
         latent_pool=latent_pool,
+        _h3_mux=None,
+        _h3_output_ring=None,
         device_products=device_products,
         encoder_cache=encoder_cache,
         _device_events=device_events,
@@ -1006,6 +1009,7 @@ def _open_partition(
         request_bases=bases,
         request_rows={request.session_id: request for request in candidates},
         completion=completion,
+        admissions={admission.request_key: admission for admission in admissions},
         prepared_transfers={
             transfer.product: transfer
             for transfer in prepared
@@ -1210,7 +1214,7 @@ def _run_ready_set(
     *,
     qualify_mixed: bool,
 ) -> dict[int, BaseException]:
-    from . import encode, flow, token, transfer
+    from . import encode, flow, h3, token, transfer
 
     producers = {output: state for state in states for output in state.operation.outputs}
     errors: dict[int, BaseException] = {}
@@ -1246,6 +1250,8 @@ def _run_ready_set(
                     continue
                 forward.extend((state, row) for row in rows)
         if forward:
+            if runtime.runner is None:
+                raise RuntimeError("KV-free execution packed a model forward row")
             outputs = _run_partitioned_wave(
                 runtime,
                 tuple((cast(ForwardRow, row), state.partition) for state, row in forward),
@@ -1306,6 +1312,7 @@ def _run_ready_set(
             try:
                 progressed = encode.run_action(runtime, state) or progressed
                 progressed = transfer.run_action(runtime, state) or progressed
+                progressed = h3.run_action(runtime, state) or progressed
             except BaseException as error:
                 errors[state.partition.partition.partition_id] = error
         if progressed:
@@ -1326,9 +1333,11 @@ def _pack_state_forward(
     operation = state.operation
     if operation.work.token_mode is not None:
         return token.pack_forward(runtime, state)
-    if operation.work.gen_mode is not None:
+    if operation.work is ForwardMode.GEN_FLOW and runtime.latent_pool is not None:
         return flow.pack_forward(runtime, state)
-    if operation.work.encode_mode is not None or operation.work is ForwardMode.MATERIALIZE:
+    if operation.work.encode_mode is not None or (
+        operation.work is ForwardMode.MATERIALIZE and runtime.latent_pool is not None
+    ):
         return encode.pack_forward(runtime, state)
     return ()
 
@@ -1343,9 +1352,11 @@ def _consume_state_forward(
     operation = state.operation
     if operation.work.token_mode is not None:
         token.consume_forward(runtime, state, outputs)
-    elif operation.work.gen_mode is not None:
+    elif operation.work is ForwardMode.GEN_FLOW and runtime.latent_pool is not None:
         flow.consume_forward(runtime, state, outputs)
-    elif operation.work.encode_mode is not None or operation.work is ForwardMode.MATERIALIZE:
+    elif operation.work.encode_mode is not None or (
+        operation.work is ForwardMode.MATERIALIZE and runtime.latent_pool is not None
+    ):
         encode.consume_forward(runtime, state, outputs)
     else:
         raise RuntimeError("model output has no operation consumer")
@@ -1581,6 +1592,8 @@ def _discard_partition(
     _finish_device_reads(runtime, scope)
     for reservation in scope.cpu_tasks.values():
         reservation.abandon()
+    for lease in scope.h3_output_leases.values():
+        lease.release()
     if scope.publication_started:
         raise RuntimeError("published partition state cannot be discarded")
     scope.completion.abandon()
@@ -1601,13 +1614,41 @@ def _reserve_cpu_tasks(
     operations: tuple[Operation, ...],
     scope: PartitionState,
 ) -> None:
+    from uniserve_worker.models.minimax_h3 import MiniMaxH3Model
+
+    h3_model = isinstance(runtime.model, MiniMaxH3Model)
+    rank_zero = runtime.mesh.coord("sp") == 0 if h3_model else True
     for operation in operations:
-        if operation.work is not ForwardMode.MATERIALIZE:
+        if operation.work is not ForwardMode.MATERIALIZE and not (
+            h3_model and operation.work is ForwardMode.GEN_DECODE
+        ):
+            continue
+        if not rank_zero:
             continue
         identity = _operation_identity(operation)
         if identity in scope.cpu_tasks:
             raise invalid_descriptor("materialization repeats its CPU task identity")
-        scope.cpu_tasks[identity] = runtime._cpu_tasks.reserve()
+        reservation = runtime._cpu_tasks.reserve()
+        try:
+            if h3_model and operation.work is ForwardMode.GEN_DECODE:
+                placement = next(
+                    (
+                        placement
+                        for placement in scope.partition.decode_placements
+                        if placement.request_key == operation.request_key
+                        and int(placement.op_id) == int(operation.op_id)
+                    ),
+                    None,
+                )
+                if placement is None:
+                    raise invalid_descriptor("H3 decode operation has no exact decode placement")
+                scope.h3_output_leases[identity] = runtime.h3_output_ring().reserve(
+                    placement.kind.value
+                )
+        except BaseException:
+            reservation.abandon()
+            raise
+        scope.cpu_tasks[identity] = reservation
 
 
 def _registration_error_partition(
@@ -1841,6 +1882,19 @@ def _validate_batch_identity(runtime, batch: Batch) -> None:
             raise invalid_descriptor(
                 "tensorized mixed submission has no exact qualified capability bucket"
             )
+    validate_collective_sequence(runtime.mesh, runtime._collective_history, batch)
+
+
+def validate_collective_sequence(
+    mesh: DeviceMesh,
+    history: OrderedDict[int, str],
+    batch: Batch,
+) -> None:
+    """Reject divergent or non-advancing collective identities across all worker roots."""
+
+    groups: dict[int, list[BatchPartition]] = defaultdict(list)
+    for partition in batch.partitions:
+        groups[partition.submission_group].append(partition)
     group_identities: list[tuple[int, str]] = []
     for submission_group, partitions in groups.items():
         collective_seq = partitions[0].collective_seq
@@ -1856,7 +1910,7 @@ def _validate_batch_identity(runtime, batch: Batch) -> None:
                 digest.update(operation.plan_digest.encode("ascii"))
         group_identities.append((int(collective_seq), digest.hexdigest()))
     for collective_seq, collective_digest in sorted(group_identities):
-        existing = runtime._collective_history.get(collective_seq)
+        existing = history.get(collective_seq)
         if existing is not None:
             if existing != collective_digest:
                 raise invalid_descriptor("collective sequence was reused with different work")
@@ -1865,15 +1919,11 @@ def _validate_batch_identity(runtime, batch: Batch) -> None:
         # execution must consume them monotonically. A single-rank worker
         # runs no collectives and may launch session-disjoint submissions
         # in admission-priority order, so only sequence reuse is checked.
-        if (
-            runtime.mesh.tp_size > 1
-            and runtime._collective_history
-            and collective_seq <= next(reversed(runtime._collective_history))
-        ):
+        if mesh.tp_size > 1 and history and collective_seq <= next(reversed(history)):
             raise invalid_descriptor("collective sequence does not advance")
-        runtime._collective_history[collective_seq] = collective_digest
-        while len(runtime._collective_history) > 4096:
-            runtime._collective_history.popitem(last=False)
+        history[collective_seq] = collective_digest
+        while len(history) > 4096:
+            history.popitem(last=False)
 
 
 def _completion_devices(runtime, operations: tuple[Operation, ...]) -> tuple[str, ...]:

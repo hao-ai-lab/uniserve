@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import struct
 import time
+from abc import ABC, abstractmethod
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
@@ -42,6 +43,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "DeferredDerivedInteger",
+    "DeferredCompletionTask",
     "DeferredDigest",
     "DeferredErrorDigest",
     "DeferredImagePayload",
@@ -1041,7 +1043,21 @@ class DeferredTopLogprobs:
         return 1 + int(self.batch.counts[local]) + len(self.batch.requested_ids[local])
 
 
-class DeferredLogprobPayload:
+class DeferredCompletionTask(ABC):
+    """A completion-owned asynchronous action with nominal readiness semantics."""
+
+    __slots__ = ()
+
+    @abstractmethod
+    def ready(self) -> bool:
+        raise NotImplementedError
+
+    @abstractmethod
+    def finalize(self) -> object:
+        raise NotImplementedError
+
+
+class DeferredLogprobPayload(DeferredCompletionTask):
     __slots__ = ("logprob", "top_logprobs", "prompt_logprobs", "_value")
 
     def __init__(
@@ -1170,7 +1186,7 @@ class DeferredTransferPayload:
         return self.finalize()
 
 
-class DeferredImagePayload:
+class DeferredImagePayload(DeferredCompletionTask):
     """Pinned D2H image capture followed by bounded asynchronous PNG encoding."""
 
     __slots__ = (
@@ -1280,7 +1296,7 @@ class DeferredDigest(DeferredSemanticDigest):
         status: OpStatus,
         selected_point: int,
         resolved_callback: Callable[[ModelOutput, str, str], None] | None = None,
-        completion_tasks: tuple[DeferredImagePayload | DeferredLogprobPayload, ...] = (),
+        completion_tasks: tuple[DeferredCompletionTask, ...] = (),
     ) -> None:
         self._record: ModelOutput | None = None
         self._parent = parent

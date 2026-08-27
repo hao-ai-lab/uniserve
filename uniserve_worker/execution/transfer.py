@@ -39,7 +39,7 @@ def run_action(runtime: ExecutionResources, state: OperationState) -> bool:
     if state.phase != "initial":
         return False
     work = state.operation.work
-    if work is ForwardMode.GEN_TRANSITION:
+    if work is ForwardMode.GEN_TRANSITION and runtime.latent_pool is not None:
         _transition(runtime, state)
         return True
     if work.transfer_mode is not None or work is ForwardMode.DRAFT:

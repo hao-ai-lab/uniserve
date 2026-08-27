@@ -32,6 +32,8 @@ from uniserve_worker.foundation.errors import capability_mismatch, invalid_descr
 from uniserve_worker.loader.weight_set import WeightSet
 from uniserve_worker.models.generation import GenerationPipeline
 from uniserve_worker.models.inputs import ImageProcessor
+from uniserve_worker.models.minimax_h3 import MiniMaxH3Model
+from uniserve_worker.models.minimax_h3.execution import H3MuxCoordinator, H3OutputRing
 from uniserve_worker.models.runtime import ExecutionModel, WorkerDeployment
 from uniserve_worker.nn.mesh import BroadcastTransport, DeviceMesh
 from uniserve_worker.runtime.cache_pool import CachePool
@@ -50,7 +52,7 @@ from uniserve_worker.transfer.tickets import Locator, Transport
 @dataclass(slots=True)
 class ExecutionResources:
     runner: ModelRunner | None
-    model: ExecutionModel
+    model: ExecutionModel | MiniMaxH3Model
     deployment: WorkerDeployment
     attention: AttentionSelection
     requests: RequestTable
@@ -59,6 +61,8 @@ class ExecutionResources:
     req_to_token_pool: ReqToTokenPool | None
     cache_publications: CachePublications | None
     latent_pool: LatentPool | None
+    _h3_mux: H3MuxCoordinator | None
+    _h3_output_ring: H3OutputRing | None
     device_products: DeviceProducts
     encoder_cache: EncoderCache
     _device_events: DeviceEventPool
@@ -104,6 +108,16 @@ class ExecutionResources:
         if not isinstance(value, ImageProcessor):
             raise invalid_descriptor("operation requires model image processing")
         return value
+
+    def h3_mux(self) -> H3MuxCoordinator:
+        if not isinstance(self.model, MiniMaxH3Model) or self._h3_mux is None:
+            raise capability_mismatch("operation requires MiniMax H3 mux resources")
+        return self._h3_mux
+
+    def h3_output_ring(self) -> H3OutputRing:
+        if not isinstance(self.model, MiniMaxH3Model) or self._h3_output_ring is None:
+            raise capability_mismatch("operation requires a rank-zero H3 output ring")
+        return self._h3_output_ring
 
     def cache_coordinates(
         self,
