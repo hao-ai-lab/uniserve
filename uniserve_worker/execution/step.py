@@ -10,6 +10,7 @@ from collections import OrderedDict, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
 from functools import partial
+from pathlib import Path
 from typing import Any, cast
 
 import torch
@@ -73,6 +74,8 @@ from uniserve_worker.models.generation import (
     GenerationPipeline,
 )
 from uniserve_worker.models.inputs import ImageProcessor
+from uniserve_worker.models.minimax_h3 import MiniMaxH3Model
+from uniserve_worker.models.minimax_h3.execution import H3MuxCoordinator, H3OutputRing
 from uniserve_worker.models.runtime import (
     ExecutionModel,
     WorkerDeployment,
@@ -176,9 +179,9 @@ MIXED_SERVICE_SERIAL_DENOMINATOR = 4
 def create_execution_resources(
     *,
     runner: ModelRunner | None,
-    model: ExecutionModel,
+    model: ExecutionModel | MiniMaxH3Model,
     deployment: WorkerDeployment,
-    attention: AttentionSelection,
+    attention: AttentionSelection | None,
     requests: RequestTable,
     runtime_states: RuntimeStates | None,
     cache_pool: CachePool | None,
@@ -197,6 +200,9 @@ def create_execution_resources(
     allowed_work_variants: frozenset[ForwardMode],
     mixed_buckets: tuple[MixedExecutionCapability, ...],
     trace: ExecutionTrace,
+    h3_mux: H3MuxCoordinator | None = None,
+    h3_output_ring: H3OutputRing | None = None,
+    media_spool: Path | None = None,
 ) -> ExecutionResources:
     if not allowed_work_variants:
         raise ValueError("execution step must accept at least one work variant")
@@ -217,6 +223,17 @@ def create_execution_resources(
         raise capability_mismatch("packed-forward resources must be allocated as one set")
     if model.resource_geometry.kv != (cache_pool is not None):
         raise capability_mismatch("execution resources disagree with model KV ownership")
+    if cache_pool is not None and attention is None:
+        raise capability_mismatch("packed-forward execution requires attention selection")
+    h3_model = isinstance(model, MiniMaxH3Model)
+    if h3_model != (media_spool is not None):
+        raise capability_mismatch("H3 execution resources require one configured media spool")
+    if h3_model and mesh.coord("sp") == 0 and (
+        h3_mux is None or h3_output_ring is None
+    ):
+        raise capability_mismatch("rank-zero H3 execution requires mux and output-ring resources")
+    if not h3_model and (h3_mux is not None or h3_output_ring is not None):
+        raise capability_mismatch("packed-forward execution cannot own H3 output resources")
     device = canonical_device(deployment.device)
     generation_device = (
         device
@@ -238,8 +255,9 @@ def create_execution_resources(
             else None
         ),
         latent_pool=latent_pool,
-        _h3_mux=None,
-        _h3_output_ring=None,
+        _h3_mux=h3_mux,
+        _h3_output_ring=h3_output_ring,
+        _media_spool=media_spool,
         device_products=device_products,
         encoder_cache=encoder_cache,
         _device_events=device_events,
@@ -1882,6 +1900,10 @@ def _validate_batch_identity(runtime, batch: Batch) -> None:
             raise invalid_descriptor(
                 "tensorized mixed submission has no exact qualified capability bucket"
             )
+    if isinstance(runtime.model, MiniMaxH3Model):
+        from .h3 import validate_batch
+
+        validate_batch(runtime, batch)
     validate_collective_sequence(runtime.mesh, runtime._collective_history, batch)
 
 

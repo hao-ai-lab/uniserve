@@ -17,7 +17,11 @@ from uniserve_worker.bootstrap.model_loader import WorkerModelLoadRequest, load_
 from uniserve_worker.bootstrap.plan import ModelLoadScope
 from uniserve_worker.loader import LoadConfig, LoadFormat, LoadRequest, WeightSet, get_model_loader
 from uniserve_worker.loader.handles import TensorWeightHandle
-from uniserve_worker.loader.source import resolve_model_root, resolve_weight_sources
+from uniserve_worker.loader.source import (
+    read_model_config,
+    resolve_model_root,
+    resolve_weight_sources,
+)
 from uniserve_worker.loader.update import BucketTensor, WeightUpdater
 from uniserve_worker.loader.weight_loaders import attach_parameter_loaders, load_parameter_weight
 from uniserve_worker.models.qwen3 import Qwen3ForCausalLM
@@ -170,6 +174,29 @@ def _write_qwen_checkpoint(root: Path, *, indexed: bool = False) -> Qwen3ForCaus
         index = {"weight_map": {name: filename for name in checkpoint}}
         (root / "model.safetensors.index.json").write_text(json.dumps(index), encoding="utf-8")
     return reference
+
+
+def test_modular_h3_manifest_resolves_through_the_model_catalog(tmp_path):
+    (tmp_path / "modular_model_index.json").write_text(
+        json.dumps({"_class_name": "MiniMaxH3ModularPipeline"}),
+        encoding="utf-8",
+    )
+
+    config = read_model_config(tmp_path)
+    entry = resolve_catalog_entry(tuple(config["architectures"]))
+
+    assert entry.architecture == "MiniMaxH3Transformer3DModel"
+    assert entry.scopes == (ModelLoadScope.WHOLE, ModelLoadScope.GENERATION)
+
+
+def test_unknown_modular_pipeline_is_rejected_at_discovery(tmp_path):
+    (tmp_path / "modular_model_index.json").write_text(
+        json.dumps({"_class_name": "UnknownPipeline"}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="unsupported pipeline"):
+        read_model_config(tmp_path)
 
 
 def test_indexed_qwen_checkpoint_installs_packed_weights_on_the_requested_device(tmp_path):

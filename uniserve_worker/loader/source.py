@@ -82,25 +82,46 @@ def resolve_model_root(model_path: str, load: LoadConfig) -> tuple[Path, str | N
     if candidate.exists():
         return (candidate.parent if candidate.is_file() else candidate), None
     from huggingface_hub import hf_hub_download
+    from huggingface_hub.errors import EntryNotFoundError
 
-    config_path = Path(
-        hf_hub_download(
-            repo_id=model_path,
-            filename="config.json",
-            cache_dir=load.download_dir,
-            revision=load.revision,
+    config_path: Path | None = None
+    for filename in ("config.json", "modular_model_index.json"):
+        try:
+            config_path = Path(
+                hf_hub_download(
+                    repo_id=model_path,
+                    filename=filename,
+                    cache_dir=load.download_dir,
+                    revision=load.revision,
+                )
+            )
+            break
+        except EntryNotFoundError:
+            continue
+    if config_path is None:
+        raise FileNotFoundError(
+            f"checkpoint {model_path!r} has neither config.json nor modular_model_index.json"
         )
-    )
     return config_path.parent, model_path
 
 
 def read_model_config(root: Path) -> dict[str, Any]:
     path = root / "config.json"
     if not path.is_file():
-        raise FileNotFoundError(f"checkpoint is missing {path.name!r}")
+        path = root / "modular_model_index.json"
+    if not path.is_file():
+        raise FileNotFoundError(
+            "checkpoint is missing 'config.json' or 'modular_model_index.json'"
+        )
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
-        raise TypeError("checkpoint config.json must contain an object")
+        raise TypeError(f"checkpoint {path.name} must contain an object")
+    if path.name == "modular_model_index.json":
+        if value.get("_class_name") != "MiniMaxH3ModularPipeline":
+            raise ValueError(
+                "checkpoint modular_model_index.json declares an unsupported pipeline"
+            )
+        return {**value, "architectures": ["MiniMaxH3Transformer3DModel"]}
     return value
 
 

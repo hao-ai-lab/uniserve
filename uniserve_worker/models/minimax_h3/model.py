@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any, Literal
 
 import torch
 from torch import nn
 
-from ...batch import Admission, DecodeKind, DecodePlacement, MediaProfileId
+from ...batch import Admission, DecodeKind, DecodePlacement, ForwardMode, MediaProfileId
 from ...nn.mesh import DeviceMesh
 from ...server.profiler import profile_range
+from ..runtime import ResourceGeometry
 from .packing import patchify_video, unpatchify_video_into
 from .schedule import solver_step
 from .state import H3Layout, H3Scratch, H3StatePool, H3StateSlot
@@ -23,6 +23,19 @@ class MiniMaxH3Model(nn.Module):
     """One SP4 replica with TP4 conditioning and a serial shared scratch lane."""
 
     architecture = "MiniMaxH3Transformer3DModel"
+    serving_dtype = "bfloat16"
+    resource_geometry = ResourceGeometry(kv=False)
+    supported_work = frozenset(
+        {
+            ForwardMode.GEN_TRANSITION,
+            ForwardMode.GEN_FLOW,
+            ForwardMode.GEN_DECODE,
+            ForwardMode.MATERIALIZE,
+        }
+    )
+    generation = None
+    image_processor = None
+    tensorized_mixed = False
 
     def __init__(
         self,
@@ -30,7 +43,7 @@ class MiniMaxH3Model(nn.Module):
         components: H3Components,
         layout: H3Layout,
         *,
-        state_slots: int,
+        max_state_slots: int,
     ) -> None:
         super().__init__()
         if mesh.size("sp") != 4 or mesh.size("tp") != 4:
@@ -44,7 +57,6 @@ class MiniMaxH3Model(nn.Module):
         self.tokenizer = components.tokenizer
         self.checkpoint_digest = components.checkpoint.digest
         self.scratch = H3Scratch.allocate(layout, mesh.local_device)
-        self.states = H3StatePool(layout, state_slots, mesh.local_device)
         self.preparation_stream = torch.cuda.Stream(device=mesh.local_device)
         self.prompt_device = torch.empty(
             (1 + int(layout.packed.text_indices.numel()),),
@@ -111,6 +123,17 @@ class MiniMaxH3Model(nn.Module):
             ),
             persistent=False,
         )
+        if int(max_state_slots) < 2:
+            raise ValueError("the FastH3 serving topology requires at least two state slots")
+        torch.cuda.empty_cache()
+        free_bytes, _total_bytes = torch.cuda.mem_get_info(mesh.local_device)
+        state_slots = min(
+            int(max_state_slots),
+            int(free_bytes) // H3StatePool.bytes_per_slot(layout),
+        )
+        if state_slots < 2:
+            raise RuntimeError("MiniMax H3 has insufficient CUDA memory for two state slots")
+        self.states = H3StatePool(layout, state_slots, mesh.local_device)
 
     @classmethod
     def from_pretrained(
@@ -118,7 +141,7 @@ class MiniMaxH3Model(nn.Module):
         checkpoint: str,
         mesh: DeviceMesh,
         *,
-        state_slots: int,
+        max_state_slots: int,
         cache_dir: str | None = None,
         revision: str | None = None,
         attention_mode: Literal[
@@ -134,7 +157,7 @@ class MiniMaxH3Model(nn.Module):
             revision=revision,
             attention_mode=attention_mode,
         )
-        return cls(mesh, components, layout, state_slots=state_slots)
+        return cls(mesh, components, layout, max_state_slots=max_state_slots)
 
     def _token_ids(self, prompt: str) -> torch.Tensor:
         token_error: BaseException | None = None
@@ -280,9 +303,6 @@ class MiniMaxH3Model(nn.Module):
         if slot.video_overlap is not None:
             slot.video_overlap.zero_()
         slot.request_key = admission.request_key
-        slot.output_path = Path(media.output_path)
-        slot.semantic_digest = admission.digest
-        slot.producer_plan_digest = ""
         slot.denoise_step = 0
         slot.next_video_unit = 0
         slot.audio_decoded = False

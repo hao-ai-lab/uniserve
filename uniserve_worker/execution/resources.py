@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -54,7 +55,7 @@ class ExecutionResources:
     runner: ModelRunner | None
     model: ExecutionModel | MiniMaxH3Model
     deployment: WorkerDeployment
-    attention: AttentionSelection
+    attention: AttentionSelection | None
     requests: RequestTable
     runtime_states: RuntimeStates | None
     cache_pool: CachePool | None
@@ -63,6 +64,7 @@ class ExecutionResources:
     latent_pool: LatentPool | None
     _h3_mux: H3MuxCoordinator | None
     _h3_output_ring: H3OutputRing | None
+    _media_spool: Path | None
     device_products: DeviceProducts
     encoder_cache: EncoderCache
     _device_events: DeviceEventPool

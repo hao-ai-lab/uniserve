@@ -6,12 +6,14 @@ import logging
 from dataclasses import dataclass, replace
 from typing import Any
 
+import torch
 from torch import nn
 
 from ..foundation.errors import capability_mismatch
 from ..loader import LoadConfig, LoadRequest, WeightSet, get_model_loader
 from ..loader.source import read_model_config, resolve_model_root
 from ..models.identity import ModelIdentity, architecture_identity
+from ..models.minimax_h3 import MiniMaxH3Model
 from ..models.runtime import ExecutionModel, WorkerDeployment
 from ..nn.mesh import DeviceMesh, TensorParallelSpec
 from .capacity import DEFAULT_MAX_REQUEST_POOL_SIZE
@@ -41,7 +43,7 @@ class WorkerModelLoadRequest:
 
 @dataclass(frozen=True)
 class LoadedWorkerModel:
-    model: ExecutionModel
+    model: ExecutionModel | MiniMaxH3Model
     tokenizer: Any | None
     deployment: WorkerDeployment
     identity: ModelIdentity
@@ -49,11 +51,26 @@ class LoadedWorkerModel:
     weight_sidecars: tuple[str, ...]
 
 
-def load_worker_model(request: WorkerModelLoadRequest) -> LoadedWorkerModel:
+def load_worker_model(
+    request: WorkerModelLoadRequest,
+    *,
+    mesh: DeviceMesh | None = None,
+    pipeline_depth: int | None = None,
+    media_spool: str | None = None,
+) -> LoadedWorkerModel:
     model_root, repository_id = resolve_model_root(request.model_path, request.load)
     config = read_model_config(model_root)
     entry = resolve_catalog_entry(tuple(str(value) for value in config.get("architectures") or ()))
     _require_supported_scope(entry, request.scope)
+
+    if entry.model_class is MiniMaxH3Model:
+        return _load_h3_worker_model(
+            request,
+            entry,
+            mesh=mesh,
+            pipeline_depth=pipeline_depth,
+            media_spool=media_spool,
+        )
 
     load_request = LoadRequest(
         model_path=request.model_path,
@@ -106,7 +123,90 @@ def materialize_worker_model(
 ) -> LoadedWorkerModel:
     if config.use_stub_model:
         return _stub_worker_model(config, plan)
-    return load_worker_model(_checkpoint_request(config, plan, mesh))
+    return load_worker_model(
+        _checkpoint_request(config, plan, mesh),
+        mesh=mesh,
+        pipeline_depth=config.ipc.pipeline_depth,
+        media_spool=config.media_spool,
+    )
+
+
+def _load_h3_worker_model(
+    request: WorkerModelLoadRequest,
+    entry: CatalogEntry,
+    *,
+    mesh: DeviceMesh | None,
+    pipeline_depth: int | None,
+    media_spool: str | None,
+) -> LoadedWorkerModel:
+    from pathlib import Path
+
+    if mesh is None or pipeline_depth is None:
+        raise capability_mismatch("MiniMax H3 loading requires the worker device mesh")
+    if request.parallel.size != 4 or mesh.size("tp") != 4 or mesh.size("sp") != 4:
+        raise capability_mismatch("MiniMax H3 requires one TP4/SP4 replica")
+    if mesh.local_device.type != "cuda" or torch.cuda.get_device_capability(
+        mesh.local_device
+    ) < (10, 0):
+        raise capability_mismatch("MiniMax H3 requires an SM100-class CUDA device")
+    if not media_spool or not Path(media_spool).expanduser().is_absolute():
+        raise capability_mismatch("MiniMax H3 requires an absolute shared media spool")
+    unresolved_window = 2
+    max_state_slots = min(
+        int(request.max_batch_operations),
+        int(pipeline_depth) // (unresolved_window + 1),
+    )
+    if max_state_slots < 2:
+        raise capability_mismatch(
+            "MiniMax H3 requires capacity for two state slots with two unresolved outputs each"
+        )
+    model = MiniMaxH3Model.from_pretrained(
+        request.model_path,
+        mesh,
+        max_state_slots=max_state_slots,
+        cache_dir=request.load.download_dir,
+        revision=request.load.revision,
+    )
+    state_slots = int(model.states.slot_count)
+    max_operations = min(state_slots, int(request.max_batch_operations))
+    deployment = replace(
+        _deployment(request),
+        kv_token_capacity=None,
+        attention_backend=None,
+        max_batch_operations=max_operations,
+        max_batch_tokens=max_operations,
+        max_request_pool_size=state_slots,
+        generation_device=None,
+    )
+    weights = WeightSet.from_module(model, digest=model.checkpoint_digest)
+    identity = ModelIdentity(
+        architecture=model.architecture,
+        architecture_digest=architecture_identity(
+            entry.architecture,
+            {
+                "profile": "minimax_h3_t2va_v0.2",
+                "height": 768,
+                "width": 1344,
+                "frames": 124,
+                "evaluations": 4,
+            },
+        ),
+        weight_digest=weights.digest,
+    )
+    logger.info(
+        "loaded model architecture=%s architecture_digest=%s weight_digest=%s",
+        identity.architecture,
+        identity.architecture_digest,
+        identity.weight_digest,
+    )
+    return LoadedWorkerModel(
+        model=model,
+        tokenizer=model.tokenizer,
+        deployment=deployment,
+        identity=identity,
+        weights=weights,
+        weight_sidecars=entry.sidecars,
+    )
 
 
 def _checkpoint_request(

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from ..batch import ForwardMode, SamplingOwnership
+from ..batch import Domain, ForwardMode, SamplingOwnership
 from ..capabilities import (
     KvGroupKind,
     KvGroupSpec,
+    LaneCapabilities,
     RankInfo,
     RequestKind,
     ResourceClass,
@@ -14,6 +15,7 @@ from ..capabilities import (
 from ..foundation.errors import invalid_descriptor
 from ..foundation.math import ceil_div
 from ..models.generation import GenerationPipeline, LatentLayout
+from ..models.minimax_h3 import MiniMaxH3Model
 from ..models.runtime import ExecutionModel, WorkerDeployment, active_latent_capacity_tokens
 from .capacity import (
     derive_runtime_kv_capacity,
@@ -27,7 +29,7 @@ __all__ = ["resolve_capabilities"]
 
 
 def resolve_capabilities(
-    model: ExecutionModel,
+    model: ExecutionModel | MiniMaxH3Model,
     deployment: WorkerDeployment,
     *,
     architecture_digest: str | None = None,
@@ -36,6 +38,16 @@ def resolve_capabilities(
     completion_payload_bytes: int = 1 << 20,
 ) -> WorkerCapabilities:
     """Build the complete capability snapshot from model-owned behavior."""
+
+    if isinstance(model, MiniMaxH3Model):
+        return _h3_capabilities(
+            model,
+            deployment,
+            architecture_digest=architecture_digest,
+            weight_digest=weight_digest,
+            pipeline_depth=pipeline_depth,
+            completion_payload_bytes=completion_payload_bytes,
+        )
 
     resources = model.resource_geometry
     owns_kv = bool(resources.kv)
@@ -178,6 +190,83 @@ def resolve_capabilities(
         ),
         model_identity=architecture_digest or "",
         weight_digest=weight_digest or "",
+    )
+
+
+def _h3_capabilities(
+    model: MiniMaxH3Model,
+    deployment: WorkerDeployment,
+    *,
+    architecture_digest: str | None,
+    weight_digest: str | None,
+    pipeline_depth: int,
+    completion_payload_bytes: int,
+) -> WorkerCapabilities:
+    if int(completion_payload_bytes) < 1:
+        raise ValueError("completion payload capacity must be positive")
+    slots = int(model.states.slot_count)
+    depth = int(pipeline_depth)
+    unresolved_window = depth // slots - 1
+    if unresolved_window < 2 or depth < slots * (unresolved_window + 1):
+        raise invalid_descriptor(
+            "MiniMax H3 pipeline depth does not provide two unresolved outputs per state slot"
+        )
+    max_operations = min(slots, int(deployment.max_batch_operations))
+    layout = model.layout
+    lane = LaneCapabilities(
+        lane_id="h3",
+        domains=(Domain.FLOW,),
+        resolved_sm_count=1,
+        kv_capacity_tokens=None,
+        latent_capacity_units=int(layout.persistent_units) * slots,
+        max_batch_operations=max_operations,
+        max_batch_tokens=max_operations,
+        max_inflight=depth,
+        graph_buckets=(),
+        eager_max_batch_operations=max_operations,
+        eager_max_batch_tokens=max_operations,
+    )
+    return WorkerCapabilities(
+        block_size=0,
+        num_blocks=0,
+        num_layers=0,
+        num_kv_heads=0,
+        head_dim=0,
+        supported_work=tuple(
+            variant for variant in ForwardMode if variant in model.supported_work
+        ),
+        latent_page_units=int(layout.persistent_units),
+        num_latent_pages=slots + 1,
+        latent_width=1,
+        latent_dtype="float32",
+        latent_downsample=1,
+        max_vae_grid_tokens=int(layout.packed.video_indices.numel()),
+        max_vit_grid_tokens=0,
+        max_latent_feature_bytes=0,
+        max_vision_feature_bytes=0,
+        commit_marker_tokens=0,
+        gen_rope_advance=1,
+        max_cfg_branches=1,
+        bytes_per_token=0,
+        groups=(),
+        kv_dtype="",
+        model_dtype="bfloat16",
+        attention_backend="h3_vsa_sm100",
+        rank=RankInfo(tp_rank=model.mesh.coord("sp"), tp_size=model.mesh.size("sp")),
+        pipeline_depth=depth,
+        encoder_cache_budget=0,
+        supported_controls=(RequestKind.DROP_SESSION, RequestKind.RELEASE_PRODUCTS),
+        max_batch_operations=max_operations,
+        max_batch_tokens=max_operations,
+        max_request_pool_size=slots,
+        max_unresolved_window=unresolved_window,
+        incremental_kv_publication=False,
+        mixed_buckets=(),
+        sampling_ownership=SamplingOwnership.DESIGNATED_RANK,
+        resource_classes=(ResourceClass.IMAGE_LATENT,),
+        model_identity=architecture_digest or "",
+        weight_digest=weight_digest or "",
+        lanes=(lane,),
     )
 
 

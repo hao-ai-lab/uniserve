@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..models.generation import GenerationPipeline
+from ..models.minimax_h3 import MiniMaxH3Model
 from ..models.runtime import ExecutionModel, WorkerDeployment
 from ..runtime.device_products import device_product_capacity_bytes
 
@@ -96,7 +97,7 @@ def operation_window(pipeline_depth: int, max_operations: int) -> int:
 
 
 def model_arena_capacity(
-    model: ExecutionModel,
+    model: ExecutionModel | MiniMaxH3Model,
     deployment: WorkerDeployment,
     *,
     pipeline_depth: int,
@@ -117,6 +118,26 @@ def model_arena_capacity(
         raise ValueError("model arena sizing requires positive runtime bounds")
 
     slots = depth * max_operations
+    if isinstance(model, MiniMaxH3Model):
+        transfer_tickets = min(slots, _MAX_TRANSFER_ENTRIES)
+        state_slots = int(model.states.slot_count)
+        unresolved_window = depth // state_slots - 1
+        device_products = _DEVICE_PRODUCTS_PER_OPERATION * (
+            slots + _DEVICE_PRODUCT_RETIREMENT_BATCHES * max_operations
+        )
+        return ArenaCapacity(
+            latent_pool_bytes=0,
+            device_products=device_products,
+            device_product_bytes=device_product_capacity_bytes(
+                device_products,
+                1,
+                selected_points_per_operation=1,
+                max_value_bytes=1,
+            ),
+            transfer_bytes=max(1, transfer_tickets),
+            transfer_tickets=max(1, transfer_tickets),
+            cpu_tasks=state_slots * (unresolved_window + 1),
+        )
     transfer_tickets = min(slots, _MAX_TRANSFER_ENTRIES)
     block_size = int(deployment.block_size)
     flow = model.generation

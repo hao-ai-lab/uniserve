@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from pathlib import Path
 
 import torch
 
-from ...batch import DeferredSemanticDigest, RequestKey
+from ...batch import RequestKey
 from ...nn.mesh import DeviceMesh
 from .packing import H3PackedLayout, build_packed_layout
 from .schedule import H3Schedule
@@ -111,10 +110,6 @@ class H3StateSlot:
     rotary_cosine: torch.Tensor
     rotary_sine: torch.Tensor
     request_key: RequestKey | None = None
-    output_path: Path | None = None
-    semantic_digest: str | DeferredSemanticDigest = ""
-    producer_op_id: int = 0
-    producer_plan_digest: str = ""
     denoise_step: int = 0
     next_video_unit: int = 0
     audio_decoded: bool = False
@@ -126,10 +121,6 @@ class H3StateSlot:
 
     def clear(self) -> None:
         self.request_key = None
-        self.output_path = None
-        self.semantic_digest = ""
-        self.producer_op_id = 0
-        self.producer_plan_digest = ""
         self.denoise_step = 0
         self.next_video_unit = 0
         self.audio_decoded = False
@@ -175,6 +166,30 @@ class H3StatePool:
                 video_overlap=torch.empty((1, 3, 5, 768, 1344), dtype=torch.float16, device=device),
             )
             for index in range(1, slot_count + 1)
+        )
+
+    @staticmethod
+    def bytes_per_slot(layout: H3Layout) -> int:
+        """Return the exact persistent CUDA tensor bytes owned by one state slot."""
+
+        packed = layout.packed
+        text_rows = int(packed.text_indices.numel())
+        video_rows = int(layout.local_video_rows)
+        audio_rows = int(layout.local_audio_rows)
+        padded_rows = int(packed.padded_rows)
+        return sum(
+            (
+                text_rows * 5376 * 2,
+                video_rows * 96 * 4,
+                audio_rows * 32 * 4,
+                int(packed.tile_valid_sizes.numel()) * 4,
+                int(packed.prefix_tiles) * 4,
+                (int(packed.prefix_tiles) + int(packed.video_tiles)) * 4,
+                4,
+                padded_rows,
+                padded_rows * 96 * 4 * 2,
+                3 * 5 * PROFILE_HEIGHT * PROFILE_WIDTH * 2,
+            )
         )
 
     @property

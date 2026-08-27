@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import logging
+import os
+import tempfile
 from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import replace
+from pathlib import Path
 from threading import Condition, RLock
 from typing import TYPE_CHECKING
 
@@ -37,6 +40,7 @@ from ..capabilities import (
     LaneCapabilities,
     MixedExecutionCapability,
     RequestKind,
+    ResourceClass,
     WorkerCapabilities,
 )
 from ..execution.cuda_graph import CudaGraphRunner
@@ -45,6 +49,7 @@ from ..execution.model_runner import ModelRunner
 from ..execution.step import (
     PreparedExecution,
     close_execution,
+    complete_startup,
     create_execution_resources,
     execute_batch,
     execute_prepared,
@@ -60,6 +65,12 @@ from ..foundation.math import ceil_div
 from ..loader.update import WeightUpdater
 from ..loader.weight_set import WeightSet
 from ..models.identity import ModelIdentity, architecture_identity
+from ..models.minimax_h3 import MiniMaxH3Model
+from ..models.minimax_h3.execution import (
+    H3MuxCoordinator,
+    H3OutputRing,
+    require_h3_codecs,
+)
 from ..models.runtime import ExecutionModel, WorkerDeployment
 from ..nn.diffusion.cfg import build_flow_cfg_plan
 from ..nn.mesh import DeviceMesh
@@ -95,7 +106,7 @@ logger = logging.getLogger(__name__)
 class Worker:
     """Own one configured process and its sole model execution root."""
 
-    model: ExecutionModel
+    model: ExecutionModel | MiniMaxH3Model
     deployment: WorkerDeployment
     weights: WeightSet
     runner: ModelRunner | None
@@ -132,15 +143,21 @@ class Worker:
         )
         loaded = materialize_worker_model(config, plan, mesh)
         place_towers(loaded.model, mesh)
+        attention = (
+            resolve_attention_selection(
+                loaded.deployment.attention_backend or "auto",
+                tuning=config.execution.flashinfer,
+                block_size=loaded.deployment.block_size,
+            )
+            if isinstance(loaded.model, ExecutionModel)
+            and loaded.model.resource_geometry.kv
+            else None
+        )
         return cls(
             loaded.model,
             mesh=mesh,
             deployment=loaded.deployment,
-            attention=resolve_attention_selection(
-                loaded.deployment.attention_backend or "auto",
-                tuning=config.execution.flashinfer,
-                block_size=loaded.deployment.block_size,
-            ),
+            attention=attention,
             execution=config.execution,
             tokenizer=loaded.tokenizer,
             allowed_work_variants=plan.allowed_work_variants,
@@ -148,20 +165,23 @@ class Worker:
             cross_process=config.worker_kind is not WorkerKind.FULL,
             architecture_digest=loaded.identity.architecture_digest,
             weight_digest=loaded.identity.weight_digest,
-            weights=WeightSet.from_module(loaded.model, digest=loaded.identity.weight_digest),
+            weights=loaded.weights,
             weight_sidecars=loaded.weight_sidecars,
             pipeline_depth=config.ipc.pipeline_depth,
             completion_payload_bytes=config.ipc.max_payload_bytes,
             snapshot_dir=config.snapshot_dir,
+            media_spool=(
+                None if config.media_spool is None else Path(config.media_spool).expanduser()
+            ),
         )
 
     def __init__(
         self,
-        model: ExecutionModel,
+        model: ExecutionModel | MiniMaxH3Model,
         *,
         mesh: DeviceMesh,
         deployment: WorkerDeployment,
-        attention: AttentionSelection,
+        attention: AttentionSelection | None,
         execution: ExecutionConfig,
         tokenizer: object | None,
         allowed_work_variants: frozenset[ForwardMode],
@@ -174,13 +194,16 @@ class Worker:
         pipeline_depth: int,
         completion_payload_bytes: int,
         snapshot_dir: str | None = None,
+        media_spool: Path | None = None,
     ) -> None:
-        if not isinstance(model, ExecutionModel):
-            raise capability_mismatch("worker model must implement ExecutionModel")
+        if not isinstance(model, (ExecutionModel, MiniMaxH3Model)):
+            raise capability_mismatch("worker model has no supported execution surface")
         if not isinstance(deployment, WorkerDeployment):
             raise capability_mismatch("model worker requires a worker deployment")
         self.model = model
+        self.mesh = mesh
         self.deployment = deployment
+        self.media_spool = media_spool
         self._weight_condition = Condition(RLock())
         self._active_model_calls = 0
         self._weight_update_active = False
@@ -250,17 +273,28 @@ class Worker:
             pipeline_depth=int(pipeline_depth),
         )
         owns_kv = bool(model.resource_geometry.kv)
-        cache = model.cache_geometry if owns_kv else None
+        packed_model = model if isinstance(model, ExecutionModel) else None
+        if owns_kv != (attention is not None):
+            raise capability_mismatch(
+                "attention selection must exactly match model-owned KV resources"
+            )
+        if isinstance(model, MiniMaxH3Model):
+            if media_spool is None or not media_spool.is_absolute():
+                raise capability_mismatch("MiniMax H3 requires an absolute shared media spool")
+        elif media_spool is not None:
+            raise capability_mismatch("packed-forward models do not own a media spool")
+        cache = packed_model.cache_geometry if owns_kv and packed_model is not None else None
         self.cache_pool = None
         self.req_to_token_pool = None
         max_blocks_per_row = 0
         if cache is not None:
+            assert packed_model is not None
             cache_dtype = getattr(torch, str(cache.dtype).removeprefix("torch."), None)
             if not isinstance(cache_dtype, torch.dtype):
                 raise capability_mismatch(f"unsupported cache dtype {cache.dtype!r}")
             max_blocks_per_row = max(
                 1,
-                ceil_div(int(model.text_max_tokens), int(deployment.block_size)),
+                ceil_div(int(packed_model.text_max_tokens), int(deployment.block_size)),
             )
             self.cache_pool = CachePool(
                 num_layers=int(cache.num_layers),
@@ -280,6 +314,7 @@ class Worker:
                     else None
                 ),
             )
+            assert attention is not None
             if (
                 ForwardMode.GEN_FLOW in self._effective_work_variants
                 and not _supports_flow_attention(
@@ -300,7 +335,7 @@ class Worker:
                 device=deployment.device,
                 staging_depth=int(pipeline_depth),
             )
-            model.bind_cache_pool(self.cache_pool, attention)
+            packed_model.bind_cache_pool(self.cache_pool, attention)
         self.requests = RequestTable(int(self._capabilities.max_request_pool_size))
         torch_dtype = getattr(
             torch,
@@ -309,19 +344,19 @@ class Worker:
         )
         if not isinstance(torch_dtype, torch.dtype):
             raise capability_mismatch(f"unsupported model dtype {deployment.model_dtype!r}")
-        self.runtime_states = (
-            RuntimeStates(
+        if self.req_to_token_pool is not None:
+            assert packed_model is not None
+            self.runtime_states = RuntimeStates(
                 request_pool_size=int(self._capabilities.max_request_pool_size),
-                vocab_size=int(model.vocab_size),
+                vocab_size=int(packed_model.vocab_size),
                 continuation_width=1,
                 device=deployment.device,
                 logits_dtype=torch_dtype,
                 valid_cache_lengths=self.req_to_token_pool.verified_lens,
             )
-            if self.req_to_token_pool is not None
-            else None
-        )
-        flow = model.generation
+        else:
+            self.runtime_states = None
+        flow = None if packed_model is None else packed_model.generation
         latent_dtype = getattr(
             torch,
             str(self._capabilities.latent_dtype).removeprefix("torch."),
@@ -444,10 +479,10 @@ class Worker:
         prefill_capacity = (
             min(
                 int(self._capabilities.max_batch_tokens),
-                int(model.text_max_tokens),
+                int(packed_model.text_max_tokens),
                 max(0, int(self._capabilities.num_blocks) - 1) * int(deployment.block_size),
             )
-            if owns_kv
+            if owns_kv and packed_model is not None
             else 0
         )
         prefill_graph_token_sizes = tuple(
@@ -522,7 +557,8 @@ class Worker:
             ()
             if (
                 not flow_graph_buckets
-                or not model.tensorized_mixed
+                or packed_model is None
+                or not packed_model.tensorized_mixed
                 or not _has_decode_flow_partition(execution.lanes)
                 or not {
                     ForwardMode.TOKEN_DECODE,
@@ -554,7 +590,7 @@ class Worker:
             for text_batch_size in mixed_text_batch_sizes
         )
         flow_prefix_lengths: dict[int, tuple[int, ...]] = {}
-        if flow is not None and model.tensorized_mixed and flow_graph_buckets:
+        if flow is not None and packed_model is not None and packed_model.tensorized_mixed and flow_graph_buckets:
             for cfg_branches in flow_cfg_branches:
                 image = _startup_image_parameters(
                     cfg_branches,
@@ -618,6 +654,13 @@ class Worker:
             stream: torch.cuda.Stream | None,
             expected_context: int | None,
         ) -> CudaGraphRunner:
+            if (
+                packed_model is None
+                or attention is None
+                or self.cache_pool is None
+                or self.runtime_states is None
+            ):
+                raise RuntimeError("packed graph construction lost model-owned KV resources")
             domains = tuple(Domain) if lane is None else lane.domains
             owns_model_compute = str(device) == str(torch.device(deployment.device))
             lane_max_operations = (
@@ -681,7 +724,7 @@ class Worker:
                 ):
                     expected_resident_executables += (
                         len(lane_prefill_buckets)
-                        if model.tensorized_mixed
+                        if packed_model.tensorized_mixed
                         else len(lane_prefill_catalog)
                     )
                 if execution.prefill_cuda_graph and {
@@ -710,7 +753,7 @@ class Worker:
             return CudaGraphRunner(
                 enabled=execution.cuda_graph,
                 prefill_enabled=execution.prefill_cuda_graph,
-                cache=model.cache_geometry,
+                cache=packed_model.cache_geometry,
                 cache_pool=self.cache_pool,
                 attention=attention,
                 block_size=deployment.block_size,
@@ -724,7 +767,9 @@ class Worker:
                 ),
                 decode_context_blocks=self._decode_context_blocks(),
                 packed_context_blocks=max_blocks_per_row,
-                prefill_token_sizes=(() if model.tensorized_mixed else lane_prefill_buckets),
+                prefill_token_sizes=(
+                    () if packed_model.tensorized_mixed else lane_prefill_buckets
+                ),
                 prefill_row_sizes=lane_prefill_row_sizes,
                 stream=stream,
                 expected_context=expected_context,
@@ -741,23 +786,24 @@ class Worker:
         )
         runner = (
             ModelRunner(
-                model,
+                packed_model,
                 deployment,
                 self.trace,
                 max_rows=max_staged_rows,
                 max_tokens=max_staged_tokens,
                 max_text_tokens=max_text_staged_tokens,
                 max_blocks_per_row=max_blocks_per_row,
-                hidden_size=int(model.hidden_size),
+                hidden_size=int(packed_model.hidden_size),
                 devices=devices,
                 lanes=execution.lanes,
                 max_inflight=int(pipeline_depth),
                 graph_factory=graph_factory,
             )
-            if owns_kv
+            if owns_kv and packed_model is not None
             else None
         )
         if execution.lanes and runner is not None:
+            assert packed_model is not None
             lane_by_id = {lane.lane_id: lane for lane in execution.lanes}
             lane_capabilities: list[LaneCapabilities] = []
             for partition in runner.partitions:
@@ -794,7 +840,7 @@ class Worker:
                 ):
                     paged_catalog = (
                         ()
-                        if model.tensorized_mixed
+                        if packed_model.tensorized_mixed
                         else _paged_prefill_graph_buckets(
                             prefill_graph_token_sizes,
                             prefill_graph_row_sizes,
@@ -814,7 +860,7 @@ class Worker:
                         )
                         for item in paged_catalog
                     )
-                    if model.tensorized_mixed:
+                    if packed_model.tensorized_mixed:
                         buckets.extend(
                             GraphBucketCapability(
                                 phase="text_prefill",
@@ -898,6 +944,19 @@ class Worker:
                 )
             self._capabilities = replace(self._capabilities, lanes=tuple(lane_capabilities))
         self.runner = runner
+        self.h3_mux = (
+            H3MuxCoordinator()
+            if isinstance(model, MiniMaxH3Model) and mesh.coord("sp") == 0
+            else None
+        )
+        self.h3_output_ring = (
+            H3OutputRing(
+                state_slots=model.states.slot_count,
+                unresolved_window=self._capabilities.max_unresolved_window,
+            )
+            if isinstance(model, MiniMaxH3Model) and mesh.coord("sp") == 0
+            else None
+        )
         self.execution = create_execution_resources(
             runner=runner,
             model=model,
@@ -921,6 +980,9 @@ class Worker:
             allowed_work_variants=self._effective_work_variants,
             mixed_buckets=self._capabilities.mixed_buckets,
             trace=self.trace,
+            h3_mux=self.h3_mux,
+            h3_output_ring=self.h3_output_ring,
+            media_spool=media_spool,
         )
         self._warmup_kv_pages = {}
         self._warmup_prefix_pages = {}
@@ -930,6 +992,12 @@ class Worker:
         self.snapshot_recovery = None
         if snapshot_dir is not None:
             caps = self._capabilities
+            if (
+                self.cache_pool is None
+                or self.req_to_token_pool is None
+                or self.execution.cache_publications is None
+            ):
+                raise RuntimeError("snapshot recovery lost model-owned KV resources")
             self.snapshot_recovery = SnapshotRecovery(
                 snapshot_dir,
                 model_identity=self.identity.architecture_digest,
@@ -958,15 +1026,19 @@ class Worker:
                 runtime_states=self.runtime_states,
                 transport=self.transfers.transport,
             )
-        self.weight_updater = WeightUpdater(
-            self.model,
-            architecture=self.identity.architecture,
-            scope=self.deployment.model_scope,
-            sidecars=weight_sidecars,
-            weights=self.weights,
-            publish=self._publish_weight_set,
-            exclusive=self._exclusive_weight_update,
-            gather_rank_digests=self._gather_rank_weight_digests,
+        self.weight_updater = (
+            WeightUpdater(
+                self.model,
+                architecture=self.identity.architecture,
+                scope=self.deployment.model_scope,
+                sidecars=weight_sidecars,
+                weights=self.weights,
+                publish=self._publish_weight_set,
+                exclusive=self._exclusive_weight_update,
+                gather_rank_digests=self._gather_rank_weight_digests,
+            )
+            if isinstance(self.model, ExecutionModel)
+            else None
         )
 
     @property
@@ -975,6 +1047,8 @@ class Worker:
 
     def _decode_context_blocks(self) -> int:
         model = self.model
+        if not isinstance(model, ExecutionModel):
+            return 0
         deployment = self.deployment
         max_tokens = int(model.text_max_tokens)
         if max_tokens < 1:
@@ -1071,17 +1145,47 @@ class Worker:
         return tuple(str(value) for value in gathered)
 
     def warmup(self) -> None:
-        packed_warmup.warmup(self)
+        if not isinstance(self.model, MiniMaxH3Model):
+            packed_warmup.warmup(self)
+            return
+        spool = self.media_spool
+        if spool is None:
+            raise RuntimeError("MiniMax H3 has no configured media spool")
+        try:
+            spool = spool.resolve(strict=True)
+        except OSError as error:
+            raise RuntimeError(f"media spool {spool} is unavailable") from error
+        if not spool.is_dir():
+            raise RuntimeError(f"media spool {spool} is not a directory")
+        try:
+            descriptor, probe = tempfile.mkstemp(
+                dir=spool,
+                prefix=f".uniserve-worker-{self.mesh.coord('sp')}-",
+            )
+            os.close(descriptor)
+            Path(probe).unlink()
+        except OSError as error:
+            raise RuntimeError(f"media spool {spool} is not writable") from error
+        self.media_spool = spool
+        self.execution._media_spool = spool
+        if self.mesh.coord("sp") == 0:
+            require_h3_codecs()
+        self.model.warmup()
+        complete_startup(self.execution)
 
     def drop_session(self, session_id: int) -> None:
         session_id = int(session_id)
         session = self.requests.peek(session_id)
         drop_execution_session(self.execution, session_id)
         self.device_products.drop_session(session_id)
+        if isinstance(self.model, MiniMaxH3Model):
+            self.model.states.drop_session(session_id)
+            if self.h3_mux is not None:
+                self.h3_mux.drop(session_id)
         if session is not None and self.latent_pool is not None:
             self.latent_pool.release_slots((int(session.request_pool_idx),))
         self.requests.drop(session_id)
-        if session is not None:
+        if session is not None and self.cache_pool is not None:
             for group_id in range(self.cache_pool.group_count):
                 self._warmup_kv_pages.pop((session.request_key, group_id), None)
             self._warmup_prefix_pages.pop(session.request_key, None)
@@ -1103,9 +1207,12 @@ class Worker:
             )
 
     def copy_kv(self, copies: tuple[CacheCopy, ...]) -> None:
+        cache_pool = self.cache_pool
+        if cache_pool is None:
+            raise capability_mismatch("this worker has no KV cache")
         for group_id in {copy.group_id for copy in copies}:
             selected = tuple(copy for copy in copies if copy.group_id == group_id)
-            self.cache_pool.copy_pages(
+            cache_pool.copy_pages(
                 group_id,
                 tuple(copy.source_page for copy in selected),
                 tuple(copy.destination_page for copy in selected),
@@ -1139,6 +1246,16 @@ class Worker:
         self.snapshot_recovery.restore(reference, placement)
 
     def resource_pressure(self) -> list[dict[str, object]]:
+        if isinstance(self.model, MiniMaxH3Model):
+            used_slots = sum(slot.active for slot in self.model.states.slots)
+            bytes_per_slot = self.model.states.bytes_per_slot(self.model.layout)
+            return [
+                _pressure(
+                    ResourceClass.IMAGE_LATENT.value,
+                    used_slots * bytes_per_slot,
+                    self.model.states.slot_count * bytes_per_slot,
+                )
+            ]
         caps = self._capabilities
         counts = {
             "image_latent": (
@@ -1165,6 +1282,10 @@ class Worker:
         close_execution(self.execution)
         if runner is not None:
             runner.close()
+        if isinstance(self.model, MiniMaxH3Model):
+            torch.cuda.synchronize(self.model.mesh.local_device)
+        if self.h3_mux is not None:
+            self.h3_mux.close()
         self.cpu_tasks.close()
         self.transfers.close()
         if self.latent_pool is not None:

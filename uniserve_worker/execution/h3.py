@@ -7,10 +7,13 @@ from pathlib import Path
 import torch
 
 from uniserve_worker.batch import (
+    Admission,
+    Batch,
     BatchPartition,
     DecodeKind,
     DecodePlacement,
     FinishFlags,
+    FixedPoint,
     ForwardMode,
     Operation,
     OpStatus,
@@ -55,6 +58,36 @@ def decode_placement(partition: BatchPartition, operation: Operation) -> DecodeP
     if len(selected) != 1:
         raise invalid_descriptor("H3 decode operation has no exact decode placement")
     return selected[0]
+
+
+def validate_batch(runtime: ExecutionResources, batch: Batch) -> None:
+    """Validate the fixed H3 admission and spool contract before state is staged."""
+
+    if not isinstance(runtime.model, MiniMaxH3Model):
+        return
+    admissions = {admission.request_key: admission for admission in batch.admissions}
+    transitions = {
+        operation.request_key: operation
+        for operation in batch.operations
+        if operation.work is ForwardMode.GEN_TRANSITION
+    }
+    if set(admissions) != set(transitions):
+        raise invalid_descriptor("H3 admissions must exactly match transition operations")
+    for request_key, admission in admissions.items():
+        output_path = _output_path(runtime, admission)
+        slot = runtime.model.states.get(int(admission.request_pool_idx))
+        if slot.active:
+            raise invalid_descriptor("H3 admission targets an occupied request slot")
+        operation = transitions[request_key]
+        point = operation.parent.point
+        if (
+            int(operation.parent.producer_op_id) != 0
+            or not isinstance(point, FixedPoint)
+            or point.semantic_digest != admission.digest
+        ):
+            raise invalid_descriptor("H3 transition does not name its admission root")
+        if output_path.name in {".", ".."}:
+            raise invalid_descriptor("H3 output has an invalid filename")
 
 
 def execute_action(
@@ -168,9 +201,7 @@ def run_action(runtime: ExecutionResources, state: OperationState) -> bool:
         if admission is None:
             raise invalid_descriptor("H3 transition has no matching admission")
         model.prepare(slot, admission)
-        output_path = Path(admission.media.output_path) if admission.media is not None else None
-        if output_path is None:
-            raise invalid_descriptor("H3 admission is missing its media output")
+        output_path = _output_path(runtime, admission)
         if runtime.mesh.coord("sp") == 0:
             assert mux is not None
             mux.open(operation.request_key, output_path)
@@ -206,6 +237,21 @@ def run_action(runtime: ExecutionResources, state: OperationState) -> bool:
     return True
 
 
+def _output_path(runtime: ExecutionResources, admission: Admission) -> Path:
+    media = admission.media
+    spool = runtime._media_spool
+    if media is None or spool is None:
+        raise invalid_descriptor("H3 admission is missing its media output")
+    output_path = Path(media.output_path).expanduser()
+    try:
+        output_parent = output_path.parent.resolve(strict=True)
+    except OSError as error:
+        raise invalid_descriptor("H3 output directory is unavailable") from error
+    if output_parent != spool or output_path.suffix != ".mp4":
+        raise invalid_descriptor("H3 output must be an MP4 in the configured media spool")
+    return output_parent / output_path.name
+
+
 def _request_label(operation: Operation) -> str:
     key = operation.request_key
     return f"{key.authority_id}:{key.session_id}:{key.epoch}"
@@ -216,4 +262,5 @@ __all__ = [
     "execute_action",
     "run_action",
     "trajectory_placement",
+    "validate_batch",
 ]
