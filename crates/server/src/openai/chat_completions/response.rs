@@ -382,11 +382,7 @@ pub async fn chat_completion_chunk_stream(
                 y.yield_ok(chunk).await;
             }
             Ok(ServeEvent::PublicCommit { commit }) => {
-                if pending_public_commit.replace(commit).is_some() {
-                    bail_server_error!(
-                        "visible output publication arrived before the preceding publication was consumed"
-                    );
-                }
+                pending_public_commit = Some(commit);
             }
             Ok(ServeEvent::TextDelta {
                 text,

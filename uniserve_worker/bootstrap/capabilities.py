@@ -39,7 +39,8 @@ def resolve_capabilities(
     """Build the complete capability snapshot from model-owned behavior."""
 
     resources = model.resource_geometry
-    bytes_per_token = _kv_bytes_per_token(model, deployment)
+    owns_kv = bool(resources.kv)
+    bytes_per_token = _kv_bytes_per_token(model, deployment) if owns_kv else 0
     flow = model.generation
     if flow is not None and not isinstance(flow, GenerationPipeline):
         raise invalid_descriptor("model generation behavior has an invalid type")
@@ -70,9 +71,13 @@ def resolve_capabilities(
         if flow is not None
         else 0
     )
-    cache = model.cache_geometry
+    cache = model.cache_geometry if owns_kv else None
     max_vit_grid_tokens = int(getattr(model, "max_vit_grid_tokens", 0))
-    hidden_elements = int(cache.num_attention_heads) * int(cache.head_dim)
+    hidden_elements = (
+        int(cache.num_attention_heads) * int(cache.head_dim)
+        if cache is not None
+        else int(getattr(model, "hidden_size", 0))
+    )
     max_vision_feature_bytes = max_vit_grid_tokens * hidden_elements * model_dtype_bytes
     max_latent_feature_bytes = (
         0
@@ -85,22 +90,26 @@ def resolve_capabilities(
             * model_dtype_bytes
         )
     )
-    resident_copies, co_resident_blocks = _kv_residency_shape(
-        deployment,
-        bytes_per_token=bytes_per_token,
-        co_resident_bytes=(
-            latent_pool_bytes if deployment.generation_device in {None, deployment.device} else 0
-        ),
-    )
-    capacity = derive_runtime_kv_capacity(
-        block_size=int(deployment.block_size),
-        kv_token_capacity=deployment.kv_token_capacity,
-        bytes_per_token=bytes_per_token,
-        device=deployment.device,
-        memory_fraction=float(deployment.kv_memory_fraction),
-        resident_copies=resident_copies,
-        co_resident_blocks=co_resident_blocks,
-    )
+    capacity = None
+    if owns_kv:
+        resident_copies, co_resident_blocks = _kv_residency_shape(
+            deployment,
+            bytes_per_token=bytes_per_token,
+            co_resident_bytes=(
+                latent_pool_bytes
+                if deployment.generation_device in {None, deployment.device}
+                else 0
+            ),
+        )
+        capacity = derive_runtime_kv_capacity(
+            block_size=int(deployment.block_size),
+            kv_token_capacity=deployment.kv_token_capacity,
+            bytes_per_token=bytes_per_token,
+            device=deployment.device,
+            memory_fraction=float(deployment.kv_memory_fraction),
+            resident_copies=resident_copies,
+            co_resident_blocks=co_resident_blocks,
+        )
     if int(completion_payload_bytes) < 1:
         raise ValueError("completion payload capacity must be positive")
     unresolved_window = operation_window(
@@ -109,17 +118,18 @@ def resolve_capabilities(
     )
     controls = [
         RequestKind.DROP_SESSION,
-        RequestKind.COPY_KV,
         RequestKind.RELEASE_PRODUCTS,
     ]
+    if owns_kv:
+        controls.insert(1, RequestKind.COPY_KV)
     supported_work = configured_work_variants(model.supported_work)
     sampling_ownership = SamplingOwnership.DESIGNATED_RANK
     return WorkerCapabilities(
-        block_size=int(deployment.block_size),
-        num_blocks=int(capacity.num_blocks),
-        num_layers=int(cache.num_layers),
-        num_kv_heads=int(cache.num_kv_heads),
-        head_dim=int(cache.head_dim),
+        block_size=int(deployment.block_size) if owns_kv else 0,
+        num_blocks=int(capacity.num_blocks) if capacity is not None else 0,
+        num_layers=int(cache.num_layers) if cache is not None else 0,
+        num_kv_heads=int(cache.num_kv_heads) if cache is not None else 0,
+        head_dim=int(cache.head_dim) if cache is not None else 0,
         supported_work=supported_work,
         latent_page_units=latent_page_units,
         num_latent_pages=num_latent_pages,
@@ -132,12 +142,12 @@ def resolve_capabilities(
         max_batch_tokens=int(deployment.max_batch_tokens),
         max_request_pool_size=int(deployment.max_request_pool_size),
         max_unresolved_window=unresolved_window,
-        incremental_kv_publication=True,
+        incremental_kv_publication=owns_kv,
         mixed_buckets=(),
         sampling_ownership=sampling_ownership,
         resource_classes=tuple(ResourceClass(value) for value in resources.classes()),
-        attention_backend=deployment.attention_backend or "auto",
-        kv_dtype=_kv_dtype(model, deployment),
+        attention_backend=(deployment.attention_backend or "auto") if owns_kv else "",
+        kv_dtype=_kv_dtype(model, deployment) if owns_kv else "",
         model_dtype=deployment.model_dtype,
         encoder_cache_budget=int(resources.encoder_cache_entries),
         max_vae_grid_tokens=int(flow.max_vae_grid_tokens) if flow is not None else 0,
@@ -154,14 +164,18 @@ def resolve_capabilities(
         rank=RankInfo(tp_rank=int(deployment.tp_rank), tp_size=int(deployment.tp_size)),
         pipeline_depth=int(pipeline_depth),
         groups=(
-            KvGroupSpec(
-                group_id=0,
-                block_offset=0,
-                num_blocks=int(capacity.num_blocks),
-                kind=KvGroupKind.FULL,
-                window=0,
-                sink=0,
-            ),
+            (
+                KvGroupSpec(
+                    group_id=0,
+                    block_offset=0,
+                    num_blocks=int(capacity.num_blocks),
+                    kind=KvGroupKind.FULL,
+                    window=0,
+                    sink=0,
+                ),
+            )
+            if capacity is not None
+            else ()
         ),
         model_identity=architecture_digest or "",
         weight_digest=weight_digest or "",

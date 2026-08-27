@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, TypeAlias
 
@@ -10,6 +11,7 @@ import torch
 from uniserve_worker.batch import (
     Batch,
     BatchPartition,
+    CompletionReport,
     FinishFlags,
     LatentPlacement,
     LogicalLengths,
@@ -27,7 +29,7 @@ from uniserve_worker.batch import (
     ForwardRow as WireForwardRow,
 )
 from uniserve_worker.execution.forward_batch import FlowPatches, ModelPhase, TokenSelection
-from uniserve_worker.foundation.errors import invalid_descriptor
+from uniserve_worker.foundation.errors import WorkerError, classify, invalid_descriptor
 from uniserve_worker.loader.weight_set import WeightSet
 from uniserve_worker.runtime.device_products import (
     DeviceProductMetadata,
@@ -305,11 +307,17 @@ class PreparedPredicateBatch:
             pass
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class PreparedExecution:
     batch: Batch
     transfers: tuple[PreparedTransferInput, ...]
     predicates: PreparedPredicateBatch | None = None
+    _execute: Callable[[PreparedExecution], CompletionReport] | None = field(
+        default=None,
+        repr=False,
+    )
+    _release: Callable[[], None] | None = field(default=None, repr=False)
+    _finished: bool = field(default=False, init=False, repr=False)
 
     def ready(self) -> bool:
         return all(transfer.ready() for transfer in self.transfers) and (
@@ -318,6 +326,51 @@ class PreparedExecution:
 
     def predicate_values(self) -> dict[OperationIdentity, bool]:
         return {} if self.predicates is None else self.predicates.resolve()
+
+    def bind(
+        self,
+        execute: Callable[[PreparedExecution], CompletionReport],
+        release: Callable[[], None],
+    ) -> PreparedExecution:
+        if self._execute is not None or self._release is not None:
+            raise RuntimeError("prepared execution is already bound")
+        self._execute = execute
+        self._release = release
+        return self
+
+    def resolve(self) -> CompletionReport:
+        if not self.ready():
+            raise RuntimeError("prepared execution was observed before transfer readiness")
+        execute = self._execute
+        if execute is None:
+            raise RuntimeError("prepared execution has no worker binding")
+        try:
+            return execute(self)
+        finally:
+            self._finish()
+
+    def record_failure(self, error: BaseException) -> WorkerError:
+        self.abandon()
+        return classify(error, context="execute")
+
+    def abandon(self) -> None:
+        if self.predicates is not None:
+            self.predicates.abandon()
+        self._finish()
+
+    def _finish(self) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        release = self._release
+        if release is not None:
+            release()
+
+    def __del__(self) -> None:
+        try:
+            self.abandon()
+        except Exception:
+            pass
 
 
 @dataclass(frozen=True, slots=True)

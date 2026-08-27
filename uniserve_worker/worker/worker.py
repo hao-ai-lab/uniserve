@@ -12,7 +12,6 @@ from threading import Condition, RLock
 from typing import TYPE_CHECKING
 
 import torch
-from torch import nn
 
 from ..batch import (
     Admission,
@@ -25,6 +24,7 @@ from ..batch import (
     CompletionReport,
     Domain,
     ExecutionCapability,
+    ForwardMode,
     ForwardRow,
     ImageParams,
     LatentPlacement,
@@ -37,7 +37,6 @@ from ..batch import (
     RequestKey,
     SnapshotRef,
     StorageClass,
-    ForwardMode,
 )
 from ..bootstrap.capabilities import resolve_capabilities
 from ..bootstrap.capacity import (
@@ -127,14 +126,6 @@ class _PagedPrefillGraphBucket:
     token_bucket: int
     row_bucket: int
     live_rows: int
-
-
-@dataclass(slots=True)
-class _PreparedWeightCall:
-    prepared: PreparedExecution
-
-    def ready(self) -> bool:
-        return self.prepared.ready()
 
 
 def _flow_graph_executable(bucket: _FlowGraphBucket) -> tuple[object, ...]:
@@ -353,7 +344,10 @@ class Worker:
     model: ExecutionModel
     deployment: WorkerDeployment
     weights: WeightSet
-    runtime_states: RuntimeStates
+    runner: ModelRunner | None
+    runtime_states: RuntimeStates | None
+    cache_pool: CachePool | None
+    req_to_token_pool: ReqToTokenPool | None
     latent_pool: LatentPool | None
     snapshot_recovery: SnapshotRecovery | None
     _warmup_kv_pages: dict[tuple[RequestKey, int], list[int]]
@@ -427,9 +421,11 @@ class Worker:
         completion_payload_bytes: int,
         snapshot_dir: str | None = None,
     ) -> None:
-        if not isinstance(model, ExecutionModel) or type(model).forward is nn.Module.forward:
+        if not isinstance(model, ExecutionModel):
+            raise capability_mismatch("worker model must implement ExecutionModel")
+        if model.resource_geometry.kv and type(model).forward is ExecutionModel.forward:
             raise capability_mismatch(
-                "model worker requires forward(input_ids, positions, forward_batch)"
+                "KV-backed model requires forward(input_ids, positions, forward_batch)"
             )
         if not isinstance(deployment, WorkerDeployment):
             raise capability_mismatch("model worker requires a worker deployment")
@@ -475,6 +471,8 @@ class Worker:
             max_vision_feature_bytes=int(declared.max_vision_feature_bytes),
             bytes_per_token=int(declared.bytes_per_token),
         )
+        if snapshot_dir is not None and not model.resource_geometry.kv:
+            raise capability_mismatch("session snapshots require model-owned KV resources")
         if snapshot_dir is not None:
             declared = replace(
                 declared,
@@ -501,55 +499,61 @@ class Worker:
             supported_work=tuple(variant for variant in ForwardMode if variant in advertised_work),
             pipeline_depth=int(pipeline_depth),
         )
-        cache = model.cache_geometry
-        cache_dtype = getattr(torch, str(cache.dtype).removeprefix("torch."), None)
-        if not isinstance(cache_dtype, torch.dtype):
-            raise capability_mismatch(f"unsupported cache dtype {cache.dtype!r}")
-        max_blocks_per_row = max(
-            1,
-            ceil_div(int(model.text_max_tokens), int(deployment.block_size)),
-        )
-        self.cache_pool = CachePool(
-            num_layers=int(cache.num_layers),
-            num_pages=int(self._capabilities.num_blocks),
-            page_size=int(self._capabilities.block_size),
-            num_kv_heads=int(cache.num_kv_heads),
-            head_dim=int(cache.head_dim),
-            device=deployment.device,
-            dtype=cache_dtype,
-            store_dtype=cache.store_dtype,
-            group_ranges=(
-                tuple(
-                    (int(group.block_offset), int(group.num_blocks))
-                    for group in self._capabilities.groups
-                )
-                if self._capabilities.groups
-                else None
-            ),
-        )
-        if ForwardMode.GEN_FLOW in self._effective_work_variants and not _supports_flow_attention(
-            attention,
-            cache,
-            self.cache_pool,
-            torch.device(deployment.device),
-        ):
-            raise capability_mismatch(
-                "image generation requires paged-prefix plus dense-current attention"
+        owns_kv = bool(model.resource_geometry.kv)
+        cache = model.cache_geometry if owns_kv else None
+        self.cache_pool = None
+        self.req_to_token_pool = None
+        max_blocks_per_row = 0
+        if cache is not None:
+            cache_dtype = getattr(torch, str(cache.dtype).removeprefix("torch."), None)
+            if not isinstance(cache_dtype, torch.dtype):
+                raise capability_mismatch(f"unsupported cache dtype {cache.dtype!r}")
+            max_blocks_per_row = max(
+                1,
+                ceil_div(int(model.text_max_tokens), int(deployment.block_size)),
             )
-        self.req_to_token_pool = ReqToTokenPool(
-            group_count=self.cache_pool.group_count,
-            request_pool_size=int(self._capabilities.max_request_pool_size),
-            max_blocks_per_request=max_blocks_per_row,
-            block_size=int(self._capabilities.block_size),
-            device=deployment.device,
-            staging_depth=int(pipeline_depth),
-        )
-        from ..nn.attention import bind_attention_modules
+            self.cache_pool = CachePool(
+                num_layers=int(cache.num_layers),
+                num_pages=int(self._capabilities.num_blocks),
+                page_size=int(self._capabilities.block_size),
+                num_kv_heads=int(cache.num_kv_heads),
+                head_dim=int(cache.head_dim),
+                device=deployment.device,
+                dtype=cache_dtype,
+                store_dtype=cache.store_dtype,
+                group_ranges=(
+                    tuple(
+                        (int(group.block_offset), int(group.num_blocks))
+                        for group in self._capabilities.groups
+                    )
+                    if self._capabilities.groups
+                    else None
+                ),
+            )
+            if (
+                ForwardMode.GEN_FLOW in self._effective_work_variants
+                and not _supports_flow_attention(
+                    attention,
+                    cache,
+                    self.cache_pool,
+                    torch.device(deployment.device),
+                )
+            ):
+                raise capability_mismatch(
+                    "image generation requires paged-prefix plus dense-current attention"
+                )
+            self.req_to_token_pool = ReqToTokenPool(
+                group_count=self.cache_pool.group_count,
+                request_pool_size=int(self._capabilities.max_request_pool_size),
+                max_blocks_per_request=max_blocks_per_row,
+                block_size=int(self._capabilities.block_size),
+                device=deployment.device,
+                staging_depth=int(pipeline_depth),
+            )
+            from ..nn.attention import bind_attention_modules
 
-        bind_attention_modules(model, self.cache_pool, attention)
-        bind_cache_pool = getattr(model, "bind_cache_pool", None)
-        if callable(bind_cache_pool):
-            bind_cache_pool(self.cache_pool)
+            bind_attention_modules(model, self.cache_pool, attention)
+            model.bind_cache_pool(self.cache_pool)
         self.requests = RequestTable(int(self._capabilities.max_request_pool_size))
         torch_dtype = getattr(
             torch,
@@ -558,13 +562,17 @@ class Worker:
         )
         if not isinstance(torch_dtype, torch.dtype):
             raise capability_mismatch(f"unsupported model dtype {deployment.model_dtype!r}")
-        self.runtime_states = RuntimeStates(
-            request_pool_size=int(self._capabilities.max_request_pool_size),
-            vocab_size=int(model.vocab_size),
-            continuation_width=1,
-            device=deployment.device,
-            logits_dtype=torch_dtype,
-            valid_cache_lengths=self.req_to_token_pool.verified_lens,
+        self.runtime_states = (
+            RuntimeStates(
+                request_pool_size=int(self._capabilities.max_request_pool_size),
+                vocab_size=int(model.vocab_size),
+                continuation_width=1,
+                device=deployment.device,
+                logits_dtype=torch_dtype,
+                valid_cache_lengths=self.req_to_token_pool.verified_lens,
+            )
+            if self.req_to_token_pool is not None
+            else None
         )
         flow = model.generation
         latent_dtype = getattr(
@@ -683,12 +691,17 @@ class Worker:
             value
             for value in execution.decode_graph_batch_sizes
             if 0 < int(value) <= decode_max_operations
+            and owns_kv
             and int(value) < int(self._capabilities.num_blocks)
         )
-        prefill_capacity = min(
-            int(self._capabilities.max_batch_tokens),
-            int(model.text_max_tokens),
-            max(0, int(self._capabilities.num_blocks) - 1) * int(deployment.block_size),
+        prefill_capacity = (
+            min(
+                int(self._capabilities.max_batch_tokens),
+                int(model.text_max_tokens),
+                max(0, int(self._capabilities.num_blocks) - 1) * int(deployment.block_size),
+            )
+            if owns_kv
+            else 0
         )
         prefill_graph_token_sizes = tuple(
             value
@@ -979,21 +992,25 @@ class Worker:
             if deployment.generation_device is None
             else (deployment.device, deployment.generation_device)
         )
-        runner = ModelRunner(
-            model,
-            deployment,
-            self.trace,
-            max_rows=max_staged_rows,
-            max_tokens=max_staged_tokens,
-            max_text_tokens=max_text_staged_tokens,
-            max_blocks_per_row=max_blocks_per_row,
-            hidden_size=int(model.hidden_size),
-            devices=devices,
-            lanes=execution.lanes,
-            max_inflight=int(pipeline_depth),
-            graph_factory=graph_factory,
+        runner = (
+            ModelRunner(
+                model,
+                deployment,
+                self.trace,
+                max_rows=max_staged_rows,
+                max_tokens=max_staged_tokens,
+                max_text_tokens=max_text_staged_tokens,
+                max_blocks_per_row=max_blocks_per_row,
+                hidden_size=int(model.hidden_size),
+                devices=devices,
+                lanes=execution.lanes,
+                max_inflight=int(pipeline_depth),
+                graph_factory=graph_factory,
+            )
+            if owns_kv
+            else None
         )
-        if execution.lanes:
+        if execution.lanes and runner is not None:
             lane_by_id = {lane.lane_id: lane for lane in execution.lanes}
             lane_capabilities: list[LaneCapabilities] = []
             for partition in runner.partitions:
@@ -1216,13 +1233,16 @@ class Worker:
         if max_tokens < 1:
             return 0
         blocks = (max_tokens + int(deployment.block_size) - 1) // int(deployment.block_size)
-        return min(blocks, max(0, int(self.cache_pool.num_pages) - 1))
+        pool = self.cache_pool
+        if pool is None:
+            return 0
+        return min(blocks, max(0, int(pool.num_pages) - 1))
 
     def execute(self, batch: Batch) -> CompletionReport:
         with self._model_call():
             return execute_batch(self.execution, batch)
 
-    def prepare_execute(self, batch: Batch) -> object | None:
+    def prepare_execute(self, batch: Batch) -> PreparedExecution | None:
         self._begin_model_call()
         try:
             prepared = prepare_batch(self.execution, batch)
@@ -1232,15 +1252,15 @@ class Worker:
         if prepared is None:
             self._end_model_call()
             return None
-        return _PreparedWeightCall(prepared)
+        return prepared.bind(
+            lambda value: execute_prepared(self.execution, value),
+            self._end_model_call,
+        )
 
-    def execute_prepared(self, prepared: object) -> CompletionReport:
-        if not isinstance(prepared, _PreparedWeightCall):
+    def execute_prepared(self, prepared: PreparedExecution) -> CompletionReport:
+        if not isinstance(prepared, PreparedExecution):
             raise invalid_descriptor("prepared execution has an invalid type")
-        try:
-            return execute_prepared(self.execution, prepared.prepared)
-        finally:
-            self._end_model_call()
+        return prepared.resolve()
 
     @contextmanager
     def _model_call(self) -> Generator[None, None, None]:
@@ -1350,9 +1370,7 @@ class Worker:
         occupied_blocks = {page for pages in self._warmup_kv_pages.values() for page in pages}
         request_pool_indices: dict[RequestKey, int] = {}
         block_tables: dict[tuple[RequestKey, int], tuple[BlockTable, ...]] = {}
-        new_cache_pages: dict[
-            tuple[RequestKey, int], tuple[CachePageAllocation, ...]
-        ] = {}
+        new_cache_pages: dict[tuple[RequestKey, int], tuple[CachePageAllocation, ...]] = {}
         forward_rows: dict[tuple[RequestKey, int], tuple[ForwardRow, ...]] = {}
         latent_placements: dict[tuple[RequestKey, int], LatentPlacement] = {}
         for operation in operations:
@@ -1572,11 +1590,9 @@ class Worker:
             for page in pages
         }
         occupied.update(page for pages in self._warmup_kv_pages.values() for page in pages)
-        allocated = tuple(
-            page
-            for page in self.cache_pool.page_ids(0)
-            if page not in occupied
-        )[:missing]
+        allocated = tuple(page for page in self.cache_pool.page_ids(0) if page not in occupied)[
+            :missing
+        ]
         if len(allocated) != missing:
             raise invalid_descriptor("warmup alternative prefix exceeds KV capacity")
         lease.extend(allocated)
@@ -1587,8 +1603,7 @@ class Worker:
         if alternative:
             alternative_slot = self._warmup_prefix_slots.setdefault(
                 operation.request_key,
-                int(self._capabilities.max_request_pool_size)
-                - len(self._warmup_prefix_slots),
+                int(self._capabilities.max_request_pool_size) - len(self._warmup_prefix_slots),
             )
             if alternative_slot == main_slot or alternative_slot < 1:
                 raise invalid_descriptor("warmup has no request slot for an alternative prefix")
@@ -1696,7 +1711,6 @@ class Worker:
             ShapeBound,
             StaticDim,
             StorageClass,
-            TokenMode,
             UndAdmission,
             VersionRef,
             encode_token_product_bytes,
@@ -1773,7 +1787,7 @@ class Worker:
                 request_key=keys[sid],
                 op_id=op_id,
                 parent=parent,
-                work=ForwardMode.token(TokenMode.EXTEND),
+                work=ForwardMode.TOKEN_EXTEND,
                 route=0,
                 domain=Domain.PREFILL,
                 bounds=Bounds(max_points=1, max_tokens=max(1, len(tokens))),
@@ -1799,7 +1813,7 @@ class Worker:
                     predecessor.op_id,
                     DevicePoint(1, None, predecessor.plan_digest),
                 ),
-                work=ForwardMode.token(TokenMode.DECODE),
+                work=ForwardMode.TOKEN_DECODE,
                 route=0,
                 domain=Domain.DECODE,
                 bounds=Bounds(max_points=1, max_tokens=1),
@@ -1879,7 +1893,6 @@ class Worker:
             ShapeBound,
             StaticDim,
             StorageClass,
-            TokenMode,
             UndAdmission,
             VersionRef,
             encode_token_product_bytes,
@@ -1966,7 +1979,7 @@ class Worker:
                             request_key=rk,
                             op_id=1,
                             parent=VersionRef(rk, 0, FixedPoint(0, admission.digest)),
-                            work=ForwardMode.token(TokenMode.EXTEND),
+                            work=ForwardMode.TOKEN_EXTEND,
                             route=0,
                             domain=Domain.PREFILL,
                             bounds=Bounds(max_points=1, max_tokens=token_count),
@@ -2176,7 +2189,7 @@ class Worker:
                                 0,
                                 FixedPoint(0, text_admissions[session_id].digest),
                             ),
-                            work=ForwardMode.token(TokenMode.EXTEND),
+                            work=ForwardMode.TOKEN_EXTEND,
                             route=0,
                             domain=Domain.PREFILL,
                             bounds=Bounds(max_points=1, max_tokens=1),
@@ -2346,7 +2359,7 @@ class Worker:
                                         predecessor.op_id,
                                         DevicePoint(1, None, predecessor.plan_digest),
                                     ),
-                                    work=ForwardMode.token(TokenMode.DECODE),
+                                    work=ForwardMode.TOKEN_DECODE,
                                     route=0,
                                     domain=Domain.DECODE,
                                     bounds=Bounds(max_points=1, max_tokens=1),
@@ -2473,7 +2486,10 @@ class Worker:
     def snapshot_session(self, placement: RecoveryPlacement) -> SnapshotRef:
         if self.snapshot_recovery is None:
             raise capability_mismatch("this worker has no configured snapshot recovery")
-        self.runner.synchronize()
+        runner = self.runner
+        if runner is None:
+            raise capability_mismatch("session snapshots require packed-forward execution")
+        runner.synchronize()
         return self.snapshot_recovery.snapshot_session(placement)
 
     def restore_session(
@@ -2483,7 +2499,10 @@ class Worker:
     ) -> None:
         if self.snapshot_recovery is None:
             raise capability_mismatch("this worker has no configured snapshot recovery")
-        self.runner.synchronize()
+        runner = self.runner
+        if runner is None:
+            raise capability_mismatch("session snapshots require packed-forward execution")
+        runner.synchronize()
         self.snapshot_recovery.restore(reference, placement)
 
     def resource_pressure(self) -> list[dict[str, object]]:
@@ -2507,9 +2526,12 @@ class Worker:
         ]
 
     def close(self) -> None:
-        self.runner.synchronize()
+        runner = self.runner
+        if runner is not None:
+            runner.synchronize()
         close_execution(self.execution)
-        self.runner.close()
+        if runner is not None:
+            runner.close()
         self.cpu_tasks.close()
         self.transfers.close()
         if self.latent_pool is not None:

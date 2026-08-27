@@ -17,7 +17,6 @@ import torch
 from uniserve_worker.batch import (
     Batch,
     BatchPartition,
-    ModelOutput,
     CompletionReport,
     DevicePoint,
     Domain,
@@ -25,8 +24,10 @@ from uniserve_worker.batch import (
     ExecutionCapability,
     FinishFlags,
     FixedPoint,
+    ForwardMode,
     LatentPlacement,
     LogicalLengths,
+    ModelOutput,
     Operation,
     OpStatus,
     PartitionCompletion,
@@ -42,7 +43,6 @@ from uniserve_worker.batch import (
     TokenSpan,
     VersionRef,
     WorkerForwardStats,
-    ForwardMode,
     decode_sampling_state_bytes,
     decode_token_product_bytes,
 )
@@ -88,6 +88,7 @@ from uniserve_worker.nn.diffusion.schedule import (
 from uniserve_worker.nn.mesh import BroadcastTransport, DeviceMesh
 from uniserve_worker.runtime.cache_pool import CachePool
 from uniserve_worker.runtime.device import canonical_device
+from uniserve_worker.runtime.device_events import DeviceEventPool
 from uniserve_worker.runtime.device_products import (
     DeviceProductMetadata,
     DeviceProductRead,
@@ -175,15 +176,15 @@ MIXED_SERVICE_SERIAL_DENOMINATOR = 4
 
 @dataclass(slots=True)
 class ExecutionResources:
-    runner: ModelRunner
+    runner: ModelRunner | None
     model: ExecutionModel
     deployment: WorkerDeployment
     attention: AttentionSelection
     requests: RequestTable
-    runtime_states: RuntimeStates
-    cache_pool: CachePool
-    req_to_token_pool: ReqToTokenPool
-    cache_publications: CachePublications
+    runtime_states: RuntimeStates | None
+    cache_pool: CachePool | None
+    req_to_token_pool: ReqToTokenPool | None
+    cache_publications: CachePublications | None
     latent_pool: LatentPool | None
     device_products: DeviceProducts
     encoder_cache: EncoderCache
@@ -210,14 +211,14 @@ class ExecutionResources:
 
 def create_execution_resources(
     *,
-    runner: ModelRunner,
+    runner: ModelRunner | None,
     model: ExecutionModel,
     deployment: WorkerDeployment,
     attention: AttentionSelection,
     requests: RequestTable,
-    runtime_states: RuntimeStates,
-    cache_pool: CachePool,
-    req_to_token_pool: ReqToTokenPool,
+    runtime_states: RuntimeStates | None,
+    cache_pool: CachePool | None,
+    req_to_token_pool: ReqToTokenPool | None,
     latent_pool: LatentPool | None,
     device_products: DeviceProducts,
     encoder_cache: EncoderCache,
@@ -245,6 +246,13 @@ def create_execution_resources(
             "execution work set exceeds the model implementation: "
             f"{sorted(value.value for value in unsupported)!r}"
         )
+    kv_resources = (runner, runtime_states, cache_pool, req_to_token_pool)
+    if any(resource is None for resource in kv_resources) != all(
+        resource is None for resource in kv_resources
+    ):
+        raise capability_mismatch("packed-forward resources must be allocated as one set")
+    if model.resource_geometry.kv != (cache_pool is not None):
+        raise capability_mismatch("execution resources disagree with model KV ownership")
     device = canonical_device(deployment.device)
     generation_device = (
         device
@@ -260,7 +268,11 @@ def create_execution_resources(
         runtime_states=runtime_states,
         cache_pool=cache_pool,
         req_to_token_pool=req_to_token_pool,
-        cache_publications=CachePublications(cache_pool, req_to_token_pool),
+        cache_publications=(
+            CachePublications(cache_pool, req_to_token_pool)
+            if cache_pool is not None and req_to_token_pool is not None
+            else None
+        ),
         latent_pool=latent_pool,
         device_products=device_products,
         encoder_cache=encoder_cache,
@@ -290,7 +302,8 @@ def close_execution(runtime: ExecutionResources) -> None:
 def install_weights(runtime: ExecutionResources, weights: WeightSet) -> None:
     if weights.version <= runtime.weights.version:
         raise ValueError("installed weight version must increase")
-    runtime.runner.invalidate_graphs(weights.digest)
+    if runtime.runner is not None:
+        runtime.runner.invalidate_graphs(weights.digest)
     runtime.weights = weights
     runtime.weight_digest = weights.digest
 
@@ -992,7 +1005,11 @@ def _open_partition(
         for operation in operations:
             slot = admission_slots.get(operation.request_key)
             resident = runtime.requests.peek(operation.request_key.session_id)
-            if slot is None and resident is not None and resident.request_key == operation.request_key:
+            if (
+                slot is None
+                and resident is not None
+                and resident.request_key == operation.request_key
+            ):
                 slot = int(resident.request_pool_idx)
             if slot is None:
                 raise invalid_descriptor("operation request is not resident or admitted")
@@ -1050,7 +1067,17 @@ def _open_partition(
         _reserve_cpu_tasks(runtime, active_operations, scope)
         active_partition = _active_partition(runtime, partition, active_operations)
         if active_partition is not None:
-            _bind_cache_tables(runtime, active_partition, scope)
+            if runtime.cache_pool is None or runtime.req_to_token_pool is None:
+                if (
+                    active_partition.block_tables
+                    or active_partition.new_cache_pages
+                    or active_partition.forward_rows
+                ):
+                    raise capability_mismatch(
+                        "KV-free execution received cache tables or packed forward rows"
+                    )
+            else:
+                _bind_cache_tables(runtime, active_partition, scope)
         scope.layout = PartitionLayout(
             operations=operations,
             requests=candidates,
@@ -1105,7 +1132,11 @@ def _active_partition(
     old_to_new = {
         index: selected
         for selected, (index, operation) in enumerate(
-            (item for item in enumerate(partition.operations) if _operation_identity(item[1]) in identities)
+            (
+                item
+                for item in enumerate(partition.operations)
+                if _operation_identity(item[1]) in identities
+            )
         )
     }
     return replace(
@@ -1158,8 +1189,7 @@ def _execute_partition_group(
         if _operation_identity(operation) not in scope.predicated_operations
     )
     homogeneous_decode = bool(group_active) and all(
-        operation.work is ForwardMode.TOKEN_DECODE
-        for operation in group_active
+        operation.work is ForwardMode.TOKEN_DECODE for operation in group_active
     )
     states: list[OperationState] = []
     locations: dict[int, tuple[int, int]] = {}
@@ -1228,15 +1258,9 @@ def _run_ready_set(
     while any(live(state) for state in states):
         forward: list[tuple[OperationState, object]] = []
         ready = tuple(
-            state
-            for state in states
-            if live(state) and dependencies_ready(state, producers)
+            state for state in states if live(state) and dependencies_ready(state, producers)
         )
-        flow_ready = tuple(
-            state
-            for state in ready
-            if state.operation.work is ForwardMode.GEN_FLOW
-        )
+        flow_ready = tuple(state for state in ready if state.operation.work is ForwardMode.GEN_FLOW)
         flow_ready_ids = {id(state) for state in flow_ready}
         for state in flow_ready:
             try:
@@ -1474,11 +1498,17 @@ def _commit_partition(
         worker_exec_us=(time.perf_counter_ns() - scope.started_ns) // 1000,
         forward_stats=_forward_stats(scope.observations, scope.component_us),
     )
-    cache_commit = runtime.cache_publications.prepare_commit(
-        scope.cache_publications,
-        scope.cache_installations,
-        runtime.transport,
-    )
+    cache_publications = runtime.cache_publications
+    if cache_publications is None:
+        if scope.cache_publications or scope.cache_installations:
+            raise RuntimeError("cache publication has no backing KV resources")
+        cache_commit = ()
+    else:
+        cache_commit = cache_publications.prepare_commit(
+            scope.cache_publications,
+            scope.cache_installations,
+            runtime.transport,
+        )
     request_publication = runtime.requests.prepare_publication(
         step_id=step_id,
         operations=operations,
@@ -1499,7 +1529,8 @@ def _commit_partition(
             scope.latent_publications,
             scope.latent_releases,
         )
-    runtime.cache_publications.apply_commit(cache_commit)
+    if cache_publications is not None:
+        cache_publications.apply_commit(cache_commit)
     for publication_identity, locators in scope.stage_publications.items():
         runtime._transport_publications[publication_identity] = locators
     _commit_runtime_states(runtime, scope)
@@ -1981,9 +2012,7 @@ def _reserve_outputs(
                 and output.kind is not ProductKind.COMPLETION
             ):
                 continue
-            if operation.work is ForwardMode.TRANSFER_PRODUCT and transfer.transferable(
-                output
-            ):
+            if operation.work is ForwardMode.TRANSFER_PRODUCT and transfer.transferable(output):
                 continue
             if output.kind in {
                 ProductKind.VISION_FEATURE,
@@ -2008,7 +2037,9 @@ def _reserve_outputs(
     scope.encoder_writes.extend(runtime.encoder_cache.bind_outputs(tuple(encoder_bindings)))
     operation_identities = {_operation_identity(operation) for operation in operations}
     token_operation_identities = {
-        _operation_identity(operation) for operation in operations if operation.work.token_mode is not None
+        _operation_identity(operation)
+        for operation in operations
+        if operation.work.token_mode is not None
     }
     for write in scope.device_writes:
         operation_identity = _reference_operation_identity(write.reference)
@@ -2245,7 +2276,8 @@ def _apply_release_controls(runtime, batch: Batch) -> None:
     )
     runtime.device_products.release_operations(releases)
     runtime.encoder_cache.release_operations(releases)
-    runtime.cache_publications.release_operations(releases)
+    if runtime.cache_publications is not None:
+        runtime.cache_publications.release_operations(releases)
     consumed_predicates = tuple(
         int(predicate.generation)
         for operation in batch.operations
@@ -2265,9 +2297,11 @@ def drop_session(runtime, session_id: int) -> None:
     if session is not None:
         if runtime.runtime_states is not None:
             runtime.runtime_states.release((int(session.request_pool_idx),))
-        runtime.req_to_token_pool.release((int(session.request_pool_idx),))
-    runtime.cache_publications.drop(session_id)
-    if session is not None:
+        if runtime.req_to_token_pool is not None:
+            runtime.req_to_token_pool.release((int(session.request_pool_idx),))
+    if runtime.cache_publications is not None:
+        runtime.cache_publications.drop(session_id)
+    if session is not None and runtime.req_to_token_pool is not None:
         runtime.req_to_token_pool.release(
             tuple(runtime._flow_prefix_slots.pop(session.request_key, ()))
         )
@@ -2291,7 +2325,43 @@ def _bind_latent_rows(
         return
     pool = runtime.latent_pool
     if pool is None:
-        raise capability_mismatch("scheduler latent placement has no worker physical pool")
+        operations = {
+            _operation_identity(operation): (
+                operation,
+                _request_row(runtime, scope, operation.request_key.session_id),
+            )
+            for operation in partition.operations
+        }
+        for placement in partition.latent_placements:
+            identity = placement.request_key, int(placement.op_id)
+            selected = operations.get(identity)
+            if selected is None:
+                raise invalid_descriptor(
+                    "latent placement names an operation outside its partition"
+                )
+            operation, request = selected
+            slot = int(request.request_pool_idx)
+            if placement.page_table != (slot,):
+                raise invalid_descriptor(
+                    "pool-free latent placement must name its request-pool capacity token"
+                )
+            if operation.work is ForwardMode.GEN_TRANSITION:
+                valid = int(placement.start_step) == 0 and int(placement.step_count) == 0
+            elif operation.work is ForwardMode.GEN_FLOW:
+                valid = (
+                    int(placement.start_step) == int(request.flow_step)
+                    and int(placement.step_count) == 1
+                )
+            else:
+                valid = (
+                    int(placement.start_step) == int(request.flow_step)
+                    and int(placement.step_count) == 0
+                )
+            if not valid:
+                raise invalid_descriptor(
+                    "pool-free latent placement disagrees with resident generation state"
+                )
+        return
     operations = {
         _operation_identity(operation): (
             operation,
@@ -2425,11 +2495,9 @@ def _bind_cache_tables(
         for descriptor in operation_rows:
             slot = int(descriptor.request_pool_index)
             runtime.req_to_token_pool.pages(slot, 0)
-            if (
-                slot != main_slot
-                and int(descriptor.seq_len)
-                > runtime.req_to_token_pool.allocated_length(slot)
-            ):
+            if slot != main_slot and int(
+                descriptor.seq_len
+            ) > runtime.req_to_token_pool.allocated_length(slot):
                 raise invalid_descriptor("forward row exceeds alternative-prefix capacity")
             if slot != main_slot:
                 runtime._flow_prefix_slots.setdefault(operation.request_key, set()).add(slot)

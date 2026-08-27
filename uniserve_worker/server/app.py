@@ -17,12 +17,13 @@ from ..batch import (
     Batch,
     CacheCopy,
     CompletionReport,
+    ForwardMode,
     PartitionCompletion,
     RecoveryPlacement,
     SnapshotRef,
-    ForwardMode,
 )
 from ..capabilities import RequestKind, ResponseKind
+from ..execution.rows import PreparedExecution
 from ..foundation.env import env_int, env_optional_int
 from ..foundation.errors import (
     WorkerError,
@@ -72,32 +73,6 @@ class WorkerIpcTransport(Protocol):
     def wake(self) -> None: ...
 
     def wake_on_stream(self, stream: int) -> None: ...
-
-
-class _PendingExecution:
-    def __init__(self, worker: Worker, prepared: object) -> None:
-        self.worker = worker
-        self.prepared = prepared
-
-    def ready(self) -> bool:
-        query = getattr(self.prepared, "ready", None)
-        if not callable(query):
-            raise invalid_descriptor("prepared execution has no readiness query")
-        return bool(query())
-
-    def resolve(self) -> CompletionReport:
-        if not self.ready():
-            raise RuntimeError("pending execution was observed before transfer readiness")
-        execute = getattr(self.worker, "execute_prepared", None)
-        if not callable(execute):
-            raise invalid_descriptor("worker cannot execute prepared transfer inputs")
-        result = execute(self.prepared)
-        if not isinstance(result, CompletionReport):
-            raise RuntimeError("prepared worker execution returned an invalid report")
-        return result
-
-    def record_failure(self, error: BaseException) -> WorkerError:
-        return classify(error, context="execute")
 
 
 def _response(kind: ResponseKind, **payload: Any) -> dict[str, Any]:
@@ -239,9 +214,7 @@ def _batch_lineage(batch: Batch) -> tuple[frozenset[int], frozenset[_EpochKey]]:
             *(control.request_key for control in batch.controls),
         )
     )
-    epochs = frozenset(
-        (int(request.session_id), int(request.epoch)) for request in request_keys
-    )
+    epochs = frozenset((int(request.session_id), int(request.epoch)) for request in request_keys)
     return frozenset(session_id for session_id, _epoch in epochs), epochs
 
 
@@ -413,7 +386,7 @@ class InflightStep:
         self.active_cursors = 0
         self.state = "QUEUED"
         self.error: WorkerError | None = None
-        self.source: object | None = None
+        self.source: CompletionReport | PreparedExecution | None = None
         self._raw_report: CompletionReport | None = None
         self._materialized: dict[int, PartitionCompletion] = {}
         self._ready_cursor: dict[int, tuple[int, int]] = {}
@@ -427,16 +400,9 @@ class InflightStep:
     def current(self) -> InflightStep | TerminalStep:
         return self if self._terminal is None else self._terminal
 
-    def attach(self, source: object) -> None:
+    def attach(self, source: CompletionReport | PreparedExecution) -> None:
         if self.source is not None or self._terminal is not None:
             raise RuntimeError("execution step already has an execution source")
-        if not isinstance(source, CompletionReport):
-            ready = getattr(source, "ready", None)
-            resolve = getattr(source, "resolve", None)
-            if not callable(ready) or not callable(resolve):
-                raise invalid_descriptor(
-                    "in-flight execution source has no readiness and resolution contract"
-                )
         self.source = source
         self.state = "RUNNING"
 
@@ -448,7 +414,7 @@ class InflightStep:
             error
             if isinstance(error, WorkerError)
             else source.record_failure(error)
-            if isinstance(source, _PendingExecution)
+            if isinstance(source, PreparedExecution)
             else classify(error, context=context)
         )
         return self._terminalize(error=classified)
@@ -465,13 +431,9 @@ class InflightStep:
             if isinstance(source, CompletionReport):
                 report = source
             else:
-                if not bool(getattr(source, "ready")()):
+                if not source.ready():
                     return False
-                report = getattr(source, "resolve")()
-                if not isinstance(report, CompletionReport):
-                    raise RuntimeError(
-                        "in-flight execution resolved to an invalid completion report"
-                    )
+                report = source.resolve()
             _validate_report_shape(
                 report,
                 step_id=self.step_id,
@@ -524,20 +486,17 @@ class InflightStep:
         partition: PartitionCompletion,
     ) -> bool:
         record_cursor, product_cursor = self._ready_cursor.get(partition_id, (0, 0))
-        while (
-            record_cursor < len(partition.completions)
-            and _record_ready(partition.completions[record_cursor])
+        while record_cursor < len(partition.completions) and _record_ready(
+            partition.completions[record_cursor]
         ):
             record_cursor += 1
-        while (
-            product_cursor < len(partition.products)
-            and _completion_payload_ready(partition.products[product_cursor].payload)
+        while product_cursor < len(partition.products) and _completion_payload_ready(
+            partition.products[product_cursor].payload
         ):
             product_cursor += 1
         self._ready_cursor[partition_id] = (record_cursor, product_cursor)
-        return (
-            record_cursor == len(partition.completions)
-            and product_cursor == len(partition.products)
+        return record_cursor == len(partition.completions) and product_cursor == len(
+            partition.products
         )
 
     def materialized_partitions(self) -> tuple[PartitionCompletion, ...]:
@@ -611,7 +570,9 @@ def _finalize_response(response: Mapping[str, Any]) -> dict[str, Any]:
     return finalized
 
 
-def _control(worker: Worker, kind: RequestKind, request: Mapping[str, Any]) -> dict[str, Any] | None:
+def _control(
+    worker: Worker, kind: RequestKind, request: Mapping[str, Any]
+) -> dict[str, Any] | None:
     supported = frozenset(worker.capabilities.supported_controls)
     if kind not in supported:
         raise unsupported_control(kind.value)
@@ -688,9 +649,7 @@ class WorkerServer:
             else int(step_cache_capacity)
         )
         if capacity < max_operations:
-            raise ValueError(
-                "completed step cache capacity must hold one maximum-sized submission"
-            )
+            raise ValueError("completed step cache capacity must hold one maximum-sized submission")
         self.completed_steps = CompletedStepCache(capacity)
         self.steps: dict[int, InflightStep | TerminalStep] = {}
         self.poll_outputs: dict[int, StepOutputs] = {}
@@ -720,9 +679,8 @@ class WorkerServer:
         if ipc_endpoint is not None:
             wake = getattr(ipc_endpoint, "wake", None)
             wake_on_stream = getattr(ipc_endpoint, "wake_on_stream", None)
-            install = getattr(worker, "set_completion_wake", None)
-            if callable(wake) and callable(wake_on_stream) and callable(install):
-                install(wake, wake_on_stream)
+            if callable(wake) and callable(wake_on_stream):
+                worker.set_completion_wake(wake, wake_on_stream)
 
     def _profile_tick(self) -> None:
         if self._profile_state is None:
@@ -843,7 +801,9 @@ class WorkerServer:
                     else -1
                 )
                 with profile_range(self._profile_name("batch_wire", step_id=raw_step_id)):
-                    batch = raw_batch if isinstance(raw_batch, Batch) else Batch.from_mapping(raw_batch)
+                    batch = (
+                        raw_batch if isinstance(raw_batch, Batch) else Batch.from_mapping(raw_batch)
+                    )
                 identity = batch_identity(batch)
                 sessions = _batch_lineage(batch)[0]
                 early = self._starts_early(batch)
@@ -872,16 +832,12 @@ class WorkerServer:
         if not self._launch_reorder:
             return False
         return any(
-            operation.work.encode_mode is not None
-            or operation.work is ForwardMode.TOKEN_EXTEND
+            operation.work.encode_mode is not None or operation.work is ForwardMode.TOKEN_EXTEND
             for operation in batch.operations
         )
 
     def _transport_window_open(self) -> bool:
-        return (
-            len(self.waiting_requests) + len(self.pending_responses)
-            < self.pipeline_depth
-        )
+        return len(self.waiting_requests) + len(self.pending_responses) < self.pipeline_depth
 
     def _live_execution_count(self) -> int:
         return sum(isinstance(step, InflightStep) for step in self.steps.values())
@@ -911,12 +867,8 @@ class WorkerServer:
         if not self.waiting_requests:
             return False
         items = tuple(self.waiting_requests)
-        misses = [
-            index for index, pending in enumerate(items) if self._is_execution_miss(pending)
-        ]
-        non_sources = [
-            index for index, pending in enumerate(items) if index not in set(misses)
-        ]
+        misses = [index for index, pending in enumerate(items) if self._is_execution_miss(pending)]
+        non_sources = [index for index, pending in enumerate(items) if index not in set(misses)]
         for index in non_sources:
             pending = items[index]
             if self._session_gate(index, pending):
@@ -926,9 +878,7 @@ class WorkerServer:
         if self._live_execution_count() >= self.pipeline_depth or not misses:
             return False
         if self._launch_reorder:
-            ordered_misses = [
-                index for index in misses if items[index].early_launch
-            ] + [
+            ordered_misses = [index for index in misses if items[index].early_launch] + [
                 index for index in misses if not items[index].early_launch
             ]
         else:
@@ -1005,24 +955,18 @@ class WorkerServer:
         try:
             supported = frozenset(self.worker.capabilities.supported_work)
             unsupported = tuple(
-                operation.work
-                for operation in batch.operations
-                if operation.work not in supported
+                operation.work for operation in batch.operations if operation.work not in supported
             )
             if unsupported:
                 names = sorted({value.value for value in unsupported})
                 raise invalid_descriptor(
-                    "execution batch contains work variants outside worker capabilities: "
-                    f"{names!r}"
+                    f"execution batch contains work variants outside worker capabilities: {names!r}"
                 )
-            prepare = getattr(self.worker, "prepare_execute", None)
-            prepared = prepare(batch) if batch.operations and callable(prepare) else None
+            prepared = self.worker.prepare_execute(batch) if batch.operations else None
             if prepared is not None:
-                source: object = _PendingExecution(self.worker, prepared)
+                source: CompletionReport | PreparedExecution = prepared
             else:
-                with profile_range(
-                    self._profile_name("model_execute", step_id=int(batch.step_id))
-                ):
+                with profile_range(self._profile_name("model_execute", step_id=int(batch.step_id))):
                     source = self.worker.execute(batch)
             step.attach(source)
         except BaseException as error:
@@ -1105,17 +1049,12 @@ class WorkerServer:
             isinstance(step, InflightStep) and target in step.session_ids
             for step in self.steps.values()
         ):
-            raise resource_error(
-                f"session {target} still has an in-flight execution step"
-            )
+            raise resource_error(f"session {target} still has an in-flight execution step")
 
     def _drop_session_steps(self, session_id: int) -> None:
         target = int(session_id)
         self._ended_epochs.update(
-            epoch
-            for step in self.steps.values()
-            for epoch in step.epochs
-            if epoch[0] == target
+            epoch for step in self.steps.values() for epoch in step.epochs if epoch[0] == target
         )
         for step_id, step in tuple(self.steps.items()):
             if not isinstance(step, TerminalStep) or step.active_cursors:
@@ -1139,9 +1078,7 @@ class WorkerServer:
         if cursor is None:
             return True
         try:
-            with profile_range(
-                self._profile_name("completion", step_id=int(cursor.step_id))
-            ):
+            with profile_range(self._profile_name("completion", step_id=int(cursor.step_id))):
                 return cursor.ready()
         except BaseException as error:
             pending.response = self._boxed_error(pending.response, error)
@@ -1197,10 +1134,7 @@ class WorkerServer:
         return f"{name} step={step_id}" if step_id is not None and step_id >= 0 else name
 
     def _reap_device_events(self) -> None:
-        event_pool = getattr(self.worker, "device_events", None)
-        reap = getattr(event_pool, "reap", None)
-        if callable(reap):
-            reap()
+        self.worker.device_events.reap()
 
     def _drain_continuations(self) -> None:
         for step_id, cursor in tuple(self.poll_outputs.items()):
@@ -1288,6 +1222,4 @@ class WorkerServer:
             if gc_was_enabled:
                 gc.enable()
             self.profiler.close()
-            close = getattr(self.worker, "close", None)
-            if callable(close):
-                close()
+            self.worker.close()

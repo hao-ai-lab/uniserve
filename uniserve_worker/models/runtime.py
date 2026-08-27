@@ -119,6 +119,9 @@ class ExecutionModel(nn.Module):
     image_processor: ImageProcessor | None = None
     generation: GenerationPipeline | None = None
 
+    def bind_cache_pool(self, cache_pool: object) -> None:
+        """Bind model-owned attention state to its process KV allocation."""
+
 
 def active_latent_capacity_tokens(
     per_image_tokens: int, concurrency_token_budget: int | None
