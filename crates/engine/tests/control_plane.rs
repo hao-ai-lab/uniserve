@@ -4,7 +4,8 @@
 //! real `Scheduler` over a `LocalExecutor`+`SimEngine` and assert the lifecycle/event
 //! contract. This is the regression harness every workstream relies on.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -16,12 +17,10 @@ use uniserve_core::{
     TriggerPolicyDescriptor, UndVisibility,
 };
 use uniserve_core::{FinishReason, GenerationEvent, PublicModality};
-use uniserve_engine::EngineHandle;
-use uniserve_engine::executor::Executor;
-use uniserve_engine::scheduler::{ControlTokens, Scheduler, SchedulingPolicy};
-use uniserve_engine::sim::SimEngine;
-use uniserve_engine::sim::SimExecutor;
-use uniserve_engine::worker::MultiprocExecutor;
+use uniserve_engine::{
+    ControlTokens, EngineHandle, Executor, MultiprocExecutor, Scheduler, SchedulingPolicy,
+    SimEngine, SimExecutor,
+};
 
 fn ctrl() -> ControlTokens {
     ControlTokens::default()
@@ -159,7 +158,7 @@ fn run_requests(
 ) -> HashMap<RequestId, Collected> {
     let mut sim = SimEngine::new();
     sim.set_pipeline_depth(depth);
-    let executor = Box::new(SimExecutor::new(Box::new(sim)));
+    let executor = Box::new(SimExecutor::new(sim));
     let sched = Scheduler::with_policy(executor, ctrl(), 32, policy);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
@@ -250,7 +249,7 @@ fn cancellation_releases_latent_admission_for_a_waiting_image() {
     sim.mut_caps_for_test().num_latent_pages = 17;
     sim.mut_caps_for_test().latent_downsample = 16;
     sim.mut_caps_for_test().max_batch_operations = 1024;
-    let scheduler = Scheduler::new(Box::new(SimExecutor::new(Box::new(sim))), ctrl(), 32);
+    let scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let thread = thread::spawn(move || scheduler.run(rx));
@@ -323,11 +322,7 @@ fn cancellation_releases_latent_admission_for_a_waiting_image() {
 #[test]
 fn image_events_cover_declared_denoise_steps() {
     const STEPS: u16 = 3;
-    let scheduler = Scheduler::new(
-        Box::new(SimExecutor::new(Box::new(SimEngine::new()))),
-        ctrl(),
-        32,
-    );
+    let scheduler = Scheduler::new(Box::new(SimExecutor::new(SimEngine::new())), ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let scheduler_thread = thread::spawn(move || scheduler.run(rx));
@@ -395,7 +390,7 @@ fn image_events_cover_declared_denoise_steps() {
 fn scheduler_clamps_max_batch_to_worker_caps() {
     let mut sim = SimEngine::new();
     sim.mut_caps_for_test().max_batch_operations = 3;
-    let sched = Scheduler::new(Box::new(SimExecutor::new(Box::new(sim))), ctrl(), 32);
+    let sched = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
 
     assert_eq!(sched.config().max_batch, 3);
 }
@@ -425,12 +420,10 @@ fn pipeline_depth_is_token_identical() {
 
 #[test]
 fn operation_window_metrics_record_the_full_lifecycle() {
-    use uniserve_engine::scheduler::LifecyclePhase;
-
     let mut sim = SimEngine::new();
     sim.set_pipeline_depth(2);
     sim.set_text_len(6);
-    let mut scheduler = Scheduler::new(Box::new(SimExecutor::new(Box::new(sim))), ctrl(), 32);
+    let mut scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
     let request = generation_request(
         RequestId(1),
         text_context(vec![1, 2, 3, 4, 5]),
@@ -457,32 +450,28 @@ fn operation_window_metrics_record_the_full_lifecycle() {
         scheduler.step();
     }
 
-    let metrics = scheduler.resource_window_metrics();
-    assert!(metrics.max_operations >= metrics.active_operations);
-    assert_eq!(metrics.active_operations, 0);
-    assert!(metrics.max_unresolved_window >= 1);
-    let roundtrip = metrics
-        .phase_delays
-        .iter()
-        .find(|delay| {
-            matches!(delay.from, LifecyclePhase::Submitted)
-                && matches!(delay.to, LifecyclePhase::CompletionObserved)
-        })
-        .expect("submit->observed span present");
-    assert!(roundtrip.count > 0, "device roundtrip delays recorded");
-    let active_domains = metrics
-        .domains
-        .iter()
-        .filter(|domain| domain.launched_operations > 0)
-        .collect::<Vec<_>>();
+    let active_domains = [
+        &scheduler.stats.domains.prefill,
+        &scheduler.stats.domains.decode,
+        &scheduler.stats.domains.flow,
+    ]
+    .into_iter()
+    .filter(|domain| domain.launched_operations.load(Ordering::Relaxed) > 0)
+    .collect::<Vec<_>>();
     assert!(!active_domains.is_empty(), "domain launches recorded");
     for domain in &active_domains {
-        assert_eq!(domain.active_credits, 0);
-        assert_eq!(domain.launched_operations, domain.completed_operations);
-        assert_eq!(domain.launched_operations, domain.reclaimed_credits);
-        assert!(domain.completed_partitions > 0);
+        assert_eq!(domain.active_credits.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            domain.launched_operations.load(Ordering::Relaxed),
+            domain.completed_operations.load(Ordering::Relaxed)
+        );
+        assert_eq!(
+            domain.launched_operations.load(Ordering::Relaxed),
+            domain.reclaimed_credits.load(Ordering::Relaxed)
+        );
+        assert!(domain.completed_partitions.load(Ordering::Relaxed) > 0);
     }
-    let mut reporter = uniserve_engine::scheduler::SchedStatsReporter::default();
+    let mut reporter = uniserve_engine::SchedStatsReporter::default();
     let wire = reporter.snapshot(&scheduler.stats, 16);
     let wire_active = wire
         .domain_stats
@@ -495,32 +484,6 @@ fn operation_window_metrics_record_the_full_lifecycle() {
             && domain.launched_operations == domain.completed_operations
             && domain.launched_operations == domain.reclaimed_credits
     }));
-
-    let traces = scheduler.take_completed_traces();
-    let trace = traces
-        .iter()
-        .find(|trace| trace.request_key.session_id == RequestId(1))
-        .expect("completed trace archived");
-    assert!(
-        trace.is_ordered(),
-        "operation lifecycle stamps are causally ordered"
-    );
-    let resolved = trace
-        .operations()
-        .iter()
-        .find(|op| op.reached(LifecyclePhase::CompletionObserved))
-        .expect("a resolved operation");
-    for phase in [
-        LifecyclePhase::Planned,
-        LifecyclePhase::WorkerRegistrationComplete,
-        LifecyclePhase::Submitted,
-        LifecyclePhase::DeviceExecutionStarted,
-        LifecyclePhase::ProducerReady,
-        LifecyclePhase::CompletionCopyReady,
-        LifecyclePhase::CompletionObserved,
-    ] {
-        assert!(resolved.reached(phase), "resolved op reached {phase:?}");
-    }
 }
 
 fn relay_run(
@@ -529,13 +492,11 @@ fn relay_run(
     max_und_tokens: usize,
     text_len: usize,
     depth: u32,
-) -> (Vec<u32>, bool) {
-    use uniserve_engine::scheduler::LifecyclePhase;
-
+) -> Vec<u32> {
     let mut sim = SimEngine::new();
     sim.set_pipeline_depth(depth);
     sim.set_text_len(text_len);
-    let mut scheduler = Scheduler::new(Box::new(SimExecutor::new(Box::new(sim))), ctrl(), 32);
+    let mut scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
     let mut request = generation_request(
         RequestId(1),
         text_context(vec![1, 2, 3, 4, 5]),
@@ -563,31 +524,7 @@ fn relay_run(
     }
     assert!(finished, "processor request reached a terminal event");
 
-    let trace = scheduler
-        .take_completed_traces()
-        .into_iter()
-        .find(|trace| trace.request_key.session_id == RequestId(1))
-        .expect("completed processor trace");
-    let token_operations = trace
-        .operations()
-        .iter()
-        .filter(|operation| {
-            matches!(
-                operation.op_kind,
-                Some("token_extend" | "token_decode" | "token_verify")
-            )
-        })
-        .collect::<Vec<_>>();
-    let successor_precedes_parent_observation = token_operations.windows(2).any(|pair| {
-        let Some(parent_observed) = pair[0].at(LifecyclePhase::CompletionObserved) else {
-            return false;
-        };
-        let Some(successor_submitted) = pair[1].at(LifecyclePhase::Submitted) else {
-            return false;
-        };
-        successor_submitted < parent_observed
-    });
-    (tokens, successor_precedes_parent_observation)
+    tokens
 }
 
 #[test]
@@ -649,22 +586,13 @@ fn generalized_processor_successors_match_depth_one_before_observation() {
     ];
 
     for (label, sampling, stop_token_ids) in cases {
-        let (serial, serial_preobserved) =
-            relay_run(sampling.clone(), stop_token_ids.clone(), 24, 12, 1);
-        let (relayed, relayed_preobserved) = relay_run(sampling, stop_token_ids, 24, 12, 2);
+        let serial = relay_run(sampling.clone(), stop_token_ids.clone(), 24, 12, 1);
+        let relayed = relay_run(sampling, stop_token_ids, 24, 12, 2);
 
         assert!(!serial.is_empty(), "[{label}] produced no tokens");
         assert_eq!(
             serial, relayed,
             "[{label}] device-relay tokens diverged from the depth-one serial oracle",
-        );
-        assert!(
-            !serial_preobserved,
-            "[{label}] the depth-one oracle submitted a successor before observation",
-        );
-        assert!(
-            relayed_preobserved,
-            "[{label}] expected a token successor submission before parent observation",
         );
     }
 }
@@ -676,7 +604,7 @@ fn image_context_decode_is_depth_invariant() {
         let mut sim = SimEngine::new();
         sim.set_pipeline_depth(pipeline_depth);
         sim.set_text_len(8);
-        let mut scheduler = Scheduler::new(Box::new(SimExecutor::new(Box::new(sim))), ctrl(), 32);
+        let mut scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
         let request = generation_request(
             RequestId(1),
             context_with_image(vec![1, 2], vec![3, 4], 0xD3C0DE, 4, 1),
@@ -713,7 +641,7 @@ fn image_context_decode_is_depth_invariant() {
 fn stop_token_terminates_with_stop() {
     let mut sim = SimEngine::new();
     sim.set_pipeline_depth(2);
-    let executor = Box::new(SimExecutor::new(Box::new(sim)));
+    let executor = Box::new(SimExecutor::new(sim));
     let sched = Scheduler::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
@@ -757,7 +685,7 @@ fn run_until_control(abort: bool) -> FinishReason {
     let mut sim = SimEngine::new();
     sim.set_text_len(1024);
     sim.set_pipeline_depth(2);
-    let executor = Box::new(SimExecutor::new(Box::new(sim)));
+    let executor = Box::new(SimExecutor::new(sim));
     let sched = Scheduler::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
@@ -814,7 +742,7 @@ fn stop_string_cutoff_is_request_local() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1024);
     sim.set_pipeline_depth(2);
-    let scheduler = Scheduler::new(Box::new(SimExecutor::new(Box::new(sim))), ctrl(), 32);
+    let scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let scheduler_thread = thread::spawn(move || scheduler.run(rx));
@@ -910,7 +838,7 @@ fn hybrid_groups_handshake_runs() {
             },
         },
     ]);
-    let executor = Box::new(SimExecutor::new(Box::new(sim)));
+    let executor = Box::new(SimExecutor::new(sim));
     let sched = Scheduler::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
@@ -951,7 +879,7 @@ fn prefix_cache_reuses_shared_prompt() {
     use std::sync::atomic::Ordering;
     let mut sim = SimEngine::new();
     sim.set_text_len(4);
-    let executor = Box::new(SimExecutor::new(Box::new(sim)));
+    let executor = Box::new(SimExecutor::new(sim));
     let sched = Scheduler::new(executor, ctrl(), 32); // block_size 256
     let stats = sched.stats_handle();
     let (tx, rx) = crossbeam_channel::unbounded();
@@ -1012,7 +940,7 @@ fn prefix_cache_enforces_read_write_and_isolation_policy() {
 
     let mut sim = SimEngine::new();
     sim.set_text_len(2);
-    let sched = Scheduler::new(Box::new(SimExecutor::new(Box::new(sim))), ctrl(), 32);
+    let sched = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
     let stats = sched.stats_handle();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
@@ -1088,7 +1016,7 @@ fn prefix_cache_enforces_read_write_and_isolation_policy() {
 fn chunked_prefill_progresses_with_decode() {
     let mut sim = SimEngine::new();
     sim.set_pipeline_depth(2);
-    let executor = Box::new(SimExecutor::new(Box::new(sim)));
+    let executor = Box::new(SimExecutor::new(sim));
     let mut sched = Scheduler::with_policy(executor, ctrl(), 32, SchedulingPolicy::Fcfs);
     sched.set_long_prefill_threshold(64); // cap a prefill chunk at 64 tokens
     sched.set_token_budget(256); // leaves room for other decodes per step
@@ -1150,7 +1078,7 @@ fn run_sampling(
 ) -> (Vec<u32>, bool, Option<FinishReason>) {
     let mut sim = SimEngine::new();
     sim.set_text_len(text_len);
-    let executor = Box::new(SimExecutor::new(Box::new(sim)));
+    let executor = Box::new(SimExecutor::new(sim));
     let sched = Scheduler::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
@@ -1277,7 +1205,7 @@ fn multimodal_encode_then_cache_hit() {
     use std::sync::atomic::Ordering;
     let mut sim = SimEngine::new();
     sim.set_pipeline_depth(2);
-    let executor = Box::new(SimExecutor::new(Box::new(sim)));
+    let executor = Box::new(SimExecutor::new(sim));
     let sched = Scheduler::new(executor, ctrl(), 32);
     let stats = sched.stats_handle();
     let (tx, rx) = crossbeam_channel::unbounded();
@@ -1354,7 +1282,7 @@ fn concurrent_same_image_misses_converge_on_one_exact_cached_product() {
     let mut sim = SimEngine::new();
     sim.set_text_len(6);
     sim.set_pipeline_depth(2);
-    let mut scheduler = Scheduler::new(Box::new(SimExecutor::new(Box::new(sim))), ctrl(), 32);
+    let mut scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
     let request = |request_id| {
         generation_request(
             RequestId(request_id),
@@ -1392,8 +1320,7 @@ fn concurrent_same_image_misses_converge_on_one_exact_cached_product() {
     assert_eq!(
         reasons,
         [Some(FinishReason::Eos), Some(FinishReason::Eos)],
-        "events={seen:?}, health={:?}",
-        scheduler.health_snapshot()
+        "events={seen:?}"
     );
     assert!(text_tokens.iter().all(|count| *count > 0));
     assert_eq!(
@@ -1412,7 +1339,7 @@ fn und_only_image_context_encodes_then_produces_text_without_gen_output() {
 
     let mut sim = SimEngine::new();
     sim.set_text_len(20);
-    let sched = Scheduler::new(Box::new(SimExecutor::new(Box::new(sim))), ctrl(), 32);
+    let sched = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
     let stats = sched.stats_handle();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
@@ -1459,7 +1386,7 @@ fn gen_branch_round_trip_preserves_publication_and_step_invariants() {
         let mut sim = SimEngine::new();
         sim.set_text_len(1_000_000);
         sim.set_pipeline_depth(pipeline_depth);
-        let executor = Box::new(SimExecutor::new(Box::new(sim)));
+        let executor = Box::new(SimExecutor::new(sim));
         let sched = Scheduler::new(executor, ctrl(), 32);
         let (tx, rx) = crossbeam_channel::unbounded();
         let handle = EngineHandle::new(tx);
@@ -1573,7 +1500,7 @@ fn interleave_c4_generated_images_complete() {
     let mut sim = SimEngine::new();
     sim.set_pipeline_depth(2);
     sim.set_text_len(1_000_000);
-    let mut scheduler = Scheduler::new(Box::new(SimExecutor::new(Box::new(sim))), ctrl(), 32);
+    let mut scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
     let mut events = HashMap::new();
     let mut results = HashMap::new();
 
@@ -1639,27 +1566,21 @@ fn interleave_c4_generated_images_complete() {
         );
         assert_eq!(result.images, 1, "request {id:?} missed its image branch");
     }
-    let metrics = scheduler.resource_window_metrics();
-    let decode = metrics
-        .domains
-        .iter()
-        .find(|domain| domain.domain == uniserve_worker_ipc::Domain::Decode)
-        .expect("decode accounting");
-    let flow = metrics
-        .domains
-        .iter()
-        .find(|domain| domain.domain == uniserve_worker_ipc::Domain::Flow)
-        .expect("flow accounting");
-    assert!(decode.co_resident_partitions > 0);
-    assert!(flow.co_resident_partitions > 0);
-    assert_eq!(decode.co_resident_partitions, flow.co_resident_partitions);
+    let decode = &scheduler.stats.domains.decode;
+    let flow = &scheduler.stats.domains.flow;
+    assert!(decode.co_resident_partitions.load(Ordering::Relaxed) > 0);
+    assert!(flow.co_resident_partitions.load(Ordering::Relaxed) > 0);
+    assert_eq!(
+        decode.co_resident_partitions.load(Ordering::Relaxed),
+        flow.co_resident_partitions.load(Ordering::Relaxed)
+    );
 }
 
 #[test]
 fn generated_image_reingest_runs_declared_encoder_recipe_before_continuation() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
-    let executor = Box::new(SimExecutor::new(Box::new(sim)));
+    let executor = Box::new(SimExecutor::new(sim));
     let sched = Scheduler::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
@@ -1726,7 +1647,7 @@ fn gen_branch_waits_for_model_image_starts() {
         let mut sim = SimEngine::new();
         sim.set_text_len(1_000_000);
         sim.set_pipeline_depth(depth);
-        let sched = Scheduler::new(Box::new(SimExecutor::new(Box::new(sim))), ctrl(), 32);
+        let sched = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
         let (tx, rx) = crossbeam_channel::unbounded();
         let handle = EngineHandle::new(tx);
         let jh = thread::spawn(move || sched.run(rx));
@@ -1776,7 +1697,7 @@ fn gen_branch_waits_for_model_image_starts() {
 fn gen_only_can_discover_its_trigger_with_internal_und_decode() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
-    let sched = Scheduler::new(Box::new(SimExecutor::new(Box::new(sim))), ctrl(), 32);
+    let sched = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -1830,7 +1751,7 @@ fn und_only_round_close_trigger_cannot_open_gen() {
     sim.set_text_len(2);
     let control = ctrl();
     let close_token_ids = control.eos.clone();
-    let sched = Scheduler::new(Box::new(SimExecutor::new(Box::new(sim))), control, 32);
+    let sched = Scheduler::new(Box::new(SimExecutor::new(sim)), control, 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -1879,7 +1800,7 @@ fn und_only_round_close_trigger_cannot_open_gen() {
 fn gen_branch_model_image_starts_spend_budget() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
-    let executor = Box::new(SimExecutor::new(Box::new(sim)));
+    let executor = Box::new(SimExecutor::new(sim));
     let trig = ControlTokens {
         ..ControlTokens::default()
     };
@@ -1950,7 +1871,7 @@ fn gen_branch_rejects_oversized_worstcase_at_admission() {
     sim.set_text_len(8);
     sim.set_num_blocks(128);
     sim.set_block_size(256);
-    let executor = Box::new(SimExecutor::new(Box::new(sim)));
+    let executor = Box::new(SimExecutor::new(sim));
     let sched = Scheduler::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
@@ -2001,7 +1922,7 @@ fn gen_branch_rejects_oversized_worstcase_at_admission() {
 fn commit_eos_finishes_without_spending_remaining_budget() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
-    let executor = Box::new(SimExecutor::new(Box::new(sim)));
+    let executor = Box::new(SimExecutor::new(sim));
     let sched = Scheduler::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
@@ -2067,7 +1988,7 @@ fn multiworker_executor_drives_scheduler_unchanged() {
         sim.set_pipeline_depth(2);
         sim.mut_caps_for_test().rank.tp_rank = rank;
         sim.mut_caps_for_test().rank.tp_size = 2;
-        Box::new(SimExecutor::new(Box::new(sim))) as Box<dyn Executor>
+        Box::new(SimExecutor::new(sim)) as Box<dyn Executor>
     };
     let executor = Box::new(MultiprocExecutor::new(vec![mk(0), mk(1)]).unwrap());
     // rank-aware caps reflect the topology at the handshake.
@@ -2131,7 +2052,7 @@ fn gen_branch_literal_trigger_starts_images() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000); // never EOS on its own
     sim.set_pipeline_depth(2);
-    let executor = Box::new(SimExecutor::new(Box::new(sim)));
+    let executor = Box::new(SimExecutor::new(sim));
     // Sim emits 1000 + ((id*7 + n) % 5000) for request id=1: 1007, 1008, 1009…
     // After an image commits, the sim resets and the round repeats from 1007.
     let sched = Scheduler::new(executor, ctrl(), 32);
@@ -2197,7 +2118,7 @@ fn image_start_logit_bias_steers_gen_branch() {
     let run = |bias: f32| -> (usize, usize, bool) {
         let mut sim = SimEngine::new();
         sim.set_text_len(1_000_000); // never EOS on its own
-        let executor = Box::new(SimExecutor::new(Box::new(sim)));
+        let executor = Box::new(SimExecutor::new(sim));
         // an image-start token inside the sim's vocab
         let sched = Scheduler::new(executor, ctrl(), 32);
         let (tx, rx) = crossbeam_channel::unbounded();
@@ -2264,7 +2185,7 @@ fn image_start_logit_bias_steers_gen_branch() {
 fn gen_branch_prefilled_image_start_begins_without_text() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
-    let executor = Box::new(SimExecutor::new(Box::new(sim)));
+    let executor = Box::new(SimExecutor::new(sim));
     let sched = Scheduler::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
@@ -2315,7 +2236,7 @@ fn gen_branch_prefilled_image_start_begins_without_text() {
 fn context_image_request_commits_existing_image_context_at_round_close() {
     let mut sim = SimEngine::new();
     sim.set_text_len(2);
-    let executor = Box::new(SimExecutor::new(Box::new(sim)));
+    let executor = Box::new(SimExecutor::new(sim));
     let control = ctrl();
     let close_token_ids = control.eos.clone();
     let sched = Scheduler::new(executor, control, 32);
@@ -2378,7 +2299,7 @@ fn context_image_request_commits_existing_image_context_at_round_close() {
 fn image_budget_suppresses_biased_image_start() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000); // never EOS on its own
-    let executor = Box::new(SimExecutor::new(Box::new(sim)));
+    let executor = Box::new(SimExecutor::new(sim));
     let sched = Scheduler::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
@@ -2444,7 +2365,7 @@ fn image_budget_suppresses_biased_image_start() {
 /// Every logical KV reservation returns to the block manager after completion.
 #[test]
 fn kv_resources_return_after_completion() {
-    let executor = Box::new(SimExecutor::new(Box::new(SimEngine::new())));
+    let executor = Box::new(SimExecutor::new(SimEngine::new()));
     let mut sched = Scheduler::with_policy(executor, ctrl(), 32, SchedulingPolicy::Fcfs);
 
     // Keep receivers alive — a dropped receiver is treated as a cancellation.
@@ -2481,333 +2402,17 @@ fn kv_resources_return_after_completion() {
         }
     }
 
-    let health = sched.health_snapshot();
-    assert_eq!(health.running, 0);
-    assert_eq!(health.in_flight, 0);
-    assert_eq!(health.free_blocks, health.total_blocks);
-}
-
-#[test]
-fn policy_facts_and_decisions_are_recorded() {
-    let executor = Box::new(SimExecutor::new(Box::new(SimEngine::new())));
-    let mut sched = Scheduler::with_policy(executor, ctrl(), 32, SchedulingPolicy::Fcfs);
-
-    let mut keep_alive = Vec::new();
-    for i in 0..3u64 {
-        keep_alive.push(sched.submit_for_test(generation_request(
-            RequestId(i + 1),
-            text_context(vec![1, 2, 3, 4, 5]),
-            SamplingParams::default(),
-            ImageParams {
-                steps: 4,
-                ..Default::default()
-            },
-            GenerationConstraint::UndOnly,
-            16,
-        )));
-    }
-    let mut idle = 0;
-    for _ in 0..5000 {
-        if sched.step() {
-            idle = 0;
-        } else {
-            idle += 1;
-        }
-        if idle >= 3 {
-            break;
-        }
-    }
-
-    // Structured facts: idle after completion, blocks returned.
-    let snap = sched.policy_snapshot();
-    assert_eq!(snap.running, 0);
-    assert_eq!(snap.in_flight, 0);
-    assert!(snap.free_blocks > 0 && snap.total_blocks > 0);
-
-    // Latency history populated for the op kinds that ran.
-    assert!(
-        sched.op_latency_us("token_decode").is_some()
-            || sched.op_latency_us("token_extend").is_some(),
-        "per-op latency history must be observed"
-    );
-
-    // Explainable decisions: every request was admitted.
-    let decisions = sched.take_policy_decisions();
-    let admitted = decisions
-        .iter()
-        .filter(|d| d.reason == uniserve_engine::scheduler::PolicyReason::Admitted)
-        .count();
+    assert_eq!(sched.stats.general.running.load(Ordering::Relaxed), 0);
+    assert_eq!(sched.stats.general.in_flight.load(Ordering::Relaxed), 0);
     assert_eq!(
-        admitted, 3,
-        "all three requests should record an Admitted decision"
+        sched.stats.kv_cache.free_blocks.load(Ordering::Relaxed),
+        sched.stats.kv_cache.num_blocks.load(Ordering::Relaxed)
     );
-    // draining empties the ring
-    assert!(sched.take_policy_decisions().is_empty());
-}
-
-///: a request's lifecycle is reconstructable from its trace
-/// (admitted → op submitted [op_id + kind] → op resolved → finished), and the
-/// engine exposes a self-describing, leak-free health snapshot.
-#[test]
-fn lifecycle_trace_and_health_snapshot() {
-    let executor = Box::new(SimExecutor::new(Box::new(SimEngine::new())));
-    let mut sched = Scheduler::with_policy(executor, ctrl(), 32, SchedulingPolicy::Fcfs);
-    let _keep = sched.submit_for_test(generation_request(
-        RequestId(1),
-        text_context(vec![1, 2, 3, 4, 5]),
-        SamplingParams::default(),
-        ImageParams {
-            steps: 4,
-            ..Default::default()
-        },
-        GenerationConstraint::UndOnly,
-        8,
-    ));
-    let mut idle = 0;
-    for _ in 0..5000 {
-        if sched.step() {
-            idle = 0;
-        } else {
-            idle += 1;
-        }
-        if idle >= 3 {
-            break;
-        }
-    }
-
-    // Health snapshot: idle and alive (read before draining traces).
-    let h = sched.health_snapshot();
-    assert_eq!(h.running, 0);
-    assert!(!h.fatal);
-    assert!(h.completed_traces >= 1);
-    assert!(!h.supported_work.is_empty());
-
-    let traces = sched.take_completed_traces();
-    assert_eq!(traces.len(), 1);
-    let t = &traces[0];
-    assert!(
-        t.was_admitted() && t.is_finished(),
-        "trace must span admit→finish"
-    );
-    assert!(t.resolved_ops() > 0, "ops must resolve");
-    assert_eq!(
-        t.request_key.session_id,
-        RequestId(1),
-        "trace is tied to the request"
-    );
-    assert_eq!(t.trace_id.0, 1, "trace id is assigned");
-    assert!(
-        t.is_ordered(),
-        "every operation's lifecycle stamps are ordered"
-    );
-    let submitted: Vec<_> = t
-        .operations()
-        .iter()
-        .filter(|op| op.reached(uniserve_engine::scheduler::LifecyclePhase::Submitted))
-        .collect();
-    assert!(!submitted.is_empty());
-    assert!(
-        submitted.iter().all(|op| op.op_kind.is_some()),
-        "every submitted op carries a kind for correlation"
-    );
-    // A resolved op reconstructs its device phases from the completion record.
-    let resolved = t
-        .operations()
-        .iter()
-        .find(|op| op.reached(uniserve_engine::scheduler::LifecyclePhase::CompletionObserved))
-        .expect("at least one operation resolved");
-    for phase in [
-        uniserve_engine::scheduler::LifecyclePhase::Submitted,
-        uniserve_engine::scheduler::LifecyclePhase::DeviceExecutionStarted,
-        uniserve_engine::scheduler::LifecyclePhase::ProducerReady,
-        uniserve_engine::scheduler::LifecyclePhase::CompletionCopyReady,
-        uniserve_engine::scheduler::LifecyclePhase::CompletionObserved,
-    ] {
-        assert!(resolved.reached(phase), "resolved op reached {phase:?}");
-    }
-}
-
-#[test]
-fn slow_cpu_continuation_suspends_only_its_request_lineage() {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    use uniserve_engine::scheduler::{
-        LogitsProcessor, MaskContribution, ProcCtx, ProcessorDeclaration,
-    };
-
-    struct ControlledProcessor {
-        release: Arc<AtomicBool>,
-    }
-
-    impl LogitsProcessor for ControlledProcessor {
-        fn name(&self) -> &'static str {
-            "controlled"
-        }
-
-        fn declaration(&self) -> ProcessorDeclaration {
-            ProcessorDeclaration {
-                snapshotable: true,
-                deterministic: true,
-                max_output_tokens: 1,
-                max_outstanding_tasks: 1,
-            }
-        }
-
-        fn is_argmax_invariant(&self) -> bool {
-            true
-        }
-
-        fn contribute(&self, context: &ProcCtx<'_>) -> MaskContribution {
-            if context.sampling.seed == Some(1)
-                && context.n_generated == 0
-                && !self.release.load(Ordering::Acquire)
-            {
-                while !self.release.load(Ordering::Acquire) {
-                    thread::sleep(Duration::from_millis(1));
-                }
-            }
-            MaskContribution::default()
-        }
-    }
-
-    let release = Arc::new(AtomicBool::new(false));
-    let executor = Box::new(SimExecutor::new(Box::new(SimEngine::new())));
-    let mut scheduler = Scheduler::with_policy(executor, ctrl(), 32, SchedulingPolicy::Fcfs)
-        .with_logits_processor(Box::new(ControlledProcessor {
-            release: Arc::clone(&release),
-        }));
-    let mut slow_request = generation_request(
-        RequestId(1),
-        text_context(vec![1, 2, 3]),
-        SamplingParams::default(),
-        ImageParams::default(),
-        GenerationConstraint::UndOnly,
-        4,
-    );
-    slow_request.sampling.seed = Some(1);
-    let mut fast_request = generation_request(
-        RequestId(2),
-        text_context(vec![1, 2, 3]),
-        SamplingParams::default(),
-        ImageParams::default(),
-        GenerationConstraint::UndOnly,
-        4,
-    );
-    fast_request.sampling.seed = Some(2);
-    let mut slow_events = scheduler.submit_for_test(slow_request);
-    let mut fast_events = scheduler.submit_for_test(fast_request);
-
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut fast_finished = false;
-    while Instant::now() < deadline && !fast_finished {
-        scheduler.step();
-        while let Ok(event) = fast_events.try_recv() {
-            fast_finished |= matches!(event, GenerationEvent::Finished { .. });
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
-    assert!(
-        fast_finished,
-        "an unrelated request must complete while one CPU continuation is suspended"
-    );
-
-    release.store(true, Ordering::Release);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut slow_finished = false;
-    while Instant::now() < deadline && !slow_finished {
-        scheduler.step();
-        while let Ok(event) = slow_events.try_recv() {
-            slow_finished |= matches!(event, GenerationEvent::Finished { .. });
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
-    assert!(slow_finished);
-}
-
-#[test]
-fn cpu_continuation_timeout_closes_only_its_request_lineage() {
-    use uniserve_engine::scheduler::{
-        LogitsProcessor, MaskContribution, ProcCtx, ProcessorDeclaration,
-    };
-
-    struct DelayedProcessor;
-
-    impl LogitsProcessor for DelayedProcessor {
-        fn name(&self) -> &'static str {
-            "delayed"
-        }
-
-        fn declaration(&self) -> ProcessorDeclaration {
-            ProcessorDeclaration {
-                snapshotable: true,
-                deterministic: true,
-                max_output_tokens: 1,
-                max_outstanding_tasks: 1,
-            }
-        }
-
-        fn is_argmax_invariant(&self) -> bool {
-            true
-        }
-
-        fn contribute(&self, context: &ProcCtx<'_>) -> MaskContribution {
-            if context.sampling.seed == Some(11) && context.n_generated == 0 {
-                thread::sleep(Duration::from_millis(200));
-            }
-            MaskContribution::default()
-        }
-    }
-
-    let executor = Box::new(SimExecutor::new(Box::new(SimEngine::new())));
-    let mut scheduler = Scheduler::with_policy(executor, ctrl(), 32, SchedulingPolicy::Fcfs)
-        .with_logits_processor(Box::new(DelayedProcessor))
-        .with_cpu_task_timeout(Duration::from_millis(25));
-    let mut slow_request = generation_request(
-        RequestId(11),
-        text_context(vec![1, 2, 3]),
-        SamplingParams::default(),
-        ImageParams::default(),
-        GenerationConstraint::UndOnly,
-        4,
-    );
-    slow_request.sampling.seed = Some(11);
-    let mut fast_request = generation_request(
-        RequestId(12),
-        text_context(vec![1, 2, 3]),
-        SamplingParams::default(),
-        ImageParams::default(),
-        GenerationConstraint::UndOnly,
-        4,
-    );
-    fast_request.sampling.seed = Some(12);
-    let mut slow_events = scheduler.submit_for_test(slow_request);
-    let mut fast_events = scheduler.submit_for_test(fast_request);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut slow_reason = None;
-    let mut fast_reason = None;
-    while Instant::now() < deadline && (slow_reason.is_none() || fast_reason.is_none()) {
-        scheduler.step();
-        while let Ok(event) = slow_events.try_recv() {
-            if let GenerationEvent::Finished { reason, .. } = event {
-                slow_reason = Some(reason);
-            }
-        }
-        while let Ok(event) = fast_events.try_recv() {
-            if let GenerationEvent::Finished { reason, .. } = event {
-                fast_reason = Some(reason);
-            }
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
-
-    assert_eq!(slow_reason, Some(FinishReason::Error));
-    assert!(fast_reason.is_some_and(|reason| reason != FinishReason::Error));
 }
 
 #[test]
 fn cancellation_storm_retires_every_request() {
-    let executor = Box::new(SimExecutor::new(Box::new(SimEngine::new())));
+    let executor = Box::new(SimExecutor::new(SimEngine::new()));
     let mut scheduler = Scheduler::new(executor, ctrl(), 32);
     let receivers = (1..=128)
         .map(|request_id| {
@@ -2825,100 +2430,25 @@ fn cancellation_storm_retires_every_request() {
 
     for _ in 0..10_000 {
         scheduler.step();
-        let health = scheduler.health_snapshot();
-        if health.running == 0 && health.pending == 0 && health.in_flight == 0 {
+        if scheduler.stats.general.running.load(Ordering::Relaxed) == 0
+            && scheduler.stats.general.pending.load(Ordering::Relaxed) == 0
+            && scheduler.stats.general.in_flight.load(Ordering::Relaxed) == 0
+        {
             break;
         }
         thread::sleep(Duration::from_micros(50));
     }
 
-    let health = scheduler.health_snapshot();
-    assert_eq!(health.running, 0);
-    assert_eq!(health.pending, 0);
-    assert_eq!(health.in_flight, 0);
-}
-
-#[test]
-fn cpu_failure_storm_is_request_local_and_retires_every_request() {
-    use uniserve_engine::scheduler::{
-        LogitsProcessor, MaskContribution, ProcCtx, ProcessorDeclaration,
-    };
-
-    struct BoundViolatingProcessor;
-
-    impl LogitsProcessor for BoundViolatingProcessor {
-        fn name(&self) -> &'static str {
-            "bound_violating"
-        }
-
-        fn declaration(&self) -> ProcessorDeclaration {
-            ProcessorDeclaration {
-                snapshotable: true,
-                deterministic: true,
-                max_output_tokens: 1,
-                max_outstanding_tasks: 1,
-            }
-        }
-
-        fn is_argmax_invariant(&self) -> bool {
-            true
-        }
-
-        fn contribute(&self, _context: &ProcCtx<'_>) -> MaskContribution {
-            MaskContribution {
-                allowed: None,
-                suppress: vec![1, 2],
-            }
-        }
-    }
-
-    let executor = Box::new(SimExecutor::new(Box::new(SimEngine::new())));
-    let mut scheduler = Scheduler::new(executor, ctrl(), 32)
-        .with_logits_processor(Box::new(BoundViolatingProcessor));
-    let mut receivers = (1..=128)
-        .map(|request_id| {
-            scheduler.submit_for_test(generation_request(
-                RequestId(request_id),
-                text_context(vec![1, 2, 3]),
-                SamplingParams::default(),
-                ImageParams::default(),
-                GenerationConstraint::UndOnly,
-                8,
-            ))
-        })
-        .collect::<Vec<_>>();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut failed = HashSet::new();
-    while Instant::now() < deadline && failed.len() < receivers.len() {
-        scheduler.step();
-        for (index, receiver) in receivers.iter_mut().enumerate() {
-            while let Ok(event) = receiver.try_recv() {
-                if matches!(
-                    event,
-                    GenerationEvent::Finished {
-                        reason: FinishReason::Error,
-                        ..
-                    }
-                ) {
-                    failed.insert(index);
-                }
-            }
-        }
-        thread::sleep(Duration::from_micros(50));
-    }
-
-    assert_eq!(failed.len(), receivers.len());
-    let health = scheduler.health_snapshot();
-    assert_eq!(health.running, 0);
-    assert_eq!(health.pending, 0);
-    assert_eq!(health.in_flight, 0);
+    assert_eq!(scheduler.stats.general.running.load(Ordering::Relaxed), 0);
+    assert_eq!(scheduler.stats.general.pending.load(Ordering::Relaxed), 0);
+    assert_eq!(scheduler.stats.general.in_flight.load(Ordering::Relaxed), 0);
 }
 
 #[test]
 fn slow_client_releases_execution_slots_before_output_capacity_returns() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
-    let executor = Box::new(SimExecutor::new(Box::new(sim)));
+    let executor = Box::new(SimExecutor::new(sim));
     let mut scheduler = Scheduler::with_policy(executor, ctrl(), 32, SchedulingPolicy::Fcfs);
     let slow_events = scheduler.submit_for_test(generation_request(
         RequestId(1),
@@ -2952,21 +2482,21 @@ fn slow_client_releases_execution_slots_before_output_capacity_returns() {
 
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline && scheduler.step() {}
-    let health = scheduler.health_snapshot();
     assert_eq!(
-        health.in_flight, 0,
+        scheduler.stats.general.in_flight.load(Ordering::Relaxed),
+        0,
         "an output-stalled request cannot retain an execution slot"
     );
-    assert_eq!(health.running, 1);
+    assert_eq!(scheduler.stats.general.running.load(Ordering::Relaxed), 1);
 
     drop(slow_events);
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline
-        && (scheduler.health_snapshot().running > 0 || scheduler.health_snapshot().in_flight > 0)
+        && (scheduler.stats.general.running.load(Ordering::Relaxed) > 0
+            || scheduler.stats.general.in_flight.load(Ordering::Relaxed) > 0)
     {
         scheduler.step();
     }
-    let health = scheduler.health_snapshot();
-    assert_eq!(health.running, 0);
-    assert_eq!(health.in_flight, 0);
+    assert_eq!(scheduler.stats.general.running.load(Ordering::Relaxed), 0);
+    assert_eq!(scheduler.stats.general.in_flight.load(Ordering::Relaxed), 0);
 }

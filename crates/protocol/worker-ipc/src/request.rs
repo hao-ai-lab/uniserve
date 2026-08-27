@@ -12,25 +12,19 @@ pub enum RequestKind {
     PollCompletions,
     DropSession,
     Shutdown,
-    CopyKv,
     ReleaseProducts,
     GetPressure,
-    SnapshotSession,
-    RestoreSession,
 }
 
 impl RequestKind {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 7] = [
         Self::GetCapabilities,
         Self::Execute,
         Self::PollCompletions,
         Self::DropSession,
         Self::Shutdown,
-        Self::CopyKv,
         Self::ReleaseProducts,
         Self::GetPressure,
-        Self::SnapshotSession,
-        Self::RestoreSession,
     ];
 
     pub const fn as_wire_str(self) -> &'static str {
@@ -40,70 +34,21 @@ impl RequestKind {
             Self::PollCompletions => "poll_completions",
             Self::DropSession => "drop_session",
             Self::Shutdown => "shutdown",
-            Self::CopyKv => "copy_kv",
             Self::ReleaseProducts => "release_products",
             Self::GetPressure => "get_pressure",
-            Self::SnapshotSession => "snapshot_session",
-            Self::RestoreSession => "restore_session",
         }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SnapshotRef {
-    pub version: VersionRef,
-    pub digest: Digest,
-    pub locator: String,
-}
-
-impl SnapshotRef {
-    pub fn validate(&self) -> ProtocolResult<()> {
-        self.version.validate()?;
-        protocol_ensure!(
-            self.version.is_fixed(),
-            "snapshot reference version is not fixed"
-        );
-        protocol_ensure!(
-            is_digest(&self.digest) && self.locator == self.digest.as_str(),
-            "snapshot reference artifact digest or locator is invalid"
-        );
-        Ok(())
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkerRequest {
-    GetCapabilities {
-        call_id: Option<u64>,
-    },
-    Execute {
-        call_id: Option<u64>,
-        batch: Batch,
-    },
-    PollCompletions {
-        call_id: Option<u64>,
-        step_id: u64,
-    },
-    DropSession {
-        session_id: RequestId,
-    },
-    CopyKv {
-        copies: Vec<CacheCopy>,
-    },
-    ReleaseProducts {
-        product_handles: Vec<u64>,
-    },
-    GetPressure {
-        call_id: Option<u64>,
-    },
-    SnapshotSession {
-        recovery_placement: RecoveryPlacement,
-    },
-    RestoreSession {
-        snapshot: SnapshotRef,
-        recovery_placement: RecoveryPlacement,
-    },
+    GetCapabilities { call_id: Option<u64> },
+    Execute { call_id: Option<u64>, batch: Batch },
+    PollCompletions { call_id: Option<u64>, step_id: u64 },
+    DropSession { session_id: RequestId },
+    ReleaseProducts { product_handles: Vec<u64> },
+    GetPressure { call_id: Option<u64> },
     Shutdown,
 }
 
@@ -114,11 +59,8 @@ impl WorkerRequest {
             Self::Execute { .. } => RequestKind::Execute,
             Self::PollCompletions { .. } => RequestKind::PollCompletions,
             Self::DropSession { .. } => RequestKind::DropSession,
-            Self::CopyKv { .. } => RequestKind::CopyKv,
             Self::ReleaseProducts { .. } => RequestKind::ReleaseProducts,
             Self::GetPressure { .. } => RequestKind::GetPressure,
-            Self::SnapshotSession { .. } => RequestKind::SnapshotSession,
-            Self::RestoreSession { .. } => RequestKind::RestoreSession,
             Self::Shutdown => RequestKind::Shutdown,
         }
     }
@@ -129,12 +71,7 @@ impl WorkerRequest {
             | Self::Execute { call_id, .. }
             | Self::PollCompletions { call_id, .. }
             | Self::GetPressure { call_id } => *call_id,
-            Self::DropSession { .. }
-            | Self::CopyKv { .. }
-            | Self::ReleaseProducts { .. }
-            | Self::SnapshotSession { .. }
-            | Self::RestoreSession { .. }
-            | Self::Shutdown => None,
+            Self::DropSession { .. } | Self::ReleaseProducts { .. } | Self::Shutdown => None,
         }
     }
 
@@ -176,23 +113,11 @@ impl WorkerRequest {
     pub fn shutdown() -> Self {
         Self::Shutdown
     }
-    pub fn copy_kv(copies: Vec<CacheCopy>) -> Self {
-        Self::CopyKv { copies }
-    }
     pub fn release_products(product_handles: Vec<u64>) -> Self {
         Self::ReleaseProducts { product_handles }
     }
     pub fn get_pressure() -> Self {
         Self::GetPressure { call_id: None }
-    }
-    pub fn snapshot_session(recovery_placement: RecoveryPlacement) -> Self {
-        Self::SnapshotSession { recovery_placement }
-    }
-    pub fn restore_session(snapshot: SnapshotRef, recovery_placement: RecoveryPlacement) -> Self {
-        Self::RestoreSession {
-            snapshot,
-            recovery_placement,
-        }
     }
 }
 
@@ -204,7 +129,6 @@ pub enum ResponseKind {
     Ok,
     Error,
     Pressure,
-    Snapshot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -246,10 +170,6 @@ pub enum WorkerResponse {
         call_id: Option<u64>,
         pressure: Vec<ResourcePressure>,
     },
-    Snapshot {
-        call_id: Option<u64>,
-        snapshot: SnapshotRef,
-    },
 }
 
 impl WorkerResponse {
@@ -260,7 +180,6 @@ impl WorkerResponse {
             Self::Ok { .. } => ResponseKind::Ok,
             Self::Error { .. } => ResponseKind::Error,
             Self::Pressure { .. } => ResponseKind::Pressure,
-            Self::Snapshot { .. } => ResponseKind::Snapshot,
         }
     }
 
@@ -270,8 +189,7 @@ impl WorkerResponse {
             | Self::Result { call_id, .. }
             | Self::Ok { call_id }
             | Self::Error { call_id, .. }
-            | Self::Pressure { call_id, .. }
-            | Self::Snapshot { call_id, .. } => *call_id,
+            | Self::Pressure { call_id, .. } => *call_id,
         }
     }
 
@@ -281,8 +199,7 @@ impl WorkerResponse {
             | Self::Result { call_id, .. }
             | Self::Ok { call_id }
             | Self::Error { call_id, .. }
-            | Self::Pressure { call_id, .. }
-            | Self::Snapshot { call_id, .. } => *call_id = value,
+            | Self::Pressure { call_id, .. } => *call_id = value,
         }
     }
 
@@ -317,13 +234,6 @@ impl WorkerResponse {
         Self::Error {
             call_id: None,
             error,
-        }
-    }
-
-    pub fn snapshot(snapshot: SnapshotRef) -> Self {
-        Self::Snapshot {
-            call_id: None,
-            snapshot,
         }
     }
 }

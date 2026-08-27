@@ -34,8 +34,6 @@ impl Scheduler {
     pub(super) fn step_nonblocking(&mut self) -> bool {
         let _span = tracing::trace_span!("scheduler.step").entered();
         let mut progressed = self.flush_output_journals();
-        progressed |= self.drain_cpu_continuations();
-        progressed |= self.expire_cpu_continuations();
         // 1. Resolve one completed batch. Refilling immediately after one
         // completion preserves an occupied execution slot when multiple
         // responses become ready together at pipeline depth greater than one.
@@ -65,13 +63,11 @@ impl Scheduler {
         // happens to open.
         self.admit();
         self.admit_media();
-        progressed |= self.start_cpu_continuations();
 
         // 4. submit as many batches as pipeline capacity allows.
         while self.executor.can_submit() {
             self.admit();
             self.admit_media();
-            progressed |= self.start_cpu_continuations();
             if self.prefer_media && self.submit_media_batch() {
                 self.prefer_media = false;
                 progressed = true;
@@ -666,29 +662,6 @@ impl Scheduler {
         };
         state.committed_producer_op_id = selected.producer_op_id.0;
         state.public_event_limit = public_event_limit;
-        let committed_us = uniserve_core::now_monotonic_us();
-        let newly_committed = state.trace.stamp_existing(
-            selected.producer_op_id,
-            crate::scheduler::trace::LifecyclePhase::SemanticallyCommitted,
-            committed_us,
-        );
-        let domain_commit = newly_committed.then(|| {
-            (
-                state.trace.domain(selected.producer_op_id),
-                state.trace.span_us(
-                    selected.producer_op_id,
-                    crate::scheduler::trace::LifecyclePhase::CompletionObserved,
-                    crate::scheduler::trace::LifecyclePhase::SemanticallyCommitted,
-                ),
-            )
-        });
-        if let Some((Some(domain), delay)) = domain_commit {
-            let stats = self.stats.domains.get(domain);
-            stats.semantic_commits.fetch_add(1, Ordering::Relaxed);
-            if let Some(delay) = delay {
-                stats.semantic_commit_us.fetch_add(delay, Ordering::Relaxed);
-            }
-        }
         self.pending_controls.push_back(Control::Commit {
             request_key: selected.request_key,
             control_seq: state.control_seq,
@@ -809,7 +782,6 @@ impl Scheduler {
             || queue.len() >= self.caps.max_unresolved_window as usize
             || state.terminal_intent.is_terminal()
             || self.pending_finishes.contains_key(&id)
-            || self.custom_logits_processors > 0
             || !Self::device_token_relay_eligible(state)
         {
             return false;
@@ -949,7 +921,6 @@ impl Scheduler {
     pub(super) fn can_reuse_resolved_token_product(&self, id: RequestId) -> bool {
         self.running.get(&id).is_some_and(|state| {
             state.cursor.resources.worker_registered
-                && self.custom_logits_processors == 0
                 && state.cursor.und.tokens_emitted > 0
                 && state
                     .latest_device_version
@@ -969,7 +940,6 @@ impl Scheduler {
     pub(super) fn can_schedule_next(&self, id: RequestId) -> bool {
         !self.pending_finishes.contains_key(&id)
             && self.output_window_ready(id)
-            && self.cpu_continuation_ready(id)
             && self
                 .running
                 .get(&id)
@@ -988,147 +958,6 @@ impl Scheduler {
     pub(super) fn pending_commit_horizon_open(&self, state: &ReqState) -> bool {
         let horizon = self.caps.max_unresolved_window.max(1) as usize;
         state.pending_commits.len() < horizon
-    }
-
-    /// A request needs the asynchronous CPU-continuation future only for custom
-    /// logit processors, whose semantics are arbitrary host code. The built-in
-    /// minimum-token floor, bad-word, and allowed-token masks are cheap,
-    /// position- or set-derived host computations that run inline in
-    /// [`Self::token_masks`], so they never suspend the request behind a future.
-    pub(super) fn cpu_continuation_required(&self, _state: &ReqState) -> bool {
-        self.custom_logits_processors > 0
-    }
-
-    pub(super) fn cpu_continuation_ready(&self, id: RequestId) -> bool {
-        self.running.get(&id).is_some_and(|state| {
-            !self.cpu_continuation_required(state)
-                || (state.cpu_pending.is_none() && state.cpu_masks.is_some())
-        })
-    }
-
-    pub(super) fn start_cpu_continuations(&mut self) -> bool {
-        let ids = self
-            .order
-            .iter()
-            .filter_map(|id| self.running.get(id).is_some().then_some(*id))
-            .collect::<Vec<_>>();
-        let mut progressed = false;
-        for id in ids {
-            let required = self
-                .running
-                .get(&id)
-                .is_some_and(|state| self.cpu_continuation_required(state));
-            if !required {
-                continue;
-            }
-            let pipeline = self.logits_pipeline.clone();
-            let eos = self.ctrl.eos.clone();
-            let Some(state) = self.running.get_mut(&id) else {
-                continue;
-            };
-            if state.terminal_intent.is_terminal()
-                || state.cpu_pending.is_some()
-                || state.cpu_masks.is_some()
-                || self.pending_finishes.contains_key(&id)
-            {
-                continue;
-            }
-            state.cpu_generation = state.cpu_generation.saturating_add(1);
-            let key = CpuTaskKey {
-                request_id: id,
-                epoch: state.epoch,
-                point: state.version,
-                generation: state.cpu_generation,
-            };
-            let task = CpuTask {
-                key,
-                n_generated: state.cursor.und.tokens_emitted,
-                eos,
-                generated: state.cursor.replay.generated_ids.clone(),
-                sampling: state.req.sampling.clone(),
-                pipeline,
-            };
-            match self.cpu_continuations.try_submit(task) {
-                Ok(()) => {
-                    state.cpu_pending = Some(key);
-                    self.cpu_deadlines
-                        .insert(key, Instant::now() + self.cpu_task_timeout);
-                    progressed = true;
-                }
-                Err(_) => {
-                    break;
-                }
-            }
-        }
-        progressed
-    }
-
-    pub(super) fn drain_cpu_continuations(&mut self) -> bool {
-        let ready = self.cpu_continuations.drain_ready();
-        if ready.is_empty() {
-            return false;
-        }
-        let mut failed = Vec::new();
-        for result in ready {
-            self.cpu_deadlines.remove(&result.key);
-            let Some(state) = self.running.get_mut(&result.key.request_id) else {
-                continue;
-            };
-            if state.cpu_pending != Some(result.key)
-                || state.epoch != result.key.epoch
-                || state.version != result.key.point
-            {
-                continue;
-            }
-            state.cpu_pending = None;
-            match result.outcome {
-                Ok(masks) => state.cpu_masks = Some(masks),
-                Err(error) => {
-                    tracing::error!(
-                        request_id = result.key.request_id.0,
-                        %error,
-                        "CPU semantic continuation failed"
-                    );
-                    failed.push(result.key.request_id);
-                }
-            }
-        }
-        for id in failed {
-            self.finish_after_inflight(id, FinishReason::Error, None);
-        }
-        true
-    }
-
-    pub(super) fn expire_cpu_continuations(&mut self) -> bool {
-        if self.cpu_deadlines.is_empty() {
-            return false;
-        }
-        let now = Instant::now();
-        let expired = self
-            .cpu_deadlines
-            .iter()
-            .filter_map(|(key, deadline)| (*deadline <= now).then_some(*key))
-            .collect::<Vec<_>>();
-        let mut failed = Vec::new();
-        for key in expired {
-            self.cpu_deadlines.remove(&key);
-            if let Some(state) = self.running.get_mut(&key.request_id)
-                && state.cpu_pending == Some(key)
-            {
-                state.cpu_pending = None;
-                state.cpu_generation = state.cpu_generation.saturating_add(1);
-                failed.push(key.request_id);
-            }
-        }
-        for id in &failed {
-            tracing::error!(
-                request_id = id.0,
-                timeout_ms = self.cpu_task_timeout.as_millis(),
-                "CPU semantic continuation exceeded its request-local deadline"
-            );
-            self.finish_after_inflight(*id, FinishReason::Error, None);
-        }
-        !failed.is_empty()
     }
 
     pub(super) fn output_window_ready(&self, id: RequestId) -> bool {
@@ -1484,7 +1313,6 @@ impl Scheduler {
         }
         let inflight = queue.pop_front().expect("front checked above");
         let empty = queue.is_empty();
-        let parent_op_id = inflight.operation.parent.producer_op_id.0;
         if inflight.operation.bounds.max_transfer_bytes > 0 {
             self.inflight_transfers = self
                 .inflight_transfers
@@ -1495,29 +1323,7 @@ impl Scheduler {
             self.inflight_ops.remove(&id);
         }
         self.reclaim_domain_credit(inflight.operation.domain, false);
-        if parent_op_id > 0 {
-            self.mark_operation_reclaimed(id, parent_op_id);
-        }
         Some((inflight.operation, inflight.apply, inflight.started))
-    }
-
-    pub(super) fn mark_operation_reclaimed(&mut self, id: RequestId, op_id: u64) {
-        if let Some(st) = self.running.get_mut(&id) {
-            st.trace.stamp_existing(
-                uniserve_worker_ipc::OpId(op_id),
-                crate::scheduler::trace::LifecyclePhase::ReleaseIssued,
-                uniserve_core::now_monotonic_us(),
-            );
-        }
-        // The operation's device products are now freed under event-safe
-        // reclamation; record the terminal lifecycle phase.
-        if let Some(st) = self.running.get_mut(&id) {
-            st.trace.stamp_existing(
-                uniserve_worker_ipc::OpId(op_id),
-                crate::scheduler::trace::LifecyclePhase::PhysicallyReclaimed,
-                uniserve_core::now_monotonic_us(),
-            );
-        }
     }
 
     pub(super) fn release_products(&mut self, products: Vec<ProductRef>) {
@@ -1774,10 +1580,7 @@ impl Scheduler {
                     continue;
                 };
                 let operation_variant = operation.work;
-                // fold this op's host-side round-trip latency into the history.
                 let roundtrip_us = started.elapsed().as_micros() as u64;
-                self.latency
-                    .observe(operation_variant.as_wire_str(), roundtrip_us);
                 let apply = match apply {
                     InflightApply::Media(cursor_after) => {
                         self.apply_media_completion(operation, cursor_after, record);
@@ -1786,8 +1589,6 @@ impl Scheduler {
                     InflightApply::Generation(apply) => apply,
                 };
                 let view = SequenceView::from_report(&record, products.as_ref());
-                // record the op-resolved lifecycle event (op_id echoed by the
-                // worker, host round-trip + worker compute time).
                 let sampled_token_ids_len = view.committed_tokens.len();
                 let sampled_token_ids_last = view.committed_tokens.last().copied();
                 if let Some(resolved_ops) = resolved_ops.as_mut() {
@@ -1818,54 +1619,6 @@ impl Scheduler {
                         "kv_tokens": view.kv_visible_len,
                         "product_handle": view.encode_generation,
                     }));
-                }
-                if let Some(st) = self.running.get_mut(&id) {
-                    let op_key = crate::scheduler::trace::OperationKey::from(&operation);
-                    let kind = operation_variant.as_wire_str();
-                    let observed_us = uniserve_core::now_monotonic_us();
-                    // Device phases are reconstructed from the completion
-                    // record's asynchronously reported durations, anchored at
-                    // submission and clamped to the host observation.
-                    let submitted_us = st.trace.at(
-                        op_key.op_id,
-                        crate::scheduler::trace::LifecyclePhase::Submitted,
-                    );
-                    if let Some(submitted_us) = submitted_us {
-                        let timing = &record.timing_counters;
-                        let device_started = submitted_us
-                            .saturating_add(timing.queued_us)
-                            .min(observed_us);
-                        let producer_ready = device_started
-                            .saturating_add(timing.device_us)
-                            .min(observed_us);
-                        let copy_ready = producer_ready
-                            .saturating_add(timing.copy_us)
-                            .min(observed_us);
-                        st.trace.stamp(
-                            op_key,
-                            Some(kind),
-                            crate::scheduler::trace::LifecyclePhase::DeviceExecutionStarted,
-                            device_started,
-                        );
-                        st.trace.stamp(
-                            op_key,
-                            Some(kind),
-                            crate::scheduler::trace::LifecyclePhase::ProducerReady,
-                            producer_ready,
-                        );
-                        st.trace.stamp(
-                            op_key,
-                            Some(kind),
-                            crate::scheduler::trace::LifecyclePhase::CompletionCopyReady,
-                            copy_ready,
-                        );
-                    }
-                    st.trace.stamp(
-                        op_key,
-                        Some(kind),
-                        crate::scheduler::trace::LifecyclePhase::CompletionObserved,
-                        observed_us,
-                    );
                 }
                 let predicated_parent_point = (record.status == OpStatus::Predicated).then(|| {
                     self.running

@@ -20,8 +20,7 @@ use anyhow::{Context as _, Result};
 pub use config::{Config, EngineBackendKind, EngineSettings, HttpListenerMode};
 use tracing::info;
 pub use uniserve_engine::SchedulingPolicy;
-use uniserve_engine::sim::{SimEngine, SimExecutor};
-use uniserve_engine::{EngineBackend, EngineCoreConfig};
+use uniserve_engine::{EngineCoreConfig, SimEngine, SimExecutor};
 
 pub use crate::http::{ApiError, build_router, serve};
 pub use crate::state::AppState;
@@ -77,12 +76,9 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     let request_slot_capacity = assets.request_slot_capacity();
     let control_tokens = runtime_control_tokens(&assets, config.engine.backend);
 
-    let (backend, eos) = match config.engine.backend {
-        EngineBackendKind::Sim => (EngineBackend::Sim, control_tokens.eos.clone()),
-        EngineBackendKind::Worker => (EngineBackend::Worker, control_tokens.eos.clone()),
-    };
+    let eos = control_tokens.eos.clone();
     info!(
-        ?backend,
+        backend = ?config.engine.backend,
         device = %config.engine.device,
         block_size = config.engine.block_size,
         pipeline_depth = config.engine.pipeline_depth,
@@ -92,7 +88,6 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         model: config.model.clone(),
         device: config.engine.device.clone(),
         attention_backend: config.engine.attention_backend.clone(),
-        backend,
         block_size: config.engine.block_size,
         pipeline_depth: config.engine.pipeline_depth,
         max_batch: config.engine.max_batch,
@@ -113,7 +108,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         eos,
         end_of_image: control_tokens.end_of_image,
     };
-    let client = if backend == EngineBackend::Sim {
+    let client = if config.engine.backend == EngineBackendKind::Sim {
         let mut sim = SimEngine::new();
         let special_tokens = [
             control_tokens.bos,
@@ -127,10 +122,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
             engine_config.eos.first().copied().unwrap_or(151645),
             &special_tokens,
         );
-        EngineClient::connect_with_executor(
-            engine_config,
-            Box::new(SimExecutor::new(Box::new(sim))),
-        )
+        EngineClient::connect_with_executor(engine_config, Box::new(SimExecutor::new(sim)))
     } else {
         EngineClient::connect(engine_config)
     }

@@ -76,27 +76,17 @@ enum ReqKind : ubyte {
   PollCompletions,
   DropSession,
   Shutdown,
-  CopyKv,
   ReleaseProducts,
-  GetPressure,
-  SnapshotSession,
-  RestoreSession
+  GetPressure
 }
 
-enum RespKind : ubyte { Capabilities, Result, Ok, Error, Pressure, Snapshot }
+enum RespKind : ubyte { Capabilities, Result, Ok, Error, Pressure }
 enum ResourceClass : ubyte { KvBlock, EncoderOutput, ImageLatent }
 enum KvGroupKind : ubyte { Full, SlidingWindow }
 
 table U32List { items:[uint]; }
 table TokenBias { token_id:uint; bias:float; }
-table BlockPair { group_id:uint; src:uint; dst:uint; }
 table StringU64Pair { key:string; value:ulong; }
-
-table SnapshotRef {
-  version:VersionRef;
-  digest:string;
-  locator:string;
-}
 
 table SamplingParams {
   temperature:float;
@@ -161,37 +151,12 @@ table ResourcePressure {
   free:ulong;
 }
 
-table GraphBucketCapability {
-  phase:string;
-  batch_size:uint;
-  token_bucket:uint;
-  attention_form:string;
-  height:uint;
-  width:uint;
-  cfg_branches:uint;
-  layout:string;
-}
-
 table MixedExecutionCapability {
   decode_rows:uint;
   flow_rows:uint;
   height:uint;
   width:uint;
   cfg_branches:uint;
-}
-
-table LaneCapabilities {
-  lane_id:string;
-  domains:[Domain];
-  resolved_sm_count:uint;
-  kv_capacity_tokens:ulong = null;
-  latent_capacity_units:ulong = null;
-  max_batch_operations:uint;
-  max_batch_tokens:uint;
-  max_inflight:uint;
-  graph_buckets:[GraphBucketCapability];
-  eager_max_batch_operations:uint;
-  eager_max_batch_tokens:uint;
 }
 
 table WorkerCapabilities {
@@ -217,7 +182,6 @@ table WorkerCapabilities {
   groups:[KvGroupSpec];
   kv_dtype:string;
   model_dtype:string;
-  attention_backend:string;
   rank:RankInfo;
   pipeline_depth:uint;
   encoder_cache_budget:uint;
@@ -232,8 +196,6 @@ table WorkerCapabilities {
   resource_classes:[ResourceClass];
   model_identity:string;
   weight_digest:string;
-  protocol_layout_digest:string;
-  lanes:[LaneCapabilities];
 }
 
 // ---- Identities and the four protocol records -----------------------------
@@ -537,23 +499,13 @@ table WorkerForwardStats {
   component_us:[StringU64Pair];
 }
 
-table RecoveryPlacement {
-  request_key:RequestKey;
-  request_pool_idx:uint;
-  block_tables:[BlockTable];
-  latent_page_table:[uint];
-}
-
 table WorkerRequest {
   kind:ReqKind;
   call_id:ulong = null;
   batch:Batch;
   step_id:ulong = null;
   session_id:ulong = null;
-  copies:[BlockPair];
   product_handles:[ulong];
-  snapshot:SnapshotRef;
-  recovery_placement:RecoveryPlacement;
 }
 
 table ErrorOperationIdentity {
@@ -574,7 +526,6 @@ table WorkerResponse {
   phase:string;
   route:string;
   operations:[ErrorOperationIdentity];
-  snapshot:SnapshotRef;
 }
 
 root_type WorkerRequest;

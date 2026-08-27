@@ -8,24 +8,16 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use sha2::{Digest as _, Sha256};
-use uniserve_core::{
-    BlockId, ContextSegment, GenerationBehaviorDescriptor, GenerationConstraint,
-    GenerationPolicyDescriptor, GenerationRequest, GenerationResourceBounds, ImageParams,
-    RequestId, SamplingParams, UndVisibility,
+use uniserve_core::Digest as SemanticDigest;
+use uniserve_core::{BlockId, RequestId, SamplingParams};
+use uniserve_engine::{
+    ControlOp, Executor, MultiprocExecutor, TransferBackend, WorkerExecError, WorkerKind,
+    WorkerLaunchConfig, WorkerLossError, WorkerSpawnSpec,
 };
-use uniserve_core::{Digest as SemanticDigest, FinishReason, GenerationEvent};
-use uniserve_engine::executor::{
-    ControlOp, Executor, TransferBackend, WorkerExecError, WorkerKind, WorkerLossError,
-};
-use uniserve_engine::scheduler::{
-    ControlTokens, LogitsProcessor, MaskContribution, ProcCtx, ProcessorDeclaration, Scheduler,
-    SchedulerConfig,
-};
-use uniserve_engine::worker::{MultiprocExecutor, WorkerLaunchConfig, WorkerSpawnSpec};
 use uniserve_worker_ipc::{
     Admission, AttentionRegime, Batch, BatchPartition, BlockTable, Bounds, CachePageAllocation,
     CloseReason, Control, DType, DimBound, Disposition, ErrorCode, ExecutionCapability,
@@ -42,7 +34,6 @@ fn multiprocess_topology_obeys_protocol_failure_and_capacity_contracts() -> anyh
     qualify_rank_protocol()?;
     qualify_slow_transfer()?;
     qualify_peer_replacement()?;
-    qualify_combined_pressure()?;
     Ok(())
 }
 
@@ -594,149 +585,6 @@ fn post_named_semaphore(name: &CString) -> anyhow::Result<()> {
     post_result.and(close_result)
 }
 
-fn qualify_combined_pressure() -> anyhow::Result<()> {
-    struct HeldProcessor {
-        release: Arc<AtomicBool>,
-    }
-
-    impl LogitsProcessor for HeldProcessor {
-        fn name(&self) -> &'static str {
-            "qualification_hold"
-        }
-
-        fn declaration(&self) -> ProcessorDeclaration {
-            ProcessorDeclaration {
-                snapshotable: true,
-                deterministic: true,
-                max_output_tokens: 1,
-                max_outstanding_tasks: 1,
-            }
-        }
-
-        fn is_argmax_invariant(&self) -> bool {
-            true
-        }
-
-        fn contribute(&self, context: &ProcCtx<'_>) -> MaskContribution {
-            if context.sampling.seed == Some(1)
-                && context.n_generated == 0
-                && !self.release.load(Ordering::Acquire)
-            {
-                while !self.release.load(Ordering::Acquire) {
-                    thread::sleep(Duration::from_millis(1));
-                }
-            }
-            MaskContribution::default()
-        }
-    }
-
-    let executor = spawn_rank_group()?;
-    let release = Arc::new(AtomicBool::new(false));
-    let mut scheduler = Scheduler::with_config(
-        Box::new(executor),
-        ControlTokens::default(),
-        SchedulerConfig {
-            max_batch: 4,
-            max_num_batched_tokens: 32,
-            max_num_seqs: 4,
-            long_prefill_threshold: 16,
-            max_num_waiting: 8,
-            mixed_prefill_tokens: 4,
-            ..SchedulerConfig::default()
-        },
-    )
-    .with_logits_processor(Box::new(HeldProcessor {
-        release: Arc::clone(&release),
-    }));
-
-    let mut slow_cpu = scheduler.submit_for_test(text_request(101, 4, 1));
-    let mut fast = scheduler.submit_for_test(text_request(102, 4, 2));
-    let slow_client = scheduler.submit_for_test(text_request(103, 128, 3));
-    let cancelled = (104..=108)
-        .map(|request_id| scheduler.submit_for_test(text_request(request_id, 32, request_id)))
-        .collect::<Vec<_>>();
-    drop(cancelled);
-    let mut rejected = (109..=112)
-        .map(|request_id| scheduler.submit_for_test(text_request(request_id, 4, request_id)))
-        .collect::<Vec<_>>();
-
-    let first_deadline = Instant::now() + Duration::from_secs(15);
-    let mut fast_finish = None;
-    let mut rejected_count = 0;
-    while Instant::now() < first_deadline && fast_finish.is_none() {
-        scheduler.step();
-        while let Ok(event) = fast.try_recv() {
-            if let GenerationEvent::Finished { reason, .. } = event {
-                fast_finish = Some(reason);
-            }
-        }
-        for receiver in &mut rejected {
-            while let Ok(event) = receiver.try_recv() {
-                if matches!(event, GenerationEvent::Rejected { .. }) {
-                    rejected_count += 1;
-                }
-            }
-        }
-        assert_scheduler_bounds(&scheduler);
-        thread::sleep(Duration::from_millis(1));
-    }
-    assert!(fast_finish.is_some_and(|reason| reason != FinishReason::Error));
-    assert!(rejected_count > 0);
-
-    release.store(true, Ordering::Release);
-    let cpu_deadline = Instant::now() + Duration::from_secs(15);
-    let mut cpu_finish = None;
-    while Instant::now() < cpu_deadline && cpu_finish.is_none() {
-        scheduler.step();
-        while let Ok(event) = slow_cpu.try_recv() {
-            if let GenerationEvent::Finished { reason, .. } = event {
-                cpu_finish = Some(reason);
-            }
-        }
-        assert_scheduler_bounds(&scheduler);
-        thread::sleep(Duration::from_millis(1));
-    }
-    assert!(cpu_finish.is_some_and(|reason| reason != FinishReason::Error));
-
-    let stall_deadline = Instant::now() + Duration::from_secs(15);
-    while Instant::now() < stall_deadline {
-        scheduler.step();
-        assert_scheduler_bounds(&scheduler);
-        let health = scheduler.health_snapshot();
-        if health.in_flight == 0 && health.running <= 1 && health.pending == 0 {
-            break;
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
-    let stalled = scheduler.health_snapshot();
-    assert_eq!(stalled.in_flight, 0);
-    assert!(stalled.running <= 1);
-
-    drop(slow_client);
-    drop(rejected);
-    let drain_deadline = Instant::now() + Duration::from_secs(15);
-    while Instant::now() < drain_deadline {
-        scheduler.step();
-        assert_scheduler_bounds(&scheduler);
-        let health = scheduler.health_snapshot();
-        if health.running == 0 && health.pending == 0 && health.in_flight == 0 {
-            break;
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
-    let drained = scheduler.health_snapshot();
-    assert_eq!(drained.running, 0);
-    assert_eq!(drained.pending, 0);
-    assert_eq!(drained.in_flight, 0);
-    let resources = scheduler.resource_window_metrics();
-    assert_eq!(resources.active_operations, 0);
-    assert!(resources.peak_ops_in_batch <= 4);
-    assert!(resources.domains.iter().all(
-        |domain| domain.active_credits == 0 && domain.peak_credits <= resources.max_operations
-    ));
-    Ok(())
-}
-
 fn spawn_rank_group() -> anyhow::Result<MultiprocExecutor> {
     let worker = worker_python();
     let config = WorkerLaunchConfig {
@@ -951,53 +799,4 @@ fn with_request_key(version: &VersionRef, request_key: RequestKey) -> VersionRef
         producer_op_id: version.producer_op_id,
         point: version.point.clone(),
     }
-}
-
-fn text_request(request_id: u64, max_tokens: usize, seed: u64) -> GenerationRequest {
-    let constraint = GenerationConstraint::UndOnly;
-    let policy = GenerationPolicyDescriptor::default();
-    GenerationRequest {
-        request_id: RequestId(request_id),
-        context: vec![ContextSegment::UndTokens {
-            token_ids: vec![1, 2, 3],
-            visibility: UndVisibility::Internal,
-        }],
-        negative_context: Vec::new(),
-        constraint,
-        behavior: GenerationBehaviorDescriptor::resolve(constraint, &policy),
-        sampling: SamplingParams {
-            ignore_eos: true,
-            seed: Some(seed),
-            ..SamplingParams::default()
-        },
-        image: ImageParams::default(),
-        max_und_tokens: max_tokens,
-        stop_strings: Vec::new(),
-        stop_token_ids: Vec::new(),
-        priority: 0,
-        cache: Default::default(),
-        policy,
-        resources: GenerationResourceBounds {
-            context_tokens: 3,
-            max_kv_tokens: 3 + max_tokens,
-            ..GenerationResourceBounds::default()
-        },
-    }
-}
-
-fn assert_scheduler_bounds(scheduler: &Scheduler) {
-    let health = scheduler.health_snapshot();
-    assert!(health.running <= scheduler.config().max_num_seqs);
-    assert!(health.pending <= scheduler.config().max_num_waiting);
-    assert!(health.in_flight <= PIPELINE_DEPTH);
-    assert!(health.free_blocks <= health.total_blocks);
-    assert!(health.reserved_blocks <= health.total_blocks);
-    let resources = scheduler.resource_window_metrics();
-    assert!(resources.active_operations <= resources.max_operations);
-    assert!(
-        resources
-            .domains
-            .iter()
-            .all(|domain| domain.active_credits <= resources.max_operations)
-    );
 }

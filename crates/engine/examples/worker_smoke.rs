@@ -8,10 +8,10 @@ use uniserve_core::{
     GenerationRequest, GenerationResourceBounds, ImageParams, RequestId, SamplingParams,
     TriggerPolicyDescriptor, UndVisibility,
 };
-use uniserve_engine::executor::Executor;
-use uniserve_engine::scheduler::{ControlTokens, Scheduler};
-use uniserve_engine::worker::{UniprocExecutor, WorkerLaunchConfig, WorkerSpawnSpec};
-use uniserve_engine::{AttentionBackend, TransferBackend};
+use uniserve_engine::{
+    AttentionBackend, ControlTokens, Executor, Scheduler, TransferBackend, UniprocExecutor,
+    WorkerLaunchConfig, WorkerSpawnSpec,
+};
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()

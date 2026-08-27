@@ -9,7 +9,7 @@ use uniserve_core::RequestId;
 use crate::scheduler::ReqState;
 
 /// Ordering policy for waiting requests.
-pub trait RequestQueue: Send {
+pub(crate) trait RequestQueue: Send {
     /// Append a newly arrived request.
     fn add_request(&mut self, st: ReqState);
     /// The next request admission would consider.
@@ -26,7 +26,7 @@ pub trait RequestQueue: Send {
 
 /// First-come-first-served: a plain deque.
 #[derive(Default)]
-pub struct FcfsRequestQueue {
+pub(crate) struct FcfsRequestQueue {
     queue: VecDeque<ReqState>,
 }
 
@@ -58,7 +58,7 @@ impl RequestQueue for FcfsRequestQueue {
 /// rather than a binary heap because removal-by-id must be supported anyway;
 /// the sorted invariant lets the insertion point be located by binary search.
 #[derive(Default)]
-pub struct PriorityRequestQueue {
+pub(crate) struct PriorityRequestQueue {
     /// Sorted ascending by `(priority, queued_at)`.
     queue: VecDeque<ReqState>,
 }

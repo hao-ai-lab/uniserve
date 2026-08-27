@@ -15,12 +15,9 @@ from typing import Any, Protocol
 
 from ..batch import (
     Batch,
-    CacheCopy,
     CompletionReport,
     ForwardMode,
     PartitionCompletion,
-    RecoveryPlacement,
-    SnapshotRef,
 )
 from ..capabilities import RequestKind, ResponseKind
 from ..execution.rows import PreparedExecution
@@ -578,28 +575,8 @@ def _control(
         raise unsupported_control(kind.value)
     if kind is RequestKind.DROP_SESSION:
         worker.drop_session(_integer(request, "session_id", kind))
-    elif kind is RequestKind.COPY_KV:
-        raw_copies = _required(request, "copies", kind)
-        if not isinstance(raw_copies, list):
-            raise invalid_descriptor("copy_kv copies must be a list")
-        worker.copy_kv(
-            tuple(
-                CacheCopy.from_mapping(value, f"copy_kv copies[{index}]")
-                for index, value in enumerate(raw_copies)
-            )
-        )
     elif kind is RequestKind.RELEASE_PRODUCTS:
         worker.release_products(_integers(request, "product_handles", kind))
-    elif kind is RequestKind.SNAPSHOT_SESSION:
-        reference = worker.snapshot_session(
-            RecoveryPlacement.from_mapping(_required(request, "recovery_placement", kind))
-        )
-        return _response(ResponseKind.SNAPSHOT, snapshot=reference.to_mapping())
-    elif kind is RequestKind.RESTORE_SESSION:
-        worker.restore_session(
-            SnapshotRef.from_mapping(_required(request, "snapshot", kind)),
-            RecoveryPlacement.from_mapping(_required(request, "recovery_placement", kind)),
-        )
     else:
         raise unsupported_control(kind.value)
     return None

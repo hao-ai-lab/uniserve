@@ -16,13 +16,10 @@ import torch
 
 from ..batch import (
     Batch,
-    CacheCopy,
     CompletionReport,
     Domain,
     ForwardMode,
-    RecoveryPlacement,
     RequestKey,
-    SnapshotRef,
 )
 from ..bootstrap.capabilities import resolve_capabilities
 from ..bootstrap.capacity import (
@@ -36,10 +33,7 @@ from ..bootstrap.execution_config import (
     graph_memory_budget_bytes,
 )
 from ..capabilities import (
-    GraphBucketCapability,
-    LaneCapabilities,
     MixedExecutionCapability,
-    RequestKind,
     ResourceClass,
     WorkerCapabilities,
 )
@@ -74,7 +68,6 @@ from ..models.minimax_h3.execution import (
 from ..models.runtime import ExecutionModel, WorkerDeployment
 from ..nn.diffusion.cfg import build_flow_cfg_plan
 from ..nn.mesh import DeviceMesh
-from ..recovery.snapshot import SnapshotRecovery
 from ..runtime.cache_pool import CachePool
 from ..runtime.device_events import DeviceEventPool
 from ..runtime.device_products import DeviceProducts
@@ -114,7 +107,6 @@ class Worker:
     cache_pool: CachePool | None
     req_to_token_pool: ReqToTokenPool | None
     latent_pool: LatentPool | None
-    snapshot_recovery: SnapshotRecovery | None
     _warmup_kv_pages: dict[tuple[RequestKey, int], list[int]]
     _warmup_prefix_pages: dict[RequestKey, list[int]]
     _warmup_prefix_slots: dict[RequestKey, int]
@@ -169,7 +161,6 @@ class Worker:
             weight_sidecars=loaded.weight_sidecars,
             pipeline_depth=config.ipc.pipeline_depth,
             completion_payload_bytes=config.ipc.max_payload_bytes,
-            snapshot_dir=config.snapshot_dir,
             media_spool=(
                 None if config.media_spool is None else Path(config.media_spool).expanduser()
             ),
@@ -193,7 +184,6 @@ class Worker:
         weight_sidecars: tuple[str, ...] = ("config.json",),
         pipeline_depth: int,
         completion_payload_bytes: int,
-        snapshot_dir: str | None = None,
         media_spool: Path | None = None,
     ) -> None:
         if not isinstance(model, (ExecutionModel, MiniMaxH3Model)):
@@ -244,17 +234,6 @@ class Worker:
             max_vision_feature_bytes=int(declared.max_vision_feature_bytes),
             bytes_per_token=int(declared.bytes_per_token),
         )
-        if snapshot_dir is not None and not model.resource_geometry.kv:
-            raise capability_mismatch("session snapshots require model-owned KV resources")
-        if snapshot_dir is not None:
-            declared = replace(
-                declared,
-                supported_controls=(
-                    *declared.supported_controls,
-                    RequestKind.SNAPSHOT_SESSION,
-                    RequestKind.RESTORE_SESSION,
-                ),
-            )
         if int(pipeline_depth) <= 0:
             raise capability_mismatch("worker pipeline depth must be positive")
         implemented_work = model.supported_work
@@ -267,10 +246,26 @@ class Worker:
         advertised_work = self._effective_work_variants
         if not advertised_work:
             raise capability_mismatch(f"{type(self).__name__} advertises no executable work")
+        lane_operation_bound = min(
+            (
+                int(lane.max_batch_operations or declared.max_batch_operations)
+                for lane in execution.lanes
+            ),
+            default=int(declared.max_batch_operations),
+        )
+        lane_token_bound = min(
+            (int(lane.max_batch_tokens or declared.max_batch_tokens) for lane in execution.lanes),
+            default=int(declared.max_batch_tokens),
+        )
         self._capabilities = replace(
             declared,
             supported_work=tuple(variant for variant in ForwardMode if variant in advertised_work),
             pipeline_depth=int(pipeline_depth),
+            max_batch_operations=min(
+                int(declared.max_batch_operations),
+                lane_operation_bound,
+            ),
+            max_batch_tokens=min(int(declared.max_batch_tokens), lane_token_bound),
         )
         owns_kv = bool(model.resource_geometry.kv)
         packed_model = model if isinstance(model, ExecutionModel) else None
@@ -802,147 +797,6 @@ class Worker:
             if owns_kv and packed_model is not None
             else None
         )
-        if execution.lanes and runner is not None:
-            assert packed_model is not None
-            lane_by_id = {lane.lane_id: lane for lane in execution.lanes}
-            lane_capabilities: list[LaneCapabilities] = []
-            for partition in runner.partitions:
-                if partition.lane_id is None:
-                    continue
-                lane = lane_by_id[partition.lane_id]
-                max_operations = min(
-                    int(self._capabilities.max_batch_operations),
-                    int(lane.max_batch_operations or self._capabilities.max_batch_operations),
-                )
-                max_tokens = min(
-                    int(self._capabilities.max_batch_tokens),
-                    int(lane.max_batch_tokens or self._capabilities.max_batch_tokens),
-                )
-                buckets: list[GraphBucketCapability] = []
-                if execution.cuda_graph and Domain.DECODE in lane.domains:
-                    buckets.extend(
-                        GraphBucketCapability(
-                            phase="text_decode",
-                            batch_size=int(batch_size),
-                            token_bucket=int(batch_size),
-                            attention_form="paged_decode",
-                            height=0,
-                            width=0,
-                            cfg_branches=1,
-                        )
-                        for batch_size in decode_graph_batch_sizes
-                        if int(batch_size) <= max_operations
-                    )
-                if (
-                    execution.cuda_graph
-                    and execution.prefill_cuda_graph
-                    and Domain.PREFILL in lane.domains
-                ):
-                    paged_catalog = (
-                        ()
-                        if packed_model.tensorized_mixed
-                        else _paged_prefill_graph_buckets(
-                            prefill_graph_token_sizes,
-                            prefill_graph_row_sizes,
-                            max_rows=max_operations,
-                            max_tokens=max_tokens,
-                        )
-                    )
-                    buckets.extend(
-                        GraphBucketCapability(
-                            phase="text_prefill",
-                            batch_size=item.row_bucket,
-                            token_bucket=item.token_bucket,
-                            attention_form="paged_varlen",
-                            height=0,
-                            width=0,
-                            cfg_branches=1,
-                        )
-                        for item in paged_catalog
-                    )
-                    if packed_model.tensorized_mixed:
-                        buckets.extend(
-                            GraphBucketCapability(
-                                phase="text_prefill",
-                                batch_size=1,
-                                token_bucket=int(token_size),
-                                attention_form="packed",
-                                height=0,
-                                width=0,
-                                cfg_branches=1,
-                            )
-                            for token_size in prefill_graph_token_sizes
-                            if int(token_size) <= max_tokens
-                        )
-                if (
-                    execution.cuda_graph
-                    and execution.prefill_cuda_graph
-                    and Domain.FLOW in lane.domains
-                    and flow is not None
-                ):
-                    buckets.extend(
-                        GraphBucketCapability(
-                            phase="text_prefill",
-                            batch_size=bucket.rows * len(bucket.prefix_lengths),
-                            token_bucket=bucket.rows * sum(bucket.prefix_lengths),
-                            attention_form="packed",
-                            height=0,
-                            width=0,
-                            cfg_branches=bucket.cfg_branches,
-                            layout="flow_prefix",
-                        )
-                        for bucket in flow_prefix_graph_buckets
-                        if bucket.rows <= max_operations
-                        and bucket.rows * sum(bucket.prefix_lengths) <= max_tokens
-                    )
-                    buckets.extend(
-                        GraphBucketCapability(
-                            phase="denoise",
-                            batch_size=bucket.rows,
-                            token_bucket=0,
-                            attention_form="packed",
-                            height=bucket.height,
-                            width=bucket.width,
-                            cfg_branches=bucket.cfg_branches,
-                            layout="flow",
-                        )
-                        for bucket in flow_graph_buckets
-                        if bucket.rows <= max_operations
-                    )
-                    if ForwardMode.TOKEN_DECODE in self._effective_work_variants and {
-                        Domain.DECODE,
-                        Domain.FLOW,
-                    } <= set(lane.domains):
-                        buckets.extend(
-                            GraphBucketCapability(
-                                phase="denoise",
-                                batch_size=bucket.decode_rows + bucket.flow_rows,
-                                token_bucket=bucket.decode_rows,
-                                attention_form="packed",
-                                height=bucket.height,
-                                width=bucket.width,
-                                cfg_branches=bucket.cfg_branches,
-                                layout="decode_flow",
-                            )
-                            for bucket in mixed_flow_graph_buckets
-                            if bucket.decode_rows + bucket.flow_rows <= max_operations
-                        )
-                lane_capabilities.append(
-                    LaneCapabilities(
-                        lane_id=lane.lane_id,
-                        domains=lane.domains,
-                        resolved_sm_count=partition.sm_count,
-                        kv_capacity_tokens=lane.kv_capacity_tokens,
-                        latent_capacity_units=lane.latent_capacity_units,
-                        max_batch_operations=max_operations,
-                        max_batch_tokens=max_tokens,
-                        max_inflight=int(lane.max_inflight or pipeline_depth),
-                        graph_buckets=tuple(buckets),
-                        eager_max_batch_operations=max_operations,
-                        eager_max_batch_tokens=max_tokens,
-                    )
-                )
-            self._capabilities = replace(self._capabilities, lanes=tuple(lane_capabilities))
         self.runner = runner
         self.h3_mux = (
             H3MuxCoordinator()
@@ -989,43 +843,6 @@ class Worker:
         self._warmup_prefix_slots = {}
         self._warmup_latent_pages = {}
         self._warmup_step_id = 0
-        self.snapshot_recovery = None
-        if snapshot_dir is not None:
-            caps = self._capabilities
-            if (
-                self.cache_pool is None
-                or self.req_to_token_pool is None
-                or self.execution.cache_publications is None
-            ):
-                raise RuntimeError("snapshot recovery lost model-owned KV resources")
-            self.snapshot_recovery = SnapshotRecovery(
-                snapshot_dir,
-                model_identity=self.identity.architecture_digest,
-                weight_digest=self.weight_digest,
-                topology={
-                    "rank": caps.rank.to_mapping(),
-                    "model_scope": deployment.model_scope,
-                    "block_size": caps.block_size,
-                    "num_blocks": caps.num_blocks,
-                    "num_layers": caps.num_layers,
-                    "max_request_pool_size": caps.max_request_pool_size,
-                    "latent_page_units": caps.latent_page_units,
-                    "num_latent_pages": caps.num_latent_pages,
-                    "latent_width": caps.latent_width,
-                    "latent_dtype": caps.latent_dtype,
-                    "latent_downsample": caps.latent_downsample,
-                },
-                device=deployment.device,
-                requests=self.requests,
-                cache_pool=self.cache_pool,
-                req_to_token_pool=self.req_to_token_pool,
-                cache_publications=self.execution.cache_publications,
-                latent_pool=self.latent_pool,
-                device_products=self.device_products,
-                encoder_cache=self.encoder_cache,
-                runtime_states=self.runtime_states,
-                transport=self.transfers.transport,
-            )
         self.weight_updater = (
             WeightUpdater(
                 self.model,
@@ -1132,8 +949,6 @@ class Worker:
             weight_digest=weights.digest,
         )
         self._capabilities = replace(self._capabilities, weight_digest=weights.digest)
-        if self.snapshot_recovery is not None:
-            self.snapshot_recovery.rebind_weight_digest(weights.digest)
 
     def _gather_rank_weight_digests(self, rank_digest: str) -> Sequence[str]:
         if not torch.distributed.is_available() or not torch.distributed.is_initialized():
@@ -1191,8 +1006,6 @@ class Worker:
             self._warmup_prefix_pages.pop(session.request_key, None)
             self._warmup_prefix_slots.pop(session.request_key, None)
             self._warmup_latent_pages.pop(session.request_key, None)
-        if self.snapshot_recovery is not None:
-            self.snapshot_recovery.drop_session(session_id)
         if session is not None:
             self.trace.emit(
                 ExecutionPhase.CLEANUP,
@@ -1206,44 +1019,10 @@ class Worker:
                 ),
             )
 
-    def copy_kv(self, copies: tuple[CacheCopy, ...]) -> None:
-        cache_pool = self.cache_pool
-        if cache_pool is None:
-            raise capability_mismatch("this worker has no KV cache")
-        for group_id in {copy.group_id for copy in copies}:
-            selected = tuple(copy for copy in copies if copy.group_id == group_id)
-            cache_pool.copy_pages(
-                group_id,
-                tuple(copy.source_page for copy in selected),
-                tuple(copy.destination_page for copy in selected),
-            )
-
     def release_products(self, handles: tuple[int, ...]) -> None:
         generations = tuple(int(handle) for handle in handles)
         self.device_products.release_generations(generations)
         self.encoder_cache.release_generations(generations)
-
-    def snapshot_session(self, placement: RecoveryPlacement) -> SnapshotRef:
-        if self.snapshot_recovery is None:
-            raise capability_mismatch("this worker has no configured snapshot recovery")
-        runner = self.runner
-        if runner is None:
-            raise capability_mismatch("session snapshots require packed-forward execution")
-        runner.synchronize()
-        return self.snapshot_recovery.snapshot_session(placement)
-
-    def restore_session(
-        self,
-        reference: SnapshotRef,
-        placement: RecoveryPlacement,
-    ) -> None:
-        if self.snapshot_recovery is None:
-            raise capability_mismatch("this worker has no configured snapshot recovery")
-        runner = self.runner
-        if runner is None:
-            raise capability_mismatch("session snapshots require packed-forward execution")
-        runner.synchronize()
-        self.snapshot_recovery.restore(reference, placement)
 
     def resource_pressure(self) -> list[dict[str, object]]:
         if isinstance(self.model, MiniMaxH3Model):

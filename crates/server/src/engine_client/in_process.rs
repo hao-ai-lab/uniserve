@@ -6,9 +6,7 @@ use tracing::warn;
 use super::error::{Error, Result};
 use super::media::MediaSubmission;
 use uniserve_core::{GenerationRuntimeCapabilities, ModelDtype, RequestId};
-use uniserve_engine::EngineHandle;
-use uniserve_engine::executor::Executor;
-use uniserve_engine::{EngineCore, EventRx, MediaEventRx};
+use uniserve_engine::{EngineCore, EngineHandle, EventRx, Executor, MediaEventRx};
 
 use crate::serving::TokenizedGenerateReqInput;
 
@@ -264,9 +262,9 @@ mod tests {
     async fn sim_engine_generates_tokens_through_engine_client() {
         let client = EngineClient::connect_with_executor(
             EngineCoreConfig::sim("sim-model"),
-            Box::new(uniserve_engine::sim::SimExecutor::new(Box::new(
-                uniserve_engine::sim::SimEngine::new(),
-            ))),
+            Box::new(uniserve_engine::SimExecutor::new(
+                uniserve_engine::SimEngine::new(),
+            )),
         )
         .expect("connect in-process sim engine");
 
@@ -332,9 +330,9 @@ mod tests {
     async fn sim_engine_generates_image_through_engine_client() {
         let client = EngineClient::connect_with_executor(
             EngineCoreConfig::sim("sim-model"),
-            Box::new(uniserve_engine::sim::SimExecutor::new(Box::new(
-                uniserve_engine::sim::SimEngine::new(),
-            ))),
+            Box::new(uniserve_engine::SimExecutor::new(
+                uniserve_engine::SimEngine::new(),
+            )),
         )
         .expect("connect in-process sim engine");
 

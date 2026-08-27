@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crate::executor::{ControlAck, ControlOp, Executor, ModelEngine};
+use crate::executor::{ControlAck, ControlOp, Executor};
 use base64::Engine as _;
 use crossbeam_channel::{Receiver, Sender};
 use uniserve_core::philox;
@@ -40,7 +40,7 @@ enum Job {
     Shutdown,
 }
 
-/// Runs a synchronous [`ModelEngine`] on a bounded asynchronous executor seam.
+/// Runs the deterministic model simulator on a bounded asynchronous executor seam.
 pub struct SimExecutor {
     caps: WorkerCapabilities,
     depth: usize,
@@ -54,12 +54,12 @@ pub struct SimExecutor {
 }
 
 impl SimExecutor {
-    pub fn new(engine: Box<dyn ModelEngine>) -> Self {
+    pub fn new(engine: SimEngine) -> Self {
         let depth = (engine.caps().pipeline_depth as usize).max(1);
         Self::with_depth(engine, depth)
     }
 
-    pub fn with_depth(mut engine: Box<dyn ModelEngine>, depth: usize) -> Self {
+    pub fn with_depth(mut engine: SimEngine, depth: usize) -> Self {
         let caps = engine.caps().clone();
         let depth = depth.max(1);
         let (to_worker, jobs) = crossbeam_channel::unbounded();
@@ -112,10 +112,7 @@ impl SimExecutor {
                     .send(Job::Drop(*session_id))
                     .map_err(|_| anyhow::anyhow!("sim executor thread gone"))?;
             }
-            ControlOp::CopyKv(_) | ControlOp::ReleaseProducts(_) => {}
-            ControlOp::SnapshotSession(_) | ControlOp::RestoreSession { .. } => {
-                unreachable!("unsupported controls are rejected before dispatch")
-            }
+            ControlOp::ReleaseProducts(_) => {}
         }
         Ok(())
     }
@@ -212,7 +209,7 @@ impl Executor for SimExecutor {
         self.apply_control(&operation)?;
         Ok(vec![ControlAck {
             rank: 0,
-            result: Ok(None),
+            result: Ok(()),
         }])
     }
 
@@ -347,11 +344,7 @@ impl SimEngine {
             max_latent_feature_bytes: 1 << 20,
             max_vision_feature_bytes: 1 << 20,
             encoder_cache_budget: 256,
-            supported_controls: vec![
-                RequestKind::DropSession,
-                RequestKind::CopyKv,
-                RequestKind::ReleaseProducts,
-            ],
+            supported_controls: vec![RequestKind::DropSession, RequestKind::ReleaseProducts],
             max_batch_operations: 1024,
             max_unresolved_window: 2,
             mixed_buckets: (1..=128)
@@ -831,6 +824,11 @@ impl SimEngine {
 
     pub fn set_num_blocks(&mut self, count: u32) {
         self.caps.num_blocks = count;
+        if self.caps.groups.len() == 1 {
+            self.caps.groups[0].group_id = 0;
+            self.caps.groups[0].block_offset = 0;
+            self.caps.groups[0].num_blocks = count;
+        }
     }
 
     pub fn set_block_size(&mut self, size: u32) {
@@ -913,7 +911,7 @@ impl Default for SimEngine {
     }
 }
 
-impl ModelEngine for SimEngine {
+impl SimEngine {
     fn caps(&self) -> &WorkerCapabilities {
         &self.caps
     }

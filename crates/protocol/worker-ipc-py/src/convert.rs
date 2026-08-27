@@ -1038,11 +1038,8 @@ fn request_kind_py<'py>(py: Python<'py>, kind: RequestKind) -> &'py Bound<'py, P
         RequestKind::PollCompletions => intern!(py, "poll_completions"),
         RequestKind::DropSession => intern!(py, "drop_session"),
         RequestKind::Shutdown => intern!(py, "shutdown"),
-        RequestKind::CopyKv => intern!(py, "copy_kv"),
         RequestKind::ReleaseProducts => intern!(py, "release_products"),
         RequestKind::GetPressure => intern!(py, "get_pressure"),
-        RequestKind::SnapshotSession => intern!(py, "snapshot_session"),
-        RequestKind::RestoreSession => intern!(py, "restore_session"),
     }
 }
 

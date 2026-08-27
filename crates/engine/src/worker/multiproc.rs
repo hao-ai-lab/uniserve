@@ -27,10 +27,7 @@ impl WorkerSpawnSpec {
         let mut launched = Vec::with_capacity(self.world_size);
         for rank in 0..self.world_size {
             let rank_device = device_for_rank(&self.device, rank, self.world_size);
-            let mut rank_config = self.launch.clone();
-            if let Some(root) = &self.launch.snapshot_dir {
-                rank_config.snapshot_dir = Some(root.join("ranks").join(rank.to_string()));
-            }
+            let rank_config = self.launch.clone();
             launched.push(crate::UniprocExecutor::spawn_rank_deferred(
                 self,
                 &rank_device,
@@ -270,16 +267,10 @@ impl MultiprocExecutor {
                 self.known_sessions.remove(session_id);
                 self.dirty_sessions.remove(session_id);
             }
-            ControlOp::RestoreSession { snapshot, .. } => {
-                let session_id = snapshot.version.request_key.session_id;
-                self.known_sessions.insert(session_id);
-                self.dirty_sessions.remove(&session_id);
-            }
-            ControlOp::CopyKv(_) | ControlOp::ReleaseProducts(_) => {
+            ControlOp::ReleaseProducts(_) => {
                 self.dirty_sessions
                     .extend(self.known_sessions.iter().copied());
             }
-            _ => {}
         }
     }
 
@@ -911,34 +902,6 @@ impl Executor for MultiprocExecutor {
                 continue;
             }
             let succeeded = acks.iter().all(|ack| ack.result.is_ok());
-            if succeeded && let ControlOp::SnapshotSession(placement) = &op {
-                let session_id = placement.request_key.session_id;
-                let references =
-                    acks.iter()
-                        .map(|ack| {
-                            ack.result.as_ref().ok().and_then(Option::as_ref).ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "rank {} acknowledged session {} snapshot without a reference",
-                                ack.rank,
-                                session_id.0
-                            )
-                        })
-                        })
-                        .collect::<anyhow::Result<Vec<_>>>()?;
-                anyhow::ensure!(
-                    !references.is_empty(),
-                    "session snapshot control selected no tensor-parallel rank"
-                );
-                let first = references[0];
-                anyhow::ensure!(
-                    references.iter().all(|reference| {
-                        reference.version.request_key.session_id == session_id
-                            && reference.version == first.version
-                    }),
-                    "tensor-parallel snapshot ranks disagree on session, epoch, or version"
-                );
-                self.dirty_sessions.remove(&session_id);
-            }
             self.apply_control_session_effect(&op, succeeded);
             return Ok(acks);
         }

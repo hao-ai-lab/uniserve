@@ -18,10 +18,9 @@ use uniserve_core::{
     GenerationRequest, GenerationResourceBounds, ImageParams, RequestId, SamplingParams,
     UndVisibility,
 };
-use uniserve_engine::executor::Executor;
-use uniserve_engine::scheduler::{ControlTokens, Scheduler};
-use uniserve_engine::worker::{UniprocExecutor, WorkerLaunchConfig};
-use uniserve_engine::{Command, EngineHandle};
+use uniserve_engine::{
+    Command, ControlTokens, EngineHandle, Executor, Scheduler, UniprocExecutor, WorkerLaunchConfig,
+};
 
 type Rxs = HashMap<RequestId, uniserve_engine::EventRx>;
 

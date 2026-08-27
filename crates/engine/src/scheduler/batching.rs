@@ -498,7 +498,6 @@ impl Scheduler {
             }
             let output_event_bound = transition_output_bound(&transition);
             let planned_us = transition.planned_us;
-            let reserved_us = transition.reserved_us;
             let registered = transition.register(
                 request_key,
                 OpId(oid),
@@ -671,7 +670,6 @@ impl Scheduler {
                 }));
             }
             input_products.extend(payloads);
-            let op_key = crate::scheduler::trace::OperationKey::from(&operation);
             let submitted_us = uniserve_core::now_monotonic_us();
             self.register_inflight(
                 operation.clone(),
@@ -682,34 +680,6 @@ impl Scheduler {
             wire_ops.push(operation);
             if let Some(st) = self.running.get_mut(&request_id) {
                 st.latest_device_version = None;
-                // Backfill the two pre-registration phases from the builder now
-                // that the operation carries its canonical identity.
-                st.trace.stamp(
-                    op_key,
-                    Some(operation_variant),
-                    crate::scheduler::trace::LifecyclePhase::Planned,
-                    planned_us,
-                );
-                if reserved_us != 0 {
-                    st.trace.stamp(
-                        op_key,
-                        Some(operation_variant),
-                        crate::scheduler::trace::LifecyclePhase::LogicalResourcesReserved,
-                        reserved_us,
-                    );
-                }
-                st.trace.stamp(
-                    op_key,
-                    Some(operation_variant),
-                    crate::scheduler::trace::LifecyclePhase::WorkerRegistrationComplete,
-                    submitted_us,
-                );
-                st.trace.stamp(
-                    op_key,
-                    Some(operation_variant),
-                    crate::scheduler::trace::LifecyclePhase::Submitted,
-                    submitted_us,
-                );
             }
         }
         self.peak_ops_in_batch = self.peak_ops_in_batch.max(wire_ops.len());
@@ -1140,14 +1110,6 @@ impl Scheduler {
         }
     }
 
-    /// Data-plane causality gate for the request's next operation. A staged
-    /// executor retains a cross-pool consumer until every exact input product
-    /// has a published transfer descriptor. Direct executors are immediately
-    /// ready because producer and consumer share worker-resident ownership.
-    pub(super) fn stage_ready(&self, id: RequestId) -> bool {
-        self.executor.stage_ready(id)
-    }
-
     pub(super) fn plan_intent(
         &mut self,
         id: RequestId,
@@ -1173,9 +1135,6 @@ impl Scheduler {
         id: RequestId,
         budget: usize,
     ) -> Option<PlannedTransition> {
-        if !self.stage_ready(id) {
-            return None;
-        }
         let projection = self.projected_cursor(id)?;
         let context_pending = self.running.get(&id).is_some_and(|st| {
             projection.prompt_cursor < st.context.prompt_ids.len() as u32
@@ -1614,13 +1573,6 @@ impl Scheduler {
             Some(s) => s,
             None => return (None, None),
         };
-        if self.cpu_continuation_required(st) {
-            return st
-                .cpu_masks
-                .as_ref()
-                .map(|masks| (masks.allowed.clone(), masks.suppress.clone()))
-                .unwrap_or((Some(Vec::new()), None));
-        }
         let ctx = crate::scheduler::logits::ProcCtx {
             n_generated,
             eos: &self.ctrl.eos,
@@ -1695,16 +1647,6 @@ impl Scheduler {
             finish_token_ids,
             transition_token_ids,
             force_finish: n_generated.saturating_add(1) >= state.req.max_und_tokens,
-        }
-    }
-
-    pub(super) fn invalidate_cpu_masks(&mut self, id: RequestId) {
-        let required = self
-            .running
-            .get(&id)
-            .is_some_and(|state| self.cpu_continuation_required(state));
-        if required && let Some(state) = self.running.get_mut(&id) {
-            state.cpu_masks = None;
         }
     }
 }

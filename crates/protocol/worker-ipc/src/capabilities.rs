@@ -4,19 +4,6 @@ use super::*;
 // Capabilities and startup agreement
 // ---------------------------------------------------------------------------
 
-/// One direct physical CUDA graph shape advertised by an execution lane.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct GraphBucketCapability {
-    pub phase: String,
-    pub batch_size: u32,
-    pub token_bucket: u32,
-    pub attention_form: String,
-    pub height: u32,
-    pub width: u32,
-    pub cfg_branches: u32,
-    pub layout: String,
-}
-
 /// One exact decode-and-flow row combination qualified for a single physical call.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MixedExecutionCapability {
@@ -26,23 +13,6 @@ pub struct MixedExecutionCapability {
     pub width: u32,
     pub cfg_branches: u32,
 }
-
-/// Immutable scheduler-visible resources and execution coverage for one lane.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LaneCapabilities {
-    pub lane_id: String,
-    pub domains: Vec<Domain>,
-    pub resolved_sm_count: u32,
-    pub kv_capacity_tokens: Option<u64>,
-    pub latent_capacity_units: Option<u64>,
-    pub max_batch_operations: u32,
-    pub max_batch_tokens: u32,
-    pub max_inflight: u32,
-    pub graph_buckets: Vec<GraphBucketCapability>,
-    pub eager_max_batch_operations: u32,
-    pub eager_max_batch_tokens: u32,
-}
-
 /// A worker's advertised capabilities. Admission requires every rank, worker,
 /// and frontend to agree on the protocol layout.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -69,7 +39,6 @@ pub struct WorkerCapabilities {
     pub groups: Vec<KvCacheGroupSpec>,
     pub kv_dtype: Option<KvCacheDtype>,
     pub model_dtype: ModelDtype,
-    pub attention_backend: AttentionBackend,
     pub rank: RankInfo,
     pub pipeline_depth: u32,
     pub encoder_cache_budget: u32,
@@ -84,8 +53,6 @@ pub struct WorkerCapabilities {
     pub resource_classes: Vec<ResourceClass>,
     pub model_identity: Option<Digest>,
     pub weight_digest: Option<Digest>,
-    pub protocol_layout_digest: Digest,
-    pub lanes: Vec<LaneCapabilities>,
 }
 
 impl WorkerCapabilities {
@@ -105,8 +72,7 @@ impl WorkerCapabilities {
                     | ForwardMode::TransferKvPublish
                     | ForwardMode::TransferKvInstall
             )
-        }) || self.supported_controls.contains(&RequestKind::CopyKv)
-            || self.resource_classes.contains(&ResourceClass::KvBlock)
+        }) || self.resource_classes.contains(&ResourceClass::KvBlock)
     }
 
     pub fn validate(&self) -> ProtocolResult<()> {
@@ -141,43 +107,6 @@ impl WorkerCapabilities {
                 == self.resource_classes.len(),
             "worker capabilities repeat a resource class"
         );
-        let mut lane_ids = HashSet::with_capacity(self.lanes.len());
-        let mut lane_domains = HashSet::new();
-        for lane in &self.lanes {
-            protocol_ensure!(
-                !lane.lane_id.is_empty() && lane_ids.insert(lane.lane_id.as_str()),
-                "worker capabilities repeat or omit a lane id"
-            );
-            protocol_ensure!(
-                lane.resolved_sm_count > 0
-                    && lane.max_batch_operations > 0
-                    && lane.max_batch_tokens > 0
-                    && lane.max_inflight > 0
-                    && lane.eager_max_batch_operations > 0
-                    && lane.eager_max_batch_tokens > 0,
-                "worker lane declares a zero execution bound"
-            );
-            protocol_ensure!(!lane.domains.is_empty(), "worker lane binds no domain");
-            for domain in &lane.domains {
-                protocol_ensure!(
-                    lane_domains.insert(*domain),
-                    "worker capabilities repeat a lane domain binding"
-                );
-            }
-            protocol_ensure!(
-                lane.graph_buckets.iter().collect::<HashSet<_>>().len() == lane.graph_buckets.len(),
-                "worker lane repeats a graph bucket"
-            );
-            for bucket in &lane.graph_buckets {
-                protocol_ensure!(
-                    !bucket.phase.is_empty()
-                        && !bucket.attention_form.is_empty()
-                        && bucket.batch_size > 0
-                        && bucket.cfg_branches > 0,
-                    "worker lane graph bucket is invalid"
-                );
-            }
-        }
         protocol_ensure!(
             self.max_batch_operations > 0
                 && self.max_batch_tokens > 0
@@ -268,10 +197,6 @@ impl WorkerCapabilities {
             "worker capabilities advertise latent work without a latent page pool"
         );
         protocol_ensure!(
-            self.protocol_layout_digest == protocol_layout_digest(),
-            "worker capabilities carry a disagreeing protocol-layout digest"
-        );
-        protocol_ensure!(
             self.model_identity.is_some() == self.weight_digest.is_some(),
             "worker capability model and weight identities are incomplete"
         );
@@ -336,7 +261,6 @@ impl Default for WorkerCapabilities {
             }],
             kv_dtype: Some(KvCacheDtype::BFloat16),
             model_dtype: ModelDtype::BFloat16,
-            attention_backend: AttentionBackend::FlashInfer,
             rank: RankInfo::default(),
             pipeline_depth: 1,
             encoder_cache_budget: 0,
@@ -351,212 +275,6 @@ impl Default for WorkerCapabilities {
             resource_classes: Vec::new(),
             model_identity: None,
             weight_digest: None,
-            protocol_layout_digest: protocol_layout_digest(),
-            lanes: Vec::new(),
         }
     }
-}
-
-/// The canonical protocol-layout digest over the closed `ForwardMode` and `Control`
-/// variants and the fixed record field layouts.
-pub fn protocol_layout_digest() -> Digest {
-    let mut digest = CanonicalDigest::new(b"uniserve-protocol-layout\0");
-    digest.u64(ForwardMode::ALL.len() as u64);
-    for variant in ForwardMode::ALL {
-        digest.string(variant.as_wire_str());
-    }
-    let product_kinds = [
-        "token",
-        "logprob",
-        "draft",
-        "vision_feature",
-        "latent_feature",
-        "kv",
-        "latent",
-        "artifact",
-        "completion",
-        "sampling_state",
-        "finish",
-        "selected_point",
-        "accepted_span",
-        "continuation",
-    ];
-    digest.u64(product_kinds.len() as u64);
-    for kind in product_kinds {
-        digest.string(kind);
-    }
-    for control in ["commit", "close", "release"] {
-        digest.string(control);
-    }
-    // Record field layouts, in declaration order.
-    let record_layouts: [&[&str]; 18] = [
-        &[
-            "request_key",
-            "op_id",
-            "parent",
-            "work",
-            "route",
-            "domain",
-            "advances_state",
-            "bounds",
-            "inputs",
-            "outputs",
-            "predicate",
-            "rng",
-            "control_seq",
-            "plan_digest",
-        ],
-        &["request_key", "producer_op_id", "point"],
-        &[
-            "request_key",
-            "producer_op_id",
-            "output_index",
-            "generation",
-            "kind",
-            "storage_class",
-            "dtype",
-            "shape_bound",
-            "point_range",
-        ],
-        &[
-            "request_key",
-            "op_id",
-            "completion_slot_generation",
-            "status",
-            "selected_point",
-            "logical_lengths",
-            "token_span",
-            "committed_tokens",
-            "finish_flags",
-            "product_generations",
-            "semantic_digest",
-            "error_code",
-            "timing_counters",
-        ],
-        &["version", "digest", "locator"],
-        &[
-            "sampling",
-            "negative_token_ids",
-            "finish_token_ids",
-            "initial_position",
-        ],
-        &["prompt", "seed", "profile", "output_path"],
-        &[
-            "request_key",
-            "request_pool_idx",
-            "digest",
-            "und",
-            "gen_admission",
-            "media",
-        ],
-        &[
-            "request_pool_idx",
-            "group_id",
-            "page_ids",
-            "allocated_tokens",
-        ],
-        &["request_pool_idx", "group_id", "page_ids"],
-        &[
-            "operation_index",
-            "request_pool_index",
-            "seq_len",
-            "query_len",
-        ],
-        &[
-            "request_key",
-            "request_pool_idx",
-            "block_tables",
-            "latent_page_table",
-        ],
-        &["group_id", "source_page", "destination_page"],
-        &[
-            "request_key",
-            "op_id",
-            "page_table",
-            "latent_units",
-            "height",
-            "width",
-            "start_step",
-            "step_count",
-        ],
-        &["request_key", "op_id", "kind", "start_unit", "unit_count"],
-        &[
-            "partition_id",
-            "submission_group",
-            "collective_seq",
-            "domain",
-            "route",
-            "execution",
-            "attention",
-            "shape_class",
-            "operations",
-            "block_tables",
-            "new_cache_pages",
-            "forward_rows",
-            "latent_placements",
-            "decode_placements",
-        ],
-        &[
-            "block_size",
-            "num_blocks",
-            "num_layers",
-            "num_kv_heads",
-            "head_dim",
-            "supported_work",
-            "latent_page_units",
-            "num_latent_pages",
-            "latent_width",
-            "latent_dtype",
-            "latent_downsample",
-            "max_vae_grid_tokens",
-            "max_vit_grid_tokens",
-            "max_latent_feature_bytes",
-            "max_vision_feature_bytes",
-            "commit_marker_tokens",
-            "gen_rope_advance",
-            "max_cfg_branches",
-            "bytes_per_token",
-            "groups",
-            "kv_dtype",
-            "model_dtype",
-            "attention_backend",
-            "rank",
-            "pipeline_depth",
-            "encoder_cache_budget",
-            "supported_controls",
-            "max_batch_operations",
-            "max_unresolved_window",
-            "incremental_kv_publication",
-            "mixed_buckets",
-            "sampling_ownership",
-            "resource_classes",
-            "model_identity",
-            "weight_digest",
-            "protocol_layout_digest",
-        ],
-        &[
-            "decode_rows",
-            "flow_rows",
-            "height",
-            "width",
-            "cfg_branches",
-        ],
-    ];
-    for record in record_layouts {
-        digest.u64(record.len() as u64);
-        for field in record {
-            digest.string(field);
-        }
-    }
-    let logical_lengths = [
-        "token_len",
-        "kv_visible_len",
-        "kv_computed_len",
-        "latent_len",
-    ];
-    digest.u64(logical_lengths.len() as u64);
-    for field in logical_lengths {
-        digest.string(field);
-    }
-    digest.finish()
 }

@@ -66,7 +66,6 @@ class WorkerLaunchConfig:
     execution: ExecutionConfig
     load: LoadConfig
     use_stub_model: bool
-    snapshot_dir: str | None
     media_spool: str | None
 
     @classmethod
@@ -134,7 +133,6 @@ class WorkerLaunchConfig:
             execution=execution_config_from_namespace(namespace),
             load=_load_config(namespace),
             use_stub_model=use_stub_model,
-            snapshot_dir=_optional_text(namespace.snapshot_dir),
             media_spool=_optional_absolute_path(namespace.media_spool, "--media-spool"),
         )
 

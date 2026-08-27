@@ -18,7 +18,6 @@ def execution_worker(
     block_size: int = 16,
     device: str = "cpu",
     pipeline_depth: int = 1,
-    snapshot_dir: str | None = None,
     transfer_backend: str = "local",
     execution: ExecutionConfig | None = None,
     max_batch_tokens: int = 8192,
@@ -60,7 +59,6 @@ def execution_worker(
         transfer_backend=transfer_backend,
         pipeline_depth=pipeline_depth,
         completion_payload_bytes=1 << 16,
-        snapshot_dir=snapshot_dir,
     )
     from .depth_one import configure_physical_pool
 

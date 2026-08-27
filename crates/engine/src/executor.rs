@@ -8,16 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use uniserve_core::{CommandWaker, RequestId};
 use uniserve_worker_ipc::{
-    Batch, CacheCopy, CompletionReport, ForwardMode, Operation, RecoveryPlacement, RequestKind,
-    SnapshotRef, WorkerCapabilities, WorkerRequest,
+    Batch, CompletionReport, ForwardMode, Operation, RequestKind, WorkerCapabilities, WorkerRequest,
 };
-
-/// Synchronous model-engine seam used by deterministic local implementations.
-pub trait ModelEngine: Send {
-    fn caps(&self) -> &WorkerCapabilities;
-    fn execute(&mut self, batch: Batch) -> anyhow::Result<CompletionReport>;
-    fn drop_session(&mut self, id: RequestId) -> anyhow::Result<()>;
-}
 
 /// Which pipeline stage a worker pool serves.
 ///
@@ -286,11 +278,6 @@ impl TransferSpec {
         }
         Ok(Self { edges })
     }
-
-    /// Backend for an edge, or `"inproc"` (the in-process zero-transfer default).
-    pub fn backend_for(&self, src: WorkerKind, dst: WorkerKind) -> TransferBackend {
-        self.edges.get(&(src, dst)).copied().unwrap_or_default()
-    }
 }
 
 impl FromStr for TransferSpec {
@@ -321,46 +308,28 @@ pub enum TransferSpecError {
 #[derive(Debug, Clone)]
 pub enum ControlOp {
     DropSession(RequestId),
-    CopyKv(Vec<CacheCopy>),
     ReleaseProducts(Vec<u64>),
-    SnapshotSession(RecoveryPlacement),
-    RestoreSession {
-        snapshot: SnapshotRef,
-        placement: RecoveryPlacement,
-    },
 }
 
 impl ControlOp {
     pub const fn request_kind(&self) -> RequestKind {
         match self {
             Self::DropSession(_) => RequestKind::DropSession,
-            Self::CopyKv(_) => RequestKind::CopyKv,
             Self::ReleaseProducts(_) => RequestKind::ReleaseProducts,
-            Self::SnapshotSession(_) => RequestKind::SnapshotSession,
-            Self::RestoreSession { .. } => RequestKind::RestoreSession,
         }
     }
 
     pub fn method(&self) -> &'static str {
         match self {
             Self::DropSession(_) => "drop_session",
-            Self::CopyKv(_) => "copy_kv",
             Self::ReleaseProducts(_) => "release_products",
-            Self::SnapshotSession(_) => "snapshot_session",
-            Self::RestoreSession { .. } => "restore_session",
         }
     }
 
     pub fn to_request(&self, call_id: u64) -> WorkerRequest {
         let mut req = match self {
             Self::DropSession(id) => WorkerRequest::drop_session(*id),
-            Self::CopyKv(copies) => WorkerRequest::copy_kv(copies.clone()),
             Self::ReleaseProducts(handles) => WorkerRequest::release_products(handles.clone()),
-            Self::SnapshotSession(placement) => WorkerRequest::snapshot_session(placement.clone()),
-            Self::RestoreSession {
-                snapshot,
-                placement,
-            } => WorkerRequest::restore_session(snapshot.clone(), placement.clone()),
         };
         req.set_call_id(Some(call_id));
         req
@@ -371,13 +340,7 @@ impl ControlOp {
 #[derive(Debug, Clone)]
 pub struct ControlAck {
     pub rank: u32,
-    pub result: Result<Option<SnapshotRef>, ControlError>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum ControlError {
-    #[error("worker control failed: {message}")]
-    Worker { message: String },
+    pub result: Result<(), String>,
 }
 
 /// A worker-reported execution error classified for scheduler failure policy.
@@ -454,13 +417,6 @@ pub trait Executor: Send {
     /// may satisfy this contract by retaining the consumer until the producing
     /// pool publishes its bounded transfer descriptor.
     fn device_products_reachable(&self, _producer: ForwardMode, _consumer: ForwardMode) -> bool {
-        true
-    }
-
-    /// Data-plane causality gate for an explicit asynchronous transfer already
-    /// registered for the request. Executors without staged transfer state are
-    /// always ready.
-    fn stage_ready(&self, _req_id: RequestId) -> bool {
         true
     }
 
@@ -617,20 +573,15 @@ mod tests {
     }
 
     #[test]
-    fn transfer_spec_parses_edges_and_defaults_inproc() {
+    fn transfer_spec_parses_edges() {
         let t = TransferSpec::parse("encoder->prefill=cuda_ipc,prefill->decode=shm").unwrap();
         assert_eq!(
-            t.backend_for(WorkerKind::Encoder, WorkerKind::Prefill),
-            TransferBackend::CudaIpc
+            t.edges.get(&(WorkerKind::Encoder, WorkerKind::Prefill)),
+            Some(&TransferBackend::CudaIpc)
         );
         assert_eq!(
-            t.backend_for(WorkerKind::Prefill, WorkerKind::Decode),
-            TransferBackend::Shm
-        );
-        // Unconfigured edge falls back to the in-process backend.
-        assert_eq!(
-            t.backend_for(WorkerKind::Decode, WorkerKind::Full),
-            TransferBackend::Inproc
+            t.edges.get(&(WorkerKind::Prefill, WorkerKind::Decode)),
+            Some(&TransferBackend::Shm)
         );
         assert!(TransferSpec::parse("bad-entry").is_err());
         assert!(TransferSpec::parse("prefill->decode=tcp").is_err());

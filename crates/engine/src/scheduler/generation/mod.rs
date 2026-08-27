@@ -440,7 +440,7 @@ impl std::error::Error for ContextLoweringError {}
 
 /// Lifecycle phase for a canonical generation request.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum GenerationPhase {
+pub(crate) enum GenerationPhase {
     /// Encode staged input images before continuing text prefill.
     Encode,
     IngestState,
@@ -459,7 +459,7 @@ pub enum GenerationPhase {
 /// single typed owner; transition application is the only operation that
 /// commits worker-derived lifecycle progress.
 #[derive(Debug, Clone, PartialEq)]
-pub struct GenerationCursor {
+pub(crate) struct GenerationCursor {
     pub(crate) lifecycle: LifecycleCursor,
     pub(crate) ingest: ContextCursor,
     pub(crate) und: UndCursor,
@@ -690,26 +690,6 @@ impl GenerationCursor {
         Ok(())
     }
 
-    pub fn context(&self) -> &ContextCursor {
-        &self.ingest
-    }
-
-    pub fn und(&self) -> &UndCursor {
-        &self.und
-    }
-
-    pub fn gen_cursor(&self) -> &GenCursor {
-        &self.image_gen
-    }
-
-    pub fn resources(&self) -> &ResourceCursor {
-        &self.resources
-    }
-
-    pub fn replay(&self) -> &ReplayCursor {
-        &self.replay
-    }
-
     pub(crate) fn project<'a>(
         &self,
         applies: impl IntoIterator<Item = &'a SchedulerApply>,
@@ -755,12 +735,12 @@ fn find_product(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LifecycleCursor {
+pub(crate) struct LifecycleCursor {
     pub(crate) phase: GenerationPhase,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContextCursor {
+pub(crate) struct ContextCursor {
     pub(crate) prompt_cursor: u32,
     pub(crate) prompt_logprobs_processed: usize,
     pub(crate) prompt_logprobs_emitted: usize,
@@ -779,7 +759,7 @@ pub(crate) struct EncoderCachePin {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UndCursor {
+pub(crate) struct UndCursor {
     pub(crate) logical_pos: u32,
     pub(crate) physical_kv_len: u32,
     pub(crate) next_token: u32,
@@ -789,7 +769,7 @@ pub struct UndCursor {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GenCursor {
+pub(crate) struct GenCursor {
     pub(crate) image_id: u32,
     pub(crate) images_done: usize,
     pub(crate) branch_pending: bool,
@@ -804,7 +784,7 @@ pub struct GenCursor {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct FeedbackCursor {
+pub(crate) struct FeedbackCursor {
     pub(crate) image_b64: Option<String>,
     pub(crate) ingest_step: usize,
     pub(crate) source_product: Option<ProductRef>,
@@ -812,7 +792,7 @@ pub struct FeedbackCursor {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResourceCursor {
+pub(crate) struct ResourceCursor {
     pub(crate) worker_registered: bool,
     pub(crate) blocks_sent: usize,
     pub(crate) reserve_worstcase: bool,
@@ -820,7 +800,7 @@ pub struct ResourceCursor {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReplayCursor {
+pub(crate) struct ReplayCursor {
     pub(crate) block_hashes: Vec<Vec<u64>>,
     pub(crate) prefix_cached_blocks: usize,
     pub(crate) blocks_cached: bool,
@@ -2357,7 +2337,7 @@ pub(crate) struct TransitionResources {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Replayability {
+pub(crate) enum Replayability {
     Replayable,
     NotReplayable,
 }

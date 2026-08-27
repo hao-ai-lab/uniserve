@@ -20,18 +20,6 @@ use anyhow::Context as _;
 use uniserve_core::{GenerationRequest, GenerationRuntimeCapabilities, ModelDtype, RequestId};
 use uniserve_worker_ipc::{AttentionBackend, WorkerCapabilities};
 
-/// Which forward-only worker the engine drives.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EngineBackend {
-    /// GPU-free CPU simulation engine (`sim`): no Python, no GPU. Used for
-    /// fast, deterministic end-to-end tests of the full serving stack.
-    Sim,
-    /// The real GPU path: spawn the Python forward-only worker
-    /// (`python -m uniserve_worker.main`) and drive it over the shared-memory
-    /// descriptor ring.
-    Worker,
-}
-
 /// Place a staged pool on GPU `gpu`. A plain `cuda`/`gpu`
 /// device becomes `cuda:{gpu}` (distinct GPU per pool); an explicit device
 /// (`cuda:1`, `cpu`) is left as the operator set it.
@@ -49,8 +37,6 @@ pub struct EngineCoreConfig {
     pub model: String,
     /// Compute device for the worker (e.g. `cuda`, `cpu`).
     pub device: String,
-    /// Which forward-only worker to drive.
-    pub backend: EngineBackend,
     /// KV block size in tokens (the page size).
     pub block_size: u32,
     /// How many op-batches the scheduler keeps in flight against the worker.
@@ -104,7 +90,6 @@ impl EngineCoreConfig {
         Self {
             model: model.into(),
             device: "cpu".into(),
-            backend: EngineBackend::Sim,
             block_size: 64,
             pipeline_depth: 2,
             max_batch: DEFAULT_MAX_BATCH,
@@ -162,17 +147,7 @@ impl EngineCore {
     /// Blocks until the worker has loaded the model and answered the
     /// capability handshake — for the real worker this can take minutes.
     ///
-    /// Only [`EngineBackend::Worker`] is constructible here: the `Sim` backend
-    /// has no spawnable process, so a `Sim` config must instead supply its
-    /// `SimEngine` executor through [`EngineCore::with_executor`] (which is
-    /// backend-agnostic). Passing a `Sim` config to `new` is rejected rather
-    /// than silently producing a half-built engine.
     pub fn new(config: EngineCoreConfig) -> anyhow::Result<Self> {
-        if config.backend == EngineBackend::Sim {
-            anyhow::bail!(
-                "sim backend has no spawnable worker; construct it via EngineCore::with_executor"
-            );
-        }
         let executor: Box<dyn Executor> = if config.workers.is_single_full() {
             Self::spawn_full_pool(&config, config.workers.pools[0].tp)?
         } else {
@@ -271,14 +246,7 @@ impl EngineCore {
                     config.device.clone()
                 };
                 next_gpu += pool.tp.max(1);
-                let mut pool_worker_launch = config.worker_launch.clone();
-                if let Some(root) = &config.worker_launch.snapshot_dir {
-                    pool_worker_launch.snapshot_dir = Some(
-                        root.join("pools")
-                            .join(pool.kind.as_str())
-                            .join(instance.to_string()),
-                    );
-                }
+                let pool_worker_launch = config.worker_launch.clone();
                 let exec = MultiprocExecutor::spawn(WorkerSpawnSpec {
                     python: config.worker_python.clone(),
                     model: config.model.clone(),
@@ -309,10 +277,7 @@ impl EngineCore {
         Ok(Box::new(StagedExecutor::try_new(pools)?))
     }
 
-    /// Build the engine core from an executor supplied by a higher composition
-    /// layer. This is the backend-agnostic entry point and the only way to
-    /// construct an [`EngineBackend::Sim`] core (whose `SimEngine` executor is
-    /// caller-supplied rather than spawned).
+    /// Build the engine core from an executor supplied by a higher composition layer.
     pub fn with_executor(
         config: EngineCoreConfig,
         executor: Box<dyn Executor>,

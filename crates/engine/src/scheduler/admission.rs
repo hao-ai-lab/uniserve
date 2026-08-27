@@ -37,11 +37,6 @@ impl Scheduler {
         // in-flight request. Reject the new submit with a typed event.
         let waiting = self.pending_request_count() + self.completed_outputs.len();
         if waiting >= self.config.max_num_waiting {
-            self.record_decision(
-                req.request_id,
-                crate::scheduler::policy::PolicyReason::RejectedTooLarge,
-                0,
-            );
             self.trace_record(json!({
                 "event": "request_rejected",
                 "at_s": now(),
@@ -73,11 +68,6 @@ impl Scheduler {
         // Context-image requests prefill the text before each image position,
         // then encode the image into that marker gap.
         let phase0 = Phase::Prefill;
-        // A lifecycle trace keyed by the canonical request key.
-        let trace = crate::scheduler::trace::RequestTrace::new(
-            RequestKey::new(self.authority_id, req.request_id, self.next_epoch),
-            uniserve_core::TraceId(req.request_id.0),
-        );
         let st = ReqState {
             block_tables: (0..self.kv_state().block_pool.num_groups())
                 .map(|group| BlockTable::new(group, self.caps.block_size as usize))
@@ -107,10 +97,6 @@ impl Scheduler {
             event_tx,
             queued_at: now(),
             terminal_intent: super::TerminalIntent::None,
-            cpu_pending: None,
-            cpu_masks: None,
-            cpu_generation: 0,
-            trace,
             req,
         };
         self.next_epoch = self.next_epoch.saturating_add(1);
@@ -456,11 +442,6 @@ impl Scheduler {
                     <= self.enc_cache.budget();
                 if need > self.usable_kv_blocks() {
                     let st = self.pending.pop_request().unwrap();
-                    self.record_decision(
-                        st.req.request_id,
-                        crate::scheduler::policy::PolicyReason::RejectedTooLarge,
-                        need,
-                    );
                     self.trace_record(json!({
                         "event": "request_rejected",
                         "at_s": now(),
@@ -484,11 +465,6 @@ impl Scheduler {
                     // these blocks, so this request can never fail mid-flight.
                     self.ensure_request_capacity(id, need * bs);
                     self.reserved_blocks += need;
-                    self.record_decision(
-                        id,
-                        crate::scheduler::policy::PolicyReason::Admitted,
-                        need,
-                    );
                     continue;
                 }
             } else {
@@ -516,11 +492,6 @@ impl Scheduler {
                     .saturating_sub(cached_prefix_blocks);
                 if n > text_usable_blocks * bs {
                     let st = self.pending.pop_request().unwrap();
-                    self.record_decision(
-                        st.req.request_id,
-                        crate::scheduler::policy::PolicyReason::RejectedTooLarge,
-                        first_chunk_blocks,
-                    );
                     self.trace_record(json!({
                         "event": "request_rejected",
                         "at_s": now(),
@@ -549,13 +520,7 @@ impl Scheduler {
                     );
                 if capacity_available {
                     let st = self.pending.pop_request().unwrap();
-                    let id = st.req.request_id;
                     self.admit_running(st);
-                    self.record_decision(
-                        id,
-                        crate::scheduler::policy::PolicyReason::Admitted,
-                        first_chunk_blocks,
-                    );
                     continue;
                 }
             }
@@ -603,7 +568,6 @@ impl Scheduler {
                 scheduled_at,
             },
         );
-        st.trace.mark_admitted(uniserve_core::now_monotonic_us());
         self.running.insert(id, st);
         self.order.push(id);
         self.reserved_encoder_entries = self

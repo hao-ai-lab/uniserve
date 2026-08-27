@@ -765,7 +765,6 @@ fn commit_control_requires_a_fixed_selected_version() {
 #[test]
 fn capabilities_round_trip_with_the_canonical_layout() {
     let caps = WorkerCapabilities::default();
-    assert_eq!(caps.protocol_layout_digest, protocol_layout_digest());
     let response = WorkerResponse::capabilities(caps.clone());
     let decoded = decode_response(&encode_response(&response).unwrap()).unwrap();
     let WorkerResponse::Capabilities {
@@ -807,15 +806,6 @@ fn kv_free_capabilities_round_trip_without_kv_geometry() {
         panic!("decoded response must preserve its capabilities variant");
     };
     assert_eq!(decoded, caps);
-}
-
-#[test]
-fn capabilities_with_a_disagreeing_layout_digest_are_rejected() {
-    let caps = WorkerCapabilities {
-        protocol_layout_digest: digest_string(0x00),
-        ..Default::default()
-    };
-    assert!(caps.validate().is_err());
 }
 
 #[test]
@@ -1103,35 +1093,6 @@ fn comprehensive_batch() -> Batch {
         .with_input_products(input_products)
 }
 
-fn snapshot_fixture() -> SnapshotRef {
-    SnapshotRef {
-        version: VersionRef {
-            request_key: RequestKey::new(1, RequestId(9), 3),
-            producer_op_id: OpId(17),
-            point: Point::Fixed {
-                point_index: 17,
-                semantic_digest: digest_string(0xdc),
-            },
-        },
-        digest: digest_string(0xdd),
-        locator: digest_string(0xdd).to_string(),
-    }
-}
-
-fn recovery_placement_fixture() -> RecoveryPlacement {
-    RecoveryPlacement {
-        request_key: RequestKey::new(1, RequestId(9), 3),
-        request_pool_idx: 4,
-        block_tables: vec![BlockTable {
-            request_pool_idx: 4,
-            group_id: 0,
-            page_ids: vec![BlockId(5), BlockId(6)],
-            allocated_tokens: 17,
-        }],
-        latent_page_table: vec![7, 8],
-    }
-}
-
 /// One fixture per `RequestKind`, plus call-id coverage on the execute frame.
 fn request_fixtures() -> Vec<WorkerRequest> {
     let mut execute = WorkerRequest::execute(comprehensive_batch());
@@ -1142,22 +1103,8 @@ fn request_fixtures() -> Vec<WorkerRequest> {
         WorkerRequest::poll_completions(42),
         WorkerRequest::drop_session(RequestId(42)),
         WorkerRequest::shutdown(),
-        WorkerRequest::copy_kv(vec![
-            CacheCopy {
-                group_id: 0,
-                source_page: BlockId(1),
-                destination_page: BlockId(2),
-            },
-            CacheCopy {
-                group_id: 1,
-                source_page: BlockId(3),
-                destination_page: BlockId(4),
-            },
-        ]),
         WorkerRequest::release_products(vec![1, 2, 3]),
         WorkerRequest::get_pressure(),
-        WorkerRequest::snapshot_session(recovery_placement_fixture()),
-        WorkerRequest::restore_session(snapshot_fixture(), recovery_placement_fixture()),
     ]
 }
 
@@ -1207,28 +1154,6 @@ fn full_caps() -> WorkerCapabilities {
         latent_dtype: Some(ModelDtype::BFloat16),
         model_identity: Some(digest_string(0x21)),
         weight_digest: Some(digest_string(0x22)),
-        lanes: vec![LaneCapabilities {
-            lane_id: "decode".into(),
-            domains: vec![Domain::Decode],
-            resolved_sm_count: 64,
-            kv_capacity_tokens: Some(65_536),
-            latent_capacity_units: None,
-            max_batch_operations: 128,
-            max_batch_tokens: 16_384,
-            max_inflight: 2,
-            graph_buckets: vec![GraphBucketCapability {
-                phase: "text_decode".into(),
-                batch_size: 32,
-                token_bucket: 32,
-                attention_form: "paged_decode".into(),
-                height: 0,
-                width: 0,
-                cfg_branches: 1,
-                layout: String::new(),
-            }],
-            eager_max_batch_operations: 128,
-            eager_max_batch_tokens: 16_384,
-        }],
         ..WorkerCapabilities::default()
     }
 }
@@ -1405,10 +1330,6 @@ fn response_fixtures() -> Vec<WorkerResponse> {
                 },
             ],
         },
-        WorkerResponse::Snapshot {
-            call_id: Some(17),
-            snapshot: snapshot_fixture(),
-        },
     ]
 }
 
@@ -1441,7 +1362,6 @@ fn every_response_kind_round_trips_through_the_wire() {
         ResponseKind::Ok,
         ResponseKind::Error,
         ResponseKind::Pressure,
-        ResponseKind::Snapshot,
     ] {
         assert!(
             fixtures.iter().any(|response| response.kind() == kind),

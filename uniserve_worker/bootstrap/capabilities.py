@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from ..batch import Domain, ForwardMode, SamplingOwnership
+from ..batch import ForwardMode, SamplingOwnership
 from ..capabilities import (
     KvGroupKind,
     KvGroupSpec,
-    LaneCapabilities,
     RankInfo,
     RequestKind,
     ResourceClass,
@@ -131,8 +130,6 @@ def resolve_capabilities(
         RequestKind.DROP_SESSION,
         RequestKind.RELEASE_PRODUCTS,
     ]
-    if owns_kv:
-        controls.insert(1, RequestKind.COPY_KV)
     supported_work = tuple(variant for variant in ForwardMode if variant in model.supported_work)
     sampling_ownership = SamplingOwnership.DESIGNATED_RANK
     return WorkerCapabilities(
@@ -157,7 +154,6 @@ def resolve_capabilities(
         mixed_buckets=(),
         sampling_ownership=sampling_ownership,
         resource_classes=tuple(ResourceClass(value) for value in resources.classes()),
-        attention_backend=(deployment.attention_backend or "auto") if owns_kv else "",
         kv_dtype=_kv_dtype(model, deployment) if owns_kv else "",
         model_dtype=deployment.model_dtype,
         encoder_cache_budget=int(resources.encoder_cache_entries),
@@ -213,19 +209,6 @@ def _h3_capabilities(
         )
     max_operations = min(slots, int(deployment.max_batch_operations))
     layout = model.layout
-    lane = LaneCapabilities(
-        lane_id="h3",
-        domains=(Domain.FLOW,),
-        resolved_sm_count=1,
-        kv_capacity_tokens=None,
-        latent_capacity_units=int(layout.persistent_units) * slots,
-        max_batch_operations=max_operations,
-        max_batch_tokens=max_operations,
-        max_inflight=depth,
-        graph_buckets=(),
-        eager_max_batch_operations=max_operations,
-        eager_max_batch_tokens=max_operations,
-    )
     return WorkerCapabilities(
         block_size=0,
         num_blocks=0,
@@ -251,7 +234,6 @@ def _h3_capabilities(
         groups=(),
         kv_dtype="",
         model_dtype="bfloat16",
-        attention_backend="h3_vsa_sm100",
         rank=RankInfo(tp_rank=model.mesh.coord("sp"), tp_size=model.mesh.size("sp")),
         pipeline_depth=depth,
         encoder_cache_budget=0,
@@ -266,7 +248,6 @@ def _h3_capabilities(
         resource_classes=(ResourceClass.IMAGE_LATENT,),
         model_identity=architecture_digest or "",
         weight_digest=weight_digest or "",
-        lanes=(lane,),
     )
 
 

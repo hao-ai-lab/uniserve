@@ -44,7 +44,6 @@ from uniserve_worker.batch import (
     ProductKind,
     ProductPayload,
     ProductRef,
-    RecoveryPlacement,
     RequestKey,
     Rng,
     RowGeometry,
@@ -65,7 +64,6 @@ from uniserve_worker.batch import (
     encode_token_product_bytes,
     execution_domain,
     mark_typed_wire,
-    protocol_layout_digest,
 )
 from uniserve_worker.foundation.errors import WorkerError
 
@@ -336,11 +334,6 @@ def test_identity_is_invariant_to_batch_allocation_topology_and_completion_order
         assert observed == expected
 
 
-def test_protocol_layout_digest_matches_rust() -> None:
-    fixture = _fixture()
-    assert protocol_layout_digest() == fixture["protocol_layout_digest"]
-
-
 # --- Validation ------------------------------------------------------------
 
 
@@ -422,17 +415,6 @@ def test_submission_group_has_one_fixed_latent_staging_partition() -> None:
     )
     with pytest.raises(WorkerError, match="multiple latent staging partitions"):
         Batch(step_id=1, partitions=partitions)
-
-
-def test_recovery_placement_rejects_duplicate_latent_pages() -> None:
-    placement = RecoveryPlacement(
-        request_key=_request_key(),
-        request_pool_idx=8,
-        block_tables=(BlockTable(8, 0, (1, 2), 17),),
-        latent_page_table=(7, 8),
-    )
-    with pytest.raises(WorkerError, match="identity"):
-        replace(placement, latent_page_table=(7, 7))
 
 
 def test_operation_rejects_a_work_domain_mismatch() -> None:

@@ -14,7 +14,7 @@ use uniserve_worker_ipc::{
     Bounds, DType, DimBound, Domain, DrawLayout, FinishFlags, ForwardMode, LogicalLengths,
     ModelOutput, OpId, OpStatus, Operation, OperationSpec, Point, PointRange, ProductKind,
     ProductRef, RequestKey, Rng, RouteId, ShapeBound, StorageClass, TimingCounters, TokenSpan,
-    VersionRef, protocol_layout_digest,
+    VersionRef,
 };
 
 fn digest_string(seed: u8) -> Digest {
@@ -202,15 +202,12 @@ fn emit_digest_parity_fixture() {
         .validate()
         .expect("canonical completion is valid");
 
-    let layout_digest = protocol_layout_digest();
-
     let fixture = serde_json::json!({
         "parent_semantic_digest": parent_semantic_digest,
         "operation": operation,
         "completion": completion,
         "plan_digest": plan_digest,
         "semantic_digest": semantic_digest,
-        "protocol_layout_digest": layout_digest,
     });
 
     let path = fixture_path();

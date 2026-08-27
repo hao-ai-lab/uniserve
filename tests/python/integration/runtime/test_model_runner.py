@@ -47,7 +47,6 @@ from uniserve_worker.batch import (
     ProductKind,
     ProductPayload,
     ProductRef,
-    RecoveryPlacement,
     Release,
     SamplingState,
     ShapeBound,
@@ -1136,108 +1135,6 @@ def test_trajectory_advances_across_many_generations_and_rejects_a_stale_referen
     )
     stale_report = worker.execute(execution_batch(step_id=54, operations=(stale_operation,)))
     assert stale_report.completions[0].status is OpStatus.ERROR
-
-
-def test_snapshot_restore_preserves_an_active_trajectory_and_final_artifact(tmp_path) -> None:
-    snapshot_dir = str(tmp_path / "worker-state")
-    worker = execution_worker(snapshot_dir=snapshot_dir)
-    admission = gen_admission(72, ImageParams(steps=2, height=16, width=16, seed=29))
-    conditioning = _publish_conditioning(worker, admission, op_id=1, step_id=1)
-    latent, transition_commit = _transition_generation(
-        worker,
-        admission,
-        conditioning,
-        op_id=2,
-        parent=root_parent(admission),
-        step_id=2,
-    )
-    first_flow, partial_latent = flow_operation(
-        admission.request_key,
-        op_id=3,
-        parent=transition_commit.selected,
-        conditioning=conditioning,
-        latent=latent,
-        steps=1,
-        control_seq=transition_commit.control_seq,
-    )
-    first = worker.execute(
-        execution_batch(
-            step_id=3,
-            operations=(first_flow,),
-            controls=(transition_commit,),
-        )
-    )
-    assert first.completions[0].status is OpStatus.OK
-    assert first.completions[0].logical_lengths.latent_len == 1
-    partial_commit = commit_for_completion(first_flow, first)
-    worker.execute(execution_batch(step_id=4, controls=(partial_commit,)))
-    placement = RecoveryPlacement(
-        request_key=admission.request_key,
-        request_pool_idx=admission.request_pool_idx,
-        block_tables=(
-            BlockTable(
-                request_pool_idx=admission.request_pool_idx,
-                group_id=0,
-                page_ids=(),
-                allocated_tokens=0,
-            ),
-        ),
-        latent_page_table=(1,),
-    )
-    reference = worker.snapshot_session(placement)
-
-    source_continuation, source_final_latent = flow_operation(
-        admission.request_key,
-        op_id=4,
-        parent=reference.version,
-        conditioning=conditioning,
-        latent=partial_latent,
-        steps=1,
-        control_seq=partial_commit.control_seq,
-    )
-    source_report = worker.execute(execution_batch(step_id=5, operations=(source_continuation,)))
-    assert source_report.completions[0].status is OpStatus.OK
-    assert source_report.completions[0].logical_lengths.latent_len == 2
-    source_commit = commit_for_completion(source_continuation, source_report)
-    source_artifact = _materialized_artifact(
-        worker,
-        admission,
-        source_final_latent,
-        source_commit,
-        op_id=5,
-        step_id=6,
-    )
-
-    restored = execution_worker(
-        snapshot_dir=snapshot_dir,
-    )
-    restored.restore_session(reference, placement)
-    continuation, successor = flow_operation(
-        admission.request_key,
-        op_id=4,
-        parent=reference.version,
-        conditioning=conditioning,
-        latent=partial_latent,
-        steps=1,
-        control_seq=partial_commit.control_seq,
-    )
-
-    report = restored.execute(execution_batch(step_id=5, operations=(continuation,)))
-
-    assert report.completions[0].status is OpStatus.OK
-    assert report.completions[0].logical_lengths.latent_len == 2
-    restored_commit = commit_for_completion(continuation, report)
-    restored_artifact = _materialized_artifact(
-        restored,
-        admission,
-        successor,
-        restored_commit,
-        op_id=5,
-        step_id=6,
-    )
-    assert restored_artifact == source_artifact
-    worker.close()
-    restored.close()
 
 
 def test_cross_stage_feature_transfer_rebinds_exact_product_without_request_thread_wait() -> None:

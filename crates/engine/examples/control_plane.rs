@@ -11,14 +11,11 @@ use uniserve_core::{
     GenerationRequest, GenerationResourceBounds, GenerationRuntimeCapabilities, ImageIngestRecipe,
     ImageKvEffect, ImageParams, RequestId, SamplingParams, TriggerPolicyDescriptor, UndVisibility,
 };
-use uniserve_engine::EngineHandle;
-use uniserve_engine::scheduler::{ControlTokens, Scheduler};
-use uniserve_engine::sim::SimEngine;
-use uniserve_engine::sim::SimExecutor;
+use uniserve_engine::{ControlTokens, EngineHandle, Scheduler, SimEngine, SimExecutor};
 
 fn main() {
     let ctrl = ControlTokens::default();
-    let executor = Box::new(SimExecutor::new(Box::new(SimEngine::new())));
+    let executor = Box::new(SimExecutor::new(SimEngine::new()));
     let sched = Scheduler::new(executor, ctrl, 32);
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(cmd_tx);

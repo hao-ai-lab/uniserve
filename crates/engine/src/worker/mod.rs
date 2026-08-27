@@ -8,7 +8,9 @@ mod uniproc;
 
 pub use multiproc::MultiprocExecutor;
 pub use staged_executor::StagedExecutor;
-pub use uniproc::{FlashInferBackend, LaneConfig, UniprocExecutor, WorkerLaunchConfig};
+pub use uniproc::{
+    FlashInferBackend, FlashInferBackendParseError, LaneConfig, UniprocExecutor, WorkerLaunchConfig,
+};
 
 /// Complete context required to spawn one worker pool.
 #[derive(Debug, Clone, PartialEq)]

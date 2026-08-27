@@ -1170,61 +1170,6 @@ impl RowGeometry {
     }
 }
 
-/// Scheduler-assigned request slot and physical pages for administrative recovery.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RecoveryPlacement {
-    pub request_key: RequestKey,
-    pub request_pool_idx: u32,
-    pub block_tables: Vec<BlockTable>,
-    pub latent_page_table: Vec<u32>,
-}
-
-/// One exact in-pool cache page copy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CacheCopy {
-    pub group_id: u32,
-    pub source_page: BlockId,
-    pub destination_page: BlockId,
-}
-
-impl CacheCopy {
-    pub fn validate(self) -> ProtocolResult<()> {
-        protocol_ensure!(
-            self.source_page.0 > 0 && self.destination_page.0 > 0,
-            "cache copy carries page zero"
-        );
-        Ok(())
-    }
-}
-
-impl RecoveryPlacement {
-    pub fn validate(&self) -> ProtocolResult<()> {
-        protocol_ensure!(
-            self.request_pool_idx > 0,
-            "recovery placement request slot must be positive"
-        );
-        let mut groups = HashSet::with_capacity(self.block_tables.len());
-        for table in &self.block_tables {
-            protocol_ensure!(
-                table.request_pool_idx == self.request_pool_idx,
-                "recovery block table disagrees with its request slot"
-            );
-            protocol_ensure!(
-                groups.insert(table.group_id),
-                "recovery placement repeats a cache group"
-            );
-            table.validate()?;
-        }
-        protocol_ensure!(
-            self.latent_page_table.iter().all(|page| *page > 0)
-                && self.latent_page_table.iter().collect::<HashSet<_>>().len()
-                    == self.latent_page_table.len(),
-            "recovery latent page table repeats a page or carries page zero"
-        );
-        Ok(())
-    }
-}
-
 /// One operation's complete scheduler-owned latent trajectory placement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LatentPlacement {

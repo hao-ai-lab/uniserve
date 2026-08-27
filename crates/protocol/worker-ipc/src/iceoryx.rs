@@ -89,7 +89,7 @@ macro_rules! ipc_error {
 }
 
 /// Wire protocol version this build emits on every [`Header`].
-pub const WIRE_VERSION: u16 = 7;
+pub const WIRE_VERSION: u16 = 8;
 
 /// Whether a peer-advertised wire `version` is one this build can decode.
 pub fn is_supported_wire_version(version: u16) -> bool {
@@ -530,11 +530,8 @@ fn request_kind_code(kind: RequestKind) -> u8 {
         RequestKind::PollCompletions => 3,
         RequestKind::DropSession => 4,
         RequestKind::Shutdown => 5,
-        RequestKind::CopyKv => 6,
         RequestKind::ReleaseProducts => 7,
         RequestKind::GetPressure => 8,
-        RequestKind::SnapshotSession => 9,
-        RequestKind::RestoreSession => 10,
     }
 }
 
@@ -545,7 +542,6 @@ fn response_kind_code(kind: ResponseKind) -> u8 {
         ResponseKind::Ok => 3,
         ResponseKind::Error => 4,
         ResponseKind::Pressure => 5,
-        ResponseKind::Snapshot => 6,
     }
 }
 

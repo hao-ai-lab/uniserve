@@ -12,11 +12,10 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use thiserror_ext::AsReport as _;
 use uniserve_core::{KvCacheDtype, ModelDtype};
-use uniserve_engine::worker::{LaneConfig, WorkerLaunchConfig};
 use uniserve_engine::{
     AttentionBackend, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
     DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS,
-    FlashInferBackend, TransferSpec, WorkersSpec,
+    FlashInferBackend, LaneConfig, TransferSpec, WorkerLaunchConfig, WorkersSpec,
 };
 use uniserve_server::{
     ChatTemplateContentFormatOption, Config, EngineBackendKind, EngineSettings, HttpListenerMode,
@@ -380,8 +379,6 @@ pub(crate) struct WorkerLaunchArgs {
     pub flashinfer_disable_split_kv: bool,
     #[arg(long, action = ArgAction::Set, default_value_t = true, hide = true)]
     pub flashinfer_fast_decode_plan: bool,
-    #[arg(long, hide = true)]
-    pub snapshot_dir: Option<std::path::PathBuf>,
 }
 
 impl WorkerLaunchArgs {
@@ -412,7 +409,6 @@ impl WorkerLaunchArgs {
             flashinfer_prefill_split_tile_size: self.flashinfer_prefill_split_tile_size,
             flashinfer_disable_split_kv: self.flashinfer_disable_split_kv,
             flashinfer_fast_decode_plan: self.flashinfer_fast_decode_plan,
-            snapshot_dir: self.snapshot_dir.clone(),
             media_spool: None,
         }
     }

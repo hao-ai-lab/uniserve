@@ -25,33 +25,24 @@ mod admission;
 mod batching;
 pub(crate) mod bench_trace;
 mod control;
-pub(crate) mod cpu_continuation;
 mod execution;
-pub mod generation;
+pub(crate) mod generation;
 pub(crate) mod image_artifact;
-pub mod logits;
-pub mod policy;
+mod logits;
 pub(crate) mod prefix_cache;
 mod publication;
-pub mod queue;
+pub(crate) mod queue;
 mod runtime;
 mod stats;
-pub mod stats_report;
-pub mod trace;
+pub(crate) mod stats_report;
 
-pub use crate::executor::{ControlAck, ControlOp, Executor};
-pub use logits::{
-    BuiltinLogitsProcessor, DEFAULT_PIPELINE, LogitsProcessor, MaskContribution, ProcCtx,
-    ProcessorDeclaration,
-};
-pub use policy::{DecisionLog, LatencyHistory, PolicyDecision, PolicyReason, PolicySnapshot};
-pub use queue::{FcfsRequestQueue, PriorityRequestQueue, RequestQueue};
+pub(crate) use crate::executor::{ControlOp, Executor};
+pub(crate) use queue::{FcfsRequestQueue, PriorityRequestQueue, RequestQueue};
 pub use stats::{
     DomainStats, EncoderStats, ExecutionDomainStats, GeneralStats, KvCacheStats, PrefixStats,
     SchedStats, TimingStats, WorkerStats,
 };
 pub use stats_report::SchedStatsReporter;
-pub use trace::{LifecyclePhase, OperationKey, OperationLifecycle, RequestTrace};
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
@@ -60,7 +51,6 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::scheduler::cpu_continuation::{CpuContinuationPool, CpuMasks, CpuTask, CpuTaskKey};
 use crate::scheduler::generation::{
     CursorApplyError, CursorProjection, EncoderCachePin, GenerationCursor,
     GenerationPhase as Phase, GenerationPlanner, PlannedTransition, SchedulerApply,
@@ -77,12 +67,12 @@ pub const DEFAULT_LONG_PREFILL_THRESHOLD: usize = DEFAULT_MAX_NUM_BATCHED_TOKENS
 /// `enable_mixed_chunk` default: its reference serving configuration keeps
 /// prefill and decode in separate batches.
 pub const DEFAULT_MIXED_PREFILL_TOKENS: usize = 0;
-pub const DEFAULT_DENOISE_STEP_BURST: u16 = 1;
+pub(crate) const DEFAULT_DENOISE_STEP_BURST: u16 = 1;
 /// Default admission backpressure bound: maximum waiting requests buffered
 /// before new submits are rejected at enqueue.
-pub const DEFAULT_MAX_NUM_WAITING: usize = 4096;
-pub const MAX_NUM_WAITING: usize = 65_536;
-pub const MAX_NUM_SEQS: usize = 65_536;
+pub(crate) const DEFAULT_MAX_NUM_WAITING: usize = 4096;
+pub(crate) const MAX_NUM_WAITING: usize = 65_536;
+pub(crate) const MAX_NUM_SEQS: usize = 65_536;
 const MAX_INFLIGHT_TRANSFERS: usize = 256;
 
 use crate::handle::{
@@ -320,7 +310,7 @@ impl Default for SchedulerConfig {
     }
 }
 
-pub struct ReqState {
+pub(crate) struct ReqState {
     pub req: GenerationRequest,
     /// The cached sequence mappings. Each table owns its physical page
     /// references and therefore has exactly the request's lifetime.
@@ -372,12 +362,6 @@ pub struct ReqState {
     pub(crate) cursor: GenerationCursor,
     pub queued_at: f64,
     pub(crate) terminal_intent: TerminalIntent,
-    /// At most one CPU continuation may run for this lineage.
-    pub(crate) cpu_pending: Option<CpuTaskKey>,
-    pub(crate) cpu_masks: Option<CpuMasks>,
-    pub(crate) cpu_generation: u64,
-    /// This request's lifecycle trace.
-    pub(crate) trace: crate::scheduler::trace::RequestTrace,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -774,8 +758,7 @@ pub struct Scheduler {
     ctrl: ControlTokens,
     config: SchedulerConfig,
     /// Pluggable host-side logits-processor pipeline.
-    logits_pipeline: Vec<crate::scheduler::logits::PipelineProcessor>,
-    custom_logits_processors: usize,
+    logits_pipeline: Vec<crate::scheduler::logits::BuiltinLogitsProcessor>,
     /// Encoder-output cache (hashed, LRU, budgeted).
     enc_cache: EncoderCacheManager,
     /// Encoder-cache entries reserved by admitted image requests.
@@ -796,11 +779,6 @@ pub struct Scheduler {
     retiring_media: HashMap<RequestId, RetiringMedia>,
     prefer_media: bool,
     pending: Box<dyn RequestQueue>,
-    cpu_continuations: CpuContinuationPool,
-    cpu_task_timeout: Duration,
-    /// Request-local continuation deadlines, bounded by the CPU task pool. This
-    /// keeps the scheduler hot path independent of the number of active requests.
-    cpu_deadlines: HashMap<CpuTaskKey, Instant>,
     reserved_blocks: usize,
     transfer_capacity: usize,
     inflight_transfers: usize,
@@ -826,9 +804,6 @@ pub struct Scheduler {
     /// Engine-fatal latch: set when the executor/worker dies;
     /// the control loop exits and the host converts this into engine-dead.
     fatal: bool,
-    /// Explainable policy decisions and per-op latency history.
-    decisions: crate::scheduler::policy::DecisionLog,
-    latency: crate::scheduler::policy::LatencyHistory,
     planner: GenerationPlanner,
     /// Submit timestamp per in-flight batch (for batch round-trip traces).
     batch_started: HashMap<u64, Instant>,
@@ -844,81 +819,15 @@ pub struct Scheduler {
     control_batches: HashMap<u64, Vec<Control>>,
     /// The scheduler-authority identity stamped into every request key.
     authority_id: u64,
-    /// Monotonic op ids and archived lifecycle traces.
+    /// Monotonic operation and request epochs.
     next_op_id: u64,
     next_completion_seq: u64,
     next_product_generation: u64,
     next_collective_seq: u64,
     next_epoch: u64,
-    completed_traces: VecDeque<crate::scheduler::trace::RequestTrace>,
     trace_sink: Option<crate::scheduler::bench_trace::SchedulerTraceSink>,
     pub peak_ops_in_batch: usize,
     pub stats: Arc<SchedStats>,
-}
-
-/// A self-describing health snapshot.
-#[derive(Debug, Clone)]
-pub struct HealthSnapshot {
-    pub running: usize,
-    pub pending: usize,
-    pub in_flight: usize,
-    pub free_blocks: usize,
-    pub total_blocks: usize,
-    pub reserved_blocks: usize,
-    pub completed_traces: usize,
-    pub last_worker_exec_us: u64,
-    pub queue_wait_count: u64,
-    pub queue_wait_us_total: u64,
-    pub queue_wait_us_max: u64,
-    pub fatal: bool,
-    pub supported_work: Vec<ForwardMode>,
-    pub op_latency_us: Vec<(String, u64)>,
-}
-
-/// Aggregate delay across one lifecycle phase span over completed operations.
-#[derive(Debug, Clone)]
-pub struct PhaseSpanDelay {
-    pub from: crate::scheduler::trace::LifecyclePhase,
-    pub to: crate::scheduler::trace::LifecyclePhase,
-    pub count: u64,
-    pub sum_us: u64,
-    pub max_us: u64,
-}
-
-/// Cumulative operation-window and lifecycle accounting for one domain.
-#[derive(Debug, Clone)]
-pub struct DomainWindowMetrics {
-    pub domain: uniserve_worker_ipc::Domain,
-    pub active_credits: usize,
-    pub peak_credits: usize,
-    pub launched_operations: u64,
-    pub completed_operations: u64,
-    pub predicated_operations: u64,
-    pub error_operations: u64,
-    pub backpressure_events: u64,
-    pub reclaimed_credits: u64,
-    pub completed_partitions: u64,
-    pub semantic_commits: u64,
-    pub public_commits: u64,
-    pub co_resident_partitions: u64,
-    pub queue_us: u64,
-    pub launch_us: u64,
-    pub device_us: u64,
-    pub completion_us: u64,
-    pub semantic_commit_us: u64,
-    pub public_commit_us: u64,
-    pub co_resident_us: u64,
-}
-
-/// The bounded operation-window and lifecycle observability surface.
-#[derive(Debug, Clone)]
-pub struct ResourceWindowMetrics {
-    pub max_operations: usize,
-    pub active_operations: usize,
-    pub max_unresolved_window: u32,
-    pub peak_ops_in_batch: usize,
-    pub phase_delays: Vec<PhaseSpanDelay>,
-    pub domains: Vec<DomainWindowMetrics>,
 }
 
 fn now() -> f64 {
@@ -1141,35 +1050,6 @@ fn execution_capability_str(execution: ExecutionCapability) -> &'static str {
     match execution {
         ExecutionCapability::DomainHomogeneous => "domain_homogeneous",
         ExecutionCapability::TensorizedMixed => "tensorized_mixed",
-    }
-}
-
-fn domain_window_metrics(
-    domains: &ExecutionDomainStats,
-    domain: uniserve_worker_ipc::Domain,
-) -> DomainWindowMetrics {
-    let stats = domains.get(domain);
-    DomainWindowMetrics {
-        domain,
-        active_credits: stats.active_credits.load(Ordering::Relaxed),
-        peak_credits: stats.peak_credits.load(Ordering::Relaxed),
-        launched_operations: stats.launched_operations.load(Ordering::Relaxed),
-        completed_operations: stats.completed_operations.load(Ordering::Relaxed),
-        predicated_operations: stats.predicated_operations.load(Ordering::Relaxed),
-        error_operations: stats.error_operations.load(Ordering::Relaxed),
-        backpressure_events: stats.backpressure_events.load(Ordering::Relaxed),
-        reclaimed_credits: stats.reclaimed_credits.load(Ordering::Relaxed),
-        completed_partitions: stats.completed_partitions.load(Ordering::Relaxed),
-        semantic_commits: stats.semantic_commits.load(Ordering::Relaxed),
-        public_commits: stats.public_commits.load(Ordering::Relaxed),
-        co_resident_partitions: stats.co_resident_partitions.load(Ordering::Relaxed),
-        queue_us: stats.queue_us.load(Ordering::Relaxed),
-        launch_us: stats.launch_us.load(Ordering::Relaxed),
-        device_us: stats.device_us.load(Ordering::Relaxed),
-        completion_us: stats.completion_us.load(Ordering::Relaxed),
-        semantic_commit_us: stats.semantic_commit_us.load(Ordering::Relaxed),
-        public_commit_us: stats.public_commit_us.load(Ordering::Relaxed),
-        co_resident_us: stats.co_resident_us.load(Ordering::Relaxed),
     }
 }
 

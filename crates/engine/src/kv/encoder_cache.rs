@@ -14,19 +14,19 @@ struct Entry {
 }
 
 #[derive(Default, Debug, Clone, Copy)]
-pub struct EncoderCacheStats {
-    pub queries: u64,
-    pub hits: u64,
-    pub evictions: u64,
+pub(crate) struct EncoderCacheStats {
+    pub(crate) queries: u64,
+    pub(crate) hits: u64,
+    pub(crate) evictions: u64,
     /// inserts that landed while at budget with *every* entry pinned, so
     /// no victim could be evicted and the live set grew past `budget`. This is
     /// bounded by the count of concurrently-pinned entries (itself bounded by
     /// the scheduler's multimodal admission), but a nonzero value means the
     /// encoder budget is under-provisioned for the admitted concurrency.
-    pub over_budget_inserts: u64,
+    pub(crate) over_budget_inserts: u64,
 }
 
-pub struct EncoderCacheManager {
+pub(crate) struct EncoderCacheManager {
     budget: usize,                // max cached entries
     entries: HashMap<u64, Entry>, // content hash -> entry
     // Reset removes entries from lookup immediately, but a worker-side tensor
@@ -41,11 +41,11 @@ pub struct EncoderCacheManager {
     // `next_tick`), so each entry occupies at most one key here.
     evictable: BTreeMap<u64, u64>, // lru tick -> content hash
     tick: u64,
-    pub stats: EncoderCacheStats,
+    pub(crate) stats: EncoderCacheStats,
 }
 
 impl EncoderCacheManager {
-    pub fn new(budget: usize) -> Self {
+    pub(crate) fn new(budget: usize) -> Self {
         Self {
             budget,
             entries: HashMap::new(),
@@ -56,18 +56,18 @@ impl EncoderCacheManager {
         }
     }
 
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.entries.len() + self.retired.values().map(Vec::len).sum::<usize>()
     }
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty() && self.retired.is_empty()
     }
-    pub fn budget(&self) -> usize {
+    pub(crate) fn budget(&self) -> usize {
         self.budget
     }
 
     /// Inspect a resident output without changing LRU order or cache metrics.
-    pub fn peek_product(&self, hash: u64) -> Option<ProductRef> {
+    pub(crate) fn peek_product(&self, hash: u64) -> Option<ProductRef> {
         self.entries.get(&hash).map(|entry| entry.product.clone())
     }
 
@@ -77,7 +77,7 @@ impl EncoderCacheManager {
     }
 
     /// Look up the exact product and measured KV effect needed to skip encode.
-    pub fn lookup_product(&mut self, hash: u64) -> Option<ProductRef> {
+    pub(crate) fn lookup_product(&mut self, hash: u64) -> Option<ProductRef> {
         self.stats.queries += 1;
         let tick = self.next_tick();
         if let Some(e) = self.entries.get_mut(&hash) {
@@ -98,7 +98,7 @@ impl EncoderCacheManager {
 
     /// Whether there's room (under budget, counting only unreferenced evictables)
     /// to insert another entry without exceeding the budget by referenced ones.
-    pub fn can_insert(&self) -> bool {
+    pub(crate) fn can_insert(&self) -> bool {
         // room exists if under budget, or some entry is unreferenced (evictable).
         self.len() < self.budget || !self.evictable.is_empty()
     }
@@ -115,7 +115,7 @@ impl EncoderCacheManager {
     /// `max_num_seqs` requests) and is counted in `stats.over_budget_inserts` so
     /// the over-subscription is observable rather than silent. The hard cap is
     /// enforced upstream via [`can_insert`](Self::can_insert) at admission.
-    pub fn insert(&mut self, hash: u64, product: ProductRef) -> Option<ProductRef> {
+    pub(crate) fn insert(&mut self, hash: u64, product: ProductRef) -> Option<ProductRef> {
         if self.entries.contains_key(&hash) {
             let tick = self.next_tick();
             if let Some(existing) = self.entries.get_mut(&hash) {
@@ -180,7 +180,7 @@ impl EncoderCacheManager {
     }
 
     /// Reference a cached entry (pins it against eviction while a request uses it).
-    pub fn acquire(&mut self, hash: u64) -> Option<ProductRef> {
+    pub(crate) fn acquire(&mut self, hash: u64) -> Option<ProductRef> {
         let tick = self.next_tick();
         let e = self.entries.get_mut(&hash)?;
         let old_lru = e.lru;
@@ -196,7 +196,7 @@ impl EncoderCacheManager {
 
     /// Release a reference. Active entries become evictable at zero references;
     /// retired entries are removed and return their worker handle for reclaim.
-    pub fn release(&mut self, hash: u64, product: &ProductRef) -> Option<ProductRef> {
+    pub(crate) fn release(&mut self, hash: u64, product: &ProductRef) -> Option<ProductRef> {
         if let Some(e) = self.entries.get_mut(&hash)
             && &e.product == product
             && e.ref_cnt > 0

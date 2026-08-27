@@ -237,7 +237,7 @@ impl Scheduler {
             "event": "request_queued",
             "at_s": st.queued_at,
             "request_id": st.req.request_id.0,
-            "trace_id": st.trace.trace_id.0,
+            "trace_id": st.req.request_id.0,
             "queue": queue,
             "generation": behavior_str(&st.req),
             "initial_phase": phase_str(st.cursor.lifecycle.phase),

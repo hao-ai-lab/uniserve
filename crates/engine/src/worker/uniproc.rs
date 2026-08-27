@@ -150,7 +150,6 @@ pub struct WorkerLaunchConfig {
     pub flashinfer_prefill_split_tile_size: Option<u32>,
     pub flashinfer_disable_split_kv: bool,
     pub flashinfer_fast_decode_plan: bool,
-    pub snapshot_dir: Option<PathBuf>,
     pub media_spool: Option<PathBuf>,
 }
 
@@ -182,7 +181,6 @@ impl Default for WorkerLaunchConfig {
             flashinfer_prefill_split_tile_size: None,
             flashinfer_disable_split_kv: false,
             flashinfer_fast_decode_plan: true,
-            snapshot_dir: None,
             media_spool: None,
         }
     }
@@ -260,9 +258,6 @@ impl WorkerLaunchConfig {
         }
         if !self.flashinfer_fast_decode_plan {
             cmd.arg("--no-flashinfer-fast-decode-plan");
-        }
-        if let Some(value) = &self.snapshot_dir {
-            cmd.arg("--snapshot-dir").arg(value);
         }
         if let Some(value) = &self.media_spool {
             cmd.arg("--media-spool").arg(value);
@@ -571,13 +566,8 @@ impl UniprocExecutor {
             } => self.route_batch(step_id, remaining_partitions, wr),
             OutstandingKind::Control => {
                 let result = match wr {
-                    WorkerResponse::Ok { .. } => Ok(None),
-                    WorkerResponse::Snapshot { snapshot, .. } => Ok(Some(snapshot)),
-                    WorkerResponse::Error { error, .. } => {
-                        Err(crate::executor::ControlError::Worker {
-                            message: error.message,
-                        })
-                    }
+                    WorkerResponse::Ok { .. } => Ok(()),
+                    WorkerResponse::Error { error, .. } => Err(error.message),
                     other => bail!("unexpected control response kind: {:?}", other.kind()),
                 };
                 if let Err(error) = &result {
@@ -842,7 +832,6 @@ impl Executor for UniprocExecutor {
     /// `0` is returned for empty copy or product-release controls that are never sent.
     fn control(&mut self, op: ControlOp) -> anyhow::Result<u64> {
         match &op {
-            ControlOp::CopyKv(copies) if copies.is_empty() => return Ok(0),
             ControlOp::ReleaseProducts(handles) if handles.is_empty() => return Ok(0),
             _ => {}
         }

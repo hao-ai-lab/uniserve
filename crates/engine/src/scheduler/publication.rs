@@ -92,7 +92,6 @@ impl Scheduler {
                 st.cursor.lifecycle.phase = Phase::DecodeUnd;
                 st.cursor.und.round_tokens.push(tok);
             }
-            self.invalidate_cpu_masks(id);
             if can_open_gen_branch
                 && images_done < max_images
                 && self
@@ -218,7 +217,6 @@ impl Scheduler {
                             st.cursor.lifecycle.phase = Phase::DecodeUnd;
                             st.cursor.und.round_tokens.push(tok);
                         }
-                        self.invalidate_cpu_masks(id);
                         if can_open_gen_branch
                             && images_done < max_images
                             && self
@@ -327,7 +325,6 @@ impl Scheduler {
                     st.cursor.und.next_token = tok;
                     st.cursor.lifecycle.phase = Phase::DecodeUnd;
                 }
-                self.invalidate_cpu_masks(id);
                 if can_open_gen_branch
                     && images_done < max_images
                     && self
@@ -742,33 +739,6 @@ impl Scheduler {
             .running
             .get(&id)
             .is_some_and(|state| state.public_event_seq > before);
-        if published {
-            let published_us = uniserve_core::now_monotonic_us();
-            let accounting = self.running.get_mut(&id).and_then(|state| {
-                let newly_published = state.trace.stamp_existing(
-                    producer_op_id,
-                    crate::scheduler::trace::LifecyclePhase::PubliclyCommitted,
-                    published_us,
-                );
-                newly_published.then(|| {
-                    (
-                        state.trace.domain(producer_op_id),
-                        state.trace.span_us(
-                            producer_op_id,
-                            crate::scheduler::trace::LifecyclePhase::SemanticallyCommitted,
-                            crate::scheduler::trace::LifecyclePhase::PubliclyCommitted,
-                        ),
-                    )
-                })
-            });
-            if let Some((Some(domain), delay)) = accounting {
-                let stats = self.stats.domains.get(domain);
-                stats.public_commits.fetch_add(1, Ordering::Relaxed);
-                if let Some(delay) = delay {
-                    stats.public_commit_us.fetch_add(delay, Ordering::Relaxed);
-                }
-            }
-        }
         published
     }
 
@@ -1006,9 +976,6 @@ impl Scheduler {
                 .flow_prefix
                 .as_ref()
                 .map(|prefix| prefix.request_pool_idx);
-            if let Some(key) = st.cpu_pending.take() {
-                self.cpu_deadlines.remove(&key);
-            }
             if st.admission_digest.is_some() {
                 let request_key = RequestKey::new(self.authority_id, id, st.epoch);
                 let cutoff = st.cancel_cutoff.clone().unwrap_or_else(|| VersionRef {
@@ -1054,15 +1021,6 @@ impl Scheduler {
                 }
             }
             self.release_products(free_encoder_products);
-            // close + archive the lifecycle trace (reconstructable post-finish).
-            st.trace.mark_finished(
-                finish_reason_str(&reason),
-                uniserve_core::now_monotonic_us(),
-            );
-            if self.completed_traces.len() >= 64 {
-                self.completed_traces.pop_front();
-            }
-            self.completed_traces.push_back(st.trace.clone());
             self.trace_request_finished(super::control::FinishedTrace {
                 id,
                 reason: &reason,

@@ -7,11 +7,10 @@ use crate::serving::chat::ChatTemplateContentFormatOption;
 use anyhow::Result;
 use serde::Serialize;
 use serde_json::Value;
-use uniserve_engine::worker::WorkerLaunchConfig;
 use uniserve_engine::{
     AttentionBackend, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
     DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS,
-    SchedulingPolicy, TransferSpec, WorkersSpec,
+    SchedulingPolicy, TransferSpec, WorkerLaunchConfig, WorkersSpec,
 };
 
 /// How the HTTP server obtains its listening socket.
