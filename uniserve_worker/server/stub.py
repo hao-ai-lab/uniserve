@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from ..batch import ForwardMode
+from ..execution.batch import ForwardMode
 from ..bootstrap.capacity import (
     DEFAULT_BLOCK_SIZE,
     DEFAULT_MAX_BATCH_OPS,

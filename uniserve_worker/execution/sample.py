@@ -9,7 +9,7 @@ from typing import cast
 import torch
 
 from uniserve_worker.backends.triton import triton_available
-from uniserve_worker.batch import SamplingParams
+from uniserve_worker.execution.batch import SamplingParams
 from uniserve_worker.execution.forward_batch import packed_tensor_views
 from uniserve_worker.foundation.errors import capability_mismatch, invalid_descriptor
 from uniserve_worker.foundation.math import bucketed_length

@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use flatbuffers::FlatBufferBuilder;
-use uniserve_core::{BlockId, KvCacheGroupSpec, KvGroupKind, RankInfo, RequestId, SamplingParams};
+use uniserve_core::{BlockId, KvCacheGroup, KvGroupKind, RankInfo, RequestId, SamplingParams};
 
 use crate::schema::uniserve::wire as fbs;
 use crate::{
@@ -1087,7 +1087,7 @@ fn map_from_table(
         .unwrap_or_default()
 }
 
-fn kv_group_from_table(group: fbs::KvGroupSpec<'_>) -> CodecResult<KvCacheGroupSpec> {
+fn kv_group_from_table(group: fbs::KvGroupSpec<'_>) -> CodecResult<KvCacheGroup> {
     let kind = if group.kind() == fbs::KvGroupKind::Full {
         KvGroupKind::Full
     } else if group.kind() == fbs::KvGroupKind::SlidingWindow {
@@ -1098,7 +1098,7 @@ fn kv_group_from_table(group: fbs::KvGroupSpec<'_>) -> CodecResult<KvCacheGroupS
     } else {
         codec_bail!("unknown KV group kind {}", group.kind().0)
     };
-    Ok(KvCacheGroupSpec {
+    Ok(KvCacheGroup {
         num_blocks: group.num_blocks(),
         kind,
     })
@@ -1908,7 +1908,7 @@ fn map_to_fb(map: &BTreeMap<String, u64>) -> Vec<fbs::StringU64PairT> {
         .collect()
 }
 
-fn kv_group_to_fb(group: &KvCacheGroupSpec) -> fbs::KvGroupSpecT {
+fn kv_group_to_fb(group: &KvCacheGroup) -> fbs::KvGroupSpecT {
     match group.kind {
         KvGroupKind::Full => fbs::KvGroupSpecT {
             num_blocks: group.num_blocks,

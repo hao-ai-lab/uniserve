@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
-from ..batch import ForwardMode
+from ..execution.batch import ForwardMode
 from ..server.worker_kind import WorkerKind
 
 

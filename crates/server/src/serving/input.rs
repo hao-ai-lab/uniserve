@@ -127,7 +127,7 @@ pub struct SchedulingBounds {
 
 /// Public output contract: which per-token detail the caller receives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum OutputContract {
+pub enum OutputDetail {
     #[default]
     VisibleText,
     Tokens,
@@ -164,7 +164,7 @@ pub struct GenerateReqInput {
     pub image_gen: Option<ImageGenControls>,
     pub cache: CacheBounds,
     pub scheduling: SchedulingBounds,
-    pub output: OutputContract,
+    pub output: OutputDetail,
     pub decode: DecodeControls,
 }
 
@@ -200,7 +200,7 @@ impl GenerateReqInput {
             image_gen: None,
             cache: CacheBounds::default(),
             scheduling: SchedulingBounds::default(),
-            output: OutputContract::default(),
+            output: OutputDetail::default(),
             decode: DecodeControls::default(),
         }
     }

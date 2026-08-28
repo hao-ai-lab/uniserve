@@ -485,7 +485,7 @@ pub struct GenerationResourceBounds {
 }
 
 /// Inputs used to derive conservative resources for one generation graph.
-pub struct GenerationResourceSpec<'a> {
+pub struct GenerationResources<'a> {
     pub context: &'a [ContextSegment],
     pub negative_context: &'a [ContextSegment],
     pub behavior: &'a GenerationBehaviorDescriptor,
@@ -524,8 +524,8 @@ impl GenerationRuntimeCapabilities {
 }
 
 impl GenerationResourceBounds {
-    pub fn conservative(spec: GenerationResourceSpec<'_>) -> Result<Self, GenerationResourceError> {
-        let GenerationResourceSpec {
+    pub fn conservative(inputs: GenerationResources<'_>) -> Result<Self, GenerationResourceError> {
+        let GenerationResources {
             context,
             negative_context,
             behavior,
@@ -534,7 +534,7 @@ impl GenerationResourceBounds {
             max_und_tokens,
             cache,
             capabilities,
-        } = spec;
+        } = inputs;
         let context_tokens = context
             .iter()
             .map(|segment| match segment {
@@ -1021,7 +1021,7 @@ impl GenerationRequest {
         &self,
         capabilities: &GenerationRuntimeCapabilities,
     ) -> Result<(), GenerationResourceError> {
-        let required = GenerationResourceBounds::conservative(GenerationResourceSpec {
+        let required = GenerationResourceBounds::conservative(GenerationResources {
             context: &self.context,
             negative_context: &self.negative_context,
             behavior: &self.behavior,
@@ -1228,7 +1228,7 @@ mod tests {
             policy,
             resources: GenerationResourceBounds::default(),
         };
-        request.resources = GenerationResourceBounds::conservative(GenerationResourceSpec {
+        request.resources = GenerationResourceBounds::conservative(GenerationResources {
             context: &request.context,
             negative_context: &request.negative_context,
             behavior: &request.behavior,
@@ -1366,7 +1366,7 @@ mod tests {
         request.cache.read = true;
         request.cache.write = true;
         request.image.max_images = 2;
-        let bounds = GenerationResourceBounds::conservative(GenerationResourceSpec {
+        let bounds = GenerationResourceBounds::conservative(GenerationResources {
             context: &request.context,
             negative_context: &request.negative_context,
             behavior: &request.behavior,
@@ -1411,7 +1411,7 @@ mod tests {
         request.policy.feedback = None;
         request.max_und_tokens = 256;
 
-        let bounds = GenerationResourceBounds::conservative(GenerationResourceSpec {
+        let bounds = GenerationResourceBounds::conservative(GenerationResources {
             context: &request.context,
             negative_context: &request.negative_context,
             behavior: &request.behavior,
@@ -1437,7 +1437,7 @@ mod tests {
         let mut capabilities = runtime_capabilities();
         capabilities.max_vit_grid_tokens = 0;
         assert_eq!(
-            GenerationResourceBounds::conservative(GenerationResourceSpec {
+            GenerationResourceBounds::conservative(GenerationResources {
                 context: &request.context,
                 negative_context: &request.negative_context,
                 behavior: &request.behavior,
@@ -1458,7 +1458,7 @@ mod tests {
         };
         ingest.step_kv_tokens.pop();
         assert_eq!(
-            GenerationResourceBounds::conservative(GenerationResourceSpec {
+            GenerationResourceBounds::conservative(GenerationResources {
                 context: &invalid_request.context,
                 negative_context: &invalid_request.negative_context,
                 behavior: &invalid_request.behavior,

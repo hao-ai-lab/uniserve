@@ -503,7 +503,7 @@ fn finish_tokenized(
         .into_iter()
         .collect::<Vec<_>>();
     let mut resources =
-        GenerationResourceBounds::conservative(uniserve_core::GenerationResourceSpec {
+        GenerationResourceBounds::conservative(uniserve_core::GenerationResources {
             context: &context,
             negative_context: &negative_context,
             behavior: &behavior,
@@ -526,7 +526,7 @@ fn finish_tokenized(
                     binding.max_model_tokens
                 )
             })?;
-        resources = GenerationResourceBounds::conservative(uniserve_core::GenerationResourceSpec {
+        resources = GenerationResourceBounds::conservative(uniserve_core::GenerationResources {
             context: &context,
             negative_context: &negative_context,
             behavior: &behavior,
@@ -589,8 +589,8 @@ fn finish_tokenized(
         },
         emit_token_ids: matches!(
             request.output,
-            crate::serving::input::OutputContract::Tokens
-                | crate::serving::input::OutputContract::Logprobs
+            crate::serving::input::OutputDetail::Tokens
+                | crate::serving::input::OutputDetail::Logprobs
         ),
         prompt_logprobs_requested,
         generated_logprobs_requested,

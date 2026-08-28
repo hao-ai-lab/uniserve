@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ...batch import ForwardMode
+from ...execution.batch import ForwardMode
 from ...execution.forward_batch import (
     AttentionMode,
     ExpertRoute,
@@ -34,7 +34,7 @@ from ...nn.diffusion import (
 )
 from ...nn.diffusion.cfg import CfgRecipe
 from ...nn.expert_routing import RoutedTensor
-from ...nn.layer import LayerSpec
+from ...nn.layer import LayerConfig
 from ...nn.linear import (
     LinearBase,
     QKVParallelLinear,
@@ -263,7 +263,7 @@ class _VisionModel(nn.Module):
 class _SenseAttention(nn.Module):
     """SenseNova dual-expert QKV projection over one explicit attention plan."""
 
-    def __init__(self, config: NeoLlmConfig, layer: int, *, spec: LayerSpec) -> None:
+    def __init__(self, config: NeoLlmConfig, layer: int, *, spec: LayerConfig) -> None:
         super().__init__()
         hidden_size = int(getattr(config, "hidden_size"))
         total_heads = int(getattr(config, "num_attention_heads"))
@@ -465,7 +465,7 @@ class _SenseAttention(nn.Module):
 
 
 class _SenseLayer(nn.Module):
-    def __init__(self, config: NeoLlmConfig, layer: int, *, spec: LayerSpec) -> None:
+    def __init__(self, config: NeoLlmConfig, layer: int, *, spec: LayerConfig) -> None:
         super().__init__()
         hidden = int(getattr(config, "hidden_size"))
         epsilon = float(getattr(config, "rms_norm_eps"))
@@ -536,7 +536,7 @@ class _SenseLayer(nn.Module):
 class _SenseDecoder(nn.Module):
     """One packed text/flow decoder with no serving state."""
 
-    def __init__(self, config: NeoLlmConfig, *, spec: LayerSpec) -> None:
+    def __init__(self, config: NeoLlmConfig, *, spec: LayerConfig) -> None:
         super().__init__()
         hidden = int(getattr(config, "hidden_size"))
         self.embed_tokens = VocabParallelEmbedding(
@@ -616,7 +616,7 @@ class _SenseDecoder(nn.Module):
 
 
 class _LanguageModel(nn.Module):
-    def __init__(self, config: NeoLlmConfig, *, spec: LayerSpec) -> None:
+    def __init__(self, config: NeoLlmConfig, *, spec: LayerConfig) -> None:
         super().__init__()
         self.model = _SenseDecoder(config, spec=spec)
         self.lm_head = ParallelLMHead(
@@ -664,7 +664,7 @@ class NEOChatModel(ExecutionModel):
         self,
         config: NeoChatConfig,
         *,
-        layer_spec: LayerSpec,
+        layer_config: LayerConfig,
         scope: str = "whole",
     ) -> None:
         super().__init__()
@@ -674,13 +674,13 @@ class NEOChatModel(ExecutionModel):
         vision = config.vision_config
         hidden = int(config.llm_config.hidden_size)
         self.vision_model = _VisionModel(vision)
-        self._parallel = layer_spec.parallel
-        self.language_model = _LanguageModel(config.llm_config, spec=layer_spec)
+        self._parallel = layer_config.parallel
+        self.language_model = _LanguageModel(config.llm_config, spec=layer_config)
         self.fm_modules = nn.ModuleDict(
             {
                 "vision_model_mot_gen": _VisionModel(vision),
                 "timestep_embedder": TimestepEmbedder(hidden),
-                "fm_head": self._flow_head(config, hidden, layer_spec),
+                "fm_head": self._flow_head(config, hidden, layer_config),
             }
         )
         self._patch_size = int(vision.patch_size)
@@ -700,7 +700,7 @@ class NEOChatModel(ExecutionModel):
     def _flow_head(
         config: NeoChatConfig,
         hidden: int,
-        layer_spec: LayerSpec,
+        layer_config: LayerConfig,
     ) -> nn.Module:
         merge = int(1 / float(config.downsample_ratio))
         output_dim = 3 * (int(config.vision_config.patch_size) * merge) ** 2
@@ -708,15 +708,15 @@ class NEOChatModel(ExecutionModel):
             return FlowMatchingHead(
                 hidden,
                 output_dim,
-                spec=layer_spec,
+                spec=layer_config,
                 dim=int(getattr(config, "fm_head_dim")),
                 layers=int(getattr(config, "fm_head_layers")),
                 mlp_ratio=float(getattr(config, "fm_head_mlp_ratio")),
             )
         return nn.Sequential(
-            LinearBase(hidden, 4096, spec=layer_spec, bias=True),
+            LinearBase(hidden, 4096, spec=layer_config, bias=True),
             nn.GELU(),
-            LinearBase(4096, output_dim, spec=layer_spec, bias=True),
+            LinearBase(4096, output_dim, spec=layer_config, bias=True),
         )
 
     def _configure_runtime(self, config: NeoChatConfig) -> None:

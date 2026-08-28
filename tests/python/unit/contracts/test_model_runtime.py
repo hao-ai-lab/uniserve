@@ -7,7 +7,7 @@ from dataclasses import replace
 import pytest
 
 from tests.python.fixtures.model_execution import TEST_DEPLOYMENT, TEST_MODEL
-from uniserve_worker.batch import ForwardMode
+from uniserve_worker.execution.batch import ForwardMode
 from uniserve_worker.bootstrap.capabilities import resolve_capabilities
 from uniserve_worker.bootstrap.capacity import latent_trajectory_bytes, model_arena_capacity
 from uniserve_worker.foundation.errors import WorkerError

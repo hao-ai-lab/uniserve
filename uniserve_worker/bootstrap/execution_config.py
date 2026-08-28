@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from uniserve_worker.backends.attention.tuning import FlashInferTuningConfig
-from uniserve_worker.batch import Domain
+from uniserve_worker.execution.batch import Domain
 
 __all__ = [
     "DEFAULT_DECODE_GRAPH_BATCH_SIZES",

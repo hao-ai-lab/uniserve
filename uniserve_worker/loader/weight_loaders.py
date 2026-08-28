@@ -183,7 +183,7 @@ def sharded_weight_loader(
         raise ValueError("sharded parameters cannot receive packed checkpoint shards")
     plan = _required_plan(parameter)
     parameter = _materialize(parameter, dtype=_target_dtype(parameter, handle))
-    payload = _payload_for_spec(handle, plan, tuple(parameter.shape))
+    payload = _payload_for_plan(handle, plan, tuple(parameter.shape))
     _copy(parameter.data, payload, parameter)
     _mark_loaded(parameter)
 
@@ -205,7 +205,7 @@ def packed_weight_loader(
     selection = [slice(None)] * parameter.ndim
     selection[plan.shard_axis] = slice(slot.offset, slot.offset + slot.size)
     target = parameter.data[tuple(selection)]
-    payload = _payload_for_shard(handle, slot.spec, tuple(target.shape))
+    payload = _payload_for_shard(handle, slot.shard, tuple(target.shape))
     _copy(target, payload, parameter)
     _mark_shard_loaded(parameter, plan, shard_id)
 
@@ -269,7 +269,7 @@ def fp8_weight_loader(
         payload = (
             handle.full()
             if plan is None
-            else _payload_for_spec(handle, plan, tuple(parameter.shape))
+            else _payload_for_plan(handle, plan, tuple(parameter.shape))
         )
         _copy(parameter.data, payload, parameter, preserve_dtype=offline)
     else:
@@ -290,7 +290,7 @@ def fp8_scale_loader(
     if shard_id is None:
         plan = get_shard_plan(parameter)
         target_shape = tuple(parameter.shape)
-        payload = handle.full() if plan is None else _payload_for_spec(handle, plan, target_shape)
+        payload = handle.full() if plan is None else _payload_for_plan(handle, plan, target_shape)
         payload = payload.reshape(-1, 1) if payload.ndim == 1 else payload
         _copy(parameter.data, payload, parameter, preserve_dtype=True)
     else:
@@ -317,32 +317,32 @@ def _copy_packed(
     selection = [slice(None)] * parameter.ndim
     selection[plan.shard_axis] = slice(slot.offset, slot.offset + slot.size)
     target = parameter.data[tuple(selection)]
-    payload = _payload_for_shard(handle, slot.spec, tuple(target.shape))
+    payload = _payload_for_shard(handle, slot.shard, tuple(target.shape))
     if reshape_scale and payload.ndim == 1:
         payload = payload.reshape(-1, 1)
     _copy(target, payload, parameter, preserve_dtype=preserve_dtype)
 
 
-def _payload_for_spec(
+def _payload_for_plan(
     handle: WeightHandle,
     plan: ShardPlan,
     target_shape: tuple[int, ...],
 ) -> torch.Tensor:
-    return _payload_for_shard(handle, plan.spec, target_shape)
+    return _payload_for_shard(handle, plan.shard, target_shape)
 
 
-def _payload_for_shard(handle: WeightHandle, spec: Any, target_shape: tuple[int, ...]) -> torch.Tensor:
-    axis = int(spec.axis)
-    if spec.replicated or int(spec.size) <= 1 or handle.shape[axis] == target_shape[axis]:
+def _payload_for_shard(handle: WeightHandle, shard: Any, target_shape: tuple[int, ...]) -> torch.Tensor:
+    axis = int(shard.axis)
+    if shard.replicated or int(shard.size) <= 1 or handle.shape[axis] == target_shape[axis]:
         return handle.full()
     source_extent = int(handle.shape[axis])
-    if source_extent % int(spec.size):
+    if source_extent % int(shard.size):
         raise ValueError(
             f"checkpoint tensor {handle.name!r} dimension {axis}={source_extent} is not divisible "
-            f"by tensor-parallel size {int(spec.size)}"
+            f"by tensor-parallel size {int(shard.size)}"
         )
-    local = source_extent // int(spec.size)
-    return handle.narrow(axis, int(spec.rank) * local, local)
+    local = source_extent // int(shard.size)
+    return handle.narrow(axis, int(shard.rank) * local, local)
 
 
 def _required_plan(parameter: nn.Parameter) -> ShardPlan:

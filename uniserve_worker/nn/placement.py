@@ -6,14 +6,14 @@ from enum import Enum, auto
 
 import torch.nn as nn
 
-from .mesh import DeviceMesh, TensorParallelSpec
+from .mesh import DeviceMesh, TensorParallel
 
 __all__ = [
     'WeightMode',
-    'ShardSpec',
+    'Shard',
     'ShardSlot',
     'ShardPlan',
-    'shard_spec',
+    'shard_for',
     'get_shard_plan',
     'set_shard_plan',
     # tower-axis module placement
@@ -44,7 +44,7 @@ class WeightMode(Enum):
 
 
 @dataclass(frozen=True)
-class ShardSpec:
+class Shard:
     """Resolved split of one tensor across tensor-parallel coordinates."""
 
     axis: int
@@ -59,7 +59,7 @@ class ShardSlot:
 
     offset: int
     size: int
-    spec: ShardSpec
+    shard: Shard
 
 
 @dataclass
@@ -72,7 +72,7 @@ class ShardPlan:
     placement; ``mode`` resolves string shard ids (``"q"``) to slot indices.
     """
 
-    spec: ShardSpec
+    shard: Shard
     mode: WeightMode = WeightMode.VANILLA
     shard_axis: int | None = None
     slots: dict[int | str, ShardSlot] = field(default_factory=dict)
@@ -84,9 +84,9 @@ class ShardPlan:
         return self.slots.get(key)
 
 
-def shard_spec(axis: int, parallel: TensorParallelSpec, *, replicated: bool = False) -> ShardSpec:
-    """Resolve a tensor-parallel :class:`ShardSpec` for one parameter dimension."""
-    return ShardSpec(
+def shard_for(axis: int, parallel: TensorParallel, *, replicated: bool = False) -> Shard:
+    """Resolve a tensor-parallel :class:`Shard` for one parameter dimension."""
+    return Shard(
         axis=int(axis),
         rank=int(parallel.rank),
         size=int(parallel.size),

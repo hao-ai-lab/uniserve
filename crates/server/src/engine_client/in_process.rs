@@ -375,7 +375,7 @@ mod tests {
             },
         };
         request.resources =
-            GenerationResourceBounds::conservative(uniserve_core::GenerationResourceSpec {
+            GenerationResourceBounds::conservative(uniserve_core::GenerationResources {
                 context: &request.context,
                 negative_context: &request.negative_context,
                 behavior: &request.behavior,

@@ -10,7 +10,7 @@ use futures::{StreamExt as _, pin_mut};
 use super::processor::AssistantEvent;
 use crate::serving::chat::output::error::Error;
 use crate::serving::chat::output::{FinishReason, Result};
-use crate::serving::chat::protocol::{
+use crate::serving::chat::{
     AssistantBlockKind, AssistantContentBlock, AssistantMessage, AssistantToolCall, ChatEvent,
 };
 

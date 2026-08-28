@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 import torch
 from torch import nn
 
-from ..batch import ForwardMode
+from ..execution.batch import ForwardMode
 from ..execution.forward_batch import AttentionSelection, ForwardBatch, ForwardOutput
 from ..foundation.errors import invalid_descriptor
 

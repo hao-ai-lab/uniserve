@@ -161,7 +161,7 @@ UNISERVE_RUN_GPU_E2E=1 \
 just test-python-gpu
 ```
 
-The serving benchmark protocol is documented in [`docs/benchmark-protocol.md`](docs/benchmark-protocol.md), and the explicit evaluator points are defined in [`uniserve_eval/profiles.toml`](uniserve_eval/profiles.toml).
+Serving benchmark usage is documented in [`docs/benchmark-protocol.md`](docs/benchmark-protocol.md), and the evaluator points are defined in [`uniserve_eval/profiles.toml`](uniserve_eval/profiles.toml).
 
 ## Repository layout
 
@@ -169,15 +169,15 @@ The serving benchmark protocol is documented in [`docs/benchmark-protocol.md`](d
 crates/foundation/core/                  Shared values and the engine-process codec
 crates/foundation/observability/         Runtime metrics and process registry
 crates/foundation/observability-derive/  Metrics proc-macro
-crates/protocol/worker-ipc/              Worker execution algebra, codec, and iceoryx endpoints
-crates/protocol/worker-ipc-py/           Python worker IPC extension
+crates/worker-ipc/                       Worker messages, serialization, and iceoryx endpoints
+crates/worker-ipc-py/                    Python worker IPC extension
 crates/engine/                           Scheduler, KV pool, executors, simulator, and engine process
 crates/server/                           Model profiles, serving funnel, OpenAI API, HTTP, and engine clients
 crates/bin/uniserve/                     `serve` and `engine` CLI entrypoints
-uniserve_worker/         Forward-only Python model workers
-uniserve_eval/           Public-protocol serving evaluator
-specs/                   Builder-facing runtime and serving contracts
-docs/                    User-facing protocols and evaluation documentation
+uniserve_worker/                          Forward-only Python model workers
+uniserve_eval/                            Serving evaluator
+specs/                                    Builder-facing implementation notes
+docs/                                     User-facing runtime and evaluation documentation
 ```
 
 ## License

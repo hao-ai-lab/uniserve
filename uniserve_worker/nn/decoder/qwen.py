@@ -10,7 +10,7 @@ import torch.nn as nn
 
 from ...execution.forward_batch import MeshView
 from ..activation import GeluAndMul
-from ..layer import LayerSpec
+from ..layer import LayerConfig
 from ..linear import MergedColumnParallelLinear, RowParallelLinear
 from ..placement import WeightMode
 
@@ -44,7 +44,7 @@ class Qwen3MLP(nn.Module):
         self,
         config: Any,
         *,
-        spec: LayerSpec,
+        spec: LayerConfig,
         weight_mode: WeightMode = WeightMode.VANILLA,
     ) -> None:
         super().__init__()

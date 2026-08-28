@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from ..batch import ForwardMode
+from ..execution.batch import ForwardMode
 
 
 class WorkerKind(StrEnum):

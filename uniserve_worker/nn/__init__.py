@@ -32,13 +32,13 @@ _EXPORTS: dict[str, str] = {
     "local_kv_head_count": "linear",
     "RowParallelLinear": "linear",
     # immutable layer construction
-    "LayerSpec": "layer",
+    "LayerConfig": "layer",
     # logits
     "LogitsProcessor": "logits",
     # mesh (parallelism topology + transports)
     "DeviceMesh": "mesh",
     "MeshAxis": "mesh",
-    "TensorParallelSpec": "mesh",
+    "TensorParallel": "mesh",
     "divide": "mesh",
     # moe
     "FusedMoE": "moe",
@@ -48,14 +48,14 @@ _EXPORTS: dict[str, str] = {
     # parameter and modality-tower placement
     "ShardPlan": "placement",
     "ShardSlot": "placement",
-    "ShardSpec": "placement",
+    "Shard": "placement",
     "WeightMode": "placement",
     "get_shard_plan": "placement",
     "get_tower_coord": "placement",
     "place_towers": "placement",
     "set_shard_plan": "placement",
     "set_tower_coord": "placement",
-    "shard_spec": "placement",
+    "shard_for": "placement",
     # rope
     "HFRotaryEmbedding": "rope",
     "RotaryEmbedding": "rope",
@@ -92,7 +92,7 @@ __all__ = [
     "GeluAndMul",
     "HFRotaryEmbedding",
     "LinearBase",
-    "LayerSpec",
+    "LayerConfig",
     "LogitsProcessor",
     "MLPConnector",
     "MergedColumnParallelLinear",
@@ -110,11 +110,11 @@ __all__ = [
     "RowParallelLinear",
     "ShardPlan",
     "ShardSlot",
-    "ShardSpec",
+    "Shard",
     "RadixAttention",
     "SiglipNavitEncoder",
     "SiluAndMul",
-    "TensorParallelSpec",
+    "TensorParallel",
     "TopK",
     "VisionEncoder",
     "VocabParallelEmbedding",
@@ -133,7 +133,7 @@ __all__ = [
     "rotate_half",
     "set_shard_plan",
     "set_tower_coord",
-    "shard_spec",
+    "shard_for",
 ]
 
 # Single-source-of-truth guard: the lazy resolver map and the advertised surface
@@ -159,7 +159,7 @@ if TYPE_CHECKING:  # let type-checkers see the concrete exports without eager co
     from .activation import GeluAndMul, SiluAndMul, get_act_fn
     from .attention import RadixAttention
     from .decoder import MoTDecoderLayer, MoTModel
-    from .layer import LayerSpec
+    from .layer import LayerConfig
     from .linear import (
         ColumnParallelLinear,
         LinearBase,
@@ -171,7 +171,7 @@ if TYPE_CHECKING:  # let type-checkers see the concrete exports without eager co
     from .mesh import (
         DeviceMesh,
         MeshAxis,
-        TensorParallelSpec,
+        TensorParallel,
         divide,
     )
     from .moe import FusedMoE, TopK
@@ -179,14 +179,14 @@ if TYPE_CHECKING:  # let type-checkers see the concrete exports without eager co
     from .placement import (
         ShardPlan,
         ShardSlot,
-        ShardSpec,
+        Shard,
         WeightMode,
         get_shard_plan,
         get_tower_coord,
         place_towers,
         set_shard_plan,
         set_tower_coord,
-        shard_spec,
+        shard_for,
     )
     from .rope import (
         HFRotaryEmbedding,

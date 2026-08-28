@@ -11,7 +11,7 @@ from typing import Callable
 import numpy as np
 import torch
 
-from ...batch import RequestKey
+from ...execution.batch import RequestKey
 from ...foundation.errors import resource_error
 from ...server.completion import DeferredCompletionTask, PinnedByteCapture
 from ...server.cpu_tasks import CpuTaskReservation

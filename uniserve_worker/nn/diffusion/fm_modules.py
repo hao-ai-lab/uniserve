@@ -7,7 +7,7 @@ from typing import cast
 import torch
 import torch.nn as nn
 
-from ..layer import LayerSpec
+from ..layer import LayerConfig
 from ..linear import LinearBase
 from .timestep import TimestepEmbedder
 
@@ -53,7 +53,7 @@ def modulate(
 
 
 class ResBlock(nn.Module):
-    def __init__(self, channels: int, *, spec: LayerSpec, mlp_ratio: float = 1.0):
+    def __init__(self, channels: int, *, spec: LayerConfig, mlp_ratio: float = 1.0):
         super().__init__()
         self.channels = int(channels)
         self.intermediate_size = int(channels * mlp_ratio)
@@ -75,7 +75,7 @@ class ResBlock(nn.Module):
 
 
 class _TimeAdaptiveFinalLayer(nn.Module):
-    def __init__(self, model_channels: int, out_channels: int, *, spec: LayerSpec):
+    def __init__(self, model_channels: int, out_channels: int, *, spec: LayerConfig):
         super().__init__()
         self.norm_final = nn.LayerNorm(model_channels, elementwise_affine=False, eps=1e-6)
         self.linear = LinearBase(model_channels, out_channels, spec=spec, bias=True)
@@ -95,7 +95,7 @@ class _TimeConditionedMLPAdaLN(nn.Module):
         input_dim: int,
         out_dim: int,
         *,
-        spec: LayerSpec,
+        spec: LayerConfig,
         dim: int = _DEFAULT_FLOW_HEAD.dim,
         layers: int = _DEFAULT_FLOW_HEAD.layers,
         mlp_ratio: float = _DEFAULT_FLOW_HEAD.mlp_ratio,
@@ -164,7 +164,7 @@ class FlowMatchingHead(nn.Module):
         input_dim: int,
         out_dim: int,
         *,
-        spec: LayerSpec,
+        spec: LayerConfig,
         dim: int = _DEFAULT_FLOW_HEAD.dim,
         layers: int = _DEFAULT_FLOW_HEAD.layers,
         mlp_ratio: float = _DEFAULT_FLOW_HEAD.mlp_ratio,
@@ -196,7 +196,7 @@ class FlowMatchingHead(nn.Module):
 class FinalLayer(nn.Module):
     """Untimed DiT-style final projection used by patch-space decoders."""
 
-    def __init__(self, model_channels: int, out_channels: int, *, spec: LayerSpec):
+    def __init__(self, model_channels: int, out_channels: int, *, spec: LayerConfig):
         super().__init__()
         self.norm_final = nn.LayerNorm(model_channels, elementwise_affine=False, eps=1e-6)
         self.linear = LinearBase(model_channels, out_channels, spec=spec, bias=True)

@@ -7,10 +7,10 @@ use thiserror_ext::AsReport as _;
 use tracing::warn;
 
 use crate::profile::reasoning::{Qwen3ReasoningParser, ReasoningDelta};
+use crate::serving::chat::AssistantBlockKind;
 use crate::serving::chat::output::Result;
 use crate::serving::chat::output::error::Error;
 use crate::serving::chat::output::processor::ReasoningEvent;
-use crate::serving::chat::protocol::AssistantBlockKind;
 
 struct ReasoningState {
     parser: Option<Qwen3ReasoningParser>,

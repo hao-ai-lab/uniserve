@@ -6,7 +6,7 @@ import pytest
 import torch
 from torch import nn
 
-from uniserve_worker.batch import ForwardMode
+from uniserve_worker.execution.batch import ForwardMode
 from uniserve_worker.execution.forward_batch import (
     AttentionMode,
     EmptyMeshView,
@@ -19,14 +19,14 @@ from uniserve_worker.models.qwen3 import Qwen3ForCausalLM
 from uniserve_worker.models.sensenova.config import NeoChatConfig
 from uniserve_worker.models.sensenova.model import NEOChatModel
 from uniserve_worker.nn.diffusion.schedule import ScheduleDirection
-from uniserve_worker.nn.layer import LayerSpec
-from uniserve_worker.nn.mesh import TensorParallelSpec
+from uniserve_worker.nn.layer import LayerConfig
+from uniserve_worker.nn.mesh import TensorParallel
 
 pytestmark = pytest.mark.unit
 
 
-def _layer_spec() -> LayerSpec:
-    return LayerSpec(TensorParallelSpec(rank=0, size=1), None)
+def _layer_config() -> LayerConfig:
+    return LayerConfig(TensorParallel(rank=0, size=1), None)
 
 
 def _qwen_config() -> dict[str, object]:
@@ -172,7 +172,7 @@ def test_sensenova_composition_resolves_top_level_token_ids():
 
 def test_qwen_constructs_runtime_behavior_from_checkpoint_configuration():
     config = _qwen_config()
-    model = Qwen3ForCausalLM(config, layer_spec=_layer_spec())
+    model = Qwen3ForCausalLM(config, layer_config=_layer_config())
     config["num_hidden_layers"] = 7
     config["max_position_embeddings"] = 4096
 
@@ -187,7 +187,7 @@ def test_qwen_constructs_runtime_behavior_from_checkpoint_configuration():
 
 
 def test_qwen_decode_projection_preserves_row_alignment():
-    model = Qwen3ForCausalLM(_qwen_config(), layer_spec=_layer_spec())
+    model = Qwen3ForCausalLM(_qwen_config(), layer_config=_layer_config())
     weight = _projection_weight(model.lm_head)
     hidden = torch.arange(32, dtype=torch.float32).view(4, 8)
     batch = _text_batch((1, 1, 1, 1), forward_mode=AttentionMode.PAGED_DECODE)
@@ -199,7 +199,7 @@ def test_qwen_decode_projection_preserves_row_alignment():
 
 
 def test_sensenova_decode_projection_preserves_row_alignment():
-    model = NEOChatModel(_sensenova_config(), layer_spec=_layer_spec())
+    model = NEOChatModel(_sensenova_config(), layer_config=_layer_config())
     weight = _projection_weight(model.language_model.lm_head)
     hidden = torch.arange(32, dtype=torch.float32).view(4, 8)
     batch = _text_batch((1, 1, 1, 1), forward_mode=AttentionMode.PAGED_DECODE)
@@ -211,7 +211,7 @@ def test_sensenova_decode_projection_preserves_row_alignment():
 
 
 def test_qwen_prefill_selects_the_last_logit_for_each_ragged_row():
-    model = Qwen3ForCausalLM(_qwen_config(), layer_spec=_layer_spec())
+    model = Qwen3ForCausalLM(_qwen_config(), layer_config=_layer_config())
     weight = _projection_weight(model.lm_head)
     hidden = torch.arange(56, dtype=torch.float32).view(7, 8)
     batch = _text_batch((2, 5), forward_mode=AttentionMode.PAGED_VARLEN)
@@ -223,16 +223,16 @@ def test_qwen_prefill_selects_the_last_logit_for_each_ragged_row():
 
 def test_qwen_rejects_incomplete_or_untyped_configuration():
     with pytest.raises(ValueError, match="requires integer field"):
-        Qwen3ForCausalLM({}, layer_spec=_layer_spec())
+        Qwen3ForCausalLM({}, layer_config=_layer_config())
     with pytest.raises(TypeError, match="must be a mapping"):
-        Qwen3ForCausalLM(object(), layer_spec=_layer_spec())  # type: ignore[arg-type]
+        Qwen3ForCausalLM(object(), layer_config=_layer_config())  # type: ignore[arg-type]
 
 
 def test_bagel_exposes_configured_generation_behavior():
     config = _bagel_config()
     model = BagelForConditionalGeneration(
         config,
-        layer_spec=_layer_spec(),
+        layer_config=_layer_config(),
         graph=_LoadedBagelGraph(config),  # type: ignore[arg-type]
     )
 
@@ -244,7 +244,7 @@ def test_bagel_exposes_configured_generation_behavior():
 
 def test_sensenova_freezes_runtime_behavior_at_construction():
     config = _sensenova_config()
-    model = NEOChatModel(config, layer_spec=_layer_spec())
+    model = NEOChatModel(config, layer_config=_layer_config())
     config.downsample_ratio = 0.25
     config.max_image_seq_len = 2048
 

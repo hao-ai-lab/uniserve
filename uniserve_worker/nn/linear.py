@@ -8,14 +8,14 @@ import torch
 import torch.nn as nn
 
 from ..execution.forward_batch import MeshView
-from .layer import LayerSpec
-from .mesh import TensorParallelSpec, divide
+from .layer import LayerConfig
+from .mesh import TensorParallel, divide
 from .placement import (
     ShardPlan,
     ShardSlot,
     WeightMode,
     set_shard_plan,
-    shard_spec,
+    shard_for,
 )
 
 __all__ = [
@@ -37,7 +37,7 @@ class LinearBase(nn.Module):
         input_size: int,
         output_size: int,
         *,
-        spec: LayerSpec,
+        spec: LayerConfig,
         bias: bool = True,
         prefix: str = "",
     ) -> None:
@@ -94,7 +94,7 @@ class ColumnParallelLinear(LinearBase):
         input_size: int,
         output_size: int,
         *,
-        spec: LayerSpec,
+        spec: LayerConfig,
         bias: bool = True,
         prefix: str = "",
     ) -> None:
@@ -109,8 +109,8 @@ class ColumnParallelLinear(LinearBase):
             bias=bias,
             prefix=prefix,
         )
-        partition = shard_spec(0, parallel)
-        _attach_shard_plan(self, lambda _param: ShardPlan(spec=partition))
+        partition = shard_for(0, parallel)
+        _attach_shard_plan(self, lambda _param: ShardPlan(shard=partition))
 
 
 class RowParallelLinear(LinearBase):
@@ -121,7 +121,7 @@ class RowParallelLinear(LinearBase):
         input_size: int,
         output_size: int,
         *,
-        spec: LayerSpec,
+        spec: LayerConfig,
         bias: bool = True,
         prefix: str = "",
     ) -> None:
@@ -138,7 +138,7 @@ class RowParallelLinear(LinearBase):
         )
         # The weight shards on the input axis; the per-channel weight_scale is
         # replicated across ranks (its rows index the unsharded output axis).
-        set_shard_plan(self.weight, ShardPlan(spec=shard_spec(1, parallel)))
+        set_shard_plan(self.weight, ShardPlan(shard=shard_for(1, parallel)))
         from ..loader.weight_loaders import default_weight_loader, sharded_weight_loader
 
         if getattr(self.weight, "weight_loader", None) is default_weight_loader:
@@ -147,7 +147,7 @@ class RowParallelLinear(LinearBase):
         if isinstance(weight_scale, nn.Parameter):
             set_shard_plan(
                 weight_scale,
-                ShardPlan(spec=shard_spec(0, parallel, replicated=parallel.size > 1)),
+                ShardPlan(shard=shard_for(0, parallel, replicated=parallel.size > 1)),
             )
 
     def forward(  # type: ignore[override]
@@ -170,7 +170,7 @@ class MergedColumnParallelLinear(LinearBase):
         input_size: int,
         output_sizes: list[int] | tuple[int, ...],
         *,
-        spec: LayerSpec,
+        spec: LayerConfig,
         bias: bool = True,
         prefix: str = "",
         local_output_sizes: list[int] | tuple[int, ...] | None = None,
@@ -199,13 +199,13 @@ class MergedColumnParallelLinear(LinearBase):
             slots[idx] = ShardSlot(
                 offset=cursor,
                 size=size,
-                spec=shard_spec(0, parallel, replicated=replicated),
+                shard=shard_for(0, parallel, replicated=replicated),
             )
             cursor += size
         _attach_shard_plan(
             self,
             lambda _param: ShardPlan(
-                spec=shard_spec(0, parallel),
+                shard=shard_for(0, parallel),
                 mode=weight_mode,
                 shard_axis=0,
                 slots=dict(slots),
@@ -213,12 +213,12 @@ class MergedColumnParallelLinear(LinearBase):
         )
 
 
-def local_attention_head_count(total_heads: int, *, parallel: TensorParallelSpec) -> int:
+def local_attention_head_count(total_heads: int, *, parallel: TensorParallel) -> int:
     """This tensor-parallel rank's query-head count (query heads always shard)."""
     return divide(int(total_heads), parallel.size)
 
 
-def local_kv_head_count(total_kv_heads: int, *, parallel: TensorParallelSpec) -> int:
+def local_kv_head_count(total_kv_heads: int, *, parallel: TensorParallel) -> int:
     """This tensor-parallel rank's KV-head count.
 
     The single owner of the attention KV sharding rule: a KV group divides
@@ -242,7 +242,7 @@ class QKVParallelLinear(MergedColumnParallelLinear):
         total_num_heads: int,
         total_num_kv_heads: int,
         *,
-        spec: LayerSpec,
+        spec: LayerConfig,
         bias: bool = True,
         prefix: str = "",
     ) -> None:

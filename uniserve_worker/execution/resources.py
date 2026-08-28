@@ -10,7 +10,7 @@ from typing import Any
 
 import torch
 
-from uniserve_worker.batch import (
+from uniserve_worker.execution.batch import (
     DevicePoint,
     FixedPoint,
     ForwardMode,

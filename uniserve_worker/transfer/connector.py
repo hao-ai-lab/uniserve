@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import torch
 
-from ..batch import FixedPoint, ProductKind, ProductRef, RequestKey, VersionRef
+from ..execution.batch import FixedPoint, ProductKind, ProductRef, RequestKey, VersionRef
 from ..foundation.errors import capability_mismatch, invalid_descriptor
 from ..runtime.cache_pool import CachePool
 from ..runtime.req_to_token_pool import ReqToTokenPool

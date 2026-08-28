@@ -101,7 +101,7 @@ fn generation_request(
         max_cfg_branches: 3,
         encoder_cache_entries: 256,
     };
-    let resources = GenerationResourceBounds::conservative(uniserve_core::GenerationResourceSpec {
+    let resources = GenerationResourceBounds::conservative(uniserve_core::GenerationResources {
         context: &context,
         negative_context: &[],
         behavior: &behavior,
@@ -816,16 +816,16 @@ fn stop_string_cutoff_is_request_local() {
 
 #[test]
 fn hybrid_groups_handshake_runs() {
-    use uniserve_core::{KvCacheGroupSpec, KvGroupKind};
+    use uniserve_core::{KvCacheGroup, KvGroupKind};
     let mut sim = SimEngine::new();
     sim.set_pipeline_depth(2);
     // Group 0 covers [0, 2048); group 1 covers [2048, 4096).
     sim.set_groups(vec![
-        KvCacheGroupSpec {
+        KvCacheGroup {
             num_blocks: 2048,
             kind: KvGroupKind::Full,
         },
-        KvCacheGroupSpec {
+        KvCacheGroup {
             num_blocks: 2048,
             kind: KvGroupKind::SlidingWindow {
                 window: 4096,

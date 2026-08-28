@@ -50,7 +50,7 @@ __all__ = [
     'LocalP2PTransport',
     'MeshAxis',
     'DeviceMesh',
-    'TensorParallelSpec',
+    'TensorParallel',
 ]
 
 
@@ -371,7 +371,7 @@ class DeviceMesh:
         )
 
 @dataclass(frozen=True, slots=True)
-class TensorParallelSpec:
+class TensorParallel:
     """Transport-free tensor-parallel coordinates used during layer construction."""
 
     rank: int
@@ -384,5 +384,5 @@ class TensorParallelSpec:
             raise ValueError("tensor-parallel rank must satisfy 0 <= rank < size")
 
     @classmethod
-    def from_mesh(cls, mesh: DeviceMesh) -> "TensorParallelSpec":
+    def from_mesh(cls, mesh: DeviceMesh) -> "TensorParallel":
         return cls(rank=mesh.tp_rank, size=mesh.tp_size)

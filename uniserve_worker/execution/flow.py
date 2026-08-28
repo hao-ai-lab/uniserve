@@ -8,7 +8,7 @@ from typing import cast
 
 import torch
 
-from uniserve_worker.batch import (
+from uniserve_worker.execution.batch import (
     DrawLayout,
     FinishFlags,
     ForwardMode,

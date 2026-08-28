@@ -9,7 +9,7 @@ from typing import Any, Mapping
 import torch
 import torch.nn as nn
 
-from ..batch import ForwardMode
+from ..execution.batch import ForwardMode
 from ..execution.forward_batch import (
     AttentionMode,
     ForwardBatch,
@@ -20,7 +20,7 @@ from ..loader.handles import WeightHandle
 from ..loader.mapping import LoadReport, WeightNameMap, stacked_weight_name
 from ..loader.weight_loaders import load_parameter_weight
 from ..nn import (
-    LayerSpec,
+    LayerConfig,
     LinearBase,
     MLPConnector,
     ParallelLMHead,
@@ -183,19 +183,19 @@ class BagelConfig:
 class _BagelGraph(nn.Module):
     """BAGEL neural graph: MoT language model, VAE, ViT, and flow-matching connectors."""
 
-    def __init__(self, cfg: BagelConfig, *, layer_spec: LayerSpec) -> None:
+    def __init__(self, cfg: BagelConfig, *, layer_config: LayerConfig) -> None:
         super().__init__()
         self.cfg = cfg
         hidden = cfg.llm.hidden_size
-        self.lm = MoTModel(cfg.llm, spec=layer_spec)
+        self.lm = MoTModel(cfg.llm, spec=layer_config)
         self.lm_head = ParallelLMHead(
             hidden,
             cfg.llm.vocab_size,
-            spec=layer_spec,
+            spec=layer_config,
             bias=False,
         )
-        self.vae2llm = LinearBase(cfg.patch_latent_dim, hidden, spec=layer_spec)
-        self.llm2vae = LinearBase(hidden, cfg.patch_latent_dim, spec=layer_spec)
+        self.vae2llm = LinearBase(cfg.patch_latent_dim, hidden, spec=layer_config)
+        self.llm2vae = LinearBase(hidden, cfg.patch_latent_dim, spec=layer_config)
         self.time_embedder = TimestepEmbedder(hidden)
         self.latent_pos_embed = PositionEmbedding(cfg.max_latent_size, hidden, init_sincos=False)
         self.vae = AutoEncoder(default_ae_params())
@@ -209,7 +209,7 @@ class _BagelGraph(nn.Module):
                 num_hidden_layers=cfg.vit_num_hidden_layers,
                 layer_norm_eps=cfg.vit_layer_norm_eps,
             ),
-            spec=layer_spec,
+            spec=layer_config,
         )
         self.connector = MLPConnector(cfg.vit_hidden_size, hidden, cfg.connector_act)
         self.vit_pos_embed = PositionEmbedding(
@@ -469,15 +469,15 @@ class BagelForConditionalGeneration(ExecutionModel):
         self,
         config: BagelConfig,
         *,
-        layer_spec: LayerSpec,
+        layer_config: LayerConfig,
         graph: _BagelGraph | None = None,
     ) -> None:
         super().__init__()
         if graph is not None and graph.cfg != config:
             raise ValueError("BAGEL graph and root must use the same immutable configuration")
         self.cfg = config
-        self._parallel = layer_spec.parallel
-        self.model = graph if graph is not None else _BagelGraph(config, layer_spec=layer_spec)
+        self._parallel = layer_config.parallel
+        self.model = graph if graph is not None else _BagelGraph(config, layer_config=layer_config)
         llm = self.cfg.llm
         self.architecture = "BagelForConditionalGeneration"
         self.generation = GenerationPipeline(

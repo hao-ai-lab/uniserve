@@ -3,8 +3,8 @@ use crate::serving::text::TextDecodeOptions;
 use llm_multimodal::ImageDetail;
 use serde::{Deserialize, Serialize};
 
-use crate::serving::chat::protocol::error::{Error, Result};
-use crate::serving::chat::protocol::event::{AssistantContentBlock, AssistantMessage};
+use crate::serving::chat::error::{Error, Result};
+use crate::serving::chat::event::{AssistantContentBlock, AssistantMessage};
 
 /// Role label for one text-only chat message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -443,7 +443,7 @@ mod tests {
     use serde_json::{json, to_value};
 
     use super::{ChatContent, ChatContentPart, ChatMessage, ChatRole, Tool};
-    use crate::serving::chat::protocol::event::AssistantContentBlock;
+    use crate::serving::chat::event::AssistantContentBlock;
 
     #[test]
     fn chat_content_deserializes_from_raw_string() {

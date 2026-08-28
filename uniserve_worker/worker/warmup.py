@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from ..batch import (
+from ..execution.batch import (
     AttentionRegime,
     Batch,
     BatchPartition,
@@ -258,7 +258,7 @@ def _warmup_token_outputs(
     *,
     finish_candidate: bool = False,
 ) -> tuple[ProductRef, ...]:
-    from ..batch import (
+    from ..execution.batch import (
         DType,
         PointRange,
         ProductKind,
@@ -652,7 +652,7 @@ def _warmup_sequence(self: Worker) -> None:
     every configured batch size (two rounds each: capture, then replay).
     """
 
-    from ..batch import (
+    from ..execution.batch import (
         Bounds,
         DevicePoint,
         Domain,
@@ -840,7 +840,7 @@ def _warmup_sequence(self: Worker) -> None:
 def _warmup_prefill_graphs(self: Worker) -> None:
     """Capture the paged-prefill CUDA graph for every configured token bucket."""
 
-    from ..batch import (
+    from ..execution.batch import (
         Bounds,
         Domain,
         DType,
@@ -971,7 +971,7 @@ def _warmup_prefill_graphs(self: Worker) -> None:
 def _warmup_flow(self: Worker) -> None:
     """Drive one denoise quantum through the real flow forward path."""
 
-    from ..batch import (
+    from ..execution.batch import (
         Bounds,
         DeviceDim,
         DevicePoint,

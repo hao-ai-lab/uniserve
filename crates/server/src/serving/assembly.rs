@@ -265,11 +265,11 @@ async fn emit_terminal(
 
 #[try_stream]
 pub(super) async fn assemble_chat_event_stream(
-    assembly: StreamAssemblySpec,
+    assembly: StreamInput,
     processor: Qwen3ChatOutputProcessor,
     mut y: TryYielder<ServeEvent, ServeError>,
 ) -> Result<()> {
-    let StreamAssemblySpec {
+    let StreamInput {
         request_id,
         event_context,
         prompt_token_ids,
@@ -614,11 +614,11 @@ impl RawAssemblerState {
 
 #[try_stream]
 pub(super) async fn assemble_event_stream(
-    assembly: StreamAssemblySpec,
+    assembly: StreamInput,
     output_processor: OutputProcessorPolicy,
     mut y: TryYielder<ServeEvent, ServeError>,
 ) -> Result<()> {
-    let StreamAssemblySpec {
+    let StreamInput {
         request_id,
         event_context,
         prompt_token_ids,

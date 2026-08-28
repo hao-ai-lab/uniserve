@@ -10,7 +10,7 @@ from __future__ import annotations
 import time
 from collections.abc import Sequence
 
-from uniserve_worker.batch import (
+from uniserve_worker.execution.batch import (
     AttentionRegime,
     Batch,
     BatchPartition,

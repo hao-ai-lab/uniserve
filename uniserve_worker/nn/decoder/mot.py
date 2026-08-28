@@ -17,7 +17,7 @@ from ...execution.forward_batch import (
 )
 from ..attention import RadixAttention
 from ..expert_routing import RoutedTensor
-from ..layer import LayerSpec
+from ..layer import LayerConfig
 from ..linear import (
     QKVParallelLinear,
     RowParallelLinear,
@@ -151,7 +151,7 @@ def _parallel_call(
 class MoTDecoderLayer(nn.Module):
     """One decoder layer with text and flow experts over shared attention."""
 
-    def __init__(self, config: _MoTConfig, *, spec: LayerSpec) -> None:
+    def __init__(self, config: _MoTConfig, *, spec: LayerConfig) -> None:
         super().__init__()
         hidden = int(config.hidden_size)
         head_dim = int(config.head_dim)
@@ -365,7 +365,7 @@ class MoTDecoderLayer(nn.Module):
 class MoTModel(nn.Module):
     """Packed text/flow decoder with no request or runtime state."""
 
-    def __init__(self, config: _MoTConfig, *, spec: LayerSpec) -> None:
+    def __init__(self, config: _MoTConfig, *, spec: LayerConfig) -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,

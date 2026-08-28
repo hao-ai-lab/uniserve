@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from uniserve_worker.batch import Domain
+from uniserve_worker.execution.batch import Domain
 from uniserve_worker.bootstrap.cli import parse_worker_args
 
 pytestmark = pytest.mark.unit

@@ -1119,11 +1119,11 @@ fn full_caps() -> WorkerInfo {
     WorkerInfo {
         supported_work: ForwardMode::ALL.to_vec(),
         groups: vec![
-            KvCacheGroupSpec {
+            KvCacheGroup {
                 num_blocks: 2048,
                 kind: KvGroupKind::Full,
             },
-            KvCacheGroupSpec {
+            KvCacheGroup {
                 num_blocks: 2048,
                 kind: KvGroupKind::SlidingWindow {
                     window: 4096,

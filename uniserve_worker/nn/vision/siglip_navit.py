@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 
 from ...execution.forward_batch import ForwardBatch
-from ..layer import LayerSpec
+from ..layer import LayerConfig
 from ..linear import LinearBase
 from .encoder import VisionEncoder, VisionEncoderConfig
 from .patching import patchify_batch
@@ -42,7 +42,7 @@ SIGLIP_SO400M = SiglipNavitConfig()
 class SiglipNavitEncoder(nn.Module):
     """Linear-patch, learned-absolute-position NaViT encoder."""
 
-    def __init__(self, cfg: SiglipNavitConfig, *, spec: LayerSpec) -> None:
+    def __init__(self, cfg: SiglipNavitConfig, *, spec: LayerConfig) -> None:
         super().__init__()
         self.patch_size = int(cfg.patch_size)
         hidden = int(cfg.hidden_size)

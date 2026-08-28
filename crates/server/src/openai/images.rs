@@ -1,5 +1,5 @@
 use crate::serving::{
-    GenerateReqInput, ImageGenControls, ModalitySelection, OutputContract, PromptInput,
+    GenerateReqInput, ImageGenControls, ModalitySelection, OutputDetail, PromptInput,
     SchedulingBounds, ServeEvent, ServeRequestId,
 };
 use futures::{Stream, StreamExt as _};
@@ -61,7 +61,7 @@ pub fn lower_image_generation_request(
             max_images: Some(1),
             ..ImageGenControls::default()
         }),
-        output: OutputContract::VisibleText,
+        output: OutputDetail::VisibleText,
         scheduling: SchedulingBounds {
             trace_context: context.trace_context.into_iter().collect(),
             ..SchedulingBounds::default()

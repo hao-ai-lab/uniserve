@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from tests.python.fixtures.execution_worker import execution_worker
-from uniserve_worker.batch import ForwardMode, SamplingOwnership
+from uniserve_worker.execution.batch import ForwardMode, SamplingOwnership
 from uniserve_worker.bootstrap.capabilities import resolve_capabilities
 from uniserve_worker.bootstrap.capacity import operation_window
 from uniserve_worker.models.runtime import ExecutionModel, ResourceGeometry, WorkerDeployment

@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any, Final, cast, overload
 
 import torch
 
-from ..batch import (
+from ..execution.batch import (
     CompletionReport,
     DeferredSemanticDigest,
     ErrorCode,

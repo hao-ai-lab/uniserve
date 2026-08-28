@@ -12,7 +12,7 @@ from typing import Final, cast
 
 import torch
 
-from ..batch import (
+from ..execution.batch import (
     DType,
     ProductKind,
     ProductRef,

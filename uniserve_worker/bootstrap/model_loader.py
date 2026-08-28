@@ -15,7 +15,7 @@ from ..loader.source import read_model_config, resolve_model_root
 from ..models.identity import ModelIdentity, architecture_identity
 from ..models.minimax_h3 import MiniMaxH3Model
 from ..models.runtime import ExecutionModel, WorkerDeployment
-from ..nn.mesh import DeviceMesh, TensorParallelSpec
+from ..nn.mesh import DeviceMesh, TensorParallel
 from .capacity import DEFAULT_MAX_REQUEST_POOL_SIZE
 from .catalog import CatalogEntry, resolve_catalog_entry
 from .config import WorkerProcessArgs
@@ -35,7 +35,7 @@ class WorkerModelLoadRequest:
     kv_token_capacity: int | None
     attention_backend: str | None
     execution: ExecutionConfig
-    parallel: TensorParallelSpec
+    parallel: TensorParallel
     scope: ModelLoadScope = ModelLoadScope.WHOLE
     generation_device: str | None = None
     load: LoadConfig = LoadConfig()
@@ -226,7 +226,7 @@ def _checkpoint_request(
         kv_token_capacity=config.resources.kv_token_capacity,
         attention_backend=model.attention_backend,
         execution=config.execution,
-        parallel=TensorParallelSpec.from_mesh(mesh),
+        parallel=TensorParallel.from_mesh(mesh),
         scope=plan.model_scope,
         generation_device=config.placement.generation_device,
         load=config.load,

@@ -83,7 +83,7 @@ uniserve_eval = ["profiles.toml"]
 # Native worker IPC extension (PyO3).
 [[tool.setuptools-rust.ext-modules]]
 target = "uniserve_worker._uniserve_ipc"
-path = "crates/protocol/worker-ipc-py/Cargo.toml"
+path = "crates/worker-ipc-py/Cargo.toml"
 binding = "PyO3"
 
 # Server/scheduler binary, installed onto PATH as `uniserve`.

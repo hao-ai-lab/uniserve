@@ -817,7 +817,7 @@ impl SimEngine {
         );
     }
 
-    pub fn set_groups(&mut self, groups: Vec<uniserve_core::KvCacheGroupSpec>) {
+    pub fn set_groups(&mut self, groups: Vec<uniserve_core::KvCacheGroup>) {
         self.caps.groups = groups;
     }
 

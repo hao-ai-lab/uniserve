@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ..batch import ForwardMode, SamplingOwnership
+from ..execution.batch import ForwardMode, SamplingOwnership
 from ..capabilities import (
     KvGroupKind,
     KvGroupSpec,

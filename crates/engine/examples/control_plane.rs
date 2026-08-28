@@ -48,7 +48,7 @@ fn main() {
         };
         let cache = Default::default();
         let resources =
-            GenerationResourceBounds::conservative(uniserve_core::GenerationResourceSpec {
+            GenerationResourceBounds::conservative(uniserve_core::GenerationResources {
                 context: &context,
                 negative_context: &[],
                 behavior: &behavior,

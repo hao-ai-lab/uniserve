@@ -10,7 +10,7 @@ from typing import Final
 
 import torch
 
-from ..batch import DType, ProductKind, ProductRef, RequestKey, StaticDim, StorageClass
+from ..execution.batch import DType, ProductKind, ProductRef, RequestKey, StaticDim, StorageClass
 from ..foundation.errors import WorkerError, WorkerErrorCode, invalid_descriptor, resource_error
 from .device import canonical_device
 from .device_events import DeviceEventPool

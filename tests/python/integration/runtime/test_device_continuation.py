@@ -11,7 +11,7 @@ from tests.python.fixtures.depth_one import (
     und_admission,
 )
 from tests.python.fixtures.execution_worker import execution_worker
-from uniserve_worker.batch import (
+from uniserve_worker.execution.batch import (
     Commit,
     DevicePoint,
     Disposition,

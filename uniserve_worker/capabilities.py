@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, TypeVar, cast
 
-from .batch import ForwardMode, SamplingOwnership
+from .execution.batch import ForwardMode, SamplingOwnership
 from .foundation.errors import invalid_descriptor
 
 

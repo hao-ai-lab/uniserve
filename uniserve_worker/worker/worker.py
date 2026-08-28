@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from ..batch import (
+from ..execution.batch import (
     Batch,
     CompletionReport,
     Domain,

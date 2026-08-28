@@ -18,7 +18,7 @@ from typing import cast
 import torch
 import torch.nn as nn
 
-from ..batch import ForwardMode
+from ..execution.batch import ForwardMode
 from ..execution.forward_batch import (
     AttentionMode,
     ForwardBatch,
@@ -30,7 +30,7 @@ from ..loader.mapping import LoadReport, WeightNameMap, stacked_weight_name
 from ..loader.weight_loaders import load_parameter_weight
 from ..nn import (
     FusedMoE,
-    LayerSpec,
+    LayerConfig,
     LinearBase,
     ParallelLMHead,
     QKVParallelLinear,
@@ -216,7 +216,7 @@ def _expert_cfg(cfg: _QwenConfig, intermediate_size: int | None = None) -> _MlpC
 class Qwen3Attention(nn.Module):
     """Multi-head self-attention with QK-norm, RoPE, and paged KV via ``RadixAttention``."""
 
-    def __init__(self, cfg: _QwenConfig, layer_id: int, *, spec: LayerSpec) -> None:
+    def __init__(self, cfg: _QwenConfig, layer_id: int, *, spec: LayerConfig) -> None:
         super().__init__()
         self.total_num_heads = cfg.num_attention_heads
         self.total_num_kv_heads = cfg.num_key_value_heads
@@ -380,7 +380,7 @@ class Qwen3Attention(nn.Module):
 class Qwen3MoE(nn.Module):
     """Mixture-of-experts feed-forward routed by a learned gate."""
 
-    def __init__(self, cfg: _QwenConfig, *, spec: LayerSpec) -> None:
+    def __init__(self, cfg: _QwenConfig, *, spec: LayerConfig) -> None:
         super().__init__()
         num_experts = cfg.num_experts
         top_k = cfg.num_experts_per_tok
@@ -402,7 +402,7 @@ class Qwen3MoE(nn.Module):
 class Qwen3DecoderLayer(nn.Module):
     """One transformer decoder layer (attention + MLP or MoE)."""
 
-    def __init__(self, cfg: _QwenConfig, layer_id: int, *, spec: LayerSpec) -> None:
+    def __init__(self, cfg: _QwenConfig, layer_id: int, *, spec: LayerConfig) -> None:
         super().__init__()
         self.self_attn = Qwen3Attention(cfg, layer_id, spec=spec)
         self.mlp = Qwen3MoE(cfg, spec=spec) if cfg.num_experts > 0 else Qwen3MLP(cfg, spec=spec)
@@ -442,7 +442,7 @@ class Qwen3DecoderLayer(nn.Module):
 class Qwen3Model(nn.Module):
     """Stack of Qwen3 decoder layers with token embeddings and final RMSNorm."""
 
-    def __init__(self, cfg: _QwenConfig, *, spec: LayerSpec) -> None:
+    def __init__(self, cfg: _QwenConfig, *, spec: LayerConfig) -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(
             cfg.vocab_size,
@@ -520,17 +520,17 @@ class Qwen3ForCausalLM(ExecutionModel):
             report.loaded.add(target_name)
         return report
 
-    def __init__(self, config: Mapping[str, object], *, layer_spec: LayerSpec) -> None:
+    def __init__(self, config: Mapping[str, object], *, layer_config: LayerConfig) -> None:
         super().__init__()
         if not isinstance(config, Mapping):
             raise TypeError("Qwen3 config must be a mapping")
         cfg = _QwenConfig.from_mapping(config)
-        self._parallel = layer_spec.parallel
-        self.model = Qwen3Model(cfg, spec=layer_spec)
+        self._parallel = layer_config.parallel
+        self.model = Qwen3Model(cfg, spec=layer_config)
         self.lm_head = ParallelLMHead(
             cfg.hidden_size,
             cfg.vocab_size,
-            spec=layer_spec,
+            spec=layer_config,
             bias=False,
         )
         self._tied_embeddings = cfg.tie_word_embeddings

@@ -126,7 +126,7 @@ fn enum_members<const N: usize>(
 
 impl NativeRequestTypes {
     fn build(py: Python<'_>) -> PyResult<Self> {
-        let module = py.import("uniserve_worker.batch")?;
+        let module = py.import("uniserve_worker.execution.batch")?;
         let class = |name: &str| -> PyResult<Py<PyAny>> { Ok(module.getattr(name)?.unbind()) };
         Ok(Self {
             operation: class("Operation")?,
@@ -1798,7 +1798,7 @@ mod tests {
             // The natively constructed batch must be exactly what the
             // canonical codec decodes from its own wire form.
             let round_tripped = py
-                .import("uniserve_worker.batch")
+                .import("uniserve_worker.execution.batch")
                 .unwrap()
                 .getattr("Batch")
                 .unwrap()

@@ -7,7 +7,7 @@ from typing import Any, Literal
 import torch
 from torch import nn
 
-from ...batch import DecodeKind, DecodePlacement, ForwardMode, MediaProfileId, NewRequest
+from ...execution.batch import DecodeKind, DecodePlacement, ForwardMode, MediaProfileId, NewRequest
 from ...nn.mesh import DeviceMesh
 from ...server.profiler import profile_range
 from ..runtime import ResourceGeometry

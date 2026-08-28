@@ -11,8 +11,8 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use uniserve_core::{
-    BlockId, GenerationRuntimeCapabilities, ImageParams, KvCacheDtype, KvCacheGroupSpec,
-    ModelDtype, RankInfo, RequestId, SamplingParams,
+    BlockId, GenerationRuntimeCapabilities, ImageParams, KvCacheDtype, KvCacheGroup, ModelDtype,
+    RankInfo, RequestId, SamplingParams,
 };
 pub use uniserve_core::{Digest, OpId, WorkerForwardStats};
 

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import torch
 
-from ...batch import RequestKey
+from ...execution.batch import RequestKey
 from ...nn.mesh import DeviceMesh
 from .packing import H3PackedLayout, build_packed_layout
 from .schedule import H3Schedule

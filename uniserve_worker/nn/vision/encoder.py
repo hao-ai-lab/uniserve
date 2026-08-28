@@ -12,7 +12,7 @@ import uniserve_worker.ops as ops
 
 from ...execution.forward_batch import ForwardBatch
 from ..attention import RadixAttention
-from ..layer import LayerSpec
+from ..layer import LayerConfig
 from ..linear import LinearBase
 
 __all__ = [
@@ -33,7 +33,7 @@ class VisionEncoderConfig:
 
 
 class VisionSelfAttention(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int, *, spec: LayerSpec) -> None:
+    def __init__(self, hidden_size: int, num_heads: int, *, spec: LayerConfig) -> None:
         super().__init__()
         if hidden_size % num_heads != 0:
             raise ValueError("vision hidden_size must be divisible by num_attention_heads")
@@ -103,7 +103,7 @@ class VisionSelfAttention(nn.Module):
 
 
 class VisionEncoderLayer(nn.Module):
-    def __init__(self, cfg: VisionEncoderConfig, *, spec: LayerSpec) -> None:
+    def __init__(self, cfg: VisionEncoderConfig, *, spec: LayerConfig) -> None:
         super().__init__()
         self.layer_norm1 = nn.LayerNorm(cfg.hidden_size, eps=cfg.layer_norm_eps)
         self.self_attn = VisionSelfAttention(
@@ -142,7 +142,7 @@ class VisionEncoder(nn.Module):
         self,
         cfg: VisionEncoderConfig,
         *,
-        spec: LayerSpec,
+        spec: LayerConfig,
         post_norm: bool = True,
     ) -> None:
         super().__init__()

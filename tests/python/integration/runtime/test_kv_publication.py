@@ -15,7 +15,7 @@ from tests.python.fixtures.depth_one import (
     kv_publication_operation as _publication_operation,
 )
 from tests.python.fixtures.execution_worker import execution_worker
-from uniserve_worker.batch import (
+from uniserve_worker.execution.batch import (
     BlockTable,
     Bounds,
     CachePageAllocation,

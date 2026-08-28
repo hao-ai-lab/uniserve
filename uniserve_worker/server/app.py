@@ -13,7 +13,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from ..batch import (
+from ..execution.batch import (
     Batch,
     CompletionReport,
     ForwardMode,

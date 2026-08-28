@@ -11,7 +11,7 @@ from enum import StrEnum
 
 import torch
 
-from uniserve_worker.batch import Domain, Operation
+from uniserve_worker.execution.batch import Domain, Operation
 from uniserve_worker.execution.cuda_graph import (
     CudaGraphRunner,
     GraphExecutionError,

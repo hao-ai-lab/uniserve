@@ -24,7 +24,7 @@ from enum import StrEnum
 from functools import lru_cache
 from typing import Any, TypeAlias, TypeVar, cast
 
-from .foundation.errors import invalid_descriptor
+from ..foundation.errors import invalid_descriptor
 
 TRANSFER_DESCRIPTOR_PREFIX = b"uniserve-transfer\0"
 MAX_TRANSFER_DESCRIPTOR_BYTES = 64 * 1024

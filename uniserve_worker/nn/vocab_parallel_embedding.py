@@ -15,7 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..execution.forward_batch import MeshView
-from .layer import LayerSpec
+from .layer import LayerConfig
 from .linear import ColumnParallelLinear
 
 __all__ = [
@@ -67,7 +67,7 @@ class VocabParallelEmbedding(nn.Module):
         embedding_dim: int,
         padding_idx: int | None = None,
         *,
-        spec: LayerSpec,
+        spec: LayerConfig,
         pad_vocab_size_to: int = _VOCAB_PAD_MULTIPLE,
         init_weights: bool = True,
     ) -> None:
@@ -136,7 +136,7 @@ class ParallelLMHead(ColumnParallelLinear):
         input_size: int,
         vocab_size: int,
         *,
-        spec: LayerSpec,
+        spec: LayerConfig,
         bias: bool = False,
         gather_output: bool = True,
         pad_vocab_size_to: int = _VOCAB_PAD_MULTIPLE,

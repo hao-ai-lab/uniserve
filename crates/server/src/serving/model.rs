@@ -31,7 +31,7 @@ use crate::serving::chat::{
     ChatRequest, ChatTemplateLoadOptions, HfChatRenderer, Qwen3ChatOutputProcessor,
 };
 use crate::serving::input::{
-    GenerateReqInput, ModelEventIdentity, OutputContract, OutputProcessorPolicy, PromptInput,
+    GenerateReqInput, ModelEventIdentity, OutputDetail, OutputProcessorPolicy, PromptInput,
     TokenizedGenerateReqInput,
 };
 use crate::serving::text::{SamplingHints, TextDecodeOptions, resolve_max_tokens};
@@ -838,7 +838,7 @@ impl Qwen3Desc {
             decode,
             emit_token_ids: matches!(
                 request.output,
-                OutputContract::Tokens | OutputContract::Logprobs
+                OutputDetail::Tokens | OutputDetail::Logprobs
             ),
             prompt_logprobs_requested,
             generated_logprobs_requested,

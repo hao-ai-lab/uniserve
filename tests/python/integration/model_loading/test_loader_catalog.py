@@ -25,9 +25,9 @@ from uniserve_worker.loader.source import (
 from uniserve_worker.loader.update import BucketTensor, WeightUpdater
 from uniserve_worker.loader.weight_loaders import attach_parameter_loaders, load_parameter_weight
 from uniserve_worker.models.qwen3 import Qwen3ForCausalLM
-from uniserve_worker.nn.layer import LayerSpec
+from uniserve_worker.nn.layer import LayerConfig
 from uniserve_worker.nn.linear import ColumnParallelLinear, QKVParallelLinear
-from uniserve_worker.nn.mesh import TensorParallelSpec
+from uniserve_worker.nn.mesh import TensorParallel
 from uniserve_worker.nn.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -37,8 +37,8 @@ from uniserve_worker.nn.vocab_parallel_embedding import (
 pytestmark = pytest.mark.integration
 
 
-def _parallel(rank: int = 0, size: int = 1) -> TensorParallelSpec:
-    return TensorParallelSpec(rank=rank, size=size)
+def _parallel(rank: int = 0, size: int = 1) -> TensorParallel:
+    return TensorParallel(rank=rank, size=size)
 
 
 def _execution(dtype: str = "float32") -> ExecutionConfig:
@@ -99,7 +99,7 @@ def _sense_config() -> dict[str, object]:
 def _qwen_reference(config: dict[str, object]) -> Qwen3ForCausalLM:
     model = Qwen3ForCausalLM(
         config,
-        layer_spec=LayerSpec(parallel=_parallel(), quantization=None),
+        layer_config=LayerConfig(parallel=_parallel(), quantization=None),
     )
     with torch.no_grad():
         for index, parameter in enumerate(model.parameters(), start=1):
@@ -345,7 +345,7 @@ def test_remote_resolution_fetches_only_weights_index_and_architecture_sidecars(
 
 
 def test_partition_loaders_copy_rank_slices_packed_slots_and_vocab_overlap():
-    spec = LayerSpec(parallel=_parallel(rank=1, size=2), quantization=None)
+    spec = LayerConfig(parallel=_parallel(rank=1, size=2), quantization=None)
     column = ColumnParallelLinear(4, 6, spec=spec, bias=False)
     qkv = QKVParallelLinear(4, 2, 2, 2, spec=spec, bias=False)
     vocab = VocabParallelEmbedding(65, 2, spec=spec, init_weights=False)

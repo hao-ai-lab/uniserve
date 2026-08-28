@@ -9,7 +9,7 @@ use super::structured::structured_chat_event_stream;
 use crate::profile::reasoning::Qwen3ReasoningParser;
 use crate::profile::tools::Qwen3XmlToolParser;
 use crate::serving::chat::output::{Error, Result as ChatResult};
-use crate::serving::chat::protocol::{ChatRequest, ChatToolChoice};
+use crate::serving::chat::{ChatRequest, ChatToolChoice};
 use crate::serving::text::tokenizer::DynTokenizer;
 
 /// Request-scoped Qwen3 reasoning and tool-call processor.

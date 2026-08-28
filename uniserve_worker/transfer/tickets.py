@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
-from ..batch import MAX_TRANSFER_DESCRIPTOR_BYTES, TRANSFER_DESCRIPTOR_PREFIX
+from ..execution.batch import MAX_TRANSFER_DESCRIPTOR_BYTES, TRANSFER_DESCRIPTOR_PREFIX
 from ..foundation.errors import capability_mismatch, invalid_descriptor, resource_error
 
 if TYPE_CHECKING:

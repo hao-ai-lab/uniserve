@@ -24,7 +24,7 @@ pub use generation::{
     GeneratedImageFeedbackRecipe, GenerationBehaviorDescriptor, GenerationCachePolicyDescriptor,
     GenerationConstraint, GenerationConstraintParseError, GenerationFeatures,
     GenerationPolicyDescriptor, GenerationRequest, GenerationRequestError,
-    GenerationResourceBounds, GenerationResourceError, GenerationResourceSpec,
+    GenerationResourceBounds, GenerationResourceError, GenerationResources,
     GenerationRuntimeCapabilities, ImageIngestRecipe, ImageIngestStep, ImageKvEffect, ImageSegment,
     SegmentPlacement, TerminationPolicyDescriptor, TriggerPolicyDescriptor, UndTokenAction,
     UndVisibility, VisibilityPolicyDescriptor, encoder_cache_key,
@@ -709,7 +709,7 @@ pub enum KvGroupKind {
 
 /// One positional KV-cache group reported by the worker at handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct KvCacheGroupSpec {
+pub struct KvCacheGroup {
     /// Number of physical pages in this group's subspace.
     pub num_blocks: u32,
     #[serde(default)]

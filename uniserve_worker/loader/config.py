@@ -8,7 +8,7 @@ from typing import cast
 
 from ..bootstrap.execution_config import ExecutionConfig
 from ..bootstrap.plan import ModelLoadScope
-from ..nn.mesh import TensorParallelSpec
+from ..nn.mesh import TensorParallel
 
 __all__ = ["LoadConfig", "LoadFormat", "LoadRequest"]
 
@@ -99,7 +99,7 @@ class LoadRequest:
     model_path: str
     device: str
     execution: ExecutionConfig
-    parallel: TensorParallelSpec
+    parallel: TensorParallel
     scope: ModelLoadScope
     load: LoadConfig = LoadConfig()
     attention_backend: str | None = None

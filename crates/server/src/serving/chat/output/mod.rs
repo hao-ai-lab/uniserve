@@ -11,7 +11,7 @@ pub use qwen3::Qwen3ChatOutputProcessor;
 
 pub use crate::profile::reasoning::ReasoningDelta;
 pub use crate::profile::tools::ToolParserError;
-pub use crate::serving::chat::protocol::{
+pub use crate::serving::chat::{
     AssistantBlockKind, AssistantContentBlock, AssistantMessage, AssistantToolCall, ChatEvent,
     ChatRequest, ChatToolChoice, Tool,
 };

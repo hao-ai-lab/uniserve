@@ -14,7 +14,7 @@ from PIL import Image
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as vision
 
-from uniserve_worker.batch import EncodeMode
+from uniserve_worker.execution.batch import EncodeMode
 from uniserve_worker.foundation.errors import invalid_descriptor
 from uniserve_worker.models.inputs import (
     ImageProcessor,

@@ -16,7 +16,7 @@ use super::format::{
     ChatTemplateContentFormat, ChatTemplateContentFormatOption, detect_chat_template_content_format,
 };
 use super::tojson::hf_tojson_filter;
-use crate::serving::chat::protocol::ReasoningEffort;
+use crate::serving::chat::ReasoningEffort;
 use crate::serving::chat::template::renderer::hf::{TemplateMessage, TemplateTool};
 
 type Result<T> = std::result::Result<T, TemplateError>;

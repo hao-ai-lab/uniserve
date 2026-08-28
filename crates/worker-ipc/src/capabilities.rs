@@ -37,7 +37,7 @@ pub struct WorkerInfo {
     pub gen_rope_advance: u32,
     pub max_cfg_branches: u32,
     pub bytes_per_token: u64,
-    pub groups: Vec<KvCacheGroupSpec>,
+    pub groups: Vec<KvCacheGroup>,
     pub kv_dtype: Option<KvCacheDtype>,
     pub model_dtype: ModelDtype,
     pub rank: RankInfo,
@@ -262,7 +262,7 @@ impl Default for WorkerInfo {
             gen_rope_advance: 2,
             max_cfg_branches: 3,
             bytes_per_token: 57_344,
-            groups: vec![KvCacheGroupSpec {
+            groups: vec![KvCacheGroup {
                 num_blocks: 4096,
                 kind: Default::default(),
             }],

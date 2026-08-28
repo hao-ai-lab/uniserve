@@ -5,7 +5,7 @@ use crate::serving::chat::{
 };
 use crate::serving::{
     CacheBounds, DecodeControls, GenerateReqInput, ImageGenControls, ModalitySelection,
-    OutputContract, PromptInput, SamplingConfig, SchedulingBounds, ServeRequestId, StopConfig,
+    OutputDetail, PromptInput, SamplingConfig, SchedulingBounds, ServeRequestId, StopConfig,
 };
 use itertools::Itertools as _;
 
@@ -51,11 +51,11 @@ pub fn lower_chat_request(
     let include_prompt_logprobs = prompt_logprobs.is_some();
     let return_token_ids = request.return_token_ids.unwrap_or(false);
     let output = if requested_logprobs || include_prompt_logprobs {
-        OutputContract::Logprobs
+        OutputDetail::Logprobs
     } else if return_token_ids {
-        OutputContract::Tokens
+        OutputDetail::Tokens
     } else {
-        OutputContract::VisibleText
+        OutputDetail::VisibleText
     };
     let modalities = convert_modalities(&request.modalities);
     let image_gen = request.image_config.as_ref().map(convert_image_config);

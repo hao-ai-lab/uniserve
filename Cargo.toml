@@ -2,7 +2,8 @@
 resolver = "3"
 members = [
     "crates/foundation/*",
-    "crates/protocol/*",
+    "crates/worker-ipc",
+    "crates/worker-ipc-py",
     "crates/engine",
     "crates/server",
     "crates/bin/uniserve",
@@ -19,7 +20,7 @@ readme = "README.md"
 uniserve-core = { path = "crates/foundation/core" }
 uniserve-observability = { path = "crates/foundation/observability" }
 uniserve-observability-derive = { path = "crates/foundation/observability-derive" }
-uniserve-worker-ipc = { path = "crates/protocol/worker-ipc" }
+uniserve-worker-ipc = { path = "crates/worker-ipc" }
 uniserve-engine = { path = "crates/engine" }
 uniserve-server = { path = "crates/server" }
 

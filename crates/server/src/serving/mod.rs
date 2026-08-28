@@ -38,7 +38,7 @@ use uniserve_engine::EventRx;
 
 pub use input::{
     CacheBounds, DecodeControls, GenerateReqInput, ImageGenControls, ImageInput, ModalitySelection,
-    ModelEventIdentity, OutputContract, OutputProcessorPolicy, PromptInput, SamplingConfig,
+    ModelEventIdentity, OutputDetail, OutputProcessorPolicy, PromptInput, SamplingConfig,
     SchedulingBounds, StopConfig, TokenizedGenerateReqInput,
 };
 pub use model::{
@@ -458,7 +458,7 @@ impl ServingRuntime {
 
         let stream_result: Result<ServeEventStream> = match engine_stream {
             Ok(stream) => {
-                let assembly = StreamAssemblySpec {
+                let assembly = StreamInput {
                     request_id: request_id.clone(),
                     event_context,
                     prompt_token_ids,
@@ -996,7 +996,7 @@ struct EventContext {
     metrics: Arc<RuntimeLifecycleMetrics>,
 }
 
-struct StreamAssemblySpec {
+struct StreamInput {
     request_id: ServeRequestId,
     event_context: EventContext,
     prompt_token_ids: Vec<u32>,
@@ -1565,7 +1565,7 @@ mod tests {
         drop(tx);
 
         let events = assemble_event_stream(
-            StreamAssemblySpec {
+            StreamInput {
                 request_id: "req".into(),
                 event_context: event_context(),
                 prompt_token_ids: vec![b'p' as u32],
@@ -1618,7 +1618,7 @@ mod tests {
         .unwrap();
 
         let events = assemble_event_stream(
-            StreamAssemblySpec {
+            StreamInput {
                 request_id: "feedback-output".into(),
                 event_context: event_context(),
                 prompt_token_ids: vec![b'p' as u32],

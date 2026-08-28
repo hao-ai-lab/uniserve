@@ -7,7 +7,7 @@ from collections.abc import Sequence
 
 import torch
 
-from uniserve_worker.batch import ForwardMode
+from uniserve_worker.execution.batch import ForwardMode
 from uniserve_worker.execution.forward_batch import AttentionMode, ExpertRoute, RouteSpan
 from uniserve_worker.foundation.errors import invalid_descriptor
 from uniserve_worker.foundation.math import bucketed_length

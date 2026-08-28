@@ -19,7 +19,7 @@ import torch
 from torch import nn
 
 from ..foundation.errors import capability_mismatch
-from ..nn.layer import LayerSpec
+from ..nn.layer import LayerConfig
 from ..nn.quant import QuantizationConfig
 from ..nn.quant.base import process_quantized_modules
 from .audit import audit_load_report
@@ -312,7 +312,7 @@ def _construct_model(
     dtype = _serving_dtype(request.execution.model_dtype)
     quantization = QuantizationConfig.from_model_config(config)
     _validate_quantization(quantization, request.device, dtype)
-    spec = LayerSpec(parallel=request.parallel, quantization=quantization)
+    spec = LayerConfig(parallel=request.parallel, quantization=quantization)
     use_meta = (
         request.load.load_format is LoadFormat.LAYERED
         or (
@@ -323,9 +323,9 @@ def _construct_model(
     construction_device = torch.device("meta" if use_meta else request.device)
     with _default_dtype(dtype), torch.device(construction_device):
         if entry.architecture == "NEOChatModel":
-            model = entry.model_class(config, layer_spec=spec, scope=request.scope.value)
+            model = entry.model_class(config, layer_config=spec, scope=request.scope.value)
         else:
-            model = entry.model_class(config, layer_spec=spec)
+            model = entry.model_class(config, layer_config=spec)
     if not isinstance(model, nn.Module):
         raise capability_mismatch("catalog model constructor did not return torch.nn.Module")
     attach_parameter_loaders(model, device=request.device, dtype=dtype)

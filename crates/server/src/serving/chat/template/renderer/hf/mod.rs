@@ -13,9 +13,9 @@ use self::format::{
 };
 use self::template::{CompiledChatTemplate, TemplateContext};
 use self::value::{TemplateValue, to_template_value};
-use crate::serving::chat::protocol::{ChatContent, ChatContentPart, ChatMessage, ChatRequest};
 use crate::serving::chat::template::error::Result;
 use crate::serving::chat::template::{ChatTemplateLoadOptions, Error, Tool};
+use crate::serving::chat::{ChatContent, ChatContentPart, ChatMessage, ChatRequest};
 
 mod error;
 mod format;
@@ -424,11 +424,11 @@ mod tests {
     use serde_json::Value;
 
     use super::{ChatTemplateContentFormatOption, HfChatRenderer, MultimodalRenderInfo};
-    use crate::serving::chat::protocol::{
+    use crate::serving::chat::template::{AssistantContentBlock, Error, Result};
+    use crate::serving::chat::{
         ChatContentPart, ChatMessage, ChatRequest, ChatRole, ChatToolChoice, GenerationPromptMode,
         ReasoningEffort, Tool,
     };
-    use crate::serving::chat::template::{AssistantContentBlock, Error, Result};
 
     const QWEN3_0_6B_TEMPLATE: &str = include_str!("../../../../../../tests/templates/qwen3.jinja");
     fn sample_request(messages: Vec<ChatMessage>) -> ChatRequest {

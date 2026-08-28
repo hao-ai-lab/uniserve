@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from uniserve_worker.batch import (
+from uniserve_worker.execution.batch import (
     AttentionRegime,
     Batch,
     BatchPartition,

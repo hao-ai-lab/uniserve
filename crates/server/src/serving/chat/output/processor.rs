@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 
+use crate::serving::chat::AssistantBlockKind;
 use crate::serving::chat::output::FinishReason;
-use crate::serving::chat::protocol::AssistantBlockKind;
 use crate::serving::text::output::{DecodedLogprobs, DecodedPromptLogprobs};
 use uniserve_core::PublicCommit;
 
