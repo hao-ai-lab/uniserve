@@ -831,6 +831,14 @@ class WorkerServer:
         for earlier in tuple(self.waiting_requests)[:index]:
             if not earlier.sessions.isdisjoint(pending.sessions):
                 return False
+        if not self._launch_reorder:
+            self._advance_execution_order()
+            return all(
+                not isinstance(step, InflightStep)
+                or step.session_ids.isdisjoint(pending.sessions)
+                or step.source is None
+                for step in self.steps.values()
+            )
         for step in tuple(self.steps.values()):
             if not isinstance(step, InflightStep):
                 continue
@@ -1063,11 +1071,23 @@ class WorkerServer:
             pending.cursor = None
             return True
 
+    def _advance_execution_order(self) -> None:
+        for step in tuple(self.steps.values()):
+            if isinstance(step, InflightStep) and not step.advance_execution():
+                return
+
     def _send_one_ready_response(self) -> bool:
+        if not self._launch_reorder:
+            self._advance_execution_order()
         earlier_sessions: set[int] = set()
         for index, pending in enumerate(self.pending_responses):
             lineage_ready = earlier_sessions.isdisjoint(pending.sessions)
-            if lineage_ready and self._pending_ready(pending):
+            execution_ready = (
+                self._launch_reorder
+                or pending.cursor is None
+                or pending.cursor.source is None
+            )
+            if lineage_ready and execution_ready and self._pending_ready(pending):
                 del self.pending_responses[index]
                 self._send_pending(pending)
                 return True
@@ -1155,6 +1175,10 @@ class WorkerServer:
             cursor=cursor if isinstance(cursor, StepOutputs) else None,
             origin=RequestKind.EXECUTE,
         )
+        if not self._launch_reorder:
+            self._advance_execution_order()
+            if pending.cursor is not None and pending.cursor.source is not None:
+                raise RuntimeError("worker response is not query-ready")
         if not self._pending_ready(pending):
             raise RuntimeError("worker response is not query-ready")
         self._send_pending(pending)

@@ -888,8 +888,11 @@ class Worker:
             self._end_model_call()
             raise
         if prepared is None:
-            self._end_model_call()
-            return None
+            if int(self.capabilities.rank.tp_size) > 1:
+                prepared = PreparedExecution(batch=batch, transfers=())
+            else:
+                self._end_model_call()
+                return None
         return prepared.bind(
             lambda value: execute_prepared(self.execution, value),
             self._end_model_call,
