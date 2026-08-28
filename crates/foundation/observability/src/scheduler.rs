@@ -153,13 +153,8 @@ pub struct SchedulerMetrics {
     )]
     pub scheduler_domain_completed_partitions: Family<EngineDomainLabels, U64Counter>,
     #[metric(
-        name = "uniserve:scheduler_domain_commits",
-        help = "Semantic and public commit events by execution domain and kind."
-    )]
-    pub scheduler_domain_commits: Family<EngineDomainKindLabels, U64Counter>,
-    #[metric(
         name = "uniserve:scheduler_domain_time_us",
-        help = "Cumulative execution-domain time in microseconds by phase: queue, launch, device, completion, semantic_commit, public_commit, or co_resident."
+        help = "Cumulative execution-domain time in microseconds by phase: queue, launch, device, completion, or co_resident."
     )]
     pub scheduler_domain_time_us: Family<EngineDomainKindLabels, U64Counter>,
     #[metric(

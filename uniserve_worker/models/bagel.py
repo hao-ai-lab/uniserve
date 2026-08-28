@@ -199,16 +199,16 @@ class _BagelGraph(nn.Module):
                 rope_theta=cfg.llm.rope_theta,
                 head_dim=cfg.llm.head_dim,
             ),
-            spec=layer_config,
+            layer_config=layer_config,
         )
         self.lm_head = ParallelLMHead(
             hidden,
             cfg.llm.vocab_size,
-            spec=layer_config,
+            layer_config=layer_config,
             bias=False,
         )
-        self.vae2llm = LinearBase(cfg.patch_latent_dim, hidden, spec=layer_config)
-        self.llm2vae = LinearBase(hidden, cfg.patch_latent_dim, spec=layer_config)
+        self.vae2llm = LinearBase(cfg.patch_latent_dim, hidden, layer_config=layer_config)
+        self.llm2vae = LinearBase(hidden, cfg.patch_latent_dim, layer_config=layer_config)
         self.time_embedder = TimestepEmbedder(hidden)
         self.latent_pos_embed = PositionEmbedding(cfg.max_latent_size, hidden, init_sincos=False)
         self.vae = AutoEncoder(default_ae_params())
@@ -222,7 +222,7 @@ class _BagelGraph(nn.Module):
                 num_hidden_layers=cfg.vit_num_hidden_layers,
                 layer_norm_eps=cfg.vit_layer_norm_eps,
             ),
-            spec=layer_config,
+            layer_config=layer_config,
         )
         self.connector = MLPConnector(cfg.vit_hidden_size, hidden, cfg.connector_act)
         self.vit_pos_embed = PositionEmbedding(
@@ -251,7 +251,7 @@ class _BagelGraph(nn.Module):
         """Marker/VAE-latent/timestep embeddings for one gen segment, ``[num_vae+2, hidden]``.
 
         Shared by graph denoise and image-commit paths so marker and latent
-        embeddings follow one model contract.
+        embeddings follow one model layout.
         """
         hidden = self.cfg.llm.hidden_size
         total = int(num_vae) + 2

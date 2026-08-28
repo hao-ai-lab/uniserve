@@ -13,7 +13,7 @@ class MiniMaxH3AudioVAE(nn.Module):
         super().__init__()
         self.vae = vae.float()
         if not hasattr(vae, "decode"):
-            raise TypeError("MiniMax H3 audio VAE does not expose its decode contract")
+            raise TypeError("MiniMax H3 audio VAE does not expose decode")
         mean = vae.config.latents_mean
         std = vae.config.latents_std
         if mean is None or std is None or len(mean) != 32 or len(std) != 32:

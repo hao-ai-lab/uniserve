@@ -7,7 +7,7 @@ from collections.abc import Iterable, Sequence
 import torch
 
 from ..backends.paged_kv_math import paged_kv_write
-from ..foundation.errors import capability_mismatch, compute_error, invalid_descriptor
+from ..foundation.errors import unsupported_setup, compute_error, invalid_descriptor
 from ..nn.quant.kv_cache import (
     dequantize_fp8_block,
     fp8_quantize,
@@ -278,7 +278,7 @@ class CachePool:
         self.validate_group(group)
         layer_id = self._validate_layer(layer)
         if self.is_quantized:
-            raise capability_mismatch(
+            raise unsupported_setup(
                 "paged attention cannot consume quantized KV storage without scale-aware kernels"
             )
         return self.k[layer_id], self.v[layer_id]

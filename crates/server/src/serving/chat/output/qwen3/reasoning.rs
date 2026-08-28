@@ -118,12 +118,8 @@ pub async fn reasoning_event_stream(
                 delta,
                 token_ids,
                 logprobs,
-                public_commit,
                 finished,
             } => {
-                if let Some(commit) = public_commit {
-                    y.yield_ok(ReasoningEvent::PublicCommit(commit)).await;
-                }
                 for next in state.process_delta(delta) {
                     y.yield_ok(next).await;
                 }

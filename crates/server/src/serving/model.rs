@@ -22,9 +22,9 @@ use crate::profile::{
 use thiserror::Error;
 use uniserve_core::{
     ContextSegment as CoreContextSegment, GenerationBehaviorDescriptor,
-    GenerationCachePolicyDescriptor, GenerationConstraint, GenerationFeatures,
-    GenerationPolicyDescriptor, GenerationRequest, GenerationResourceBounds,
-    GenerationRuntimeCapabilities, ImageParams, RequestId, SamplingParams, UndVisibility,
+    GenerationCachePolicyDescriptor, GenerationConstraint, GenerationFeatures, GenerationLimits,
+    GenerationPolicyDescriptor, GenerationRequest, GenerationResourceBounds, ImageParams,
+    RequestId, SamplingParams, UndVisibility,
 };
 
 use crate::serving::chat::{
@@ -124,7 +124,7 @@ impl ServedSamplingControl {
 
 /// Exact public route declaration for one load-bound model.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServedModelCapabilities {
+pub struct ModelSupport {
     pub endpoints: Vec<ServedEndpoint>,
     pub input_modalities: Vec<ServedModality>,
     pub output_modalities: Vec<ServedModality>,
@@ -144,7 +144,7 @@ pub enum OmniDesc {
     Bagel(BagelDesc),
 }
 
-/// Typed assets awaiting validation against the running worker capabilities.
+/// Typed assets awaiting validation against the running worker limits.
 pub enum ResolvedAssets {
     Text {
         profile: CommonModelProfile,
@@ -181,12 +181,10 @@ pub enum ModelResolutionError {
         #[source]
         source: std::io::Error,
     },
-    #[error(
-        "configured model description `{description}` requires worker capability `{capability}`"
-    )]
-    MissingCapability {
+    #[error("configured model description `{description}` requires worker feature `{feature}`")]
+    MissingFeature {
         description: &'static str,
-        capability: GenerationFeatures,
+        feature: GenerationFeatures,
     },
 }
 
@@ -375,7 +373,7 @@ pub struct Qwen3Desc {
     tokenizer: DynTokenizer,
     renderer: HfChatRenderer,
     hints: SamplingHints,
-    capabilities: GenerationRuntimeCapabilities,
+    limits: GenerationLimits,
     sampling_controls: Vec<ServedSamplingControl>,
     logprobs_supported: bool,
     parse_reasoning: bool,
@@ -388,7 +386,7 @@ pub struct SenseNovaDesc {
     tokenizer: DynTokenizer,
     renderer: HfChatRenderer,
     preprocessing: SenseNovaProfile,
-    capabilities: GenerationRuntimeCapabilities,
+    limits: GenerationLimits,
     sampling_controls: Vec<ServedSamplingControl>,
     default_max_output_tokens: Option<u32>,
     max_model_tokens: u32,
@@ -400,7 +398,7 @@ pub struct BagelDesc {
     tokenizer: DynTokenizer,
     renderer: HfChatRenderer,
     preprocessing: BagelProfile,
-    capabilities: GenerationRuntimeCapabilities,
+    limits: GenerationLimits,
     sampling_controls: Vec<ServedSamplingControl>,
     default_max_output_tokens: Option<u32>,
     max_model_tokens: u32,
@@ -417,7 +415,7 @@ impl ResolvedModel {
     /// assets are checked before construction.
     pub fn resolve(
         assets: ResolvedAssets,
-        capabilities: GenerationRuntimeCapabilities,
+        limits: GenerationLimits,
         sampling_controls: Vec<ServedSamplingControl>,
         max_model_tokens: u32,
         parse_reasoning: bool,
@@ -428,9 +426,9 @@ impl ResolvedModel {
                 tokenizer,
                 renderer,
             } => {
-                validate_runtime_capabilities(
+                validate_runtime_features(
                     &profile.identity,
-                    &capabilities,
+                    &limits,
                     GenerationFeatures::UNDERSTANDING,
                 )?;
                 let hints = sampling_hints(&profile, max_model_tokens);
@@ -441,7 +439,7 @@ impl ResolvedModel {
                     tokenizer,
                     renderer,
                     hints,
-                    capabilities,
+                    limits,
                     sampling_controls,
                     logprobs_supported,
                     parse_reasoning,
@@ -461,9 +459,9 @@ impl ResolvedModel {
                         (&value.generation_policy, &value.image_ingest)
                     }
                 };
-                validate_runtime_capabilities(
+                validate_runtime_features(
                     &profile.identity,
-                    &capabilities,
+                    &limits,
                     configured_omni_needs(generation_policy, image_ingest),
                 )?;
                 let default_max_output_tokens = profile
@@ -477,7 +475,7 @@ impl ResolvedModel {
                             tokenizer,
                             renderer,
                             preprocessing,
-                            capabilities,
+                            limits,
                             sampling_controls,
                             default_max_output_tokens,
                             max_model_tokens,
@@ -488,7 +486,7 @@ impl ResolvedModel {
                         tokenizer,
                         renderer,
                         preprocessing,
-                        capabilities,
+                        limits,
                         sampling_controls,
                         default_max_output_tokens,
                         max_model_tokens,
@@ -535,11 +533,11 @@ impl ResolvedModel {
         matches!(self, Self::Omni(_))
     }
 
-    /// Exact route capabilities exposed by model discovery and enforced by
+    /// Exact route limits exposed by model discovery and enforced by
     /// request admission.
-    pub fn served_capabilities(&self) -> ServedModelCapabilities {
+    pub fn support(&self) -> ModelSupport {
         if matches!(self, Self::Media(_)) {
-            return ServedModelCapabilities {
+            return ModelSupport {
                 endpoints: vec![ServedEndpoint::VideoGenerations],
                 input_modalities: vec![ServedModality::Text],
                 output_modalities: vec![ServedModality::Video, ServedModality::Audio],
@@ -554,7 +552,7 @@ impl ResolvedModel {
             Self::Text(description) => description.sampling_controls.clone(),
             Self::Omni(OmniDesc::SenseNova(description)) => description.sampling_controls.clone(),
             Self::Omni(OmniDesc::Bagel(description)) => description.sampling_controls.clone(),
-            Self::Media(_) => unreachable!("media capabilities returned above"),
+            Self::Media(_) => unreachable!("media limits returned above"),
         };
         let mut features = vec![ServedFeature::Streaming, ServedFeature::Usage];
         if sampling_controls.contains(&ServedSamplingControl::Logprobs) {
@@ -577,9 +575,9 @@ impl ResolvedModel {
                 input_modalities.push(ServedModality::Image);
                 output_modalities.push(ServedModality::Image);
             }
-            Self::Media(_) => unreachable!("media capabilities returned above"),
+            Self::Media(_) => unreachable!("media limits returned above"),
         }
-        ServedModelCapabilities {
+        ModelSupport {
             endpoints,
             input_modalities,
             output_modalities,
@@ -588,11 +586,11 @@ impl ResolvedModel {
         }
     }
 
-    /// Deterministic capability admission or rejection from the resolved route.
+    /// Deterministic feature admission or rejection from the resolved route.
     pub fn validate_request(&self, request: &GenerateReqInput) -> Result<()> {
-        let reject = |capability: &'static str| ServeError::UnsupportedCapability {
+        let reject = |feature: &'static str| ServeError::UnsupportedFeature {
             request_id: request.request_id.clone(),
-            capability,
+            feature,
         };
         if matches!(self, Self::Media(_)) {
             return Err(reject("generation_endpoint"));
@@ -604,26 +602,26 @@ impl ResolvedModel {
         if request.modalities.includes_image() && !self.supports_image_output() {
             return Err(reject("image_output"));
         }
-        let declared = self.served_capabilities();
+        let declared = self.support();
         if request.uses_tools() && !declared.features.contains(&ServedFeature::ToolCalling) {
             return Err(reject("tool_calling"));
         }
         if request.requests_reasoning() && !declared.features.contains(&ServedFeature::Reasoning) {
             return Err(reject("reasoning"));
         }
-        let (capabilities, needs) = match self {
-            Self::Text(d) => (&d.capabilities, GenerationFeatures::UNDERSTANDING),
+        let (limits, needs) = match self {
+            Self::Text(d) => (&d.limits, GenerationFeatures::UNDERSTANDING),
             Self::Omni(OmniDesc::SenseNova(d)) => (
-                &d.capabilities,
-                omni_capability_needs(
+                &d.limits,
+                omni_required_features(
                     &d.preprocessing.generation_policy,
                     &d.preprocessing.image_ingest,
                     request,
                 ),
             ),
             Self::Omni(OmniDesc::Bagel(d)) => (
-                &d.capabilities,
-                omni_capability_needs(
+                &d.limits,
+                omni_required_features(
                     &d.preprocessing.generation_policy,
                     &d.preprocessing.image_ingest,
                     request,
@@ -631,8 +629,8 @@ impl ResolvedModel {
             ),
             Self::Media(_) => unreachable!("media generation was rejected above"),
         };
-        if let Err(capability) = capabilities.covers(needs) {
-            return Err(reject(capability.name()));
+        if let Err(feature) = limits.covers(needs) {
+            return Err(reject(feature.name()));
         }
         Ok(())
     }
@@ -644,9 +642,9 @@ impl ResolvedModel {
             Self::Text(d) => d.tokenize(request),
             Self::Omni(OmniDesc::SenseNova(d)) => d.tokenize(request),
             Self::Omni(OmniDesc::Bagel(d)) => d.tokenize(request),
-            Self::Media(_) => Err(ServeError::UnsupportedCapability {
+            Self::Media(_) => Err(ServeError::UnsupportedFeature {
                 request_id: request.request_id,
-                capability: "generation_endpoint",
+                feature: "generation_endpoint",
             }),
         }
     }
@@ -657,23 +655,23 @@ fn configured_omni_needs(
     image_ingest: &uniserve_core::ImageIngestRecipe,
 ) -> GenerationFeatures {
     GenerationBehaviorDescriptor::resolve(GenerationConstraint::Default, policy)
-        .capability_needs(policy, image_ingest.steps.iter().copied())
+        .required_features(policy, image_ingest.steps.iter().copied())
 }
 
-fn validate_runtime_capabilities(
+fn validate_runtime_features(
     identity: &ModelIdentity,
-    capabilities: &GenerationRuntimeCapabilities,
+    limits: &GenerationLimits,
     needs: GenerationFeatures,
 ) -> Result<()> {
-    capabilities.covers(needs).map_err(|capability| {
-        ServeError::ModelResolution(ModelResolutionError::MissingCapability {
+    limits.covers(needs).map_err(|feature| {
+        ServeError::ModelResolution(ModelResolutionError::MissingFeature {
             description: identity.description.id(),
-            capability,
+            feature,
         })
     })
 }
 
-fn omni_capability_needs(
+fn omni_required_features(
     policy: &GenerationPolicyDescriptor,
     image_ingest: &uniserve_core::ImageIngestRecipe,
     request: &GenerateReqInput,
@@ -686,7 +684,7 @@ fn omni_capability_needs(
     } else {
         Vec::new()
     };
-    behavior.capability_needs(policy, context_steps)
+    behavior.required_features(policy, context_steps)
 }
 
 fn sampling_hints(profile: &CommonModelProfile, max_model_tokens: u32) -> SamplingHints {
@@ -970,7 +968,7 @@ impl SenseNovaDesc {
             crate::serving::omni::RuntimeBinding {
                 tokenizer: std::sync::Arc::clone(&self.tokenizer),
                 renderer: &self.renderer,
-                capabilities: &self.capabilities,
+                limits: &self.limits,
                 default_max_output_tokens: self.default_max_output_tokens,
                 max_model_tokens: self.max_model_tokens,
                 identity: ModelEventIdentity {
@@ -990,7 +988,7 @@ impl BagelDesc {
             crate::serving::omni::RuntimeBinding {
                 tokenizer: std::sync::Arc::clone(&self.tokenizer),
                 renderer: &self.renderer,
-                capabilities: &self.capabilities,
+                limits: &self.limits,
                 default_max_output_tokens: self.default_max_output_tokens,
                 max_model_tokens: self.max_model_tokens,
                 identity: ModelEventIdentity {

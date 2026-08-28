@@ -1,6 +1,6 @@
 # Serving evaluation
 
-`uniserve-eval` plans explicit TOML points and runs them serially. Offline comparison of matched result bundles is [`scripts/compare_eval.py`](../scripts/compare_eval.py). The detailed command and measurement semantics are documented in [`benchmark-protocol.md`](benchmark-protocol.md). Builder-facing layering and registries are documented in [`specs/eval.md`](../specs/eval.md).
+`uniserve-eval` plans explicit TOML points and runs them serially. Offline comparison of matched result bundles is [`scripts/compare_eval.py`](../scripts/compare_eval.py). Commands and measurement semantics are documented in [`benchmarking.md`](benchmarking.md). Evaluator implementation details are documented in [`specs/eval.md`](../specs/eval.md).
 
 ## Inspect available work
 

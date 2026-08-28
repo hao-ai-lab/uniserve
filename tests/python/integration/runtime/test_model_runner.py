@@ -503,7 +503,7 @@ def test_mixed_token_and_flow_match_homogeneous_results():
     )
 
 
-def test_mixed_submission_requires_tensorized_model_capability():
+def test_mixed_submission_requires_tensorized_model_support():
     worker = execution_worker(_SeparatePhaseModel())
     token_admission = und_admission(1, block_ids=(0,))
     flow_admission = gen_admission(2, ImageParams(steps=1, height=16, width=16, seed=29))
@@ -1763,7 +1763,7 @@ def test_generated_feedback_commits_absolute_visual_token_state():
     assert len(artifacts) == 1
     # The Artifact product carries the base64 PNG string as bytes: the scheduler
     # recovers it with String::from_utf8 and hands it to validate_png_artifact,
-    # which base64-decodes it and checks the PNG dimensions. Mirror that contract.
+    # which base64-decodes it and checks the PNG dimensions. Mirror that response.
     png_b64 = artifacts[0].payload
     png_bytes = base64.b64decode(png_b64.decode("ascii"), validate=True)
     assert png_bytes[:8] == _PNG_MAGIC

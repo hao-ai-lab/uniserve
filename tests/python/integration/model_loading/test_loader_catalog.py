@@ -335,10 +335,10 @@ def test_remote_resolution_fetches_only_weights_index_and_architecture_sidecars(
 
 
 def test_partition_loaders_copy_rank_slices_packed_slots_and_vocab_overlap():
-    spec = LayerConfig(parallel=_parallel(rank=1, size=2), quantization=None)
-    column = ColumnParallelLinear(4, 6, spec=spec, bias=False)
-    qkv = QKVParallelLinear(4, 2, 2, 2, spec=spec, bias=False)
-    vocab = VocabParallelEmbedding(65, 2, spec=spec, init_weights=False)
+    layer_config = LayerConfig(parallel=_parallel(rank=1, size=2), quantization=None)
+    column = ColumnParallelLinear(4, 6, layer_config=layer_config, bias=False)
+    qkv = QKVParallelLinear(4, 2, 2, 2, layer_config=layer_config, bias=False)
+    vocab = VocabParallelEmbedding(65, 2, layer_config=layer_config, init_weights=False)
     graph = torch.nn.ModuleDict({"column": column, "qkv": qkv, "vocab": vocab})
     attach_parameter_loaders(graph, device="cpu", dtype=torch.float32)
 

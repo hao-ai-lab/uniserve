@@ -2,7 +2,7 @@
 
 The FA4 reference kernel is an attention-only kernel: unlike FA2's
 ``flash_attn_with_kvcache`` it does not append current K/V into the cache.
-This backend keeps that contract explicit by writing the current K/V span into
+This backend keeps that layout explicit by writing the current K/V span into
 the worker-owned paged cache before calling the FA4 paged forward.
 """
 

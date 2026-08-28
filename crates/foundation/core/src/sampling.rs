@@ -9,7 +9,7 @@
 //!
 //! It operates on a logits slice and the per-request `SamplingParams` plus the
 //! small descriptor lists the host computed (recent tokens, allowed/suppress
-//! masks). No logits tensor crosses the wire — this runs inside the worker.
+//! masks). No logits tensor crosses the IPC — this runs inside the worker.
 
 use crate::SamplingParams;
 

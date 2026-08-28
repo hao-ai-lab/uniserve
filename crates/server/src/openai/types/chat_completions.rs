@@ -171,21 +171,6 @@ pub struct ChatCompletionStreamResponse {
     pub choices: Vec<ChatCompletionStreamChoice>,
     pub usage: Option<Usage>,
     pub prompt_token_ids: Option<Vec<u32>>,
-    pub public_commit: Option<StreamPublicCommit>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct StreamPublicCommit {
-    pub event_seq: u64,
-    pub modality: String,
-    pub committed_at: f64,
-    pub semantic_root: StreamSemanticRoot,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct StreamSemanticRoot {
-    pub producer_op_id: u64,
-    pub point_index: u32,
 }
 
 impl ChatCompletionStreamResponse {
@@ -198,7 +183,6 @@ impl ChatCompletionStreamResponse {
             choices: Vec::new(),
             usage: None,
             prompt_token_ids: None,
-            public_commit: None,
         }
     }
 }

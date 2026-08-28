@@ -1,8 +1,7 @@
-//! Byte encodings for the non-semantic completion product values a worker packs
+//! Byte encodings for completion product values a worker packs
 //! into `CompletionReport.products` and the host decodes for output.
 //!
-//! These values carry no lineage identity and enter no semantic digest; they are
-//! pure host-facing payloads addressed by their `ProductRef`. The encoding is a
+//! These are host-facing payloads addressed by their `ProductRef`. The encoding is a
 //! deterministic little-endian, length-prefixed layout so a producer and a
 //! consumer compute identical bytes.
 

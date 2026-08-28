@@ -1,7 +1,7 @@
-namespace uniserve.wire;
+namespace uniserve.ipc;
 
 // Closed forward-mode tag for one operation. Declaration order is the
-// canonical index on the wire and in capability negotiation.
+// canonical index in IPC and worker selection.
 enum ForwardMode : ubyte {
   TokenExtend,
   TokenDecode,
@@ -70,7 +70,7 @@ enum CloseReason : ubyte { Completed, Cancelled, Error, Preempted }
 
 // Administrative worker command channel (separate from request `Control`).
 enum ReqKind : ubyte {
-  GetCapabilities,
+  GetInfo,
   Execute,
   PollCompletions,
   DropSession,
@@ -79,7 +79,7 @@ enum ReqKind : ubyte {
   GetPressure
 }
 
-enum RespKind : ubyte { Capabilities, Result, Ok, Error, Pressure }
+enum RespKind : ubyte { Info, Result, Ok, Error, Pressure }
 enum ResourceClass : ubyte { KvBlock, EncoderOutput, ImageLatent }
 enum KvGroupKind : ubyte { Full, SlidingWindow }
 
@@ -128,7 +128,7 @@ table ImageParams {
   retain_images:bool = true;
 }
 
-table KvGroupSpec {
+table KvGroup {
   num_blocks:uint;
   kind:KvGroupKind;
   window:uint;
@@ -176,7 +176,7 @@ table WorkerInfo {
   commit_marker_tokens:uint;
   gen_rope_advance:uint;
   max_cfg_branches:uint;
-  groups:[KvGroupSpec];
+  groups:[KvGroup];
   kv_dtype:string;
   model_dtype:string;
   rank:RankInfo;
@@ -195,7 +195,7 @@ table WorkerInfo {
   weight_version:ulong;
 }
 
-// ---- Identities and the four protocol records -----------------------------
+// ---- Identities and the four operation records ----------------------------
 
 table RequestKey {
   authority_id:ulong;
@@ -436,8 +436,8 @@ table Batch {
 table RegistrationAck { visible:bool; }
 
 // A resolved output-product value the worker delivers for host consumption:
-// requested logprob blobs, materialized image bytes, and similar. Never a
-// lineage identity, so it enters no semantic digest.
+// requested logprob blobs, materialized image bytes, and similar. The consumer
+// interprets the bytes for its product kind.
 table ProductPayload {
   product:ProductRef;
   bytes:[ubyte];
@@ -507,7 +507,7 @@ table ErrorOperationIdentity {
 table WorkerResponse {
   kind:RespKind;
   call_id:ulong = null;
-  capabilities:WorkerInfo;
+  info:WorkerInfo;
   completion_report:CompletionReport;
   pressure:[ResourcePressure];
   message:string;

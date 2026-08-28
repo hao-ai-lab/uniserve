@@ -42,7 +42,7 @@ SIGLIP_SO400M = SiglipNavitConfig()
 class SiglipNavitEncoder(nn.Module):
     """Linear-patch, learned-absolute-position NaViT encoder."""
 
-    def __init__(self, cfg: SiglipNavitConfig, *, spec: LayerConfig) -> None:
+    def __init__(self, cfg: SiglipNavitConfig, *, layer_config: LayerConfig) -> None:
         super().__init__()
         self.patch_size = int(cfg.patch_size)
         hidden = int(cfg.hidden_size)
@@ -56,7 +56,7 @@ class SiglipNavitEncoder(nn.Module):
         self.patch_embedding = LinearBase(
             self.num_channels * self.patch_size * self.patch_size,
             hidden,
-            spec=spec,
+            layer_config=layer_config,
             bias=True,
         )
         self.position_embedding = nn.Embedding(self.max_num_patch_per_side**2, hidden)
@@ -68,7 +68,7 @@ class SiglipNavitEncoder(nn.Module):
                 num_hidden_layers=layers,
                 layer_norm_eps=eps,
             ),
-            spec=spec,
+            layer_config=layer_config,
         )
 
     def forward(

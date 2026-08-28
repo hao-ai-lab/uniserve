@@ -33,17 +33,17 @@ class VisionEncoderConfig:
 
 
 class VisionSelfAttention(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int, *, spec: LayerConfig) -> None:
+    def __init__(self, hidden_size: int, num_heads: int, *, layer_config: LayerConfig) -> None:
         super().__init__()
         if hidden_size % num_heads != 0:
             raise ValueError("vision hidden_size must be divisible by num_attention_heads")
         self.num_heads = int(num_heads)
         self.head_dim = int(hidden_size) // self.num_heads
         self.scale = self.head_dim**-0.5
-        self.q_proj = LinearBase(hidden_size, hidden_size, spec=spec)
-        self.k_proj = LinearBase(hidden_size, hidden_size, spec=spec)
-        self.v_proj = LinearBase(hidden_size, hidden_size, spec=spec)
-        self.out_proj = LinearBase(hidden_size, hidden_size, spec=spec)
+        self.q_proj = LinearBase(hidden_size, hidden_size, layer_config=layer_config)
+        self.k_proj = LinearBase(hidden_size, hidden_size, layer_config=layer_config)
+        self.v_proj = LinearBase(hidden_size, hidden_size, layer_config=layer_config)
+        self.out_proj = LinearBase(hidden_size, hidden_size, layer_config=layer_config)
         self.attn = RadixAttention(self.num_heads, self.num_heads, self.head_dim)
 
     def forward(
@@ -103,19 +103,19 @@ class VisionSelfAttention(nn.Module):
 
 
 class VisionEncoderLayer(nn.Module):
-    def __init__(self, cfg: VisionEncoderConfig, *, spec: LayerConfig) -> None:
+    def __init__(self, cfg: VisionEncoderConfig, *, layer_config: LayerConfig) -> None:
         super().__init__()
         self.layer_norm1 = nn.LayerNorm(cfg.hidden_size, eps=cfg.layer_norm_eps)
         self.self_attn = VisionSelfAttention(
             cfg.hidden_size,
             cfg.num_attention_heads,
-            spec=spec,
+            layer_config=layer_config,
         )
         self.layer_norm2 = nn.LayerNorm(cfg.hidden_size, eps=cfg.layer_norm_eps)
         self.mlp = nn.Sequential(
-            LinearBase(cfg.hidden_size, cfg.intermediate_size, spec=spec),
+            LinearBase(cfg.hidden_size, cfg.intermediate_size, layer_config=layer_config),
             nn.GELU(approximate="tanh"),
-            LinearBase(cfg.intermediate_size, cfg.hidden_size, spec=spec),
+            LinearBase(cfg.intermediate_size, cfg.hidden_size, layer_config=layer_config),
         )
 
     def forward(
@@ -142,12 +142,12 @@ class VisionEncoder(nn.Module):
         self,
         cfg: VisionEncoderConfig,
         *,
-        spec: LayerConfig,
+        layer_config: LayerConfig,
         post_norm: bool = True,
     ) -> None:
         super().__init__()
         self.layers = nn.ModuleList(
-            VisionEncoderLayer(cfg, spec=spec) for _ in range(cfg.num_hidden_layers)
+            VisionEncoderLayer(cfg, layer_config=layer_config) for _ in range(cfg.num_hidden_layers)
         )
         self.post_layernorm = (
             nn.LayerNorm(cfg.hidden_size, eps=cfg.layer_norm_eps) if post_norm else nn.Identity()

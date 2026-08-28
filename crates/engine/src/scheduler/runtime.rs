@@ -34,16 +34,16 @@ impl Scheduler {
         ctrl: ControlTokens,
         mut config: SchedulerConfig,
     ) -> Self {
-        let caps = executor.caps().clone();
-        let max_batch_ops = caps.max_batch_operations as usize;
-        let max_batch_tokens = caps.max_batch_tokens as usize;
-        let transfer_capacity = (caps.pipeline_depth as usize)
+        let info = executor.info().clone();
+        let max_batch_ops = info.max_batch_operations as usize;
+        let max_batch_tokens = info.max_batch_tokens as usize;
+        let transfer_capacity = (info.pipeline_depth as usize)
             .saturating_mul(max_batch_ops)
             .clamp(1, MAX_INFLIGHT_TRANSFERS);
         config.max_num_waiting = config.max_num_waiting.clamp(1, MAX_NUM_WAITING);
         let flow_slot_reserve =
-            usize::from(caps.uses_kv() && caps.supported_work.contains(&ForwardMode::GenFlow));
-        let request_pool_capacity = caps.max_request_pool_size as usize;
+            usize::from(info.uses_kv() && info.supported_work.contains(&ForwardMode::GenFlow));
+        let request_pool_capacity = info.max_request_pool_size as usize;
         let main_request_capacity = request_pool_capacity
             .saturating_sub(flow_slot_reserve)
             .max(1);
@@ -55,21 +55,25 @@ impl Scheduler {
         if max_batch_ops > 0 {
             config.max_batch = config.max_batch.min(max_batch_ops.max(1));
         }
-        let kv = caps.uses_kv().then(|| {
-            let block_pool = if caps.groups.is_empty() {
-                BlockPool::new(caps.num_blocks as usize, caps.block_size as usize)
+        let kv = info.uses_kv().then(|| {
+            let block_pool = if info.groups.is_empty() {
+                BlockPool::new(info.num_blocks as usize, info.block_size as usize)
             } else {
                 let mut offset = 0_u32;
-                let specs: Vec<(uniserve_core::KvGroupKind, u32, u32)> = caps
+                let group_shapes: Vec<(uniserve_core::KvGroupKind, u32, u32)> = info
                     .groups
                     .iter()
                     .map(|group| {
-                        let spec = (group.kind, offset, group.num_blocks);
+                        let group_shape = (group.kind, offset, group.num_blocks);
                         offset = offset.saturating_add(group.num_blocks);
-                        spec
+                        group_shape
                     })
                     .collect();
-                BlockPool::with_groups(caps.num_blocks as usize, caps.block_size as usize, &specs)
+                BlockPool::with_groups(
+                    info.num_blocks as usize,
+                    info.block_size as usize,
+                    &group_shapes,
+                )
             };
             let usable_blocks = block_pool.request_page_capacity();
             KvSchedulerState {
@@ -83,13 +87,13 @@ impl Scheduler {
             kv.as_ref().map_or(0, |state| state.usable_blocks),
             Ordering::Relaxed,
         );
-        let caps_encoder_budget = caps.encoder_cache_budget as usize;
+        let encoder_budget = info.encoder_cache_budget as usize;
         let kv_budget = KvBudget::new(
             kv,
-            caps_encoder_budget,
+            encoder_budget,
             request_pool_capacity,
-            caps.num_latent_pages,
-            caps.latent_page_units,
+            info.num_latent_pages,
+            info.latent_page_units,
         );
         let denoise_step_burst = denoise_step_burst_from_env();
         let flow_exclusive_batch = env::var(FLOW_EXCLUSIVE_BATCH_ENV)
@@ -109,32 +113,32 @@ impl Scheduler {
                     "mixed_prefill_tokens": config.mixed_prefill_tokens,
                     "denoise_step_burst": denoise_step_burst,
                 },
-                "caps": {
-                    "block_size": caps.block_size,
-                    "num_blocks": caps.num_blocks,
-                    "supported_work": &caps.supported_work,
-                    "max_batch_operations": caps.max_batch_operations,
-                    "max_batch_tokens": caps.max_batch_tokens,
-                    "max_request_pool_size": caps.max_request_pool_size,
-                    "pipeline_depth": caps.pipeline_depth,
-                    "latent_page_units": caps.latent_page_units,
-                    "num_latent_pages": caps.num_latent_pages,
-                    "latent_width": caps.latent_width,
-                    "latent_dtype": &caps.latent_dtype,
-                    "latent_downsample": caps.latent_downsample,
-                    "max_vae_grid_tokens": caps.max_vae_grid_tokens,
-                    "max_vit_grid_tokens": caps.max_vit_grid_tokens,
-                    "commit_marker_tokens": caps.commit_marker_tokens,
-                    "gen_rope_advance": caps.gen_rope_advance,
-                    "max_cfg_branches": caps.max_cfg_branches,
-                    "resource_classes": &caps.resource_classes,
+                "info": {
+                    "block_size": info.block_size,
+                    "num_blocks": info.num_blocks,
+                    "supported_work": &info.supported_work,
+                    "max_batch_operations": info.max_batch_operations,
+                    "max_batch_tokens": info.max_batch_tokens,
+                    "max_request_pool_size": info.max_request_pool_size,
+                    "pipeline_depth": info.pipeline_depth,
+                    "latent_page_units": info.latent_page_units,
+                    "num_latent_pages": info.num_latent_pages,
+                    "latent_width": info.latent_width,
+                    "latent_dtype": &info.latent_dtype,
+                    "latent_downsample": info.latent_downsample,
+                    "max_vae_grid_tokens": info.max_vae_grid_tokens,
+                    "max_vit_grid_tokens": info.max_vit_grid_tokens,
+                    "commit_marker_tokens": info.commit_marker_tokens,
+                    "gen_rope_advance": info.gen_rope_advance,
+                    "max_cfg_branches": info.max_cfg_branches,
+                    "resource_classes": &info.resource_classes,
                 },
             }));
         }
-        let latent_dtype = worker_float_dtype(caps.latent_dtype);
+        let latent_dtype = worker_float_dtype(info.latent_dtype);
         Self {
             executor,
-            caps,
+            info,
             kv_budget,
             ctrl,
             pending: RequestQueue::new(config.policy),
@@ -186,7 +190,7 @@ impl Scheduler {
     }
     pub fn set_max_num_seqs(&mut self, n: usize) {
         let flow_slot_reserve = usize::from(
-            self.caps.uses_kv() && self.caps.supported_work.contains(&ForwardMode::GenFlow),
+            self.info.uses_kv() && self.info.supported_work.contains(&ForwardMode::GenFlow),
         );
         let capacity = self
             .kv_budget
@@ -200,8 +204,8 @@ impl Scheduler {
     pub fn set_max_num_waiting(&mut self, n: usize) {
         self.config.max_num_waiting = n.clamp(1, MAX_NUM_WAITING);
     }
-    pub fn caps(&self) -> &WorkerInfo {
-        &self.caps
+    pub fn info(&self) -> &WorkerInfo {
+        &self.info
     }
     pub fn stats_handle(&self) -> Arc<SchedStats> {
         self.stats.clone()

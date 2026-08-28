@@ -3,8 +3,8 @@
 Every failure is classified into a stable error class with ``code``, ``message``,
 ``retryable``, and ``fatal`` (whether the worker process must be torn down).
 
-``to_wire()`` produces ``{"kind": "error", "message", "code", "retryable",
-"fatal", ...}``. Wire fields are scalars and short strings only — never tensors.
+``to_mapping()`` produces ``{"kind": "error", "message", "code", "retryable",
+"fatal", ...}``. Message fields are scalars and short strings only — never tensors.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ __all__ = [
     "classify",
     "should_capture_trace",
     "invalid_descriptor",
-    "capability_mismatch",
+    "unsupported_setup",
     "unsupported_operation",
     "unsupported_control",
     "compute_error",
@@ -33,16 +33,15 @@ __all__ = [
 
 
 class WorkerErrorCode(StrEnum):
-    """Stable wire-string error class identifiers.
+    """Stable worker error identifiers.
 
-    Members are ``str`` values because their values are the canonical wire
-    identifiers.
+    Members are strings because the IPC reply carries their names.
     """
 
     UNSUPPORTED_OPERATION = "UnsupportedOperation"
     UNSUPPORTED_CONTROL = "UnsupportedControl"
     INVALID_DESCRIPTOR = "InvalidDescriptor"
-    CAPABILITY_MISMATCH = "CapabilityMismatch"
+    UNSUPPORTED_SETUP = "UnsupportedSetup"
     RESOURCE_LEASE_VIOLATION = "ResourceLeaseViolation"
     INPUT_ERROR = "InputError"
     COMPUTE_ERROR = "ComputeError"
@@ -72,7 +71,7 @@ _POLICY: dict[WorkerErrorCode, ErrorPolicy] = {
     WorkerErrorCode.UNSUPPORTED_OPERATION: ErrorPolicy(False, False, False),
     WorkerErrorCode.UNSUPPORTED_CONTROL: ErrorPolicy(False, False, False),
     WorkerErrorCode.INVALID_DESCRIPTOR: ErrorPolicy(False, False, False),
-    WorkerErrorCode.CAPABILITY_MISMATCH: ErrorPolicy(False, False, False),
+    WorkerErrorCode.UNSUPPORTED_SETUP: ErrorPolicy(False, False, False),
     WorkerErrorCode.RESOURCE_LEASE_VIOLATION: ErrorPolicy(False, False, False),
     WorkerErrorCode.INPUT_ERROR: ErrorPolicy(False, False, False),
     WorkerErrorCode.COMPUTE_ERROR: ErrorPolicy(False, False, True),
@@ -111,7 +110,7 @@ class WorkerError(Exception):
         Exception.__init__(self, f"{self.code}: {self.message}")
 
     def to_mapping(self) -> dict[str, Any]:
-        # Only the fields modeled on the Rust WorkerResponse cross the wire.
+        # Only the fields modeled on the Rust WorkerResponse cross the IPC boundary.
         # Richer context (req_id, op_id, op_kind, details) stays local
         # for logging and metrics.
         return {
@@ -137,7 +136,7 @@ class WorkerError(Exception):
 
 
 class InputError(WorkerError):
-    """A staged execution input violates its declared route contract."""
+    """A staged execution input is invalid for its declared route."""
 
     def __init__(self, message: str, **kw: Any) -> None:
         policy = _POLICY[WorkerErrorCode.INPUT_ERROR]
@@ -233,8 +232,8 @@ def invalid_descriptor(message: str, **kw: Any) -> WorkerError:
     return _make(WorkerErrorCode.INVALID_DESCRIPTOR, message, **kw)
 
 
-def capability_mismatch(message: str, **kw: Any) -> WorkerError:
-    return _make(WorkerErrorCode.CAPABILITY_MISMATCH, message, **kw)
+def unsupported_setup(message: str, **kw: Any) -> WorkerError:
+    return _make(WorkerErrorCode.UNSUPPORTED_SETUP, message, **kw)
 
 
 def compute_error(message: str, **kw: Any) -> ComputeError:
@@ -248,11 +247,11 @@ def resource_error(message: str, **kw: Any) -> ResourceError:
 def distributed_setup_error(message: str, **kw: Any) -> WorkerError:
     """Tensor-parallel/distributed initialization failure.
 
-    Routed through the taxonomy as a capability mismatch: the worker cannot
+    Reported as an unsupported setup: the worker cannot
     provide the requested multi-rank topology (missing torch.distributed, a
     misconfigured world size, or no rendezvous address).
     """
-    return _make(WorkerErrorCode.CAPABILITY_MISMATCH, message, **kw)
+    return _make(WorkerErrorCode.UNSUPPORTED_SETUP, message, **kw)
 
 
 # Ordered exception -> code rules, evaluated top to bottom; the first matching
@@ -260,7 +259,7 @@ def distributed_setup_error(message: str, **kw: Any) -> WorkerError:
 # exception and its lowered message. The ordering is load-bearing:
 #   - fatal-CUDA before OOM: a context-corrupting CUDA error is FATAL even when
 #     it also mentions "out of memory" (the worker cannot serve further work).
-#   - the typed checks (NotImplementedError / wire-decode errors / AssertionError)
+#   - the typed checks (NotImplementedError / decode errors / AssertionError)
 #     follow the text/hierarchy heuristics.
 # An exception matching no rule falls through to ComputeError below.
 _CLASSIFY_RULES: list[tuple[Any, WorkerErrorCode]] = [
@@ -270,7 +269,7 @@ _CLASSIFY_RULES: list[tuple[Any, WorkerErrorCode]] = [
         lambda exc, lowered: isinstance(exc, NotImplementedError),
         WorkerErrorCode.UNSUPPORTED_OPERATION,
     ),
-    # malformed op/descriptor decoded from the wire
+    # malformed operation or descriptor decoded from IPC
     (
         lambda exc, lowered: isinstance(exc, (KeyError, IndexError, TypeError, ValueError)),
         WorkerErrorCode.INPUT_ERROR,

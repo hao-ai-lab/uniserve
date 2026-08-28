@@ -95,9 +95,6 @@ fn map_chat_event(event: ChatEvent) -> MappedChatEvent {
             token_ids,
             logprobs,
         }),
-        ChatEvent::PublicCommit { commit } => {
-            MappedChatEvent::Event(ServeEvent::PublicCommit { commit })
-        }
         ChatEvent::BlockEnd { index, block } => {
             MappedChatEvent::Event(ServeEvent::OutputBlockEnd {
                 candidate_id: CandidateId::PRIMARY,
@@ -150,7 +147,6 @@ async fn emit_text_update(
     text: String,
     token_ids: Vec<u32>,
     logprobs: Option<DecodedLogprobs>,
-    mut public_commit: Option<PublicCommit>,
     finished: Option<crate::serving::text::Finished>,
     first_visible_output_us: &mut Option<u64>,
     y: &mut TryYielder<ServeEvent, ServeError>,
@@ -165,9 +161,6 @@ async fn emit_text_update(
 
     if !delta.reasoning.is_empty() {
         first_visible_output_us.get_or_insert_with(|| context.started.elapsed().as_micros() as u64);
-        if let Some(commit) = public_commit.take() {
-            y.yield_ok(ServeEvent::PublicCommit { commit }).await;
-        }
         y.yield_ok(ServeEvent::ReasoningDelta {
             candidate_id: CandidateId::PRIMARY,
             text: delta.reasoning,
@@ -176,9 +169,6 @@ async fn emit_text_update(
     }
     if !delta.visible.is_empty() {
         first_visible_output_us.get_or_insert_with(|| context.started.elapsed().as_micros() as u64);
-        if let Some(commit) = public_commit.take() {
-            y.yield_ok(ServeEvent::PublicCommit { commit }).await;
-        }
     }
     if !delta.visible.is_empty()
         || !token_ids.is_empty()
@@ -420,8 +410,7 @@ struct RawAssemblerState {
     prompt_positions: Vec<uniserve_core::PositionLogprobs>,
     accepted: bool,
     pending_scheduled: Option<(f64, f64)>,
-    pending_token: Option<(u32, Option<PublicCommit>)>,
-    last_public_commit: Option<PublicCommit>,
+    pending_token: Option<u32>,
     pending_image_events: Vec<ServeEvent>,
     sink: OutputSink,
 }
@@ -493,12 +482,8 @@ impl RawAssemblerState {
         &mut self,
         id: u32,
         logprobs: Option<DecodedLogprobs>,
-        public_commit: Option<PublicCommit>,
         context: &mut RawTokenEmitContext<'_, '_>,
     ) -> Result<bool> {
-        if public_commit.is_some() {
-            self.last_public_commit = public_commit.clone();
-        }
         self.flush_pending_images(context.y).await;
         self.emitted_output_tokens = self.emitted_output_tokens.saturating_add(1);
         let new_bytes =
@@ -580,7 +565,6 @@ impl RawAssemblerState {
             text,
             emitted_ids,
             logprobs,
-            public_commit,
             finished,
             &mut self.first_visible_output_us,
             context.y,
@@ -647,7 +631,6 @@ pub(super) async fn assemble_event_stream(
         accepted: false,
         pending_scheduled: None,
         pending_token: None,
-        last_public_commit: None,
         pending_image_events: Vec::new(),
         sink,
     };
@@ -744,9 +727,7 @@ pub(super) async fn assemble_event_stream(
                         .await;
                 }
             }
-            GenerationEvent::TextToken {
-                id, public_commit, ..
-            } => {
+            GenerationEvent::TextToken { id, .. } => {
                 if !state.accepted {
                     return Err(malformed_output(
                         request_id.clone(),
@@ -760,7 +741,7 @@ pub(super) async fn assemble_event_stream(
                     ));
                 }
                 if generated_logprobs_requested {
-                    state.pending_token = Some((id, public_commit));
+                    state.pending_token = Some(id);
                 } else {
                     let mut context = RawTokenEmitContext {
                         emit: &emit_context,
@@ -771,16 +752,13 @@ pub(super) async fn assemble_event_stream(
                         stream: &mut stream,
                         y: &mut y,
                     };
-                    if state
-                        .consume_token(id, None, public_commit, &mut context)
-                        .await?
-                    {
+                    if state.consume_token(id, None, &mut context).await? {
                         return Ok(());
                     }
                 }
             }
             GenerationEvent::TokenLogprobs { id, candidates } => {
-                let (pending, public_commit) = state.pending_token.take().ok_or_else(|| {
+                let pending = state.pending_token.take().ok_or_else(|| {
                     malformed_output(
                         request_id.clone(),
                         "engine returned token logprobs without a pending token",
@@ -813,7 +791,7 @@ pub(super) async fn assemble_event_stream(
                     y: &mut y,
                 };
                 if state
-                    .consume_token(id, Some(logprobs), public_commit, &mut context)
+                    .consume_token(id, Some(logprobs), &mut context)
                     .await?
                 {
                     return Ok(());
@@ -865,22 +843,16 @@ pub(super) async fn assemble_event_stream(
                 bytes,
                 sha256,
                 pixels_png_b64,
-                public_commit,
             } => {
                 state.ensure_output_ready(&request_id, "image-done event")?;
                 state.image_count = state.image_count.saturating_add(1);
-                if let Some(commit) = public_commit {
-                    state
-                        .pending_image_events
-                        .push(ServeEvent::PublicCommit { commit });
-                }
                 state.pending_image_events.push(ServeEvent::ImageDone {
                     candidate_id: CandidateId::PRIMARY,
                     image_id: image_id.to_string(),
                     width: Some(width),
                     height: Some(height),
                     bytes: Some(bytes),
-                    sha256: Some(sha256.into_string()),
+                    sha256: Some(sha256),
                     pixels_png_b64: Some(pixels_png_b64),
                     elapsed_us: started.elapsed().as_micros() as u64,
                 });
@@ -915,7 +887,6 @@ pub(super) async fn assemble_event_stream(
                     last_chunk.unwrap_or_default(),
                     Vec::new(),
                     None,
-                    state.last_public_commit,
                     Some(finished),
                     &mut state.first_visible_output_us,
                     &mut y,

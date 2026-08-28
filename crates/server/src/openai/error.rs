@@ -121,7 +121,7 @@ pub fn serve_error_to_api(error: ServeError) -> ApiError {
             format!("Only one output is supported, got {requested}."),
             Some("n"),
         ),
-        error @ (ServeError::UnsupportedCapability { .. }
+        error @ (ServeError::UnsupportedFeature { .. }
         | ServeError::ContextLengthExceeded { .. }
         | ServeError::ContextCapacityExceeded { .. }
         | ServeError::DuplicateRequestId { .. }

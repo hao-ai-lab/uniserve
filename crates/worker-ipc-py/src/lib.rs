@@ -4,7 +4,7 @@
 //!
 //! Each IPC call crosses two boundaries:
 //!
-//! 1. The shared-memory wire boundary (iceoryx2), which carries flatbuffer
+//! 1. The shared-memory IPC boundary (iceoryx2), which carries flatbuffer
 //!    bytes. `Frame::decode_request` / `ServerEndpoint::respond` handle this
 //!    via the zero-copy-friendly flatbuffer codec in `uniserve-worker-ipc::codec`.
 //! 2. The Rust↔Python FFI boundary, crossed once on the inbound path
@@ -12,7 +12,7 @@
 //!    path ([`PyServer::respond`]).
 //!
 //! The steady-state `execute` and `result` frames use typed converters with
-//! interned keys, preallocated lists, and direct scalar extraction. Capability,
+//! interned keys, preallocated lists, and direct scalar extraction. Worker-info,
 //! control, pressure, snapshot, and error frames use the schema-derived serde
 //! converter. Frame kind determines exactly one conversion path.
 
@@ -305,9 +305,8 @@ impl PyServer {
 
 fn pythonize_request(py: Python<'_>, request: &WorkerRequest) -> PyResult<Py<PyAny>> {
     // Execute batches use the typed converter, which constructs the worker's
-    // protocol objects directly: the decoded Rust batch has already passed
-    // `Batch::validate`, and control content digests are carried across so the
-    // worker never re-derives them.
+    // Python operation objects directly: the decoded Rust batch has already passed
+    // `Batch::validate`.
     if request.kind() == RequestKind::Execute {
         let object = convert::execute_request_to_py(py, request)?;
         return Ok(object.into_any().unbind());

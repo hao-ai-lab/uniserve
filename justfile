@@ -25,9 +25,9 @@ lint: fmt clippy
     {{python}} -m ruff check uniserve_worker uniserve_eval tests/python
     {{python}} -m mypy uniserve_worker uniserve_eval
 
-# Fast Python tests (unit / contract / architecture)
+# Fast Python tests
 test-python-fast:
-    {{python}} -m pytest -m "unit or contract or architecture"
+    {{python}} -m pytest -m "unit or architecture"
 
 # Integration Python tests
 test-python-integration:

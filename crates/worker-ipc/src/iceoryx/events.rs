@@ -12,7 +12,7 @@
 //! a shared service would enqueue every result on the worker's own listener
 //! while it is busy on the GPU and eventually overflow that listener.
 //!
-//! Wait deadlines are supplied by the caller's operation or liveness contract.
+//! Wait deadlines are supplied by the caller's operation or liveness deadline.
 //! They are not transport polling intervals: progress is signalled by an event.
 
 use std::sync::Arc;

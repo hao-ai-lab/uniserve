@@ -1,3 +1,5 @@
+"""Image response decoding behavior."""
+
 from __future__ import annotations
 
 import base64
@@ -25,5 +27,5 @@ def test_openai_image_part_decodes_payload_and_metadata() -> None:
 
 def test_openai_image_part_rejects_declared_mime_mismatch() -> None:
     encoded = base64.b64encode(_png()).decode("ascii")
-    with pytest.raises(ImageOutputError, match="protocol_image_mime_mismatch"):
+    with pytest.raises(ImageOutputError, match="response_image_mime_mismatch"):
         decode_openai_image_part({"image_url": {"url": f"data:image/jpeg;base64,{encoded}"}})

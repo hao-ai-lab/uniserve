@@ -1,4 +1,4 @@
-"""Deployment roles and the exact wire work variants each is admitted to run."""
+"""Deployment roles and the work variants each is admitted to run."""
 
 from __future__ import annotations
 
@@ -17,12 +17,12 @@ class WorkerKind(StrEnum):
 
     @property
     def allowed_work_variants(self) -> frozenset[ForwardMode]:
-        """The wire work variants this deployment role is admitted to run."""
+        """The work variants this deployment role is admitted to run."""
 
         return _ROUTES[self]
 
     @classmethod
-    def wire_values(cls) -> tuple[str, ...]:
+    def values(cls) -> tuple[str, ...]:
         return tuple(member.value for member in cls)
 
 

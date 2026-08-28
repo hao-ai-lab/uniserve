@@ -26,7 +26,7 @@ impl RequestKey {
     }
 }
 
-/// Route identity assigned by the scheduler for capability negotiation.
+/// Route identity assigned by the scheduler for worker selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RouteId(pub u32);
 
@@ -50,7 +50,7 @@ pub enum MediaProfileId {
 }
 
 /// Closed forward-mode tag for one operation. Declaration order is the
-/// canonical index on the wire and in capability negotiation.
+/// canonical index in IPC and worker selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
@@ -85,7 +85,7 @@ pub enum AttentionBackend {
 }
 
 impl AttentionBackend {
-    pub fn as_wire_name(&self) -> String {
+    pub fn as_name(&self) -> String {
         match self {
             Self::Auto => "auto".to_owned(),
             Self::TrtllmMha => "trtllm_mha".to_owned(),
@@ -97,7 +97,7 @@ impl AttentionBackend {
             Self::H3VsaSm100 => "h3_vsa_sm100".to_owned(),
             Self::Composite(backends) => backends
                 .iter()
-                .map(Self::as_wire_name)
+                .map(Self::as_name)
                 .collect::<Vec<_>>()
                 .join("+"),
         }
@@ -138,7 +138,7 @@ impl std::str::FromStr for AttentionBackend {
 
 impl std::fmt::Display for AttentionBackend {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.as_wire_name())
+        formatter.write_str(&self.as_name())
     }
 }
 
@@ -147,7 +147,7 @@ impl Serialize for AttentionBackend {
     where
         S: serde::Serializer,
     {
-        serializer.serialize_str(&self.as_wire_name())
+        serializer.serialize_str(&self.as_name())
     }
 }
 
@@ -216,7 +216,7 @@ impl ForwardMode {
         }
     }
 
-    pub const fn as_wire_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::TokenExtend => "token_extend",
             Self::TokenDecode => "token_decode",
@@ -276,7 +276,7 @@ impl VersionRef {
         matches!(self.point, Point::Fixed { .. })
     }
 
-    pub fn validate(&self) -> ProtocolResult<()> {
+    pub fn validate(&self) -> ValidationResult<()> {
         match &self.point {
             Point::Fixed { .. } => {}
             Point::Device {
@@ -284,21 +284,21 @@ impl VersionRef {
                 selected_point,
             } => {
                 if let Some(selected_point) = selected_point {
-                    wire_ensure!(
+                    ensure_valid!(
                         *point_index == 0,
                         "a dynamic device version also declares a fixed point"
                     );
                     selected_point.validate()?;
-                    wire_ensure!(
+                    ensure_valid!(
                         selected_point.request_key == self.request_key
                             && selected_point.producer_op_id == self.producer_op_id,
                         "device version selected point is not owned by its producer"
                     );
-                    wire_ensure!(
+                    ensure_valid!(
                         selected_point.generation > 0,
                         "device version selected point has no logical generation"
                     );
-                    wire_ensure!(
+                    ensure_valid!(
                         selected_point.kind == ProductKind::SelectedPoint
                             && selected_point.storage_class == StorageClass::DeviceTensor
                             && selected_point.dtype == DType::U32
@@ -306,7 +306,7 @@ impl VersionRef {
                         "device version does not name a scalar selected-point product"
                     );
                 } else {
-                    wire_ensure!(
+                    ensure_valid!(
                         *point_index > 0,
                         "a static device version must name a positive producer point"
                     );
@@ -405,22 +405,22 @@ impl Operation {
         self
     }
 
-    pub fn validate(&self) -> ProtocolResult<()> {
-        wire_ensure!(self.op_id.0 > 0, "operation id must be positive");
-        wire_ensure!(
+    pub fn validate(&self) -> ValidationResult<()> {
+        ensure_valid!(self.op_id.0 > 0, "operation id must be positive");
+        ensure_valid!(
             self.domain == self.work.domain(),
             "operation domain is inconsistent with its work variant"
         );
-        wire_ensure!(
+        ensure_valid!(
             self.advances_state == self.work.advances_state(),
             "operation declares an advances_state inconsistent with its work variant"
         );
         self.parent.validate()?;
-        wire_ensure!(
+        ensure_valid!(
             self.parent.request_key == self.request_key,
             "operation parent belongs to another request lineage"
         );
-        wire_ensure!(
+        ensure_valid!(
             !self.work.requires_fixed_parent() || self.parent.is_fixed(),
             "operation requires a fixed semantic parent"
         );
@@ -428,41 +428,41 @@ impl Operation {
         let mut output_indices = HashSet::with_capacity(self.outputs.len());
         for output in &self.outputs {
             output.validate()?;
-            wire_ensure!(
+            ensure_valid!(
                 output.request_key == self.request_key && output.producer_op_id == self.op_id,
                 "an output product is not owned by its producing operation"
             );
-            wire_ensure!(
+            ensure_valid!(
                 output.generation > 0,
                 "an output product has no logical generation"
             );
-            wire_ensure!(
+            ensure_valid!(
                 output.point_range.max_points <= self.bounds.max_points.max(1),
                 "an output product exceeds the operation point bound"
             );
             match output.storage_class {
-                StorageClass::LatentArena => wire_ensure!(
+                StorageClass::LatentArena => ensure_valid!(
                     output.max_bytes() <= self.bounds.max_latent_bytes,
                     "a latent-arena output exceeds the operation latent-byte bound"
                 ),
-                StorageClass::HostStaging | StorageClass::PinnedOutput => wire_ensure!(
+                StorageClass::HostStaging | StorageClass::PinnedOutput => ensure_valid!(
                     output.max_bytes() <= self.bounds.max_completion_bytes,
                     "a host-visible output exceeds the operation completion-byte bound"
                 ),
-                StorageClass::PagedKv => wire_ensure!(
+                StorageClass::PagedKv => ensure_valid!(
                     output.max_bytes() <= self.bounds.max_transfer_bytes,
                     "a paged-KV output exceeds the operation transfer-byte bound"
                 ),
                 _ => {}
             }
-            wire_ensure!(
+            ensure_valid!(
                 output_indices.insert(output.output_index),
                 "operation repeats an output index"
             );
         }
         for input in &self.inputs {
             input.validate()?;
-            wire_ensure!(
+            ensure_valid!(
                 input.request_key == self.request_key
                     || matches!(
                         input.kind,
@@ -473,14 +473,14 @@ impl Operation {
         }
         if let Some(predicate) = &self.predicate {
             predicate.validate()?;
-            wire_ensure!(
+            ensure_valid!(
                 predicate.request_key == self.request_key,
                 "operation predicate belongs to another request lineage"
             );
             let continuation_token = predicate.kind == ProductKind::Token
                 && predicate.dtype == DType::U32
                 && predicate.shape_bound.max_elements() == 1;
-            wire_ensure!(
+            ensure_valid!(
                 predicate.generation > 0
                     && predicate.storage_class == StorageClass::DeviceTensor
                     && (predicate.kind == ProductKind::Completion || continuation_token),
@@ -490,11 +490,11 @@ impl Operation {
         Ok(())
     }
 
-    fn bounds_are_finite(&self) -> ProtocolResult<()> {
+    fn bounds_are_finite(&self) -> ValidationResult<()> {
         // Bounds are unsigned integers; the invariant enforced here is that a
         // state-advancing operation can advance by at least one point.
         if self.advances_state {
-            wire_ensure!(
+            ensure_valid!(
                 self.bounds.max_points >= 1,
                 "a state-advancing operation must admit at least one point"
             );
@@ -585,34 +585,34 @@ pub struct ModelOutput {
 }
 
 impl ModelOutput {
-    pub fn validate(&self) -> ProtocolResult<()> {
-        wire_ensure!(self.op_id.0 > 0, "completion op id must be positive");
-        wire_ensure!(
+    pub fn validate(&self) -> ValidationResult<()> {
+        ensure_valid!(self.op_id.0 > 0, "completion op id must be positive");
+        ensure_valid!(
             self.logical_lengths.kv_visible_len <= self.logical_lengths.kv_computed_len,
             "completion selected KV length exceeds computed length"
         );
-        wire_ensure!(
+        ensure_valid!(
             self.completion_slot_generation > 0,
             "completion slot generation must be positive"
         );
         match self.status {
-            OpStatus::Error => wire_ensure!(
+            OpStatus::Error => ensure_valid!(
                 self.error_code.is_some(),
                 "an error completion must carry an error code"
             ),
-            OpStatus::Ok | OpStatus::Predicated => wire_ensure!(
+            OpStatus::Ok | OpStatus::Predicated => ensure_valid!(
                 self.error_code.is_none(),
                 "a non-error completion must not carry an error code"
             ),
         }
         if self.status == OpStatus::Predicated {
-            wire_ensure!(
+            ensure_valid!(
                 self.token_span.len == 0
                     && self.committed_tokens.is_empty()
                     && self.product_generations.is_empty(),
                 "a predicated completion must select its parent without semantic output"
             );
-            wire_ensure!(
+            ensure_valid!(
                 !self.finish_flags.eos && !self.finish_flags.length && !self.finish_flags.stop,
                 "a predicated completion must not select a terminal outcome"
             );
@@ -702,7 +702,7 @@ impl Control {
         }
     }
 
-    pub fn validate(&self) -> ProtocolResult<()> {
+    pub fn validate(&self) -> ValidationResult<()> {
         match self {
             Self::Commit {
                 expected_parent,
@@ -711,20 +711,20 @@ impl Control {
             } => {
                 expected_parent.validate()?;
                 selected.validate()?;
-                wire_ensure!(
+                ensure_valid!(
                     selected.is_fixed(),
                     "a commit control must select a fixed version"
                 );
             }
             Self::Close { cutoff, .. } => {
                 cutoff.validate()?;
-                wire_ensure!(
+                ensure_valid!(
                     cutoff.is_fixed(),
                     "a close control must name a fixed cutoff version"
                 );
             }
             Self::Release { op_id, .. } => {
-                wire_ensure!(op_id.0 > 0, "a release control must name a valid operation");
+                ensure_valid!(op_id.0 > 0, "a release control must name a valid operation");
             }
         }
         Ok(())
@@ -778,9 +778,9 @@ impl NewRequest {
         request_pool_idx: u32,
         und: Option<UndAdmission>,
         gen_admission: Option<GenAdmission>,
-    ) -> ProtocolResult<Self> {
-        wire_ensure!(request_pool_idx > 0, "request-pool index must be positive");
-        wire_ensure!(
+    ) -> ValidationResult<Self> {
+        ensure_valid!(request_pool_idx > 0, "request-pool index must be positive");
+        ensure_valid!(
             und.is_some() || gen_admission.is_some(),
             "admission must declare an understanding or generation branch"
         );
@@ -798,8 +798,8 @@ impl NewRequest {
         request_key: RequestKey,
         request_pool_idx: u32,
         media: MediaAdmission,
-    ) -> ProtocolResult<Self> {
-        wire_ensure!(request_pool_idx > 0, "request-pool index must be positive");
+    ) -> ValidationResult<Self> {
+        ensure_valid!(request_pool_idx > 0, "request-pool index must be positive");
         let admission = Self {
             request_key,
             request_pool_idx,
@@ -811,18 +811,18 @@ impl NewRequest {
         Ok(admission)
     }
 
-    pub fn validate(&self) -> ProtocolResult<()> {
-        wire_ensure!(
+    pub fn validate(&self) -> ValidationResult<()> {
+        ensure_valid!(
             self.request_pool_idx > 0,
             "request-pool index must be positive"
         );
-        wire_ensure!(
+        ensure_valid!(
             self.und.is_some() || self.gen_admission.is_some() || self.media.is_some(),
             "admission must declare an understanding, generation, or media branch"
         );
         if let Some(und) = &self.und {
             und.sampling.validate()?;
-            wire_ensure!(
+            ensure_valid!(
                 und.finish_token_ids
                     .windows(2)
                     .all(|pair| pair[0] < pair[1]),
@@ -833,11 +833,11 @@ impl NewRequest {
             branch.image.validate()?;
         }
         if let Some(media) = &self.media {
-            wire_ensure!(
+            ensure_valid!(
                 !media.prompt.is_empty(),
                 "media admission prompt must not be empty"
             );
-            wire_ensure!(
+            ensure_valid!(
                 !media.output_path.is_empty(),
                 "media admission output path must not be empty"
             );
@@ -896,17 +896,17 @@ pub struct CachePageAllocation {
 }
 
 impl BlockTable {
-    pub fn validate(&self) -> ProtocolResult<()> {
-        wire_ensure!(
+    pub fn validate(&self) -> ValidationResult<()> {
+        ensure_valid!(
             self.request_pool_idx > 0,
             "block table request slot must be positive"
         );
-        wire_ensure!(
+        ensure_valid!(
             self.page_ids.iter().all(|page| page.0 > 0)
                 && self.page_ids.iter().collect::<HashSet<_>>().len() == self.page_ids.len(),
             "block table repeats a page or carries page zero"
         );
-        wire_ensure!(
+        ensure_valid!(
             !self.page_ids.is_empty() || self.allocated_tokens == 0,
             "empty block table carries allocated tokens"
         );
@@ -915,12 +915,12 @@ impl BlockTable {
 }
 
 impl CachePageAllocation {
-    pub fn validate(&self) -> ProtocolResult<()> {
-        wire_ensure!(
+    pub fn validate(&self) -> ValidationResult<()> {
+        ensure_valid!(
             self.request_pool_idx > 0,
             "cache-page allocation request slot must be positive"
         );
-        wire_ensure!(
+        ensure_valid!(
             !self.page_ids.is_empty()
                 && self.page_ids.iter().all(|page| page.0 > 0)
                 && self.page_ids.iter().collect::<HashSet<_>>().len() == self.page_ids.len(),
@@ -940,16 +940,16 @@ pub struct RowGeometry {
 }
 
 impl RowGeometry {
-    pub fn validate(self, operation_count: usize) -> ProtocolResult<()> {
-        wire_ensure!(
+    pub fn validate(self, operation_count: usize) -> ValidationResult<()> {
+        ensure_valid!(
             (self.operation_index as usize) < operation_count,
             "forward row operation index is outside its partition"
         );
-        wire_ensure!(
+        ensure_valid!(
             self.request_pool_index > 0,
             "forward row carries the reserved request slot"
         );
-        wire_ensure!(
+        ensure_valid!(
             self.query_len > 0,
             "forward row query length must be positive"
         );
@@ -971,16 +971,16 @@ pub struct LatentPlacement {
 }
 
 impl LatentPlacement {
-    pub fn validate(&self) -> ProtocolResult<()> {
-        wire_ensure!(
+    pub fn validate(&self) -> ValidationResult<()> {
+        ensure_valid!(
             self.op_id.0 > 0,
             "latent placement operation id must be positive"
         );
-        wire_ensure!(
+        ensure_valid!(
             self.latent_units > 0 && self.height > 0 && self.width > 0,
             "latent placement geometry must be positive"
         );
-        wire_ensure!(
+        ensure_valid!(
             !self.page_table.is_empty()
                 && self.page_table.iter().all(|page| *page > 0)
                 && self.page_table.iter().collect::<HashSet<_>>().len() == self.page_table.len(),
@@ -1000,12 +1000,12 @@ pub struct DecodePlacement {
 }
 
 impl DecodePlacement {
-    pub fn validate(&self) -> ProtocolResult<()> {
-        wire_ensure!(
+    pub fn validate(&self) -> ValidationResult<()> {
+        ensure_valid!(
             self.op_id.0 > 0,
             "decode placement operation id must be positive"
         );
-        wire_ensure!(
+        ensure_valid!(
             self.unit_count > 0,
             "decode placement unit count must be positive"
         );
@@ -1014,23 +1014,23 @@ impl DecodePlacement {
 }
 
 impl BatchPartition {
-    pub fn validate(&self) -> ProtocolResult<()> {
-        wire_ensure!(self.partition_id > 0, "batch partition id must be positive");
-        wire_ensure!(
+    pub fn validate(&self) -> ValidationResult<()> {
+        ensure_valid!(self.partition_id > 0, "batch partition id must be positive");
+        ensure_valid!(
             self.submission_group > 0,
             "batch partition submission group must be positive"
         );
-        wire_ensure!(
+        ensure_valid!(
             self.collective_seq > 0,
             "batch partition collective sequence must be positive"
         );
-        wire_ensure!(
+        ensure_valid!(
             !self.operations.is_empty(),
             "batch partition must carry at least one operation"
         );
         for operation in &self.operations {
             operation.validate()?;
-            wire_ensure!(
+            ensure_valid!(
                 operation.domain == self.domain && operation.route == self.route,
                 "batch partition operation disagrees with its domain or route"
             );
@@ -1038,7 +1038,7 @@ impl BatchPartition {
         let mut table_ids = HashSet::with_capacity(self.block_tables.len());
         for table in &self.block_tables {
             table.validate()?;
-            wire_ensure!(
+            ensure_valid!(
                 table_ids.insert((table.request_pool_idx, table.group_id)),
                 "batch partition repeats a block table"
             );
@@ -1052,15 +1052,15 @@ impl BatchPartition {
         for allocation in &self.new_cache_pages {
             allocation.validate()?;
             let identity = (allocation.request_pool_idx, allocation.group_id);
-            wire_ensure!(
+            ensure_valid!(
                 allocation_ids.insert(identity),
                 "batch partition repeats a cache-page allocation"
             );
-            let table = tables
-                .get(&identity)
-                .ok_or_else(|| wire_error!("cache-page allocation has no matching block table"))?;
+            let table = tables.get(&identity).ok_or_else(|| {
+                invalid_message!("cache-page allocation has no matching block table")
+            })?;
             let table_pages = table.page_ids.iter().collect::<HashSet<_>>();
-            wire_ensure!(
+            ensure_valid!(
                 allocation
                     .page_ids
                     .iter()
@@ -1081,12 +1081,12 @@ impl BatchPartition {
         for placement in &self.latent_placements {
             placement.validate()?;
             let identity = (placement.request_key, placement.op_id);
-            wire_ensure!(
+            ensure_valid!(
                 latent_ids.insert(identity),
                 "batch partition repeats a latent placement identity"
             );
             let operation = operations.get(&identity).ok_or_else(|| {
-                wire_error!("latent placement does not name a partition operation")
+                invalid_message!("latent placement does not name a partition operation")
             })?;
             let addresses_trajectory = matches!(
                 operation.work,
@@ -1095,11 +1095,11 @@ impl BatchPartition {
                 .inputs
                 .iter()
                 .any(|reference| reference.kind == ProductKind::Latent);
-            wire_ensure!(
+            ensure_valid!(
                 addresses_trajectory,
                 "latent placement names an operation that does not address a trajectory"
             );
-            wire_ensure!(
+            ensure_valid!(
                 placement
                     .page_table
                     .iter()
@@ -1115,7 +1115,7 @@ impl BatchPartition {
                 .inputs
                 .iter()
                 .any(|reference| reference.kind == ProductKind::Latent);
-            wire_ensure!(
+            ensure_valid!(
                 !needs_latent || latent_ids.contains(&(operation.request_key, operation.op_id)),
                 "operation that addresses a trajectory has no latent placement"
             );
@@ -1124,20 +1124,20 @@ impl BatchPartition {
         for placement in &self.decode_placements {
             placement.validate()?;
             let identity = (placement.request_key, placement.op_id);
-            wire_ensure!(
+            ensure_valid!(
                 decode_ids.insert(identity),
                 "batch partition repeats a decode placement identity"
             );
             let operation = operations.get(&identity).ok_or_else(|| {
-                wire_error!("decode placement does not name a partition operation")
+                invalid_message!("decode placement does not name a partition operation")
             })?;
-            wire_ensure!(
+            ensure_valid!(
                 operation.work == ForwardMode::GenDecode,
                 "decode placement does not name a GenDecode operation"
             );
         }
         for operation in &self.operations {
-            wire_ensure!(
+            ensure_valid!(
                 operation.work != ForwardMode::GenDecode
                     || decode_ids.contains(&(operation.request_key, operation.op_id)),
                 "GenDecode operation has no decode placement"
@@ -1193,8 +1193,8 @@ impl Batch {
         self
     }
 
-    pub fn validate(&self) -> ProtocolResult<()> {
-        wire_ensure!(
+    pub fn validate(&self) -> ValidationResult<()> {
+        ensure_valid!(
             !self.partitions.is_empty() || !self.controls.is_empty(),
             "a submission batch must carry at least one operation or control"
         );
@@ -1203,7 +1203,7 @@ impl Batch {
             std::collections::HashMap::new();
         for partition in &self.partitions {
             partition.validate()?;
-            wire_ensure!(
+            ensure_valid!(
                 partition_ids.insert(partition.partition_id),
                 "a submission batch repeats a partition id"
             );
@@ -1213,7 +1213,7 @@ impl Batch {
                 .push(partition);
         }
         for partitions in submission_groups.values() {
-            wire_ensure!(
+            ensure_valid!(
                 partitions
                     .iter()
                     .filter(|partition| !partition.latent_placements.is_empty())
@@ -1224,7 +1224,7 @@ impl Batch {
             let collective_seq = partitions[0].collective_seq;
             let attention = partitions[0].attention;
             let shape_class = partitions[0].shape_class;
-            wire_ensure!(
+            ensure_valid!(
                 partitions.iter().all(|partition| {
                     partition.collective_seq == collective_seq
                         && partition.attention == attention
@@ -1233,7 +1233,7 @@ impl Batch {
                 "physical submission partitions disagree on attention, shape, or collective order"
             );
             if partitions.len() >= 2 {
-                wire_ensure!(
+                ensure_valid!(
                     partitions
                         .iter()
                         .map(|partition| partition.domain)
@@ -1242,11 +1242,11 @@ impl Batch {
                         == partitions.len(),
                     "a tensorized-mixed submission group repeats a domain"
                 );
-                wire_ensure!(
+                ensure_valid!(
                     partitions
                         .iter()
                         .all(|partition| partition.route == partitions[0].route),
-                    "a tensorized-mixed submission group spans route capabilities"
+                    "a tensorized-mixed submission group spans route info"
                 );
             }
         }
@@ -1254,7 +1254,7 @@ impl Batch {
         let mut request_keys = HashSet::with_capacity(self.operation_count());
         for partition in &self.partitions {
             for operation in &partition.operations {
-                wire_ensure!(
+                ensure_valid!(
                     request_keys.insert(operation.request_key),
                     "a submission batch carries multiple operations for one request"
                 );
@@ -1263,11 +1263,11 @@ impl Batch {
         let mut admitted = HashSet::with_capacity(self.admissions.len());
         for admission in &self.admissions {
             admission.validate()?;
-            wire_ensure!(
+            ensure_valid!(
                 admitted.insert(admission.request_key),
                 "a submission batch carries a duplicate admission"
             );
-            wire_ensure!(
+            ensure_valid!(
                 self.operations()
                     .any(|operation| operation.request_key == admission.request_key),
                 "a submission batch admits a request without an operation"
@@ -1286,7 +1286,7 @@ impl Batch {
                 control.variant_index(),
             );
             if let Some(existing) = control_identities.get(&identity) {
-                wire_ensure!(
+                ensure_valid!(
                     existing == control,
                     "a submission batch reuses a control identity with different content"
                 );
@@ -1307,7 +1307,7 @@ impl Batch {
                 .iter()
                 .filter(|input| input.storage_class == StorageClass::HostStaging)
             {
-                wire_ensure!(
+                ensure_valid!(
                     input.request_key == operation.request_key
                         && input.producer_op_id == operation.op_id,
                     "a host-staging input is not owned by its consuming operation"
@@ -1316,23 +1316,23 @@ impl Batch {
         }
         let mut supplied_inputs = HashSet::with_capacity(self.input_products.len());
         for payload in &self.input_products {
-            wire_ensure!(
+            ensure_valid!(
                 declared_inputs.contains(&payload.product),
                 "an input product payload is not declared by any operation"
             );
             let transferred = is_transfer_descriptor(&payload.bytes);
             if payload.product.storage_class == StorageClass::HostStaging {
-                wire_ensure!(
+                ensure_valid!(
                     !transferred,
                     "host-staging input cannot carry a cross-stage transfer descriptor"
                 );
             } else {
-                wire_ensure!(
+                ensure_valid!(
                     transferred && payload.bytes.len() <= MAX_TRANSFER_DESCRIPTOR_BYTES,
                     "cross-stage product input has an invalid transfer descriptor frame"
                 );
             }
-            wire_ensure!(
+            ensure_valid!(
                 supplied_inputs.insert(&payload.product),
                 "a submission batch repeats an input product payload"
             );
@@ -1340,7 +1340,7 @@ impl Batch {
         }
         for input in declared_inputs {
             if input.storage_class == StorageClass::HostStaging {
-                wire_ensure!(
+                ensure_valid!(
                     supplied_inputs.contains(input),
                     "a host-staging operation input has no product payload"
                 );
@@ -1362,8 +1362,8 @@ pub struct PartitionCompletion {
 }
 
 impl PartitionCompletion {
-    pub fn validate(&self) -> ProtocolResult<()> {
-        wire_ensure!(
+    pub fn validate(&self) -> ValidationResult<()> {
+        ensure_valid!(
             self.partition_id > 0,
             "partition completion id must be positive"
         );
@@ -1399,11 +1399,11 @@ impl CompletionReport {
             .flat_map(|partition| partition.products.iter())
     }
 
-    pub fn validate(&self) -> ProtocolResult<()> {
+    pub fn validate(&self) -> ValidationResult<()> {
         let mut partition_ids = HashSet::with_capacity(self.partitions.len());
         for partition in &self.partitions {
             partition.validate()?;
-            wire_ensure!(
+            ensure_valid!(
                 partition_ids.insert(partition.partition_id),
                 "completion report repeats a partition id"
             );

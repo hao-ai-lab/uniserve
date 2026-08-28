@@ -23,7 +23,7 @@ _PHILOX_M1 = 0xCD9E8D57
 _PHILOX_KEY_BUMP_0 = 0x9E3779B9
 _PHILOX_KEY_BUMP_1 = 0xBB67AE85
 
-# Draw layout identifiers matching the wire ``DrawLayout`` discriminants. They
+# Draw layout identifiers matching the IPC ``DrawLayout`` discriminants. They
 # separate the proposal and target draw spaces so rejected proposals cannot
 # shift target coordinates.
 DRAW_LAYOUT_TARGET = 0

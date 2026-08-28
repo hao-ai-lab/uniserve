@@ -91,9 +91,9 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
             .max(1)
             .min(config.engine.max_num_seqs.max(1)),
     )
-    .context("max_batch exceeds the worker capability representation")?;
+    .context("max_batch exceeds the worker field width")?;
     let max_batch_tokens = u32::try_from(config.engine.max_num_batched_tokens)
-        .context("max_num_batched_tokens exceeds the worker capability representation")?;
+        .context("max_num_batched_tokens exceeds the worker field width")?;
     let worker_process = WorkerProcessArgs {
         model: config.model.clone(),
         req_slot_cap: request_slot_capacity,
@@ -141,7 +141,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     let route_max_model_len = effective_max_model_len.min(snapshot.max_model_len);
     let model = ResolvedModel::resolve(
         assets,
-        snapshot.generation_capabilities,
+        snapshot.generation_limits,
         snapshot.sampling_controls,
         route_max_model_len,
         config.reasoning_parsing,

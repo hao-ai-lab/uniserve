@@ -182,9 +182,6 @@ pub enum ChatEvent {
         logprobs: Option<DecodedLogprobs>,
         token_ids: Vec<u32>,
     },
-    PublicCommit {
-        commit: uniserve_core::PublicCommit,
-    },
     /// One assistant output block has ended.
     BlockEnd {
         index: usize,
@@ -198,10 +195,7 @@ pub enum ChatEvent {
     },
     /// One incremental tool-call arguments delta for the currently open tool
     /// call.
-    ToolCallArgumentsDelta {
-        index: usize,
-        delta: String,
-    },
+    ToolCallArgumentsDelta { index: usize, delta: String },
     /// One tool call has ended.
     ToolCallEnd {
         index: usize,

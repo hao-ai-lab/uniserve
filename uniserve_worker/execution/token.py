@@ -25,7 +25,7 @@ from uniserve_worker.execution.batch import (
     TokenMode,
     TokenSpan,
 )
-from uniserve_worker.foundation.errors import capability_mismatch, invalid_descriptor
+from uniserve_worker.foundation.errors import unsupported_setup, invalid_descriptor
 from uniserve_worker.loader.weight_set import WeightSet
 from uniserve_worker.runtime.device_products import (
     DeviceProductScalarBatch,
@@ -739,7 +739,7 @@ def project_graph_decode(
     output: GraphGreedyOutput | None,
     scope: PartitionState,
 ) -> tuple[Outcome, ...] | None:
-    """Project a captured greedy decision directly into protocol state."""
+    """Project a captured greedy decision directly into request state."""
 
     if output is None:
         return None
@@ -907,7 +907,7 @@ def prompt_logprob_details(
         raise invalid_descriptor("prompt scoring logits do not align with input tokens")
     states = runtime.runtime_states
     if states is None:
-        raise capability_mismatch("prompt scoring has no request-indexed runtime state")
+        raise unsupported_setup("prompt scoring has no request-indexed runtime state")
     slot = int(session.request_pool_idx)
     if start == 0:
         score_logits = logits[:-1]
@@ -1076,7 +1076,7 @@ def token_task(
     cache = runtime.cache_coordinates(operation, scope)
     visible = cache[2] if seq_len is None else int(seq_len)
     if visible != cache[2]:
-        raise invalid_descriptor("token row visibility disagrees with wire metadata")
+        raise invalid_descriptor("token row visibility disagrees with operation metadata")
     return ForwardRow(
         operation=operation,
         request=session,
@@ -1154,7 +1154,7 @@ def resolve_decode_token(
             raise invalid_descriptor("device token continuation is not registered")
         states = runtime.runtime_states
         if states is None:
-            raise capability_mismatch("device continuation has no request runtime state")
+            raise unsupported_setup("device continuation has no request runtime state")
         slot = int(session.request_pool_idx)
         pending = _pending_runtime_token(runtime, slot, scope)
         if pending is not None:
@@ -1180,7 +1180,7 @@ def resolve_decode_tokens(
                 raise invalid_descriptor("device token continuation is not registered")
             states = runtime.runtime_states
             if states is None:
-                raise capability_mismatch("device continuation has no request runtime state")
+                raise unsupported_setup("device continuation has no request runtime state")
             session = runtime.request_row(scope, operation.request_key.session_id)
             slot = int(session.request_pool_idx)
             pending = _pending_runtime_token(runtime, slot, scope)
@@ -1646,7 +1646,7 @@ def _session_penalty_base(
     if states is None:
         raise RuntimeError("token sampling has no request runtime-state owner")
     if states.vocab_size != int(vocab) or states.device != device:
-        raise capability_mismatch("sampling geometry disagrees with request runtime state")
+        raise unsupported_setup("sampling geometry disagrees with request runtime state")
     return states.penalty_counts[int(session.request_pool_idx)]
 
 

@@ -36,7 +36,7 @@ use uniserve_worker_ipc::Bounds;
 // Request -> Python (recv hot path)
 // ---------------------------------------------------------------------------
 
-/// Convert an `execute` [`WorkerRequest`] into the canonical Python wire mapping.
+/// Convert an `execute` [`WorkerRequest`] into the canonical Python IPC mapping.
 pub(crate) fn execute_request_to_py<'py>(
     py: Python<'py>,
     request: &WorkerRequest,
@@ -67,13 +67,13 @@ pub(crate) fn execute_request_to_py<'py>(
 // Native typed construction (recv hot path)
 // ---------------------------------------------------------------------------
 
-/// Cached handles to the worker's protocol types and enum members.
+/// Cached handles to the worker's operation types and enum members.
 ///
 /// The serve loop constructs one `Batch` object per submission; every hot
 /// record (operations, KV placements, commit/close/release controls) is built
-/// by calling the protocol dataclass constructors positionally, so the worker
-/// never re-decodes those records from wire maps. Rare members (admissions,
-/// input products, branch and latent placements) still cross as wire maps and
+/// by calling the operation dataclass constructors positionally, so the worker
+/// never re-decodes those records from IPC maps. Rare members (admissions,
+/// input products, branch and latent placements) still cross as IPC maps and
 /// are decoded by `native_batch`/`native_partition` on the Python side.
 struct NativeRequestTypes {
     operation: Py<PyAny>,
@@ -1010,7 +1010,7 @@ fn product_payload_to_py<'py>(
 
 fn request_kind_py<'py>(py: Python<'py>, kind: RequestKind) -> &'py Bound<'py, PyString> {
     match kind {
-        RequestKind::GetCapabilities => intern!(py, "get_capabilities"),
+        RequestKind::GetInfo => intern!(py, "get_info"),
         RequestKind::Execute => intern!(py, "execute"),
         RequestKind::PollCompletions => intern!(py, "poll_completions"),
         RequestKind::DropSession => intern!(py, "drop_session"),
@@ -1095,7 +1095,7 @@ fn decode_completion_response_from_py(response: &Bound<'_, PyAny>) -> Option<Wor
     }
     // Result reports reserve these fields for their respective response kinds.
     for key in [
-        intern!(py, "capabilities"),
+        intern!(py, "info"),
         intern!(py, "pressure"),
         intern!(py, "snapshot"),
     ] {
@@ -1128,7 +1128,7 @@ fn decode_error_response_from_py(response: &Bound<'_, PyAny>) -> Option<WorkerRe
         return None;
     }
     for key in [
-        intern!(py, "capabilities"),
+        intern!(py, "info"),
         intern!(py, "completion_report"),
         intern!(py, "pressure"),
         intern!(py, "snapshot"),
@@ -1498,7 +1498,7 @@ fn str_field<'py>(
 }
 
 fn u64_of(value: &Bound<'_, PyAny>) -> Option<u64> {
-    // Protocol integer fields reject Python booleans instead of coercing them
+    // Integer fields reject Python booleans instead of coercing them
     // to zero or one.
     if value.cast::<PyBool>().is_ok() {
         return None;
@@ -1739,13 +1739,13 @@ mod tests {
     }
 
     #[test]
-    fn native_execute_and_result_round_trip_preserves_protocol_values() {
+    fn native_execute_and_result_round_trip_preserves_values() {
         Python::initialize();
         let nonce = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let service = format!("uniserve/ipc-py-contract-{}-{nonce}", std::process::id());
+        let service = format!("uniserve/ipc-py-test-{}-{nonce}", std::process::id());
         let server = crate::PyServer::new(&service, 1 << 20, 2).unwrap();
         let client = ClientEndpoint::connect(&service, 1 << 20, 2).unwrap();
         let request = execute_request();
@@ -1779,7 +1779,7 @@ mod tests {
                 1
             );
             // The natively constructed batch must be exactly what the
-            // canonical codec decodes from its own wire form.
+            // canonical codec decodes from its own IPC form.
             let round_tripped = py
                 .import("uniserve_worker.execution.batch")
                 .unwrap()

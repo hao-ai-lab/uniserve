@@ -1,6 +1,6 @@
 # KV cache management
 
-UniServe uses one scheduler-owned physical page address space for every persistent KV sequence and one worker execution image of that state. Conversational history, generation conditioning, alternative classifier-free-guidance (CFG) prefixes, transfer installation, and recovery all use the same block-table contract.
+UniServe uses one scheduler-owned physical page address space for every persistent KV sequence and one worker execution image of that state. Conversational history, generation conditioning, alternative classifier-free-guidance (CFG) prefixes, transfer installation, and recovery all use the same block-table layout.
 
 ## Ownership
 
@@ -35,7 +35,7 @@ Page `0` is reserved as the padding sentinel. Positive page IDs belong to declar
 
 A scheduler `BlockTable` maps one cached sequence's logical blocks to physical pages and records its allocated token capacity. Scheduler request state owns the conversational tables. A distinct alternative CFG prefix owns ordinary tables for the lifetime of the flow operation. Reference-counted page handles keep shared prefixes live until their last owning table is released.
 
-The wire representation of every table is:
+The IPC representation of every table is:
 
 ```text
 request_pool_idx
@@ -49,7 +49,7 @@ Newly allocated page IDs travel separately so the worker can reset their content
 ```mermaid
 flowchart LR
     S["Scheduler BlockPool"] --> T["Request-owned BlockTable"]
-    T --> W["Wire table update"]
+    T --> W["IPC table update"]
     W --> R["Worker ReqToTokenPool"]
     R --> F["ForwardBatch coordinates"]
     F --> A["Attention backend"]
@@ -58,7 +58,7 @@ flowchart LR
 
 ## Forward execution
 
-`ForwardBatch` is the model-facing execution contract. Its KV core consists of `forward_mode`, `req_pool_indices`, `seq_lens`, `query_lens`, and `out_cache_loc`.
+`ForwardBatch` is the model-facing execution input. Its KV core consists of `forward_mode`, `req_pool_indices`, `seq_lens`, `query_lens`, and `out_cache_loc`.
 
 Each packed current token has one `out_cache_loc`. Zero means its K/V is available to the current attention call but is not persisted. A positive value encodes a physical page and page offset in `CachePool`. Text extend and decode rows use positive destinations for selected current tokens; denoise image rows use zero destinations.
 

@@ -1,4 +1,4 @@
-"""Attention over one row-aligned forward tensor contract."""
+"""Attention over row-aligned forward tensors."""
 
 from __future__ import annotations
 

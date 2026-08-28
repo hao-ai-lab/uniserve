@@ -20,20 +20,16 @@ struct DomainCumulative {
     backpressure_events: u64,
     reclaimed_credits: u64,
     completed_partitions: u64,
-    semantic_commits: u64,
-    public_commits: u64,
     co_resident_partitions: u64,
     queue_us: u64,
     launch_us: u64,
     device_us: u64,
     completion_us: u64,
-    semantic_commit_us: u64,
-    public_commit_us: u64,
     co_resident_us: u64,
 }
 
 /// Converts the scheduler's cumulative counters into per-update deltas for the
-/// wire shape (whose prefix-cache counters are increments, not totals).
+/// snapshot shape (whose prefix-cache counters are increments, not totals).
 #[derive(Debug, Default)]
 pub struct SchedStatsReporter {
     last_prefix_queries: u64,
@@ -49,10 +45,10 @@ pub struct SchedStatsReporter {
 }
 
 impl SchedStatsReporter {
-    /// Snapshot the live counters into one wire `SchedulerStats` update.
+    /// Snapshot the live counters into one snapshot `SchedulerStats` update.
     ///
     /// `block_size` converts block-granular prefix-cache query counts into the
-    /// token-granular counts the wire shape documents.
+    /// token-granular counts the snapshot shape documents.
     pub fn snapshot(&mut self, stats: &SchedStats, block_size: u32) -> SchedulerStats {
         let num_blocks = stats.kv_cache.num_blocks.load(Ordering::Relaxed);
         let free_blocks = stats.kv_cache.free_blocks.load(Ordering::Relaxed);
@@ -162,12 +158,6 @@ impl SchedStatsReporter {
                     completed_partitions: current
                         .completed_partitions
                         .saturating_sub(previous.completed_partitions),
-                    semantic_commits: current
-                        .semantic_commits
-                        .saturating_sub(previous.semantic_commits),
-                    public_commits: current
-                        .public_commits
-                        .saturating_sub(previous.public_commits),
                     co_resident_partitions: current
                         .co_resident_partitions
                         .saturating_sub(previous.co_resident_partitions),
@@ -175,12 +165,6 @@ impl SchedStatsReporter {
                     launch_us: current.launch_us.saturating_sub(previous.launch_us),
                     device_us: current.device_us.saturating_sub(previous.device_us),
                     completion_us: current.completion_us.saturating_sub(previous.completion_us),
-                    semantic_commit_us: current
-                        .semantic_commit_us
-                        .saturating_sub(previous.semantic_commit_us),
-                    public_commit_us: current
-                        .public_commit_us
-                        .saturating_sub(previous.public_commit_us),
                     co_resident_us: current
                         .co_resident_us
                         .saturating_sub(previous.co_resident_us),
@@ -208,15 +192,11 @@ fn domain_cumulative(stats: &crate::scheduler::DomainStats) -> DomainCumulative 
         backpressure_events: stats.backpressure_events.load(Ordering::Relaxed),
         reclaimed_credits: stats.reclaimed_credits.load(Ordering::Relaxed),
         completed_partitions: stats.completed_partitions.load(Ordering::Relaxed),
-        semantic_commits: stats.semantic_commits.load(Ordering::Relaxed),
-        public_commits: stats.public_commits.load(Ordering::Relaxed),
         co_resident_partitions: stats.co_resident_partitions.load(Ordering::Relaxed),
         queue_us: stats.queue_us.load(Ordering::Relaxed),
         launch_us: stats.launch_us.load(Ordering::Relaxed),
         device_us: stats.device_us.load(Ordering::Relaxed),
         completion_us: stats.completion_us.load(Ordering::Relaxed),
-        semantic_commit_us: stats.semantic_commit_us.load(Ordering::Relaxed),
-        public_commit_us: stats.public_commit_us.load(Ordering::Relaxed),
         co_resident_us: stats.co_resident_us.load(Ordering::Relaxed),
     }
 }
@@ -253,7 +233,7 @@ fn worker_forward_stats_snapshot(stats: &SchedStats) -> WorkerForwardStats {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
     // surface the two maps the worker computes (attention backend /
-    // cuda-graph runtime mode) so they reach the wire stats and Prometheus.
+    // cuda-graph runtime mode) so they reach the snapshot stats and Prometheus.
     let attention_backend_counts = stats
         .worker
         .attention_backend_counts
@@ -502,17 +482,17 @@ mod tests {
             .insert("greedy_device".into(), 4);
 
         let mut reporter = SchedStatsReporter::default();
-        let wire = reporter.snapshot(&stats, 256);
-        assert_eq!(wire.num_running_reqs, 3);
-        assert_eq!(wire.num_waiting_reqs, 2);
-        assert!((wire.kv_cache_usage - 0.25).abs() < 1e-9);
-        assert_eq!(wire.num_admitted_reqs, 3);
-        assert_eq!(wire.avg_queue_wait_us, 5_001);
-        assert_eq!(wire.queue_wait_us_total, 15_003);
-        assert_eq!(wire.max_queue_wait_us, 9_000);
-        assert_eq!(wire.prefix_cache_stats.base.queries, 10 * 256);
-        assert_eq!(wire.prefix_cache_stats.base.hits, 512);
-        let worker = wire.worker_forward_stats.expect("worker stats present");
+        let snapshot = reporter.snapshot(&stats, 256);
+        assert_eq!(snapshot.num_running_reqs, 3);
+        assert_eq!(snapshot.num_waiting_reqs, 2);
+        assert!((snapshot.kv_cache_usage - 0.25).abs() < 1e-9);
+        assert_eq!(snapshot.num_admitted_reqs, 3);
+        assert_eq!(snapshot.avg_queue_wait_us, 5_001);
+        assert_eq!(snapshot.queue_wait_us_total, 15_003);
+        assert_eq!(snapshot.max_queue_wait_us, 9_000);
+        assert_eq!(snapshot.prefix_cache_stats.base.queries, 10 * 256);
+        assert_eq!(snapshot.prefix_cache_stats.base.hits, 512);
+        let worker = snapshot.worker_forward_stats.expect("worker stats present");
         assert_eq!(worker.component_us.get("text_model_forward"), Some(&42));
         assert_eq!(worker.flashinfer_decode_plan_calls, 5);
         assert_eq!(worker.flashinfer_decode_plan_reuses, 120);
@@ -524,21 +504,21 @@ mod tests {
         );
 
         // Second snapshot with unchanged counters reports zero deltas.
-        let wire2 = reporter.snapshot(&stats, 256);
-        assert_eq!(wire2.num_admitted_reqs, 0);
-        assert_eq!(wire2.avg_queue_wait_us, 0);
-        assert_eq!(wire2.queue_wait_us_total, 0);
-        assert_eq!(wire2.max_queue_wait_us, 9_000);
-        assert_eq!(wire2.prefix_cache_stats.base.queries, 0);
-        assert_eq!(wire2.prefix_cache_stats.base.hits, 0);
-        assert!(wire2.worker_forward_stats.is_none());
+        let second_snapshot = reporter.snapshot(&stats, 256);
+        assert_eq!(second_snapshot.num_admitted_reqs, 0);
+        assert_eq!(second_snapshot.avg_queue_wait_us, 0);
+        assert_eq!(second_snapshot.queue_wait_us_total, 0);
+        assert_eq!(second_snapshot.max_queue_wait_us, 9_000);
+        assert_eq!(second_snapshot.prefix_cache_stats.base.queries, 0);
+        assert_eq!(second_snapshot.prefix_cache_stats.base.hits, 0);
+        assert!(second_snapshot.worker_forward_stats.is_none());
     }
 
     /// the two maps the worker computes (attention backend / cuda-graph
-    /// runtime mode) must survive the SchedStats -> wire snapshot/delta instead
+    /// runtime mode) must survive the SchedStats -> snapshot snapshot/delta instead
     /// of being silently dropped before they can reach Prometheus.
     /// the directly-measured per-batch worker compute time and host
-    /// round-trip latency must surface as per-update deltas in the wire stats so
+    /// round-trip latency must surface as per-update deltas in the snapshot stats so
     /// they reach Prometheus.
     #[test]
     fn snapshot_surfaces_batch_timing() {
@@ -554,16 +534,16 @@ mod tests {
         stats.timing.batch_timing_count.store(3, Ordering::Relaxed);
 
         let mut reporter = SchedStatsReporter::default();
-        let wire = reporter.snapshot(&stats, 256);
-        assert_eq!(wire.worker_exec_us, 1_200);
-        assert_eq!(wire.batch_roundtrip_us, 1_500);
-        assert_eq!(wire.batch_count, 3);
+        let snapshot = reporter.snapshot(&stats, 256);
+        assert_eq!(snapshot.worker_exec_us, 1_200);
+        assert_eq!(snapshot.batch_roundtrip_us, 1_500);
+        assert_eq!(snapshot.batch_count, 3);
 
         // Counters unchanged -> zero deltas on the next snapshot.
-        let wire2 = reporter.snapshot(&stats, 256);
-        assert_eq!(wire2.worker_exec_us, 0);
-        assert_eq!(wire2.batch_roundtrip_us, 0);
-        assert_eq!(wire2.batch_count, 0);
+        let second_snapshot = reporter.snapshot(&stats, 256);
+        assert_eq!(second_snapshot.worker_exec_us, 0);
+        assert_eq!(second_snapshot.batch_roundtrip_us, 0);
+        assert_eq!(second_snapshot.batch_count, 0);
     }
 
     #[test]
@@ -583,14 +563,14 @@ mod tests {
             .insert("graph".into(), 5);
 
         let mut reporter = SchedStatsReporter::default();
-        let wire = reporter.snapshot(&stats, 256);
-        let worker = wire.worker_forward_stats.expect("worker stats present");
+        let snapshot = reporter.snapshot(&stats, 256);
+        let worker = snapshot.worker_forward_stats.expect("worker stats present");
         assert_eq!(worker.attention_backend_counts.get("flashinfer"), Some(&9));
         assert_eq!(worker.cuda_graph_runtime_mode_counts.get("graph"), Some(&5));
 
         // Second snapshot with unchanged counters reports zero deltas (so both
         // maps are part of the delta/is_empty bookkeeping, not always-present).
-        let wire2 = reporter.snapshot(&stats, 256);
-        assert!(wire2.worker_forward_stats.is_none());
+        let second_snapshot = reporter.snapshot(&stats, 256);
+        assert!(second_snapshot.worker_forward_stats.is_none());
     }
 }

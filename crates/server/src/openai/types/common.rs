@@ -304,7 +304,7 @@ pub struct PromptTokenUsageInfo {
 }
 
 /// Mirrors the `CompletionTokenUsageInfo` class.
-/// Breakdown of completion-token usage required by the current OpenAI spec,
+/// Breakdown of completion-token usage required by the current OpenAI API,
 /// notably `reasoning_tokens` for reasoning-capable models.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize)]
@@ -368,31 +368,7 @@ pub struct ModelObject {
     pub object: String,
     pub created: i64,
     pub owned_by: String,
-    pub identity: ServedModelIdentity,
-    pub capabilities: ModelCapabilities,
 }
-
-/// Load-bound identity of the configured model description.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ServedModelIdentity {
-    pub served_name: String,
-    pub description: crate::profile::ModelDescription,
-}
-
-/// Typed public capabilities for the configured model route.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ModelCapabilities {
-    pub endpoints: Vec<ModelEndpoint>,
-    pub input_modalities: Vec<ModelModality>,
-    pub output_modalities: Vec<ModelModality>,
-    pub features: Vec<ModelFeature>,
-    pub sampling_controls: Vec<ModelSamplingControl>,
-}
-
-pub type ModelEndpoint = crate::serving::ServedEndpoint;
-pub type ModelModality = crate::serving::ServedModality;
-pub type ModelFeature = crate::serving::ServedFeature;
-pub type ModelSamplingControl = crate::serving::ServedSamplingControl;
 
 /// Response body for `GET /v1/models`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

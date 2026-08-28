@@ -5,7 +5,6 @@ use uuid::Uuid;
 use crate::serving::chat::AssistantBlockKind;
 use crate::serving::chat::output::FinishReason;
 use crate::serving::text::output::{DecodedLogprobs, DecodedPromptLogprobs};
-use uniserve_core::PublicCommit;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ReasoningEvent {
@@ -23,7 +22,6 @@ pub(crate) enum ReasoningEvent {
         logprobs: Option<DecodedLogprobs>,
         token_ids: Vec<u32>,
     },
-    PublicCommit(PublicCommit),
     Done {
         prompt_token_count: usize,
         output_token_count: usize,
@@ -48,7 +46,6 @@ pub(crate) enum AssistantEvent {
         logprobs: Option<DecodedLogprobs>,
         token_ids: Vec<u32>,
     },
-    PublicCommit(PublicCommit),
     ToolCallStart {
         id: String,
         name: String,
@@ -86,7 +83,6 @@ impl From<ReasoningEvent> for AssistantEvent {
                 logprobs,
                 token_ids,
             },
-            ReasoningEvent::PublicCommit(commit) => Self::PublicCommit(commit),
             ReasoningEvent::Done {
                 prompt_token_count,
                 output_token_count,

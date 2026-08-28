@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from ...execution.forward_batch import AttentionSelection
-from ...foundation.errors import capability_mismatch
+from ...foundation.errors import unsupported_setup
 from .base import AttentionBackend
 from .tuning import FlashInferTuningConfig
 
@@ -58,7 +58,7 @@ def resolve_attention_selection(
 
     requested = str(name)
     if requested not in ATTENTION_BACKENDS:
-        raise capability_mismatch(
+        raise unsupported_setup(
             f"unknown attention backend {requested!r}; expected one of {ATTENTION_BACKENDS!r}"
         )
     available: list[AttentionBackend] = []
@@ -70,6 +70,6 @@ def resolve_attention_selection(
         if backend.available and int(block_size) % multiple == 0:
             available.append(backend)
     if not available:
-        raise capability_mismatch(f"attention backend {requested!r} is unavailable")
+        raise unsupported_setup(f"attention backend {requested!r} is unavailable")
     identity = requested if requested != "auto" else "+".join(value.name for value in available)
     return AttentionSelection(identity=identity, providers=tuple(available))

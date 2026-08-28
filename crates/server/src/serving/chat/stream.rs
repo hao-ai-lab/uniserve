@@ -82,7 +82,6 @@ impl CollectedAssistantMessage {
                 }
                 ChatEvent::BlockStart { .. }
                 | ChatEvent::BlockDelta { .. }
-                | ChatEvent::PublicCommit { .. }
                 | ChatEvent::ToolCallStart { .. }
                 | ChatEvent::ToolCallArgumentsDelta { .. } => {}
             }

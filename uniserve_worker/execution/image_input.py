@@ -36,14 +36,14 @@ class PreparedImage:
 
 
 def prepare_image(
-    spec: ImageProcessor,
+    processor: ImageProcessor,
     kind: EncodeMode,
     encoded: str,
     *,
     device: torch.device,
 ) -> PreparedImage:
     image = _decode_rgb(encoded)
-    transform = spec.vit if kind is EncodeMode.VISION else spec.vae
+    transform = processor.vit if kind is EncodeMode.VISION else processor.vae
     if transform is None:
         raise invalid_descriptor(f"model declares no {kind.value} image transform")
 
@@ -62,7 +62,7 @@ def prepare_image(
         )
         grid = torch.tensor([[grid_height, grid_width]], dtype=torch.long)
         return PreparedImage(
-            _stage(pixels, spec, device),
+            _stage(pixels, processor, device),
             grid.to(device=device, non_blocking=True),
             (grid_height, grid_width),
             height,
@@ -70,16 +70,16 @@ def prepare_image(
         )
 
     canvas = image
-    if spec.vae is not None:
-        canvas = _resize_stride(canvas, spec.vae.resize)
+    if processor.vae is not None:
+        canvas = _resize_stride(canvas, processor.vae.resize)
     height, width = canvas.height, canvas.width
     tower_image = _resize_stride(canvas, transform.resize)
     pixels = _normalize(tower_image, transform.normalization)
-    return PreparedImage(_stage(pixels, spec, device), None, None, height, width)
+    return PreparedImage(_stage(pixels, processor, device), None, None, height, width)
 
 
 def prepare_tensor_image(
-    spec: ImageProcessor,
+    processor: ImageProcessor,
     kind: EncodeMode,
     image: torch.Tensor,
     *,
@@ -99,7 +99,7 @@ def prepare_tensor_image(
         value = (value + 1.0) * 0.5
     value = value.clamp(0.0, 1.0)
     source_height, source_width = int(value.shape[1]), int(value.shape[2])
-    transform = spec.vit if kind is EncodeMode.VISION else spec.vae
+    transform = processor.vit if kind is EncodeMode.VISION else processor.vae
     if transform is None:
         raise invalid_descriptor(f"model declares no {kind.value} image transform")
 
@@ -122,7 +122,7 @@ def prepare_tensor_image(
         )
         grid = torch.tensor([[grid_height, grid_width]], dtype=torch.long)
         return PreparedImage(
-            _stage(pixels, spec, device),
+            _stage(pixels, processor, device),
             grid.to(device=device, non_blocking=True),
             (grid_height, grid_width),
             source_height,
@@ -157,7 +157,7 @@ def prepare_tensor_image(
     value = _resize_tensor(value, target_height, target_width)
     normalized = _normalize_tensor(value, transform.normalization)
     return PreparedImage(
-        _stage(normalized, spec, device),
+        _stage(normalized, processor, device),
         None,
         None,
         source_height,
@@ -182,8 +182,8 @@ def _decode_rgb(encoded: str) -> Image.Image:
     return image.convert("RGB")
 
 
-def _resize_patch_image(image: Image.Image, spec: PatchTransform) -> Image.Image:
-    height, width = _patch_image_shape(spec, image.height, image.width)
+def _resize_patch_image(image: Image.Image, processor: PatchTransform) -> Image.Image:
+    height, width = _patch_image_shape(processor, image.height, image.width)
     return vision.resize(
         image,
         (height, width),
@@ -193,29 +193,29 @@ def _resize_patch_image(image: Image.Image, spec: PatchTransform) -> Image.Image
 
 
 def patch_grid_shape(
-    spec: PatchTransform,
+    processor: PatchTransform,
     source_height: int,
     source_width: int,
 ) -> tuple[int, int]:
     """Return the host-known patch grid for one declared image geometry."""
 
-    height, width = _patch_image_shape(spec, source_height, source_width)
-    patch = int(spec.patch_size)
+    height, width = _patch_image_shape(processor, source_height, source_width)
+    patch = int(processor.patch_size)
     return height // patch, width // patch
 
 
 def _patch_image_shape(
-    spec: PatchTransform,
+    processor: PatchTransform,
     source_height: int,
     source_width: int,
 ) -> tuple[int, int]:
-    factor = int(round(int(spec.patch_size) / float(spec.downsample_ratio)))
+    factor = int(round(int(processor.patch_size) / float(processor.downsample_ratio)))
     return _bounded_grid_shape(
         source_height,
         source_width,
         factor=factor,
-        minimum=int(spec.min_pixels),
-        maximum=int(spec.max_pixels),
+        minimum=int(processor.min_pixels),
+        maximum=int(processor.max_pixels),
     )
 
 
@@ -244,17 +244,17 @@ def _bounded_grid_shape(
     return result_height, result_width
 
 
-def _resize_stride(image: Image.Image, spec: StrideResize) -> Image.Image:
+def _resize_stride(image: Image.Image, processor: StrideResize) -> Image.Image:
     width, height = image.size
-    scale = min(int(spec.max_size) / max(width, height), 1.0)
-    scale = max(scale, int(spec.min_size) / min(width, height))
-    new_width, new_height = _stride_shape(width, height, scale, int(spec.stride))
-    if new_width * new_height > int(spec.max_pixels):
-        scale = int(spec.max_pixels) / (new_width * new_height)
-        new_width, new_height = _stride_shape(new_width, new_height, scale, int(spec.stride))
-    if max(new_width, new_height) > int(spec.max_size):
-        scale = int(spec.max_size) / max(new_width, new_height)
-        new_width, new_height = _stride_shape(new_width, new_height, scale, int(spec.stride))
+    scale = min(int(processor.max_size) / max(width, height), 1.0)
+    scale = max(scale, int(processor.min_size) / min(width, height))
+    new_width, new_height = _stride_shape(width, height, scale, int(processor.stride))
+    if new_width * new_height > int(processor.max_pixels):
+        scale = int(processor.max_pixels) / (new_width * new_height)
+        new_width, new_height = _stride_shape(new_width, new_height, scale, int(processor.stride))
+    if max(new_width, new_height) > int(processor.max_size):
+        scale = int(processor.max_size) / max(new_width, new_height)
+        new_width, new_height = _stride_shape(new_width, new_height, scale, int(processor.stride))
     return vision.resize(
         image,
         (new_height, new_width),
@@ -295,10 +295,10 @@ def _resize_tensor(value: torch.Tensor, height: int, width: int) -> torch.Tensor
     )[0]
 
 
-def _stage(value: torch.Tensor, spec: ImageProcessor, device: torch.device) -> torch.Tensor:
-    dtype = None if spec.staging_dtype is None else getattr(torch, spec.staging_dtype, None)
-    if spec.staging_dtype is not None and not isinstance(dtype, torch.dtype):
-        raise invalid_descriptor(f"unknown image staging dtype {spec.staging_dtype!r}")
+def _stage(value: torch.Tensor, processor: ImageProcessor, device: torch.device) -> torch.Tensor:
+    dtype = None if processor.staging_dtype is None else getattr(torch, processor.staging_dtype, None)
+    if processor.staging_dtype is not None and not isinstance(dtype, torch.dtype):
+        raise invalid_descriptor(f"unknown image staging dtype {processor.staging_dtype!r}")
     return value.to(device=device, dtype=dtype, non_blocking=True)
 
 

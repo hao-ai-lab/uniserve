@@ -1,4 +1,4 @@
-"""Behavioral contracts for shared worker helpers."""
+"""Behavior tests for shared worker helpers."""
 from __future__ import annotations
 
 import pytest

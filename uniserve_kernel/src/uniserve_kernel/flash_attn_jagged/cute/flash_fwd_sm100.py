@@ -2165,7 +2165,7 @@ class FlashAttentionForwardSm100:
                         ] = softmax.row_max[0]
                     # if tidx == 0:
                     #     cute.printf("softmax row sum stage %d: %f, row_max = %f\n", stage, softmax.row_sum[0], softmax.row_max[0])
-                    # See block_sparse_utils.py NOTE [SM100 block-sparse empty tiles: mbarrier contract].
+                    # See block_sparse_utils.py NOTE [SM100 block-sparse empty tiles: mbarrier use].
                     # pipeline_sm_stats.producer_commit_w_index(stage)
                     sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx)
                     # if tidx == 0: cute.printf("softmax row sum stage %d: %f\n", stage, softmax.row_sum[0])

@@ -1,6 +1,6 @@
-# Benchmark protocol
+# Serving benchmarks
 
-`uniserve-eval` runs explicit public-protocol benchmark points from [`uniserve_eval/profiles.toml`](../uniserve_eval/profiles.toml). A point starts one server, executes one workload, writes one result bundle, and stops the server before another point begins.
+`uniserve-eval` runs explicit benchmark points from [`uniserve_eval/profiles.toml`](../uniserve_eval/profiles.toml). A point starts one server, executes one workload, writes one result bundle, and stops the server before another point begins.
 
 ## Commands
 
@@ -27,7 +27,7 @@ python scripts/compare_eval.py decode-runtime \
   --output-dir /path/to/comparison
 ```
 
-The `decode-runtime` suite produces a threshold-free direct-parent report. Before each construction commit, run all four suite points for the prospective commit and its direct parent, then compare those two result roots and submit the raw values for the authorization decision defined by the construction protocol. A single benchmark point can be used in place of a suite name. Callers may request an independent numerical screen with `--max-regression` when another protocol requires one; `serving-runtime` uses `--max-regression 0.10`.
+The `decode-runtime` suite contains four ordered points and produces a threshold-free comparison report. A single benchmark point can be used in place of a suite name. `--max-regression` adds a numerical screen when one is needed; `serving-runtime` uses `--max-regression 0.10`.
 
 ## Configuration
 
@@ -51,7 +51,7 @@ T2I declares `image.image_count`; every request must return exactly that many de
 
 Interleave sends no image-count field. Individual requests may emit zero or multiple images. The evaluator requires `sum(images) / request_count` across the full point to be at least 1.1. Realized image metrics use decoded public stream events and client receive timestamps. After an image event, the next text interval is not recorded as inter-token latency.
 
-A stream request must receive Server-Sent Events. A JSON body in response to `sampling.stream = true` is a protocol failure.
+A stream request must receive Server-Sent Events. A JSON body in response to `sampling.stream = true` is a request failure.
 
 ## Result bundle
 

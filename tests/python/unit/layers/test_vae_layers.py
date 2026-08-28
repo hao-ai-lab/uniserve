@@ -1,4 +1,4 @@
-"""Conformance for the shared VAE layer."""
+"""Behavior tests for the shared VAE layer."""
 from __future__ import annotations
 
 import pytest

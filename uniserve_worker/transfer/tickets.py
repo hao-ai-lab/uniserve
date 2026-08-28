@@ -35,7 +35,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 from ..execution.batch import MAX_TRANSFER_DESCRIPTOR_BYTES, TRANSFER_DESCRIPTOR_PREFIX
-from ..foundation.errors import capability_mismatch, invalid_descriptor, resource_error
+from ..foundation.errors import unsupported_setup, invalid_descriptor, resource_error
 
 if TYPE_CHECKING:
     import torch
@@ -68,7 +68,7 @@ TRANSPORTS = tuple(kind.value for kind in TransportKind)
 
 @dataclass(frozen=True)
 class Locator:
-    """Compact, wire-ready reference into a registered region.
+    """Compact IPC reference into a registered region.
 
     Carried opaquely as an exact generation-tagged product reference from the
     producing operation, through the control plane, to the consuming operation,
@@ -110,7 +110,7 @@ class Locator:
     @staticmethod
     def from_mapping(raw: dict[str, Any]) -> "Locator":
         if int(raw.get("version", 1)) != 1:
-            raise invalid_descriptor("unsupported locator wire version")
+            raise invalid_descriptor("unsupported locator version")
         return Locator(
             transport=str(raw["transport"]),
             session=str(raw["session"]),
@@ -122,14 +122,14 @@ class Locator:
             meta=dict(raw.get("meta") or {}),
         )
 
-    def to_wire_json(self) -> str:
+    def to_json(self) -> str:
         return json.dumps(self.to_mapping(), separators=(",", ":"), sort_keys=True)
 
     @staticmethod
-    def from_wire_json(raw: str) -> "Locator":
+    def from_json(raw: str) -> "Locator":
         value = json.loads(raw)
         if not isinstance(value, dict):
-            raise invalid_descriptor("locator wire value must be a JSON object")
+            raise invalid_descriptor("locator value must be a JSON object")
         return Locator.from_mapping(value)
 
 
@@ -224,7 +224,7 @@ class Transport(ABC):
         """Enqueue publication without observing device completion on the caller."""
 
         if not self.supports_async_publication:
-            raise capability_mismatch(
+            raise unsupported_setup(
                 f"{self.name} transport does not support asynchronous publication"
             )
         return self.publish(tensor)
@@ -236,7 +236,7 @@ class Transport(ABC):
     def fetch_async(self, locator: Locator) -> "TransferTicket":
         """Submit a read without waiting for remote or device progress."""
 
-        raise capability_mismatch(f"{self.name} transport does not support asynchronous reads")
+        raise unsupported_setup(f"{self.name} transport does not support asynchronous reads")
 
     def ready(self, locator: Locator) -> bool:
         """Query producer readiness without waiting."""
@@ -782,7 +782,7 @@ class ShmTransport(Transport):
             if header and shm[0] == 0:
                 self._await_publication(locator)
             if header and shm[0] != 1:
-                raise capability_mismatch("shared-memory publication did not complete")
+                raise unsupported_setup("shared-memory publication did not complete")
             buf = bytearray(shm[header : header + locator.nbytes])
         finally:
             shm.close()

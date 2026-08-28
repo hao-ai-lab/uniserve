@@ -37,7 +37,7 @@ class LinearBase(nn.Module):
         input_size: int,
         output_size: int,
         *,
-        spec: LayerConfig,
+        layer_config: LayerConfig,
         bias: bool = True,
         prefix: str = "",
     ) -> None:
@@ -46,7 +46,7 @@ class LinearBase(nn.Module):
         self.output_size = int(output_size)
         self.prefix = str(prefix)
         self.has_bias = bool(bias)
-        self.quant_method = spec.quant_method(self.prefix)
+        self.quant_method = layer_config.quant_method(self.prefix)
         self.quant_method.create_weights(
             self,
             input_size=self.input_size,
@@ -94,18 +94,18 @@ class ColumnParallelLinear(LinearBase):
         input_size: int,
         output_size: int,
         *,
-        spec: LayerConfig,
+        layer_config: LayerConfig,
         bias: bool = True,
         prefix: str = "",
     ) -> None:
-        parallel = spec.parallel
+        parallel = layer_config.parallel
         self.global_input_size = int(input_size)
         self.global_output_size = int(output_size)
         local_output = divide(self.global_output_size, parallel.size)
         super().__init__(
             input_size,
             local_output,
-            spec=spec,
+            layer_config=layer_config,
             bias=bias,
             prefix=prefix,
         )
@@ -121,18 +121,18 @@ class RowParallelLinear(LinearBase):
         input_size: int,
         output_size: int,
         *,
-        spec: LayerConfig,
+        layer_config: LayerConfig,
         bias: bool = True,
         prefix: str = "",
     ) -> None:
-        parallel = spec.parallel
+        parallel = layer_config.parallel
         self.global_input_size = int(input_size)
         self.global_output_size = int(output_size)
         local_input = divide(self.global_input_size, parallel.size)
         super().__init__(
             local_input,
             output_size,
-            spec=spec,
+            layer_config=layer_config,
             bias=bias,
             prefix=prefix,
         )
@@ -170,13 +170,13 @@ class MergedColumnParallelLinear(LinearBase):
         input_size: int,
         output_sizes: list[int] | tuple[int, ...],
         *,
-        spec: LayerConfig,
+        layer_config: LayerConfig,
         bias: bool = True,
         prefix: str = "",
         local_output_sizes: list[int] | tuple[int, ...] | None = None,
         weight_mode: WeightMode = WeightMode.VANILLA,
     ):
-        parallel = spec.parallel
+        parallel = layer_config.parallel
         self.global_output_sizes = tuple(int(s) for s in output_sizes)
         self.output_sizes = (
             tuple(int(s) for s in local_output_sizes)
@@ -188,7 +188,7 @@ class MergedColumnParallelLinear(LinearBase):
         super().__init__(
             input_size,
             sum(self.output_sizes),
-            spec=spec,
+            layer_config=layer_config,
             bias=bias,
             prefix=prefix,
         )
@@ -242,11 +242,11 @@ class QKVParallelLinear(MergedColumnParallelLinear):
         total_num_heads: int,
         total_num_kv_heads: int,
         *,
-        spec: LayerConfig,
+        layer_config: LayerConfig,
         bias: bool = True,
         prefix: str = "",
     ) -> None:
-        parallel = spec.parallel
+        parallel = layer_config.parallel
         self.head_size = head_size
         self.total_num_heads = total_num_heads
         self.total_num_kv_heads = total_num_kv_heads
@@ -260,7 +260,7 @@ class QKVParallelLinear(MergedColumnParallelLinear):
         super().__init__(
             hidden_size,
             (q_size, kv_size, kv_size),
-            spec=spec,
+            layer_config=layer_config,
             bias=bias,
             prefix=prefix,
             local_output_sizes=(q_size_local, kv_size_local, kv_size_local),

@@ -59,9 +59,9 @@ pub(crate) fn block_hash(
             for token in tokens {
                 hasher.update(token.to_le_bytes());
             }
-            let digest = hasher.finalize();
+            let hash_bytes = hasher.finalize();
             u64::from_le_bytes(
-                digest[..8]
+                hash_bytes[..8]
                     .try_into()
                     .expect("SHA-256 prefix is eight bytes"),
             )

@@ -20,7 +20,7 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--worker-kind",
         default=WorkerKind.FULL.value,
-        choices=WorkerKind.wire_values(),
+        choices=WorkerKind.values(),
         help="deployment role served by this worker process",
     )
     parser.add_argument("--device", default="cuda")

@@ -7,8 +7,8 @@ use std::time::Duration;
 use uniserve_core::GenerationEvent;
 use uniserve_core::{
     ContextSegment, FeedbackNextToken, FeedbackSource, GeneratedImageFeedbackRecipe,
-    GenerationBehaviorDescriptor, GenerationConstraint, GenerationPolicyDescriptor,
-    GenerationRequest, GenerationResourceBounds, GenerationRuntimeCapabilities, ImageIngestRecipe,
+    GenerationBehaviorDescriptor, GenerationConstraint, GenerationLimits,
+    GenerationPolicyDescriptor, GenerationRequest, GenerationResourceBounds, ImageIngestRecipe,
     ImageKvEffect, ImageParams, RequestId, SamplingParams, TriggerPolicyDescriptor, UndVisibility,
 };
 use uniserve_engine::{ControlTokens, EngineHandle, Scheduler, SimEngine, SimExecutor};
@@ -56,7 +56,7 @@ fn main() {
                 image: &image,
                 max_und_tokens: 20,
                 cache: &cache,
-                capabilities: &GenerationRuntimeCapabilities {
+                limits: &GenerationLimits {
                     features: uniserve_core::GenerationFeatures::UNDERSTANDING
                         | uniserve_core::GenerationFeatures::IMAGE_GENERATION,
                     max_latent_units: 64,

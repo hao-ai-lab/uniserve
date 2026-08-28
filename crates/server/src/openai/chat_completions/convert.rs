@@ -18,7 +18,7 @@ use crate::openai::utils::{ResolvedRequestContext, convert_logit_bias};
 
 use super::validate;
 
-/// Public response metadata retained after the wire request has been lowered.
+/// Public response metadata retained after request lowering.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatResponseContext {
     pub request_id: String,
@@ -31,7 +31,7 @@ pub struct ChatResponseContext {
     pub return_tokens_as_token_ids: bool,
 }
 
-/// Lower one validated wire request into the sole generate admission value and
+/// Lower one validated chat request into the sole generate admission value and
 /// response-only metadata.
 pub fn lower_chat_request(
     request: ChatCompletionRequest,

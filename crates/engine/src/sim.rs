@@ -1,6 +1,6 @@
-//! GPU-free execution engine for scheduler and frontend conformance tests.
+//! GPU-free execution engine for scheduler and frontend behavior tests.
 //!
-//! The simulator is a strict peer of the production execution protocol: it
+//! The simulator accepts the same requests as the production executor: it
 //! consumes typed admissions and operations, enforces lifecycle, version, and
 //! replay invariants, and returns one [`ModelOutput`] per operation with the
 //! resolved output-product values a host consumes. Every state point is named by
@@ -41,7 +41,7 @@ enum Job {
 
 /// Runs the deterministic model simulator on a bounded asynchronous executor seam.
 pub struct SimExecutor {
-    caps: WorkerInfo,
+    info: WorkerInfo,
     depth: usize,
     to_worker: Sender<Job>,
     from_worker: Receiver<anyhow::Result<CompletionReport>>,
@@ -54,12 +54,12 @@ pub struct SimExecutor {
 
 impl SimExecutor {
     pub fn new(engine: SimEngine) -> Self {
-        let depth = (engine.caps().pipeline_depth as usize).max(1);
+        let depth = (engine.info().pipeline_depth as usize).max(1);
         Self::with_depth(engine, depth)
     }
 
     pub fn with_depth(mut engine: SimEngine, depth: usize) -> Self {
-        let caps = engine.caps().clone();
+        let info = engine.info().clone();
         let depth = depth.max(1);
         let (to_worker, jobs) = crossbeam_channel::unbounded();
         let (results_tx, from_worker) = crossbeam_channel::unbounded();
@@ -85,7 +85,7 @@ impl SimExecutor {
             })
             .expect("spawn sim executor thread");
         Self {
-            caps,
+            info,
             depth,
             to_worker,
             from_worker,
@@ -99,7 +99,7 @@ impl SimExecutor {
 
     fn apply_control(&mut self, operation: &ControlOp) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.caps
+            self.info
                 .supported_controls
                 .contains(&operation.request_kind()),
             "sim executor does not support control {}",
@@ -118,8 +118,8 @@ impl SimExecutor {
 }
 
 impl Executor for SimExecutor {
-    fn caps(&self) -> &WorkerInfo {
-        &self.caps
+    fn info(&self) -> &WorkerInfo {
+        &self.info
     }
 
     fn pipeline_depth(&self) -> usize {
@@ -306,9 +306,9 @@ impl SimSession {
     }
 }
 
-/// Deterministic local model engine with protocol-faithful lifecycle state.
+/// Deterministic local model engine with production-equivalent lifecycle state.
 pub struct SimEngine {
-    caps: WorkerInfo,
+    info: WorkerInfo,
     text_len: usize,
     fake_eos: u32,
     vocab: usize,
@@ -317,7 +317,7 @@ pub struct SimEngine {
 
 impl SimEngine {
     pub fn new() -> Self {
-        let caps = WorkerInfo {
+        let info = WorkerInfo {
             supported_work: vec![
                 ForwardMode::TokenExtend,
                 ForwardMode::TokenDecode,
@@ -360,7 +360,7 @@ impl SimEngine {
             ..WorkerInfo::default()
         };
         Self {
-            caps,
+            info,
             text_len: DEFAULT_TEXT_LEN,
             fake_eos: FAKE_EOS_TOKEN,
             vocab: SYNTH_VOCAB_SIZE,
@@ -777,7 +777,7 @@ impl SimEngine {
     }
 
     pub fn set_pipeline_depth(&mut self, depth: u32) {
-        self.caps.pipeline_depth = depth.max(1);
+        self.info.pipeline_depth = depth.max(1);
     }
 
     pub fn set_text_len(&mut self, length: usize) {
@@ -800,22 +800,22 @@ impl SimEngine {
     }
 
     pub fn set_groups(&mut self, groups: Vec<uniserve_core::KvCacheGroup>) {
-        self.caps.groups = groups;
+        self.info.groups = groups;
     }
 
     pub fn set_num_blocks(&mut self, count: u32) {
-        self.caps.num_blocks = count;
-        if self.caps.groups.len() == 1 {
-            self.caps.groups[0].num_blocks = count;
+        self.info.num_blocks = count;
+        if self.info.groups.len() == 1 {
+            self.info.groups[0].num_blocks = count;
         }
     }
 
     pub fn set_block_size(&mut self, size: u32) {
-        self.caps.block_size = size;
+        self.info.block_size = size;
     }
 
-    pub fn mut_caps_for_test(&mut self) -> &mut WorkerInfo {
-        &mut self.caps
+    pub fn mut_info_for_test(&mut self) -> &mut WorkerInfo {
+        &mut self.info
     }
 }
 
@@ -891,8 +891,8 @@ impl Default for SimEngine {
 }
 
 impl SimEngine {
-    fn caps(&self) -> &WorkerInfo {
-        &self.caps
+    fn info(&self) -> &WorkerInfo {
+        &self.info
     }
 
     fn execute(&mut self, batch: Batch) -> anyhow::Result<CompletionReport> {
@@ -950,7 +950,7 @@ impl SimEngine {
                             *point_index == session.point_index,
                             "operation {} ({}) parent point {} does not match session point {}",
                             operation.op_id.0,
-                            operation.work.as_wire_str(),
+                            operation.work.as_str(),
                             point_index,
                             session.point_index
                         );
@@ -1184,10 +1184,10 @@ mod tests {
     }
 
     #[test]
-    fn default_capabilities_admit_public_image_geometry() {
+    fn default_limits_admit_public_image_geometry() {
         let engine = SimEngine::new();
-        let caps = engine.caps();
-        let latent_units = (2_048 / caps.latent_downsample) * (1_152 / caps.latent_downsample);
-        assert!(u64::from(latent_units) <= caps.latent_capacity_units());
+        let info = engine.info();
+        let latent_units = (2_048 / info.latent_downsample) * (1_152 / info.latent_downsample);
+        assert!(u64::from(latent_units) <= info.latent_capacity_units());
     }
 }

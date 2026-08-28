@@ -1,4 +1,4 @@
-//! Northbound engine contract for streamed generation and terminal media requests.
+//! Engine interface for streamed generation and terminal media requests.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 use tokio::sync::mpsc;
@@ -528,14 +528,12 @@ mod tests {
             .send(GenerationEvent::TextToken {
                 id: 7,
                 logprob: None,
-                public_commit: None,
             })
             .unwrap();
         event_tx
             .send(GenerationEvent::TextToken {
                 id: 8,
                 logprob: None,
-                public_commit: None,
             })
             .unwrap();
 

@@ -15,7 +15,7 @@
 //!   exact physical state cannot be relocated remain resident and apply queue
 //!   backpressure when capacity is exhausted.
 //!
-//! The worker contract is a stateful diff: a request's static state crosses once
+//! Worker updates are stateful: a request's static state crosses once
 //! as [`NewRequest`]; per-step ops carry only deltas (new block ids, new
 //! tokens, and per-step masks).
 
@@ -84,11 +84,11 @@ use uniserve_core::product_blob::{LogprobBlob, RankedToken};
 use uniserve_core::{BlockId, CfgParams, ImageIngestStep, encoder_cache_key};
 use uniserve_core::{
     FinishReason, GenerationEvent, GenerationRequest, MediaEvent, MediaRequest, PositionLogprobs,
-    PublicCommit, PublicModality, SemanticRoot, TokenLogprob,
+    TokenLogprob,
 };
 use uniserve_core::{HashAlgo, RequestId};
 use uniserve_worker_ipc::{
-    AttentionRegime, Batch, BatchPartition, BlockTable as WireBlockTable, Bounds,
+    AttentionRegime, Batch, BatchPartition, BlockTable as IpcBlockTable, Bounds,
     CachePageAllocation, CloseReason, CompletionReport, Control, DType, DecodeKind,
     DecodePlacement, DimBound, Disposition, ForwardMode, GenAdmission, LatentPlacement,
     MediaAdmission, MediaProfileId, ModelOutput, NewRequest, OpId, OpStatus, Operation, Point,
@@ -145,7 +145,6 @@ fn image_done_event(image_id: u32, pixels_png_b64: String) -> Option<GenerationE
         bytes: metadata.bytes,
         sha256: metadata.sha256,
         pixels_png_b64,
-        public_commit: None,
     })
 }
 
@@ -518,7 +517,7 @@ struct PendingMedia {
 
 pub struct Scheduler {
     executor: Box<dyn Executor>,
-    caps: WorkerInfo,
+    info: WorkerInfo,
     /// Resident resource ownership and reservation accounting.
     kv_budget: KvBudget,
     ctrl: ControlTokens,
@@ -912,7 +911,7 @@ fn operation_trace(operation: &Operation, apply: &SchedulerApply) -> serde_json:
         Point::Device { .. } => "device",
     };
     json!({
-        "work": operation.work.as_wire_str(),
+        "work": operation.work.as_str(),
         "domain": format!("{:?}", operation.domain),
         "parent_kind": parent_kind,
         "predicated": operation.predicate.is_some(),
@@ -932,7 +931,7 @@ fn denoise_step_burst_from_env() -> u16 {
         .unwrap_or(DEFAULT_DENOISE_STEP_BURST)
 }
 
-/// Build the wire [`CfgParams`] for a denoise op.
+/// Build the IPC [`CfgParams`] for a denoise op.
 ///
 /// The exact text/image CFG branch set is derived by the worker-side CFG plan.
 /// The scheduler only carries the per-path branch bound needed by generic

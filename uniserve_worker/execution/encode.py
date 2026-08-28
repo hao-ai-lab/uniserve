@@ -20,7 +20,7 @@ from uniserve_worker.execution.batch import (
     StorageClass,
     TokenSpan,
 )
-from uniserve_worker.foundation.errors import capability_mismatch, invalid_descriptor
+from uniserve_worker.foundation.errors import unsupported_setup, invalid_descriptor
 from uniserve_worker.models.generation import LatentLayout, Materialization
 from uniserve_worker.models.inputs import FeatureLayout, PatchTransform
 from uniserve_worker.models.runtime import PositionLayout
@@ -91,7 +91,7 @@ def _pack_encode(runtime: ExecutionResources, state: OperationState) -> tuple[ob
 
     operation = state.operation
     partition = state.partition
-    image_spec = runtime.image_processor()
+    image_processor = runtime.image_processor()
     mode = operation.work.encode_mode
     if mode is None:
         raise invalid_descriptor("encode operation is missing an encode mode")
@@ -111,14 +111,14 @@ def _pack_encode(runtime: ExecutionResources, state: OperationState) -> tuple[ob
     if isinstance(source, tuple):
         source_tensor, source_metadata = source
         prepared = prepare_tensor_image(
-            image_spec,
+            image_processor,
             mode,
             source_tensor,
             device=target_device,
             signed_unit=source_metadata.value_range is ImageRange.SIGNED_UNIT,
         )
     else:
-        prepared = prepare_image(image_spec, mode, source, device=target_device)
+        prepared = prepare_image(image_processor, mode, source, device=target_device)
     task = encode_row(runtime, operation, mode, prepared, partition)
     state.data.update(
         mode="encode",
@@ -480,7 +480,7 @@ def _feature_token_id(runtime: ExecutionResources, injection: Any, *, start: boo
     if value is not None:
         return int(value)
     if text is None or runtime.tokenizer is None:
-        raise capability_mismatch("feature marker requires a worker tokenizer or token id")
+        raise unsupported_setup("feature marker requires a worker tokenizer or token id")
     token_id = runtime.tokenizer.convert_tokens_to_ids(text)
     if token_id is None or int(token_id) < 0:
         raise invalid_descriptor("declared feature marker is absent from the tokenizer")

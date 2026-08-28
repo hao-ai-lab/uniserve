@@ -99,26 +99,10 @@ pub fn record_scheduler_stats(
             .get_or_create(&domain_labels)
             .inc_by(domain.completed_partitions);
         for (kind, value) in [
-            ("semantic", domain.semantic_commits),
-            ("public", domain.public_commits),
-        ] {
-            metrics
-                .scheduler_domain_commits
-                .get_or_create(&EngineDomainKindLabels {
-                    model_name: model_name.clone(),
-                    engine,
-                    domain: domain.domain.clone(),
-                    kind: kind.to_string(),
-                })
-                .inc_by(value);
-        }
-        for (kind, value) in [
             ("queue", domain.queue_us),
             ("launch", domain.launch_us),
             ("device", domain.device_us),
             ("completion", domain.completion_us),
-            ("semantic_commit", domain.semantic_commit_us),
-            ("public_commit", domain.public_commit_us),
             ("co_resident", domain.co_resident_us),
         ] {
             metrics
@@ -319,7 +303,7 @@ pub fn record_scheduler_stats(
     // round-trip), now surfaced to Prometheus instead of the JSON trace only.
 
     // the worker/scheduler latency counters use cumulative *microseconds*
-    // (the `_us` suffix is the unit contract carried on the wire), deliberately
+    // (the `_us` suffix records the unit in IPC), deliberately
     // distinct from the per-request second-valued histograms in
     // `uniserve_observability::request`. They are not a competing unit system:
     // a dashboard reconciles them as `seconds = <_us counter> / 1e6`. The
@@ -396,15 +380,11 @@ mod tests {
                 backpressure_events: 3,
                 reclaimed_credits: 6,
                 completed_partitions: 4,
-                semantic_commits: 5,
-                public_commits: 4,
                 co_resident_partitions: 2,
                 queue_us: 11,
                 launch_us: 13,
                 device_us: 17,
                 completion_us: 19,
-                semantic_commit_us: 23,
-                public_commit_us: 29,
                 co_resident_us: 31,
                 ..Default::default()
             }],

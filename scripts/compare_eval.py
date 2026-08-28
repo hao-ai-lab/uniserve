@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare matched public-protocol serving result bundles offline."""
+"""Compare matched serving result bundles offline."""
 
 from __future__ import annotations
 

@@ -355,20 +355,19 @@ def test_failed_cross_stage_kv_read_preserves_source_and_destination_state() -> 
                 execution_batch(step_id=2, operations=(publication,), controls=(commit,))
             )
         ).products[0]
-        kind, value, producer_digest = decode_transfer_descriptor(published.payload)
+        kind, value = decode_transfer_descriptor(published.payload)
         snapshot = CachePublication.from_mapping(value["snapshot"])
-        first = Locator.from_wire_json(snapshot.locators[0])
+        first = Locator.from_json(snapshot.locators[0])
         missing = replace(first, handle=b"uniserve-missing-transfer-segment")
         broken = replace(
             snapshot,
-            locators=(missing.to_wire_json(), *snapshot.locators[1:]),
+            locators=(missing.to_json(), *snapshot.locators[1:]),
         )
         payload = ProductPayload(
             product=published.product,
             payload=encode_transfer_descriptor(
                 kind,
                 {"generation": value["generation"], "snapshot": broken.to_mapping()},
-                producer_digest,
             ),
         )
         installation, _installed = _installation_operation(

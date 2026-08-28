@@ -10,21 +10,21 @@ class OpenAIChat:
     @staticmethod
     def classify_events(events: Sequence[Any]) -> tuple[bool, str]:
         if not events:
-            return False, "protocol_empty_response"
+            return False, "response_empty_response"
         if any(not isinstance(event, dict) for event in events):
-            return False, "protocol_invalid_event"
+            return False, "response_invalid_event"
         if any(event.get("type") == "parse_error" for event in events):
-            return False, "protocol_invalid_event"
+            return False, "response_invalid_event"
         if any(isinstance(event.get("error"), dict) for event in events):
             return False, "model_error"
         if not any(event.get("type") == "sse_done" for event in events) and not any(
             OpenAIChat._has_finish_reason(event) for event in events
         ):
-            return False, "protocol_missing_terminal"
+            return False, "response_missing_terminal"
         if not any(
             OpenAIChat.delta_text(event) or OpenAIChat.delta_images(event) for event in events
         ):
-            return False, "protocol_empty_output"
+            return False, "response_empty_output"
         return True, "ok"
 
     @staticmethod

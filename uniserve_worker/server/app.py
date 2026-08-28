@@ -1,4 +1,4 @@
-"""Event-driven worker protocol serving with exact-once step execution."""
+"""Event-driven worker IPC serving with exact-once step execution."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from ..capabilities import RequestKind, ResponseKind
+from ..worker_info import RequestKind, ResponseKind
 from ..execution.batch import (
     Batch,
     CompletionReport,
@@ -61,7 +61,7 @@ def _response(kind: ResponseKind, **payload: Any) -> dict[str, Any]:
     response: dict[str, Any] = {
         "kind": kind.value,
         "call_id": None,
-        "capabilities": None,
+        "info": None,
         "completion_report": None,
         "pressure": None,
         "message": None,
@@ -494,7 +494,7 @@ def _finalize_response(response: Mapping[str, Any]) -> dict[str, Any]:
 def _control(
     worker: Worker, kind: RequestKind, request: Mapping[str, Any]
 ) -> dict[str, Any] | None:
-    supported = frozenset(worker.capabilities.supported_controls)
+    supported = frozenset(worker.info.supported_controls)
     if kind not in supported:
         raise unsupported_control(kind.value)
     if kind is RequestKind.DROP_SESSION:
@@ -510,10 +510,10 @@ def dispatch(worker: Worker, request: Mapping[str, Any]) -> dict[str, Any]:
     """Pure request-to-response dispatch for non-execution worker controls."""
 
     kind = _request_kind(request)
-    if kind is RequestKind.GET_CAPABILITIES:
+    if kind is RequestKind.GET_INFO:
         return _response(
-            ResponseKind.CAPABILITIES,
-            capabilities=worker.capabilities.to_mapping(),
+            ResponseKind.INFO,
+            info=worker.info.to_mapping(),
         )
     if kind is RequestKind.GET_PRESSURE:
         return _response(ResponseKind.PRESSURE, pressure=worker.resource_pressure())
@@ -538,8 +538,8 @@ class WorkerServer:
         self.worker = worker
         self.ipc_endpoint = ipc_endpoint
         self.profiler = WorkerProfiler.from_env()
-        self.pipeline_depth = max(1, int(worker.capabilities.pipeline_depth))
-        max_operations = max(1, int(worker.capabilities.max_batch_operations))
+        self.pipeline_depth = max(1, int(worker.info.pipeline_depth))
+        max_operations = max(1, int(worker.info.max_batch_operations))
         capacity = (
             env_int(
                 "UNISERVE_WORKER_STEP_CACHE_CAPACITY",
@@ -561,7 +561,7 @@ class WorkerServer:
         self._shutdown_response: dict[str, Any] | None = None
         self._accepting_closed = False
         self._fatal_shutdown = False
-        self._launch_reorder = int(worker.capabilities.rank.tp_size) == 1
+        self._launch_reorder = int(worker.info.rank.tp_size) == 1
         self._execute_count = 0
         self._terminate_after = env_int("UNISERVE_STUB_DIE_AFTER", default=0)
         self._terminate_rank = env_optional_int("UNISERVE_STUB_DIE_RANK")
@@ -683,7 +683,7 @@ class WorkerServer:
                     self._profile_tick()
                 terminate_this_rank = self._terminate_rank in {
                     None,
-                    int(self.worker.capabilities.rank.tp_rank),
+                    int(self.worker.info.rank.tp_rank),
                 }
                 self._execute_count += 1
                 if (
@@ -700,7 +700,7 @@ class WorkerServer:
                     if isinstance(raw_batch, Mapping)
                     else -1
                 )
-                with profile_range(self._profile_name("batch_wire", step_id=raw_step_id)):
+                with profile_range(self._profile_name("batch_decode", step_id=raw_step_id)):
                     batch = (
                         raw_batch if isinstance(raw_batch, Batch) else Batch.from_mapping(raw_batch)
                     )
@@ -858,14 +858,14 @@ class WorkerServer:
 
     def _start_execution(self, step: InflightStep, batch: Batch) -> None:
         try:
-            supported = frozenset(self.worker.capabilities.supported_work)
+            supported = frozenset(self.worker.info.supported_work)
             unsupported = tuple(
                 operation.work for operation in batch.operations if operation.work not in supported
             )
             if unsupported:
                 names = sorted({value.value for value in unsupported})
                 raise invalid_descriptor(
-                    f"execution batch contains work variants outside worker capabilities: {names!r}"
+                    f"execution batch contains work variants unsupported by this worker: {names!r}"
                 )
             prepared = self.worker.prepare_execute(batch) if batch.operations else None
             if prepared is not None:
@@ -992,8 +992,19 @@ class WorkerServer:
             return True
 
     def _advance_execution_order(self) -> None:
-        for step in tuple(self.steps.values()):
-            if isinstance(step, InflightStep) and not step.advance_execution():
+        inflight = (step for step in self.steps.values() if isinstance(step, InflightStep))
+        ordered = sorted(
+            inflight,
+            key=lambda step: (
+                min(
+                    (partition.collective_seq for partition in step.batch.partitions),
+                    default=0,
+                ),
+                step.step_id,
+            ),
+        )
+        for step in ordered:
+            if not step.advance_execution():
                 return
 
     def _send_one_ready_response(self) -> bool:
@@ -1045,7 +1056,7 @@ class WorkerServer:
             self.ipc_endpoint.respond(response)
 
     def _profile_name(self, boundary: str, *, step_id: int | None = None) -> str:
-        name = f"uniserve.worker.{boundary} rank={int(self.worker.capabilities.rank.tp_rank)}"
+        name = f"uniserve.worker.{boundary} rank={int(self.worker.info.rank.tp_rank)}"
         return f"{name} step={step_id}" if step_id is not None and step_id >= 0 else name
 
     def _reap_device_events(self) -> None:

@@ -15,11 +15,11 @@ pub(crate) struct SenseNovaTextDelta {
 
 impl SenseNovaOutputProcessor {
     pub(crate) fn new(
-        spec: OutputFilterPolicy,
+        policy: OutputFilterPolicy,
         tokenizer: DynTokenizer,
         prompt_token_ids: &[u32],
     ) -> crate::profile::reasoning::Result<Self> {
-        let reasoning = if let Some(reasoning) = spec.reasoning.clone() {
+        let reasoning = if let Some(reasoning) = policy.reasoning.clone() {
             let mut parser =
                 DelimitedReasoningParser::new(tokenizer, reasoning.start, reasoning.end, false)?;
             parser.initialize(prompt_token_ids);
@@ -29,7 +29,7 @@ impl SenseNovaOutputProcessor {
         };
         Ok(Self {
             reasoning,
-            visible_wrappers: VisibleWrapperFilter::new(spec.visible_wrappers),
+            visible_wrappers: VisibleWrapperFilter::new(policy.visible_wrappers),
         })
     }
 

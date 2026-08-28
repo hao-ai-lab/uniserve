@@ -1,4 +1,4 @@
-"""Quantization method contract for shared layers.
+"""Quantization methods for shared layers.
 
 Only the unquantized method is active today.  The important production seam is
 that the method owns parameter creation, so future fp8/int8 layouts do not have

@@ -33,7 +33,7 @@ use futures::{Stream, StreamExt as _};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::Notify;
-use uniserve_core::{GenerationEvent, PublicCommit};
+use uniserve_core::GenerationEvent;
 use uniserve_engine::EventRx;
 
 pub use input::{
@@ -42,8 +42,8 @@ pub use input::{
     SchedulingBounds, StopConfig, TokenizedGenerateReqInput,
 };
 pub use model::{
-    ResolvedAssets, ResolvedModel, ServedEndpoint, ServedFeature, ServedModality,
-    ServedModelCapabilities, ServedSamplingControl,
+    ModelSupport, ResolvedAssets, ResolvedModel, ServedEndpoint, ServedFeature, ServedModality,
+    ServedSamplingControl,
 };
 
 use crate::serving::chat::{
@@ -194,10 +194,10 @@ pub enum ServeError {
         request_id: ServeRequestId,
         requested: u32,
     },
-    #[error("request `{request_id}` requires unsupported capability `{capability}`")]
-    UnsupportedCapability {
+    #[error("request `{request_id}` requires unsupported feature `{feature}`")]
+    UnsupportedFeature {
         request_id: ServeRequestId,
-        capability: &'static str,
+        feature: &'static str,
     },
     #[error(
         "request `{request_id}` has {prompt_tokens} prompt tokens, exceeding the {max_tokens}-token profile limit"
@@ -315,13 +315,13 @@ impl ServingRuntime {
     pub async fn generate_video(&self, request: VideoGenerationInput) -> Result<MediaEventRx> {
         if !self
             .model
-            .served_capabilities()
+            .support()
             .endpoints
             .contains(&ServedEndpoint::VideoGenerations)
         {
-            return Err(ServeError::UnsupportedCapability {
+            return Err(ServeError::UnsupportedFeature {
                 request_id: request.request_id,
-                capability: "video_generation",
+                feature: "video_generation",
             });
         }
         if request.prompt.trim().is_empty() {
@@ -841,7 +841,6 @@ impl RuntimeRequestRegistry {
                         ((scheduled - queued).max(0.0) * 1_000_000.0) as u64
                     });
             }
-            ServeEvent::PublicCommit { .. } => {}
             ServeEvent::TextDelta { token_ids, .. } => {
                 stats.state = RequestLifecycleState::Streaming;
                 stats.visible_output_tokens = stats
@@ -1280,7 +1279,7 @@ pub struct RuntimeTimings {
     pub total_us: u64,
 }
 
-/// Protocol-neutral runtime event.
+/// Runtime event consumed by the HTTP response layer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ServeEvent {
     Accepted {
@@ -1298,9 +1297,6 @@ pub enum ServeEvent {
         scheduled_at: Option<f64>,
         cache: CacheAccounting,
         resources: ResourceAccounting,
-    },
-    PublicCommit {
-        commit: PublicCommit,
     },
     TextDelta {
         candidate_id: CandidateId,
@@ -1489,7 +1485,7 @@ async fn control_aware_event_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uniserve_core::{PublicModality, SemanticRoot, TokenLogprob};
+    use uniserve_core::TokenLogprob;
     use uniserve_engine::EventRx;
 
     fn event_context() -> EventContext {
@@ -1512,18 +1508,6 @@ mod tests {
         }
     }
 
-    fn public_commit(event_seq: u64, modality: PublicModality) -> PublicCommit {
-        PublicCommit {
-            event_seq,
-            modality,
-            committed_at: event_seq as f64,
-            semantic_root: SemanticRoot {
-                producer_op_id: uniserve_core::OpId(event_seq),
-                point_index: event_seq as u32,
-            },
-        }
-    }
-
     fn bagel_output_policy() -> OutputProcessorPolicy {
         OutputProcessorPolicy::Bagel
     }
@@ -1540,7 +1524,6 @@ mod tests {
         tx.try_send(GenerationEvent::TextToken {
             id: b'a' as u32,
             logprob: Some(-0.25),
-            public_commit: None,
         })
         .unwrap();
         tx.try_send(GenerationEvent::TokenLogprobs {
@@ -1642,16 +1625,9 @@ mod tests {
         tx.send(GenerationEvent::TextToken {
             id: b'a' as u32,
             logprob: None,
-            public_commit: Some(public_commit(1, PublicModality::Text)),
         })
         .await
         .unwrap();
-        assert!(matches!(
-            events.next().await,
-            Some(Ok(ServeEvent::PublicCommit {
-                commit: PublicCommit { event_seq: 1, .. }
-            }))
-        ));
         assert!(matches!(
             events.next().await,
             Some(Ok(ServeEvent::TextDelta { text, .. })) if text == "a"
@@ -1665,9 +1641,8 @@ mod tests {
             height: 1,
             width: 1,
             bytes: 3,
-            sha256: uniserve_core::Digest::zero(),
+            sha256: "0".repeat(64),
             pixels_png_b64: "cG5n".to_string(),
-            public_commit: Some(public_commit(3, PublicModality::Image)),
         })
         .await
         .unwrap();
@@ -1681,19 +1656,12 @@ mod tests {
         tx.send(GenerationEvent::TextToken {
             id: b'b' as u32,
             logprob: None,
-            public_commit: Some(public_commit(4, PublicModality::Text)),
         })
         .await
         .unwrap();
         assert!(matches!(
             events.next().await,
             Some(Ok(ServeEvent::ImageCommit { .. }))
-        ));
-        assert!(matches!(
-            events.next().await,
-            Some(Ok(ServeEvent::PublicCommit {
-                commit: PublicCommit { event_seq: 3, .. }
-            }))
         ));
         assert!(matches!(
             events.next().await,

@@ -10,7 +10,7 @@ pub(crate) struct BlockMeta {
     /// Collision safety: the exact token ids whose content produced
     /// `hash`. Retained alongside the hash so `lookup_cached`/`acquire_cached`
     /// can re-verify a candidate prefix's tokens against the block on a hash
-    /// hit — a 64-bit (or 64-bit-truncated) digest collision would otherwise let
+    /// hit — a 64-bit (or 64-bit-truncated) hash collision would otherwise let
     /// one request silently reuse another's KV for a *different* prefix. Mirrors
     /// the reference `BlockPool`, which stores the block's tokens and compares
     /// them on a hit. Empty when the block is not cached; cleared on eviction.

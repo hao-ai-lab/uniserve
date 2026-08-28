@@ -7,27 +7,25 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 pub mod codec;
-mod digest;
 mod events;
 pub mod generation;
 pub mod philox;
 pub mod product_blob;
 pub mod sampling;
 pub use codec::stats::WorkerForwardStats;
-pub use digest::{Digest, DigestError};
 pub use events::{
     FinishReason, GenerationEvent, MediaEvent, MediaRequest, MediaRequestError, PositionLogprobs,
-    PublicCommit, PublicCommitError, PublicModality, SemanticRoot, StopReason, TokenLogprob,
+    StopReason, TokenLogprob,
 };
 pub use generation::{
     ContextSegment, FeedbackNextToken, FeedbackSource, GenOnlyStartPolicyDescriptor,
     GeneratedImageFeedbackRecipe, GenerationBehaviorDescriptor, GenerationCachePolicyDescriptor,
-    GenerationConstraint, GenerationConstraintParseError, GenerationFeatures,
+    GenerationConstraint, GenerationConstraintParseError, GenerationFeatures, GenerationLimits,
     GenerationPolicyDescriptor, GenerationRequest, GenerationRequestError,
-    GenerationResourceBounds, GenerationResourceError, GenerationResources,
-    GenerationRuntimeCapabilities, ImageIngestRecipe, ImageIngestStep, ImageKvEffect, ImageSegment,
-    SegmentPlacement, TerminationPolicyDescriptor, TriggerPolicyDescriptor, UndTokenAction,
-    UndVisibility, VisibilityPolicyDescriptor, encoder_cache_key,
+    GenerationResourceBounds, GenerationResourceError, GenerationResources, ImageIngestRecipe,
+    ImageIngestStep, ImageKvEffect, ImageSegment, SegmentPlacement, TerminationPolicyDescriptor,
+    TriggerPolicyDescriptor, UndTokenAction, UndVisibility, VisibilityPolicyDescriptor,
+    encoder_cache_key,
 };
 pub use sampling::{SampleOutput, score_token_logprobs, try_apply_sampling_counts};
 
@@ -94,7 +92,7 @@ impl std::fmt::Debug for CommandWaker {
 /// Current wall-clock time in fractional seconds since the Unix epoch.
 ///
 /// Shared by the frontend, engine client, scheduler, and engine process for
-/// latency metrics and wire timestamps. Never panics: a clock set before the
+/// latency metrics and IPC timestamps. Never panics: a clock set before the
 /// epoch (or stepped backward) clamps to `0.0` rather than unwrapping the
 /// `Result`.
 pub fn now_unix_secs() -> f64 {
@@ -146,7 +144,7 @@ pub struct RequestId(pub u64);
 pub struct TraceId(pub u64);
 
 /// Op id: a single op within a program/request. `(request, seq)`
-/// flattened to a u64 on the wire so the host correlates op result ↔ submitted op.
+/// flattened to a u64 on the IPC so the host correlates op result ↔ submitted op.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct OpId(pub u64);
 
@@ -403,7 +401,7 @@ impl Default for SamplingParams {
     /// as greedy (argmax). The production frontend resolves an unset user
     /// temperature to `1.0` during lowering; a `SamplingParams` reaching the
     /// worker has always passed through that path. This default is for direct
-    /// constructors (tests, sim, wire fallbacks) only.
+    /// constructors (tests, sim, IPC fallbacks) only.
     fn default() -> Self {
         Self {
             temperature: 0.0,
@@ -718,7 +716,7 @@ pub struct KvCacheGroup {
 
 /// Rank and parallelism topology descriptor reported by a worker. The host fans
 /// descriptors to ranks and joins small results; cross-rank KV movement lives
-/// inside the worker tier, not on the control-plane wire.
+/// inside the worker tier, not on the control-plane IPC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RankInfo {
     pub tp_rank: u32,
@@ -735,7 +733,7 @@ impl Default for RankInfo {
 
 /// Prefix-cache block-hash algorithm. Pluggable, seeded from config; the
 /// default is the fast non-cryptographic FNV-1a-with-seed mixer. Sha256 is an
-/// option for environments that want a cryptographic digest. Both produce a
+/// option for environments that want a cryptographic hash. Both produce a
 /// `u64` slot for `BlockHashToBlock`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]

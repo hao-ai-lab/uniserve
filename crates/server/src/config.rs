@@ -62,7 +62,7 @@ pub struct EngineSettings {
     /// Number of tensor-parallel worker rank processes (tp size of the single
     /// Full pool in the default topology).
     /// Staged-worker topology, e.g. `encoder:2,prefill:1:tp=4,decode:1:tp=4`.
-    /// `None` selects one Full pool. A multi-stage spec
+    /// `None` selects one Full pool. A multi-stage layout
     /// composes pools behind a `StagedExecutor`.
     pub workers: WorkerTopology,
     /// Per-edge data-plane transfer backend (`--transfer`), e.g.

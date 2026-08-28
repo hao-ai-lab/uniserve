@@ -75,7 +75,7 @@ class _RequestPublication:
 
 @dataclass(slots=True)
 class RequestRow:
-    """Bounded host protocol state for one scheduler-assigned request slot."""
+    """Bounded host state for one scheduler-assigned request slot."""
 
     request_key: RequestKey
     request_pool_idx: int

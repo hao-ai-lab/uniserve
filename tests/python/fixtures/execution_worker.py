@@ -1,4 +1,4 @@
-"""Construction helpers for canonical worker-boundary conformance tests."""
+"""Construction helpers for worker IPC behavior tests."""
 
 from __future__ import annotations
 
@@ -64,12 +64,12 @@ def execution_worker(
 
     configure_physical_pool(
         cache_pages=worker.cache_pool.num_pages,
-        request_pool_size=worker.capabilities.max_request_pool_size,
+        request_pool_size=worker.info.max_request_pool_size,
         block_size=worker.cache_pool.block_size,
-        commit_marker_tokens=worker.capabilities.commit_marker_tokens,
-        max_cfg_branches=worker.capabilities.max_cfg_branches,
-        latent_page_units=worker.capabilities.latent_page_units,
-        latent_downsample=worker.capabilities.latent_downsample,
+        commit_marker_tokens=worker.info.commit_marker_tokens,
+        max_cfg_branches=worker.info.max_cfg_branches,
+        latent_page_units=worker.info.latent_page_units,
+        latent_downsample=worker.info.latent_downsample,
     )
     return worker
 

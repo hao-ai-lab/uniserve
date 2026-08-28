@@ -1,4 +1,4 @@
-"""Derive one row-aligned forward tensor contract from scheduler tables."""
+"""Derive row-aligned forward tensors from scheduler tables."""
 
 from __future__ import annotations
 
@@ -238,12 +238,12 @@ def _cumulative(lengths: Sequence[int]) -> torch.Tensor:
 
 
 def _binding_identity(tasks: Sequence[ForwardRow]) -> int:
-    digest = hashlib.blake2b(digest_size=8)
+    hasher = hashlib.blake2b(digest_size=8)
     for task in tasks:
-        digest.update(int(task.operation.request_key.session_id).to_bytes(8, "little"))
-        digest.update(int(task.operation.request_key.epoch).to_bytes(8, "little"))
-        digest.update(int(task.operation.op_id).to_bytes(8, "little"))
-    return int.from_bytes(digest.digest(), "little")
+        hasher.update(int(task.operation.request_key.session_id).to_bytes(8, "little"))
+        hasher.update(int(task.operation.request_key.epoch).to_bytes(8, "little"))
+        hasher.update(int(task.operation.op_id).to_bytes(8, "little"))
+    return int.from_bytes(hasher.digest(), "little")
 
 
 __all__ = ["columns", "dense_columns"]

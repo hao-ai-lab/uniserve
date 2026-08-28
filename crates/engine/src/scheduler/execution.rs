@@ -145,7 +145,7 @@ impl Scheduler {
     }
 
     pub(super) fn submit_media_batch(&mut self) -> bool {
-        let max_unresolved = usize::try_from(self.caps.max_unresolved_window.max(1))
+        let max_unresolved = usize::try_from(self.info.max_unresolved_window.max(1))
             .unwrap_or(usize::MAX)
             .min(self.executor.pipeline_depth().max(1));
         let mut candidates = self
@@ -236,7 +236,7 @@ impl Scheduler {
                     request_key,
                     op_id,
                     page_table: self.kv_budget.latent_pages.pages_for(id).to_vec(),
-                    latent_units: self.caps.latent_page_units,
+                    latent_units: self.info.latent_page_units,
                     height: 768,
                     width: 1344,
                     start_step,
@@ -636,7 +636,7 @@ impl Scheduler {
             return false;
         };
         if queue.len() >= self.executor.pipeline_depth().max(1)
-            || queue.len() >= self.caps.max_unresolved_window as usize
+            || queue.len() >= self.info.max_unresolved_window as usize
             || state.terminal_intent.is_terminal()
             || self.inflight.finishes.contains_key(&id)
             || !Self::device_token_relay_eligible(state)
@@ -833,7 +833,7 @@ impl Scheduler {
     /// frontend decision may run ahead by at most the unresolved-window depth,
     /// after which it waits for an acknowledgement so the horizon stays finite.
     pub(super) fn pending_commit_horizon_open(&self, state: &ReqState) -> bool {
-        let horizon = self.caps.max_unresolved_window.max(1) as usize;
+        let horizon = self.info.max_unresolved_window.max(1) as usize;
         state.pending_commits.len() < horizon
     }
 
@@ -1428,7 +1428,7 @@ impl Scheduler {
                     resolved_ops.push(json!({
                         "request_id": id.0,
                         "op_id": op_id,
-                        "operation_type": operation_variant.as_wire_str(),
+                        "operation_type": operation_variant.as_str(),
                         "domain": operation.domain,
                         "transition_delta": &apply.intent,
                         "transition_replayability": apply.replayability_after_apply,
@@ -1464,7 +1464,7 @@ impl Scheduler {
                         "at_s": now(),
                         "request_id": id.0,
                         "op_id": op_id,
-                        "operation_type": operation_variant.as_wire_str(),
+                        "operation_type": operation_variant.as_str(),
                         "error": error.detail(),
                     }));
                     if self.running.contains_key(&id) {
@@ -1523,7 +1523,7 @@ impl Scheduler {
                         "at_s": now(),
                         "request_id": id.0,
                         "op_id": op_id,
-                        "operation_type": operation_variant.as_wire_str(),
+                        "operation_type": operation_variant.as_str(),
                         "error": error.to_string(),
                     }));
                     if self.running.contains_key(&id) {

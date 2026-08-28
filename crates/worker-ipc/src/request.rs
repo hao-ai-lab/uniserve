@@ -9,7 +9,7 @@ use super::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestKind {
-    GetCapabilities,
+    GetInfo,
     Execute,
     PollCompletions,
     DropSession,
@@ -20,7 +20,7 @@ pub enum RequestKind {
 
 impl RequestKind {
     pub const ALL: [Self; 7] = [
-        Self::GetCapabilities,
+        Self::GetInfo,
         Self::Execute,
         Self::PollCompletions,
         Self::DropSession,
@@ -29,9 +29,9 @@ impl RequestKind {
         Self::GetPressure,
     ];
 
-    pub const fn as_wire_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
-            Self::GetCapabilities => "get_capabilities",
+            Self::GetInfo => "get_info",
             Self::Execute => "execute",
             Self::PollCompletions => "poll_completions",
             Self::DropSession => "drop_session",
@@ -45,7 +45,7 @@ impl RequestKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkerRequest {
-    GetCapabilities { call_id: Option<u64> },
+    GetInfo { call_id: Option<u64> },
     Execute { call_id: Option<u64>, batch: Batch },
     PollCompletions { call_id: Option<u64>, step_id: u64 },
     DropSession { session_id: RequestId },
@@ -57,7 +57,7 @@ pub enum WorkerRequest {
 impl WorkerRequest {
     pub const fn kind(&self) -> RequestKind {
         match self {
-            Self::GetCapabilities { .. } => RequestKind::GetCapabilities,
+            Self::GetInfo { .. } => RequestKind::GetInfo,
             Self::Execute { .. } => RequestKind::Execute,
             Self::PollCompletions { .. } => RequestKind::PollCompletions,
             Self::DropSession { .. } => RequestKind::DropSession,
@@ -69,7 +69,7 @@ impl WorkerRequest {
 
     pub const fn call_id(&self) -> Option<u64> {
         match self {
-            Self::GetCapabilities { call_id }
+            Self::GetInfo { call_id }
             | Self::Execute { call_id, .. }
             | Self::PollCompletions { call_id, .. }
             | Self::GetPressure { call_id } => *call_id,
@@ -79,7 +79,7 @@ impl WorkerRequest {
 
     pub fn set_call_id(&mut self, value: Option<u64>) {
         match self {
-            Self::GetCapabilities { call_id }
+            Self::GetInfo { call_id }
             | Self::Execute { call_id, .. }
             | Self::PollCompletions { call_id, .. }
             | Self::GetPressure { call_id } => *call_id = value,
@@ -94,8 +94,8 @@ impl WorkerRequest {
         }
     }
 
-    pub fn get_capabilities() -> Self {
-        Self::GetCapabilities { call_id: None }
+    pub fn get_info() -> Self {
+        Self::GetInfo { call_id: None }
     }
     pub fn execute(batch: Batch) -> Self {
         Self::Execute {
@@ -126,7 +126,7 @@ impl WorkerRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResponseKind {
-    Capabilities,
+    Info,
     Result,
     Ok,
     Error,
@@ -153,9 +153,9 @@ pub struct WorkerResponseError {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkerResponse {
-    Capabilities {
+    Info {
         call_id: Option<u64>,
-        capabilities: WorkerInfo,
+        info: WorkerInfo,
     },
     Result {
         call_id: Option<u64>,
@@ -177,7 +177,7 @@ pub enum WorkerResponse {
 impl WorkerResponse {
     pub const fn kind(&self) -> ResponseKind {
         match self {
-            Self::Capabilities { .. } => ResponseKind::Capabilities,
+            Self::Info { .. } => ResponseKind::Info,
             Self::Result { .. } => ResponseKind::Result,
             Self::Ok { .. } => ResponseKind::Ok,
             Self::Error { .. } => ResponseKind::Error,
@@ -187,7 +187,7 @@ impl WorkerResponse {
 
     pub const fn call_id(&self) -> Option<u64> {
         match self {
-            Self::Capabilities { call_id, .. }
+            Self::Info { call_id, .. }
             | Self::Result { call_id, .. }
             | Self::Ok { call_id }
             | Self::Error { call_id, .. }
@@ -197,7 +197,7 @@ impl WorkerResponse {
 
     pub fn set_call_id(&mut self, value: Option<u64>) {
         match self {
-            Self::Capabilities { call_id, .. }
+            Self::Info { call_id, .. }
             | Self::Result { call_id, .. }
             | Self::Ok { call_id }
             | Self::Error { call_id, .. }
@@ -214,10 +214,10 @@ impl WorkerResponse {
         }
     }
 
-    pub fn capabilities(capabilities: WorkerInfo) -> Self {
-        Self::Capabilities {
+    pub fn info(info: WorkerInfo) -> Self {
+        Self::Info {
             call_id: None,
-            capabilities,
+            info,
         }
     }
 

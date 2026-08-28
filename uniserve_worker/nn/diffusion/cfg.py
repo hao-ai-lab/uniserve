@@ -53,7 +53,7 @@ class RenormKind(str, Enum):
 class Branch(str, Enum):
     """Named CFG branch the model evaluates.
 
-    Values match the wire strings ``"cond"``, ``"text_uncond"``, and ``"img_uncond"``.
+    Values match the IPC strings ``"cond"``, ``"text_uncond"``, and ``"img_uncond"``.
     """
 
     COND = "cond"

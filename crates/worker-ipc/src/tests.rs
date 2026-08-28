@@ -313,7 +313,7 @@ fn partition_report(
 }
 
 #[test]
-fn every_work_variant_round_trips_through_the_wire() {
+fn every_work_variant_round_trips_through_ipc() {
     let variants = [
         (ForwardMode::TokenExtend, true, Domain::Prefill),
         (ForwardMode::TokenDecode, true, Domain::Decode),
@@ -452,7 +452,7 @@ fn error_completion_round_trips_with_its_error_code() {
 }
 
 #[test]
-fn every_control_variant_round_trips_through_the_wire() {
+fn every_control_variant_round_trips_through_ipc() {
     let commit = Control::Commit {
         request_key: request_key(),
         control_seq: 1,
@@ -674,23 +674,19 @@ fn commit_control_requires_a_fixed_selected_version() {
 }
 
 #[test]
-fn capabilities_round_trip_with_the_canonical_layout() {
-    let caps = WorkerInfo::default();
-    let response = WorkerResponse::capabilities(caps.clone());
+fn worker_info_round_trips() {
+    let info = WorkerInfo::default();
+    let response = WorkerResponse::info(info.clone());
     let decoded = decode_response(&encode_response(&response).unwrap()).unwrap();
-    let WorkerResponse::Capabilities {
-        capabilities: decoded,
-        ..
-    } = decoded
-    else {
-        panic!("decoded response must preserve its capabilities variant");
+    let WorkerResponse::Info { info: decoded, .. } = decoded else {
+        panic!("decoded response must preserve its info variant");
     };
-    assert_eq!(decoded, caps);
+    assert_eq!(decoded, info);
 }
 
 #[test]
-fn kv_free_capabilities_round_trip_without_kv_geometry() {
-    let caps = WorkerInfo {
+fn kv_free_worker_info_round_trips() {
+    let info = WorkerInfo {
         block_size: 0,
         num_blocks: 0,
         num_layers: 0,
@@ -707,21 +703,17 @@ fn kv_free_capabilities_round_trip_without_kv_geometry() {
         resource_classes: vec![ResourceClass::ImageLatent],
         ..WorkerInfo::default()
     };
-    let response = WorkerResponse::capabilities(caps.clone());
+    let response = WorkerResponse::info(info.clone());
     let decoded = decode_response(&encode_response(&response).unwrap()).unwrap();
-    let WorkerResponse::Capabilities {
-        capabilities: decoded,
-        ..
-    } = decoded
-    else {
-        panic!("decoded response must preserve its capabilities variant");
+    let WorkerResponse::Info { info: decoded, .. } = decoded else {
+        panic!("decoded response must preserve its info variant");
     };
-    assert_eq!(decoded, caps);
+    assert_eq!(decoded, info);
 }
 
 #[test]
-fn capabilities_reject_duplicate_set_members() {
-    let caps = WorkerInfo {
+fn worker_info_rejects_duplicate_set_members() {
+    let info = WorkerInfo {
         supported_work: vec![
             ForwardMode::TokenExtend,
             ForwardMode::TokenDecode,
@@ -729,49 +721,49 @@ fn capabilities_reject_duplicate_set_members() {
         ],
         ..Default::default()
     };
-    assert!(encode_response(&WorkerResponse::capabilities(caps)).is_err());
+    assert!(encode_response(&WorkerResponse::info(info)).is_err());
 
-    let caps = WorkerInfo {
+    let info = WorkerInfo {
         supported_controls: vec![RequestKind::Execute, RequestKind::Execute],
         ..Default::default()
     };
-    assert!(encode_response(&WorkerResponse::capabilities(caps)).is_err());
+    assert!(encode_response(&WorkerResponse::info(info)).is_err());
 
-    let caps = WorkerInfo {
+    let info = WorkerInfo {
         resource_classes: vec![ResourceClass::KvBlock, ResourceClass::KvBlock],
         ..Default::default()
     };
-    assert!(encode_response(&WorkerResponse::capabilities(caps)).is_err());
+    assert!(encode_response(&WorkerResponse::info(info)).is_err());
 }
 
 #[test]
-fn capabilities_require_group_totals_to_match_the_cache() {
-    let mut caps = full_caps();
-    caps.groups[1].num_blocks = 2047;
-    assert!(encode_response(&WorkerResponse::capabilities(caps)).is_err());
+fn worker_info_requires_group_totals_to_match_the_cache() {
+    let mut info = full_caps();
+    info.groups[1].num_blocks = 2047;
+    assert!(encode_response(&WorkerResponse::info(info)).is_err());
 }
 
 #[test]
 fn image_generation_requires_incremental_kv_publication() {
-    let mut caps = full_caps();
-    caps.incremental_kv_publication = false;
+    let mut info = full_caps();
+    info.incremental_kv_publication = false;
     assert!(
-        !caps
-            .generation_runtime_capabilities()
+        !info
+            .generation_limits()
             .features
             .contains(uniserve_core::GenerationFeatures::IMAGE_GENERATION)
     );
 
-    caps.incremental_kv_publication = true;
+    info.incremental_kv_publication = true;
     assert!(
-        caps.generation_runtime_capabilities()
+        info.generation_limits()
             .features
             .contains(uniserve_core::GenerationFeatures::IMAGE_GENERATION)
     );
 }
 
 // ---------------------------------------------------------------------------
-// Canonical wire fixtures cover every request and response kind, every `ForwardMode`
+// Canonical IPC fixtures cover every request and response kind, every `ForwardMode`
 // and `Control` variant, fixed and device parents, full admissions, and non-empty
 // product payloads. Distinct scalar values expose transposed field mappings.
 // ---------------------------------------------------------------------------
@@ -1001,7 +993,7 @@ fn request_fixtures() -> Vec<WorkerRequest> {
     let mut execute = WorkerRequest::execute(comprehensive_batch());
     execute.set_call_id(Some(91));
     vec![
-        WorkerRequest::get_capabilities(),
+        WorkerRequest::get_info(),
         execute,
         WorkerRequest::poll_completions(42),
         WorkerRequest::drop_session(RequestId(42)),
@@ -1171,17 +1163,17 @@ fn full_completion_report() -> CompletionReport {
     )
 }
 
-/// One fixture per `ResponseKind`, plus a second capabilities frame that
-/// exercises non-default capability values.
+/// One fixture per `ResponseKind`, plus a second info frame that
+/// exercises non-default worker information.
 fn response_fixtures() -> Vec<WorkerResponse> {
     vec![
-        WorkerResponse::Capabilities {
+        WorkerResponse::Info {
             call_id: None,
-            capabilities: WorkerInfo::default(),
+            info: WorkerInfo::default(),
         },
-        WorkerResponse::Capabilities {
+        WorkerResponse::Info {
             call_id: Some(17),
-            capabilities: full_caps(),
+            info: full_caps(),
         },
         WorkerResponse::Result {
             call_id: Some(17),
@@ -1232,7 +1224,7 @@ fn response_fixtures() -> Vec<WorkerResponse> {
 }
 
 #[test]
-fn every_request_kind_round_trips_through_the_wire() {
+fn every_request_kind_round_trips_through_ipc() {
     let fixtures = request_fixtures();
     for kind in RequestKind::ALL {
         assert!(
@@ -1252,10 +1244,10 @@ fn every_request_kind_round_trips_through_the_wire() {
 }
 
 #[test]
-fn every_response_kind_round_trips_through_the_wire() {
+fn every_response_kind_round_trips_through_ipc() {
     let fixtures = response_fixtures();
     for kind in [
-        ResponseKind::Capabilities,
+        ResponseKind::Info,
         ResponseKind::Result,
         ResponseKind::Ok,
         ResponseKind::Error,
@@ -1278,12 +1270,12 @@ fn every_response_kind_round_trips_through_the_wire() {
 }
 
 #[test]
-fn wire_decode_rejects_malformed_frames() {
+fn ipc_decode_rejects_malformed_frames() {
     let garbage: &[u8] = &[0x01, 0x02, 0x03];
     assert!(decode_request(garbage).is_err());
     assert!(decode_response(garbage).is_err());
 
-    let mut request = encode_request(&WorkerRequest::get_capabilities()).unwrap();
+    let mut request = encode_request(&WorkerRequest::get_info()).unwrap();
     request.truncate(request.len() / 2);
     assert!(decode_request(&request).is_err());
 

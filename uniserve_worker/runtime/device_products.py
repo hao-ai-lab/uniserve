@@ -36,7 +36,7 @@ _DEVICE_DTYPES: Final[dict[DType, torch.dtype]] = {
     DType.F32: torch.float32,
 }
 _DEVICE_TORCH_DTYPES: Final[tuple[torch.dtype, ...]] = tuple(dict.fromkeys(_DEVICE_DTYPES.values()))
-_PROTOCOL_STORAGE: Final[dict[DType, tuple[str, int]]] = {
+_DTYPE_STORAGE: Final[dict[DType, tuple[str, int]]] = {
     dtype: (
         str(torch_dtype).removeprefix("torch."),
         int(torch.empty((), dtype=torch_dtype).element_size()),
@@ -62,9 +62,9 @@ _DEVICE_PRODUCT_KINDS: Final[frozenset[ProductKind]] = frozenset(
 
 
 def device_product_storage(dtype: DType) -> tuple[str, int]:
-    """Return the concrete tensor storage used for one protocol dtype."""
+    """Return the concrete tensor storage used for one product dtype."""
 
-    return _PROTOCOL_STORAGE[DType(dtype)]
+    return _DTYPE_STORAGE[DType(dtype)]
 
 
 def device_product_capacity_bytes(
@@ -82,7 +82,7 @@ def device_product_capacity_bytes(
     value_bytes = int(max_value_bytes)
     if min(slots, devices, points, value_bytes) < 1:
         raise ValueError("device-product geometry must be positive")
-    scalar_bytes = slots * devices * sum(dict(_PROTOCOL_STORAGE.values()).values())
+    scalar_bytes = slots * devices * sum(dict(_DTYPE_STORAGE.values()).values())
     accepted_span_bytes = (points + 1) * device_product_storage(DType.U32)[1]
     continuation_bytes = 4 * device_product_storage(DType.I64)[1]
     return scalar_bytes + slots * devices * max(

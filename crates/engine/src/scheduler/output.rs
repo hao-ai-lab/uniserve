@@ -498,7 +498,7 @@ impl Scheduler {
                         return self.finish(id, FinishReason::Error);
                     };
                     let root = self.fixed_version(id);
-                    self.emit_visible(id, event, root.as_ref(), PublicModality::Image);
+                    self.emit_visible(id, event, root.as_ref());
                 }
                 self.activate_request_tables(id);
                 let (continues_after_gen_commit, feedback_source) = {
@@ -796,41 +796,18 @@ impl Scheduler {
     pub(super) fn emit_visible(
         &mut self,
         id: RequestId,
-        mut event: GenerationEvent,
+        event: GenerationEvent,
         root: Option<&VersionRef>,
-        modality: PublicModality,
     ) -> bool {
         let root = root.cloned().or_else(|| self.fixed_version(id));
         let Some(VersionRef {
-            producer_op_id,
-            point: Point::Fixed { point_index },
+            point: Point::Fixed { .. },
             ..
         }) = root
         else {
             self.finish_after_inflight(id, FinishReason::Error, None);
             return false;
         };
-        let event_seq = self
-            .running
-            .get(&id)
-            .map_or(1, |state| state.output.event_seq.saturating_add(1));
-        let commit = PublicCommit {
-            event_seq,
-            modality,
-            committed_at: uniserve_core::now_monotonic_secs(),
-            semantic_root: SemanticRoot {
-                producer_op_id,
-                point_index,
-            },
-        };
-        match &mut event {
-            GenerationEvent::TextToken { public_commit, .. }
-            | GenerationEvent::ImageDone { public_commit, .. } => *public_commit = Some(commit),
-            _ => {
-                self.finish_after_inflight(id, FinishReason::Error, None);
-                return false;
-            }
-        }
         let before = self
             .running
             .get(&id)
@@ -860,16 +837,8 @@ impl Scheduler {
         };
         match action {
             uniserve_core::UndTokenAction::Emit => {
-                let published = self.emit_visible(
-                    id,
-                    GenerationEvent::TextToken {
-                        id: tok,
-                        logprob,
-                        public_commit: None,
-                    },
-                    root,
-                    PublicModality::Text,
-                );
+                let published =
+                    self.emit_visible(id, GenerationEvent::TextToken { id: tok, logprob }, root);
                 let first_token = published
                     && self
                         .running

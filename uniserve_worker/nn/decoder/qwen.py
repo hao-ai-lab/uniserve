@@ -44,14 +44,14 @@ class Qwen3MLP(nn.Module):
         self,
         config: Any,
         *,
-        spec: LayerConfig,
+        layer_config: LayerConfig,
         weight_mode: WeightMode = WeightMode.VANILLA,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             int(config.hidden_size),
             (int(config.intermediate_size), int(config.intermediate_size)),
-            spec=spec,
+            layer_config=layer_config,
             bias=False,
             weight_mode=weight_mode,
         )
@@ -59,7 +59,7 @@ class Qwen3MLP(nn.Module):
         self.down_proj = RowParallelLinear(
             int(config.intermediate_size),
             int(config.hidden_size),
-            spec=spec,
+            layer_config=layer_config,
             bias=False,
         )
 

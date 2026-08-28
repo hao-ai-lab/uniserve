@@ -14,7 +14,7 @@ use crate::scheduler::{
 };
 use crate::worker::{MultiprocExecutor, StagedExecutor, UniprocExecutor, WorkerProcessArgs};
 use anyhow::Context as _;
-use uniserve_core::{GenerationRequest, GenerationRuntimeCapabilities, ModelDtype, RequestId};
+use uniserve_core::{GenerationLimits, GenerationRequest, ModelDtype, RequestId};
 use uniserve_worker_ipc::WorkerInfo;
 
 /// Place a staged pool on GPU `gpu`. A plain `cuda`/`gpu`
@@ -103,11 +103,11 @@ impl EngineCoreConfig {
     }
 }
 
-/// The engine core: scheduler thread, executor, and capabilities as one
+/// The engine core: scheduler thread, executor, and worker info as one
 /// transport-free object.
 pub struct EngineCore {
     handle: EngineHandle,
-    caps: WorkerInfo,
+    info: WorkerInfo,
     stats: Arc<SchedStats>,
     model_name: String,
     model_dtype: ModelDtype,
@@ -124,7 +124,7 @@ impl EngineCore {
     /// scheduler owner thread.
     ///
     /// Blocks until the worker has loaded the model and answered the
-    /// capability handshake — for the real worker this can take minutes.
+    /// worker-info handshake — for the real worker this can take minutes.
     ///
     pub fn new(config: EngineCoreConfig) -> anyhow::Result<Self> {
         let executor: Box<dyn Executor> = if config.workers.is_single_full() {
@@ -139,19 +139,19 @@ impl EngineCore {
     /// is a `UniprocExecutor`; `tp > 1` a `MultiprocExecutor`. No `--worker-kind`
     /// is passed because the worker starts in Full mode by default.
     fn spawn_full_pool(config: &EngineCoreConfig, tp: usize) -> anyhow::Result<Box<dyn Executor>> {
-        let spec = WorkerProcessArgs {
+        let args = WorkerProcessArgs {
             world_size: tp,
             worker_kind: None,
             transfer_backend: TransferBackend::Inproc,
             ..config.worker_process.clone()
         };
         if tp > 1 {
-            let workers = MultiprocExecutor::spawn(spec)
+            let workers = MultiprocExecutor::spawn(args)
                 .context("failed to spawn forward-only worker ranks")?;
             Ok(Box::new(workers))
         } else {
             let worker =
-                UniprocExecutor::spawn(spec).context("failed to spawn forward-only worker")?;
+                UniprocExecutor::spawn(args).context("failed to spawn forward-only worker")?;
             Ok(Box::new(worker))
         }
     }
@@ -249,8 +249,8 @@ impl EngineCore {
                 ..Default::default()
             },
         );
-        let caps = sched.caps().clone();
-        let model_dtype = caps.model_dtype;
+        let info = sched.info().clone();
+        let model_dtype = info.model_dtype;
         let stats = sched.stats_handle();
 
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
@@ -271,7 +271,7 @@ impl EngineCore {
 
         Ok(Self {
             handle,
-            caps,
+            info,
             stats,
             model_name: config.worker_process.model,
             model_dtype,
@@ -287,18 +287,18 @@ impl EngineCore {
         self.handle.clone()
     }
 
-    /// Worker-reported capabilities (the post-load truth).
-    pub fn caps(&self) -> &WorkerInfo {
-        &self.caps
+    /// Worker-reported worker info (the post-load truth).
+    pub fn info(&self) -> &WorkerInfo {
+        &self.info
     }
 
     /// Serving-facing projection of post-load worker limits.
-    pub fn generation_capabilities(&self) -> GenerationRuntimeCapabilities {
-        self.caps.generation_runtime_capabilities()
+    pub fn generation_limits(&self) -> GenerationLimits {
+        self.info.generation_limits()
     }
 
     pub fn supports_token_sampling(&self) -> bool {
-        self.caps.supported_work.iter().any(|mode| {
+        self.info.supported_work.iter().any(|mode| {
             matches!(
                 mode,
                 uniserve_worker_ipc::ForwardMode::TokenDecode

@@ -88,12 +88,12 @@ macro_rules! ipc_error {
     };
 }
 
-/// Wire protocol version this build emits on every [`Header`].
-pub const WIRE_VERSION: u16 = 10;
+/// IPC version this build emits on every [`Header`].
+pub const IPC_VERSION: u16 = 11;
 
-/// Whether a peer-advertised wire `version` is one this build can decode.
-pub fn is_supported_wire_version(version: u16) -> bool {
-    version == WIRE_VERSION
+/// Whether a peer-advertised IPC `version` is one this build can decode.
+pub fn is_supported_ipc_version(version: u16) -> bool {
+    version == IPC_VERSION
 }
 
 /// Fixed-size IPC frame header sent zero-copy across the worker process
@@ -129,7 +129,7 @@ impl Default for Header {
             len: 0,
             reserved0: 0,
             reserved1: 0,
-            version: WIRE_VERSION,
+            version: IPC_VERSION,
             kind: 0,
             flags: 0,
         }
@@ -506,11 +506,11 @@ pub fn header_for_response(resp: &WorkerResponse) -> Header {
 }
 
 fn verify_header_len(header: Header, actual: usize) -> IpcResult<()> {
-    if !is_supported_wire_version(header.version) {
+    if !is_supported_ipc_version(header.version) {
         ipc_bail!(
-            "unsupported IPC wire version {}: this build requires {}",
+            "unsupported IPC IPC version {}: this build requires {}",
             header.version,
-            WIRE_VERSION
+            IPC_VERSION
         );
     }
     if header.len as usize != actual {
@@ -525,7 +525,7 @@ fn verify_header_len(header: Header, actual: usize) -> IpcResult<()> {
 // Diagnostic-only header byte; the authoritative kind travels in the payload.
 fn request_kind_code(kind: RequestKind) -> u8 {
     match kind {
-        RequestKind::GetCapabilities => 1,
+        RequestKind::GetInfo => 1,
         RequestKind::Execute => 2,
         RequestKind::PollCompletions => 3,
         RequestKind::DropSession => 4,
@@ -537,7 +537,7 @@ fn request_kind_code(kind: RequestKind) -> u8 {
 
 fn response_kind_code(kind: ResponseKind) -> u8 {
     match kind {
-        ResponseKind::Capabilities => 1,
+        ResponseKind::Info => 1,
         ResponseKind::Result => 2,
         ResponseKind::Ok => 3,
         ResponseKind::Error => 4,
@@ -551,17 +551,17 @@ mod tests {
 
     #[test]
     fn header_len_matches_encoded_request() {
-        let req = WorkerRequest::get_capabilities();
+        let req = WorkerRequest::get_info();
         let bytes = encode_request(&req).unwrap();
         let mut h = header_for_request(&req);
         h.len = payload_len_u32(bytes.len()).unwrap();
         verify_header_len(h, bytes.len()).unwrap();
         assert_eq!(h.kind, 1);
-        assert_eq!(h.version, WIRE_VERSION);
+        assert_eq!(h.version, IPC_VERSION);
     }
 
     #[test]
-    fn request_kind_codes_cover_every_wire_kind_uniquely() {
+    fn request_kind_codes_cover_every_ipc_kind_uniquely() {
         // Every payload kind has a distinct nonzero diagnostic code.
         use std::collections::HashSet;
         let mut seen = HashSet::new();
@@ -587,16 +587,16 @@ mod tests {
     }
 
     #[test]
-    fn wire_version_is_exact() {
-        assert!(is_supported_wire_version(WIRE_VERSION));
-        assert!(!is_supported_wire_version(WIRE_VERSION + 1));
-        assert!(!is_supported_wire_version(WIRE_VERSION - 1));
+    fn ipc_version_is_exact() {
+        assert!(is_supported_ipc_version(IPC_VERSION));
+        assert!(!is_supported_ipc_version(IPC_VERSION + 1));
+        assert!(!is_supported_ipc_version(IPC_VERSION - 1));
     }
 
     #[test]
     fn verify_header_len_rejects_unsupported_version() {
         let h = Header {
-            version: WIRE_VERSION + 1,
+            version: IPC_VERSION + 1,
             len: 0,
             ..Default::default()
         };

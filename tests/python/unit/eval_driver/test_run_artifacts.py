@@ -22,7 +22,7 @@ pytestmark = pytest.mark.unit
 
 
 class _EmptyStreamHandler(BaseHTTPRequestHandler):
-    def do_POST(self) -> None:  # noqa: N802 - stdlib HTTP handler contract.
+    def do_POST(self) -> None:  # noqa: N802 - stdlib handler method name.
         length = int(self.headers.get("content-length", "0"))
         self.rfile.read(length)
         payload = (
@@ -61,7 +61,7 @@ def test_failed_warmup_writes_terminal_diagnostic_artifacts(tmp_path: Path) -> N
     thread.start()
     output = tmp_path / "result"
     try:
-        with pytest.raises(WarmupFailure, match="protocol_empty_output"):
+        with pytest.raises(WarmupFailure, match="response_empty_output"):
             asyncio.run(
                 run_point(
                     f"http://127.0.0.1:{server.server_port}",
@@ -84,6 +84,6 @@ def test_failed_warmup_writes_terminal_diagnostic_artifacts(tmp_path: Path) -> N
         for line in (output / "warmup_requests.jsonl").read_text(encoding="utf-8").splitlines()
     ]
     assert len(warmup) == 1
-    assert warmup[0]["classifier"] == "protocol_empty_output"
+    assert warmup[0]["classifier"] == "response_empty_output"
     assert (output / "requests.jsonl").read_text(encoding="utf-8") == ""
     assert not (output / "summary.json").exists()

@@ -1,11 +1,11 @@
-//! Hand-written FlatBuffers codec for the worker execution protocol.
+//! Hand-written FlatBuffers codec for the worker execution IPC.
 
 use std::collections::BTreeMap;
 
 use flatbuffers::FlatBufferBuilder;
 use uniserve_core::{BlockId, KvCacheGroup, KvGroupKind, RankInfo, RequestId, SamplingParams};
 
-use crate::schema::uniserve::wire as fbs;
+use crate::schema::uniserve::ipc as fbs;
 use crate::{
     AttentionRegime, Batch, BatchPartition, BlockTable, Bounds, CachePageAllocation, CloseReason,
     CompletionReport, Control, DType, DecodeKind, DecodePlacement, DimBound, Disposition, Domain,
@@ -25,7 +25,7 @@ pub enum CodecError {
     #[error("worker codec error: {0}")]
     Invalid(String),
     #[error(transparent)]
-    Protocol(#[from] crate::WireError),
+    Validation(#[from] crate::ValidationError),
 }
 
 impl CodecError {
@@ -115,7 +115,7 @@ pub fn decode_response(bytes: &[u8]) -> CodecResult<WorkerResponse> {
 }
 
 // ---------------------------------------------------------------------------
-// Verified FlatBuffer table decoding reads fields directly into canonical wire
+// Verified FlatBuffer table decoding reads fields directly into canonical IPC
 // values, with one allocation per owned field and one copy per byte vector.
 // ---------------------------------------------------------------------------
 
@@ -133,9 +133,9 @@ fn request_from_table(request: fbs::WorkerRequest<'_>) -> CodecResult<WorkerRequ
         + usize::from(session_id.is_some())
         + usize::from(product_handles.is_some());
     Ok(match kind {
-        RequestKind::GetCapabilities => {
-            codec_ensure!(payload_count == 0, "get_capabilities carries a payload");
-            WorkerRequest::GetCapabilities { call_id }
+        RequestKind::GetInfo => {
+            codec_ensure!(payload_count == 0, "get_info carries a payload");
+            WorkerRequest::GetInfo { call_id }
         }
         RequestKind::Execute => {
             codec_ensure!(payload_count == 1, "execute requires exactly one batch");
@@ -180,10 +180,7 @@ fn request_from_table(request: fbs::WorkerRequest<'_>) -> CodecResult<WorkerRequ
 fn response_from_table(response: fbs::WorkerResponse<'_>) -> CodecResult<WorkerResponse> {
     let kind = response_kind_from_fb(response.kind())?;
     let call_id = response.call_id();
-    let capabilities = response
-        .capabilities()
-        .map(capabilities_from_table)
-        .transpose()?;
+    let info = response.info().map(info_from_table).transpose()?;
     let completion_report = response
         .completion_report()
         .map(completion_report_from_table)
@@ -192,7 +189,7 @@ fn response_from_table(response: fbs::WorkerResponse<'_>) -> CodecResult<WorkerR
         .pressure()
         .map(|items| items.iter().map(pressure_from_table).collect())
         .transpose()?;
-    let payload_count = usize::from(capabilities.is_some())
+    let payload_count = usize::from(info.is_some())
         + usize::from(completion_report.is_some())
         + usize::from(pressure.is_some());
     let message = response.message().map(str::to_owned);
@@ -219,14 +216,14 @@ fn response_from_table(response: fbs::WorkerResponse<'_>) -> CodecResult<WorkerR
         || route.is_some()
         || !operations.is_empty();
     Ok(match kind {
-        ResponseKind::Capabilities => {
+        ResponseKind::Info => {
             codec_ensure!(
                 payload_count == 1 && !carries_error,
-                "invalid capabilities response"
+                "invalid info response"
             );
-            WorkerResponse::Capabilities {
+            WorkerResponse::Info {
                 call_id,
-                capabilities: capabilities.context("capabilities response has no capabilities")?,
+                info: info.context("info response has no info")?,
             }
         }
         ResponseKind::Result => {
@@ -405,7 +402,7 @@ fn und_admission_from_table(admission: fbs::UndAdmission<'_>) -> CodecResult<Und
         sampling: sampling_from_table(
             admission
                 .sampling()
-                .context("und admission has no sampling spec")?,
+                .context("und admission has no sampling parameters")?,
         )?,
         negative_token_ids: admission
             .negative_token_ids()
@@ -424,7 +421,7 @@ fn gen_admission_from_table(admission: fbs::GenAdmission<'_>) -> CodecResult<Gen
         image: image_from_table(
             admission
                 .image()
-                .context("gen admission has no image spec")?,
+                .context("gen admission has no image parameters")?,
         )?,
     })
 }
@@ -853,32 +850,32 @@ fn error_operation_from_table(
     })
 }
 
-fn capabilities_from_table(caps: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
-    let caps = WorkerInfo {
-        block_size: caps.block_size(),
-        num_blocks: caps.num_blocks(),
-        num_layers: caps.num_layers(),
-        num_kv_heads: caps.num_kv_heads(),
-        head_dim: caps.head_dim(),
-        supported_work: caps
+fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
+    let info = WorkerInfo {
+        block_size: info.block_size(),
+        num_blocks: info.num_blocks(),
+        num_layers: info.num_layers(),
+        num_kv_heads: info.num_kv_heads(),
+        head_dim: info.head_dim(),
+        supported_work: info
             .supported_work()
             .map(|items| items.iter().map(work_from_fb).collect::<CodecResult<_>>())
             .transpose()?
             .unwrap_or_default(),
-        latent_page_units: caps.latent_page_units(),
-        num_latent_pages: caps.num_latent_pages(),
-        latent_width: caps.latent_width(),
-        latent_dtype: optional_parse(caps.latent_dtype(), "capabilities.latent_dtype")?,
-        latent_downsample: caps.latent_downsample(),
-        bytes_per_token: caps.bytes_per_token(),
-        max_vae_grid_tokens: caps.max_vae_grid_tokens(),
-        max_vit_grid_tokens: caps.max_vit_grid_tokens(),
-        max_latent_feature_bytes: caps.max_latent_feature_bytes(),
-        max_vision_feature_bytes: caps.max_vision_feature_bytes(),
-        commit_marker_tokens: caps.commit_marker_tokens(),
-        gen_rope_advance: caps.gen_rope_advance(),
-        max_cfg_branches: caps.max_cfg_branches(),
-        groups: caps
+        latent_page_units: info.latent_page_units(),
+        num_latent_pages: info.num_latent_pages(),
+        latent_width: info.latent_width(),
+        latent_dtype: optional_parse(info.latent_dtype(), "info.latent_dtype")?,
+        latent_downsample: info.latent_downsample(),
+        bytes_per_token: info.bytes_per_token(),
+        max_vae_grid_tokens: info.max_vae_grid_tokens(),
+        max_vit_grid_tokens: info.max_vit_grid_tokens(),
+        max_latent_feature_bytes: info.max_latent_feature_bytes(),
+        max_vision_feature_bytes: info.max_vision_feature_bytes(),
+        commit_marker_tokens: info.commit_marker_tokens(),
+        gen_rope_advance: info.gen_rope_advance(),
+        max_cfg_branches: info.max_cfg_branches(),
+        groups: info
             .groups()
             .map(|items| {
                 items
@@ -888,15 +885,15 @@ fn capabilities_from_table(caps: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo>
             })
             .transpose()?
             .unwrap_or_default(),
-        kv_dtype: optional_parse(caps.kv_dtype(), "capabilities.kv_dtype")?,
-        model_dtype: required_parse(caps.model_dtype(), "capabilities.model_dtype")?,
-        rank: caps
+        kv_dtype: optional_parse(info.kv_dtype(), "info.kv_dtype")?,
+        model_dtype: required_parse(info.model_dtype(), "info.model_dtype")?,
+        rank: info
             .rank()
             .map(rank_from_table)
-            .context("capabilities have no rank")?,
-        pipeline_depth: caps.pipeline_depth(),
-        encoder_cache_budget: caps.encoder_cache_budget(),
-        supported_controls: caps
+            .context("info have no rank")?,
+        pipeline_depth: info.pipeline_depth(),
+        encoder_cache_budget: info.encoder_cache_budget(),
+        supported_controls: info
             .supported_controls()
             .map(|items| {
                 items
@@ -906,17 +903,17 @@ fn capabilities_from_table(caps: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo>
             })
             .transpose()?
             .unwrap_or_default(),
-        max_batch_operations: caps.max_batch_operations(),
-        max_batch_tokens: caps.max_batch_tokens(),
-        max_request_pool_size: caps.max_request_pool_size(),
-        max_unresolved_window: caps.max_unresolved_window(),
-        incremental_kv_publication: caps.incremental_kv_publication(),
-        mixed_buckets: caps
+        max_batch_operations: info.max_batch_operations(),
+        max_batch_tokens: info.max_batch_tokens(),
+        max_request_pool_size: info.max_request_pool_size(),
+        max_unresolved_window: info.max_unresolved_window(),
+        incremental_kv_publication: info.incremental_kv_publication(),
+        mixed_buckets: info
             .mixed_buckets()
             .map(|items| items.iter().map(mixed_bucket_from_table).collect())
             .unwrap_or_default(),
-        sampling_ownership: sampling_ownership_from_fb(caps.sampling_ownership())?,
-        resource_classes: caps
+        sampling_ownership: sampling_ownership_from_fb(info.sampling_ownership())?,
+        resource_classes: info
             .resource_classes()
             .map(|items| {
                 items
@@ -926,11 +923,11 @@ fn capabilities_from_table(caps: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo>
             })
             .transpose()?
             .unwrap_or_default(),
-        model_name: required_str(caps.model_name(), "capabilities.model_name")?,
-        weight_version: caps.weight_version(),
+        model_name: required_str(info.model_name(), "info.model_name")?,
+        weight_version: info.weight_version(),
     };
-    caps.validate()?;
-    Ok(caps)
+    info.validate()?;
+    Ok(info)
 }
 
 fn sampling_from_table(sampling: fbs::SamplingParams<'_>) -> CodecResult<SamplingParams> {
@@ -1072,7 +1069,7 @@ fn map_from_table(
         .unwrap_or_default()
 }
 
-fn kv_group_from_table(group: fbs::KvGroupSpec<'_>) -> CodecResult<KvCacheGroup> {
+fn kv_group_from_table(group: fbs::KvGroup<'_>) -> CodecResult<KvCacheGroup> {
     let kind = if group.kind() == fbs::KvGroupKind::Full {
         KvGroupKind::Full
     } else if group.kind() == fbs::KvGroupKind::SlidingWindow {
@@ -1140,7 +1137,7 @@ where
 
 fn request_to_fb(request: &WorkerRequest) -> CodecResult<fbs::WorkerRequestT> {
     let (batch, step_id, session_id, product_handles) = match request {
-        WorkerRequest::GetCapabilities { .. }
+        WorkerRequest::GetInfo { .. }
         | WorkerRequest::GetPressure { .. }
         | WorkerRequest::Shutdown => (None, None, None, None),
         WorkerRequest::Execute { batch, .. } => {
@@ -1164,8 +1161,8 @@ fn request_to_fb(request: &WorkerRequest) -> CodecResult<fbs::WorkerRequestT> {
 }
 
 fn response_to_fb(response: &WorkerResponse) -> CodecResult<fbs::WorkerResponseT> {
-    let (capabilities, completion_report, pressure, error) = match response {
-        WorkerResponse::Capabilities { capabilities, .. } => (Some(capabilities), None, None, None),
+    let (info, completion_report, pressure, error) = match response {
+        WorkerResponse::Info { info, .. } => (Some(info), None, None, None),
         WorkerResponse::Result {
             completion_report, ..
         } => (None, Some(completion_report), None, None),
@@ -1176,10 +1173,7 @@ fn response_to_fb(response: &WorkerResponse) -> CodecResult<fbs::WorkerResponseT
     Ok(fbs::WorkerResponseT {
         kind: response_kind_to_fb(response.kind()),
         call_id: response.call_id(),
-        capabilities: capabilities
-            .map(capabilities_to_fb)
-            .transpose()?
-            .map(Box::new),
+        info: info.map(info_to_fb).transpose()?.map(Box::new),
         completion_report: completion_report
             .map(completion_report_to_fb)
             .transpose()?
@@ -1634,7 +1628,7 @@ fn error_operation_to_fb(operation: &ErrorOperationIdentity) -> fbs::ErrorOperat
 }
 
 // ---------------------------------------------------------------------------
-// Capabilities
+// Info
 // ---------------------------------------------------------------------------
 
 fn mixed_bucket_from_table(bucket: fbs::GraphBucket<'_>) -> GraphBucket {
@@ -1657,73 +1651,73 @@ fn mixed_bucket_to_fb(bucket: &GraphBucket) -> fbs::GraphBucketT {
     }
 }
 
-fn capabilities_to_fb(caps: &WorkerInfo) -> CodecResult<fbs::WorkerInfoT> {
-    caps.validate()?;
+fn info_to_fb(info: &WorkerInfo) -> CodecResult<fbs::WorkerInfoT> {
+    info.validate()?;
     Ok(fbs::WorkerInfoT {
-        block_size: caps.block_size,
-        num_blocks: caps.num_blocks,
-        num_layers: caps.num_layers,
-        num_kv_heads: caps.num_kv_heads,
-        head_dim: caps.head_dim,
+        block_size: info.block_size,
+        num_blocks: info.num_blocks,
+        num_layers: info.num_layers,
+        num_kv_heads: info.num_kv_heads,
+        head_dim: info.head_dim,
         supported_work: Some(
-            caps.supported_work
+            info.supported_work
                 .iter()
                 .copied()
                 .map(work_to_fb)
                 .collect(),
         ),
-        latent_page_units: caps.latent_page_units,
-        num_latent_pages: caps.num_latent_pages,
-        latent_width: caps.latent_width,
+        latent_page_units: info.latent_page_units,
+        num_latent_pages: info.num_latent_pages,
+        latent_width: info.latent_width,
         latent_dtype: Some(
-            caps.latent_dtype
+            info.latent_dtype
                 .map(uniserve_core::ModelDtype::as_str)
                 .unwrap_or_default()
                 .to_owned(),
         ),
-        latent_downsample: caps.latent_downsample,
-        bytes_per_token: caps.bytes_per_token,
-        max_vae_grid_tokens: caps.max_vae_grid_tokens,
-        max_vit_grid_tokens: caps.max_vit_grid_tokens,
-        max_latent_feature_bytes: caps.max_latent_feature_bytes,
-        max_vision_feature_bytes: caps.max_vision_feature_bytes,
-        commit_marker_tokens: caps.commit_marker_tokens,
-        gen_rope_advance: caps.gen_rope_advance,
-        max_cfg_branches: caps.max_cfg_branches,
-        groups: Some(caps.groups.iter().map(kv_group_to_fb).collect()),
+        latent_downsample: info.latent_downsample,
+        bytes_per_token: info.bytes_per_token,
+        max_vae_grid_tokens: info.max_vae_grid_tokens,
+        max_vit_grid_tokens: info.max_vit_grid_tokens,
+        max_latent_feature_bytes: info.max_latent_feature_bytes,
+        max_vision_feature_bytes: info.max_vision_feature_bytes,
+        commit_marker_tokens: info.commit_marker_tokens,
+        gen_rope_advance: info.gen_rope_advance,
+        max_cfg_branches: info.max_cfg_branches,
+        groups: Some(info.groups.iter().map(kv_group_to_fb).collect()),
         kv_dtype: Some(
-            caps.kv_dtype
+            info.kv_dtype
                 .map(uniserve_core::KvCacheDtype::as_str)
                 .unwrap_or_default()
                 .to_owned(),
         ),
-        model_dtype: Some(caps.model_dtype.as_str().to_owned()),
-        rank: Some(Box::new(rank_to_fb(caps.rank))),
-        pipeline_depth: caps.pipeline_depth,
-        encoder_cache_budget: caps.encoder_cache_budget,
+        model_dtype: Some(info.model_dtype.as_str().to_owned()),
+        rank: Some(Box::new(rank_to_fb(info.rank))),
+        pipeline_depth: info.pipeline_depth,
+        encoder_cache_budget: info.encoder_cache_budget,
         supported_controls: Some(
-            caps.supported_controls
+            info.supported_controls
                 .iter()
                 .copied()
                 .map(request_kind_to_fb)
                 .collect(),
         ),
-        max_batch_operations: caps.max_batch_operations,
-        max_batch_tokens: caps.max_batch_tokens,
-        max_request_pool_size: caps.max_request_pool_size,
-        max_unresolved_window: caps.max_unresolved_window,
-        incremental_kv_publication: caps.incremental_kv_publication,
-        mixed_buckets: Some(caps.mixed_buckets.iter().map(mixed_bucket_to_fb).collect()),
-        sampling_ownership: sampling_ownership_to_fb(caps.sampling_ownership),
+        max_batch_operations: info.max_batch_operations,
+        max_batch_tokens: info.max_batch_tokens,
+        max_request_pool_size: info.max_request_pool_size,
+        max_unresolved_window: info.max_unresolved_window,
+        incremental_kv_publication: info.incremental_kv_publication,
+        mixed_buckets: Some(info.mixed_buckets.iter().map(mixed_bucket_to_fb).collect()),
+        sampling_ownership: sampling_ownership_to_fb(info.sampling_ownership),
         resource_classes: Some(
-            caps.resource_classes
+            info.resource_classes
                 .iter()
                 .copied()
                 .map(resource_class_to_fb)
                 .collect(),
         ),
-        model_name: Some(caps.model_name.clone()),
-        weight_version: caps.weight_version,
+        model_name: Some(info.model_name.clone()),
+        weight_version: info.weight_version,
     })
 }
 
@@ -1859,15 +1853,15 @@ fn map_to_fb(map: &BTreeMap<String, u64>) -> Vec<fbs::StringU64PairT> {
         .collect()
 }
 
-fn kv_group_to_fb(group: &KvCacheGroup) -> fbs::KvGroupSpecT {
+fn kv_group_to_fb(group: &KvCacheGroup) -> fbs::KvGroupT {
     match group.kind {
-        KvGroupKind::Full => fbs::KvGroupSpecT {
+        KvGroupKind::Full => fbs::KvGroupT {
             num_blocks: group.num_blocks,
             kind: fbs::KvGroupKind::Full,
             window: 0,
             sink: 0,
         },
-        KvGroupKind::SlidingWindow { window, sink } => fbs::KvGroupSpecT {
+        KvGroupKind::SlidingWindow { window, sink } => fbs::KvGroupT {
             num_blocks: group.num_blocks,
             kind: fbs::KvGroupKind::SlidingWindow,
             window,
@@ -2189,7 +2183,7 @@ fn close_reason_from_fb(reason: fbs::CloseReason) -> CodecResult<CloseReason> {
 
 fn request_kind_to_fb(kind: RequestKind) -> fbs::ReqKind {
     match kind {
-        RequestKind::GetCapabilities => fbs::ReqKind::GetCapabilities,
+        RequestKind::GetInfo => fbs::ReqKind::GetInfo,
         RequestKind::Execute => fbs::ReqKind::Execute,
         RequestKind::PollCompletions => fbs::ReqKind::PollCompletions,
         RequestKind::DropSession => fbs::ReqKind::DropSession,
@@ -2209,12 +2203,12 @@ fn request_kind_from_fb(kind: fbs::ReqKind) -> CodecResult<RequestKind> {
 }
 
 pub fn request_kind_names() -> impl Iterator<Item = &'static str> {
-    RequestKind::ALL.into_iter().map(RequestKind::as_wire_str)
+    RequestKind::ALL.into_iter().map(RequestKind::as_str)
 }
 
 fn response_kind_to_fb(kind: ResponseKind) -> fbs::RespKind {
     match kind {
-        ResponseKind::Capabilities => fbs::RespKind::Capabilities,
+        ResponseKind::Info => fbs::RespKind::Info,
         ResponseKind::Result => fbs::RespKind::Result,
         ResponseKind::Ok => fbs::RespKind::Ok,
         ResponseKind::Error => fbs::RespKind::Error,
@@ -2223,8 +2217,8 @@ fn response_kind_to_fb(kind: ResponseKind) -> fbs::RespKind {
 }
 
 fn response_kind_from_fb(kind: fbs::RespKind) -> CodecResult<ResponseKind> {
-    if kind == fbs::RespKind::Capabilities {
-        Ok(ResponseKind::Capabilities)
+    if kind == fbs::RespKind::Info {
+        Ok(ResponseKind::Info)
     } else if kind == fbs::RespKind::Result {
         Ok(ResponseKind::Result)
     } else if kind == fbs::RespKind::Ok {

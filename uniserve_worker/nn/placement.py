@@ -66,7 +66,7 @@ class ShardSlot:
 class ShardPlan:
     """Resolved per-parameter load layout, attached as ``_uniserve_shard``.
 
-    ``spec`` is the whole-tensor placement. When the parameter packs several
+    ``shard`` is the whole-tensor placement. When the parameter packs several
     named shards along one axis (merged / fused QKV linears), ``shard_axis``
     names that axis and ``slots`` maps each shard id to its slice + per-shard
     placement; ``mode`` resolves string shard ids (``"q"``) to slot indices.

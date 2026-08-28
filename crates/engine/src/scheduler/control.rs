@@ -204,9 +204,9 @@ impl Scheduler {
         state.terminal_intent = TerminalIntent::StopMatched;
     }
 
-    /// Accept only controls declared in the worker capability handshake.
+    /// Accept only controls declared by the worker.
     pub(super) fn control_allowed(&self, op: &ControlOp) -> bool {
-        self.caps.supported_controls.contains(&op.request_kind())
+        self.info.supported_controls.contains(&op.request_kind())
     }
 
     /// Dispatch a control only if the worker declares support; otherwise drop it

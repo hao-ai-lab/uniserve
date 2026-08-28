@@ -356,7 +356,7 @@ impl Scheduler {
             tracing::trace_span!("scheduler.submit_batch", ops = transitions.len()).entered();
         let step = self.inflight.next_step();
         let submit_at = Instant::now();
-        let mut wire_ops = Vec::with_capacity(transitions.len());
+        let mut operations = Vec::with_capacity(transitions.len());
         let mut input_products = Vec::new();
         let mut trace_ops = self
             .trace_enabled()
@@ -482,11 +482,11 @@ impl Scheduler {
                         .map(|state| state.request_pool_idx)
                         .expect("registered request has a live slot");
                     if table_changed {
-                        operation_block_tables.push(WireBlockTable {
+                        operation_block_tables.push(IpcBlockTable {
                             request_pool_idx,
                             group_id: group_id as u32,
                             allocated_tokens: u32::try_from(
-                                page_ids.len().saturating_mul(self.caps.block_size as usize),
+                                page_ids.len().saturating_mul(self.info.block_size as usize),
                             )
                             .unwrap_or(u32::MAX),
                             page_ids: page_ids.clone(),
@@ -498,7 +498,7 @@ impl Scheduler {
                                 .get(&request_id)
                                 .map(|state| {
                                     (state.cursor.ingest.prompt_cursor as usize)
-                                        .div_ceil(self.caps.block_size as usize)
+                                        .div_ceil(self.info.block_size as usize)
                                 })
                                 .unwrap_or_default()
                                 .min(page_ids.len())
@@ -567,7 +567,7 @@ impl Scheduler {
                         .get(&request_id)
                         .map(|state| self.num_vae(&state.req.image))
                         .unwrap_or_default()
-                        .saturating_add(u64::from(self.caps.commit_marker_tokens)),
+                        .saturating_add(u64::from(self.info.commit_marker_tokens)),
                 )
                 .unwrap_or(u32::MAX);
                 let Some(state) = self.running.get_mut(&request_id) else {
@@ -584,7 +584,7 @@ impl Scheduler {
                         .unwrap_or_default();
                     if !prefix.materialized || !prefix.new_pages.is_empty() {
                         for table in &prefix.block_tables {
-                            operation_block_tables.push(WireBlockTable {
+                            operation_block_tables.push(IpcBlockTable {
                                 request_pool_idx: prefix.request_pool_idx,
                                 group_id: table.group_id() as u32,
                                 page_ids: table.page_ids(),
@@ -661,7 +661,7 @@ impl Scheduler {
                     _ => {
                         tracing::error!(
                             request_id = request_id.0,
-                            operation = operation.work.as_wire_str(),
+                            operation = operation.work.as_str(),
                             "latent operation has no declared schedule placement"
                         );
                         self.fatal = true;
@@ -682,7 +682,7 @@ impl Scheduler {
                     },
                 );
             }
-            let operation_variant = operation.work.as_wire_str();
+            let operation_variant = operation.work.as_str();
             if let Some(trace_ops) = trace_ops.as_mut() {
                 let phase = self
                     .running
@@ -713,16 +713,16 @@ impl Scheduler {
                 submit_at,
                 submitted_us.saturating_sub(planned_us),
             );
-            wire_ops.push(operation);
+            operations.push(operation);
             if let Some(st) = self.running.get_mut(&request_id) {
                 st.latest_device_version = None;
             }
         }
-        self.peak_ops_in_batch = self.peak_ops_in_batch.max(wire_ops.len());
+        self.peak_ops_in_batch = self.peak_ops_in_batch.max(operations.len());
         self.stats
             .general
             .peak_ops
-            .fetch_max(wire_ops.len(), Ordering::Relaxed);
+            .fetch_max(operations.len(), Ordering::Relaxed);
         self.stats.general.steps.fetch_add(1, Ordering::Relaxed);
         self.stats
             .general
@@ -736,24 +736,24 @@ impl Scheduler {
             .kv_cache
             .free_blocks
             .store(self.kv_budget.free_blocks(), Ordering::Relaxed);
-        let mixed = wire_ops.first().is_some_and(|first| {
-            wire_ops
+        let mixed = operations.first().is_some_and(|first| {
+            operations
                 .iter()
                 .any(|operation| operation.work != first.work)
         });
         self.inflight.batch_started.insert(step, submit_at);
-        if wire_ops
+        if operations
             .iter()
             .any(|operation| batch_kind(operation.work) == BatchKind::Prefill)
         {
             self.inflight.prefill_steps.insert(step);
         }
         if let Some(trace_ops) = trace_ops {
-            let operation_types: Vec<&'static str> = wire_ops
+            let operation_types: Vec<&'static str> = operations
                 .iter()
-                .map(|operation| operation.work.as_wire_str())
+                .map(|operation| operation.work.as_str())
                 .collect();
-            let req_ids: Vec<u64> = wire_ops
+            let req_ids: Vec<u64> = operations
                 .iter()
                 .map(|operation| operation.request_key.session_id.0)
                 .collect();
@@ -765,7 +765,7 @@ impl Scheduler {
                 "event": "batch_submitted",
                 "at_s": now(),
                 "step_id": step,
-                "batch_size": wire_ops.len(),
+                "batch_size": operations.len(),
                 "mixed": mixed,
                 "operation_types": operation_types,
                 "request_ids": req_ids,
@@ -782,15 +782,15 @@ impl Scheduler {
                 "free_blocks": self.kv_budget.free_blocks(),
                 "reserved_blocks": self.kv_budget.reserved_blocks,
                 "worker_image_latent_active": self.worker_image_latent_used(),
-                "worker_image_latent_capacity": self.caps.latent_capacity_units(),
+                "worker_image_latent_capacity": self.info.latent_capacity_units(),
             }));
         }
         if mixed {
-            let operation_types: Vec<&'static str> = wire_ops
+            let operation_types: Vec<&'static str> = operations
                 .iter()
-                .map(|operation| operation.work.as_wire_str())
+                .map(|operation| operation.work.as_str())
                 .collect();
-            let req_ids: Vec<u64> = wire_ops
+            let req_ids: Vec<u64> = operations
                 .iter()
                 .map(|operation| operation.request_key.session_id.0)
                 .collect();
@@ -801,7 +801,7 @@ impl Scheduler {
                 "submitting mixed forward batch"
             );
         }
-        let releases = wire_ops
+        let releases = operations
             .iter()
             .filter(|operation| operation.parent.producer_op_id.0 > 0)
             .map(|operation| Control::Release {
@@ -811,7 +811,7 @@ impl Scheduler {
             .collect::<Vec<_>>();
         controls.extend(releases);
         let partitions = self.partition_batch(
-            wire_ops,
+            operations,
             &block_tables,
             &new_cache_pages,
             &forward_rows,
@@ -872,7 +872,7 @@ impl Scheduler {
     pub(super) fn partition_batch(
         &mut self,
         operations: Vec<Operation>,
-        block_tables: &HashMap<(RequestKey, OpId), Vec<WireBlockTable>>,
+        block_tables: &HashMap<(RequestKey, OpId), Vec<IpcBlockTable>>,
         new_cache_pages: &HashMap<(RequestKey, OpId), Vec<CachePageAllocation>>,
         forward_rows: &HashMap<(RequestKey, OpId), Vec<RowGeometry>>,
         latent_placements: &HashMap<(RequestKey, OpId), LatentPlacement>,
@@ -902,7 +902,7 @@ impl Scheduler {
         let mut next_partition_id = 1u32;
         let mut next_submission_group = 1u32;
         for (route, groups) in routes {
-            let mixed_capable = !self.caps.mixed_buckets.is_empty();
+            let mixed_capable = !self.info.mixed_buckets.is_empty();
             let mut mixed_candidates = Vec::new();
             let mut homogeneous = Vec::new();
             for (domain, operations) in groups {
@@ -922,7 +922,7 @@ impl Scheduler {
             }
             while let Some(mixed_group) = extract_mixed_group(
                 &mut mixed_candidates,
-                &self.caps.mixed_buckets,
+                &self.info.mixed_buckets,
                 forward_rows,
                 latent_placements,
             ) {
@@ -1002,8 +1002,8 @@ impl Scheduler {
     pub(super) fn block_tables(
         &self,
         operations: &[Operation],
-        tables: &HashMap<(RequestKey, OpId), Vec<WireBlockTable>>,
-    ) -> Vec<WireBlockTable> {
+        tables: &HashMap<(RequestKey, OpId), Vec<IpcBlockTable>>,
+    ) -> Vec<IpcBlockTable> {
         operations
             .iter()
             .flat_map(|operation| {
@@ -1129,7 +1129,7 @@ impl Scheduler {
     }
 
     /// The block-id delta since the last op for this request (the stateful-diff
-    /// contract): everything `blocks_for` holds beyond what already crossed.
+    /// update): everything `blocks_for` holds beyond what already crossed.
     pub(super) fn take_new_blocks(&mut self, id: RequestId) -> Vec<BlockId> {
         let Some(st) = self.running.get_mut(&id) else {
             return Vec::new();
@@ -1459,7 +1459,7 @@ impl Scheduler {
                         uniserve_core::ImageIngestStep::VaeEncode => {
                             self.cap_max_vae_grid_tokens().min(u32::MAX as usize) as u32
                         }
-                        uniserve_core::ImageIngestStep::VitEncode => self.caps.max_vit_grid_tokens,
+                        uniserve_core::ImageIngestStep::VitEncode => self.info.max_vit_grid_tokens,
                     },
                 };
                 if !self.ensure_request_capacity(

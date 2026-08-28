@@ -8,7 +8,7 @@ use crate::openai::error::{ApiError, serve_error_to_api};
 use crate::openai::types::{GeneratedImageData, ImageGenerationRequest, ImageGenerationResponse};
 use crate::openai::utils::{ResolvedRequestContext, check_model_served};
 
-/// Lower one image-generation wire request into the sole generate admission
+/// Lower one image-generation request into the sole generate admission
 /// value.
 pub fn lower_image_generation_request(
     request: ImageGenerationRequest,
@@ -142,7 +142,6 @@ pub async fn collect_image_generation(
             }
             ServeEvent::Accepted { .. }
             | ServeEvent::Scheduled { .. }
-            | ServeEvent::PublicCommit { .. }
             | ServeEvent::TextDelta { .. }
             | ServeEvent::InternalTextDelta { .. }
             | ServeEvent::ReasoningDelta { .. }

@@ -53,19 +53,19 @@ def modulate(
 
 
 class ResBlock(nn.Module):
-    def __init__(self, channels: int, *, spec: LayerConfig, mlp_ratio: float = 1.0):
+    def __init__(self, channels: int, *, layer_config: LayerConfig, mlp_ratio: float = 1.0):
         super().__init__()
         self.channels = int(channels)
         self.intermediate_size = int(channels * mlp_ratio)
         self.in_ln = nn.LayerNorm(self.channels, eps=1e-6)
         self.mlp = nn.Sequential(
-            LinearBase(self.channels, self.intermediate_size, spec=spec),
+            LinearBase(self.channels, self.intermediate_size, layer_config=layer_config),
             nn.SiLU(),
-            LinearBase(self.intermediate_size, self.channels, spec=spec),
+            LinearBase(self.intermediate_size, self.channels, layer_config=layer_config),
         )
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            LinearBase(self.channels, 3 * self.channels, spec=spec, bias=True),
+            LinearBase(self.channels, 3 * self.channels, layer_config=layer_config, bias=True),
         )
 
     def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -75,13 +75,13 @@ class ResBlock(nn.Module):
 
 
 class _TimeAdaptiveFinalLayer(nn.Module):
-    def __init__(self, model_channels: int, out_channels: int, *, spec: LayerConfig):
+    def __init__(self, model_channels: int, out_channels: int, *, layer_config: LayerConfig):
         super().__init__()
         self.norm_final = nn.LayerNorm(model_channels, elementwise_affine=False, eps=1e-6)
-        self.linear = LinearBase(model_channels, out_channels, spec=spec, bias=True)
+        self.linear = LinearBase(model_channels, out_channels, layer_config=layer_config, bias=True)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            LinearBase(model_channels, 2 * model_channels, spec=spec, bias=True),
+            LinearBase(model_channels, 2 * model_channels, layer_config=layer_config, bias=True),
         )
 
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
@@ -95,7 +95,7 @@ class _TimeConditionedMLPAdaLN(nn.Module):
         input_dim: int,
         out_dim: int,
         *,
-        spec: LayerConfig,
+        layer_config: LayerConfig,
         dim: int = _DEFAULT_FLOW_HEAD.dim,
         layers: int = _DEFAULT_FLOW_HEAD.layers,
         mlp_ratio: float = _DEFAULT_FLOW_HEAD.mlp_ratio,
@@ -109,14 +109,14 @@ class _TimeConditionedMLPAdaLN(nn.Module):
         self.mlp_ratio = float(mlp_ratio)
 
         self.time_embed = TimestepEmbedder(self.dim)
-        self.input_proj = LinearBase(self.input_dim, self.dim, spec=spec)
+        self.input_proj = LinearBase(self.input_dim, self.dim, layer_config=layer_config)
         self.res_blocks = nn.ModuleList(
             [
-                ResBlock(self.dim, spec=spec, mlp_ratio=self.mlp_ratio)
+                ResBlock(self.dim, layer_config=layer_config, mlp_ratio=self.mlp_ratio)
                 for _ in range(self.layers)
             ]
         )
-        self.final_layer = _TimeAdaptiveFinalLayer(self.dim, self.out_dim, spec=spec)
+        self.final_layer = _TimeAdaptiveFinalLayer(self.dim, self.out_dim, layer_config=layer_config)
         # Random init is wasted on the serving path (the checkpoint overwrites it);
         # gate it off by default so construction is cheap and never-loaded weights
         # surface as garbage rather than a plausible random init.
@@ -164,7 +164,7 @@ class FlowMatchingHead(nn.Module):
         input_dim: int,
         out_dim: int,
         *,
-        spec: LayerConfig,
+        layer_config: LayerConfig,
         dim: int = _DEFAULT_FLOW_HEAD.dim,
         layers: int = _DEFAULT_FLOW_HEAD.layers,
         mlp_ratio: float = _DEFAULT_FLOW_HEAD.mlp_ratio,
@@ -174,7 +174,7 @@ class FlowMatchingHead(nn.Module):
         self.net = _TimeConditionedMLPAdaLN(
             input_dim=input_dim,
             out_dim=out_dim,
-            spec=spec,
+            layer_config=layer_config,
             dim=dim,
             layers=layers,
             mlp_ratio=mlp_ratio,
@@ -196,10 +196,10 @@ class FlowMatchingHead(nn.Module):
 class FinalLayer(nn.Module):
     """Untimed DiT-style final projection used by patch-space decoders."""
 
-    def __init__(self, model_channels: int, out_channels: int, *, spec: LayerConfig):
+    def __init__(self, model_channels: int, out_channels: int, *, layer_config: LayerConfig):
         super().__init__()
         self.norm_final = nn.LayerNorm(model_channels, elementwise_affine=False, eps=1e-6)
-        self.linear = LinearBase(model_channels, out_channels, spec=spec, bias=True)
+        self.linear = LinearBase(model_channels, out_channels, layer_config=layer_config, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.linear(self.norm_final(x))

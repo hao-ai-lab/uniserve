@@ -111,7 +111,7 @@ def build_packed_layout(
     # The sparse kernel consumes actual (4, 4, 4) spatiotemporal tiles, not
     # arbitrary runs of 64 raster-order rows. Boundary tiles reserve all 64
     # transport rows and place their valid rows first, matching the checkpoint
-    # VSA variable-block-size contract.
+    # VSA variable-block-size layout.
     tile_t, tile_h, tile_w = (4, 4, 4)
     grid_t = video_frames // patch_t
     grid_h = latent_height // patch_h

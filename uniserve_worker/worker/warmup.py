@@ -35,7 +35,7 @@ from ..execution.batch import (
 from ..bootstrap.execution_config import (
     LaneConfig,
 )
-from ..capabilities import (
+from ..worker_info import (
     GraphBucket,
 )
 from ..execution.step import (
@@ -429,10 +429,10 @@ def _build_warmup_batch(
     height, width = image_geometry or _warmup_image_geometry(self)
     latent_units = max(
         1,
-        (height // max(1, int(self._capabilities.latent_downsample)))
-        * (width // max(1, int(self._capabilities.latent_downsample))),
+        (height // max(1, int(self._info.latent_downsample)))
+        * (width // max(1, int(self._info.latent_downsample))),
     )
-    page_units = int(self._capabilities.latent_page_units)
+    page_units = int(self._info.latent_page_units)
     latent_page_count = (latent_units + page_units - 1) // page_units if page_units > 0 else 0
     occupied_latent_pages = {page for pages in self._warmup_latent_pages.values() for page in pages}
     for operation in operations:
@@ -447,7 +447,7 @@ def _build_warmup_batch(
             raise invalid_descriptor("warmup latent placement regresses its physical extent")
         allocated = tuple(
             page
-            for page in range(1, int(self._capabilities.num_latent_pages))
+            for page in range(1, int(self._info.num_latent_pages))
             if page not in occupied_latent_pages
         )[:missing]
         if len(allocated) != missing:
@@ -562,7 +562,7 @@ def _warmup_flow_tables(
     if alternative:
         alternative_slot = self._warmup_prefix_slots.setdefault(
             operation.request_key,
-            int(self._capabilities.max_request_pool_size) - len(self._warmup_prefix_slots),
+            int(self._info.max_request_pool_size) - len(self._warmup_prefix_slots),
         )
         if alternative_slot == main_slot or alternative_slot < 1:
             raise invalid_descriptor("warmup has no request slot for an alternative prefix")
@@ -622,7 +622,7 @@ def warmup(self: Worker) -> None:
         logger.info("completed token CUDA graph warmup")
         _warmup_flow(self)
         logger.info("completed flow CUDA graph warmup")
-    elif self._capabilities.mixed_buckets:
+    elif self._info.mixed_buckets:
         _warmup_flow(self)
         logger.info("completed mixed execution warmup")
     complete_startup(self.execution)
@@ -634,11 +634,11 @@ def _warmup_image_geometry(self: Worker) -> tuple[int, int]:
 
     import math
 
-    caps = self._capabilities
-    downsample = max(1, int(caps.latent_downsample))
-    capacity = int(caps.latent_capacity_units)
-    if int(caps.max_vae_grid_tokens) > 0:
-        capacity = min(capacity, int(caps.max_vae_grid_tokens))
+    info = self._info
+    downsample = max(1, int(info.latent_downsample))
+    capacity = int(info.latent_capacity_units)
+    if int(info.max_vae_grid_tokens) > 0:
+        capacity = min(capacity, int(info.max_vae_grid_tokens))
     side = max(1, math.isqrt(max(1, capacity)))
     return side * downsample, side * downsample
 
@@ -883,7 +883,7 @@ def _warmup_prefill_graphs(self: Worker) -> None:
         else _paged_prefill_graph_buckets(
             token_buckets,
             self._prefill_graph_row_sizes,
-            max_rows=int(self._capabilities.max_request_pool_size),
+            max_rows=int(self._info.max_request_pool_size),
             max_tokens=capacity,
         )
     )
@@ -1033,7 +1033,7 @@ def _warmup_flow(self: Worker) -> None:
         height = bucket.height
         width = bucket.width
         cfg_branches = bucket.cfg_branches
-        if batch_size > int(self._capabilities.max_request_pool_size):
+        if batch_size > int(self._info.max_request_pool_size):
             continue
         mixed_text_sizes = tuple(
             mixed.decode_rows
@@ -1042,7 +1042,7 @@ def _warmup_flow(self: Worker) -> None:
             and mixed.height == height
             and mixed.width == width
             and mixed.cfg_branches == cfg_branches
-            and mixed.decode_rows + batch_size <= int(self._capabilities.max_request_pool_size)
+            and mixed.decode_rows + batch_size <= int(self._info.max_request_pool_size)
         )
         mixed_rounds = 3 if self._execution.cuda_graph and self._execution.prefill_cuda_graph else 1
         session_ids = tuple(range(next_session_id, next_session_id + batch_size))

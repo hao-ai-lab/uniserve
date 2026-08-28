@@ -48,7 +48,7 @@ impl WorkerProcessArgs {
 pub struct MultiprocExecutor {
     workers: Vec<Box<dyn Executor>>,
     buffers: Vec<VecDeque<CompletionReport>>,
-    caps: WorkerInfo,
+    info: WorkerInfo,
     depth: usize,
     inflight: usize,
     next_call_id: u64,
@@ -57,7 +57,7 @@ pub struct MultiprocExecutor {
     rank_errors: Vec<BTreeMap<u64, WorkerExecError>>,
     rank_returned_partitions: Vec<BTreeMap<u64, BTreeSet<u32>>>,
     rank_successes: Vec<BTreeSet<u64>>,
-    spawn_spec: Option<WorkerProcessArgs>,
+    process_args: Option<WorkerProcessArgs>,
     known_sessions: BTreeSet<RequestId>,
     dirty_sessions: BTreeSet<RequestId>,
 }
@@ -69,44 +69,44 @@ impl MultiprocExecutor {
 
     fn from_workers(
         workers: Vec<Box<dyn Executor>>,
-        spawn_spec: Option<WorkerProcessArgs>,
+        process_args: Option<WorkerProcessArgs>,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(!workers.is_empty(), "need >= 1 worker");
         let n = workers.len();
-        let tp_size = u32::try_from(n).context("TP world size exceeds the wire representation")?;
-        let caps = workers[0].caps().clone();
-        let mut canonical = caps.clone();
+        let tp_size = u32::try_from(n).context("TP world size exceeds the IPC representation")?;
+        let info = workers[0].info().clone();
+        let mut canonical = info.clone();
         canonical.rank.tp_rank = 0;
         for (rank, worker) in workers.iter().enumerate() {
-            let rank_caps = worker.caps();
-            rank_caps
+            let rank_info = worker.info();
+            rank_info
                 .validate()
-                .with_context(|| format!("TP rank {rank} reported invalid capabilities"))?;
+                .with_context(|| format!("TP rank {rank} reported invalid worker info"))?;
             anyhow::ensure!(
-                rank_caps.rank.tp_rank == rank as u32 && rank_caps.rank.tp_size == tp_size,
+                rank_info.rank.tp_rank == rank as u32 && rank_info.rank.tp_size == tp_size,
                 "TP rank {rank} reported topology ({}/{}) for launched topology ({rank}/{tp_size})",
-                rank_caps.rank.tp_rank,
-                rank_caps.rank.tp_size,
+                rank_info.rank.tp_rank,
+                rank_info.rank.tp_size,
             );
             anyhow::ensure!(
-                worker.pipeline_depth() == rank_caps.pipeline_depth.max(1) as usize,
-                "TP rank {rank} executor depth {} disagrees with capability depth {}",
+                worker.pipeline_depth() == rank_info.pipeline_depth.max(1) as usize,
+                "TP rank {rank} executor depth {} disagrees with worker depth {}",
                 worker.pipeline_depth(),
-                rank_caps.pipeline_depth.max(1),
+                rank_info.pipeline_depth.max(1),
             );
-            let mut normalized = rank_caps.clone();
+            let mut normalized = rank_info.clone();
             normalized.rank.tp_rank = 0;
             anyhow::ensure!(
                 normalized == canonical,
-                "TP rank {rank} capabilities disagree with rank 0"
+                "TP rank {rank} worker info disagree with rank 0"
             );
         }
-        let depth = caps.pipeline_depth.max(1) as usize;
+        let depth = info.pipeline_depth.max(1) as usize;
         let buffers = (0..n).map(|_| VecDeque::new()).collect();
         Ok(Self {
             workers,
             buffers,
-            caps,
+            info,
             depth,
             inflight: 0,
             next_call_id: 1,
@@ -115,16 +115,16 @@ impl MultiprocExecutor {
             rank_errors: (0..n).map(|_| BTreeMap::new()).collect(),
             rank_returned_partitions: (0..n).map(|_| BTreeMap::new()).collect(),
             rank_successes: (0..n).map(|_| BTreeSet::new()).collect(),
-            spawn_spec,
+            process_args,
             known_sessions: BTreeSet::new(),
             dirty_sessions: BTreeSet::new(),
         })
     }
 
-    pub fn spawn(spec: WorkerProcessArgs) -> anyhow::Result<Self> {
-        anyhow::ensure!(spec.world_size > 0, "worker world size must be positive");
-        let workers = spec.launch()?;
-        Self::from_workers(workers, Some(spec))
+    pub fn spawn(args: WorkerProcessArgs) -> anyhow::Result<Self> {
+        anyhow::ensure!(args.world_size > 0, "worker world size must be positive");
+        let workers = args.launch()?;
+        Self::from_workers(workers, Some(args))
     }
 
     fn pump_once(&mut self) -> anyhow::Result<()> {
@@ -190,7 +190,7 @@ impl MultiprocExecutor {
     }
 
     fn recover_workers(&mut self, cause: &anyhow::Error) -> anyhow::Result<()> {
-        let spec = self.spawn_spec.clone().ok_or_else(|| {
+        let args = self.process_args.clone().ok_or_else(|| {
             anyhow::anyhow!("worker process failed without a restart specification: {cause}")
         })?;
         tracing::warn!(error = %cause, "worker process lost; replacing its complete rank group");
@@ -198,9 +198,9 @@ impl MultiprocExecutor {
             worker.shutdown();
         }
 
-        let workers = spec.launch().context("spawning replacement worker ranks")?;
-        self.install_replacement(workers, &spec)?;
-        self.spawn_spec = Some(spec);
+        let workers = args.launch().context("spawning replacement worker ranks")?;
+        self.install_replacement(workers, &args)?;
+        self.process_args = Some(args);
         self.discard_sessions_after_loss();
         Err(WorkerLossError {
             message: format!(
@@ -213,20 +213,20 @@ impl MultiprocExecutor {
     fn install_replacement(
         &mut self,
         workers: Vec<Box<dyn Executor>>,
-        spec: &WorkerProcessArgs,
+        args: &WorkerProcessArgs,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
-            workers.len() == spec.world_size,
+            workers.len() == args.world_size,
             "replacement worker rank count changed"
         );
         for (rank, worker) in workers.iter().enumerate() {
-            validate_replacement_caps(&self.caps, &worker.caps(), rank)?;
+            validate_replacement_info(&self.info, &worker.info(), rank)?;
         }
         self.workers = workers;
-        self.buffers = (0..spec.world_size).map(|_| VecDeque::new()).collect();
-        self.rank_errors = (0..spec.world_size).map(|_| BTreeMap::new()).collect();
-        self.rank_returned_partitions = (0..spec.world_size).map(|_| BTreeMap::new()).collect();
-        self.rank_successes = (0..spec.world_size).map(|_| BTreeSet::new()).collect();
+        self.buffers = (0..args.world_size).map(|_| VecDeque::new()).collect();
+        self.rank_errors = (0..args.world_size).map(|_| BTreeMap::new()).collect();
+        self.rank_returned_partitions = (0..args.world_size).map(|_| BTreeMap::new()).collect();
+        self.rank_successes = (0..args.world_size).map(|_| BTreeSet::new()).collect();
         Ok(())
     }
 
@@ -320,7 +320,7 @@ impl MultiprocExecutor {
         }
         let mut out = per_rank.remove(0);
         for (rank, report) in per_rank.iter().enumerate() {
-            merge_rank_report(&self.caps, batch, &mut out, report, rank + 1)?;
+            merge_rank_report(&self.info, batch, &mut out, report, rank + 1)?;
         }
         let remaining = self
             .pending_partitions
@@ -431,7 +431,7 @@ fn report_partition_ids(report: &CompletionReport) -> Vec<u32> {
 /// semantic completion for each operation; only the per-rank product shards
 /// differ and are concatenated in rank order.
 fn merge_rank_report(
-    caps: &WorkerInfo,
+    info: &WorkerInfo,
     batch: &Batch,
     rank0: &mut CompletionReport,
     rankn: &CompletionReport,
@@ -465,7 +465,7 @@ fn merge_rank_report(
             "rank join received unplanned partition {} for step {step_id}",
             canonical_partition.partition_id
         );
-        let ownership = caps.sampling_ownership;
+        let ownership = info.sampling_ownership;
         anyhow::ensure!(
             canonical_partition.partition_id == actual_partition.partition_id,
             "rank {rank} report for step {step_id} partition {partition_index} identity differs from rank 0"
@@ -609,19 +609,19 @@ fn merge_completion_record(
     Ok(())
 }
 
-fn validate_replacement_caps(
+fn validate_replacement_info(
     expected: &WorkerInfo,
     actual: &WorkerInfo,
     rank: usize,
 ) -> anyhow::Result<()> {
     actual
         .validate()
-        .with_context(|| format!("replacement rank {rank} reported invalid capabilities"))?;
+        .with_context(|| format!("replacement rank {rank} reported invalid worker info"))?;
     let mut normalized_expected = expected.clone();
     normalized_expected.rank.tp_rank = rank as u32;
     anyhow::ensure!(
         normalized_expected == *actual,
-        "replacement rank {rank} capabilities changed"
+        "replacement rank {rank} worker info changed"
     );
     Ok(())
 }
@@ -642,8 +642,8 @@ fn device_for_rank(device: &str, rank: usize, world_size: usize) -> String {
 }
 
 impl Executor for MultiprocExecutor {
-    fn caps(&self) -> &WorkerInfo {
-        &self.caps
+    fn info(&self) -> &WorkerInfo {
+        &self.info
     }
 
     fn pipeline_depth(&self) -> usize {
@@ -840,7 +840,7 @@ impl Executor for MultiprocExecutor {
     }
 
     fn control(&mut self, op: ControlOp) -> anyhow::Result<u64> {
-        // NOTE: the returned id is a local fire-and-forget token, NOT a wire
+        // NOTE: the returned id is a local fire-and-forget token, NOT a IPC
         // call_id. Each per-rank worker.control allocates its own real
         // call_id internally; this counter correlates to none of them. Callers
         // must not use this value to match a later worker ack — use

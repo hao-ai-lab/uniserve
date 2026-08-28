@@ -157,7 +157,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_dimension_contract() {
+    fn configured_dimensions() {
         let fixed = policy(false);
         let named = resolve_resolution(&fixed, Some(ResolutionName::Square), None, None).unwrap();
         assert_eq!((named.width, named.height), (512, 512));

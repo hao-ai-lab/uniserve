@@ -304,7 +304,7 @@ def native_partition(
 
     The native transport is produced by the engine's own encoder, so members
     already carry their registered identities and the validation that guards
-    untrusted wire maps is not repeated here.
+    untrusted IPC maps is not repeated here.
     """
 
     partition = object.__new__(BatchPartition)
@@ -678,10 +678,10 @@ class ShapeBound:
         return cls(tuple(dims))
 
     def to_mapping(self) -> dict[str, object]:
-        return {"dims": [_dim_to_wire(dim) for dim in self.dims]}
+        return {"dims": [_dim_to_mapping(dim) for dim in self.dims]}
 
 
-def _dim_to_wire(dim: DimBound) -> dict[str, object]:
+def _dim_to_mapping(dim: DimBound) -> dict[str, object]:
     if isinstance(dim, StaticDim):
         return {"kind": "static", "value": dim.extent}
     return {"kind": "device", "value": {"max": dim.bound}}
@@ -1401,7 +1401,7 @@ def _control_variant_index(control: Control) -> int:
     return 2
 
 
-def control_from_wire(
+def control_from_mapping(
     value: object,
     where: str = "control",
 ) -> Control:
@@ -1454,7 +1454,7 @@ def control_from_wire(
     return control
 
 
-def control_to_wire(control: Control) -> dict[str, object]:
+def control_to_mapping(control: Control) -> dict[str, object]:
     if isinstance(control, Commit):
         return {
             "kind": "commit",
@@ -2092,7 +2092,7 @@ class Batch:
                     )
                 if len(routes) != 1:
                     raise invalid_descriptor(
-                        "a tensorized-mixed submission group spans route capabilities"
+                        "a tensorized-mixed submission group spans execution routes"
                     )
         request_keys = [operation.request_key for operation in self.operations]
         if len(set(request_keys)) != len(request_keys):
@@ -2188,7 +2188,7 @@ class Batch:
         )
         controls = tuple(
             _fast_release_control(item)
-            or control_from_wire(
+            or control_from_mapping(
                 item,
                 f"execute batch.controls[{index}]",
             )
@@ -2213,7 +2213,7 @@ class Batch:
             "step_id": self.step_id,
             "admissions": [value.to_mapping() for value in self.admissions],
             "partitions": [value.to_mapping() for value in self.partitions],
-            "controls": [control_to_wire(value) for value in self.controls],
+            "controls": [control_to_mapping(value) for value in self.controls],
             "input_products": [value.to_mapping() for value in self.input_products],
         }
 
@@ -2603,7 +2603,7 @@ class CompletionReport:
 # ---------------------------------------------------------------------------
 # Decode helpers
 #
-# Each `_fast_*` helper recognizes the exact built-in wire shape without
+# Each `_fast_*` helper recognizes the exact built-in IPC shape without
 # allocating error-location strings. A non-matching value returns ``None`` so
 # the caller applies the canonical validated constructor and its precise error.
 # ---------------------------------------------------------------------------
@@ -2710,7 +2710,7 @@ def _nonnegative(value: int, where: str) -> None:
 # ---------------------------------------------------------------------------
 # Allocation-light record decoders for the per-batch hot path
 #
-# Each returns the decoded record for a well-formed wire value and ``None``
+# Each returns the decoded record for a well-formed IPC value and ``None``
 # otherwise; the caller uses validating decoders in declaration order so the
 # first invalid field receives a precise diagnostic.
 # Construction bypasses ``__init__``/``__post_init__`` only where the fast

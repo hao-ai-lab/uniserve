@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -234,16 +233,6 @@ def test_sensenova_public_production_lineage(tmp_path: Path):
             if (delta := visible_stream_delta(event)) is not None
         ]
         assert visible_events
-        commits = [event["public_commit"] for event, _ in visible_events]
-        assert [commit["event_seq"] for commit in commits] == sorted(
-            commit["event_seq"] for commit in commits
-        )
-        for commit in commits:
-            assert commit["modality"] in {"text", "image"}
-            assert math.isfinite(commit["committed_at"])
-            assert commit["committed_at"] >= 0.0
-            assert commit["semantic_root"]["producer_op_id"] > 0
-            assert commit["semantic_root"]["point_index"] > 0
         images = [image for _, delta in visible_events for image in delta.get("images", [])]
         assert len(images) == 2
         for image in images:

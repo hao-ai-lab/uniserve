@@ -1,4 +1,4 @@
-//! Executor contracts shared by scheduler, worker IPC, and local engines.
+//! Executor types shared by scheduler, worker IPC, and local engines.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 use std::str::FromStr;
@@ -70,7 +70,7 @@ const GEN_WORK: &[ForwardMode] = &[
 ];
 
 impl WorkerKind {
-    /// Wire/config name (matches the Python `--worker-kind` vocabulary).
+    /// IPC/config name (matches the Python `--worker-kind` vocabulary).
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Full => "full",
@@ -124,7 +124,7 @@ pub struct Pool {
     pub tp: usize,
 }
 
-/// The `--workers` topology: an ordered list of pool specs. `full:1` (one Full
+/// The `--workers` topology: an ordered list of pool entries. `full:1` (one Full
 /// pool, tp = `--worker-ranks`) is the default.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerTopology {
@@ -362,7 +362,7 @@ pub struct ControlAck {
 
 /// A worker-reported execution error classified for scheduler failure policy.
 ///
-/// The typed taxonomy and execution context cross the wire together so failure
+/// The typed taxonomy and execution context cross the IPC together so failure
 /// policy and diagnostics use the same operation identity.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("worker execute error: {message}")]
@@ -392,7 +392,7 @@ pub struct WorkerLossError {
 
 /// The asynchronous, pipelined boundary the scheduler drives.
 pub trait Executor: Send {
-    fn caps(&self) -> &WorkerInfo;
+    fn info(&self) -> &WorkerInfo;
     fn pipeline_depth(&self) -> usize;
     fn in_flight(&self) -> usize;
 
@@ -405,7 +405,7 @@ pub trait Executor: Send {
 
     /// Whether the executor can preserve an exact device product from the
     /// producer through registration of the consumer. A local staged executor
-    /// may satisfy this contract by retaining the consumer until the producing
+    /// may retain the consumer until the producing
     /// pool publishes its bounded transfer descriptor.
     fn device_products_reachable(&self, _producer: ForwardMode, _consumer: ForwardMode) -> bool {
         true

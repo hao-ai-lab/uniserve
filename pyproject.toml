@@ -97,7 +97,6 @@ addopts = "-ra"
 pythonpath = ["."]
 markers = [
     "unit: pure local tests without server, GPU, or external model files",
-    "contract: canonical public schema and protocol conformance tests",
     "architecture: build-time dependency direction and package layout checks",
     "integration: multi-component tests using fake/simulated backends",
     "e2e: black-box server or worker tests",

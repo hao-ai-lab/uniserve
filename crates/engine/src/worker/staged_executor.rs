@@ -81,7 +81,7 @@ fn transfer_kind(bytes: &[u8]) -> anyhow::Result<String> {
 pub struct StagedExecutor {
     routing: HashMap<ForwardMode, usize>,
     pools: Vec<PoolEntry>,
-    caps: WorkerInfo,
+    info: WorkerInfo,
     depth: usize,
     pending: BTreeMap<u64, PendingStep>,
     ready: VecDeque<CompletionReport>,
@@ -118,17 +118,17 @@ impl StagedExecutor {
 
         let mut routing = HashMap::new();
         for (index, (kind, executor)) in pools.iter().enumerate() {
-            let caps = executor.caps();
-            caps.validate()
-                .with_context(|| format!("staged pool {index} reported invalid capabilities"))?;
+            let info = executor.info();
+            info.validate()
+                .with_context(|| format!("staged pool {index} reported invalid worker info"))?;
             anyhow::ensure!(
-                executor.pipeline_depth() == caps.pipeline_depth.max(1) as usize,
-                "staged pool {index} executor depth {} disagrees with capability depth {}",
+                executor.pipeline_depth() == info.pipeline_depth.max(1) as usize,
+                "staged pool {index} executor depth {} disagrees with worker depth {}",
                 executor.pipeline_depth(),
-                caps.pipeline_depth.max(1),
+                info.pipeline_depth.max(1),
             );
             for variant in kind.supported_work() {
-                if !caps.supported_work.contains(variant) {
+                if !info.supported_work.contains(variant) {
                     continue;
                 }
                 anyhow::ensure!(
@@ -146,7 +146,7 @@ impl StagedExecutor {
             .into_iter()
             .map(|(_, exec)| PoolEntry { exec })
             .collect();
-        let caps = Self::merge_caps(&pools, &routing)?;
+        let info = Self::merge_info(&pools, &routing)?;
         let depth = pools
             .iter()
             .map(|pool| pool.exec.pipeline_depth())
@@ -157,7 +157,7 @@ impl StagedExecutor {
         Ok(Self {
             routing,
             pools,
-            caps,
+            info,
             depth,
             pending: BTreeMap::new(),
             ready: VecDeque::new(),
@@ -174,12 +174,12 @@ impl StagedExecutor {
         })
     }
 
-    fn merge_caps(
+    fn merge_info(
         pools: &[PoolEntry],
         routing: &HashMap<ForwardMode, usize>,
     ) -> anyhow::Result<WorkerInfo> {
         let routed_caps =
-            |variant: ForwardMode| routing.get(&variant).map(|index| pools[*index].exec.caps());
+            |variant: ForwardMode| routing.get(&variant).map(|index| pools[*index].exec.info());
         let mut kv_pool_indices = [
             ForwardMode::TokenExtend,
             ForwardMode::TokenDecode,
@@ -195,11 +195,11 @@ impl StagedExecutor {
         kv_pool_indices.dedup();
 
         let seed_index = kv_pool_indices.first().copied().unwrap_or(0);
-        let mut merged = pools[seed_index].exec.caps().clone();
+        let mut merged = pools[seed_index].exec.info().clone();
         let versions = pools
             .iter()
-            .map(|pool| pool.exec.caps())
-            .map(|caps| (caps.model_name.clone(), caps.weight_version))
+            .map(|pool| pool.exec.info())
+            .map(|info| (info.model_name.clone(), info.weight_version))
             .collect::<Vec<_>>();
         if let Some(version) = versions.first() {
             anyhow::ensure!(
@@ -211,9 +211,9 @@ impl StagedExecutor {
         }
 
         if let Some(first_index) = kv_pool_indices.first().copied() {
-            let first = pools[first_index].exec.caps();
+            let first = pools[first_index].exec.info();
             for index in kv_pool_indices.iter().copied().skip(1) {
-                let other = pools[index].exec.caps();
+                let other = pools[index].exec.info();
                 anyhow::ensure!(
                     other.block_size == first.block_size,
                     "staged KV pools disagree on block size"
@@ -230,7 +230,7 @@ impl StagedExecutor {
             merged.block_size = first.block_size;
             merged.num_blocks = kv_pool_indices
                 .iter()
-                .map(|index| pools[*index].exec.caps().num_blocks)
+                .map(|index| pools[*index].exec.info().num_blocks)
                 .min()
                 .unwrap_or(first.num_blocks);
             merged.num_layers = first.num_layers;
@@ -240,7 +240,7 @@ impl StagedExecutor {
             merged.kv_dtype = first.kv_dtype;
             merged.bytes_per_token = kv_pool_indices
                 .iter()
-                .map(|index| pools[*index].exec.caps().bytes_per_token)
+                .map(|index| pools[*index].exec.info().bytes_per_token)
                 .max()
                 .unwrap_or(first.bytes_per_token);
         }
@@ -252,50 +252,50 @@ impl StagedExecutor {
         merged.supported_controls.clear();
         merged.resource_classes.clear();
         for pool in pools {
-            let caps = pool.exec.caps();
+            let info = pool.exec.info();
             extend_unique(
                 &mut merged.supported_controls,
-                caps.supported_controls.clone(),
+                info.supported_controls.clone(),
             );
-            extend_unique(&mut merged.resource_classes, caps.resource_classes.clone());
+            extend_unique(&mut merged.resource_classes, info.resource_classes.clone());
         }
         merged.pipeline_depth = pools
             .iter()
-            .map(|pool| pool.exec.caps().pipeline_depth.max(1))
+            .map(|pool| pool.exec.info().pipeline_depth.max(1))
             .min()
             .unwrap_or(1);
         merged.max_batch_operations = pools
             .iter()
-            .map(|pool| pool.exec.caps().max_batch_operations)
+            .map(|pool| pool.exec.info().max_batch_operations)
             .filter(|limit| *limit > 0)
             .min()
             .unwrap_or(0);
         merged.max_batch_tokens = pools
             .iter()
-            .map(|pool| pool.exec.caps().max_batch_tokens)
+            .map(|pool| pool.exec.info().max_batch_tokens)
             .filter(|limit| *limit > 0)
             .min()
             .unwrap_or(0);
         merged.max_request_pool_size = pools
             .iter()
-            .map(|pool| pool.exec.caps().max_request_pool_size)
+            .map(|pool| pool.exec.info().max_request_pool_size)
             .filter(|limit| *limit > 0)
             .min()
             .unwrap_or(0);
         merged.max_unresolved_window = pools
             .iter()
-            .map(|pool| pool.exec.caps().max_unresolved_window)
+            .map(|pool| pool.exec.info().max_unresolved_window)
             .filter(|limit| *limit > 0)
             .min()
             .unwrap_or(0);
         merged.incremental_kv_publication = pools
             .iter()
-            .all(|pool| pool.exec.caps().incremental_kv_publication);
-        let sampling_ownership = pools[0].exec.caps().sampling_ownership;
+            .all(|pool| pool.exec.info().incremental_kv_publication);
+        let sampling_ownership = pools[0].exec.info().sampling_ownership;
         anyhow::ensure!(
             pools
                 .iter()
-                .all(|pool| pool.exec.caps().sampling_ownership == sampling_ownership),
+                .all(|pool| pool.exec.info().sampling_ownership == sampling_ownership),
             "staged pools disagree on sampling ownership"
         );
         merged.sampling_ownership = sampling_ownership;
@@ -304,37 +304,37 @@ impl StagedExecutor {
             routing.get(&ForwardMode::GenFlow),
         ) {
             (Some(decode), Some(flow)) if decode == flow => {
-                pools[*decode].exec.caps().mixed_buckets.clone()
+                pools[*decode].exec.info().mixed_buckets.clone()
             }
             _ => Vec::new(),
         };
 
         let flow = routed_caps(ForwardMode::GenFlow);
-        merged.latent_page_units = flow.as_ref().map_or(0, |caps| caps.latent_page_units);
-        merged.num_latent_pages = flow.as_ref().map_or(0, |caps| caps.num_latent_pages);
-        merged.latent_width = flow.as_ref().map_or(0, |caps| caps.latent_width);
-        merged.latent_dtype = flow.as_ref().and_then(|caps| caps.latent_dtype);
-        merged.latent_downsample = flow.as_ref().map_or(0, |caps| caps.latent_downsample);
-        merged.max_cfg_branches = flow.as_ref().map_or(0, |caps| caps.max_cfg_branches);
+        merged.latent_page_units = flow.as_ref().map_or(0, |info| info.latent_page_units);
+        merged.num_latent_pages = flow.as_ref().map_or(0, |info| info.num_latent_pages);
+        merged.latent_width = flow.as_ref().map_or(0, |info| info.latent_width);
+        merged.latent_dtype = flow.as_ref().and_then(|info| info.latent_dtype);
+        merged.latent_downsample = flow.as_ref().map_or(0, |info| info.latent_downsample);
+        merged.max_cfg_branches = flow.as_ref().map_or(0, |info| info.max_cfg_branches);
         merged.max_vae_grid_tokens = routed_caps(ForwardMode::EncodeLatent)
             .as_ref()
-            .map_or(0, |caps| caps.max_vae_grid_tokens);
+            .map_or(0, |info| info.max_vae_grid_tokens);
         merged.max_vit_grid_tokens = routed_caps(ForwardMode::EncodeVision)
             .as_ref()
-            .map_or(0, |caps| caps.max_vit_grid_tokens);
+            .map_or(0, |info| info.max_vit_grid_tokens);
         merged.max_latent_feature_bytes = routed_caps(ForwardMode::EncodeLatent)
             .as_ref()
-            .map_or(0, |caps| caps.max_latent_feature_bytes);
+            .map_or(0, |info| info.max_latent_feature_bytes);
         merged.max_vision_feature_bytes = routed_caps(ForwardMode::EncodeVision)
             .as_ref()
-            .map_or(0, |caps| caps.max_vision_feature_bytes);
+            .map_or(0, |info| info.max_vision_feature_bytes);
         if let Some(materialize) = routed_caps(ForwardMode::Materialize) {
             merged.commit_marker_tokens = materialize.commit_marker_tokens;
             merged.gen_rope_advance = materialize.gen_rope_advance;
         }
         merged.encoder_cache_budget = [ForwardMode::EncodeLatent, ForwardMode::EncodeVision]
             .into_iter()
-            .filter_map(|variant| routed_caps(variant).map(|caps| caps.encoder_cache_budget))
+            .filter_map(|variant| routed_caps(variant).map(|info| info.encoder_cache_budget))
             .min()
             .unwrap_or(0);
         merged.validate()?;
@@ -664,7 +664,7 @@ impl StagedExecutor {
             .enumerate()
             .filter(|(_, pool)| {
                 pool.exec
-                    .caps()
+                    .info()
                     .supported_controls
                     .contains(&operation.request_kind())
             })
@@ -687,8 +687,8 @@ impl StagedExecutor {
 }
 
 impl Executor for StagedExecutor {
-    fn caps(&self) -> &WorkerInfo {
-        &self.caps
+    fn info(&self) -> &WorkerInfo {
+        &self.info
     }
 
     fn pipeline_depth(&self) -> usize {

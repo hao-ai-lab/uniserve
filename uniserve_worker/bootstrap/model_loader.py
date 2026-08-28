@@ -9,7 +9,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from ..foundation.errors import capability_mismatch
+from ..foundation.errors import unsupported_setup
 from ..loader import LoadConfig, LoadRequest, WeightSet, get_model_loader
 from ..loader.source import read_model_config, resolve_model_root
 from ..models.minimax_h3 import MiniMaxH3Model
@@ -87,7 +87,7 @@ def load_worker_model(
         root=model_root,
         repository_id=repository_id,
     )
-    model = _check_model_conformance(loaded.model)
+    model = _check_model_interface(loaded.model)
 
     _resolve_input_tokens(model, loaded.tokenizer)
     deployment = _deployment(request)
@@ -130,23 +130,23 @@ def _load_h3_worker_model(
     from pathlib import Path
 
     if mesh is None or pipeline_depth is None:
-        raise capability_mismatch("MiniMax H3 loading requires the worker device mesh")
+        raise unsupported_setup("MiniMax H3 loading requires the worker device mesh")
     if request.parallel.size != 4 or mesh.size("tp") != 4 or mesh.size("sp") != 4:
-        raise capability_mismatch("MiniMax H3 requires one TP4/SP4 replica")
+        raise unsupported_setup("MiniMax H3 requires one TP4/SP4 replica")
     if mesh.local_device.type != "cuda" or torch.cuda.get_device_capability(mesh.local_device) < (
         10,
         0,
     ):
-        raise capability_mismatch("MiniMax H3 requires an SM100-class CUDA device")
+        raise unsupported_setup("MiniMax H3 requires an SM100-class CUDA device")
     if not media_spool or not Path(media_spool).expanduser().is_absolute():
-        raise capability_mismatch("MiniMax H3 requires an absolute shared media spool")
+        raise unsupported_setup("MiniMax H3 requires an absolute shared media spool")
     unresolved_window = 2
     max_state_slots = min(
         int(request.max_batch_operations),
         int(pipeline_depth) // (unresolved_window + 1),
     )
     if max_state_slots < 2:
-        raise capability_mismatch(
+        raise unsupported_setup(
             "MiniMax H3 requires capacity for two state slots with two unresolved outputs each"
         )
     model = MiniMaxH3Model.from_pretrained(
@@ -247,12 +247,12 @@ def _resolve_input_tokens(model: ExecutionModel, tokenizer: Any | None) -> None:
         if token_id is not None or token is None:
             continue
         if tokenizer is None:
-            raise capability_mismatch(
+            raise unsupported_setup(
                 f"model input declaration requires tokenizer resolution for {token!r}"
             )
         resolved = tokenizer.convert_tokens_to_ids(token)
         if resolved is None or int(resolved) < 0:
-            raise capability_mismatch(f"tokenizer does not define declared token {token!r}")
+            raise unsupported_setup(f"tokenizer does not define declared token {token!r}")
         updates[id_field] = int(resolved)
     if not updates:
         return
@@ -286,12 +286,12 @@ def _deployment(request: WorkerModelLoadRequest) -> WorkerDeployment:
 
 def _require_supported_scope(entry: CatalogEntry, scope: ModelLoadScope) -> None:
     if scope not in entry.scopes:
-        raise capability_mismatch(
+        raise unsupported_setup(
             f"{entry.architecture} does not support {scope.value!r} model materialization"
         )
 
 
-def _check_model_conformance(model: nn.Module) -> ExecutionModel:
+def _check_model_interface(model: nn.Module) -> ExecutionModel:
     if not isinstance(model, ExecutionModel):
-        raise capability_mismatch(f"{type(model).__name__} must implement ExecutionModel")
+        raise unsupported_setup(f"{type(model).__name__} must implement ExecutionModel")
     return model

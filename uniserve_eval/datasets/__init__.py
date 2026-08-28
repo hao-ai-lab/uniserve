@@ -51,7 +51,7 @@ def load_examples(point: BenchmarkPoint) -> tuple[list[Example], Any | None]:
     rows = dataset_cls(point).load(tokenizer)
     if len(rows) != point.load.num_prompts:
         raise ValueError(
-            f"dataset resolved {len(rows)} rows; benchmark contract requires "
+            f"dataset resolved {len(rows)} rows; benchmark point requires "
             f"exactly {point.load.num_prompts}"
         )
     return rows, tokenizer

@@ -29,7 +29,7 @@ def test_stream_request_rejects_a_json_response() -> None:
                 task="text",
             )
         assert record.success is False
-        assert record.classifier == "protocol_expected_sse"
+        assert record.classifier == "response_expected_sse"
 
     asyncio.run(run())
 
@@ -153,7 +153,7 @@ def test_stream_rejects_non_object_events() -> None:
                 task="text",
             )
         assert record.success is False
-        assert record.classifier == "protocol_invalid_event"
+        assert record.classifier == "response_invalid_event"
         assert record.token_timing_available is False
 
     asyncio.run(run())

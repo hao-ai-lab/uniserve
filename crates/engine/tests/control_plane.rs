@@ -2,7 +2,7 @@
 
 //! Full-stack GPU-free control-plane integration tests: drive the
 //! real `Scheduler` over a `LocalExecutor`+`SimEngine` and assert the lifecycle/event
-//! contract. This is the regression harness every workstream relies on.
+//! behavior. This is the regression harness every workstream relies on.
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -11,12 +11,12 @@ use std::time::{Duration, Instant};
 
 use uniserve_core::{
     ContextSegment, FeedbackNextToken, FeedbackSource, GeneratedImageFeedbackRecipe,
-    GenerationBehaviorDescriptor, GenerationConstraint, GenerationPolicyDescriptor,
-    GenerationRequest, GenerationResourceBounds, GenerationRuntimeCapabilities, ImageIngestRecipe,
+    GenerationBehaviorDescriptor, GenerationConstraint, GenerationLimits,
+    GenerationPolicyDescriptor, GenerationRequest, GenerationResourceBounds, ImageIngestRecipe,
     ImageKvEffect, ImageParams, ImageSegment, RequestId, SamplingParams, SegmentPlacement,
     TriggerPolicyDescriptor, UndVisibility,
 };
-use uniserve_core::{FinishReason, GenerationEvent, PublicModality};
+use uniserve_core::{FinishReason, GenerationEvent};
 use uniserve_engine::{
     ControlTokens, EngineHandle, Executor, MultiprocExecutor, Scheduler, SchedulingPolicy,
     SimEngine, SimExecutor,
@@ -87,7 +87,7 @@ fn generation_request(
     };
     let behavior = GenerationBehaviorDescriptor::resolve(constraint, &policy);
     let cache = Default::default();
-    let capabilities = GenerationRuntimeCapabilities {
+    let limits = GenerationLimits {
         features: uniserve_core::GenerationFeatures::UNDERSTANDING
             | uniserve_core::GenerationFeatures::VISION_ENCODE
             | uniserve_core::GenerationFeatures::IMAGE_GENERATION,
@@ -109,7 +109,7 @@ fn generation_request(
         image: &image,
         max_und_tokens,
         cache: &cache,
-        capabilities: &capabilities,
+        limits: &limits,
     })
     .expect("bounded simulation request");
     GenerationRequest {
@@ -153,7 +153,7 @@ struct Collected {
 fn run_requests(
     depth: u32,
     policy: SchedulingPolicy,
-    specs: &[(GenerationConstraint, usize)],
+    cases: &[(GenerationConstraint, usize)],
 ) -> HashMap<RequestId, Collected> {
     let mut sim = SimEngine::new();
     sim.set_pipeline_depth(depth);
@@ -165,7 +165,7 @@ fn run_requests(
 
     let mut rxs: HashMap<RequestId, uniserve_engine::EventRx> = HashMap::new();
     let mut id = 1u64;
-    for (constraint, n) in specs {
+    for (constraint, n) in cases {
         for _ in 0..*n {
             let req = generation_request(
                 RequestId(id),
@@ -243,11 +243,11 @@ fn cancellation_releases_latent_admission_for_a_waiting_image() {
 
     let mut sim = SimEngine::new();
     sim.set_pipeline_depth(4);
-    sim.mut_caps_for_test().resource_classes = vec![ResourceClass::ImageLatent];
-    sim.mut_caps_for_test().latent_page_units = 64;
-    sim.mut_caps_for_test().num_latent_pages = 17;
-    sim.mut_caps_for_test().latent_downsample = 16;
-    sim.mut_caps_for_test().max_batch_operations = 1024;
+    sim.mut_info_for_test().resource_classes = vec![ResourceClass::ImageLatent];
+    sim.mut_info_for_test().latent_page_units = 64;
+    sim.mut_info_for_test().num_latent_pages = 17;
+    sim.mut_info_for_test().latent_downsample = 16;
+    sim.mut_info_for_test().max_batch_operations = 1024;
     let scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
@@ -363,9 +363,8 @@ fn image_events_cover_declared_denoise_steps() {
                 image_id,
                 height,
                 width,
-                public_commit,
                 ..
-            }) => image_done = Some((image_id, height, width, public_commit)),
+            }) => image_done = Some((image_id, height, width)),
             Ok(GenerationEvent::Finished { reason, images, .. }) => {
                 finished = Some((reason, images))
             }
@@ -379,16 +378,15 @@ fn image_events_cover_declared_denoise_steps() {
     assert_eq!(begin, Some((1, 512, 512, STEPS)));
     assert_eq!(steps, (1..=STEPS).map(|step| (1, step)).collect::<Vec<_>>());
     assert_eq!(commits, 1);
-    let (image_id, height, width, public_commit) = image_done.expect("image completion event");
+    let (image_id, height, width) = image_done.expect("image completion event");
     assert_eq!((image_id, height, width), (1, 512, 512));
-    assert!(public_commit.is_some());
     assert_eq!(finished, Some((FinishReason::ImageDone, 1)));
 }
 
 #[test]
-fn scheduler_clamps_max_batch_to_worker_caps() {
+fn scheduler_clamps_max_batch_to_worker_info() {
     let mut sim = SimEngine::new();
-    sim.mut_caps_for_test().max_batch_operations = 3;
+    sim.mut_info_for_test().max_batch_operations = 3;
     let sched = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
 
     assert_eq!(sched.config().max_batch, 3);
@@ -471,14 +469,14 @@ fn operation_window_metrics_record_the_full_lifecycle() {
         assert!(domain.completed_partitions.load(Ordering::Relaxed) > 0);
     }
     let mut reporter = uniserve_engine::SchedStatsReporter::default();
-    let wire = reporter.snapshot(&scheduler.stats, 16);
-    let wire_active = wire
+    let snapshot = reporter.snapshot(&scheduler.stats, 16);
+    let decoded_active = snapshot
         .domain_stats
         .iter()
         .filter(|domain| domain.launched_operations > 0)
         .collect::<Vec<_>>();
-    assert_eq!(wire_active.len(), active_domains.len());
-    assert!(wire_active.iter().all(|domain| {
+    assert_eq!(decoded_active.len(), active_domains.len());
+    assert!(decoded_active.iter().all(|domain| {
         domain.active_credits == 0
             && domain.launched_operations == domain.completed_operations
             && domain.launched_operations == domain.reclaimed_credits
@@ -1405,7 +1403,6 @@ fn gen_branch_round_trip_preserves_publication_and_step_invariants() {
         let mut erx = handle.submit(req).unwrap();
 
         let mut signature: Vec<(char, u32)> = Vec::new();
-        let mut publications = Vec::new();
         let mut image_begins = 0;
         let mut image_steps = 0;
         let mut image_commits = 0;
@@ -1413,35 +1410,11 @@ fn gen_branch_round_trip_preserves_publication_and_step_invariants() {
         let deadline = Instant::now() + Duration::from_secs(15);
         while finish_reason.is_none() && Instant::now() < deadline {
             match erx.try_recv() {
-                Ok(GenerationEvent::TextToken {
-                    id,
-                    public_commit: Some(commit),
-                    ..
-                }) => {
-                    assert_eq!(commit.modality, PublicModality::Text);
-                    signature.push(('T', id));
-                    publications.push(commit);
-                }
+                Ok(GenerationEvent::TextToken { id, .. }) => signature.push(('T', id)),
                 Ok(GenerationEvent::ImageBegin { .. }) => image_begins += 1,
                 Ok(GenerationEvent::ImageStep { .. }) => image_steps += 1,
                 Ok(GenerationEvent::ImageCommit { .. }) => image_commits += 1,
-                Ok(GenerationEvent::ImageDone {
-                    image_id,
-                    public_commit: Some(commit),
-                    ..
-                }) => {
-                    assert_eq!(commit.modality, PublicModality::Image);
-                    signature.push(('I', image_id));
-                    publications.push(commit);
-                }
-                Ok(GenerationEvent::TextToken {
-                    public_commit: None,
-                    ..
-                })
-                | Ok(GenerationEvent::ImageDone {
-                    public_commit: None,
-                    ..
-                }) => panic!("visible event omitted its exact publication identity"),
+                Ok(GenerationEvent::ImageDone { image_id, .. }) => signature.push(('I', image_id)),
                 Ok(GenerationEvent::Finished { reason, .. }) => finish_reason = Some(reason),
                 Ok(_) => {}
                 Err(_) => thread::sleep(Duration::from_millis(1)),
@@ -1470,12 +1443,6 @@ fn gen_branch_round_trip_preserves_publication_and_step_invariants() {
         assert_eq!(image_begins, 4);
         assert_eq!(image_steps, 12);
         assert_eq!(image_commits, 4);
-        assert!(publications.windows(2).all(|pair| {
-            pair[0].event_seq < pair[1].event_seq && pair[0].committed_at <= pair[1].committed_at
-        }));
-        assert!(publications.iter().all(|commit| {
-            commit.semantic_root.producer_op_id.0 > 0 && commit.semantic_root.point_index > 0
-        }));
         signatures.push(signature);
     }
 
@@ -1968,13 +1935,13 @@ fn multiworker_executor_drives_scheduler_unchanged() {
     let mk = |rank| {
         let mut sim = SimEngine::new();
         sim.set_pipeline_depth(2);
-        sim.mut_caps_for_test().rank.tp_rank = rank;
-        sim.mut_caps_for_test().rank.tp_size = 2;
+        sim.mut_info_for_test().rank.tp_rank = rank;
+        sim.mut_info_for_test().rank.tp_size = 2;
         Box::new(SimExecutor::new(sim)) as Box<dyn Executor>
     };
     let executor = Box::new(MultiprocExecutor::new(vec![mk(0), mk(1)]).unwrap());
-    // rank-aware caps reflect the topology at the handshake.
-    assert_eq!(executor.caps().rank.tp_size, 2);
+    // rank-aware info reflect the topology at the handshake.
+    assert_eq!(executor.info().rank.tp_size, 2);
     let sched = Scheduler::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
@@ -2352,13 +2319,13 @@ fn kv_resources_return_after_completion() {
 
     // Keep receivers alive — a dropped receiver is treated as a cancellation.
     let mut keep_alive = Vec::new();
-    let specs = [
+    let cases = [
         GenerationConstraint::UndOnly,
         GenerationConstraint::GenOnly,
         GenerationConstraint::Default,
         GenerationConstraint::UndOnly,
     ];
-    for (i, mode) in specs.iter().enumerate() {
+    for (i, mode) in cases.iter().enumerate() {
         let req = generation_request(
             RequestId(i as u64 + 1),
             text_context(vec![1, 2, 3, 4, 5]),

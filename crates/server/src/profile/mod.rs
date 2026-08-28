@@ -333,7 +333,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_descriptions_resolve_their_serving_contracts() {
+    fn configured_descriptions_resolve_their_serving_behavior() {
         for (description, model_type) in [
             (ModelDescription::Qwen3, "qwen3"),
             (ModelDescription::SenseNova, "neo_chat"),

@@ -11,8 +11,8 @@ use crate::profile::omni::sensenova::SenseNovaProfile;
 use base64::Engine as _;
 use uniserve_core::{
     ContextSegment as CoreContextSegment, GenerationBehaviorDescriptor,
-    GenerationCachePolicyDescriptor, GenerationConstraint, GenerationPolicyDescriptor,
-    GenerationRequest, GenerationResourceBounds, GenerationRuntimeCapabilities, ImageIngestRecipe,
+    GenerationCachePolicyDescriptor, GenerationConstraint, GenerationLimits,
+    GenerationPolicyDescriptor, GenerationRequest, GenerationResourceBounds, ImageIngestRecipe,
     ImageParams, ImageSegment as CoreImageSegment, RequestId, SamplingParams, SegmentPlacement,
     UndVisibility,
 };
@@ -74,7 +74,7 @@ mod context_image_defaults {
 pub(super) struct RuntimeBinding<'a> {
     pub(super) tokenizer: DynTokenizer,
     pub(super) renderer: &'a HfChatRenderer,
-    pub(super) capabilities: &'a GenerationRuntimeCapabilities,
+    pub(super) limits: &'a GenerationLimits,
     pub(super) default_max_output_tokens: Option<u32>,
     pub(super) max_model_tokens: u32,
     pub(super) identity: ModelEventIdentity,
@@ -511,7 +511,7 @@ fn finish_tokenized(
             image: &lowered.image,
             max_und_tokens: max_tokens,
             cache: &cache,
-            capabilities: binding.capabilities,
+            limits: binding.limits,
         })
         .map_err(|error| error.to_string())?;
     if resources.max_kv_tokens > binding.max_model_tokens as usize && behavior.und_decode {
@@ -534,7 +534,7 @@ fn finish_tokenized(
             image: &lowered.image,
             max_und_tokens: max_tokens,
             cache: &cache,
-            capabilities: binding.capabilities,
+            limits: binding.limits,
         })
         .map_err(|error| error.to_string())?;
     }

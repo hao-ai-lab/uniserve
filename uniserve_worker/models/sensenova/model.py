@@ -263,7 +263,7 @@ class _VisionModel(nn.Module):
 class _SenseAttention(nn.Module):
     """SenseNova dual-expert QKV projection over one explicit attention plan."""
 
-    def __init__(self, config: NeoLlmConfig, layer: int, *, spec: LayerConfig) -> None:
+    def __init__(self, config: NeoLlmConfig, layer: int, *, layer_config: LayerConfig) -> None:
         super().__init__()
         hidden_size = int(getattr(config, "hidden_size"))
         total_heads = int(getattr(config, "num_attention_heads"))
@@ -279,7 +279,7 @@ class _SenseAttention(nn.Module):
             self.head_dim,
             total_heads,
             total_kv_heads,
-            spec=spec,
+            layer_config=layer_config,
             bias=bias,
         )
         self.qkv_proj_mot_gen = QKVParallelLinear(
@@ -287,7 +287,7 @@ class _SenseAttention(nn.Module):
             self.head_dim,
             total_heads,
             total_kv_heads,
-            spec=spec,
+            layer_config=layer_config,
             bias=bias,
         )
         self.num_heads = int(self.qkv_proj.output_sizes[0]) // self.head_dim
@@ -300,11 +300,11 @@ class _SenseAttention(nn.Module):
             self.head_dim,
             layer_id=layer,
         )
-        self.o_proj = RowParallelLinear(query_width, hidden_size, spec=spec, bias=bias)
+        self.o_proj = RowParallelLinear(query_width, hidden_size, layer_config=layer_config, bias=bias)
         self.o_proj_mot_gen = RowParallelLinear(
             query_width,
             hidden_size,
-            spec=spec,
+            layer_config=layer_config,
             bias=bias,
         )
 
@@ -465,19 +465,19 @@ class _SenseAttention(nn.Module):
 
 
 class _SenseLayer(nn.Module):
-    def __init__(self, config: NeoLlmConfig, layer: int, *, spec: LayerConfig) -> None:
+    def __init__(self, config: NeoLlmConfig, layer: int, *, layer_config: LayerConfig) -> None:
         super().__init__()
         hidden = int(getattr(config, "hidden_size"))
         epsilon = float(getattr(config, "rms_norm_eps"))
-        self.self_attn = _SenseAttention(config, layer, spec=spec)
+        self.self_attn = _SenseAttention(config, layer, layer_config=layer_config)
         self.mlp = Qwen3MLP(
             config,
-            spec=spec,
+            layer_config=layer_config,
             weight_mode=WeightMode.FUSED_GATE_UP_LINEAR,
         )
         self.mlp_mot_gen = Qwen3MLP(
             config,
-            spec=spec,
+            layer_config=layer_config,
             weight_mode=WeightMode.FUSED_GATE_UP_LINEAR,
         )
         self.input_layernorm = RMSNorm(hidden, eps=epsilon)
@@ -536,18 +536,18 @@ class _SenseLayer(nn.Module):
 class _SenseDecoder(nn.Module):
     """One packed text/flow decoder with no serving state."""
 
-    def __init__(self, config: NeoLlmConfig, *, spec: LayerConfig) -> None:
+    def __init__(self, config: NeoLlmConfig, *, layer_config: LayerConfig) -> None:
         super().__init__()
         hidden = int(getattr(config, "hidden_size"))
         self.embed_tokens = VocabParallelEmbedding(
             int(getattr(config, "vocab_size")),
             hidden,
             int(getattr(config, "pad_token_id")),
-            spec=spec,
+            layer_config=layer_config,
             init_weights=False,
         )
         self.layers = nn.ModuleList(
-            _SenseLayer(config, index, spec=spec)
+            _SenseLayer(config, index, layer_config=layer_config)
             for index in range(int(getattr(config, "num_hidden_layers")))
         )
         epsilon = float(getattr(config, "rms_norm_eps"))
@@ -616,13 +616,13 @@ class _SenseDecoder(nn.Module):
 
 
 class _LanguageModel(nn.Module):
-    def __init__(self, config: NeoLlmConfig, *, spec: LayerConfig) -> None:
+    def __init__(self, config: NeoLlmConfig, *, layer_config: LayerConfig) -> None:
         super().__init__()
-        self.model = _SenseDecoder(config, spec=spec)
+        self.model = _SenseDecoder(config, layer_config=layer_config)
         self.lm_head = ParallelLMHead(
             int(getattr(config, "hidden_size")),
             int(getattr(config, "vocab_size")),
-            spec=spec,
+            layer_config=layer_config,
             bias=False,
         )
 
@@ -675,7 +675,7 @@ class NEOChatModel(ExecutionModel):
         hidden = int(config.llm_config.hidden_size)
         self.vision_model = _VisionModel(vision)
         self._parallel = layer_config.parallel
-        self.language_model = _LanguageModel(config.llm_config, spec=layer_config)
+        self.language_model = _LanguageModel(config.llm_config, layer_config=layer_config)
         self.fm_modules = nn.ModuleDict(
             {
                 "vision_model_mot_gen": _VisionModel(vision),
@@ -708,15 +708,15 @@ class NEOChatModel(ExecutionModel):
             return FlowMatchingHead(
                 hidden,
                 output_dim,
-                spec=layer_config,
+                layer_config=layer_config,
                 dim=int(getattr(config, "fm_head_dim")),
                 layers=int(getattr(config, "fm_head_layers")),
                 mlp_ratio=float(getattr(config, "fm_head_mlp_ratio")),
             )
         return nn.Sequential(
-            LinearBase(hidden, 4096, spec=layer_config, bias=True),
+            LinearBase(hidden, 4096, layer_config=layer_config, bias=True),
             nn.GELU(),
-            LinearBase(4096, output_dim, spec=layer_config, bias=True),
+            LinearBase(4096, output_dim, layer_config=layer_config, bias=True),
         )
 
     def _configure_runtime(self, config: NeoChatConfig) -> None:

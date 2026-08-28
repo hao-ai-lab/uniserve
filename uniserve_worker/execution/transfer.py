@@ -24,7 +24,7 @@ from uniserve_worker.execution.batch import (
     TokenSpan,
     TransferMode,
 )
-from uniserve_worker.foundation.errors import capability_mismatch, invalid_descriptor
+from uniserve_worker.foundation.errors import unsupported_setup, invalid_descriptor
 from uniserve_worker.runtime.device_products import ImageRange, device_product_storage
 from uniserve_worker.runtime.latent_pool import LatentPublication
 from uniserve_worker.server.completion import DeferredTransferPayload
@@ -143,7 +143,7 @@ def _transfer(runtime: ExecutionResources, state: OperationState) -> None:
     partition = state.partition
     transport = runtime.transport
     if transport is None:
-        raise capability_mismatch("product transfer requires a configured transport")
+        raise unsupported_setup("product transfer requires a configured transport")
     session_id = operation.request_key.session_id
     mode = operation.work.transfer_mode
     if mode is TransferMode.KV_PUBLISH:
@@ -168,11 +168,11 @@ def _transfer(runtime: ExecutionResources, state: OperationState) -> None:
         )
         partition.cache_publications.append((outputs[0], snapshot))
         for encoded in snapshot.locators:
-            partition.published.append(Locator.from_wire_json(encoded))
+            partition.published.append(Locator.from_json(encoded))
         payload = DeferredTransferPayload(
             "kv",
             {"generation": int(outputs[0].generation), "snapshot": snapshot.to_mapping()},
-            tuple(Locator.from_wire_json(encoded) for encoded in snapshot.locators),
+            tuple(Locator.from_json(encoded) for encoded in snapshot.locators),
             transport,
         )
         state.outcome = encode.non_state_outcome(
@@ -241,7 +241,7 @@ def publish_product(
 ) -> ProductPayload:
     transport = runtime.transport
     if transport is None:
-        raise capability_mismatch("product publication requires a configured transport")
+        raise unsupported_setup("product publication requires a configured transport")
     source_kind = metadata_string(source_metadata, "payload_kind", "")
     if source_kind != product.kind.value and not (
         product.kind is ProductKind.ARTIFACT and source_kind == "image_nchw"

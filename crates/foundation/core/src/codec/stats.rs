@@ -239,10 +239,6 @@ pub struct DomainSchedulerStats {
     #[serde(default)]
     pub completed_partitions: u64,
     #[serde(default)]
-    pub semantic_commits: u64,
-    #[serde(default)]
-    pub public_commits: u64,
-    #[serde(default)]
     pub co_resident_partitions: u64,
     #[serde(default)]
     pub queue_us: u64,
@@ -252,10 +248,6 @@ pub struct DomainSchedulerStats {
     pub device_us: u64,
     #[serde(default)]
     pub completion_us: u64,
-    #[serde(default)]
-    pub semantic_commit_us: u64,
-    #[serde(default)]
-    pub public_commit_us: u64,
     #[serde(default)]
     pub co_resident_us: u64,
 }

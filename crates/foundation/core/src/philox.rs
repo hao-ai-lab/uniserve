@@ -24,7 +24,7 @@ const PHILOX_KEY_BUMP_0: u32 = 0x9E37_79B9;
 const PHILOX_KEY_BUMP_1: u32 = 0xBB67_AE85;
 const SPLITMIX_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
 
-/// Draw layout identifiers. They match the wire `DrawLayout` discriminants and
+/// Draw layout identifiers. They match the IPC `DrawLayout` discriminants and
 /// separate the proposal and target draw spaces so rejected proposals cannot
 /// shift target coordinates.
 pub const DRAW_LAYOUT_TARGET: u64 = 0;

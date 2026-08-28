@@ -1,11 +1,11 @@
-"""Resolve WorkerInfo from one loaded model and worker geometry."""
+"""Build WorkerInfo from a loaded model and worker geometry."""
 
 from __future__ import annotations
 
 from ..execution.batch import ForwardMode, SamplingOwnership
-from ..capabilities import (
+from ..worker_info import (
     KvGroupKind,
-    KvGroupSpec,
+    KvGroup,
     RankInfo,
     RequestKind,
     ResourceClass,
@@ -24,10 +24,10 @@ from .capacity import (
 )
 from .execution_config import graph_memory_budget_bytes, graph_padding_block_count
 
-__all__ = ["resolve_capabilities"]
+__all__ = ["build_worker_info"]
 
 
-def resolve_capabilities(
+def build_worker_info(
     model: ExecutionModel | MiniMaxH3Model,
     deployment: WorkerDeployment,
     *,
@@ -41,7 +41,7 @@ def resolve_capabilities(
     model_name = model.architecture if model_name is None else model_name
 
     if isinstance(model, MiniMaxH3Model):
-        return _h3_capabilities(
+        return _h3_worker_info(
             model,
             deployment,
             model_name=model_name,
@@ -174,7 +174,7 @@ def resolve_capabilities(
         pipeline_depth=int(pipeline_depth),
         groups=(
             (
-                KvGroupSpec(
+                KvGroup(
                     num_blocks=int(capacity.num_blocks),
                     kind=KvGroupKind.FULL,
                     window=0,
@@ -189,7 +189,7 @@ def resolve_capabilities(
     )
 
 
-def _h3_capabilities(
+def _h3_worker_info(
     model: MiniMaxH3Model,
     deployment: WorkerDeployment,
     *,

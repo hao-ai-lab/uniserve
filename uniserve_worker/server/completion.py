@@ -685,7 +685,7 @@ class DeferredTokenSpan:
 
 
 class DeferredToken:
-    """A protocol integer finalized only when the worker serializes its result."""
+    """An integer finalized only when the worker serializes its result."""
 
     __slots__ = ("span", "index")
 
@@ -1578,7 +1578,7 @@ def _completion_payload_ready(payload: object) -> bool:
 
 
 def finalize_completion_report(report: CompletionReport) -> CompletionReport:
-    """Materialize query-ready partitions into host-owned protocol values."""
+    """Materialize query-ready partitions into host-owned values."""
 
     changed = False
     partitions: list[PartitionCompletion] = []

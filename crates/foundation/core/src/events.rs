@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{Digest, OpId, RequestId};
+use crate::RequestId;
 
 /// Terminal cause for one engine generation lineage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,61 +38,6 @@ pub struct PositionLogprobs {
     pub entries: Vec<TokenLogprob>,
 }
 
-/// Visible modality associated with one scheduler publication.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PublicModality {
-    Text,
-    Image,
-}
-
-/// Exact fixed state point that semantically owns a visible publication.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SemanticRoot {
-    pub producer_op_id: OpId,
-    pub point_index: u32,
-}
-
-/// Scheduler publication identity carried through decoding and protocol layers.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PublicCommit {
-    pub event_seq: u64,
-    pub modality: PublicModality,
-    pub committed_at: f64,
-    pub semantic_root: SemanticRoot,
-}
-
-impl PublicCommit {
-    pub fn validate_for(&self, modality: PublicModality) -> Result<(), PublicCommitError> {
-        if self.event_seq == 0 {
-            return Err(PublicCommitError::ZeroSequence);
-        }
-        if self.modality != modality {
-            return Err(PublicCommitError::ModalityMismatch {
-                expected: modality,
-                actual: self.modality,
-            });
-        }
-        if !self.committed_at.is_finite() || self.committed_at < 0.0 {
-            return Err(PublicCommitError::InvalidTimestamp(self.committed_at));
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, thiserror::Error)]
-pub enum PublicCommitError {
-    #[error("public event sequence must be positive")]
-    ZeroSequence,
-    #[error("public event modality mismatch: expected {expected:?}, got {actual:?}")]
-    ModalityMismatch {
-        expected: PublicModality,
-        actual: PublicModality,
-    },
-    #[error("public commit timestamp must be finite and nonnegative, got {0}")]
-    InvalidTimestamp(f64),
-}
-
 /// Typed text and image event stream emitted by an engine.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -104,7 +49,6 @@ pub enum GenerationEvent {
     TextToken {
         id: u32,
         logprob: Option<f32>,
-        public_commit: Option<PublicCommit>,
     },
     TokenLogprobs {
         id: u32,
@@ -131,9 +75,8 @@ pub enum GenerationEvent {
         height: u32,
         width: u32,
         bytes: u64,
-        sha256: Digest,
+        sha256: String,
         pixels_png_b64: String,
-        public_commit: Option<PublicCommit>,
     },
     MediaCompleted {
         bytes: u64,

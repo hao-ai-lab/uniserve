@@ -1,7 +1,7 @@
 """KV-cache quantization helpers.
 
 These helpers intentionally provide a dequantized correctness floor for cache
-reads. Paged attention kernels need a separate scale-aware storage contract
+reads. Paged attention kernels need a separate scale-aware storage layout
 before they can consume quantized pages directly.
 """
 from __future__ import annotations

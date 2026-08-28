@@ -150,7 +150,7 @@ pub(crate) struct SharedRuntimeArgs {
     #[arg(long = "tp-size", default_value_t = 1, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub worker_ranks: usize,
     /// Staged-worker topology, e.g. `encoder:2,prefill:1:tp=4,decode:1:tp=4`.
-    /// Unset = a single Full pool; a multi-stage spec composes local pools
+    /// Unset = a single Full pool; a multi-stage layout composes local pools
     /// behind a StagedExecutor.
     #[arg(long, hide = true)]
     pub workers: Option<WorkerTopology>,
@@ -335,7 +335,7 @@ pub(crate) struct WorkerProcessOptions {
     /// Concurrent checkpoint file readers.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
     pub load_threads: Option<u32>,
-    /// JSON map of checkpoint-relative paths to SHA-256 digests.
+    /// JSON map of checkpoint-relative paths to SHA-256 checksums.
     #[arg(long)]
     pub checksum_manifest: Option<std::path::PathBuf>,
     #[arg(long = "dtype", default_value = "bfloat16")]

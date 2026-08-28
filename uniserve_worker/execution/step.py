@@ -14,7 +14,7 @@ from typing import Any, cast
 
 import torch
 
-from uniserve_worker.capabilities import GraphBucket
+from uniserve_worker.worker_info import GraphBucket
 from uniserve_worker.execution.batch import (
     Batch,
     BatchPartition,
@@ -61,7 +61,7 @@ from uniserve_worker.execution.trace import (
 from uniserve_worker.foundation.errors import (
     WorkerError,
     WorkerErrorCode,
-    capability_mismatch,
+    unsupported_setup,
     classify,
     invalid_descriptor,
     should_capture_trace,
@@ -204,12 +204,12 @@ def create_execution_resources(
     if not allowed_work_variants:
         raise ValueError("execution step must accept at least one work variant")
     if not model_name:
-        raise capability_mismatch("execution model name is empty")
+        raise unsupported_setup("execution model name is empty")
     if weights.version != weight_version:
-        raise capability_mismatch("base-weight version does not match its weight set")
+        raise unsupported_setup("base-weight version does not match its weight set")
     unsupported = allowed_work_variants - model.supported_work
     if unsupported:
-        raise capability_mismatch(
+        raise unsupported_setup(
             "execution work set exceeds the model implementation: "
             f"{sorted(value.value for value in unsupported)!r}"
         )
@@ -217,18 +217,18 @@ def create_execution_resources(
     if any(resource is None for resource in kv_resources) != all(
         resource is None for resource in kv_resources
     ):
-        raise capability_mismatch("packed-forward resources must be allocated as one set")
+        raise unsupported_setup("packed-forward resources must be allocated as one set")
     if model.resource_geometry.kv != (cache_pool is not None):
-        raise capability_mismatch("execution resources disagree with model KV ownership")
+        raise unsupported_setup("execution resources disagree with model KV ownership")
     if cache_pool is not None and attention is None:
-        raise capability_mismatch("packed-forward execution requires attention selection")
+        raise unsupported_setup("packed-forward execution requires attention selection")
     h3_model = isinstance(model, MiniMaxH3Model)
     if h3_model != (media_spool is not None):
-        raise capability_mismatch("H3 execution resources require one configured media spool")
+        raise unsupported_setup("H3 execution resources require one configured media spool")
     if h3_model and mesh.coord("sp") == 0 and (h3_mux is None or h3_output_ring is None):
-        raise capability_mismatch("rank-zero H3 execution requires mux and output-ring resources")
+        raise unsupported_setup("rank-zero H3 execution requires mux and output-ring resources")
     if not h3_model and (h3_mux is not None or h3_output_ring is not None):
-        raise capability_mismatch("packed-forward execution cannot own H3 output resources")
+        raise unsupported_setup("packed-forward execution cannot own H3 output resources")
     device = canonical_device(deployment.device)
     generation_device = (
         device
@@ -306,7 +306,7 @@ def _unique_scopes(scopes: Sequence[PartitionState]) -> tuple[PartitionState, ..
     return tuple(unique)
 
 
-def _protocol_error_code(code: WorkerErrorCode) -> ErrorCode:
+def _completion_error_code(code: WorkerErrorCode) -> ErrorCode:
     if code == WorkerErrorCode.RESOURCE_ERROR:
         return ErrorCode.RESOURCE_EXHAUSTED
     if code == WorkerErrorCode.COMPUTE_ERROR:
@@ -328,7 +328,7 @@ def prepare_batch(runtime, batch: Batch) -> PreparedExecution | None:
     )
     transport = runtime.transport
     if entries and transport is None:
-        raise capability_mismatch("cross-stage input requires a configured transport")
+        raise unsupported_setup("cross-stage input requires a configured transport")
     transfers: list[PreparedTransferInput] = []
     for entry in entries:
         assert transport is not None
@@ -497,7 +497,7 @@ def prepare_batch(runtime, batch: Batch) -> PreparedExecution | None:
                 or generation != int(entry.product.generation)
             ):
                 raise invalid_descriptor("KV transfer entry names a non-KV product")
-            locators = tuple(Locator.from_wire_json(raw) for raw in snapshot.locators)
+            locators = tuple(Locator.from_json(raw) for raw in snapshot.locators)
         else:
             raise invalid_descriptor("cross-stage transfer entry has an unknown kind")
         transfers.append(
@@ -685,14 +685,14 @@ def _execute(
         _validate_batch(runtime, batch)
     except BaseException as error:
         runtime.trace.emit(
-            ExecutionPhase.PROTOCOL_VALIDATION,
+            ExecutionPhase.INPUT_VALIDATION,
             operations,
             duration_us=(time.perf_counter_ns() - validation_started) // 1000,
             error=error,
         )
         raise
     runtime.trace.emit(
-        ExecutionPhase.PROTOCOL_VALIDATION,
+        ExecutionPhase.INPUT_VALIDATION,
         operations,
         duration_us=(time.perf_counter_ns() - validation_started) // 1000,
     )
@@ -1053,7 +1053,7 @@ def _open_partition(
                     or active_partition.new_cache_pages
                     or active_partition.forward_rows
                 ):
-                    raise capability_mismatch(
+                    raise unsupported_setup(
                         "KV-free execution received cache tables or packed forward rows"
                     )
             else:
@@ -1712,7 +1712,7 @@ def _build_error_partition(
     started: int,
     forward_stats: WorkerForwardStats,
 ) -> PartitionCompletion:
-    protocol_code = _protocol_error_code(error.code)
+    completion_code = _completion_error_code(error.code)
     records: list[ModelOutput] = []
     for operation in partition.operations:
         session = runtime.requests.peek(operation.request_key.session_id)
@@ -1741,7 +1741,7 @@ def _build_error_partition(
             committed_tokens=(),
             finish_flags=FinishFlags(),
             product_generations=(),
-            error_code=protocol_code,
+            error_code=completion_code,
             timing_counters=TimingCounters(),
         )
         records.append(placeholder)
@@ -1846,12 +1846,12 @@ def _validate_batch(runtime, batch: Batch) -> None:
             ForwardMode.GEN_FLOW,
         }:
             raise invalid_descriptor(
-                "tensorized mixed submission exceeds worker mixed-execution capabilities"
+                "tensorized mixed submission exceeds the supported mixed buckets"
             )
-        capability = _mixed_capability(runtime, tuple(partitions))
-        if capability not in runtime.mixed_buckets:
+        bucket = _mixed_bucket(runtime, tuple(partitions))
+        if bucket not in runtime.mixed_buckets:
             raise invalid_descriptor(
-                "tensorized mixed submission has no exact qualified capability bucket"
+                "tensorized mixed submission has no exact qualified bucket"
             )
     if isinstance(runtime.model, MiniMaxH3Model):
         from .h3 import validate_batch
@@ -1915,7 +1915,7 @@ def _completion_devices(runtime, operations: tuple[Operation, ...]) -> tuple[str
     return tuple(selected)
 
 
-def _mixed_capability(
+def _mixed_bucket(
     runtime,
     partitions: tuple[BatchPartition, ...],
 ) -> GraphBucket:
@@ -2758,7 +2758,7 @@ def _stage_input_products(
         if product.kind is not ProductKind.ARTIFACT:
             raise invalid_descriptor("host-staging payload has no concrete product owner")
         if product.storage_class is not StorageClass.HOST_STAGING or not entry.payload:
-            raise invalid_descriptor("source image payload has an invalid storage contract")
+            raise invalid_descriptor("source image payload has invalid storage metadata")
         scope.input_images[product] = entry.payload.decode("utf-8")
 
 
@@ -2812,7 +2812,7 @@ def _run_partitioned_wave(
                 runtime,
             ).tensorized_mixed
         ):
-            raise invalid_descriptor("tensorized mixed submission is outside the model capability")
+            raise invalid_descriptor("tensorized mixed submission is outside the model limits")
         indexes = tuple(index for index, _task, _scope in group)
         group_tasks = tuple(task for _index, task, _scope in group)
         group_scopes = tuple(scope for _index, _task, scope in group)
@@ -2870,14 +2870,14 @@ def _run_partitioned_wave(
                         "mixed service exceeds the 5/4 serial homogeneous envelope: "
                         f"mixed_us={mixed_us} homogeneous_us={tuple(homogeneous_us)!r}"
                     )
-                capability = _mixed_capability(
+                bucket = _mixed_bucket(
                     runtime, tuple(scope.partition for scope in _unique_scopes(group_scopes))
                 )
-                runtime._qualified_mixed_buckets.add(capability)
+                runtime._qualified_mixed_buckets.add(bucket)
                 logger.info(
                     "qualified mixed execution bucket=%r mixed_us=%d homogeneous_us=%r "
                     "serial_over_mixed=%.3f",
-                    capability,
+                    bucket,
                     mixed_us,
                     tuple(homogeneous_us),
                     serial_us / mixed_us,
@@ -3140,7 +3140,7 @@ def _generation(runtime) -> GenerationPipeline:
 
 def _latent_pool(runtime) -> LatentPool:
     if runtime.latent_pool is None:
-        raise capability_mismatch("operation requires a physical latent pool")
+        raise unsupported_setup("operation requires a physical latent pool")
     return runtime.latent_pool
 
 

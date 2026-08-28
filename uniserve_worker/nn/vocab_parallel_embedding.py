@@ -67,12 +67,12 @@ class VocabParallelEmbedding(nn.Module):
         embedding_dim: int,
         padding_idx: int | None = None,
         *,
-        spec: LayerConfig,
+        layer_config: LayerConfig,
         pad_vocab_size_to: int = _VOCAB_PAD_MULTIPLE,
         init_weights: bool = True,
     ) -> None:
         super().__init__()
-        parallel = spec.parallel
+        parallel = layer_config.parallel
         self.num_embeddings = int(num_embeddings)
         self.embedding_dim = int(embedding_dim)
         self.padding_idx = None if padding_idx is None else int(padding_idx)
@@ -136,13 +136,13 @@ class ParallelLMHead(ColumnParallelLinear):
         input_size: int,
         vocab_size: int,
         *,
-        spec: LayerConfig,
+        layer_config: LayerConfig,
         bias: bool = False,
         gather_output: bool = True,
         pad_vocab_size_to: int = _VOCAB_PAD_MULTIPLE,
         prefix: str = "",
     ) -> None:
-        parallel = spec.parallel
+        parallel = layer_config.parallel
         self.vocab_size = int(vocab_size)
         self.padded_vocab_size = pad_vocab_size(
             self.vocab_size,
@@ -153,7 +153,7 @@ class ParallelLMHead(ColumnParallelLinear):
         super().__init__(
             input_size,
             self.padded_vocab_size,
-            spec=spec,
+            layer_config=layer_config,
             bias=bias,
             prefix=prefix,
         )

@@ -185,9 +185,6 @@ pub async fn tool_event_stream(
                 })
                 .await;
             }
-            ReasoningEvent::PublicCommit(commit) => {
-                y.yield_ok(AssistantEvent::PublicCommit(commit)).await;
-            }
             ReasoningEvent::Done {
                 prompt_token_count,
                 output_token_count,

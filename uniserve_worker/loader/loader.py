@@ -18,7 +18,7 @@ from urllib.request import urlopen
 import torch
 from torch import nn
 
-from ..foundation.errors import capability_mismatch
+from ..foundation.errors import unsupported_setup
 from ..nn.layer import LayerConfig
 from ..nn.quant import QuantizationConfig
 from ..nn.quant.base import process_quantized_modules
@@ -285,18 +285,18 @@ def _construct_model(
     dtype = _serving_dtype(request.execution.model_dtype)
     quantization = QuantizationConfig.from_model_config(config)
     _validate_quantization(quantization, request.device, dtype)
-    spec = LayerConfig(parallel=request.parallel, quantization=quantization)
+    layer_config = LayerConfig(parallel=request.parallel, quantization=quantization)
     use_meta = request.load.load_format is LoadFormat.LAYERED or (
         entry.architecture == "NEOChatModel" and request.scope.value != "whole"
     )
     construction_device = torch.device("meta" if use_meta else request.device)
     with _default_dtype(dtype), torch.device(construction_device):
         if entry.architecture == "NEOChatModel":
-            model = entry.model_class(config, layer_config=spec, scope=request.scope.value)
+            model = entry.model_class(config, layer_config=layer_config, scope=request.scope.value)
         else:
-            model = entry.model_class(config, layer_config=spec)
+            model = entry.model_class(config, layer_config=layer_config)
     if not isinstance(model, nn.Module):
-        raise capability_mismatch("catalog model constructor did not return torch.nn.Module")
+        raise unsupported_setup("catalog model constructor did not return torch.nn.Module")
     attach_parameter_loaders(model, device=request.device, dtype=dtype)
     tokenizer = None
     if entry.architecture == "NEOChatModel":
@@ -343,15 +343,15 @@ def _prepare_architecture_config(
             continue
         path = root / filename
         if not path.is_file():
-            raise capability_mismatch(f"BAGEL checkpoint is missing {filename!r} for {field!r}")
+            raise unsupported_setup(f"BAGEL checkpoint is missing {filename!r} for {field!r}")
         value = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(value, dict):
-            raise capability_mismatch(f"BAGEL checkpoint file {filename!r} must contain an object")
+            raise unsupported_setup(f"BAGEL checkpoint file {filename!r} must contain an object")
         raw[field] = value
     positions = sources[0].preview_shape("latent_pos_embed.pos_embed")[0]
     max_latent_size = math.isqrt(positions)
     if max_latent_size * max_latent_size != positions:
-        raise capability_mismatch(f"BAGEL latent position count {positions} is not square")
+        raise unsupported_setup(f"BAGEL latent position count {positions} is not square")
     raw["max_latent_size"] = max_latent_size
     return BagelConfig.from_mapping(raw)
 
@@ -364,10 +364,10 @@ def _load_primary(
 ) -> LoadReport:
     load_weights = getattr(model, "load_weights", None)
     if not callable(load_weights):
-        raise capability_mismatch(f"{architecture} must implement load_weights")
+        raise unsupported_setup(f"{architecture} must implement load_weights")
     report = load_weights(iter_weight_handles(source, request.load))
     if not isinstance(report, LoadReport):
-        raise capability_mismatch(f"{architecture}.load_weights must return LoadReport")
+        raise unsupported_setup(f"{architecture}.load_weights must return LoadReport")
     return report
 
 
@@ -391,11 +391,11 @@ def _load_layered_weights(
 ) -> LoadReport:
     load_weights = getattr(model, "load_weights", None)
     if not callable(load_weights):
-        raise capability_mismatch(f"{architecture} must implement load_weights")
+        raise unsupported_setup(f"{architecture} must implement load_weights")
     with defer_parameter_weights() as placements:
         report = load_weights(handles)
     if not isinstance(report, LoadReport):
-        raise capability_mismatch(f"{architecture}.load_weights must return LoadReport")
+        raise unsupported_setup(f"{architecture}.load_weights must return LoadReport")
     _materialize_layered_placements(model, placements)
     return report
 
@@ -446,10 +446,10 @@ def _load_secondary(
     request: LoadRequest,
 ) -> None:
     if architecture != "BagelForConditionalGeneration" or len(sources) != 1:
-        raise capability_mismatch(f"{architecture} does not declare these secondary sources")
+        raise unsupported_setup(f"{architecture} does not declare these secondary sources")
     load_autoencoder = getattr(model, "load_autoencoder_weights", None)
     if not callable(load_autoencoder):
-        raise capability_mismatch("BAGEL must implement load_autoencoder_weights")
+        raise unsupported_setup("BAGEL must implement load_autoencoder_weights")
     report = load_autoencoder(iter_weight_handles(sources[0], request.load))
     target = getattr(getattr(model, "model"), "vae")
     optional = _bagel_vae_optional(target)
@@ -469,15 +469,15 @@ def _load_layered_secondary(
     request: LoadRequest,
 ) -> None:
     if architecture != "BagelForConditionalGeneration" or len(sources) != 1:
-        raise capability_mismatch(f"{architecture} does not declare these secondary sources")
+        raise unsupported_setup(f"{architecture} does not declare these secondary sources")
     load_autoencoder = getattr(model, "load_autoencoder_weights", None)
     if not callable(load_autoencoder):
-        raise capability_mismatch("BAGEL must implement load_autoencoder_weights")
+        raise unsupported_setup("BAGEL must implement load_autoencoder_weights")
     target = getattr(getattr(model, "model"), "vae")
     with defer_parameter_weights() as placements:
         report = load_autoencoder(iter_weight_handles(sources[0], request.load))
     if not isinstance(report, LoadReport):
-        raise capability_mismatch("BAGEL autoencoder loader must return LoadReport")
+        raise unsupported_setup("BAGEL autoencoder loader must return LoadReport")
     _materialize_layered_placements(target, placements)
     optional = _bagel_vae_optional(target)
     audit_load_report(
@@ -515,24 +515,24 @@ def _verify_checksums(
         for relative, path in zip(source.relative_paths, source.weight_files):
             expected = value.get(relative)
             if not isinstance(expected, str):
-                raise ValueError(f"checksum manifest has no digest for {relative!r}")
+                raise ValueError(f"checksum manifest has no entry for {relative!r}")
             actual = _file_sha256(path)
             if actual.lower() != expected.lower().removeprefix("sha256:"):
                 raise ValueError(f"checksum mismatch for checkpoint file {relative!r}")
 
 
 def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
+    hasher = hashlib.sha256()
     with path.open("rb") as handle:
         while chunk := handle.read(8 * 1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
+            hasher.update(chunk)
+    return hasher.hexdigest()
 
 
 def _warn_skips(architecture: str, report: LoadReport) -> None:
     if report.skipped:
         logger.warning(
-            "%s declared %d checkpoint tensors outside its load contract",
+            "%s declared %d checkpoint tensors outside its load set",
             architecture,
             len(report.skipped),
         )
@@ -626,10 +626,10 @@ def _validate_quantization(
     if config is None or config.method == "unquantized":
         return
     if dtype not in {torch.float16, torch.bfloat16}:
-        raise capability_mismatch("W8A8 FP8 requires float16 or bfloat16 activations")
+        raise unsupported_setup("W8A8 FP8 requires float16 or bfloat16 activations")
     target = torch.device(device)
     if target.type == "cuda" and torch.cuda.get_device_capability(target) < (8, 9):
-        raise capability_mismatch("W8A8 FP8 requires CUDA compute capability 8.9 or newer")
+        raise unsupported_setup("W8A8 FP8 requires CUDA compute capability 8.9 or newer")
 
 
 @contextmanager

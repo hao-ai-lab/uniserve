@@ -30,24 +30,21 @@ const WORLD_SIZE: usize = 2;
 const PIPELINE_DEPTH: usize = 2;
 
 #[test]
-fn multiprocess_topology_obeys_protocol_failure_and_capacity_contracts() -> anyhow::Result<()> {
-    qualify_rank_protocol()?;
+fn multiprocess_topology_handles_rank_failure_and_capacity_limits() -> anyhow::Result<()> {
+    check_rank_ipc()?;
     qualify_slow_transfer()?;
     qualify_peer_replacement()?;
     Ok(())
 }
 
-fn qualify_rank_protocol() -> anyhow::Result<()> {
+fn check_rank_ipc() -> anyhow::Result<()> {
     let mut executor = spawn_rank_group()?;
-    let capabilities = executor.caps();
-    assert_eq!(capabilities.rank.tp_rank, 0);
-    assert_eq!(capabilities.rank.tp_size, WORLD_SIZE as u32);
-    assert_eq!(
-        capabilities.sampling_ownership,
-        SamplingOwnership::DesignatedRank
-    );
-    assert_eq!(capabilities.max_batch_operations, 256);
-    assert_eq!(capabilities.max_batch_tokens, 256);
+    let info = executor.info();
+    assert_eq!(info.rank.tp_rank, 0);
+    assert_eq!(info.rank.tp_size, WORLD_SIZE as u32);
+    assert_eq!(info.sampling_ownership, SamplingOwnership::DesignatedRank);
+    assert_eq!(info.max_batch_operations, 256);
+    assert_eq!(info.max_batch_tokens, 256);
     assert_eq!(executor.pipeline_depth(), PIPELINE_DEPTH);
 
     let admission = text_admission(11, 1, 1)?;

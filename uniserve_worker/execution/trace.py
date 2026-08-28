@@ -14,7 +14,7 @@ logger = logging.getLogger("uniserve.execution")
 
 
 class ExecutionPhase(StrEnum):
-    PROTOCOL_VALIDATION = "protocol_validation"
+    INPUT_VALIDATION = "input_validation"
     CANDIDATE_STAGE = "candidate_stage"
     ROUTE_EXECUTION = "route_execution"
     FORWARD_COMPLETION = "forward_completion"
@@ -108,8 +108,8 @@ class ExecutionTrace:
         with self._lock:
             self._events.append(event)
         # One record per execution phase runs tens of thousands of times in a
-        # single multi-image request, so emit the wire trace only when DEBUG is
-        # actually enabled. The guard also skips the ``to_wire`` serialization,
+        # single multi-image request, so emit the IPC trace only when DEBUG is
+        # actually enabled. The guard also skips the ``to_mapping`` serialization,
         # keeping this off the hot path at the default INFO level. The in-memory
         # trace above remains the durable record.
         if logger.isEnabledFor(logging.DEBUG):

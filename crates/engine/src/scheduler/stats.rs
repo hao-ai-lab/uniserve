@@ -65,15 +65,11 @@ pub struct DomainStats {
     pub backpressure_events: AtomicU64,
     pub reclaimed_credits: AtomicU64,
     pub completed_partitions: AtomicU64,
-    pub semantic_commits: AtomicU64,
-    pub public_commits: AtomicU64,
     pub co_resident_partitions: AtomicU64,
     pub queue_us: AtomicU64,
     pub launch_us: AtomicU64,
     pub device_us: AtomicU64,
     pub completion_us: AtomicU64,
-    pub semantic_commit_us: AtomicU64,
-    pub public_commit_us: AtomicU64,
     pub co_resident_us: AtomicU64,
 }
 

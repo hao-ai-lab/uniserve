@@ -10,7 +10,7 @@ from typing import Any
 
 import torch
 
-from uniserve_worker.capabilities import GraphBucket
+from uniserve_worker.worker_info import GraphBucket
 from uniserve_worker.execution.batch import (
     DevicePoint,
     FixedPoint,
@@ -29,7 +29,7 @@ from uniserve_worker.execution.rows import (
     PartitionState,
 )
 from uniserve_worker.execution.trace import ExecutionTrace
-from uniserve_worker.foundation.errors import capability_mismatch, invalid_descriptor
+from uniserve_worker.foundation.errors import unsupported_setup, invalid_descriptor
 from uniserve_worker.loader.weight_set import WeightSet
 from uniserve_worker.models.generation import GenerationPipeline
 from uniserve_worker.models.inputs import ImageProcessor
@@ -113,12 +113,12 @@ class ExecutionResources:
 
     def h3_mux(self) -> H3MuxCoordinator:
         if not isinstance(self.model, MiniMaxH3Model) or self._h3_mux is None:
-            raise capability_mismatch("operation requires MiniMax H3 mux resources")
+            raise unsupported_setup("operation requires MiniMax H3 mux resources")
         return self._h3_mux
 
     def h3_output_ring(self) -> H3OutputRing:
         if not isinstance(self.model, MiniMaxH3Model) or self._h3_output_ring is None:
-            raise capability_mismatch("operation requires a rank-zero H3 output ring")
+            raise unsupported_setup("operation requires a rank-zero H3 output ring")
         return self._h3_output_ring
 
     def cache_coordinates(
@@ -139,7 +139,7 @@ class ExecutionResources:
         visible = int(parent.kv_visible_len) if descriptor is None else int(descriptor.seq_len)
         pool = self.req_to_token_pool
         if pool is None:
-            raise capability_mismatch("operation requires request-to-token storage")
+            raise unsupported_setup("operation requires request-to-token storage")
         pool.pages(slot, group_id)
         capacity = pool.allocated_length(slot)
         if visible > capacity:
@@ -154,7 +154,7 @@ class ExecutionResources:
 
     def require_latent_pool(self) -> LatentPool:
         if self.latent_pool is None:
-            raise capability_mismatch("operation requires a physical latent pool")
+            raise unsupported_setup("operation requires a physical latent pool")
         return self.latent_pool
 
     def logical_lengths(

@@ -17,15 +17,15 @@ impl Scheduler {
                 return;
             }
         };
-        if let Some(capability) = self.missing_required_capability(&req) {
+        if let Some(feature) = self.missing_required_feature(&req) {
             let _ = event_tx.send(GenerationEvent::Rejected {
                 message: format!(
-                    "generation request requires worker capability `{capability}`, but the worker does not support it"
+                    "generation request requires worker feature `{feature}`, but the worker does not support it"
                 ),
             });
             return;
         }
-        if let Err(error) = req.validate_resources(&self.caps.generation_runtime_capabilities()) {
+        if let Err(error) = req.validate_resources(&self.info.generation_limits()) {
             let _ = event_tx.send(GenerationEvent::Rejected {
                 message: format!("invalid generation resource declaration: {error}"),
             });
@@ -60,7 +60,7 @@ impl Scheduler {
         let worst = req
             .resources
             .max_kv_tokens
-            .div_ceil(self.caps.block_size as usize);
+            .div_ceil(self.info.block_size as usize);
         // Multimodal requests reserve their configured bounded KV envelope at
         // admission so excess concurrency queues instead of exhausting KV.
         let reserve_worstcase = !context.images.is_empty() || req.behavior.gen_output;
@@ -72,7 +72,7 @@ impl Scheduler {
         let st = ReqState {
             finish_token_ids,
             block_tables: (0..self.kv_budget.cache().block_pool.num_groups())
-                .map(|group| BlockTable::new(group, self.caps.block_size as usize))
+                .map(|group| BlockTable::new(group, self.info.block_size as usize))
                 .collect(),
             flow_prefix: None,
             request_pool_idx: 0,
@@ -115,16 +115,16 @@ impl Scheduler {
         ];
         if required
             .iter()
-            .any(|variant| !self.caps.supported_work.contains(variant))
+            .any(|variant| !self.info.supported_work.contains(variant))
         {
             let _ = submission.event_tx.send(MediaEvent::Rejected {
                 message: "worker does not support the fixed media flow".to_string(),
             });
             return;
         }
-        if self.caps.max_request_pool_size < 2
-            || self.caps.num_latent_pages < 3
-            || self.caps.latent_page_units == 0
+        if self.info.max_request_pool_size < 2
+            || self.info.num_latent_pages < 3
+            || self.info.latent_page_units == 0
         {
             let _ = submission.event_tx.send(MediaEvent::Rejected {
                 message: "worker does not provide two resident media state slots".to_string(),
@@ -157,7 +157,7 @@ impl Scheduler {
             if !self
                 .kv_budget
                 .latent_pages
-                .reserve(id, u64::from(self.caps.latent_page_units))
+                .reserve(id, u64::from(self.info.latent_page_units))
             {
                 let _ = self.kv_budget.request_slots.release(request_pool_idx);
                 self.pending_media.push_front(submission);
@@ -198,19 +198,19 @@ impl Scheduler {
     }
 
     pub(super) fn num_vae(&self, ip: &uniserve_core::ImageParams) -> u64 {
-        let dl = u64::from(self.caps.latent_downsample).max(1);
+        let dl = u64::from(self.info.latent_downsample).max(1);
         (ip.height as u64 / dl) * (ip.width as u64 / dl)
     }
 
     pub(super) fn cap_max_vae_grid_tokens(&self) -> usize {
-        if self.caps.max_vae_grid_tokens > 0 {
-            self.caps.max_vae_grid_tokens as usize
+        if self.info.max_vae_grid_tokens > 0 {
+            self.info.max_vae_grid_tokens as usize
         } else {
-            self.caps.latent_capacity_units().min(usize::MAX as u64) as usize
+            self.info.latent_capacity_units().min(usize::MAX as u64) as usize
         }
     }
 
-    pub(super) fn missing_required_capability(
+    pub(super) fn missing_required_feature(
         &self,
         request: &GenerationRequest,
     ) -> Option<uniserve_core::GenerationFeatures> {
@@ -220,29 +220,26 @@ impl Scheduler {
         });
         let needs = request
             .behavior
-            .capability_needs(&request.policy, context_steps);
-        self.caps
-            .generation_runtime_capabilities()
-            .covers(needs)
-            .err()
+            .required_features(&request.policy, context_steps);
+        self.info.generation_limits().covers(needs).err()
     }
 
     pub(super) fn worker_tracks_image_latent(&self) -> bool {
-        self.caps.latent_page_units > 0
-            && self.caps.num_latent_pages > 1
+        self.info.latent_page_units > 0
+            && self.info.num_latent_pages > 1
             && self
-                .caps
+                .info
                 .resource_classes
                 .contains(&ResourceClass::ImageLatent)
     }
 
     pub(super) fn worker_image_latent_used(&self) -> u64 {
         (self.kv_budget.latent_pages.used_pages() as u64)
-            .saturating_mul(u64::from(self.caps.latent_page_units))
+            .saturating_mul(u64::from(self.info.latent_page_units))
     }
 
     pub(super) fn worker_image_latent_units_for(&self, st: &ReqState) -> u64 {
-        let downsample = (self.caps.latent_downsample as u64).max(1);
+        let downsample = (self.info.latent_downsample as u64).max(1);
         let (height, width) = (st.req.image.height, st.req.image.width);
         ceil_div_u64((height as u64).max(1), downsample)
             * ceil_div_u64((width as u64).max(1), downsample)
@@ -282,7 +279,7 @@ impl Scheduler {
             return false;
         };
         let mut block_tables = (0..self.kv_budget.cache().block_pool.num_groups())
-            .map(|group| BlockTable::new(group, self.caps.block_size as usize))
+            .map(|group| BlockTable::new(group, self.info.block_size as usize))
             .collect::<Vec<_>>();
         let Some(new_pages) = self.kv_budget.cache().coordinator.ensure_capacity(
             &self.kv_budget.cache().block_pool,
@@ -378,7 +375,7 @@ impl Scheduler {
     /// allocate their full worst-case KV here, which is what makes them
     /// resident for its complete lifetime.
     pub(super) fn admit(&mut self) {
-        let bs = self.caps.block_size as usize;
+        let bs = self.info.block_size as usize;
         loop {
             if self.running_request_count() >= self.config.max_num_seqs
                 || self.kv_budget.request_slots.is_empty()

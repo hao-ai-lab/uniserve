@@ -19,7 +19,7 @@ from uniserve_worker.execution.batch import (
     OpStatus,
     TokenSpan,
 )
-from uniserve_worker.foundation.errors import capability_mismatch, invalid_descriptor
+from uniserve_worker.foundation.errors import unsupported_setup, invalid_descriptor
 from uniserve_worker.models.minimax_h3 import MiniMaxH3Model
 from uniserve_worker.models.minimax_h3.execution import (
     DeferredH3Task,
@@ -61,7 +61,7 @@ def decode_placement(partition: BatchPartition, operation: Operation) -> DecodeP
 
 
 def validate_batch(runtime: ExecutionResources, batch: Batch) -> None:
-    """Validate the fixed H3 admission and spool contract before state is staged."""
+    """Validate fixed H3 admission and spool requirements before staging state."""
 
     if not isinstance(runtime.model, MiniMaxH3Model):
         return
@@ -194,7 +194,7 @@ def run_action(runtime: ExecutionResources, state: OperationState) -> bool:
     slot = model.states.get(int(session.request_pool_idx))
     mux = runtime._h3_mux
     if runtime.mesh.coord("sp") == 0 and mux is None:
-        raise capability_mismatch("rank zero has no H3 mux resources")
+        raise unsupported_setup("rank zero has no H3 mux resources")
     identity = runtime.operation_identity(operation)
     if operation.work is ForwardMode.GEN_TRANSITION:
         admission = scope.admissions.get(operation.request_key)

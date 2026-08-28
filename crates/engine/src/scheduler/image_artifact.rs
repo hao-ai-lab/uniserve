@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::io::Cursor;
 
 use base64::Engine as _;
@@ -8,7 +9,7 @@ pub(crate) struct ImageArtifactMetadata {
     pub(crate) height: u32,
     pub(crate) width: u32,
     pub(crate) bytes: u64,
-    pub(crate) sha256: uniserve_core::Digest,
+    pub(crate) sha256: String,
 }
 
 /// Height/width parsed from a base64 PNG's IHDR header, decoding only the
@@ -48,7 +49,10 @@ pub(crate) fn validate_png_artifact(
     if (output.height, output.width) != (height, width) {
         return None;
     }
-    let sha256 = uniserve_core::Digest::from_sha256_bytes(Sha256::digest(&bytes).into());
+    let mut sha256 = String::with_capacity(64);
+    for byte in Sha256::digest(&bytes) {
+        write!(&mut sha256, "{byte:02x}").expect("writing to a String is infallible");
+    }
     Some(ImageArtifactMetadata {
         height,
         width,

@@ -24,7 +24,7 @@ fn enqueue_ready(ready: &mut VecDeque<CompletionReport>, report: CompletionRepor
     ready.push_back(report);
 }
 
-/// Deadline for the initial worker connect / caps handshake, where the worker may still
+/// Deadline for the initial worker connect / info handshake, where the worker may still
 /// be loading a large model and the IPC server may not yet be connected.
 const WORKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(300);
 /// Per-call backpressure deadline for steady-state sends (batch submit / control). The
@@ -251,7 +251,7 @@ impl WorkerProcessArgs {
 /// Single-process worker executor over iceoryx2 IPC.
 pub struct UniprocExecutor {
     client: ClientEndpoint,
-    caps: WorkerInfo,
+    info: WorkerInfo,
     child: Child,
     depth: usize,
     rank: u32,
@@ -288,27 +288,27 @@ enum OutstandingKind {
 }
 
 impl UniprocExecutor {
-    pub fn spawn(spec: WorkerProcessArgs) -> anyhow::Result<Self> {
+    pub fn spawn(args: WorkerProcessArgs) -> anyhow::Result<Self> {
         anyhow::ensure!(
-            spec.world_size == 1,
+            args.world_size == 1,
             "uniproc worker world size must be one"
         );
-        let mut me = Self::spawn_rank_deferred(&spec, &spec.device, 0, 1, None)?;
+        let mut me = Self::spawn_rank_deferred(&args, &args.device, 0, 1, None)?;
         me.finish_startup()?;
         Ok(me)
     }
 
     pub(crate) fn spawn_rank_deferred(
-        spec: &WorkerProcessArgs,
+        args: &WorkerProcessArgs,
         device: &str,
         tp_rank: u32,
         tp_size: u32,
         tp_init_method: Option<&str>,
     ) -> anyhow::Result<Self> {
-        let depth = spec.pipeline_depth.max(1);
-        let max_payload = spec.req_slot_cap.max(spec.resp_slot_cap).max(1);
+        let depth = args.pipeline_depth.max(1);
+        let max_payload = args.req_slot_cap.max(args.resp_slot_cap).max(1);
         let service = service_name(&format!("{}_{}_{}", std::process::id(), tp_rank, nano_id()));
-        let mut cmd = Command::new(&spec.python);
+        let mut cmd = Command::new(&args.python);
         cmd.arg("-m")
             .arg("uniserve_worker.main")
             .arg("--service-name")
@@ -320,17 +320,17 @@ impl UniprocExecutor {
             .arg("--ipc-max-inflight")
             .arg(depth.to_string())
             .arg("--model")
-            .arg(&spec.model)
+            .arg(&args.model)
             .arg("--device")
             .arg(device)
             .arg("--attention-backend")
-            .arg(spec.attention_backend.as_wire_name())
+            .arg(args.attention_backend.as_name())
             .arg("--block-size")
-            .arg(spec.block_size.to_string())
+            .arg(args.block_size.to_string())
             .arg("--max-batch-operations")
-            .arg(spec.max_batch_operations.to_string())
+            .arg(args.max_batch_operations.to_string())
             .arg("--max-batch-tokens")
-            .arg(spec.max_batch_tokens.to_string())
+            .arg(args.max_batch_tokens.to_string())
             .arg("--tp-rank")
             .arg(tp_rank.to_string())
             .arg("--tp-size")
@@ -338,15 +338,15 @@ impl UniprocExecutor {
         // Staged topology: tell the worker which pipeline stage it serves.
         // Omitted for the default `full` worker so the command line stays
         // identical to the direct full-pool command shape.
-        if let Some(kind) = spec.worker_kind {
+        if let Some(kind) = args.worker_kind {
             cmd.arg("--worker-kind").arg(kind.as_str());
         }
         // Data-plane Tier-2 backend for this stage's tensor handoffs. The
         // default (in-process) is omitted so the full-pool worker command
         // line stays byte-identical.
-        if spec.transfer_backend != crate::executor::TransferBackend::Inproc {
+        if args.transfer_backend != crate::executor::TransferBackend::Inproc {
             cmd.arg("--transfer-backend")
-                .arg(spec.transfer_backend.as_str());
+                .arg(args.transfer_backend.as_str());
         }
         cmd.env("RANK", tp_rank.to_string())
             .env("WORLD_SIZE", tp_size.to_string())
@@ -365,10 +365,10 @@ impl UniprocExecutor {
         {
             cmd.arg("--tp-init-method").arg(init_method);
         }
-        if let Some(c) = spec.kv_token_capacity {
+        if let Some(c) = args.kv_token_capacity {
             cmd.arg("--kv-token-capacity").arg(c.to_string());
         }
-        spec.append_worker_args(&mut cmd);
+        args.append_worker_args(&mut cmd);
         if let Ok(cwd) = std::env::current_dir() {
             let pp = std::env::var("PYTHONPATH").unwrap_or_default();
             cmd.env("PYTHONPATH", format!("{}:{}", cwd.display(), pp));
@@ -380,7 +380,7 @@ impl UniprocExecutor {
         let death_watcher = DeathWatcher::spawn(child.id(), client.death_wake());
         Ok(Self {
             client,
-            caps: WorkerInfo::default(),
+            info: WorkerInfo::default(),
             child,
             depth,
             rank: tp_rank,
@@ -399,41 +399,41 @@ impl UniprocExecutor {
         tracing::info!(
             tp_rank = self.rank,
             tp_size = self.tp_size,
-            "waiting for worker to load model + report caps..."
+            "waiting for worker to load model + report info..."
         );
         let call_id = self.alloc_call_id();
-        let mut req = WorkerRequest::get_capabilities();
+        let mut req = WorkerRequest::get_info();
         req.set_call_id(Some(call_id));
         let pending =
-            self.send_request_with_timeout(&req, "caps handshake", WORKER_CONNECT_TIMEOUT)?;
-        let resp = self.wait_pending_response(&pending, "caps handshake")?;
+            self.send_request_with_timeout(&req, "info handshake", WORKER_CONNECT_TIMEOUT)?;
+        let resp = self.wait_pending_response(&pending, "info handshake")?;
         let wr = resp.decode_response()?;
-        let caps = match wr {
-            WorkerResponse::Capabilities { capabilities, .. } => capabilities,
+        let info = match wr {
+            WorkerResponse::Info { info, .. } => info,
             WorkerResponse::Error { error, .. } => {
-                bail!("worker error during caps: {}", error.message)
+                bail!("worker error during info: {}", error.message)
             }
-            other => bail!("unexpected capabilities response kind: {:?}", other.kind()),
+            other => bail!("unexpected worker info response kind: {:?}", other.kind()),
         };
-        caps.validate()
-            .context("worker reported invalid capabilities during startup")?;
+        info.validate()
+            .context("worker reported invalid worker info during startup")?;
         let host_depth = self.depth as u32;
         anyhow::ensure!(
-            caps.pipeline_depth == host_depth,
+            info.pipeline_depth == host_depth,
             "worker pipeline_depth {} does not match launched depth {}",
-            caps.pipeline_depth,
+            info.pipeline_depth,
             host_depth
         );
         anyhow::ensure!(
-            caps.rank.tp_rank == self.rank && caps.rank.tp_size == self.tp_size,
+            info.rank.tp_rank == self.rank && info.rank.tp_size == self.tp_size,
             "worker TP rank/size ({}/{}) does not match launched topology ({}/{})",
-            caps.rank.tp_rank,
-            caps.rank.tp_size,
+            info.rank.tp_rank,
+            info.rank.tp_size,
             self.rank,
             self.tp_size
         );
-        self.caps = caps;
-        tracing::info!(?self.caps, "worker ready");
+        self.info = info;
+        tracing::info!(?self.info, "worker ready");
         Ok(())
     }
 
@@ -696,8 +696,8 @@ impl UniprocExecutor {
 }
 
 impl Executor for UniprocExecutor {
-    fn caps(&self) -> &WorkerInfo {
-        &self.caps
+    fn info(&self) -> &WorkerInfo {
+        &self.info
     }
 
     fn pipeline_depth(&self) -> usize {
@@ -808,7 +808,7 @@ impl Executor for UniprocExecutor {
 
     /// Fire-and-forget control op. The returned `u64` MUST be treated as opaque: callers
     /// should discard it and use [`Executor::control_wait`] when they need to correlate an
-    /// ack. In this single-worker transport the value happens to be the genuine wire
+    /// ack. In this single-worker transport the value happens to be the genuine IPC
     /// call_id the worker echoes, but the multiproc transport returns a private
     /// counter that matches no worker request, so no caller may assume these semantics.
     /// `0` is returned for empty copy or product-release controls that are never sent.

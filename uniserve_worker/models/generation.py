@@ -9,7 +9,7 @@ from typing import Any
 import torch
 
 from ..execution.forward_batch import FlowPatches
-from ..foundation.errors import capability_mismatch, invalid_descriptor
+from ..foundation.errors import unsupported_setup, invalid_descriptor
 from ..nn.diffusion.cfg import Branch, CfgRecipe
 from ..nn.diffusion.schedule import (
     ScheduleDirection,
@@ -71,7 +71,7 @@ class FlowPrompt:
 
     def encode(self, tokenizer: Any, *, text: str, conditioned: bool) -> tuple[int, ...]:
         if tokenizer is None:
-            raise capability_mismatch("the configured generation prompt requires a tokenizer")
+            raise unsupported_setup("the configured generation prompt requires a tokenizer")
         append = self.conditioned_append if conditioned else self.unconditional_append
         framed = (
             self.system_prefix

@@ -1,4 +1,4 @@
-//! Versioned scheduler-to-worker protocol and FlatBuffers transport types.
+//! Versioned scheduler-to-worker IPC and FlatBuffers transport types.
 //!
 //! A [`NewRequest`] carries static request state once, [`Batch`] carries planned
 //! operations, and [`CompletionReport`] returns resolved outputs. [`WorkerInfo`]
@@ -11,51 +11,51 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use uniserve_core::{
-    BlockId, GenerationRuntimeCapabilities, ImageParams, KvCacheDtype, KvCacheGroup, ModelDtype,
-    RankInfo, RequestId, SamplingParams,
+    BlockId, GenerationLimits, ImageParams, KvCacheDtype, KvCacheGroup, ModelDtype, RankInfo,
+    RequestId, SamplingParams,
 };
 pub use uniserve_core::{OpId, WorkerForwardStats};
 
-pub type ProtocolResult<T> = std::result::Result<T, WireError>;
+pub type ValidationResult<T> = std::result::Result<T, ValidationError>;
 
 #[derive(Debug, thiserror::Error)]
-#[error("worker protocol violation: {0}")]
-pub struct WireError(String);
+#[error("invalid worker message: {0}")]
+pub struct ValidationError(String);
 
-impl WireError {
+impl ValidationError {
     pub(crate) fn message(message: impl Into<String>) -> Self {
         Self(message.into())
     }
 }
 
-impl From<uniserve_core::SamplingParamsError> for WireError {
+impl From<uniserve_core::SamplingParamsError> for ValidationError {
     fn from(error: uniserve_core::SamplingParamsError) -> Self {
         Self::message(error.to_string())
     }
 }
 
-impl From<uniserve_core::ImageParamsError> for WireError {
+impl From<uniserve_core::ImageParamsError> for ValidationError {
     fn from(error: uniserve_core::ImageParamsError) -> Self {
         Self::message(error.to_string())
     }
 }
 
-macro_rules! wire_error {
+macro_rules! invalid_message {
     ($($arg:tt)*) => {
-        WireError::message(format!($($arg)*))
+        ValidationError::message(format!($($arg)*))
     };
 }
 
-macro_rules! wire_bail {
+macro_rules! bail_invalid {
     ($($arg:tt)*) => {
-        return Err(wire_error!($($arg)*))
+        return Err(invalid_message!($($arg)*))
     };
 }
 
-macro_rules! wire_ensure {
+macro_rules! ensure_valid {
     ($condition:expr, $($arg:tt)*) => {
         if !$condition {
-            wire_bail!($($arg)*);
+            bail_invalid!($($arg)*);
         }
     };
 }
@@ -70,18 +70,18 @@ pub mod schema {
 
 pub use iceoryx::{
     ClientEndpoint, DEFAULT_SERVICE_PREFIX, EVT_COMMAND, EVT_COMPLETION, EVT_DEATH, EVT_REQUEST,
-    EVT_RESULT, Frame, Header, IpcError, IpcResult, Pending, ServerEndpoint, WIRE_VERSION,
-    WakeEvents, WakeSender, header_for_request, header_for_response, is_supported_wire_version,
+    EVT_RESULT, Frame, Header, IPC_VERSION, IpcError, IpcResult, Pending, ServerEndpoint,
+    WakeEvents, WakeSender, header_for_request, header_for_response, is_supported_ipc_version,
     service_name,
 };
 pub use resources::{ResourceClass, ResourcePressure};
 
-mod capabilities;
+mod info;
 mod operation;
 mod product;
 mod request;
 
-pub use capabilities::*;
+pub use info::*;
 pub use operation::*;
 pub use product::*;
 pub use request::*;

@@ -1,4 +1,4 @@
-//! Two-process IPC smoke test: spawn the (stub) Python worker, handshake caps,
+//! Two-process IPC smoke test: spawn the (stub) Python worker, handshake info,
 //! and drive a few requests through the scheduler over the shared-memory ring.
 use std::collections::HashMap;
 
@@ -39,7 +39,7 @@ fn main() -> anyhow::Result<()> {
         transfer_backend: TransferBackend::Inproc,
         ..worker_config
     })?;
-    println!("caps from worker: {:?}", engine.caps());
+    println!("info from worker: {:?}", engine.info());
 
     let ctrl = ControlTokens {
         ..ControlTokens::default()

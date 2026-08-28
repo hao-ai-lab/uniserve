@@ -135,14 +135,14 @@ def _parallel_call(
 class MoTDecoderLayer(nn.Module):
     """One decoder layer with text and flow experts over shared attention."""
 
-    def __init__(self, config: MoTConfig, *, spec: LayerConfig) -> None:
+    def __init__(self, config: MoTConfig, *, layer_config: LayerConfig) -> None:
         super().__init__()
         hidden = int(config.hidden_size)
         head_dim = int(config.head_dim)
         total_heads = int(config.num_attention_heads)
         total_kv_heads = int(config.num_key_value_heads)
-        self.num_heads = local_attention_head_count(total_heads, parallel=spec.parallel)
-        self.num_kv_heads = local_kv_head_count(total_kv_heads, parallel=spec.parallel)
+        self.num_heads = local_attention_head_count(total_heads, parallel=layer_config.parallel)
+        self.num_kv_heads = local_kv_head_count(total_kv_heads, parallel=layer_config.parallel)
         self.head_dim = head_dim
         self.query_size = self.num_heads * head_dim
         self.total_query_size = total_heads * head_dim
@@ -154,13 +154,13 @@ class MoTDecoderLayer(nn.Module):
             head_dim,
             total_heads,
             total_kv_heads,
-            spec=spec,
+            layer_config=layer_config,
             bias=True,
         )
         self.o_proj = RowParallelLinear(
             self.total_query_size,
             hidden,
-            spec=spec,
+            layer_config=layer_config,
             bias=False,
         )
         self.q_norm = RMSNorm(head_dim, config.rms_norm_eps)
@@ -171,7 +171,7 @@ class MoTDecoderLayer(nn.Module):
                 hidden_size=hidden,
                 intermediate_size=int(config.intermediate_size),
             ),
-            spec=spec,
+            layer_config=layer_config,
         )
 
         self.input_layernorm_moe_gen = RMSNorm(hidden, config.rms_norm_eps)
@@ -180,13 +180,13 @@ class MoTDecoderLayer(nn.Module):
             head_dim,
             total_heads,
             total_kv_heads,
-            spec=spec,
+            layer_config=layer_config,
             bias=True,
         )
         self.o_proj_moe_gen = RowParallelLinear(
             self.total_query_size,
             hidden,
-            spec=spec,
+            layer_config=layer_config,
             bias=False,
         )
         self.q_norm_moe_gen = RMSNorm(head_dim, config.rms_norm_eps)
@@ -197,7 +197,7 @@ class MoTDecoderLayer(nn.Module):
                 hidden_size=hidden,
                 intermediate_size=int(config.intermediate_size),
             ),
-            spec=spec,
+            layer_config=layer_config,
         )
         self.attention = RadixAttention(self.num_heads, self.num_kv_heads, head_dim)
 
@@ -349,15 +349,15 @@ class MoTDecoderLayer(nn.Module):
 class MoTModel(nn.Module):
     """Packed text/flow decoder with no request or runtime state."""
 
-    def __init__(self, config: MoTConfig, *, spec: LayerConfig) -> None:
+    def __init__(self, config: MoTConfig, *, layer_config: LayerConfig) -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            spec=spec,
+            layer_config=layer_config,
         )
         self.layers = nn.ModuleList(
-            MoTDecoderLayer(config, spec=spec) for _ in range(config.num_hidden_layers)
+            MoTDecoderLayer(config, layer_config=layer_config) for _ in range(config.num_hidden_layers)
         )
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.norm_moe_gen = RMSNorm(config.hidden_size, config.rms_norm_eps)

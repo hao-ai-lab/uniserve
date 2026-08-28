@@ -33,24 +33,6 @@ MODEL_ENV = "UNISERVE_SENSENOVA_MODEL"
 QWEN_MODEL_ENV = "UNISERVE_QWEN3_MODEL"
 BAGEL_MODEL_ENV = "UNISERVE_BAGEL_MODEL"
 CONTROL_TOKENS = ("<img>", "</img>")
-SAMPLING_CONTROLS = [
-    "greedy",
-    "temperature",
-    "top_k",
-    "top_p",
-    "min_p",
-    "repetition_penalty",
-    "frequency_penalty",
-    "presence_penalty",
-    "logit_bias",
-    "allowed_token_ids",
-    "bad_words",
-    "min_tokens",
-    "logprobs",
-    "stop_token_ids",
-    "eos",
-    "stop_strings",
-]
 
 
 def active_model(environment_variable: str) -> Path:
@@ -71,11 +53,6 @@ def assert_model_discovery(
     base_url: str,
     *,
     model_id: str,
-    description_id: str,
-    endpoints: list[str],
-    input_modalities: list[str],
-    output_modalities: list[str],
-    features: list[str],
 ) -> None:
     response = httpx.get(f"{base_url}/v1/models", timeout=30)
     response.raise_for_status()
@@ -87,15 +64,6 @@ def assert_model_discovery(
     assert model["object"] == "model"
     assert model["created"] > 0
     assert model["owned_by"] == "uniserve"
-    identity = model["identity"]
-    assert identity == {"served_name": model_id, "description": description_id}
-    assert model["capabilities"] == {
-        "endpoints": endpoints,
-        "input_modalities": input_modalities,
-        "output_modalities": output_modalities,
-        "features": features,
-        "sampling_controls": SAMPLING_CONTROLS,
-    }
 
 
 def serving_lifecycle_metrics(text: str) -> dict[str, float]:
@@ -144,9 +112,9 @@ def _control_ids_from_tokenizer_config(model: Path) -> dict[str, int]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     decoder = payload.get("added_tokens_decoder", {})
     control_ids = {
-        str(spec["content"]): int(token_id)
-        for token_id, spec in decoder.items()
-        if isinstance(spec, dict) and spec.get("content") in CONTROL_TOKENS
+        str(entry["content"]): int(token_id)
+        for token_id, entry in decoder.items()
+        if isinstance(entry, dict) and entry.get("content") in CONTROL_TOKENS
     }
     assert set(control_ids) == set(CONTROL_TOKENS), (
         f"worker tokenizer_config.json must define both SenseNova image controls; got {control_ids}"
@@ -293,11 +261,6 @@ def test_qwen3_public_chat_funnel(tmp_path: Path):
         assert_model_discovery(
             base_url,
             model_id="Qwen3-32B",
-            description_id="qwen3",
-            endpoints=["chat_completions"],
-            input_modalities=["text"],
-            output_modalities=["text"],
-            features=["streaming", "usage", "logprobs", "reasoning", "tool_calling"],
         )
         response = httpx.post(
             f"{base_url}/v1/chat/completions",
@@ -368,11 +331,6 @@ def test_bagel_public_funnels(tmp_path: Path):
         assert_model_discovery(
             base_url,
             model_id="BAGEL",
-            description_id="bagel",
-            endpoints=["chat_completions", "image_generations"],
-            input_modalities=["text", "image"],
-            output_modalities=["text", "image"],
-            features=["streaming", "usage", "logprobs"],
         )
         unsupported_tools = httpx.post(
             f"{base_url}/v1/chat/completions",
@@ -455,9 +413,9 @@ def test_bagel_public_funnels(tmp_path: Path):
             assert len(image["sha256"]) == 64
 
 
-def test_sim_http_configured_routes_and_evaluator_contract(tmp_path: Path):
+def test_sim_http_configured_routes_and_evaluator(tmp_path: Path):
     # CPU simulation emits deterministic text and image fixtures through the
-    # configured HTTP, scheduler, generation-event, and geometry contracts.
+    # configured HTTP, scheduler, generation-event, and geometry behavior.
     image_start_id = active_sensenova_control_ids(active_sensenova_model())["<img>"]
     with sim_server(tmp_path) as base_url:
         health_response = httpx.get(f"{base_url}/health", timeout=30)
@@ -474,17 +432,6 @@ def test_sim_http_configured_routes_and_evaluator_contract(tmp_path: Path):
         assert_model_discovery(
             base_url,
             model_id="SenseNova-U1",
-            description_id="sensenova",
-            endpoints=["chat_completions", "image_generations"],
-            input_modalities=["text", "image"],
-            output_modalities=["text", "image"],
-            features=[
-                "streaming",
-                "usage",
-                "logprobs",
-                "reasoning",
-                "repeated_interleave",
-            ],
         )
 
         unknown_chat_control = httpx.post(
@@ -508,7 +455,7 @@ def test_sim_http_configured_routes_and_evaluator_contract(tmp_path: Path):
         assert unknown_image_control.json()["error"]["type"] == "invalid_request_error"
 
         # The deterministic model emits EOS after eight tokens; this request
-        # exercises the runtime's EOS completion contract.
+        # exercises EOS completion through the runtime.
         text_events = post_sse(
             base_url,
             "/v1/chat/completions",
@@ -649,7 +596,7 @@ def test_sim_http_configured_routes_and_evaluator_contract(tmp_path: Path):
         trace_path.write_text(
             json.dumps(
                 {
-                    "id": "sensenova-interleave-contract",
+                    "id": "sensenova-interleave",
                     "task": "interleave",
                     "prompt": "Generate a travel guide covering Sonoma, Sequoia, Tahoe, and the Golden Gate.",
                 }
@@ -658,7 +605,7 @@ def test_sim_http_configured_routes_and_evaluator_contract(tmp_path: Path):
             encoding="utf-8",
         )
         point = BenchmarkPoint(
-            name="sensenova_interleave_contract",
+            name="sensenova_interleave",
             server="test",
             task=TaskName.INTERLEAVE,
             model="SenseNova-U1",

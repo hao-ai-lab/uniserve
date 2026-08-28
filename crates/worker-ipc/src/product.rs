@@ -71,17 +71,17 @@ pub struct ShapeBound {
 }
 
 impl ShapeBound {
-    pub fn validate(&self) -> ProtocolResult<()> {
+    pub fn validate(&self) -> ValidationResult<()> {
         let device_dims = self
             .dims
             .iter()
             .filter(|dim| matches!(dim, DimBound::Device { .. }))
             .count();
-        wire_ensure!(
+        ensure_valid!(
             device_dims <= 1,
             "a shape bound carries more than one device-actual dimension"
         );
-        wire_ensure!(
+        ensure_valid!(
             self.dims.iter().all(|dim| match dim {
                 DimBound::Static(value) => *value > 0,
                 DimBound::Device { max } => *max > 0,
@@ -124,8 +124,8 @@ pub struct ProductRef {
 }
 
 impl ProductRef {
-    pub fn validate(&self) -> ProtocolResult<()> {
-        wire_ensure!(
+    pub fn validate(&self) -> ValidationResult<()> {
+        ensure_valid!(
             self.generation > 0,
             "product reference has no logical generation"
         );
@@ -156,11 +156,9 @@ pub struct RegistrationAck {
 /// value the worker consumes (prompt, forced, or draft token ids; encode image
 /// bytes) referenced through `Operation::inputs`, or a worker-produced output
 /// value the host consumes (requested logprob blobs, materialized image bytes).
-/// The `product` identifies what the value is by `ProductRef` identity; the
-/// bytes are the value. A product payload is never a lineage identity and enters
-/// no digest.
+/// `product` says what the value is; `bytes` carries the value.
 ///
-/// The protocol layer treats other product bytes as opaque. This crate fixes
+/// The IPC decoder treats other product bytes as opaque. This crate fixes
 /// the cross-language layouts for token inputs and branch-local sampling state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProductPayload {
@@ -174,13 +172,13 @@ pub struct ProductPayload {
 }
 
 impl ProductPayload {
-    pub fn validate(&self) -> ProtocolResult<()> {
+    pub fn validate(&self) -> ValidationResult<()> {
         self.product.validate()
     }
 
-    pub(crate) fn validate_input_value(&self) -> ProtocolResult<()> {
+    pub(crate) fn validate_input_value(&self) -> ValidationResult<()> {
         if is_transfer_descriptor(&self.bytes) {
-            wire_ensure!(
+            ensure_valid!(
                 self.product.storage_class != StorageClass::HostStaging
                     && self.bytes.len() <= MAX_TRANSFER_DESCRIPTOR_BYTES,
                 "cross-stage product input has an invalid transfer descriptor frame"
@@ -190,19 +188,19 @@ impl ProductPayload {
         match self.product.kind {
             ProductKind::Token => {
                 let tokens = decode_token_product_bytes(&self.bytes)?;
-                wire_ensure!(
+                ensure_valid!(
                     tokens.len() as u64 <= self.product.shape_bound.max_elements(),
                     "token input product exceeds its registered element bound"
                 );
             }
             ProductKind::SamplingState => {
                 decode_sampling_state_bytes(&self.bytes)?;
-                wire_ensure!(
+                ensure_valid!(
                     self.bytes.len() as u64 <= self.product.max_bytes(),
                     "sampling-state input exceeds its registered byte bound"
                 );
             }
-            _ => wire_ensure!(
+            _ => ensure_valid!(
                 self.bytes.len() as u64 <= self.product.max_bytes(),
                 "input product payload exceeds its registered byte bound"
             ),
@@ -210,10 +208,10 @@ impl ProductPayload {
         Ok(())
     }
 
-    pub(crate) fn validate_output_value(&self) -> ProtocolResult<()> {
+    pub(crate) fn validate_output_value(&self) -> ValidationResult<()> {
         self.validate()?;
         if is_transfer_descriptor(&self.bytes) {
-            wire_ensure!(
+            ensure_valid!(
                 self.product.storage_class != StorageClass::HostStaging
                     && self.product.storage_class != StorageClass::PinnedOutput
                     && self.bytes.len() <= MAX_TRANSFER_DESCRIPTOR_BYTES,
@@ -221,7 +219,7 @@ impl ProductPayload {
             );
             return Ok(());
         }
-        wire_ensure!(
+        ensure_valid!(
             self.bytes.len() as u64 <= self.product.max_bytes(),
             "output product payload exceeds its registered byte bound"
         );
@@ -249,14 +247,14 @@ pub fn encode_token_product_bytes(tokens: &[u32]) -> Vec<u8> {
 
 /// Decode a `ProductKind::Token` product value produced by
 /// [`encode_token_product_bytes`].
-pub fn decode_token_product_bytes(bytes: &[u8]) -> ProtocolResult<Vec<u32>> {
-    wire_ensure!(
+pub fn decode_token_product_bytes(bytes: &[u8]) -> ValidationResult<Vec<u32>> {
+    ensure_valid!(
         bytes.len() >= 4,
         "token product bytes are too short to carry a count"
     );
     let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
     let expected = 4 + count * 4;
-    wire_ensure!(
+    ensure_valid!(
         bytes.len() == expected,
         "token product byte length {} does not match declared count {count}",
         bytes.len()
@@ -345,22 +343,22 @@ pub fn encode_sampling_state_bytes(state: &SamplingState) -> Vec<u8> {
 }
 
 /// Decode and validate canonical branch-local sampling state.
-pub fn decode_sampling_state_bytes(bytes: &[u8]) -> ProtocolResult<SamplingState> {
-    fn take_u32(bytes: &[u8], offset: &mut usize) -> ProtocolResult<u32> {
+pub fn decode_sampling_state_bytes(bytes: &[u8]) -> ValidationResult<SamplingState> {
+    fn take_u32(bytes: &[u8], offset: &mut usize) -> ValidationResult<u32> {
         let end = offset
             .checked_add(4)
-            .ok_or_else(|| wire_error!("sampling-state offset overflow"))?;
-        wire_ensure!(end <= bytes.len(), "sampling-state bytes are truncated");
+            .ok_or_else(|| invalid_message!("sampling-state offset overflow"))?;
+        ensure_valid!(end <= bytes.len(), "sampling-state bytes are truncated");
         let value = u32::from_le_bytes(bytes[*offset..end].try_into().unwrap());
         *offset = end;
         Ok(value)
     }
-    fn take_ids(bytes: &[u8], offset: &mut usize, count: u32) -> ProtocolResult<Vec<u32>> {
+    fn take_ids(bytes: &[u8], offset: &mut usize, count: u32) -> ValidationResult<Vec<u32>> {
         let mut values = Vec::with_capacity(count as usize);
         for _ in 0..count {
             values.push(take_u32(bytes, offset)?);
         }
-        wire_ensure!(
+        ensure_valid!(
             values.windows(2).all(|pair| pair[0] < pair[1]),
             "sampling-state token ids are not canonical"
         );
@@ -368,7 +366,7 @@ pub fn decode_sampling_state_bytes(bytes: &[u8]) -> ProtocolResult<SamplingState
     }
 
     let mut offset = 0;
-    wire_ensure!(
+    ensure_valid!(
         offset < bytes.len(),
         "sampling-state bytes omit allowed presence"
     );
@@ -382,7 +380,7 @@ pub fn decode_sampling_state_bytes(bytes: &[u8]) -> ProtocolResult<SamplingState
             let count = take_u32(bytes, &mut offset)?;
             Some(take_ids(bytes, &mut offset, count)?)
         }
-        other => wire_bail!("sampling-state allowed presence {other} is invalid"),
+        other => bail_invalid!("sampling-state allowed presence {other} is invalid"),
     };
     let suppressed_len = take_u32(bytes, &mut offset)?;
     let suppressed_token_ids = take_ids(bytes, &mut offset, suppressed_len)?;
@@ -390,17 +388,17 @@ pub fn decode_sampling_state_bytes(bytes: &[u8]) -> ProtocolResult<SamplingState
     let finish_token_ids = take_ids(bytes, &mut offset, finish_len)?;
     let transition_len = take_u32(bytes, &mut offset)?;
     let transition_token_ids = take_ids(bytes, &mut offset, transition_len)?;
-    wire_ensure!(
+    ensure_valid!(
         offset < bytes.len(),
         "sampling-state bytes omit force-finish"
     );
     let force_finish = match bytes[offset] {
         0 => false,
         1 => true,
-        other => wire_bail!("sampling-state force-finish {other} is invalid"),
+        other => bail_invalid!("sampling-state force-finish {other} is invalid"),
     };
     offset += 1;
-    wire_ensure!(
+    ensure_valid!(
         offset == bytes.len(),
         "sampling-state bytes contain trailing data"
     );

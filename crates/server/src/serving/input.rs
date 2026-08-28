@@ -76,7 +76,7 @@ pub struct SamplingConfig {
 }
 
 /// Stop-token, stop-string, bad-word, allowed-token, logit-bias, and logprob
-/// controls supported by the configured sampler capability.
+/// controls supported by the configured sampler.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct StopConfig {
     pub stop_token_ids: Vec<u32>,
@@ -125,7 +125,7 @@ pub struct SchedulingBounds {
     pub trace_context: BTreeMap<String, String>,
 }
 
-/// Public output contract: which per-token detail the caller receives.
+/// Per-token detail included in the public output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OutputDetail {
     #[default]
@@ -211,7 +211,7 @@ impl GenerateReqInput {
             || matches!(&self.prompt, PromptInput::Chat { messages, .. } if messages.iter().any(ChatMessage::has_multimodal))
     }
 
-    /// True when the request uses the function-tool protocol in either the
+    /// True when the request uses function-tool syntax in either the
     /// current turn or its chat history.
     pub fn uses_tools(&self) -> bool {
         let PromptInput::Chat {

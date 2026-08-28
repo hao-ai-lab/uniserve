@@ -1,4 +1,4 @@
-"""WorkerInfo handshake types, validation, and wire projection."""
+"""Worker startup information shared with the scheduler."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from .foundation.errors import invalid_descriptor
 
 
 class RequestKind(StrEnum):
-    GET_CAPABILITIES = "get_capabilities"
+    GET_INFO = "get_info"
     EXECUTE = "execute"
     POLL_COMPLETIONS = "poll_completions"
     DROP_SESSION = "drop_session"
@@ -22,7 +22,7 @@ class RequestKind(StrEnum):
 
 
 class ResponseKind(StrEnum):
-    CAPABILITIES = "capabilities"
+    INFO = "info"
     RESULT = "result"
     OK = "ok"
     ERROR = "error"
@@ -41,14 +41,14 @@ class KvGroupKind(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
-class KvGroupSpec:
+class KvGroup:
     num_blocks: int
     kind: KvGroupKind
     window: int
     sink: int
 
     @classmethod
-    def from_mapping(cls, value: object, where: str) -> KvGroupSpec:
+    def from_mapping(cls, value: object, where: str) -> KvGroup:
         data = _map(value, where)
         kind_data = _map(data.get("kind"), f"{where}.kind")
         return cls(
@@ -111,7 +111,7 @@ class GraphBucket:
             )
             < 1
         ):
-            raise invalid_descriptor("mixed execution capability dimensions must be positive")
+            raise invalid_descriptor("mixed execution bucket dimensions must be positive")
 
     @classmethod
     def from_mapping(cls, value: object, where: str) -> GraphBucket:
@@ -155,7 +155,7 @@ class WorkerInfo:
     gen_rope_advance: int
     max_cfg_branches: int
     bytes_per_token: int
-    groups: tuple[KvGroupSpec, ...]
+    groups: tuple[KvGroup, ...]
     kv_dtype: str
     model_dtype: str
     rank: RankInfo
@@ -209,7 +209,7 @@ class WorkerInfo:
             "max_unresolved_window",
         ):
             if getattr(self, name) < 1:
-                raise invalid_descriptor(f"capabilities.{name} must be positive")
+                raise invalid_descriptor(f"worker info.{name} must be positive")
         kv_values = (
             self.block_size,
             self.num_blocks,
@@ -220,20 +220,20 @@ class WorkerInfo:
         )
         if self.uses_kv:
             if any(value < 1 for value in kv_values) or not self.groups or not self.kv_dtype:
-                raise invalid_descriptor("capabilities declare incomplete KV geometry")
+                raise invalid_descriptor("worker info declares incomplete KV geometry")
             total_blocks = 0
             for group in self.groups:
                 if group.num_blocks < 1:
                     raise invalid_descriptor(
-                        "capabilities.groups must be a canonical physical page partition"
+                        "worker info.groups must be a canonical physical page partition"
                     )
                 total_blocks += group.num_blocks
             if total_blocks != self.num_blocks:
                 raise invalid_descriptor(
-                    "capabilities.groups must cover the physical request page pool"
+                    "worker info.groups must cover the physical request page pool"
                 )
         elif any(kv_values) or self.groups or self.kv_dtype:
-            raise invalid_descriptor("KV-free capabilities must carry zero KV geometry")
+            raise invalid_descriptor("KV-free worker info must carry zero KV geometry")
         for name in (
             "latent_page_units",
             "num_latent_pages",
@@ -245,17 +245,17 @@ class WorkerInfo:
             "encoder_cache_budget",
         ):
             if getattr(self, name) < 0:
-                raise invalid_descriptor(f"capabilities.{name} must not be negative")
+                raise invalid_descriptor(f"worker info.{name} must not be negative")
         if not self.supported_work:
-            raise invalid_descriptor("capabilities must support a work variant")
+            raise invalid_descriptor("worker info must support a work variant")
         if len(set(self.supported_work)) != len(self.supported_work):
-            raise invalid_descriptor("capabilities repeat a work variant")
+            raise invalid_descriptor("worker info repeats a work variant")
         if len(set(self.supported_controls)) != len(self.supported_controls):
-            raise invalid_descriptor("capabilities repeat a control")
+            raise invalid_descriptor("worker info repeats a control")
         if len(set(self.resource_classes)) != len(self.resource_classes):
-            raise invalid_descriptor("capabilities repeat a resource class")
+            raise invalid_descriptor("worker info repeats a resource class")
         if len(set(self.mixed_buckets)) != len(self.mixed_buckets):
-            raise invalid_descriptor("capabilities repeat a mixed-execution bucket")
+            raise invalid_descriptor("worker info repeats a mixed-execution bucket")
         if any(
             bucket.decode_rows + bucket.flow_rows > self.max_batch_operations
             for bucket in self.mixed_buckets
@@ -275,7 +275,7 @@ class WorkerInfo:
                 or self.latent_dtype not in {"float16", "bfloat16", "float32"}
             ):
                 raise invalid_descriptor(
-                    "worker capabilities declare incomplete latent pool geometry"
+                    "worker worker info declares incomplete latent pool geometry"
                 )
         addresses_latent = any(
             variant
@@ -287,13 +287,13 @@ class WorkerInfo:
         )
         if addresses_latent and ResourceClass.IMAGE_LATENT not in self.resource_classes:
             raise invalid_descriptor(
-                "worker capabilities advertise latent work without a latent page pool"
+                "worker info advertise latent work without a latent page pool"
             )
         if not self.model_name or self.weight_version < 0:
             raise invalid_descriptor("worker model name and weight version are invalid")
 
     @classmethod
-    def from_mapping(cls, value: object, where: str = "capabilities") -> WorkerInfo:
+    def from_mapping(cls, value: object, where: str = "info") -> WorkerInfo:
         data = _map(value, where)
         return cls(
             block_size=_uint(data.get("block_size"), f"{where}.block_size"),
@@ -331,7 +331,7 @@ class WorkerInfo:
             max_cfg_branches=_uint(data.get("max_cfg_branches"), f"{where}.max_cfg_branches"),
             bytes_per_token=_uint(data.get("bytes_per_token"), f"{where}.bytes_per_token"),
             groups=tuple(
-                KvGroupSpec.from_mapping(item, f"{where}.groups[{index}]")
+                KvGroup.from_mapping(item, f"{where}.groups[{index}]")
                 for index, item in enumerate(_seq(data.get("groups", ()), f"{where}.groups"))
             ),
             kv_dtype=_str(data.get("kv_dtype"), f"{where}.kv_dtype"),

@@ -21,7 +21,7 @@ impl EngineClient {
             engine_count: self.engine_count(),
             max_model_len: self.max_model_len(),
             model_dtype: self.model_dtype(),
-            generation_capabilities: self.generation_capabilities(),
+            generation_limits: self.generation_limits(),
             sampling_controls: if self.supports_token_sampling() {
                 crate::serving::ServedSamplingControl::ALL.to_vec()
             } else {
@@ -39,13 +39,13 @@ impl EngineClient {
     }
 }
 
-/// Engine health and capability values used while binding a served model.
+/// Engine health and limits used while binding a served model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineSnapshot {
     pub model_name: String,
     pub engine_count: usize,
     pub max_model_len: u32,
     pub model_dtype: uniserve_core::ModelDtype,
-    pub generation_capabilities: uniserve_core::GenerationRuntimeCapabilities,
+    pub generation_limits: uniserve_core::GenerationLimits,
     pub sampling_controls: Vec<crate::serving::ServedSamplingControl>,
 }

@@ -1,4 +1,4 @@
-"""Canonical worker error classification and wire behavior."""
+"""Canonical worker error classification and snapshot behavior."""
 
 from __future__ import annotations
 
@@ -99,7 +99,7 @@ def test_fatal_cuda_marker_takes_precedence_over_oom_in_same_message():
     assert err.retryable is False
 
 
-def test_to_wire_emits_canonical_error_context():
+def test_to_mapping_emits_canonical_error_context():
     err = WorkerError(
         code=WorkerErrorCode.RESOURCE_ERROR,
         message="CUDA out of memory",
@@ -114,16 +114,16 @@ def test_to_wire_emits_canonical_error_context():
         details={"device": 0},
     )
 
-    wire = err.to_mapping()
+    snapshot = err.to_mapping()
 
-    assert wire["kind"] == "error"
-    assert wire["code"] == "ResourceError"
-    assert wire["message"] == "CUDA out of memory"
-    assert wire["retryable"] is True
-    assert wire["fatal"] is False
-    assert wire["phase"] == "run"
-    assert wire["route"] == "language"
-    assert wire["operations"] == [
+    assert snapshot["kind"] == "error"
+    assert snapshot["code"] == "ResourceError"
+    assert snapshot["message"] == "CUDA out of memory"
+    assert snapshot["retryable"] is True
+    assert snapshot["fatal"] is False
+    assert snapshot["phase"] == "run"
+    assert snapshot["route"] == "language"
+    assert snapshot["operations"] == [
         {
             "request_key": {"authority_id": 5, "session_id": 42, "epoch": 3},
             "op_id": 7,
@@ -131,15 +131,15 @@ def test_to_wire_emits_canonical_error_context():
     ]
 
 
-def test_to_wire_coerces_truthy_flags_to_bool():
-    # to_wire normalizes retryable/fatal through bool(): non-bool truthy/falsey
-    # inputs surface on the wire as real booleans.
-    wire = WorkerError(
+def test_to_mapping_coerces_truthy_flags_to_bool():
+    # to_mapping normalizes retryable/fatal through bool(): non-bool truthy/falsey
+    # inputs surface on the snapshot as real booleans.
+    snapshot = WorkerError(
         code=WorkerErrorCode.RESOURCE_ERROR,
         message="m",
         retryable=1,
         fatal=0,
     ).to_mapping()
 
-    assert wire["retryable"] is True
-    assert wire["fatal"] is False
+    assert snapshot["retryable"] is True
+    assert snapshot["fatal"] is False

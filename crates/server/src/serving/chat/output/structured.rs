@@ -266,9 +266,6 @@ pub async fn structured_chat_event_stream(
                     y.yield_ok(next).await;
                 }
             }
-            AssistantEvent::PublicCommit(commit) => {
-                y.yield_ok(ChatEvent::PublicCommit { commit }).await;
-            }
             AssistantEvent::ToolCallStart { id, name } => {
                 for next in state.start_tool_call(id, name)? {
                     y.yield_ok(next).await;

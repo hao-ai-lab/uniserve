@@ -23,7 +23,7 @@ def _vision_stage_scalar(value: Any, field_name: str) -> Any:
 
 
 # Architecture names used to default an absent sub-config section (the standard
-# HF ``is_composition`` contract). Named once so the magic strings are not
+# HF ``is_composition`` behavior). Named once so the magic strings are not
 # repeated inline in the ``NeoChatConfig`` default-resolution branches.
 _DEFAULT_VISION_ARCHITECTURE = "NEOVisionModel"
 _DEFAULT_LLM_ARCHITECTURE = "Qwen3ForCausalLM"

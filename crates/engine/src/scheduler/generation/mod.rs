@@ -14,7 +14,7 @@ use uniserve_worker_ipc::{
 
 use crate::scheduler::image_artifact::png_artifact_dims_b64;
 
-/// The scheduler's single route identity; capability negotiation collapses to one
+/// The scheduler's single route identity; worker selection collapses to one
 /// route in this control plane.
 const ROUTE: RouteId = RouteId(0);
 
@@ -78,8 +78,7 @@ fn product_bound_bytes(product: &ProductRef) -> u64 {
 
 fn dynamic_element_bound(bytes: u64, dtype: DType) -> Result<ShapeBound, PlanningError> {
     let elements = bytes.div_ceil(dtype_bytes(dtype));
-    let max = u32::try_from(elements)
-        .map_err(|_| PlanningError::ProductBoundExceedsProtocol { bytes })?;
+    let max = u32::try_from(elements).map_err(|_| PlanningError::ProductBoundTooLarge { bytes })?;
     if max == 0 {
         return Err(PlanningError::MissingProductBound);
     }
@@ -91,11 +90,11 @@ fn dynamic_element_bound(bytes: u64, dtype: DType) -> Result<ShapeBound, Plannin
 fn png_base64_bound(width: u32, height: u32) -> Result<u64, PlanningError> {
     let raw = u64::from(height)
         .checked_mul(u64::from(width).saturating_mul(3).saturating_add(1))
-        .ok_or(PlanningError::ProductBoundExceedsProtocol { bytes: u64::MAX })?;
+        .ok_or(PlanningError::ProductBoundTooLarge { bytes: u64::MAX })?;
     let png = raw
         .checked_mul(2)
         .and_then(|value| value.checked_add(1 << 20))
-        .ok_or(PlanningError::ProductBoundExceedsProtocol { bytes: u64::MAX })?;
+        .ok_or(PlanningError::ProductBoundTooLarge { bytes: u64::MAX })?;
     Ok(png.div_ceil(3).saturating_mul(4))
 }
 
@@ -111,10 +110,9 @@ fn host_input_product(
     dtype: DType,
     elements: usize,
 ) -> Result<ProductRef, PlanningError> {
-    let extent =
-        u32::try_from(elements).map_err(|_| PlanningError::ProductBoundExceedsProtocol {
-            bytes: (elements as u64).saturating_mul(dtype_bytes(dtype)),
-        })?;
+    let extent = u32::try_from(elements).map_err(|_| PlanningError::ProductBoundTooLarge {
+        bytes: (elements as u64).saturating_mul(dtype_bytes(dtype)),
+    })?;
     if extent == 0 {
         return Err(PlanningError::MissingProductBound);
     }
@@ -154,36 +152,36 @@ fn logprob_blob_bound(
         1_u64
             .checked_add(u64::from(sampling.n_logprobs))
             .and_then(|value| value.checked_add(requested_ids))
-            .ok_or(PlanningError::ProductBoundExceedsProtocol { bytes: u64::MAX })?,
+            .ok_or(PlanningError::ProductBoundTooLarge { bytes: u64::MAX })?,
     );
     let prompt_entries = prompt.then_some(
         1_u64
             .checked_add(u64::from(sampling.n_prompt_logprobs))
             .and_then(|value| value.checked_add(requested_ids))
-            .ok_or(PlanningError::ProductBoundExceedsProtocol { bytes: u64::MAX })?,
+            .ok_or(PlanningError::ProductBoundTooLarge { bytes: u64::MAX })?,
     );
     let generated_bytes = generated_entries
         .unwrap_or(0)
         .checked_mul(RANKED_LOGPROB_BYTES)
-        .ok_or(PlanningError::ProductBoundExceedsProtocol { bytes: u64::MAX })?;
+        .ok_or(PlanningError::ProductBoundTooLarge { bytes: u64::MAX })?;
     let per_prompt_bytes = 4_u64
         .checked_add(
             prompt_entries
                 .unwrap_or(0)
                 .checked_mul(RANKED_LOGPROB_BYTES)
-                .ok_or(PlanningError::ProductBoundExceedsProtocol { bytes: u64::MAX })?,
+                .ok_or(PlanningError::ProductBoundTooLarge { bytes: u64::MAX })?,
         )
-        .ok_or(PlanningError::ProductBoundExceedsProtocol { bytes: u64::MAX })?;
+        .ok_or(PlanningError::ProductBoundTooLarge { bytes: u64::MAX })?;
     let prompt_bytes = u64::from(prompt_positions)
         .checked_mul(per_prompt_bytes)
-        .ok_or(PlanningError::ProductBoundExceedsProtocol { bytes: u64::MAX })?;
+        .ok_or(PlanningError::ProductBoundTooLarge { bytes: u64::MAX })?;
     let bytes = 1_u64
         .checked_add(if generated { 4 } else { 0 })
         .and_then(|value| value.checked_add(4))
         .and_then(|value| value.checked_add(generated_bytes))
         .and_then(|value| value.checked_add(4))
         .and_then(|value| value.checked_add(prompt_bytes))
-        .ok_or(PlanningError::ProductBoundExceedsProtocol { bytes: u64::MAX })?;
+        .ok_or(PlanningError::ProductBoundTooLarge { bytes: u64::MAX })?;
     Ok(Some(bytes))
 }
 
@@ -1840,8 +1838,8 @@ pub(crate) enum PlanningError {
     MissingProductBound,
     #[error("worker did not report a latent dtype")]
     MissingLatentDType,
-    #[error("product bound {bytes} bytes exceeds the wire representation")]
-    ProductBoundExceedsProtocol { bytes: u64 },
+    #[error("product bound {bytes} bytes exceeds the IPC representation")]
+    ProductBoundTooLarge { bytes: u64 },
     #[error("product generation counter exhausted")]
     ProductGenerationExhausted,
 }

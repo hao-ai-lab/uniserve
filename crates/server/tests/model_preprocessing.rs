@@ -8,7 +8,7 @@ use tempfile::tempdir;
 use tokenizers::models::bpe::{BPE, Vocab};
 use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 use uniserve_core::{
-    ContextSegment, GenerationRuntimeCapabilities, ImageIngestStep, ImageKvEffect, SegmentPlacement,
+    ContextSegment, GenerationLimits, ImageIngestStep, ImageKvEffect, SegmentPlacement,
 };
 use uniserve_server::profile::assets::ResolvedModelFiles;
 use uniserve_server::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
@@ -38,13 +38,13 @@ fn resolved_model(
     description: ModelDescription,
     model_type: &str,
 ) -> (tempfile::TempDir, DynTokenizer, ResolvedModel) {
-    try_resolved_model(description, model_type, runtime_capabilities()).unwrap()
+    try_resolved_model(description, model_type, runtime_limits()).unwrap()
 }
 
 fn try_resolved_model(
     description: ModelDescription,
     model_type: &str,
-    capabilities: GenerationRuntimeCapabilities,
+    limits: GenerationLimits,
 ) -> uniserve_server::serving::Result<(tempfile::TempDir, DynTokenizer, ResolvedModel)> {
     let directory = tempdir().unwrap();
     let mut vocab = Vocab::from_iter([("<unk>".to_string(), 0_u32)]);
@@ -115,7 +115,7 @@ fn try_resolved_model(
     .unwrap();
     let model = ResolvedModel::resolve(
         assets,
-        capabilities,
+        limits,
         uniserve_server::serving::ServedSamplingControl::ALL.to_vec(),
         4096,
         true,
@@ -123,8 +123,8 @@ fn try_resolved_model(
     Ok((directory, tokenizer, model))
 }
 
-fn runtime_capabilities() -> GenerationRuntimeCapabilities {
-    GenerationRuntimeCapabilities {
+fn runtime_limits() -> GenerationLimits {
+    GenerationLimits {
         features: uniserve_core::GenerationFeatures::all(),
         max_latent_units: 1_000_000,
         latent_downsample: 16,
@@ -151,19 +151,14 @@ fn image_chat_request() -> GenerateReqInput {
 
 #[test]
 fn model_resolution_requires_every_configured_runtime_branch() {
-    type RemoveCapability = fn(&mut GenerationRuntimeCapabilities);
-    let cases: [(
-        ModelDescription,
-        &'static str,
-        &'static str,
-        RemoveCapability,
-    ); 4] = [
+    type ChangeLimits = fn(&mut GenerationLimits);
+    let cases: [(ModelDescription, &'static str, &'static str, ChangeLimits); 4] = [
         (
             ModelDescription::Qwen3,
             "qwen3",
             "runtime_und_execution",
-            |capabilities: &mut GenerationRuntimeCapabilities| {
-                capabilities
+            |limits: &mut GenerationLimits| {
+                limits
                     .features
                     .remove(uniserve_core::GenerationFeatures::UNDERSTANDING);
             },
@@ -172,8 +167,8 @@ fn model_resolution_requires_every_configured_runtime_branch() {
             ModelDescription::SenseNova,
             "neo_chat",
             "runtime_vit_encode",
-            |capabilities: &mut GenerationRuntimeCapabilities| {
-                capabilities
+            |limits: &mut GenerationLimits| {
+                limits
                     .features
                     .remove(uniserve_core::GenerationFeatures::VISION_ENCODE);
             },
@@ -182,8 +177,8 @@ fn model_resolution_requires_every_configured_runtime_branch() {
             ModelDescription::Bagel,
             "bagel",
             "runtime_vae_encode",
-            |capabilities: &mut GenerationRuntimeCapabilities| {
-                capabilities
+            |limits: &mut GenerationLimits| {
+                limits
                     .features
                     .remove(uniserve_core::GenerationFeatures::LATENT_ENCODE);
             },
@@ -192,8 +187,8 @@ fn model_resolution_requires_every_configured_runtime_branch() {
             ModelDescription::SenseNova,
             "neo_chat",
             "runtime_gen_denoise",
-            |capabilities: &mut GenerationRuntimeCapabilities| {
-                capabilities
+            |limits: &mut GenerationLimits| {
+                limits
                     .features
                     .remove(uniserve_core::GenerationFeatures::IMAGE_GENERATION);
             },
@@ -201,10 +196,10 @@ fn model_resolution_requires_every_configured_runtime_branch() {
     ];
 
     for (description, model_type, required, remove) in cases {
-        let mut capabilities = runtime_capabilities();
-        remove(&mut capabilities);
-        let error = match try_resolved_model(description, model_type, capabilities) {
-            Ok(_) => panic!("incomplete worker capabilities must fail model resolution"),
+        let mut limits = runtime_limits();
+        remove(&mut limits);
+        let error = match try_resolved_model(description, model_type, limits) {
+            Ok(_) => panic!("incomplete worker limits must fail model resolution"),
             Err(error) => error,
         };
         assert!(error.to_string().contains(required), "got: {error}");

@@ -69,7 +69,6 @@ async fn qwen3_processor_emits_reasoning_text_and_tool_calls()
             .to_string(),
             token_ids: Vec::new(),
             logprobs: None,
-            public_commit: None,
             finished: Some(Finished {
                 prompt_token_count: 1,
                 output_token_count: 1,
@@ -111,14 +110,12 @@ async fn disabled_reasoning_parsing_streams_delimiters_as_content()
             delta: "<think>".to_string(),
             token_ids: Vec::new(),
             logprobs: None,
-            public_commit: None,
             finished: None,
         }),
         Ok(DecodedTextEvent::TextDelta {
             delta: "hi</think>after".to_string(),
             token_ids: Vec::new(),
             logprobs: None,
-            public_commit: None,
             finished: Some(Finished {
                 prompt_token_count: 0,
                 output_token_count: 2,

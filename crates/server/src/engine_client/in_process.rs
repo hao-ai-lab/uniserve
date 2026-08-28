@@ -5,7 +5,7 @@ use tracing::warn;
 
 use super::error::{Error, Result};
 use super::media::MediaSubmission;
-use uniserve_core::{GenerationRuntimeCapabilities, ModelDtype, RequestId};
+use uniserve_core::{GenerationLimits, ModelDtype, RequestId};
 use uniserve_engine::{EngineCore, EngineHandle, EventRx, Executor, MediaEventRx};
 
 use crate::serving::TokenizedGenerateReqInput;
@@ -67,7 +67,7 @@ impl EngineClient {
         let stats_guard = Arc::new(());
         {
             let stats = Arc::clone(core.stats());
-            let block_size = core.caps().block_size;
+            let block_size = core.info().block_size;
             let model_name = core.model_name().to_string();
             let guard = Arc::downgrade(&stats_guard);
             tokio::spawn(async move {
@@ -79,12 +79,12 @@ impl EngineClient {
                     if guard.upgrade().is_none() {
                         return;
                     }
-                    let wire = reporter.snapshot(&stats, block_size);
+                    let snapshot = reporter.snapshot(&stats, block_size);
                     crate::engine_client::metrics::record_scheduler_stats(
                         &uniserve_observability::METRICS.scheduler,
                         &model_name,
                         0,
-                        &wire,
+                        &snapshot,
                     );
                 }
             });
@@ -111,8 +111,8 @@ impl EngineClient {
         self.core.max_model_len()
     }
 
-    pub fn generation_capabilities(&self) -> GenerationRuntimeCapabilities {
-        self.core.generation_capabilities()
+    pub fn generation_limits(&self) -> GenerationLimits {
+        self.core.generation_limits()
     }
 
     pub fn supports_token_sampling(&self) -> bool {
@@ -128,7 +128,7 @@ impl EngineClient {
     }
 
     pub fn total_num_gpu_blocks(&self) -> u64 {
-        self.core.caps().num_blocks as u64
+        self.core.info().num_blocks as u64
     }
 
     pub fn is_healthy(&self) -> bool {
@@ -383,7 +383,7 @@ mod tests {
                 image: &request.image,
                 max_und_tokens: request.max_und_tokens,
                 cache: &request.cache,
-                capabilities: &client.generation_capabilities(),
+                limits: &client.generation_limits(),
             })
             .expect("request resources must fit the in-process runtime");
 

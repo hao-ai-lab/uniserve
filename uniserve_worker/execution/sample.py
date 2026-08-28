@@ -11,7 +11,7 @@ import torch
 from uniserve_worker.backends.triton import triton_available
 from uniserve_worker.execution.batch import SamplingParams
 from uniserve_worker.execution.forward_batch import packed_tensor_views
-from uniserve_worker.foundation.errors import capability_mismatch, invalid_descriptor
+from uniserve_worker.foundation.errors import unsupported_setup, invalid_descriptor
 from uniserve_worker.foundation.math import bucketed_length
 from uniserve_worker.runtime.device_products import (
     DeviceProductRead,
@@ -226,7 +226,7 @@ def sample(
             raise invalid_descriptor("ordinary sampling tasks must contain exactly one row")
         vocab = int(task.logits.shape[1])
         if vocab > TOKEN_VALUE_MASK:
-            raise capability_mismatch("vocabulary exceeds the device token decision range")
+            raise unsupported_setup("vocabulary exceeds the device token decision range")
         if any(value < 0 or value >= vocab for value in task.draft_token_ids):
             raise invalid_descriptor("speculative draft token is outside the model vocabulary")
         sampling_path = (
@@ -652,7 +652,7 @@ def _run_fused_top_k_sampling(
     top_k: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if not triton_available(logits.device):
-        raise capability_mismatch(
+        raise unsupported_setup(
             "fused top-k sampling requires a supported CUDA compile toolchain"
         )
     return sample_top_k(
@@ -833,7 +833,7 @@ def _capture_sample_span(
         )
     )
     if int(metadata.numel()) != SAMPLING_COMPLETION_FIELDS * count:
-        raise RuntimeError("sampling completion field count diverged from its capacity contract")
+        raise RuntimeError("sampling completion field count exceeds its fixed capacity")
     owns_completion = completion is None
     if metadata.device.type != "cuda":
         values = tuple(int(value) for value in metadata.tolist())

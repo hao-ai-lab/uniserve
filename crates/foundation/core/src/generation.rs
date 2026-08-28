@@ -408,8 +408,8 @@ impl GenerationBehaviorDescriptor {
     }
 
     /// The generation branches this resolved behavior requires a runtime to
-    /// execute, for admission-time capability gating.
-    pub fn capability_needs(
+    /// execute, for admission-time feature gating.
+    pub fn required_features(
         &self,
         policy: &GenerationPolicyDescriptor,
         context_image_steps: impl IntoIterator<Item = ImageIngestStep>,
@@ -493,12 +493,12 @@ pub struct GenerationResources<'a> {
     pub image: &'a ImageParams,
     pub max_und_tokens: usize,
     pub cache: &'a GenerationCachePolicyDescriptor,
-    pub capabilities: &'a GenerationRuntimeCapabilities,
+    pub limits: &'a GenerationLimits,
 }
 
 /// Worker and scheduler limits needed to compile a bounded generation graph.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct GenerationRuntimeCapabilities {
+pub struct GenerationLimits {
     pub features: GenerationFeatures,
     pub max_latent_units: u64,
     pub latent_downsample: u32,
@@ -511,9 +511,9 @@ pub struct GenerationRuntimeCapabilities {
     pub encoder_cache_entries: u32,
 }
 
-impl GenerationRuntimeCapabilities {
+impl GenerationLimits {
     /// Whether this runtime covers every branch the request needs. On a gap,
-    /// returns the admission-capability name of the first missing branch.
+    /// returns the admission-feature name of the first missing branch.
     pub fn covers(&self, needs: GenerationFeatures) -> Result<(), GenerationFeatures> {
         let missing = needs.difference(self.features);
         if !missing.is_empty() {
@@ -533,7 +533,7 @@ impl GenerationResourceBounds {
             image,
             max_und_tokens,
             cache,
-            capabilities,
+            limits,
         } = inputs;
         let context_tokens = context
             .iter()
@@ -553,11 +553,11 @@ impl GenerationResourceBounds {
             let ContextSegment::Image { ingest, .. } = segment else {
                 return Ok(total);
             };
-            Ok(total.saturating_add(ingest_kv_bound(ingest, capabilities)?))
+            Ok(total.saturating_add(ingest_kv_bound(ingest, limits)?))
         })?;
         let feedback_kv_per_image = if behavior.generated_image_feedback {
             match policy.feedback.as_ref() {
-                Some(feedback) => ingest_kv_bound(&feedback.ingest, capabilities)?,
+                Some(feedback) => ingest_kv_bound(&feedback.ingest, limits)?,
                 None => return Err(GenerationResourceError::MissingFeedback),
             }
         } else {
@@ -579,12 +579,12 @@ impl GenerationResourceBounds {
         };
         let uses_latent_features = uses_ingest_step(ImageIngestStep::VaeEncode);
         let uses_vision_features = uses_ingest_step(ImageIngestStep::VitEncode);
-        if uses_latent_features && capabilities.max_latent_feature_bytes == 0 {
+        if uses_latent_features && limits.max_latent_feature_bytes == 0 {
             return Err(GenerationResourceError::MissingRuntimeBound {
                 resource: "max_latent_feature_bytes",
             });
         }
-        if uses_vision_features && capabilities.max_vision_feature_bytes == 0 {
+        if uses_vision_features && limits.max_vision_feature_bytes == 0 {
             return Err(GenerationResourceError::MissingRuntimeBound {
                 resource: "max_vision_feature_bytes",
             });
@@ -603,71 +603,70 @@ impl GenerationResourceBounds {
             Vec::new()
         };
         if !encoder_cache_keys.is_empty() {
-            if capabilities.encoder_cache_entries == 0 {
+            if limits.encoder_cache_entries == 0 {
                 return Err(GenerationResourceError::MissingRuntimeBound {
                     resource: "encoder_cache_entries",
                 });
             }
-            if encoder_cache_keys.len() > capabilities.encoder_cache_entries as usize {
+            if encoder_cache_keys.len() > limits.encoder_cache_entries as usize {
                 return Err(GenerationResourceError::EncoderCacheCapacity {
                     requested: encoder_cache_keys.len(),
-                    available: capabilities.encoder_cache_entries,
+                    available: limits.encoder_cache_entries,
                 });
             }
         }
-        if behavior.gen_output && capabilities.latent_downsample == 0 {
+        if behavior.gen_output && limits.latent_downsample == 0 {
             return Err(GenerationResourceError::MissingRuntimeBound {
                 resource: "latent_downsample",
             });
         }
         if behavior.gen_output
-            && (!image.width.is_multiple_of(capabilities.latent_downsample)
-                || !image.height.is_multiple_of(capabilities.latent_downsample))
+            && (!image.width.is_multiple_of(limits.latent_downsample)
+                || !image.height.is_multiple_of(limits.latent_downsample))
         {
             return Err(GenerationResourceError::ImageDimensionAlignment {
                 width: image.width,
                 height: image.height,
-                latent_downsample: capabilities.latent_downsample,
+                latent_downsample: limits.latent_downsample,
             });
         }
-        if behavior.gen_output && capabilities.max_latent_units == 0 {
+        if behavior.gen_output && limits.max_latent_units == 0 {
             return Err(GenerationResourceError::MissingRuntimeBound {
                 resource: "max_latent_units",
             });
         }
-        if behavior.gen_output && capabilities.max_cfg_branches == 0 {
+        if behavior.gen_output && limits.max_cfg_branches == 0 {
             return Err(GenerationResourceError::MissingRuntimeBound {
                 resource: "max_cfg_branches",
             });
         }
-        let latent_downsample = capabilities.latent_downsample.max(1);
+        let latent_downsample = limits.latent_downsample.max(1);
         let requested_latent_units = u64::from(image.width / latent_downsample)
             .saturating_mul(u64::from(image.height / latent_downsample));
-        if behavior.gen_output && requested_latent_units > capabilities.max_latent_units {
+        if behavior.gen_output && requested_latent_units > limits.max_latent_units {
             return Err(GenerationResourceError::LatentCapacity {
                 requested: requested_latent_units,
-                available: capabilities.max_latent_units,
+                available: limits.max_latent_units,
             });
         }
         let image_latent_bytes = if behavior.gen_output {
-            if capabilities.max_vae_grid_tokens == 0 || capabilities.max_latent_feature_bytes == 0 {
+            if limits.max_vae_grid_tokens == 0 || limits.max_latent_feature_bytes == 0 {
                 return Err(GenerationResourceError::MissingRuntimeBound {
                     resource: "max_latent_feature_bytes",
                 });
             }
-            let bytes_per_unit = capabilities
+            let bytes_per_unit = limits
                 .max_latent_feature_bytes
-                .div_ceil(u64::from(capabilities.max_vae_grid_tokens));
+                .div_ceil(u64::from(limits.max_vae_grid_tokens));
             requested_latent_units.saturating_mul(bytes_per_unit)
         } else {
             0
         };
         let requested_cfg_branches = u64::from(image.cfg_branch_count());
-        if behavior.gen_output && requested_cfg_branches > u64::from(capabilities.max_cfg_branches)
-        {
+        if behavior.gen_output && requested_cfg_branches > u64::from(limits.max_cfg_branches) {
             return Err(GenerationResourceError::CfgBranchCapacity {
                 requested: requested_cfg_branches,
-                available: capabilities.max_cfg_branches,
+                available: limits.max_cfg_branches,
             });
         }
 
@@ -685,12 +684,12 @@ impl GenerationResourceBounds {
             },
             max_image_latent_bytes: image_latent_bytes,
             max_latent_feature_bytes: if uses_latent_features {
-                capabilities.max_latent_feature_bytes
+                limits.max_latent_feature_bytes
             } else {
                 0
             },
             max_vision_feature_bytes: if uses_vision_features {
-                capabilities.max_vision_feature_bytes
+                limits.max_vision_feature_bytes
             } else {
                 0
             },
@@ -746,7 +745,7 @@ impl GenerationResourceBounds {
 
 fn ingest_kv_bound(
     ingest: &ImageIngestRecipe,
-    capabilities: &GenerationRuntimeCapabilities,
+    limits: &GenerationLimits,
 ) -> Result<usize, GenerationResourceError> {
     if ingest.steps.len() != ingest.step_kv_tokens.len() {
         return Err(GenerationResourceError::ImageIngestKvArity {
@@ -761,8 +760,8 @@ fn ingest_kv_bound(
         .zip(ingest.step_kv_tokens.iter().copied())
         .try_fold(0usize, |total, (step, effect)| {
             let fallback = match step {
-                ImageIngestStep::VaeEncode => capabilities.max_vae_grid_tokens,
-                ImageIngestStep::VitEncode => capabilities.max_vit_grid_tokens,
+                ImageIngestStep::VaeEncode => limits.max_vae_grid_tokens,
+                ImageIngestStep::VitEncode => limits.max_vit_grid_tokens,
             };
             let step_bound = kv_effect_bound(effect, fallback, step.as_str())?;
             Ok(total.saturating_add(step_bound))
@@ -1019,7 +1018,7 @@ impl GenerationRequest {
 
     pub fn validate_resources(
         &self,
-        capabilities: &GenerationRuntimeCapabilities,
+        limits: &GenerationLimits,
     ) -> Result<(), GenerationResourceError> {
         let required = GenerationResourceBounds::conservative(GenerationResources {
             context: &self.context,
@@ -1029,7 +1028,7 @@ impl GenerationRequest {
             image: &self.image,
             max_und_tokens: self.max_und_tokens,
             cache: &self.cache,
-            capabilities,
+            limits,
         })?;
         self.resources.validate_covers(&required)
     }
@@ -1144,8 +1143,8 @@ impl Default for GenerationPolicyDescriptor {
 mod tests {
     use super::*;
 
-    fn runtime_capabilities() -> GenerationRuntimeCapabilities {
-        GenerationRuntimeCapabilities {
+    fn runtime_limits() -> GenerationLimits {
+        GenerationLimits {
             features: GenerationFeatures::all(),
             max_latent_units: 4_096,
             latent_downsample: 16,
@@ -1236,7 +1235,7 @@ mod tests {
             image: &request.image,
             max_und_tokens: request.max_und_tokens,
             cache: &request.cache,
-            capabilities: &runtime_capabilities(),
+            limits: &runtime_limits(),
         })
         .expect("bounded request fixture");
         request
@@ -1322,7 +1321,7 @@ mod tests {
         assert!(!immediate.und_decode);
         assert!(immediate.finish_after_gen_commit);
         assert_eq!(
-            immediate.capability_needs(&immediate_policy, []),
+            immediate.required_features(&immediate_policy, []),
             GenerationFeatures::UNDERSTANDING | GenerationFeatures::IMAGE_GENERATION
         );
     }
@@ -1374,7 +1373,7 @@ mod tests {
             image: &request.image,
             max_und_tokens: request.max_und_tokens,
             cache: &request.cache,
-            capabilities: &runtime_capabilities(),
+            limits: &runtime_limits(),
         })
         .expect("bounded resources");
 
@@ -1419,7 +1418,7 @@ mod tests {
             image: &request.image,
             max_und_tokens: request.max_und_tokens,
             cache: &request.cache,
-            capabilities: &runtime_capabilities(),
+            limits: &runtime_limits(),
         })
         .expect("exact per-step image resources");
 
@@ -1434,8 +1433,8 @@ mod tests {
             panic!("image fixture");
         };
         ingest.step_kv_tokens[1] = ImageKvEffect::WorkerDefined;
-        let mut capabilities = runtime_capabilities();
-        capabilities.max_vit_grid_tokens = 0;
+        let mut limits = runtime_limits();
+        limits.max_vit_grid_tokens = 0;
         assert_eq!(
             GenerationResourceBounds::conservative(GenerationResources {
                 context: &request.context,
@@ -1445,7 +1444,7 @@ mod tests {
                 image: &request.image,
                 max_und_tokens: request.max_und_tokens,
                 cache: &request.cache,
-                capabilities: &capabilities,
+                limits: &limits,
             }),
             Err(GenerationResourceError::UnboundedImageKv {
                 operation: "vit_encode",
@@ -1466,7 +1465,7 @@ mod tests {
                 image: &invalid_request.image,
                 max_und_tokens: invalid_request.max_und_tokens,
                 cache: &invalid_request.cache,
-                capabilities: &runtime_capabilities(),
+                limits: &runtime_limits(),
             }),
             Err(GenerationResourceError::ImageIngestKvArity {
                 steps: 2,
@@ -1474,10 +1473,10 @@ mod tests {
             })
         );
 
-        let mut capabilities = runtime_capabilities();
-        capabilities.max_latent_units = 1_023;
+        let mut limits = runtime_limits();
+        limits.max_latent_units = 1_023;
         assert!(matches!(
-            request.validate_resources(&capabilities),
+            request.validate_resources(&limits),
             Err(GenerationResourceError::LatentCapacity { .. })
         ));
     }
@@ -1485,11 +1484,11 @@ mod tests {
     #[test]
     fn resource_compilation_requires_runtime_aligned_image_dimensions() {
         let request = complete_request();
-        let mut capabilities = runtime_capabilities();
-        capabilities.latent_downsample = 24;
+        let mut limits = runtime_limits();
+        limits.latent_downsample = 24;
 
         assert_eq!(
-            request.validate_resources(&capabilities),
+            request.validate_resources(&limits),
             Err(GenerationResourceError::ImageDimensionAlignment {
                 width: request.image.width,
                 height: request.image.height,
@@ -1499,11 +1498,11 @@ mod tests {
     }
 
     #[test]
-    fn declared_resources_must_cover_the_capability_derived_envelope() {
+    fn declared_resources_must_cover_the_required_envelope() {
         let mut request = complete_request();
         request.resources.max_kv_tokens -= 1;
         assert!(matches!(
-            request.validate_resources(&runtime_capabilities()),
+            request.validate_resources(&runtime_limits()),
             Err(GenerationResourceError::DeclaredBoundTooSmall {
                 resource: "max_kv_tokens",
                 ..

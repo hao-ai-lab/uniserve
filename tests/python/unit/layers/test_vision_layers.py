@@ -1,4 +1,4 @@
-"""Conformance for shared vision building blocks."""
+"""Behavior tests for shared vision building blocks."""
 
 from __future__ import annotations
 

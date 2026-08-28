@@ -14,7 +14,7 @@ def test_engine_batch_capacity_reaches_worker_resources() -> None:
     config = parse_worker_args(
         [
             "--service-name",
-            "capacity-contract",
+            "capacity-test",
             "--ipc-payload-cap",
             "65536",
             "--model",
@@ -36,7 +36,7 @@ def test_execution_lanes_are_typed_and_domain_disjoint() -> None:
     config = parse_worker_args(
         [
             "--service-name",
-            "lane-contract",
+            "lane-test",
             "--ipc-payload-cap",
             "65536",
             "--model",
@@ -62,7 +62,7 @@ def test_execution_lanes_reject_duplicate_domain_bindings() -> None:
         parse_worker_args(
             [
                 "--service-name",
-                "lane-contract",
+                "lane-test",
                 "--ipc-payload-cap",
                 "65536",
                 "--model",

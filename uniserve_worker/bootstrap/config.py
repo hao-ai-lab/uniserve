@@ -197,11 +197,11 @@ def _validate_data_plane(
 
 
 def _parse_mesh(
-    spec: str,
+    value: str,
     *,
     device: str,
 ) -> tuple[str, str] | None:
-    text = spec.strip()
+    text = value.strip()
     if not text:
         return None
 

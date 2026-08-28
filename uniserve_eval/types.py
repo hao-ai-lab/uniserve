@@ -1,4 +1,4 @@
-"""Contracts shared by configuration, tasks, transport, and reports."""
+"""Data shared by configuration, tasks, requests, and reports."""
 
 from __future__ import annotations
 

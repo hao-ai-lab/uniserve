@@ -1,5 +1,4 @@
 //! Validated JSON extractor for automatic request validation.
-//! Variation of https://github.com/lightseekorg/smg/blob/main/crates/protocols/src/validated.rs
 
 use crate::openai::Normalizable;
 use axum::Json;
@@ -17,8 +16,8 @@ use crate::openai::ApiError;
 /// [`Normalizable::normalize`] and then `Validate::validate`. The amount of
 /// checking performed by the latter is entirely determined by `T`'s `Validate`
 /// impl. Request types declare `#[validate(...)]` constraints for ranges and
-/// cross-parameter checks, while fallible protocol lowering enforces the
-/// configured serving-surface capability. When validation reports errors,
+/// cross-parameter checks, while fallible request lowering enforces the
+/// configured serving features. When validation reports errors,
 /// this returns [`ApiError::InvalidRequest`] with the details.
 pub(crate) struct ValidatedJson<T>(pub T);
 

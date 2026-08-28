@@ -4,7 +4,7 @@ use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer, IncrementalD
 use asynk_strim_attr::{TryYielder, try_stream};
 use serde::{Deserialize, Serialize};
 use tracing::{Level, debug, trace};
-use uniserve_core::{GenerationEvent, PositionLogprobs, PublicCommit};
+use uniserve_core::{GenerationEvent, PositionLogprobs};
 use uniserve_engine::EventRx;
 
 use super::finish::{FinishReason, StopReason};
@@ -55,7 +55,6 @@ pub enum DecodedTextEvent {
         delta: String,
         token_ids: Vec<u32>,
         logprobs: Option<DecodedLogprobs>,
-        public_commit: Option<PublicCommit>,
         finished: Option<Finished>,
     },
 }
@@ -72,8 +71,7 @@ struct DecodeState<'a> {
     queued_at: Option<f64>,
     scheduled_at: Option<f64>,
     started: bool,
-    pending_token: Option<(u32, Option<PublicCommit>)>,
-    last_public_commit: Option<PublicCommit>,
+    pending_token: Option<u32>,
     output_token_count: usize,
     accumulated_token_ids: Vec<u32>,
     accumulated_logprobs: Option<DecodedLogprobs>,
@@ -122,14 +120,10 @@ impl DecodeState<'_> {
         prompt_token_count: usize,
         token_id: u32,
         positions: Vec<PositionLogprobs>,
-        public_commit: Option<PublicCommit>,
         intermediate: bool,
         raw_stream: &mut EventRx,
         y: &mut TryYielder<DecodedTextEvent, Error>,
     ) -> Result<bool, Error> {
-        if public_commit.is_some() {
-            self.last_public_commit = public_commit.clone();
-        }
         let decoded_logprobs = (!positions.is_empty())
             .then(|| decode_logprobs(tokenizer, &positions, self.options.skip_special_tokens))
             .transpose()?;
@@ -179,7 +173,6 @@ impl DecodeState<'_> {
                 delta,
                 token_ids,
                 logprobs,
-                public_commit: public_commit.or_else(|| self.last_public_commit.clone()),
                 finished: Some(Finished {
                     prompt_token_count,
                     output_token_count: self.output_token_count,
@@ -199,7 +192,6 @@ impl DecodeState<'_> {
                 delta: decoded.delta,
                 token_ids: vec![token_id],
                 logprobs: decoded_logprobs,
-                public_commit,
                 finished: None,
             })
             .await;
@@ -268,7 +260,6 @@ pub async fn decoded_text_event_stream(
         scheduled_at: None,
         started: false,
         pending_token: None,
-        last_public_commit: None,
         output_token_count: 0,
         accumulated_token_ids: Vec::new(),
         accumulated_logprobs: None,
@@ -318,9 +309,7 @@ pub async fn decoded_text_event_stream(
                     )
                     .await?;
             }
-            GenerationEvent::TextToken {
-                id, public_commit, ..
-            } => {
+            GenerationEvent::TextToken { id, .. } => {
                 state
                     .emit_start_if_ready(
                         &request_id,
@@ -345,14 +334,13 @@ pub async fn decoded_text_event_stream(
                     });
                 }
                 if generated_logprobs_requested {
-                    state.pending_token = Some((id, public_commit));
+                    state.pending_token = Some(id);
                 } else if state
                     .consume_token(
                         tokenizer.as_ref(),
                         prompt_token_count,
                         id,
                         Vec::new(),
-                        public_commit,
                         intermediate,
                         &mut raw_stream,
                         &mut y,
@@ -363,15 +351,14 @@ pub async fn decoded_text_event_stream(
                 }
             }
             GenerationEvent::TokenLogprobs { id, candidates } => {
-                let (pending, public_commit) =
-                    state
-                        .pending_token
-                        .take()
-                        .ok_or_else(|| Error::MalformedOutput {
-                            request_id: request_id.clone(),
-                            message: "engine returned token logprobs without a pending token"
-                                .to_string(),
-                        })?;
+                let pending = state
+                    .pending_token
+                    .take()
+                    .ok_or_else(|| Error::MalformedOutput {
+                        request_id: request_id.clone(),
+                        message: "engine returned token logprobs without a pending token"
+                            .to_string(),
+                    })?;
                 if pending != id || candidates.first().is_none_or(|entry| entry.token_id != id) {
                     return Err(Error::MalformedOutput {
                         request_id: request_id.clone(),
@@ -386,7 +373,6 @@ pub async fn decoded_text_event_stream(
                         vec![PositionLogprobs {
                             entries: candidates,
                         }],
-                        public_commit,
                         intermediate,
                         &mut raw_stream,
                         &mut y,
@@ -443,7 +429,6 @@ pub async fn decoded_text_event_stream(
                     delta,
                     token_ids,
                     logprobs,
-                    public_commit: state.last_public_commit,
                     finished: Some(Finished {
                         prompt_token_count,
                         output_token_count: completion_tokens,

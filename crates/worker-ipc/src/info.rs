@@ -1,4 +1,4 @@
-//! `WorkerInfo` handshake data and mixed graph-bucket validation.
+//! Worker startup geometry, limits, and supported operations.
 
 use super::*;
 
@@ -76,51 +76,51 @@ impl WorkerInfo {
         }) || self.resource_classes.contains(&ResourceClass::KvBlock)
     }
 
-    pub fn validate(&self) -> ProtocolResult<()> {
-        wire_ensure!(
+    pub fn validate(&self) -> ValidationResult<()> {
+        ensure_valid!(
             !self.supported_work.is_empty(),
-            "worker capabilities declare no work variants"
+            "worker info declare no work variants"
         );
-        wire_ensure!(
+        ensure_valid!(
             self.supported_work
                 .iter()
                 .copied()
                 .collect::<HashSet<_>>()
                 .len()
                 == self.supported_work.len(),
-            "worker capabilities repeat a work variant"
+            "worker info repeat a work variant"
         );
-        wire_ensure!(
+        ensure_valid!(
             self.supported_controls
                 .iter()
                 .copied()
                 .collect::<HashSet<_>>()
                 .len()
                 == self.supported_controls.len(),
-            "worker capabilities repeat a control"
+            "worker info repeat a control"
         );
-        wire_ensure!(
+        ensure_valid!(
             self.resource_classes
                 .iter()
                 .copied()
                 .collect::<HashSet<_>>()
                 .len()
                 == self.resource_classes.len(),
-            "worker capabilities repeat a resource class"
+            "worker info repeat a resource class"
         );
-        wire_ensure!(
+        ensure_valid!(
             self.max_batch_operations > 0
                 && self.max_batch_tokens > 0
                 && self.max_request_pool_size > 0
                 && self.max_unresolved_window > 0,
-            "worker capabilities declare a zero scheduling bound"
+            "worker info declare a zero scheduling bound"
         );
-        wire_ensure!(
+        ensure_valid!(
             self.mixed_buckets.iter().collect::<HashSet<_>>().len() == self.mixed_buckets.len(),
-            "worker capabilities repeat a mixed-execution bucket"
+            "worker info repeat a mixed-execution bucket"
         );
         for bucket in &self.mixed_buckets {
-            wire_ensure!(
+            ensure_valid!(
                 bucket.decode_rows > 0
                     && bucket.flow_rows > 0
                     && bucket.height > 0
@@ -128,15 +128,15 @@ impl WorkerInfo {
                     && bucket.cfg_branches > 0
                     && bucket.decode_rows.saturating_add(bucket.flow_rows)
                         <= self.max_batch_operations,
-                "worker capabilities declare an invalid mixed-execution bucket"
+                "worker info declare an invalid mixed-execution bucket"
             );
         }
-        wire_ensure!(
+        ensure_valid!(
             self.pipeline_depth > 0,
             "worker pipeline depth must be positive"
         );
         if self.uses_kv() {
-            wire_ensure!(
+            ensure_valid!(
                 self.block_size > 0
                     && self.num_blocks > 0
                     && self.num_layers > 0
@@ -145,24 +145,24 @@ impl WorkerInfo {
                     && self.bytes_per_token > 0
                     && !self.groups.is_empty()
                     && self.kv_dtype.is_some(),
-                "worker capabilities declare incomplete KV geometry"
+                "worker info declare incomplete KV geometry"
             );
             let mut total_blocks = 0u64;
             for group in &self.groups {
-                wire_ensure!(
+                ensure_valid!(
                     group.num_blocks > 0,
                     "worker KV groups are not a canonical physical page partition"
                 );
                 total_blocks = total_blocks
                     .checked_add(u64::from(group.num_blocks))
-                    .ok_or_else(|| wire_error!("worker KV group page range overflows"))?;
+                    .ok_or_else(|| invalid_message!("worker KV group page range overflows"))?;
             }
-            wire_ensure!(
+            ensure_valid!(
                 total_blocks == u64::from(self.num_blocks),
                 "worker KV groups do not cover the physical request page pool"
             );
         } else {
-            wire_ensure!(
+            ensure_valid!(
                 self.block_size == 0
                     && self.num_blocks == 0
                     && self.num_layers == 0
@@ -171,7 +171,7 @@ impl WorkerInfo {
                     && self.bytes_per_token == 0
                     && self.groups.is_empty()
                     && self.kv_dtype.is_none(),
-                "KV-free worker capabilities must carry zero KV geometry"
+                "KV-free worker info must carry zero KV geometry"
             );
         }
         let has_latent_geometry = self.latent_page_units > 0
@@ -179,27 +179,27 @@ impl WorkerInfo {
             || self.latent_width > 0
             || self.latent_dtype.is_some();
         if has_latent_geometry || self.resource_classes.contains(&ResourceClass::ImageLatent) {
-            wire_ensure!(
+            ensure_valid!(
                 self.latent_page_units > 0
                     && self.num_latent_pages > 1
                     && self.latent_width > 0
                     && self.latent_dtype.is_some(),
-                "worker capabilities declare incomplete latent pool geometry"
+                "worker info declare incomplete latent pool geometry"
             );
         }
         let addresses_latent = self
             .supported_work
             .iter()
             .any(|variant| matches!(variant, ForwardMode::GenTransition | ForwardMode::GenFlow));
-        wire_ensure!(
+        ensure_valid!(
             !addresses_latent || self.resource_classes.contains(&ResourceClass::ImageLatent),
-            "worker capabilities advertise latent work without a latent page pool"
+            "worker info advertise latent work without a latent page pool"
         );
-        wire_ensure!(!self.model_name.is_empty(), "worker model name is empty");
+        ensure_valid!(!self.model_name.is_empty(), "worker model name is empty");
         Ok(())
     }
 
-    pub fn generation_runtime_capabilities(&self) -> GenerationRuntimeCapabilities {
+    pub fn generation_limits(&self) -> GenerationLimits {
         let supports = |variant: ForwardMode| self.supported_work.contains(&variant);
         let mut features = uniserve_core::GenerationFeatures::empty();
         if supports(ForwardMode::TokenExtend) && supports(ForwardMode::TokenDecode) {
@@ -218,7 +218,7 @@ impl WorkerInfo {
         {
             features.insert(uniserve_core::GenerationFeatures::IMAGE_GENERATION);
         }
-        GenerationRuntimeCapabilities {
+        GenerationLimits {
             features,
             max_latent_units: self.latent_capacity_units(),
             latent_downsample: self.latent_downsample,

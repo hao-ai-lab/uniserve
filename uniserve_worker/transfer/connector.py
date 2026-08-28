@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import torch
 
 from ..execution.batch import FixedPoint, ProductKind, ProductRef, RequestKey, VersionRef
-from ..foundation.errors import capability_mismatch, invalid_descriptor
+from ..foundation.errors import unsupported_setup, invalid_descriptor
 from ..runtime.cache_pool import CachePool
 from ..runtime.req_to_token_pool import ReqToTokenPool
 from .tickets import Locator, Transport, fetch_locator, make_transport
@@ -34,13 +34,13 @@ class TransferConnector:
     ) -> None:
         selected = str(backend)
         if bool(cross_process) and selected in {"", "local"}:
-            raise capability_mismatch(
+            raise unsupported_setup(
                 f"cross-process transfer requires a shared transport, got {selected!r}"
             )
         if int(byte_capacity) < 1:
-            raise capability_mismatch("transfer byte capacity must be positive")
+            raise unsupported_setup("transfer byte capacity must be positive")
         if int(ticket_capacity) < 1:
-            raise capability_mismatch("transfer ticket capacity must be positive")
+            raise unsupported_setup("transfer ticket capacity must be positive")
         self.transport = make_transport(
             selected,
             byte_capacity=int(byte_capacity),
@@ -189,7 +189,7 @@ class CachePublications:
             raise invalid_descriptor("KV publication destination is ahead of its source")
         suffix = visible - base_extent
         if suffix and not bool(getattr(transport, "supports_async_publication", False)):
-            raise capability_mismatch("KV publication requires asynchronous transport")
+            raise unsupported_setup("KV publication requires asynchronous transport")
         locators: list[Locator] = []
         try:
             if suffix:
@@ -214,7 +214,7 @@ class CachePublications:
                 transport.release(locator)
             raise
         publication = CachePublication(
-            locators=tuple(locator.to_wire_json() for locator in locators),
+            locators=tuple(locator.to_json() for locator in locators),
             source_version=source_version,
             destination=destination,
             base_version=expected_base,
@@ -291,9 +291,9 @@ class CachePublications:
             raise invalid_descriptor("KV publication locator count does not match cache layers")
         if transferred_tensors is None:
             if getattr(transport, "blocking_fetch", False):
-                raise capability_mismatch("KV installation requires prepared transfer tensors")
+                raise unsupported_setup("KV installation requires prepared transfer tensors")
             transferred_tensors = tuple(
-                fetch_locator(transport, Locator.from_wire_json(raw))
+                fetch_locator(transport, Locator.from_json(raw))
                 for raw in publication.locators
             )
         if len(transferred_tensors) != expected_locators:
@@ -357,10 +357,10 @@ class CachePublications:
             )
             if publication.locators:
                 if transport is None:
-                    raise capability_mismatch("KV publication has no configured transport")
+                    raise unsupported_setup("KV publication has no configured transport")
                 identity = (session_id, int(product.producer_op_id))
                 held = (
-                    tuple(Locator.from_wire_json(raw) for raw in publication.locators),
+                    tuple(Locator.from_json(raw) for raw in publication.locators),
                     transport,
                 )
                 if identity in locators and locators[identity] != held:
@@ -483,7 +483,7 @@ class CachePublications:
             self._products[product] = publication
             if publication.locators:
                 self._locators[(state.session_id, int(product.producer_op_id))] = (
-                    tuple(Locator.from_wire_json(raw) for raw in publication.locators),
+                    tuple(Locator.from_json(raw) for raw in publication.locators),
                     transport,
                 )
         for destination, version, extent in state.destination_bases:

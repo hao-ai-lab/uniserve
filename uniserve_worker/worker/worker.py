@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from ..bootstrap.capabilities import resolve_capabilities
+from ..bootstrap.worker_info import build_worker_info
 from ..bootstrap.capacity import (
     device_total_bytes,
     model_arena_capacity,
@@ -25,7 +25,7 @@ from ..bootstrap.execution_config import (
     LaneConfig,
     graph_memory_budget_bytes,
 )
-from ..capabilities import (
+from ..worker_info import (
     GraphBucket,
     ResourceClass,
     WorkerInfo,
@@ -54,7 +54,7 @@ from ..execution.step import (
     drop_session as drop_execution_session,
 )
 from ..execution.trace import ExecutionPhase, ExecutionTrace, OperationTrace
-from ..foundation.errors import capability_mismatch, invalid_descriptor
+from ..foundation.errors import unsupported_setup, invalid_descriptor
 from ..foundation.math import ceil_div
 from ..loader.update import WeightUpdater
 from ..loader.weight_set import WeightSet
@@ -181,9 +181,9 @@ class Worker:
         media_spool: Path | None = None,
     ) -> None:
         if not isinstance(model, (ExecutionModel, MiniMaxH3Model)):
-            raise capability_mismatch("worker model has no supported execution surface")
+            raise unsupported_setup("worker model has no supported execution surface")
         if not isinstance(deployment, WorkerDeployment):
-            raise capability_mismatch("model worker requires a worker deployment")
+            raise unsupported_setup("model worker requires a worker deployment")
         self.model = model
         self.mesh = mesh
         self.deployment = deployment
@@ -195,7 +195,7 @@ class Worker:
         self.weights = installed_weights
         self.architecture = model.architecture
         self.weight_version = installed_weights.version
-        declared = resolve_capabilities(
+        declared = build_worker_info(
             model,
             deployment,
             model_name=self.architecture,
@@ -218,17 +218,17 @@ class Worker:
             bytes_per_token=int(declared.bytes_per_token),
         )
         if int(pipeline_depth) <= 0:
-            raise capability_mismatch("worker pipeline depth must be positive")
+            raise unsupported_setup("worker pipeline depth must be positive")
         implemented_work = model.supported_work
         self._effective_work_variants = allowed_work_variants & implemented_work
         if not self._effective_work_variants:
-            raise capability_mismatch(
+            raise unsupported_setup(
                 f"{type(self).__name__} implements none of the requested work variants "
                 f"{sorted(value.value for value in allowed_work_variants)!r}"
             )
         advertised_work = self._effective_work_variants
         if not advertised_work:
-            raise capability_mismatch(f"{type(self).__name__} advertises no executable work")
+            raise unsupported_setup(f"{type(self).__name__} advertises no executable work")
         lane_operation_bound = min(
             (
                 int(lane.max_batch_operations or declared.max_batch_operations)
@@ -240,7 +240,7 @@ class Worker:
             (int(lane.max_batch_tokens or declared.max_batch_tokens) for lane in execution.lanes),
             default=int(declared.max_batch_tokens),
         )
-        self._capabilities = replace(
+        self._info = replace(
             declared,
             supported_work=tuple(variant for variant in ForwardMode if variant in advertised_work),
             pipeline_depth=int(pipeline_depth),
@@ -253,14 +253,14 @@ class Worker:
         owns_kv = bool(model.resource_geometry.kv)
         packed_model = model if isinstance(model, ExecutionModel) else None
         if owns_kv != (attention is not None):
-            raise capability_mismatch(
+            raise unsupported_setup(
                 "attention selection must exactly match model-owned KV resources"
             )
         if isinstance(model, MiniMaxH3Model):
             if media_spool is None or not media_spool.is_absolute():
-                raise capability_mismatch("MiniMax H3 requires an absolute shared media spool")
+                raise unsupported_setup("MiniMax H3 requires an absolute shared media spool")
         elif media_spool is not None:
-            raise capability_mismatch("packed-forward models do not own a media spool")
+            raise unsupported_setup("packed-forward models do not own a media spool")
         cache = packed_model.cache_geometry if owns_kv and packed_model is not None else None
         self.cache_pool = None
         self.req_to_token_pool = None
@@ -269,20 +269,20 @@ class Worker:
             assert packed_model is not None
             cache_dtype = getattr(torch, str(cache.dtype).removeprefix("torch."), None)
             if not isinstance(cache_dtype, torch.dtype):
-                raise capability_mismatch(f"unsupported cache dtype {cache.dtype!r}")
+                raise unsupported_setup(f"unsupported cache dtype {cache.dtype!r}")
             max_blocks_per_row = max(
                 1,
                 ceil_div(int(packed_model.text_max_tokens), int(deployment.block_size)),
             )
             group_ranges: list[tuple[int, int]] = []
             group_offset = 0
-            for group in self._capabilities.groups:
+            for group in self._info.groups:
                 group_ranges.append((group_offset, int(group.num_blocks)))
                 group_offset += int(group.num_blocks)
             self.cache_pool = CachePool(
                 num_layers=int(cache.num_layers),
-                num_pages=int(self._capabilities.num_blocks),
-                page_size=int(self._capabilities.block_size),
+                num_pages=int(self._info.num_blocks),
+                page_size=int(self._info.block_size),
                 num_kv_heads=int(cache.num_kv_heads),
                 head_dim=int(cache.head_dim),
                 device=deployment.device,
@@ -300,30 +300,30 @@ class Worker:
                     torch.device(deployment.device),
                 )
             ):
-                raise capability_mismatch(
+                raise unsupported_setup(
                     "image generation requires paged-prefix plus dense-current attention"
                 )
             self.req_to_token_pool = ReqToTokenPool(
                 group_count=self.cache_pool.group_count,
-                request_pool_size=int(self._capabilities.max_request_pool_size),
+                request_pool_size=int(self._info.max_request_pool_size),
                 max_blocks_per_request=max_blocks_per_row,
-                block_size=int(self._capabilities.block_size),
+                block_size=int(self._info.block_size),
                 device=deployment.device,
                 staging_depth=int(pipeline_depth),
             )
             packed_model.bind_cache_pool(self.cache_pool, attention)
-        self.requests = RequestTable(int(self._capabilities.max_request_pool_size))
+        self.requests = RequestTable(int(self._info.max_request_pool_size))
         torch_dtype = getattr(
             torch,
             str(deployment.model_dtype).removeprefix("torch."),
             None,
         )
         if not isinstance(torch_dtype, torch.dtype):
-            raise capability_mismatch(f"unsupported model dtype {deployment.model_dtype!r}")
+            raise unsupported_setup(f"unsupported model dtype {deployment.model_dtype!r}")
         if self.req_to_token_pool is not None:
             assert packed_model is not None
             self.runtime_states = RuntimeStates(
-                request_pool_size=int(self._capabilities.max_request_pool_size),
+                request_pool_size=int(self._info.max_request_pool_size),
                 vocab_size=int(packed_model.vocab_size),
                 continuation_width=1,
                 device=deployment.device,
@@ -335,22 +335,22 @@ class Worker:
         flow = None if packed_model is None else packed_model.generation
         latent_dtype = getattr(
             torch,
-            str(self._capabilities.latent_dtype).removeprefix("torch."),
+            str(self._info.latent_dtype).removeprefix("torch."),
             None,
         )
         if flow is not None and not isinstance(latent_dtype, torch.dtype):
-            raise capability_mismatch(
-                f"unsupported latent dtype {self._capabilities.latent_dtype!r}"
+            raise unsupported_setup(
+                f"unsupported latent dtype {self._info.latent_dtype!r}"
             )
         if flow is None:
             self.latent_pool = None
         else:
             assert isinstance(latent_dtype, torch.dtype)
             self.latent_pool = LatentPool(
-                request_pool_size=int(self._capabilities.max_request_pool_size),
-                num_pages=int(self._capabilities.num_latent_pages),
-                page_units=int(self._capabilities.latent_page_units),
-                latent_width=int(self._capabilities.latent_width),
+                request_pool_size=int(self._info.max_request_pool_size),
+                num_pages=int(self._info.num_latent_pages),
+                page_units=int(self._info.latent_page_units),
+                latent_width=int(self._info.latent_width),
                 dtype=latent_dtype,
                 device=deployment.generation_device or deployment.device,
             )
@@ -377,8 +377,8 @@ class Worker:
             entry_capacity=int(model.resource_geometry.encoder_cache_entries),
             max_entry_bytes=max(
                 1,
-                int(self._capabilities.max_latent_feature_bytes),
-                int(self._capabilities.max_vision_feature_bytes),
+                int(self._info.max_latent_feature_bytes),
+                int(self._info.max_vision_feature_bytes),
             ),
             devices=owner_devices,
             event_pool=self.device_events,
@@ -394,11 +394,11 @@ class Worker:
             cross_process=bool(cross_process),
         )
         max_rows = min(
-            int(self._capabilities.max_batch_operations),
-            int(self._capabilities.max_request_pool_size),
+            int(self._info.max_batch_operations),
+            int(self._info.max_request_pool_size),
         )
         max_staged_rows = max_rows * (1 if flow is None else int(flow.max_cfg_branches))
-        max_text_staged_tokens = int(self._capabilities.max_batch_tokens)
+        max_text_staged_tokens = int(self._info.max_batch_tokens)
         max_flow_staged_tokens = (
             0
             if flow is None
@@ -434,11 +434,11 @@ class Worker:
             max_rows if decode_lane is None else int(decode_lane.max_batch_operations or max_rows),
         )
         prefill_max_tokens = min(
-            int(self._capabilities.max_batch_tokens),
+            int(self._info.max_batch_tokens),
             (
-                int(self._capabilities.max_batch_tokens)
+                int(self._info.max_batch_tokens)
                 if prefill_lane is None
-                else int(prefill_lane.max_batch_tokens or self._capabilities.max_batch_tokens)
+                else int(prefill_lane.max_batch_tokens or self._info.max_batch_tokens)
             ),
         )
         flow_max_operations = min(
@@ -450,13 +450,13 @@ class Worker:
             for value in execution.decode_graph_batch_sizes
             if 0 < int(value) <= decode_max_operations
             and owns_kv
-            and int(value) < int(self._capabilities.num_blocks)
+            and int(value) < int(self._info.num_blocks)
         )
         prefill_capacity = (
             min(
-                int(self._capabilities.max_batch_tokens),
+                int(self._info.max_batch_tokens),
                 int(packed_model.text_max_tokens),
-                max(0, int(self._capabilities.num_blocks) - 1) * int(deployment.block_size),
+                max(0, int(self._info.num_blocks) - 1) * int(deployment.block_size),
             )
             if owns_kv and packed_model is not None
             else 0
@@ -508,7 +508,7 @@ class Worker:
                 and int(batch_size) * flow.physical_tokens(int(height), int(width)) * cfg_branches
                 <= max_staged_tokens
                 and flow.image_tokens(int(height), int(width))
-                <= int(self._capabilities.latent_capacity_units)
+                <= int(self._info.latent_capacity_units)
                 and self.latent_pool is not None
                 and int(batch_size) * flow.image_tokens(int(height), int(width))
                 <= int(self.latent_pool.capacity_units)
@@ -623,8 +623,8 @@ class Worker:
         self._flow_cfg_branches = flow_cfg_branches
         self._flow_graph_buckets = flow_graph_buckets
         self._mixed_flow_graph_buckets = mixed_flow_graph_buckets
-        self._capabilities = replace(
-            self._capabilities,
+        self._info = replace(
+            self._info,
             mixed_buckets=mixed_flow_graph_buckets,
         )
         graph_budget = graph_memory_budget_bytes(device_total_bytes(deployment.device))
@@ -790,7 +790,7 @@ class Worker:
         self.h3_output_ring = (
             H3OutputRing(
                 state_slots=model.states.slot_count,
-                unresolved_window=self._capabilities.max_unresolved_window,
+                unresolved_window=self._info.max_unresolved_window,
             )
             if isinstance(model, MiniMaxH3Model) and mesh.coord("sp") == 0
             else None
@@ -816,7 +816,7 @@ class Worker:
             model_name=self.architecture,
             weight_version=self.weight_version,
             allowed_work_variants=self._effective_work_variants,
-            mixed_buckets=self._capabilities.mixed_buckets,
+            mixed_buckets=self._info.mixed_buckets,
             trace=self.trace,
             h3_mux=self.h3_mux,
             h3_output_ring=self.h3_output_ring,
@@ -842,8 +842,8 @@ class Worker:
         )
 
     @property
-    def capabilities(self) -> WorkerInfo:
-        return self._capabilities
+    def info(self) -> WorkerInfo:
+        return self._info
 
     def _decode_context_blocks(self) -> int:
         model = self.model
@@ -871,7 +871,7 @@ class Worker:
             self._end_model_call()
             raise
         if prepared is None:
-            if int(self.capabilities.rank.tp_size) > 1:
+            if int(self.info.rank.tp_size) > 1:
                 prepared = PreparedExecution(batch=batch, transfers=())
             else:
                 self._end_model_call()
@@ -929,7 +929,7 @@ class Worker:
         install_weights(self.execution, weights)
         self.weights = weights
         self.weight_version = weights.version
-        self._capabilities = replace(self._capabilities, weight_version=weights.version)
+        self._info = replace(self._info, weight_version=weights.version)
 
     def warmup(self) -> None:
         if not isinstance(self.model, MiniMaxH3Model):
@@ -1008,7 +1008,7 @@ class Worker:
                     self.model.states.slot_count * bytes_per_slot,
                 )
             ]
-        caps = self._capabilities
+        info = self._info
         counts = {
             "image_latent": (
                 0 if self.latent_pool is None else self.latent_pool.resident_byte_count()
@@ -1019,11 +1019,11 @@ class Worker:
             "image_latent": (
                 0 if self.latent_pool is None else int(self.latent_pool.capacity_bytes)
             ),
-            "encoder_output": int(caps.encoder_cache_budget),
+            "encoder_output": int(info.encoder_cache_budget),
         }
         return [
             _pressure(value.value, counts[value.value], totals[value.value])
-            for value in caps.resource_classes
+            for value in info.resource_classes
             if value.value in counts
         ]
 

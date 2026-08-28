@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 from torch import nn
 
-from ..foundation.errors import capability_mismatch, invalid_descriptor
+from ..foundation.errors import unsupported_setup, invalid_descriptor
 from ..models.bagel import BagelForConditionalGeneration
 from ..models.minimax_h3 import MiniMaxH3Model
 from ..models.qwen3 import Qwen3ForCausalLM
@@ -96,7 +96,7 @@ def resolve_catalog_entry(architectures: list[str] | tuple[str, ...]) -> Catalog
             return SENSENOVA_ENTRY
         case ("MiniMaxH3Transformer3DModel",):
             return MINIMAX_H3_ENTRY
-    raise capability_mismatch(
+    raise unsupported_setup(
         "configured checkpoint must declare exactly one architecture from "
         "Qwen3ForCausalLM, BagelForConditionalGeneration, NEOChatModel, or "
         "MiniMaxH3Transformer3DModel; "

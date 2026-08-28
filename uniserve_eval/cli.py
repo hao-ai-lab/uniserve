@@ -1,4 +1,4 @@
-"""Run explicit public-protocol serving benchmarks."""
+"""Run explicit serving benchmarks against public HTTP endpoints."""
 
 from __future__ import annotations
 

@@ -8,7 +8,7 @@ import pytest
 
 from tests.python.fixtures.model_execution import TEST_DEPLOYMENT, TEST_MODEL
 from uniserve_worker.execution.batch import ForwardMode
-from uniserve_worker.bootstrap.capabilities import resolve_capabilities
+from uniserve_worker.bootstrap.worker_info import build_worker_info
 from uniserve_worker.bootstrap.capacity import latent_trajectory_bytes, model_arena_capacity
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.foundation.math import ceil_div
@@ -16,20 +16,20 @@ from uniserve_worker.foundation.math import ceil_div
 pytestmark = pytest.mark.unit
 
 
-def test_capabilities_project_model_behavior_and_resource_geometry():
-    capabilities = resolve_capabilities(
+def test_worker_info_projects_model_behavior_and_resource_geometry():
+    info = build_worker_info(
         TEST_MODEL,
         TEST_DEPLOYMENT,
         model_name="test-model",
         weight_version=7,
     )
 
-    assert ForwardMode.TOKEN_EXTEND in capabilities.supported_work
-    assert ForwardMode.GEN_FLOW in capabilities.supported_work
-    assert capabilities.mixed_buckets == ()
-    assert capabilities.num_layers == TEST_MODEL.cache_geometry.num_layers
-    assert capabilities.model_name == "test-model"
-    assert capabilities.weight_version == 7
+    assert ForwardMode.TOKEN_EXTEND in info.supported_work
+    assert ForwardMode.GEN_FLOW in info.supported_work
+    assert info.mixed_buckets == ()
+    assert info.num_layers == TEST_MODEL.cache_geometry.num_layers
+    assert info.model_name == "test-model"
+    assert info.weight_version == 7
 
 
 def test_latent_capacity_rounds_to_complete_scheduler_pages() -> None:
@@ -40,22 +40,22 @@ def test_latent_capacity_rounds_to_complete_scheduler_pages() -> None:
         kv_token_capacity=int(flow.max_latent_tokens) + 1,
     )
 
-    capabilities = resolve_capabilities(TEST_MODEL, deployment)
+    info = build_worker_info(TEST_MODEL, deployment)
 
     expected_pages = ceil_div(
         int(flow.max_latent_tokens) + 1,
         int(deployment.block_size),
     )
-    assert capabilities.num_latent_pages == expected_pages + 1
-    assert capabilities.latent_capacity_units == expected_pages * int(deployment.block_size)
+    assert info.num_latent_pages == expected_pages + 1
+    assert info.latent_capacity_units == expected_pages * int(deployment.block_size)
 
 
 def test_transfer_capacity_covers_one_maximum_float32_trajectory_per_ticket() -> None:
     deployment = replace(TEST_DEPLOYMENT, model_dtype="float32")
-    capabilities = resolve_capabilities(TEST_MODEL, deployment)
+    info = build_worker_info(TEST_MODEL, deployment)
     flow = TEST_MODEL.generation
     assert flow is not None
-    assert capabilities.max_latent_feature_bytes == latent_trajectory_bytes(
+    assert info.max_latent_feature_bytes == latent_trajectory_bytes(
         int(flow.max_vae_grid_tokens),
         int(flow.latent_channels) * int(flow.latent_patch_size) ** 2,
         4,

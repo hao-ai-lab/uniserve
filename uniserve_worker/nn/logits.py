@@ -19,7 +19,7 @@ def forced_eos_logits(
 ) -> torch.Tensor:
     """Synthetic one-hot logits row that forces EOS.
 
-    Used for empty-token text ops, where the contract still requires a logits
+    Used for empty-token text operations, which still require a logits
     tensor but no model forward runs; sampling any distribution over these
     logits yields ``eos_id``.
     """
