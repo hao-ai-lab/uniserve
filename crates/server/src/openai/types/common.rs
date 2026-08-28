@@ -377,7 +377,6 @@ pub struct ModelObject {
 pub struct ServedModelIdentity {
     pub served_name: String,
     pub description: crate::profile::ModelDescription,
-    pub fingerprint: Option<String>,
 }
 
 /// Typed public capabilities for the configured model route.

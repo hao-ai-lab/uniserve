@@ -12,7 +12,6 @@ from torch import nn
 from ..foundation.errors import capability_mismatch
 from ..loader import LoadConfig, LoadRequest, WeightSet, get_model_loader
 from ..loader.source import read_model_config, resolve_model_root
-from ..models.identity import ModelIdentity, architecture_identity
 from ..models.minimax_h3 import MiniMaxH3Model
 from ..models.runtime import ExecutionModel, WorkerDeployment
 from ..nn.mesh import DeviceMesh, TensorParallel
@@ -46,7 +45,7 @@ class LoadedWorkerModel:
     model: ExecutionModel | MiniMaxH3Model
     tokenizer: Any | None
     deployment: WorkerDeployment
-    identity: ModelIdentity
+    architecture: str
     weights: WeightSet
     weight_sidecars: tuple[str, ...]
 
@@ -92,25 +91,14 @@ def load_worker_model(
 
     _resolve_input_tokens(model, loaded.tokenizer)
     deployment = _deployment(request)
-    identity = ModelIdentity(
-        architecture=model.architecture,
-        architecture_digest=architecture_identity(
-            entry.architecture,
-            loaded.architecture_config,
-        ),
-        weight_digest=loaded.weights.digest,
-    )
     logger.info(
-        "loaded model architecture=%s architecture_digest=%s weight_digest=%s",
-        identity.architecture,
-        identity.architecture_digest,
-        identity.weight_digest,
+        "loaded model architecture=%s weight_version=%d", model.architecture, loaded.weights.version
     )
     return LoadedWorkerModel(
         model=model,
         tokenizer=loaded.tokenizer,
         deployment=deployment,
-        identity=identity,
+        architecture=model.architecture,
         weights=loaded.weights,
         weight_sidecars=entry.sidecars,
     )
@@ -145,9 +133,10 @@ def _load_h3_worker_model(
         raise capability_mismatch("MiniMax H3 loading requires the worker device mesh")
     if request.parallel.size != 4 or mesh.size("tp") != 4 or mesh.size("sp") != 4:
         raise capability_mismatch("MiniMax H3 requires one TP4/SP4 replica")
-    if mesh.local_device.type != "cuda" or torch.cuda.get_device_capability(
-        mesh.local_device
-    ) < (10, 0):
+    if mesh.local_device.type != "cuda" or torch.cuda.get_device_capability(mesh.local_device) < (
+        10,
+        0,
+    ):
         raise capability_mismatch("MiniMax H3 requires an SM100-class CUDA device")
     if not media_spool or not Path(media_spool).expanduser().is_absolute():
         raise capability_mismatch("MiniMax H3 requires an absolute shared media spool")
@@ -178,32 +167,15 @@ def _load_h3_worker_model(
         max_request_pool_size=state_slots,
         generation_device=None,
     )
-    weights = WeightSet.from_module(model, digest=model.checkpoint_digest)
-    identity = ModelIdentity(
-        architecture=model.architecture,
-        architecture_digest=architecture_identity(
-            entry.architecture,
-            {
-                "profile": "minimax_h3_t2va_v0.2",
-                "height": 768,
-                "width": 1344,
-                "frames": 124,
-                "evaluations": 4,
-            },
-        ),
-        weight_digest=weights.digest,
-    )
+    weights = WeightSet.from_module(model)
     logger.info(
-        "loaded model architecture=%s architecture_digest=%s weight_digest=%s",
-        identity.architecture,
-        identity.architecture_digest,
-        identity.weight_digest,
+        "loaded model architecture=%s weight_version=%d", model.architecture, weights.version
     )
     return LoadedWorkerModel(
         model=model,
         tokenizer=model.tokenizer,
         deployment=deployment,
-        identity=identity,
+        architecture=model.architecture,
         weights=weights,
         weight_sidecars=entry.sidecars,
     )
@@ -257,14 +229,7 @@ def _stub_worker_model(config: WorkerProcessArgs, plan: WorkerPlan) -> LoadedWor
             kv_memory_fraction=config.execution.kv_memory_fraction,
             generation_device=config.placement.generation_device,
         ),
-        identity=ModelIdentity(
-            architecture=stub.architecture,
-            architecture_digest=architecture_identity(
-                stub.architecture,
-                {"architecture": stub.architecture},
-            ),
-            weight_digest=weights.digest,
-        ),
+        architecture=stub.architecture,
         weights=weights,
         weight_sidecars=("config.json",),
     )

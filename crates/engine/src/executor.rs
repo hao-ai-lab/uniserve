@@ -469,7 +469,7 @@ pub trait Executor: Send {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uniserve_core::{Digest, RequestId};
+    use uniserve_core::RequestId;
     use uniserve_worker_ipc::{Bounds, ForwardMode, OpId, RequestKey, RouteId, VersionRef};
 
     #[test]
@@ -508,7 +508,7 @@ mod tests {
         Operation {
             request_key,
             op_id: OpId(1),
-            parent: VersionRef::admission_root(request_key, OpId(1), Digest::zero()),
+            parent: VersionRef::admission_root(request_key, OpId(1)),
             work,
             route: RouteId(0),
             domain: work.domain(),
@@ -519,7 +519,6 @@ mod tests {
             predicate: None,
             rng: None,
             control_seq: 0,
-            plan_digest: Digest::zero(),
         }
         .sealed()
     }

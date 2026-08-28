@@ -101,7 +101,7 @@ class CudaGraphRunner:
         cache_pool: CachePool,
         attention: AttentionSelection,
         block_size: int,
-        weight_digest: str,
+        weight_version: int,
         memory_budget_bytes: int,
         decode_batch_sizes: tuple[int, ...] = (),
         decode_predicates: torch.Tensor | None = None,
@@ -114,7 +114,7 @@ class CudaGraphRunner:
         expected_resident_executables: int | None = None,
         output_slot_count: int = 2,
     ) -> None:
-        if not weight_digest or block_size < 1 or memory_budget_bytes < 0 or output_slot_count < 1:
+        if weight_version < 0 or block_size < 1 or memory_budget_bytes < 0 or output_slot_count < 1:
             raise ValueError("graph-store identity and geometry are invalid")
         if decode_predicates is not None and (
             decode_predicates.ndim != 1 or decode_predicates.dtype is not torch.bool
@@ -126,7 +126,7 @@ class CudaGraphRunner:
         self.cache_pool = cache_pool
         self.attention = attention
         self.block_size = int(block_size)
-        self.weight_digest = str(weight_digest)
+        self.weight_version = int(weight_version)
         self.memory_budget_bytes = int(memory_budget_bytes)
         self.decode_batch_sizes = tuple(
             sorted({int(value) for value in decode_batch_sizes if int(value) > 0})
@@ -421,13 +421,13 @@ class CudaGraphRunner:
         for state in states:
             _release_state(state)
 
-    def invalidate(self, weight_digest: str) -> None:
+    def invalidate(self, weight_version: int) -> None:
         """Retire every executable captured against the previous weight identity."""
 
-        if not weight_digest:
-            raise ValueError("CUDA graph invalidation requires a weight digest")
+        if weight_version <= self.weight_version:
+            raise ValueError("CUDA graph invalidation requires a newer weight version")
         self.close()
-        self.weight_digest = str(weight_digest)
+        self.weight_version = int(weight_version)
         self._sealed = False
 
     def _capture(

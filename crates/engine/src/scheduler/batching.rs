@@ -187,22 +187,16 @@ impl Scheduler {
                     // admission, identified by operation-id 0 — the sentinel the
                     // worker seeds as its initial committed version — so the first
                     // operation's fixed parent matches the worker's committed state.
-                    st.resolved_semantic = admission.digest.clone();
                     st.resolved_producer_op_id = 0;
-                    st.committed_semantic = admission.digest.clone();
                     st.committed_producer_op_id = 0;
                     st.latest_device_version = None;
-                    st.admission_digest = Some(admission.digest.clone());
                     st.token_cutoffs.clear();
                     st.token_cutoffs.insert(
                         st.output.tokens_sent,
                         VersionRef {
                             request_key,
                             producer_op_id: OpId(0),
-                            point: Point::Fixed {
-                                point_index: 0,
-                                semantic_digest: admission.digest.clone(),
-                            },
+                            point: Point::Fixed { point_index: 0 },
                         },
                     );
                     admissions.push(admission);
@@ -382,9 +376,10 @@ impl Scheduler {
             let Some((epoch, latest_device_version)) =
                 self.running.get(&request_id).and_then(|state| {
                     state
-                        .admission_digest
-                        .as_ref()
-                        .map(|_| (state.epoch, state.latest_device_version.clone()))
+                        .cursor
+                        .resources
+                        .worker_registered
+                        .then(|| (state.epoch, state.latest_device_version.clone()))
                 })
             else {
                 tracing::error!(

@@ -119,7 +119,7 @@ def test_false_device_predicate_preserves_parent_cutoff_across_registered_descen
         parent=VersionRef(
             admission.request_key,
             parent.op_id,
-            DevicePoint(1, None, parent.plan_digest),
+            DevicePoint(1, None),
         ),
         mode=TokenMode.DECODE,
         tokens=(0,),
@@ -143,7 +143,7 @@ def test_false_device_predicate_preserves_parent_cutoff_across_registered_descen
         parent=VersionRef(
             admission.request_key,
             successor.op_id,
-            DevicePoint(1, None, successor.plan_digest),
+            DevicePoint(1, None),
         ),
         mode=TokenMode.DECODE,
         tokens=(0,),
@@ -174,7 +174,7 @@ def test_false_device_predicate_preserves_parent_cutoff_across_registered_descen
     selected = VersionRef(
         admission.request_key,
         parent.op_id,
-        FixedPoint(parent_completion.selected_point, parent_completion.semantic_digest),
+        FixedPoint(parent_completion.selected_point),
     )
     commit = Commit(
         request_key=admission.request_key,
@@ -213,7 +213,7 @@ def test_false_device_predicate_preserves_parent_cutoff_across_registered_descen
     later_selected = VersionRef(
         admission.request_key,
         later.op_id,
-        FixedPoint(later_completion.selected_point, later_completion.semantic_digest),
+        FixedPoint(later_completion.selected_point),
     )
     later_commit = Commit(
         request_key=admission.request_key,
@@ -313,7 +313,7 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
         parent=VersionRef(
             admission.request_key,
             parent.op_id,
-            DevicePoint(1, None, parent.plan_digest),
+            DevicePoint(1, None),
         ),
         conditioning=conditioning,
         control_seq=initial_commit.control_seq,
@@ -343,7 +343,6 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
     parent_completion = finalize_completion_report(parent_report).completions[0]
     candidate_completion = candidate_report.completions[0]
     assert candidate_completion.status is OpStatus.PREDICATED
-    assert candidate_completion.semantic_digest == parent_completion.semantic_digest
     assert candidate_completion.logical_lengths == parent_completion.logical_lengths
     assert candidate_completion.product_generations == ()
 

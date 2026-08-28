@@ -425,7 +425,7 @@ def gen_admission(session_id: int, image: ImageParams, *, epoch: int = 1) -> New
 def root_parent(admission: NewRequest) -> VersionRef:
     """The admission-root fixed version a request's first operation parents on."""
 
-    return VersionRef(admission.request_key, 0, FixedPoint(0, admission.digest))
+    return VersionRef(admission.request_key, 0, FixedPoint(0))
 
 
 def finalized_report(report: CompletionReport) -> CompletionReport:
@@ -459,7 +459,7 @@ def commit_for_completion(
     selected = VersionRef(
         operation.request_key,
         int(operation.op_id),
-        FixedPoint(int(record.selected_point), str(record.semantic_digest)),
+        FixedPoint(int(record.selected_point)),
     )
     _OP_KV_RESULTS[(operation.request_key, int(operation.op_id))] = int(
         record.logical_lengths.kv_visible_len

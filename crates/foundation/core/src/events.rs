@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{Digest, DigestError, OpId, RequestId};
+use crate::{Digest, OpId, RequestId};
 
 /// Terminal cause for one engine generation lineage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,7 +51,6 @@ pub enum PublicModality {
 pub struct SemanticRoot {
     pub producer_op_id: OpId,
     pub point_index: u32,
-    pub semantic_digest: Digest,
 }
 
 /// Scheduler publication identity carried through decoding and protocol layers.
@@ -77,7 +76,6 @@ impl PublicCommit {
         if !self.committed_at.is_finite() || self.committed_at < 0.0 {
             return Err(PublicCommitError::InvalidTimestamp(self.committed_at));
         }
-        Digest::validate(self.semantic_root.semantic_digest.as_str())?;
         Ok(())
     }
 }
@@ -93,8 +91,6 @@ pub enum PublicCommitError {
     },
     #[error("public commit timestamp must be finite and nonnegative, got {0}")]
     InvalidTimestamp(f64),
-    #[error(transparent)]
-    Digest(#[from] DigestError),
 }
 
 /// Typed text and image event stream emitted by an engine.

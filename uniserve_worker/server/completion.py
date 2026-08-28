@@ -14,7 +14,7 @@ import torch
 
 from ..execution.batch import (
     CompletionReport,
-    DeferredSemanticDigest,
+    DeferredCompletion,
     ErrorCode,
     FinishFlags,
     FixedPoint,
@@ -44,8 +44,7 @@ if TYPE_CHECKING:
 __all__ = [
     "DeferredDerivedInteger",
     "DeferredCompletionTask",
-    "DeferredDigest",
-    "DeferredErrorDigest",
+    "DeferredResult",
     "DeferredImagePayload",
     "DeferredInteger",
     "DeferredLogprobBatch",
@@ -1137,7 +1136,6 @@ class DeferredTransferPayload:
         "kind",
         "descriptor_value",
         "locators",
-        "producer_plan_digest",
         "transport",
         "_value",
     )
@@ -1147,13 +1145,11 @@ class DeferredTransferPayload:
         kind: str,
         descriptor_value: dict[str, object],
         locators: tuple[Locator, ...],
-        producer_plan_digest: str,
         transport: Transport,
     ) -> None:
         self.kind = kind
         self.descriptor_value = descriptor_value
         self.locators = locators
-        self.producer_plan_digest = producer_plan_digest
         self.transport = transport
         self._value: bytes | None = None
 
@@ -1167,7 +1163,6 @@ class DeferredTransferPayload:
             encode_transfer_descriptor(
                 self.kind,
                 self.descriptor_value,
-                self.producer_plan_digest,
             )
         )
 
@@ -1178,7 +1173,6 @@ class DeferredTransferPayload:
             self._value = encode_transfer_descriptor(
                 self.kind,
                 self.descriptor_value,
-                self.producer_plan_digest,
             )
         return self._value
 
@@ -1254,26 +1248,17 @@ class DeferredImagePayload(DeferredCompletionTask):
         self.reservation.abandon()
 
 
-class DeferredDigest(DeferredSemanticDigest):
-    """A semantic digest finalized from a query-ready completion generation.
-
-    The digest includes committed tokens copied asynchronously into the pinned
-    output buffer. Finalization reads that host storage only after every copy
-    event reports ready, validates the buffer generation, and releases the
-    observed row. A device-parent successor may retain its predecessor's
-    pending digest, so finalization follows the request lineage while unrelated
-    completions remain independently dispatchable.
-    """
+class DeferredResult(DeferredCompletion):
+    """A query-ready completion backed by one pinned output-buffer row."""
 
     __slots__ = (
         "_record",
         "_parent",
-        "_plan_digest",
         "_buffer",
         "_row",
         "_generation",
         "_completion_timing",
-        "_value",
+        "_done",
         "_observed",
         "_invalid_sampling",
         "_predicated",
@@ -1287,25 +1272,23 @@ class DeferredDigest(DeferredSemanticDigest):
 
     def __init__(
         self,
-        parent: str | DeferredSemanticDigest,
-        plan_digest: str,
+        parent: DeferredCompletion | None,
         buffer: PinnedOutputBuffer,
         row: int,
         predicated_parent: Callable[[], tuple[VersionRef, RequestRuntime]],
         *,
         status: OpStatus,
         selected_point: int,
-        resolved_callback: Callable[[ModelOutput, str, str], None] | None = None,
+        resolved_callback: Callable[[ModelOutput], None] | None = None,
         completion_tasks: tuple[DeferredCompletionTask, ...] = (),
     ) -> None:
         self._record: ModelOutput | None = None
         self._parent = parent
-        self._plan_digest = plan_digest
         self._buffer: PinnedOutputBuffer | None = buffer
         self._row = int(row)
         self._generation = int(buffer.generation)
         self._completion_timing: tuple[int, int, int, int] | None = None
-        self._value: str | None = None
+        self._done = False
         self._observed = False
         self._invalid_sampling = False
         self._predicated = status is OpStatus.PREDICATED
@@ -1319,27 +1302,27 @@ class DeferredDigest(DeferredSemanticDigest):
         self._completion_error = False
 
     def bind_record(self, record: ModelOutput) -> ModelOutput:
-        """Bind the one final record that carries this deferred digest."""
+        """Bind the one record backed by this deferred result."""
 
         if self._record is not None:
-            raise RuntimeError("completion digest record was bound more than once")
-        if record.semantic_digest is not self:
-            raise RuntimeError("completion record does not carry its bound digest")
+            raise RuntimeError("completion record was bound more than once")
+        if record.deferred is not self:
+            raise RuntimeError("completion record does not carry its deferred result")
         if int(record.completion_slot_generation) != self._generation:
             raise RuntimeError("completion record generation does not match its output buffer")
         if (record.status is OpStatus.PREDICATED) != self._predicated:
-            raise RuntimeError("completion record status changed during digest binding")
+            raise RuntimeError("completion record status changed during binding")
         if int(record.selected_point) != int(self._selected_point):
-            raise RuntimeError("completion selected point changed during digest binding")
+            raise RuntimeError("completion selected point changed during binding")
         self._record = record
         return record
 
     def ready(self) -> bool:
         if self._record is None:
-            raise RuntimeError("completion digest has no bound record")
-        if self._value is not None:
+            raise RuntimeError("completion has no bound record")
+        if self._done:
             return True
-        if isinstance(self._parent, DeferredSemanticDigest) and not self._parent.ready():
+        if self._parent is not None and not self._parent.ready():
             return False
         if self._buffer is None or not self._buffer.ready():
             return False
@@ -1348,65 +1331,45 @@ class DeferredDigest(DeferredSemanticDigest):
                 return False
         return True
 
-    def finalize(self) -> str:
-        if self._value is None:
+    def finalize(self) -> None:
+        if not self._done:
             if not self.ready():
-                raise RuntimeError("completion digest was resolved before query-ready")
+                raise RuntimeError("completion was resolved before query-ready")
             record = self._record
             if record is None:
-                raise RuntimeError("completion digest has no bound record")
-            parent = (
-                self._parent.finalize()
-                if isinstance(self._parent, DeferredSemanticDigest)
-                else self._parent
-            )
+                raise RuntimeError("completion has no bound record")
+            parent = self._parent
+            if parent is not None:
+                parent.finalize()
+                self._parent = None
             if self._predicated:
-                self._resolve_predicated(cast(str, parent))
+                self._resolve_predicated()
             else:
                 try:
                     for task in self._completion_tasks:
                         task.finalize()
                 except Exception:
                     self._completion_error = True
-                    self._value = _completion_error_record(record).compute_semantic_digest(
-                        parent_semantic=cast(str, parent),
-                        plan_digest=self._plan_digest,
-                    )
                 else:
                     try:
-                        # The digest packs each committed token via ``__index__``, which
-                        # finalizes a deferred token exactly as ``int(value)`` would, so
-                        # the record is hashed in place without a concrete-token copy.
-                        digest = record.compute_semantic_digest(
-                            parent_semantic=cast(str, parent),
-                            plan_digest=self._plan_digest,
-                        )
+                        tuple(int(value) for value in record.committed_tokens)
                         if self._resolved_callback is not None:
-                            self._resolved_callback(record, digest, cast(str, parent))
-                        self._value = digest
+                            self._resolved_callback(record)
                     except _PredicatedOperation:
                         self._predicated = True
-                        self._resolve_predicated(cast(str, parent))
+                        self._resolve_predicated()
                     except _InvalidSamplingDistribution:
                         self._invalid_sampling = True
-                        self._value = _invalid_sampling_record(record).compute_semantic_digest(
-                            parent_semantic=cast(str, parent),
-                            plan_digest=self._plan_digest,
-                        )
             buffer = self._buffer
             if buffer is None:
-                raise RuntimeError("completion digest lost its pinned output buffer")
+                raise RuntimeError("completion lost its pinned output buffer")
             buffer.observe(self._row, self._generation)
             self._completion_timing = buffer.timing()
             self._observed = True
             self._buffer = None
-        resolved = self._value
-        if resolved is None:
-            raise RuntimeError("completion digest resolved without a value")
-        return resolved
+            self._done = True
 
-    def _resolve_predicated(self, parent: str) -> None:
-        self._value = parent
+    def _resolve_predicated(self) -> None:
         predicated_parent = self._predicated_parent
         if predicated_parent is None:
             raise RuntimeError("predicated completion lost its parent resolver")
@@ -1416,9 +1379,6 @@ class DeferredDigest(DeferredSemanticDigest):
             raise RuntimeError("predicated operation selected a non-fixed parent")
         self._selected_point = int(point.point_index)
         self._selected_runtime = runtime
-
-    def __str__(self) -> str:
-        return self.finalize()
 
     def completion_timing(self) -> tuple[int, int, int, int]:
         self.finalize()
@@ -1451,19 +1411,7 @@ class DeferredDigest(DeferredSemanticDigest):
             raise RuntimeError("predicated operation lost its selected runtime state")
         return self._selected_runtime
 
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, DeferredDigest):
-            return self.finalize() == other.finalize()
-        if isinstance(other, str):
-            return self.finalize() == other
-        return NotImplemented
-
-    def __hash__(self) -> int:
-        return hash(self.finalize())
-
-    def __deepcopy__(self, memo: dict[int, object]) -> DeferredDigest:
-        # A committed session snapshot shares ownership of the exact pinned
-        # completion generation and its lineage digest.
+    def __deepcopy__(self, memo: dict[int, object]) -> DeferredResult:
         memo[id(self)] = self
         return self
 
@@ -1473,61 +1421,11 @@ class DeferredDigest(DeferredSemanticDigest):
             buffer.discard(self._row, self._generation)
 
 
-class DeferredErrorDigest(DeferredSemanticDigest):
-    """An error digest causally chained to an unobserved parent completion."""
-
-    __slots__ = ("_parent", "_plan_digest", "_record", "_value")
-
-    def __init__(
-        self,
-        parent: DeferredSemanticDigest,
-        record: ModelOutput,
-        plan_digest: str,
-    ) -> None:
-        self._parent = parent
-        self._record = record
-        self._plan_digest = plan_digest
-        self._value: str | None = None
-
-    def ready(self) -> bool:
-        return self._value is not None or self._parent.ready()
-
-    def finalize(self) -> str:
-        if self._value is None:
-            if not self.ready():
-                raise RuntimeError("error digest was resolved before its parent was query-ready")
-            self._value = self._record.compute_semantic_digest(
-                self._parent.finalize(),
-                self._plan_digest,
-            )
-        return self._value
-
-    def __str__(self) -> str:
-        return self.finalize()
-
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, (DeferredDigest, DeferredErrorDigest)):
-            return self.finalize() == other.finalize()
-        if isinstance(other, str):
-            return self.finalize() == other
-        return NotImplemented
-
-    def __hash__(self) -> int:
-        return hash(self.finalize())
-
-    def __deepcopy__(self, memo: dict[int, object]) -> DeferredErrorDigest:
-        memo[id(self)] = self
-        return self
-
-
 def _record_ready(record: ModelOutput) -> bool:
-    """Whether a completion's deferred token copy and digest chain have landed."""
+    """Whether a completion's deferred device and CPU work has landed."""
 
-    digest = record.semantic_digest
-    if isinstance(digest, DeferredDigest):
-        return digest.ready()
-    if isinstance(digest, DeferredErrorDigest):
-        return digest.ready()
+    if record.deferred is not None:
+        return record.deferred.ready()
     for value in cast(tuple[object, ...], record.committed_tokens):
         if isinstance(value, DeferredToken) and not value.ready():
             return False
@@ -1535,12 +1433,10 @@ def _record_ready(record: ModelOutput) -> bool:
 
 
 def _finalized_record(record: ModelOutput) -> ModelOutput:
-    digest = record.semantic_digest
-    if isinstance(digest, DeferredErrorDigest):
-        return replace(record, semantic_digest=digest.finalize())
-    if isinstance(digest, DeferredDigest):
-        resolved = digest.finalize()
-        queued_us, device_us, copy_us, host_us = digest.completion_timing()
+    deferred = record.deferred
+    if isinstance(deferred, DeferredResult):
+        deferred.finalize()
+        queued_us, device_us, copy_us, host_us = deferred.completion_timing()
         timing = replace(
             record.timing_counters,
             queued_us=queued_us,
@@ -1548,26 +1444,25 @@ def _finalized_record(record: ModelOutput) -> ModelOutput:
             copy_us=copy_us,
             host_us=host_us,
         )
-        if digest.completion_error:
+        if deferred.completion_error:
             return replace(
                 _completion_error_record(record),
-                semantic_digest=resolved,
                 timing_counters=timing,
+                deferred=None,
             )
-        if digest.invalid_sampling:
+        if deferred.invalid_sampling:
             return replace(
                 _invalid_sampling_record(record),
-                semantic_digest=resolved,
                 timing_counters=timing,
+                deferred=None,
             )
-        if digest.predicated:
+        if deferred.predicated:
             return replace(
-                _predicated_record(record, digest.selected_point, digest.selected_runtime),
-                semantic_digest=resolved,
+                _predicated_record(record, deferred.selected_point, deferred.selected_runtime),
                 timing_counters=timing,
+                deferred=None,
             )
     else:
-        resolved = digest
         timing = record.timing_counters
     lengths = record.logical_lengths
     span = record.token_span
@@ -1596,8 +1491,8 @@ def _finalized_record(record: ModelOutput) -> ModelOutput:
         logical_lengths=lengths,
         token_span=span,
         committed_tokens=tokens,
-        semantic_digest=resolved,
         timing_counters=timing,
+        deferred=None,
     )
 
 
@@ -1650,7 +1545,7 @@ def _predicated_record(
 
 
 def completion_report_ready(report: CompletionReport) -> bool:
-    """True once every completion's deferred token/digest/artifact can be read
+    """True once every completion's deferred token and artifact can be read
     without a stall."""
 
     for record in report.completions:

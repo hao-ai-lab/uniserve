@@ -2001,7 +2001,6 @@ impl NextOp {
             predicate: self.predicate,
             rng: self.rng,
             control_seq: self.control_seq,
-            plan_digest: uniserve_core::Digest::zero(),
         }
         .sealed();
         let mut input_products = Vec::with_capacity(2);

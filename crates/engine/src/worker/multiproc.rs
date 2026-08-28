@@ -586,8 +586,7 @@ fn merge_completion_record(
     anyhow::ensure!(
         canonical.request_key == rank_completion.request_key
             && canonical.op_id == rank_completion.op_id
-            && canonical.selected_point == rank_completion.selected_point
-            && canonical.semantic_digest == rank_completion.semantic_digest,
+            && canonical.selected_point == rank_completion.selected_point,
         "completion identity or selected point diverged"
     );
     anyhow::ensure!(

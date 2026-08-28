@@ -200,50 +200,22 @@ impl SequenceView {
 fn token_prefix_versions(
     operation: Option<&Operation>,
     record: &ModelOutput,
-    parent: Option<&VersionRef>,
+    _parent: Option<&VersionRef>,
 ) -> Vec<VersionRef> {
-    let Some(operation) = operation else {
+    if operation.is_none() {
         return Vec::new();
-    };
-    let Some(Point::Fixed {
-        semantic_digest: parent_semantic,
-        ..
-    }) = parent.map(|version| &version.point)
-    else {
-        return Vec::new();
-    };
+    }
     let count = record.committed_tokens.len();
     if record.status != OpStatus::Ok || count == 0 || record.selected_point as usize != count {
         return Vec::new();
     }
     (1..=count)
-        .map(|point_index| {
-            let digest = if point_index == count {
-                record.semantic_digest.clone()
-            } else {
-                let mut prefix = record.clone();
-                prefix.selected_point = point_index as u32;
-                prefix.logical_lengths.token_len = record
-                    .logical_lengths
-                    .token_len
-                    .saturating_sub((count - point_index) as u32);
-                prefix.logical_lengths.kv_visible_len = record
-                    .logical_lengths
-                    .kv_visible_len
-                    .saturating_sub((count - point_index) as u32);
-                prefix.token_span.len = point_index as u32;
-                prefix.committed_tokens.truncate(point_index);
-                prefix.finish_flags = Default::default();
-                prefix.compute_semantic_digest(parent_semantic, &operation.plan_digest)
-            };
-            VersionRef {
-                request_key: record.request_key,
-                producer_op_id: record.op_id,
-                point: Point::Fixed {
-                    point_index: point_index as u32,
-                    semantic_digest: digest,
-                },
-            }
+        .map(|point_index| VersionRef {
+            request_key: record.request_key,
+            producer_op_id: record.op_id,
+            point: Point::Fixed {
+                point_index: point_index as u32,
+            },
         })
         .collect()
 }
@@ -330,13 +302,10 @@ pub(crate) struct ReqState {
     /// Scheduler-owned lifecycle generation and latest host-resolved worker version.
     pub(crate) epoch: u64,
     pub(crate) version: u64,
-    pub(crate) admission_digest: Option<uniserve_core::Digest>,
-    /// Latest host-resolved lineage used to build the next exact fixed parent.
-    pub(crate) resolved_semantic: uniserve_core::Digest,
+    /// Latest host-resolved producer used to build the next exact fixed parent.
     pub(crate) resolved_producer_op_id: u64,
-    /// Latest semantically committed lineage.
+    /// Latest committed point.
     pub(crate) committed_version: u64,
-    pub(crate) committed_semantic: uniserve_core::Digest,
     pub(crate) committed_producer_op_id: u64,
     /// Last ordered semantic control emitted for this request.
     pub(crate) control_seq: u64,

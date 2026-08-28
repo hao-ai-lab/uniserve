@@ -232,9 +232,9 @@ class ModelRunner:
                 raise GraphExecutionError("tensor-parallel execution partitions disagree")
             logger.info("verified tensor-parallel execution partition agreement")
 
-    def invalidate_graphs(self, weight_digest: str) -> None:
+    def invalidate_graphs(self, weight_version: int) -> None:
         for partition in self._owned_partitions:
-            partition.graphs.invalidate(weight_digest)
+            partition.graphs.invalidate(weight_version)
 
     def close(self) -> None:
         for partition in reversed(self._owned_partitions):
@@ -409,10 +409,7 @@ class ModelRunner:
 
         calls = 0
         weights = tasks[0].weights
-        if any(
-            task.weights.digest != weights.digest or task.weights.version != weights.version
-            for task in tasks
-        ):
+        if any(task.weights.version != weights.version for task in tasks):
             raise ValueError("one model call cannot mix immutable weight sets")
 
         def invoke(value: ForwardBatch) -> ForwardOutput:

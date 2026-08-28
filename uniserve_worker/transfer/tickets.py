@@ -136,16 +136,12 @@ class Locator:
 def encode_transfer_descriptor(
     kind: str,
     value: dict[str, object],
-    producer_plan_digest: str,
 ) -> bytes:
     if kind not in {"encoder", "device_product", "kv", "latent"}:
         raise invalid_descriptor("transport entry kind is invalid")
-    if not _is_sha256(producer_plan_digest):
-        raise invalid_descriptor("transport entry producer plan digest is invalid")
     encoded = TRANSFER_DESCRIPTOR_PREFIX + _canonical_json(
         {
             "kind": kind,
-            "producer_plan_digest": producer_plan_digest,
             "value": value,
         }
     )
@@ -154,7 +150,7 @@ def encode_transfer_descriptor(
     return encoded
 
 
-def decode_transfer_descriptor(raw: bytes) -> tuple[str, dict[str, object], str]:
+def decode_transfer_descriptor(raw: bytes) -> tuple[str, dict[str, object]]:
     if not raw.startswith(TRANSFER_DESCRIPTOR_PREFIX):
         raise invalid_descriptor("transport entry prefix is invalid")
     if len(raw) > MAX_TRANSFER_DESCRIPTOR_BYTES:
@@ -165,22 +161,15 @@ def decode_transfer_descriptor(raw: bytes) -> tuple[str, dict[str, object], str]
         raise invalid_descriptor(f"transport entry JSON is invalid: {error}") from error
     if _canonical_json(value) != raw[len(TRANSFER_DESCRIPTOR_PREFIX) :]:
         raise invalid_descriptor("transport entry JSON is not canonical")
-    if not isinstance(value, dict) or set(value) != {
-        "kind",
-        "producer_plan_digest",
-        "value",
-    }:
+    if not isinstance(value, dict) or set(value) != {"kind", "value"}:
         raise invalid_descriptor("transport entry has an invalid shape")
     kind = value["kind"]
     if kind not in {"encoder", "device_product", "kv", "latent"}:
         raise invalid_descriptor("transport entry kind is invalid")
-    digest = value["producer_plan_digest"]
-    if not isinstance(digest, str) or not _is_sha256(digest):
-        raise invalid_descriptor("transport entry producer plan digest is invalid")
     descriptor_value = value["value"]
     if not isinstance(descriptor_value, dict):
         raise invalid_descriptor("transport entry value is invalid")
-    return kind, descriptor_value, digest
+    return kind, descriptor_value
 
 
 def fetch_locator(transport: "Transport", locator: Locator) -> "torch.Tensor":
@@ -197,10 +186,6 @@ def _canonical_json(value: object) -> bytes:
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
-
-
-def _is_sha256(value: str) -> bool:
-    return len(value) == 64 and all(character in "0123456789abcdef" for character in value)
 
 
 def _dtype_to_str(dtype: "torch.dtype") -> str:

@@ -805,7 +805,6 @@ fn attach_public_commit(chunk: &mut ChatCompletionStreamResponse, commit: Option
         semantic_root: StreamSemanticRoot {
             producer_op_id: commit.semantic_root.producer_op_id.0,
             point_index: commit.semantic_root.point_index,
-            semantic_digest: commit.semantic_root.semantic_digest.to_string(),
         },
     });
 }

@@ -55,7 +55,6 @@ class MiniMaxH3Model(nn.Module):
         self.video_vae = components.video_vae
         self.audio_vae = components.audio_vae
         self.tokenizer = components.tokenizer
-        self.checkpoint_digest = components.checkpoint.digest
         self.scratch = H3Scratch.allocate(layout, mesh.local_device)
         self.preparation_stream = torch.cuda.Stream(device=mesh.local_device)
         self.prompt_device = torch.empty(
@@ -84,9 +83,7 @@ class MiniMaxH3Model(nn.Module):
                     layout.packed.prefix_tiles + layout.packed.video_tiles,
                 ),
             )
-            prefix_row = torch.zeros(
-                (layout.packed.prefix_tiles,), dtype=torch.int32
-            )
+            prefix_row = torch.zeros((layout.packed.prefix_tiles,), dtype=torch.int32)
             prefix_row[: len(prefix)] = torch.tensor(prefix, dtype=torch.int32)
             dense_row = torch.zeros(
                 (layout.packed.prefix_tiles + layout.packed.video_tiles,),
@@ -118,9 +115,7 @@ class MiniMaxH3Model(nn.Module):
         )
         self.register_buffer(
             "prompt_prefix_counts",
-            torch.tensor(
-                prefix_counts, dtype=torch.int32, device=mesh.local_device
-            ),
+            torch.tensor(prefix_counts, dtype=torch.int32, device=mesh.local_device),
             persistent=False,
         )
         if int(max_state_slots) < 2:
@@ -144,9 +139,7 @@ class MiniMaxH3Model(nn.Module):
         max_state_slots: int,
         cache_dir: str | None = None,
         revision: str | None = None,
-        attention_mode: Literal[
-            "sparse_kernel", "sparse_oracle", "dense_oracle"
-        ] = "sparse_kernel",
+        attention_mode: Literal["sparse_kernel", "sparse_oracle", "dense_oracle"] = "sparse_kernel",
     ) -> "MiniMaxH3Model":
         layout = H3Layout.build(mesh)
         components = load_h3_components(
@@ -170,22 +163,14 @@ class MiniMaxH3Model(nn.Module):
                 if tokenizer is None:
                     raise RuntimeError("rank zero has no H3 tokenizer")
                 encoded: Any = tokenizer(prompt, add_special_tokens=False)
-                values = (
-                    encoded["input_ids"]
-                    if isinstance(encoded, dict)
-                    else encoded.input_ids
-                )
+                values = encoded["input_ids"] if isinstance(encoded, dict) else encoded.input_ids
                 if values and isinstance(values[0], list):
                     if len(values) != 1:
-                        raise ValueError(
-                            "H3 presentation produced more than one token sequence"
-                        )
+                        raise ValueError("H3 presentation produced more than one token sequence")
                     values = values[0]
                 token_ids = tuple(int(value) for value in values)
                 if not 1 <= len(token_ids) <= self.layout.packed.text_indices.numel():
-                    raise ValueError(
-                        "H3 prompt must encode to between 1 and 1024 tokens"
-                    )
+                    raise ValueError("H3 prompt must encode to between 1 and 1024 tokens")
                 host[0] = len(token_ids)
                 host[1 : 1 + len(token_ids)].copy_(torch.tensor(token_ids))
             except BaseException as error:
@@ -268,9 +253,7 @@ class MiniMaxH3Model(nn.Module):
             video_owned.nonzero(as_tuple=False).flatten(),
             out=video_source,
         )
-        audio_noise = torch.empty(
-            (414, 32), dtype=torch.float32, pin_memory=True
-        )
+        audio_noise = torch.empty((414, 32), dtype=torch.float32, pin_memory=True)
         audio_noise.normal_(generator=generator)
         audio_owned = (self.layout.packed.audio_indices >= self.layout.local_start) & (
             self.layout.packed.audio_indices < self.layout.local_end
@@ -297,9 +280,7 @@ class MiniMaxH3Model(nn.Module):
         slot.text_condition[:, : refined.shape[1]].copy_(refined)
         self._prepare_tile_metadata(slot, int(refined.shape[1]))
         self._prepare_rotary(slot, int(refined.shape[1]))
-        torch.cuda.current_stream(self.mesh.local_device).wait_stream(
-            self.preparation_stream
-        )
+        torch.cuda.current_stream(self.mesh.local_device).wait_stream(self.preparation_stream)
         if slot.video_overlap is not None:
             slot.video_overlap.zero_()
         slot.request_key = admission.request_key
@@ -403,9 +384,7 @@ class MiniMaxH3Model(nn.Module):
             f"uniserve.h3.collective kind=video_overlap_gather rank={self.layout.sp_rank}"
         ):
             self.mesh.all_gather_into_tensor(
-                scratch.overlap_gather.reshape(
-                    self.layout.sp_size, 3, 5, 768, 1344
-                ),
+                scratch.overlap_gather.reshape(self.layout.sp_size, 3, 5, 768, 1344),
                 scratch.overlap_send.reshape(1, 3, 5, 768, 1344),
                 "sp",
             )
@@ -416,9 +395,7 @@ class MiniMaxH3Model(nn.Module):
             f"uniserve.h3.collective kind=video_rgb_gather rank={self.layout.sp_rank}"
         ):
             self.mesh.all_gather_into_tensor(
-                scratch.rgb_gather.reshape(
-                    self.layout.sp_size * 22, 768, 1344, 3
-                ),
+                scratch.rgb_gather.reshape(self.layout.sp_size * 22, 768, 1344, 3),
                 scratch.rgb_send,
                 "sp",
             )
@@ -452,9 +429,7 @@ class MiniMaxH3Model(nn.Module):
             return None
         if self.audio_vae is None:
             raise RuntimeError("rank zero has no resident H3 audio VAE")
-        scratch.audio_latents.copy_(
-            scratch.audio_input.view(2, 207, 32).permute(0, 2, 1)
-        )
+        scratch.audio_latents.copy_(scratch.audio_input.view(2, 207, 32).permute(0, 2, 1))
         pcm = self.audio_vae.decode(scratch.audio_latents)
         target_samples = round(124 * 32_000 / 24)
         if pcm.shape[0] < target_samples:

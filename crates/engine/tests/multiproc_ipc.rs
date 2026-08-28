@@ -13,8 +13,6 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
-use sha2::{Digest as _, Sha256};
-use uniserve_core::Digest as SemanticDigest;
 use uniserve_core::{BlockId, RequestId, SamplingParams};
 use uniserve_engine::{
     ControlOp, Executor, MultiprocExecutor, TransferBackend, WorkerExecError, WorkerKind,
@@ -53,7 +51,7 @@ fn qualify_rank_protocol() -> anyhow::Result<()> {
     assert_eq!(executor.pipeline_depth(), PIPELINE_DEPTH);
 
     let admission = text_admission(11, 1, 1)?;
-    let root = VersionRef::admission_root(admission.request_key, OpId(0), admission.digest.clone());
+    let root = VersionRef::admission_root(admission.request_key, OpId(0));
     let initial = token_batch(
         1,
         1,
@@ -69,7 +67,6 @@ fn qualify_rank_protocol() -> anyhow::Result<()> {
     let first = execute(&mut executor, initial.clone())?;
     let first_record = &first.partitions[0].completions[0];
     assert_eq!(first_record.status, OpStatus::Ok);
-    assert_eq!(first_record.semantic_digest.len(), 64);
     assert_eq!(first_record.committed_tokens.len(), 1);
 
     let replayed = execute(&mut executor, initial.clone())?;
@@ -87,7 +84,7 @@ fn qualify_rank_protocol() -> anyhow::Result<()> {
         BlockId(1),
         0,
     );
-    assert_execution_error(&mut executor, conflicting, "canonical batch identity")?;
+    assert_execution_error(&mut executor, conflicting, "submitted batch")?;
 
     let selected = fixed_completion(first_record);
     let commit = Control::Commit {
@@ -132,10 +129,7 @@ fn qualify_rank_protocol() -> anyhow::Result<()> {
     let cutoff = VersionRef {
         request_key: admission.request_key,
         producer_op_id: OpId(99),
-        point: Point::Fixed {
-            point_index: 1,
-            semantic_digest: SemanticDigest::try_from("f".repeat(64))?,
-        },
+        point: Point::Fixed { point_index: 1 },
     };
     let unreachable = Control::Close {
         request_key: admission.request_key,
@@ -221,11 +215,7 @@ fn qualify_peer_replacement() -> anyhow::Result<()> {
     }
 
     let first_admission = text_admission(21, 1, 1)?;
-    let first_root = VersionRef::admission_root(
-        first_admission.request_key,
-        OpId(0),
-        first_admission.digest.clone(),
-    );
+    let first_root = VersionRef::admission_root(first_admission.request_key, OpId(0));
     execute(
         &mut executor,
         token_batch(
@@ -243,11 +233,7 @@ fn qualify_peer_replacement() -> anyhow::Result<()> {
     )?;
 
     let lost_admission = text_admission(22, 1, 2)?;
-    let lost_root = VersionRef::admission_root(
-        lost_admission.request_key,
-        OpId(0),
-        lost_admission.digest.clone(),
-    );
+    let lost_root = VersionRef::admission_root(lost_admission.request_key, OpId(0));
     executor.submit(token_batch(
         2,
         2,
@@ -267,11 +253,7 @@ fn qualify_peer_replacement() -> anyhow::Result<()> {
     assert_eq!(executor.in_flight(), 0);
 
     let recovered_admission = text_admission(23, 1, 1)?;
-    let recovered_root = VersionRef::admission_root(
-        recovered_admission.request_key,
-        OpId(0),
-        recovered_admission.digest.clone(),
-    );
+    let recovered_root = VersionRef::admission_root(recovered_admission.request_key, OpId(0));
     let recovered = execute(
         &mut executor,
         token_batch(
@@ -319,11 +301,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
     })?;
 
     let slow_admission = text_admission(31, 1, 1)?;
-    let slow_root = VersionRef::admission_root(
-        slow_admission.request_key,
-        OpId(0),
-        slow_admission.digest.clone(),
-    );
+    let slow_root = VersionRef::admission_root(slow_admission.request_key, OpId(0));
     let mut slow = token_batch(
         1,
         2,
@@ -349,19 +327,13 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
     };
     let mut publication = SlowShmPublication::start()?;
     slow.partitions[0].operations[0].predicate = Some(predicate.clone());
-    slow.partitions[0].operations[0].plan_digest =
-        slow.partitions[0].operations[0].compute_plan_digest();
     slow.input_products.push(ProductPayload {
         product: predicate,
         bytes: publication.descriptor(91)?,
     });
 
     let fast_admission = text_admission(32, 1, 2)?;
-    let fast_root = VersionRef::admission_root(
-        fast_admission.request_key,
-        OpId(0),
-        fast_admission.digest.clone(),
-    );
+    let fast_root = VersionRef::admission_root(fast_admission.request_key, OpId(0));
     let fast = token_batch(
         2,
         1,
@@ -528,16 +500,8 @@ impl SlowShmPublication {
         value.insert("value_range", serde_json::json!(""));
         value.insert("width", serde_json::json!(0));
 
-        let producer_plan_digest = format!(
-            "{:x}",
-            Sha256::digest(format!("{}:{generation}", self.name).as_bytes())
-        );
         let mut envelope = BTreeMap::new();
         envelope.insert("kind", serde_json::json!("device_product"));
-        envelope.insert(
-            "producer_plan_digest",
-            serde_json::json!(producer_plan_digest),
-        );
         envelope.insert("value", serde_json::to_value(value)?);
 
         let mut descriptor = TRANSFER_DESCRIPTOR_PREFIX.to_vec();
@@ -741,7 +705,6 @@ fn token_batch(
         predicate: None,
         rng: None,
         control_seq,
-        plan_digest: uniserve_core::Digest::zero(),
     }
     .sealed();
     let input_length = tokens.len() as u32;
@@ -796,7 +759,6 @@ fn fixed_completion(record: &uniserve_worker_ipc::ModelOutput) -> VersionRef {
         producer_op_id: record.op_id,
         point: Point::Fixed {
             point_index: record.selected_point,
-            semantic_digest: record.semantic_digest.clone(),
         },
     }
 }

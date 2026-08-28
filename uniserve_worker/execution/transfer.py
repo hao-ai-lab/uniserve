@@ -161,7 +161,6 @@ def _transfer(runtime: ExecutionResources, state: OperationState) -> None:
             group_id=cache[1],
             visible_length=cache[2],
             source_version=operation.parent,
-            source_digest=point.semantic_digest,
             destination="gen",
             expected_base=expected_base,
             product=outputs[0],
@@ -174,7 +173,6 @@ def _transfer(runtime: ExecutionResources, state: OperationState) -> None:
             "kv",
             {"generation": int(outputs[0].generation), "snapshot": snapshot.to_mapping()},
             tuple(Locator.from_wire_json(encoded) for encoded in snapshot.locators),
-            operation.plan_digest,
             transport,
         )
         state.outcome = encode.non_state_outcome(
@@ -309,7 +307,6 @@ def publish_product(
         descriptor_kind,
         descriptor_value,
         (locator,),
-        operation.plan_digest,
         transport,
     )
     return ProductPayload(product=product, payload=cast(bytes, descriptor))

@@ -52,8 +52,8 @@ pub struct WorkerInfo {
     pub mixed_buckets: Vec<GraphBucket>,
     pub sampling_ownership: SamplingOwnership,
     pub resource_classes: Vec<ResourceClass>,
-    pub model_identity: Option<Digest>,
-    pub weight_digest: Option<Digest>,
+    pub model_name: String,
+    pub weight_version: u64,
 }
 
 impl WorkerInfo {
@@ -195,10 +195,7 @@ impl WorkerInfo {
             !addresses_latent || self.resource_classes.contains(&ResourceClass::ImageLatent),
             "worker capabilities advertise latent work without a latent page pool"
         );
-        wire_ensure!(
-            self.model_identity.is_some() == self.weight_digest.is_some(),
-            "worker capability model and weight identities are incomplete"
-        );
+        wire_ensure!(!self.model_name.is_empty(), "worker model name is empty");
         Ok(())
     }
 
@@ -280,8 +277,8 @@ impl Default for WorkerInfo {
             mixed_buckets: Vec::new(),
             sampling_ownership: SamplingOwnership::DesignatedRank,
             resource_classes: Vec::new(),
-            model_identity: None,
-            weight_digest: None,
+            model_name: "model".to_owned(),
+            weight_version: 0,
         }
     }
 }

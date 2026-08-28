@@ -1,22 +1,18 @@
-//! Protocol round trips, canonical identity, and descriptor validation.
+//! Request round trips and descriptor validation.
 
 use std::collections::BTreeMap;
 
-use uniserve_core::{BlockId, CfgRenorm, Digest, KvGroupKind, ModelDtype, RequestId};
+use uniserve_core::{BlockId, CfgRenorm, KvGroupKind, ModelDtype, RequestId};
 
 use super::*;
 use crate::codec::{decode_request, decode_response, encode_request, encode_response};
-
-fn digest_string(seed: u8) -> Digest {
-    Digest::try_from(format!("{seed:02x}").repeat(32)).unwrap()
-}
 
 fn request_key() -> RequestKey {
     RequestKey::new(4, RequestId(7), 2)
 }
 
 fn fixed_parent() -> VersionRef {
-    VersionRef::admission_root(request_key(), OpId(1), digest_string(0xaa))
+    VersionRef::admission_root(request_key(), OpId(1))
 }
 
 fn output_product(op: OpId) -> ProductRef {
@@ -124,7 +120,6 @@ fn token_decode_operation() -> Operation {
             draw_layout: DrawLayout::TargetSampling,
         }),
         control_seq: 0,
-        plan_digest: Digest::zero(),
     }
     .sealed()
 }
@@ -147,7 +142,6 @@ fn operation_for(work: ForwardMode, op_id: OpId, advances: bool) -> Operation {
         predicate: None,
         rng: None,
         control_seq: 0,
-        plan_digest: Digest::zero(),
     }
     .sealed()
 }
@@ -174,7 +168,6 @@ fn completion_record() -> ModelOutput {
             stop: false,
         },
         product_generations: vec![3, 4, 5, 6],
-        semantic_digest: digest_string(0xbb),
         error_code: None,
         timing_counters: TimingCounters::default(),
     }
@@ -361,7 +354,6 @@ fn version_ref_device_point_round_trips() {
         point: Point::Device {
             point_index: 0,
             selected_point: Some(selected_point_product(OpId(9))),
-            producer_plan_digest: digest_string(0xcc),
         },
     };
     let operation = Operation {
@@ -381,7 +373,6 @@ fn version_ref_device_point_round_trips() {
         predicate: None,
         rng: None,
         control_seq: 0,
-        plan_digest: Digest::zero(),
     }
     .sealed();
     let batch = execute_round_trip(batch_with_operations(2, Vec::new(), vec![operation]));
@@ -389,20 +380,13 @@ fn version_ref_device_point_round_trips() {
 }
 
 #[test]
-fn block_table_placement_round_trips_without_changing_operation_identity() {
+fn block_table_placement_round_trips_with_the_operation() {
     let base = token_decode_operation();
     let batch = execute_round_trip(batch_with_operations(9, Vec::new(), vec![base.clone()]));
     assert_eq!(batch.operations().next().unwrap(), &base);
     assert_eq!(
         batch.partitions[0].block_tables[0].page_ids,
         vec![BlockId(1)]
-    );
-    let mut relocated = batch.clone();
-    relocated.partitions[0].block_tables[0].page_ids = vec![BlockId(17)];
-    relocated.partitions[0].new_cache_pages[0].page_ids = vec![BlockId(17)];
-    assert_eq!(
-        relocated.operations().next().unwrap().plan_digest,
-        base.plan_digest
     );
 }
 
@@ -494,73 +478,19 @@ fn every_control_variant_round_trips_through_the_wire() {
 }
 
 #[test]
-fn new_request_round_trips_and_binds_its_operation() {
+fn new_request_round_trips() {
     let batch = execute_round_trip(batch_with_operations(
         4,
         vec![admission()],
         vec![token_decode_operation()],
     ));
     assert_eq!(batch.admissions[0], admission());
-    let mut relocated = admission();
-    relocated.request_pool_idx = 19;
-    assert_eq!(relocated.payload_digest(), admission().digest);
-}
-
-#[test]
-fn plan_digest_is_deterministic_and_binds_control_seq() {
-    let mut a = token_decode_operation();
-    let b = token_decode_operation();
-    assert_eq!(a.plan_digest, b.plan_digest);
-    assert_eq!(a.plan_digest, a.compute_plan_digest());
-    a.control_seq = 999;
-    assert_ne!(a.compute_plan_digest(), b.plan_digest);
-}
-
-#[test]
-fn semantic_digest_binds_parent_plan_and_output_delta() {
-    let operation = token_decode_operation();
-    let completion = completion_record();
-    let parent = digest_string(0xaa);
-    let base = completion.compute_semantic_digest(&parent, &operation.plan_digest);
-    // Deterministic.
-    assert_eq!(
-        base,
-        completion.compute_semantic_digest(&parent, &operation.plan_digest)
-    );
-    // A different selected result yields a different semantic digest.
-    let mut other = completion.clone();
-    other.selected_point = 2;
-    assert_ne!(
-        base,
-        other.compute_semantic_digest(&parent, &operation.plan_digest)
-    );
-    // A different parent lineage yields a different semantic digest.
-    assert_ne!(
-        base,
-        completion.compute_semantic_digest(&digest_string(0x11), &operation.plan_digest)
-    );
-    // A different committed token at the same span yields a different digest:
-    // token values, not just positions, are lineage identity.
-    let mut other_token = completion.clone();
-    other_token.committed_tokens = vec![272];
-    assert_ne!(
-        base,
-        other_token.compute_semantic_digest(&parent, &operation.plan_digest)
-    );
-}
-
-#[test]
-fn validation_rejects_a_forged_plan_digest() {
-    let mut operation = token_decode_operation();
-    operation.plan_digest = digest_string(0x00);
-    assert!(operation.validate().is_err());
 }
 
 #[test]
 fn validation_rejects_inconsistent_advances_state() {
     let mut operation = token_decode_operation();
     operation.advances_state = false;
-    operation.plan_digest = operation.compute_plan_digest();
     assert!(operation.validate().is_err());
 }
 
@@ -568,7 +498,6 @@ fn validation_rejects_inconsistent_advances_state() {
 fn validation_rejects_a_work_domain_mismatch() {
     let mut operation = token_decode_operation();
     operation.domain = Domain::Flow;
-    operation.plan_digest = operation.compute_plan_digest();
     assert!(operation.validate().is_err());
 }
 
@@ -581,10 +510,8 @@ fn kv_publication_requires_a_fixed_semantic_parent() {
         point: Point::Device {
             point_index: 1,
             selected_point: None,
-            producer_plan_digest: digest_string(0xcc),
         },
     };
-    operation.plan_digest = operation.compute_plan_digest();
 
     assert!(operation.validate().is_err());
 }
@@ -593,7 +520,6 @@ fn kv_publication_requires_a_fixed_semantic_parent() {
 fn validation_rejects_an_output_owned_by_another_operation() {
     let mut operation = token_decode_operation();
     operation.outputs[0].producer_op_id = OpId(999);
-    operation.plan_digest = operation.compute_plan_digest();
     assert!(operation.validate().is_err());
 }
 
@@ -605,11 +531,9 @@ fn validation_allows_shared_encoder_features_and_rejects_foreign_lineage_state()
     feature.kind = ProductKind::VisionFeature;
     let mut operation = token_decode_operation();
     operation.inputs = vec![feature];
-    operation.plan_digest = operation.compute_plan_digest();
     operation.validate().unwrap();
 
     operation.inputs[0].kind = ProductKind::Token;
-    operation.plan_digest = operation.compute_plan_digest();
     assert!(operation.validate().is_err());
 }
 
@@ -688,7 +612,6 @@ fn batch_carries_host_supplied_input_product_values() {
     };
     let mut operation = token_decode_operation();
     operation.inputs.push(token_input);
-    operation.plan_digest = operation.compute_plan_digest();
     let batch = batch_with_operations(1, vec![admission()], vec![operation])
         .with_input_products(vec![payload.clone()]);
     let decoded = execute_round_trip(batch);
@@ -730,25 +653,6 @@ fn batch_allows_a_duplicate_identical_control() {
 }
 
 #[test]
-fn control_content_digest_distinguishes_variants() {
-    let commit = Control::Commit {
-        request_key: request_key(),
-        control_seq: 1,
-        expected_parent: fixed_parent(),
-        selected: fixed_parent(),
-        public_event_limit: 1,
-        disposition: Disposition::Publish,
-    };
-    let close = Control::Close {
-        request_key: request_key(),
-        control_seq: 1,
-        cutoff: fixed_parent(),
-        reason: CloseReason::Completed,
-    };
-    assert_ne!(commit.content_digest(), close.content_digest());
-}
-
-#[test]
 fn commit_control_requires_a_fixed_selected_version() {
     let device_selected = VersionRef {
         request_key: request_key(),
@@ -756,7 +660,6 @@ fn commit_control_requires_a_fixed_selected_version() {
         point: Point::Device {
             point_index: 0,
             selected_point: Some(selected_point_product(OpId(9))),
-            producer_plan_digest: digest_string(0xcc),
         },
     };
     let control = Control::Commit {
@@ -983,7 +886,7 @@ fn comprehensive_batch() -> Batch {
         let key = session_key(100 + index as u64);
         let op_id = OpId(11 + index as u64);
         let parent = if work.requires_fixed_parent() || index % 2 == 0 {
-            VersionRef::admission_root(key, OpId(1), digest_string(0xaa))
+            VersionRef::admission_root(key, OpId(1))
         } else {
             VersionRef {
                 request_key: key,
@@ -991,7 +894,6 @@ fn comprehensive_batch() -> Batch {
                 point: Point::Device {
                     point_index: 0,
                     selected_point: Some(product_for(key, OpId(9), 0, ProductKind::SelectedPoint)),
-                    producer_plan_digest: digest_string(0xcc),
                 },
             }
         };
@@ -1029,7 +931,6 @@ fn comprehensive_batch() -> Batch {
                     },
                 }),
                 control_seq: index as u64,
-                plan_digest: Digest::zero(),
             }
             .sealed(),
         );
@@ -1059,19 +960,15 @@ fn comprehensive_batch() -> Batch {
         Control::Commit {
             request_key: session_key(200),
             control_seq: 1,
-            expected_parent: VersionRef::admission_root(
-                session_key(200),
-                OpId(1),
-                digest_string(0xaa),
-            ),
-            selected: VersionRef::admission_root(session_key(200), OpId(2), digest_string(0xab)),
+            expected_parent: VersionRef::admission_root(session_key(200), OpId(1)),
+            selected: VersionRef::admission_root(session_key(200), OpId(2)),
             public_event_limit: 7,
             disposition: Disposition::Retain,
         },
         Control::Close {
             request_key: session_key(201),
             control_seq: 2,
-            cutoff: VersionRef::admission_root(session_key(201), OpId(1), digest_string(0xac)),
+            cutoff: VersionRef::admission_root(session_key(201), OpId(1)),
             reason: CloseReason::Preempted,
         },
         Control::Release {
@@ -1090,7 +987,6 @@ fn comprehensive_batch() -> Batch {
         dims: vec![DimBound::Static(4)],
     };
     operations[0].inputs.push(input_product.clone());
-    operations[0].plan_digest = operations[0].compute_plan_digest();
     let input_products = vec![ProductPayload {
         product: input_product,
         bytes: encode_token_product_bytes(&[7, 8, 9, 10]),
@@ -1155,8 +1051,8 @@ fn full_caps() -> WorkerInfo {
         num_latent_pages: 17,
         latent_width: 16,
         latent_dtype: Some(ModelDtype::BFloat16),
-        model_identity: Some(digest_string(0x21)),
-        weight_digest: Some(digest_string(0x22)),
+        model_name: "test-model".into(),
+        weight_version: 7,
         ..WorkerInfo::default()
     }
 }
@@ -1223,7 +1119,6 @@ fn full_completion_report() -> CompletionReport {
             stop: false,
         },
         product_generations: vec![3, 5],
-        semantic_digest: digest_string(0xbb),
         error_code: None,
         timing_counters: TimingCounters {
             queued_us: 41,

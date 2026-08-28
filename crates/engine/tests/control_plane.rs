@@ -1474,12 +1474,7 @@ fn gen_branch_round_trip_preserves_publication_and_step_invariants() {
             pair[0].event_seq < pair[1].event_seq && pair[0].committed_at <= pair[1].committed_at
         }));
         assert!(publications.iter().all(|commit| {
-            commit.semantic_root.semantic_digest.len() == 64
-                && commit
-                    .semantic_root
-                    .semantic_digest
-                    .bytes()
-                    .all(|byte| byte.is_ascii_hexdigit())
+            commit.semantic_root.producer_op_id.0 > 0 && commit.semantic_root.point_index > 0
         }));
         signatures.push(signature);
     }

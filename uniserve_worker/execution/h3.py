@@ -83,7 +83,7 @@ def validate_batch(runtime: ExecutionResources, batch: Batch) -> None:
         if (
             int(operation.parent.producer_op_id) != 0
             or not isinstance(point, FixedPoint)
-            or point.semantic_digest != admission.digest
+            or int(point.point_index) != 0
         ):
             raise invalid_descriptor("H3 transition does not name its admission root")
         if output_path.name in {".", ".."}:

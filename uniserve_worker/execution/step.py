@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import math
 import time
@@ -20,7 +19,7 @@ from uniserve_worker.execution.batch import (
     Batch,
     BatchPartition,
     CompletionReport,
-    DeferredSemanticDigest,
+    DeferredCompletion,
     DevicePoint,
     Domain,
     DType,
@@ -107,8 +106,7 @@ from uniserve_worker.runtime.latent_pool import (
 from uniserve_worker.runtime.req_to_token_pool import ReqToTokenPool
 from uniserve_worker.runtime.runtime_states import RuntimeStates
 from uniserve_worker.server.completion import (
-    DeferredDigest,
-    DeferredErrorDigest,
+    DeferredResult,
     DeferredImagePayload,
     DeferredLogprobPayload,
     DeferredTransferPayload,
@@ -194,8 +192,8 @@ def create_execution_resources(
     mesh: DeviceMesh,
     transport: Transport | None,
     tokenizer: Any | None,
-    architecture_digest: str,
-    weight_digest: str,
+    model_name: str,
+    weight_version: int,
     allowed_work_variants: frozenset[ForwardMode],
     mixed_buckets: tuple[GraphBucket, ...],
     trace: ExecutionTrace,
@@ -205,10 +203,10 @@ def create_execution_resources(
 ) -> ExecutionResources:
     if not allowed_work_variants:
         raise ValueError("execution step must accept at least one work variant")
-    if len(architecture_digest) != 64:
-        raise capability_mismatch("execution identity is invalid")
-    if weights.digest != weight_digest:
-        raise capability_mismatch("base-weight identity does not match its weight set")
+    if not model_name:
+        raise capability_mismatch("execution model name is empty")
+    if weights.version != weight_version:
+        raise capability_mismatch("base-weight version does not match its weight set")
     unsupported = allowed_work_variants - model.supported_work
     if unsupported:
         raise capability_mismatch(
@@ -263,8 +261,8 @@ def create_execution_resources(
         mesh=mesh,
         transport=transport,
         tokenizer=tokenizer,
-        architecture_digest=architecture_digest,
-        weight_digest=weight_digest,
+        model_name=model_name,
+        weight_version=weight_version,
         allowed_work_variants=allowed_work_variants,
         mixed_buckets=frozenset(mixed_buckets),
         trace=trace,
@@ -284,9 +282,9 @@ def install_weights(runtime: ExecutionResources, weights: WeightSet) -> None:
     if weights.version <= runtime.weights.version:
         raise ValueError("installed weight version must increase")
     if runtime.runner is not None:
-        runtime.runner.invalidate_graphs(weights.digest)
+        runtime.runner.invalidate_graphs(weights.version)
     runtime.weights = weights
-    runtime.weight_digest = weights.digest
+    runtime.weight_version = weights.version
 
 
 def _operation_identity(operation: Operation) -> OperationIdentity:
@@ -334,7 +332,7 @@ def prepare_batch(runtime, batch: Batch) -> PreparedExecution | None:
     transfers: list[PreparedTransferInput] = []
     for entry in entries:
         assert transport is not None
-        kind, value, producer_plan_digest = decode_transfer_descriptor(entry.payload)
+        kind, value = decode_transfer_descriptor(entry.payload)
         locators: tuple[Locator, ...]
         payload_kind: ProductKind | None = None
         height: int | None = None
@@ -506,7 +504,6 @@ def prepare_batch(runtime, batch: Batch) -> PreparedExecution | None:
             PreparedTransferInput(
                 product=entry.product,
                 kind=kind,
-                producer_plan_digest=producer_plan_digest,
                 locators=locators,
                 tickets=tuple(transport.fetch_async(locator) for locator in locators),
                 payload_kind=payload_kind,
@@ -577,7 +574,6 @@ def _prepare_predicates(
                     (
                         cast(ProductRef, operation.predicate),
                         int(operation.op_id),
-                        None,
                         device,
                     )
                     for operation in device_operations
@@ -686,7 +682,7 @@ def _execute(
     operations = _trace_envelopes(batch.operations)
     validation_started = time.perf_counter_ns()
     try:
-        _validate_batch_identity(runtime, batch)
+        _validate_batch(runtime, batch)
     except BaseException as error:
         runtime.trace.emit(
             ExecutionPhase.PROTOCOL_VALIDATION,
@@ -1404,8 +1400,8 @@ def _commit_partition(
     scope.completion.seal()
     records: list[ModelOutput] = []
     selected_versions: dict[int, VersionRef] = {}
+    pending_completions: dict[int, DeferredCompletion] = {}
     report_products: list[ProductPayload] = []
-    pending_by_session: dict[int, DeferredDigest] = {}
     resolved_runtime: dict[int, RequestRuntime] = {}
     layout = scope.layout
     if layout is None or layout.operations != operations:
@@ -1421,10 +1417,12 @@ def _commit_partition(
         _validate_completion_products(runtime, operation, outcome.products)
         if int(runtime.deployment.tp_rank) == 0:
             report_products.extend(outcome.products)
-        parent_semantic = _parent_semantic(operation, request)
-        pending = DeferredDigest(
-            parent_semantic,
-            operation.plan_digest,
+        pending = DeferredResult(
+            (
+                request.pending_operations.get(int(operation.parent.producer_op_id))
+                if isinstance(operation.parent.point, DevicePoint)
+                else None
+            ),
             scope.completion,
             row,
             partial(_finalize_predicated_runtime, runtime, operation),
@@ -1456,19 +1454,19 @@ def _commit_partition(
                 committed_tokens=cast(tuple[int, ...], outcome.committed_tokens),
                 finish_flags=outcome.finish_flags,
                 product_generations=outcome.product_generations,
-                semantic_digest=pending,
                 error_code=None,
                 timing_counters=TimingCounters(),
+                deferred=pending,
             )
         )
         records.append(record)
         if operation.advances_state:
+            pending_completions[operation.request_key.session_id] = pending
             selected_versions[operation.request_key.session_id] = VersionRef(
                 request_key=operation.request_key,
                 producer_op_id=operation.op_id,
-                point=FixedPoint(cast(int, outcome.selected_point), pending),
+                point=FixedPoint(cast(int, outcome.selected_point)),
             )
-            pending_by_session[operation.request_key.session_id] = pending
         else:
             selected = request.resolve_version(operation.parent)
             if selected is None:
@@ -1509,6 +1507,7 @@ def _commit_partition(
         bases=scope.request_bases,
         selected_versions=selected_versions,
         runtimes=resolved_runtime,
+        completions=pending_completions,
     )
     for identity, locators in scope.stage_publications.items():
         existing = runtime._transport_publications.get(identity)
@@ -1528,9 +1527,6 @@ def _commit_partition(
         runtime._transport_publications[publication_identity] = locators
     _commit_runtime_states(runtime, scope)
     runtime.requests.publish(request_publication)
-    for session_id, pending in pending_by_session.items():
-        if pending.ready():
-            runtime.requests.get(session_id).resolved_digest = pending.finalize()
     return partition_report
 
 
@@ -1729,9 +1725,6 @@ def _build_error_partition(
         )
         point = None if selected_parent is None else selected_parent.point
         selected_point = point.point_index if isinstance(point, FixedPoint) else 0
-        parent_semantic: object = (
-            point.semantic_digest if isinstance(point, FixedPoint) else "0" * 64
-        )
         lengths = (
             LogicalLengths()
             if session is None
@@ -1748,27 +1741,10 @@ def _build_error_partition(
             committed_tokens=(),
             finish_flags=FinishFlags(),
             product_generations=(),
-            semantic_digest="0" * 64,
             error_code=protocol_code,
             timing_counters=TimingCounters(),
         )
-        if isinstance(parent_semantic, (DeferredDigest, DeferredErrorDigest)):
-            semantic_digest = DeferredErrorDigest(
-                parent_semantic,
-                placeholder,
-                operation.plan_digest,
-            )
-        else:
-            semantic_digest = placeholder.compute_semantic_digest(
-                cast(str, parent_semantic),
-                operation.plan_digest,
-            )
-        records.append(
-            replace(
-                placeholder,
-                semantic_digest=semantic_digest,
-            )
-        )
+        records.append(placeholder)
     return PartitionCompletion(
         partition_id=partition.partition_id,
         completions=tuple(records),
@@ -1795,8 +1771,6 @@ def _finalize_speculative_runtime(
     operation: Operation,
     selection: SpeculativeSelection,
     record: ModelOutput,
-    selected_digest: str,
-    parent_semantic: str,
 ) -> None:
     tokens = tuple(int(value) for value in record.committed_tokens)
     selected_point = len(tokens)
@@ -1816,21 +1790,6 @@ def _finalize_speculative_runtime(
         raise RuntimeError("speculative KV selection is outside initialized state")
     prefixes: list[tuple[VersionRef, RequestRuntime]] = []
     for point_index in range(1, selected_point + 1):
-        prefix_record = replace(
-            record,
-            selected_point=point_index,
-            logical_lengths=replace(
-                record.logical_lengths,
-                token_len=selection.base_logical_position + point_index,
-                kv_visible_len=selection.base_kv_visible + point_index,
-            ),
-            token_span=replace(record.token_span, len=point_index),
-            committed_tokens=tokens[:point_index],
-        )
-        digest = prefix_record.compute_semantic_digest(
-            parent_semantic=parent_semantic,
-            plan_digest=operation.plan_digest,
-        )
         request = runtime.requests.get(operation.request_key.session_id)
         prefix_runtime = RequestRuntime(
             logical_position=selection.base_logical_position + point_index,
@@ -1845,15 +1804,11 @@ def _finalize_speculative_runtime(
                 VersionRef(
                     request_key=operation.request_key,
                     producer_op_id=operation.op_id,
-                    point=FixedPoint(point_index, digest),
+                    point=FixedPoint(point_index),
                 ),
                 prefix_runtime,
             )
         )
-    selected, _runtime = prefixes[-1]
-    point = cast(FixedPoint, selected.point)
-    if point.semantic_digest != selected_digest:
-        raise RuntimeError("selected speculative prefix digest is inconsistent")
     runtime.requests.finalize_prefixes(
         operation.request_key.session_id,
         operation.op_id,
@@ -1861,7 +1816,7 @@ def _finalize_speculative_runtime(
     )
 
 
-def _validate_batch_identity(runtime, batch: Batch) -> None:
+def _validate_batch(runtime, batch: Batch) -> None:
     if len(batch.operations) > runtime.deployment.max_batch_operations:
         raise invalid_descriptor("execution batch exceeds the deployment operation limit")
     for operation in batch.operations:
@@ -1907,7 +1862,7 @@ def _validate_batch_identity(runtime, batch: Batch) -> None:
 
 def validate_collective_sequence(
     mesh: DeviceMesh,
-    history: OrderedDict[int, str],
+    history: OrderedDict[int, object],
     batch: Batch,
 ) -> None:
     """Reject divergent or non-advancing collective identities across all worker roots."""
@@ -1915,23 +1870,22 @@ def validate_collective_sequence(
     groups: dict[int, list[BatchPartition]] = defaultdict(list)
     for partition in batch.partitions:
         groups[partition.submission_group].append(partition)
-    group_identities: list[tuple[int, str]] = []
+    group_identities: list[tuple[int, object]] = []
     for submission_group, partitions in groups.items():
         collective_seq = partitions[0].collective_seq
-        digest = hashlib.sha256()
-        digest.update(int(submission_group).to_bytes(4, "little"))
-        digest.update(int(collective_seq).to_bytes(8, "little"))
-        for partition in sorted(partitions, key=lambda value: value.partition_id):
-            digest.update(int(partition.partition_id).to_bytes(4, "little"))
-            digest.update(int(partition.route).to_bytes(4, "little"))
-            digest.update(partition.domain.value.encode("ascii"))
-            for operation in partition.operations:
-                digest.update(operation.plan_digest.encode("ascii"))
-        group_identities.append((int(collective_seq), digest.hexdigest()))
-    for collective_seq, collective_digest in sorted(group_identities):
+        identity = (
+            int(submission_group),
+            int(collective_seq),
+            tuple(
+                (partition.partition_id, partition.route, partition.domain, partition.operations)
+                for partition in sorted(partitions, key=lambda value: value.partition_id)
+            ),
+        )
+        group_identities.append((int(collective_seq), identity))
+    for collective_seq, collective_identity in sorted(group_identities, key=lambda item: item[0]):
         existing = history.get(collective_seq)
         if existing is not None:
-            if existing != collective_digest:
+            if existing != collective_identity:
                 raise invalid_descriptor("collective sequence was reused with different work")
             continue
         # Collective positions order cross-rank collectives, so multi-rank
@@ -1940,7 +1894,7 @@ def validate_collective_sequence(
         # in admission-priority order, so only sequence reuse is checked.
         if mesh.tp_size > 1 and history and collective_seq <= next(reversed(history)):
             raise invalid_descriptor("collective sequence does not advance")
-        history[collective_seq] = collective_digest
+        history[collective_seq] = collective_identity
         while len(history) > 4096:
             history.popitem(last=False)
 
@@ -2033,10 +1987,10 @@ def _reserve_outputs(
 
     scalar_groups: dict[
         tuple[torch.device, ProductKind, DType, ShapeBound],
-        list[tuple[ProductRef, str, torch.device | str]],
+        list[tuple[ProductRef, torch.device | str]],
     ] = {}
-    general_bindings: list[tuple[ProductRef, str, torch.device | str]] = []
-    encoder_bindings: list[tuple[ProductRef, str, torch.device | str]] = []
+    general_bindings: list[tuple[ProductRef, torch.device | str]] = []
+    encoder_bindings: list[tuple[ProductRef, torch.device | str]] = []
     for operation in operations:
         device = _operation_device(runtime, operation)
         for output in operation.outputs:
@@ -2051,10 +2005,10 @@ def _reserve_outputs(
                 ProductKind.VISION_FEATURE,
                 ProductKind.LATENT_FEATURE,
             }:
-                encoder_bindings.append((output, operation.plan_digest, device))
+                encoder_bindings.append((output, device))
                 continue
             if transfer.requires_device_product_binding(output):
-                binding = (output, operation.plan_digest, device)
+                binding = (output, device)
                 if output.shape_bound.max_elements == 1:
                     scalar_groups.setdefault(
                         (device, output.kind, output.dtype, output.shape_bound),
@@ -2188,7 +2142,6 @@ def _consume_predicates(
                 (
                     predicate,
                     int(operation.op_id),
-                    None,
                     device,
                 ),
             )
@@ -2212,13 +2165,12 @@ def _consume_predicates(
             predicate = cast(ProductRef, operation.predicate)
             if predicate not in scope.transferred_device_products:
                 continue
-            _reference, consumer_op_id, producer_digest, target = request
+            _reference, consumer_op_id, target = request
             read = _consume_device_product(
                 runtime,
                 predicate,
                 scope,
                 consumer_op_id=consumer_op_id,
-                producer_plan_digest=producer_digest,
                 device=target,
             )
             scope.device_reads.append(read)
@@ -2550,7 +2502,6 @@ def _consume_device_product(
     scope: PartitionState,
     *,
     consumer_op_id: int,
-    producer_plan_digest: str | None = None,
     device: torch.device | str | None = None,
 ) -> DeviceProductRead:
     candidate = scope.transferred_device_products.get(reference)
@@ -2558,13 +2509,11 @@ def _consume_device_product(
         return runtime.device_products.consume_candidate(
             candidate,
             consumer_op_id=consumer_op_id,
-            producer_plan_digest=producer_plan_digest,
             device=device,
         )
     return runtime.device_products.consume(
         reference,
         consumer_op_id=consumer_op_id,
-        producer_plan_digest=producer_plan_digest,
         device=device,
     )
 
@@ -2575,7 +2524,6 @@ def _consume_encoder_feature(
     scope: PartitionState,
     *,
     consumer_op_id: int,
-    producer_plan_digest: str | None = None,
     device: torch.device | str | None = None,
 ) -> EncoderRead:
     candidate = scope.transferred_encoder_features.get(reference)
@@ -2583,13 +2531,11 @@ def _consume_encoder_feature(
         return runtime.encoder_cache.consume_candidate(
             candidate,
             consumer_op_id=consumer_op_id,
-            producer_plan_digest=producer_plan_digest,
             device=device,
         )
     return runtime.encoder_cache.consume(
         reference,
         consumer_op_id=consumer_op_id,
-        producer_plan_digest=producer_plan_digest,
         device=device,
     )
 
@@ -2767,9 +2713,7 @@ def _stage_input_products(
                 raise invalid_descriptor("transferred product spans multiple consumer devices")
             device = next(iter(devices))
             if transfer.kind == "device_product":
-                binding = runtime.device_products.bind_outputs(
-                    ((product, transfer.producer_plan_digest, device),)
-                )[0]
+                binding = runtime.device_products.bind_outputs(((product, device),))[0]
                 scope.device_writes.append(binding)
                 scope.transferred_device_products[product] = binding
                 runtime.device_products.publish_write(
@@ -2794,9 +2738,7 @@ def _stage_input_products(
                 or product.kind is not payload_kind
             ):
                 raise invalid_descriptor("encoder transfer payload geometry is invalid")
-            encoder_binding = runtime.encoder_cache.bind_outputs(
-                ((product, transfer.producer_plan_digest, device),)
-            )[0]
+            encoder_binding = runtime.encoder_cache.bind_outputs(((product, device),))[0]
             scope.encoder_writes.append(encoder_binding)
             scope.transferred_encoder_features[product] = encoder_binding
             runtime.encoder_cache.publish(
@@ -3125,7 +3067,6 @@ def _group_key(runtime, task: ForwardRow) -> tuple[object, ...]:
     return (
         phase,
         str(_phase_device(runtime, task.phase)),
-        task.weights.digest,
         task.weights.version,
         (
             ()
@@ -3274,22 +3215,6 @@ def _fixed_parent(operation: Operation) -> FixedPoint:
     if not isinstance(point, FixedPoint):
         raise invalid_descriptor("operation names a device parent; depth one commits fixed")
     return point
-
-
-def _parent_semantic(
-    operation: Operation,
-    session: RequestRow,
-) -> str | DeferredSemanticDigest:
-    """The parent semantic digest a completion's own semantic digest chains from.
-
-    A fixed parent names it directly; a device parent chains from the session's
-    resolved semantic digest.
-    """
-
-    selected = session.resolve_version(operation.parent)
-    if selected is None or not isinstance(selected.point, FixedPoint):
-        raise invalid_descriptor("operation parent has no resolved semantic state")
-    return selected.point.semantic_digest
 
 
 def _output_generations(operation: Operation) -> tuple[int, ...]:

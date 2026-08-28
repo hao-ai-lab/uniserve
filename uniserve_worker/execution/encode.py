@@ -175,7 +175,6 @@ def _consume_encode(
                 "width": prepared.width,
             },
             (locator,),
-            operation.plan_digest,
             runtime.transport,
         )
         products = (ProductPayload(product=feature_output, payload=cast(bytes, descriptor)),)

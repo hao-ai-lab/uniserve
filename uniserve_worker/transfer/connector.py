@@ -58,7 +58,6 @@ class TransferConnector:
 class CachePublication:
     locators: tuple[str, ...]
     source_version: VersionRef
-    source_digest: str
     destination: str
     base_version: VersionRef | None
     base_extent: int
@@ -67,8 +66,7 @@ class CachePublication:
     scale_identity: str
 
     def __post_init__(self) -> None:
-        point = self.source_version.point
-        if not isinstance(point, FixedPoint) or point.semantic_digest != self.source_digest:
+        if not isinstance(self.source_version.point, FixedPoint):
             raise invalid_descriptor("KV publication source identity is not exact")
         if not self.destination or self.base_extent < 0 or self.published_extent < self.base_extent:
             raise invalid_descriptor("KV publication extent or destination is invalid")
@@ -81,7 +79,6 @@ class CachePublication:
         return {
             "locators": list(self.locators),
             "source_version": self.source_version.to_mapping(),
-            "source_digest": self.source_digest,
             "destination": self.destination,
             "base_version": None if self.base_version is None else self.base_version.to_mapping(),
             "base_extent": self.base_extent,
@@ -107,7 +104,6 @@ class CachePublication:
                 value.get("source_version"),
                 "KV publication.source_version",
             ),
-            source_digest=str(value.get("source_digest", "")),
             destination=str(value.get("destination", "")),
             base_version=None
             if base is None
@@ -165,7 +161,6 @@ class CachePublications:
         group_id: int,
         visible_length: int,
         source_version: VersionRef,
-        source_digest: str,
         destination: str,
         expected_base: VersionRef | None,
         product: ProductRef,
@@ -174,7 +169,7 @@ class CachePublications:
         if product.kind is not ProductKind.KV or product.request_key != source_version.request_key:
             raise invalid_descriptor("KV publication product identity is invalid")
         point = source_version.point
-        if not isinstance(point, FixedPoint) or point.semantic_digest != source_digest:
+        if not isinstance(point, FixedPoint):
             raise invalid_descriptor("KV publication source identity is invalid")
         session_id = int(source_version.request_key.session_id)
         installed = self._destination_bases.get((session_id, destination))
@@ -221,7 +216,6 @@ class CachePublications:
         publication = CachePublication(
             locators=tuple(locator.to_wire_json() for locator in locators),
             source_version=source_version,
-            source_digest=source_digest,
             destination=destination,
             base_version=expected_base,
             base_extent=base_extent,
@@ -256,8 +250,7 @@ class CachePublications:
         if (
             int(visible_length) < publication.published_extent
             or int(group_id) != publication.group_id
-            or self.request_tables.allocated_length(request_pool_idx)
-            < publication.published_extent
+            or self.request_tables.allocated_length(request_pool_idx) < publication.published_extent
         ):
             raise invalid_descriptor("KV conditioning placement disagrees with its publication")
         self.request_tables.pages(request_pool_idx, group_id)

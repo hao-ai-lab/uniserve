@@ -389,7 +389,6 @@ def publish_latent_transfer(
         "latent",
         {"locator": locator.to_mapping(), **metadata},
         (locator,),
-        operation.plan_digest,
         transport,
     )
     return (ProductPayload(product=product, payload=cast(bytes, descriptor)),)

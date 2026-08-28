@@ -182,7 +182,6 @@ class DeviceProductMetadata:
 @dataclass(frozen=True, slots=True)
 class DeviceProductSnapshot:
     reference: ProductRef
-    producer_plan_digest: str
     value: torch.Tensor
     device: str
     metadata: DeviceProductMetadata | None
@@ -193,7 +192,6 @@ class DeviceProductWrite:
     """One table-issued physical binding retained through producer submission."""
 
     reference: ProductRef
-    producer_plan_digest: str
     slot: _DeviceSlot
     physical_generation: int
     binding_id: int
@@ -350,7 +348,7 @@ class DeviceProducts:
 
     def bind_outputs(
         self,
-        bindings: tuple[tuple[ProductRef, str, torch.device | str], ...],
+        bindings: tuple[tuple[ProductRef, torch.device | str], ...],
     ) -> tuple[DeviceProductWrite, ...]:
         return self.bind_output_batch(bindings).writes
 
@@ -376,7 +374,6 @@ class DeviceProducts:
                 snapshots.append(
                     DeviceProductSnapshot(
                         reference=entry.reference,
-                        producer_plan_digest=entry.producer_plan_digest,
                         value=value.detach().cpu().contiguous(),
                         device=entry.slot.device_name,
                         metadata=entry.metadata,
@@ -394,9 +391,7 @@ class DeviceProducts:
             raise invalid_descriptor("device-product snapshot contains an undeclared session")
         for session_id in selected:
             self.drop_session(session_id)
-        batch = self.bind_output_batch(
-            tuple((item.reference, item.producer_plan_digest, item.device) for item in snapshots)
-        )
+        batch = self.bind_output_batch(tuple((item.reference, item.device) for item in snapshots))
         try:
             for write, item in zip(batch.writes, snapshots, strict=True):
                 self.publish_write(
@@ -411,16 +406,16 @@ class DeviceProducts:
 
     def bind_output_batch(
         self,
-        bindings: tuple[tuple[ProductRef, str, torch.device | str], ...],
+        bindings: tuple[tuple[ProductRef, torch.device | str], ...],
     ) -> DeviceProductBindingBatch:
         """Atomically bind outputs and retain their direct scalar range."""
 
         device_bindings = bindings
         if not device_bindings:
             return DeviceProductBindingBatch(())
-        for reference, _plan_digest, _device in device_bindings:
+        for reference, _device in device_bindings:
             _validate_owner(reference)
-        first_reference, _first_digest, first_raw_device = device_bindings[0]
+        first_reference, first_raw_device = device_bindings[0]
         first_device_object = _resolved_device(first_raw_device)
         first_shape = _device_shape(first_reference)
         first_dtype = _device_dtype(first_reference.dtype)
@@ -428,7 +423,7 @@ class DeviceProducts:
             _resolved_device(device) == first_device_object
             and reference.shape_bound == first_reference.shape_bound
             and reference.dtype is first_reference.dtype
-            for reference, _plan_digest, device in device_bindings
+            for reference, device in device_bindings
         )
         if homogeneous and math.prod(first_shape) == 1:
             return self._bind_homogeneous_outputs(
@@ -440,25 +435,20 @@ class DeviceProducts:
         requested = tuple(
             (
                 reference,
-                plan_digest,
                 _resolved_device(device),
                 _device_shape(reference),
                 _device_dtype(reference.dtype),
             )
-            for reference, plan_digest, device in device_bindings
+            for reference, device in device_bindings
         )
-        keys = [
-            _reference_key(reference) for reference, _digest, _device, _shape, _dtype in requested
-        ]
+        keys = [_reference_key(reference) for reference, _device, _shape, _dtype in requested]
         if len(set(keys)) != len(keys):
             raise invalid_descriptor("device-product registration repeats an output identity")
         with self._lock:
             candidate_keys = {
                 _reference_key(candidate.reference) for candidate in self._candidates.values()
             }
-            for (reference, _digest, _device, _shape, _dtype), key in zip(
-                requested, keys, strict=True
-            ):
+            for (reference, _device, _shape, _dtype), key in zip(requested, keys, strict=True):
                 if int(reference.generation) < 1:
                     raise invalid_descriptor(
                         "device-product registration requires a positive logical generation"
@@ -476,7 +466,7 @@ class DeviceProducts:
                 str,
                 list[tuple[int, ProductRef, torch.device, tuple[int, ...], torch.dtype]],
             ] = {}
-            for index, (reference, _digest, device, shape, dtype) in enumerate(requested):
+            for index, (reference, device, shape, dtype) in enumerate(requested):
                 by_device.setdefault(str(device), []).append(
                     (index, reference, device, shape, dtype)
                 )
@@ -512,7 +502,7 @@ class DeviceProducts:
             writes: list[DeviceProductWrite] = []
             try:
                 for request_index, (
-                    (reference, plan_digest, device, shape, dtype),
+                    (reference, device, shape, dtype),
                     key,
                 ) in enumerate(zip(requested, keys, strict=True)):
                     planned_slot = planned_slots[request_index]
@@ -526,7 +516,6 @@ class DeviceProducts:
                     )
                     write = DeviceProductWrite(
                         reference=reference,
-                        producer_plan_digest=str(plan_digest),
                         slot=slot,
                         physical_generation=slot.generation,
                         binding_id=self._next_binding_id,
@@ -551,7 +540,7 @@ class DeviceProducts:
     def bind_output_groups(
         self,
         groups: tuple[
-            tuple[tuple[ProductRef, str, torch.device | str], ...],
+            tuple[tuple[ProductRef, torch.device | str], ...],
             ...,
         ],
     ) -> tuple[DeviceProductBindingBatch, ...]:
@@ -592,7 +581,7 @@ class DeviceProducts:
 
     def _bind_homogeneous_outputs(
         self,
-        bindings: tuple[tuple[ProductRef, str, torch.device | str], ...],
+        bindings: tuple[tuple[ProductRef, torch.device | str], ...],
         device: torch.device,
         shape: tuple[int, ...],
         dtype: torch.dtype,
@@ -603,7 +592,7 @@ class DeviceProducts:
             }
             keys: list[_ReferenceKey] = []
             seen: set[_ReferenceKey] = set()
-            for reference, _digest, _device in bindings:
+            for reference, _device in bindings:
                 key = _reference_key(reference)
                 if key in seen:
                     raise invalid_descriptor(
@@ -638,7 +627,7 @@ class DeviceProducts:
             occupied_before = self._occupied_slots.get(device_name, 0)
             self._occupied_slots[device_name] = occupied_before + len(bindings)
             try:
-                for (reference, plan_digest, _device), key, slot in zip(
+                for (reference, _device), key, slot in zip(
                     bindings,
                     keys,
                     slots,
@@ -646,7 +635,6 @@ class DeviceProducts:
                 ):
                     write = DeviceProductWrite(
                         reference=reference,
-                        producer_plan_digest=str(plan_digest),
                         slot=slot,
                         physical_generation=slot.generation,
                         binding_id=self._next_binding_id,
@@ -1020,17 +1008,15 @@ class DeviceProducts:
         reference: ProductRef,
         *,
         consumer_op_id: int,
-        producer_plan_digest: str | None = None,
         device: torch.device | str | None = None,
     ) -> DeviceProductRead:
-        return self.consume_batch(((reference, consumer_op_id, producer_plan_digest, device),))[0]
+        return self.consume_batch(((reference, consumer_op_id, device),))[0]
 
     def consume_candidate(
         self,
         write: DeviceProductWrite,
         *,
         consumer_op_id: int,
-        producer_plan_digest: str | None = None,
         device: torch.device | str | None = None,
     ) -> DeviceProductRead:
         """Read one unpublished candidate inside its producing partition."""
@@ -1041,11 +1027,6 @@ class DeviceProducts:
                 raise _invariant("device-product candidate is not live")
             if not entry.producer_recorded:
                 raise invalid_descriptor("device product was consumed before producer readiness")
-            if (
-                producer_plan_digest is not None
-                and entry.producer_plan_digest != producer_plan_digest
-            ):
-                raise invalid_descriptor("device product plan digest does not match its producer")
             storage = entry.slot.tensor
             if storage is None:
                 raise _invariant("device product has no physical tensor")
@@ -1073,7 +1054,7 @@ class DeviceProducts:
     def consume_batch(
         self,
         requests: tuple[
-            tuple[ProductRef, int, str | None, torch.device | str | None],
+            tuple[ProductRef, int, torch.device | str | None],
             ...,
         ],
         *,
@@ -1088,7 +1069,7 @@ class DeviceProducts:
             target_name = str(shared_target)
             with self._lock:
                 shared_resolved: list[tuple[DeviceProductWrite, torch.Tensor, int]] = []
-                for reference, consumer_op_id, producer_plan_digest, requested_device in requests:
+                for reference, consumer_op_id, requested_device in requests:
                     entry = self._require_locked(reference)
                     if entry.released or entry.logical_references < 1:
                         raise invalid_descriptor(
@@ -1097,13 +1078,6 @@ class DeviceProducts:
                     if not entry.producer_recorded:
                         raise invalid_descriptor(
                             "device product was consumed before producer publication"
-                        )
-                    if (
-                        producer_plan_digest is not None
-                        and entry.producer_plan_digest != producer_plan_digest
-                    ):
-                        raise invalid_descriptor(
-                            "device parent plan digest does not match its producer"
                         )
                     storage = entry.slot.tensor
                     if storage is None:
@@ -1163,20 +1137,13 @@ class DeviceProducts:
         assert shared_target is None
         with self._lock:
             resolved: list[tuple[DeviceProductWrite, torch.Tensor, torch.device, int]] = []
-            for reference, consumer_op_id, producer_plan_digest, requested_device in requests:
+            for reference, consumer_op_id, requested_device in requests:
                 entry = self._require_locked(reference)
                 if entry.released or entry.logical_references < 1:
                     raise invalid_descriptor("device product was consumed after logical release")
                 if not entry.producer_recorded:
                     raise invalid_descriptor(
                         "device product was consumed before producer publication"
-                    )
-                if (
-                    producer_plan_digest is not None
-                    and entry.producer_plan_digest != producer_plan_digest
-                ):
-                    raise invalid_descriptor(
-                        "device parent plan digest does not match its producer"
                     )
                 storage = entry.slot.tensor
                 if storage is None:

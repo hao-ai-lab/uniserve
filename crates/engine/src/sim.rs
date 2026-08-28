@@ -4,7 +4,7 @@
 //! consumes typed admissions and operations, enforces lifecycle, version, and
 //! replay invariants, and returns one [`ModelOutput`] per operation with the
 //! resolved output-product values a host consumes. Every state point is named by
-//! its point index and semantic digest, exactly as a real worker names it.
+//! its request epoch, producing operation, and producer-local point index.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -21,7 +21,7 @@ use uniserve_core::{
     CommandWaker, ImageParams, RequestId, SampleOutput, SamplingParams, try_apply_sampling_counts,
 };
 use uniserve_worker_ipc::{
-    Batch, CompletionReport, Digest, DrawLayout, ErrorCode, FinishFlags, ForwardMode, GraphBucket,
+    Batch, CompletionReport, DrawLayout, ErrorCode, FinishFlags, ForwardMode, GraphBucket,
     LogicalLengths, ModelOutput, NewRequest, OpStatus, Operation, PartitionCompletion, Point,
     ProductKind, ProductPayload, ProductRef, RegistrationAck, RequestKind, ResourceClass,
     SamplingState, TimingCounters, TokenSpan, WorkerInfo, decode_sampling_state_bytes,
@@ -230,7 +230,7 @@ impl Drop for SimExecutor {
 /// operation, replayed verbatim when the same operation is resubmitted.
 #[derive(Clone)]
 struct RecordedCompletion {
-    plan_digest: Digest,
+    operation: Operation,
     completion: ModelOutput,
     products: Vec<ProductPayload>,
 }
@@ -242,7 +242,6 @@ struct RecordedCompletion {
 struct SimSession {
     admission: NewRequest,
     point_index: u32,
-    committed_semantic: Digest,
     logical_position: u32,
     kv_visible_len: u32,
     kv_published_len: u32,
@@ -260,7 +259,6 @@ struct SimSession {
 
 impl SimSession {
     fn new(admission: NewRequest) -> Self {
-        let committed_semantic = admission.digest.clone();
         let prefix_len = admission
             .und
             .as_ref()
@@ -268,7 +266,6 @@ impl SimSession {
         Self {
             admission,
             point_index: 0,
-            committed_semantic,
             logical_position: prefix_len,
             kv_visible_len: prefix_len,
             kv_published_len: 0,
@@ -358,13 +355,8 @@ impl SimEngine {
                 })
                 .collect(),
             resource_classes: vec![ResourceClass::ImageLatent],
-            model_identity: Some(Digest::zero()),
-            weight_digest: Some(
-                Digest::try_from(
-                    "1111111111111111111111111111111111111111111111111111111111111111",
-                )
-                .expect("constant digest"),
-            ),
+            model_name: "sim".to_owned(),
+            weight_version: 0,
             ..WorkerInfo::default()
         };
         Self {
@@ -496,8 +488,6 @@ impl SimEngine {
     ) -> anyhow::Result<(ModelOutput, Vec<ProductPayload>)> {
         let point_index = session.point_index;
         let selected_point = u32::from(operation.advances_state);
-        let parent_semantic = session.committed_semantic.clone();
-
         let mut record = ModelOutput {
             request_key: operation.request_key,
             op_id: operation.op_id,
@@ -509,7 +499,6 @@ impl SimEngine {
             committed_tokens: Vec::new(),
             finish_flags: FinishFlags::default(),
             product_generations: operation.outputs.iter().map(|out| out.generation).collect(),
-            semantic_digest: Digest::zero(),
             error_code: None,
             timing_counters: TimingCounters::default(),
         };
@@ -582,8 +571,6 @@ impl SimEngine {
                         record.selected_point = point_index;
                         record.product_generations.clear();
                         record.error_code = Some(ErrorCode::InvalidOperation);
-                        record.semantic_digest = record
-                            .compute_semantic_digest(&parent_semantic, &operation.plan_digest);
                         return Ok((record, Vec::new()));
                     };
                     record.finish_flags.eos = output.token == fake_eos;
@@ -761,13 +748,11 @@ impl SimEngine {
             });
         }
 
-        record.semantic_digest =
-            record.compute_semantic_digest(&parent_semantic, &operation.plan_digest);
         Ok((record, products))
     }
 
     fn predicated_completion(operation: &Operation, session: &SimSession) -> ModelOutput {
-        let mut record = ModelOutput {
+        ModelOutput {
             request_key: operation.request_key,
             op_id: operation.op_id,
             completion_slot_generation: ((operation.op_id.0 - 1) % u64::from(u32::MAX) + 1) as u32,
@@ -786,12 +771,9 @@ impl SimEngine {
             committed_tokens: Vec::new(),
             finish_flags: FinishFlags::default(),
             product_generations: Vec::new(),
-            semantic_digest: Digest::zero(),
             error_code: None,
             timing_counters: TimingCounters::default(),
-        };
-        record.semantic_digest = session.committed_semantic.clone();
-        record
+        }
     }
 
     pub fn set_pipeline_depth(&mut self, depth: u32) {
@@ -949,8 +931,8 @@ impl SimEngine {
                     })?;
                 if let Some(recorded) = session.terminal.get(&operation.op_id.0) {
                     anyhow::ensure!(
-                        recorded.plan_digest == operation.plan_digest,
-                        "operation {} plan digest conflicts with its terminal record",
+                        recorded.operation == operation,
+                        "operation {} conflicts with its terminal record",
                         operation.op_id.0
                     );
                     completions.push(recorded.completion.clone());
@@ -963,10 +945,7 @@ impl SimEngine {
                     operation.request_key
                 );
                 match &operation.parent.point {
-                    Point::Fixed {
-                        point_index,
-                        semantic_digest,
-                    } => {
+                    Point::Fixed { point_index } => {
                         anyhow::ensure!(
                             *point_index == session.point_index,
                             "operation {} ({}) parent point {} does not match session point {}",
@@ -975,17 +954,10 @@ impl SimEngine {
                             point_index,
                             session.point_index
                         );
-                        anyhow::ensure!(
-                            *semantic_digest == session.committed_semantic,
-                            "operation {} ({}) parent semantic digest does not match the committed point",
-                            operation.op_id.0,
-                            operation.work.as_wire_str()
-                        );
                     }
                     Point::Device {
                         point_index,
                         selected_point,
-                        producer_plan_digest,
                     } => {
                         // A device-relay successor roots on its predecessor's
                         // selected point before host observation. By the time it
@@ -1000,10 +972,6 @@ impl SimEngine {
                                 "device parent names unknown predecessor op {producer_op_id}"
                             )
                         })?;
-                        anyhow::ensure!(
-                            recorded.plan_digest == *producer_plan_digest,
-                            "device parent producer plan digest does not match its predecessor"
-                        );
                         if let Some(selected_point) = selected_point {
                             anyhow::ensure!(
                                 selected_point.producer_op_id.0 == producer_op_id,
@@ -1045,7 +1013,7 @@ impl SimEngine {
                         session.terminal.insert(
                             operation.op_id.0,
                             RecordedCompletion {
-                                plan_digest: operation.plan_digest.clone(),
+                                operation: operation.clone(),
                                 completion: completion.clone(),
                                 products: Vec::new(),
                             },
@@ -1065,12 +1033,11 @@ impl SimEngine {
                 )?;
                 if operation.advances_state && completion.status == OpStatus::Ok {
                     session.point_index = completion.selected_point;
-                    session.committed_semantic = completion.semantic_digest.clone();
                 }
                 session.terminal.insert(
                     operation.op_id.0,
                     RecordedCompletion {
-                        plan_digest: operation.plan_digest.clone(),
+                        operation,
                         completion: completion.clone(),
                         products: op_products.clone(),
                     },
@@ -1153,7 +1120,7 @@ mod tests {
     fn batch(step_id: u64, op_id: u64) -> Batch {
         let request_key = request_key();
         let admission = admission();
-        let parent = VersionRef::admission_root(request_key, OpId(1), admission.digest.clone());
+        let parent = VersionRef::admission_root(request_key, OpId(1));
         let operation = Operation {
             request_key,
             op_id: OpId(op_id),
@@ -1172,7 +1139,6 @@ mod tests {
             predicate: None,
             rng: None,
             control_seq: 0,
-            plan_digest: uniserve_core::Digest::zero(),
         }
         .sealed();
         Batch::new(

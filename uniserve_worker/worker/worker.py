@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -58,7 +58,6 @@ from ..foundation.errors import capability_mismatch, invalid_descriptor
 from ..foundation.math import ceil_div
 from ..loader.update import WeightUpdater
 from ..loader.weight_set import WeightSet
-from ..models.identity import ModelIdentity, architecture_identity
 from ..models.minimax_h3 import MiniMaxH3Model
 from ..models.minimax_h3.execution import (
     H3MuxCoordinator,
@@ -154,8 +153,6 @@ class Worker:
             allowed_work_variants=plan.allowed_work_variants,
             transfer_backend=config.data_plane.backend,
             cross_process=config.worker_kind is not WorkerKind.FULL,
-            architecture_digest=loaded.identity.architecture_digest,
-            weight_digest=loaded.identity.weight_digest,
             weights=loaded.weights,
             weight_sidecars=loaded.weight_sidecars,
             pipeline_depth=config.ipc.pipeline_depth,
@@ -177,8 +174,6 @@ class Worker:
         allowed_work_variants: frozenset[ForwardMode],
         transfer_backend: str = "local",
         cross_process: bool = False,
-        architecture_digest: str | None = None,
-        weight_digest: str | None = None,
         weights: WeightSet | None = None,
         weight_sidecars: tuple[str, ...] = ("config.json",),
         pipeline_depth: int,
@@ -196,26 +191,15 @@ class Worker:
         self._weight_condition = Condition(RLock())
         self._active_model_calls = 0
         self._weight_update_active = False
-        installed_weights = (
-            WeightSet.from_module(model, digest=weight_digest) if weights is None else weights
-        )
-        if weight_digest is not None and installed_weights.digest != weight_digest:
-            raise capability_mismatch(
-                "worker weight identity does not match the installed WeightSet"
-            )
+        installed_weights = WeightSet.from_module(model) if weights is None else weights
         self.weights = installed_weights
-        self.weight_digest = installed_weights.digest
-        self.identity = ModelIdentity(
-            architecture=model.architecture,
-            architecture_digest=architecture_digest
-            or architecture_identity(model.architecture, {"architecture": model.architecture}),
-            weight_digest=self.weight_digest,
-        )
+        self.architecture = model.architecture
+        self.weight_version = installed_weights.version
         declared = resolve_capabilities(
             model,
             deployment,
-            architecture_digest=self.identity.architecture_digest,
-            weight_digest=self.weight_digest,
+            model_name=self.architecture,
+            weight_version=self.weight_version,
             pipeline_depth=int(pipeline_depth),
             completion_payload_bytes=int(completion_payload_bytes),
         )
@@ -754,7 +738,7 @@ class Worker:
                 cache_pool=self.cache_pool,
                 attention=attention,
                 block_size=deployment.block_size,
-                weight_digest=self.weight_digest,
+                weight_version=self.weight_version,
                 memory_budget_bytes=graph_budget,
                 decode_batch_sizes=lane_decode_buckets,
                 decode_predicates=(
@@ -773,7 +757,7 @@ class Worker:
             )
 
         self._execution = execution
-        self.trace = ExecutionTrace(self.identity.architecture_digest)
+        self.trace = ExecutionTrace(self.architecture)
         devices = (
             (deployment.device,)
             if deployment.generation_device is None
@@ -829,8 +813,8 @@ class Worker:
             mesh=mesh,
             transport=self.transfers.transport,
             tokenizer=tokenizer,
-            architecture_digest=self.identity.architecture_digest,
-            weight_digest=self.weight_digest,
+            model_name=self.architecture,
+            weight_version=self.weight_version,
             allowed_work_variants=self._effective_work_variants,
             mixed_buckets=self._capabilities.mixed_buckets,
             trace=self.trace,
@@ -846,13 +830,12 @@ class Worker:
         self.weight_updater = (
             WeightUpdater(
                 self.model,
-                architecture=self.identity.architecture,
+                architecture=self.architecture,
                 scope=self.deployment.model_scope,
                 sidecars=weight_sidecars,
                 weights=self.weights,
                 publish=self._publish_weight_set,
                 exclusive=self._exclusive_weight_update,
-                gather_rank_digests=self._gather_rank_weight_digests,
             )
             if isinstance(self.model, ExecutionModel)
             else None
@@ -945,22 +928,8 @@ class Worker:
     def _publish_weight_set(self, weights: WeightSet) -> None:
         install_weights(self.execution, weights)
         self.weights = weights
-        self.weight_digest = weights.digest
-        self.identity = ModelIdentity(
-            architecture=self.identity.architecture,
-            architecture_digest=self.identity.architecture_digest,
-            weight_digest=weights.digest,
-        )
-        self._capabilities = replace(self._capabilities, weight_digest=weights.digest)
-
-    def _gather_rank_weight_digests(self, rank_digest: str) -> Sequence[str]:
-        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-            return (rank_digest,)
-        gathered: list[object] = [None] * torch.distributed.get_world_size()
-        torch.distributed.all_gather_object(gathered, rank_digest)
-        if any(not isinstance(value, str) for value in gathered):
-            raise RuntimeError("tensor-parallel ranks did not publish weight digests")
-        return tuple(str(value) for value in gathered)
+        self.weight_version = weights.version
+        self._capabilities = replace(self._capabilities, weight_version=weights.version)
 
     def warmup(self) -> None:
         if not isinstance(self.model, MiniMaxH3Model):

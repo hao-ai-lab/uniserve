@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -27,9 +26,9 @@ from .loader import (
 )
 from .mapping import LoadReport
 from .source import resolve_weight_sources
-from .weight_set import WeightSet, module_weight_digest, source_weight_digest
+from .weight_set import WeightSet
 
-__all__ = ["BucketTensor", "WeightUpdater", "group_weight_digest"]
+__all__ = ["BucketTensor", "WeightUpdater"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,9 +62,8 @@ class WeightUpdater:
         sidecars: tuple[str, ...] = ("config.json",),
         weights: WeightSet,
         publish: Callable[[WeightSet], None] | None = None,
-        invalidate_graphs: Callable[[str], None] | None = None,
+        invalidate_graphs: Callable[[int], None] | None = None,
         exclusive: Callable[[], Any] | None = None,
-        gather_rank_digests: Callable[[str], Sequence[str]] | None = None,
         derived_cache_active: Callable[[], bool] | None = None,
     ) -> None:
         if weights.version < 0:
@@ -78,7 +76,6 @@ class WeightUpdater:
         self._publish = publish
         self._invalidate_graphs = invalidate_graphs
         self._exclusive = exclusive
-        self._gather_rank_digests = gather_rank_digests
         self._derived_cache_active = derived_cache_active
         self.unhealthy = False
 
@@ -89,13 +86,11 @@ class WeightUpdater:
         expected_parameters: Iterable[str] | None = None,
     ) -> WeightSet:
         handles = tuple(
-            TensorWeightHandle(name, tensor)
-            for name, tensor in sorted(tensors.items())
+            TensorWeightHandle(name, tensor) for name, tensor in sorted(tensors.items())
         )
         return self._install(
             handles,
             expected_parameters=expected_parameters,
-            digest=None,
         )
 
     def update_distributed(
@@ -130,9 +125,9 @@ class WeightUpdater:
                 raise ValueError(f"flattened bucket tensor {descriptor.name!r} exceeds the bucket")
             if descriptor.name in tensors:
                 raise ValueError(f"flattened bucket repeats tensor {descriptor.name!r}")
-            tensors[descriptor.name] = flat.narrow(
-                0, descriptor.offset, descriptor.length
-            ).view(descriptor.shape)
+            tensors[descriptor.name] = flat.narrow(0, descriptor.offset, descriptor.length).view(
+                descriptor.shape
+            )
         return self.update_named(tensors, expected_parameters=expected_parameters)
 
     def update_disk(
@@ -150,12 +145,6 @@ class WeightUpdater:
             repository_id=repository_id,
         )
         _verify_checksums(sources, request.load.checksum_manifest)
-        digest = source_weight_digest(
-            self.architecture,
-            self.scope,
-            request.load.load_format,
-            sources,
-        )
         layered = request.load.load_format is LoadFormat.LAYERED
         if len(sources) == 1:
             after_primary = None
@@ -178,7 +167,6 @@ class WeightUpdater:
         return self._install(
             iter_weight_handles(sources[0], request.load),
             expected_parameters=None,
-            digest=digest,
             after_primary=after_primary,
             layered=layered,
         )
@@ -188,7 +176,6 @@ class WeightUpdater:
         handles: Iterable[WeightHandle],
         *,
         expected_parameters: Iterable[str] | None,
-        digest: str | None,
         after_primary: Callable[[], None] | None = None,
         layered: bool = False,
     ) -> WeightSet:
@@ -196,7 +183,9 @@ class WeightUpdater:
             raise RuntimeError("weight updater is unhealthy")
         if self._derived_cache_active is not None and self._derived_cache_active():
             raise RuntimeError("active derived-weight cache cannot observe in-place replacement")
-        expected = None if expected_parameters is None else {str(name) for name in expected_parameters}
+        expected = (
+            None if expected_parameters is None else {str(name) for name in expected_parameters}
+        )
         snapshot_names = (
             {name for name, _ in self.model.named_parameters()}
             if after_primary is not None
@@ -219,14 +208,12 @@ class WeightUpdater:
                         _process_loaded_modules(self.model, report.loaded)
                     else:
                         process_quantized_modules(self.model.modules())
-                installed_digest = digest or self._installed_group_digest()
                 updated = WeightSet.from_module(
                     self.model,
-                    digest=installed_digest,
                     version=self.weights.version + 1,
                 )
                 if self._invalidate_graphs is not None:
-                    self._invalidate_graphs(updated.digest)
+                    self._invalidate_graphs(updated.version)
                 self.weights = updated
                 if self._publish is not None:
                     self._publish(updated)
@@ -236,7 +223,9 @@ class WeightUpdater:
                     _restore_tensors(self.model, snapshot)
                 except BaseException as rollback_error:
                     self.unhealthy = True
-                    raise RuntimeError("weight update failed and rollback could not restore the model") from rollback_error
+                    raise RuntimeError(
+                        "weight update failed and rollback could not restore the model"
+                    ) from rollback_error
                 raise
 
     def _audit(self, report: LoadReport, expected: set[str] | None) -> None:
@@ -249,28 +238,8 @@ class WeightUpdater:
             target = self.model
         audit_load_report(target, report, included=expected, label="weight update")
 
-    def _installed_group_digest(self) -> str:
-        rank_digest = module_weight_digest(self.model)
-        rank_digests = (
-            tuple(self._gather_rank_digests(rank_digest))
-            if self._gather_rank_digests is not None
-            else (rank_digest,)
-        )
-        return group_weight_digest(rank_digests)
-
     def _exclusive_context(self) -> Any:
         return self._exclusive() if self._exclusive is not None else nullcontext()
-
-
-def group_weight_digest(rank_digests: Sequence[str]) -> str:
-    if not rank_digests:
-        raise ValueError("weight group digest requires at least one rank")
-    digest = hashlib.sha256(b"uniserve-weight-group\0")
-    for value in rank_digests:
-        if len(value) != 64:
-            raise ValueError("rank weight digest must be SHA-256")
-        digest.update(bytes.fromhex(value))
-    return digest.hexdigest()
 
 
 def _invoke_load_weights(model: nn.Module, handles: Iterable[WeightHandle]) -> LoadReport:

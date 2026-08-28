@@ -219,7 +219,6 @@ class PromptLogitsPublication:
 class PreparedTransferInput:
     product: ProductRef
     kind: str
-    producer_plan_digest: str
     locators: tuple[Locator, ...]
     tickets: tuple[TransferTicket, ...]
     payload_kind: ProductKind | None
@@ -481,9 +480,9 @@ class SpeculativeSelection:
 class Outcome:
     """The selected result of one operation, projected onto its completion record.
 
-    ``committed_tokens`` are the semantic tokens the sampler selected and copied
-    to completion storage for the semantic digest. ``products`` are the
-    operation's non-semantic host-facing payloads (a materialized image artifact,
+    ``committed_tokens`` are the tokens selected by the sampler and copied to
+    completion storage. ``products`` are the operation's host-facing payloads
+    (a materialized image artifact,
     requested logprobs) carried by the completion report under their product
     references.
     """

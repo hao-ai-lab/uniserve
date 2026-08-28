@@ -36,7 +36,7 @@ class OperationTrace:
 class ExecutionEvent:
     phase: ExecutionPhase
     operations: tuple[OperationTrace, ...]
-    candidate_digest: str
+    model_name: str
     timestamp_ns: int
     duration_us: int | None = None
     route: str | None = None
@@ -57,7 +57,7 @@ class ExecutionEvent:
                 }
                 for value in self.operations
             ],
-            "candidate_digest": self.candidate_digest,
+            "model_name": self.model_name,
             "timestamp_ns": self.timestamp_ns,
             "duration_us": self.duration_us,
             "route": self.route,
@@ -70,10 +70,10 @@ class ExecutionEvent:
 class ExecutionTrace:
     """Worker-owned bounded event stream and structured-log publisher."""
 
-    def __init__(self, candidate_digest: str, *, capacity: int = 4096) -> None:
+    def __init__(self, model_name: str, *, capacity: int = 4096) -> None:
         if int(capacity) < 1:
             raise ValueError("execution trace capacity must be positive")
-        self.candidate_digest = str(candidate_digest)
+        self.model_name = str(model_name)
         self._events: deque[ExecutionEvent] = deque(maxlen=int(capacity))
         self._lock = RLock()
 
@@ -97,7 +97,7 @@ class ExecutionTrace:
         event = ExecutionEvent(
             phase=phase,
             operations=tuple(operations),
-            candidate_digest=self.candidate_digest,
+            model_name=self.model_name,
             timestamp_ns=time.time_ns(),
             duration_us=None if duration_us is None else int(duration_us),
             route=None if route is None else str(route),

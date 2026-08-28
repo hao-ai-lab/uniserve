@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
 import json
 from pathlib import Path
 from typing import Any, Literal
@@ -25,7 +24,6 @@ CHECKPOINT_ID = "FastVideo/FastVideo-Minimax-FastH3-Preview-v0.2"
 @dataclass(frozen=True, slots=True)
 class H3Checkpoint:
     root: Path
-    digest: str
 
 
 @dataclass(slots=True)
@@ -84,12 +82,7 @@ def resolve_h3_checkpoint(
         raise FileNotFoundError(
             f"FastH3 checkpoint {root} is missing required components {missing!r}"
         )
-    digest = hashlib.sha256()
-    digest.update(b"uniserve-minimax-h3-v0.2\0")
-    for relative in required:
-        digest.update(relative.encode("utf-8"))
-        digest.update((root / relative).read_bytes())
-    return H3Checkpoint(root=root, digest=digest.hexdigest())
+    return H3Checkpoint(root=root)
 
 
 def _require_checkpoint_geometry(checkpoint: H3Checkpoint) -> None:
@@ -148,9 +141,7 @@ def _require_checkpoint_geometry(checkpoint: H3Checkpoint) -> None:
 
     for component, expected_shift in (("scheduler", 12.0), ("audio_scheduler", 3.0)):
         scheduler = json.loads(
-            (checkpoint.root / component / "scheduler_config.json").read_text(
-                encoding="utf-8"
-            )
+            (checkpoint.root / component / "scheduler_config.json").read_text(encoding="utf-8")
         )
         if scheduler.get("shift") != expected_shift:
             raise ValueError(
@@ -169,9 +160,7 @@ def _weight_map(component: Path) -> dict[str, Any]:
         mapping = payload.get("weight_map")
         if not isinstance(mapping, dict):
             raise RuntimeError(f"checkpoint index {indexes[0]} has no weight_map")
-        locations = {
-            str(name): component / str(filename) for name, filename in mapping.items()
-        }
+        locations = {str(name): component / str(filename) for name, filename in mapping.items()}
     else:
         files = sorted(component.glob("*.safetensors"))
         if len(files) != 1:
@@ -194,9 +183,7 @@ def _weight_map(component: Path) -> dict[str, Any]:
             available = set(source.keys())
             absent = sorted(set(names) - available)
             if absent:
-                raise KeyError(
-                    f"checkpoint shard {path} is missing indexed tensor {absent[0]!r}"
-                )
+                raise KeyError(f"checkpoint shard {path} is missing indexed tensor {absent[0]!r}")
             for name in names:
                 value = source.get_slice(name)
                 handles[name] = SafetensorFileWeightHandle(
@@ -324,9 +311,7 @@ def load_h3_components(
     *,
     cache_dir: str | None = None,
     revision: str | None = None,
-    attention_mode: Literal[
-        "sparse_kernel", "sparse_oracle", "dense_oracle"
-    ] = "sparse_kernel",
+    attention_mode: Literal["sparse_kernel", "sparse_oracle", "dense_oracle"] = "sparse_kernel",
 ) -> H3Components:
     checkpoint = resolve_h3_checkpoint(
         checkpoint_path,

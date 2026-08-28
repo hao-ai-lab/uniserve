@@ -88,9 +88,7 @@ def assert_model_discovery(
     assert model["created"] > 0
     assert model["owned_by"] == "uniserve"
     identity = model["identity"]
-    assert identity["description_id"] == description_id
-    assert identity["profile_id"].startswith(f"{description_id}:")
-    assert re.fullmatch(r"[0-9a-f]{64}", identity["config_fingerprint"])
+    assert identity == {"served_name": model_id, "description": description_id}
     assert model["capabilities"] == {
         "endpoints": endpoints,
         "input_modalities": input_modalities,

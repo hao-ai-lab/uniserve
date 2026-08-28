@@ -769,7 +769,7 @@ def _warmup_sequence(self: Worker) -> None:
             parent=VersionRef(
                 keys[sid],
                 predecessor.op_id,
-                DevicePoint(1, None, predecessor.plan_digest),
+                DevicePoint(1, None),
             ),
             work=ForwardMode.TOKEN_DECODE,
             route=0,
@@ -785,7 +785,7 @@ def _warmup_sequence(self: Worker) -> None:
         operations = []
         payloads = []
         for sid in session_ids:
-            root = VersionRef(keys[sid], 0, FixedPoint(0, admissions[sid].digest))
+            root = VersionRef(keys[sid], 0, FixedPoint(0))
             op_ids[sid] += 1
             operation, payload = prompt_op(sid, op_ids[sid], root, (0,))
             operations.append(operation)
@@ -937,7 +937,7 @@ def _warmup_prefill_graphs(self: Worker) -> None:
                     Operation.registered(
                         request_key=rk,
                         op_id=1,
-                        parent=VersionRef(rk, 0, FixedPoint(0, admission.digest)),
+                        parent=VersionRef(rk, 0, FixedPoint(0)),
                         work=ForwardMode.TOKEN_EXTEND,
                         route=0,
                         domain=Domain.PREFILL,
@@ -1079,7 +1079,7 @@ def _warmup_flow(self: Worker) -> None:
             for index, session_id in enumerate(text_session_ids, start=1)
         }
         roots = tuple(
-            VersionRef(key, 0, FixedPoint(0, admission.digest))
+            VersionRef(key, 0, FixedPoint(0))
             for key, admission in zip(keys, admissions, strict=True)
         )
         conditionings: list[ProductRef] = []
@@ -1147,7 +1147,7 @@ def _warmup_flow(self: Worker) -> None:
                         parent=VersionRef(
                             key,
                             0,
-                            FixedPoint(0, text_admissions[session_id].digest),
+                            FixedPoint(0),
                         ),
                         work=ForwardMode.TOKEN_EXTEND,
                         route=0,
@@ -1269,11 +1269,7 @@ def _warmup_flow(self: Worker) -> None:
                             parent=VersionRef(
                                 key,
                                 flow_predecessors[session_id].op_id,
-                                DevicePoint(
-                                    1,
-                                    None,
-                                    flow_predecessors[session_id].plan_digest,
-                                ),
+                                DevicePoint(1, None),
                             ),
                             work=ForwardMode.GEN_FLOW,
                             route=0,
@@ -1323,7 +1319,7 @@ def _warmup_flow(self: Worker) -> None:
                                 parent=VersionRef(
                                     text_keys[session_id],
                                     predecessor.op_id,
-                                    DevicePoint(1, None, predecessor.plan_digest),
+                                    DevicePoint(1, None),
                                 ),
                                 work=ForwardMode.TOKEN_DECODE,
                                 route=0,
@@ -1363,11 +1359,7 @@ def _warmup_flow(self: Worker) -> None:
                                 parent=VersionRef(
                                     key,
                                     flow_predecessors[session_id].op_id,
-                                    DevicePoint(
-                                        1,
-                                        None,
-                                        flow_predecessors[session_id].plan_digest,
-                                    ),
+                                    DevicePoint(1, None),
                                 ),
                                 work=ForwardMode.GEN_FLOW,
                                 route=0,

@@ -69,7 +69,6 @@ class _EncoderSlot:
 @dataclass(slots=True)
 class EncoderWrite:
     reference: ProductRef
-    producer_plan_digest: str
     slot: _EncoderSlot
     physical_generation: int
     binding_id: int
@@ -98,7 +97,6 @@ class EncoderRead:
 @dataclass(frozen=True, slots=True)
 class EncoderSnapshot:
     reference: ProductRef
-    producer_plan_digest: str
     value: torch.Tensor
     device: str
     metadata: EncoderMetadata
@@ -168,7 +166,7 @@ class EncoderCache:
 
     def bind_outputs(
         self,
-        bindings: tuple[tuple[ProductRef, str, torch.device | str], ...],
+        bindings: tuple[tuple[ProductRef, torch.device | str], ...],
     ) -> tuple[EncoderWrite, ...]:
         if not bindings:
             return ()
@@ -176,12 +174,12 @@ class EncoderCache:
             self._reclaim_ready_locked()
             if len(self._entries) + len(self._candidates) + len(bindings) > self.entry_capacity:
                 raise resource_error("encoder cache has no query-ready entry capacity")
-            keys = tuple(_reference_key(reference) for reference, _digest, _device in bindings)
+            keys = tuple(_reference_key(reference) for reference, _device in bindings)
             if len(set(keys)) != len(keys):
                 raise invalid_descriptor("encoder cache registration repeats a product identity")
-            validated: list[tuple[ProductRef, str, torch.device]] = []
+            validated: list[tuple[ProductRef, torch.device]] = []
             requested_by_device: dict[str, int] = {}
-            for (reference, digest, raw_device), key in zip(bindings, keys, strict=True):
+            for (reference, raw_device), key in zip(bindings, keys, strict=True):
                 if reference.kind not in {
                     ProductKind.VISION_FEATURE,
                     ProductKind.LATENT_FEATURE,
@@ -211,19 +209,19 @@ class EncoderCache:
                 requested_by_device[str(device)] = requested_by_device.get(str(device), 0) + 1
                 if requested_by_device[str(device)] > len(free):
                     raise resource_error("encoder cache has no query-ready device slot")
-                validated.append((reference, str(digest), device))
-            prepared: list[tuple[ProductRef, str, torch.device, _EncoderSlot]] = []
+                validated.append((reference, device))
+            prepared: list[tuple[ProductRef, torch.device, _EncoderSlot]] = []
             try:
-                for reference, digest, device in validated:
+                for reference, device in validated:
                     slot = self._slots[str(device)][self._free[str(device)].popleft()]
-                    prepared.append((reference, digest, device, slot))
+                    prepared.append((reference, device, slot))
             except BaseException:
-                for _reference, _digest, device, slot in reversed(prepared):
+                for _reference, device, slot in reversed(prepared):
                     self._free[str(device)].appendleft(slot.index)
                 raise
             writes: list[EncoderWrite] = []
             try:
-                for (reference, digest, _device, slot), key in zip(prepared, keys, strict=True):
+                for (reference, _device, slot), key in zip(prepared, keys, strict=True):
                     generation = slot.generation + 1
                     slot.generation = 1 if generation > _MAX_GENERATION else generation
                     binding_id = self._next_binding_id
@@ -231,7 +229,6 @@ class EncoderCache:
                     slot.owner = binding_id
                     write = EncoderWrite(
                         reference=reference,
-                        producer_plan_digest=digest,
                         slot=slot,
                         physical_generation=slot.generation,
                         binding_id=binding_id,
@@ -243,7 +240,7 @@ class EncoderCache:
                     self._candidates.pop(write.binding_id, None)
                     write.slot.owner = 0
                     self._free[str(write.slot.device)].appendleft(write.slot.index)
-                for _reference, _digest, device, slot in reversed(prepared[len(writes) :]):
+                for _reference, device, slot in reversed(prepared[len(writes) :]):
                     self._free[str(device)].appendleft(slot.index)
                 raise
             return tuple(writes)
@@ -285,7 +282,6 @@ class EncoderCache:
         reference: ProductRef,
         *,
         consumer_op_id: int,
-        producer_plan_digest: str | None = None,
         device: torch.device | str | None = None,
     ) -> EncoderRead:
         with self._lock:
@@ -294,11 +290,6 @@ class EncoderCache:
                 raise invalid_descriptor("encoder feature was consumed after release")
             if not entry.published or entry.tensor is None or entry.metadata is None:
                 raise invalid_descriptor("encoder feature was consumed before publication")
-            if (
-                producer_plan_digest is not None
-                and entry.producer_plan_digest != producer_plan_digest
-            ):
-                raise invalid_descriptor("encoder feature plan digest does not match its producer")
             target = entry.tensor.device if device is None else canonical_device(device)
             if target != entry.tensor.device:
                 raise invalid_descriptor("encoder feature consumer names a different device")
@@ -321,7 +312,6 @@ class EncoderCache:
         write: EncoderWrite,
         *,
         consumer_op_id: int,
-        producer_plan_digest: str | None = None,
         device: torch.device | str | None = None,
     ) -> EncoderRead:
         """Read one unpublished feature inside its consuming partition."""
@@ -332,11 +322,6 @@ class EncoderCache:
                 raise _invariant("encoder feature candidate is not live")
             if not entry.published or entry.tensor is None or entry.metadata is None:
                 raise invalid_descriptor("encoder feature was consumed before producer readiness")
-            if (
-                producer_plan_digest is not None
-                and entry.producer_plan_digest != producer_plan_digest
-            ):
-                raise invalid_descriptor("encoder feature plan digest does not match its producer")
             target = entry.tensor.device if device is None else canonical_device(device)
             if target != entry.tensor.device:
                 raise invalid_descriptor("encoder feature consumer names a different device")
@@ -462,7 +447,6 @@ class EncoderCache:
                 result.append(
                     EncoderSnapshot(
                         reference=entry.reference,
-                        producer_plan_digest=entry.producer_plan_digest,
                         value=entry.tensor.detach().cpu().contiguous(),
                         device=str(entry.tensor.device),
                         metadata=entry.metadata,
@@ -484,9 +468,7 @@ class EncoderCache:
                     entry.released = True
                     self._detach_locked(entry)
             self._reclaim_ready_locked()
-        writes = self.bind_outputs(
-            tuple((item.reference, item.producer_plan_digest, item.device) for item in snapshots)
-        )
+        writes = self.bind_outputs(tuple((item.reference, item.device) for item in snapshots))
         try:
             for write, item in zip(writes, snapshots, strict=True):
                 self.publish(write, item.value.to(write.slot.device), item.metadata)

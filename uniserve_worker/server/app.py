@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import gc
-import hashlib
 import logging
 import os
-import struct
 import time
 from collections import deque
 from collections.abc import Mapping, Sequence
@@ -50,7 +48,6 @@ __all__ = [
     "PendingResponse",
     "TerminalStep",
     "WorkerServer",
-    "batch_identity",
     "dispatch",
 ]
 
@@ -123,63 +120,6 @@ def _request_kind(request: Mapping[str, Any]) -> RequestKind:
         return RequestKind(raw)
     except ValueError:
         raise invalid_descriptor(f"unknown worker request kind {raw!r}") from None
-
-
-def _canonical_bytes(value: object) -> bytes:
-    encoded = bytearray()
-
-    def write(item: object) -> None:
-        if item is None:
-            encoded.extend(b"n")
-        elif type(item) is bool:
-            encoded.extend(b"t" if item else b"f")
-        elif type(item) is int:
-            raw = str(item).encode("ascii")
-            encoded.extend(b"i")
-            encoded.extend(struct.pack("<I", len(raw)))
-            encoded.extend(raw)
-        elif type(item) is float:
-            encoded.extend(b"d")
-            encoded.extend(struct.pack("<d", item))
-        elif type(item) is str:
-            raw = item.encode("utf-8")
-            encoded.extend(b"s")
-            encoded.extend(struct.pack("<I", len(raw)))
-            encoded.extend(raw)
-        elif type(item) is bytes:
-            encoded.extend(b"b")
-            encoded.extend(struct.pack("<Q", len(item)))
-            encoded.extend(item)
-        elif isinstance(item, Mapping):
-            encoded.extend(b"m")
-            pairs = sorted(item.items(), key=lambda pair: str(pair[0]))
-            encoded.extend(struct.pack("<I", len(pairs)))
-            for key, child in pairs:
-                if not isinstance(key, str):
-                    raise invalid_descriptor("canonical batch mapping keys must be strings")
-                write(key)
-                write(child)
-        elif isinstance(item, Sequence):
-            encoded.extend(b"q")
-            encoded.extend(struct.pack("<I", len(item)))
-            for child in item:
-                write(child)
-        else:
-            raise invalid_descriptor(
-                f"canonical batch identity cannot encode {type(item).__name__}"
-            )
-
-    write(value)
-    return bytes(encoded)
-
-
-def batch_identity(batch: Batch) -> str:
-    """Stable digest of the complete execution meaning of one batch."""
-
-    digest = hashlib.sha256()
-    digest.update(b"uniserve-worker-step\0")
-    digest.update(_canonical_bytes(batch.to_mapping()))
-    return digest.hexdigest()
 
 
 def _operation_key(operation: object) -> _OperationKey:
@@ -301,8 +241,6 @@ def _materialize_partition(step_id: int, partition: PartitionCompletion) -> Part
     if len(report.partitions) != 1:
         raise RuntimeError("completion materialization changed partition cardinality")
     materialized = report.partitions[0]
-    if any(type(record.semantic_digest) is not str for record in materialized.completions):
-        raise RuntimeError("materialized completion carries an unresolved semantic digest")
     if any(
         type(token) is not int
         for record in materialized.completions
@@ -317,7 +255,7 @@ def _materialize_partition(step_id: int, partition: PartitionCompletion) -> Part
 @dataclass(slots=True)
 class TerminalStep:
     step_id: int
-    identity: str
+    batch: Batch
     session_ids: frozenset[int]
     epochs: frozenset[_EpochKey]
     partition_order: tuple[int, ...]
@@ -356,13 +294,12 @@ class InflightStep:
     def __init__(
         self,
         batch: Batch,
-        identity: str,
         *,
         on_terminal: Any,
     ) -> None:
         sessions, epochs = _batch_lineage(batch)
         self.step_id = int(batch.step_id)
-        self.identity = identity
+        self.batch = batch
         self.session_ids = sessions
         self.epochs = epochs
         self.partition_order = _report_partition_order(batch)
@@ -508,7 +445,7 @@ class InflightStep:
         )
         terminal = TerminalStep(
             step_id=self.step_id,
-            identity=self.identity,
+            batch=self.batch,
             session_ids=self.session_ids,
             epochs=self.epochs,
             partition_order=self.partition_order,
@@ -534,7 +471,6 @@ class PendingRequest:
     sessions: frozenset[int]
     kind: RequestKind
     batch: Batch | None = None
-    identity: str | None = None
     early_launch: bool = False
 
 
@@ -738,7 +674,6 @@ class WorkerServer:
                 )
                 return sequence
             batch: Batch | None = None
-            identity: str | None = None
             early = False
             if kind is RequestKind.EXECUTE:
                 self._profile_executes += 1
@@ -769,7 +704,6 @@ class WorkerServer:
                     batch = (
                         raw_batch if isinstance(raw_batch, Batch) else Batch.from_mapping(raw_batch)
                     )
-                identity = batch_identity(batch)
                 sessions = _batch_lineage(batch)[0]
                 early = self._starts_early(batch)
             self.waiting_requests.append(
@@ -779,7 +713,6 @@ class WorkerServer:
                     sessions=sessions,
                     kind=kind,
                     batch=batch,
-                    identity=identity,
                     early_launch=early,
                 )
             )
@@ -889,9 +822,8 @@ class WorkerServer:
 
     def _launch_execute(self, pending: PendingRequest) -> None:
         batch = pending.batch
-        identity = pending.identity
-        if batch is None or identity is None:
-            raise RuntimeError("accepted execute request lost its canonical batch")
+        if batch is None:
+            raise RuntimeError("accepted execute request lost its batch")
         step_id = int(batch.step_id)
         existing = self.steps.get(step_id)
         if existing is not None:
@@ -899,14 +831,14 @@ class WorkerServer:
             if current is not existing:
                 self.steps[step_id] = current
                 existing = current
-            if existing.identity != identity:
+            if existing.batch != batch:
                 raise invalid_descriptor(
-                    f"execution step {step_id} conflicts with its canonical batch identity"
+                    f"execution step {step_id} conflicts with its submitted batch"
                 )
             self.completed_steps.touch(step_id)
             cursor = self._new_cursor(existing)
         else:
-            step = InflightStep(batch, identity, on_terminal=self._step_terminal)
+            step = InflightStep(batch, on_terminal=self._step_terminal)
             self.steps[step_id] = step
             cursor = self._new_cursor(step)
             self._start_execution(step, batch)
@@ -1071,9 +1003,7 @@ class WorkerServer:
         for index, pending in enumerate(self.pending_responses):
             lineage_ready = earlier_sessions.isdisjoint(pending.sessions)
             execution_ready = (
-                self._launch_reorder
-                or pending.cursor is None
-                or pending.cursor.source is None
+                self._launch_reorder or pending.cursor is None or pending.cursor.source is None
             )
             if lineage_ready and execution_ready and self._pending_ready(pending):
                 del self.pending_responses[index]

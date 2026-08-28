@@ -73,15 +73,15 @@ class ExecutionResources:
     mesh: DeviceMesh
     transport: Transport | None
     tokenizer: Any | None
-    architecture_digest: str
-    weight_digest: str
+    model_name: str
+    weight_version: int
     allowed_work_variants: frozenset[ForwardMode]
     mixed_buckets: frozenset[GraphBucket]
     trace: ExecutionTrace
     _device: torch.device
     _generation_device: torch.device
     _qualified_mixed_buckets: set[GraphBucket] = field(default_factory=set)
-    _collective_history: OrderedDict[int, str] = field(default_factory=OrderedDict)
+    _collective_history: OrderedDict[int, object] = field(default_factory=OrderedDict)
     _transport_publications: dict[OperationIdentity, tuple[Locator, ...]] = field(
         default_factory=dict
     )
@@ -205,7 +205,6 @@ class ExecutionResources:
         scope: PartitionState,
         *,
         consumer_op_id: int,
-        producer_plan_digest: str | None = None,
         device: torch.device | str | None = None,
     ) -> DeviceProductRead:
         candidate = scope.transferred_device_products.get(reference)
@@ -213,13 +212,11 @@ class ExecutionResources:
             return self.device_products.consume_candidate(
                 candidate,
                 consumer_op_id=consumer_op_id,
-                producer_plan_digest=producer_plan_digest,
                 device=device,
             )
         return self.device_products.consume(
             reference,
             consumer_op_id=consumer_op_id,
-            producer_plan_digest=producer_plan_digest,
             device=device,
         )
 
@@ -229,7 +226,6 @@ class ExecutionResources:
         scope: PartitionState,
         *,
         consumer_op_id: int,
-        producer_plan_digest: str | None = None,
         device: torch.device | str | None = None,
     ) -> EncoderRead:
         candidate = scope.transferred_encoder_features.get(reference)
@@ -237,13 +233,11 @@ class ExecutionResources:
             return self.encoder_cache.consume_candidate(
                 candidate,
                 consumer_op_id=consumer_op_id,
-                producer_plan_digest=producer_plan_digest,
                 device=device,
             )
         return self.encoder_cache.consume(
             reference,
             consumer_op_id=consumer_op_id,
-            producer_plan_digest=producer_plan_digest,
             device=device,
         )
 

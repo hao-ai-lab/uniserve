@@ -380,28 +380,23 @@ impl<'py> NativeRequestConversion<'py> {
 
     fn version_ref(&mut self, version: &VersionRef) -> PyResult<Bound<'py, PyAny>> {
         let point = match &version.point {
-            Point::Fixed {
-                point_index,
-                semantic_digest,
-            } => self
+            Point::Fixed { point_index } => self
                 .types
                 .fixed_point
                 .bind(self.py)
-                .call1((*point_index, semantic_digest.as_str()))?,
+                .call1((*point_index,))?,
             Point::Device {
                 point_index,
                 selected_point,
-                producer_plan_digest,
             } => {
                 let selected = selected_point
                     .as_ref()
                     .map(|selected| self.product_ref(selected))
                     .transpose()?;
-                self.types.device_point.bind(self.py).call1((
-                    *point_index,
-                    selected,
-                    producer_plan_digest.as_str(),
-                ))?
+                self.types
+                    .device_point
+                    .bind(self.py)
+                    .call1((*point_index, selected))?
             }
         };
         let request_key = self.request_key(version.request_key)?;
@@ -475,7 +470,6 @@ impl<'py> NativeRequestConversion<'py> {
                 rng.map(Bound::into_any)
                     .unwrap_or_else(|| py.None().into_bound(py)),
                 operation.control_seq.into_pyobject(py)?.into_any(),
-                operation.plan_digest.as_str().into_pyobject(py)?.into_any(),
             ],
         )?;
         self.types.operation.bind(py).call1(arguments)
@@ -535,7 +529,6 @@ impl<'py> NativeRequestConversion<'py> {
                     selected,
                     *public_event_limit,
                     self.types.dispositions[disposition].bind(self.py).clone(),
-                    control.content_digest().as_str(),
                 ))
             }
             Control::Close {
@@ -557,16 +550,14 @@ impl<'py> NativeRequestConversion<'py> {
                     *control_seq,
                     cutoff,
                     self.types.close_reasons[reason].bind(self.py).clone(),
-                    control.content_digest().as_str(),
                 ))
             }
             Control::Release { request_key, op_id } => {
                 let request_key = self.request_key(*request_key)?;
-                self.types.release.bind(self.py).call1((
-                    request_key,
-                    op_id.0,
-                    control.content_digest().as_str(),
-                ))
+                self.types
+                    .release
+                    .bind(self.py)
+                    .call1((request_key, op_id.0))
             }
         }
     }
@@ -783,7 +774,6 @@ fn admission_to_py<'py>(
         context.request_key(admission.request_key)?,
     )?;
     dict.set_item(intern!(py, "request_pool_idx"), admission.request_pool_idx)?;
-    dict.set_item(intern!(py, "digest"), admission.digest.as_str())?;
     dict.set_item(
         intern!(py, "und"),
         admission
@@ -1352,11 +1342,6 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<ModelOutput> {
         committed_tokens: u32_vec(&get(dict, intern!(py, "committed_tokens"))?)?,
         finish_flags,
         product_generations: u32_vec(&get(dict, intern!(py, "product_generations"))?)?,
-        semantic_digest: uniserve_core::Digest::try_from(string_of(&get(
-            dict,
-            intern!(py, "semantic_digest"),
-        )?)?)
-        .ok()?,
         error_code,
         timing_counters,
     })
@@ -1659,7 +1644,7 @@ mod tests {
         let operation = Operation {
             request_key,
             op_id: OpId(1),
-            parent: VersionRef::admission_root(request_key, OpId(0), admission.digest.clone()),
+            parent: VersionRef::admission_root(request_key, OpId(0)),
             work: ForwardMode::TokenExtend,
             route: uniserve_worker_ipc::RouteId(0),
             domain: Domain::Prefill,
@@ -1675,7 +1660,6 @@ mod tests {
             predicate: None,
             rng: None,
             control_seq: 0,
-            plan_digest: uniserve_core::Digest::zero(),
         }
         .sealed();
         let partition = BatchPartition {
@@ -1741,7 +1725,6 @@ mod tests {
                     committed_tokens: vec![42],
                     finish_flags: FinishFlags::default(),
                     product_generations: vec![5, 6],
-                    semantic_digest: uniserve_core::Digest::try_from("b".repeat(64)).unwrap(),
                     error_code: None,
                     timing_counters: TimingCounters::default(),
                 }],

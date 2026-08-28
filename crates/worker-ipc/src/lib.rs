@@ -2,8 +2,8 @@
 //!
 //! A [`NewRequest`] carries static request state once, [`Batch`] carries planned
 //! operations, and [`CompletionReport`] returns resolved outputs. [`WorkerInfo`]
-//! is the post-load handshake. Semantic identity is anchored by operation and
-//! model-output digests rather than transport-local representation.
+//! is the post-load handshake. Runtime identity is numeric and stable across
+//! serialization: request epoch, operation id, point index, and generation.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -14,7 +14,7 @@ use uniserve_core::{
     BlockId, GenerationRuntimeCapabilities, ImageParams, KvCacheDtype, KvCacheGroup, ModelDtype,
     RankInfo, RequestId, SamplingParams,
 };
-pub use uniserve_core::{Digest, OpId, WorkerForwardStats};
+pub use uniserve_core::{OpId, WorkerForwardStats};
 
 pub type ProtocolResult<T> = std::result::Result<T, WireError>;
 
@@ -77,13 +77,11 @@ pub use iceoryx::{
 pub use resources::{ResourceClass, ResourcePressure};
 
 mod capabilities;
-mod digest;
 mod operation;
 mod product;
 mod request;
 
 pub use capabilities::*;
-pub(crate) use digest::{CanonicalDigest, is_digest};
 pub use operation::*;
 pub use product::*;
 pub use request::*;

@@ -386,7 +386,6 @@ fn admission_from_table(admission: fbs::NewRequest<'_>) -> CodecResult<NewReques
     let admission = NewRequest {
         request_key: request_key_from_table(admission.request_key(), "admission.request_key")?,
         request_pool_idx: admission.request_pool_idx(),
-        digest: required_digest(admission.digest(), "admission.digest")?,
         und: admission.und().map(und_admission_from_table).transpose()?,
         gen_admission: admission
             .gen_admission()
@@ -545,12 +544,7 @@ fn operation_from_table(operation: fbs::Operation<'_>) -> CodecResult<Operation>
             .transpose()?,
         rng: operation.rng().map(rng_from_table).transpose()?,
         control_seq: operation.control_seq(),
-        plan_digest: required_digest(operation.plan_digest(), "operation.plan_digest")?,
     };
-    // No per-operation validate() here: the worker's Python `from_mapping` is the
-    // authoritative ingress validator and recomputes the plan digest for every
-    // operation (forged-digest rejection unchanged); running the SHA-256
-    // recompute here too made the wire decode do the same work twice per op.
     Ok(operation)
 }
 
@@ -634,10 +628,6 @@ fn version_ref_from_table(version: fbs::VersionRef<'_>) -> CodecResult<VersionRe
                 .context("fixed point table is missing")?;
             Point::Fixed {
                 point_index: fixed.point_index(),
-                semantic_digest: required_digest(
-                    fixed.semantic_digest(),
-                    "point.fixed.semantic_digest",
-                )?,
             }
         }
         fbs::Point::PointDevice => {
@@ -650,10 +640,6 @@ fn version_ref_from_table(version: fbs::VersionRef<'_>) -> CodecResult<VersionRe
                     .selected_point()
                     .map(product_ref_from_table)
                     .transpose()?,
-                producer_plan_digest: required_digest(
-                    device.producer_plan_digest(),
-                    "point.device.producer_plan_digest",
-                )?,
             }
         }
         _ => codec_bail!("version reference point union is empty"),
@@ -827,7 +813,6 @@ fn completion_record_from_table(record: fbs::ModelOutput<'_>) -> CodecResult<Mod
             .product_generations()
             .map(|items| items.iter().collect())
             .unwrap_or_default(),
-        semantic_digest: required_digest(record.semantic_digest(), "completion.semantic_digest")?,
         error_code: record.error_code().map(error_code_from_fb).transpose()?,
         timing_counters: TimingCounters {
             queued_us: timing_counters.queued_us(),
@@ -941,8 +926,8 @@ fn capabilities_from_table(caps: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo>
             })
             .transpose()?
             .unwrap_or_default(),
-        model_identity: optional_digest(caps.model_identity(), "capabilities.model_identity")?,
-        weight_digest: optional_digest(caps.weight_digest(), "capabilities.weight_digest")?,
+        model_name: required_str(caps.model_name(), "capabilities.model_name")?,
+        weight_version: caps.weight_version(),
     };
     caps.validate()?;
     Ok(caps)
@@ -1126,21 +1111,6 @@ fn required_str(value: Option<&str>, label: &str) -> CodecResult<String> {
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .with_context(|| format!("{label} is missing"))
-}
-
-fn required_digest(value: Option<&str>, label: &str) -> CodecResult<uniserve_core::Digest> {
-    let value = required_str(value, label)?;
-    uniserve_core::Digest::try_from(value)
-        .with_context(|| format!("{label} is not a canonical SHA-256 digest"))
-}
-
-fn optional_digest(value: Option<&str>, label: &str) -> CodecResult<Option<uniserve_core::Digest>> {
-    match value.filter(|value| !value.is_empty()) {
-        Some(value) => uniserve_core::Digest::try_from(value)
-            .map(Some)
-            .with_context(|| format!("{label} is not a canonical SHA-256 digest")),
-        None => Ok(None),
-    }
 }
 
 fn required_parse<T>(value: Option<&str>, label: &str) -> CodecResult<T>
@@ -1332,7 +1302,6 @@ fn admission_to_fb(admission: &NewRequest) -> CodecResult<fbs::NewRequestT> {
     Ok(fbs::NewRequestT {
         request_key: Some(Box::new(request_key_to_fb(admission.request_key))),
         request_pool_idx: admission.request_pool_idx,
-        digest: Some(admission.digest.to_string()),
         und: admission
             .und
             .as_ref()
@@ -1445,7 +1414,6 @@ fn operation_to_fb(operation: &Operation) -> CodecResult<fbs::OperationT> {
             .map(Box::new),
         rng: operation.rng.as_ref().map(rng_to_fb).map(Box::new),
         control_seq: operation.control_seq,
-        plan_digest: Some(operation.plan_digest.to_string()),
     })
 }
 
@@ -1503,23 +1471,17 @@ fn version_ref_to_fb(version: &VersionRef) -> fbs::VersionRefT {
         request_key: Some(Box::new(request_key_to_fb(version.request_key))),
         producer_op_id: version.producer_op_id.0,
         point: match &version.point {
-            Point::Fixed {
-                point_index,
-                semantic_digest,
-            } => fbs::PointT::PointFixed(Box::new(fbs::PointFixedT {
+            Point::Fixed { point_index } => fbs::PointT::PointFixed(Box::new(fbs::PointFixedT {
                 point_index: *point_index,
-                semantic_digest: Some(semantic_digest.to_string()),
             })),
             Point::Device {
                 point_index,
                 selected_point,
-                producer_plan_digest,
             } => fbs::PointT::PointDevice(Box::new(fbs::PointDeviceT {
                 point_index: *point_index,
                 selected_point: selected_point
                     .as_ref()
                     .map(|value| Box::new(product_ref_to_fb(value))),
-                producer_plan_digest: Some(producer_plan_digest.to_string()),
             })),
         },
     }
@@ -1647,7 +1609,6 @@ fn completion_record_to_fb(record: &ModelOutput) -> fbs::ModelOutputT {
             stop: record.finish_flags.stop,
         })),
         product_generations: Some(record.product_generations.clone()),
-        semantic_digest: Some(record.semantic_digest.to_string()),
         error_code: record.error_code.map(error_code_to_fb),
         timing_counters: Some(Box::new(fbs::TimingCountersT {
             queued_us: record.timing_counters.queued_us,
@@ -1761,18 +1722,8 @@ fn capabilities_to_fb(caps: &WorkerInfo) -> CodecResult<fbs::WorkerInfoT> {
                 .map(resource_class_to_fb)
                 .collect(),
         ),
-        model_identity: Some(
-            caps.model_identity
-                .as_ref()
-                .map(ToString::to_string)
-                .unwrap_or_default(),
-        ),
-        weight_digest: Some(
-            caps.weight_digest
-                .as_ref()
-                .map(ToString::to_string)
-                .unwrap_or_default(),
-        ),
+        model_name: Some(caps.model_name.clone()),
+        weight_version: caps.weight_version,
     })
 }
 

@@ -31,19 +31,21 @@ def resolve_capabilities(
     model: ExecutionModel | MiniMaxH3Model,
     deployment: WorkerDeployment,
     *,
-    architecture_digest: str | None = None,
-    weight_digest: str | None = None,
+    model_name: str | None = None,
+    weight_version: int = 0,
     pipeline_depth: int = 1,
     completion_payload_bytes: int = 1 << 20,
 ) -> WorkerInfo:
     """Build the post-load worker handshake from model-owned behavior."""
 
+    model_name = model.architecture if model_name is None else model_name
+
     if isinstance(model, MiniMaxH3Model):
         return _h3_capabilities(
             model,
             deployment,
-            architecture_digest=architecture_digest,
-            weight_digest=weight_digest,
+            model_name=model_name,
+            weight_version=weight_version,
             pipeline_depth=pipeline_depth,
             completion_payload_bytes=completion_payload_bytes,
         )
@@ -182,8 +184,8 @@ def resolve_capabilities(
             if capacity is not None
             else ()
         ),
-        model_identity=architecture_digest or "",
-        weight_digest=weight_digest or "",
+        model_name=model_name,
+        weight_version=weight_version,
     )
 
 
@@ -191,8 +193,8 @@ def _h3_capabilities(
     model: MiniMaxH3Model,
     deployment: WorkerDeployment,
     *,
-    architecture_digest: str | None,
-    weight_digest: str | None,
+    model_name: str,
+    weight_version: int,
     pipeline_depth: int,
     completion_payload_bytes: int,
 ) -> WorkerInfo:
@@ -213,9 +215,7 @@ def _h3_capabilities(
         num_layers=0,
         num_kv_heads=0,
         head_dim=0,
-        supported_work=tuple(
-            variant for variant in ForwardMode if variant in model.supported_work
-        ),
+        supported_work=tuple(variant for variant in ForwardMode if variant in model.supported_work),
         latent_page_units=int(layout.persistent_units),
         num_latent_pages=slots + 1,
         latent_width=1,
@@ -244,8 +244,8 @@ def _h3_capabilities(
         mixed_buckets=(),
         sampling_ownership=SamplingOwnership.DESIGNATED_RANK,
         resource_classes=(ResourceClass.IMAGE_LATENT,),
-        model_identity=architecture_digest or "",
-        weight_digest=weight_digest or "",
+        model_name=model_name,
+        weight_version=weight_version,
     )
 
 

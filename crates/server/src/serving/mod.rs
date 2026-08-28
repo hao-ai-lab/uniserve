@@ -1520,8 +1520,6 @@ mod tests {
             semantic_root: SemanticRoot {
                 producer_op_id: uniserve_core::OpId(event_seq),
                 point_index: event_seq as u32,
-                semantic_digest: uniserve_core::Digest::try_from(format!("{event_seq:064x}"))
-                    .expect("valid digest"),
             },
         }
     }

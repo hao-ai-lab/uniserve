@@ -803,11 +803,7 @@ impl Scheduler {
         let root = root.cloned().or_else(|| self.fixed_version(id));
         let Some(VersionRef {
             producer_op_id,
-            point:
-                Point::Fixed {
-                    point_index,
-                    semantic_digest,
-                },
+            point: Point::Fixed { point_index },
             ..
         }) = root
         else {
@@ -825,7 +821,6 @@ impl Scheduler {
             semantic_root: SemanticRoot {
                 producer_op_id,
                 point_index,
-                semantic_digest,
             },
         };
         match &mut event {
@@ -1074,14 +1069,13 @@ impl Scheduler {
                 .flow_prefix
                 .as_ref()
                 .map(|prefix| prefix.request_pool_idx);
-            if st.admission_digest.is_some() {
+            if st.cursor.resources.worker_registered {
                 let request_key = RequestKey::new(self.authority_id, id, st.epoch);
                 let cutoff = st.cancel_cutoff.clone().unwrap_or_else(|| VersionRef {
                     request_key,
                     producer_op_id: OpId(st.committed_producer_op_id),
                     point: Point::Fixed {
                         point_index: st.committed_version as u32,
-                        semantic_digest: st.committed_semantic.clone(),
                     },
                 });
                 st.control_seq = st.control_seq.saturating_add(1);

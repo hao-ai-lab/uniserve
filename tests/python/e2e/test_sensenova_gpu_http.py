@@ -243,12 +243,8 @@ def test_sensenova_public_production_lineage(tmp_path: Path):
             assert math.isfinite(commit["committed_at"])
             assert commit["committed_at"] >= 0.0
             assert commit["semantic_root"]["producer_op_id"] > 0
-            assert len(commit["semantic_root"]["semantic_digest"]) == 64
-        images = [
-            image
-            for _, delta in visible_events
-            for image in delta.get("images", [])
-        ]
+            assert commit["semantic_root"]["point_index"] > 0
+        images = [image for _, delta in visible_events for image in delta.get("images", [])]
         assert len(images) == 2
         for image in images:
             image_url = image["image_url"]["url"]

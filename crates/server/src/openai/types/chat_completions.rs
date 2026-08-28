@@ -186,7 +186,6 @@ pub struct StreamPublicCommit {
 pub struct StreamSemanticRoot {
     pub producer_op_id: u64,
     pub point_index: u32,
-    pub semantic_digest: String,
 }
 
 impl ChatCompletionStreamResponse {

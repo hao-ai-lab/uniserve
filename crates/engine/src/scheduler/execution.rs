@@ -222,7 +222,6 @@ impl Scheduler {
                 predicate,
                 rng: None,
                 control_seq: 0,
-                plan_digest: uniserve_core::Digest::zero(),
             }
             .sealed();
             if matches!(
@@ -273,7 +272,6 @@ impl Scheduler {
                 point: Point::Device {
                     point_index: 1,
                     selected_point: None,
-                    producer_plan_digest: operation.plan_digest.clone(),
                 },
             };
             let state = self.media_state_mut(id).expect("media candidate exists");
@@ -442,13 +440,12 @@ impl Scheduler {
 
     pub(super) fn fixed_version(&self, id: RequestId) -> Option<VersionRef> {
         let state = self.running.get(&id)?;
-        state.admission_digest.as_ref()?;
+        state.cursor.resources.worker_registered.then_some(())?;
         Some(VersionRef {
             request_key: RequestKey::new(self.authority_id, id, state.epoch),
             producer_op_id: OpId(state.resolved_producer_op_id),
             point: Point::Fixed {
                 point_index: state.version as u32,
-                semantic_digest: state.resolved_semantic.clone(),
             },
         })
     }
@@ -483,7 +480,6 @@ impl Scheduler {
             point: Point::Device {
                 point_index: u32::from(selected_point.is_none()),
                 selected_point,
-                producer_plan_digest: operation.plan_digest.clone(),
             },
         })
     }
@@ -513,12 +509,6 @@ impl Scheduler {
         state.committed_version = match &selected.point {
             Point::Fixed { point_index, .. } => u64::from(*point_index),
             Point::Device { .. } => state.committed_version,
-        };
-        state.committed_semantic = match &selected.point {
-            Point::Fixed {
-                semantic_digest, ..
-            } => semantic_digest.clone(),
-            Point::Device { .. } => state.committed_semantic.clone(),
         };
         state.committed_producer_op_id = selected.producer_op_id.0;
         state.public_event_limit = public_event_limit;
@@ -1071,7 +1061,6 @@ impl Scheduler {
                         producer_op_id: record.op_id,
                         point: Point::Fixed {
                             point_index: record.selected_point,
-                            semantic_digest: record.semantic_digest.clone(),
                         },
                     };
                 }
@@ -1566,7 +1555,6 @@ impl Scheduler {
                             point: Point::Device {
                                 point_index: record.selected_point,
                                 selected_point: None,
-                                producer_plan_digest: operation.plan_digest.clone(),
                             },
                         },
                     })
@@ -1578,7 +1566,6 @@ impl Scheduler {
                     && advanced
                 {
                     state.version = u64::from(record.selected_point);
-                    state.resolved_semantic = record.semantic_digest.clone();
                     state.resolved_producer_op_id = record.op_id.0;
                     state.latest_device_version = if retain_device_version {
                         latest_device_version

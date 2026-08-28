@@ -191,8 +191,8 @@ table WorkerInfo {
   mixed_buckets:[GraphBucket];
   sampling_ownership:SamplingOwnership;
   resource_classes:[ResourceClass];
-  model_identity:string;
-  weight_digest:string;
+  model_name:string;
+  weight_version:ulong;
 }
 
 // ---- Identities and the four protocol records -----------------------------
@@ -205,13 +205,11 @@ table RequestKey {
 
 table PointFixed {
   point_index:uint;
-  semantic_digest:string;
 }
 
 table PointDevice {
   point_index:uint;
   selected_point:ProductRef;
-  producer_plan_digest:string;
 }
 
 union Point { PointFixed, PointDevice }
@@ -277,7 +275,6 @@ table Operation {
   predicate:ProductRef;
   rng:Rng;
   control_seq:ulong;
-  plan_digest:string;
 }
 
 table BlockTable {
@@ -355,7 +352,6 @@ table ModelOutput {
   committed_tokens:[uint];
   finish_flags:FinishFlags;
   product_generations:[uint];
-  semantic_digest:string;
   error_code:ErrorCode = null;
   timing_counters:TimingCounters;
 }
@@ -406,7 +402,6 @@ table MediaAdmission {
 table NewRequest {
   request_key:RequestKey;
   request_pool_idx:uint;
-  digest:string;
   und:UndAdmission;
   gen_admission:GenAdmission;
   media:MediaAdmission;

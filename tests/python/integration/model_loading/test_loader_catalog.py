@@ -204,28 +204,19 @@ def test_indexed_qwen_checkpoint_installs_packed_weights_on_the_requested_device
 
     loaded = load_worker_model(_qwen_request(str(tmp_path)))
 
-    assert loaded.identity.architecture == "Qwen3ForCausalLM"
+    assert loaded.architecture == "Qwen3ForCausalLM"
     assert loaded.weights.version == 0
-    assert loaded.weights.digest == loaded.identity.weight_digest
     assert {parameter.device.type for parameter in loaded.model.parameters()} == {"cpu"}
     for name, parameter in loaded.model.state_dict().items():
         torch.testing.assert_close(parameter, reference.state_dict()[name].to(torch.bfloat16))
 
 
-def test_index_is_the_closed_weight_set_for_failures_and_identity(tmp_path):
+def test_index_is_the_closed_weight_set_for_loading(tmp_path):
     _write_qwen_checkpoint(tmp_path, indexed=True)
-    first = load_worker_model(_qwen_request(str(tmp_path))).identity.weight_digest
+    load_worker_model(_qwen_request(str(tmp_path)))
     save_file({"unused": torch.tensor([1.0])}, tmp_path / "extra.safetensors")
     (tmp_path / "unused.pth").write_bytes(b"not a checkpoint")
-    second = load_worker_model(_qwen_request(str(tmp_path))).identity.weight_digest
-    assert second == first
-
-    shard = tmp_path / "model-00001-of-00001.safetensors"
-    changed = _qwen_hugging_face_weights(_qwen_reference(_qwen_config()))
-    changed["model.norm.weight"] = changed["model.norm.weight"] + 1
-    save_file(changed, shard)
-    third = load_worker_model(_qwen_request(str(tmp_path))).identity.weight_digest
-    assert third != first
+    load_worker_model(_qwen_request(str(tmp_path)))
 
     index = json.loads((tmp_path / "model.safetensors.index.json").read_text(encoding="utf-8"))
     missing_name = "model-00002-of-00002.safetensors"
@@ -266,8 +257,7 @@ def test_pt_index_selects_only_its_declared_shards(tmp_path):
     torch.save({name: checkpoint[name] for name in names[:midpoint]}, tmp_path / shards[0])
     torch.save({name: checkpoint[name] for name in names[midpoint:]}, tmp_path / shards[1])
     weight_map = {
-        name: shards[0] if index < midpoint else shards[1]
-        for index, name in enumerate(names)
+        name: shards[0] if index < midpoint else shards[1] for index, name in enumerate(names)
     }
     (tmp_path / "pytorch_model.bin.index.json").write_text(
         json.dumps({"weight_map": weight_map}),
@@ -391,7 +381,6 @@ def test_dummy_load_is_deterministic_and_does_not_read_weight_bytes(tmp_path):
     first = load_worker_model(_qwen_request(str(tmp_path), load=load))
     second = load_worker_model(_qwen_request(str(tmp_path), load=load))
 
-    assert first.weights.digest == second.weights.digest
     for name, value in first.model.state_dict().items():
         torch.testing.assert_close(value, second.model.state_dict()[name])
 
@@ -462,7 +451,7 @@ def test_sensenova_dummy_scopes_materialize_only_selected_parameters(tmp_path, m
             assert buffer.device.type == ("cpu" if selected else "meta")
 
 
-def test_weight_update_publishes_identity_and_rolls_back_partial_failure():
+def test_weight_update_publishes_version_and_rolls_back_partial_failure():
     model = _qwen_reference(_qwen_config())
     attach_parameter_loaders(model, device="cpu", dtype=torch.float32)
     initial = WeightSet.from_module(model)
@@ -480,7 +469,6 @@ def test_weight_update_publishes_identity_and_rolls_back_partial_failure():
     )
 
     assert current.version == 1
-    assert current.digest != initial.digest
     assert current.tensors["model.norm.weight"].data_ptr() == model.model.norm.weight.data_ptr()
     torch.testing.assert_close(model.model.norm.weight, replacement)
 
@@ -553,6 +541,4 @@ def test_online_fp8_weights_remain_replaceable_after_post_load_finalize(tmp_path
 def test_qwen_rejects_partial_model_materialization(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps(_qwen_config()), encoding="utf-8")
     with pytest.raises(Exception, match="does not support 'generation'"):
-        load_worker_model(
-            _qwen_request(str(tmp_path), scope=ModelLoadScope.GENERATION)
-        )
+        load_worker_model(_qwen_request(str(tmp_path), scope=ModelLoadScope.GENERATION))

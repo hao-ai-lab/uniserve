@@ -43,10 +43,9 @@ struct PoolSubmission {
 #[derive(Clone)]
 struct ProductRoute {
     pool_index: usize,
-    producer_plan_digest: uniserve_core::Digest,
 }
 
-fn transfer_identity(bytes: &[u8]) -> anyhow::Result<(String, uniserve_core::Digest)> {
+fn transfer_kind(bytes: &[u8]) -> anyhow::Result<String> {
     anyhow::ensure!(
         is_transfer_descriptor(bytes),
         "cross-stage product has no transfer descriptor frame"
@@ -57,10 +56,7 @@ fn transfer_identity(bytes: &[u8]) -> anyhow::Result<(String, uniserve_core::Dig
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("cross-stage transfer descriptor is not an object"))?;
     anyhow::ensure!(
-        object.len() == 3
-            && object.contains_key("kind")
-            && object.contains_key("producer_plan_digest")
-            && object.contains_key("value"),
+        object.len() == 2 && object.contains_key("kind") && object.contains_key("value"),
         "cross-stage transfer descriptor has an invalid shape"
     );
     let kind = object
@@ -74,17 +70,11 @@ fn transfer_identity(bytes: &[u8]) -> anyhow::Result<(String, uniserve_core::Dig
                 .is_some_and(serde_json::Value::is_object),
         "cross-stage transfer descriptor has an invalid kind or value"
     );
-    let digest = object
-        .get("producer_plan_digest")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("cross-stage transfer descriptor has no plan digest"))?;
-    let digest = uniserve_core::Digest::try_from(digest)
-        .map_err(|error| anyhow::anyhow!("invalid transfer descriptor plan digest: {error}"))?;
     anyhow::ensure!(
         serde_json::to_vec(&value)? == encoded,
         "cross-stage transfer descriptor is not canonical JSON"
     );
-    Ok((kind.to_string(), digest))
+    Ok(kind.to_string())
 }
 
 /// Routes a canonical typed batch across the pools of a staged topology.
@@ -206,23 +196,18 @@ impl StagedExecutor {
 
         let seed_index = kv_pool_indices.first().copied().unwrap_or(0);
         let mut merged = pools[seed_index].exec.caps().clone();
-        let identities = pools
+        let versions = pools
             .iter()
             .map(|pool| pool.exec.caps())
-            .filter(|caps| caps.model_identity.is_some() || caps.weight_digest.is_some())
-            .map(|caps| (caps.model_identity.clone(), caps.weight_digest.clone()))
+            .map(|caps| (caps.model_name.clone(), caps.weight_version))
             .collect::<Vec<_>>();
-        if let Some(identity) = identities.first() {
+        if let Some(version) = versions.first() {
             anyhow::ensure!(
-                identity.0.is_some() && identity.1.is_some(),
-                "model worker capability identity is incomplete"
+                versions.iter().all(|candidate| candidate == version),
+                "staged model workers expose different model names or weight versions"
             );
-            anyhow::ensure!(
-                identities.iter().all(|candidate| candidate == identity),
-                "staged model workers expose different model or weight identities"
-            );
-            merged.model_identity = identity.0.clone();
-            merged.weight_digest = identity.1.clone();
+            merged.model_name = version.0.clone();
+            merged.weight_version = version.1;
         }
 
         if let Some(first_index) = kv_pool_indices.first().copied() {
@@ -619,11 +604,7 @@ impl StagedExecutor {
                     "pool {pool_index} returned a cross-stage product owned by pool {}",
                     route.pool_index
                 );
-                let (kind, producer_plan_digest) = transfer_identity(&product.bytes)?;
-                anyhow::ensure!(
-                    producer_plan_digest == route.producer_plan_digest,
-                    "cross-stage product plan digest conflicts with its producer"
-                );
+                let kind = transfer_kind(&product.bytes)?;
                 if let Some(existing) = self.transfer_products.get(&product.product) {
                     anyhow::ensure!(
                         existing == &product,
@@ -770,13 +751,11 @@ impl Executor for StagedExecutor {
                 for output in &operation.outputs {
                     let route = ProductRoute {
                         pool_index: operation_pool,
-                        producer_plan_digest: operation.plan_digest.clone(),
                     };
                     if let Some(existing) = self.product_routes.get(output) {
                         anyhow::ensure!(
-                            existing.pool_index == route.pool_index
-                                && existing.producer_plan_digest == route.producer_plan_digest,
-                            "product identity was routed with conflicting producer provenance"
+                            existing.pool_index == route.pool_index,
+                            "product identity was routed to conflicting pools"
                         );
                     } else {
                         self.product_routes.insert(output.clone(), route);
@@ -858,10 +837,7 @@ impl Executor for StagedExecutor {
                         continue;
                     }
                     let producer = self.product_routes.get(input).ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "cross-stage input {:?} has no exact producer provenance",
-                            input
-                        )
+                        anyhow::anyhow!("cross-stage input {:?} has no registered producer", input)
                     })?;
                     if producer.pool_index == consumer_pool {
                         continue;

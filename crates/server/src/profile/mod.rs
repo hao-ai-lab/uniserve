@@ -2,11 +2,8 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
-use std::collections::BTreeSet;
-use std::fs;
-
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
+use std::collections::BTreeSet;
 
 use crate::profile::assets::{
     GenerationConfig, HfTokenizerConfig, ResolvedModelFiles, load_generation_config,
@@ -83,7 +80,6 @@ pub struct ProfileDeploymentConfig {
 pub struct ModelIdentity {
     pub served_name: String,
     pub description: ModelDescription,
-    pub fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -140,15 +136,10 @@ pub(crate) enum ModelProfile {
 
 impl ModelProfile {
     pub(crate) fn minimax_h3(model_id: &str) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(b"uniserve-minimax-h3-t2va-v0.2\0");
-        hasher.update(model_id.as_bytes());
-        let config_fingerprint = format!("{:x}", hasher.finalize());
         Self::MiniMaxH3(CommonModelProfile {
             identity: ModelIdentity {
                 served_name: model_id.to_string(),
                 description: ModelDescription::MiniMaxH3,
-                fingerprint: Some(config_fingerprint),
             },
             generation_defaults: GenerationDefaultsDescriptor::default(),
             context_limits: ContextLimits::default(),
@@ -177,12 +168,10 @@ impl ModelProfile {
         }
         let generation_config = load_generation_config(files.generation_config_path.as_deref())?;
         let tokenizer_config = load_tokenizer_config(files.tokenizer_config_path.as_deref())?;
-        let config_fingerprint = profile_fingerprint(files, deployment)?;
         let common = CommonModelProfile {
             identity: ModelIdentity {
                 served_name: model_id.to_string(),
                 description,
-                fingerprint: Some(config_fingerprint),
             },
             generation_defaults: generation_defaults(&generation_config),
             context_limits: ContextLimits {
@@ -265,39 +254,6 @@ fn stop_token_policy(
             .map(|token| vec![token.as_str().to_string()])
             .unwrap_or_default(),
     }
-}
-
-fn profile_fingerprint(
-    files: &ResolvedModelFiles,
-    deployment: &ProfileDeploymentConfig,
-) -> assets::Result<String> {
-    let mut hasher = Sha256::new();
-    let paths = std::iter::once(files.tokenizer_path.as_path()).chain(
-        [
-            files.config_path.as_deref(),
-            files.generation_config_path.as_deref(),
-            files.tokenizer_config_path.as_deref(),
-            files.preprocessor_config_path.as_deref(),
-            files.chat_template_path.as_deref(),
-        ]
-        .into_iter()
-        .flatten(),
-    );
-    for path in paths {
-        hasher.update(
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or_default(),
-        );
-        hasher.update(fs::read(path).map_err(|source| assets::Error::Io {
-            path: path.to_path_buf(),
-            source,
-        })?);
-    }
-    hasher.update(serde_json::to_vec(deployment).map_err(|error| {
-        assets::Error::invalid(format!("failed to fingerprint deployment profile: {error}"))
-    })?);
-    Ok(format!("{:x}", hasher.finalize()))
 }
 
 #[cfg(test)]

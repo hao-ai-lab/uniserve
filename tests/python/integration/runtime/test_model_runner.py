@@ -293,7 +293,7 @@ def test_invalid_physical_placement_reports_error_behind_an_unobserved_parent() 
     device_parent = VersionRef(
         admission.request_key,
         parent.op_id,
-        DevicePoint(1, None, parent.plan_digest),
+        DevicePoint(1, None),
     )
     template, _ = token_operation(
         admission.request_key,
@@ -356,7 +356,7 @@ def test_decode_reuses_the_published_request_page_table() -> None:
     device_parent = VersionRef(
         admission.request_key,
         parent.op_id,
-        DevicePoint(1, None, parent.plan_digest),
+        DevicePoint(1, None),
     )
     template, _ = token_operation(
         admission.request_key,
@@ -480,10 +480,10 @@ def test_mixed_token_and_flow_match_homogeneous_results():
         == sequence_result.completions[0].committed_tokens
     )
     assert (
-        mixed_result.completions[0].semantic_digest
-        == sequence_result.completions[0].semantic_digest
+        mixed_result.completions[0].logical_lengths
+        == sequence_result.completions[0].logical_lengths
     )
-    assert mixed_result.completions[1].semantic_digest == flow_result.completions[0].semantic_digest
+    assert mixed_result.completions[1].logical_lengths == flow_result.completions[0].logical_lengths
     mixed_flow_commit = commit_for_completion(flow, mixed_result)
     split_flow_commit = commit_for_completion(split_flow, flow_result)
     assert _materialized_artifact(
@@ -1252,10 +1252,9 @@ def test_cross_stage_device_product_transfer_preserves_generation_and_value() ->
         assert len(transfer_report.products) == 1
         payload = transfer_report.products[0]
         assert payload.product == transferred
-        kind, descriptor, producer_digest = decode_transfer_descriptor(payload.payload)
+        kind, descriptor = decode_transfer_descriptor(payload.payload)
         assert kind == "device_product"
         assert descriptor["generation"] == transferred.generation
-        assert producer_digest == transfer.plan_digest
 
         consume, consume_input = token_operation(
             admission.request_key,

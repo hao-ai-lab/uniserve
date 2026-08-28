@@ -76,7 +76,7 @@ def test_same_request_continues_before_parent_report_materialization() -> None:
     device_parent = VersionRef(
         admission.request_key,
         parent.op_id,
-        DevicePoint(1, None, parent.plan_digest),
+        DevicePoint(1, None),
     )
     successor_template, _ = token_operation(
         admission.request_key,
@@ -118,7 +118,7 @@ def test_same_request_continues_before_parent_report_materialization() -> None:
     parent_selected = VersionRef(
         admission.request_key,
         parent.op_id,
-        FixedPoint(parent_record.selected_point, parent_record.semantic_digest),
+        FixedPoint(parent_record.selected_point),
     )
     worker.execute(
         execution_batch(
@@ -169,13 +169,11 @@ def test_device_continuation_chain_matches_serial_token_sequence() -> None:
             parent=VersionRef(
                 admission.request_key,
                 parent.op_id,
-                DevicePoint(1, None, parent.plan_digest),
+                DevicePoint(1, None),
             ),
             mode=TokenMode.DECODE,
             tokens=(0,),
-            predicate=next(
-                output for output in parent.outputs if output.kind is ProductKind.TOKEN
-            ),
+            predicate=next(output for output in parent.outputs if output.kind is ProductKind.TOKEN),
         )
         reports.append(
             worker.execute(
@@ -191,8 +189,7 @@ def test_device_continuation_chain_matches_serial_token_sequence() -> None:
 
     torch.cuda.synchronize()
     tokens = tuple(
-        finalize_completion_report(report).completions[0].committed_tokens[0]
-        for report in reports
+        finalize_completion_report(report).completions[0].committed_tokens[0] for report in reports
     )
     expected = []
     current = 4
@@ -228,7 +225,7 @@ def test_stochastic_device_continuation_matches_depth_one_serial_execution() -> 
         parent=VersionRef(
             pipelined.request_key,
             parent.op_id,
-            DevicePoint(1, None, parent.plan_digest),
+            DevicePoint(1, None),
         ),
         mode=TokenMode.DECODE,
         tokens=(0,),
@@ -329,7 +326,7 @@ def test_penalty_device_continuation_matches_depth_one_serial_execution() -> Non
         parent=VersionRef(
             pipelined.request_key,
             parent.op_id,
-            DevicePoint(1, None, parent.plan_digest),
+            DevicePoint(1, None),
         ),
         mode=TokenMode.DECODE,
         tokens=(0,),

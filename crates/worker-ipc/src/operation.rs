@@ -243,18 +243,14 @@ impl ForwardMode {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 pub enum Point {
-    /// A host-observed state point named by its index and semantic digest.
-    Fixed {
-        point_index: u32,
-        semantic_digest: Digest,
-    },
+    /// A host-observed state point named by its producer-local index.
+    Fixed { point_index: u32 },
     /// A device-selected point a successor may consume before host observation.
     Device {
         /// The producer-local point when selection is statically determined.
         point_index: u32,
         /// The producer's dynamic selection product for multi-point work.
         selected_point: Option<ProductRef>,
-        producer_plan_digest: Digest,
     },
 }
 
@@ -268,18 +264,11 @@ pub struct VersionRef {
 
 impl VersionRef {
     /// The admission root: point zero of the request-admission operation.
-    pub fn admission_root(
-        request_key: RequestKey,
-        producer_op_id: OpId,
-        semantic_digest: Digest,
-    ) -> Self {
+    pub fn admission_root(request_key: RequestKey, producer_op_id: OpId) -> Self {
         Self {
             request_key,
             producer_op_id,
-            point: Point::Fixed {
-                point_index: 0,
-                semantic_digest,
-            },
+            point: Point::Fixed { point_index: 0 },
         }
     }
 
@@ -289,16 +278,10 @@ impl VersionRef {
 
     pub fn validate(&self) -> ProtocolResult<()> {
         match &self.point {
-            Point::Fixed {
-                semantic_digest, ..
-            } => wire_ensure!(
-                is_digest(semantic_digest),
-                "fixed version reference has an invalid semantic digest"
-            ),
+            Point::Fixed { .. } => {}
             Point::Device {
                 point_index,
                 selected_point,
-                producer_plan_digest,
             } => {
                 if let Some(selected_point) = selected_point {
                     wire_ensure!(
@@ -328,10 +311,6 @@ impl VersionRef {
                         "a static device version must name a positive producer point"
                     );
                 }
-                wire_ensure!(
-                    is_digest(producer_plan_digest),
-                    "device version reference has an invalid producer plan digest"
-                );
             }
         }
         Ok(())
@@ -417,41 +396,13 @@ pub struct Operation {
     pub predicate: Option<ProductRef>,
     pub rng: Option<Rng>,
     pub control_seq: u64,
-    pub plan_digest: Digest,
 }
 
 impl Operation {
-    /// Seal a literally constructed operation with its derived state advance
-    /// and registration identity digest.
+    /// Seal a literally constructed operation with its derived state advance.
     pub fn sealed(mut self) -> Self {
         self.advances_state = self.work.advances_state();
-        self.plan_digest = self.compute_plan_digest();
         self
-    }
-
-    /// The immutable registration identity digest.
-    pub fn compute_plan_digest(&self) -> Digest {
-        let mut digest = CanonicalDigest::new(b"uniserve-operation\0");
-        digest.request_key(self.request_key);
-        digest.op_id(self.op_id);
-        digest.version_ref(&self.parent);
-        digest.u8(self.work as u8);
-        digest.u32(self.route.0);
-        digest.u8(self.domain as u8);
-        digest.bool(self.advances_state);
-        digest.bounds(&self.bounds);
-        digest.u64(self.inputs.len() as u64);
-        for input in &self.inputs {
-            digest.product_ref(input);
-        }
-        digest.u64(self.outputs.len() as u64);
-        for output in &self.outputs {
-            digest.product_ref(output);
-        }
-        digest.option(self.predicate.as_ref(), CanonicalDigest::product_ref);
-        digest.option(self.rng.as_ref(), CanonicalDigest::rng);
-        digest.u64(self.control_seq);
-        digest.finish()
     }
 
     pub fn validate(&self) -> ProtocolResult<()> {
@@ -536,14 +487,6 @@ impl Operation {
                 "operation predicate is not a generation-tagged device decision product"
             );
         }
-        wire_ensure!(
-            is_digest(&self.plan_digest),
-            "operation plan digest is not a lowercase SHA-256 digest"
-        );
-        wire_ensure!(
-            self.plan_digest == self.compute_plan_digest(),
-            "operation plan digest does not match its registration fields"
-        );
         Ok(())
     }
 
@@ -637,34 +580,11 @@ pub struct ModelOutput {
     pub committed_tokens: Vec<u32>,
     pub finish_flags: FinishFlags,
     pub product_generations: Vec<u32>,
-    pub semantic_digest: Digest,
     pub error_code: Option<ErrorCode>,
     pub timing_counters: TimingCounters,
 }
 
 impl ModelOutput {
-    /// The selected-result identity digest, host-computed from the ready record.
-    /// The committed token values are part of the semantic output delta, so two
-    /// different tokens selected at the same span do not share a lineage.
-    pub fn compute_semantic_digest(&self, parent_semantic: &str, plan_digest: &str) -> Digest {
-        let mut digest = CanonicalDigest::new(b"uniserve-semantic\0");
-        digest.string(parent_semantic);
-        digest.string(plan_digest);
-        digest.u32(self.selected_point);
-        digest.u8(self.status as u8);
-        digest.u32(self.logical_lengths.token_len);
-        digest.u32(self.logical_lengths.kv_visible_len);
-        digest.u32(self.logical_lengths.latent_len);
-        digest.u32(self.token_span.base);
-        digest.u32(self.token_span.len);
-        digest.u32s(self.committed_tokens.iter().copied());
-        digest.bool(self.finish_flags.eos);
-        digest.bool(self.finish_flags.length);
-        digest.bool(self.finish_flags.stop);
-        digest.u32s(self.product_generations.iter().copied());
-        digest.finish()
-    }
-
     pub fn validate(&self) -> ProtocolResult<()> {
         wire_ensure!(self.op_id.0 > 0, "completion op id must be positive");
         wire_ensure!(
@@ -674,10 +594,6 @@ impl ModelOutput {
         wire_ensure!(
             self.completion_slot_generation > 0,
             "completion slot generation must be positive"
-        );
-        wire_ensure!(
-            is_digest(&self.semantic_digest),
-            "completion semantic digest is not a lowercase SHA-256 digest"
         );
         match self.status {
             OpStatus::Error => wire_ensure!(
@@ -768,7 +684,6 @@ impl Control {
         }
     }
 
-    /// The variant tag used in the idempotency identity.
     pub const fn variant_index(&self) -> u8 {
         match self {
             Self::Commit { .. } => 0,
@@ -785,44 +700,6 @@ impl Control {
             }
             Self::Release { .. } => None,
         }
-    }
-
-    /// The canonical content digest for idempotency: two controls with the same
-    /// `(request_key, control_seq, variant)` but different content conflict.
-    pub fn content_digest(&self) -> Digest {
-        let mut digest = CanonicalDigest::new(b"uniserve-control\0");
-        digest.u8(self.variant_index());
-        digest.request_key(self.request_key());
-        match self {
-            Self::Commit {
-                control_seq,
-                expected_parent,
-                selected,
-                public_event_limit,
-                disposition,
-                ..
-            } => {
-                digest.u64(*control_seq);
-                digest.version_ref(expected_parent);
-                digest.version_ref(selected);
-                digest.u64(*public_event_limit);
-                digest.u8(*disposition as u8);
-            }
-            Self::Close {
-                control_seq,
-                cutoff,
-                reason,
-                ..
-            } => {
-                digest.u64(*control_seq);
-                digest.version_ref(cutoff);
-                digest.u8(*reason as u8);
-            }
-            Self::Release { op_id, .. } => {
-                digest.op_id(*op_id);
-            }
-        }
-        digest.finish()
     }
 
     pub fn validate(&self) -> ProtocolResult<()> {
@@ -890,7 +767,6 @@ pub struct NewRequest {
     /// Scheduler-assigned stable request-state row. Index zero is reserved for
     /// inactive graph padding and never identifies a live request.
     pub request_pool_idx: u32,
-    pub digest: Digest,
     pub und: Option<UndAdmission>,
     pub gen_admission: Option<GenAdmission>,
     pub media: Option<MediaAdmission>,
@@ -908,15 +784,13 @@ impl NewRequest {
             und.is_some() || gen_admission.is_some(),
             "admission must declare an understanding or generation branch"
         );
-        let mut admission = Self {
+        let admission = Self {
             request_key,
             request_pool_idx,
-            digest: Digest::zero(),
             und,
             gen_admission,
             media: None,
         };
-        admission.digest = admission.payload_digest();
         Ok(admission)
     }
 
@@ -926,38 +800,15 @@ impl NewRequest {
         media: MediaAdmission,
     ) -> ProtocolResult<Self> {
         wire_ensure!(request_pool_idx > 0, "request-pool index must be positive");
-        let mut admission = Self {
+        let admission = Self {
             request_key,
             request_pool_idx,
-            digest: Digest::zero(),
             und: None,
             gen_admission: None,
             media: Some(media),
         };
-        admission.digest = admission.payload_digest();
         admission.validate()?;
         Ok(admission)
-    }
-
-    pub fn payload_digest(&self) -> Digest {
-        let mut digest = CanonicalDigest::new(b"uniserve-admission\0");
-        digest.request_key(self.request_key);
-        digest.option(self.und.as_ref(), |digest, und| {
-            digest.sampling(&und.sampling);
-            digest.u32s(und.negative_token_ids.iter().copied());
-            digest.u32s(und.finish_token_ids.iter().copied());
-            digest.u32(und.initial_position);
-        });
-        digest.option(self.gen_admission.as_ref(), |digest, branch| {
-            digest.image(&branch.image)
-        });
-        digest.option(self.media.as_ref(), |digest, media| {
-            digest.string(&media.prompt);
-            digest.u64(media.seed);
-            digest.u8(media.profile as u8);
-            digest.string(&media.output_path);
-        });
-        digest.finish()
     }
 
     pub fn validate(&self) -> ProtocolResult<()> {
@@ -968,14 +819,6 @@ impl NewRequest {
         wire_ensure!(
             self.und.is_some() || self.gen_admission.is_some() || self.media.is_some(),
             "admission must declare an understanding, generation, or media branch"
-        );
-        wire_ensure!(
-            is_digest(&self.digest),
-            "admission digest is not a lowercase SHA-256 digest"
-        );
-        wire_ensure!(
-            self.digest == self.payload_digest(),
-            "admission digest does not match its payload"
         );
         if let Some(und) = &self.und {
             und.sampling.validate()?;
@@ -1312,10 +1155,7 @@ pub struct Batch {
     pub admissions: Vec<NewRequest>,
     pub partitions: Vec<BatchPartition>,
     pub controls: Vec<Control>,
-    /// Host-supplied input product values the operations reference through
-    /// `Operation::inputs`, matched by `ProductRef` identity. These are
-    /// transported values, not lineage identity: `plan_digest` already covers
-    /// the input product references, so `input_products` enters no digest.
+    /// Host-supplied input product values matched by `ProductRef` identity.
     pub input_products: Vec<ProductPayload>,
 }
 
@@ -1433,10 +1273,10 @@ impl Batch {
                 "a submission batch admits a request without an operation"
             );
         }
-        // Idempotency identity: (request_key, control_seq, variant, content).
+        // A repeated control identity must carry exactly the same command.
         let mut control_identities: std::collections::HashMap<
             (RequestKey, Option<u64>, u8),
-            Digest,
+            Control,
         > = std::collections::HashMap::new();
         for control in &self.controls {
             control.validate()?;
@@ -1445,14 +1285,13 @@ impl Batch {
                 control.control_seq(),
                 control.variant_index(),
             );
-            let content = control.content_digest();
             if let Some(existing) = control_identities.get(&identity) {
                 wire_ensure!(
-                    existing == &content,
+                    existing == control,
                     "a submission batch reuses a control identity with different content"
                 );
             } else {
-                control_identities.insert(identity, content);
+                control_identities.insert(identity, control.clone());
             }
         }
         for payload in &self.input_products {

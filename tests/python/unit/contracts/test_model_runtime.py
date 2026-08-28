@@ -1,4 +1,4 @@
-"""Behavioral contracts for model execution and worker identity."""
+"""Model execution and worker resource behavior."""
 
 from __future__ import annotations
 
@@ -12,41 +12,24 @@ from uniserve_worker.bootstrap.capabilities import resolve_capabilities
 from uniserve_worker.bootstrap.capacity import latent_trajectory_bytes, model_arena_capacity
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.foundation.math import ceil_div
-from uniserve_worker.models.identity import ModelIdentity, architecture_identity
 
 pytestmark = pytest.mark.unit
-
-
-def test_architecture_identity_is_stable_and_binds_checkpoint_configuration():
-    first = architecture_identity("ConformanceModel", {"layers": 2, "width": 8})
-
-    assert first == architecture_identity("ConformanceModel", {"width": 8, "layers": 2})
-    assert first != architecture_identity("ConformanceModel", {"layers": 3, "width": 8})
-    assert first != architecture_identity("OtherModel", {"layers": 2, "width": 8})
-    assert len(first) == 64
-    int(first, 16)
-
-
-def test_model_identity_requires_exact_checkpoint_digests():
-    ModelIdentity("ConformanceModel", "a" * 64, "b" * 64)
-    with pytest.raises(WorkerError):
-        ModelIdentity("ConformanceModel", "A" * 64, "b" * 64)
 
 
 def test_capabilities_project_model_behavior_and_resource_geometry():
     capabilities = resolve_capabilities(
         TEST_MODEL,
         TEST_DEPLOYMENT,
-        architecture_digest="a" * 64,
-        weight_digest="b" * 64,
+        model_name="test-model",
+        weight_version=7,
     )
 
     assert ForwardMode.TOKEN_EXTEND in capabilities.supported_work
     assert ForwardMode.GEN_FLOW in capabilities.supported_work
     assert capabilities.mixed_buckets == ()
     assert capabilities.num_layers == TEST_MODEL.cache_geometry.num_layers
-    assert capabilities.model_identity == "a" * 64
-    assert capabilities.weight_digest == "b" * 64
+    assert capabilities.model_name == "test-model"
+    assert capabilities.weight_version == 7
 
 
 def test_latent_capacity_rounds_to_complete_scheduler_pages() -> None:

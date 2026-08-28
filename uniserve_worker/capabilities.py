@@ -170,8 +170,8 @@ class WorkerInfo:
     mixed_buckets: tuple[GraphBucket, ...]
     sampling_ownership: SamplingOwnership
     resource_classes: tuple[ResourceClass, ...]
-    model_identity: str
-    weight_digest: str
+    model_name: str
+    weight_version: int
 
     @property
     def latent_capacity_units(self) -> int:
@@ -289,14 +289,8 @@ class WorkerInfo:
             raise invalid_descriptor(
                 "worker capabilities advertise latent work without a latent page pool"
             )
-        identities = (self.model_identity, self.weight_digest)
-        if any(identities) and any(
-            len(value) != 64 or any(character not in "0123456789abcdef" for character in value)
-            for value in identities
-        ):
-            raise invalid_descriptor(
-                "capability model identities must be lowercase SHA-256 digests"
-            )
+        if not self.model_name or self.weight_version < 0:
+            raise invalid_descriptor("worker model name and weight version are invalid")
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "capabilities") -> WorkerInfo:
@@ -381,8 +375,8 @@ class WorkerInfo:
                     _seq(data.get("resource_classes", ()), f"{where}.resource_classes")
                 )
             ),
-            model_identity=_str(data.get("model_identity", ""), f"{where}.model_identity"),
-            weight_digest=_str(data.get("weight_digest", ""), f"{where}.weight_digest"),
+            model_name=_str(data.get("model_name", ""), f"{where}.model_name"),
+            weight_version=_uint(data.get("weight_version", 0), f"{where}.weight_version"),
         )
 
     def to_mapping(self) -> dict[str, object]:
@@ -421,8 +415,8 @@ class WorkerInfo:
             "mixed_buckets": [bucket.to_mapping() for bucket in self.mixed_buckets],
             "sampling_ownership": self.sampling_ownership.value,
             "resource_classes": [value.value for value in self.resource_classes],
-            "model_identity": self.model_identity or None,
-            "weight_digest": self.weight_digest or None,
+            "model_name": self.model_name,
+            "weight_version": self.weight_version,
         }
 
 

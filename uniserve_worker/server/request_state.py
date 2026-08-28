@@ -11,7 +11,7 @@ from ..execution.batch import (
     Close,
     Commit,
     Control,
-    DeferredSemanticDigest,
+    DeferredCompletion,
     FixedPoint,
     ImageParams,
     NewRequest,
@@ -20,7 +20,6 @@ from ..execution.batch import (
     RequestKey,
     SamplingParams,
     VersionRef,
-    control_content_digest,
 )
 from ..foundation.errors import invalid_descriptor
 
@@ -64,6 +63,7 @@ class _RequestAssignment:
     base: RequestRow | None
     selected: VersionRef
     runtime: RequestRuntime
+    completion: DeferredCompletion | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,23 +79,22 @@ class RequestRow:
 
     request_key: RequestKey
     request_pool_idx: int
-    admission_digest: str
+    admission: NewRequest
     sampling: SamplingParams | None
     image: ImageParams | None
     negative_token_ids: tuple[int, ...]
     finish_token_ids: tuple[int, ...]
     version: int = 0
     resolved_op_id: int = 0
-    resolved_digest: str | DeferredSemanticDigest = ""
     committed_point: int = 0
     committed_op_id: int = 0
-    committed_digest: str | DeferredSemanticDigest = ""
     public_event_limit: int = 0
     applied_control_seq: int = 0
-    control_digests: dict[tuple[int, str], str] = field(default_factory=dict)
+    control_history: dict[tuple[int, str], Commit | Close] = field(default_factory=dict)
     resolved_versions: dict[tuple[int, int], VersionRef] = field(default_factory=dict)
     resolved_runtime: dict[tuple[int, int], RequestRuntime] = field(default_factory=dict)
     resolved_operations: dict[int, VersionRef] = field(default_factory=dict)
+    pending_operations: dict[int, DeferredCompletion] = field(default_factory=dict)
     declared_parents: dict[int, VersionRef] = field(default_factory=dict)
     terminal_cutoff: VersionRef | None = None
     latent_product: ProductRef | None = None
@@ -122,14 +121,14 @@ class RequestRow:
         return VersionRef(
             request_key=self.request_key,
             producer_op_id=self.committed_op_id,
-            point=FixedPoint(self.committed_point, str(self.committed_digest)),
+            point=FixedPoint(self.committed_point),
         )
 
     def resolved_version(self) -> VersionRef:
         return VersionRef(
             request_key=self.request_key,
             producer_op_id=self.resolved_op_id,
-            point=FixedPoint(self.version, str(self.resolved_digest)),
+            point=FixedPoint(self.version),
         )
 
     def install_runtime(self, runtime: RequestRuntime) -> None:
@@ -252,10 +251,7 @@ class RequestTable:
                         f"operation {operation.op_id} names request-pool index {slot}; "
                         f"session index is {base.request_pool_idx}"
                     )
-                if admission is not None and (
-                    admission.digest != base.admission_digest
-                    or int(admission.request_pool_idx) != int(base.request_pool_idx)
-                ):
+                if admission is not None and admission != base.admission:
                     raise invalid_descriptor(
                         f"session {session_id} admission conflicts with committed state"
                     )
@@ -274,6 +270,7 @@ class RequestTable:
         bases: Sequence[RequestRow | None],
         selected_versions: Mapping[int, VersionRef],
         runtimes: Mapping[int, RequestRuntime],
+        completions: Mapping[int, DeferredCompletion],
     ) -> _RequestPublication:
         """Validate and freeze one direct request-row publication."""
 
@@ -290,6 +287,9 @@ class RequestTable:
             runtime = runtimes.get(session_id)
             if selected is None or runtime is None:
                 raise RuntimeError("request-row publication is missing its resolved outcome")
+            completion = completions.get(session_id)
+            if operation.advances_state and completion is None:
+                raise RuntimeError("request-row publication is missing its pending completion")
             point = selected.point
             if not isinstance(point, FixedPoint):
                 raise RuntimeError("published request version must be fixed")
@@ -314,6 +314,7 @@ class RequestTable:
                     base=base,
                     selected=selected,
                     runtime=runtime,
+                    completion=completion,
                 )
             )
         return _RequestPublication(
@@ -344,7 +345,6 @@ class RequestTable:
             point = cast(FixedPoint, selected.point)
             row.version = point.point_index
             row.resolved_op_id = selected.producer_op_id
-            row.resolved_digest = point.semantic_digest
             if operation.advances_state and isinstance(point.point_index, int):
                 key = row.point_key(selected)
                 row.resolved_versions[key] = selected
@@ -353,6 +353,8 @@ class RequestTable:
                 row.resolved_runtime[row.point_key(selected)] = runtime
                 row.install_runtime(runtime)
             row.resolved_operations[int(operation.op_id)] = selected
+            if assignment.completion is not None:
+                row.pending_operations[int(operation.op_id)] = assignment.completion
             row.declared_parents[int(operation.op_id)] = operation.parent
             row.last_op_id = int(operation.op_id)
             row.last_step_id = int(publication.step_id)
@@ -381,7 +383,7 @@ class RequestTable:
         selected = VersionRef(
             request_key=selected.request_key,
             producer_op_id=selected.producer_op_id,
-            point=FixedPoint(point.point_index, str(point.semantic_digest)),
+            point=FixedPoint(point.point_index),
         )
         key = row.point_key(selected)
         row.resolved_versions[key] = selected
@@ -421,7 +423,6 @@ class RequestTable:
         row.resolved_operations[int(op_id)] = selected
         row.version = int(point.point_index)
         row.resolved_op_id = int(op_id)
-        row.resolved_digest = point.semantic_digest
         row.install_runtime(runtime)
         return selected, runtime
 
@@ -437,7 +438,6 @@ class RequestTable:
             snapshot = copy.deepcopy(self.get(session_id))
             snapshot.version = snapshot.committed_point
             snapshot.resolved_op_id = snapshot.committed_op_id
-            snapshot.resolved_digest = str(snapshot.committed_digest)
             committed = snapshot.committed_version()
             runtime = snapshot.runtime_for(committed)
             if runtime is None:
@@ -447,6 +447,7 @@ class RequestTable:
             snapshot.resolved_versions = {key: committed}
             snapshot.resolved_runtime = {key: runtime}
             snapshot.resolved_operations = {snapshot.committed_op_id: committed}
+            snapshot.pending_operations = {}
             snapshot.declared_parents = {snapshot.committed_op_id: committed}
             snapshots.append(snapshot)
         return tuple(snapshots)
@@ -478,8 +479,8 @@ class RequestTable:
             retained_slots[slot] = session_id
             if row.epoch < 0 or row.version < 0 or row.committed_point < 0:
                 raise invalid_descriptor("request snapshot version is invalid")
-            if not row.admission_digest:
-                raise invalid_descriptor("request snapshot admission identity is missing")
+            if row.admission.request_key != row.request_key:
+                raise invalid_descriptor("request snapshot admission belongs to another request")
             if (
                 row.resolved_versions.get(row.point_key(row.resolved_version()))
                 != row.resolved_version()
@@ -511,13 +512,11 @@ class RequestTable:
         row = RequestRow(
             request_key=admission.request_key,
             request_pool_idx=slot,
-            admission_digest=admission.digest,
+            admission=admission,
             sampling=None if admission.und is None else admission.und.sampling,
             image=None if admission.gen_admission is None else admission.gen_admission.image,
             negative_token_ids=() if admission.und is None else admission.und.negative_token_ids,
             finish_token_ids=() if admission.und is None else admission.und.finish_token_ids,
-            resolved_digest=admission.digest,
-            committed_digest=admission.digest,
             logical_position=prefix_len,
         )
         root = row.committed_version()
@@ -563,30 +562,29 @@ class RequestTable:
         self,
         row: RequestRow,
         control: Commit | Close,
-    ) -> tuple[bool, tuple[int, str], str]:
+    ) -> tuple[bool, tuple[int, str]]:
         kind = "commit" if isinstance(control, Commit) else "close"
         identity = (int(control.control_seq), kind)
-        digest = control_content_digest(control)
-        existing = row.control_digests.get(identity)
+        existing = row.control_history.get(identity)
         if existing is not None:
-            if existing != digest:
+            if existing != control:
                 raise invalid_descriptor(
                     f"control identity {identity} conflicts with its committed content"
                 )
-            return True, identity, digest
-        if len(row.control_digests) >= self.history_capacity:
+            return True, identity
+        if len(row.control_history) >= self.history_capacity:
             raise invalid_descriptor("request control history capacity is exhausted")
         if int(control.control_seq) != row.applied_control_seq + 1:
             raise invalid_descriptor(
                 f"control sequence {control.control_seq} does not follow {row.applied_control_seq}"
             )
-        return False, identity, digest
+        return False, identity
 
     def _apply_commit(self, control: Commit) -> None:
         row = self.get(control.request_key.session_id)
         if control.request_key != row.request_key:
             raise invalid_descriptor("commit control has a stale request key")
-        duplicate, identity, digest = self._control_identity(row, control)
+        duplicate, identity = self._control_identity(row, control)
         if duplicate:
             return
         if row.terminal_cutoff is not None:
@@ -607,16 +605,15 @@ class RequestTable:
             raise invalid_descriptor("commit control regresses the public event limit")
         row.committed_point = int(point.point_index)
         row.committed_op_id = int(selected.producer_op_id)
-        row.committed_digest = point.semantic_digest
         row.public_event_limit = int(control.public_event_limit)
         row.applied_control_seq = int(control.control_seq)
-        row.control_digests[identity] = digest
+        row.control_history[identity] = control
 
     def _apply_close(self, control: Close) -> None:
         row = self.get(control.request_key.session_id)
         if control.request_key != row.request_key:
             raise invalid_descriptor("close control has a stale request key")
-        duplicate, identity, digest = self._control_identity(row, control)
+        duplicate, identity = self._control_identity(row, control)
         if duplicate:
             return
         cutoff = control.cutoff
@@ -634,18 +631,17 @@ class RequestTable:
             raise invalid_descriptor("close control cutoff lost its runtime")
         row.committed_point = int(point.point_index)
         row.committed_op_id = int(cutoff.producer_op_id)
-        row.committed_digest = point.semantic_digest
         row.version = int(point.point_index)
         row.resolved_op_id = int(cutoff.producer_op_id)
-        row.resolved_digest = point.semantic_digest
         row.install_runtime(runtime)
         row.terminal_cutoff = cutoff
         row.applied_control_seq = int(control.control_seq)
-        row.control_digests[identity] = digest
+        row.control_history[identity] = control
         key = row.point_key(cutoff)
         row.resolved_versions = {key: cutoff}
         row.resolved_runtime = {key: runtime}
         row.resolved_operations = {int(cutoff.producer_op_id): cutoff}
+        row.pending_operations = {}
         row.declared_parents = {int(cutoff.producer_op_id): cutoff}
 
 

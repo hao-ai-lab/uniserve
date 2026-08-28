@@ -34,7 +34,7 @@ from .weight_loaders import (
     default_weight_loader,
     defer_parameter_weights,
 )
-from .weight_set import WeightSet, dummy_weight_digest, source_weight_digest
+from .weight_set import WeightSet
 
 logger = logging.getLogger(__name__)
 
@@ -98,17 +98,11 @@ class DefaultModelLoader(BaseModelLoader):
         _warn_skips(entry.architecture, report)
         _process_quantization_for_scope(model, entry.architecture, report.loaded)
         model.eval()
-        digest = source_weight_digest(
-            entry.architecture,
-            request.scope.value,
-            request.load.load_format,
-            sources,
-        )
         return LoadedModel(
             model=model,
             tokenizer=tokenizer,
             device=request.device,
-            weights=WeightSet.from_module(model, digest=digest),
+            weights=WeightSet.from_module(model),
             sources=sources,
             architecture_config=_canonical_architecture_config(prepared),
         )
@@ -135,14 +129,11 @@ class DummyModelLoader(BaseModelLoader):
         )
         loaded: set[str] = set()
         with torch.no_grad():
-            for name in sorted(included):
+            for index, name in enumerate(sorted(included), start=1):
                 current = dict(model.named_parameters()).get(name)
                 if current is None:
                     continue
-                seed = int.from_bytes(
-                    hashlib.sha256(f"{entry.architecture}\0{name}".encode()).digest()[:8],
-                    "little",
-                )
+                seed = index
                 generator = torch.Generator(device="cpu")
                 generator.manual_seed(seed)
                 value = torch.empty(
@@ -160,17 +151,11 @@ class DummyModelLoader(BaseModelLoader):
         _zero_dummy_vocab_padding(model, loaded)
         _process_loaded_quantization(model, loaded)
         model.eval()
-        digest = dummy_weight_digest(
-            entry.architecture,
-            request.scope.value,
-            request.execution.model_dtype,
-            model,
-        )
         return LoadedModel(
             model=model,
             tokenizer=tokenizer,
             device=request.device,
-            weights=WeightSet.from_module(model, digest=digest),
+            weights=WeightSet.from_module(model),
             sources=sources,
             architecture_config=_canonical_architecture_config(prepared),
         )
@@ -223,17 +208,11 @@ class ShardedStateLoader(BaseModelLoader):
         )
         _process_quantization_for_scope(model, entry.architecture, report.loaded)
         model.eval()
-        digest = source_weight_digest(
-            entry.architecture,
-            request.scope.value,
-            request.load.load_format,
-            sources,
-        )
         return LoadedModel(
             model=model,
             tokenizer=tokenizer,
             device=request.device,
-            weights=WeightSet.from_module(model, digest=digest),
+            weights=WeightSet.from_module(model),
             sources=sources,
             architecture_config=_canonical_architecture_config(prepared),
         )
@@ -268,17 +247,11 @@ class LayeredModelLoader(BaseModelLoader):
             _load_layered_secondary(model, entry.architecture, sources[1:], request)
         _warn_skips(entry.architecture, report)
         model.eval()
-        digest = source_weight_digest(
-            entry.architecture,
-            request.scope.value,
-            request.load.load_format,
-            sources,
-        )
         return LoadedModel(
             model=model,
             tokenizer=tokenizer,
             device=request.device,
-            weights=WeightSet.from_module(model, digest=digest),
+            weights=WeightSet.from_module(model),
             sources=sources,
             architecture_config=_canonical_architecture_config(prepared),
         )
@@ -313,12 +286,8 @@ def _construct_model(
     quantization = QuantizationConfig.from_model_config(config)
     _validate_quantization(quantization, request.device, dtype)
     spec = LayerConfig(parallel=request.parallel, quantization=quantization)
-    use_meta = (
-        request.load.load_format is LoadFormat.LAYERED
-        or (
-            entry.architecture == "NEOChatModel"
-            and request.scope.value != "whole"
-        )
+    use_meta = request.load.load_format is LoadFormat.LAYERED or (
+        entry.architecture == "NEOChatModel" and request.scope.value != "whole"
     )
     construction_device = torch.device("meta" if use_meta else request.device)
     with _default_dtype(dtype), torch.device(construction_device):
@@ -522,9 +491,7 @@ def _load_layered_secondary(
 
 def _bagel_vae_optional(module: nn.Module) -> set[str]:
     return {
-        name
-        for name, _ in module.named_parameters()
-        if name == "reg" or name.startswith("reg.")
+        name for name, _ in module.named_parameters() if name == "reg" or name.startswith("reg.")
     }
 
 
@@ -591,10 +558,7 @@ def _materialize_scope_buffers(
         active_modules.update(".".join(parts[:end]) for end in range(1, len(parts) + 1))
     for module_name, module in model.named_modules():
         parts = module_name.split(".")
-        if not any(
-            ".".join(parts[:end]) in active_modules
-            for end in range(1, len(parts) + 1)
-        ):
+        if not any(".".join(parts[:end]) in active_modules for end in range(1, len(parts) + 1)):
             continue
         materialize = getattr(module, "materialize_load_buffers", None)
         if callable(materialize):

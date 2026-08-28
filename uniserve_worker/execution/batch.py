@@ -1,25 +1,12 @@
-"""Typed values crossing the scheduler-to-worker execution boundary.
-
-The scheduler and worker exchange four cross-layer records — :class:`Operation`,
-:class:`VersionRef`, :class:`ProductRef`, and :class:`ModelOutput` — plus a
-request :class:`Control` command. Every operation names one closed
-:class:`ForwardMode` variant, one exact parent version, and its declared input
-and output products. Two host-computed digests fix identity:
-:meth:`Operation.compute_plan_digest` over immutable registration fields, and
-:meth:`ModelOutput.compute_semantic_digest` over the selected result. The
-digest byte layout matches the Rust ``uniserve-worker-ipc`` crate exactly so both sides
-compute identical digests.
-"""
+"""Scheduler-to-worker execution records and their validation."""
 
 from __future__ import annotations
 
-import hashlib
 import math
-import re
 import struct
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, MutableMapping, Sequence
-from dataclasses import dataclass, field, replace
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from enum import StrEnum
 from functools import lru_cache
 from typing import Any, TypeAlias, TypeVar, cast
@@ -30,16 +17,14 @@ TRANSFER_DESCRIPTOR_PREFIX = b"uniserve-transfer\0"
 MAX_TRANSFER_DESCRIPTOR_BYTES = 64 * 1024
 
 
-class DeferredSemanticDigest(ABC):
-    """A query-ready semantic digest awaiting host finalization."""
+class DeferredCompletion(ABC):
+    """Query-ready completion work owned by a model-output record."""
 
     @abstractmethod
-    def ready(self) -> bool:
-        """Return whether finalization can proceed without blocking."""
+    def ready(self) -> bool: ...
 
     @abstractmethod
-    def finalize(self) -> str:
-        """Resolve and return the semantic digest."""
+    def finalize(self) -> None: ...
 
 
 def is_transfer_descriptor(value: bytes) -> bool:
@@ -297,25 +282,7 @@ _STATE_ADVANCING_WORK = frozenset(
     }
 )
 
-# Canonical variant-index tables. Digest byte layouts index enum members by
-# declaration order (mirroring the Rust codec); precomputing the tables keeps
-# the per-operation digest recomputation off `list(Enum).index` linear scans.
-_FORWARD_MODE_INDEX = {member: index for index, member in enumerate(ForwardMode)}
 _FORWARD_MODE_BY_VALUE = {member.value: member for member in ForwardMode}
-_DOMAIN_INDEX = {member: index for index, member in enumerate(Domain)}
-_PRODUCT_KIND_INDEX = {member: index for index, member in enumerate(ProductKind)}
-_STORAGE_CLASS_INDEX = {member: index for index, member in enumerate(StorageClass)}
-_DTYPE_INDEX = {member: index for index, member in enumerate(DType)}
-_OP_STATUS_INDEX = {member: index for index, member in enumerate(OpStatus)}
-_DRAW_LAYOUT_INDEX = {member: index for index, member in enumerate(DrawLayout)}
-_DISPOSITION_INDEX = {member: index for index, member in enumerate(Disposition)}
-_CLOSE_REASON_INDEX = {member: index for index, member in enumerate(CloseReason)}
-
-# The native worker transport attaches this process-local token only after the
-# decoded Rust Batch has passed its complete wire validation. Direct Python
-# mappings never carry the token and retain the full decoder validation path.
-_WIRE_VALIDATION_TOKEN = object()
-_WIRE_VALIDATION_KEY = "_uniserve_wire_validation"
 
 
 def native_partition(
@@ -403,93 +370,6 @@ def native_batch(
         ),
     )
     return batch
-
-
-def mark_typed_wire(batch: MutableMapping[str, object]) -> None:
-    """Record that a decoded execute batch came from the typed worker wire.
-
-    The typed wire is produced by the engine's own encoder, so each operation
-    map already carries the plan digest the scheduler registered it under.
-    Marking the map lets `Batch.from_mapping` build operations, partitions, and
-    controls directly instead of re-deriving that digest per operation.
-    """
-
-    batch[_WIRE_VALIDATION_KEY] = _WIRE_VALIDATION_TOKEN
-
-
-# Precompiled little-endian packers. Multi-field formats fuse the fixed-width
-# runs of the record digests into single calls; `<` guarantees no padding, so
-# the produced bytes are identical to packing each field separately.
-_PACK_B = struct.Struct("<B").pack
-_PACK_H = struct.Struct("<H").pack
-_PACK_I = struct.Struct("<I").pack
-_PACK_Q = struct.Struct("<Q").pack
-_PACK_F = struct.Struct("<f").pack
-_PACK_II = struct.Struct("<II").pack
-_PACK_BI = struct.Struct("<BI").pack
-_PACK_QQB = struct.Struct("<QQB").pack
-_PACK_QQQ = struct.Struct("<QQQ").pack
-_PACK_QQQQB = struct.Struct("<QQQQB").pack
-_PACK_IB = struct.Struct("<IB").pack
-_PACK_BBB = struct.Struct("<BBB").pack
-_PACK_BIBB = struct.Struct("<BIBB").pack
-_PACK_IIIII = struct.Struct("<IIIII").pack
-_PACK_IIIQQQ = struct.Struct("<IIIQQQ").pack
-_PACK_PRODUCT_HEAD = struct.Struct("<QQQQHIBBB").pack
-
-
-class _Digest:
-    """Little-endian, length-prefixed SHA-256 builder mirroring the Rust codec.
-
-    Fields accumulate into one byte buffer hashed once at :meth:`finish`; the
-    digest bytes are identical to streaming each field into the hash.
-    """
-
-    __slots__ = ("buf",)
-
-    def __init__(self, domain: bytes) -> None:
-        self.buf = bytearray(domain)
-
-    def finish(self) -> str:
-        return hashlib.sha256(self.buf).hexdigest()
-
-    def u8(self, value: int) -> None:
-        self.buf += _PACK_B(value)
-
-    def u16(self, value: int) -> None:
-        self.buf += _PACK_H(value)
-
-    def u32(self, value: int) -> None:
-        self.buf += _PACK_I(value)
-
-    def u64(self, value: int) -> None:
-        self.buf += _PACK_Q(value)
-
-    def f32(self, value: float) -> None:
-        self.buf += _PACK_F(value)
-
-    def boolean(self, value: bool) -> None:
-        self.buf += _PACK_B(int(value))
-
-    def string(self, value: str) -> None:
-        encoded = value.encode("utf-8")
-        buf = self.buf
-        buf += _PACK_Q(len(encoded))
-        buf += encoded
-
-    def u32s(self, values: Sequence[int]) -> None:
-        buf = self.buf
-        buf += _PACK_Q(len(values))
-        for value in values:
-            buf += _PACK_I(value)
-
-    def option(self, value: object | None, encode: Any) -> None:
-        if value is None:
-            self.buf += b"\x00"
-        else:
-            self.buf += b"\x01"
-            encode(value)
-
 
 
 @dataclass(frozen=True, slots=True)
@@ -893,14 +773,12 @@ class ProductRef:
 @dataclass(frozen=True, slots=True)
 class FixedPoint:
     point_index: int
-    semantic_digest: str | DeferredSemanticDigest
 
 
 @dataclass(frozen=True, slots=True)
 class DevicePoint:
     point_index: int
     selected_point: ProductRef | None
-    producer_plan_digest: str
 
 
 Point: TypeAlias = FixedPoint | DevicePoint
@@ -925,10 +803,7 @@ class VersionRef:
         if kind == "fixed":
             inner = _map(payload, f"{where}.point.value")
             point: Point = FixedPoint(
-                point_index=_uint(inner.get("point_index"), f"{where}.point.value.point_index"),
-                semantic_digest=_str(
-                    inner.get("semantic_digest"), f"{where}.point.value.semantic_digest"
-                ),
+                point_index=_uint(inner.get("point_index"), f"{where}.point.value.point_index")
             )
         elif kind == "device":
             inner = _map(payload, f"{where}.point.value")
@@ -941,10 +816,6 @@ class VersionRef:
                         inner.get("selected_point"), f"{where}.point.value.selected_point"
                     )
                 ),
-                producer_plan_digest=_str(
-                    inner.get("producer_plan_digest"),
-                    f"{where}.point.value.producer_plan_digest",
-                ),
             )
         else:
             raise invalid_descriptor(f"{where}.point has unknown variant {kind!r}")
@@ -956,14 +827,9 @@ class VersionRef:
 
     def to_mapping(self) -> dict[str, object]:
         if isinstance(self.point, FixedPoint):
-            if not isinstance(self.point.semantic_digest, str):
-                raise invalid_descriptor("fixed-point semantic digest is not finalized")
             point = {
                 "kind": "fixed",
-                "value": {
-                    "point_index": self.point.point_index,
-                    "semantic_digest": self.point.semantic_digest,
-                },
+                "value": {"point_index": self.point.point_index},
             }
         else:
             point = {
@@ -975,7 +841,6 @@ class VersionRef:
                         if self.point.selected_point is None
                         else self.point.selected_point.to_mapping()
                     ),
-                    "producer_plan_digest": self.point.producer_plan_digest,
                 },
             }
         return {
@@ -983,7 +848,6 @@ class VersionRef:
             "producer_op_id": self.producer_op_id,
             "point": point,
         }
-
 
 
 @dataclass(frozen=True, slots=True)
@@ -1066,7 +930,6 @@ class Operation:
     predicate: ProductRef | None
     rng: Rng | None
     control_seq: int
-    plan_digest: str
 
     @classmethod
     def registered(
@@ -1085,7 +948,7 @@ class Operation:
         rng: Rng | None = None,
         control_seq: int = 0,
     ) -> Operation:
-        value = cls(
+        return cls(
             request_key=request_key,
             op_id=op_id,
             parent=parent,
@@ -1099,42 +962,7 @@ class Operation:
             predicate=predicate,
             rng=rng,
             control_seq=control_seq,
-            plan_digest="",
         )
-        return replace(value, plan_digest=value.compute_plan_digest())
-
-    def compute_plan_digest(self) -> str:
-        digest = _Digest(b"uniserve-operation\0")
-        buf = digest.buf
-        key = self.request_key
-        buf += _PACK_QQQ(key.authority_id, key.session_id, key.epoch)
-        buf += _PACK_Q(self.op_id)
-        _digest_version_ref(digest, self.parent)
-        buf += _PACK_BIBB(
-            _FORWARD_MODE_INDEX[self.work],
-            self.route,
-            _DOMAIN_INDEX[self.domain],
-            int(self.advances_state),
-        )
-        _digest_bounds(digest, self.bounds)
-        buf += _PACK_Q(len(self.inputs))
-        for product in self.inputs:
-            _digest_product_ref(digest, product)
-        buf += _PACK_Q(len(self.outputs))
-        for product in self.outputs:
-            _digest_product_ref(digest, product)
-        if self.predicate is None:
-            buf += b"\x00"
-        else:
-            buf += b"\x01"
-            _digest_product_ref(digest, self.predicate)
-        if self.rng is None:
-            buf += b"\x00"
-        else:
-            buf += b"\x01"
-            _digest_rng(digest, self.rng)
-        digest.u64(self.control_seq)
-        return digest.finish()
 
     def validate(self) -> None:
         if self.op_id < 1:
@@ -1237,18 +1065,12 @@ class Operation:
                 raise invalid_descriptor(
                     "operation predicate is not a generation-tagged device decision product"
                 )
-        if not _is_digest(self.plan_digest):
-            raise invalid_descriptor("operation plan digest is not a lowercase SHA-256 digest")
-        if self.plan_digest != self.compute_plan_digest():
-            raise invalid_descriptor("operation plan digest does not match its registration fields")
 
     @classmethod
     def from_mapping(
         cls,
         value: object,
         where: str = "operation",
-        *,
-        _validated_wire: bool = False,
     ) -> Operation:
         # Field decoding follows declaration order with a no-allocation fast
         # path per field. Irregular values use the validating field decoders so
@@ -1309,27 +1131,6 @@ class Operation:
         control_seq = get("control_seq")
         if not (type(control_seq) is int and control_seq >= 0):
             control_seq = _uint(control_seq, f"{where}.control_seq")
-        plan_digest = get("plan_digest")
-        if type(plan_digest) is not str:
-            plan_digest = _str(plan_digest, f"{where}.plan_digest")
-        if _validated_wire:
-            operation = object.__new__(cls)
-            set_field = object.__setattr__
-            set_field(operation, "request_key", request_key)
-            set_field(operation, "op_id", op_id)
-            set_field(operation, "parent", parent)
-            set_field(operation, "work", work)
-            set_field(operation, "route", route)
-            set_field(operation, "domain", domain)
-            set_field(operation, "advances_state", advances_state)
-            set_field(operation, "bounds", bounds)
-            set_field(operation, "inputs", inputs)
-            set_field(operation, "outputs", outputs)
-            set_field(operation, "predicate", predicate)
-            set_field(operation, "rng", rng)
-            set_field(operation, "control_seq", control_seq)
-            set_field(operation, "plan_digest", plan_digest)
-            return operation
         operation = cls(
             request_key=request_key,
             op_id=op_id,
@@ -1344,7 +1145,6 @@ class Operation:
             predicate=predicate,
             rng=rng,
             control_seq=control_seq,
-            plan_digest=plan_digest,
         )
         operation.validate()
         return operation
@@ -1364,7 +1164,6 @@ class Operation:
             "predicate": None if self.predicate is None else self.predicate.to_mapping(),
             "rng": None if self.rng is None else self.rng.to_mapping(),
             "control_seq": self.control_seq,
-            "plan_digest": self.plan_digest,
         }
 
 
@@ -1468,30 +1267,9 @@ class ModelOutput:
     committed_tokens: tuple[int, ...]
     finish_flags: FinishFlags
     product_generations: tuple[int, ...]
-    semantic_digest: str | DeferredSemanticDigest
     error_code: ErrorCode | None
     timing_counters: TimingCounters
-
-    def compute_semantic_digest(self, parent_semantic: str, plan_digest: str) -> str:
-        digest = _Digest(b"uniserve-semantic\0")
-        digest.string(parent_semantic)
-        digest.string(plan_digest)
-        buf = digest.buf
-        lengths = self.logical_lengths
-        span = self.token_span
-        buf += _PACK_IB(self.selected_point, _OP_STATUS_INDEX[self.status])
-        buf += _PACK_IIIII(
-            lengths.token_len,
-            lengths.kv_visible_len,
-            lengths.latent_len,
-            span.base,
-            span.len,
-        )
-        digest.u32s(self.committed_tokens)
-        flags = self.finish_flags
-        buf += _PACK_BBB(int(flags.eos), int(flags.length), int(flags.stop))
-        digest.u32s(self.product_generations)
-        return digest.finish()
+    deferred: DeferredCompletion | None = field(default=None, compare=False, repr=False)
 
     def validate(self) -> None:
         if self.op_id < 1:
@@ -1500,12 +1278,6 @@ class ModelOutput:
             raise invalid_descriptor("completion selected KV length exceeds computed length")
         if self.completion_slot_generation < 1:
             raise invalid_descriptor("completion slot generation must be positive")
-        if isinstance(self.semantic_digest, str):
-            digest_valid = _is_digest(self.semantic_digest)
-        else:
-            digest_valid = isinstance(self.semantic_digest, DeferredSemanticDigest)
-        if not digest_valid:
-            raise invalid_descriptor("completion semantic digest is not a lowercase SHA-256 digest")
         if self.status is OpStatus.ERROR:
             if self.error_code is None:
                 raise invalid_descriptor("an error completion must carry an error code")
@@ -1545,7 +1317,6 @@ class ModelOutput:
             product_generations=_uints(
                 data.get("product_generations", ()), f"{where}.product_generations"
             ),
-            semantic_digest=_str(data.get("semantic_digest"), f"{where}.semantic_digest"),
             error_code=(
                 None
                 if data.get("error_code") is None
@@ -1559,8 +1330,6 @@ class ModelOutput:
         return record
 
     def to_mapping(self) -> dict[str, object]:
-        if not isinstance(self.semantic_digest, str):
-            raise invalid_descriptor("completion semantic digest is not finalized")
         key = self.request_key
         lengths = self.logical_lengths
         span = self.token_span
@@ -1587,7 +1356,6 @@ class ModelOutput:
             "committed_tokens": list(self.committed_tokens),
             "finish_flags": {"eos": flags.eos, "length": flags.length, "stop": flags.stop},
             "product_generations": list(self.product_generations),
-            "semantic_digest": self.semantic_digest,
             "error_code": None if error_code is None else error_code.value,
             "timing_counters": {
                 "queued_us": timing.queued_us,
@@ -1606,7 +1374,6 @@ class Commit:
     selected: VersionRef
     public_event_limit: int
     disposition: Disposition
-    _content_digest: str | None = field(default=None, compare=False, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1615,14 +1382,12 @@ class Close:
     control_seq: int
     cutoff: VersionRef
     reason: CloseReason
-    _content_digest: str | None = field(default=None, compare=False, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
 class Release:
     request_key: RequestKey
     op_id: int
-    _content_digest: str | None = field(default=None, compare=False, repr=False)
 
 
 Control: TypeAlias = Commit | Close | Release
@@ -1636,42 +1401,15 @@ def _control_variant_index(control: Control) -> int:
     return 2
 
 
-def control_content_digest(control: Control) -> str:
-    if control._content_digest is not None:
-        return control._content_digest
-    digest = _Digest(b"uniserve-control\0")
-    digest.u8(_control_variant_index(control))
-    _digest_request_key(digest, control.request_key)
-    if isinstance(control, Commit):
-        digest.u64(control.control_seq)
-        _digest_version_ref(digest, control.expected_parent)
-        _digest_version_ref(digest, control.selected)
-        digest.u64(control.public_event_limit)
-        digest.u8(_DISPOSITION_INDEX[control.disposition])
-    elif isinstance(control, Close):
-        digest.u64(control.control_seq)
-        _digest_version_ref(digest, control.cutoff)
-        digest.u8(_CLOSE_REASON_INDEX[control.reason])
-    else:
-        digest.u64(control.op_id)
-    return digest.finish()
-
-
 def control_from_wire(
     value: object,
     where: str = "control",
-    *,
-    _validated_wire: bool = False,
 ) -> Control:
     kind, payload = _tagged(value, where)
-    envelope = _map(value, where)
     data = _map(payload, f"{where}.value")
     request_key = _fast_request_key(data.get("request_key"))
     if request_key is None:
         request_key = RequestKey.from_mapping(data.get("request_key"), f"{where}.value.request_key")
-    cached_digest = envelope.get("_content_digest") if _validated_wire else None
-    if cached_digest is not None and not _is_digest(cached_digest):
-        raise invalid_descriptor(f"{where} has an invalid trusted content digest")
     if kind == "commit":
         expected_parent = _fast_version_ref(data.get("expected_parent"))
         if expected_parent is None:
@@ -1690,7 +1428,6 @@ def control_from_wire(
                 data.get("public_event_limit"), f"{where}.value.public_event_limit"
             ),
             disposition=_enum(Disposition, data.get("disposition"), f"{where}.value.disposition"),
-            _content_digest=cast(str | None, cached_digest),
         )
         if not commit.selected.is_fixed():
             raise invalid_descriptor("a commit control must select a fixed version")
@@ -1704,7 +1441,6 @@ def control_from_wire(
             control_seq=_uint(data.get("control_seq"), f"{where}.value.control_seq"),
             cutoff=cutoff,
             reason=_enum(CloseReason, data.get("reason"), f"{where}.value.reason"),
-            _content_digest=cast(str | None, cached_digest),
         )
         if not control.cutoff.is_fixed():
             raise invalid_descriptor("a close control must name a fixed cutoff version")
@@ -1712,7 +1448,6 @@ def control_from_wire(
         control = Release(
             request_key=request_key,
             op_id=_uint(data.get("op_id"), f"{where}.value.op_id"),
-            _content_digest=cast(str | None, cached_digest),
         )
     else:
         raise invalid_descriptor(f"{where} has unknown variant {kind!r}")
@@ -1838,7 +1573,6 @@ class MediaAdmission:
 class NewRequest:
     request_key: RequestKey
     request_pool_idx: int
-    digest: str
     und: UndAdmission | None
     gen_admission: GenAdmission | None
     media: MediaAdmission | None = None
@@ -1861,8 +1595,7 @@ class NewRequest:
         gen_admission: GenAdmission | None = None,
         media: MediaAdmission | None = None,
     ) -> NewRequest:
-        value = cls(request_key, request_pool_idx, "", und, gen_admission, media)
-        return replace(value, digest=value.payload_digest())
+        return cls(request_key, request_pool_idx, und, gen_admission, media)
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "admission") -> NewRequest:
@@ -1870,7 +1603,6 @@ class NewRequest:
         admission = cls(
             request_key=RequestKey.from_mapping(data.get("request_key"), f"{where}.request_key"),
             request_pool_idx=_uint(data.get("request_pool_idx"), f"{where}.request_pool_idx"),
-            digest=_str(data.get("digest"), f"{where}.digest"),
             und=(
                 None
                 if data.get("und") is None
@@ -1887,38 +1619,12 @@ class NewRequest:
                 else MediaAdmission.from_mapping(data["media"], f"{where}.media")
             ),
         )
-        admission.validate()
         return admission
-
-    def validate(self) -> None:
-        if not _is_digest(self.digest):
-            raise invalid_descriptor("admission digest must be a lowercase SHA-256 digest")
-        if self.digest != self.payload_digest():
-            raise invalid_descriptor(
-                f"admission digest mismatch for request {self.request_key.session_id}"
-            )
-
-    def payload_digest(self) -> str:
-        digest = _Digest(b"uniserve-admission\0")
-        _digest_request_key(digest, self.request_key)
-        digest.option(self.und, lambda value: _digest_und_admission(digest, value))
-        digest.option(self.gen_admission, lambda value: _digest_image(digest, value.image))
-        digest.option(
-            self.media,
-            lambda value: (
-                digest.string(value.prompt),
-                digest.u64(value.seed),
-                digest.u8(tuple(MediaProfileId).index(value.profile)),
-                digest.string(value.output_path),
-            ),
-        )
-        return digest.finish()
 
     def to_mapping(self) -> dict[str, object]:
         return {
             "request_key": self.request_key.to_mapping(),
             "request_pool_idx": self.request_pool_idx,
-            "digest": self.digest,
             "und": None if self.und is None else self.und.to_mapping(),
             "gen_admission": None
             if self.gen_admission is None
@@ -1950,8 +1656,6 @@ class BlockTable:
         cls,
         value: object,
         where: str = "block table",
-        *,
-        _validated_wire: bool = False,
     ) -> BlockTable:
         data = _map(value, where)
 
@@ -1968,11 +1672,6 @@ class BlockTable:
             page_ids,
             uint_field("allocated_tokens"),
         )
-        if _validated_wire:
-            placement = object.__new__(cls)
-            for name, item in zip(cls.__slots__, fields, strict=True):
-                object.__setattr__(placement, name, item)
-            return placement
         return cls(*fields)
 
     def to_mapping(self) -> dict[str, object]:
@@ -2005,8 +1704,6 @@ class CachePageAllocation:
         cls,
         value: object,
         where: str = "cache-page allocation",
-        *,
-        _validated_wire: bool = False,
     ) -> CachePageAllocation:
         data = _map(value, where)
 
@@ -2022,11 +1719,6 @@ class CachePageAllocation:
             uint_field("group_id"),
             page_ids,
         )
-        if _validated_wire:
-            placement = object.__new__(cls)
-            for name, item in zip(cls.__slots__, fields, strict=True):
-                object.__setattr__(placement, name, item)
-            return placement
         return cls(*fields)
 
     def to_mapping(self) -> dict[str, object]:
@@ -2074,7 +1766,6 @@ class RowGeometry:
             "seq_len": self.seq_len,
             "query_len": self.query_len,
         }
-
 
 
 @dataclass(frozen=True, slots=True)
@@ -2271,8 +1962,6 @@ class BatchPartition:
         cls,
         value: object,
         where: str = "batch partition",
-        *,
-        _validated_wire: bool = False,
     ) -> BatchPartition:
         data = _map(value, where)
         fields = dict(
@@ -2287,7 +1976,6 @@ class BatchPartition:
                 Operation.from_mapping(
                     item,
                     f"{where}.operations[{index}]",
-                    _validated_wire=_validated_wire,
                 )
                 for index, item in enumerate(
                     _seq(data.get("operations", ()), f"{where}.operations")
@@ -2297,7 +1985,6 @@ class BatchPartition:
                 BlockTable.from_mapping(
                     item,
                     f"{where}.block_tables[{index}]",
-                    _validated_wire=_validated_wire,
                 )
                 for index, item in enumerate(
                     _seq(data.get("block_tables", ()), f"{where}.block_tables")
@@ -2307,7 +1994,6 @@ class BatchPartition:
                 CachePageAllocation.from_mapping(
                     item,
                     f"{where}.new_cache_pages[{index}]",
-                    _validated_wire=_validated_wire,
                 )
                 for index, item in enumerate(
                     _seq(data.get("new_cache_pages", ()), f"{where}.new_cache_pages")
@@ -2332,11 +2018,6 @@ class BatchPartition:
                 )
             ),
         )
-        if _validated_wire:
-            partition = object.__new__(cls)
-            for name, item in fields.items():
-                object.__setattr__(partition, name, item)
-            return partition
         return cls(**cast(Any, fields))
 
     def to_mapping(self) -> dict[str, object]:
@@ -2422,7 +2103,6 @@ class Batch:
         if len(set(admitted)) != len(admitted):
             raise invalid_descriptor("a submission batch carries a duplicate admission")
         for admission in self.admissions:
-            admission.validate()
             if admission.request_key not in request_keys:
                 raise invalid_descriptor("a submission batch admits a request without an operation")
         identities: dict[tuple[RequestKey, int | None, int], Control] = {}
@@ -2490,7 +2170,6 @@ class Batch:
     @classmethod
     def from_mapping(cls, value: object) -> Batch:
         data = _map(value, "execute batch")
-        validated_wire = data.get(_WIRE_VALIDATION_KEY) is _WIRE_VALIDATION_TOKEN
         step_id = _uint(data.get("step_id"), "execute batch.step_id")
         admissions = tuple(
             NewRequest.from_mapping(item, f"execute batch.admissions[{index}]")
@@ -2502,7 +2181,6 @@ class Batch:
             BatchPartition.from_mapping(
                 item,
                 f"execute batch.partitions[{index}]",
-                _validated_wire=validated_wire,
             )
             for index, item in enumerate(
                 _seq(data.get("partitions", ()), "execute batch.partitions")
@@ -2513,7 +2191,6 @@ class Batch:
             or control_from_wire(
                 item,
                 f"execute batch.controls[{index}]",
-                _validated_wire=validated_wire,
             )
             for index, item in enumerate(_seq(data.get("controls", ()), "execute batch.controls"))
         )
@@ -2523,15 +2200,6 @@ class Batch:
                 _seq(data.get("input_products", ()), "execute batch.input_products")
             )
         )
-        if validated_wire:
-            batch = object.__new__(cls)
-            set_field = object.__setattr__
-            set_field(batch, "step_id", step_id)
-            set_field(batch, "admissions", admissions)
-            set_field(batch, "partitions", partitions)
-            set_field(batch, "controls", controls)
-            set_field(batch, "input_products", input_products)
-            return batch
         return cls(
             step_id=step_id,
             admissions=admissions,
@@ -2933,135 +2601,6 @@ class CompletionReport:
 
 
 # ---------------------------------------------------------------------------
-# Digest helpers mirroring the Rust `CanonicalDigest`
-# ---------------------------------------------------------------------------
-
-
-def _digest_request_key(digest: _Digest, value: RequestKey) -> None:
-    digest.buf += _PACK_QQQ(value.authority_id, value.session_id, value.epoch)
-
-
-def _digest_shape_bound(digest: _Digest, value: ShapeBound) -> None:
-    buf = digest.buf
-    dims = value.dims
-    buf += _PACK_Q(len(dims))
-    for dim in dims:
-        if isinstance(dim, StaticDim):
-            buf += _PACK_BI(0, dim.extent)
-        else:
-            buf += _PACK_BI(1, dim.bound)
-
-
-def _digest_product_ref(digest: _Digest, value: ProductRef) -> None:
-    key = value.request_key
-    digest.buf += _PACK_PRODUCT_HEAD(
-        key.authority_id,
-        key.session_id,
-        key.epoch,
-        value.producer_op_id,
-        value.output_index,
-        value.generation,
-        _PRODUCT_KIND_INDEX[value.kind],
-        _STORAGE_CLASS_INDEX[value.storage_class],
-        _DTYPE_INDEX[value.dtype],
-    )
-    _digest_shape_bound(digest, value.shape_bound)
-    point_range = value.point_range
-    digest.buf += _PACK_II(point_range.base_point, point_range.max_points)
-
-
-def _digest_version_ref(digest: _Digest, value: VersionRef) -> None:
-    key = value.request_key
-    point = value.point
-    if isinstance(point, FixedPoint):
-        digest.buf += _PACK_QQQQB(
-            key.authority_id, key.session_id, key.epoch, value.producer_op_id, 0
-        )
-        digest.buf += _PACK_I(point.point_index)
-        digest.string(point.semantic_digest)
-    else:
-        digest.buf += _PACK_QQQQB(
-            key.authority_id, key.session_id, key.epoch, value.producer_op_id, 1
-        )
-        digest.buf += _PACK_IB(point.point_index, int(point.selected_point is not None))
-        if point.selected_point is not None:
-            _digest_product_ref(digest, point.selected_point)
-        digest.string(point.producer_plan_digest)
-
-
-def _digest_bounds(digest: _Digest, value: Bounds) -> None:
-    digest.buf += _PACK_IIIQQQ(
-        value.max_points,
-        value.max_tokens,
-        value.max_kv_pages,
-        value.max_latent_bytes,
-        value.max_completion_bytes,
-        value.max_transfer_bytes,
-    )
-
-
-def _digest_rng(digest: _Digest, value: Rng) -> None:
-    digest.buf += _PACK_QQB(
-        value.seed, value.semantic_index_base, _DRAW_LAYOUT_INDEX[value.draw_layout]
-    )
-
-
-def _digest_sampling(digest: _Digest, value: SamplingParams) -> None:
-    digest.f32(value.temperature)
-    digest.u32(value.top_k)
-    digest.f32(value.top_p)
-    digest.boolean(value.ignore_eos)
-    digest.option(value.seed, digest.u64)
-    digest.f32(value.min_p)
-    digest.f32(value.repetition_penalty)
-    digest.f32(value.frequency_penalty)
-    digest.f32(value.presence_penalty)
-    digest.u64(len(value.logit_bias))
-    for token, bias in value.logit_bias:
-        digest.u32(token)
-        digest.f32(bias)
-    digest.u64(value.min_tokens)
-    digest.boolean(value.return_logprobs)
-    digest.u32(value.n_logprobs)
-    digest.boolean(value.return_prompt_logprobs)
-    digest.u32(value.n_prompt_logprobs)
-    digest.u32s(value.logprob_token_ids)
-    digest.u64(len(value.bad_words_ids))
-    for tokens in value.bad_words_ids:
-        digest.u32s(tokens)
-    digest.option(value.allowed_token_ids, digest.u32s)
-    digest.f32(value.typical_p)
-    digest.u32s(value.forced_token_ids)
-
-
-def _digest_image(digest: _Digest, value: ImageParams) -> None:
-    digest.u16(value.steps)
-    digest.f32(value.cfg_text_scale)
-    digest.f32(value.cfg_img_scale)
-    digest.string(value.cfg_renorm_type)
-    digest.f32(value.cfg_renorm_min)
-    digest.f32(value.cfg_interval[0])
-    digest.f32(value.cfg_interval[1])
-    digest.f32(value.timestep_shift)
-    digest.u32(value.height)
-    digest.u32(value.width)
-    digest.option(value.seed, digest.u64)
-    digest.string(value.negative_prompt)
-    digest.u16(value.max_images)
-    digest.u64(len(value.image_prompts))
-    for prompt in value.image_prompts:
-        digest.string(prompt)
-    digest.boolean(value.retain_images)
-
-
-def _digest_und_admission(digest: _Digest, value: UndAdmission) -> None:
-    _digest_sampling(digest, value.sampling)
-    digest.u32s(value.negative_token_ids)
-    digest.u32s(value.finish_token_ids)
-    digest.u32(value.initial_position)
-
-
-# ---------------------------------------------------------------------------
 # Decode helpers
 #
 # Each `_fast_*` helper recognizes the exact built-in wire shape without
@@ -3166,13 +2705,6 @@ def _uints(value: object, where: str) -> tuple[int, ...]:
 
 def _nonnegative(value: int, where: str) -> None:
     _uint(value, where)
-
-
-_HEX64_MATCH = re.compile(r"[0-9a-f]{64}\Z").match
-
-
-def _is_digest(value: object) -> bool:
-    return isinstance(value, str) and len(value) == 64 and _HEX64_MATCH(value) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -3378,24 +2910,20 @@ def _fast_version_ref(value: object) -> VersionRef | None:
     point: Point
     if tag == "fixed":
         point_index = payload.get("point_index")
-        semantic_digest = payload.get("semantic_digest")
-        if not (type(point_index) is int and point_index >= 0 and type(semantic_digest) is str):
+        if not (type(point_index) is int and point_index >= 0):
             return None
-        point = FixedPoint(point_index, semantic_digest)
+        point = FixedPoint(point_index)
     elif tag == "device":
         point_index = payload.get("point_index")
         raw_selected_point = payload.get("selected_point")
         selected_point = (
             None if raw_selected_point is None else _fast_product_ref(raw_selected_point)
         )
-        producer_plan_digest = payload.get("producer_plan_digest")
-        if (
-            not (type(point_index) is int and point_index >= 0)
-            or (raw_selected_point is not None and selected_point is None)
-            or type(producer_plan_digest) is not str
+        if not (type(point_index) is int and point_index >= 0) or (
+            raw_selected_point is not None and selected_point is None
         ):
             return None
-        point = DevicePoint(point_index, selected_point, producer_plan_digest)
+        point = DevicePoint(point_index, selected_point)
     else:
         return None
     reference = object.__new__(VersionRef)

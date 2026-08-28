@@ -78,11 +78,8 @@ impl Scheduler {
             request_pool_idx: 0,
             epoch: self.next_epoch,
             version: 0,
-            admission_digest: None,
-            resolved_semantic: uniserve_core::Digest::zero(),
             resolved_producer_op_id: 0,
             committed_version: 0,
-            committed_semantic: uniserve_core::Digest::zero(),
             committed_producer_op_id: 0,
             control_seq: 0,
             public_event_limit: 0,
@@ -180,7 +177,7 @@ impl Scheduler {
                 },
             )
             .expect("validated media admission");
-            let root = VersionRef::admission_root(request_key, OpId(0), admission.digest.clone());
+            let root = VersionRef::admission_root(request_key, OpId(0));
             self.running_media.insert(
                 id,
                 MediaFlowState {

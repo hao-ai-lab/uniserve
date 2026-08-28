@@ -501,7 +501,7 @@ impl ResolvedModel {
         }
     }
 
-    /// Served-model identity used by `/v1/models` and event provenance.
+    /// Served-model description used by `/v1/models` and public events.
     pub fn served_identity(&self) -> &ModelIdentity {
         match self {
             Self::Text(d) => &d.identity,

@@ -26,7 +26,6 @@ pub(crate) async fn list_models(State(state): State<Arc<AppState>>) -> Json<List
             identity: ServedModelIdentity {
                 served_name: identity.served_name.clone(),
                 description: identity.description,
-                fingerprint: identity.fingerprint.clone(),
             },
             capabilities: ModelCapabilities {
                 endpoints: declared.endpoints,

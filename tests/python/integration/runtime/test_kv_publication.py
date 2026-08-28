@@ -80,12 +80,8 @@ def _installation_operation(
 def _installation_placement(operation: Operation, length: int) -> dict[str, object]:
     request_pool_idx = int(operation.request_key.session_id) + 1
     return {
-        "block_tables": (
-            BlockTable(request_pool_idx, 0, (1,), max(1, int(length))),
-        ),
-        "new_cache_pages": (
-            CachePageAllocation(request_pool_idx, 0, (1,)),
-        ),
+        "block_tables": (BlockTable(request_pool_idx, 0, (1,), max(1, int(length))),),
+        "new_cache_pages": (CachePageAllocation(request_pool_idx, 0, (1,)),),
     }
 
 
@@ -162,13 +158,12 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
 
     assert publication_result.completions[0].selected_point == 0
     assert publication_result.completions[0].logical_lengths.kv_visible_len == 3
-    assert worker.execution.cache_publications.published_extent(
-        admission.request_key.session_id
-    ) == 3
+    assert (
+        worker.execution.cache_publications.published_extent(admission.request_key.session_id) == 3
+    )
     payload = publication_result.products[0]
-    kind, descriptor, producer_plan_digest = decode_transfer_descriptor(payload.payload)
+    kind, descriptor = decode_transfer_descriptor(payload.payload)
     assert kind == "kv"
-    assert producer_plan_digest == publication.plan_digest
     snapshot = CachePublication.from_mapping(descriptor["snapshot"])
     assert payload.product == publication_product
     assert snapshot.source_version == second_commit.selected
@@ -223,9 +218,8 @@ def test_tail_closure_precedes_exact_incremental_publication() -> None:
         )
     )
     incremental_payload = incremental_result.products[0]
-    kind, descriptor, producer_plan_digest = decode_transfer_descriptor(incremental_payload.payload)
+    kind, descriptor = decode_transfer_descriptor(incremental_payload.payload)
     assert kind == "kv"
-    assert producer_plan_digest == incremental.plan_digest
     incremental_snapshot = CachePublication.from_mapping(descriptor["snapshot"])
     assert incremental_payload.product == incremental_product
     assert incremental_snapshot.source_version == suffix_commit.selected
