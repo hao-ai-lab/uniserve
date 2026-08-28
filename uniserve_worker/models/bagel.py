@@ -27,7 +27,7 @@ from ..nn import (
     local_attention_head_count,
     local_kv_head_count,
 )
-from ..nn.decoder import MoTModel
+from ..nn.decoder import MoTConfig, MoTModel
 from ..nn.diffusion import (
     ScheduleDirection,
     ScheduleShiftDomain,
@@ -187,7 +187,20 @@ class _BagelGraph(nn.Module):
         super().__init__()
         self.cfg = cfg
         hidden = cfg.llm.hidden_size
-        self.lm = MoTModel(cfg.llm, spec=layer_config)
+        self.lm = MoTModel(
+            MoTConfig(
+                hidden_size=cfg.llm.hidden_size,
+                intermediate_size=cfg.llm.intermediate_size,
+                num_hidden_layers=cfg.llm.num_hidden_layers,
+                num_attention_heads=cfg.llm.num_attention_heads,
+                num_key_value_heads=cfg.llm.num_key_value_heads,
+                vocab_size=cfg.llm.vocab_size,
+                rms_norm_eps=cfg.llm.rms_norm_eps,
+                rope_theta=cfg.llm.rope_theta,
+                head_dim=cfg.llm.head_dim,
+            ),
+            spec=layer_config,
+        )
         self.lm_head = ParallelLMHead(
             hidden,
             cfg.llm.vocab_size,

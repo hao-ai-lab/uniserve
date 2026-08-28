@@ -8,27 +8,18 @@ import torch
 import torch.nn.functional as F
 
 from ...execution.forward_batch import ForwardBatch
-from .base import AttentionCapabilities, merge_attention_states
+from .base import AttentionBackend, merge_attention_states
 
 __all__ = [
     "TorchSDPAAttentionBackend",
 ]
 
 
-class TorchSDPAAttentionBackend:
+class TorchSDPAAttentionBackend(AttentionBackend):
     name = "torch_sdpa"
-
-    def capabilities(self) -> AttentionCapabilities:
-        return AttentionCapabilities(
-            paged_kv=True,
-            varlen_attention=True,
-            varlen_paged_kv=True,
-            visible_end=True,
-            segmented_attention=True,
-            visible_end_cuda_graph=True,
-            dense_ranks=frozenset({3, 4}),
-            accepts_dense_mask=True,
-        )
+    paged_varlen = True
+    dense_ranks = frozenset({3, 4})
+    accepts_dense_mask = True
 
     def forward(
         self,

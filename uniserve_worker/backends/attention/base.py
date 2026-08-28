@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Protocol
-
 import torch
 
-from ...execution.forward_batch import ForwardBatch
+from ...execution.forward_batch import AttentionMode, ForwardBatch
 from ..triton import triton_available
 
 try:  # pragma: no cover - availability depends on the serving environment.
@@ -18,12 +15,7 @@ except Exception:  # pragma: no cover
     tl = None
 
 __all__ = [
-    "AttentionCapabilities",
     "AttentionBackend",
-    "PagedAttentionBackend",
-    "SegmentedAttentionBackend",
-    "VarlenAttentionBackend",
-    "VisibleEndAttentionBackend",
     "merge_attention_states",
 ]
 
@@ -134,79 +126,298 @@ def _triton_merge_eligible(
     )
 
 
-@dataclass(frozen=True)
-class AttentionCapabilities:
-    # Whether the provider's runtime dependency is currently usable. Optional
-    # provider modules may still register an unavailable backend so explicit
-    # selection and diagnostics can name it, but dispatch must not route generic
-    # dense/paged attention through a backend whose kernel import failed.
+class AttentionBackend:
+    """Base class for attention implementations selected at worker startup."""
+
+    name = "attention"
     available: bool = True
-    paged_kv: bool = False
-    varlen_attention: bool = False
-    varlen_paged_kv: bool = False
-    # True when ``forward_varlen`` only supports paged KV cache inputs and must
-    # not be selected for contiguous q/k/v varlen prefill.
-    requires_paged_varlen: bool = False
-    visible_end: bool = False
-    segmented_attention: bool = False
-    segmented_attention_cuda_graph: bool = False
-    paged_block_size_multiple: int = 1
-    min_head_dim: int = 1
-    # The backend's paged-KV kernel only supports single-token decode (one query
-    # token per row), so it must not be dispatched for multi-token paged prefill.
-    # Backends whose paged kernel handles arbitrary query lengths leave this False.
-    paged_decode_only: bool = False
-    # The backend's paged-varlen prefill path can be captured directly in a CUDA
-    # graph because it consumes live tensor inputs and does not bake mutable host
-    # wrapper plan state that another request can later overwrite.
+    paged_varlen: bool = False
+    paged_varlen_only: bool = False
+    packed_cuda_graph: bool = False
     paged_varlen_cuda_graph: bool = False
-    # The backend's paged visible-end path consumes only live tensors and is
-    # safe to capture for mixed causal/bidirectional segment compositions.
-    visible_end_cuda_graph: bool = False
-    # (q, k, v) head-dim geometries the backend's kernel can run. Empty means the
-    # backend imposes no fixed-geometry restriction (the common case); a non-empty
-    # set declares the exact tuples a geometry-restricted kernel (e.g. fa4_cute's
-    # unified trunk path) accepts, so callers and the registry can pre-emptively
-    # avoid dispatching shapes the kernel would hard-reject. This is the single
-    # authoritative source for that table.
-    trunk_geometries: frozenset[tuple[int, int, int]] = field(default_factory=frozenset)
-    # Dense-forward constraints. ``cuda_only`` and ``min_cuda_capability`` also
-    # apply to every other regime; ``dense_ranks`` is the set of accepted q/k/v
-    # ndims for the contiguous dense path; ``accepts_dense_mask`` is whether
-    # ``DenseAttention.attn_mask`` may be non-None.
+    page_size_multiple: int = 1
+    min_head_dim: int = 1
+    single_token_decode: bool = False
+    head_geometries: frozenset[tuple[int, int, int]] = frozenset()
     cuda_only: bool = False
-    min_cuda_capability: tuple[int, int] | None = None
-    dense_ranks: frozenset[int] = field(default_factory=lambda: frozenset({3, 4}))
+    min_compute_version: tuple[int, int] | None = None
+    dense_ranks: frozenset[int] = frozenset({3, 4})
     accepts_dense_mask: bool = False
 
-    def supports_trunk_geometry(self, q_head_dim: int, k_head_dim: int, v_head_dim: int) -> bool:
-        """Whether the backend kernel accepts this exact ``(q, k, v)`` geometry.
-
-        An empty :attr:`trunk_geometries` means the backend is not
-        geometry-restricted and accepts any shape it is otherwise capable of.
-        """
-        if not self.trunk_geometries:
+    def supports_head_geometry(
+        self, q_head_dim: int, k_head_dim: int, v_head_dim: int
+    ) -> bool:
+        if not self.head_geometries:
             return True
-        return (int(q_head_dim), int(k_head_dim), int(v_head_dim)) in self.trunk_geometries
+        return (int(q_head_dim), int(k_head_dim), int(v_head_dim)) in self.head_geometries
 
+    def supports(self, mode: AttentionMode, *, cuda_graph: bool = False) -> bool:
+        if not self.available:
+            return False
+        implementation = type(self)
+        if mode is AttentionMode.DENSE:
+            supported = bool(self.dense_ranks) and implementation.forward is not AttentionBackend.forward
+        elif mode is AttentionMode.PAGED_DECODE:
+            supported = implementation.forward_paged is not AttentionBackend.forward_paged
+        elif mode is AttentionMode.PAGED_VARLEN:
+            supported = self.paged_varlen and implementation.forward_varlen is not AttentionBackend.forward_varlen
+        elif mode is AttentionMode.PACKED:
+            supported = implementation.forward_segmented is not AttentionBackend.forward_segmented
+        else:
+            supported = False
+        if not supported or not cuda_graph:
+            return supported
+        if mode is AttentionMode.PACKED:
+            return self.packed_cuda_graph
+        if mode is AttentionMode.PAGED_VARLEN:
+            return self.paged_varlen_cuda_graph or (
+                callable(getattr(self, "bind_paged_prefill_graph_wrapper", None))
+                and callable(getattr(self, "prepare_paged_prefill_cuda_graph", None))
+            )
+        return True
 
-class AttentionBackend(Protocol):
-    """Universal attention-backend contract.
+    def supports_varlen(self) -> bool:
+        return (
+            self.available
+            and not self.paged_varlen_only
+            and type(self).forward_varlen is not AttentionBackend.forward_varlen
+        )
 
-    Only the members declared here are mandatory for *every* registered
-    backend. The paged- and
-    varlen-specific entry points are intentionally *not* part of this base
-    Protocol because they are optional and capability-gated: a backend
-    implements ``forward_paged`` only when it advertises
-    ``capabilities().paged_kv`` and ``forward_varlen`` only when it advertises
-    ``capabilities().varlen_attention``. Callers must narrow via the
-    corresponding capability flag (or the ``PagedAttentionBackend`` /
-    ``VarlenAttentionBackend`` Protocols below) before invoking those methods.
-    """
+    def can_bind(
+        self,
+        mode: AttentionMode,
+        *,
+        head_dim: int,
+        block_size: int,
+        device: torch.device,
+        cuda_graph: bool = False,
+    ) -> bool:
+        if not self.supports(mode, cuda_graph=cuda_graph):
+            return False
+        return self._bind_geometry_supported(head_dim, block_size, device)
 
-    name: str
+    def can_bind_varlen(
+        self,
+        *,
+        head_dim: int,
+        block_size: int,
+        device: torch.device,
+    ) -> bool:
+        if not self.supports_varlen():
+            return False
+        return self._bind_geometry_supported(head_dim, block_size, device)
 
-    def capabilities(self) -> AttentionCapabilities: ...
+    def _bind_geometry_supported(
+        self, head_dim: int, block_size: int, device: torch.device
+    ) -> bool:
+        if int(head_dim) < int(self.min_head_dim):
+            return False
+        if not self.supports_head_geometry(head_dim, head_dim, head_dim):
+            return False
+        if int(block_size) % max(1, int(self.page_size_multiple)) != 0:
+            return False
+        if self.cuda_only and device.type != "cuda":
+            return False
+        if self.min_compute_version is not None:
+            if device.type != "cuda":
+                return False
+            if torch.cuda.get_device_capability(device) < self.min_compute_version:
+                return False
+        return True
+
+    def can_run(self, req: object) -> bool:
+        from ...ops.requests import (
+            DenseAttention,
+            PagedDecodeAttention,
+            VarlenAttention,
+            VisibleEndAttention,
+        )
+
+        q = getattr(req, "q", None)
+        if not self.available or not isinstance(q, torch.Tensor) or not self._device_supported(q):
+            return False
+        if int(q.shape[-1]) < int(self.min_head_dim):
+            return False
+        k_dim, v_dim = self._kv_dims(req)
+        if not self.supports_head_geometry(int(q.shape[-1]), k_dim, v_dim):
+            return False
+        if isinstance(req, VisibleEndAttention):
+            if req.prefix_k is not None:
+                return (
+                    self.supports(AttentionMode.PACKED)
+                    and (
+                        not bool(getattr(req.ctx, "cuda_graph_capture", False))
+                        or self.packed_cuda_graph
+                    )
+                    and self._paged_storage_supported(req)
+                )
+            return type(self).forward_visible_end is not AttentionBackend.forward_visible_end
+        if isinstance(req, VarlenAttention):
+            if req.block_table is not None:
+                return self.supports(AttentionMode.PAGED_VARLEN) and self._paged_storage_supported(req)
+            return self.supports_varlen()
+        if isinstance(req, PagedDecodeAttention):
+            if self.single_token_decode and not self._is_one_token_decode(req):
+                return False
+            return (
+                self.supports(AttentionMode.PAGED_DECODE)
+                and self._paged_storage_supported(req)
+            )
+        if not isinstance(req, DenseAttention):
+            return False
+        if not self.supports(AttentionMode.DENSE):
+            return False
+        if self.single_token_decode or (req.attn_mask is not None and not self.accepts_dense_mask):
+            return False
+        if req.q.ndim != req.k.ndim or req.q.ndim != req.v.ndim:
+            return False
+        return int(req.q.ndim) in self.dense_ranks
+
+    def run(self, req: object) -> torch.Tensor:
+        from ...ops.requests import (
+            DenseAttention,
+            PagedDecodeAttention,
+            VarlenAttention,
+            VisibleEndAttention,
+        )
+
+        if not self.can_run(req):
+            raise RuntimeError(f"bound attention backend {self.name!r} rejects the request geometry")
+        if isinstance(req, VisibleEndAttention) and req.prefix_k is not None:
+            if (
+                req.prefix_v is None
+                or req.prefix_lens is None
+                or req.cu_seqlens_q is None
+                or req.page_table is None
+            ):
+                raise ValueError("segmented attention metadata is incomplete")
+            return self.forward_segmented(
+                req.q,
+                req.k,
+                req.v,
+                req.prefix_k,
+                req.prefix_v,
+                page_table=req.page_table,
+                prefix_lens=req.prefix_lens,
+                cu_seqlens_q=req.cu_seqlens_q,
+                visible_current_end=req.visible_end,
+                scale=req.scale,
+                fully_visible_current=req.fully_visible,
+                context=req.ctx,
+            )
+        if isinstance(req, VisibleEndAttention):
+            return self.forward_visible_end(
+                req.q,
+                req.k,
+                req.v,
+                visible_end=req.visible_end,
+                cu_seqlens_q=req.cu_seqlens_q,
+                cu_seqlens_k=req.cu_seqlens_k,
+                page_table=req.page_table,
+                seqused_k=req.seqused_k,
+                max_seqlen_q=req.max_seqlen_q,
+                max_seqlen_k=req.max_seqlen_k,
+                scale=req.scale,
+                use_prefix_bounds=req.use_prefix_bounds,
+                fully_visible=req.fully_visible,
+                context=req.ctx,
+            )
+        if isinstance(req, VarlenAttention):
+            return self.forward_varlen(
+                req.q,
+                req.k,
+                req.v,
+                cu_seqlens_q=req.cu_seqlens_q,
+                cu_seqlens_k=req.cu_seqlens_k,
+                max_seqlen_q=int(req.max_seqlen_q),
+                max_seqlen_k=int(req.max_seqlen_k),
+                causal=req.causal,
+                scale=req.scale,
+                block_table=req.block_table,
+                context=req.ctx,
+            )
+        if isinstance(req, PagedDecodeAttention):
+            return self.forward_paged(
+                req.q,
+                req.k,
+                req.v,
+                block_table=req.block_table,
+                cache_seqlens=req.cache_seqlens,
+                k=req.current_k,
+                v=req.current_v,
+                causal=req.causal,
+                scale=req.scale,
+                context=req.ctx,
+            )
+        if not isinstance(req, DenseAttention):
+            raise TypeError(f"unsupported attention request {type(req).__name__}")
+        return self.forward(
+            req.q,
+            req.k,
+            req.v,
+            causal=req.causal,
+            scale=req.scale,
+            attn_mask=req.attn_mask,
+            context=req.ctx,
+        )
+
+    def _device_supported(self, tensor: torch.Tensor) -> bool:
+        if self.cuda_only and tensor.device.type != "cuda":
+            return False
+        if self.min_compute_version is None:
+            return True
+        return tensor.device.type == "cuda" and (
+            torch.cuda.get_device_capability(tensor.device) >= self.min_compute_version
+        )
+
+    def _paged_storage_supported(self, req: object) -> bool:
+        from ...ops.requests import VisibleEndAttention
+
+        kv_cache = getattr(req, "kv_cache", None)
+        view_block_size = getattr(kv_cache, "block_size", None)
+        block_table = getattr(req, "block_table", None)
+        if view_block_size is not None:
+            if not bool(getattr(kv_cache, "supports_paged_attention_storage", True)):
+                return False
+            block_size = int(view_block_size or 0)
+        elif block_table is not None:
+            paged_k = (
+                req.prefix_k
+                if isinstance(req, VisibleEndAttention) and req.prefix_k is not None
+                else getattr(req, "k", None)
+            )
+            if not isinstance(paged_k, torch.Tensor) or paged_k.ndim != 4:
+                return False
+            block_size = int(paged_k.shape[1])
+        else:
+            return True
+        return block_size > 0 and block_size % max(1, int(self.page_size_multiple)) == 0
+
+    @staticmethod
+    def _kv_dims(req: object) -> tuple[int, int]:
+        from ...ops.requests import PagedDecodeAttention, VisibleEndAttention
+
+        if isinstance(req, VisibleEndAttention) and req.prefix_k is not None and req.prefix_v is not None:
+            return int(req.prefix_k.shape[-1]), int(req.prefix_v.shape[-1])
+        if isinstance(req, PagedDecodeAttention):
+            k = req.current_k if req.current_k is not None else req.k
+            v = req.current_v if req.current_v is not None else req.v
+            return int(k.shape[-1]), int(v.shape[-1])
+        return int(getattr(req, "k").shape[-1]), int(getattr(req, "v").shape[-1])
+
+    @staticmethod
+    def _is_one_token_decode(req: object) -> bool:
+        from ...ops.requests import PagedDecodeAttention
+
+        if not isinstance(req, PagedDecodeAttention):
+            return False
+        if req.q.ndim == 3:
+            plan = req.ctx
+            query_lens = getattr(plan, "query_lens_cpu", ()) or ()
+            if getattr(plan, "forward_mode", None) is AttentionMode.PAGED_DECODE and len(query_lens) == int(req.q.shape[0]):
+                return all(int(length) == 1 for length in query_lens)
+            return int(req.q.shape[0]) == 1
+        return req.q.ndim == 4 and int(req.q.shape[2]) == 1
 
     def forward(
         self,
@@ -218,16 +429,8 @@ class AttentionBackend(Protocol):
         scale: float,
         attn_mask: torch.Tensor | None = None,
         context: ForwardBatch | None = None,
-    ) -> torch.Tensor: ...
-
-
-class PagedAttentionBackend(AttentionBackend, Protocol):
-    """Backends that support paged KV decode.
-
-    Implemented only by backends reporting ``capabilities().paged_kv`` (e.g.
-    ``flash_attn``, ``fa4_cute``, ``flashinfer``, ``sgl_kernel``). ``paged_kv``
-    being ``True`` is the precondition for calling ``forward_paged``.
-    """
+    ) -> torch.Tensor:
+        raise NotImplementedError
 
     def forward_paged(
         self,
@@ -242,16 +445,8 @@ class PagedAttentionBackend(AttentionBackend, Protocol):
         causal: bool,
         scale: float,
         context: ForwardBatch | None = None,
-    ) -> torch.Tensor: ...
-
-
-class VarlenAttentionBackend(AttentionBackend, Protocol):
-    """Backends that support variable-length (cu_seqlens) prefill.
-
-    Implemented only by backends reporting ``capabilities().varlen_attention``
-    ``varlen_attention`` being ``True`` is the precondition for calling
-    ``forward_varlen``.
-    """
+    ) -> torch.Tensor:
+        raise NotImplementedError
 
     def forward_varlen(
         self,
@@ -267,18 +462,8 @@ class VarlenAttentionBackend(AttentionBackend, Protocol):
         scale: float,
         block_table: torch.Tensor | None = None,
         context: ForwardBatch | None = None,
-    ) -> torch.Tensor: ...
-
-
-class VisibleEndAttentionBackend(AttentionBackend, Protocol):
-    """Backends that support the hybrid ``visible_end`` mask path.
-
-    Implemented only by backends reporting ``capabilities().visible_end``.
-    Callers must check the capability before invoking ``forward_visible_end``.
-
-    ``q`` may be fixed ``[B, L, H, D]`` or varlen ``[total, H, D]``;
-    ``visible_end`` is padded ``[B, max_q]`` and indexed locally per sequence.
-    """
+    ) -> torch.Tensor:
+        raise NotImplementedError
 
     def forward_visible_end(
         self,
@@ -297,11 +482,8 @@ class VisibleEndAttentionBackend(AttentionBackend, Protocol):
         use_prefix_bounds: bool = False,
         fully_visible: bool = False,
         context: ForwardBatch | None = None,
-    ) -> torch.Tensor: ...
-
-
-class SegmentedAttentionBackend(AttentionBackend, Protocol):
-    """Backends that compose paged-prefix and dense-current attention state."""
+    ) -> torch.Tensor:
+        raise NotImplementedError
 
     def forward_segmented(
         self,
@@ -318,4 +500,5 @@ class SegmentedAttentionBackend(AttentionBackend, Protocol):
         scale: float,
         fully_visible_current: bool,
         context: ForwardBatch | None = None,
-    ) -> torch.Tensor: ...
+    ) -> torch.Tensor:
+        raise NotImplementedError

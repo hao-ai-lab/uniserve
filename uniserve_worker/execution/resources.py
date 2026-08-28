@@ -10,6 +10,7 @@ from typing import Any
 
 import torch
 
+from uniserve_worker.capabilities import GraphBucket
 from uniserve_worker.execution.batch import (
     DevicePoint,
     FixedPoint,
@@ -19,7 +20,6 @@ from uniserve_worker.execution.batch import (
     ProductRef,
     RequestKey,
 )
-from uniserve_worker.capabilities import GraphBucket
 from uniserve_worker.execution.forward_batch import AttentionSelection, ModelPhase
 from uniserve_worker.execution.model_runner import ForwardResult, ModelRunner
 from uniserve_worker.execution.rows import (
@@ -36,7 +36,7 @@ from uniserve_worker.models.inputs import ImageProcessor
 from uniserve_worker.models.minimax_h3 import MiniMaxH3Model
 from uniserve_worker.models.minimax_h3.execution import H3MuxCoordinator, H3OutputRing
 from uniserve_worker.models.runtime import ExecutionModel, WorkerDeployment
-from uniserve_worker.nn.mesh import BroadcastTransport, DeviceMesh
+from uniserve_worker.nn.mesh import DeviceMesh
 from uniserve_worker.runtime.cache_pool import CachePool
 from uniserve_worker.runtime.device_events import DeviceEventPool
 from uniserve_worker.runtime.device_products import DeviceProductRead, DeviceProducts
@@ -251,8 +251,6 @@ class ExecutionResources:
         if self.mesh.tp_size <= 1:
             return value
         transport = self.mesh.transport("tp")
-        if not isinstance(transport, BroadcastTransport):
-            raise RuntimeError("designated-rank sampling requires TP broadcast transport")
         return transport.broadcast(value, src=0)
 
     def run_observed_forward_group(

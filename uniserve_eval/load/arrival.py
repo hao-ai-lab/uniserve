@@ -6,20 +6,17 @@ import asyncio
 import time
 from collections.abc import AsyncGenerator, Callable, Coroutine
 from dataclasses import dataclass
-from typing import Any, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import numpy as np
 
 from ..types import Example
 
+if TYPE_CHECKING:
+    from ..nsys import NsysCapture
+
 T = TypeVar("T")
 Submit = Callable[[Example, float | None], Coroutine[Any, Any, T]]
-
-
-class MeasurementWindow(Protocol):
-    def start(self) -> None: ...
-
-    def stop(self) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -60,7 +57,7 @@ async def run_load(
     max_concurrency: int | None,
     submit: Submit[T],
     warmup_requests: int = 1,
-    measurement: MeasurementWindow | None = None,
+    measurement: NsysCapture | None = None,
 ) -> LoadResult:
     if not rows:
         return LoadResult((), (), 0.0)

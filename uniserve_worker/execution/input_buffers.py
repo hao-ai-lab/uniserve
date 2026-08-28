@@ -10,12 +10,10 @@ from uniserve_worker.runtime.device import HostStagingRing, fill_cpu_bools, fill
 from .forward_batch import (
     AttentionMode,
     EmptyMeshView,
-    EmptyOutputView,
     FlowPatches,
     ForwardBatch,
     MeshView,
     ModelPhase,
-    OutputView,
     TokenSelection,
     packed_tensor_views,
 )
@@ -142,8 +140,7 @@ class InputBuffers:
         decode_heights: tuple[int, ...] = (),
         decode_widths: tuple[int, ...] = (),
         attention: dict[str, object],
-        mesh: MeshView | EmptyMeshView = EmptyMeshView(),
-        output: OutputView | EmptyOutputView = EmptyOutputView(),
+        mesh: MeshView = EmptyMeshView(),
     ) -> ForwardBatch:
         if row_count < 1 or row_count > self.max_rows:
             raise ValueError("forward row count exceeds input-buffer capacity")
@@ -196,7 +193,6 @@ class InputBuffers:
                 token_selections=token_selections,
                 attention=attention,
                 mesh=mesh,
-                output=output,
             )
         self._scrub(
             attention["forward_mode"],
@@ -370,7 +366,6 @@ class InputBuffers:
             decode_heights=decode_heights,
             decode_widths=decode_widths,
             mesh=mesh,
-            output=output,
         )
 
     def _stage_request_indexed_decode(
@@ -387,8 +382,7 @@ class InputBuffers:
         token_positions: tuple[torch.Tensor, ...],
         token_selections: tuple[TokenSelection, ...],
         attention: dict[str, object],
-        mesh: MeshView | EmptyMeshView,
-        output: OutputView | EmptyOutputView,
+        mesh: MeshView,
     ) -> ForwardBatch:
         if (
             token_row_indices != tuple(range(row_count))
@@ -472,7 +466,6 @@ class InputBuffers:
             positions=self.positions[0, :row_count],
             token_selections=token_selections,
             mesh=mesh,
-            output=output,
         )
 
     def stage_attention(self, attention: dict[str, object]) -> dict[str, object]:

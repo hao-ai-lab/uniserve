@@ -18,7 +18,6 @@ from uniserve_worker.execution.cuda_graph import (
     GraphGreedyOutput,
 )
 from uniserve_worker.execution.forward_batch import (
-    EmptyMeshView,
     ForwardBatch,
     ForwardOutput,
     MeshView,
@@ -254,7 +253,7 @@ class ModelRunner:
         *,
         device: torch.device | str,
         attention: dict[str, object],
-        mesh: MeshView | EmptyMeshView,
+        mesh: MeshView,
         graph_shape: tuple[object, ...],
         graph_eligible: bool,
         domain: Domain,

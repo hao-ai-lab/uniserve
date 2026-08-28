@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
-
 import torch
 from torch import nn
 
 import uniserve_worker.ops as ops
 
-from ..backends.attention.base import AttentionBackend, AttentionCapabilities
+from ..backends.attention.base import AttentionBackend
 from ..execution.forward_batch import AttentionMode, AttentionSelection, ForwardBatch
 from ..runtime.cache_pool import CachePool
 
@@ -41,47 +39,54 @@ class RadixAttention(nn.Module):
     def bind(self, cache_pool: CachePool, selection: AttentionSelection) -> None:
         self._cache_pool = cache_pool
         self._selection = selection
-        common = dict(
-            head_dim=self.head_dim,
-            block_size=cache_pool.block_size,
-            device=cache_pool.k.device,
-        )
         candidates = {
             AttentionMode.DENSE: _select_provider(
                 selection,
-                lambda caps: bool(caps.dense_ranks),
-                **common,
+                AttentionMode.DENSE,
+                head_dim=self.head_dim,
+                block_size=cache_pool.block_size,
+                device=cache_pool.k.device,
             ),
             AttentionMode.PAGED_DECODE: _select_provider(
                 selection,
-                lambda caps: caps.paged_kv,
-                **common,
+                AttentionMode.PAGED_DECODE,
+                head_dim=self.head_dim,
+                block_size=cache_pool.block_size,
+                device=cache_pool.k.device,
             ),
             AttentionMode.PAGED_VARLEN: _select_provider(
                 selection,
-                lambda caps: caps.varlen_attention and caps.varlen_paged_kv,
-                **common,
+                AttentionMode.PAGED_VARLEN,
+                head_dim=self.head_dim,
+                block_size=cache_pool.block_size,
+                device=cache_pool.k.device,
             ),
             AttentionMode.PACKED: (
                 _select_provider(
                     selection,
-                    lambda caps: caps.segmented_attention and caps.segmented_attention_cuda_graph,
-                    **common,
+                    AttentionMode.PACKED,
+                    cuda_graph=True,
+                    head_dim=self.head_dim,
+                    block_size=cache_pool.block_size,
+                    device=cache_pool.k.device,
                 )
                 or _select_provider(
                     selection,
-                    lambda caps: caps.segmented_attention,
-                    **common,
+                    AttentionMode.PACKED,
+                    head_dim=self.head_dim,
+                    block_size=cache_pool.block_size,
+                    device=cache_pool.k.device,
                 )
             ),
         }
         self._providers = {
             mode: provider for mode, provider in candidates.items() if provider is not None
         }
-        self._varlen_provider = _select_provider(
+        self._varlen_provider = _select_varlen_provider(
             selection,
-            lambda caps: caps.varlen_attention and not caps.requires_paged_varlen,
-            **common,
+            head_dim=self.head_dim,
+            block_size=cache_pool.block_size,
+            device=cache_pool.k.device,
         )
 
     @property
@@ -254,32 +259,39 @@ class RadixAttention(nn.Module):
 
 def _select_provider(
     selection: AttentionSelection,
-    supports: Callable[[AttentionCapabilities], bool],
+    mode: AttentionMode,
+    *,
+    head_dim: int,
+    block_size: int,
+    device: torch.device,
+    cuda_graph: bool = False,
+) -> AttentionBackend | None:
+    for provider in selection.providers:
+        if provider.can_bind(
+            mode,
+            head_dim=head_dim,
+            block_size=block_size,
+            device=device,
+            cuda_graph=cuda_graph,
+        ):
+            return provider
+    return None
+
+
+def _select_varlen_provider(
+    selection: AttentionSelection,
     *,
     head_dim: int,
     block_size: int,
     device: torch.device,
 ) -> AttentionBackend | None:
     for provider in selection.providers:
-        capabilities = provider.capabilities()
-        if not capabilities.available or not supports(capabilities):
-            continue
-        if head_dim < int(capabilities.min_head_dim):
-            continue
-        if not capabilities.supports_trunk_geometry(head_dim, head_dim, head_dim):
-            continue
-        multiple = max(1, int(capabilities.paged_block_size_multiple))
-        if block_size % multiple != 0:
-            continue
-        if capabilities.cuda_only and device.type != "cuda":
-            continue
-        minimum = capabilities.min_cuda_capability
-        if minimum is not None:
-            if device.type != "cuda":
-                continue
-            if torch.cuda.get_device_capability(device) < minimum:
-                continue
-        return provider
+        if provider.can_bind_varlen(
+            head_dim=head_dim,
+            block_size=block_size,
+            device=device,
+        ):
+            return provider
     return None
 
 

@@ -890,10 +890,7 @@ def _batch_tensor_signature(batch: ForwardBatch) -> tuple[object, ...]:
 
 
 def _owner_signature(batch: ForwardBatch) -> tuple[object, ...]:
-    return (
-        type(batch.mesh).__qualname__,
-        type(batch.output).__qualname__,
-    )
+    return (type(batch.mesh).__qualname__,)
 
 
 def _direct_key(key: Hashable) -> tuple[object, ...]:
@@ -1055,28 +1052,8 @@ def _copy_into_leaves(
 
 def _graph_provider(selection: AttentionSelection, mode: AttentionMode):
     for provider in selection.providers:
-        capabilities = provider.capabilities()
-        available = capabilities.available
-        if mode is AttentionMode.PACKED:
-            capable = capabilities.segmented_attention
-            safe = capabilities.segmented_attention_cuda_graph
-        elif mode is AttentionMode.PAGED_VARLEN:
-            capable = capabilities.varlen_attention and capabilities.varlen_paged_kv
-            safe = capabilities.paged_varlen_cuda_graph or (
-                callable(getattr(provider, "bind_paged_prefill_graph_wrapper", None))
-                and callable(getattr(provider, "prepare_paged_prefill_cuda_graph", None))
-            )
-        elif mode is AttentionMode.PAGED_DECODE:
-            capable = capabilities.paged_kv
-            safe = capabilities.paged_kv
-        else:
-            capable = bool(capabilities.dense_ranks)
-            safe = True
-        if not available or not capable:
-            continue
-        if not safe:
-            continue
-        return provider
+        if provider.supports(mode, cuda_graph=True):
+            return provider
     raise _GraphMiss("no provisioned attention provider is graph-safe")
 
 

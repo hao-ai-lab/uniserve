@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import torch
 
-from ...execution.forward_batch import ForwardBatch
-from .base import AttentionCapabilities
+from ...execution.forward_batch import AttentionMode, ForwardBatch
+from .base import AttentionBackend
 
 __all__ = [
     "SglKernelAttentionBackend",
@@ -26,21 +26,24 @@ except Exception:  # pragma: no cover
     _flash_attn_with_kvcache = None
 
 
-class SglKernelAttentionBackend:
+class SglKernelAttentionBackend(AttentionBackend):
     name = "sgl_kernel"
+    available = any(
+        value is not None for value in (_flash_attn_varlen_func, _flash_attn_with_kvcache)
+    )
+    page_size_multiple = 256
+    cuda_only = True
+    dense_ranks = frozenset({3, 4})
 
-    def capabilities(self) -> AttentionCapabilities:
-        return AttentionCapabilities(
-            available=any(
-                value is not None for value in (_flash_attn_varlen_func, _flash_attn_with_kvcache)
-            ),
-            paged_kv=_flash_attn_with_kvcache is not None,
-            varlen_attention=_flash_attn_varlen_func is not None,
-            varlen_paged_kv=False,
-            paged_block_size_multiple=256,
-            cuda_only=True,
-            dense_ranks=frozenset({3, 4}),
-        )
+    def supports(self, mode: AttentionMode, *, cuda_graph: bool = False) -> bool:
+        if mode is AttentionMode.DENSE and _flash_attn_varlen_func is None:
+            return False
+        if mode is AttentionMode.PAGED_DECODE and _flash_attn_with_kvcache is None:
+            return False
+        return super().supports(mode, cuda_graph=cuda_graph)
+
+    def supports_varlen(self) -> bool:
+        return _flash_attn_varlen_func is not None and super().supports_varlen()
 
     def forward(
         self,
@@ -125,7 +128,7 @@ class SglKernelAttentionBackend:
             raise RuntimeError("sgl_kernel paged KV attention backend is not available")
         if k_cache.shape != v_cache.shape or k_cache.ndim != 4:
             raise ValueError("sgl_kernel paged cache expects k/v [pages, page, heads, dim]")
-        mult = self.capabilities().paged_block_size_multiple
+        mult = self.page_size_multiple
         if int(k_cache.shape[1]) % mult != 0:
             raise RuntimeError(f"sgl_kernel paged KV requires a {mult}-multiple page size")
 

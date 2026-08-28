@@ -11,8 +11,8 @@ __all__ = [
     "FlashInferAttentionBackend",
 ]
 
-from ...execution.forward_batch import ForwardBatch
-from .base import AttentionCapabilities
+from ...execution.forward_batch import AttentionMode, ForwardBatch
+from .base import AttentionBackend
 from .flashinfer_kernels import (
     _decode_effective_seqlens,
     _fill_paged_decode_plan_tensors,
@@ -28,11 +28,8 @@ from .flashinfer_plan import (
     _DecodePlanTensors,
     _indptr_last,
     _PlanCache,
-    _PlanStats,
     _prefill_plan_key,
     _PrefillPlanTensors,
-    _record_decode_plan_stats,
-    _record_prefill_plan_stats,
     _weakref_or_none,
 )
 from .flashinfer_pool import WrapperKey, _WrapperPool
@@ -93,44 +90,35 @@ class _DecodeGraphPlanInputs(NamedTuple):
     wrapper: Any
 
 
-class FlashInferAttentionBackend(_WrapperPool):
+class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
     """Paged decode and varlen prefill via FlashInfer wrappers."""
 
     name = "flashinfer"
+    available = _flashinfer is not None
+    paged_varlen = _BatchPrefillWithPagedKVCacheWrapper is not None
+    paged_varlen_only = True
+    min_head_dim = 64
+    single_token_decode = True
+    cuda_only = True
+    dense_ranks = frozenset({3})
+
+    def supports(self, mode: AttentionMode, *, cuda_graph: bool = False) -> bool:
+        if mode is AttentionMode.PAGED_DECODE and _BatchDecodeWithPagedKVCacheWrapper is None:
+            return False
+        if mode is AttentionMode.PAGED_VARLEN and _BatchPrefillWithPagedKVCacheWrapper is None:
+            return False
+        if mode is AttentionMode.PACKED and (
+            _BatchPrefillWithPagedKVCacheWrapper is None
+            or _single_prefill_return_lse is None
+            or _merge_state is None
+        ):
+            return False
+        return super().supports(mode, cuda_graph=cuda_graph)
 
     def __init__(self, *, tuning: FlashInferTuningConfig) -> None:
         super().__init__(tuning=tuning)
-        self._decode_plan_cache = _PlanCache(
-            lambda stats, *, planned, graph, rows, indices: _record_decode_plan_stats(
-                stats, planned=planned, graph=graph, rows=rows, indices=indices
-            )
-        )
-        self._prefill_plan_cache = _PlanCache(
-            lambda stats, *, planned, graph, rows, indices: _record_prefill_plan_stats(
-                stats, planned=planned, rows=rows, indices=indices
-            )
-        )
-
-    def capabilities(self) -> AttentionCapabilities:
-        has_paged_decode = _BatchDecodeWithPagedKVCacheWrapper is not None
-        has_paged_prefill = _BatchPrefillWithPagedKVCacheWrapper is not None
-        return AttentionCapabilities(
-            available=_flashinfer is not None,
-            paged_kv=has_paged_decode,
-            varlen_attention=has_paged_prefill,
-            varlen_paged_kv=has_paged_prefill,
-            requires_paged_varlen=True,
-            paged_block_size_multiple=1,
-            min_head_dim=64,
-            paged_decode_only=True,
-            segmented_attention=(
-                has_paged_prefill
-                and _single_prefill_return_lse is not None
-                and _merge_state is not None
-            ),
-            cuda_only=True,
-            dense_ranks=frozenset({3}),
-        )
+        self._decode_plan_cache = _PlanCache()
+        self._prefill_plan_cache = _PlanCache()
 
     def forward(
         self,
@@ -225,8 +213,6 @@ class FlashInferAttentionBackend(_WrapperPool):
             wrapper_key=wrapper_key,
             plan_key=plan_key,
             binding=binding,
-            stats=None,
-            rows=int(q_bhd.shape[0]),
             build=build,
         )
 
@@ -410,8 +396,6 @@ class FlashInferAttentionBackend(_WrapperPool):
             wrapper_key=wrapper_key,
             plan_key=plan_key,
             binding=binding,
-            stats=None,
-            rows=inputs.batch_size,
             build=build,
         )
 
@@ -674,7 +658,6 @@ class FlashInferAttentionBackend(_WrapperPool):
         kv_dtype: torch.dtype,
         causal: bool,
         scale: float | None = None,
-        stats: _PlanStats | None = None,
     ) -> None:
         """Refresh a graph-scoped paged-prefill wrapper from live side-table tensors."""
 
@@ -730,12 +713,6 @@ class FlashInferAttentionBackend(_WrapperPool):
             causal=bool(causal),
             scale=scale,
         )
-        _record_prefill_plan_stats(
-            stats,
-            planned=True,
-            rows=batch_size,
-            indices=plan_tensors.index_count,
-        )
 
     def prepare_paged_decode_cuda_graph(
         self,
@@ -751,7 +728,6 @@ class FlashInferAttentionBackend(_WrapperPool):
         q_dtype: torch.dtype,
         kv_dtype: torch.dtype,
         scale: float | None = None,
-        stats: _PlanStats | None = None,
     ) -> None:
         if _BatchDecodeWithPagedKVCacheWrapper is None:
             raise RuntimeError("flashinfer paged decode wrapper is not available")
@@ -773,7 +749,6 @@ class FlashInferAttentionBackend(_WrapperPool):
             page_size=int(page_size),
             batch_size=int(batch_size),
             cpu_indptr=inputs.cpu_indptr,
-            stats=stats,
         )
         plan_key = self._decode_graph_plan_key(
             binding,
@@ -924,7 +899,6 @@ class FlashInferAttentionBackend(_WrapperPool):
         page_size: int,
         batch_size: int,
         cpu_indptr: torch.Tensor,
-        stats: _PlanStats | None,
     ) -> _DecodePlanTensors:
         plan = self._decode_plan_tensors(
             wrapper_key,
@@ -932,13 +906,6 @@ class FlashInferAttentionBackend(_WrapperPool):
             effective_seqlens,
             int(page_size),
             index_count=_indptr_last(cpu_indptr),
-        )
-        _record_decode_plan_stats(
-            stats,
-            planned=True,
-            graph=True,
-            rows=int(batch_size),
-            indices=plan.index_count,
         )
         return plan
 

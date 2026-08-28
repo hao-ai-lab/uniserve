@@ -7,7 +7,7 @@ from typing import Any, NamedTuple
 import torch
 
 from ...execution.forward_batch import ForwardBatch
-from .base import AttentionCapabilities
+from .base import AttentionBackend
 from .flashinfer_kernels import _decode_effective_seqlens, _write_decode_token
 from .layout import QKVLayout, normalize_kv, normalize_to
 from .tuning import FlashInferTuningConfig
@@ -46,31 +46,23 @@ class _VarlenPrefillInputs(NamedTuple):
     batch_size: int
 
 
-class TRTLLMMHAAttentionBackend:
+class TRTLLMMHAAttentionBackend(AttentionBackend):
     """Paged decode and varlen prefill through FlashInfer TRT-LLM MHA kernels."""
 
     name = "trtllm_mha"
+    available = _trtllm_decode is not None and _trtllm_context is not None
+    paged_varlen = available
+    paged_varlen_only = True
+    min_head_dim = 64
+    single_token_decode = True
+    paged_varlen_cuda_graph = available
+    cuda_only = True
+    min_compute_version = (10, 0)
+    dense_ranks = frozenset()
 
     def __init__(self, *, tuning: FlashInferTuningConfig) -> None:
         self._workspaces: dict[torch.device, torch.Tensor] = {}
         self._workspace_size = int(tuning.workspace_size)
-
-    def capabilities(self) -> AttentionCapabilities:
-        available = _trtllm_decode is not None and _trtllm_context is not None
-        return AttentionCapabilities(
-            available=available,
-            paged_kv=available,
-            varlen_attention=available,
-            varlen_paged_kv=available,
-            requires_paged_varlen=True,
-            paged_block_size_multiple=1,
-            min_head_dim=64,
-            paged_decode_only=True,
-            paged_varlen_cuda_graph=available,
-            cuda_only=True,
-            min_cuda_capability=(10, 0),
-            dense_ranks=frozenset(),
-        )
 
     def forward(
         self,

@@ -11,15 +11,15 @@ import time
 from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any
 
+from ..capabilities import RequestKind, ResponseKind
 from ..execution.batch import (
     Batch,
     CompletionReport,
     ForwardMode,
     PartitionCompletion,
 )
-from ..capabilities import RequestKind, ResponseKind
 from ..execution.rows import PreparedExecution
 from ..foundation.env import env_int, env_optional_int
 from ..foundation.errors import (
@@ -41,12 +41,14 @@ from .completion import (
 )
 from .profiler import WorkerProfiler, profile_range
 
+if TYPE_CHECKING:
+    from .ipc import WorkerIpcEndpoint
+
 __all__ = [
     "InflightStep",
     "PendingRequest",
     "PendingResponse",
     "TerminalStep",
-    "WorkerIpcTransport",
     "WorkerServer",
     "batch_identity",
     "dispatch",
@@ -56,20 +58,6 @@ logger = logging.getLogger(__name__)
 
 _OperationKey = tuple[int, int, int]
 _EpochKey = tuple[int, int]
-
-
-class WorkerIpcTransport(Protocol):
-    def recv(self) -> dict[str, Any]: ...
-
-    def try_recv(self) -> dict[str, Any] | None: ...
-
-    def respond(self, response: dict[str, Any]) -> None: ...
-
-    def wait_incoming(self, timeout_us: int) -> None: ...
-
-    def wake(self) -> None: ...
-
-    def wake_on_stream(self, stream: int) -> None: ...
 
 
 def _response(kind: ResponseKind, **payload: Any) -> dict[str, Any]:
@@ -607,7 +595,7 @@ class WorkerServer:
     def __init__(
         self,
         worker: Worker,
-        ipc_endpoint: WorkerIpcTransport | None,
+        ipc_endpoint: WorkerIpcEndpoint | None,
         *,
         step_cache_capacity: int | None = None,
     ) -> None:

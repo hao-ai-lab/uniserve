@@ -1,26 +1,12 @@
-"""Operator dispatch: one provider protocol and one selector."""
+"""Operator dispatch."""
 from __future__ import annotations
 
 import os
 import time
-from typing import Any, Callable, Generic, Protocol, TypeVar, runtime_checkable
+from typing import Any, Callable, Generic, TypeVar
 
 Req = TypeVar("Req")
 Res = TypeVar("Res")
-ProviderReq = TypeVar("ProviderReq", contravariant=True)
-ProviderRes = TypeVar("ProviderRes", covariant=True)
-
-
-@runtime_checkable
-class Provider(Protocol[ProviderReq, ProviderRes]):
-    name: str
-    operator: str
-
-    def can_run(self, req: ProviderReq) -> bool: ...
-
-    def run(self, req: ProviderReq) -> ProviderRes: ...
-
-    def launch_name(self, req: ProviderReq) -> str: ...
 
 
 class Operator:
@@ -34,6 +20,12 @@ class Operator:
         del req
         return self.name
 
+    def can_run(self, req: Any) -> bool:
+        raise NotImplementedError
+
+    def run(self, req: Any) -> Any:
+        raise NotImplementedError
+
 
 class Dispatcher(Generic[Req, Res]):
     """Run the first eligible provider for one operator.
@@ -45,7 +37,7 @@ class Dispatcher(Generic[Req, Res]):
     def __init__(
         self,
         operator: str,
-        providers: list[Provider[Req, Res]],
+        providers: list[Operator],
         *,
         env_override: str | None = None,
         signature: Callable[[Req], Any] | None = None,
@@ -64,7 +56,7 @@ class Dispatcher(Generic[Req, Res]):
     def provider_names(self) -> tuple[str, ...]:
         return tuple(provider.name for provider in self._providers)
 
-    def ordered(self, override: str | None = None) -> tuple[Provider[Req, Res], ...]:
+    def ordered(self, override: str | None = None) -> tuple[Operator, ...]:
         return tuple(self._ordered(override))
 
     def _resolve_override(self, override: str | None) -> str | None:
@@ -78,7 +70,7 @@ class Dispatcher(Generic[Req, Res]):
             return None
         return selected
 
-    def _ordered(self, override: str | None) -> list[Provider[Req, Res]]:
+    def _ordered(self, override: str | None) -> list[Operator]:
         selected = self._resolve_override(override)
         if selected is None:
             return list(self._providers)
@@ -91,7 +83,7 @@ class Dispatcher(Generic[Req, Res]):
             )
         return [match, *[provider for provider in self._providers if provider is not match]]
 
-    def _observe(self, provider: Provider[Req, Res], req: Req) -> Res:
+    def _observe(self, provider: Operator, req: Req) -> Res:
         stats = getattr(req, "stats", None)
         if stats is None:
             ctx = getattr(req, "ctx", None)

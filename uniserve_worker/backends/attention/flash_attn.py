@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import torch
 
-from ...execution.forward_batch import ForwardBatch
-from .base import AttentionCapabilities
+from ...execution.forward_batch import AttentionMode, ForwardBatch
+from .base import AttentionBackend
 from .layout import QKVLayout, normalize_kv, normalize_to
 
 __all__ = [
@@ -28,22 +28,28 @@ except ImportError:  # pragma: no cover
     _flash_attn_with_kvcache = None
 
 
-class FlashAttentionBackend:
+class FlashAttentionBackend(AttentionBackend):
     name = "flash_attn"
+    available = any(
+        value is not None
+        for value in (_flash_attn_func, _flash_attn_varlen_func, _flash_attn_with_kvcache)
+    )
+    paged_varlen = _flash_attn_varlen_func is not None
+    page_size_multiple = 256
+    cuda_only = True
+    dense_ranks = frozenset({4})
 
-    def capabilities(self) -> AttentionCapabilities:
-        return AttentionCapabilities(
-            available=any(
-                value is not None
-                for value in (_flash_attn_func, _flash_attn_varlen_func, _flash_attn_with_kvcache)
-            ),
-            paged_kv=_flash_attn_with_kvcache is not None,
-            varlen_attention=_flash_attn_varlen_func is not None,
-            varlen_paged_kv=_flash_attn_varlen_func is not None,
-            paged_block_size_multiple=256,
-            cuda_only=True,
-            dense_ranks=frozenset({4}),
-        )
+    def supports(self, mode: AttentionMode, *, cuda_graph: bool = False) -> bool:
+        if mode is AttentionMode.DENSE and _flash_attn_func is None:
+            return False
+        if mode is AttentionMode.PAGED_DECODE and _flash_attn_with_kvcache is None:
+            return False
+        if mode is AttentionMode.PAGED_VARLEN and _flash_attn_varlen_func is None:
+            return False
+        return super().supports(mode, cuda_graph=cuda_graph)
+
+    def supports_varlen(self) -> bool:
+        return _flash_attn_varlen_func is not None and super().supports_varlen()
 
     def forward(
         self,
@@ -91,7 +97,7 @@ class FlashAttentionBackend:
         if _flash_attn_with_kvcache is None:
             raise RuntimeError("flash-attn paged KV kernel is not available")
         q_blh, restore = normalize_to(q, QKVLayout.BLHD)
-        mult = self.capabilities().paged_block_size_multiple
+        mult = self.page_size_multiple
         if int(k_cache.shape[1]) % mult != 0:
             raise RuntimeError(f"flash-attn paged KV requires a {mult}-multiple page size")
         block_table = block_table.to(device=q_blh.device, dtype=torch.int32).contiguous()

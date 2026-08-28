@@ -4,7 +4,7 @@ Models import this package instead of vendor kernels or backend registries.
 """
 from __future__ import annotations
 
-from .core import Dispatcher, Operator, Provider
+from .core import Dispatcher, Operator
 from .facade import (
     add_rms_norm,
     attention,
@@ -42,7 +42,6 @@ __all__ = [
     "Operator",
     "PackedRopeReq",
     "PagedDecodeAttention",
-    "Provider",
     "QKNormReq",
     "QKNormRopeReq",
     "RmsNormReq",

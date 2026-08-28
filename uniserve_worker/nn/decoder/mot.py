@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Protocol, cast
+from typing import cast
 
 import torch
 import torch.nn as nn
@@ -30,39 +30,23 @@ from ..rope import apply_rotary_emb, get_rope
 from ..vocab_parallel_embedding import VocabParallelEmbedding
 from .qwen import Qwen3MLP
 
-__all__ = ["MoTDecoderLayer", "MoTModel"]
+__all__ = ["MoTConfig", "MoTDecoderLayer", "MoTModel"]
 
 _TEXT_COORDINATE = 0
 _FLOW_COORDINATE = 1
 
 
-class _MoTConfig(Protocol):
-    @property
-    def hidden_size(self) -> int: ...
-
-    @property
-    def intermediate_size(self) -> int: ...
-
-    @property
-    def num_hidden_layers(self) -> int: ...
-
-    @property
-    def num_attention_heads(self) -> int: ...
-
-    @property
-    def num_key_value_heads(self) -> int: ...
-
-    @property
-    def vocab_size(self) -> int: ...
-
-    @property
-    def rms_norm_eps(self) -> float: ...
-
-    @property
-    def rope_theta(self) -> float: ...
-
-    @property
-    def head_dim(self) -> int: ...
+@dataclass(frozen=True, slots=True)
+class MoTConfig:
+    hidden_size: int
+    intermediate_size: int
+    num_hidden_layers: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    vocab_size: int
+    rms_norm_eps: float
+    rope_theta: float
+    head_dim: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,7 +135,7 @@ def _parallel_call(
 class MoTDecoderLayer(nn.Module):
     """One decoder layer with text and flow experts over shared attention."""
 
-    def __init__(self, config: _MoTConfig, *, spec: LayerConfig) -> None:
+    def __init__(self, config: MoTConfig, *, spec: LayerConfig) -> None:
         super().__init__()
         hidden = int(config.hidden_size)
         head_dim = int(config.head_dim)
@@ -365,7 +349,7 @@ class MoTDecoderLayer(nn.Module):
 class MoTModel(nn.Module):
     """Packed text/flow decoder with no request or runtime state."""
 
-    def __init__(self, config: _MoTConfig, *, spec: LayerConfig) -> None:
+    def __init__(self, config: MoTConfig, *, spec: LayerConfig) -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,

@@ -15,6 +15,7 @@ from typing import Any, cast
 
 import torch
 
+from uniserve_worker.capabilities import GraphBucket
 from uniserve_worker.execution.batch import (
     Batch,
     BatchPartition,
@@ -48,7 +49,6 @@ from uniserve_worker.execution.batch import (
     decode_sampling_state_bytes,
     decode_token_product_bytes,
 )
-from uniserve_worker.capabilities import GraphBucket
 from uniserve_worker.execution.forward_batch import (
     AttentionSelection,
     ModelPhase,
@@ -84,7 +84,7 @@ from uniserve_worker.nn.diffusion.integrator import euler_step
 from uniserve_worker.nn.diffusion.schedule import (
     x_pred_to_velocity,
 )
-from uniserve_worker.nn.mesh import BroadcastTransport, DeviceMesh
+from uniserve_worker.nn.mesh import DeviceMesh
 from uniserve_worker.runtime.cache_pool import CachePool
 from uniserve_worker.runtime.device import canonical_device
 from uniserve_worker.runtime.device_events import DeviceEventPool
@@ -3110,8 +3110,6 @@ def _broadcast_tp_selection(runtime, value: torch.Tensor) -> torch.Tensor:
     if runtime.mesh.tp_size <= 1:
         return value
     transport = runtime.mesh.transport("tp")
-    if not isinstance(transport, BroadcastTransport):
-        raise RuntimeError("designated-rank sampling requires TP broadcast transport")
     return transport.broadcast(value, src=0)
 
 

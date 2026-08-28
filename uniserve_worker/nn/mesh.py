@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Protocol, runtime_checkable
+from typing import Any, Mapping, TypeAlias
 
 import torch
 
@@ -43,9 +43,6 @@ def _all_to_all_single_into_custom_fake(
 __all__ = [
     'divide',
     'AxisTransport',
-    'BroadcastTransport',
-    'CollectiveAxisTransport',
-    'PeerAxisTransport',
     'CollectiveTransport',
     'LocalP2PTransport',
     'MeshAxis',
@@ -63,46 +60,6 @@ def divide(numerator: int, denominator: int) -> int:
     if numerator % denominator != 0:
         raise ValueError(f"{numerator} is not divisible by {denominator}")
     return numerator // denominator
-
-
-@runtime_checkable
-class AxisTransport(Protocol):
-    """Coordinate metadata common to every axis transport."""
-
-    @property
-    def size(self) -> int: ...
-    @property
-    def coord(self) -> int: ...
-
-
-@runtime_checkable
-class CollectiveAxisTransport(AxisTransport, Protocol):
-    """Collective operations implemented by a distributed process group."""
-
-    def all_reduce(self, t: torch.Tensor) -> torch.Tensor: ...
-    def all_gather(self, t: torch.Tensor, dim: int) -> torch.Tensor: ...
-    def all_to_all_single_into(
-        self,
-        output: torch.Tensor,
-        input: torch.Tensor,
-        output_splits: tuple[int, ...] | list[int],
-        input_splits: tuple[int, ...] | list[int],
-    ) -> Any: ...
-    def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor) -> Any: ...
-
-
-@runtime_checkable
-class PeerAxisTransport(AxisTransport, Protocol):
-    """Point-to-point movement implemented by an in-process or staged peer axis."""
-
-    def copy_to(self, t: torch.Tensor, *, coord: int, non_blocking: bool = True) -> torch.Tensor: ...
-
-
-@runtime_checkable
-class BroadcastTransport(AxisTransport, Protocol):
-    """One-to-all movement for a transport that defines broadcast semantics."""
-
-    def broadcast(self, t: torch.Tensor, *, src: int) -> torch.Tensor: ...
 
 
 @dataclass(frozen=True)
@@ -229,6 +186,9 @@ class LocalP2PTransport:
             raise ValueError(f"broadcast source {src} is outside axis {self.axis!r}")
         return t.to(self.devices[self.coord]) if t.device != self.devices[self.coord] else t
 
+
+AxisTransport: TypeAlias = CollectiveTransport | LocalP2PTransport
+
 @dataclass(frozen=True)
 class MeshAxis:
     """One parallelism dimension of the mesh.
@@ -292,7 +252,7 @@ class DeviceMesh:
         if self.is_trivial(group):
             return tensor
         transport = self.transport(group)
-        if not isinstance(transport, CollectiveAxisTransport):
+        if not isinstance(transport, CollectiveTransport):
             raise RuntimeError(f"mesh axis {group!r} does not support collectives")
         return transport.all_reduce(tensor)
 
@@ -310,7 +270,7 @@ class DeviceMesh:
             output.copy_(input, non_blocking=input.device.type == "cuda")
             return None
         transport = self.transport(group)
-        if not isinstance(transport, CollectiveAxisTransport):
+        if not isinstance(transport, CollectiveTransport):
             raise RuntimeError(f"mesh axis {group!r} does not support collectives")
         return transport.all_to_all_single_into(
             output,
@@ -331,7 +291,7 @@ class DeviceMesh:
             output.copy_(input, non_blocking=input.device.type == "cuda")
             return None
         transport = self.transport(group)
-        if not isinstance(transport, CollectiveAxisTransport):
+        if not isinstance(transport, CollectiveTransport):
             raise RuntimeError(f"mesh axis {group!r} does not support collectives")
         return transport.all_gather_into_tensor(output, input)
 
@@ -347,8 +307,6 @@ class DeviceMesh:
         if self.is_trivial(group):
             return tensor
         transport = self.transport(group)
-        if not isinstance(transport, BroadcastTransport):
-            raise RuntimeError(f"mesh axis {group!r} does not support broadcast")
         return transport.broadcast(tensor, src=src)
 
     @property

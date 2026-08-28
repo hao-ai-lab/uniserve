@@ -5,7 +5,7 @@ import weakref
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -13,19 +13,6 @@ from ...foundation.math import ceil_div
 
 if TYPE_CHECKING:
     from .flashinfer_pool import WrapperKey
-
-
-class _PlanStats(Protocol):
-    flashinfer_decode_plan_calls: int
-    flashinfer_decode_plan_rows: int
-    flashinfer_decode_plan_indices: int
-    flashinfer_decode_graph_plan_calls: int
-    flashinfer_decode_plan_reuses: int
-    flashinfer_decode_graph_plan_reuses: int
-    flashinfer_prefill_plan_calls: int
-    flashinfer_prefill_plan_rows: int
-    flashinfer_prefill_plan_indices: int
-    flashinfer_prefill_plan_reuses: int
 
 
 @dataclass
@@ -92,15 +79,11 @@ class _PlanCache:
     ``record`` callback.
     """
 
-    def __init__(
-        self,
-        record: Callable[..., None],
-    ) -> None:
+    def __init__(self) -> None:
         self._plan_keys: dict[
             "WrapperKey",
             tuple[tuple[Any, ...], weakref.ReferenceType[Any] | None],
         ] = {}
-        self._record = record
 
     def is_current(
         self,
@@ -135,23 +118,13 @@ class _PlanCache:
         wrapper_key: "WrapperKey",
         plan_key: tuple[Any, ...],
         binding: Any,
-        stats: _PlanStats | None,
-        rows: int,
         build: Callable[[], int],
     ) -> None:
-        """Reuse the cached plan, or run ``build`` to (re)plan and commit it.
+        """Reuse the cached plan, or run ``build`` to replan and commit it."""
 
-        ``build`` constructs the plan tensors, issues the wrapper plan call, and
-        returns the planned index count; it runs only when the cached plan is
-        stale. Stats are recorded for both the planned and reused branches.
-        """
-
-        graph = wrapper_key.is_graph
         if self.is_current(wrapper_key, plan_key, binding):
-            self._record(stats, planned=False, graph=graph, rows=rows, indices=0)
             return
-        indices = build()
-        self._record(stats, planned=True, graph=graph, rows=rows, indices=indices)
+        build()
         self.remember(wrapper_key, plan_key, binding)
 
 
@@ -696,42 +669,3 @@ def _weakref_or_none(obj: Any) -> weakref.ReferenceType[Any] | None:
         return weakref.ref(obj)
     except TypeError:
         return None
-
-
-def _record_decode_plan_stats(
-    stats: _PlanStats | None,
-    *,
-    planned: bool,
-    graph: bool,
-    rows: int,
-    indices: int,
-) -> None:
-    if stats is None:
-        return
-    if planned:
-        stats.flashinfer_decode_plan_calls += 1
-        stats.flashinfer_decode_plan_rows += max(0, int(rows))
-        stats.flashinfer_decode_plan_indices += max(0, int(indices))
-        if graph:
-            stats.flashinfer_decode_graph_plan_calls += 1
-    else:
-        stats.flashinfer_decode_plan_reuses += 1
-        if graph:
-            stats.flashinfer_decode_graph_plan_reuses += 1
-
-
-def _record_prefill_plan_stats(
-    stats: _PlanStats | None,
-    *,
-    planned: bool,
-    rows: int,
-    indices: int,
-) -> None:
-    if stats is None:
-        return
-    if planned:
-        stats.flashinfer_prefill_plan_calls += 1
-        stats.flashinfer_prefill_plan_rows += max(0, int(rows))
-        stats.flashinfer_prefill_plan_indices += max(0, int(indices))
-    else:
-        stats.flashinfer_prefill_plan_reuses += 1

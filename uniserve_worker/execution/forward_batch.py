@@ -11,55 +11,14 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, TypeAlias
 
 import torch
 
-from ..nn.mesh import CollectiveAxisTransport, DeviceMesh, PeerAxisTransport
+from ..nn.mesh import CollectiveTransport, DeviceMesh, LocalP2PTransport
 
 if TYPE_CHECKING:
     from ..backends.attention.base import AttentionBackend
-
-
-@runtime_checkable
-class LatentView(Protocol):
-    """Partition-bounded latent scratch access."""
-
-    def read(self, handle: int) -> torch.Tensor: ...
-
-    def write(self, handle: int, value: torch.Tensor) -> None: ...
-
-
-@dataclass(frozen=True, slots=True)
-class EmptyLatentView:
-    """Typed absence of latent access for a route."""
-
-    def read(self, handle: int) -> torch.Tensor:
-        del handle
-        raise RuntimeError("this forward route has no latent view")
-
-    def write(self, handle: int, value: torch.Tensor) -> None:
-        del handle, value
-        raise RuntimeError("this forward route has no latent view")
-
-
-@runtime_checkable
-class MeshView(Protocol):
-    """The collectives available to one immutable route topology."""
-
-    def all_reduce(self, value: torch.Tensor, axis: str) -> torch.Tensor: ...
-
-    def all_gather(self, value: torch.Tensor, axis: str, dimension: int) -> torch.Tensor: ...
-
-    def dispatch(self, value: torch.Tensor, axis: str, coordinate: int) -> torch.Tensor: ...
-
-    def combine(
-        self,
-        value: torch.Tensor,
-        axis: str,
-        coordinate: int,
-        target: torch.device,
-    ) -> torch.Tensor: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,7 +61,7 @@ class RouteMeshView:
         transport = self._transport(axis)
         if transport is None:
             return value
-        if not isinstance(transport, CollectiveAxisTransport):
+        if not isinstance(transport, CollectiveTransport):
             raise RuntimeError(f"mesh axis {axis!r} does not support all-reduce")
         return transport.all_reduce(value)
 
@@ -110,7 +69,7 @@ class RouteMeshView:
         transport = self._transport(axis)
         if transport is None:
             return value
-        if not isinstance(transport, CollectiveAxisTransport):
+        if not isinstance(transport, CollectiveTransport):
             raise RuntimeError(f"mesh axis {axis!r} does not support all-gather")
         return transport.all_gather(value, dimension)
 
@@ -118,7 +77,7 @@ class RouteMeshView:
         transport = self._transport(axis)
         if transport is None:
             return value
-        if not isinstance(transport, PeerAxisTransport):
+        if not isinstance(transport, LocalP2PTransport):
             raise RuntimeError(f"mesh axis {axis!r} does not support peer dispatch")
         return transport.copy_to(value, coord=int(coordinate))
 
@@ -144,33 +103,7 @@ class RouteMeshView:
             raise RuntimeError(f"mesh axis {axis!r} is outside this forward route")
 
 
-@dataclass(frozen=True, slots=True)
-class WrittenRange:
-    """A validated span written through an :class:`OutputView`."""
-
-    slot: int
-    begin: int
-    end: int
-
-    def __post_init__(self) -> None:
-        if self.slot < 0 or self.begin < 0 or self.end < self.begin:
-            raise ValueError("output write range is invalid")
-
-
-@runtime_checkable
-class OutputView(Protocol):
-    """Bounded execution scratch for large model outputs."""
-
-    def write(self, slot: int, value: torch.Tensor) -> WrittenRange: ...
-
-
-@dataclass(frozen=True, slots=True)
-class EmptyOutputView:
-    """Typed absence of output scratch for a route."""
-
-    def write(self, slot: int, value: torch.Tensor) -> WrittenRange:
-        del slot, value
-        raise RuntimeError("this forward route has no output view")
+MeshView: TypeAlias = EmptyMeshView | RouteMeshView
 
 
 @dataclass(frozen=True, slots=True)
@@ -324,8 +257,7 @@ class ForwardBatch:
     decode_latents: tuple[torch.Tensor, ...] = ()
     decode_heights: tuple[int, ...] = ()
     decode_widths: tuple[int, ...] = ()
-    mesh: MeshView | EmptyMeshView = EmptyMeshView()
-    output: OutputView | EmptyOutputView = EmptyOutputView()
+    mesh: MeshView = EmptyMeshView()
 
     def __post_init__(self) -> None:
         if self.row_count < 1:
@@ -396,20 +328,15 @@ class ForwardOutput:
 
 __all__ = [
     "AttentionMode",
-    "EmptyLatentView",
     "EmptyMeshView",
-    "EmptyOutputView",
     "ExpertRoute",
     "FlowPatches",
     "ForwardBatch",
     "ForwardOutput",
-    "LatentView",
     "MeshView",
-    "OutputView",
     "RouteMeshView",
     "RouteSpan",
     "ModelPhase",
     "TokenSelection",
-    "WrittenRange",
     "packed_tensor_views",
 ]

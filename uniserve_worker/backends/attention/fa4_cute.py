@@ -10,14 +10,15 @@ from __future__ import annotations
 
 import inspect
 from collections import OrderedDict
-from typing import Any, Protocol
+from collections.abc import Callable
+from typing import Any
 
 import torch
 
 from ...execution.forward_batch import ForwardBatch
 from ...foundation.math import ceil_div
 from ..paged_kv_math import paged_kv_write, write_locations
-from .base import AttentionCapabilities, merge_attention_states
+from .base import AttentionBackend, merge_attention_states
 from .layout import QKVLayout, normalize_kv, normalize_to
 
 __all__ = [
@@ -25,10 +26,6 @@ __all__ = [
 ]
 
 _IMPORT_ERROR: BaseException | None = None
-# Authoritative table of (q, k, v) head-dim geometries the FA4 unified trunk
-# kernel accepts. This is the single source of truth: it is published through
-# AttentionCapabilities.trunk_geometries so the registry selector and the
-# model-facing RadixAttention layer query it instead of duplicating the literal.
 _SUPPORTED_TRUNK_GEOMETRIES: frozenset[tuple[int, int, int]] = frozenset(
     {
         (64, 64, 64),
@@ -48,23 +45,10 @@ _PREFIX_BOUNDS_CACHE: OrderedDict[
 ] = OrderedDict()
 
 
-class _ComputePrefixBounds(Protocol):
-    def __call__(self, visible_end: torch.Tensor, *, q_tile_size: int) -> torch.Tensor: ...
-
-
-class _ComputePrefixBoundsVarlen(Protocol):
-    def __call__(
-        self,
-        visible_end: torch.Tensor,
-        seqlens_q: torch.Tensor,
-        *,
-        q_tile_size: int,
-        num_q_tiles: int | None = None,
-    ) -> torch.Tensor: ...
-
-
-_compute_prefix_bounds: _ComputePrefixBounds | None
-_compute_prefix_bounds_varlen: _ComputePrefixBoundsVarlen | None
+_compute_prefix_bounds: Callable[..., torch.Tensor] | None
+_compute_prefix_bounds_varlen: Callable[..., torch.Tensor] | None
+_fa4_flash_attn_fwd: Any | None
+_hybrid_multimodal_mask: Any | None
 try:  # pragma: no cover - optional CUDA package.
     import uniserve_kernel.flash_attn_jagged as _jagged
 
@@ -87,25 +71,15 @@ except Exception as exc:  # pragma: no cover
     _fa4_accepts_prefix_bounds = False
 
 
-class Fa4CuteAttentionBackend:
+class Fa4CuteAttentionBackend(AttentionBackend):
     """FlashAttention-4 CUTE backend with explicit paged KV writes before forward."""
 
     name = "fa4_cute"
-
-    def capabilities(self) -> AttentionCapabilities:
-        available = _fa4_flash_attn_fwd is not None
-        return AttentionCapabilities(
-            available=available,
-            paged_kv=available,
-            visible_end=available,
-            segmented_attention=available,
-            segmented_attention_cuda_graph=available,
-            visible_end_cuda_graph=available,
-            paged_block_size_multiple=1,
-            trunk_geometries=_SUPPORTED_TRUNK_GEOMETRIES,
-            cuda_only=True,
-            dense_ranks=frozenset({4}),
-        )
+    available = _fa4_flash_attn_fwd is not None
+    packed_cuda_graph = available
+    head_geometries = _SUPPORTED_TRUNK_GEOMETRIES
+    cuda_only = True
+    dense_ranks = frozenset({4})
 
     def forward(
         self,

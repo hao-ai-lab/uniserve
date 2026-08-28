@@ -14,13 +14,6 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from ..execution.batch import (
-    Batch,
-    CompletionReport,
-    Domain,
-    ForwardMode,
-    RequestKey,
-)
 from ..bootstrap.capabilities import resolve_capabilities
 from ..bootstrap.capacity import (
     device_total_bytes,
@@ -37,8 +30,15 @@ from ..capabilities import (
     ResourceClass,
     WorkerInfo,
 )
+from ..execution.batch import (
+    Batch,
+    CompletionReport,
+    Domain,
+    ForwardMode,
+    RequestKey,
+)
 from ..execution.cuda_graph import CudaGraphRunner
-from ..execution.forward_batch import AttentionSelection
+from ..execution.forward_batch import AttentionMode, AttentionSelection
 from ..execution.model_runner import ModelRunner
 from ..execution.step import (
     PreparedExecution,
@@ -1097,26 +1097,13 @@ def _supports_flow_attention(
         return False
     head_dim = int(getattr(geometry, "head_dim"))
     for provider in selection.providers:
-        capabilities = provider.capabilities()
-        if not capabilities.available or not capabilities.segmented_attention:
-            continue
-        if head_dim < int(capabilities.min_head_dim):
-            continue
-        multiple = max(1, int(capabilities.paged_block_size_multiple))
-        if pool.block_size % max(1, multiple) != 0:
-            continue
-        if not capabilities.supports_trunk_geometry(head_dim, head_dim, head_dim):
-            continue
-        if capabilities.cuda_only and device.type != "cuda":
-            continue
-        minimum = capabilities.min_cuda_capability
-        if minimum is not None:
-            if device.type != "cuda":
-                continue
-            major, minor = torch.cuda.get_device_capability(device)
-            if (int(major), int(minor)) < (int(minimum[0]), int(minimum[1])):
-                continue
-        return True
+        if provider.can_bind(
+            AttentionMode.PACKED,
+            head_dim=head_dim,
+            block_size=pool.block_size,
+            device=device,
+        ):
+            return True
     return False
 
 

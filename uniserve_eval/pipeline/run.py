@@ -12,7 +12,7 @@ import numpy as np
 from ..artifacts import ArtifactWriter
 from ..datasets import load_examples
 from ..load import GpuMemorySampler, WarmupFailure, run_load
-from ..load.arrival import MeasurementWindow
+from ..nsys import NsysCapture
 from ..tasks import get_task
 from ..transport import send_request
 from ..types import BenchmarkPoint, Example, RequestRecord, RunResult, selected_rows_identity
@@ -26,7 +26,7 @@ async def run_point(
     *,
     launch: dict[str, Any] | None = None,
     timeout_s: float = 6 * 60 * 60.0,
-    measurement: MeasurementWindow | None = None,
+    measurement: NsysCapture | None = None,
 ) -> RunResult:
     output_path = Path(output_dir)
     if output_path.exists() and any(output_path.iterdir()):

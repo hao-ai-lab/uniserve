@@ -6,12 +6,11 @@ from collections.abc import Callable
 
 from ...execution.forward_batch import AttentionSelection
 from ...foundation.errors import capability_mismatch
-from .base import AttentionBackend, AttentionCapabilities
+from .base import AttentionBackend
 from .tuning import FlashInferTuningConfig
 
 __all__ = [
     "AttentionBackend",
-    "AttentionCapabilities",
     "ATTENTION_BACKENDS",
     "FlashInferTuningConfig",
     "resolve_attention_selection",
@@ -67,9 +66,8 @@ def resolve_attention_selection(
         if requested != "auto" and candidate != requested:
             continue
         backend = construct()
-        capabilities = backend.capabilities()
-        multiple = max(1, int(capabilities.paged_block_size_multiple))
-        if capabilities.available and int(block_size) % multiple == 0:
+        multiple = max(1, int(backend.page_size_multiple))
+        if backend.available and int(block_size) % multiple == 0:
             available.append(backend)
     if not available:
         raise capability_mismatch(f"attention backend {requested!r} is unavailable")
