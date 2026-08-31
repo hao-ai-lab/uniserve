@@ -89,7 +89,7 @@ macro_rules! ipc_error {
 }
 
 /// IPC version this build emits on every [`Header`].
-pub const IPC_VERSION: u16 = 11;
+pub const IPC_VERSION: u16 = 13;
 
 /// Whether a peer-advertised IPC `version` is one this build can decode.
 pub fn is_supported_ipc_version(version: u16) -> bool {

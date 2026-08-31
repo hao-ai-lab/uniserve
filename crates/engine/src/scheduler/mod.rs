@@ -91,8 +91,8 @@ use uniserve_worker_ipc::{
     AttentionRegime, Batch, BatchPartition, BlockTable as IpcBlockTable, Bounds,
     CachePageAllocation, CloseReason, CompletionReport, Control, DType, DecodeKind,
     DecodePlacement, DimBound, Disposition, ForwardMode, GenAdmission, LatentPlacement,
-    MediaAdmission, MediaProfileId, ModelOutput, NewRequest, OpId, OpStatus, Operation, Point,
-    PointRange, ProductKind, ProductPayload, ProductRef, RequestKey, ResourceClass, RouteId,
+    MediaAdmission, MediaPlan, MediaProfileId, ModelOutput, NewRequest, OpId, OpStatus, Operation,
+    Point, PointRange, ProductKind, ProductPayload, ProductRef, RequestKey, ResourceClass, RouteId,
     RowGeometry, SamplingState, ShapeBound, StorageClass, TimingCounters, UndAdmission, VersionRef,
     WorkerForwardStats, WorkerInfo,
 };
@@ -103,7 +103,7 @@ use inflight::{
     InflightApply, InflightOp, InflightWindow, PendingCompletion, PendingFinish,
     SubmittedPartitionAccounting,
 };
-use kv_budget::{KvBudget, KvSchedulerState};
+use kv_budget::{KvBudget, worker_kv_state};
 use output::{OutputSender, RequestOutput};
 use serde_json::json;
 
@@ -426,23 +426,23 @@ struct MediaCursor {
 enum MediaQuantum {
     Transition,
     Flow { step: u32 },
-    Video { unit: u32 },
+    Video { start_unit: u32, unit_count: u32 },
     Audio,
     Materialize,
 }
 
-fn next_media_quantum(cursor: MediaCursor) -> Option<MediaQuantum> {
-    const DENOISE_STEPS: u32 = 4;
-    const VIDEO_UNITS: u32 = 7;
+fn next_media_quantum(cursor: MediaCursor, plan: MediaPlan) -> Option<MediaQuantum> {
+    const VIDEO_UNITS_PER_ROUND: u32 = 4;
     if !cursor.prepared {
         Some(MediaQuantum::Transition)
-    } else if cursor.denoise_step < DENOISE_STEPS {
+    } else if cursor.denoise_step < plan.denoise_steps {
         Some(MediaQuantum::Flow {
             step: cursor.denoise_step,
         })
-    } else if cursor.video_unit < VIDEO_UNITS {
+    } else if cursor.video_unit < plan.video_decode_units {
         Some(MediaQuantum::Video {
-            unit: cursor.video_unit,
+            start_unit: cursor.video_unit,
+            unit_count: VIDEO_UNITS_PER_ROUND.min(plan.video_decode_units - cursor.video_unit),
         })
     } else if !cursor.audio_done {
         Some(MediaQuantum::Audio)
@@ -457,7 +457,10 @@ fn advance_media_cursor(mut cursor: MediaCursor, quantum: MediaQuantum) -> Media
     match quantum {
         MediaQuantum::Transition => cursor.prepared = true,
         MediaQuantum::Flow { step } => cursor.denoise_step = step.saturating_add(1),
-        MediaQuantum::Video { unit } => cursor.video_unit = unit.saturating_add(1),
+        MediaQuantum::Video {
+            start_unit,
+            unit_count,
+        } => cursor.video_unit = start_unit.saturating_add(unit_count),
         MediaQuantum::Audio => cursor.audio_done = true,
         MediaQuantum::Materialize => cursor.materialized = true,
     }
@@ -478,12 +481,19 @@ struct MediaFlowState {
     event_tx: MediaEventTx,
     request_pool_idx: u32,
     admission: NewRequest,
-    admission_sent: bool,
+    admission_state: MediaAdmissionState,
     committed: MediaCursor,
     projected: MediaCursor,
     fixed_parent: VersionRef,
     projected_parent: VersionRef,
     terminal_intent: MediaTerminalIntent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaAdmissionState {
+    Unsubmitted,
+    InFlight,
+    Registered,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

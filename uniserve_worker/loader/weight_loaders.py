@@ -34,6 +34,7 @@ __all__ = [
     "defer_parameter_weights",
     "fp8_scale_loader",
     "fp8_weight_loader",
+    "interleaved_packed_weight_loader",
     "load_parameter_weight",
     "packed_weight_loader",
     "set_vocab_layout",
@@ -121,6 +122,7 @@ def load_parameter_weight(
     if deferred is not None:
         deferred.append(DeferredWeightPlacement(parameter, handle, shard_id))
         return
+    parameter = _current_parameter(parameter)
     loader = getattr(parameter, _LOADER_ATTR, None)
     if not callable(loader):
         raise TypeError("loadable parameter has no weight_loader")
@@ -208,6 +210,46 @@ def packed_weight_loader(
     payload = _payload_for_shard(handle, slot.shard, tuple(target.shape))
     _copy(target, payload, parameter)
     _mark_shard_loaded(parameter, plan, shard_id)
+
+
+def interleaved_packed_weight_loader(
+    parameter: nn.Parameter,
+    handle: WeightHandle,
+    shard_id: str | int | None = None,
+    *,
+    rank: int,
+    size: int,
+    branches: int,
+    group_width: int,
+) -> None:
+    """Load one branch into a head/group-interleaved merged projection."""
+
+    if not isinstance(shard_id, int) or not 0 <= shard_id < int(branches):
+        raise ValueError("interleaved packed parameters require an integer branch id")
+    if len(handle.shape) != 2 or int(handle.shape[0]) % int(size):
+        raise ValueError("interleaved projection source cannot be column-sharded")
+    local_rows = int(handle.shape[0]) // int(size)
+    if local_rows % int(group_width):
+        raise ValueError("interleaved projection branch does not divide into output groups")
+    expected = (local_rows * int(branches), int(handle.shape[1]))
+    if tuple(parameter.shape) != expected:
+        raise ValueError(
+            f"interleaved projection target shape {tuple(parameter.shape)} != {expected}"
+        )
+    parameter = _materialize(parameter, dtype=_target_dtype(parameter, handle))
+    payload = handle.narrow(0, int(rank) * local_rows, local_rows)
+    target = parameter.data.view(
+        local_rows // int(group_width),
+        int(branches),
+        int(group_width),
+        int(handle.shape[1]),
+    )[:, shard_id]
+    _copy(target, payload.reshape_as(target), parameter)
+    loaded = set(getattr(parameter, _SHARDS_ATTR, set()))
+    loaded.add(shard_id)
+    setattr(parameter, _SHARDS_ATTR, loaded)
+    if len(loaded) == int(branches):
+        _mark_loaded(parameter)
 
 
 def vocab_weight_loader(

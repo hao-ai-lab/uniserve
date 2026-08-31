@@ -9,7 +9,7 @@ import torch.nn as nn
 
 from ..execution.forward_batch import MeshView
 from .layer import LayerConfig
-from .mesh import TensorParallel, divide
+from .mesh import DeviceMesh, TensorParallel, divide
 from .placement import (
     ShardPlan,
     ShardSlot,
@@ -17,12 +17,14 @@ from .placement import (
     set_shard_plan,
     shard_for,
 )
+from .quant.base import QuantizeMethodBase
 
 __all__ = [
     "LinearBase",
     "ColumnParallelLinear",
     "RowParallelLinear",
     "MergedColumnParallelLinear",
+    "InterleavedMergedColumnParallelLinear",
     "QKVParallelLinear",
 ]
 
@@ -30,7 +32,7 @@ __all__ = [
 class LinearBase(nn.Module):
     weight: nn.Parameter
     bias: nn.Parameter | None
-    weight_scale: nn.Parameter
+    weight_scale: torch.Tensor | None
 
     def __init__(
         self,
@@ -38,6 +40,7 @@ class LinearBase(nn.Module):
         output_size: int,
         *,
         layer_config: LayerConfig,
+        quant_method: QuantizeMethodBase | None = None,
         bias: bool = True,
         prefix: str = "",
     ) -> None:
@@ -46,7 +49,9 @@ class LinearBase(nn.Module):
         self.output_size = int(output_size)
         self.prefix = str(prefix)
         self.has_bias = bool(bias)
-        self.quant_method = layer_config.quant_method(self.prefix)
+        self.quant_method = (
+            layer_config.quant_method(self.prefix) if quant_method is None else quant_method
+        )
         self.quant_method.create_weights(
             self,
             input_size=self.input_size,
@@ -57,6 +62,19 @@ class LinearBase(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.quant_method.apply(self, x)
+
+    def forward_sequence_parallel(
+        self,
+        x: torch.Tensor,
+        mesh: DeviceMesh,
+        workspace: torch.Tensor,
+        *,
+        group: str,
+    ) -> torch.Tensor:
+        execute = getattr(self.quant_method, "apply_sequence_parallel", None)
+        if not callable(execute):
+            raise RuntimeError("linear quantization method has no sequence-parallel execution")
+        return execute(self, x, mesh, workspace, group=group)
 
 
 def _attach_shard_plan(module: LinearBase, plan_for: Callable[[nn.Parameter], ShardPlan]) -> None:
@@ -95,6 +113,7 @@ class ColumnParallelLinear(LinearBase):
         output_size: int,
         *,
         layer_config: LayerConfig,
+        quant_method: QuantizeMethodBase | None = None,
         bias: bool = True,
         prefix: str = "",
     ) -> None:
@@ -106,6 +125,7 @@ class ColumnParallelLinear(LinearBase):
             input_size,
             local_output,
             layer_config=layer_config,
+            quant_method=quant_method,
             bias=bias,
             prefix=prefix,
         )
@@ -209,6 +229,62 @@ class MergedColumnParallelLinear(LinearBase):
                 mode=weight_mode,
                 shard_axis=0,
                 slots=dict(slots),
+            ),
+        )
+
+
+class InterleavedMergedColumnParallelLinear(LinearBase):
+    """Column-parallel branches interleaved by fixed-width output groups."""
+
+    def __init__(
+        self,
+        input_size: int,
+        branch_output_size: int,
+        branches: int,
+        group_width: int,
+        *,
+        layer_config: LayerConfig,
+        quant_method: QuantizeMethodBase | None = None,
+        bias: bool = True,
+        prefix: str = "",
+    ) -> None:
+        parallel = layer_config.parallel
+        branch_output_size = int(branch_output_size)
+        branches = int(branches)
+        group_width = int(group_width)
+        if branches <= 0 or group_width <= 0:
+            raise ValueError("interleaved merged linear dimensions must be positive")
+        if branch_output_size % group_width:
+            raise ValueError("branch output size must divide into fixed-width groups")
+        local_branch = divide(branch_output_size, parallel.size)
+        if local_branch % group_width:
+            raise ValueError("local branch output must divide into fixed-width groups")
+        self.global_branch_output_size = branch_output_size
+        self.local_branch_output_size = local_branch
+        self.branches = branches
+        self.group_width = group_width
+        super().__init__(
+            input_size,
+            local_branch * branches,
+            layer_config=layer_config,
+            quant_method=quant_method,
+            bias=bias,
+            prefix=prefix,
+        )
+        from functools import partial
+        from ..loader.weight_loaders import (
+            attach_weight_loader,
+            interleaved_packed_weight_loader,
+        )
+
+        attach_weight_loader(
+            self.weight,
+            partial(
+                interleaved_packed_weight_loader,
+                rank=parallel.rank,
+                size=parallel.size,
+                branches=branches,
+                group_width=group_width,
             ),
         )
 

@@ -40,7 +40,7 @@ def video_latent_frames(num_frames: int) -> int:
 
 
 def audio_latent_frames(num_frames: int) -> int:
-    return int(round(num_frames / FPS * AUDIO_LATENTS_PER_SECOND))
+    return math.ceil(num_frames / FPS * AUDIO_LATENTS_PER_SECOND)
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,15 +89,20 @@ def build_packed_layout(
     width: int = 1344,
     patch_size: tuple[int, int, int] = (1, 2, 2),
     row_multiple: int = 256,
+    audio_frames: int | None = None,
 ) -> H3PackedLayout:
     """Build the immutable T2VA `[text|audio|video|padding]` document."""
 
-    if text_rows < 1 or height != 768 or width != 1344 or num_frames != 124:
-        raise ValueError("the FastH3 profile is fixed to 1344x768x124 with nonempty text")
+    if text_rows < 1 or height != 768 or width != 1344:
+        raise ValueError("the FastH3 profile requires 1344x768 output and nonempty text")
     patch_t, patch_h, patch_w = patch_size
     latent_height, latent_width = height // 16, width // 16
     video_frames = video_latent_frames(num_frames)
-    audio_frames = audio_latent_frames(num_frames)
+    audio_frames = (
+        audio_latent_frames(num_frames) if audio_frames is None else int(audio_frames)
+    )
+    if audio_frames < 1:
+        raise ValueError("H3 audio latent frame count must be positive")
     if video_frames % patch_t or latent_height % patch_h or latent_width % patch_w:
         raise ValueError("fixed latent geometry is not divisible by the transformer patch")
     rows_per_frame = latent_height // patch_h * (latent_width // patch_w)

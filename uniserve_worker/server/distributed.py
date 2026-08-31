@@ -123,11 +123,19 @@ def _build_tp_axis(
                 "device": str(device),
             },
         )
+        process_group_options = None
+        device_id = None
+        if backend == "nccl" and device.type == "cuda":
+            process_group_options = torch.distributed.ProcessGroupNCCL.Options()
+            process_group_options.use_pg_for_symm_mem_rendezvous = True
+            device_id = device
         torch.distributed.init_process_group(
             backend=backend,
             init_method=init_method,
             rank=tp_rank,
             world_size=tp_size,
+            pg_options=process_group_options,
+            device_id=device_id,
         )
     else:
         world = int(torch.distributed.get_world_size())

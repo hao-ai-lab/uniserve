@@ -158,8 +158,13 @@ impl InflightWindow {
         Some(inflight)
     }
 
-    pub(super) fn clear_failed(&mut self) -> Vec<RequestId> {
+    pub(super) fn clear_failed(&mut self) -> (Vec<RequestId>, Vec<Control>) {
         let ids = self.operations.keys().copied().collect();
+        let controls = self
+            .control_batches
+            .drain()
+            .flat_map(|(_, controls)| controls)
+            .collect();
         self.operations.clear();
         self.inflight_transfers = 0;
         self.completions.clear();
@@ -167,6 +172,6 @@ impl InflightWindow {
         self.prefill_steps.clear();
         self.batch_partitions.clear();
         self.batch_group_worker_exec_us.clear();
-        ids
+        (ids, controls)
     }
 }

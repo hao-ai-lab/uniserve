@@ -270,11 +270,12 @@ pub struct ServingRuntime {
     requests: Arc<RuntimeRequestRegistry>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct VideoGenerationInput {
     pub request_id: ServeRequestId,
     pub prompt: String,
     pub seed: u64,
+    pub seconds: f64,
     pub output_path: String,
 }
 
@@ -330,11 +331,15 @@ impl ServingRuntime {
                 source: TokenizeError::Invalid("video prompt must not be empty".to_string()),
             });
         }
+        let (plan, prompt_token_ids) =
+            self.model
+                .resolve_video_plan(&request.request_id, &request.prompt, request.seconds)?;
         let submission = MediaSubmission::new(
             request.request_id.to_string(),
-            request.prompt,
+            prompt_token_ids,
             request.seed,
             request.output_path,
+            plan,
         );
         self.engine
             .submit_media(submission)

@@ -129,6 +129,36 @@ pub(super) struct KvSchedulerState {
     pub(super) usable_blocks: usize,
 }
 
+pub(super) fn worker_kv_state(info: &WorkerInfo) -> Option<KvSchedulerState> {
+    info.uses_kv().then(|| {
+        let block_pool = if info.groups.is_empty() {
+            BlockPool::new(info.num_blocks as usize, info.block_size as usize)
+        } else {
+            let mut offset = 0_u32;
+            let group_shapes = info
+                .groups
+                .iter()
+                .map(|group| {
+                    let shape = (group.kind, offset, group.num_blocks);
+                    offset = offset.saturating_add(group.num_blocks);
+                    shape
+                })
+                .collect::<Vec<_>>();
+            BlockPool::with_groups(
+                info.num_blocks as usize,
+                info.block_size as usize,
+                &group_shapes,
+            )
+        };
+        let usable_blocks = block_pool.request_page_capacity();
+        KvSchedulerState {
+            block_pool,
+            coordinator: KvCacheCoordinator::default(),
+            usable_blocks,
+        }
+    })
+}
+
 pub(super) struct KvBudget {
     pub(super) cache: Option<KvSchedulerState>,
     pub(super) encoder_cache: EncoderCacheManager,
@@ -182,6 +212,23 @@ impl KvBudget {
         if let Some(cache) = self.cache.as_mut() {
             cache.coordinator.set_hash_algo(algo);
         }
+    }
+
+    pub(super) fn reset_after_worker_loss(&mut self, info: &WorkerInfo) {
+        let coordinator = self.cache.take().map(|state| state.coordinator);
+        let mut cache = worker_kv_state(info);
+        if let (Some(cache), Some(coordinator)) = (&mut cache, coordinator) {
+            cache.coordinator = coordinator;
+        }
+        let encoder_cache_budget = self.encoder_cache.budget();
+        let request_pool_capacity = self.request_slots.capacity();
+        *self = Self::new(
+            cache,
+            encoder_cache_budget,
+            request_pool_capacity,
+            info.num_latent_pages,
+            info.latent_page_units,
+        );
     }
 
     pub(super) fn release_transition(&mut self, id: RequestId, apply: &SchedulerApply) {

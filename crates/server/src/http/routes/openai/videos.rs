@@ -35,6 +35,7 @@ pub(crate) async fn videos_sync(
     headers: HeaderMap,
     ValidatedJson(body): ValidatedJson<VideoGenerationRequest>,
 ) -> Response {
+    let started_at = std::time::Instant::now();
     let context = resolve_request_context(&headers);
     let path = state
         .media_spool()
@@ -94,10 +95,15 @@ pub(crate) async fn videos_sync(
                         Ok::<_, std::io::Error>(Some((Bytes::from(buffer), (file, guard))))
                     }
                 });
+            let generation_ms = started_at.elapsed().as_secs_f64() * 1_000.0;
             Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "video/mp4")
                 .header(header::CONTENT_LENGTH, bytes)
+                .header(
+                    "server-timing",
+                    format!("generation;dur={generation_ms:.1}"),
+                )
                 .body(Body::from_stream(body_stream))
                 .unwrap_or_else(|error| {
                     ApiError::server_error(format!("failed to construct media response: {error}"))

@@ -791,6 +791,8 @@ class Worker:
             H3OutputRing(
                 state_slots=model.states.slot_count,
                 unresolved_window=self._info.max_unresolved_window,
+                max_video_frames_per_round=model.layout.video_round_frames,
+                max_frame_count=model.layout.frame_count,
             )
             if isinstance(model, MiniMaxH3Model) and mesh.coord("sp") == 0
             else None

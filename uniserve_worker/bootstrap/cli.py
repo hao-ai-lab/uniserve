@@ -40,6 +40,31 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--attention-backend", default="auto")
     parser.add_argument(
+        "--linear-precision",
+        choices=("fp8", "nvfp4"),
+        default="fp8",
+    )
+    parser.add_argument(
+        "--h3-transformer-attention-precision",
+        choices=("fp8", "nvfp4"),
+        default=None,
+    )
+    parser.add_argument(
+        "--h3-transformer-mlp-precision",
+        choices=("fp8", "nvfp4"),
+        default=None,
+    )
+    parser.add_argument(
+        "--h3-text-encoder-precision",
+        choices=("bf16", "nvfp4"),
+        default=None,
+    )
+    parser.add_argument(
+        "--h3-video-vae-precision",
+        choices=("fp16", "bf16", "nvfp4"),
+        default=None,
+    )
+    parser.add_argument(
         "--load-format",
         default="auto",
         choices=("auto", "safetensors", "pt", "dummy", "sharded_state", "layered"),
@@ -119,6 +144,9 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-model", action="store_true")
     parser.add_argument("--allow-stub", action="store_true", default=False)
     parser.add_argument("--media-spool", default=None)
+    parser.add_argument("--max-model-len", type=int, default=8192)
+    parser.add_argument("--max-video-seconds", type=float, default=15.0)
+    parser.add_argument("--fixed-graph-cache-capacity", type=int, default=32)
     return parser
 
 

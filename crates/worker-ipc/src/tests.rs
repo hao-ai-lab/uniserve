@@ -188,6 +188,27 @@ fn admission() -> NewRequest {
     .unwrap()
 }
 
+fn media_admission(prompt_token_ids: Vec<u32>) -> NewRequest {
+    NewRequest::new_media(
+        request_key(),
+        u32::try_from(request_key().session_id.0).unwrap(),
+        MediaAdmission {
+            plan: MediaPlan {
+                frame_count: 22,
+                video_decode_units: 1,
+                audio_latent_frames: 37,
+                prompt_tokens: u32::try_from(prompt_token_ids.len()).unwrap(),
+                denoise_steps: 4,
+            },
+            prompt_token_ids,
+            seed: 17,
+            profile: MediaProfileId::MinimaxH3T2va,
+            output_path: "/tmp/media.mp4".to_string(),
+        },
+    )
+    .unwrap()
+}
+
 fn execute_round_trip(batch: Batch) -> Batch {
     let request = WorkerRequest::execute(batch);
     let decoded = decode_request(&encode_request(&request).unwrap()).unwrap();
@@ -485,6 +506,20 @@ fn new_request_round_trips() {
         vec![token_decode_operation()],
     ));
     assert_eq!(batch.admissions[0], admission());
+}
+
+#[test]
+fn maximum_media_prompt_round_trips() {
+    let prompt_token_ids = (0..16_384_u32).map(|index| 100_000 + index).collect();
+    let admission = media_admission(prompt_token_ids);
+    let request = WorkerRequest::execute(batch_with_operations(
+        5,
+        vec![admission.clone()],
+        vec![operation_for(ForwardMode::GenTransition, OpId(12), true)],
+    ));
+
+    let decoded = decode_request(&encode_request(&request).unwrap()).unwrap();
+    assert_eq!(decoded.batch().unwrap().admissions, vec![admission]);
 }
 
 #[test]

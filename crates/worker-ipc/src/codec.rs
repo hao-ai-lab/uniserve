@@ -10,12 +10,12 @@ use crate::{
     AttentionRegime, Batch, BatchPartition, BlockTable, Bounds, CachePageAllocation, CloseReason,
     CompletionReport, Control, DType, DecodeKind, DecodePlacement, DimBound, Disposition, Domain,
     DrawLayout, ErrorCode, ErrorOperationIdentity, FinishFlags, ForwardMode, GenAdmission,
-    GraphBucket, LatentPlacement, LogicalLengths, MediaAdmission, MediaProfileId, ModelOutput,
-    NewRequest, OpId, OpStatus, Operation, PartitionCompletion, Point, PointRange, ProductKind,
-    ProductPayload, ProductRef, RegistrationAck, RequestKey, RequestKind, ResourceClass,
-    ResourcePressure, ResponseKind, Rng, RouteId, RowGeometry, SamplingOwnership, ShapeBound,
-    StorageClass, TimingCounters, TokenSpan, UndAdmission, VersionRef, WorkerForwardStats,
-    WorkerInfo, WorkerRequest, WorkerResponse, WorkerResponseError,
+    GraphBucket, LatentPlacement, LogicalLengths, MediaAdmission, MediaPlan, MediaProfileId,
+    ModelOutput, NewRequest, OpId, OpStatus, Operation, PartitionCompletion, Point, PointRange,
+    ProductKind, ProductPayload, ProductRef, RegistrationAck, RequestKey, RequestKind,
+    ResourceClass, ResourcePressure, ResponseKind, Rng, RouteId, RowGeometry, SamplingOwnership,
+    ShapeBound, StorageClass, TimingCounters, TokenSpan, UndAdmission, VersionRef,
+    WorkerForwardStats, WorkerInfo, WorkerRequest, WorkerResponse, WorkerResponseError,
 };
 
 pub type CodecResult<T> = std::result::Result<T, CodecError>;
@@ -427,11 +427,24 @@ fn gen_admission_from_table(admission: fbs::GenAdmission<'_>) -> CodecResult<Gen
 }
 
 fn media_admission_from_table(admission: fbs::MediaAdmission<'_>) -> CodecResult<MediaAdmission> {
+    let plan = admission
+        .plan()
+        .context("media admission has no resolved plan")?;
     Ok(MediaAdmission {
-        prompt: required_str(admission.prompt(), "media admission.prompt")?,
+        prompt_token_ids: admission
+            .prompt_token_ids()
+            .map(|items| items.iter().collect())
+            .unwrap_or_default(),
         seed: admission.seed(),
         profile: media_profile_from_fb(admission.profile())?,
         output_path: required_str(admission.output_path(), "media admission.output_path")?,
+        plan: MediaPlan {
+            frame_count: plan.frame_count(),
+            video_decode_units: plan.video_decode_units(),
+            audio_latent_frames: plan.audio_latent_frames(),
+            prompt_tokens: plan.prompt_tokens(),
+            denoise_steps: plan.denoise_steps(),
+        },
     })
 }
 
@@ -1332,10 +1345,17 @@ fn gen_admission_to_fb(admission: &GenAdmission) -> fbs::GenAdmissionT {
 
 fn media_admission_to_fb(admission: &MediaAdmission) -> fbs::MediaAdmissionT {
     fbs::MediaAdmissionT {
-        prompt: Some(admission.prompt.clone()),
+        prompt_token_ids: Some(admission.prompt_token_ids.clone()),
         seed: admission.seed,
         profile: media_profile_to_fb(admission.profile),
         output_path: Some(admission.output_path.clone()),
+        plan: Some(Box::new(fbs::MediaPlanT {
+            frame_count: admission.plan.frame_count,
+            video_decode_units: admission.plan.video_decode_units,
+            audio_latent_frames: admission.plan.audio_latent_frames,
+            prompt_tokens: admission.plan.prompt_tokens,
+            denoise_steps: admission.plan.denoise_steps,
+        })),
     }
 }
 

@@ -5,6 +5,8 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from ...execution.fixed_graph import FixedShapeGraphCache
+
 __all__ = ["MiniMaxH3AudioVAE"]
 
 
@@ -27,6 +29,18 @@ class MiniMaxH3AudioVAE(nn.Module):
             "latents_std",
             torch.tensor(std, dtype=torch.float32, device=self.device).view(1, 32, 1),
             persistent=False,
+        )
+        self.decode_graphs: FixedShapeGraphCache[torch.Tensor] | None = None
+        self.register_buffer("decode_graph_storage", None, persistent=False)
+
+    def configure_graph_cache(self, capacity: int, *, max_latent_frames: int) -> None:
+        self.decode_graphs = FixedShapeGraphCache(self.device, capacity=capacity)
+        if int(max_latent_frames) < 1:
+            raise ValueError("audio graph latent capacity must be positive")
+        self.decode_graph_storage = torch.empty(
+            (2, 32, int(max_latent_frames)),
+            dtype=torch.float32,
+            device=self.device,
         )
 
     @classmethod
@@ -53,10 +67,7 @@ class MiniMaxH3AudioVAE(nn.Module):
     def device(self) -> torch.device:
         return next(self.vae.parameters()).device
 
-    @torch.inference_mode()
-    def decode(self, normalized_latents: torch.Tensor) -> torch.Tensor:
-        if normalized_latents.shape != (2, 32, 207):
-            raise ValueError("the fixed H3 audio latent must have shape [2, 32, 207]")
+    def _decode(self, normalized_latents: torch.Tensor) -> torch.Tensor:
         latents = normalized_latents.to(device=self.device, dtype=torch.float32)
         latents = latents * self.latents_std + self.latents_mean
         decoded = self.vae.decode(latents).sample.float()
@@ -72,3 +83,26 @@ class MiniMaxH3AudioVAE(nn.Module):
             .to(torch.int16)
             .contiguous()
         )
+
+    @torch.inference_mode()
+    def decode(self, normalized_latents: torch.Tensor) -> torch.Tensor:
+        if normalized_latents.ndim != 3 or normalized_latents.shape[:2] != (2, 32):
+            raise ValueError("the H3 audio latent must have shape [2, 32, time]")
+        if self.decode_graphs is None or self.decode_graph_storage is None:
+            raise RuntimeError("the H3 audio decoder graph has not been captured")
+        key = tuple(int(value) for value in normalized_latents.shape)
+        if normalized_latents.shape[-1] > self.decode_graph_storage.shape[-1]:
+            raise ValueError("audio decoder input exceeds the configured graph capacity")
+        graph_input = self.decode_graph_storage[..., : normalized_latents.shape[-1]]
+        graph_input.copy_(normalized_latents)
+        return self.decode_graphs.execute(
+            key,
+            lambda: self._decode(graph_input),
+            warmup=lambda: self._decode(graph_input),
+        )
+
+    @torch.inference_mode()
+    def capture_decoder(self, normalized_latents: torch.Tensor) -> torch.Tensor:
+        if normalized_latents.ndim != 3 or normalized_latents.shape[:2] != (2, 32):
+            raise ValueError("the H3 audio latent must have shape [2, 32, time]")
+        return self.decode(normalized_latents)

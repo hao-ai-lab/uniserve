@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from uniserve_worker.execution.batch import Domain
 from uniserve_worker.bootstrap.cli import parse_worker_args
+from uniserve_worker.execution.batch import Domain
 
 pytestmark = pytest.mark.unit
 
@@ -30,6 +30,57 @@ def test_engine_batch_capacity_reaches_worker_resources() -> None:
 
     assert config.resources.max_batch_operations == 128
     assert config.resources.max_batch_tokens == 16384
+
+
+def test_linear_precision_reaches_model_launch_config() -> None:
+    config = parse_worker_args(
+        [
+            "--service-name",
+            "precision-test",
+            "--ipc-payload-cap",
+            "65536",
+            "--model",
+            "model",
+            "--max-batch-tokens",
+            "8192",
+            "--linear-precision",
+            "nvfp4",
+        ]
+    )
+
+    assert config.model is not None
+    assert config.model.linear_precision == "nvfp4"
+    assert not config.model.h3_precision_overrides.configured
+
+
+def test_h3_precision_overrides_reach_model_launch_config() -> None:
+    config = parse_worker_args(
+        [
+            "--service-name",
+            "precision-test",
+            "--ipc-payload-cap",
+            "65536",
+            "--model",
+            "model",
+            "--max-batch-tokens",
+            "8192",
+            "--h3-transformer-attention-precision",
+            "nvfp4",
+            "--h3-transformer-mlp-precision",
+            "fp8",
+            "--h3-text-encoder-precision",
+            "bf16",
+            "--h3-video-vae-precision",
+            "bf16",
+        ]
+    )
+
+    assert config.model is not None
+    assert config.model.h3_precision_overrides.configured
+    assert config.model.h3_precision_overrides.transformer_attention == "nvfp4"
+    assert config.model.h3_precision_overrides.transformer_mlp == "fp8"
+    assert config.model.h3_precision_overrides.text_encoder == "bf16"
+    assert config.model.h3_precision_overrides.video_vae == "bf16"
 
 
 def test_execution_lanes_are_typed_and_domain_disjoint() -> None:

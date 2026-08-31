@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::config::EngineSettings;
-use crate::profile::assets::ResolvedModelFiles;
+use crate::profile::assets::{ResolvedModelFiles, resolve_model_file};
 use crate::profile::omni::bagel::BagelProfile;
 use crate::profile::omni::sensenova::SenseNovaProfile;
 use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer, TokenizerError};
@@ -159,6 +159,8 @@ pub enum ResolvedAssets {
     },
     Media {
         profile: CommonModelProfile,
+        tokenizer: DynTokenizer,
+        max_video_seconds: f64,
     },
 }
 
@@ -198,13 +200,20 @@ impl ResolvedAssets {
             .unwrap_or_else(|| config.model.clone());
         if config.model_description == ModelDescription::MiniMaxH3 {
             prepare_media_spool(&config.media_spool)?;
+            let tokenizer_path =
+                resolve_model_file(&config.model, "tokenizer/tokenizer.json").await?;
+            let tokenizer: DynTokenizer = Arc::new(HuggingFaceTokenizer::new(&tokenizer_path)?);
             let mut profile = ModelProfile::minimax_h3(&served_name);
             profile.common_mut().context_limits.max_model_tokens =
-                Some(config.engine.max_model_len.unwrap_or(1));
+                Some(config.engine.max_model_len.unwrap_or(16_384));
             let ModelProfile::MiniMaxH3(profile) = profile else {
                 unreachable!("MiniMax H3 construction returns its matching closed variant")
             };
-            return Ok(Self::Media { profile });
+            return Ok(Self::Media {
+                profile,
+                tokenizer,
+                max_video_seconds: config.engine.max_video_seconds,
+            });
         }
 
         let files = ResolvedModelFiles::new(&config.model).await?;
@@ -293,15 +302,19 @@ impl ResolvedAssets {
                 renderer,
                 preprocessing: OmniPreprocessing::Bagel(profile.preprocessing),
             },
-            ModelProfile::MiniMaxH3(profile) => Self::Media { profile },
+            ModelProfile::MiniMaxH3(profile) => Self::Media {
+                profile,
+                tokenizer,
+                max_video_seconds: 15.0,
+            },
         })
     }
 
     pub(crate) fn profile(&self) -> &CommonModelProfile {
         match self {
-            Self::Text { profile, .. } | Self::Omni { profile, .. } | Self::Media { profile } => {
-                profile
-            }
+            Self::Text { profile, .. }
+            | Self::Omni { profile, .. }
+            | Self::Media { profile, .. } => profile,
         }
     }
 
@@ -406,6 +419,9 @@ pub struct BagelDesc {
 
 pub struct MiniMaxH3Desc {
     identity: ModelIdentity,
+    tokenizer: DynTokenizer,
+    max_prompt_tokens: u32,
+    max_video_seconds: f64,
 }
 
 impl ResolvedModel {
@@ -493,8 +509,15 @@ impl ResolvedModel {
                     }),
                 }))
             }
-            ResolvedAssets::Media { profile } => Ok(Self::Media(MiniMaxH3Desc {
+            ResolvedAssets::Media {
+                profile,
+                tokenizer,
+                max_video_seconds,
+            } => Ok(Self::Media(MiniMaxH3Desc {
                 identity: profile.identity,
+                tokenizer,
+                max_prompt_tokens: max_model_tokens,
+                max_video_seconds,
             })),
         }
     }
@@ -512,6 +535,96 @@ impl ResolvedModel {
     /// Friendly served-model name.
     pub fn served_model_name(&self) -> &str {
         &self.served_identity().served_name
+    }
+
+    pub fn resolve_video_plan(
+        &self,
+        request_id: &crate::serving::ServeRequestId,
+        prompt: &str,
+        seconds: f64,
+    ) -> Result<(uniserve_core::MediaPlan, Vec<u32>)> {
+        let Self::Media(description) = self else {
+            return Err(ServeError::UnsupportedFeature {
+                request_id: request_id.clone(),
+                feature: "video_generation",
+            });
+        };
+        let prompt_token_ids = description
+            .tokenizer
+            .encode(prompt, false)
+            .map_err(|source| ServeError::Tokenize {
+                request_id: request_id.clone(),
+                source: crate::serving::TokenizeError::Tokenizer(source),
+            })?;
+        if prompt_token_ids.is_empty() {
+            return Err(ServeError::Tokenize {
+                request_id: request_id.clone(),
+                source: crate::serving::TokenizeError::Invalid(
+                    "video prompt must contain at least one token".to_string(),
+                ),
+            });
+        }
+        if prompt_token_ids.len() > description.max_prompt_tokens as usize {
+            return Err(ServeError::ContextLengthExceeded {
+                request_id: request_id.clone(),
+                prompt_tokens: prompt_token_ids.len(),
+                max_tokens: description.max_prompt_tokens,
+            });
+        }
+        if !seconds.is_finite() || seconds <= 0.0 || seconds > description.max_video_seconds {
+            return Err(ServeError::Tokenize {
+                request_id: request_id.clone(),
+                source: crate::serving::TokenizeError::Invalid(format!(
+                    "video duration must be finite, positive, and at most {} seconds",
+                    description.max_video_seconds
+                )),
+            });
+        }
+        let raw_frames = (seconds * 24.0).round();
+        if raw_frames < 1.0 || raw_frames > f64::from(u32::MAX - 16) {
+            return Err(ServeError::Tokenize {
+                request_id: request_id.clone(),
+                source: crate::serving::TokenizeError::Invalid(
+                    "video duration cannot be represented by the deployment".to_string(),
+                ),
+            });
+        }
+        let raw_frames = raw_frames as u32;
+        let frame_count = raw_frames + (5 + 17 - raw_frames % 17) % 17;
+        if frame_count < 22 {
+            return Err(ServeError::Tokenize {
+                request_id: request_id.clone(),
+                source: crate::serving::TokenizeError::Invalid(
+                    "video duration is shorter than the supported media geometry".to_string(),
+                ),
+            });
+        }
+        let prompt_tokens =
+            u32::try_from(prompt_token_ids.len()).map_err(|_| ServeError::Tokenize {
+                request_id: request_id.clone(),
+                source: crate::serving::TokenizeError::Invalid(
+                    "video prompt token count exceeds the protocol width".to_string(),
+                ),
+            })?;
+        let audio_latent_frames = u32::try_from(
+            uniserve_core::MediaPlan::required_audio_latent_frames(frame_count),
+        )
+        .map_err(|_| ServeError::Tokenize {
+            request_id: request_id.clone(),
+            source: crate::serving::TokenizeError::Invalid(
+                "video duration exceeds the audio latent protocol width".to_string(),
+            ),
+        })?;
+        Ok((
+            uniserve_core::MediaPlan {
+                frame_count,
+                video_decode_units: (frame_count - 5) / 17,
+                audio_latent_frames,
+                prompt_tokens,
+                denoise_steps: 4,
+            },
+            prompt_token_ids,
+        ))
     }
 
     /// Event identity stamped onto `Accepted`.

@@ -213,7 +213,13 @@ impl Scheduler {
     /// (logged) instead of fire-and-forgetting into an UnsupportedControl error.
     pub(super) fn gated_control(&mut self, op: ControlOp) {
         if self.control_allowed(&op) {
-            let _ = self.executor.control(op);
+            if let Err(error) = self.executor.control(op) {
+                if self.fatal {
+                    tracing::error!(%error, "executor control failed during shutdown");
+                } else {
+                    self.on_executor_error(error);
+                }
+            }
         } else {
             tracing::debug!(
                 control = op.method(),

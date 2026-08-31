@@ -14,7 +14,6 @@ from typing import Any, cast
 
 import torch
 
-from uniserve_worker.worker_info import GraphBucket
 from uniserve_worker.execution.batch import (
     Batch,
     BatchPartition,
@@ -61,11 +60,11 @@ from uniserve_worker.execution.trace import (
 from uniserve_worker.foundation.errors import (
     WorkerError,
     WorkerErrorCode,
-    unsupported_setup,
     classify,
     invalid_descriptor,
     should_capture_trace,
     unsupported_operation,
+    unsupported_setup,
 )
 from uniserve_worker.loader.weight_set import WeightSet
 from uniserve_worker.models.generation import (
@@ -106,9 +105,9 @@ from uniserve_worker.runtime.latent_pool import (
 from uniserve_worker.runtime.req_to_token_pool import ReqToTokenPool
 from uniserve_worker.runtime.runtime_states import RuntimeStates
 from uniserve_worker.server.completion import (
-    DeferredResult,
     DeferredImagePayload,
     DeferredLogprobPayload,
+    DeferredResult,
     DeferredTransferPayload,
     PinnedOutputBuffer,
     PinnedTokenCapture,
@@ -127,6 +126,7 @@ from uniserve_worker.transfer.tickets import (
     Transport,
     decode_transfer_descriptor,
 )
+from uniserve_worker.worker_info import GraphBucket
 
 from .attention import columns as _attention_columns
 from .attention import dense_columns as _dense_attention_columns
@@ -1609,6 +1609,21 @@ def _discard_partition(
         lease.release()
     if scope.publication_started:
         raise RuntimeError("published partition state cannot be discarded")
+    if isinstance(runtime.model, MiniMaxH3Model) and scope.admissions:
+        admitted_slots = tuple(
+            (
+                admission,
+                runtime.model.states.get(int(admission.request_pool_idx)),
+            )
+            for admission in scope.admissions.values()
+        )
+        for admission, slot in admitted_slots:
+            if slot.request_key not in (None, admission.request_key):
+                raise RuntimeError("discarded H3 admission no longer owns its state slot")
+        for admission, slot in admitted_slots:
+            if runtime._h3_mux is not None:
+                runtime._h3_mux.drop(int(admission.request_key.session_id))
+            slot.clear()
     scope.completion.abandon()
     runtime.device_products.abandon_writes(tuple(scope.device_writes))
     runtime.encoder_cache.abandon_writes(tuple(scope.encoder_writes))

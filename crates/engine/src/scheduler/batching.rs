@@ -858,8 +858,12 @@ impl Scheduler {
                 "error": format!("{e}"),
             }));
             tracing::error!("executor submit failed: {e}");
-            self.fatal = true;
-            self.fail_all_inflight(&format!("{e}"));
+            if e.downcast_ref::<WorkerLossError>().is_some() {
+                self.on_executor_error(e);
+            } else {
+                self.fatal = true;
+                self.fail_all_inflight(&format!("{e}"));
+            }
             false
         } else {
             if !controls.is_empty() {

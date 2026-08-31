@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import struct
 import time
+import concurrent.futures
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
@@ -36,6 +37,7 @@ from ..transfer.tickets import (
 )
 from .cpu_tasks import CpuTaskReservation
 from .image_codec import uint8_image_to_png_base64_bytes
+from .profiler import profile_range
 from .request_state import RequestRuntime
 
 if TYPE_CHECKING:
@@ -44,6 +46,7 @@ if TYPE_CHECKING:
 __all__ = [
     "DeferredDerivedInteger",
     "DeferredCompletionTask",
+    "EventGatedDeferredTask",
     "DeferredResult",
     "DeferredImagePayload",
     "DeferredInteger",
@@ -282,6 +285,10 @@ class PinnedByteCapture:
         return self.buffer.read_bytes(self)
 
     def numpy(self) -> Any:
+        if self.external is not None:
+            if int(self.external.numel()) != int(self.count):
+                raise _invariant("external completion byte storage has an invalid extent")
+            return self.external.view(self.shape).numpy()
         return self.tensor().numpy()
 
 
@@ -1054,6 +1061,119 @@ class DeferredCompletionTask(ABC):
     @abstractmethod
     def finalize(self) -> object:
         raise NotImplementedError
+
+
+class EventGatedDeferredTask(DeferredCompletionTask):
+    """A bounded CPU action gated by dependencies and optional CUDA readiness."""
+
+    __slots__ = (
+        "capture",
+        "reservation",
+        "dependencies",
+        "action",
+        "_future",
+        "promise",
+        "_submission_error",
+        "profile_name",
+        "ready_event",
+        "_release",
+        "_defer_release",
+        "_resource_released",
+    )
+
+    def __init__(
+        self,
+        reservation: CpuTaskReservation,
+        action: Callable[[], None],
+        *,
+        capture: PinnedByteCapture | None = None,
+        dependencies: tuple[concurrent.futures.Future[None], ...] = (),
+        profile_name: str,
+        release: Callable[[], None] | None = None,
+        defer_release: Callable[[PinnedByteCapture], None] | None = None,
+    ) -> None:
+        self.capture = capture
+        self.reservation = reservation
+        self.dependencies = dependencies
+        self.action = action
+        self._future: concurrent.futures.Future[None] | None = None
+        self.promise: concurrent.futures.Future[None] = concurrent.futures.Future()
+        self._submission_error: BaseException | None = None
+        self.profile_name = profile_name
+        self.ready_event: torch.cuda.Event | None = None
+        self._release = release
+        self._defer_release = defer_release
+        self._resource_released = False
+
+    def _release_now(self) -> None:
+        if self._resource_released or self._release is None:
+            return
+        self._resource_released = True
+        self._release()
+
+    def _release_after_capture(self) -> None:
+        if self._resource_released or self._release is None:
+            return
+        self._resource_released = True
+        if self.capture is not None and self._defer_release is not None:
+            self._defer_release(self.capture)
+        else:
+            self._release()
+
+    def _run(self) -> None:
+        try:
+            if self.ready_event is not None:
+                self.ready_event.synchronize()
+            for dependency in self.dependencies:
+                dependency.result()
+            with profile_range(self.profile_name):
+                self.action()
+        except BaseException as error:
+            self.promise.set_exception(error)
+            raise
+        else:
+            self.promise.set_result(None)
+        finally:
+            self._release_now()
+
+    def start(self, ready_event: torch.cuda.Event | None = None) -> None:
+        if self._submission_error is not None:
+            return
+        if self._future is not None:
+            raise RuntimeError("deferred CPU completion was submitted more than once")
+        self.ready_event = ready_event
+        try:
+            self._future = self.reservation.submit(self._run)
+        except BaseException as error:
+            self._submission_error = error
+            self._release_now()
+            if not self.promise.done():
+                self.promise.set_exception(error)
+
+    def ready(self) -> bool:
+        if self._submission_error is not None:
+            return True
+        if self._future is None:
+            if self.capture is not None and not self.capture.ready():
+                return False
+            self.start()
+        return self._future is None or bool(self._future.done())
+
+    def finalize(self) -> None:
+        if not self.ready():
+            raise RuntimeError("deferred CPU completion was observed before it was ready")
+        if self._submission_error is not None:
+            raise self._submission_error
+        if self._future is None:
+            raise RuntimeError("deferred CPU completion lost its submitted future")
+        self._future.result(timeout=0)
+
+    def __del__(self) -> None:
+        self.reservation.abandon()
+        if self.capture is None or self.capture.ready():
+            self._release_now()
+        else:
+            self._release_after_capture()
 
 
 class DeferredLogprobPayload(DeferredCompletionTask):

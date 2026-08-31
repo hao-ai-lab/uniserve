@@ -418,6 +418,12 @@ pub trait Executor: Send {
         Ok(())
     }
 
+    /// Whether a reported [`WorkerLossError`] means the complete executor-side
+    /// session and routing epoch was replaced before the error was returned.
+    fn resets_all_state_after_worker_loss(&self) -> bool {
+        false
+    }
+
     /// Cloneable waker the command ingress fires after enqueuing a command.
     /// In-process test executors may retain the default when they never drive
     /// the threaded scheduler loop.

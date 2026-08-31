@@ -59,6 +59,10 @@ pub struct EngineSettings {
     /// [`EngineSettings::DEFAULT_MAX_MODEL_LEN`] for the final fallback when the
     /// model exposes no value).
     pub max_model_len: Option<u32>,
+    /// Largest request duration resident media state is sized to serve.
+    pub max_video_seconds: f64,
+    /// Maximum number of retained fixed-shape media graph executables.
+    pub media_graph_cache_capacity: usize,
     /// Number of tensor-parallel worker rank processes (tp size of the single
     /// Full pool in the default topology).
     /// Staged-worker topology, e.g. `encoder:2,prefill:1:tp=4,decode:1:tp=4`.
@@ -83,6 +87,8 @@ impl Default for EngineSettings {
             mixed_prefill_tokens: DEFAULT_MIXED_PREFILL_TOKENS,
             scheduler_policy: SchedulingPolicy::Fcfs,
             max_model_len: None,
+            max_video_seconds: 15.0,
+            media_graph_cache_capacity: 32,
             workers: WorkerTopology::single_full(1),
             transfer: TransportMap::default(),
             worker_process: WorkerProcessArgs {
@@ -209,9 +215,9 @@ impl EngineSettings {
     /// transport (64 MiB).
     pub const DEFAULT_RESP_SLOT_CAP: usize = 64 << 20;
 
-    /// H3 carries only compact descriptors and completion records over worker
-    /// IPC; encoded media remains in the shared spool.
-    pub const MEDIA_IPC_SLOT_CAP: usize = 64 << 10;
+    /// H3 carries prompt tokens and compact media descriptors over worker IPC;
+    /// encoded media remains in the shared spool.
+    pub const MEDIA_IPC_SLOT_CAP: usize = 256 << 10;
 
     /// Reject numeric engine settings that are structurally required to be
     /// positive (they index, divide, or bound scheduling). This catches a `0`
@@ -234,6 +240,19 @@ impl EngineSettings {
         anyhow::ensure!(
             self.max_model_len.map(|len| len > 0).unwrap_or(true),
             "max_model_len must be greater than 0"
+        );
+        anyhow::ensure!(
+            self.max_video_seconds.is_finite() && self.max_video_seconds > 0.0,
+            "max_video_seconds must be finite and greater than 0"
+        );
+        let max_video_frames = (self.max_video_seconds * 24.0).round();
+        anyhow::ensure!(
+            max_video_frames >= 6.0 && max_video_frames <= f64::from(u32::MAX - 16),
+            "max_video_seconds must resolve to supported media geometry"
+        );
+        anyhow::ensure!(
+            self.media_graph_cache_capacity > 0,
+            "media_graph_cache_capacity must be greater than 0"
         );
         anyhow::ensure!(
             self.worker_process.resp_slot_cap > 0,

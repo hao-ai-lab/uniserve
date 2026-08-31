@@ -10,13 +10,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
-use uniserve_core::{BlockId, RequestId, SamplingParams};
+use uniserve_core::{BlockId, MediaEvent, MediaPlan, MediaRequest, RequestId, SamplingParams};
 use uniserve_engine::{
-    ControlOp, Executor, MultiprocExecutor, TransferBackend, WorkerExecError, WorkerKind,
-    WorkerLossError, WorkerProcessArgs,
+    ControlOp, ControlTokens, EngineHandle, Executor, MultiprocExecutor, Scheduler,
+    TransferBackend, WorkerExecError, WorkerKind, WorkerLossError, WorkerProcessArgs,
 };
 use uniserve_worker_ipc::{
     AttentionRegime, Batch, BatchPartition, BlockTable, Bounds, CachePageAllocation, CloseReason,
@@ -32,8 +32,76 @@ const PIPELINE_DEPTH: usize = 2;
 #[test]
 fn multiprocess_topology_handles_rank_failure_and_capacity_limits() -> anyhow::Result<()> {
     check_rank_ipc()?;
+    qualify_failed_media_admission_reclamation()?;
     qualify_slow_transfer()?;
     qualify_peer_replacement()?;
+    Ok(())
+}
+
+fn qualify_failed_media_admission_reclamation() -> anyhow::Result<()> {
+    let executor = spawn_rank_group_with_slot_capacity(128 << 10)?;
+    let request_capacity = usize::try_from(executor.info().max_request_pool_size)?;
+    let scheduler = Scheduler::new(
+        Box::new(executor),
+        ControlTokens::default(),
+        PIPELINE_DEPTH * 8,
+    );
+    let (command_tx, command_rx) = crossbeam_channel::unbounded();
+    let handle = EngineHandle::new(command_tx);
+    let scheduler_thread = thread::spawn(move || scheduler.run(command_rx));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()?;
+
+    let result = (|| -> anyhow::Result<()> {
+        let mut requests = Vec::with_capacity(request_capacity + 1);
+        for index in 0..=request_capacity {
+            let request_id = RequestId(10_000 + index as u64);
+            let prompt_token_ids = if index == 0 {
+                (0..16_384_u32)
+                    .map(|token| token.saturating_add(100_000))
+                    .collect()
+            } else {
+                vec![100_000 + index as u32]
+            };
+            let prompt_tokens = u32::try_from(prompt_token_ids.len())?;
+            let events = handle.submit_media(MediaRequest {
+                request_id,
+                prompt_token_ids,
+                seed: index as u64,
+                priority: 0,
+                output_path: format!("/tmp/uniserve-media-{request_id:?}.mp4"),
+                plan: MediaPlan {
+                    frame_count: 22,
+                    video_decode_units: 1,
+                    audio_latent_frames: 37,
+                    prompt_tokens,
+                    denoise_steps: 4,
+                },
+            })?;
+            requests.push((request_id, events));
+        }
+        for (request_id, mut events) in requests {
+            let event = runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(10), events.recv()).await
+            })?;
+            let event = event.ok_or_else(|| {
+                anyhow::anyhow!("media event stream closed for request {request_id:?}")
+            })?;
+            assert!(
+                matches!(event, MediaEvent::Failed { .. }),
+                "request {request_id:?} did not reach terminal failure: {event:?}"
+            );
+        }
+        Ok(())
+    })();
+
+    handle.shutdown();
+    let engine_died = scheduler_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("scheduler thread panicked"))?;
+    result?;
+    assert!(!engine_died, "media admission failures killed the engine");
     Ok(())
 }
 
@@ -549,6 +617,17 @@ fn post_named_semaphore(name: &CString) -> anyhow::Result<()> {
 }
 
 fn spawn_rank_group() -> anyhow::Result<MultiprocExecutor> {
+    spawn_rank_group_with_capacities(1 << 20, 8 << 20)
+}
+
+fn spawn_rank_group_with_slot_capacity(slot_capacity: usize) -> anyhow::Result<MultiprocExecutor> {
+    spawn_rank_group_with_capacities(slot_capacity, slot_capacity)
+}
+
+fn spawn_rank_group_with_capacities(
+    request_slot_capacity: usize,
+    response_slot_capacity: usize,
+) -> anyhow::Result<MultiprocExecutor> {
     let worker = worker_python();
     let config = WorkerProcessArgs {
         stub: true,
@@ -562,8 +641,8 @@ fn spawn_rank_group() -> anyhow::Result<MultiprocExecutor> {
         device: "cpu".into(),
         world_size: WORLD_SIZE,
         pipeline_depth: PIPELINE_DEPTH,
-        req_slot_cap: 1 << 20,
-        resp_slot_cap: 8 << 20,
+        req_slot_cap: request_slot_capacity,
+        resp_slot_cap: response_slot_capacity,
         kv_token_capacity: Some(4096),
         block_size: 16,
         max_batch_operations: 256,

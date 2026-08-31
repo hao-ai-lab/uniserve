@@ -36,6 +36,7 @@ def configure_triton_toolchain() -> bool:
     return env_flag("UNISERVE_ENABLE_UNSUPPORTED_TRITON_SM100")
 
 
+@torch.compiler.assume_constant_result
 def triton_available(device: torch.device | str) -> bool:
     """Whether fused Triton kernels may run on ``device``."""
 

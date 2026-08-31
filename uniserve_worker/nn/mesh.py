@@ -1,4 +1,5 @@
 """Device mesh and transport boundaries for model parallelism."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -7,6 +8,26 @@ from typing import Any, Mapping, TypeAlias
 import torch
 
 from ..server.profiler import profile_range
+
+
+@torch.library.custom_op(
+    "uniserve_worker::symmetric_memory_fence",
+    mutates_args=("output",),
+)
+def _symmetric_memory_fence_custom(
+    input: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    work = torch.distributed.all_gather_into_tensor(output, input, async_op=True)
+    work.block_current_stream()
+
+
+@_symmetric_memory_fence_custom.register_fake
+def _symmetric_memory_fence_custom_fake(
+    input: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    del input, output
 
 
 @torch.library.custom_op(
@@ -40,14 +61,62 @@ def _all_to_all_single_into_custom_fake(
 ) -> None:
     del output, input, output_splits, input_splits
 
+
+@torch.library.custom_op(
+    "uniserve_worker::all_gather_into_tensor",
+    mutates_args=("output",),
+)
+def _all_gather_into_tensor_custom(
+    output: torch.Tensor,
+    input: torch.Tensor,
+) -> None:
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    with profile_range(f"uniserve.h3.collective kind=all_gather rank={rank}"):
+        work = torch.distributed.all_gather_into_tensor(
+            output,
+            input,
+            async_op=True,
+        )
+        work.block_current_stream()
+
+
+@_all_gather_into_tensor_custom.register_fake
+def _all_gather_into_tensor_custom_fake(
+    output: torch.Tensor,
+    input: torch.Tensor,
+) -> None:
+    del output, input
+
+
+@torch.library.custom_op(
+    "uniserve_worker::all_reduce_max",
+    mutates_args=("value",),
+)
+def _all_reduce_max_custom(value: torch.Tensor) -> None:
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    with profile_range(f"uniserve.h3.collective kind=all_reduce_max rank={rank}"):
+        work = torch.distributed.all_reduce(
+            value,
+            op=torch.distributed.ReduceOp.MAX,
+            async_op=True,
+        )
+        work.block_current_stream()
+
+
+@_all_reduce_max_custom.register_fake
+def _all_reduce_max_custom_fake(value: torch.Tensor) -> None:
+    del value
+
+
 __all__ = [
-    'divide',
-    'AxisTransport',
-    'CollectiveTransport',
-    'LocalP2PTransport',
-    'MeshAxis',
-    'DeviceMesh',
-    'TensorParallel',
+    "divide",
+    "AxisTransport",
+    "CollectiveTransport",
+    "LocalP2PTransport",
+    "MeshAxis",
+    "DeviceMesh",
+    "TensorParallel",
+    "SymmetricMemoryWorkspace",
 ]
 
 
@@ -103,6 +172,20 @@ class CollectiveTransport:
         torch.distributed.all_reduce(t, group=group)
         return t
 
+    def all_reduce_max(self, value: torch.Tensor) -> torch.Tensor:
+        group = self._require()
+        if group is None:
+            _all_reduce_max_custom(value)
+            return value
+        work = torch.distributed.all_reduce(
+            value,
+            op=torch.distributed.ReduceOp.MAX,
+            group=group,
+            async_op=True,
+        )
+        work.block_current_stream()
+        return value
+
     def all_gather(self, t: torch.Tensor, dim: int) -> torch.Tensor:
         group = self._require()
         chunks = [torch.empty_like(t) for _ in range(self.size)]
@@ -138,9 +221,46 @@ class CollectiveTransport:
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor) -> Any:
         group = self._require()
+        if group is None:
+            _all_gather_into_tensor_custom(output, input)
+            return None
         work = torch.distributed.all_gather_into_tensor(
             output,
             input,
+            group=group,
+            async_op=True,
+        )
+        work.block_current_stream()
+        return work
+
+    def gather_into_tensor(
+        self,
+        output: torch.Tensor | None,
+        input: torch.Tensor,
+        *,
+        dst: int,
+    ) -> Any:
+        group = self._require()
+        if not 0 <= int(dst) < self.size:
+            raise ValueError(f"gather destination {dst} is outside axis {self.axis!r}")
+        if self.coord == int(dst):
+            expected = (self.size, *input.shape)
+            if output is None or tuple(output.shape) != expected:
+                raise ValueError(f"gather output must have shape {expected}")
+            if output.dtype != input.dtype or output.device != input.device:
+                raise ValueError("gather output must match the input dtype and device")
+            gather_list = list(output.unbind(0))
+        else:
+            if output is not None:
+                raise ValueError("only the gather destination may provide output storage")
+            gather_list = None
+        global_dst = (
+            int(dst) if group is None else int(torch.distributed.get_global_rank(group, int(dst)))
+        )
+        work = torch.distributed.gather(
+            input,
+            gather_list=gather_list,
+            dst=global_dst,
             group=group,
             async_op=True,
         )
@@ -151,6 +271,37 @@ class CollectiveTransport:
         group = self._require()
         torch.distributed.broadcast(t, src=src, group=group)
         return t
+
+
+@dataclass(frozen=True)
+class SymmetricMemoryWorkspace:
+    """One mesh-axis rendezvous allocation and its stream-ordered fence."""
+
+    axis: str
+    rank: int
+    size: int
+    local: torch.Tensor
+    peers: tuple[torch.Tensor, ...]
+    handle: Any
+    group: Any = None
+
+    def fence(self, input: torch.Tensor, output: torch.Tensor) -> None:
+        if tuple(input.shape) != (1,) or tuple(output.shape) != (self.size,):
+            raise ValueError("symmetric-memory fence buffers do not match the mesh axis")
+        if self.size == 1:
+            output.copy_(input)
+            return
+        if self.group is None:
+            _symmetric_memory_fence_custom(input, output)
+            return
+        work = torch.distributed.all_gather_into_tensor(
+            output,
+            input,
+            group=self.group,
+            async_op=True,
+        )
+        work.block_current_stream()
+
 
 @dataclass(frozen=True)
 class LocalP2PTransport:
@@ -189,6 +340,7 @@ class LocalP2PTransport:
 
 AxisTransport: TypeAlias = CollectiveTransport | LocalP2PTransport
 
+
 @dataclass(frozen=True)
 class MeshAxis:
     """One parallelism dimension of the mesh.
@@ -225,6 +377,11 @@ class DeviceMesh:
 
     axes: Mapping[str, MeshAxis] = field(default_factory=dict)
     local_device: torch.device = field(default_factory=lambda: torch.device("cpu"))
+    _symmetric_workspaces: dict[tuple[object, ...], SymmetricMemoryWorkspace] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
 
     def axis(self, name: str) -> MeshAxis | None:
         return self.axes.get(name)
@@ -255,6 +412,76 @@ class DeviceMesh:
         if not isinstance(transport, CollectiveTransport):
             raise RuntimeError(f"mesh axis {group!r} does not support collectives")
         return transport.all_reduce(tensor)
+
+    def symmetric_memory(
+        self,
+        shape: tuple[int, ...],
+        *,
+        dtype: torch.dtype,
+        group: str = "sp",
+        name: str = "workspace",
+    ) -> SymmetricMemoryWorkspace:
+        """Allocate or retrieve one symmetric-memory workspace on a collective axis."""
+
+        if self.is_trivial(group):
+            key = (group, name, tuple(int(value) for value in shape), dtype, self.local_device)
+            cached = self._symmetric_workspaces.get(key)
+            if cached is not None:
+                return cached
+            local = torch.empty(shape, dtype=dtype, device=self.local_device)
+            workspace = SymmetricMemoryWorkspace(
+                axis=group,
+                rank=0,
+                size=1,
+                local=local,
+                peers=(local,),
+                handle=None,
+                group=None,
+            )
+            self._symmetric_workspaces[key] = workspace
+            return workspace
+        transport = self.transport(group)
+        if not isinstance(transport, CollectiveTransport):
+            raise RuntimeError(f"mesh axis {group!r} does not support symmetric memory")
+        process_group = transport._require()
+        key = (group, name, tuple(int(value) for value in shape), dtype, self.local_device)
+        cached = self._symmetric_workspaces.get(key)
+        if cached is not None:
+            return cached
+        import torch.distributed._symmetric_memory as symm_mem
+
+        backend = symm_mem.get_backend(self.local_device)
+        if backend != "NCCL":
+            symm_mem.set_backend("NCCL")
+        local = symm_mem.empty(shape, dtype=dtype, device=self.local_device)
+        rendezvous_group = (
+            torch.distributed.group.WORLD if process_group is None else process_group
+        )
+        handle = symm_mem.rendezvous(local, rendezvous_group)
+        peers = tuple(
+            handle.get_buffer(rank, shape, dtype) for rank in range(transport.size)
+        )
+        workspace = SymmetricMemoryWorkspace(
+            axis=group,
+            rank=transport.coord,
+            size=transport.size,
+            local=local,
+            peers=peers,
+            handle=handle,
+            group=process_group,
+        )
+        self._symmetric_workspaces[key] = workspace
+        return workspace
+
+    def all_reduce_max(self, tensor: torch.Tensor, group: str = "tp") -> torch.Tensor:
+        """Reduce one tensor with MAX in place on a named collective axis."""
+
+        if self.is_trivial(group):
+            return tensor
+        transport = self.transport(group)
+        if not isinstance(transport, CollectiveTransport):
+            raise RuntimeError(f"mesh axis {group!r} does not support collectives")
+        return transport.all_reduce_max(tensor)
 
     def all_to_all_single_into(
         self,
@@ -295,6 +522,26 @@ class DeviceMesh:
             raise RuntimeError(f"mesh axis {group!r} does not support collectives")
         return transport.all_gather_into_tensor(output, input)
 
+    def gather_into_tensor(
+        self,
+        output: torch.Tensor | None,
+        input: torch.Tensor,
+        *,
+        dst: int,
+        group: str = "sp",
+    ) -> Any:
+        """Enqueue one caller-buffered gather on a named mesh axis."""
+
+        if self.is_trivial(group):
+            if int(dst) != 0 or output is None or tuple(output.shape) != (1, *input.shape):
+                raise ValueError("single-rank gather requires destination zero output storage")
+            output[0].copy_(input, non_blocking=input.device.type == "cuda")
+            return None
+        transport = self.transport(group)
+        if not isinstance(transport, CollectiveTransport):
+            raise RuntimeError(f"mesh axis {group!r} does not support collectives")
+        return transport.gather_into_tensor(output, input, dst=dst)
+
     def broadcast(
         self,
         tensor: torch.Tensor,
@@ -327,6 +574,7 @@ class DeviceMesh:
             axes={ax.name: ax for ax in axes if ax.size > 1},
             local_device=torch.device(device),
         )
+
 
 @dataclass(frozen=True, slots=True)
 class TensorParallel:

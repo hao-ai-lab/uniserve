@@ -55,33 +55,7 @@ impl Scheduler {
         if max_batch_ops > 0 {
             config.max_batch = config.max_batch.min(max_batch_ops.max(1));
         }
-        let kv = info.uses_kv().then(|| {
-            let block_pool = if info.groups.is_empty() {
-                BlockPool::new(info.num_blocks as usize, info.block_size as usize)
-            } else {
-                let mut offset = 0_u32;
-                let group_shapes: Vec<(uniserve_core::KvGroupKind, u32, u32)> = info
-                    .groups
-                    .iter()
-                    .map(|group| {
-                        let group_shape = (group.kind, offset, group.num_blocks);
-                        offset = offset.saturating_add(group.num_blocks);
-                        group_shape
-                    })
-                    .collect();
-                BlockPool::with_groups(
-                    info.num_blocks as usize,
-                    info.block_size as usize,
-                    &group_shapes,
-                )
-            };
-            let usable_blocks = block_pool.request_page_capacity();
-            KvSchedulerState {
-                block_pool,
-                coordinator: KvCacheCoordinator::default(),
-                usable_blocks,
-            }
-        });
+        let kv = worker_kv_state(&info);
         let stats = Arc::new(SchedStats::default());
         stats.kv_cache.num_blocks.store(
             kv.as_ref().map_or(0, |state| state.usable_blocks),

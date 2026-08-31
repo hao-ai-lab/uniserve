@@ -32,6 +32,23 @@ impl ResolvedModelFiles {
     }
 }
 
+/// Resolve one required file from a local model directory, the local Hub cache, or the Hub.
+pub async fn resolve_model_file(model_id: &str, filename: &'static str) -> Result<PathBuf> {
+    let local = Path::new(model_id);
+    if local.is_dir() {
+        return local_file_if_exists(local, filename).ok_or_else(|| Error::MissingFile {
+            model: local.display().to_string(),
+            file: filename,
+        });
+    }
+    let cache_repo = Cache::from_env().model(model_id.to_string());
+    if let Some(path) = cache_repo.get(filename) {
+        return Ok(path);
+    }
+    let api = build_api(model_id)?;
+    download_known_file(&api.model(model_id.to_string()), model_id, filename).await
+}
+
 fn resolve_local_model_files(model_dir: &Path) -> Result<ResolvedModelFiles> {
     let tokenizer_path =
         local_file_if_exists(model_dir, "tokenizer.json").ok_or_else(|| Error::MissingFile {

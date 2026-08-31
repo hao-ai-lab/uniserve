@@ -1,0 +1,206 @@
+"""Shared encoded audio/video output sessions."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from fractions import Fraction
+from pathlib import Path
+from threading import RLock
+
+import numpy as np
+
+__all__ = ["AvMuxConfig", "AvMuxSession", "require_media_codecs"]
+
+
+def require_media_codecs(video_codec: str, audio_codec: str) -> None:
+    try:
+        import av
+    except ImportError as error:
+        raise RuntimeError("media output requires the PyAV runtime") from error
+    missing = [
+        name for name in (video_codec, audio_codec) if name not in av.codecs_available
+    ]
+    if missing:
+        raise RuntimeError(f"media output is missing required encoders {missing!r}")
+    for name in (video_codec, audio_codec):
+        av.CodecContext.create(name, "w")
+
+
+@dataclass(frozen=True, slots=True)
+class AvMuxConfig:
+    width: int
+    height: int
+    frame_count: int
+    frame_rate: int
+    audio_rate: int
+    video_unit_frames: tuple[int, ...]
+    video_codec: str = "libx264"
+    audio_codec: str = "aac"
+    audio_frame_samples: int = 1024
+
+    def __post_init__(self) -> None:
+        if (
+            min(
+                self.width,
+                self.height,
+                self.frame_count,
+                self.frame_rate,
+                self.audio_rate,
+            )
+            < 1
+        ):
+            raise ValueError("media mux geometry and rates must be positive")
+        if (
+            not self.video_unit_frames
+            or sum(self.video_unit_frames) != self.frame_count
+        ):
+            raise ValueError("media mux decode units must cover the output frame count")
+
+
+class AvMuxSession:
+    """One request-owned H.264/AAC-style container with split A/V locking."""
+
+    def __init__(self, path: Path, config: AvMuxConfig) -> None:
+        self.path = path
+        self.config = config
+        self._container = None
+        self._video = None
+        self._audio = None
+        self._next_unit = 0
+        self._video_frames = 0
+        self._audio_written = False
+        self._audio_packets: list[object] = []
+        self._closed = False
+        self._video_lock = RLock()
+        self._audio_lock = RLock()
+        self._container_lock = RLock()
+
+    def _open(self) -> None:
+        with self._container_lock:
+            if self._container is not None:
+                return
+            import av
+
+            config = self.config
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            container = av.open(str(self.path), mode="w", format="mp4")
+            video = container.add_stream(config.video_codec, rate=config.frame_rate)
+            video.width = config.width
+            video.height = config.height
+            video.pix_fmt = "yuv420p"
+            video.options = {"preset": "ultrafast", "tune": "zerolatency"}
+            audio = container.add_stream(config.audio_codec, rate=config.audio_rate)
+            audio.layout = "stereo"
+            audio.sample_rate = config.audio_rate
+            audio.bit_rate = 144_000
+            audio.options = {"aac_coder": "fast"}
+            self._container = container
+            self._video = video
+            self._audio = audio
+
+    def write_video(self, start_unit: int, unit_count: int, rgb24: np.ndarray) -> None:
+        import av
+
+        config = self.config
+        with self._video_lock:
+            stop_unit = int(start_unit) + int(unit_count)
+            if (
+                self._closed
+                or int(start_unit) != self._next_unit
+                or int(unit_count) < 1
+                or stop_unit > len(config.video_unit_frames)
+            ):
+                raise RuntimeError("video mux units are not request-ordered")
+            expected_frames = sum(config.video_unit_frames[int(start_unit) : stop_unit])
+            if (
+                rgb24.ndim != 4
+                or rgb24.shape[1:] != (config.height, config.width, 3)
+                or int(rgb24.shape[0]) != expected_frames
+            ):
+                raise RuntimeError("video capture has invalid RGB24 geometry")
+            self._open()
+            container, stream = self._container, self._video
+            if container is None or stream is None:
+                raise RuntimeError("video stream was not initialized")
+            for pixels in rgb24:
+                frame = av.VideoFrame.from_ndarray(pixels, format="rgb24")
+                frame.pts = self._video_frames
+                frame.time_base = Fraction(1, config.frame_rate)
+                for packet in stream.encode(frame):
+                    with self._container_lock:
+                        container.mux(packet)
+                self._video_frames += 1
+            self._next_unit = stop_unit
+
+    def write_audio(self, pcm: np.ndarray) -> None:
+        import av
+
+        config = self.config
+        with self._audio_lock:
+            if self._closed or self._audio_written:
+                raise RuntimeError("audio was muxed more than once")
+            if pcm.ndim != 2 or pcm.shape[1] != 2:
+                raise RuntimeError("audio capture has invalid stereo geometry")
+            self._open()
+            container, stream = self._container, self._audio
+            if container is None or stream is None:
+                raise RuntimeError("audio stream was not initialized")
+            target_samples = round(
+                config.frame_count * config.audio_rate / config.frame_rate
+            )
+            source = pcm[:target_samples]
+            if source.shape[0] < target_samples:
+                source = np.pad(source, ((0, target_samples - source.shape[0]), (0, 0)))
+            packets: list[object] = []
+            pts = 0
+            for start in range(0, target_samples, config.audio_frame_samples):
+                stop = min(start + config.audio_frame_samples, target_samples)
+                planar = np.zeros((2, config.audio_frame_samples), dtype=np.int16)
+                planar[:, : stop - start] = source[start:stop].T
+                frame = av.AudioFrame.from_ndarray(
+                    planar, format="s16p", layout="stereo"
+                )
+                frame.sample_rate = config.audio_rate
+                frame.pts = pts
+                frame.time_base = Fraction(1, config.audio_rate)
+                packets.extend(stream.encode(frame))
+                pts += config.audio_frame_samples
+            self._audio_packets = packets
+            self._audio_written = True
+
+    def close(self) -> None:
+        config = self.config
+        with self._video_lock, self._audio_lock:
+            if self._closed:
+                return
+            if self._video_frames != config.frame_count or not self._audio_written:
+                raise RuntimeError("media materialization is incomplete")
+            container, video, audio = self._container, self._video, self._audio
+            if container is None or video is None or audio is None:
+                raise RuntimeError("media mux session was never initialized")
+            for packet in video.encode(None):
+                with self._container_lock:
+                    container.mux(packet)
+            with self._container_lock:
+                for packet in self._audio_packets:
+                    container.mux(packet)
+                for packet in audio.encode(None):
+                    container.mux(packet)
+                container.close()
+            self._closed = True
+
+    def abort(self) -> None:
+        with self._video_lock, self._audio_lock:
+            completed = self._closed
+            if not self._closed and self._container is not None:
+                try:
+                    with self._container_lock:
+                        self._container.close()
+                except Exception:
+                    pass
+            self._closed = True
+        if not completed:
+            try:
+                self.path.unlink(missing_ok=True)
+            except OSError:
+                pass

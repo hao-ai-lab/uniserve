@@ -126,6 +126,9 @@ pub(crate) struct SharedRuntimeArgs {
     /// context length (`max_position_embeddings`) is used.
     #[arg(long = "max-model-len")]
     pub max_model_len: Option<u32>,
+    /// Maximum request duration provisioned by a media deployment.
+    #[arg(long = "max-video-seconds", default_value_t = 15.0)]
+    pub max_video_seconds: f64,
     /// Optional explicit KV token capacity override for the worker.
     #[arg(long = "max-total-tokens")]
     pub kv_token_capacity: Option<u64>,
@@ -283,6 +286,8 @@ impl SharedRuntimeArgs {
             // `None` lets `build_state` derive the model's real context length;
             // an explicit `--max-model-len` overrides it.
             max_model_len: self.max_model_len,
+            max_video_seconds: self.max_video_seconds,
+            media_graph_cache_capacity: self.worker_process.media_graph_cache_capacity,
             workers: self
                 .workers
                 .clone()
@@ -340,6 +345,21 @@ pub(crate) struct WorkerProcessOptions {
     pub checksum_manifest: Option<std::path::PathBuf>,
     #[arg(long = "dtype", default_value = "bfloat16")]
     pub model_dtype: ModelDtype,
+    /// Dynamic linear precision used by models that expose a quantized linear path.
+    #[arg(long, default_value = "fp8", value_parser = ["fp8", "nvfp4"])]
+    pub linear_precision: String,
+    /// MiniMax H3 transformer-attention precision override.
+    #[arg(long, value_parser = ["fp8", "nvfp4"])]
+    pub h3_transformer_attention_precision: Option<String>,
+    /// MiniMax H3 transformer-MLP precision override.
+    #[arg(long, value_parser = ["fp8", "nvfp4"])]
+    pub h3_transformer_mlp_precision: Option<String>,
+    /// MiniMax H3 text-encoder precision override.
+    #[arg(long, value_parser = ["bf16", "nvfp4"])]
+    pub h3_text_encoder_precision: Option<String>,
+    /// MiniMax H3 video-VAE precision override.
+    #[arg(long, value_parser = ["fp16", "bf16", "nvfp4"])]
+    pub h3_video_vae_precision: Option<String>,
     #[arg(long)]
     pub kv_cache_dtype: Option<KvCacheDtype>,
     #[arg(long = "mem-fraction-static", default_value = "0.70")]
@@ -381,6 +401,9 @@ pub(crate) struct WorkerProcessOptions {
     pub flashinfer_disable_split_kv: bool,
     #[arg(long, action = ArgAction::Set, default_value_t = true, hide = true)]
     pub flashinfer_fast_decode_plan: bool,
+    /// Retained fixed-shape executable capacity for media models.
+    #[arg(long, default_value_t = 32, hide = true)]
+    pub media_graph_cache_capacity: usize,
 }
 
 impl WorkerProcessOptions {
@@ -392,6 +415,11 @@ impl WorkerProcessOptions {
             load_threads: self.load_threads,
             checksum_manifest: self.checksum_manifest.clone(),
             model_dtype: self.model_dtype.clone(),
+            linear_precision: self.linear_precision.clone(),
+            h3_transformer_attention_precision: self.h3_transformer_attention_precision.clone(),
+            h3_transformer_mlp_precision: self.h3_transformer_mlp_precision.clone(),
+            h3_text_encoder_precision: self.h3_text_encoder_precision.clone(),
+            h3_video_vae_precision: self.h3_video_vae_precision.clone(),
             kv_cache_dtype: self.kv_cache_dtype.clone(),
             kv_memory_fraction: self.kv_memory_fraction.clone(),
             mesh: self.worker_mesh.clone(),
@@ -411,6 +439,7 @@ impl WorkerProcessOptions {
             flashinfer_prefill_split_tile_size: self.flashinfer_prefill_split_tile_size,
             flashinfer_disable_split_kv: self.flashinfer_disable_split_kv,
             flashinfer_fast_decode_plan: self.flashinfer_fast_decode_plan,
+            fixed_graph_cache_capacity: self.media_graph_cache_capacity,
             media_spool: None,
             ..WorkerProcessArgs::default()
         }
@@ -545,5 +574,37 @@ mod tests {
         ])
         .expect("configured serve invocation");
         assert!(matches!(parsed.command, Command::Serve(_)));
+    }
+
+    #[test]
+    fn serve_accepts_h3_precision_overrides() {
+        let parsed = <Cli as clap::Parser>::try_parse_from([
+            "uniserve",
+            "serve",
+            "model",
+            "--model-description",
+            "minimax-h3",
+            "--h3-transformer-attention-precision",
+            "fp8",
+            "--h3-transformer-mlp-precision",
+            "nvfp4",
+            "--h3-text-encoder-precision",
+            "bf16",
+            "--h3-video-vae-precision",
+            "bf16",
+        ])
+        .expect("MiniMax H3 precision overrides");
+        let Command::Serve(args) = parsed.command;
+        let worker = args.runtime.worker_process.to_args();
+        assert_eq!(
+            worker.h3_transformer_attention_precision,
+            Some("fp8".to_string())
+        );
+        assert_eq!(
+            worker.h3_transformer_mlp_precision,
+            Some("nvfp4".to_string())
+        );
+        assert_eq!(worker.h3_text_encoder_precision, Some("bf16".to_string()));
+        assert_eq!(worker.h3_video_vae_precision, Some("bf16".to_string()));
     }
 }

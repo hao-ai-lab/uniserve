@@ -1537,35 +1537,94 @@ class GenAdmission:
 
 
 @dataclass(frozen=True, slots=True)
+class MediaPlan:
+    frame_count: int
+    video_decode_units: int
+    audio_latent_frames: int
+    prompt_tokens: int
+    denoise_steps: int
+
+    def __post_init__(self) -> None:
+        for name in (
+            "frame_count",
+            "video_decode_units",
+            "audio_latent_frames",
+            "prompt_tokens",
+            "denoise_steps",
+        ):
+            _nonnegative(getattr(self, name), f"media plan {name}")
+        if (
+            self.frame_count < 22
+            or self.frame_count % 17 != 5
+            or self.video_decode_units != (self.frame_count - 5) // 17
+            or self.audio_latent_frames != (self.frame_count * 40 + 23) // 24
+            or self.prompt_tokens == 0
+            or self.denoise_steps != 4
+        ):
+            raise invalid_descriptor("media plan is invalid")
+
+    @classmethod
+    def from_mapping(cls, value: object, where: str = "media plan") -> MediaPlan:
+        data = _map(value, where)
+        return cls(
+            frame_count=_uint(data.get("frame_count"), f"{where}.frame_count"),
+            video_decode_units=_uint(
+                data.get("video_decode_units"), f"{where}.video_decode_units"
+            ),
+            audio_latent_frames=_uint(
+                data.get("audio_latent_frames"), f"{where}.audio_latent_frames"
+            ),
+            prompt_tokens=_uint(data.get("prompt_tokens"), f"{where}.prompt_tokens"),
+            denoise_steps=_uint(data.get("denoise_steps"), f"{where}.denoise_steps"),
+        )
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "frame_count": self.frame_count,
+            "video_decode_units": self.video_decode_units,
+            "audio_latent_frames": self.audio_latent_frames,
+            "prompt_tokens": self.prompt_tokens,
+            "denoise_steps": self.denoise_steps,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class MediaAdmission:
-    prompt: str
+    prompt_token_ids: tuple[int, ...]
     seed: int
     profile: MediaProfileId
     output_path: str
+    plan: MediaPlan
 
     def __post_init__(self) -> None:
-        if not self.prompt:
-            raise invalid_descriptor("media admission prompt must not be empty")
+        if not self.prompt_token_ids:
+            raise invalid_descriptor("media admission prompt tokens must not be empty")
         _nonnegative(self.seed, "media admission seed")
         if not self.output_path:
             raise invalid_descriptor("media admission output path must not be empty")
+        if len(self.prompt_token_ids) != self.plan.prompt_tokens:
+            raise invalid_descriptor("media admission prompt tokens disagree with its plan")
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "media admission") -> MediaAdmission:
         data = _map(value, where)
         return cls(
-            prompt=_str(data.get("prompt"), f"{where}.prompt"),
+            prompt_token_ids=_uints(
+                data.get("prompt_token_ids", ()), f"{where}.prompt_token_ids"
+            ),
             seed=_uint(data.get("seed"), f"{where}.seed"),
             profile=_enum(MediaProfileId, data.get("profile"), f"{where}.profile"),
             output_path=_str(data.get("output_path"), f"{where}.output_path"),
+            plan=MediaPlan.from_mapping(data.get("plan"), f"{where}.plan"),
         )
 
     def to_mapping(self) -> dict[str, object]:
         return {
-            "prompt": self.prompt,
+            "prompt_token_ids": list(self.prompt_token_ids),
             "seed": self.seed,
             "profile": self.profile.value,
             "output_path": self.output_path,
+            "plan": self.plan.to_mapping(),
         }
 
 

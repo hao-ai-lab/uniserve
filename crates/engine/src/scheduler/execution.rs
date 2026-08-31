@@ -82,20 +82,20 @@ impl Scheduler {
                 }
                 break;
             }
-            // A prompt batch carries only the controls addressed to its own
-            // sessions. Foreign controls stay pending for the next submission
-            // that carries those sessions' operations, so a prompt batch's
-            // session set stays disjoint from in-flight decode work and the
-            // worker may launch it ahead of queued decode submissions.
+            // A prompt batch carries its own state-mutating controls plus
+            // terminal closes, whose sessions have no remaining operations.
+            // Other foreign controls stay pending so the prompt session set
+            // remains disjoint from in-flight decode work.
             let prompt_batch = ops
                 .iter()
                 .all(|op| batch_kind(op.operation_variant) == BatchKind::Prefill);
             let controls: Vec<Control> = if prompt_batch {
                 let sessions: HashSet<RequestId> = ops.iter().map(|op| op.request_id).collect();
-                let (own, foreign): (VecDeque<Control>, VecDeque<Control>) = self
-                    .pending_controls
-                    .drain(..)
-                    .partition(|control| sessions.contains(&control.request_key().session_id));
+                let (own, foreign): (VecDeque<Control>, VecDeque<Control>) =
+                    self.pending_controls.drain(..).partition(|control| {
+                        matches!(control, Control::Close { .. })
+                            || sessions.contains(&control.request_key().session_id)
+                    });
                 self.pending_controls = foreign;
                 own.into()
             } else {
@@ -156,8 +156,18 @@ impl Scheduler {
                 self.media_state(*id).and_then(|state| {
                     let inflight = self.inflight.len(*id);
                     (!state.terminal_intent.is_terminal()
+                        && state.admission_state != MediaAdmissionState::InFlight
                         && inflight < max_unresolved
-                        && next_media_quantum(state.projected).is_some())
+                        && next_media_quantum(
+                            state.projected,
+                            state
+                                .admission
+                                .media
+                                .as_ref()
+                                .expect("media admission")
+                                .plan,
+                        )
+                        .is_some())
                     .then_some((inflight, index, *id))
                 })
             })
@@ -176,13 +186,26 @@ impl Scheduler {
         let mut operations = Vec::with_capacity(candidates.len());
         let mut latent_placements = Vec::new();
         let mut decode_placements = Vec::new();
-        let mut controls = Vec::new();
+        let (media_closes, remaining_controls): (VecDeque<_>, VecDeque<_>) = self
+            .pending_controls
+            .drain(..)
+            .partition(|control| matches!(control, Control::Close { .. }));
+        self.pending_controls = remaining_controls;
+        let mut controls = media_closes.into_iter().collect::<Vec<_>>();
 
         for (_, _, id) in candidates {
             let (request_key, parent, predicate, quantum, cursor_after) = {
                 let state = self.media_state(id).expect("media candidate exists");
-                let quantum =
-                    next_media_quantum(state.projected).expect("media candidate is runnable");
+                let quantum = next_media_quantum(
+                    state.projected,
+                    state
+                        .admission
+                        .media
+                        .as_ref()
+                        .expect("media admission")
+                        .plan,
+                )
+                .expect("media candidate is runnable");
                 let predicate = self
                     .inflight
                     .operations
@@ -244,12 +267,15 @@ impl Scheduler {
                 });
             }
             match quantum {
-                MediaQuantum::Video { unit } => decode_placements.push(DecodePlacement {
+                MediaQuantum::Video {
+                    start_unit,
+                    unit_count,
+                } => decode_placements.push(DecodePlacement {
                     request_key,
                     op_id,
                     kind: DecodeKind::Video,
-                    start_unit: unit,
-                    unit_count: 1,
+                    start_unit,
+                    unit_count,
                 }),
                 MediaQuantum::Audio => decode_placements.push(DecodePlacement {
                     request_key,
@@ -275,9 +301,9 @@ impl Scheduler {
                 },
             };
             let state = self.media_state_mut(id).expect("media candidate exists");
-            if !state.admission_sent {
+            if state.admission_state == MediaAdmissionState::Unsubmitted {
                 admissions.push(state.admission.clone());
-                state.admission_sent = true;
+                state.admission_state = MediaAdmissionState::InFlight;
             }
             state.projected = cursor_after;
             state.projected_parent = projected_parent;
@@ -322,8 +348,12 @@ impl Scheduler {
             self.inflight.batch_started.remove(&step);
             self.inflight.batch_partitions.remove(&step);
             self.inflight.batch_group_worker_exec_us.remove(&step);
-            self.fatal = true;
-            self.fail_all_running(&error.to_string());
+            if error.downcast_ref::<WorkerLossError>().is_some() {
+                self.on_executor_error(error);
+            } else {
+                self.fatal = true;
+                self.fail_all_running(&error.to_string());
+            }
             return false;
         }
         if !controls.is_empty() {
@@ -536,7 +566,7 @@ impl Scheduler {
                         continue;
                     }
                     let request_pool_idx = retiring.request_pool_idx;
-                    match self.executor.control_wait(ControlOp::DropSession(id), None) {
+                    match self.drop_worker_session(id) {
                         Ok(_) => {
                             self.retiring_media.remove(&id);
                             self.kv_budget.latent_pages.release(id);
@@ -550,6 +580,10 @@ impl Scheduler {
                                 );
                                 self.fatal = true;
                             }
+                        }
+                        Err(error) if error.downcast_ref::<WorkerLossError>().is_some() => {
+                            self.on_executor_error(error);
+                            return;
                         }
                         Err(error) => {
                             tracing::error!(request_id = id.0, %error, "media worker session retirement failed");
@@ -581,7 +615,7 @@ impl Scheduler {
                     .flow_prefix
                     .as_ref()
                     .map(|prefix| prefix.request_pool_idx);
-                match self.executor.control_wait(ControlOp::DropSession(id), None) {
+                match self.drop_worker_session(id) {
                     Ok(_) => {
                         self.retiring_sessions.remove(&id);
                         self.kv_budget.latent_pages.release(id);
@@ -606,6 +640,10 @@ impl Scheduler {
                             self.fatal = true;
                         }
                     }
+                    Err(error) if error.downcast_ref::<WorkerLossError>().is_some() => {
+                        self.on_executor_error(error);
+                        return;
+                    }
                     Err(error) => {
                         tracing::error!(
                             request_id = id.0,
@@ -617,6 +655,25 @@ impl Scheduler {
                 }
             }
         }
+    }
+
+    fn drop_worker_session(&mut self, id: RequestId) -> anyhow::Result<()> {
+        let acknowledgements = self
+            .executor
+            .control_wait(ControlOp::DropSession(id), None)?;
+        anyhow::ensure!(
+            !acknowledgements.is_empty(),
+            "worker session retirement returned no acknowledgements"
+        );
+        for acknowledgement in acknowledgements {
+            if let Err(error) = acknowledgement.result {
+                anyhow::bail!(
+                    "worker rank {} rejected session retirement: {error}",
+                    acknowledgement.rank
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Whether a request may keep an additional operation in flight at the
@@ -1043,11 +1100,17 @@ impl Scheduler {
             return;
         };
         let already_failed = matches!(state.terminal_intent, MediaTerminalIntent::Failure(_));
+        let valid = record.status == OpStatus::Ok
+            && record.request_key == operation.request_key
+            && record.op_id == operation.op_id
+            && (!operation.advances_state || record.selected_point > 0);
+        if valid
+            && let Some(state) = self.media_state_mut(id)
+            && state.admission_state == MediaAdmissionState::InFlight
+        {
+            state.admission_state = MediaAdmissionState::Registered;
+        }
         if !already_failed {
-            let valid = record.status == OpStatus::Ok
-                && record.request_key == operation.request_key
-                && record.op_id == operation.op_id
-                && (!operation.advances_state || record.selected_point > 0);
             if !valid {
                 if let Some(state) = self.media_state_mut(id) {
                     state.terminal_intent =
@@ -1118,10 +1181,39 @@ impl Scheduler {
         };
         self.order.retain(|candidate| *candidate != id);
         let _ = state.event_tx.send(event);
-        if !state.admission_sent {
-            self.kv_budget.latent_pages.release(id);
-            let _ = self.kv_budget.request_slots.release(state.request_pool_idx);
-            return;
+        match state.admission_state {
+            MediaAdmissionState::Unsubmitted => {
+                self.kv_budget.latent_pages.release(id);
+                let _ = self.kv_budget.request_slots.release(state.request_pool_idx);
+                return;
+            }
+            MediaAdmissionState::InFlight => {
+                if let Err(error) = self.drop_worker_session(id) {
+                    if error.downcast_ref::<WorkerLossError>().is_some() {
+                        self.on_executor_error(error);
+                        return;
+                    }
+                    tracing::error!(
+                        request_id = id.0,
+                        %error,
+                        "failed to retire an unregistered media admission"
+                    );
+                    self.fatal = true;
+                    return;
+                }
+                self.kv_budget.latent_pages.release(id);
+                if let Err(error) = self.kv_budget.request_slots.release(state.request_pool_idx) {
+                    tracing::error!(
+                        request_id = id.0,
+                        request_pool_idx = state.request_pool_idx,
+                        error,
+                        "failed to release media request slot"
+                    );
+                    self.fatal = true;
+                }
+                return;
+            }
+            MediaAdmissionState::Registered => {}
         }
         let request_key = state.admission.request_key;
         self.pending_controls.push_back(Control::Close {
@@ -1176,8 +1268,14 @@ impl Scheduler {
     /// severity by class so a benign `InputError` does not spam warnings.
     pub(super) fn on_executor_error(&mut self, e: anyhow::Error) {
         if e.downcast_ref::<WorkerLossError>().is_some() {
-            tracing::warn!("worker state was lost; terminating affected live sessions: {e}");
-            self.fail_all_running(&e.to_string());
+            if self.executor.resets_all_state_after_worker_loss() {
+                tracing::warn!("worker state was reset; terminating affected live sessions: {e}");
+                self.fail_all_after_worker_loss(&e.to_string());
+            } else {
+                tracing::error!("worker state was lost without a complete executor reset: {e}");
+                self.fatal = true;
+                self.fail_all_running(&e.to_string());
+            }
             return;
         }
         let exec = e.downcast_ref::<WorkerExecError>();
@@ -1922,9 +2020,19 @@ impl Scheduler {
         // the submitted batches whose results will now never return are
         // failed here, so drop their pending submit-timestamps too — otherwise
         // `batch_started` accumulates orphaned entries for every failed batch.
-        let ids = self.inflight.clear_failed();
+        let (ids, controls) = self.inflight.clear_failed();
+        self.acknowledge_controls(&controls);
         for id in ids {
-            if self.running.contains_key(&id) {
+            if self.media_state(id).is_some() {
+                self.finish_media(
+                    id,
+                    MediaEvent::Failed {
+                        message: msg.to_string(),
+                    },
+                    CloseReason::Error,
+                    None,
+                );
+            } else if self.running.contains_key(&id) {
                 self.emit(
                     id,
                     GenerationEvent::Error {
@@ -1936,9 +2044,96 @@ impl Scheduler {
         }
     }
 
+    fn fail_all_after_worker_loss(&mut self, message: &str) {
+        self.fail_inflight_domain_credits();
+        let _ = self.inflight.clear_failed();
+        self.pending_controls.clear();
+
+        for state in self.running_media.values_mut() {
+            state.admission_state = MediaAdmissionState::Unsubmitted;
+        }
+        let media = self.media_ids();
+        for id in media {
+            self.finish_media(
+                id,
+                MediaEvent::Failed {
+                    message: message.to_string(),
+                },
+                CloseReason::Error,
+                None,
+            );
+        }
+
+        for state in self.running.values_mut() {
+            state.cursor.resources.worker_registered = false;
+        }
+        let ids = self.running.keys().copied().collect::<Vec<_>>();
+        for id in ids {
+            self.emit(
+                id,
+                GenerationEvent::Error {
+                    message: message.to_string(),
+                },
+            );
+            self.finish(id, FinishReason::Error);
+        }
+
+        let retiring_media = std::mem::take(&mut self.retiring_media);
+        for (id, retiring) in retiring_media {
+            self.kv_budget.latent_pages.release(id);
+            if let Err(error) = self
+                .kv_budget
+                .request_slots
+                .release(retiring.request_pool_idx)
+            {
+                tracing::error!(
+                    request_id = id.0,
+                    request_pool_idx = retiring.request_pool_idx,
+                    error,
+                    "failed to release media request slot after worker loss"
+                );
+                self.fatal = true;
+            }
+        }
+
+        let retiring_sessions = std::mem::take(&mut self.retiring_sessions);
+        for (id, retiring) in retiring_sessions {
+            self.kv_budget.latent_pages.release(id);
+            if let Some(prefix) = retiring.flow_prefix
+                && let Err(error) = self
+                    .kv_budget
+                    .request_slots
+                    .release(prefix.request_pool_idx)
+            {
+                tracing::error!(
+                    request_id = id.0,
+                    request_pool_idx = prefix.request_pool_idx,
+                    error,
+                    "failed to release flow-prefix request slot after worker loss"
+                );
+                self.fatal = true;
+            }
+            if let Err(error) = self
+                .kv_budget
+                .request_slots
+                .release(retiring.request_pool_idx)
+            {
+                tracing::error!(
+                    request_id = id.0,
+                    request_pool_idx = retiring.request_pool_idx,
+                    error,
+                    "failed to release request slot after worker loss"
+                );
+                self.fatal = true;
+            }
+        }
+        self.pending_controls.clear();
+        self.kv_budget.reset_after_worker_loss(&self.info);
+    }
+
     pub(super) fn fail_all_running(&mut self, message: &str) {
         self.fail_inflight_domain_credits();
-        self.inflight.clear_failed();
+        let _ = self.inflight.clear_failed();
         while let Some(submission) = self.pending_media.pop_front() {
             let _ = submission.event_tx.send(MediaEvent::Failed {
                 message: message.to_string(),

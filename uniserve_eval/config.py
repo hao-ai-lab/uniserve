@@ -20,6 +20,7 @@ from .types import (
     MetricDirection,
     SamplingConfig,
     TaskName,
+    VideoConfig,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,11 +40,13 @@ _ROOT_FIELDS = {
     "load",
     "sampling",
     "image",
+    "video",
     "metrics",
 }
 _LOAD_FIELDS = set(LoadConfig.__dataclass_fields__)
 _SAMPLING_FIELDS = set(SamplingConfig.__dataclass_fields__)
 _IMAGE_FIELDS = set(ImageConfig.__dataclass_fields__)
+_VIDEO_FIELDS = set(VideoConfig.__dataclass_fields__)
 
 
 @dataclass(frozen=True)
@@ -225,6 +228,7 @@ def _benchmark_point(
     load = _load_config(value.get("load"), f"benchmarks.{name}.load")
     sampling = _sampling_config(value.get("sampling"), task, f"benchmarks.{name}.sampling")
     image = _image_config(value.get("image"), task, f"benchmarks.{name}.image")
+    video = _video_config(value.get("video"), f"benchmarks.{name}.video")
     endpoint = task.check_endpoint(value.get("endpoint"), f"benchmarks.{name}")
     question = task.check_question(value.get("question"), f"benchmarks.{name}")
     tokenizer = value.get("tokenizer")
@@ -249,6 +253,7 @@ def _benchmark_point(
         load=load,
         sampling=sampling,
         image=image,
+        video=video,
         dataset_revision=revision,
         dataset_path=dataset_path,
         tokenizer=tokenizer,
@@ -304,6 +309,14 @@ def _image_config(raw: Any, task: type[BenchmarkTask], context: str) -> ImageCon
             raise ValueError(f"{context}.cfg_interval must have two values")
         value["cfg_interval"] = (float(interval[0]), float(interval[1]))
     return ImageConfig(**value)
+
+
+def _video_config(raw: Any, context: str) -> VideoConfig:
+    if raw is None:
+        return VideoConfig()
+    value = _mapping(raw, context)
+    _reject_unknown(value, _VIDEO_FIELDS, context)
+    return VideoConfig(**value)
 
 
 def _suite_profile(

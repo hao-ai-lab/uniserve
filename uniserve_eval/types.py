@@ -98,6 +98,18 @@ class ImageConfig:
 
 
 @dataclass(frozen=True)
+class VideoConfig:
+    seconds: float = 5.0
+    prompt_tokens: int = 1000
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.seconds) or self.seconds <= 0.0:
+            raise ValueError("video seconds must be finite and positive")
+        if self.prompt_tokens < 1:
+            raise ValueError("video prompt_tokens must be positive")
+
+
+@dataclass(frozen=True)
 class Example:
     id: str
     prompt: str
@@ -112,6 +124,7 @@ class Example:
     steps: int | None = None
     seed: int | None = None
     aspect_ratio: str | None = None
+    seconds: float | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {key: value for key, value in asdict(self).items() if value is not None}
@@ -421,6 +434,7 @@ class BenchmarkPoint:
     load: LoadConfig = field(default_factory=LoadConfig)
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
     image: ImageConfig = field(default_factory=ImageConfig)
+    video: VideoConfig = field(default_factory=VideoConfig)
     dataset_revision: str | None = None
     dataset_path: str | None = None
     tokenizer: str | None = None
@@ -449,6 +463,7 @@ class BenchmarkPoint:
             "load": load,
             "sampling": asdict(self.sampling),
             "image": asdict(self.image),
+            "video": asdict(self.video),
             "metrics": [metric.as_dict() for metric in self.metrics],
         }
 

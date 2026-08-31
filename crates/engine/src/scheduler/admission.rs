@@ -170,10 +170,17 @@ impl Scheduler {
                 request_key,
                 request_pool_idx,
                 MediaAdmission {
-                    prompt: submission.request.prompt.clone(),
+                    prompt_token_ids: submission.request.prompt_token_ids.clone(),
                     seed: submission.request.seed,
                     profile: MediaProfileId::MinimaxH3T2va,
                     output_path: submission.request.output_path.clone(),
+                    plan: MediaPlan {
+                        frame_count: submission.request.plan.frame_count,
+                        video_decode_units: submission.request.plan.video_decode_units,
+                        audio_latent_frames: submission.request.plan.audio_latent_frames,
+                        prompt_tokens: submission.request.plan.prompt_tokens,
+                        denoise_steps: submission.request.plan.denoise_steps,
+                    },
                 },
             )
             .expect("validated media admission");
@@ -185,7 +192,7 @@ impl Scheduler {
                     event_tx: submission.event_tx,
                     request_pool_idx,
                     admission,
-                    admission_sent: false,
+                    admission_state: MediaAdmissionState::Unsubmitted,
                     committed: MediaCursor::default(),
                     projected: MediaCursor::default(),
                     fixed_parent: root.clone(),

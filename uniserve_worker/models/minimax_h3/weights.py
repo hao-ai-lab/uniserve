@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
@@ -13,6 +13,7 @@ from torch import nn
 from ...nn.mesh import DeviceMesh
 from .audio_vae import MiniMaxH3AudioVAE
 from .encoder import H3TextEncoderConfig, MiniMaxH3TextEncoder
+from .precision import H3LinearPrecisionPolicy
 from .transformer import H3TransformerConfig, MiniMaxH3Transformer
 from .video_vae import MiniMaxH3VideoVAE
 
@@ -33,7 +34,6 @@ class H3Components:
     encoder: MiniMaxH3TextEncoder
     video_vae: MiniMaxH3VideoVAE
     audio_vae: MiniMaxH3AudioVAE | None
-    tokenizer: Any | None
 
 
 def resolve_h3_checkpoint(
@@ -227,11 +227,35 @@ def _load_transformer(
     device: torch.device,
 ) -> None:
     from ...loader.handles import weight_handle_materialization
+    from ...loader.weight_loaders import attach_parameter_loaders, load_parameter_weight
+    from ...nn.quant import process_quantized_modules
 
     sources = _weight_map(component)
+    attach_parameter_loaders(model, device=device, dtype=torch.bfloat16)
     targets = dict(model.named_parameters())
     with weight_handle_materialization():
-        for name in targets:
+        for name, target in targets.items():
+            packed_suffix = ".attn.to_qkvg.weight"
+            if name.startswith("transformer_blocks.") and name.endswith(packed_suffix):
+                prefix = name[: -len("to_qkvg.weight")]
+                source_names = tuple(
+                    prefix + suffix
+                    for suffix in (
+                        "to_q.weight",
+                        "to_k.weight",
+                        "to_v.weight",
+                        "to_gate_compress.weight",
+                    )
+                )
+                for projection, source_name in enumerate(source_names):
+                    try:
+                        handle = sources[source_name]
+                    except KeyError as error:
+                        raise KeyError(
+                            f"FastH3 transformer is missing checkpoint tensor {source_name!r}"
+                        ) from error
+                    load_parameter_weight(target, handle, projection)
+                continue
             try:
                 handle = sources[name]
             except KeyError as error:
@@ -244,12 +268,13 @@ def _load_transformer(
                 non_blocking=False,
             )
             _set_parameter(model, name, tensor)
-    gate_names = {
-        f"transformer_blocks.{index}.attn.to_gate_compress.weight"
+    packed_names = {
+        f"transformer_blocks.{index}.attn.to_qkvg.weight"
         for index in range(model.config.layers)
     }
-    if not gate_names <= targets.keys():
-        raise RuntimeError("FastH3 transformer did not materialize all trained VSA gates")
+    if not packed_names <= targets.keys():
+        raise RuntimeError("FastH3 transformer did not materialize all attention projections")
+    process_quantized_modules(model.modules())
 
 
 def _encoder_shard(
@@ -311,6 +336,7 @@ def load_h3_components(
     *,
     cache_dir: str | None = None,
     revision: str | None = None,
+    precision_policy: H3LinearPrecisionPolicy,
     attention_mode: Literal["sparse_kernel", "sparse_oracle", "dense_oracle"] = "sparse_kernel",
 ) -> H3Components:
     checkpoint = resolve_h3_checkpoint(
@@ -323,25 +349,25 @@ def load_h3_components(
         mesh,
         layout,
         parameter_device="meta",
+        attention_linear_precision=precision_policy.transformer_attention,
+        mlp_linear_precision=precision_policy.transformer_mlp,
         attention_mode=attention_mode,
     )
-    encoder = MiniMaxH3TextEncoder(mesh, parameter_device="meta")
+    encoder = MiniMaxH3TextEncoder(
+        mesh,
+        max_text_rows=int(layout.packed.text_indices.numel()),
+        parameter_device="meta",
+    )
     _load_transformer(transformer, checkpoint.root / "transformer", mesh.local_device)
     _load_encoder(encoder, checkpoint.root / "text_encoder", mesh.local_device)
+    if precision_policy.text_encoder == "nvfp4":
+        encoder.enable_nvfp4()
 
-    if mesh.coord("tp") == 0:
-        from transformers import AutoTokenizer
-
-        tokenizer = AutoTokenizer.from_pretrained(
-            checkpoint.root,
-            subfolder="tokenizer",
-            local_files_only=True,
-            trust_remote_code=False,
-        )
-    else:
-        tokenizer = None
     video_vae = MiniMaxH3VideoVAE.from_pretrained(
-        str(checkpoint.root), device=mesh.local_device, local_files_only=True
+        str(checkpoint.root),
+        device=mesh.local_device,
+        local_files_only=True,
+        linear_precision=precision_policy.video_vae,
     )
     audio_vae = (
         MiniMaxH3AudioVAE.from_pretrained(
@@ -356,5 +382,4 @@ def load_h3_components(
         encoder=encoder,
         video_vae=video_vae,
         audio_vae=audio_vae,
-        tokenizer=tokenizer,
     )

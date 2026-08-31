@@ -125,6 +125,102 @@ if triton is not None:
         tl.store(k_out_ptr + k_pid * dim + offs, k_rot, mask=k_mask)
 
     @triton.jit
+    def _qk_rms_norm_partial_rope_inplace_kernel(
+        query,
+        key,
+        query_weight,
+        key_weight,
+        cosine,
+        sine,
+        query_stride_row: tl.constexpr,
+        query_stride_head: tl.constexpr,
+        key_stride_row: tl.constexpr,
+        key_stride_head: tl.constexpr,
+        rotary_stride_row: tl.constexpr,
+        rows: tl.constexpr,
+        heads: tl.constexpr,
+        eps: tl.constexpr,
+        block_rows: tl.constexpr,
+        head_dim: tl.constexpr,
+        rotary_dim: tl.constexpr,
+    ):
+        row_offsets = tl.program_id(0) * block_rows + tl.arange(0, block_rows)
+        head = tl.program_id(1)
+        columns = tl.arange(0, head_dim)
+        valid = row_offsets[:, None] < rows
+        query_offsets = (
+            row_offsets[:, None] * query_stride_row
+            + head * query_stride_head
+            + columns[None, :]
+        )
+        key_offsets = (
+            row_offsets[:, None] * key_stride_row
+            + head * key_stride_head
+            + columns[None, :]
+        )
+        query_values = tl.load(query + query_offsets, mask=valid, other=0.0).to(tl.float32)
+        key_values = tl.load(key + key_offsets, mask=valid, other=0.0).to(tl.float32)
+        query_weights = tl.load(query_weight + columns)[None, :].to(tl.float32)
+        key_weights = tl.load(key_weight + columns)[None, :].to(tl.float32)
+        query_rstd = tl.rsqrt(tl.sum(query_values * query_values, axis=1) / head_dim + eps)
+        key_rstd = tl.rsqrt(tl.sum(key_values * key_values, axis=1) / head_dim + eps)
+        normalized_query = (query_values * query_rstd[:, None] * query_weights).to(tl.bfloat16).to(tl.float32)
+        normalized_key = (key_values * key_rstd[:, None] * key_weights).to(tl.bfloat16).to(tl.float32)
+
+        half_rotary: tl.constexpr = rotary_dim // 2
+        partner_columns = tl.where(
+            columns < half_rotary,
+            columns + half_rotary,
+            columns - half_rotary,
+        )
+        partner_columns = tl.where(columns < rotary_dim, partner_columns, columns)
+        partner_query = tl.load(
+            query
+            + row_offsets[:, None] * query_stride_row
+            + head * query_stride_head
+            + partner_columns[None, :],
+            mask=valid,
+            other=0.0,
+        ).to(tl.float32)
+        partner_key = tl.load(
+            key
+            + row_offsets[:, None] * key_stride_row
+            + head * key_stride_head
+            + partner_columns[None, :],
+            mask=valid,
+            other=0.0,
+        ).to(tl.float32)
+        partner_query_weight = tl.load(query_weight + partner_columns)[None, :].to(tl.float32)
+        partner_key_weight = tl.load(key_weight + partner_columns)[None, :].to(tl.float32)
+        partner_query = (partner_query * query_rstd[:, None] * partner_query_weight).to(tl.bfloat16).to(tl.float32)
+        partner_key = (partner_key * key_rstd[:, None] * partner_key_weight).to(tl.bfloat16).to(tl.float32)
+
+        rotary_mask = columns[None, :] < rotary_dim
+        cosine_values = tl.load(
+            cosine + row_offsets[:, None] * rotary_stride_row + columns[None, :],
+            mask=valid & rotary_mask,
+            other=1.0,
+        ).to(tl.float32)
+        sine_values = tl.load(
+            sine + row_offsets[:, None] * rotary_stride_row + columns[None, :],
+            mask=valid & rotary_mask,
+            other=0.0,
+        ).to(tl.float32)
+        sign = tl.where(columns[None, :] < half_rotary, -1.0, 1.0)
+        query_output = tl.where(
+            rotary_mask,
+            normalized_query * cosine_values + sign * partner_query * sine_values,
+            normalized_query,
+        )
+        key_output = tl.where(
+            rotary_mask,
+            normalized_key * cosine_values + sign * partner_key * sine_values,
+            normalized_key,
+        )
+        tl.store(query + query_offsets, query_output, mask=valid)
+        tl.store(key + key_offsets, key_output, mask=valid)
+
+    @triton.jit
     def _split_rms_norm_rope_row(
         x_ptr,
         base,
@@ -408,6 +504,104 @@ if triton is not None:
                 k_stride_2, dim0, half0, axis_dim, axis_half, tail_dim, k_eps,
                 block_a, block_b,
             )
+
+
+def can_run_triton_qk_rms_norm_rope_inplace(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    query_weight: torch.Tensor,
+    key_weight: torch.Tensor,
+    cosine: torch.Tensor,
+    sine: torch.Tensor,
+) -> bool:
+    return not (
+        triton is None
+        or torch.is_grad_enabled()
+        or not triton_available(query.device)
+        or not query.is_cuda
+        or query.ndim != 3
+        or query.shape != key.shape
+        or query.device != key.device
+        or query.dtype != key.dtype
+        or int(query.shape[0]) <= 0
+        or int(query.shape[1]) <= 0
+        or int(query.shape[2]) <= 0
+        or int(query.shape[2]) > 1024
+        or not query_weight.is_cuda
+        or not key_weight.is_cuda
+        or query_weight.device != query.device
+        or key_weight.device != query.device
+        or query_weight.numel() != query.shape[2]
+        or key_weight.numel() != query.shape[2]
+        or not query_weight.is_contiguous()
+        or not key_weight.is_contiguous()
+        or cosine.ndim != 2
+        or sine.shape != cosine.shape
+        or cosine.device != query.device
+        or sine.device != query.device
+        or not cosine.is_contiguous()
+        or not sine.is_contiguous()
+        or int(cosine.shape[0]) != int(query.shape[0])
+        or int(cosine.shape[1]) <= 0
+        or int(cosine.shape[1]) % 2 != 0
+        or int(cosine.shape[1]) > int(query.shape[2])
+    )
+
+
+@torch.library.custom_op(
+    "uniserve_worker::qk_rms_norm_partial_rope_inplace",
+    mutates_args=("query", "key"),
+)
+def triton_qk_rms_norm_rope_inplace(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    query_weight: torch.Tensor,
+    key_weight: torch.Tensor,
+    cosine: torch.Tensor,
+    sine: torch.Tensor,
+    eps: float,
+) -> None:
+    if not can_run_triton_qk_rms_norm_rope_inplace(
+        query, key, query_weight, key_weight, cosine, sine
+    ):
+        raise RuntimeError("in-place partial QK RMSNorm and RoPE requires eligible Triton tensors")
+    rows, heads, head_dim = (int(size) for size in query.shape)
+    rotary_dim = int(cosine.shape[-1])
+    block_rows = 8
+    _qk_rms_norm_partial_rope_inplace_kernel[(triton.cdiv(rows, block_rows), heads)](
+        query,
+        key,
+        query_weight,
+        key_weight,
+        cosine,
+        sine,
+        int(query.stride(0)),
+        int(query.stride(1)),
+        int(key.stride(0)),
+        int(key.stride(1)),
+        int(cosine.stride(0)),
+        rows,
+        heads,
+        float(eps),
+        block_rows,
+        head_dim,
+        rotary_dim,
+        num_warps=8,
+        num_stages=1,
+    )
+
+
+@triton_qk_rms_norm_rope_inplace.register_fake
+def _triton_qk_rms_norm_rope_inplace_fake(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    query_weight: torch.Tensor,
+    key_weight: torch.Tensor,
+    cosine: torch.Tensor,
+    sine: torch.Tensor,
+    eps: float,
+) -> None:
+    del query, key, query_weight, key_weight, cosine, sine, eps
 
 
 def try_triton_qk_rms_norm_rope(
@@ -921,4 +1115,3 @@ class _EagerPackedRope:
         out[..., :half] = x1 * cos - x2 * sin
         out[..., half:] = x2 * cos + x1 * sin
         return out
-

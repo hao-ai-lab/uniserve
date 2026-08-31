@@ -33,6 +33,11 @@ pub struct WorkerProcessArgs {
     pub load_threads: Option<u32>,
     pub checksum_manifest: Option<std::path::PathBuf>,
     pub model_dtype: uniserve_core::ModelDtype,
+    pub linear_precision: String,
+    pub h3_transformer_attention_precision: Option<String>,
+    pub h3_transformer_mlp_precision: Option<String>,
+    pub h3_text_encoder_precision: Option<String>,
+    pub h3_video_vae_precision: Option<String>,
     pub kv_cache_dtype: Option<uniserve_core::KvCacheDtype>,
     pub kv_memory_fraction: f64,
     pub mesh: Option<String>,
@@ -53,6 +58,9 @@ pub struct WorkerProcessArgs {
     pub flashinfer_disable_split_kv: bool,
     pub flashinfer_fast_decode_plan: bool,
     pub media_spool: Option<std::path::PathBuf>,
+    pub max_model_len: u32,
+    pub max_video_seconds: f64,
+    pub fixed_graph_cache_capacity: usize,
 }
 
 pub(crate) fn park_descriptors(fds: &[i32], timeout: std::time::Duration) -> anyhow::Result<()> {

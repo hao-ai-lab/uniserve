@@ -654,6 +654,10 @@ impl Executor for MultiprocExecutor {
         self.inflight
     }
 
+    fn resets_all_state_after_worker_loss(&self) -> bool {
+        true
+    }
+
     fn submit(&mut self, batch: Batch) -> anyhow::Result<()> {
         batch.validate()?;
         anyhow::ensure!(

@@ -21,6 +21,7 @@ pub fn lower_video_generation_request(
         request_id: ServeRequestId::from(format!("vid-{}", context.request_id)),
         prompt: request.prompt,
         seed: request.seed,
+        seconds: request.seconds,
         output_path,
     })
 }

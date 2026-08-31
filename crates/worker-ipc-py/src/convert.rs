@@ -18,6 +18,8 @@ use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyString};
 use uniserve_core::{ImageParams, SamplingParams};
+#[cfg(test)]
+use uniserve_worker_ipc::MediaPlan;
 use uniserve_worker_ipc::{
     AttentionRegime, Batch, BatchPartition, BlockTable, CachePageAllocation, CloseReason,
     CompletionReport, Control, DType, DecodeKind, DecodePlacement, DimBound, Disposition, Domain,
@@ -830,7 +832,10 @@ fn media_admission_to_py<'py>(
     media: &MediaAdmission,
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
-    dict.set_item(intern!(py, "prompt"), media.prompt.as_str())?;
+    dict.set_item(
+        intern!(py, "prompt_token_ids"),
+        u32_list(py, &media.prompt_token_ids)?,
+    )?;
     dict.set_item(intern!(py, "seed"), media.seed)?;
     dict.set_item(
         intern!(py, "profile"),
@@ -839,6 +844,19 @@ fn media_admission_to_py<'py>(
         },
     )?;
     dict.set_item(intern!(py, "output_path"), media.output_path.as_str())?;
+    let plan = PyDict::new(py);
+    plan.set_item(intern!(py, "frame_count"), media.plan.frame_count)?;
+    plan.set_item(
+        intern!(py, "video_decode_units"),
+        media.plan.video_decode_units,
+    )?;
+    plan.set_item(
+        intern!(py, "audio_latent_frames"),
+        media.plan.audio_latent_frames,
+    )?;
+    plan.set_item(intern!(py, "prompt_tokens"), media.plan.prompt_tokens)?;
+    plan.set_item(intern!(py, "denoise_steps"), media.plan.denoise_steps)?;
+    dict.set_item(intern!(py, "plan"), plan)?;
     Ok(dict)
 }
 
@@ -1691,13 +1709,79 @@ mod tests {
             latent_placements: Vec::new(),
             decode_placements: Vec::new(),
         };
-        let mut request = WorkerRequest::execute(
-            Batch::new(11, vec![admission], vec![partition]).with_input_products(vec![
-                ProductPayload {
-                    product: input,
-                    bytes: uniserve_worker_ipc::encode_token_product_bytes(&[7, 8]),
+        let media_key = RequestKey::new(1, RequestId(3), 1);
+        let media_prompt_token_ids = vec![17, 23, 65_537];
+        let media_admission = NewRequest::new_media(
+            media_key,
+            2,
+            MediaAdmission {
+                prompt_token_ids: media_prompt_token_ids,
+                seed: 29,
+                profile: MediaProfileId::MinimaxH3T2va,
+                output_path: "/tmp/media.mp4".to_string(),
+                plan: MediaPlan {
+                    frame_count: 22,
+                    video_decode_units: 1,
+                    audio_latent_frames: 37,
+                    prompt_tokens: 3,
+                    denoise_steps: 4,
                 },
-            ]),
+            },
+        )
+        .unwrap();
+        let media_operation = Operation {
+            request_key: media_key,
+            op_id: OpId(2),
+            parent: VersionRef::admission_root(media_key, OpId(0)),
+            work: ForwardMode::GenTransition,
+            route: uniserve_worker_ipc::RouteId(0),
+            domain: Domain::Flow,
+            advances_state: false,
+            bounds: Bounds {
+                max_points: 1,
+                ..Bounds::default()
+            },
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            predicate: None,
+            rng: None,
+            control_seq: 0,
+        }
+        .sealed();
+        let media_partition = BatchPartition {
+            partition_id: 2,
+            submission_group: 2,
+            collective_seq: 2,
+            domain: Domain::Flow,
+            route: uniserve_worker_ipc::RouteId(0),
+            attention: AttentionRegime::None,
+            shape_class: 0,
+            operations: vec![media_operation],
+            block_tables: Vec::new(),
+            new_cache_pages: Vec::new(),
+            forward_rows: Vec::new(),
+            latent_placements: vec![LatentPlacement {
+                request_key: media_key,
+                op_id: OpId(2),
+                page_table: vec![1],
+                latent_units: 64,
+                height: 768,
+                width: 1344,
+                start_step: 0,
+                step_count: 0,
+            }],
+            decode_placements: Vec::new(),
+        };
+        let mut request = WorkerRequest::execute(
+            Batch::new(
+                11,
+                vec![admission, media_admission],
+                vec![partition, media_partition],
+            )
+            .with_input_products(vec![ProductPayload {
+                product: input,
+                bytes: uniserve_worker_ipc::encode_token_product_bytes(&[7, 8]),
+            }]),
         );
         request.set_call_id(Some(9));
         request
@@ -1776,7 +1860,17 @@ mod tests {
             );
             assert_eq!(
                 native_batch.getattr("operations").unwrap().len().unwrap(),
-                1
+                2
+            );
+            let admissions = native_batch.getattr("admissions").unwrap();
+            let media = admissions.get_item(1).unwrap().getattr("media").unwrap();
+            assert_eq!(
+                media
+                    .getattr("prompt_token_ids")
+                    .unwrap()
+                    .extract::<Vec<u32>>()
+                    .unwrap(),
+                vec![17, 23, 65_537]
             );
             // The natively constructed batch must be exactly what the
             // canonical codec decodes from its own IPC form.

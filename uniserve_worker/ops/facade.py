@@ -77,6 +77,7 @@ def qk_norm_rope(
     unsqueeze_dim: int = 1,
     axis_dims=None,
     identity_axes=None,
+    in_place: bool = False,
     override: str | None = None,
 ):
     if axis_dims is None:
@@ -90,8 +91,11 @@ def qk_norm_rope(
             float(eps),
             position_ids,
             int(unsqueeze_dim),
+            bool(in_place),
         )
     else:
+        if in_place:
+            raise ValueError("in-place qk_norm_rope does not support multi-axis requests")
         req = MultiAxisQKNormRopeReq(
             q,
             k,

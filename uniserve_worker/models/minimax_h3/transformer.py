@@ -2,23 +2,75 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 from typing import Literal
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
-from ...nn.mesh import DeviceMesh
-from .fusions import qk_rmsnorm_rope, row_modulated_rmsnorm, value_first_swiglu
-from .packing import AUDIO_TAG
-from .state import H3Layout, H3Scratch, H3StateSlot
-from .vsa import H3VsaAttention, build_vsa_metadata
+from ...backends.attention.video_sparse import (
+    VideoSparseAttentionBackend,
+    VideoSparseAttentionWorkspace,
+    build_video_sparse_metadata,
+    video_sparse_selected_tiles,
+)
+from ...nn.diffusion.modulation import prepare_modulation_plan, select_modulation_step
+from ...nn.layer import LayerConfig
+from ...nn.linear import InterleavedMergedColumnParallelLinear, LinearBase
+from ...nn.mesh import DeviceMesh, SymmetricMemoryWorkspace, TensorParallel
+from ...nn.quant import DynamicW4A4NvFp4LinearMethod, DynamicW8A8Fp8LinearMethod
+from ...ops import qk_norm_rope
+from .fusions import (
+    row_modulated_rmsnorm,
+    value_first_swiglu,
+)
+from .packing import AUDIO_TAG, audio_latent_frames
+from .precision import LinearPrecision
+from .state import MIN_H3_FRAMES, H3Layout, H3Scratch, H3StateSlot
 
-__all__ = ["H3TransformerConfig", "MiniMaxH3Transformer"]
+__all__ = [
+    "H3TransformerConfig",
+    "H3TransformerExecution",
+    "LinearPrecision",
+    "MiniMaxH3Transformer",
+]
 
 MODALITIES = 3
+
+
+def _dynamic_quant_method(
+    precision: LinearPrecision,
+    *,
+    tensorwise: bool = False,
+) -> DynamicW8A8Fp8LinearMethod | DynamicW4A4NvFp4LinearMethod:
+    if precision == "fp8":
+        return DynamicW8A8Fp8LinearMethod(tensorwise=tensorwise)
+    if precision == "nvfp4":
+        return DynamicW4A4NvFp4LinearMethod()
+    raise ValueError(f"unsupported dynamic linear precision {precision!r}")
+
+
+def _dynamic_quantized_linear(
+    input_size: int,
+    output_size: int,
+    *,
+    linear_precision: LinearPrecision,
+    layer_config: LayerConfig,
+    device: torch.device | str,
+    bias: bool = True,
+    tensorwise: bool = False,
+) -> LinearBase:
+    with torch.device(device):
+        linear = LinearBase(
+            input_size,
+            output_size,
+            layer_config=layer_config,
+            quant_method=_dynamic_quant_method(linear_precision, tensorwise=tensorwise),
+            bias=bias,
+        )
+    return linear
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +93,20 @@ class H3TransformerConfig:
     qk_norm_eps: float = 1e-5
 
 
+@dataclass(frozen=True, slots=True)
+class H3TransformerExecution:
+    layout: H3Layout
+    vsa: VideoSparseAttentionBackend
+    local_text_indices: torch.Tensor
+    global_text_indices: torch.Tensor
+    local_video_indices: torch.Tensor
+    local_audio_indices: torch.Tensor
+    timestep_indices: torch.Tensor
+    adaln_indices: torch.Tensor
+    positions: torch.Tensor
+    non_text_mask: torch.Tensor
+
+
 class _RMSNorm(nn.Module):
     def __init__(self, width: int, eps: float, *, device: torch.device | str) -> None:
         super().__init__()
@@ -53,22 +119,57 @@ class _RMSNorm(nn.Module):
 
 
 class _SwiGLUProjection(nn.Module):
-    def __init__(self, width: int, expanded: int, *, device: torch.device | str) -> None:
+    def __init__(
+        self,
+        width: int,
+        expanded: int,
+        *,
+        linear_precision: LinearPrecision,
+        layer_config: LayerConfig,
+        device: torch.device | str,
+    ) -> None:
         super().__init__()
-        self.proj = nn.Linear(width, expanded * 2, bias=False, device=device)
+        self.proj = _dynamic_quantized_linear(
+            width,
+            expanded * 2,
+            linear_precision=linear_precision,
+            bias=False,
+            layer_config=layer_config,
+            device=device,
+        )
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
         return value_first_swiglu(self.proj(value))
 
 
 class _FeedForward(nn.Module):
-    def __init__(self, config: H3TransformerConfig, *, device: torch.device | str) -> None:
+    def __init__(
+        self,
+        config: H3TransformerConfig,
+        *,
+        linear_precision: LinearPrecision,
+        layer_config: LayerConfig,
+        device: torch.device | str,
+    ) -> None:
         super().__init__()
         self.net = nn.ModuleList(
             (
-                _SwiGLUProjection(config.hidden_size, config.ffn_dim, device=device),
+                _SwiGLUProjection(
+                    config.hidden_size,
+                    config.ffn_dim,
+                    linear_precision=linear_precision,
+                    layer_config=layer_config,
+                    device=device,
+                ),
                 nn.Identity(),
-                nn.Linear(config.ffn_dim, config.hidden_size, bias=False, device=device),
+                _dynamic_quantized_linear(
+                    config.ffn_dim,
+                    config.hidden_size,
+                    linear_precision=linear_precision,
+                    bias=False,
+                    layer_config=layer_config,
+                    device=device,
+                ),
             )
         )
 
@@ -176,12 +277,24 @@ class _DenseAttention(nn.Module):
 
 
 class _TokenRefinerBlock(nn.Module):
-    def __init__(self, config: H3TransformerConfig, *, device: torch.device | str) -> None:
+    def __init__(
+        self,
+        config: H3TransformerConfig,
+        *,
+        linear_precision: LinearPrecision,
+        layer_config: LayerConfig,
+        device: torch.device | str,
+    ) -> None:
         super().__init__()
         self.norm1 = _RMSNorm(config.hidden_size, config.norm_eps, device=device)
         self.attn = _DenseAttention(config, device=device)
         self.norm2 = _RMSNorm(config.hidden_size, config.norm_eps, device=device)
-        self.ff = _FeedForward(config, device=device)
+        self.ff = _FeedForward(
+            config,
+            linear_precision=linear_precision,
+            layer_config=layer_config,
+            device=device,
+        )
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         hidden = hidden + self.attn(self.norm1(hidden))
@@ -189,10 +302,23 @@ class _TokenRefinerBlock(nn.Module):
 
 
 class _TokenRefiner(nn.Module):
-    def __init__(self, config: H3TransformerConfig, *, device: torch.device | str) -> None:
+    def __init__(
+        self,
+        config: H3TransformerConfig,
+        *,
+        linear_precision: LinearPrecision,
+        layer_config: LayerConfig,
+        device: torch.device | str,
+    ) -> None:
         super().__init__()
         self.refiner_blocks = nn.ModuleList(
-            _TokenRefinerBlock(config, device=device) for _ in range(config.refiner_layers)
+            _TokenRefinerBlock(
+                config,
+                linear_precision=linear_precision,
+                layer_config=layer_config,
+                device=device,
+            )
+            for _ in range(config.refiner_layers)
         )
         self.final_norm = _RMSNorm(config.hidden_size, config.norm_eps, device=device)
 
@@ -207,8 +333,10 @@ class _H3Attention(nn.Module):
         self,
         config: H3TransformerConfig,
         mesh: DeviceMesh,
-        vsa: H3VsaAttention,
+        vsa: VideoSparseAttentionBackend,
         *,
+        linear_precision: LinearPrecision,
+        layer_config: LayerConfig,
         device: torch.device | str,
     ) -> None:
         super().__init__()
@@ -216,71 +344,42 @@ class _H3Attention(nn.Module):
         self.config = config
         self.mesh = mesh
         self.vsa = vsa
-        self.to_q = nn.Linear(config.hidden_size, inner, bias=False, device=device)
-        self.to_k = nn.Linear(config.hidden_size, inner, bias=False, device=device)
-        self.to_v = nn.Linear(config.hidden_size, inner, bias=False, device=device)
-        self.to_gate_compress = nn.Linear(config.hidden_size, inner, bias=False, device=device)
-        self.to_out = nn.Sequential(nn.Linear(inner, config.hidden_size, bias=False, device=device))
-        self.norm_q = _RMSNorm(config.head_dim, config.qk_norm_eps, device=device)
-        self.norm_k = _RMSNorm(config.head_dim, config.qk_norm_eps, device=device)
-
-    def _exchange(
-        self,
-        send: torch.Tensor,
-        output: torch.Tensor,
-    ) -> torch.Tensor:
-        size = self.mesh.size("sp")
-        if size == 1:
-            output.copy_(send[0])
-            return output
-        _, local_rows, local_heads, projections, width = send.shape
-        count = local_rows * local_heads * projections * width
-        self.mesh.all_to_all_single_into(
-            output.reshape(-1),
-            send.reshape(-1),
-            (count,) * size,
-            (count,) * size,
-        )
-        return output
-
-    def _reverse_exchange(
-        self,
-        value: torch.Tensor,
-        receive: torch.Tensor,
-        local_output: torch.Tensor,
-    ) -> torch.Tensor:
-        size = self.mesh.size("sp")
-        if size == 1:
-            local_output.copy_(value)
-            return local_output
-        global_rows, local_heads, width = value.shape
-        local_rows = global_rows // size
-        count = local_rows * local_heads * width
-        self.mesh.all_to_all_single_into(
-            receive.reshape(-1),
-            value.reshape(-1),
-            (count,) * size,
-            (count,) * size,
-        )
-        local_output.copy_(
-            receive.permute(1, 0, 2, 3).reshape(
-                local_rows, local_heads * size, width
+        with torch.device(device):
+            self.to_qkvg = InterleavedMergedColumnParallelLinear(
+                config.hidden_size,
+                inner,
+                4,
+                config.head_dim,
+                layer_config=layer_config,
+                quant_method=_dynamic_quant_method(linear_precision, tensorwise=True),
+                bias=False,
+            )
+        self.to_out = nn.Sequential(
+            _dynamic_quantized_linear(
+                inner,
+                config.hidden_size,
+                linear_precision=linear_precision,
+                bias=False,
+                layer_config=layer_config,
+                device=device,
             )
         )
-        return local_output
+        self.norm_q = _RMSNorm(config.head_dim, config.qk_norm_eps, device=device)
+        self.norm_k = _RMSNorm(config.head_dim, config.qk_norm_eps, device=device)
 
     def forward(
         self,
         hidden: torch.Tensor,
         rotary: tuple[torch.Tensor, torch.Tensor],
         tile_valid_sizes: torch.Tensor,
-        row_valid_mask: torch.Tensor,
         prefix_key_indices: torch.Tensor,
         dense_key_indices: torch.Tensor,
         prefix_count: torch.Tensor,
-        projection_buffer: torch.Tensor,
-        qkvg_send: torch.Tensor,
-        qkvg_exchange: torch.Tensor,
+        projection_peers: tuple[torch.Tensor, ...],
+        projection_exchange: SymmetricMemoryWorkspace,
+        projection_sync_input: torch.Tensor,
+        projection_sync_output: torch.Tensor,
+        attention_workspace: torch.Tensor,
         attention_output: torch.Tensor,
         tile_scores: torch.Tensor,
         block_counts: torch.Tensor,
@@ -289,8 +388,6 @@ class _H3Attention(nn.Module):
         pooled_key: torch.Tensor,
         pooled_value: torch.Tensor,
         compressed_tiles: torch.Tensor,
-        topk_values: torch.Tensor,
-        topk_indices: torch.Tensor,
         topk_indices_i32: torch.Tensor,
     ) -> torch.Tensor:
         local = hidden[0]
@@ -298,41 +395,47 @@ class _H3Attention(nn.Module):
         local_rows = local.shape[0]
         sp_size = self.mesh.size("sp")
         local_heads = heads // sp_size
-        projection_staging = qkvg_exchange.view(4, local_rows, heads, head_dim)
-        for projection_index, projection in enumerate(
-            (self.to_q, self.to_k, self.to_v, self.to_gate_compress)
-        ):
-            torch.mm(
-                local,
-                projection.weight.t(),
-                out=projection_staging[projection_index].view(
-                    local_rows, heads * head_dim
-                ),
-            )
-        qkvg_send.copy_(
-            projection_staging.view(
-                4, local_rows, sp_size, local_heads, head_dim
-            ).permute(2, 1, 3, 0, 4)
+        global_rows = local_rows * sp_size
+        exchanged = self.to_qkvg.forward_sequence_parallel(
+            local,
+            self.mesh,
+            attention_workspace,
+            group="sp",
+        ).view(
+            global_rows,
+            local_heads,
+            4,
+            head_dim,
         )
-        exchanged = self._exchange(qkvg_send, qkvg_exchange)
         query, key, value, gate = exchanged.unbind(2)
         cosine, sine = rotary
-        normalized_query, normalized_key = qk_rmsnorm_rope(
+        qk_norm_rope(
             query,
             key,
             self.norm_q.weight,
             self.norm_k.weight,
-            cosine[:, None],
-            sine[:, None],
-            eps=self.config.qk_norm_eps,
+            cosine,
+            sine,
+            self.config.qk_norm_eps,
+            in_place=True,
         )
-        query.copy_(normalized_query)
-        key.copy_(normalized_key)
-        exchanged.masked_fill_(
-            ~row_valid_mask.view(-1, 1, 1, 1),
-            0,
+        workspace = VideoSparseAttentionWorkspace(
+            exchange=projection_exchange,
+            exchange_outputs=projection_peers,
+            exchange_sync_input=projection_sync_input,
+            exchange_sync_output=projection_sync_output,
+            attention_buffer=attention_workspace,
+            attention_output=attention_output,
+            tile_scores=tile_scores,
+            block_counts=block_counts,
+            block_indices=block_indices,
+            pooled_query=pooled_query,
+            pooled_key=pooled_key,
+            pooled_value=pooled_value,
+            compressed_tiles=compressed_tiles,
+            topk_indices_i32=topk_indices_i32,
         )
-        self.vsa(
+        local_output = self.vsa.forward_local(
             query,
             key,
             value,
@@ -341,25 +444,7 @@ class _H3Attention(nn.Module):
             prefix_key_indices,
             dense_key_indices,
             prefix_count,
-            output=attention_output,
-            tile_scores=tile_scores,
-            block_counts=block_counts,
-            block_indices=block_indices,
-            pooled_query=pooled_query,
-            pooled_key=pooled_key,
-            pooled_value=pooled_value,
-            compressed_tiles=compressed_tiles,
-            topk_values=topk_values,
-            topk_indices=topk_indices,
-            topk_indices_i32=topk_indices_i32,
-        )
-        receive = qkvg_send.reshape(-1)[: attention_output.numel()].view(
-            self.mesh.size("sp"), local_rows, local_heads, head_dim
-        )
-        local_output = self._reverse_exchange(
-            attention_output,
-            receive,
-            projection_buffer,
+            workspace,
         )
         return self.to_out(local_output.reshape(1, local_output.shape[0], -1))
 
@@ -382,31 +467,47 @@ class _TransformerBlock(nn.Module):
         self,
         config: H3TransformerConfig,
         mesh: DeviceMesh,
-        vsa: H3VsaAttention,
+        vsa: VideoSparseAttentionBackend,
         *,
+        attention_linear_precision: LinearPrecision,
+        mlp_linear_precision: LinearPrecision,
+        layer_config: LayerConfig,
         device: torch.device | str,
     ) -> None:
         super().__init__()
         self.norm1 = _RMSNorm(config.hidden_size, config.norm_eps, device=device)
-        self.attn = _H3Attention(config, mesh, vsa, device=device)
+        self.attn = _H3Attention(
+            config,
+            mesh,
+            vsa,
+            linear_precision=attention_linear_precision,
+            layer_config=layer_config,
+            device=device,
+        )
         self.norm2 = _RMSNorm(config.hidden_size, config.norm_eps, device=device)
-        self.ff = _FeedForward(config, device=device)
+        self.ff = _FeedForward(
+            config,
+            linear_precision=mlp_linear_precision,
+            layer_config=layer_config,
+            device=device,
+        )
         self.adaln_proj = _AdaModulation(config, device=device)
 
     def forward(
         self,
         hidden: torch.Tensor,
-        time: torch.Tensor,
+        adaln_values: torch.Tensor,
         adaln_indices: torch.Tensor,
         rotary: tuple[torch.Tensor, torch.Tensor],
         tile_valid_sizes: torch.Tensor,
-        row_valid_mask: torch.Tensor,
         prefix_key_indices: torch.Tensor,
         dense_key_indices: torch.Tensor,
         prefix_count: torch.Tensor,
-        projection_buffer: torch.Tensor,
-        qkvg_send: torch.Tensor,
-        qkvg_exchange: torch.Tensor,
+        projection_peers: tuple[torch.Tensor, ...],
+        projection_exchange: SymmetricMemoryWorkspace,
+        projection_sync_input: torch.Tensor,
+        projection_sync_output: torch.Tensor,
+        attention_workspace: torch.Tensor,
         attention_output: torch.Tensor,
         tile_scores: torch.Tensor,
         block_counts: torch.Tensor,
@@ -415,12 +516,13 @@ class _TransformerBlock(nn.Module):
         pooled_key: torch.Tensor,
         pooled_value: torch.Tensor,
         compressed_tiles: torch.Tensor,
-        topk_values: torch.Tensor,
-        topk_indices: torch.Tensor,
         topk_indices_i32: torch.Tensor,
     ) -> torch.Tensor:
         shift_attn, scale_attn, gate_attn, shift_ffn, scale_ffn, gate_ffn = (
-            tensor.to(hidden.dtype) for tensor in self.adaln_proj(time)
+            tensor.to(hidden.dtype)
+            for tensor in adaln_values.reshape(-1, self.adaln_proj.hidden_size * 6).chunk(
+                6, dim=-1
+            )
         )
         normalized = row_modulated_rmsnorm(
             hidden,
@@ -434,13 +536,14 @@ class _TransformerBlock(nn.Module):
             normalized,
             rotary,
             tile_valid_sizes,
-            row_valid_mask,
             prefix_key_indices,
             dense_key_indices,
             prefix_count,
-            projection_buffer,
-            qkvg_send,
-            qkvg_exchange,
+            projection_peers,
+            projection_exchange,
+            projection_sync_input,
+            projection_sync_output,
+            attention_workspace,
             attention_output,
             tile_scores,
             block_counts,
@@ -449,8 +552,6 @@ class _TransformerBlock(nn.Module):
             pooled_key,
             pooled_value,
             compressed_tiles,
-            topk_values,
-            topk_indices,
             topk_indices_i32,
         )
         normalized = row_modulated_rmsnorm(
@@ -472,6 +573,15 @@ class _OutputNorm(nn.Module):
 
     def forward(self, hidden: torch.Tensor, time: torch.Tensor, timestep_indices: torch.Tensor) -> torch.Tensor:
         shift, scale = self.linear(F.silu(time).to(self.linear.weight.dtype)).chunk(2, dim=-1)
+        return self.forward_precomputed(hidden, shift, scale, timestep_indices)
+
+    def forward_precomputed(
+        self,
+        hidden: torch.Tensor,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+        timestep_indices: torch.Tensor,
+    ) -> torch.Tensor:
         normalized = self.norm(hidden)
         return normalized * (1.0 + scale.index_select(0, timestep_indices)) + shift.index_select(
             0, timestep_indices
@@ -489,6 +599,8 @@ class MiniMaxH3Transformer(nn.Module):
         layout: H3Layout,
         *,
         parameter_device: torch.device | str = "meta",
+        attention_linear_precision: LinearPrecision,
+        mlp_linear_precision: LinearPrecision,
         attention_mode: Literal[
             "sparse_kernel", "sparse_oracle", "dense_oracle"
         ] = "sparse_kernel",
@@ -500,14 +612,17 @@ class MiniMaxH3Transformer(nn.Module):
         self.config = config
         self.mesh = mesh
         self.layout = layout
-        metadata = build_vsa_metadata(
-            padded_rows=layout.packed.padded_rows,
-            prefix_tiles=layout.packed.prefix_tiles,
-            video_tiles=layout.packed.video_tiles,
-            valid_sizes=layout.packed.tile_valid_sizes,
-            device=mesh.local_device,
+        self.attention_mode = attention_mode
+        self.attention_linear_precision = attention_linear_precision
+        self.mlp_linear_precision = mlp_linear_precision
+        layer_config = LayerConfig(
+            parallel=TensorParallel(
+                rank=mesh.coord("sp"),
+                size=mesh.size("sp"),
+            ),
+            quantization=None,
         )
-        vsa = H3VsaAttention(mesh, metadata, mode=attention_mode)
+        execution = self.build_execution(layout)
         video_patch_width = config.video_channels * 4
         self.proj_in = nn.Linear(video_patch_width, config.hidden_size, device=parameter_device)
         self.audio_proj_in = nn.Linear(config.audio_channels, config.hidden_size, device=parameter_device)
@@ -518,52 +633,144 @@ class MiniMaxH3Transformer(nn.Module):
             buffer_device=mesh.local_device,
         )
         self.rope = _RotaryEmbedding(config, device=mesh.local_device)
-        self.token_refiner = _TokenRefiner(config, device=parameter_device)
+        self.token_refiner = _TokenRefiner(
+            config,
+            linear_precision=mlp_linear_precision,
+            layer_config=layer_config,
+            device=parameter_device,
+        )
         self.transformer_blocks = nn.ModuleList(
-            _TransformerBlock(config, mesh, vsa, device=parameter_device)
+            _TransformerBlock(
+                config,
+                mesh,
+                execution.vsa,
+                attention_linear_precision=attention_linear_precision,
+                mlp_linear_precision=mlp_linear_precision,
+                layer_config=layer_config,
+                device=parameter_device,
+            )
             for _ in range(config.layers)
         )
         self.norm_out = _OutputNorm(config, device=parameter_device)
         self.proj_out = nn.Linear(config.hidden_size, video_patch_width, device=parameter_device)
         self.audio_proj_out = nn.Linear(config.hidden_size, config.audio_channels, device=parameter_device)
-        local_text = layout.local_indices(layout.packed.text_indices)
+        for name in (
+            "local_text_indices",
+            "global_text_indices",
+            "local_video_indices",
+            "local_audio_indices",
+            "timestep_indices",
+            "adaln_indices",
+            "positions",
+            "non_text_mask",
+        ):
+            self.register_buffer(
+                name,
+                getattr(execution, name),
+                persistent=False,
+            )
+        self.execution = execution
+
+    def build_execution(self, layout: H3Layout) -> H3TransformerExecution:
+        metadata = build_video_sparse_metadata(
+            padded_rows=layout.packed.padded_rows,
+            prefix_tiles=layout.packed.prefix_tiles,
+            video_tiles=layout.packed.video_tiles,
+            valid_sizes=layout.packed.tile_valid_sizes,
+            device=self.mesh.local_device,
+        )
+        vsa = getattr(self, "vsa", None)
+        if vsa is None:
+            vsa = VideoSparseAttentionBackend(self.mesh, metadata, mode=self.attention_mode)
+            self.vsa = vsa
+        local_tags = layout.packed.token_tags[layout.local_start : layout.local_end]
+        timestep_indices = (local_tags == AUDIO_TAG).to(torch.long)
         global_text = layout.packed.text_indices[
             (layout.packed.text_indices >= layout.local_start)
             & (layout.packed.text_indices < layout.local_end)
         ]
-        local_video = layout.local_indices(layout.packed.video_indices)
-        local_audio = layout.local_indices(layout.packed.audio_indices)
-        local_tags = layout.packed.token_tags[layout.local_start : layout.local_end]
-        timestep_indices = (local_tags == AUDIO_TAG).to(torch.long)
-        for name, value in (
-            ("local_text_indices", local_text),
-            ("global_text_indices", global_text),
-            ("local_video_indices", local_video),
-            ("local_audio_indices", local_audio),
-            ("timestep_indices", timestep_indices),
-            ("adaln_indices", timestep_indices * MODALITIES + local_tags),
-            ("positions", layout.packed.position_ids.to(torch.float32)),
-            ("non_text_mask", layout.packed.token_tags != 1),
+        device = self.mesh.local_device
+        return H3TransformerExecution(
+            layout=layout,
+            vsa=vsa,
+            local_text_indices=layout.local_indices(layout.packed.text_indices).to(device),
+            global_text_indices=global_text.to(device),
+            local_video_indices=layout.local_indices(layout.packed.video_indices).to(device),
+            local_audio_indices=layout.local_indices(layout.packed.audio_indices).to(device),
+            timestep_indices=timestep_indices.to(device),
+            adaln_indices=(timestep_indices * MODALITIES + local_tags).to(device),
+            positions=layout.packed.position_ids.to(device=device, dtype=torch.float32),
+            non_text_mask=(layout.packed.token_tags != 1).to(device),
+        )
+
+    def bind_execution(self, execution: H3TransformerExecution) -> None:
+        self.layout = execution.layout
+        self.execution = execution
+        for name in (
+            "local_text_indices",
+            "global_text_indices",
+            "local_video_indices",
+            "local_audio_indices",
+            "timestep_indices",
+            "adaln_indices",
+            "positions",
+            "non_text_mask",
         ):
-            self.register_buffer(
-                name,
-                value.to(mesh.local_device),
-                persistent=False,
-            )
+            setattr(self, name, getattr(execution, name))
+        for compiled_block in self.transformer_blocks:
+            block = getattr(compiled_block, "_orig_mod", compiled_block)
+            block.attn.vsa = execution.vsa
 
     def refine_text(self, encoder_hidden: torch.Tensor) -> torch.Tensor:
         return self.token_refiner(
             self.context_embedder(encoder_hidden.to(self.context_embedder.weight.dtype))
         )
 
-    def forward_local(
+    @torch.inference_mode()
+    def prepare_adaln_plan(
+        self,
+        slot: H3StateSlot,
+        video_timesteps: torch.Tensor,
+        audio_timesteps: torch.Tensor,
+    ) -> None:
+        activated_time = torch.stack(
+            tuple(
+                F.silu(
+                    self.time_embedder(
+                        torch.stack((video_timesteps[step], audio_timesteps[step]))
+                    )
+                )
+                for step in range(int(video_timesteps.numel()))
+            )
+        ).flatten(0, 1)
+        prepare_modulation_plan(
+            activated_time,
+            tuple(
+                getattr(compiled_block, "_orig_mod", compiled_block).adaln_proj.linear
+                for compiled_block in self.transformer_blocks
+            ),
+            self.norm_out.linear,
+            slot.block_adaln_plan,
+            slot.final_adaln_plan,
+        )
+
+    @staticmethod
+    def select_adaln_step(slot: H3StateSlot, scratch: H3Scratch, step: int) -> None:
+        select_modulation_step(
+            slot.block_adaln_plan,
+            slot.final_adaln_plan,
+            step,
+            scratch.block_adaln_params,
+            scratch.final_adaln_params,
+        )
+
+    def forward_local_prepared(
         self,
         slot: H3StateSlot,
         scratch: H3Scratch,
-        *,
-        video_timestep: torch.Tensor,
-        audio_timestep: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the fixed-shape local forward from caller-populated timestep storage."""
+
         hidden = scratch.packed_hidden
         hidden.zero_()
         if self.local_text_indices.numel():
@@ -589,24 +796,87 @@ class MiniMaxH3Transformer(nn.Module):
             projected_bf16.copy_(projected)
             hidden[0].index_copy_(0, indices, projected_bf16)
 
-        scratch.time_values[0].copy_(video_timestep)
-        scratch.time_values[1].copy_(audio_timestep)
-        time = self.time_embedder(scratch.time_values)
         rotary = (slot.rotary_cosine, slot.rotary_sine)
-        for block in self.transformer_blocks:
+        mark_dynamic = torch._dynamo.mark_dynamic
+        local_min, local_max = self.dynamic_local_rows
+        global_min, global_max = self.dynamic_global_rows
+        tile_min, tile_max = self.dynamic_tiles
+        prefix_min, prefix_max = self.dynamic_prefix_tiles
+        dense_min, dense_max = self.dynamic_dense_tiles
+        mark_dynamic(self.adaln_indices, 0, min=local_min, max=local_max)
+        for value in rotary:
+            mark_dynamic(value, 0, min=global_min, max=global_max)
+        mark_dynamic(slot.tile_valid_sizes, 0, min=tile_min, max=tile_max)
+        mark_dynamic(
+            slot.prefix_key_indices,
+            0,
+            min=prefix_min,
+            max=prefix_max,
+        )
+        mark_dynamic(
+            slot.dense_key_indices,
+            0,
+            min=dense_min,
+            max=dense_max,
+        )
+        for value in scratch.projection_peers:
+            mark_dynamic(value, 0, min=local_min, max=local_max)
+        mark_dynamic(
+            scratch.attention_workspace,
+            0,
+            min=global_min * self.config.hidden_size,
+            max=global_max * self.config.hidden_size,
+        )
+        mark_dynamic(
+            scratch.attention_output,
+            0,
+            min=global_min,
+            max=global_max,
+        )
+        mark_dynamic(scratch.tile_scores, (1, 2), min=tile_min, max=tile_max)
+        mark_dynamic(scratch.block_counts, 1, min=tile_min, max=tile_max)
+        mark_dynamic(scratch.block_indices, 1, min=tile_min, max=tile_max)
+        mark_dynamic(scratch.block_indices, 2, min=dense_min, max=dense_max)
+        for value in (
+            scratch.pooled_query,
+            scratch.pooled_key,
+            scratch.pooled_value,
+        ):
+            mark_dynamic(value, 0, min=tile_min, max=tile_max)
+        mark_dynamic(scratch.compressed_tiles, 1, min=tile_min, max=tile_max)
+        mark_dynamic(
+            scratch.topk_indices_i32,
+            1,
+            min=self.dynamic_video_tiles[0],
+            max=self.dynamic_video_tiles[1],
+        )
+        mark_dynamic(
+            scratch.topk_indices_i32,
+            2,
+            min=self.dynamic_keep_video_tiles[0],
+            max=self.dynamic_keep_video_tiles[1],
+        )
+        for layer, block in enumerate(self.transformer_blocks):
+            torch._dynamo.mark_dynamic(
+                hidden,
+                1,
+                min=self.dynamic_local_rows[0],
+                max=self.dynamic_local_rows[1],
+            )
             hidden = block(
                 hidden,
-                time,
+                scratch.block_adaln_params[layer],
                 self.adaln_indices,
                 rotary,
                 slot.tile_valid_sizes,
-                slot.row_valid_mask,
                 slot.prefix_key_indices,
                 slot.dense_key_indices,
                 slot.prefix_count,
-                scratch.projection_buffer,
-                scratch.qkvg_send,
-                scratch.qkvg_exchange,
+                scratch.projection_peers,
+                scratch.projection_exchange,
+                scratch.projection_sync_input,
+                scratch.projection_sync_output,
+                scratch.attention_workspace,
                 scratch.attention_output,
                 scratch.tile_scores,
                 scratch.block_counts,
@@ -615,11 +885,15 @@ class MiniMaxH3Transformer(nn.Module):
                 scratch.pooled_key,
                 scratch.pooled_value,
                 scratch.compressed_tiles,
-                scratch.topk_values,
-                scratch.topk_indices,
                 scratch.topk_indices_i32,
             )
-        hidden = self.norm_out(hidden, time, self.timestep_indices)
+        final_shift, final_scale = scratch.final_adaln_params.chunk(2, dim=-1)
+        hidden = self.norm_out.forward_precomputed(
+            hidden,
+            final_shift,
+            final_scale,
+            self.timestep_indices,
+        )
         for indices, projection, velocity in (
             (self.local_video_indices, self.proj_out, scratch.video_velocity),
             (self.local_audio_indices, self.audio_proj_out, scratch.audio_velocity),
@@ -637,5 +911,38 @@ class MiniMaxH3Transformer(nn.Module):
         return scratch.video_velocity, scratch.audio_velocity
 
     def compile_blocks(self) -> None:
+        min_layout = H3Layout.build(
+            self.mesh,
+            frames=MIN_H3_FRAMES,
+            text_rows=64,
+            audio_frames=audio_latent_frames(MIN_H3_FRAMES),
+            schedule=self.layout.schedule,
+        )
+        min_video_tiles = int(min_layout.packed.video_tiles)
+        max_video_tiles = int(self.layout.packed.video_tiles)
+        max_prefix_tiles = int(self.layout.packed.prefix_tiles)
+        min_prefix_tiles = int(min_layout.packed.prefix_tiles)
+        min_tiles = int(min_layout.packed.padded_rows) // 64
+        max_tiles = int(self.layout.packed.padded_rows) // 64
+        self.dynamic_local_rows = (min_layout.local_rows, self.layout.local_rows)
+        self.dynamic_global_rows = (
+            min_layout.packed.padded_rows,
+            self.layout.packed.padded_rows,
+        )
+        self.dynamic_tiles = (min_tiles, max_tiles)
+        self.dynamic_prefix_tiles = (min_prefix_tiles, max_prefix_tiles)
+        self.dynamic_dense_tiles = (
+            min_prefix_tiles + min_video_tiles,
+            max_prefix_tiles + max_video_tiles,
+        )
+        self.dynamic_video_tiles = (min_video_tiles, max_video_tiles)
+        self.dynamic_keep_video_tiles = (
+            video_sparse_selected_tiles(min_video_tiles),
+            video_sparse_selected_tiles(max_video_tiles),
+        )
         for index, block in enumerate(self.transformer_blocks):
-            self.transformer_blocks[index] = torch.compile(block, fullgraph=True)
+            self.transformer_blocks[index] = torch.compile(
+                block,
+                fullgraph=True,
+                dynamic=True,
+            )

@@ -751,12 +751,22 @@ pub struct GenAdmission {
     pub image: ImageParams,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaPlan {
+    pub frame_count: u32,
+    pub video_decode_units: u32,
+    pub audio_latent_frames: u32,
+    pub prompt_tokens: u32,
+    pub denoise_steps: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaAdmission {
-    pub prompt: String,
+    pub prompt_token_ids: Vec<u32>,
     pub seed: u64,
     pub profile: MediaProfileId,
     pub output_path: String,
+    pub plan: MediaPlan,
 }
 
 /// Session establishment framing. Carries the per-domain parameters a lineage
@@ -834,12 +844,26 @@ impl NewRequest {
         }
         if let Some(media) = &self.media {
             ensure_valid!(
-                !media.prompt.is_empty(),
-                "media admission prompt must not be empty"
+                !media.prompt_token_ids.is_empty(),
+                "media admission prompt tokens must not be empty"
             );
             ensure_valid!(
                 !media.output_path.is_empty(),
                 "media admission output path must not be empty"
+            );
+            ensure_valid!(
+                media.plan.frame_count >= 22
+                    && media.plan.frame_count % 17 == 5
+                    && media.plan.video_decode_units == (media.plan.frame_count - 5) / 17
+                    && u64::from(media.plan.audio_latent_frames)
+                        == uniserve_core::MediaPlan::required_audio_latent_frames(
+                            media.plan.frame_count,
+                        )
+                    && media.plan.prompt_tokens > 0
+                    && usize::try_from(media.plan.prompt_tokens).ok()
+                        == Some(media.prompt_token_ids.len())
+                    && media.plan.denoise_steps == 4,
+                "media admission plan is invalid"
             );
         }
         Ok(())

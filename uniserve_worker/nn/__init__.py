@@ -26,6 +26,7 @@ _EXPORTS: dict[str, str] = {
     # linear
     "ColumnParallelLinear": "linear",
     "LinearBase": "linear",
+    "InterleavedMergedColumnParallelLinear": "linear",
     "MergedColumnParallelLinear": "linear",
     "QKVParallelLinear": "linear",
     "local_attention_head_count": "linear",
@@ -39,6 +40,7 @@ _EXPORTS: dict[str, str] = {
     "DeviceMesh": "mesh",
     "MeshAxis": "mesh",
     "TensorParallel": "mesh",
+    "SymmetricMemoryWorkspace": "mesh",
     "divide": "mesh",
     # moe
     "FusedMoE": "moe",
@@ -92,6 +94,7 @@ __all__ = [
     "GeluAndMul",
     "HFRotaryEmbedding",
     "LinearBase",
+    "InterleavedMergedColumnParallelLinear",
     "LayerConfig",
     "LogitsProcessor",
     "MLPConnector",
@@ -115,6 +118,7 @@ __all__ = [
     "SiglipNavitEncoder",
     "SiluAndMul",
     "TensorParallel",
+    "SymmetricMemoryWorkspace",
     "TopK",
     "VisionEncoder",
     "VocabParallelEmbedding",
@@ -162,6 +166,7 @@ if TYPE_CHECKING:  # let type-checkers see the concrete exports without eager co
     from .layer import LayerConfig
     from .linear import (
         ColumnParallelLinear,
+        InterleavedMergedColumnParallelLinear,
         LinearBase,
         MergedColumnParallelLinear,
         QKVParallelLinear,
@@ -171,6 +176,7 @@ if TYPE_CHECKING:  # let type-checkers see the concrete exports without eager co
     from .mesh import (
         DeviceMesh,
         MeshAxis,
+        SymmetricMemoryWorkspace,
         TensorParallel,
         divide,
     )

@@ -14,8 +14,8 @@ pub mod product_blob;
 pub mod sampling;
 pub use codec::stats::WorkerForwardStats;
 pub use events::{
-    FinishReason, GenerationEvent, MediaEvent, MediaRequest, MediaRequestError, PositionLogprobs,
-    StopReason, TokenLogprob,
+    FinishReason, GenerationEvent, MediaEvent, MediaPlan, MediaRequest, MediaRequestError,
+    PositionLogprobs, StopReason, TokenLogprob,
 };
 pub use generation::{
     ContextSegment, FeedbackNextToken, FeedbackSource, GenOnlyStartPolicyDescriptor,

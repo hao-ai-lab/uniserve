@@ -19,16 +19,15 @@ from uniserve_worker.execution.batch import (
     OpStatus,
     TokenSpan,
 )
-from uniserve_worker.foundation.errors import unsupported_setup, invalid_descriptor
+from uniserve_worker.foundation.errors import invalid_descriptor, unsupported_setup
 from uniserve_worker.models.minimax_h3 import MiniMaxH3Model
 from uniserve_worker.models.minimax_h3.execution import (
-    DeferredH3Task,
     H3MuxCoordinator,
     H3OutputRingLease,
 )
 from uniserve_worker.models.minimax_h3.state import H3StateSlot
 from uniserve_worker.nn.mesh import DeviceMesh
-from uniserve_worker.server.completion import PinnedOutputBuffer
+from uniserve_worker.server.completion import EventGatedDeferredTask, PinnedOutputBuffer
 from uniserve_worker.server.cpu_tasks import CpuTaskReservation
 from uniserve_worker.server.profiler import profile_range
 
@@ -100,7 +99,7 @@ def execute_action(
     buffer: PinnedOutputBuffer,
     reservation: CpuTaskReservation | None,
     ring_lease: H3OutputRingLease | None,
-) -> tuple[DeferredH3Task, ...]:
+) -> tuple[EventGatedDeferredTask, ...]:
     """Run one H3 quantum after its resident request state has been bound."""
 
     variant = operation.work
@@ -132,6 +131,7 @@ def execute_action(
                     mux.video(
                         operation.request_key,
                         placement.start_unit,
+                        placement.unit_count,
                         capture,
                         reservation,
                         ring_lease,
@@ -152,15 +152,17 @@ def execute_action(
         ):
             capture = buffer.capture_bytes_into(pcm.view(torch.uint8), ring_lease.storage)
         try:
-            return (
-                mux.audio(
-                    operation.request_key,
-                    capture,
-                    reservation,
-                    ring_lease,
-                    operation.op_id,
-                ),
+            task = mux.audio(
+                operation.request_key,
+                capture,
+                reservation,
+                ring_lease,
+                operation.op_id,
             )
+            ready_event = torch.cuda.Event(blocking=True)
+            ready_event.record(torch.cuda.current_stream(mesh.local_device))
+            task.start(ready_event)
+            return (task,)
         except BaseException:
             ring_lease.defer_until_capture_ready(capture)
             raise
@@ -204,7 +206,16 @@ def run_action(runtime: ExecutionResources, state: OperationState) -> bool:
         output_path = _output_path(runtime, admission)
         if runtime.mesh.coord("sp") == 0:
             assert mux is not None
-            mux.open(operation.request_key, output_path)
+            media = admission.media
+            if media is None:
+                raise invalid_descriptor("H3 transition has no media plan")
+            execution = model._page_execution_for_slot(slot)
+            mux.open(
+                operation.request_key,
+                output_path,
+                frame_count=media.plan.frame_count,
+                video_unit_frames=execution.layout.decode_unit_frames,
+            )
     tasks = execute_action(
         model,
         runtime.mesh,

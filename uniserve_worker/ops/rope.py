@@ -12,7 +12,6 @@ from .requests import (
     MultiAxisQKNormRopeReq,
     PackedRopeReq,
     QKNormReq,
-    QKNormRopeReq,
     QKNormRopeRequest,
 )
 from .rms import EagerQKNorm, run_qk_rms_norm
@@ -20,6 +19,8 @@ from .rope_kernels import (
     _EagerPackedRope,
     _TritonPackedRope,
     can_run_triton_qk_rms_norm_rope,
+    can_run_triton_qk_rms_norm_rope_inplace,
+    triton_qk_rms_norm_rope_inplace,
     triton,
     try_triton_qk_multi_axis_rms_norm_rope,
     try_triton_qk_rms_norm_rope,
@@ -352,6 +353,15 @@ class TritonQKNormRope(Operator):
     def can_run(self, req: QKNormRopeRequest) -> bool:
         if isinstance(req, MultiAxisQKNormRopeReq):
             return self._can_run_multi_axis(req)
+        if req.in_place:
+            return req.position_ids is None and req.unsqueeze_dim == 1 and can_run_triton_qk_rms_norm_rope_inplace(
+                req.q,
+                req.k,
+                req.q_weight,
+                req.k_weight,
+                req.cos,
+                req.sin,
+            )
         if req.position_ids is not None or req.unsqueeze_dim != 1:
             return False
         return bool(
@@ -370,6 +380,17 @@ class TritonQKNormRope(Operator):
     def run(self, req: QKNormRopeRequest) -> tuple[torch.Tensor, torch.Tensor]:
         if isinstance(req, MultiAxisQKNormRopeReq):
             return self._run_multi_axis(req)
+        if req.in_place:
+            triton_qk_rms_norm_rope_inplace(
+                req.q,
+                req.k,
+                req.q_weight,
+                req.k_weight,
+                req.cos,
+                req.sin,
+                req.eps,
+            )
+            return req.q, req.k
         out = try_triton_qk_rms_norm_rope(
             req.q, req.k, req.q_weight, req.k_weight, req.cos, req.sin, req.eps, req.eps
         )
@@ -566,7 +587,37 @@ class EagerQKNormRope(Operator):
         if isinstance(req, MultiAxisQKNormRopeReq):
             return self._run_multi_axis(req)
         q, k = self._norm.run(QKNormReq(req.q, req.k, req.q_weight, req.k_weight, req.eps))
-        return _apply_rope_axis(q, k, req.cos, req.sin, unsqueeze_dim=req.unsqueeze_dim)
+        if req.in_place:
+            rotary_dim = int(req.cos.shape[-1])
+            if (
+                req.q.ndim != 3
+                or req.k.ndim != 3
+                or req.cos.ndim != 2
+                or req.sin.shape != req.cos.shape
+                or req.cos.shape[0] != req.q.shape[0]
+                or rotary_dim <= 0
+                or rotary_dim % 2
+                or rotary_dim > req.q.shape[-1]
+            ):
+                raise ValueError("in-place partial qk_norm_rope geometry is invalid")
+
+            def partial_rope(value: torch.Tensor) -> torch.Tensor:
+                head = value[..., :rotary_dim]
+                first, second = head.chunk(2, dim=-1)
+                rotated = torch.cat((-second, first), dim=-1)
+                table_shape = (req.cos.shape[0], 1, rotary_dim)
+                output = value.clone()
+                output[..., :rotary_dim] = (
+                    head * req.cos.view(table_shape)
+                    + rotated * req.sin.view(table_shape)
+                )
+                return output
+
+            req.q.copy_(partial_rope(q))
+            req.k.copy_(partial_rope(k))
+            return req.q, req.k
+        q, k = _apply_rope_axis(q, k, req.cos, req.sin, unsqueeze_dim=req.unsqueeze_dim)
+        return q, k
 
     def _run_multi_axis(self, req: MultiAxisQKNormRopeReq) -> tuple[torch.Tensor, torch.Tensor]:
         plan = QKNormRopePlan.from_request(req)

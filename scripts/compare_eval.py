@@ -18,6 +18,7 @@ def compare_pair(
     candidate_directory: str | Path,
     *,
     max_regression: float | None = None,
+    max_latency_regression_ms: float | None = None,
 ) -> dict[str, Any]:
     reference = _load_summary(reference_directory)
     candidate = _load_summary(candidate_directory)
@@ -63,6 +64,19 @@ def compare_pair(
                     "passed": passed,
                 }
             )
+        elif max_latency_regression_ms is not None and _is_latency_metric(path, direction):
+            regression_ms = None
+            passed = False
+            if ref_value is not None and cand_value is not None:
+                regression_ms = cand_value - ref_value
+                passed = regression_ms <= max_latency_regression_ms
+            metric.update(
+                {
+                    "regression_ms": regression_ms,
+                    "maximum_regression_ms": max_latency_regression_ms,
+                    "passed": passed,
+                }
+            )
         metrics.append(metric)
     comparable = not failures
     result = {
@@ -75,9 +89,10 @@ def compare_pair(
             "candidate": candidate.get("warnings", []),
         },
     }
-    if max_regression is not None:
-        result["passed"] = comparable and bool(metrics) and all(
-            metric["passed"] for metric in metrics
+    if max_regression is not None or max_latency_regression_ms is not None:
+        screened_metrics = [metric for metric in metrics if "passed" in metric]
+        result["passed"] = comparable and bool(screened_metrics) and all(
+            metric["passed"] for metric in screened_metrics
         )
     return result
 
@@ -88,6 +103,7 @@ def compare_suite(
     points: Sequence[str],
     *,
     max_regression: float | None = None,
+    max_latency_regression_ms: float | None = None,
 ) -> dict[str, Any]:
     reference_root = Path(reference_root)
     candidate_root = Path(candidate_root)
@@ -96,6 +112,7 @@ def compare_suite(
             reference_root / point,
             candidate_root / point,
             max_regression=max_regression,
+            max_latency_regression_ms=max_latency_regression_ms,
         )
         for point in points
     ]
@@ -111,10 +128,20 @@ def compare_suite(
                 and all(comparison["passed"] for comparison in comparisons),
             }
         )
+    elif max_latency_regression_ms is not None:
+        result.update(
+            {
+                "max_latency_regression_ms": max_latency_regression_ms,
+                "passed": bool(comparisons)
+                and all(comparison["passed"] for comparison in comparisons),
+            }
+        )
     return result
 
 
 def render_markdown(report: dict[str, Any]) -> str:
+    if report.get("max_latency_regression_ms") is not None:
+        return _render_latency_screen_markdown(report)
     if report.get("max_regression") is None:
         return _render_unscreened_markdown(report)
     lines = [
@@ -139,6 +166,38 @@ def render_markdown(report: dict[str, Any]) -> str:
                     candidate=_number(metric.get("candidate")),
                     change=_percent(metric.get("raw_change_percent")),
                     ratio=_number(metric.get("normalized_ratio")),
+                    result="pass" if metric.get("passed") else "fail",
+                )
+            )
+    return "\n".join(lines) + "\n"
+
+
+def _render_latency_screen_markdown(report: dict[str, Any]) -> str:
+    lines = [
+        "# Benchmark comparison",
+        "",
+        f"Overall: {'pass' if report.get('passed') else 'fail'}",
+        "",
+        "| Benchmark | Latency metric | Reference | Candidate | Regression | Limit | Result |",
+        "| --- | --- | ---: | ---: | ---: | ---: | --- |",
+    ]
+    for comparison in report.get("comparisons", []):
+        screened_metrics = [
+            metric for metric in comparison.get("metrics", []) if "regression_ms" in metric
+        ]
+        if not screened_metrics:
+            lines.append(
+                f"| {comparison.get('benchmark')} | n/a | n/a | n/a | n/a | n/a | fail |"
+            )
+        for metric in screened_metrics:
+            lines.append(
+                "| {benchmark} | `{path}` | {reference} ms | {candidate} ms | {regression} ms | {limit} ms | {result} |".format(
+                    benchmark=comparison.get("benchmark"),
+                    path=metric.get("path"),
+                    reference=_number(metric.get("reference")),
+                    candidate=_number(metric.get("candidate")),
+                    regression=_signed_number(metric.get("regression_ms")),
+                    limit=_number(metric.get("maximum_regression_ms")),
                     result="pass" if metric.get("passed") else "fail",
                 )
             )
@@ -193,6 +252,10 @@ def _metric(metrics: Any, path: str) -> float | None:
     return numeric if math.isfinite(numeric) else None
 
 
+def _is_latency_metric(path: str, direction: Any) -> bool:
+    return direction == "lower" and (path.endswith("_ms") or "_ms." in path)
+
+
 def _number(value: Any) -> str:
     return "n/a" if value is None else f"{float(value):.6g}"
 
@@ -201,18 +264,26 @@ def _percent(value: Any) -> str:
     return "n/a" if value is None else f"{float(value):+.2f}%"
 
 
+def _signed_number(value: Any) -> str:
+    return "n/a" if value is None else f"{float(value):+.6g}"
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("selection")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--reference-root", type=Path, required=True)
     parser.add_argument("--candidate-root", type=Path, required=True)
-    parser.add_argument("--max-regression", type=float)
+    regression_group = parser.add_mutually_exclusive_group()
+    regression_group.add_argument("--max-regression", type=float)
+    regression_group.add_argument("--max-latency-regression-ms", type=float)
     parser.add_argument("--output-dir", type=Path)
     args = parser.parse_args(argv)
 
     if args.max_regression is not None and not 0 <= args.max_regression < 1:
         parser.error("--max-regression must be in [0, 1)")
+    if args.max_latency_regression_ms is not None and args.max_latency_regression_ms < 0:
+        parser.error("--max-latency-regression-ms must be non-negative")
 
     config = load_config(args.config)
     points = config.selected_points(args.selection)
@@ -221,6 +292,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.candidate_root,
         [point.name for point in points],
         max_regression=args.max_regression,
+        max_latency_regression_ms=args.max_latency_regression_ms,
     )
     markdown = render_markdown(report)
     print(markdown, end="")
@@ -231,9 +303,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             encoding="utf-8",
         )
         (args.output_dir / "comparison.md").write_text(markdown, encoding="utf-8")
-    if report["valid"] is not True or (
-        args.max_regression is not None and report["passed"] is not True
-    ):
+    screened = args.max_regression is not None or args.max_latency_regression_ms is not None
+    if report["valid"] is not True or (screened and report["passed"] is not True):
         return 2
     return 0
 

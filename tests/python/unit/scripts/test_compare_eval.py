@@ -85,3 +85,30 @@ def test_comparison_rejects_different_selected_rows(tmp_path: Path) -> None:
     result = compare_eval.compare_pair(reference, candidate, max_regression=0.05)
     assert result["comparable"] is False
     assert "selected_rows_mismatch" in result["failures"]
+
+
+def test_latency_screen_uses_absolute_millisecond_headroom(tmp_path: Path) -> None:
+    reference = tmp_path / "reference"
+    passing_candidate = tmp_path / "passing"
+    failing_candidate = tmp_path / "failing"
+    _write_summary(reference, throughput=100, latency=10_000)
+    _write_summary(passing_candidate, throughput=1, latency=10_300)
+    _write_summary(failing_candidate, throughput=100, latency=10_301)
+
+    passing = compare_eval.compare_pair(
+        reference,
+        passing_candidate,
+        max_latency_regression_ms=300,
+    )
+    failing = compare_eval.compare_pair(
+        reference,
+        failing_candidate,
+        max_latency_regression_ms=300,
+    )
+
+    assert passing["passed"] is True
+    assert "passed" not in passing["metrics"][0]
+    assert passing["metrics"][1]["regression_ms"] == pytest.approx(300)
+    assert passing["metrics"][1]["passed"] is True
+    assert failing["passed"] is False
+    assert failing["metrics"][1]["passed"] is False

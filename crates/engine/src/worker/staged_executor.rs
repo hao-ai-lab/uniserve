@@ -1050,7 +1050,9 @@ impl Executor for StagedExecutor {
             acknowledgements.extend(pool_acknowledgements);
             rank_offset = rank_offset.saturating_add(rank_count);
         }
-        if let ControlOp::DropSession(session_id) = operation {
+        let succeeded =
+            !acknowledgements.is_empty() && acknowledgements.iter().all(|ack| ack.result.is_ok());
+        if succeeded && let ControlOp::DropSession(session_id) = operation {
             self.forget_session(session_id);
         }
         Ok(acknowledgements)

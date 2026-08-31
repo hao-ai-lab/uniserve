@@ -59,12 +59,14 @@ bench = [
 # your platform. UniServe-authored optional kernels live in the independent
 # `uniserve-kernel` pack (jagged FlashAttention is
 # `uniserve-kernel[flash_attn_jagged]`). MiniMax H3 SM100a sparse attention uses
-# FastVideo.
+# FastVideo and cuDNN Frontend CuTe DSL providers.
 gpu = [
     "flashinfer-python",
 ]
 h3 = [
     "fastvideo-kernel==0.3.4",
+    "nvidia-cudnn-frontend[cutedsl]==1.27.0",
+    "nvidia-cutlass-dsl[cu13]==4.6.1",
 ]
 
 [project.scripts]

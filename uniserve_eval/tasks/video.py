@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+import math
 from typing import ClassVar
 
 from ..types import (
@@ -26,12 +27,21 @@ class VideoTask(BenchmarkTask):
             {
                 "model": self.point.model,
                 "prompt": example.prompt,
-                "seed": int(example.seed if example.seed is not None else self.point.load.seed),
+                "seed": int(
+                    example.seed if example.seed is not None else self.point.load.seed
+                ),
+                "seconds": float(
+                    example.seconds
+                    if example.seconds is not None
+                    else self.point.video.seconds
+                ),
             },
             stream=False,
         )
 
     def validate_output(self, records: Sequence[RequestRecord]) -> ValidationResult:
+        raw_frames = math.floor(float(self.point.video.seconds) * 24.0 + 0.5)
+        expected_frames = int(raw_frames + (5 - raw_frames) % 17)
         outputs = [record.decoded_video for record in records]
         present = bool(outputs) and all(output is not None for output in outputs)
         videos = [output for output in outputs if output is not None]
@@ -39,12 +49,13 @@ class VideoTask(BenchmarkTask):
         return ValidationResult(
             checks={
                 "decoded_video": present,
-                "h264_video": present and all(video.video_codec == "h264" for video in videos),
+                "h264_video": present
+                and all(video.video_codec == "h264" for video in videos),
                 "fixed_video_geometry": present
                 and all(
                     video.width == 1344
                     and video.height == 768
-                    and video.frame_count == 124
+                    and video.frame_count == expected_frames
                     and video.fps_numerator == 24 * video.fps_denominator
                     for video in videos
                 ),

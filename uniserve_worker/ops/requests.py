@@ -64,6 +64,7 @@ class QKNormRopeReq:
     eps: float
     position_ids: torch.Tensor | None = None
     unsqueeze_dim: int = 1
+    in_place: bool = False
 
 
 @dataclass(frozen=True)

@@ -145,6 +145,11 @@ impl Default for WorkerProcessArgs {
             load_threads: None,
             checksum_manifest: None,
             model_dtype: uniserve_core::ModelDtype::BFloat16,
+            linear_precision: "fp8".to_string(),
+            h3_transformer_attention_precision: None,
+            h3_transformer_mlp_precision: None,
+            h3_text_encoder_precision: None,
+            h3_video_vae_precision: None,
             kv_cache_dtype: None,
             kv_memory_fraction: 0.70,
             mesh: None,
@@ -165,6 +170,9 @@ impl Default for WorkerProcessArgs {
             flashinfer_disable_split_kv: false,
             flashinfer_fast_decode_plan: true,
             media_spool: None,
+            max_model_len: 8192,
+            max_video_seconds: 15.0,
+            fixed_graph_cache_capacity: 32,
         }
     }
 }
@@ -187,6 +195,19 @@ impl WorkerProcessArgs {
             cmd.arg("--checksum-manifest").arg(value);
         }
         cmd.arg("--model-dtype").arg(self.model_dtype.as_str());
+        cmd.arg("--linear-precision").arg(&self.linear_precision);
+        if let Some(value) = &self.h3_transformer_attention_precision {
+            cmd.arg("--h3-transformer-attention-precision").arg(value);
+        }
+        if let Some(value) = &self.h3_transformer_mlp_precision {
+            cmd.arg("--h3-transformer-mlp-precision").arg(value);
+        }
+        if let Some(value) = &self.h3_text_encoder_precision {
+            cmd.arg("--h3-text-encoder-precision").arg(value);
+        }
+        if let Some(value) = &self.h3_video_vae_precision {
+            cmd.arg("--h3-video-vae-precision").arg(value);
+        }
         if let Some(value) = &self.kv_cache_dtype {
             cmd.arg("--kv-cache-dtype").arg(value.as_str());
         }
@@ -245,6 +266,12 @@ impl WorkerProcessArgs {
         if let Some(value) = &self.media_spool {
             cmd.arg("--media-spool").arg(value);
         }
+        cmd.arg("--max-model-len")
+            .arg(self.max_model_len.to_string());
+        cmd.arg("--max-video-seconds")
+            .arg(self.max_video_seconds.to_string());
+        cmd.arg("--fixed-graph-cache-capacity")
+            .arg(self.fixed_graph_cache_capacity.to_string());
     }
 }
 

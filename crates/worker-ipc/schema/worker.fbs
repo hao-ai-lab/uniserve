@@ -392,11 +392,20 @@ table UndAdmission {
 
 table GenAdmission { image:ImageParams; }
 
+table MediaPlan {
+  frame_count:uint;
+  video_decode_units:uint;
+  audio_latent_frames:uint;
+  prompt_tokens:uint;
+  denoise_steps:uint;
+}
+
 table MediaAdmission {
-  prompt:string;
+  prompt_token_ids:[uint];
   seed:ulong;
   profile:MediaProfileId;
   output_path:string;
+  plan:MediaPlan;
 }
 
 table NewRequest {

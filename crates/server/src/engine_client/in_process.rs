@@ -175,10 +175,11 @@ impl EngineClient {
     pub async fn submit_media(&self, submission: MediaSubmission) -> Result<MediaEventRx> {
         let MediaSubmission {
             external_request_id,
-            prompt,
+            prompt_token_ids,
             seed,
             priority,
             output_path,
+            plan,
             ..
         } = submission;
         let rid = self.core.next_request_id();
@@ -193,10 +194,11 @@ impl EngineClient {
         }
         let request = uniserve_core::MediaRequest {
             request_id: rid,
-            prompt,
+            prompt_token_ids,
             seed,
             priority,
             output_path,
+            plan,
         };
         let mut scheduler_rx = self.core.handle().submit_media(request).map_err(|error| {
             remove_active_request(&self.active, &external_request_id, rid);

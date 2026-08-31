@@ -9,6 +9,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from ...nn.mesh import DeviceMesh, divide
+from ...nn.quant.nvfp4 import DynamicW4A4NvFp4LinearMethod
 
 __all__ = ["H3TextEncoderConfig", "MiniMaxH3TextEncoder"]
 
@@ -66,6 +67,10 @@ class _ColumnLinear(nn.Module):
         super().__init__()
         self.global_output_size = int(output_size)
         self.local_output_size = divide(output_size, mesh.size("tp"))
+        self.input_size = int(input_size)
+        self.output_size = self.local_output_size
+        self.bias = None
+        self.quant_method: DynamicW4A4NvFp4LinearMethod | None = None
         self.weight = nn.Parameter(
             torch.empty(
                 (self.local_output_size, input_size),
@@ -75,7 +80,15 @@ class _ColumnLinear(nn.Module):
         )
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
+        if self.quant_method is not None:
+            return self.quant_method.apply(self, value)
         return F.linear(value, self.weight)
+
+    def enable_nvfp4(self) -> None:
+        self.register_buffer("weight_scale", None, persistent=False)
+        self.register_buffer("weight_scale_2", None, persistent=False)
+        self.quant_method = DynamicW4A4NvFp4LinearMethod()
+        self.quant_method.process_weights_after_loading(self)
 
 
 class _RowLinear(nn.Module):
@@ -92,6 +105,10 @@ class _RowLinear(nn.Module):
         self.mesh = mesh
         self.global_input_size = int(input_size)
         self.local_input_size = divide(input_size, mesh.size("tp"))
+        self.input_size = self.local_input_size
+        self.output_size = int(output_size)
+        self.bias = None
+        self.quant_method: DynamicW4A4NvFp4LinearMethod | None = None
         self.weight = nn.Parameter(
             torch.empty(
                 (output_size, self.local_input_size),
@@ -101,8 +118,18 @@ class _RowLinear(nn.Module):
         )
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
-        output = F.linear(value, self.weight)
+        output = (
+            self.quant_method.apply(self, value)
+            if self.quant_method is not None
+            else F.linear(value, self.weight)
+        )
         return self.mesh.all_reduce(output, "tp")
+
+    def enable_nvfp4(self) -> None:
+        self.register_buffer("weight_scale", None, persistent=False)
+        self.register_buffer("weight_scale_2", None, persistent=False)
+        self.quant_method = DynamicW4A4NvFp4LinearMethod()
+        self.quant_method.process_weights_after_loading(self)
 
 
 class _VocabParallelEmbedding(nn.Module):
@@ -347,11 +374,12 @@ class MiniMaxH3TextEncoder(nn.Module):
         self,
         mesh: DeviceMesh,
         *,
+        max_text_rows: int,
         parameter_device: torch.device | str = "meta",
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         super().__init__()
-        self.config = H3TextEncoderConfig()
+        self.config = H3TextEncoderConfig(max_text_rows=int(max_text_rows))
         if mesh.size("tp") != 4:
             raise ValueError("the H3 text encoder requires TP4")
         self.mesh = mesh
@@ -366,5 +394,12 @@ class MiniMaxH3TextEncoder(nn.Module):
         if token_ids.ndim != 2 or token_ids.shape[0] != 1:
             raise ValueError("H3 text conditioning requires one token sequence")
         if token_ids.shape[1] < 1 or token_ids.shape[1] > self.config.max_text_rows:
-            raise ValueError("H3 prompt token count must be between 1 and 1024")
+            raise ValueError(
+                f"H3 prompt token count must be between 1 and {self.config.max_text_rows}"
+            )
         return self.language_model(token_ids)
+
+    def enable_nvfp4(self) -> None:
+        for module in self.modules():
+            if isinstance(module, (_ColumnLinear, _RowLinear)):
+                module.enable_nvfp4()

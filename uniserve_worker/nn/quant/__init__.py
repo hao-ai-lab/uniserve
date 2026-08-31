@@ -1,7 +1,7 @@
 """Quantization seam for shared layers."""
-from .base import QuantizeMethodBase, UnquantizedLinearMethod
+from .base import QuantizeMethodBase, UnquantizedLinearMethod, process_quantized_modules
 from .config import QuantizationConfig
-from .fp8 import W8A8Fp8LinearMethod
+from .fp8 import DynamicW8A8Fp8LinearMethod, W8A8Fp8LinearMethod
 from .kv_cache import (
     dequantize_fp8_block,
     is_fp8_kv_dtype,
@@ -12,11 +12,15 @@ from .kv_cache import (
     resolve_kv_store_dtype,
     scale_for_fp8_block,
 )
+from .nvfp4 import DynamicW4A4NvFp4LinearMethod
 
 __all__ = [
     "QuantizationConfig",
     "QuantizeMethodBase",
     "UnquantizedLinearMethod",
+    "process_quantized_modules",
+    "DynamicW8A8Fp8LinearMethod",
+    "DynamicW4A4NvFp4LinearMethod",
     "W8A8Fp8LinearMethod",
     "dequantize_fp8_block",
     "is_fp8_kv_dtype",
