@@ -31,7 +31,7 @@ VIDEO_ROUND_UNITS = 4
 MIN_H3_FRAMES = 22
 
 
-def _decode_unit_frames(frames: int) -> tuple[int, ...]:
+def _reconstruction_unit_frames(frames: int) -> tuple[int, ...]:
     if frames < MIN_H3_FRAMES or frames % 17 != 5:
         raise ValueError("H3 frame count must have the form 17 * n + 5")
     units = (frames - 5) // 17
@@ -47,7 +47,7 @@ class H3Layout:
     local_start: int
     local_end: int
     frame_count: int
-    decode_unit_frames: tuple[int, ...]
+    reconstruction_unit_frames: tuple[int, ...]
 
     @classmethod
     def build(
@@ -76,7 +76,7 @@ class H3Layout:
             local_start=rank * shard,
             local_end=(rank + 1) * shard,
             frame_count=int(frames),
-            decode_unit_frames=_decode_unit_frames(int(frames)),
+            reconstruction_unit_frames=_reconstruction_unit_frames(int(frames)),
         )
 
     @property
@@ -90,8 +90,8 @@ class H3Layout:
     @property
     def video_round_frames(self) -> int:
         return max(
-            sum(self.decode_unit_frames[start : start + VIDEO_ROUND_UNITS])
-            for start in range(0, self.video_decode_units, VIDEO_ROUND_UNITS)
+            sum(self.reconstruction_unit_frames[start : start + VIDEO_ROUND_UNITS])
+            for start in range(0, self.video_reconstruction_units, VIDEO_ROUND_UNITS)
         )
 
     @property
@@ -99,8 +99,8 @@ class H3Layout:
         return self.local_end - self.local_start
 
     @property
-    def video_decode_units(self) -> int:
-        return len(self.decode_unit_frames)
+    def video_reconstruction_units(self) -> int:
+        return len(self.reconstruction_unit_frames)
 
     @property
     def persistent_units(self) -> int:
@@ -173,7 +173,7 @@ class H3StateSlot:
     shape_key: tuple[int, int, int] | None = None
     denoise_step: int = 0
     next_video_unit: int = 0
-    audio_decoded: bool = False
+    audio_reconstructed: bool = False
 
     @property
     def active(self) -> bool:
@@ -192,9 +192,7 @@ class H3StateSlot:
                 "audio_rows": (layout.local_audio_rows, 32),
                 "tile_valid_sizes": (int(layout.packed.tile_valid_sizes.numel()),),
                 "prefix_key_indices": (int(layout.packed.prefix_tiles),),
-                "dense_key_indices": (
-                    int(layout.packed.prefix_tiles + layout.packed.video_tiles),
-                ),
+                "dense_key_indices": (int(layout.packed.prefix_tiles + layout.packed.video_tiles),),
                 "prefix_count": (),
                 "rotary_cosine": (layout.packed.padded_rows, 96),
                 "rotary_sine": (layout.packed.padded_rows, 96),
@@ -223,7 +221,7 @@ class H3StateSlot:
         self.shape_key = None
         self.denoise_step = 0
         self.next_video_unit = 0
-        self.audio_decoded = False
+        self.audio_reconstructed = False
         if self.video_overlap is not None:
             self.video_overlap.zero_()
 
@@ -268,9 +266,7 @@ class H3StatePool:
         prefix_capacity = int(layout.packed.prefix_tiles)
         dense_capacity = int(layout.packed.prefix_tiles + layout.packed.video_tiles)
         row_capacity = int(layout.packed.padded_rows)
-        text_condition = torch.empty(
-            (1, text_capacity, 5376), dtype=torch.bfloat16, device=device
-        )
+        text_condition = torch.empty((1, text_capacity, 5376), dtype=torch.bfloat16, device=device)
         video_rows = torch.empty((video_capacity, 96), dtype=torch.float32, device=device)
         audio_rows = torch.empty((audio_capacity, 32), dtype=torch.float32, device=device)
         tile_valid_sizes = torch.empty((tile_capacity,), dtype=torch.int32, device=device)
@@ -397,7 +393,7 @@ class H3Scratch:
     latent_send: torch.Tensor
     latent_exchange: torch.Tensor
     latent_input: torch.Tensor
-    decode_rows: torch.Tensor
+    reconstruction_rows: torch.Tensor
     audio_gather: torch.Tensor
     audio_input: torch.Tensor
     segment_placeholder: torch.Tensor
@@ -422,15 +418,10 @@ class H3Scratch:
         local_video = int(layout.local_video_rows)
         local_audio = int(layout.local_audio_rows)
         projected_rows = max(local_video, local_audio)
-        workspace_bytes = max(
-            global_rows * 5376,
-            global_rows * local_heads * 128 * 2,
-        )
+        workspace_elements = global_rows * 5376
         if self.bounded is None:
             raise RuntimeError("H3 scratch storage has no bounded-view owner")
-        shapes = {
-            name: tuple(tensor.shape) for name, tensor in self.bounded.capacity.items()
-        }
+        shapes = {name: tuple(tensor.shape) for name, tensor in self.bounded.capacity.items()}
         shapes.update(
             {
                 "packed_hidden": (1, local_rows, 5376),
@@ -441,7 +432,7 @@ class H3Scratch:
                 "local_audio_hidden": (local_audio, 5376),
                 "video_velocity": (local_video, 96),
                 "audio_velocity": (local_audio, 32),
-                "attention_workspace": (workspace_bytes,),
+                "attention_workspace": (workspace_elements,),
                 "attention_output": (global_rows, local_heads, 128),
                 "tile_scores": (local_heads, tiles, tiles),
                 "block_indices": (local_heads, tiles, prefix_width),
@@ -492,6 +483,7 @@ class H3Scratch:
         *,
         block_params_shape: tuple[int, ...],
         final_params_shape: tuple[int, ...],
+        attention_workspace_dtype: torch.dtype,
     ) -> "H3Scratch":
         device = mesh.local_device
         local_rows = layout.local_rows
@@ -534,15 +526,10 @@ class H3Scratch:
             projection_sync_input=torch.full(
                 (1,), layout.sp_rank, dtype=torch.int32, device=device
             ),
-            projection_sync_output=torch.empty(
-                (layout.sp_size,), dtype=torch.int32, device=device
-            ),
+            projection_sync_output=torch.empty((layout.sp_size,), dtype=torch.int32, device=device),
             attention_workspace=torch.empty(
-                max(
-                    global_rows * 5376,
-                    global_rows * local_heads * 128 * 2,
-                ),
-                dtype=torch.uint8,
+                global_rows * 5376,
+                dtype=attention_workspace_dtype,
                 device=device,
             ),
             attention_output=torch.empty(
@@ -585,7 +572,7 @@ class H3Scratch:
                 (layout.sp_size, 24, 7, 48, 84), dtype=torch.float32, device=device
             ),
             latent_input=torch.empty((24, 7, 48, 84), dtype=torch.float32, device=device),
-            decode_rows=torch.empty((7 * 24 * 42, 96), dtype=torch.float32, device=device),
+            reconstruction_rows=torch.empty((7 * 24 * 42, 96), dtype=torch.float32, device=device),
             audio_gather=torch.empty(
                 (layout.sp_size, layout.packed.audio_indices.numel(), 32),
                 dtype=torch.float32,
@@ -665,10 +652,7 @@ class H3Scratch:
         if scratch.rgb_round is not None:
             tensors["rgb_round"] = scratch.rgb_round
         tensors.update(
-            {
-                f"projection_peer_{rank}": peer
-                for rank, peer in enumerate(scratch.projection_peers)
-            }
+            {f"projection_peer_{rank}": peer for rank, peer in enumerate(scratch.projection_peers)}
         )
         scratch.bounded = BoundedTensorStorage(tensors)
         return scratch

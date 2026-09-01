@@ -300,7 +300,9 @@ class _SenseAttention(nn.Module):
             self.head_dim,
             layer_id=layer,
         )
-        self.o_proj = RowParallelLinear(query_width, hidden_size, layer_config=layer_config, bias=bias)
+        self.o_proj = RowParallelLinear(
+            query_width, hidden_size, layer_config=layer_config, bias=bias
+        )
         self.o_proj_mot_gen = RowParallelLinear(
             query_width,
             hidden_size,
@@ -802,8 +804,8 @@ class NEOChatModel(ExecutionModel):
                 ForwardMode.TOKEN_EXTEND,
                 ForwardMode.TOKEN_DECODE,
                 ForwardMode.TOKEN_VERIFY,
-                ForwardMode.GEN_TRANSITION,
-                ForwardMode.GEN_FLOW,
+                ForwardMode.MEDIA_PREPARE,
+                ForwardMode.MEDIA_DENOISE,
                 ForwardMode.ENCODE_VISION,
                 ForwardMode.MATERIALIZE,
                 ForwardMode.TRANSFER_PRODUCT,

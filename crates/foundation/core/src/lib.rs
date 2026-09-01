@@ -14,7 +14,7 @@ pub mod product_blob;
 pub mod sampling;
 pub use codec::stats::WorkerForwardStats;
 pub use events::{
-    FinishReason, GenerationEvent, MediaEvent, MediaPlan, MediaRequest, MediaRequestError,
+    FinishReason, GenerationEvent, MediaEvent, MediaGeometry, MediaRequest, MediaRequestError,
     PositionLogprobs, StopReason, TokenLogprob,
 };
 pub use generation::{

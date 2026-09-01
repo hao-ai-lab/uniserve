@@ -10,7 +10,6 @@ from typing import Any
 
 import torch
 
-from uniserve_worker.worker_info import GraphBucket
 from uniserve_worker.execution.batch import (
     DevicePoint,
     FixedPoint,
@@ -29,7 +28,7 @@ from uniserve_worker.execution.rows import (
     PartitionState,
 )
 from uniserve_worker.execution.trace import ExecutionTrace
-from uniserve_worker.foundation.errors import unsupported_setup, invalid_descriptor
+from uniserve_worker.foundation.errors import invalid_descriptor, unsupported_setup
 from uniserve_worker.loader.weight_set import WeightSet
 from uniserve_worker.models.generation import GenerationPipeline
 from uniserve_worker.models.inputs import ImageProcessor
@@ -48,6 +47,7 @@ from uniserve_worker.server.cpu_tasks import BoundedCpuTaskPool
 from uniserve_worker.server.request_state import RequestRow, RequestRuntime, RequestTable
 from uniserve_worker.transfer.connector import CachePublications
 from uniserve_worker.transfer.tickets import Locator, Transport
+from uniserve_worker.worker_info import GraphBucket
 
 
 @dataclass(slots=True)
@@ -186,9 +186,9 @@ class ExecutionResources:
 
     def operation_device(self, operation: Operation) -> torch.device:
         if operation.work in {
-            ForwardMode.GEN_TRANSITION,
-            ForwardMode.GEN_FLOW,
-            ForwardMode.GEN_DECODE,
+            ForwardMode.MEDIA_PREPARE,
+            ForwardMode.MEDIA_DENOISE,
+            ForwardMode.MEDIA_RECONSTRUCT,
             ForwardMode.MATERIALIZE,
         }:
             return self._generation_device

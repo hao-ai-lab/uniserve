@@ -1,4 +1,5 @@
 """Worker-side profiling spans and per-step capture."""
+
 from __future__ import annotations
 
 import inspect
@@ -20,7 +21,12 @@ except Exception:  # pragma: no cover - exercised only in torch-free envs.
 else:  # pragma: no cover
     torch = _torch_module
 
-__all__ = ["WorkerProfiler", "WorkerProfileConfig", "profile_range"]
+__all__ = [
+    "WorkerProfiler",
+    "WorkerProfileConfig",
+    "profile_range",
+    "synchronize_profile_range",
+]
 
 _PROFILE_NVTX_ENV = "UNISERVE_PROFILE_NVTX"
 _NVTX_ENV = "UNISERVE_NVTX"
@@ -70,7 +76,9 @@ class WorkerProfiler:
         if not output_dir:
             return cls(None)
         activities = _parse_activities(env.get(_PROFILE_ACTIVITIES_ENV, "CPU,GPU"))
-        cuda_profiler = "CUDA_PROFILER" in activities or flag_from_value(env.get(_CUDA_PROFILER_ENV))
+        cuda_profiler = "CUDA_PROFILER" in activities or flag_from_value(
+            env.get(_CUDA_PROFILER_ENV)
+        )
         activities = tuple(activity for activity in activities if activity != "CUDA_PROFILER")
         config = WorkerProfileConfig(
             output_dir=Path(output_dir),
@@ -97,11 +105,7 @@ class WorkerProfiler:
 
         self._seen_steps += 1
         started_for_step = False
-        if (
-            not self._active
-            and not self._finished
-            and self._seen_steps >= self.config.start_step
-        ):
+        if not self._active and not self._finished and self._seen_steps >= self.config.start_step:
             started_for_step = self._start(self._seen_steps)
 
         was_active = self._active
@@ -190,6 +194,12 @@ def profile_range(debug_name: str):
     if not record and not nvtx:
         return _NULL_CONTEXT
     return _profile_range_impl(debug_name, record=record, nvtx=nvtx)
+
+
+def synchronize_profile_range(device: Any) -> None:
+    """Close an NVTX capture range only after its device work is observable."""
+    if _nvtx_ranges_enabled() and torch is not None:
+        torch.cuda.synchronize(device)
 
 
 @contextmanager

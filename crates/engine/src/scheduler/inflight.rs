@@ -99,7 +99,7 @@ impl InflightWindow {
         self.operations
             .values()
             .flatten()
-            .any(|op| op.operation.work == ForwardMode::GenFlow)
+            .any(|op| op.operation.work == ForwardMode::MediaDenoise)
     }
 
     pub(super) fn take_ready(&mut self) -> Vec<PendingCompletion> {

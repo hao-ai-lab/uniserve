@@ -1,9 +1,5 @@
-"""Quantization methods for shared layers.
+"""Weight creation, loading finalization, and execution for shared linear layers."""
 
-Only the unquantized method is active today.  The important production seam is
-that the method owns parameter creation, so future fp8/int8 layouts do not have
-to fight a dense weight that was already registered by ``LinearBase``.
-"""
 from __future__ import annotations
 
 import abc
@@ -14,9 +10,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 __all__ = [
-    'QuantizeMethodBase',
-    'UnquantizedLinearMethod',
-    'process_quantized_modules',
+    "QuantizeMethodBase",
+    "UnquantizedLinearMethod",
+    "process_quantized_modules",
 ]
 
 
@@ -75,6 +71,28 @@ class UnquantizedLinearMethod(QuantizeMethodBase):
 
         linear = cast(LinearBase, module)
         return F.linear(x, linear.weight, linear.bias)
+
+    def apply_sequence_parallel(
+        self,
+        module: nn.Module,
+        x: torch.Tensor,
+        mesh: object,
+        workspace: torch.Tensor,
+        *,
+        group: str,
+    ) -> torch.Tensor:
+        from ..linear import LinearBase
+        from ..mesh import DeviceMesh
+
+        linear = cast(LinearBase, module)
+        device_mesh = cast(DeviceMesh, mesh)
+        global_rows = int(x.shape[0]) * device_mesh.size(group)
+        gathered = workspace.view(x.dtype)[: global_rows * x.shape[1]].view(
+            global_rows,
+            x.shape[1],
+        )
+        device_mesh.all_gather_into_tensor(gathered, x, group)
+        return F.linear(gathered, linear.weight, linear.bias)
 
 
 def process_quantized_modules(modules: Iterable[nn.Module]) -> None:

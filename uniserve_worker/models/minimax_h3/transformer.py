@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Literal
 
 import torch
 from torch import nn
@@ -20,7 +19,13 @@ from ...nn.diffusion.modulation import prepare_modulation_plan, select_modulatio
 from ...nn.layer import LayerConfig
 from ...nn.linear import InterleavedMergedColumnParallelLinear, LinearBase
 from ...nn.mesh import DeviceMesh, SymmetricMemoryWorkspace, TensorParallel
-from ...nn.quant import DynamicW4A4NvFp4LinearMethod, DynamicW8A8Fp8LinearMethod
+from ...nn.quant import (
+    DynamicW4A4NvFp4LinearMethod,
+    DynamicW8A8Fp8LinearMethod,
+    DynamicW8A8MxFp8LinearMethod,
+    QuantizeMethodBase,
+    UnquantizedLinearMethod,
+)
 from ...ops import qk_norm_rope
 from .fusions import (
     row_modulated_rmsnorm,
@@ -44,9 +49,15 @@ def _dynamic_quant_method(
     precision: LinearPrecision,
     *,
     tensorwise: bool = False,
-) -> DynamicW8A8Fp8LinearMethod | DynamicW4A4NvFp4LinearMethod:
+) -> QuantizeMethodBase:
+    if precision == "bf16":
+        return UnquantizedLinearMethod()
     if precision == "fp8":
         return DynamicW8A8Fp8LinearMethod(tensorwise=tensorwise)
+    if precision == "mxfp8":
+        if tensorwise:
+            raise ValueError("MXFP8 is not supported at the sequence-parallel attention boundary")
+        return DynamicW8A8MxFp8LinearMethod()
     if precision == "nvfp4":
         return DynamicW4A4NvFp4LinearMethod()
     raise ValueError(f"unsupported dynamic linear precision {precision!r}")
@@ -114,7 +125,9 @@ class _RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
-        normalized = value.float() * torch.rsqrt(value.float().pow(2).mean(-1, keepdim=True) + self.eps)
+        normalized = value.float() * torch.rsqrt(
+            value.float().pow(2).mean(-1, keepdim=True) + self.eps
+        )
         return (normalized * self.weight.float()).to(value.dtype)
 
 
@@ -183,7 +196,9 @@ class _RotaryEmbedding(nn.Module):
         inv = 1.0 / (
             config.rope_theta
             ** (
-                torch.arange(0, config.rope_frequency_dim * 2, 2, dtype=torch.float32, device=device)
+                torch.arange(
+                    0, config.rope_frequency_dim * 2, 2, dtype=torch.float32, device=device
+                )
                 / (config.rope_frequency_dim * 2)
             )
         )
@@ -216,12 +231,8 @@ class _RotaryEmbedding(nn.Module):
             stop = start + width
             torch.cos(frequencies[:, axis], out=cosine[:, start:stop])
             torch.sin(frequencies[:, axis], out=sine[:, start:stop])
-            cosine[:, start + 3 * width : stop + 3 * width].copy_(
-                cosine[:, start:stop]
-            )
-            sine[:, start + 3 * width : stop + 3 * width].copy_(
-                sine[:, start:stop]
-            )
+            cosine[:, start + 3 * width : stop + 3 * width].copy_(cosine[:, start:stop])
+            sine[:, start + 3 * width : stop + 3 * width].copy_(sine[:, start:stop])
 
 
 class _TimeEmbedding(nn.Module):
@@ -424,7 +435,6 @@ class _H3Attention(nn.Module):
             exchange_outputs=projection_peers,
             exchange_sync_input=projection_sync_input,
             exchange_sync_output=projection_sync_output,
-            attention_buffer=attention_workspace,
             attention_output=attention_output,
             tile_scores=tile_scores,
             block_counts=block_counts,
@@ -520,9 +530,7 @@ class _TransformerBlock(nn.Module):
     ) -> torch.Tensor:
         shift_attn, scale_attn, gate_attn, shift_ffn, scale_ffn, gate_ffn = (
             tensor.to(hidden.dtype)
-            for tensor in adaln_values.reshape(-1, self.adaln_proj.hidden_size * 6).chunk(
-                6, dim=-1
-            )
+            for tensor in adaln_values.reshape(-1, self.adaln_proj.hidden_size * 6).chunk(6, dim=-1)
         )
         normalized = row_modulated_rmsnorm(
             hidden,
@@ -571,7 +579,9 @@ class _OutputNorm(nn.Module):
         self.norm = _RMSNorm(config.hidden_size, config.norm_eps, device=device)
         self.linear = nn.Linear(config.time_dim, config.hidden_size * 2, device=device)
 
-    def forward(self, hidden: torch.Tensor, time: torch.Tensor, timestep_indices: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, hidden: torch.Tensor, time: torch.Tensor, timestep_indices: torch.Tensor
+    ) -> torch.Tensor:
         shift, scale = self.linear(F.silu(time).to(self.linear.weight.dtype)).chunk(2, dim=-1)
         return self.forward_precomputed(hidden, shift, scale, timestep_indices)
 
@@ -601,9 +611,6 @@ class MiniMaxH3Transformer(nn.Module):
         parameter_device: torch.device | str = "meta",
         attention_linear_precision: LinearPrecision,
         mlp_linear_precision: LinearPrecision,
-        attention_mode: Literal[
-            "sparse_kernel", "sparse_oracle", "dense_oracle"
-        ] = "sparse_kernel",
     ) -> None:
         super().__init__()
         config = H3TransformerConfig()
@@ -612,7 +619,6 @@ class MiniMaxH3Transformer(nn.Module):
         self.config = config
         self.mesh = mesh
         self.layout = layout
-        self.attention_mode = attention_mode
         self.attention_linear_precision = attention_linear_precision
         self.mlp_linear_precision = mlp_linear_precision
         layer_config = LayerConfig(
@@ -625,8 +631,12 @@ class MiniMaxH3Transformer(nn.Module):
         execution = self.build_execution(layout)
         video_patch_width = config.video_channels * 4
         self.proj_in = nn.Linear(video_patch_width, config.hidden_size, device=parameter_device)
-        self.audio_proj_in = nn.Linear(config.audio_channels, config.hidden_size, device=parameter_device)
-        self.context_embedder = nn.Linear(config.text_dim, config.hidden_size, device=parameter_device)
+        self.audio_proj_in = nn.Linear(
+            config.audio_channels, config.hidden_size, device=parameter_device
+        )
+        self.context_embedder = nn.Linear(
+            config.text_dim, config.hidden_size, device=parameter_device
+        )
         self.time_embedder = _TimeEmbedding(
             config,
             device=parameter_device,
@@ -635,7 +645,7 @@ class MiniMaxH3Transformer(nn.Module):
         self.rope = _RotaryEmbedding(config, device=mesh.local_device)
         self.token_refiner = _TokenRefiner(
             config,
-            linear_precision=mlp_linear_precision,
+            linear_precision="bf16",
             layer_config=layer_config,
             device=parameter_device,
         )
@@ -653,7 +663,9 @@ class MiniMaxH3Transformer(nn.Module):
         )
         self.norm_out = _OutputNorm(config, device=parameter_device)
         self.proj_out = nn.Linear(config.hidden_size, video_patch_width, device=parameter_device)
-        self.audio_proj_out = nn.Linear(config.hidden_size, config.audio_channels, device=parameter_device)
+        self.audio_proj_out = nn.Linear(
+            config.hidden_size, config.audio_channels, device=parameter_device
+        )
         for name in (
             "local_text_indices",
             "global_text_indices",
@@ -681,7 +693,7 @@ class MiniMaxH3Transformer(nn.Module):
         )
         vsa = getattr(self, "vsa", None)
         if vsa is None:
-            vsa = VideoSparseAttentionBackend(self.mesh, metadata, mode=self.attention_mode)
+            vsa = VideoSparseAttentionBackend(metadata)
             self.vsa = vsa
         local_tags = layout.packed.token_tags[layout.local_start : layout.local_end]
         timestep_indices = (local_tags == AUDIO_TAG).to(torch.long)
@@ -736,9 +748,7 @@ class MiniMaxH3Transformer(nn.Module):
         activated_time = torch.stack(
             tuple(
                 F.silu(
-                    self.time_embedder(
-                        torch.stack((video_timesteps[step], audio_timesteps[step]))
-                    )
+                    self.time_embedder(torch.stack((video_timesteps[step], audio_timesteps[step])))
                 )
                 for step in range(int(video_timesteps.numel()))
             )

@@ -323,8 +323,8 @@ impl SimEngine {
                 ForwardMode::TokenDecode,
                 ForwardMode::EncodeVision,
                 ForwardMode::EncodeLatent,
-                ForwardMode::GenTransition,
-                ForwardMode::GenFlow,
+                ForwardMode::MediaPrepare,
+                ForwardMode::MediaDenoise,
                 ForwardMode::Materialize,
                 ForwardMode::TransferProduct,
                 ForwardMode::TransferKvPublish,
@@ -688,8 +688,8 @@ impl SimEngine {
                     session.kv_published_len,
                 );
             }
-            ForwardMode::GenTransition => {}
-            ForwardMode::GenFlow => {
+            ForwardMode::MediaPrepare => {}
+            ForwardMode::MediaDenoise => {
                 let steps = operation.bounds.max_tokens.max(1) as u16;
                 session.flow_step = session.flow_step.saturating_add(steps);
                 let total = session
@@ -701,7 +701,7 @@ impl SimEngine {
                 // advanced through every scheduled step.
                 record.finish_flags.length = session.flow_step >= total;
             }
-            ForwardMode::GenDecode => {}
+            ForwardMode::MediaReconstruct => {}
             ForwardMode::Materialize => {
                 session.flow_step = 0;
                 if let Some(image) = session.image().cloned() {
@@ -1157,7 +1157,7 @@ mod tests {
                 new_cache_pages: Vec::new(),
                 forward_rows: Vec::new(),
                 latent_placements: Vec::new(),
-                decode_placements: Vec::new(),
+                reconstruction_placements: Vec::new(),
             }],
         )
     }

@@ -301,7 +301,7 @@ impl StagedExecutor {
         merged.sampling_ownership = sampling_ownership;
         merged.mixed_buckets = match (
             routing.get(&ForwardMode::TokenDecode),
-            routing.get(&ForwardMode::GenFlow),
+            routing.get(&ForwardMode::MediaDenoise),
         ) {
             (Some(decode), Some(flow)) if decode == flow => {
                 pools[*decode].exec.info().mixed_buckets.clone()
@@ -309,7 +309,7 @@ impl StagedExecutor {
             _ => Vec::new(),
         };
 
-        let flow = routed_caps(ForwardMode::GenFlow);
+        let flow = routed_caps(ForwardMode::MediaDenoise);
         merged.latent_page_units = flow.as_ref().map_or(0, |info| info.latent_page_units);
         merged.num_latent_pages = flow.as_ref().map_or(0, |info| info.num_latent_pages);
         merged.latent_width = flow.as_ref().map_or(0, |info| info.latent_width);
@@ -767,7 +767,7 @@ impl Executor for StagedExecutor {
                     partition.partition_id
                 );
                 pool_index = Some(operation_pool);
-                if variant == ForwardMode::GenFlow {
+                if variant == ForwardMode::MediaDenoise {
                     let token_pool = self
                         .routing
                         .get(&ForwardMode::TokenDecode)
@@ -775,7 +775,7 @@ impl Executor for StagedExecutor {
                     if token_pool.is_some_and(|token_pool| *token_pool != operation_pool) {
                         anyhow::ensure!(
                             !operation.inputs.is_empty(),
-                            "cross-pool generation flow for request {:?} names no input product for its conditioning",
+                            "cross-pool media denoise for request {:?} names no input product for its conditioning",
                             operation.request_key
                         );
                     }

@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from ..bootstrap.worker_info import build_worker_info
 from ..bootstrap.capacity import (
     device_total_bytes,
     model_arena_capacity,
@@ -25,11 +24,7 @@ from ..bootstrap.execution_config import (
     LaneConfig,
     graph_memory_budget_bytes,
 )
-from ..worker_info import (
-    GraphBucket,
-    ResourceClass,
-    WorkerInfo,
-)
+from ..bootstrap.worker_info import build_worker_info
 from ..execution.batch import (
     Batch,
     CompletionReport,
@@ -54,7 +49,7 @@ from ..execution.step import (
     drop_session as drop_execution_session,
 )
 from ..execution.trace import ExecutionPhase, ExecutionTrace, OperationTrace
-from ..foundation.errors import unsupported_setup, invalid_descriptor
+from ..foundation.errors import invalid_descriptor, unsupported_setup
 from ..foundation.math import ceil_div
 from ..loader.update import WeightUpdater
 from ..loader.weight_set import WeightSet
@@ -77,6 +72,11 @@ from ..runtime.runtime_states import RuntimeStates
 from ..server.cpu_tasks import BoundedCpuTaskPool
 from ..server.request_state import RequestTable
 from ..transfer.connector import TransferConnector
+from ..worker_info import (
+    GraphBucket,
+    ResourceClass,
+    WorkerInfo,
+)
 from . import warmup as packed_warmup
 from .warmup import (
     _flow_graph_executable,
@@ -292,7 +292,7 @@ class Worker:
             )
             assert attention is not None
             if (
-                ForwardMode.GEN_FLOW in self._effective_work_variants
+                ForwardMode.MEDIA_DENOISE in self._effective_work_variants
                 and not _supports_flow_attention(
                     attention,
                     cache,
@@ -339,9 +339,7 @@ class Worker:
             None,
         )
         if flow is not None and not isinstance(latent_dtype, torch.dtype):
-            raise unsupported_setup(
-                f"unsupported latent dtype {self._info.latent_dtype!r}"
-            )
+            raise unsupported_setup(f"unsupported latent dtype {self._info.latent_dtype!r}")
         if flow is None:
             self.latent_pool = None
         else:
@@ -538,7 +536,7 @@ class Worker:
                 or not _has_decode_flow_partition(execution.lanes)
                 or not {
                     ForwardMode.TOKEN_DECODE,
-                    ForwardMode.GEN_FLOW,
+                    ForwardMode.MEDIA_DENOISE,
                 }.issubset(self._effective_work_variants)
             )
             else tuple(
@@ -709,8 +707,8 @@ class Worker:
                         else len(lane_prefill_catalog)
                     )
                 if execution.prefill_cuda_graph and {
-                    ForwardMode.GEN_TRANSITION,
-                    ForwardMode.GEN_FLOW,
+                    ForwardMode.MEDIA_PREPARE,
+                    ForwardMode.MEDIA_DENOISE,
                 }.issubset(self._effective_work_variants):
                     expected_resident_executables += len(
                         {_flow_graph_executable(bucket) for bucket in lane_flow_buckets}

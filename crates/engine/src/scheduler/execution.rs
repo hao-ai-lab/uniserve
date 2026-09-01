@@ -165,7 +165,7 @@ impl Scheduler {
                                 .media
                                 .as_ref()
                                 .expect("media admission")
-                                .plan,
+                                .geometry,
                         )
                         .is_some())
                     .then_some((inflight, index, *id))
@@ -185,7 +185,7 @@ impl Scheduler {
         let mut admissions = Vec::new();
         let mut operations = Vec::with_capacity(candidates.len());
         let mut latent_placements = Vec::new();
-        let mut decode_placements = Vec::new();
+        let mut reconstruction_placements = Vec::new();
         let (media_closes, remaining_controls): (VecDeque<_>, VecDeque<_>) = self
             .pending_controls
             .drain(..)
@@ -203,7 +203,7 @@ impl Scheduler {
                         .media
                         .as_ref()
                         .expect("media admission")
-                        .plan,
+                        .geometry,
                 )
                 .expect("media candidate is runnable");
                 let predicate = self
@@ -249,10 +249,10 @@ impl Scheduler {
             .sealed();
             if matches!(
                 quantum,
-                MediaQuantum::Transition | MediaQuantum::Flow { .. }
+                MediaQuantum::Prepare | MediaQuantum::Denoise { .. }
             ) {
                 let (start_step, step_count) = match quantum {
-                    MediaQuantum::Flow { step } => (step, 1),
+                    MediaQuantum::Denoise { step } => (step, 1),
                     _ => (0, 0),
                 };
                 latent_placements.push(LatentPlacement {
@@ -267,23 +267,25 @@ impl Scheduler {
                 });
             }
             match quantum {
-                MediaQuantum::Video {
+                MediaQuantum::ReconstructVideo {
                     start_unit,
                     unit_count,
-                } => decode_placements.push(DecodePlacement {
+                } => reconstruction_placements.push(ReconstructionPlacement {
                     request_key,
                     op_id,
-                    kind: DecodeKind::Video,
+                    kind: ReconstructionKind::Video,
                     start_unit,
                     unit_count,
                 }),
-                MediaQuantum::Audio => decode_placements.push(DecodePlacement {
-                    request_key,
-                    op_id,
-                    kind: DecodeKind::Audio,
-                    start_unit: 0,
-                    unit_count: 1,
-                }),
+                MediaQuantum::ReconstructAudio => {
+                    reconstruction_placements.push(ReconstructionPlacement {
+                        request_key,
+                        op_id,
+                        kind: ReconstructionKind::Audio,
+                        start_unit: 0,
+                        unit_count: 1,
+                    })
+                }
                 _ => {}
             }
             if operation.parent.producer_op_id.0 > 0 {
@@ -325,7 +327,7 @@ impl Scheduler {
             new_cache_pages: Vec::new(),
             forward_rows: Vec::new(),
             latent_placements,
-            decode_placements,
+            reconstruction_placements,
         };
         self.inflight.batch_started.insert(step, submit_at);
         self.inflight.batch_partitions.insert(
@@ -441,7 +443,7 @@ impl Scheduler {
                 .get(&id)
                 .into_iter()
                 .flatten()
-                .any(|op| op.operation.work == ForwardMode::GenFlow)
+                .any(|op| op.operation.work == ForwardMode::MediaDenoise)
     }
 
     pub(super) fn projected_cursor(&self, id: RequestId) -> Option<GenerationCursor> {
@@ -814,8 +816,8 @@ impl Scheduler {
             Phase::Prefill | Phase::DecodeUnd => ForwardMode::TokenDecode,
             Phase::CloseKv | Phase::FeedbackState => ForwardMode::TokenExtend,
             Phase::PublishKv => ForwardMode::TransferKvPublish,
-            Phase::TransitionGen => ForwardMode::GenTransition,
-            Phase::DenoiseGen => ForwardMode::GenFlow,
+            Phase::PrepareGen => ForwardMode::MediaPrepare,
+            Phase::DenoiseGen => ForwardMode::MediaDenoise,
             Phase::CommitGen => ForwardMode::Materialize,
             Phase::FeedbackEncode => {
                 let feedback = state.req.policy.feedback.as_ref()?;
@@ -919,7 +921,9 @@ impl Scheduler {
     pub(super) fn next_output_bound(&self, id: RequestId) -> usize {
         match self.peek_next_operation_variant(id) {
             Some(ForwardMode::TokenExtend | ForwardMode::TokenDecode) => 4,
-            Some(ForwardMode::GenFlow) => usize::from(self.denoise_step_burst).saturating_add(2),
+            Some(ForwardMode::MediaDenoise) => {
+                usize::from(self.denoise_step_burst).saturating_add(2)
+            }
             Some(ForwardMode::Materialize) => 3,
             Some(_) | None => 2,
         }
@@ -1699,7 +1703,7 @@ impl Scheduler {
                         self.queue_commit(id, expected_parent, selected, public_event_limit);
                     }
                 }
-                let release_flow_prefix = operation_variant == ForwardMode::GenFlow
+                let release_flow_prefix = operation_variant == ForwardMode::MediaDenoise
                     && record.status == OpStatus::Ok
                     && match &apply.intent {
                         TransitionIntent::DenoiseGen {
@@ -1711,7 +1715,7 @@ impl Scheduler {
                         }),
                         _ => false,
                     };
-                if operation_variant == ForwardMode::GenFlow
+                if operation_variant == ForwardMode::MediaDenoise
                     && record.status == OpStatus::Ok
                     && let Some(prefix) = self
                         .running
@@ -1726,7 +1730,7 @@ impl Scheduler {
                 }
                 if matches!(
                     operation_variant,
-                    ForwardMode::GenFlow | ForwardMode::Materialize
+                    ForwardMode::MediaDenoise | ForwardMode::Materialize
                 ) {
                     let consumed_latents = operation
                         .inputs

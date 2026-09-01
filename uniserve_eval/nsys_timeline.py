@@ -18,7 +18,13 @@ _INVALID_CAPTURE = re.compile(
 )
 
 
-def transform_timeline(source: Path, destination: Path, *, point_name: str) -> None:
+def transform_timeline(
+    source: Path,
+    destination: Path,
+    *,
+    point_name: str,
+    require_cuda: bool = True,
+) -> None:
     """Create a stable interval/link database from one complete nsys export."""
 
     source = Path(source)
@@ -32,8 +38,10 @@ def transform_timeline(source: Path, destination: Path, *, point_name: str) -> N
         processes = _processes(raw)
         threads = _thread_names(raw, strings)
         tables = _tables(raw)
-        if "NVTX_EVENTS" not in tables or "CUPTI_ACTIVITY_KIND_RUNTIME" not in tables:
-            raise RuntimeError("nsys export is missing NVTX or CUDA runtime intervals")
+        if "NVTX_EVENTS" not in tables:
+            raise RuntimeError("nsys export is missing NVTX intervals")
+        if require_cuda and "CUPTI_ACTIVITY_KIND_RUNTIME" not in tables:
+            raise RuntimeError("nsys export is missing CUDA runtime intervals")
 
         ranges_by_thread: dict[int, list[dict[str, Any]]] = defaultdict(list)
         ranges_by_process: dict[int, list[dict[str, Any]]] = defaultdict(list)
@@ -93,7 +101,11 @@ def transform_timeline(source: Path, destination: Path, *, point_name: str) -> N
         }
 
         runtime_ids: dict[tuple[int, int], int] = {}
-        for row in _rows(raw, "CUPTI_ACTIVITY_KIND_RUNTIME"):
+        for row in (
+            _rows(raw, "CUPTI_ACTIVITY_KIND_RUNTIME")
+            if "CUPTI_ACTIVITY_KIND_RUNTIME" in tables
+            else ()
+        ):
             start, end = _interval(row)
             global_tid = _optional_integer(row, "globalTid")
             global_pid, pid, process_name = _process_identity(row, processes)
@@ -238,7 +250,7 @@ def transform_timeline(source: Path, destination: Path, *, point_name: str) -> N
         kernel_count = out.execute(
             "SELECT count(*) FROM events WHERE category = 'cuda_kernel'"
         ).fetchone()[0]
-        if int(kernel_count) < 1:
+        if require_cuda and int(kernel_count) < 1:
             raise RuntimeError("nsys capture contains no CUDA kernel intervals")
         invalid = out.execute(
             "SELECT text FROM diagnostics WHERE text REGEXP ? LIMIT 1",
@@ -510,9 +522,7 @@ def _copy_metadata(
             continue
         for row in _rows(raw, table):
             values[f"{table.lower()}.{row['name']}"] = str(row["value"])
-    out.executemany(
-        "INSERT INTO metadata(key, value) VALUES(?, ?)", sorted(values.items())
-    )
+    out.executemany("INSERT INTO metadata(key, value) VALUES(?, ?)", sorted(values.items()))
 
 
 def _insert_event(db: sqlite3.Connection, **values: Any) -> int:
@@ -558,9 +568,7 @@ def _insert_event(db: sqlite3.Connection, **values: Any) -> int:
     return int(cursor.lastrowid)
 
 
-def _link_parent(
-    db: sqlite3.Connection, parent: dict[str, Any] | None, child: int
-) -> None:
+def _link_parent(db: sqlite3.Connection, parent: dict[str, Any] | None, child: int) -> None:
     if parent is not None:
         _link(db, int(parent["event_id"]), child, "nvtx_contains")
 
@@ -606,8 +614,7 @@ def _enrich_nvtx(
         stack: list[dict[str, Any]] = []
         for item in ordered:
             while stack and not (
-                stack[-1]["start"] <= item["start"]
-                and stack[-1]["end"] >= item["end"]
+                stack[-1]["start"] <= item["start"] and stack[-1]["end"] >= item["end"]
             ):
                 stack.pop()
             parent = stack[-1] if stack else None
@@ -616,7 +623,9 @@ def _enrich_nvtx(
                 if parent is not None
                 else {}
             )
-            inherited.update({name: item.get(name) for name in fields if item.get(name) is not None})
+            inherited.update(
+                {name: item.get(name) for name in fields if item.get(name) is not None}
+            )
             item.update(inherited)
             if inherited:
                 assignments = ", ".join(f"{columns[name]} = ?" for name in inherited)
@@ -672,9 +681,7 @@ class _RangeIndex:
         return self._rightmost(node * 2, left, midpoint, limit, minimum_end)
 
 
-def _containing(
-    ranges: _RangeIndex | None, start: int, end: int
-) -> dict[str, Any] | None:
+def _containing(ranges: _RangeIndex | None, start: int, end: int) -> dict[str, Any] | None:
     return None if ranges is None else ranges.containing(start, end)
 
 
@@ -694,8 +701,7 @@ def _nvtx_category(text: str, marker: bool) -> str:
 def _tables(db: sqlite3.Connection) -> dict[str, set[str]]:
     names = [row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")]
     return {
-        name: {row[1] for row in db.execute(f"PRAGMA table_info({_quote(name)})")}
-        for name in names
+        name: {row[1] for row in db.execute(f"PRAGMA table_info({_quote(name)})")} for name in names
     }
 
 

@@ -6,36 +6,11 @@ import argparse
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, TypeAlias, cast
 
 from ..loader.config import LoadConfig
 from ..server.worker_kind import WorkerKind
 from .execution_config import ExecutionConfig, execution_config_from_namespace
 from .plan import ModelLoadScope, resolve_worker_plan
-
-LinearPrecision: TypeAlias = Literal["fp8", "nvfp4"]
-H3TextEncoderPrecision: TypeAlias = Literal["bf16", "nvfp4"]
-H3VideoVAEPrecision: TypeAlias = Literal["fp16", "bf16", "nvfp4"]
-
-
-@dataclass(frozen=True)
-class H3PrecisionOverrides:
-    transformer_attention: LinearPrecision | None = None
-    transformer_mlp: LinearPrecision | None = None
-    text_encoder: H3TextEncoderPrecision | None = None
-    video_vae: H3VideoVAEPrecision | None = None
-
-    @property
-    def configured(self) -> bool:
-        return any(
-            value is not None
-            for value in (
-                self.transformer_attention,
-                self.transformer_mlp,
-                self.text_encoder,
-                self.video_vae,
-            )
-        )
 
 
 @dataclass(frozen=True)
@@ -70,15 +45,13 @@ class WorkerResourceConfig:
     kv_token_capacity: int | None
     max_model_len: int
     max_video_seconds: float
-    fixed_graph_cache_capacity: int
 
 
 @dataclass(frozen=True)
 class ModelLaunchConfig:
     path: str
     attention_backend: str
-    linear_precision: LinearPrecision
-    h3_precision_overrides: H3PrecisionOverrides
+    quantization_config: dict[str, object]
 
 
 @dataclass(frozen=True)
@@ -114,15 +87,11 @@ class WorkerProcessArgs:
 
         _validate_scalars(namespace)
         if use_stub_model and not bool(namespace.allow_stub):
-            raise ValueError(
-                "--no-model loads synthetic outputs and requires --allow-stub"
-            )
+            raise ValueError("--no-model loads synthetic outputs and requires --allow-stub")
         if use_stub_model and plan.model_scope is not ModelLoadScope.WHOLE:
             raise ValueError("--no-model cannot emulate partial model materialization")
         if not use_stub_model and not model_path:
-            raise ValueError(
-                f"--model is required for worker kind {worker_kind.value!r}"
-            )
+            raise ValueError(f"--model is required for worker kind {worker_kind.value!r}")
         _validate_data_plane(
             worker_kind,
             backend=backend,
@@ -155,31 +124,12 @@ class WorkerProcessArgs:
                 ),
                 max_model_len=int(namespace.max_model_len),
                 max_video_seconds=float(namespace.max_video_seconds),
-                fixed_graph_cache_capacity=int(namespace.fixed_graph_cache_capacity),
             ),
             model=(
                 ModelLaunchConfig(
                     path=model_path,
                     attention_backend=str(namespace.attention_backend),
-                    linear_precision=cast(LinearPrecision, str(namespace.linear_precision)),
-                    h3_precision_overrides=H3PrecisionOverrides(
-                        transformer_attention=cast(
-                            LinearPrecision | None,
-                            namespace.h3_transformer_attention_precision,
-                        ),
-                        transformer_mlp=cast(
-                            LinearPrecision | None,
-                            namespace.h3_transformer_mlp_precision,
-                        ),
-                        text_encoder=cast(
-                            H3TextEncoderPrecision | None,
-                            namespace.h3_text_encoder_precision,
-                        ),
-                        video_vae=cast(
-                            H3VideoVAEPrecision | None,
-                            namespace.h3_video_vae_precision,
-                        ),
-                    ),
+                    quantization_config=dict(namespace.quantization_config),
                 )
                 if model_path
                 else None
@@ -204,15 +154,11 @@ def _validate_scalars(namespace: argparse.Namespace) -> None:
         "--ipc-max-inflight": namespace.ipc_max_inflight,
         "--tp-size": namespace.tp_size,
         "--max-model-len": namespace.max_model_len,
-        "--fixed-graph-cache-capacity": namespace.fixed_graph_cache_capacity,
     }
     for option, value in positive_fields.items():
         if int(value) <= 0:
             raise ValueError(f"{option} must be positive")
-    if (
-        namespace.kv_token_capacity is not None
-        and int(namespace.kv_token_capacity) <= 0
-    ):
+    if namespace.kv_token_capacity is not None and int(namespace.kv_token_capacity) <= 0:
         raise ValueError("--kv-token-capacity must be positive when provided")
     max_video_seconds = float(namespace.max_video_seconds)
     if not math.isfinite(max_video_seconds) or max_video_seconds <= 0:
@@ -299,11 +245,7 @@ def _parse_tower_placement(value: str, *, device: str) -> tuple[str, str]:
         part = raw_part.strip()
         name, separator, target = part.partition(":")
         normalized_name = name.strip().lower()
-        if (
-            not separator
-            or normalized_name not in {"text", "gen"}
-            or not target.strip()
-        ):
+        if not separator or normalized_name not in {"text", "gen"} or not target.strip():
             raise ValueError("tower placement must use text:<device>;gen:<device>")
         if normalized_name in placements:
             raise ValueError(f"duplicate tower placement {normalized_name!r}")

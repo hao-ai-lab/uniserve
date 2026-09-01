@@ -12,13 +12,13 @@ enum ForwardMode : ubyte {
   TransferProduct,
   TransferKvPublish,
   TransferKvInstall,
-  GenTransition,
-  GenFlow,
+  MediaPrepare,
+  MediaDenoise,
   Materialize,
-  GenDecode
+  MediaReconstruct
 }
 
-enum DecodeKind : ubyte { Video, Audio }
+enum ReconstructionKind : ubyte { Video, Audio }
 enum MediaProfileId : ubyte { MinimaxH3T2va }
 
 enum Domain : ubyte { Prefill, Decode, Flow }
@@ -308,10 +308,10 @@ table LatentPlacement {
   step_count:uint;
 }
 
-table DecodePlacement {
+table ReconstructionPlacement {
   request_key:RequestKey;
   op_id:ulong;
-  kind:DecodeKind;
+  kind:ReconstructionKind;
   start_unit:uint;
   unit_count:uint;
 }
@@ -392,9 +392,9 @@ table UndAdmission {
 
 table GenAdmission { image:ImageParams; }
 
-table MediaPlan {
+table MediaGeometry {
   frame_count:uint;
-  video_decode_units:uint;
+  video_reconstruction_units:uint;
   audio_latent_frames:uint;
   prompt_tokens:uint;
   denoise_steps:uint;
@@ -405,7 +405,7 @@ table MediaAdmission {
   seed:ulong;
   profile:MediaProfileId;
   output_path:string;
-  plan:MediaPlan;
+  geometry:MediaGeometry;
 }
 
 table NewRequest {
@@ -429,7 +429,7 @@ table BatchPartition {
   new_cache_pages:[CachePageAllocation];
   forward_rows:[RowGeometry];
   latent_placements:[LatentPlacement];
-  decode_placements:[DecodePlacement];
+  reconstruction_placements:[ReconstructionPlacement];
 }
 
 table Batch {

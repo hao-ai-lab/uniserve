@@ -163,9 +163,9 @@ TOKEN_CONTINUATION_BIT = 1 << 31
 TOKEN_VALUE_MASK = TOKEN_CONTINUATION_BIT - 1
 _GENERATION_WORK_VARIANTS = frozenset(
     {
-        ForwardMode.GEN_TRANSITION,
-        ForwardMode.GEN_FLOW,
-        ForwardMode.GEN_DECODE,
+        ForwardMode.MEDIA_PREPARE,
+        ForwardMode.MEDIA_DENOISE,
+        ForwardMode.MEDIA_RECONSTRUCT,
         ForwardMode.MATERIALIZE,
     }
 )
@@ -1240,7 +1240,9 @@ def _run_ready_set(
         ready = tuple(
             state for state in states if live(state) and dependencies_ready(state, producers)
         )
-        flow_ready = tuple(state for state in ready if state.operation.work is ForwardMode.GEN_FLOW)
+        flow_ready = tuple(
+            state for state in ready if state.operation.work is ForwardMode.MEDIA_DENOISE
+        )
         flow_ready_ids = {id(state) for state in flow_ready}
         for state in flow_ready:
             try:
@@ -1346,7 +1348,7 @@ def _pack_state_forward(
     operation = state.operation
     if operation.work.token_mode is not None:
         return token.pack_forward(runtime, state)
-    if operation.work is ForwardMode.GEN_FLOW and runtime.latent_pool is not None:
+    if operation.work is ForwardMode.MEDIA_DENOISE and runtime.latent_pool is not None:
         return flow.pack_forward(runtime, state)
     if operation.work.encode_mode is not None or (
         operation.work is ForwardMode.MATERIALIZE and runtime.latent_pool is not None
@@ -1365,7 +1367,7 @@ def _consume_state_forward(
     operation = state.operation
     if operation.work.token_mode is not None:
         token.consume_forward(runtime, state, outputs)
-    elif operation.work is ForwardMode.GEN_FLOW and runtime.latent_pool is not None:
+    elif operation.work is ForwardMode.MEDIA_DENOISE and runtime.latent_pool is not None:
         flow.consume_forward(runtime, state, outputs)
     elif operation.work.encode_mode is not None or (
         operation.work is ForwardMode.MATERIALIZE and runtime.latent_pool is not None
@@ -1648,7 +1650,7 @@ def _reserve_cpu_tasks(
     rank_zero = runtime.mesh.coord("sp") == 0 if h3_model else True
     for operation in operations:
         if operation.work is not ForwardMode.MATERIALIZE and not (
-            h3_model and operation.work is ForwardMode.GEN_DECODE
+            h3_model and operation.work is ForwardMode.MEDIA_RECONSTRUCT
         ):
             continue
         if not rank_zero:
@@ -1658,18 +1660,20 @@ def _reserve_cpu_tasks(
             raise invalid_descriptor("materialization repeats its CPU task identity")
         reservation = runtime._cpu_tasks.reserve()
         try:
-            if h3_model and operation.work is ForwardMode.GEN_DECODE:
+            if h3_model and operation.work is ForwardMode.MEDIA_RECONSTRUCT:
                 placement = next(
                     (
                         placement
-                        for placement in scope.partition.decode_placements
+                        for placement in scope.partition.reconstruction_placements
                         if placement.request_key == operation.request_key
                         and int(placement.op_id) == int(operation.op_id)
                     ),
                     None,
                 )
                 if placement is None:
-                    raise invalid_descriptor("H3 decode operation has no exact decode placement")
+                    raise invalid_descriptor(
+                        "H3 reconstruction operation has no exact reconstruction placement"
+                    )
                 scope.h3_output_leases[identity] = runtime.h3_output_ring().reserve(
                     placement.kind.value
                 )
@@ -1858,16 +1862,14 @@ def _validate_batch(runtime, batch: Batch) -> None:
         }
         if not runtime.model.tensorized_mixed or variants != {
             ForwardMode.TOKEN_DECODE,
-            ForwardMode.GEN_FLOW,
+            ForwardMode.MEDIA_DENOISE,
         }:
             raise invalid_descriptor(
                 "tensorized mixed submission exceeds the supported mixed buckets"
             )
         bucket = _mixed_bucket(runtime, tuple(partitions))
         if bucket not in runtime.mixed_buckets:
-            raise invalid_descriptor(
-                "tensorized mixed submission has no exact qualified bucket"
-            )
+            raise invalid_descriptor("tensorized mixed submission has no exact qualified bucket")
     if isinstance(runtime.model, MiniMaxH3Model):
         from .h3 import validate_batch
 
@@ -1943,7 +1945,7 @@ def _mixed_bucket(
         operation
         for partition in partitions
         for operation in partition.operations
-        if operation.work is ForwardMode.GEN_FLOW
+        if operation.work is ForwardMode.MEDIA_DENOISE
     )
     flow_placements = {
         (placement.request_key, int(placement.op_id)): placement
@@ -2082,8 +2084,8 @@ def _operation_device(runtime, operation: Operation) -> torch.device:
         runtime._generation_device
         if operation.work
         in {
-            ForwardMode.GEN_TRANSITION,
-            ForwardMode.GEN_FLOW,
+            ForwardMode.MEDIA_PREPARE,
+            ForwardMode.MEDIA_DENOISE,
             ForwardMode.MATERIALIZE,
         }
         else runtime._device
@@ -2345,9 +2347,9 @@ def _bind_latent_rows(
                 raise invalid_descriptor(
                     "pool-free latent placement must name its request-pool capacity token"
                 )
-            if operation.work is ForwardMode.GEN_TRANSITION:
+            if operation.work is ForwardMode.MEDIA_PREPARE:
                 valid = int(placement.start_step) == 0 and int(placement.step_count) == 0
-            elif operation.work is ForwardMode.GEN_FLOW:
+            elif operation.work is ForwardMode.MEDIA_DENOISE:
                 valid = (
                     int(placement.start_step) == int(request.flow_step)
                     and int(placement.step_count) == 1
@@ -2402,10 +2404,10 @@ def _bind_latent_rows(
         committed_step = (
             int(session.flow_step) if transferred is None else int(cast(int, transferred.step))
         )
-        if operation.work is ForwardMode.GEN_TRANSITION:
+        if operation.work is ForwardMode.MEDIA_PREPARE:
             if int(placement.start_step) != 0 or int(placement.step_count) != 0:
-                raise invalid_descriptor("generation transition placement carries denoise steps")
-        elif operation.work is ForwardMode.GEN_FLOW:
+                raise invalid_descriptor("media preparation placement carries denoise steps")
+        elif operation.work is ForwardMode.MEDIA_DENOISE:
             if (
                 int(placement.start_step) != committed_step
                 or int(placement.step_count) < 1
@@ -2415,7 +2417,7 @@ def _bind_latent_rows(
                     and int(placement.step_count) > int(operation.bounds.max_tokens)
                 )
             ):
-                raise invalid_descriptor("generation flow placement exceeds its committed schedule")
+                raise invalid_descriptor("media denoise placement exceeds its committed schedule")
         elif int(placement.start_step) != committed_step or int(placement.step_count) != 0:
             raise invalid_descriptor("latent reader placement disagrees with committed step state")
         rows.append((identity, placement, slot))

@@ -7,8 +7,8 @@ from tests.python.fixtures.depth_one import (
     commit_for_completion,
     execution_batch,
     gen_admission,
-    gen_transition_operation,
     kv_publication_operation,
+    media_prepare_operation,
     root_parent,
     token_operation,
     und_admission,
@@ -307,7 +307,7 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
     transition_predicate = next(
         output for output in parent.outputs if output.kind is ProductKind.COMPLETION
     )
-    candidate, _latent = gen_transition_operation(
+    candidate, _latent = media_prepare_operation(
         admission.request_key,
         op_id=4,
         parent=VersionRef(
@@ -347,7 +347,7 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
     assert candidate_completion.product_generations == ()
 
     parent_commit = commit_for_completion(parent, parent_report)
-    selected, _selected_latent = gen_transition_operation(
+    selected, _selected_latent = media_prepare_operation(
         admission.request_key,
         op_id=5,
         parent=parent_commit.selected,

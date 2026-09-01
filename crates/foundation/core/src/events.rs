@@ -102,15 +102,15 @@ pub enum GenerationEvent {
 
 /// Immutable request-shaped media geometry resolved by the serving admission layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MediaPlan {
+pub struct MediaGeometry {
     pub frame_count: u32,
-    pub video_decode_units: u32,
+    pub video_reconstruction_units: u32,
     pub audio_latent_frames: u32,
     pub prompt_tokens: u32,
     pub denoise_steps: u32,
 }
 
-impl MediaPlan {
+impl MediaGeometry {
     pub const fn required_audio_latent_frames(frame_count: u32) -> u64 {
         (frame_count as u64 * 40 + 23) / 24
     }
@@ -124,7 +124,7 @@ pub struct MediaRequest {
     pub seed: u64,
     pub priority: i32,
     pub output_path: String,
-    pub plan: MediaPlan,
+    pub geometry: MediaGeometry,
 }
 
 impl MediaRequest {
@@ -135,16 +135,17 @@ impl MediaRequest {
         if self.output_path.is_empty() {
             return Err(MediaRequestError::EmptyOutputPath);
         }
-        if self.plan.frame_count < 22
-            || self.plan.frame_count % 17 != 5
-            || self.plan.video_decode_units != (self.plan.frame_count - 5) / 17
-            || u64::from(self.plan.audio_latent_frames)
-                != MediaPlan::required_audio_latent_frames(self.plan.frame_count)
-            || self.plan.prompt_tokens == 0
-            || usize::try_from(self.plan.prompt_tokens).ok() != Some(self.prompt_token_ids.len())
-            || self.plan.denoise_steps != 4
+        if self.geometry.frame_count < 22
+            || self.geometry.frame_count % 17 != 5
+            || self.geometry.video_reconstruction_units != (self.geometry.frame_count - 5) / 17
+            || u64::from(self.geometry.audio_latent_frames)
+                != MediaGeometry::required_audio_latent_frames(self.geometry.frame_count)
+            || self.geometry.prompt_tokens == 0
+            || usize::try_from(self.geometry.prompt_tokens).ok()
+                != Some(self.prompt_token_ids.len())
+            || self.geometry.denoise_steps != 4
         {
-            return Err(MediaRequestError::InvalidPlan);
+            return Err(MediaRequestError::InvalidGeometry);
         }
         Ok(())
     }
@@ -156,8 +157,8 @@ pub enum MediaRequestError {
     EmptyPromptTokens,
     #[error("media output path must not be empty")]
     EmptyOutputPath,
-    #[error("media plan is invalid")]
-    InvalidPlan,
+    #[error("media geometry is invalid")]
+    InvalidGeometry,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -331,15 +331,17 @@ impl ServingRuntime {
                 source: TokenizeError::Invalid("video prompt must not be empty".to_string()),
             });
         }
-        let (plan, prompt_token_ids) =
-            self.model
-                .resolve_video_plan(&request.request_id, &request.prompt, request.seconds)?;
+        let (geometry, prompt_token_ids) = self.model.resolve_video_request_geometry(
+            &request.request_id,
+            &request.prompt,
+            request.seconds,
+        )?;
         let submission = MediaSubmission::new(
             request.request_id.to_string(),
             prompt_token_ids,
             request.seed,
             request.output_path,
-            plan,
+            geometry,
         );
         self.engine
             .submit_media(submission)

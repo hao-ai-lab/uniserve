@@ -1,15 +1,14 @@
-"""Media-shaped dense, sparse-oracle, and native video attention backends."""
+"""Native media-shaped video sparse attention backend."""
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Callable, Literal
+from typing import Callable
 
 import torch
-from torch.nn import functional as F
 
-from ...nn.mesh import DeviceMesh, SymmetricMemoryWorkspace
+from ...nn.mesh import SymmetricMemoryWorkspace
 from ...ops import video_sparse as video_sparse_ops
 from . import video_sparse_sm100
 
@@ -23,7 +22,6 @@ __all__ = [
 
 TILE = 64
 SPARSITY = 0.9
-H3AttentionMode = Literal["sparse_kernel", "sparse_oracle", "dense_oracle"]
 
 
 def video_sparse_selected_tiles(video_tiles: int) -> int:
@@ -45,7 +43,6 @@ class VideoSparseAttentionWorkspace:
     exchange_outputs: tuple[torch.Tensor, ...]
     exchange_sync_input: torch.Tensor
     exchange_sync_output: torch.Tensor
-    attention_buffer: torch.Tensor
     attention_output: torch.Tensor
     tile_scores: torch.Tensor
     block_counts: torch.Tensor
@@ -80,9 +77,7 @@ def build_video_sparse_metadata(
         )
     ).to(device)
     if not bool(torch.equal(valid > 0, expected)):
-        raise ValueError(
-            "H3 VSA valid sizes do not describe prefix/video/partner tiles"
-        )
+        raise ValueError("H3 VSA valid sizes do not describe prefix/video/partner tiles")
     return VideoSparseAttentionMetadata(
         padded_rows=padded_rows,
         prefix_tiles=prefix_tiles,
@@ -105,20 +100,9 @@ def _resolve_kernel() -> Callable[..., torch.Tensor]:
 class VideoSparseAttentionBackend:
     """Checkpoint VSA: sparse top-k attention plus trained dense compression."""
 
-    def __init__(
-        self,
-        mesh: DeviceMesh,
-        metadata: VideoSparseAttentionMetadata,
-        *,
-        mode: H3AttentionMode,
-    ) -> None:
-        if mode not in {"sparse_kernel", "sparse_oracle", "dense_oracle"}:
-            raise ValueError(f"unknown H3 attention mode {mode!r}")
-        self.mesh = mesh
+    def __init__(self, metadata: VideoSparseAttentionMetadata) -> None:
         self.metadata = metadata
-        self.mode = mode
-        self.kernel = _resolve_kernel() if mode == "sparse_kernel" else None
-        self.local_heads = 56 // mesh.size("sp")
+        self.kernel = _resolve_kernel()
 
     def _block_means(
         self,
@@ -162,21 +146,6 @@ class VideoSparseAttentionBackend:
         compressed.masked_fill_(valid_sizes.view(1, -1, 1) == 0, 0)
         return compressed
 
-    @staticmethod
-    def _add_compression(
-        output: torch.Tensor,
-        gate: torch.Tensor,
-        compressed: torch.Tensor,
-    ) -> torch.Tensor:
-        repeated = (
-            compressed.permute(1, 0, 2)
-            .unsqueeze(1)
-            .expand(-1, TILE, -1, -1)
-            .reshape_as(gate)
-        )
-        output.addcmul_(gate, repeated)
-        return output
-
     def block_map_from_scores(
         self,
         scores: torch.Tensor,
@@ -199,19 +168,15 @@ class VideoSparseAttentionBackend:
         video_end = prefix + video_tiles
         width = dense_key_indices.shape[0]
         if indices is None:
-            indices = torch.empty(
-                (heads, tiles, width), dtype=torch.int32, device=scores.device
-            )
+            indices = torch.empty((heads, tiles, width), dtype=torch.int32, device=scores.device)
         if counts is None:
-            counts = torch.empty(
-                (heads, tiles), dtype=torch.int32, device=scores.device
-            )
+            counts = torch.empty((heads, tiles), dtype=torch.int32, device=scores.device)
         indices.zero_()
         counts.fill_(1)
         indices[:, :prefix, :width] = dense_key_indices
         counts[:, :prefix] = prefix_count + video_tiles
         video_scores = scores[:, prefix:video_end, prefix:video_end]
-        if self.mode == "sparse_kernel" and topk_indices_i32 is not None:
+        if topk_indices_i32 is not None:
             video_sparse_ops.threshold_topk_indices(video_scores, topk_indices_i32)
             selected = topk_indices_i32
         else:
@@ -237,81 +202,6 @@ class VideoSparseAttentionBackend:
         )
         counts[:, prefix:video_end] = prefix_count + selected.shape[-1]
         return counts, indices
-
-    def _sparse_oracle(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        counts: torch.Tensor,
-        indices: torch.Tensor,
-        valid_sizes: torch.Tensor,
-        valid_tiles: int,
-    ) -> torch.Tensor:
-        output = torch.zeros_like(query)
-        for tile in range(int(valid_tiles)):
-            query_size = int(valid_sizes[tile])
-            if query_size == 0:
-                continue
-            query_rows = query[tile * TILE : tile * TILE + query_size]
-            per_head: list[torch.Tensor] = []
-            for head in range(query.shape[1]):
-                selected = indices[head, tile, : int(counts[head, tile])].long()
-                key_parts = [
-                    key[
-                        int(index) * TILE : int(index) * TILE
-                        + int(valid_sizes[int(index)]),
-                        head,
-                    ]
-                    for index in selected
-                ]
-                value_parts = [
-                    value[
-                        int(index) * TILE : int(index) * TILE
-                        + int(valid_sizes[int(index)]),
-                        head,
-                    ]
-                    for index in selected
-                ]
-                attended = F.scaled_dot_product_attention(
-                    query_rows[:, head].unsqueeze(0).unsqueeze(0),
-                    torch.cat(key_parts).unsqueeze(0).unsqueeze(0),
-                    torch.cat(value_parts).unsqueeze(0).unsqueeze(0),
-                    dropout_p=0.0,
-                    is_causal=False,
-                )
-                per_head.append(attended[0, 0])
-            output[tile * TILE : tile * TILE + query_size] = torch.stack(
-                per_head, dim=1
-            )
-        return output
-
-    @staticmethod
-    def _dense_oracle(
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        valid_sizes: torch.Tensor,
-        output: torch.Tensor | None,
-    ) -> torch.Tensor:
-        row_offsets = torch.arange(TILE, device=query.device).view(1, TILE)
-        valid_rows = (row_offsets < valid_sizes.view(-1, 1)).reshape(-1)
-        query_valid = query[valid_rows].transpose(0, 1).unsqueeze(0)
-        key_valid = key[valid_rows].transpose(0, 1).unsqueeze(0)
-        value_valid = value[valid_rows].transpose(0, 1).unsqueeze(0)
-        attended = F.scaled_dot_product_attention(
-            query_valid,
-            key_valid,
-            value_valid,
-            dropout_p=0.0,
-            is_causal=False,
-        )[0].transpose(0, 1)
-        if output is None:
-            output = torch.zeros_like(query)
-        else:
-            output.zero_()
-        output[valid_rows] = attended
-        return output
 
     def __call__(
         self,
@@ -339,13 +229,7 @@ class VideoSparseAttentionBackend:
         topk_indices_i32: torch.Tensor | None = None,
     ) -> torch.Tensor:
         valid_sizes = self.metadata.valid_sizes if valid_sizes is None else valid_sizes
-        if self.mode == "dense_oracle":
-            return self._dense_oracle(query, key, value, valid_sizes, output)
-        if (
-            prefix_key_indices is None
-            or dense_key_indices is None
-            or prefix_count is None
-        ):
+        if prefix_key_indices is None or dense_key_indices is None or prefix_count is None:
             prefix_key_indices = torch.arange(
                 self.metadata.prefix_tiles, dtype=torch.int32, device=query.device
             )
@@ -355,12 +239,7 @@ class VideoSparseAttentionBackend:
             prefix_count = torch.tensor(
                 self.metadata.prefix_tiles, dtype=torch.int32, device=query.device
             )
-        if (
-            self.mode == "sparse_kernel"
-            and pooled_query is not None
-            and pooled_key is not None
-            and pooled_value is not None
-        ):
+        if pooled_query is not None and pooled_key is not None and pooled_value is not None:
             video_sparse_ops.pool_qkv_means(
                 query,
                 key,
@@ -404,54 +283,32 @@ class VideoSparseAttentionBackend:
             selection_scores,
             compressed_tiles,
         )
-        if self.mode == "sparse_oracle":
-            sparse = self._sparse_oracle(
-                query,
-                key,
-                value,
-                counts,
-                indices,
-                valid_sizes,
-                int(dense_key_indices.shape[0]),
+        if (
+            exchange is None
+            or exchange_sync_input is None
+            or exchange_sync_output is None
+            or output is None
+        ):
+            raise RuntimeError(
+                "the H3 sparse attention route requires attention and exchange buffers"
             )
-            if output is None:
-                output = sparse
-            else:
-                output.copy_(sparse)
-            return self._add_compression(output, gate, compressed)
-        else:
-            if self.kernel is None:
-                raise RuntimeError(
-                    "the H3 sparse-kernel route lost its resolved operation"
-                )
-            if (
-                exchange is None
-                or exchange_sync_input is None
-                or exchange_sync_output is None
-                or output is None
-            ):
-                raise RuntimeError(
-                    "the H3 sparse-kernel route requires attention and exchange buffers"
-                )
-            output = self.kernel(
-                query,
-                key,
-                value,
-                mask_block_count=counts,
-                mask_block_indices=indices,
-                valid_sizes=valid_sizes,
-                tile_size=TILE,
-                prefix_tiles=prefix_key_indices.shape[0],
-                gate=gate,
-                compressed=compressed,
-                attention_output=output,
-                exchange=exchange,
-                exchange_outputs=(
-                    exchange.peers if exchange_outputs is None else exchange_outputs
-                ),
-                exchange_sync_input=exchange_sync_input,
-                exchange_sync_output=exchange_sync_output,
-            )
+        output = self.kernel(
+            query,
+            key,
+            value,
+            mask_block_count=counts,
+            mask_block_indices=indices,
+            valid_sizes=valid_sizes,
+            tile_size=TILE,
+            prefix_tiles=prefix_key_indices.shape[0],
+            gate=gate,
+            compressed=compressed,
+            attention_output=output,
+            exchange=exchange,
+            exchange_outputs=(exchange.peers if exchange_outputs is None else exchange_outputs),
+            exchange_sync_input=exchange_sync_input,
+            exchange_sync_output=exchange_sync_output,
+        )
         return output
 
     def forward_local(
@@ -489,26 +346,4 @@ class VideoSparseAttentionBackend:
             compressed_tiles=workspace.compressed_tiles,
             topk_indices_i32=workspace.topk_indices_i32,
         )
-        if self.mode == "sparse_kernel":
-            return attended
-        size = self.mesh.size("sp")
-        local_output = workspace.exchange_outputs[workspace.exchange.rank]
-        if size == 1:
-            local_output.copy_(attended)
-            return local_output
-        global_rows, local_heads, width = attended.shape
-        local_rows = global_rows // size
-        count = local_rows * local_heads * width
-        receive = workspace.attention_buffer.view(torch.bfloat16)[
-            : attended.numel()
-        ].view(size, local_rows, local_heads, width)
-        self.mesh.all_to_all_single_into(
-            receive.reshape(-1),
-            attended.reshape(-1),
-            (count,) * size,
-            (count,) * size,
-        )
-        local_output.copy_(
-            receive.permute(1, 0, 2, 3).reshape(local_rows, local_heads * size, width)
-        )
-        return local_output
+        return attended

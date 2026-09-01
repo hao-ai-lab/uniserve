@@ -51,9 +51,9 @@ _ROUTES = {
     ),
     WorkerKind.GEN: frozenset(
         {
-            ForwardMode.GEN_TRANSITION,
-            ForwardMode.GEN_FLOW,
-            ForwardMode.GEN_DECODE,
+            ForwardMode.MEDIA_PREPARE,
+            ForwardMode.MEDIA_DENOISE,
+            ForwardMode.MEDIA_RECONSTRUCT,
             ForwardMode.MATERIALIZE,
         }
     ),

@@ -187,10 +187,12 @@ impl WorkerInfo {
                 "worker info declare incomplete latent pool geometry"
             );
         }
-        let addresses_latent = self
-            .supported_work
-            .iter()
-            .any(|variant| matches!(variant, ForwardMode::GenTransition | ForwardMode::GenFlow));
+        let addresses_latent = self.supported_work.iter().any(|variant| {
+            matches!(
+                variant,
+                ForwardMode::MediaPrepare | ForwardMode::MediaDenoise
+            )
+        });
         ensure_valid!(
             !addresses_latent || self.resource_classes.contains(&ResourceClass::ImageLatent),
             "worker info advertise latent work without a latent page pool"
@@ -211,7 +213,7 @@ impl WorkerInfo {
         if supports(ForwardMode::EncodeLatent) {
             features.insert(uniserve_core::GenerationFeatures::LATENT_ENCODE);
         }
-        if supports(ForwardMode::GenFlow)
+        if supports(ForwardMode::MediaDenoise)
             && supports(ForwardMode::Materialize)
             && supports(ForwardMode::TransferKvPublish)
             && self.incremental_kv_publication

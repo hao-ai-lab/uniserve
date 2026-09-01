@@ -1,4 +1,4 @@
-"""Resident MiniMax H3 trajectory, decode, and mux actions."""
+"""Resident MiniMax H3 trajectory, reconstruction, and mux actions."""
 
 from __future__ import annotations
 
@@ -9,14 +9,14 @@ import torch
 from uniserve_worker.execution.batch import (
     Batch,
     BatchPartition,
-    DecodeKind,
-    DecodePlacement,
     FinishFlags,
     FixedPoint,
     ForwardMode,
     NewRequest,
     Operation,
     OpStatus,
+    ReconstructionKind,
+    ReconstructionPlacement,
     TokenSpan,
 )
 from uniserve_worker.foundation.errors import invalid_descriptor, unsupported_setup
@@ -47,15 +47,19 @@ def trajectory_placement(partition: BatchPartition, operation: Operation):
     return selected[0]
 
 
-def decode_placement(partition: BatchPartition, operation: Operation) -> DecodePlacement:
+def reconstruction_placement(
+    partition: BatchPartition, operation: Operation
+) -> ReconstructionPlacement:
     selected = tuple(
         placement
-        for placement in partition.decode_placements
+        for placement in partition.reconstruction_placements
         if placement.request_key == operation.request_key
         and int(placement.op_id) == int(operation.op_id)
     )
     if len(selected) != 1:
-        raise invalid_descriptor("H3 decode operation has no exact decode placement")
+        raise invalid_descriptor(
+            "H3 reconstruction operation has no exact reconstruction placement"
+        )
     return selected[0]
 
 
@@ -65,26 +69,26 @@ def validate_batch(runtime: ExecutionResources, batch: Batch) -> None:
     if not isinstance(runtime.model, MiniMaxH3Model):
         return
     admissions = {admission.request_key: admission for admission in batch.admissions}
-    transitions = {
+    preparations = {
         operation.request_key: operation
         for operation in batch.operations
-        if operation.work is ForwardMode.GEN_TRANSITION
+        if operation.work is ForwardMode.MEDIA_PREPARE
     }
-    if set(admissions) != set(transitions):
-        raise invalid_descriptor("H3 admissions must exactly match transition operations")
+    if set(admissions) != set(preparations):
+        raise invalid_descriptor("H3 admissions must exactly match preparation operations")
     for request_key, admission in admissions.items():
         output_path = _output_path(runtime, admission)
         slot = runtime.model.states.get(int(admission.request_pool_idx))
         if slot.active:
             raise invalid_descriptor("H3 admission targets an occupied request slot")
-        operation = transitions[request_key]
+        operation = preparations[request_key]
         point = operation.parent.point
         if (
             int(operation.parent.producer_op_id) != 0
             or not isinstance(point, FixedPoint)
             or int(point.point_index) != 0
         ):
-            raise invalid_descriptor("H3 transition does not name its admission root")
+            raise invalid_descriptor("H3 preparation does not name its admission root")
         if output_path.name in {".", ".."}:
             raise invalid_descriptor("H3 output has an invalid filename")
 
@@ -103,25 +107,25 @@ def execute_action(
     """Run one H3 quantum after its resident request state has been bound."""
 
     variant = operation.work
-    if variant is ForwardMode.GEN_TRANSITION:
+    if variant is ForwardMode.MEDIA_PREPARE:
         placement = trajectory_placement(partition, operation)
         if int(placement.start_step) != 0 or int(placement.step_count) != 0:
-            raise invalid_descriptor("H3 transition placement must carry zero denoise steps")
+            raise invalid_descriptor("H3 preparation placement must carry zero denoise steps")
         return ()
-    if variant is ForwardMode.GEN_FLOW:
+    if variant is ForwardMode.MEDIA_DENOISE:
         placement = trajectory_placement(partition, operation)
         model.denoise(slot, int(placement.start_step), int(placement.step_count))
         return ()
-    if variant is ForwardMode.GEN_DECODE:
-        placement = decode_placement(partition, operation)
-        if placement.kind is DecodeKind.VIDEO:
-            rgb = model.decode_video(slot, placement)
+    if variant is ForwardMode.MEDIA_RECONSTRUCT:
+        placement = reconstruction_placement(partition, operation)
+        if placement.kind is ReconstructionKind.VIDEO:
+            rgb = model.reconstruct_video(slot, placement)
             if mesh.coord("sp") != 0:
                 return ()
             if rgb is None or reservation is None or ring_lease is None or mux is None:
                 raise RuntimeError("rank zero lost its H3 video capture resources")
             with profile_range(
-                f"uniserve.h3.decode_copy request={_request_label(operation)} "
+                f"uniserve.h3.reconstruct_copy request={_request_label(operation)} "
                 f"op={operation.op_id} kind=video unit={placement.start_unit} "
                 f"rank={mesh.coord('sp')}"
             ):
@@ -141,13 +145,13 @@ def execute_action(
             except BaseException:
                 ring_lease.defer_until_capture_ready(capture)
                 raise
-        pcm = model.decode_audio(slot, placement)
+        pcm = model.reconstruct_audio(slot, placement)
         if mesh.coord("sp") != 0:
             return ()
         if pcm is None or reservation is None or ring_lease is None or mux is None:
             raise RuntimeError("rank zero lost its H3 audio capture resources")
         with profile_range(
-            f"uniserve.h3.decode_copy request={_request_label(operation)} "
+            f"uniserve.h3.reconstruct_copy request={_request_label(operation)} "
             f"op={operation.op_id} kind=audio rank={mesh.coord('sp')}"
         ):
             capture = buffer.capture_bytes_into(pcm.view(torch.uint8), ring_lease.storage)
@@ -182,9 +186,9 @@ def run_action(runtime: ExecutionResources, state: OperationState) -> bool:
         return False
     operation = state.operation
     if operation.work not in {
-        ForwardMode.GEN_TRANSITION,
-        ForwardMode.GEN_FLOW,
-        ForwardMode.GEN_DECODE,
+        ForwardMode.MEDIA_PREPARE,
+        ForwardMode.MEDIA_DENOISE,
+        ForwardMode.MEDIA_RECONSTRUCT,
         ForwardMode.MATERIALIZE,
     }:
         return False
@@ -198,23 +202,23 @@ def run_action(runtime: ExecutionResources, state: OperationState) -> bool:
     if runtime.mesh.coord("sp") == 0 and mux is None:
         raise unsupported_setup("rank zero has no H3 mux resources")
     identity = runtime.operation_identity(operation)
-    if operation.work is ForwardMode.GEN_TRANSITION:
+    if operation.work is ForwardMode.MEDIA_PREPARE:
         admission = scope.admissions.get(operation.request_key)
         if admission is None:
-            raise invalid_descriptor("H3 transition has no matching admission")
+            raise invalid_descriptor("H3 preparation has no matching admission")
         model.prepare(slot, admission)
         output_path = _output_path(runtime, admission)
         if runtime.mesh.coord("sp") == 0:
             assert mux is not None
             media = admission.media
             if media is None:
-                raise invalid_descriptor("H3 transition has no media plan")
+                raise invalid_descriptor("H3 preparation has no media geometry")
             execution = model._page_execution_for_slot(slot)
             mux.open(
                 operation.request_key,
                 output_path,
-                frame_count=media.plan.frame_count,
-                video_unit_frames=execution.layout.decode_unit_frames,
+                frame_count=media.geometry.frame_count,
+                video_unit_frames=execution.layout.reconstruction_unit_frames,
             )
     tasks = execute_action(
         model,
@@ -269,7 +273,7 @@ def _request_label(operation: Operation) -> str:
 
 
 __all__ = [
-    "decode_placement",
+    "reconstruction_placement",
     "execute_action",
     "run_action",
     "trajectory_placement",

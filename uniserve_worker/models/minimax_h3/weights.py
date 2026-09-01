@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import torch
 from torch import nn
@@ -269,38 +269,11 @@ def _load_transformer(
             )
             _set_parameter(model, name, tensor)
     packed_names = {
-        f"transformer_blocks.{index}.attn.to_qkvg.weight"
-        for index in range(model.config.layers)
+        f"transformer_blocks.{index}.attn.to_qkvg.weight" for index in range(model.config.layers)
     }
     if not packed_names <= targets.keys():
         raise RuntimeError("FastH3 transformer did not materialize all attention projections")
     process_quantized_modules(model.modules())
-
-
-def _encoder_shard(
-    name: str,
-    handle: Any,
-    mesh: DeviceMesh,
-) -> torch.Tensor:
-    size, rank = mesh.size("tp"), mesh.coord("tp")
-    if name == "language_model.embed_tokens.weight":
-        rows = handle.shape[0] // size
-        return handle.narrow(0, rank * rows, rows)
-    if name.endswith(
-        (
-            ".q_proj.weight",
-            ".k_proj.weight",
-            ".v_proj.weight",
-            ".gate_proj.weight",
-            ".up_proj.weight",
-        )
-    ):
-        rows = handle.shape[0] // size
-        return handle.narrow(0, rank * rows, rows)
-    if name.endswith((".o_proj.weight", ".down_proj.weight")):
-        columns = handle.shape[1] // size
-        return handle.narrow(1, rank * columns, columns)
-    return handle.full()
 
 
 def _load_encoder(
@@ -309,11 +282,38 @@ def _load_encoder(
     device: torch.device,
 ) -> None:
     from ...loader.handles import weight_handle_materialization
+    from ...loader.weight_loaders import attach_parameter_loaders, load_parameter_weight
+    from ...nn.quant import process_quantized_modules
 
     sources = _weight_map(component)
+    attach_parameter_loaders(model, device=device, dtype=torch.bfloat16)
     targets = dict(model.named_parameters())
     with weight_handle_materialization():
-        for name in targets:
+        for name, target in targets.items():
+            if name.endswith(".self_attn.qkv_proj.weight"):
+                prefix = name[: -len("qkv_proj.weight")]
+                for shard, projection in (("q", "q_proj"), ("k", "k_proj"), ("v", "v_proj")):
+                    source_name = f"model.{prefix}{projection}.weight"
+                    try:
+                        handle = sources[source_name]
+                    except KeyError as error:
+                        raise KeyError(
+                            f"H3 text encoder is missing checkpoint tensor {source_name!r}"
+                        ) from error
+                    load_parameter_weight(target, handle, shard)
+                continue
+            if name.endswith(".mlp.gate_up_proj.weight"):
+                prefix = name[: -len("gate_up_proj.weight")]
+                for shard, projection in (("gate", "gate_proj"), ("up", "up_proj")):
+                    source_name = f"model.{prefix}{projection}.weight"
+                    try:
+                        handle = sources[source_name]
+                    except KeyError as error:
+                        raise KeyError(
+                            f"H3 text encoder is missing checkpoint tensor {source_name!r}"
+                        ) from error
+                    load_parameter_weight(target, handle, shard)
+                continue
             source_name = f"model.{name}"
             try:
                 handle = sources[source_name]
@@ -321,12 +321,8 @@ def _load_encoder(
                 raise KeyError(
                     f"H3 text encoder is missing checkpoint tensor {source_name!r}"
                 ) from error
-            tensor = _encoder_shard(source_name[6:], handle, model.mesh)
-            _set_parameter(
-                model,
-                name,
-                tensor.to(device=device, dtype=torch.bfloat16, non_blocking=False),
-            )
+            load_parameter_weight(target, handle)
+    process_quantized_modules(model.modules())
 
 
 def load_h3_components(
@@ -337,7 +333,6 @@ def load_h3_components(
     cache_dir: str | None = None,
     revision: str | None = None,
     precision_policy: H3LinearPrecisionPolicy,
-    attention_mode: Literal["sparse_kernel", "sparse_oracle", "dense_oracle"] = "sparse_kernel",
 ) -> H3Components:
     checkpoint = resolve_h3_checkpoint(
         checkpoint_path,
@@ -351,7 +346,6 @@ def load_h3_components(
         parameter_device="meta",
         attention_linear_precision=precision_policy.transformer_attention,
         mlp_linear_precision=precision_policy.transformer_mlp,
-        attention_mode=attention_mode,
     )
     encoder = MiniMaxH3TextEncoder(
         mesh,

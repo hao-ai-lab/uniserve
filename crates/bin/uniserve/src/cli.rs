@@ -287,7 +287,6 @@ impl SharedRuntimeArgs {
             // an explicit `--max-model-len` overrides it.
             max_model_len: self.max_model_len,
             max_video_seconds: self.max_video_seconds,
-            media_graph_cache_capacity: self.worker_process.media_graph_cache_capacity,
             workers: self
                 .workers
                 .clone()
@@ -345,21 +344,15 @@ pub(crate) struct WorkerProcessOptions {
     pub checksum_manifest: Option<std::path::PathBuf>,
     #[arg(long = "dtype", default_value = "bfloat16")]
     pub model_dtype: ModelDtype,
-    /// Dynamic linear precision used by models that expose a quantized linear path.
-    #[arg(long, default_value = "fp8", value_parser = ["fp8", "nvfp4"])]
-    pub linear_precision: String,
-    /// MiniMax H3 transformer-attention precision override.
-    #[arg(long, value_parser = ["fp8", "nvfp4"])]
-    pub h3_transformer_attention_precision: Option<String>,
-    /// MiniMax H3 transformer-MLP precision override.
-    #[arg(long, value_parser = ["fp8", "nvfp4"])]
-    pub h3_transformer_mlp_precision: Option<String>,
-    /// MiniMax H3 text-encoder precision override.
-    #[arg(long, value_parser = ["bf16", "nvfp4"])]
-    pub h3_text_encoder_precision: Option<String>,
-    /// MiniMax H3 video-VAE precision override.
-    #[arg(long, value_parser = ["fp16", "bf16", "nvfp4"])]
-    pub h3_video_vae_precision: Option<String>,
+    /// JSON quantization policy, for example {"mode":"balanced"}.
+    /// An empty object selects the model-owned default.
+    #[arg(
+        long,
+        default_value = r#"{}"#,
+        value_parser = parse_json_object,
+        value_name = "JSON"
+    )]
+    pub quantization_config: serde_json::Value,
     #[arg(long)]
     pub kv_cache_dtype: Option<KvCacheDtype>,
     #[arg(long = "mem-fraction-static", default_value = "0.70")]
@@ -401,9 +394,6 @@ pub(crate) struct WorkerProcessOptions {
     pub flashinfer_disable_split_kv: bool,
     #[arg(long, action = ArgAction::Set, default_value_t = true, hide = true)]
     pub flashinfer_fast_decode_plan: bool,
-    /// Retained fixed-shape executable capacity for media models.
-    #[arg(long, default_value_t = 32, hide = true)]
-    pub media_graph_cache_capacity: usize,
 }
 
 impl WorkerProcessOptions {
@@ -415,11 +405,7 @@ impl WorkerProcessOptions {
             load_threads: self.load_threads,
             checksum_manifest: self.checksum_manifest.clone(),
             model_dtype: self.model_dtype.clone(),
-            linear_precision: self.linear_precision.clone(),
-            h3_transformer_attention_precision: self.h3_transformer_attention_precision.clone(),
-            h3_transformer_mlp_precision: self.h3_transformer_mlp_precision.clone(),
-            h3_text_encoder_precision: self.h3_text_encoder_precision.clone(),
-            h3_video_vae_precision: self.h3_video_vae_precision.clone(),
+            quantization_config: self.quantization_config.clone(),
             kv_cache_dtype: self.kv_cache_dtype.clone(),
             kv_memory_fraction: self.kv_memory_fraction.clone(),
             mesh: self.worker_mesh.clone(),
@@ -439,7 +425,6 @@ impl WorkerProcessOptions {
             flashinfer_prefill_split_tile_size: self.flashinfer_prefill_split_tile_size,
             flashinfer_disable_split_kv: self.flashinfer_disable_split_kv,
             flashinfer_fast_decode_plan: self.flashinfer_fast_decode_plan,
-            fixed_graph_cache_capacity: self.media_graph_cache_capacity,
             media_spool: None,
             ..WorkerProcessArgs::default()
         }
@@ -448,6 +433,15 @@ impl WorkerProcessOptions {
 
 fn parse_json<T: DeserializeOwned>(value: &str) -> Result<T, String> {
     serde_json::from_str(value).map_err(|e| format!("invalid JSON object: {}", e.as_report()))
+}
+
+fn parse_json_object(value: &str) -> Result<Value, String> {
+    let parsed = parse_json::<Value>(value)?;
+    if parsed.is_object() {
+        Ok(parsed)
+    } else {
+        Err("expected a JSON object".to_string())
+    }
 }
 
 fn non_empty_secret(value: Option<&str>) -> Option<String> {
@@ -577,34 +571,53 @@ mod tests {
     }
 
     #[test]
-    fn serve_accepts_h3_precision_overrides() {
+    fn serve_accepts_component_quantization_config() {
         let parsed = <Cli as clap::Parser>::try_parse_from([
             "uniserve",
             "serve",
             "model",
             "--model-description",
             "minimax-h3",
-            "--h3-transformer-attention-precision",
-            "fp8",
-            "--h3-transformer-mlp-precision",
-            "nvfp4",
-            "--h3-text-encoder-precision",
-            "bf16",
-            "--h3-video-vae-precision",
-            "bf16",
+            "--quantization-config",
+            r#"{"mode":"performance","components":{"transformer.attention":"fp8","transformer.mlp":"nvfp4","text_encoder":"bf16","video_vae":"bf16"}}"#,
         ])
-        .expect("MiniMax H3 precision overrides");
+        .expect("MiniMax H3 quantization config");
         let Command::Serve(args) = parsed.command;
         let worker = args.runtime.worker_process.to_args();
+        assert_eq!(worker.quantization_config["mode"], "performance");
         assert_eq!(
-            worker.h3_transformer_attention_precision,
-            Some("fp8".to_string())
+            worker.quantization_config["components"]["transformer.mlp"],
+            "nvfp4"
         );
-        assert_eq!(
-            worker.h3_transformer_mlp_precision,
-            Some("nvfp4".to_string())
-        );
-        assert_eq!(worker.h3_text_encoder_precision, Some("bf16".to_string()));
-        assert_eq!(worker.h3_video_vae_precision, Some("bf16".to_string()));
+    }
+
+    #[test]
+    fn serve_leaves_quantization_policy_to_model_by_default() {
+        let parsed = <Cli as clap::Parser>::try_parse_from([
+            "uniserve",
+            "serve",
+            "model",
+            "--model-description",
+            "minimax-h3",
+        ])
+        .expect("MiniMax H3 default precision policy");
+        let Command::Serve(args) = parsed.command;
+        let worker = args.runtime.worker_process.to_args();
+        assert_eq!(worker.quantization_config, serde_json::json!({}));
+    }
+
+    #[test]
+    fn serve_rejects_non_object_quantization_config() {
+        let error = <Cli as clap::Parser>::try_parse_from([
+            "uniserve",
+            "serve",
+            "model",
+            "--model-description",
+            "minimax-h3",
+            "--quantization-config",
+            r#"["fp8"]"#,
+        ])
+        .expect_err("quantization config must be an object");
+        assert!(error.to_string().contains("expected a JSON object"));
     }
 }

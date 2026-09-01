@@ -46,9 +46,9 @@ const PREFILL_WORK: &[ForwardMode] = &[ForwardMode::TokenExtend];
 const DECODE_WORK: &[ForwardMode] = &[
     ForwardMode::TokenDecode,
     ForwardMode::TokenVerify,
-    ForwardMode::GenTransition,
-    ForwardMode::GenFlow,
-    ForwardMode::GenDecode,
+    ForwardMode::MediaPrepare,
+    ForwardMode::MediaDenoise,
+    ForwardMode::MediaReconstruct,
     ForwardMode::Materialize,
     ForwardMode::TransferKvPublish,
     ForwardMode::TransferKvInstall,
@@ -63,9 +63,9 @@ const UND_WORK: &[ForwardMode] = &[
     ForwardMode::TransferKvInstall,
 ];
 const GEN_WORK: &[ForwardMode] = &[
-    ForwardMode::GenTransition,
-    ForwardMode::GenFlow,
-    ForwardMode::GenDecode,
+    ForwardMode::MediaPrepare,
+    ForwardMode::MediaDenoise,
+    ForwardMode::MediaReconstruct,
     ForwardMode::Materialize,
 ];
 
@@ -493,14 +493,14 @@ mod tests {
         }
         let extend = op(ForwardMode::TokenExtend);
         let decode = op(ForwardMode::TokenDecode);
-        let transition = op(ForwardMode::GenTransition);
+        let prepare = op(ForwardMode::MediaPrepare);
         let materialize = op(ForwardMode::Materialize);
 
         assert!(WorkerKind::Full.handles(&extend));
         assert!(WorkerKind::Prefill.handles(&extend));
         assert!(!WorkerKind::Prefill.handles(&decode));
         assert!(WorkerKind::Decode.handles(&decode));
-        assert!(WorkerKind::Decode.handles(&transition));
+        assert!(WorkerKind::Decode.handles(&prepare));
         assert!(WorkerKind::Decode.handles(&materialize));
         assert!(WorkerKind::Und.handles(&decode));
         assert!(!WorkerKind::Und.handles(&materialize));

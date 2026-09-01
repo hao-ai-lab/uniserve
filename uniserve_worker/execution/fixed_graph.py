@@ -1,16 +1,14 @@
-"""Bounded fixed-shape CUDA graph executables for non-token workloads."""
+"""Explicitly captured CUDA graph for one deployment-static operation."""
 
 from __future__ import annotations
 
-from collections import OrderedDict
-from collections.abc import Callable, Hashable
-from dataclasses import dataclass
+from collections.abc import Callable
 from threading import Lock
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, TypeVar, cast
 
 import torch
 
-__all__ = ["FixedShapeGraphCache", "FixedShapeGraphStats"]
+__all__ = ["StaticCudaGraph"]
 
 _T = TypeVar("_T")
 _POOL_LOCK = Lock()
@@ -27,95 +25,47 @@ def _graph_pool(device: torch.device) -> Any:
         return pool
 
 
-@dataclass(frozen=True, slots=True)
-class FixedShapeGraphStats:
-    captures: int
-    replays: int
-    evictions: int
-    resident_bytes: int
-    capture_failures: int
-    entries: int
+class StaticCudaGraph(Generic[_T]):
+    """Capture during model warmup and replay from stable input addresses."""
 
-
-@dataclass(slots=True)
-class _Executable(Generic[_T]):
-    graph: torch.cuda.CUDAGraph
-    output: _T
-    resident_bytes: int
-
-
-class FixedShapeGraphCache(Generic[_T]):
-    """Capture missing legal shapes and replay resident executables with LRU bounds."""
-
-    def __init__(self, device: torch.device | str, *, capacity: int) -> None:
+    def __init__(self, device: torch.device | str) -> None:
         self.device = torch.device(device)
-        self.capacity = int(capacity)
         if self.device.type != "cuda":
-            raise ValueError("fixed-shape graph execution requires a CUDA device")
-        if self.capacity < 1:
-            raise ValueError("fixed-shape graph cache capacity must be positive")
+            raise ValueError("CUDA graph execution requires a CUDA device")
         self._stream = torch.cuda.Stream(device=self.device)
-        self._entries: OrderedDict[Hashable, _Executable[_T]] = OrderedDict()
-        self._captures = 0
-        self._replays = 0
-        self._evictions = 0
-        self._resident_bytes = 0
-        self._capture_failures = 0
+        self._graph: torch.cuda.CUDAGraph | None = None
+        self._output: _T | None = None
 
-    def contains(self, shape_key: Hashable) -> bool:
-        return shape_key in self._entries
+    @property
+    def captured(self) -> bool:
+        return self._graph is not None
 
-    def execute(
+    def capture(
         self,
-        shape_key: Hashable,
-        capture: Callable[[], _T],
+        operation: Callable[[], _T],
         *,
         warmup: Callable[[], Any] | None = None,
     ) -> _T:
-        executable = self._entries.pop(shape_key, None)
-        if executable is not None:
-            executable.graph.replay()
-            self._replays += 1
-            self._entries[shape_key] = executable
-            return executable.output
-
+        if self._graph is not None:
+            raise RuntimeError("the static CUDA graph has already been captured")
         if warmup is not None:
             warmup()
         current = torch.cuda.current_stream(self.device)
         self._stream.wait_stream(current)
-        before = torch.cuda.memory_allocated(self.device)
         graph = torch.cuda.CUDAGraph(keep_graph=True)
-        try:
-            with torch.cuda.graph(
-                graph, pool=_graph_pool(self.device), stream=self._stream
-            ):
-                output = capture()
-            graph.instantiate()
-            with torch.cuda.stream(self._stream):
-                graph.replay()
-        except BaseException:
-            self._capture_failures += 1
-            current.wait_stream(self._stream)
-            raise
+        with torch.cuda.graph(graph, pool=_graph_pool(self.device), stream=self._stream):
+            output = operation()
+        graph.instantiate()
+        with torch.cuda.stream(self._stream):
+            graph.replay()
         current.wait_stream(self._stream)
-        resident_bytes = max(0, torch.cuda.memory_allocated(self.device) - before)
-        executable = _Executable(graph, output, resident_bytes)
-        self._entries[shape_key] = executable
-        self._captures += 1
-        self._resident_bytes += resident_bytes
-        while len(self._entries) > self.capacity:
-            _key, evicted = self._entries.popitem(last=False)
-            self._resident_bytes -= evicted.resident_bytes
-            self._evictions += 1
+        self._graph = graph
+        self._output = output
         return output
 
-    @property
-    def stats(self) -> FixedShapeGraphStats:
-        return FixedShapeGraphStats(
-            captures=self._captures,
-            replays=self._replays,
-            evictions=self._evictions,
-            resident_bytes=self._resident_bytes,
-            capture_failures=self._capture_failures,
-            entries=len(self._entries),
-        )
+    def replay(self) -> _T:
+        graph = self._graph
+        if graph is None:
+            raise RuntimeError("the static CUDA graph has not been captured during warmup")
+        graph.replay()
+        return cast(_T, self._output)

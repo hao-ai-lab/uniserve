@@ -42,7 +42,7 @@ impl Scheduler {
             .clamp(1, MAX_INFLIGHT_TRANSFERS);
         config.max_num_waiting = config.max_num_waiting.clamp(1, MAX_NUM_WAITING);
         let flow_slot_reserve =
-            usize::from(info.uses_kv() && info.supported_work.contains(&ForwardMode::GenFlow));
+            usize::from(info.uses_kv() && info.supported_work.contains(&ForwardMode::MediaDenoise));
         let request_pool_capacity = info.max_request_pool_size as usize;
         let main_request_capacity = request_pool_capacity
             .saturating_sub(flow_slot_reserve)
@@ -164,7 +164,11 @@ impl Scheduler {
     }
     pub fn set_max_num_seqs(&mut self, n: usize) {
         let flow_slot_reserve = usize::from(
-            self.info.uses_kv() && self.info.supported_work.contains(&ForwardMode::GenFlow),
+            self.info.uses_kv()
+                && self
+                    .info
+                    .supported_work
+                    .contains(&ForwardMode::MediaDenoise),
         );
         let capacity = self
             .kv_budget

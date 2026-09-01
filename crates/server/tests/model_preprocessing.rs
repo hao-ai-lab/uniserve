@@ -275,15 +275,15 @@ fn bagel_places_the_input_image_between_surrounding_chat_text() {
 }
 
 #[test]
-fn minimax_video_plan_carries_the_admitted_token_sequence() {
+fn minimax_video_geometry_carries_the_admitted_token_sequence() {
     let (_directory, tokenizer, model) = resolved_model(ModelDescription::MiniMaxH3, "minimax_h3");
     let prompt = "exact token sequence";
     let expected = tokenizer.encode(prompt, false).unwrap();
 
-    let (plan, prompt_token_ids) = model
-        .resolve_video_plan(&ServeRequestId::new("video"), prompt, 1.0)
+    let (geometry, prompt_token_ids) = model
+        .resolve_video_request_geometry(&ServeRequestId::new("video"), prompt, 1.0)
         .unwrap();
 
     assert_eq!(prompt_token_ids, expected);
-    assert_eq!(plan.prompt_tokens as usize, prompt_token_ids.len());
+    assert_eq!(geometry.prompt_tokens as usize, prompt_token_ids.len());
 }

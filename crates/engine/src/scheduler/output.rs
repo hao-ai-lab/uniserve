@@ -444,7 +444,7 @@ impl Scheduler {
                     self.begin_image(id);
                 }
             }
-            ForwardMode::GenFlow => {
+            ForwardMode::MediaDenoise => {
                 let (image_id, h, w, steps, prev_sd) = {
                     let st = self.running.get_mut(&id).unwrap();
                     let prev = match apply.intent {
@@ -485,7 +485,7 @@ impl Scheduler {
                 // count reaches `image.steps` (see the `Phase::DenoiseGen`
                 // planner); a worker completion flag does not drive termination.
             }
-            ForwardMode::GenDecode => {}
+            ForwardMode::MediaReconstruct => {}
             ForwardMode::Materialize => {
                 let image_id = self
                     .running
@@ -649,7 +649,7 @@ impl Scheduler {
             ForwardMode::TokenDecode
             | ForwardMode::TokenVerify
             | ForwardMode::Draft
-            | ForwardMode::GenTransition
+            | ForwardMode::MediaPrepare
             | ForwardMode::TransferProduct
             | ForwardMode::TransferKvPublish
             | ForwardMode::TransferKvInstall => {}

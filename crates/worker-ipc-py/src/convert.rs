@@ -19,16 +19,16 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyString};
 use uniserve_core::{ImageParams, SamplingParams};
 #[cfg(test)]
-use uniserve_worker_ipc::MediaPlan;
+use uniserve_worker_ipc::MediaGeometry;
 use uniserve_worker_ipc::{
     AttentionRegime, Batch, BatchPartition, BlockTable, CachePageAllocation, CloseReason,
-    CompletionReport, Control, DType, DecodeKind, DecodePlacement, DimBound, Disposition, Domain,
-    DrawLayout, ErrorCode, ErrorOperationIdentity, FinishFlags, ForwardMode, GenAdmission,
-    LatentPlacement, LogicalLengths, MediaAdmission, MediaProfileId, ModelOutput, NewRequest, OpId,
-    OpStatus, Operation, PartitionCompletion, Point, PointRange, ProductKind, ProductPayload,
-    ProductRef, RegistrationAck, RequestKey, RequestKind, RowGeometry, ShapeBound, StorageClass,
-    TimingCounters, TokenSpan, UndAdmission, VersionRef, WorkerForwardStats, WorkerRequest,
-    WorkerResponse, WorkerResponseError,
+    CompletionReport, Control, DType, DimBound, Disposition, Domain, DrawLayout, ErrorCode,
+    ErrorOperationIdentity, FinishFlags, ForwardMode, GenAdmission, LatentPlacement,
+    LogicalLengths, MediaAdmission, MediaProfileId, ModelOutput, NewRequest, OpId, OpStatus,
+    Operation, PartitionCompletion, Point, PointRange, ProductKind, ProductPayload, ProductRef,
+    ReconstructionKind, ReconstructionPlacement, RegistrationAck, RequestKey, RequestKind,
+    RowGeometry, ShapeBound, StorageClass, TimingCounters, TokenSpan, UndAdmission, VersionRef,
+    WorkerForwardStats, WorkerRequest, WorkerResponse, WorkerResponseError,
 };
 
 #[cfg(test)]
@@ -217,10 +217,10 @@ impl NativeRequestTypes {
                     "transfer_product",
                     "transfer_kv_publish",
                     "transfer_kv_install",
-                    "gen_transition",
-                    "gen_flow",
+                    "media_prepare",
+                    "media_denoise",
                     "materialize",
-                    "gen_decode",
+                    "media_reconstruct",
                 ],
             )?,
         })
@@ -614,8 +614,8 @@ impl<'py> NativeRequestConversion<'py> {
                     latent_placement_to_py(py, placement, context)
                 })?
                 .into_any(),
-                dict_list(py, &partition.decode_placements, |placement| {
-                    decode_placement_to_py(py, placement, context)
+                dict_list(py, &partition.reconstruction_placements, |placement| {
+                    reconstruction_placement_to_py(py, placement, context)
                 })?
                 .into_any(),
             ],
@@ -675,9 +675,9 @@ fn latent_placement_to_py<'py>(
     Ok(dict)
 }
 
-fn decode_placement_to_py<'py>(
+fn reconstruction_placement_to_py<'py>(
     py: Python<'py>,
-    placement: &DecodePlacement,
+    placement: &ReconstructionPlacement,
     context: &mut RequestConversion<'py>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
@@ -689,8 +689,8 @@ fn decode_placement_to_py<'py>(
     dict.set_item(
         intern!(py, "kind"),
         match placement.kind {
-            DecodeKind::Video => "video",
-            DecodeKind::Audio => "audio",
+            ReconstructionKind::Video => "video",
+            ReconstructionKind::Audio => "audio",
         },
     )?;
     dict.set_item(intern!(py, "start_unit"), placement.start_unit)?;
@@ -844,19 +844,19 @@ fn media_admission_to_py<'py>(
         },
     )?;
     dict.set_item(intern!(py, "output_path"), media.output_path.as_str())?;
-    let plan = PyDict::new(py);
-    plan.set_item(intern!(py, "frame_count"), media.plan.frame_count)?;
-    plan.set_item(
-        intern!(py, "video_decode_units"),
-        media.plan.video_decode_units,
+    let geometry = PyDict::new(py);
+    geometry.set_item(intern!(py, "frame_count"), media.geometry.frame_count)?;
+    geometry.set_item(
+        intern!(py, "video_reconstruction_units"),
+        media.geometry.video_reconstruction_units,
     )?;
-    plan.set_item(
+    geometry.set_item(
         intern!(py, "audio_latent_frames"),
-        media.plan.audio_latent_frames,
+        media.geometry.audio_latent_frames,
     )?;
-    plan.set_item(intern!(py, "prompt_tokens"), media.plan.prompt_tokens)?;
-    plan.set_item(intern!(py, "denoise_steps"), media.plan.denoise_steps)?;
-    dict.set_item(intern!(py, "plan"), plan)?;
+    geometry.set_item(intern!(py, "prompt_tokens"), media.geometry.prompt_tokens)?;
+    geometry.set_item(intern!(py, "denoise_steps"), media.geometry.denoise_steps)?;
+    dict.set_item(intern!(py, "geometry"), geometry)?;
     Ok(dict)
 }
 
@@ -1707,7 +1707,7 @@ mod tests {
                 query_len: 2,
             }],
             latent_placements: Vec::new(),
-            decode_placements: Vec::new(),
+            reconstruction_placements: Vec::new(),
         };
         let media_key = RequestKey::new(1, RequestId(3), 1);
         let media_prompt_token_ids = vec![17, 23, 65_537];
@@ -1719,9 +1719,9 @@ mod tests {
                 seed: 29,
                 profile: MediaProfileId::MinimaxH3T2va,
                 output_path: "/tmp/media.mp4".to_string(),
-                plan: MediaPlan {
+                geometry: MediaGeometry {
                     frame_count: 22,
-                    video_decode_units: 1,
+                    video_reconstruction_units: 1,
                     audio_latent_frames: 37,
                     prompt_tokens: 3,
                     denoise_steps: 4,
@@ -1733,7 +1733,7 @@ mod tests {
             request_key: media_key,
             op_id: OpId(2),
             parent: VersionRef::admission_root(media_key, OpId(0)),
-            work: ForwardMode::GenTransition,
+            work: ForwardMode::MediaPrepare,
             route: uniserve_worker_ipc::RouteId(0),
             domain: Domain::Flow,
             advances_state: false,
@@ -1770,7 +1770,7 @@ mod tests {
                 start_step: 0,
                 step_count: 0,
             }],
-            decode_placements: Vec::new(),
+            reconstruction_placements: Vec::new(),
         };
         let mut request = WorkerRequest::execute(
             Batch::new(

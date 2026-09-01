@@ -179,7 +179,7 @@ impl EngineClient {
             seed,
             priority,
             output_path,
-            plan,
+            geometry,
             ..
         } = submission;
         let rid = self.core.next_request_id();
@@ -198,7 +198,7 @@ impl EngineClient {
             seed,
             priority,
             output_path,
-            plan,
+            geometry,
         };
         let mut scheduler_rx = self.core.handle().submit_media(request).map_err(|error| {
             remove_active_request(&self.active, &external_request_id, rid);

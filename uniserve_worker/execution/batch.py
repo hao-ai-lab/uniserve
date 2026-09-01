@@ -55,13 +55,13 @@ class TransferMode(StrEnum):
     KV_INSTALL = "kv_install"
 
 
-class GenMode(StrEnum):
-    TRANSITION = "transition"
-    FLOW = "flow"
-    DECODE = "decode"
+class MediaMode(StrEnum):
+    PREPARE = "prepare"
+    DENOISE = "denoise"
+    RECONSTRUCT = "reconstruct"
 
 
-class DecodeKind(StrEnum):
+class ReconstructionKind(StrEnum):
     VIDEO = "video"
     AUDIO = "audio"
 
@@ -80,10 +80,10 @@ class ForwardMode(StrEnum):
     TRANSFER_PRODUCT = "transfer_product"
     TRANSFER_KV_PUBLISH = "transfer_kv_publish"
     TRANSFER_KV_INSTALL = "transfer_kv_install"
-    GEN_TRANSITION = "gen_transition"
-    GEN_FLOW = "gen_flow"
+    MEDIA_PREPARE = "media_prepare"
+    MEDIA_DENOISE = "media_denoise"
     MATERIALIZE = "materialize"
-    GEN_DECODE = "gen_decode"
+    MEDIA_RECONSTRUCT = "media_reconstruct"
 
     @property
     def advances_state(self) -> bool:
@@ -122,13 +122,13 @@ class ForwardMode(StrEnum):
         return None
 
     @property
-    def gen_mode(self) -> GenMode | None:
-        if self is ForwardMode.GEN_TRANSITION:
-            return GenMode.TRANSITION
-        if self is ForwardMode.GEN_FLOW:
-            return GenMode.FLOW
-        if self is ForwardMode.GEN_DECODE:
-            return GenMode.DECODE
+    def media_mode(self) -> MediaMode | None:
+        if self is ForwardMode.MEDIA_PREPARE:
+            return MediaMode.PREPARE
+        if self is ForwardMode.MEDIA_DENOISE:
+            return MediaMode.DENOISE
+        if self is ForwardMode.MEDIA_RECONSTRUCT:
+            return MediaMode.RECONSTRUCT
         return None
 
     @classmethod
@@ -155,11 +155,11 @@ class ForwardMode(StrEnum):
         }[mode]
 
     @classmethod
-    def gen(cls, mode: GenMode) -> ForwardMode:
+    def media(cls, mode: MediaMode) -> ForwardMode:
         return {
-            GenMode.TRANSITION: cls.GEN_TRANSITION,
-            GenMode.FLOW: cls.GEN_FLOW,
-            GenMode.DECODE: cls.GEN_DECODE,
+            MediaMode.PREPARE: cls.MEDIA_PREPARE,
+            MediaMode.DENOISE: cls.MEDIA_DENOISE,
+            MediaMode.RECONSTRUCT: cls.MEDIA_RECONSTRUCT,
         }[mode]
 
 
@@ -179,10 +179,10 @@ _DOMAIN_BY_WORK_VARIANT = {
     ForwardMode.TRANSFER_PRODUCT: Domain.PREFILL,
     ForwardMode.TRANSFER_KV_PUBLISH: Domain.PREFILL,
     ForwardMode.TRANSFER_KV_INSTALL: Domain.PREFILL,
-    ForwardMode.GEN_TRANSITION: Domain.FLOW,
-    ForwardMode.GEN_FLOW: Domain.FLOW,
+    ForwardMode.MEDIA_PREPARE: Domain.FLOW,
+    ForwardMode.MEDIA_DENOISE: Domain.FLOW,
     ForwardMode.MATERIALIZE: Domain.FLOW,
-    ForwardMode.GEN_DECODE: Domain.FLOW,
+    ForwardMode.MEDIA_RECONSTRUCT: Domain.FLOW,
 }
 
 
@@ -276,9 +276,9 @@ _STATE_ADVANCING_WORK = frozenset(
         ForwardMode.TOKEN_EXTEND,
         ForwardMode.TOKEN_DECODE,
         ForwardMode.TOKEN_VERIFY,
-        ForwardMode.GEN_TRANSITION,
-        ForwardMode.GEN_FLOW,
-        ForwardMode.GEN_DECODE,
+        ForwardMode.MEDIA_PREPARE,
+        ForwardMode.MEDIA_DENOISE,
+        ForwardMode.MEDIA_RECONSTRUCT,
     }
 )
 
@@ -298,7 +298,7 @@ def native_partition(
     new_cache_pages: tuple[CachePageAllocation, ...],
     forward_rows: tuple[RowGeometry, ...],
     latent_placements: Sequence[object],
-    decode_placements: Sequence[object],
+    reconstruction_placements: Sequence[object],
 ) -> BatchPartition:
     """Assemble a partition from transport-constructed members.
 
@@ -330,10 +330,12 @@ def native_partition(
     )
     set_field(
         partition,
-        "decode_placements",
+        "reconstruction_placements",
         tuple(
-            DecodePlacement.from_mapping(item, f"partition.decode_placements[{index}]")
-            for index, item in enumerate(decode_placements)
+            ReconstructionPlacement.from_mapping(
+                item, f"partition.reconstruction_placements[{index}]"
+            )
+            for index, item in enumerate(reconstruction_placements)
         ),
     )
     return partition
@@ -1537,9 +1539,9 @@ class GenAdmission:
 
 
 @dataclass(frozen=True, slots=True)
-class MediaPlan:
+class MediaGeometry:
     frame_count: int
-    video_decode_units: int
+    video_reconstruction_units: int
     audio_latent_frames: int
     prompt_tokens: int
     denoise_steps: int
@@ -1547,29 +1549,29 @@ class MediaPlan:
     def __post_init__(self) -> None:
         for name in (
             "frame_count",
-            "video_decode_units",
+            "video_reconstruction_units",
             "audio_latent_frames",
             "prompt_tokens",
             "denoise_steps",
         ):
-            _nonnegative(getattr(self, name), f"media plan {name}")
+            _nonnegative(getattr(self, name), f"media geometry {name}")
         if (
             self.frame_count < 22
             or self.frame_count % 17 != 5
-            or self.video_decode_units != (self.frame_count - 5) // 17
+            or self.video_reconstruction_units != (self.frame_count - 5) // 17
             or self.audio_latent_frames != (self.frame_count * 40 + 23) // 24
             or self.prompt_tokens == 0
             or self.denoise_steps != 4
         ):
-            raise invalid_descriptor("media plan is invalid")
+            raise invalid_descriptor("media geometry is invalid")
 
     @classmethod
-    def from_mapping(cls, value: object, where: str = "media plan") -> MediaPlan:
+    def from_mapping(cls, value: object, where: str = "media geometry") -> MediaGeometry:
         data = _map(value, where)
         return cls(
             frame_count=_uint(data.get("frame_count"), f"{where}.frame_count"),
-            video_decode_units=_uint(
-                data.get("video_decode_units"), f"{where}.video_decode_units"
+            video_reconstruction_units=_uint(
+                data.get("video_reconstruction_units"), f"{where}.video_reconstruction_units"
             ),
             audio_latent_frames=_uint(
                 data.get("audio_latent_frames"), f"{where}.audio_latent_frames"
@@ -1581,7 +1583,7 @@ class MediaPlan:
     def to_mapping(self) -> dict[str, object]:
         return {
             "frame_count": self.frame_count,
-            "video_decode_units": self.video_decode_units,
+            "video_reconstruction_units": self.video_reconstruction_units,
             "audio_latent_frames": self.audio_latent_frames,
             "prompt_tokens": self.prompt_tokens,
             "denoise_steps": self.denoise_steps,
@@ -1594,7 +1596,7 @@ class MediaAdmission:
     seed: int
     profile: MediaProfileId
     output_path: str
-    plan: MediaPlan
+    geometry: MediaGeometry
 
     def __post_init__(self) -> None:
         if not self.prompt_token_ids:
@@ -1602,20 +1604,18 @@ class MediaAdmission:
         _nonnegative(self.seed, "media admission seed")
         if not self.output_path:
             raise invalid_descriptor("media admission output path must not be empty")
-        if len(self.prompt_token_ids) != self.plan.prompt_tokens:
-            raise invalid_descriptor("media admission prompt tokens disagree with its plan")
+        if len(self.prompt_token_ids) != self.geometry.prompt_tokens:
+            raise invalid_descriptor("media admission prompt tokens disagree with its geometry")
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "media admission") -> MediaAdmission:
         data = _map(value, where)
         return cls(
-            prompt_token_ids=_uints(
-                data.get("prompt_token_ids", ()), f"{where}.prompt_token_ids"
-            ),
+            prompt_token_ids=_uints(data.get("prompt_token_ids", ()), f"{where}.prompt_token_ids"),
             seed=_uint(data.get("seed"), f"{where}.seed"),
             profile=_enum(MediaProfileId, data.get("profile"), f"{where}.profile"),
             output_path=_str(data.get("output_path"), f"{where}.output_path"),
-            plan=MediaPlan.from_mapping(data.get("plan"), f"{where}.plan"),
+            geometry=MediaGeometry.from_mapping(data.get("geometry"), f"{where}.geometry"),
         )
 
     def to_mapping(self) -> dict[str, object]:
@@ -1624,7 +1624,7 @@ class MediaAdmission:
             "seed": self.seed,
             "profile": self.profile.value,
             "output_path": self.output_path,
-            "plan": self.plan.to_mapping(),
+            "geometry": self.geometry.to_mapping(),
         }
 
 
@@ -1880,25 +1880,29 @@ class LatentPlacement:
 
 
 @dataclass(frozen=True, slots=True)
-class DecodePlacement:
+class ReconstructionPlacement:
     request_key: RequestKey
     op_id: int
-    kind: DecodeKind
+    kind: ReconstructionKind
     start_unit: int
     unit_count: int
 
     def __post_init__(self) -> None:
         if self.op_id < 1 or self.unit_count < 1:
-            raise invalid_descriptor("decode placement identity and unit count must be positive")
-        _nonnegative(self.start_unit, "decode placement start unit")
+            raise invalid_descriptor(
+                "reconstruction placement identity and unit count must be positive"
+            )
+        _nonnegative(self.start_unit, "reconstruction placement start unit")
 
     @classmethod
-    def from_mapping(cls, value: object, where: str = "decode placement") -> DecodePlacement:
+    def from_mapping(
+        cls, value: object, where: str = "reconstruction placement"
+    ) -> ReconstructionPlacement:
         data = _map(value, where)
         return cls(
             request_key=RequestKey.from_mapping(data.get("request_key"), f"{where}.request_key"),
             op_id=_uint(data.get("op_id"), f"{where}.op_id"),
-            kind=_enum(DecodeKind, data.get("kind"), f"{where}.kind"),
+            kind=_enum(ReconstructionKind, data.get("kind"), f"{where}.kind"),
             start_unit=_uint(data.get("start_unit"), f"{where}.start_unit"),
             unit_count=_uint(data.get("unit_count"), f"{where}.unit_count"),
         )
@@ -1927,7 +1931,7 @@ class BatchPartition:
     new_cache_pages: tuple[CachePageAllocation, ...] = ()
     forward_rows: tuple[RowGeometry, ...] = ()
     latent_placements: tuple[LatentPlacement, ...] = ()
-    decode_placements: tuple[DecodePlacement, ...] = ()
+    reconstruction_placements: tuple[ReconstructionPlacement, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -1971,8 +1975,8 @@ class BatchPartition:
 
         def addresses_trajectory(operation: Operation) -> bool:
             return operation.work in {
-                ForwardMode.GEN_TRANSITION,
-                ForwardMode.GEN_FLOW,
+                ForwardMode.MEDIA_PREPARE,
+                ForwardMode.MEDIA_DENOISE,
             } or any(reference.kind is ProductKind.LATENT for reference in operation.inputs)
 
         for latent_placement in self.latent_placements:
@@ -1998,23 +2002,27 @@ class BatchPartition:
             raise invalid_descriptor(
                 "operation that addresses a trajectory has no latent placement"
             )
-        decode_ids: set[tuple[RequestKey, int]] = set()
-        for placement in self.decode_placements:
+        reconstruction_ids: set[tuple[RequestKey, int]] = set()
+        for placement in self.reconstruction_placements:
             identity = (placement.request_key, placement.op_id)
-            if identity in decode_ids:
-                raise invalid_descriptor("batch partition repeats a decode placement identity")
-            decode_ids.add(identity)
-            operation = operations.get(identity)
-            if operation is None or operation.work is not ForwardMode.GEN_DECODE:
+            if identity in reconstruction_ids:
                 raise invalid_descriptor(
-                    "decode placement does not name a GenDecode partition operation"
+                    "batch partition repeats a reconstruction placement identity"
+                )
+            reconstruction_ids.add(identity)
+            operation = operations.get(identity)
+            if operation is None or operation.work is not ForwardMode.MEDIA_RECONSTRUCT:
+                raise invalid_descriptor(
+                    "reconstruction placement does not name a media reconstruction operation"
                 )
         if any(
-            operation.work is ForwardMode.GEN_DECODE
-            and (operation.request_key, operation.op_id) not in decode_ids
+            operation.work is ForwardMode.MEDIA_RECONSTRUCT
+            and (operation.request_key, operation.op_id) not in reconstruction_ids
             for operation in self.operations
         ):
-            raise invalid_descriptor("GenDecode operation has no decode placement")
+            raise invalid_descriptor(
+                "media reconstruction operation has no reconstruction placement"
+            )
 
     @classmethod
     def from_mapping(
@@ -2070,10 +2078,15 @@ class BatchPartition:
                     _seq(data.get("latent_placements", ()), f"{where}.latent_placements")
                 )
             ),
-            decode_placements=tuple(
-                DecodePlacement.from_mapping(item, f"{where}.decode_placements[{index}]")
+            reconstruction_placements=tuple(
+                ReconstructionPlacement.from_mapping(
+                    item, f"{where}.reconstruction_placements[{index}]"
+                )
                 for index, item in enumerate(
-                    _seq(data.get("decode_placements", ()), f"{where}.decode_placements")
+                    _seq(
+                        data.get("reconstruction_placements", ()),
+                        f"{where}.reconstruction_placements",
+                    )
                 )
             ),
         )
@@ -2093,7 +2106,9 @@ class BatchPartition:
             "new_cache_pages": [allocation.to_mapping() for allocation in self.new_cache_pages],
             "forward_rows": [row.to_mapping() for row in self.forward_rows],
             "latent_placements": [placement.to_mapping() for placement in self.latent_placements],
-            "decode_placements": [placement.to_mapping() for placement in self.decode_placements],
+            "reconstruction_placements": [
+                placement.to_mapping() for placement in self.reconstruction_placements
+            ],
         }
 
 

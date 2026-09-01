@@ -11,6 +11,9 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from ..bootstrap.execution_config import (
+    LaneConfig,
+)
 from ..execution.batch import (
     AttentionRegime,
     Batch,
@@ -32,12 +35,6 @@ from ..execution.batch import (
     RowGeometry,
     StorageClass,
 )
-from ..bootstrap.execution_config import (
-    LaneConfig,
-)
-from ..worker_info import (
-    GraphBucket,
-)
 from ..execution.step import (
     complete_startup,
     execute_startup,
@@ -50,6 +47,9 @@ from ..nn.diffusion.cfg import build_flow_cfg_plan
 from ..server.completion import (
     completion_report_ready,
     finalize_completion_report,
+)
+from ..worker_info import (
+    GraphBucket,
 )
 
 if TYPE_CHECKING:
@@ -235,8 +235,8 @@ def _warmup_batch(
                 for operation in members
                 if operation.work
                 in {
-                    ForwardMode.GEN_TRANSITION,
-                    ForwardMode.GEN_FLOW,
+                    ForwardMode.MEDIA_PREPARE,
+                    ForwardMode.MEDIA_DENOISE,
                     ForwardMode.MATERIALIZE,
                 }
             ),
@@ -351,8 +351,8 @@ def _build_warmup_batch(
             ForwardMode.DRAFT,
             ForwardMode.TRANSFER_KV_PUBLISH,
             ForwardMode.TRANSFER_KV_INSTALL,
-            ForwardMode.GEN_TRANSITION,
-            ForwardMode.GEN_FLOW,
+            ForwardMode.MEDIA_PREPARE,
+            ForwardMode.MEDIA_DENOISE,
         }:
             continue
         if (
@@ -437,8 +437,8 @@ def _build_warmup_batch(
     occupied_latent_pages = {page for pages in self._warmup_latent_pages.values() for page in pages}
     for operation in operations:
         if operation.work not in {
-            ForwardMode.GEN_TRANSITION,
-            ForwardMode.GEN_FLOW,
+            ForwardMode.MEDIA_PREPARE,
+            ForwardMode.MEDIA_DENOISE,
         } and not any(product.kind is ProductKind.LATENT for product in operation.inputs):
             continue
         page_table = self._warmup_latent_pages.setdefault(operation.request_key, [])
@@ -465,10 +465,12 @@ def _build_warmup_batch(
             width=width,
             start_step=start_step,
             step_count=(
-                int(operation.bounds.max_tokens) if operation.work is ForwardMode.GEN_FLOW else 0
+                int(operation.bounds.max_tokens)
+                if operation.work is ForwardMode.MEDIA_DENOISE
+                else 0
             ),
         )
-        if operation.work is ForwardMode.GEN_FLOW:
+        if operation.work is ForwardMode.MEDIA_DENOISE:
             extra_tables, extra_allocations, flow_rows = _warmup_flow_tables(
                 self,
                 operation,
@@ -999,8 +1001,8 @@ def _warmup_flow(self: Worker) -> None:
 
     generation = self.model.generation
     if not {
-        ForwardMode.GEN_TRANSITION,
-        ForwardMode.GEN_FLOW,
+        ForwardMode.MEDIA_PREPARE,
+        ForwardMode.MEDIA_DENOISE,
     }.issubset(self._effective_work_variants) or not isinstance(generation, GenerationPipeline):
         return
     if self.requests.request_ids():
@@ -1215,7 +1217,7 @@ def _warmup_flow(self: Worker) -> None:
                         request_key=key,
                         op_id=2,
                         parent=root,
-                        work=ForwardMode.GEN_TRANSITION,
+                        work=ForwardMode.MEDIA_PREPARE,
                         route=0,
                         domain=Domain.FLOW,
                         bounds=Bounds(
@@ -1271,7 +1273,7 @@ def _warmup_flow(self: Worker) -> None:
                                 flow_predecessors[session_id].op_id,
                                 DevicePoint(1, None),
                             ),
-                            work=ForwardMode.GEN_FLOW,
+                            work=ForwardMode.MEDIA_DENOISE,
                             route=0,
                             domain=Domain.FLOW,
                             bounds=Bounds(
@@ -1361,7 +1363,7 @@ def _warmup_flow(self: Worker) -> None:
                                     flow_predecessors[session_id].op_id,
                                     DevicePoint(1, None),
                                 ),
-                                work=ForwardMode.GEN_FLOW,
+                                work=ForwardMode.MEDIA_DENOISE,
                                 route=0,
                                 domain=Domain.FLOW,
                                 bounds=Bounds(

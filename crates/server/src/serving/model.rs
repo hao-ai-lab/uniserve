@@ -537,12 +537,12 @@ impl ResolvedModel {
         &self.served_identity().served_name
     }
 
-    pub fn resolve_video_plan(
+    pub fn resolve_video_request_geometry(
         &self,
         request_id: &crate::serving::ServeRequestId,
         prompt: &str,
         seconds: f64,
-    ) -> Result<(uniserve_core::MediaPlan, Vec<u32>)> {
+    ) -> Result<(uniserve_core::MediaGeometry, Vec<u32>)> {
         let Self::Media(description) = self else {
             return Err(ServeError::UnsupportedFeature {
                 request_id: request_id.clone(),
@@ -607,7 +607,7 @@ impl ResolvedModel {
                 ),
             })?;
         let audio_latent_frames = u32::try_from(
-            uniserve_core::MediaPlan::required_audio_latent_frames(frame_count),
+            uniserve_core::MediaGeometry::required_audio_latent_frames(frame_count),
         )
         .map_err(|_| ServeError::Tokenize {
             request_id: request_id.clone(),
@@ -616,9 +616,9 @@ impl ResolvedModel {
             ),
         })?;
         Ok((
-            uniserve_core::MediaPlan {
+            uniserve_core::MediaGeometry {
                 frame_count,
-                video_decode_units: (frame_count - 5) / 17,
+                video_reconstruction_units: (frame_count - 5) / 17,
                 audio_latent_frames,
                 prompt_tokens,
                 denoise_steps: 4,

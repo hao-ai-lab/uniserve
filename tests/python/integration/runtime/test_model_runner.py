@@ -17,11 +17,11 @@ from tests.python.fixtures.depth_one import (
     encode_operation,
     execution_batch,
     finalized_report,
-    flow_operation,
     gen_admission,
-    gen_transition_operation,
     kv_publication_operation,
     materialize_operation,
+    media_denoise_operation,
+    media_prepare_operation,
     root_parent,
     token_operation,
     und_admission,
@@ -104,7 +104,7 @@ def _publish_conditioning(worker: object, admission: NewRequest, *, op_id: int, 
     return product
 
 
-def _transition_generation(
+def _prepare_media(
     worker: object,
     admission: NewRequest,
     conditioning: object,
@@ -116,7 +116,7 @@ def _transition_generation(
     seed: int = 29,
     image_index: int = 1,
 ):
-    transition, latent = gen_transition_operation(
+    preparation, latent = media_prepare_operation(
         admission.request_key,
         op_id=op_id,
         parent=parent,
@@ -125,9 +125,9 @@ def _transition_generation(
         seed=seed,
         image_index=image_index,
     )
-    report = worker.execute(execution_batch(step_id=step_id, operations=(transition,)))
+    report = worker.execute(execution_batch(step_id=step_id, operations=(preparation,)))
     assert report.completions[0].status is OpStatus.OK
-    return latent, commit_for_completion(transition, report)
+    return latent, commit_for_completion(preparation, report)
 
 
 def _prepare_decode(
@@ -395,7 +395,7 @@ def test_mixed_token_and_flow_match_homogeneous_results():
     sequence_admission = und_admission(1, block_ids=(0,))
     flow_admission = gen_admission(2, ImageParams(steps=1, height=16, width=16, seed=29))
     mixed_conditioning = _publish_conditioning(mixed, flow_admission, op_id=10, step_id=1)
-    mixed_latent, mixed_transition_commit = _transition_generation(
+    mixed_latent, mixed_preparation_commit = _prepare_media(
         mixed,
         flow_admission,
         mixed_conditioning,
@@ -403,14 +403,14 @@ def test_mixed_token_and_flow_match_homogeneous_results():
         parent=root_parent(flow_admission),
         step_id=2,
     )
-    flow, mixed_output_latent = flow_operation(
+    flow, mixed_output_latent = media_denoise_operation(
         flow_admission.request_key,
         op_id=12,
-        parent=mixed_transition_commit.selected,
+        parent=mixed_preparation_commit.selected,
         conditioning=mixed_conditioning,
         latent=mixed_latent,
         steps=1,
-        control_seq=mixed_transition_commit.control_seq,
+        control_seq=mixed_preparation_commit.control_seq,
     )
     sequence, sequence_input, sequence_control = _prepare_decode(
         mixed,
@@ -425,14 +425,14 @@ def test_mixed_token_and_flow_match_homogeneous_results():
             step_id=4,
             admissions=(),
             operations=(sequence, flow),
-            controls=(mixed_transition_commit, sequence_control),
+            controls=(mixed_preparation_commit, sequence_control),
             input_products=(sequence_input,),
         )
     )
 
     split = execution_worker()
     split_conditioning = _publish_conditioning(split, flow_admission, op_id=10, step_id=1)
-    split_latent, split_transition_commit = _transition_generation(
+    split_latent, split_preparation_commit = _prepare_media(
         split,
         flow_admission,
         split_conditioning,
@@ -440,14 +440,14 @@ def test_mixed_token_and_flow_match_homogeneous_results():
         parent=root_parent(flow_admission),
         step_id=2,
     )
-    split_flow, split_output_latent = flow_operation(
+    split_flow, split_output_latent = media_denoise_operation(
         flow_admission.request_key,
         op_id=12,
-        parent=split_transition_commit.selected,
+        parent=split_preparation_commit.selected,
         conditioning=split_conditioning,
         latent=split_latent,
         steps=1,
-        control_seq=split_transition_commit.control_seq,
+        control_seq=split_preparation_commit.control_seq,
     )
     split_sequence, split_sequence_input, split_sequence_control = _prepare_decode(
         split,
@@ -470,7 +470,7 @@ def test_mixed_token_and_flow_match_homogeneous_results():
             step_id=5,
             admissions=(),
             operations=(split_flow,),
-            controls=(split_transition_commit,),
+            controls=(split_preparation_commit,),
             input_products=(),
         )
     )
@@ -525,7 +525,7 @@ def test_mixed_submission_requires_tensorized_model_support():
         shape_bound=ShapeBound((DeviceDim(1 << 20),)),
         point_range=PointRange(),
     )
-    transition, _latent = gen_transition_operation(
+    preparation, _latent = media_prepare_operation(
         flow_admission.request_key,
         op_id=11,
         parent=root_parent(flow_admission),
@@ -537,7 +537,7 @@ def test_mixed_submission_requires_tensorized_model_support():
             execution_batch(
                 step_id=2,
                 admissions=(token_admission,),
-                operations=(token, transition),
+                operations=(token, preparation),
                 input_products=(token_input,),
             )
         )
@@ -665,7 +665,7 @@ def test_failed_flow_preserves_the_next_accepted_trajectory_and_final_artifact()
     worker = execution_worker(block_size=4)
     admission = gen_admission(5, ImageParams(steps=2, height=64, width=64, seed=29))
     conditioning = _publish_conditioning(worker, admission, op_id=40, step_id=12)
-    latent, transition_commit = _transition_generation(
+    latent, preparation_commit = _prepare_media(
         worker,
         admission,
         conditioning,
@@ -673,16 +673,16 @@ def test_failed_flow_preserves_the_next_accepted_trajectory_and_final_artifact()
         parent=root_parent(admission),
         step_id=13,
     )
-    flow, _output_latent = flow_operation(
+    flow, _output_latent = media_denoise_operation(
         admission.request_key,
         op_id=42,
-        parent=transition_commit.selected,
+        parent=preparation_commit.selected,
         conditioning=conditioning,
         latent=latent,
         steps=2,
-        control_seq=transition_commit.control_seq,
+        control_seq=preparation_commit.control_seq,
     )
-    worker.execute(execution_batch(step_id=14, controls=(transition_commit,)))
+    worker.execute(execution_batch(step_id=14, controls=(preparation_commit,)))
     valid_batch = execution_batch(
         step_id=15,
         admissions=(),
@@ -714,14 +714,14 @@ def test_failed_flow_preserves_the_next_accepted_trajectory_and_final_artifact()
     assert failed.completions[0].error_code is ErrorCode.INVALID_OPERATION
     assert failed.completions[0].logical_lengths.latent_len == 0
 
-    replacement, _replacement_latent = flow_operation(
+    replacement, _replacement_latent = media_denoise_operation(
         admission.request_key,
         op_id=43,
-        parent=transition_commit.selected,
+        parent=preparation_commit.selected,
         conditioning=conditioning,
         latent=latent,
         steps=2,
-        control_seq=transition_commit.control_seq,
+        control_seq=preparation_commit.control_seq,
     )
     recovered = worker.execute(execution_batch(step_id=16, operations=(replacement,)))
     assert recovered.completions[0].status is OpStatus.OK
@@ -738,7 +738,7 @@ def test_failed_flow_preserves_the_next_accepted_trajectory_and_final_artifact()
 
     reference = execution_worker(block_size=4)
     reference_conditioning = _publish_conditioning(reference, admission, op_id=40, step_id=12)
-    reference_latent, reference_transition_commit = _transition_generation(
+    reference_latent, reference_preparation_commit = _prepare_media(
         reference,
         admission,
         reference_conditioning,
@@ -746,20 +746,20 @@ def test_failed_flow_preserves_the_next_accepted_trajectory_and_final_artifact()
         parent=root_parent(admission),
         step_id=13,
     )
-    reference_flow, reference_output = flow_operation(
+    reference_flow, reference_output = media_denoise_operation(
         admission.request_key,
         op_id=43,
-        parent=reference_transition_commit.selected,
+        parent=reference_preparation_commit.selected,
         conditioning=reference_conditioning,
         latent=reference_latent,
         steps=2,
-        control_seq=reference_transition_commit.control_seq,
+        control_seq=reference_preparation_commit.control_seq,
     )
     reference_result = reference.execute(
         execution_batch(
             step_id=14,
             operations=(reference_flow,),
-            controls=(reference_transition_commit,),
+            controls=(reference_preparation_commit,),
         )
     )
     assert reference_result.completions[0].status is OpStatus.OK
@@ -784,7 +784,7 @@ def test_mixed_partition_descriptor_failure_preserves_the_other_domain_candidate
         ImageParams(steps=1, height=16, width=16, seed=29),
     )
     conditioning = _publish_conditioning(worker, generation_admission, op_id=1, step_id=1)
-    latent, transition_commit = _transition_generation(
+    latent, preparation_commit = _prepare_media(
         worker,
         generation_admission,
         conditioning,
@@ -800,21 +800,21 @@ def test_mixed_partition_descriptor_failure_preserves_the_other_domain_candidate
         tokens=(7, 8),
     )
     missing_latent = replace(latent, generation=latent.generation + 1000)
-    flow, _output_latent = flow_operation(
+    flow, _output_latent = media_denoise_operation(
         generation_admission.request_key,
         op_id=3,
-        parent=transition_commit.selected,
+        parent=preparation_commit.selected,
         conditioning=conditioning,
         latent=missing_latent,
         steps=1,
-        control_seq=transition_commit.control_seq,
+        control_seq=preparation_commit.control_seq,
     )
     report = worker.execute(
         execution_batch(
             step_id=4,
             admissions=(),
             operations=(sequence, flow),
-            controls=(transition_commit, sequence_control),
+            controls=(preparation_commit, sequence_control),
             input_products=(sequence_input,),
         )
     )
@@ -833,7 +833,7 @@ def test_initial_flow_noise_is_stable_across_operation_schedules():
     for op_id in (41, 109):
         worker = execution_worker()
         conditioning = _publish_conditioning(worker, admission, op_id=1, step_id=1)
-        latent, transition_commit = _transition_generation(
+        latent, preparation_commit = _prepare_media(
             worker,
             admission,
             conditioning,
@@ -843,21 +843,21 @@ def test_initial_flow_noise_is_stable_across_operation_schedules():
             seed=29,
             image_index=3,
         )
-        flow, output_latent = flow_operation(
+        flow, output_latent = media_denoise_operation(
             admission.request_key,
             op_id=op_id + 1,
-            parent=transition_commit.selected,
+            parent=preparation_commit.selected,
             conditioning=conditioning,
             latent=latent,
             steps=1,
-            control_seq=transition_commit.control_seq,
+            control_seq=preparation_commit.control_seq,
         )
         flow_report = worker.execute(
             execution_batch(
                 step_id=3,
                 admissions=(),
                 operations=(flow,),
-                controls=(transition_commit,),
+                controls=(preparation_commit,),
                 input_products=(),
             )
         )
@@ -905,7 +905,7 @@ def test_multi_step_quantum_matches_the_serial_model_artifact(
             ),
         )
         conditioning = _publish_conditioning(worker, admission, op_id=1, step_id=1)
-        latent, commit = _transition_generation(
+        latent, commit = _prepare_media(
             worker,
             admission,
             conditioning,
@@ -918,7 +918,7 @@ def test_multi_step_quantum_matches_the_serial_model_artifact(
         op_id = 3
         while step < 4:
             count = min(step_quantum, 4 - step)
-            operation, successor = flow_operation(
+            operation, successor = media_denoise_operation(
                 admission.request_key,
                 op_id=op_id,
                 parent=commit.selected,
@@ -1022,7 +1022,7 @@ def test_flow_completion_reports_cumulative_denoise_step_in_latent_len():
     worker = execution_worker()
     admission = gen_admission(2, ImageParams(steps=2, height=16, width=16, seed=29))
     conditioning = _publish_conditioning(worker, admission, op_id=1, step_id=1)
-    initial_latent, transition_commit = _transition_generation(
+    initial_latent, preparation_commit = _prepare_media(
         worker,
         admission,
         conditioning,
@@ -1030,26 +1030,26 @@ def test_flow_completion_reports_cumulative_denoise_step_in_latent_len():
         parent=root_parent(admission),
         step_id=2,
     )
-    first, first_latent = flow_operation(
+    first, first_latent = media_denoise_operation(
         admission.request_key,
         op_id=3,
-        parent=transition_commit.selected,
+        parent=preparation_commit.selected,
         conditioning=conditioning,
         latent=initial_latent,
         steps=1,
-        control_seq=transition_commit.control_seq,
+        control_seq=preparation_commit.control_seq,
     )
     first_report = worker.execute(
         execution_batch(
             step_id=3,
             admissions=(),
             operations=(first,),
-            controls=(transition_commit,),
+            controls=(preparation_commit,),
             input_products=(),
         )
     )
     commit = commit_for_completion(first, first_report)
-    second, _second_latent = flow_operation(
+    second, _second_latent = media_denoise_operation(
         admission.request_key,
         op_id=4,
         parent=commit.selected,
@@ -1076,7 +1076,7 @@ def test_trajectory_advances_across_many_generations_and_rejects_a_stale_referen
     worker = execution_worker()
     admission = gen_admission(71, ImageParams(steps=50, height=16, width=16, seed=29))
     conditioning = _publish_conditioning(worker, admission, op_id=1, step_id=1)
-    current, commit = _transition_generation(
+    current, commit = _prepare_media(
         worker,
         admission,
         conditioning,
@@ -1088,7 +1088,7 @@ def test_trajectory_advances_across_many_generations_and_rejects_a_stale_referen
     releasable = None
 
     for index in range(50):
-        operation, successor = flow_operation(
+        operation, successor = media_denoise_operation(
             admission.request_key,
             op_id=3 + index,
             parent=commit.selected,
@@ -1124,7 +1124,7 @@ def test_trajectory_advances_across_many_generations_and_rejects_a_stale_referen
             ),
         )
     )
-    stale_operation, _unused = flow_operation(
+    stale_operation, _unused = media_denoise_operation(
         admission.request_key,
         op_id=54,
         parent=commit.selected,
@@ -1316,7 +1316,7 @@ def test_cross_stage_completion_predicate_preserves_device_continuation() -> Non
     )
     try:
         conditioning = _publish_conditioning(producer, admission, op_id=1, step_id=1)
-        transition, _latent = gen_transition_operation(
+        preparation, _latent = media_prepare_operation(
             admission.request_key,
             op_id=2,
             parent=root_parent(admission),
@@ -1324,31 +1324,31 @@ def test_cross_stage_completion_predicate_preserves_device_continuation() -> Non
             seed=31,
         )
         transitioned = finalized_report(
-            producer.execute(execution_batch(step_id=2, operations=(transition,)))
+            producer.execute(execution_batch(step_id=2, operations=(preparation,)))
         )
-        transition_commit = commit_for_completion(transition, transitioned)
+        preparation_commit = commit_for_completion(preparation, transitioned)
         source = next(
-            output for output in transition.outputs if output.kind is ProductKind.COMPLETION
+            output for output in preparation.outputs if output.kind is ProductKind.COMPLETION
         )
         transferred = replace(source, producer_op_id=3, generation=903)
         transfer = Operation.registered(
             request_key=admission.request_key,
             op_id=3,
-            parent=transition_commit.selected,
+            parent=preparation_commit.selected,
             work=ForwardMode.TRANSFER_PRODUCT,
             route=0,
             domain=Domain.FLOW,
             bounds=Bounds(max_transfer_bytes=source.max_bytes),
             inputs=(source,),
             outputs=(transferred,),
-            control_seq=transition_commit.control_seq,
+            control_seq=preparation_commit.control_seq,
         )
         transfer_report = finalized_report(
             producer.execute(
                 execution_batch(
                     step_id=3,
                     operations=(transfer,),
-                    controls=(transition_commit,),
+                    controls=(preparation_commit,),
                 )
             )
         )
@@ -1389,7 +1389,7 @@ def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact() ->
     consumer = execution_worker(transfer_backend="shm")
     admission = gen_admission(75, ImageParams(steps=1, height=16, width=16, seed=29))
     conditioning = _publish_conditioning(producer, admission, op_id=1, step_id=1)
-    initial_latent, transition_commit = _transition_generation(
+    initial_latent, preparation_commit = _prepare_media(
         producer,
         admission,
         conditioning,
@@ -1397,20 +1397,20 @@ def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact() ->
         parent=root_parent(admission),
         step_id=2,
     )
-    flow, final_latent = flow_operation(
+    flow, final_latent = media_denoise_operation(
         admission.request_key,
         op_id=3,
-        parent=transition_commit.selected,
+        parent=preparation_commit.selected,
         conditioning=conditioning,
         latent=initial_latent,
         steps=1,
-        control_seq=transition_commit.control_seq,
+        control_seq=preparation_commit.control_seq,
     )
     produced = producer.execute(
         execution_batch(
             step_id=3,
             operations=(flow,),
-            controls=(transition_commit,),
+            controls=(preparation_commit,),
         )
     )
     deadline = time.monotonic() + 5.0
@@ -1556,7 +1556,7 @@ def test_generated_feedback_commits_absolute_visual_token_state():
             controls=(first_commit,),
         )
     )
-    initial_latent, transition_commit = _transition_generation(
+    initial_latent, preparation_commit = _prepare_media(
         worker,
         admission,
         conditioning,
@@ -1565,21 +1565,21 @@ def test_generated_feedback_commits_absolute_visual_token_state():
         step_id=3,
         control_seq=first_commit.control_seq,
     )
-    flow, completed_latent = flow_operation(
+    flow, completed_latent = media_denoise_operation(
         admission.request_key,
         op_id=4,
-        parent=transition_commit.selected,
+        parent=preparation_commit.selected,
         conditioning=conditioning,
         latent=initial_latent,
         steps=2,
-        control_seq=transition_commit.control_seq,
+        control_seq=preparation_commit.control_seq,
     )
     flow_report = worker.execute(
         execution_batch(
             step_id=4,
             admissions=(),
             operations=(flow,),
-            controls=(transition_commit,),
+            controls=(preparation_commit,),
             input_products=(),
         )
     )
@@ -1718,7 +1718,7 @@ def test_generated_feedback_commits_absolute_visual_token_state():
             controls=(feedback_commit,),
         )
     )
-    next_latent, _next_transition_commit = _transition_generation(
+    next_latent, _next_preparation_commit = _prepare_media(
         worker,
         admission,
         next_conditioning,
@@ -1728,20 +1728,20 @@ def test_generated_feedback_commits_absolute_visual_token_state():
         control_seq=feedback_commit.control_seq,
         image_index=2,
     )
-    next_flow, next_completed_latent = flow_operation(
+    next_flow, next_completed_latent = media_denoise_operation(
         admission.request_key,
         op_id=10,
-        parent=_next_transition_commit.selected,
+        parent=_next_preparation_commit.selected,
         conditioning=next_conditioning,
         latent=next_latent,
         steps=2,
-        control_seq=_next_transition_commit.control_seq,
+        control_seq=_next_preparation_commit.control_seq,
     )
     next_report = worker.execute(
         execution_batch(
             step_id=10,
             operations=(next_flow,),
-            controls=(_next_transition_commit,),
+            controls=(_next_preparation_commit,),
         )
     )
     assert next_report.completions[0].status is OpStatus.OK

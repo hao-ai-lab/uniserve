@@ -7,9 +7,9 @@ from dataclasses import replace
 import pytest
 
 from tests.python.fixtures.model_execution import TEST_DEPLOYMENT, TEST_MODEL
-from uniserve_worker.execution.batch import ForwardMode
-from uniserve_worker.bootstrap.worker_info import build_worker_info
 from uniserve_worker.bootstrap.capacity import latent_trajectory_bytes, model_arena_capacity
+from uniserve_worker.bootstrap.worker_info import build_worker_info
+from uniserve_worker.execution.batch import ForwardMode
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.foundation.math import ceil_div
 
@@ -25,7 +25,7 @@ def test_worker_info_projects_model_behavior_and_resource_geometry():
     )
 
     assert ForwardMode.TOKEN_EXTEND in info.supported_work
-    assert ForwardMode.GEN_FLOW in info.supported_work
+    assert ForwardMode.MEDIA_DENOISE in info.supported_work
     assert info.mixed_buckets == ()
     assert info.num_layers == TEST_MODEL.cache_geometry.num_layers
     assert info.model_name == "test-model"

@@ -13,7 +13,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
-use uniserve_core::{BlockId, MediaEvent, MediaPlan, MediaRequest, RequestId, SamplingParams};
+use uniserve_core::{BlockId, MediaEvent, MediaGeometry, MediaRequest, RequestId, SamplingParams};
 use uniserve_engine::{
     ControlOp, ControlTokens, EngineHandle, Executor, MultiprocExecutor, Scheduler,
     TransferBackend, WorkerExecError, WorkerKind, WorkerLossError, WorkerProcessArgs,
@@ -71,9 +71,9 @@ fn qualify_failed_media_admission_reclamation() -> anyhow::Result<()> {
                 seed: index as u64,
                 priority: 0,
                 output_path: format!("/tmp/uniserve-media-{request_id:?}.mp4"),
-                plan: MediaPlan {
+                geometry: MediaGeometry {
                     frame_count: 22,
-                    video_decode_units: 1,
+                    video_reconstruction_units: 1,
                     audio_latent_frames: 37,
                     prompt_tokens,
                     denoise_steps: 4,
@@ -815,7 +815,7 @@ fn token_batch(
             query_len: input_length.max(1),
         }],
         latent_placements: Vec::new(),
-        decode_placements: Vec::new(),
+        reconstruction_placements: Vec::new(),
     };
     Batch::new(step_id, admission.into_iter().collect(), vec![partition]).with_input_products(vec![
         ProductPayload {

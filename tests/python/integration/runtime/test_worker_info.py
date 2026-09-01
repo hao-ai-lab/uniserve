@@ -5,9 +5,9 @@ from __future__ import annotations
 import pytest
 
 from tests.python.fixtures.execution_worker import execution_worker
-from uniserve_worker.execution.batch import ForwardMode, SamplingOwnership
-from uniserve_worker.bootstrap.worker_info import build_worker_info
 from uniserve_worker.bootstrap.capacity import operation_window
+from uniserve_worker.bootstrap.worker_info import build_worker_info
+from uniserve_worker.execution.batch import ForwardMode, SamplingOwnership
 from uniserve_worker.models.runtime import ExecutionModel, ResourceGeometry, WorkerDeployment
 from uniserve_worker.server.app import dispatch
 
@@ -33,7 +33,7 @@ def test_action_model_reports_zero_kv_geometry() -> None:
     class ActionModel(ExecutionModel):
         architecture = "ActionModel"
         resource_geometry = ResourceGeometry(kv=False)
-        supported_work = frozenset({ForwardMode.GEN_DECODE})
+        supported_work = frozenset({ForwardMode.MEDIA_RECONSTRUCT})
         generation = None
 
     deployment = WorkerDeployment(

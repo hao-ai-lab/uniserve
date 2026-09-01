@@ -37,7 +37,7 @@ pub struct RouteId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
-pub enum DecodeKind {
+pub enum ReconstructionKind {
     Video,
     Audio,
 }
@@ -64,10 +64,10 @@ pub enum ForwardMode {
     TransferProduct = 6,
     TransferKvPublish = 7,
     TransferKvInstall = 8,
-    GenTransition = 9,
-    GenFlow = 10,
+    MediaPrepare = 9,
+    MediaDenoise = 10,
     Materialize = 11,
-    GenDecode = 12,
+    MediaReconstruct = 12,
 }
 
 /// Configured or resolved worker attention implementation.
@@ -176,10 +176,10 @@ impl ForwardMode {
         Self::TransferProduct,
         Self::TransferKvPublish,
         Self::TransferKvInstall,
-        Self::GenTransition,
-        Self::GenFlow,
+        Self::MediaPrepare,
+        Self::MediaDenoise,
         Self::Materialize,
-        Self::GenDecode,
+        Self::MediaReconstruct,
     ];
 
     /// Whether a variant advances the authoritative request lineage.
@@ -189,9 +189,9 @@ impl ForwardMode {
             Self::TokenExtend
                 | Self::TokenDecode
                 | Self::TokenVerify
-                | Self::GenTransition
-                | Self::GenFlow
-                | Self::GenDecode
+                | Self::MediaPrepare
+                | Self::MediaDenoise
+                | Self::MediaReconstruct
         )
     }
 
@@ -204,9 +204,10 @@ impl ForwardMode {
     pub const fn domain(self) -> Domain {
         match self {
             Self::TokenDecode | Self::TokenVerify | Self::Draft => Domain::Decode,
-            Self::GenTransition | Self::GenFlow | Self::GenDecode | Self::Materialize => {
-                Domain::Flow
-            }
+            Self::MediaPrepare
+            | Self::MediaDenoise
+            | Self::MediaReconstruct
+            | Self::Materialize => Domain::Flow,
             Self::TokenExtend
             | Self::EncodeVision
             | Self::EncodeLatent
@@ -227,10 +228,10 @@ impl ForwardMode {
             Self::TransferProduct => "transfer_product",
             Self::TransferKvPublish => "transfer_kv_publish",
             Self::TransferKvInstall => "transfer_kv_install",
-            Self::GenTransition => "gen_transition",
-            Self::GenFlow => "gen_flow",
+            Self::MediaPrepare => "media_prepare",
+            Self::MediaDenoise => "media_denoise",
             Self::Materialize => "materialize",
-            Self::GenDecode => "gen_decode",
+            Self::MediaReconstruct => "media_reconstruct",
         }
     }
 }
@@ -752,9 +753,9 @@ pub struct GenAdmission {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MediaPlan {
+pub struct MediaGeometry {
     pub frame_count: u32,
-    pub video_decode_units: u32,
+    pub video_reconstruction_units: u32,
     pub audio_latent_frames: u32,
     pub prompt_tokens: u32,
     pub denoise_steps: u32,
@@ -766,7 +767,7 @@ pub struct MediaAdmission {
     pub seed: u64,
     pub profile: MediaProfileId,
     pub output_path: String,
-    pub plan: MediaPlan,
+    pub geometry: MediaGeometry,
 }
 
 /// Session establishment framing. Carries the per-domain parameters a lineage
@@ -852,18 +853,19 @@ impl NewRequest {
                 "media admission output path must not be empty"
             );
             ensure_valid!(
-                media.plan.frame_count >= 22
-                    && media.plan.frame_count % 17 == 5
-                    && media.plan.video_decode_units == (media.plan.frame_count - 5) / 17
-                    && u64::from(media.plan.audio_latent_frames)
-                        == uniserve_core::MediaPlan::required_audio_latent_frames(
-                            media.plan.frame_count,
+                media.geometry.frame_count >= 22
+                    && media.geometry.frame_count % 17 == 5
+                    && media.geometry.video_reconstruction_units
+                        == (media.geometry.frame_count - 5) / 17
+                    && u64::from(media.geometry.audio_latent_frames)
+                        == uniserve_core::MediaGeometry::required_audio_latent_frames(
+                            media.geometry.frame_count,
                         )
-                    && media.plan.prompt_tokens > 0
-                    && usize::try_from(media.plan.prompt_tokens).ok()
+                    && media.geometry.prompt_tokens > 0
+                    && usize::try_from(media.geometry.prompt_tokens).ok()
                         == Some(media.prompt_token_ids.len())
-                    && media.plan.denoise_steps == 4,
-                "media admission plan is invalid"
+                    && media.geometry.denoise_steps == 4,
+                "media admission geometry is invalid"
             );
         }
         Ok(())
@@ -898,8 +900,8 @@ pub struct BatchPartition {
     /// Complete scheduler-owned latent mappings for operations that address a
     /// generation trajectory.
     pub latent_placements: Vec<LatentPlacement>,
-    /// Fixed-profile media decode units owned by GenDecode operations.
-    pub decode_placements: Vec<DecodePlacement>,
+    /// Fixed-profile media reconstruction units owned by MediaReconstruct operations.
+    pub reconstruction_placements: Vec<ReconstructionPlacement>,
 }
 
 /// One scheduler-owned request-slot block table.
@@ -1015,23 +1017,23 @@ impl LatentPlacement {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DecodePlacement {
+pub struct ReconstructionPlacement {
     pub request_key: RequestKey,
     pub op_id: OpId,
-    pub kind: DecodeKind,
+    pub kind: ReconstructionKind,
     pub start_unit: u32,
     pub unit_count: u32,
 }
 
-impl DecodePlacement {
+impl ReconstructionPlacement {
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
             self.op_id.0 > 0,
-            "decode placement operation id must be positive"
+            "reconstruction placement operation id must be positive"
         );
         ensure_valid!(
             self.unit_count > 0,
-            "decode placement unit count must be positive"
+            "reconstruction placement unit count must be positive"
         );
         Ok(())
     }
@@ -1114,7 +1116,7 @@ impl BatchPartition {
             })?;
             let addresses_trajectory = matches!(
                 operation.work,
-                ForwardMode::GenTransition | ForwardMode::GenFlow
+                ForwardMode::MediaPrepare | ForwardMode::MediaDenoise
             ) || operation
                 .inputs
                 .iter()
@@ -1134,7 +1136,7 @@ impl BatchPartition {
         for operation in &self.operations {
             let needs_latent = matches!(
                 operation.work,
-                ForwardMode::GenTransition | ForwardMode::GenFlow
+                ForwardMode::MediaPrepare | ForwardMode::MediaDenoise
             ) || operation
                 .inputs
                 .iter()
@@ -1144,27 +1146,27 @@ impl BatchPartition {
                 "operation that addresses a trajectory has no latent placement"
             );
         }
-        let mut decode_ids = HashSet::with_capacity(self.decode_placements.len());
-        for placement in &self.decode_placements {
+        let mut reconstruction_ids = HashSet::with_capacity(self.reconstruction_placements.len());
+        for placement in &self.reconstruction_placements {
             placement.validate()?;
             let identity = (placement.request_key, placement.op_id);
             ensure_valid!(
-                decode_ids.insert(identity),
-                "batch partition repeats a decode placement identity"
+                reconstruction_ids.insert(identity),
+                "batch partition repeats a reconstruction placement identity"
             );
             let operation = operations.get(&identity).ok_or_else(|| {
-                invalid_message!("decode placement does not name a partition operation")
+                invalid_message!("reconstruction placement does not name a partition operation")
             })?;
             ensure_valid!(
-                operation.work == ForwardMode::GenDecode,
-                "decode placement does not name a GenDecode operation"
+                operation.work == ForwardMode::MediaReconstruct,
+                "reconstruction placement does not name a media reconstruction operation"
             );
         }
         for operation in &self.operations {
             ensure_valid!(
-                operation.work != ForwardMode::GenDecode
-                    || decode_ids.contains(&(operation.request_key, operation.op_id)),
-                "GenDecode operation has no decode placement"
+                operation.work != ForwardMode::MediaReconstruct
+                    || reconstruction_ids.contains(&(operation.request_key, operation.op_id)),
+                "media reconstruction operation has no reconstruction placement"
             );
         }
         Ok(())

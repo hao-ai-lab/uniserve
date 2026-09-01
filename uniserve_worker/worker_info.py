@@ -280,15 +280,13 @@ class WorkerInfo:
         addresses_latent = any(
             variant
             in {
-                ForwardMode.GEN_TRANSITION,
-                ForwardMode.GEN_FLOW,
+                ForwardMode.MEDIA_PREPARE,
+                ForwardMode.MEDIA_DENOISE,
             }
             for variant in self.supported_work
         )
         if addresses_latent and ResourceClass.IMAGE_LATENT not in self.resource_classes:
-            raise invalid_descriptor(
-                "worker info advertise latent work without a latent page pool"
-            )
+            raise invalid_descriptor("worker info advertise latent work without a latent page pool")
         if not self.model_name or self.weight_version < 0:
             raise invalid_descriptor("worker model name and weight version are invalid")
 

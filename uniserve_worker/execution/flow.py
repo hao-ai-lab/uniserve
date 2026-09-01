@@ -39,7 +39,7 @@ from .rows import ForwardRow, LatentExecution, OperationState, Outcome, Partitio
 
 
 def pack_forward(runtime: ExecutionResources, state: OperationState) -> tuple[object, ...]:
-    if state.operation.work is not ForwardMode.GEN_FLOW:
+    if state.operation.work is not ForwardMode.MEDIA_DENOISE:
         return ()
     if state.phase == "initial":
         _initialize(runtime, state)
@@ -220,7 +220,7 @@ def _prepare_step(runtime: ExecutionResources, state: OperationState) -> None:
     entries = data["entries"]
     descriptors = partition.forward_rows.get(runtime.operation_identity(operation), ())
     if len(descriptors) < len(guide.branches):
-        raise invalid_descriptor("generation flow has incomplete forward-row metadata")
+        raise invalid_descriptor("media denoise has incomplete forward-row metadata")
     denoise_descriptors = descriptors[-len(guide.branches) :]
     for branch_index, branch in enumerate(guide.branches):
         if branch in entries:

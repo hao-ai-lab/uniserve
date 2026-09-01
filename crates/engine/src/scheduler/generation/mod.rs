@@ -441,7 +441,7 @@ pub(crate) enum GenerationPhase {
     DecodeUnd,
     CloseKv,
     PublishKv,
-    TransitionGen,
+    PrepareGen,
     DenoiseGen,
     CommitGen,
     FeedbackEncode,
@@ -642,9 +642,9 @@ impl GenerationCursor {
                 if self.image_gen.conditioning.is_none() {
                     return Err(CursorApplyError::MissingKvProduct);
                 }
-                self.phase = GenerationPhase::TransitionGen;
+                self.phase = GenerationPhase::PrepareGen;
             }
-            TransitionIntent::TransitionGen { .. } => {
+            TransitionIntent::PrepareGen { .. } => {
                 self.image_gen.latent = operation
                     .outputs
                     .iter()
@@ -919,7 +919,7 @@ pub(crate) enum TransitionIntent {
         image_id: u32,
         physical_kv_len: u32,
     },
-    TransitionGen {
+    PrepareGen {
         image_id: u32,
         physical_kv_len: u32,
         latent_units: u64,
@@ -1058,11 +1058,11 @@ pub(crate) fn plan(
             plan_encode(request, cursor, intent)
         }
         intent @ TransitionIntent::PublishKv { .. } => plan_kv_publish(request, cursor, intent),
-        intent @ TransitionIntent::TransitionGen { .. } => {
-            plan_gen_transition(latent_dtype, request, cursor, intent)
+        intent @ TransitionIntent::PrepareGen { .. } => {
+            plan_media_prepare(latent_dtype, request, cursor, intent)
         }
         intent @ TransitionIntent::DenoiseGen { .. } => {
-            plan_gen_flow(latent_dtype, request, cursor, intent)
+            plan_media_denoise(latent_dtype, request, cursor, intent)
         }
         intent @ TransitionIntent::CommitGen { .. } => plan_materialize(request, cursor, intent),
     }
@@ -1293,7 +1293,7 @@ fn plan_kv_publish(
     )
 }
 
-fn plan_gen_transition(
+fn plan_media_prepare(
     latent_dtype: Option<DType>,
     request: &GenerationRequest,
     cursor: &GenerationCursor,
@@ -1302,15 +1302,15 @@ fn plan_gen_transition(
     if !request.behavior.gen_output {
         return Err(PlanningError::GenerationBranchDisabled);
     }
-    let TransitionIntent::TransitionGen { conditioning, .. } = &intent else {
-        unreachable!("generation-transition planner received another forward mode")
+    let TransitionIntent::PrepareGen { conditioning, .. } = &intent else {
+        unreachable!("media-prepare planner received another forward mode")
     };
     let inputs = vec![conditioning.clone()];
     finish_plan(
         request,
         cursor,
         intent,
-        ForwardMode::GenTransition,
+        ForwardMode::MediaPrepare,
         inputs,
         vec![
             latent_output(
@@ -1328,7 +1328,7 @@ fn plan_gen_transition(
     )
 }
 
-fn plan_gen_flow(
+fn plan_media_denoise(
     latent_dtype: Option<DType>,
     request: &GenerationRequest,
     cursor: &GenerationCursor,
@@ -1343,14 +1343,14 @@ fn plan_gen_flow(
         ..
     } = &intent
     else {
-        unreachable!("generation-flow planner received another forward mode")
+        unreachable!("media-denoise planner received another forward mode")
     };
     let inputs = vec![conditioning.clone(), latent.clone()];
     finish_plan(
         request,
         cursor,
         intent,
-        ForwardMode::GenFlow,
+        ForwardMode::MediaDenoise,
         inputs,
         vec![
             latent_output(
@@ -1413,7 +1413,7 @@ fn finish_plan(
     let operation_variant = work;
     let produces_latent = matches!(
         operation_variant,
-        ForwardMode::GenTransition | ForwardMode::GenFlow
+        ForwardMode::MediaPrepare | ForwardMode::MediaDenoise
     );
     let is_materialize = operation_variant == ForwardMode::Materialize;
     let produces_token = outputs
@@ -1451,7 +1451,7 @@ fn finish_plan(
         TransitionIntent::PublishKv { .. } => 0,
         TransitionIntent::DenoiseGen { step_count, .. } => usize::from((*step_count).max(1)),
         TransitionIntent::EncodeImageStep { .. }
-        | TransitionIntent::TransitionGen { .. }
+        | TransitionIntent::PrepareGen { .. }
         | TransitionIntent::CloseKv { .. }
         | TransitionIntent::CommitGen { .. }
         | TransitionIntent::EncodeFeedbackStep { .. } => 1,
@@ -1530,7 +1530,7 @@ fn finish_plan(
         _ => cursor.replay.replayability,
     };
     let latent_units = match &intent {
-        TransitionIntent::TransitionGen { latent_units, .. }
+        TransitionIntent::PrepareGen { latent_units, .. }
         | TransitionIntent::DenoiseGen { latent_units, .. } => *latent_units,
         _ => 0,
     };
@@ -1650,7 +1650,7 @@ fn finish_plan(
         max_transfer_bytes,
     };
     let rng = match &intent {
-        TransitionIntent::TransitionGen { image_id, .. } => Some(Rng {
+        TransitionIntent::PrepareGen { image_id, .. } => Some(Rng {
             seed: request.image.seed.unwrap_or(0),
             semantic_index_base: u64::from(*image_id),
             draw_layout: DrawLayout::FlowNoise,
@@ -1762,7 +1762,7 @@ fn transition_kv_target(intent: &TransitionIntent) -> Option<usize> {
         } => physical_position.saturating_add(1),
         TransitionIntent::EncodeImageStep { .. }
         | TransitionIntent::PublishKv { .. }
-        | TransitionIntent::TransitionGen { .. }
+        | TransitionIntent::PrepareGen { .. }
         | TransitionIntent::DenoiseGen { .. }
         | TransitionIntent::CommitGen { .. }
         | TransitionIntent::EncodeFeedbackStep { .. } => return None,

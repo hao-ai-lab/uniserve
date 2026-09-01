@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use uniserve_core::MediaPlan;
+use uniserve_core::MediaGeometry;
 
 /// Frontend-owned metadata and the compact fixed-profile media input.
 #[derive(Debug, Clone)]
@@ -9,7 +9,7 @@ pub struct MediaSubmission {
     pub seed: u64,
     pub priority: i32,
     pub output_path: String,
-    pub plan: MediaPlan,
+    pub geometry: MediaGeometry,
     pub arrival_time: Option<f64>,
     pub data_parallel_rank: Option<u32>,
     pub trace_headers: Option<BTreeMap<String, String>>,
@@ -21,7 +21,7 @@ impl MediaSubmission {
         prompt_token_ids: Vec<u32>,
         seed: u64,
         output_path: impl Into<String>,
-        plan: MediaPlan,
+        geometry: MediaGeometry,
     ) -> Self {
         Self {
             external_request_id: external_request_id.into(),
@@ -29,7 +29,7 @@ impl MediaSubmission {
             seed,
             priority: 0,
             output_path: output_path.into(),
-            plan,
+            geometry,
             arrival_time: None,
             data_parallel_rank: None,
             trace_headers: None,

@@ -16,7 +16,7 @@ from .nsys_timeline import transform_timeline
 class NsysCapture:
     """Delay collection through warmup, then finalize one managed-server report."""
 
-    def __init__(self, point_name: str, output_dir: Path) -> None:
+    def __init__(self, point_name: str, output_dir: Path, *, trace_cuda: bool = True) -> None:
         executable = shutil.which("nsys")
         if executable is None:
             raise RuntimeError("Nsight Systems is required for --nsys")
@@ -27,6 +27,7 @@ class NsysCapture:
         self.session = f"uniserve_eval_{os.getpid()}_{slug}"
         self.report_prefix = self.output_dir / "trace"
         self.log_path = self.output_dir / "nsys.log"
+        self.trace_cuda = trace_cuda
         self._started = False
         self._stopped = False
 
@@ -34,6 +35,15 @@ class NsysCapture:
         if self.output_dir.exists() and any(self.output_dir.iterdir()):
             raise FileExistsError(f"nsys result directory is not empty: {self.output_dir}")
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        trace = "cuda,nvtx,osrt,cublas,cudnn" if self.trace_cuda else "nvtx,osrt"
+        cuda_options = (
+            (
+                "--cuda-graph-trace=node",
+                "--cuda-event-trace=false",
+            )
+            if self.trace_cuda
+            else ()
+        )
         command = (
             self.executable,
             "profile",
@@ -41,9 +51,8 @@ class NsysCapture:
             f"--session-new={self.session}",
             "--force-overwrite=true",
             f"--output={self.report_prefix}",
-            "--trace=cuda,nvtx,osrt,cublas,cudnn",
-            "--cuda-graph-trace=node",
-            "--cuda-event-trace=false",
+            f"--trace={trace}",
+            *cuda_options,
             "--sample=process-tree",
             "--cpuctxsw=process-tree",
             "--wait=all",
@@ -86,7 +95,12 @@ class NsysCapture:
             str(report),
         )
         timeline = self.output_dir / "timeline.sqlite"
-        transform_timeline(exported, timeline, point_name=self.point_name)
+        transform_timeline(
+            exported,
+            timeline,
+            point_name=self.point_name,
+            require_cuda=self.trace_cuda,
+        )
         manifest = {
             "point": self.point_name,
             "session": self.session,
@@ -102,8 +116,10 @@ class NsysCapture:
         return {
             "session": self.session,
             "output_directory": str(self.output_dir),
-            "trace": ["cuda", "nvtx", "osrt", "cublas", "cudnn"],
-            "cuda_graph_trace": "node",
+            "trace": (
+                ["cuda", "nvtx", "osrt", "cublas", "cudnn"] if self.trace_cuda else ["nvtx", "osrt"]
+            ),
+            "cuda_graph_trace": "node" if self.trace_cuda else None,
             "measurement_window": "post-warmup load",
         }
 

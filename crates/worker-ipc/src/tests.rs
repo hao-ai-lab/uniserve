@@ -193,9 +193,9 @@ fn media_admission(prompt_token_ids: Vec<u32>) -> NewRequest {
         request_key(),
         u32::try_from(request_key().session_id.0).unwrap(),
         MediaAdmission {
-            plan: MediaPlan {
+            geometry: MediaGeometry {
                 frame_count: 22,
-                video_decode_units: 1,
+                video_reconstruction_units: 1,
                 audio_latent_frames: 37,
                 prompt_tokens: u32::try_from(prompt_token_ids.len()).unwrap(),
                 denoise_steps: 4,
@@ -268,7 +268,7 @@ fn partitions_for_operations(operations: Vec<Operation>) -> Vec<BatchPartition> 
                 .filter(|operation| {
                     matches!(
                         operation.work,
-                        ForwardMode::GenTransition | ForwardMode::GenFlow
+                        ForwardMode::MediaPrepare | ForwardMode::MediaDenoise
                     ) || operation
                         .inputs
                         .iter()
@@ -282,7 +282,18 @@ fn partitions_for_operations(operations: Vec<Operation>) -> Vec<BatchPartition> 
                     height: 1,
                     width: 1,
                     start_step: 0,
-                    step_count: u32::from(operation.work == ForwardMode::GenFlow),
+                    step_count: u32::from(operation.work == ForwardMode::MediaDenoise),
+                })
+                .collect();
+            let reconstruction_placements = operations
+                .iter()
+                .filter(|operation| operation.work == ForwardMode::MediaReconstruct)
+                .map(|operation| ReconstructionPlacement {
+                    request_key: operation.request_key,
+                    op_id: operation.op_id,
+                    kind: ReconstructionKind::Video,
+                    start_unit: 0,
+                    unit_count: 1,
                 })
                 .collect();
             BatchPartition {
@@ -298,7 +309,7 @@ fn partitions_for_operations(operations: Vec<Operation>) -> Vec<BatchPartition> 
                 new_cache_pages,
                 forward_rows,
                 latent_placements,
-                decode_placements: Vec::new(),
+                reconstruction_placements,
             }
         })
         .collect()
@@ -345,8 +356,9 @@ fn every_work_variant_round_trips_through_ipc() {
         (ForwardMode::TransferProduct, false, Domain::Prefill),
         (ForwardMode::TransferKvPublish, false, Domain::Prefill),
         (ForwardMode::TransferKvInstall, false, Domain::Prefill),
-        (ForwardMode::GenTransition, true, Domain::Flow),
-        (ForwardMode::GenFlow, true, Domain::Flow),
+        (ForwardMode::MediaPrepare, true, Domain::Flow),
+        (ForwardMode::MediaDenoise, true, Domain::Flow),
+        (ForwardMode::MediaReconstruct, true, Domain::Flow),
         (ForwardMode::Materialize, false, Domain::Flow),
     ];
     for (index, (work, advances, domain)) in variants.into_iter().enumerate() {
@@ -515,7 +527,7 @@ fn maximum_media_prompt_round_trips() {
     let request = WorkerRequest::execute(batch_with_operations(
         5,
         vec![admission.clone()],
-        vec![operation_for(ForwardMode::GenTransition, OpId(12), true)],
+        vec![operation_for(ForwardMode::MediaPrepare, OpId(12), true)],
     ));
 
     let decoded = decode_request(&encode_request(&request).unwrap()).unwrap();
@@ -727,7 +739,7 @@ fn kv_free_worker_info_round_trips() {
         num_layers: 0,
         num_kv_heads: 0,
         head_dim: 0,
-        supported_work: vec![ForwardMode::GenTransition, ForwardMode::GenFlow],
+        supported_work: vec![ForwardMode::MediaPrepare, ForwardMode::MediaDenoise],
         latent_page_units: 64,
         num_latent_pages: 3,
         latent_width: 1,
@@ -904,8 +916,9 @@ fn comprehensive_batch() -> Batch {
         ForwardMode::TransferProduct,
         ForwardMode::TransferKvPublish,
         ForwardMode::TransferKvInstall,
-        ForwardMode::GenTransition,
-        ForwardMode::GenFlow,
+        ForwardMode::MediaPrepare,
+        ForwardMode::MediaDenoise,
+        ForwardMode::MediaReconstruct,
         ForwardMode::Materialize,
     ];
     let mut operations = Vec::new();

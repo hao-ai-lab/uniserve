@@ -3,11 +3,22 @@
 from __future__ import annotations
 
 import argparse
+import json
 from collections.abc import Sequence
 
 from ..server.worker_kind import WorkerKind
 from .capacity import DEFAULT_BLOCK_SIZE, DEFAULT_MAX_BATCH_OPS
 from .config import WorkerProcessArgs
+
+
+def _json_object(value: str) -> dict[str, object]:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise argparse.ArgumentTypeError(f"invalid JSON: {error.msg}") from error
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError("quantization config must be a JSON object")
+    return parsed
 
 
 def create_worker_cli_parser() -> argparse.ArgumentParser:
@@ -40,29 +51,13 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--attention-backend", default="auto")
     parser.add_argument(
-        "--linear-precision",
-        choices=("fp8", "nvfp4"),
-        default="fp8",
-    )
-    parser.add_argument(
-        "--h3-transformer-attention-precision",
-        choices=("fp8", "nvfp4"),
-        default=None,
-    )
-    parser.add_argument(
-        "--h3-transformer-mlp-precision",
-        choices=("fp8", "nvfp4"),
-        default=None,
-    )
-    parser.add_argument(
-        "--h3-text-encoder-precision",
-        choices=("bf16", "nvfp4"),
-        default=None,
-    )
-    parser.add_argument(
-        "--h3-video-vae-precision",
-        choices=("fp16", "bf16", "nvfp4"),
-        default=None,
+        "--quantization-config",
+        type=_json_object,
+        default={},
+        help=(
+            'JSON quantization policy, for example {"mode":"balanced"}; '
+            "an empty object selects the model-owned default"
+        ),
     )
     parser.add_argument(
         "--load-format",
@@ -146,7 +141,6 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--media-spool", default=None)
     parser.add_argument("--max-model-len", type=int, default=8192)
     parser.add_argument("--max-video-seconds", type=float, default=15.0)
-    parser.add_argument("--fixed-graph-cache-capacity", type=int, default=32)
     return parser
 
 

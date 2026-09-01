@@ -23,7 +23,8 @@ impl Scheduler {
 
     fn reserve_transition_resources(&mut self, transition: &mut NextOp) -> bool {
         let id = transition.request_id;
-        if transition.operation_variant == ForwardMode::GenFlow && !self.ensure_flow_prefix(id) {
+        if transition.operation_variant == ForwardMode::MediaDenoise && !self.ensure_flow_prefix(id)
+        {
             return false;
         }
         let resources = &transition.resources;
@@ -122,7 +123,7 @@ impl Scheduler {
                     continue;
                 }
             }
-            if next_type == Some(ForwardMode::GenFlow)
+            if next_type == Some(ForwardMode::MediaDenoise)
                 && (denoise_occupies_decode_pipeline
                     || !self.flow_prefix_is_schedulable(id)
                     || !self.can_schedule_denoise(id))
@@ -134,7 +135,7 @@ impl Scheduler {
             // the flag is set a flow op only opens an empty batch, and the loop
             // below closes the batch as soon as one is placed.
             if self.flow_exclusive_batch
-                && next_type == Some(ForwardMode::GenFlow)
+                && next_type == Some(ForwardMode::MediaDenoise)
                 && !(ops.is_empty() && mixed_ops.is_empty())
             {
                 continue;
@@ -202,13 +203,13 @@ impl Scheduler {
                     admissions.push(admission);
                 }
                 selected.insert(id);
-                let placed_flow = op.operation_variant == ForwardMode::GenFlow;
+                let placed_denoise = op.operation_variant == ForwardMode::MediaDenoise;
                 if mixed_prefill {
                     mixed_ops.push(op);
                 } else {
                     ops.push(op);
                 }
-                if self.flow_exclusive_batch && placed_flow {
+                if self.flow_exclusive_batch && placed_denoise {
                     budget = 0;
                 }
             }
@@ -284,10 +285,10 @@ impl Scheduler {
                 | ForwardMode::Materialize
                 | ForwardMode::TransferKvInstall,
             ) => 1,
-            Some(ForwardMode::GenFlow | ForwardMode::GenDecode) => 2,
+            Some(ForwardMode::MediaDenoise | ForwardMode::MediaReconstruct) => 2,
             Some(
                 ForwardMode::Draft
-                | ForwardMode::GenTransition
+                | ForwardMode::MediaPrepare
                 | ForwardMode::TransferProduct
                 | ForwardMode::TransferKvPublish,
             )
@@ -329,11 +330,11 @@ impl Scheduler {
             Phase::DecodeUnd => ForwardMode::TokenDecode,
             Phase::CloseKv => ForwardMode::TokenExtend,
             Phase::PublishKv => ForwardMode::TransferKvPublish,
-            Phase::TransitionGen => ForwardMode::GenTransition,
+            Phase::PrepareGen => ForwardMode::MediaPrepare,
             Phase::DenoiseGen if st.cursor.image_gen.steps_done >= st.req.image.steps => {
                 ForwardMode::Materialize
             }
-            Phase::DenoiseGen => ForwardMode::GenFlow,
+            Phase::DenoiseGen => ForwardMode::MediaDenoise,
             Phase::CommitGen => ForwardMode::Materialize,
             Phase::FeedbackEncode => {
                 let feedback = st.req.policy.feedback.as_ref()?;
@@ -555,12 +556,12 @@ impl Scheduler {
                 }
             };
             let operation_identity = (operation.request_key, operation.op_id);
-            if operation.work == ForwardMode::GenFlow {
+            if operation.work == ForwardMode::MediaDenoise {
                 let conditioning_tokens = match &apply.intent {
                     TransitionIntent::DenoiseGen {
                         physical_kv_len, ..
                     } => *physical_kv_len,
-                    _ => unreachable!("generation flow has a non-flow scheduler delta"),
+                    _ => unreachable!("media denoise has a non-flow scheduler delta"),
                 };
                 let query_len = u32::try_from(
                     self.running
@@ -638,7 +639,7 @@ impl Scheduler {
             }
             if matches!(
                 operation.work,
-                ForwardMode::GenTransition | ForwardMode::GenFlow
+                ForwardMode::MediaPrepare | ForwardMode::MediaDenoise
             ) || operation
                 .inputs
                 .iter()
@@ -656,7 +657,7 @@ impl Scheduler {
                         step_count,
                         ..
                     } => (u32::from(*start_step), u32::from(*step_count)),
-                    TransitionIntent::TransitionGen { .. } => (0, 0),
+                    TransitionIntent::PrepareGen { .. } => (0, 0),
                     TransitionIntent::CommitGen { step, .. } => (u32::from(*step), 0),
                     _ => {
                         tracing::error!(
@@ -960,7 +961,7 @@ impl Scheduler {
                         new_cache_pages: partition_new_cache_pages,
                         forward_rows: partition_forward_rows,
                         latent_placements,
-                        decode_placements: Vec::new(),
+                        reconstruction_placements: Vec::new(),
                     });
                     next_partition_id = next_partition_id.saturating_add(1);
                 }
@@ -994,7 +995,7 @@ impl Scheduler {
                     new_cache_pages: partition_new_cache_pages,
                     forward_rows: partition_forward_rows,
                     latent_placements,
-                    decode_placements: Vec::new(),
+                    reconstruction_placements: Vec::new(),
                 });
                 next_partition_id = next_partition_id.saturating_add(1);
                 next_submission_group = next_submission_group.saturating_add(1);
@@ -1301,7 +1302,7 @@ impl Scheduler {
                     physical_kv_len: projection.und.physical_kv_len,
                 },
             ),
-            Phase::TransitionGen => {
+            Phase::PrepareGen => {
                 let st = self.running.get(&id)?;
                 let conditioning = projected_branch.image_gen.conditioning.clone()?;
                 let image_id = projected_branch.image_gen.image_id;
@@ -1309,7 +1310,7 @@ impl Scheduler {
                 self.plan_intent(
                     id,
                     &projection,
-                    TransitionIntent::TransitionGen {
+                    TransitionIntent::PrepareGen {
                         image_id,
                         physical_kv_len: projection.und.physical_kv_len,
                         latent_units,

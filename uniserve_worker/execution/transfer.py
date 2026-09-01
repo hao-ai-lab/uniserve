@@ -24,7 +24,7 @@ from uniserve_worker.execution.batch import (
     TokenSpan,
     TransferMode,
 )
-from uniserve_worker.foundation.errors import unsupported_setup, invalid_descriptor
+from uniserve_worker.foundation.errors import invalid_descriptor, unsupported_setup
 from uniserve_worker.runtime.device_products import ImageRange, device_product_storage
 from uniserve_worker.runtime.latent_pool import LatentPublication
 from uniserve_worker.server.completion import DeferredTransferPayload
@@ -39,8 +39,8 @@ def run_action(runtime: ExecutionResources, state: OperationState) -> bool:
     if state.phase != "initial":
         return False
     work = state.operation.work
-    if work is ForwardMode.GEN_TRANSITION and runtime.latent_pool is not None:
-        _transition(runtime, state)
+    if work is ForwardMode.MEDIA_PREPARE and runtime.latent_pool is not None:
+        _prepare_media(runtime, state)
         return True
     if work.transfer_mode is not None or work is ForwardMode.DRAFT:
         _transfer(runtime, state)
@@ -48,8 +48,7 @@ def run_action(runtime: ExecutionResources, state: OperationState) -> bool:
     return False
 
 
-def _transition(runtime: ExecutionResources, state: OperationState) -> None:
-
+def _prepare_media(runtime: ExecutionResources, state: OperationState) -> None:
     operation = state.operation
     partition = state.partition
     runtime.generation()
@@ -62,7 +61,7 @@ def _transition(runtime: ExecutionResources, state: OperationState) -> None:
     )
     if len(conditioning) != 1 or len(latent_outputs) != 1:
         raise invalid_descriptor(
-            "generation transition requires one exact conditioning input and latent output"
+            "media preparation requires one exact conditioning input and latent output"
         )
     cache = runtime.cache_coordinates(operation, partition)
     session = runtime.request_row(partition, session_id)
@@ -76,21 +75,19 @@ def _transition(runtime: ExecutionResources, state: OperationState) -> None:
     )
     image = session.image
     if image is None:
-        raise invalid_descriptor("generation transition has no admitted image parameters")
+        raise invalid_descriptor("media preparation has no admitted image parameters")
     if session.latent_product is not None or session.flow_step != 0:
-        raise invalid_descriptor("generation transition repeats an active latent trajectory")
+        raise invalid_descriptor("media preparation repeats an active latent trajectory")
     rng = operation.rng
     if rng is None or rng.draw_layout is not DrawLayout.FLOW_NOISE:
-        raise invalid_descriptor(
-            "generation transition requires semantic flow-noise RNG coordinates"
-        )
+        raise invalid_descriptor("media preparation requires semantic flow-noise RNG coordinates")
     if int(rng.seed) != int(image.seed or 0):
-        raise invalid_descriptor("generation transition seed disagrees with admitted image seed")
+        raise invalid_descriptor("media preparation seed disagrees with admitted image seed")
     if int(rng.semantic_index_base) < 1:
         raise invalid_descriptor("flow-noise semantic image index must be positive")
     output = latent_outputs[0]
     if int(output.generation) < 1:
-        raise invalid_descriptor("generation transition latent has no logical generation")
+        raise invalid_descriptor("media preparation latent has no logical generation")
     row = runtime.latent_row(operation, partition)
     pool = runtime.require_latent_pool()
     row.staging.value.zero_()
@@ -147,7 +144,7 @@ def _transfer(runtime: ExecutionResources, state: OperationState) -> None:
     session_id = operation.request_key.session_id
     mode = operation.work.transfer_mode
     if mode is TransferMode.KV_PUBLISH:
-        point = runtime.fixed_parent(operation)
+        runtime.fixed_parent(operation)
         outputs = tuple(output for output in operation.outputs if output.kind is ProductKind.KV)
         if len(outputs) != 1:
             raise invalid_descriptor("KV publication requires one KV output product")

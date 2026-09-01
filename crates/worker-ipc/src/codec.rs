@@ -8,14 +8,14 @@ use uniserve_core::{BlockId, KvCacheGroup, KvGroupKind, RankInfo, RequestId, Sam
 use crate::schema::uniserve::ipc as fbs;
 use crate::{
     AttentionRegime, Batch, BatchPartition, BlockTable, Bounds, CachePageAllocation, CloseReason,
-    CompletionReport, Control, DType, DecodeKind, DecodePlacement, DimBound, Disposition, Domain,
-    DrawLayout, ErrorCode, ErrorOperationIdentity, FinishFlags, ForwardMode, GenAdmission,
-    GraphBucket, LatentPlacement, LogicalLengths, MediaAdmission, MediaPlan, MediaProfileId,
-    ModelOutput, NewRequest, OpId, OpStatus, Operation, PartitionCompletion, Point, PointRange,
-    ProductKind, ProductPayload, ProductRef, RegistrationAck, RequestKey, RequestKind,
-    ResourceClass, ResourcePressure, ResponseKind, Rng, RouteId, RowGeometry, SamplingOwnership,
-    ShapeBound, StorageClass, TimingCounters, TokenSpan, UndAdmission, VersionRef,
-    WorkerForwardStats, WorkerInfo, WorkerRequest, WorkerResponse, WorkerResponseError,
+    CompletionReport, Control, DType, DimBound, Disposition, Domain, DrawLayout, ErrorCode,
+    ErrorOperationIdentity, FinishFlags, ForwardMode, GenAdmission, GraphBucket, LatentPlacement,
+    LogicalLengths, MediaAdmission, MediaGeometry, MediaProfileId, ModelOutput, NewRequest, OpId,
+    OpStatus, Operation, PartitionCompletion, Point, PointRange, ProductKind, ProductPayload,
+    ProductRef, ReconstructionKind, ReconstructionPlacement, RegistrationAck, RequestKey,
+    RequestKind, ResourceClass, ResourcePressure, ResponseKind, Rng, RouteId, RowGeometry,
+    SamplingOwnership, ShapeBound, StorageClass, TimingCounters, TokenSpan, UndAdmission,
+    VersionRef, WorkerForwardStats, WorkerInfo, WorkerRequest, WorkerResponse, WorkerResponseError,
 };
 
 pub type CodecResult<T> = std::result::Result<T, CodecError>;
@@ -364,12 +364,12 @@ fn partition_from_table(partition: fbs::BatchPartition<'_>) -> CodecResult<Batch
             })
             .transpose()?
             .unwrap_or_default(),
-        decode_placements: partition
-            .decode_placements()
+        reconstruction_placements: partition
+            .reconstruction_placements()
             .map(|items| {
                 items
                     .iter()
-                    .map(decode_placement_from_table)
+                    .map(reconstruction_placement_from_table)
                     .collect::<CodecResult<_>>()
             })
             .transpose()?
@@ -427,9 +427,9 @@ fn gen_admission_from_table(admission: fbs::GenAdmission<'_>) -> CodecResult<Gen
 }
 
 fn media_admission_from_table(admission: fbs::MediaAdmission<'_>) -> CodecResult<MediaAdmission> {
-    let plan = admission
-        .plan()
-        .context("media admission has no resolved plan")?;
+    let geometry = admission
+        .geometry()
+        .context("media admission has no resolved geometry")?;
     Ok(MediaAdmission {
         prompt_token_ids: admission
             .prompt_token_ids()
@@ -438,12 +438,12 @@ fn media_admission_from_table(admission: fbs::MediaAdmission<'_>) -> CodecResult
         seed: admission.seed(),
         profile: media_profile_from_fb(admission.profile())?,
         output_path: required_str(admission.output_path(), "media admission.output_path")?,
-        plan: MediaPlan {
-            frame_count: plan.frame_count(),
-            video_decode_units: plan.video_decode_units(),
-            audio_latent_frames: plan.audio_latent_frames(),
-            prompt_tokens: plan.prompt_tokens(),
-            denoise_steps: plan.denoise_steps(),
+        geometry: MediaGeometry {
+            frame_count: geometry.frame_count(),
+            video_reconstruction_units: geometry.video_reconstruction_units(),
+            audio_latent_frames: geometry.audio_latent_frames(),
+            prompt_tokens: geometry.prompt_tokens(),
+            denoise_steps: geometry.denoise_steps(),
         },
     })
 }
@@ -503,16 +503,16 @@ fn latent_placement_from_table(
     })
 }
 
-fn decode_placement_from_table(
-    placement: fbs::DecodePlacement<'_>,
-) -> CodecResult<DecodePlacement> {
-    Ok(DecodePlacement {
+fn reconstruction_placement_from_table(
+    placement: fbs::ReconstructionPlacement<'_>,
+) -> CodecResult<ReconstructionPlacement> {
+    Ok(ReconstructionPlacement {
         request_key: request_key_from_table(
             placement.request_key(),
-            "decode placement.request_key",
+            "reconstruction placement.request_key",
         )?,
         op_id: OpId(placement.op_id()),
-        kind: decode_kind_from_fb(placement.kind())?,
+        kind: reconstruction_kind_from_fb(placement.kind())?,
         start_unit: placement.start_unit(),
         unit_count: placement.unit_count(),
     })
@@ -1294,11 +1294,11 @@ fn partition_to_fb(partition: &BatchPartition) -> CodecResult<fbs::BatchPartitio
                 .map(latent_placement_to_fb)
                 .collect(),
         ),
-        decode_placements: Some(
+        reconstruction_placements: Some(
             partition
-                .decode_placements
+                .reconstruction_placements
                 .iter()
-                .map(decode_placement_to_fb)
+                .map(reconstruction_placement_to_fb)
                 .collect(),
         ),
     })
@@ -1349,12 +1349,12 @@ fn media_admission_to_fb(admission: &MediaAdmission) -> fbs::MediaAdmissionT {
         seed: admission.seed,
         profile: media_profile_to_fb(admission.profile),
         output_path: Some(admission.output_path.clone()),
-        plan: Some(Box::new(fbs::MediaPlanT {
-            frame_count: admission.plan.frame_count,
-            video_decode_units: admission.plan.video_decode_units,
-            audio_latent_frames: admission.plan.audio_latent_frames,
-            prompt_tokens: admission.plan.prompt_tokens,
-            denoise_steps: admission.plan.denoise_steps,
+        geometry: Some(Box::new(fbs::MediaGeometryT {
+            frame_count: admission.geometry.frame_count,
+            video_reconstruction_units: admission.geometry.video_reconstruction_units,
+            audio_latent_frames: admission.geometry.audio_latent_frames,
+            prompt_tokens: admission.geometry.prompt_tokens,
+            denoise_steps: admission.geometry.denoise_steps,
         })),
     }
 }
@@ -1398,11 +1398,13 @@ fn latent_placement_to_fb(placement: &LatentPlacement) -> fbs::LatentPlacementT 
     }
 }
 
-fn decode_placement_to_fb(placement: &DecodePlacement) -> fbs::DecodePlacementT {
-    fbs::DecodePlacementT {
+fn reconstruction_placement_to_fb(
+    placement: &ReconstructionPlacement,
+) -> fbs::ReconstructionPlacementT {
+    fbs::ReconstructionPlacementT {
         request_key: Some(Box::new(request_key_to_fb(placement.request_key))),
         op_id: placement.op_id.0,
-        kind: decode_kind_to_fb(placement.kind),
+        kind: reconstruction_kind_to_fb(placement.kind),
         start_unit: placement.start_unit,
         unit_count: placement.unit_count,
     }
@@ -1922,27 +1924,27 @@ fn work_to_fb(variant: ForwardMode) -> fbs::ForwardMode {
         ForwardMode::TransferProduct => fbs::ForwardMode::TransferProduct,
         ForwardMode::TransferKvPublish => fbs::ForwardMode::TransferKvPublish,
         ForwardMode::TransferKvInstall => fbs::ForwardMode::TransferKvInstall,
-        ForwardMode::GenTransition => fbs::ForwardMode::GenTransition,
-        ForwardMode::GenFlow => fbs::ForwardMode::GenFlow,
+        ForwardMode::MediaPrepare => fbs::ForwardMode::MediaPrepare,
+        ForwardMode::MediaDenoise => fbs::ForwardMode::MediaDenoise,
         ForwardMode::Materialize => fbs::ForwardMode::Materialize,
-        ForwardMode::GenDecode => fbs::ForwardMode::GenDecode,
+        ForwardMode::MediaReconstruct => fbs::ForwardMode::MediaReconstruct,
     }
 }
 
-fn decode_kind_to_fb(kind: DecodeKind) -> fbs::DecodeKind {
+fn reconstruction_kind_to_fb(kind: ReconstructionKind) -> fbs::ReconstructionKind {
     match kind {
-        DecodeKind::Video => fbs::DecodeKind::Video,
-        DecodeKind::Audio => fbs::DecodeKind::Audio,
+        ReconstructionKind::Video => fbs::ReconstructionKind::Video,
+        ReconstructionKind::Audio => fbs::ReconstructionKind::Audio,
     }
 }
 
-fn decode_kind_from_fb(kind: fbs::DecodeKind) -> CodecResult<DecodeKind> {
-    if kind == fbs::DecodeKind::Video {
-        Ok(DecodeKind::Video)
-    } else if kind == fbs::DecodeKind::Audio {
-        Ok(DecodeKind::Audio)
+fn reconstruction_kind_from_fb(kind: fbs::ReconstructionKind) -> CodecResult<ReconstructionKind> {
+    if kind == fbs::ReconstructionKind::Video {
+        Ok(ReconstructionKind::Video)
+    } else if kind == fbs::ReconstructionKind::Audio {
+        Ok(ReconstructionKind::Audio)
     } else {
-        codec_bail!("unknown decode kind {}", kind.0)
+        codec_bail!("unknown reconstruction kind {}", kind.0)
     }
 }
 

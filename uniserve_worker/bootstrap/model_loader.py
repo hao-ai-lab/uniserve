@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import torch
@@ -18,7 +18,7 @@ from ..models.runtime import ExecutionModel, WorkerDeployment
 from ..nn.mesh import DeviceMesh, TensorParallel
 from .capacity import DEFAULT_MAX_REQUEST_POOL_SIZE
 from .catalog import CatalogEntry, resolve_catalog_entry
-from .config import H3PrecisionOverrides, LinearPrecision, WorkerProcessArgs
+from .config import WorkerProcessArgs
 from .execution_config import ExecutionConfig
 from .plan import ModelLoadScope, WorkerPlan
 
@@ -38,9 +38,7 @@ class WorkerModelLoadRequest:
     parallel: TensorParallel
     max_model_len: int = 8192
     max_video_seconds: float = 15.0
-    fixed_graph_cache_capacity: int = 32
-    linear_precision: LinearPrecision = "fp8"
-    h3_precision_overrides: H3PrecisionOverrides = H3PrecisionOverrides()
+    quantization_config: dict[str, object] = field(default_factory=dict)
     scope: ModelLoadScope = ModelLoadScope.WHOLE
     generation_device: str | None = None
     load: LoadConfig = LoadConfig()
@@ -77,11 +75,16 @@ def load_worker_model(
             media_spool=media_spool,
         )
 
-    if request.h3_precision_overrides.configured:
-        raise unsupported_setup("MiniMax H3 precision overrides require a MiniMax H3 model")
-    if request.linear_precision != "fp8":
+    quantization_config = request.quantization_config or {}
+    if "mode" in quantization_config:
+        raise unsupported_setup("quantization modes require a componentized model")
+    quant_method = str(quantization_config.get("quant_method", "fp8"))
+    components = quantization_config.get("components")
+    if components:
+        raise unsupported_setup("component quantization policies require a componentized model")
+    if quant_method != "fp8":
         raise unsupported_setup(
-            f"linear precision {request.linear_precision!r} is not supported by this model"
+            f"quantization method {quant_method!r} is not supported by this model"
         )
 
     load_request = LoadRequest(
@@ -162,13 +165,13 @@ def _load_h3_worker_model(
         raise unsupported_setup(
             "MiniMax H3 requires capacity for two state slots with two unresolved outputs each"
         )
-    overrides = request.h3_precision_overrides
-    precision_policy = H3LinearPrecisionPolicy.resolve(
-        request.linear_precision,
-        transformer_attention=overrides.transformer_attention,
-        transformer_mlp=overrides.transformer_mlp,
-        text_encoder=overrides.text_encoder,
-        video_vae=overrides.video_vae,
+    precision_policy = H3LinearPrecisionPolicy.from_config(request.quantization_config)
+    logger.info(
+        "resolved MiniMax H3 precision attention=%s mlp=%s text=%s video_vae=%s",
+        precision_policy.transformer_attention,
+        precision_policy.transformer_mlp,
+        precision_policy.text_encoder,
+        precision_policy.video_vae,
     )
     model = MiniMaxH3Model.from_pretrained(
         request.model_path,
@@ -176,7 +179,6 @@ def _load_h3_worker_model(
         max_state_slots=max_state_slots,
         max_text_rows=request.max_model_len,
         max_video_seconds=request.max_video_seconds,
-        graph_cache_capacity=request.fixed_graph_cache_capacity,
         cache_dir=request.load.download_dir,
         revision=request.load.revision,
         precision_policy=precision_policy,
@@ -223,9 +225,7 @@ def _checkpoint_request(
         kv_token_capacity=config.resources.kv_token_capacity,
         max_model_len=config.resources.max_model_len,
         max_video_seconds=config.resources.max_video_seconds,
-        fixed_graph_cache_capacity=config.resources.fixed_graph_cache_capacity,
-        linear_precision=model.linear_precision,
-        h3_precision_overrides=model.h3_precision_overrides,
+        quantization_config=model.quantization_config,
         attention_backend=model.attention_backend,
         execution=config.execution,
         parallel=TensorParallel.from_mesh(mesh),

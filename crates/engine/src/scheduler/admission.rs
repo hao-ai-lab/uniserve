@@ -108,9 +108,9 @@ impl Scheduler {
             return;
         }
         let required = [
-            ForwardMode::GenTransition,
-            ForwardMode::GenFlow,
-            ForwardMode::GenDecode,
+            ForwardMode::MediaPrepare,
+            ForwardMode::MediaDenoise,
+            ForwardMode::MediaReconstruct,
             ForwardMode::Materialize,
         ];
         if required
@@ -174,12 +174,15 @@ impl Scheduler {
                     seed: submission.request.seed,
                     profile: MediaProfileId::MinimaxH3T2va,
                     output_path: submission.request.output_path.clone(),
-                    plan: MediaPlan {
-                        frame_count: submission.request.plan.frame_count,
-                        video_decode_units: submission.request.plan.video_decode_units,
-                        audio_latent_frames: submission.request.plan.audio_latent_frames,
-                        prompt_tokens: submission.request.plan.prompt_tokens,
-                        denoise_steps: submission.request.plan.denoise_steps,
+                    geometry: MediaGeometry {
+                        frame_count: submission.request.geometry.frame_count,
+                        video_reconstruction_units: submission
+                            .request
+                            .geometry
+                            .video_reconstruction_units,
+                        audio_latent_frames: submission.request.geometry.audio_latent_frames,
+                        prompt_tokens: submission.request.geometry.prompt_tokens,
+                        denoise_steps: submission.request.geometry.denoise_steps,
                     },
                 },
             )

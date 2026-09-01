@@ -10,6 +10,24 @@ from uniserve_worker.execution.batch import Domain
 pytestmark = pytest.mark.unit
 
 
+def test_quantization_config_defaults_to_model_policy() -> None:
+    config = parse_worker_args(
+        [
+            "--service-name",
+            "precision-default-test",
+            "--ipc-payload-cap",
+            "65536",
+            "--model",
+            "model",
+            "--max-batch-tokens",
+            "8192",
+        ]
+    )
+
+    assert config.model is not None
+    assert config.model.quantization_config == {}
+
+
 def test_engine_batch_capacity_reaches_worker_resources() -> None:
     config = parse_worker_args(
         [
@@ -32,7 +50,7 @@ def test_engine_batch_capacity_reaches_worker_resources() -> None:
     assert config.resources.max_batch_tokens == 16384
 
 
-def test_linear_precision_reaches_model_launch_config() -> None:
+def test_quantization_config_reaches_model_launch_config() -> None:
     config = parse_worker_args(
         [
             "--service-name",
@@ -43,17 +61,16 @@ def test_linear_precision_reaches_model_launch_config() -> None:
             "model",
             "--max-batch-tokens",
             "8192",
-            "--linear-precision",
-            "nvfp4",
+            "--quantization-config",
+            '{"mode":"balanced"}',
         ]
     )
 
     assert config.model is not None
-    assert config.model.linear_precision == "nvfp4"
-    assert not config.model.h3_precision_overrides.configured
+    assert config.model.quantization_config == {"mode": "balanced"}
 
 
-def test_h3_precision_overrides_reach_model_launch_config() -> None:
+def test_component_quantization_config_reaches_model_launch_config() -> None:
     config = parse_worker_args(
         [
             "--service-name",
@@ -64,23 +81,19 @@ def test_h3_precision_overrides_reach_model_launch_config() -> None:
             "model",
             "--max-batch-tokens",
             "8192",
-            "--h3-transformer-attention-precision",
-            "nvfp4",
-            "--h3-transformer-mlp-precision",
-            "fp8",
-            "--h3-text-encoder-precision",
-            "bf16",
-            "--h3-video-vae-precision",
-            "bf16",
+            "--quantization-config",
+            '{"mode":"performance","components":{"transformer.attention":"nvfp4","transformer.mlp":"fp8","text_encoder":"bf16","video_vae":"bf16"}}',
         ]
     )
 
     assert config.model is not None
-    assert config.model.h3_precision_overrides.configured
-    assert config.model.h3_precision_overrides.transformer_attention == "nvfp4"
-    assert config.model.h3_precision_overrides.transformer_mlp == "fp8"
-    assert config.model.h3_precision_overrides.text_encoder == "bf16"
-    assert config.model.h3_precision_overrides.video_vae == "bf16"
+    assert config.model.quantization_config["mode"] == "performance"
+    assert config.model.quantization_config["components"] == {
+        "transformer.attention": "nvfp4",
+        "transformer.mlp": "fp8",
+        "text_encoder": "bf16",
+        "video_vae": "bf16",
+    }
 
 
 def test_execution_lanes_are_typed_and_domain_disjoint() -> None:

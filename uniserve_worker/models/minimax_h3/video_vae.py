@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import torch
 from torch import nn
 
-from ...execution.fixed_graph import FixedShapeGraphCache
+from ...execution.fixed_graph import StaticCudaGraph
 from ...nn.quant.nvfp4 import replace_nvfp4_linears
 from .precision import VideoVAELinearPrecision
+from .video_vae_decoder import MiniMaxH3VideoDecoder
 
 __all__ = ["MiniMaxH3VideoVAE"]
 
@@ -15,13 +19,13 @@ __all__ = ["MiniMaxH3VideoVAE"]
 class MiniMaxH3VideoVAE(nn.Module):
     """Own one resident checkpoint VAE and decode temporal segments."""
 
-    def __init__(self, vae: nn.Module, *, linear_precision: VideoVAELinearPrecision) -> None:
+    def __init__(
+        self, vae: MiniMaxH3VideoDecoder, *, linear_precision: VideoVAELinearPrecision
+    ) -> None:
         super().__init__()
         self.vae = vae.float()
         self.linear_precision = linear_precision
-        self.autocast_dtype = (
-            torch.float16 if linear_precision == "fp16" else torch.bfloat16
-        )
+        self.autocast_dtype = torch.float16 if linear_precision == "fp16" else torch.bfloat16
         if linear_precision == "nvfp4":
             replaced = replace_nvfp4_linears(self.vae.decoder)
             if replaced != 217:
@@ -29,7 +33,6 @@ class MiniMaxH3VideoVAE(nn.Module):
                     f"MiniMax H3 video decoder expected 217 aligned linear layers, got {replaced}"
                 )
         required = (
-            "_decode_clip",
             "tokens_chunk_size",
             "token_overlap",
             "frame_pre_padding",
@@ -38,8 +41,58 @@ class MiniMaxH3VideoVAE(nn.Module):
         missing = [name for name in required if not hasattr(vae, name)]
         if missing:
             raise TypeError(f"MiniMax H3 video VAE is missing {missing!r}")
-        mean = tuple(float(value) for value in vae.config.latents_mean)
-        std = tuple(float(value) for value in vae.config.latents_std)
+        mean = (
+            0.858090341091156,
+            -0.9606591463088989,
+            1.0661640167236328,
+            -0.5090325474739075,
+            -0.2727581858634949,
+            -1.3675414323806763,
+            -0.2553254961967468,
+            -0.26907554268836975,
+            -0.5376840829849243,
+            -0.0464097298681736,
+            0.6657370328903198,
+            0.19690127670764923,
+            -0.5460608005523682,
+            -0.4035342037677765,
+            -0.23683024942874908,
+            0.25928452610969543,
+            -0.30133944749832153,
+            0.211341992020607,
+            -1.1206848621368408,
+            0.3581933379173279,
+            -0.04225143790245056,
+            0.2604829967021942,
+            0.22864092886447906,
+            0.7056031823158264,
+        )
+        std = (
+            1.2223774194717407,
+            1.2767263650894165,
+            1.6831774711608887,
+            1.7549455165863037,
+            1.5636216402053833,
+            2.194143533706665,
+            0.9653137922286987,
+            1.0569885969161987,
+            0.841948926448822,
+            0.7729952931404114,
+            1.8955937623977661,
+            0.946841835975647,
+            0.7996809482574463,
+            0.44988900423049927,
+            0.7197399735450745,
+            0.6936293244361877,
+            2.961095094680786,
+            2.7694199085235596,
+            3.0496184825897217,
+            2.1088054180145264,
+            3.276226282119751,
+            3.1627357006073,
+            2.2816812992095947,
+            2.6127843856811523,
+        )
         if len(mean) != 24 or len(std) != 24:
             raise ValueError("MiniMax H3 video VAE must declare 24-channel latent statistics")
         self.register_buffer(
@@ -70,11 +123,8 @@ class MiniMaxH3VideoVAE(nn.Module):
             ).view(1, 3, 1, 1, 1),
             persistent=False,
         )
-        self.decode_graphs: FixedShapeGraphCache[torch.Tensor] | None = None
+        self.decode_graph = StaticCudaGraph[torch.Tensor](self.device)
         self.register_buffer("decode_graph_input", None, persistent=False)
-
-    def configure_graph_cache(self, capacity: int) -> None:
-        self.decode_graphs = FixedShapeGraphCache(self.device, capacity=capacity)
 
     @classmethod
     def from_pretrained(
@@ -85,16 +135,33 @@ class MiniMaxH3VideoVAE(nn.Module):
         local_files_only: bool = False,
         linear_precision: VideoVAELinearPrecision,
     ) -> "MiniMaxH3VideoVAE":
-        try:
-            from diffusers import AutoencoderKLMiniMaxH3
-        except ImportError as error:
-            raise RuntimeError("MiniMax H3 requires the diffusers VAE runtime") from error
-        vae = AutoencoderKLMiniMaxH3.from_pretrained(
-            checkpoint,
-            subfolder="vae",
-            torch_dtype=torch.float32,
-            local_files_only=local_files_only,
-        ).to(device=device, dtype=torch.float32)
+        del local_files_only
+        vae = MiniMaxH3VideoDecoder(parameter_device="meta", buffer_device=device)
+        component = Path(checkpoint) / "vae"
+        indexes = tuple(component.glob("*.safetensors.index.json"))
+        if len(indexes) != 1:
+            raise RuntimeError("H3 video decoder requires one safetensor index")
+        weight_map = json.loads(indexes[0].read_text(encoding="utf-8")).get("weight_map")
+        if not isinstance(weight_map, dict):
+            raise RuntimeError("H3 video decoder checkpoint index has no weight map")
+        targets = dict(vae.named_parameters())
+        by_file: dict[Path, list[str]] = {}
+        for name in targets:
+            filename = weight_map.get(name)
+            if not isinstance(filename, str):
+                raise KeyError(f"H3 video decoder is missing checkpoint tensor {name!r}")
+            by_file.setdefault(component / filename, []).append(name)
+        from safetensors.torch import safe_open
+
+        for path, names in sorted(by_file.items()):
+            with safe_open(path, framework="pt", device="cpu") as source:
+                for name in names:
+                    value = source.get_tensor(name).to(device=device, dtype=torch.float32)
+                    owner: nn.Module = vae
+                    fields = name.split(".")
+                    for field in fields[:-1]:
+                        owner = owner[int(field)] if field.isdigit() else getattr(owner, field)
+                    setattr(owner, fields[-1], nn.Parameter(value, requires_grad=False))
         return cls(vae, linear_precision=linear_precision)
 
     @property
@@ -108,7 +175,7 @@ class MiniMaxH3VideoVAE(nn.Module):
 
     def _decode_spatial_tiles(self, latents: torch.Tensor) -> torch.Tensor:
         if not bool(self.vae.use_tiling):
-            return self.vae.decoder(self.vae.post_quant_conv(latents))
+            return self.vae(self.vae.post_quant_conv(latents))
 
         ratio = int(self.vae.spatial_compression_ratio)
         height = int(latents.shape[-2]) * ratio
@@ -135,7 +202,7 @@ class MiniMaxH3VideoVAE(nn.Module):
             ),
             dim=0,
         )
-        decoded = self.vae.decoder(self.vae.post_quant_conv(tiles))
+        decoded = self.vae(self.vae.post_quant_conv(tiles))
         flat_tiles = decoded.split(1, dim=0)
         columns = len(x_indices)
         rows = [
@@ -164,14 +231,10 @@ class MiniMaxH3VideoVAE(nn.Module):
     ) -> torch.Tensor:
         if normalized_latents.shape != (1, 24, 7, 48, 84):
             raise ValueError("an H3 video decode unit must have shape [1, 24, 7, 48, 84]")
-        if self.decode_graphs is None or self.decode_graph_input is None:
+        if self.decode_graph_input is None:
             raise RuntimeError("the H3 video decoder graph has not been captured")
         self.decode_graph_input.copy_(normalized_latents)
-        return self.decode_graphs.execute(
-            tuple(int(value) for value in normalized_latents.shape),
-            lambda: self._decode_normalized_segment(self.decode_graph_input),
-            warmup=lambda: self._decode_normalized_segment(self.decode_graph_input),
-        )
+        return self.decode_graph.replay()
 
     @torch.inference_mode()
     def assemble_segment(
@@ -204,7 +267,7 @@ class MiniMaxH3VideoVAE(nn.Module):
         return rgb24, next_overlap[:, :, :5].contiguous()
 
     def compile_decoder(self) -> None:
-        self.vae.decoder = torch.compile(self.vae.decoder, fullgraph=True)
+        self.vae = torch.compile(self.vae, fullgraph=True)
 
     @torch.inference_mode()
     def capture_decoder(self, normalized_latents: torch.Tensor) -> torch.Tensor:
@@ -214,10 +277,7 @@ class MiniMaxH3VideoVAE(nn.Module):
             raise ValueError("an H3 video decode unit must have shape [1, 24, 7, 48, 84]")
         self.decode_graph_input = torch.empty_like(normalized_latents, device=self.device)
         self.decode_graph_input.copy_(normalized_latents)
-        if self.decode_graphs is None:
-            raise RuntimeError("the H3 video decoder graph cache is not configured")
-        return self.decode_graphs.execute(
-            tuple(int(value) for value in normalized_latents.shape),
+        return self.decode_graph.capture(
             lambda: self._decode_normalized_segment(self.decode_graph_input),
             warmup=lambda: self._decode_normalized_segment(self.decode_graph_input),
         )

@@ -1,4 +1,4 @@
-"""Resident TP4 Qwen3-VL text conditioner for the fixed H3 T2VA profile."""
+"""Tensor-parallel Qwen3-VL text conditioner for MiniMax H3."""
 
 from __future__ import annotations
 
@@ -8,8 +8,14 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from ...nn.mesh import DeviceMesh, divide
+from ... import ops
+from ...nn.layer import LayerConfig
+from ...nn.linear import MergedColumnParallelLinear, QKVParallelLinear, RowParallelLinear
+from ...nn.mesh import DeviceMesh, TensorParallel
+from ...nn.norm import RMSNorm
+from ...nn.placement import WeightMode
 from ...nn.quant.nvfp4 import DynamicW4A4NvFp4LinearMethod
+from ...nn.vocab_parallel_embedding import VocabParallelEmbedding
 
 __all__ = ["H3TextEncoderConfig", "MiniMaxH3TextEncoder"]
 
@@ -29,144 +35,22 @@ class H3TextEncoderConfig:
     max_text_rows: int = 1_024
 
 
-def _rotate_half(value: torch.Tensor) -> torch.Tensor:
-    first, second = value.chunk(2, dim=-1)
-    return torch.cat((-second, first), dim=-1)
-
-
-class _RMSNorm(nn.Module):
-    def __init__(
-        self,
-        width: int,
-        eps: float,
-        *,
-        device: torch.device | str,
-        dtype: torch.dtype,
-    ) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.empty(width, device=device, dtype=dtype))
-        self.eps = float(eps)
-
-    def forward(self, value: torch.Tensor) -> torch.Tensor:
-        normalized = value.float() * torch.rsqrt(
-            value.float().pow(2).mean(dim=-1, keepdim=True) + self.eps
-        )
-        return (normalized * self.weight.float()).to(value.dtype)
-
-
-class _ColumnLinear(nn.Module):
-    def __init__(
-        self,
-        input_size: int,
-        output_size: int,
-        mesh: DeviceMesh,
-        *,
-        device: torch.device | str,
-        dtype: torch.dtype,
-    ) -> None:
-        super().__init__()
-        self.global_output_size = int(output_size)
-        self.local_output_size = divide(output_size, mesh.size("tp"))
-        self.input_size = int(input_size)
-        self.output_size = self.local_output_size
-        self.bias = None
-        self.quant_method: DynamicW4A4NvFp4LinearMethod | None = None
-        self.weight = nn.Parameter(
-            torch.empty(
-                (self.local_output_size, input_size),
-                device=device,
-                dtype=dtype,
-            )
-        )
-
-    def forward(self, value: torch.Tensor) -> torch.Tensor:
-        if self.quant_method is not None:
-            return self.quant_method.apply(self, value)
-        return F.linear(value, self.weight)
-
-    def enable_nvfp4(self) -> None:
-        self.register_buffer("weight_scale", None, persistent=False)
-        self.register_buffer("weight_scale_2", None, persistent=False)
-        self.quant_method = DynamicW4A4NvFp4LinearMethod()
-        self.quant_method.process_weights_after_loading(self)
-
-
-class _RowLinear(nn.Module):
-    def __init__(
-        self,
-        input_size: int,
-        output_size: int,
-        mesh: DeviceMesh,
-        *,
-        device: torch.device | str,
-        dtype: torch.dtype,
-    ) -> None:
-        super().__init__()
-        self.mesh = mesh
-        self.global_input_size = int(input_size)
-        self.local_input_size = divide(input_size, mesh.size("tp"))
-        self.input_size = self.local_input_size
-        self.output_size = int(output_size)
-        self.bias = None
-        self.quant_method: DynamicW4A4NvFp4LinearMethod | None = None
-        self.weight = nn.Parameter(
-            torch.empty(
-                (output_size, self.local_input_size),
-                device=device,
-                dtype=dtype,
-            )
-        )
-
-    def forward(self, value: torch.Tensor) -> torch.Tensor:
-        output = (
-            self.quant_method.apply(self, value)
-            if self.quant_method is not None
-            else F.linear(value, self.weight)
-        )
-        return self.mesh.all_reduce(output, "tp")
-
-    def enable_nvfp4(self) -> None:
-        self.register_buffer("weight_scale", None, persistent=False)
-        self.register_buffer("weight_scale_2", None, persistent=False)
-        self.quant_method = DynamicW4A4NvFp4LinearMethod()
-        self.quant_method.process_weights_after_loading(self)
-
-
-class _VocabParallelEmbedding(nn.Module):
-    def __init__(
-        self,
-        config: H3TextEncoderConfig,
-        mesh: DeviceMesh,
-        *,
-        device: torch.device | str,
-        dtype: torch.dtype,
-    ) -> None:
-        super().__init__()
-        self.mesh = mesh
-        self.rows = divide(config.vocab_size, mesh.size("tp"))
-        self.start = mesh.coord("tp") * self.rows
-        self.end = self.start + self.rows
-        self.weight = nn.Parameter(
-            torch.empty((self.rows, config.hidden_size), device=device, dtype=dtype)
-        )
-
-    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-        owned = (token_ids >= self.start) & (token_ids < self.end)
-        local_ids = (token_ids - self.start).masked_fill(~owned, 0)
-        output = F.embedding(local_ids, self.weight)
-        output.masked_fill_(~owned.unsqueeze(-1), 0)
-        return self.mesh.all_reduce(output, "tp")
+def _enable_nvfp4(module: nn.Module) -> None:
+    if not isinstance(module, (MergedColumnParallelLinear, QKVParallelLinear, RowParallelLinear)):
+        return
+    if not hasattr(module, "weight_scale"):
+        module.register_buffer("weight_scale", None, persistent=False)
+    if not hasattr(module, "weight_scale_2"):
+        module.register_buffer("weight_scale_2", None, persistent=False)
+    method = DynamicW4A4NvFp4LinearMethod()
+    module.quant_method = method
+    method.process_weights_after_loading(module)
 
 
 class _TextRotaryEmbedding(nn.Module):
-    """Qwen3-VL interleaved mRoPE reduced to its text-only position path."""
+    """Qwen3-VL mRoPE reduced to the text-only position path."""
 
-    def __init__(
-        self,
-        config: H3TextEncoderConfig,
-        *,
-        device: torch.device | str,
-    ) -> None:
+    def __init__(self, config: H3TextEncoderConfig, *, device: torch.device | str) -> None:
         super().__init__()
         inv_freq = 1.0 / (
             config.rope_theta
@@ -188,75 +72,53 @@ class _TextRotaryEmbedding(nn.Module):
 
 
 class _Attention(nn.Module):
-    def __init__(
-        self,
-        config: H3TextEncoderConfig,
-        mesh: DeviceMesh,
-        *,
-        device: torch.device | str,
-        dtype: torch.dtype,
-    ) -> None:
+    def __init__(self, config: H3TextEncoderConfig, layer_config: LayerConfig) -> None:
         super().__init__()
-        tp_size = mesh.size("tp")
-        self.heads = divide(config.heads, tp_size)
-        self.kv_heads = divide(config.kv_heads, tp_size)
+        parallel = layer_config.parallel
+        self.heads = config.heads // parallel.size
+        self.kv_heads = config.kv_heads // parallel.size
         self.head_dim = config.head_dim
         self.scaling = config.head_dim**-0.5
-        self.q_proj = _ColumnLinear(
+        self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
-            config.heads * config.head_dim,
-            mesh,
-            device=device,
-            dtype=dtype,
+            config.head_dim,
+            config.heads,
+            config.kv_heads,
+            layer_config=layer_config,
+            bias=False,
         )
-        self.k_proj = _ColumnLinear(
-            config.hidden_size,
-            config.kv_heads * config.head_dim,
-            mesh,
-            device=device,
-            dtype=dtype,
-        )
-        self.v_proj = _ColumnLinear(
-            config.hidden_size,
-            config.kv_heads * config.head_dim,
-            mesh,
-            device=device,
-            dtype=dtype,
-        )
-        self.o_proj = _RowLinear(
+        self.q_size, self.kv_size, _ = self.qkv_proj.output_sizes
+        self.o_proj = RowParallelLinear(
             config.heads * config.head_dim,
             config.hidden_size,
-            mesh,
-            device=device,
-            dtype=dtype,
+            layer_config=layer_config,
+            bias=False,
         )
-        self.q_norm = _RMSNorm(
-            config.head_dim, config.norm_eps, device=device, dtype=dtype
-        )
-        self.k_norm = _RMSNorm(
-            config.head_dim, config.norm_eps, device=device, dtype=dtype
-        )
+        self.q_norm = RMSNorm(config.head_dim, config.norm_eps)
+        self.k_norm = RMSNorm(config.head_dim, config.norm_eps)
 
     def forward(
         self,
         hidden: torch.Tensor,
         rotary: tuple[torch.Tensor, torch.Tensor],
+        mesh: DeviceMesh,
     ) -> torch.Tensor:
         batch, rows, _ = hidden.shape
-        query = self.q_norm(
-            self.q_proj(hidden).view(batch, rows, self.heads, self.head_dim)
-        ).transpose(1, 2)
-        key = self.k_norm(
-            self.k_proj(hidden).view(batch, rows, self.kv_heads, self.head_dim)
-        ).transpose(1, 2)
-        value = self.v_proj(hidden).view(
-            batch, rows, self.kv_heads, self.head_dim
-        ).transpose(1, 2)
-        cosine, sine = rotary
-        cosine = cosine.unsqueeze(1)
-        sine = sine.unsqueeze(1)
-        query = query * cosine + _rotate_half(query) * sine
-        key = key * cosine + _rotate_half(key) * sine
+        qkv = self.qkv_proj(hidden)
+        query, key, value = qkv.split((self.q_size, self.kv_size, self.kv_size), dim=-1)
+        query = query.view(batch, rows, self.heads, self.head_dim).transpose(1, 2)
+        key = key.view(batch, rows, self.kv_heads, self.head_dim).transpose(1, 2)
+        value = value.view(batch, rows, self.kv_heads, self.head_dim).transpose(1, 2)
+        query, key = ops.qk_norm_rope(
+            query,
+            key,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            rotary[0],
+            rotary[1],
+            self.q_norm.eps,
+            unsqueeze_dim=1,
+        )
         output = F.scaled_dot_product_attention(
             query,
             key,
@@ -266,71 +128,61 @@ class _Attention(nn.Module):
             scale=self.scaling,
             enable_gqa=self.heads != self.kv_heads,
         )
-        return self.o_proj(output.transpose(1, 2).reshape(batch, rows, -1))
+        return self.o_proj(output.transpose(1, 2).reshape(batch, rows, -1), mesh)
 
 
 class _MLP(nn.Module):
-    def __init__(
-        self,
-        config: H3TextEncoderConfig,
-        mesh: DeviceMesh,
-        *,
-        device: torch.device | str,
-        dtype: torch.dtype,
-    ) -> None:
+    def __init__(self, config: H3TextEncoderConfig, layer_config: LayerConfig) -> None:
         super().__init__()
-        self.gate_proj = _ColumnLinear(
+        self.gate_up_proj = MergedColumnParallelLinear(
             config.hidden_size,
-            config.intermediate_size,
-            mesh,
-            device=device,
-            dtype=dtype,
+            (config.intermediate_size, config.intermediate_size),
+            layer_config=layer_config,
+            bias=False,
+            weight_mode=WeightMode.FUSED_GATE_UP_LINEAR,
         )
-        self.up_proj = _ColumnLinear(
-            config.hidden_size,
-            config.intermediate_size,
-            mesh,
-            device=device,
-            dtype=dtype,
-        )
-        self.down_proj = _RowLinear(
+        self.down_proj = RowParallelLinear(
             config.intermediate_size,
             config.hidden_size,
-            mesh,
-            device=device,
-            dtype=dtype,
+            layer_config=layer_config,
+            bias=False,
         )
 
-    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.silu(self.gate_proj(hidden)) * self.up_proj(hidden))
+    def forward(self, hidden: torch.Tensor, mesh: DeviceMesh) -> torch.Tensor:
+        return self.down_proj(ops.silu_and_mul(self.gate_up_proj(hidden)), mesh)
 
 
 class _DecoderLayer(nn.Module):
-    def __init__(
-        self,
-        config: H3TextEncoderConfig,
-        mesh: DeviceMesh,
-        *,
-        device: torch.device | str,
-        dtype: torch.dtype,
-    ) -> None:
+    def __init__(self, config: H3TextEncoderConfig, layer_config: LayerConfig) -> None:
         super().__init__()
-        self.self_attn = _Attention(config, mesh, device=device, dtype=dtype)
-        self.mlp = _MLP(config, mesh, device=device, dtype=dtype)
-        self.input_layernorm = _RMSNorm(
-            config.hidden_size, config.norm_eps, device=device, dtype=dtype
-        )
-        self.post_attention_layernorm = _RMSNorm(
-            config.hidden_size, config.norm_eps, device=device, dtype=dtype
-        )
+        self.self_attn = _Attention(config, layer_config)
+        self.mlp = _MLP(config, layer_config)
+        self.input_layernorm = RMSNorm(config.hidden_size, config.norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, config.norm_eps)
 
     def forward(
         self,
         hidden: torch.Tensor,
+        residual: torch.Tensor | None,
         rotary: tuple[torch.Tensor, torch.Tensor],
-    ) -> torch.Tensor:
-        hidden = hidden + self.self_attn(self.input_layernorm(hidden), rotary)
-        return hidden + self.mlp(self.post_attention_layernorm(hidden))
+        mesh: DeviceMesh,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            residual = hidden
+            attention_input = self.input_layernorm(hidden)
+        else:
+            attention_input, residual = self.input_layernorm.forward_with_residual(
+                hidden,
+                residual,
+                in_place=True,
+            )
+        attention_output = self.self_attn(attention_input, rotary, mesh)
+        mlp_input, residual = self.post_attention_layernorm.forward_with_residual(
+            attention_output,
+            residual,
+            in_place=True,
+        )
+        return self.mlp(mlp_input, mesh), residual
 
 
 class _LanguageModel(nn.Module):
@@ -339,34 +191,42 @@ class _LanguageModel(nn.Module):
         config: H3TextEncoderConfig,
         mesh: DeviceMesh,
         *,
-        device: torch.device | str,
-        dtype: torch.dtype,
+        parameter_device: torch.device | str,
     ) -> None:
         super().__init__()
-        self.embed_tokens = _VocabParallelEmbedding(
-            config, mesh, device=device, dtype=dtype
+        layer_config = LayerConfig(
+            parallel=TensorParallel.from_mesh(mesh),
+            quantization=None,
         )
-        self.layers = nn.ModuleList(
-            _DecoderLayer(config, mesh, device=device, dtype=dtype)
-            for _ in range(config.retained_layers)
-        )
-        # The requested hidden_states[50] is captured before layer 50 and is
-        # therefore not passed through the checkpoint's final language norm.
+        with torch.device(parameter_device):
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                layer_config=layer_config,
+                init_weights=False,
+            )
+            self.layers = nn.ModuleList(
+                _DecoderLayer(config, layer_config) for _ in range(config.retained_layers)
+            )
         self.rotary_emb = _TextRotaryEmbedding(config, device=mesh.local_device)
+        self.mesh = mesh
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-        hidden = self.embed_tokens(token_ids)
+        hidden = self.embed_tokens(token_ids, self.mesh)
         positions = torch.arange(
             token_ids.shape[1], dtype=torch.long, device=token_ids.device
         ).view(1, -1)
         rotary = self.rotary_emb(hidden, positions)
+        residual: torch.Tensor | None = None
         for layer in self.layers:
-            hidden = layer(hidden, rotary)
+            hidden, residual = layer(hidden, residual, rotary, self.mesh)
+        if residual is not None:
+            hidden = hidden + residual
         return hidden
 
 
 class MiniMaxH3TextEncoder(nn.Module):
-    """The T2VA-only Qwen3-VL language path through hidden state index 50."""
+    """The Qwen3-VL language path through checkpoint hidden state 50."""
 
     architecture = "Qwen3VLForConditionalGeneration"
 
@@ -379,6 +239,8 @@ class MiniMaxH3TextEncoder(nn.Module):
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         super().__init__()
+        if dtype != torch.bfloat16:
+            raise ValueError("the H3 text encoder uses bfloat16 activations")
         self.config = H3TextEncoderConfig(max_text_rows=int(max_text_rows))
         if mesh.size("tp") != 4:
             raise ValueError("the H3 text encoder requires TP4")
@@ -386,8 +248,7 @@ class MiniMaxH3TextEncoder(nn.Module):
         self.language_model = _LanguageModel(
             self.config,
             mesh,
-            device=parameter_device,
-            dtype=dtype,
+            parameter_device=parameter_device,
         )
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
@@ -400,6 +261,4 @@ class MiniMaxH3TextEncoder(nn.Module):
         return self.language_model(token_ids)
 
     def enable_nvfp4(self) -> None:
-        for module in self.modules():
-            if isinstance(module, (_ColumnLinear, _RowLinear)):
-                module.enable_nvfp4()
+        self.apply(_enable_nvfp4)

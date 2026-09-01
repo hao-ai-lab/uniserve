@@ -138,7 +138,7 @@ def _latent_placement(operation: Operation) -> LatentPlacement:
         width=int(image.width),
         start_step=start_step,
         step_count=(
-            int(operation.bounds.max_tokens) if operation.work is ForwardMode.GEN_FLOW else 0
+            int(operation.bounds.max_tokens) if operation.work is ForwardMode.MEDIA_DENOISE else 0
         ),
     )
 
@@ -260,7 +260,7 @@ def execution_batch(
         variants = {operation.work for operation in routed}
         attention = (
             AttentionRegime.HYBRID
-            if any(variant.value == "gen_flow" for variant in variants)
+            if any(variant.value == "media_denoise" for variant in variants)
             else AttentionRegime.CAUSAL
             if any(
                 variant.value.startswith("token_") or variant.value == "draft"
@@ -293,7 +293,7 @@ def execution_batch(
                             lengths[1],
                         )
                     )
-                if operation.work is ForwardMode.GEN_FLOW:
+                if operation.work is ForwardMode.MEDIA_DENOISE:
                     image = _IMAGE_PARAMS[operation.request_key]
                     main_slot = _REQUEST_POOL_INDICES[operation.request_key]
                     main_len = 0 if lengths is None else lengths[2]
@@ -363,7 +363,7 @@ def execution_batch(
                     latent_placements=tuple(
                         _latent_placement(operation)
                         for operation in domain_operations
-                        if operation.work in {ForwardMode.GEN_TRANSITION, ForwardMode.GEN_FLOW}
+                        if operation.work in {ForwardMode.MEDIA_PREPARE, ForwardMode.MEDIA_DENOISE}
                         or any(product.kind is ProductKind.LATENT for product in operation.inputs)
                     ),
                 )
@@ -696,7 +696,7 @@ def encode_operation(
     return operation, payload
 
 
-def gen_transition_operation(
+def media_prepare_operation(
     rk: RequestKey,
     *,
     op_id: int,
@@ -733,7 +733,7 @@ def gen_transition_operation(
         request_key=rk,
         op_id=op_id,
         parent=parent,
-        work=ForwardMode.GEN_TRANSITION,
+        work=ForwardMode.MEDIA_PREPARE,
         route=0,
         domain=Domain.FLOW,
         bounds=Bounds(max_points=1, max_tokens=1, max_latent_bytes=8_192),
@@ -750,7 +750,7 @@ def gen_transition_operation(
     return operation, latent
 
 
-def flow_operation(
+def media_denoise_operation(
     rk: RequestKey,
     *,
     op_id: int,
@@ -776,7 +776,7 @@ def flow_operation(
         request_key=rk,
         op_id=op_id,
         parent=parent,
-        work=ForwardMode.GEN_FLOW,
+        work=ForwardMode.MEDIA_DENOISE,
         route=0,
         domain=Domain.FLOW,
         bounds=Bounds(max_points=1, max_tokens=int(steps), max_latent_bytes=8_192),
@@ -933,8 +933,8 @@ __all__ = [
     "encode_operation",
     "execution_batch",
     "finalized_report",
-    "flow_operation",
-    "gen_transition_operation",
+    "media_denoise_operation",
+    "media_prepare_operation",
     "gen_admission",
     "materialize_operation",
     "kv_publication_operation",

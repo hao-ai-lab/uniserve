@@ -89,12 +89,12 @@ use uniserve_core::{
 use uniserve_core::{HashAlgo, RequestId};
 use uniserve_worker_ipc::{
     AttentionRegime, Batch, BatchPartition, BlockTable as IpcBlockTable, Bounds,
-    CachePageAllocation, CloseReason, CompletionReport, Control, DType, DecodeKind,
-    DecodePlacement, DimBound, Disposition, ForwardMode, GenAdmission, LatentPlacement,
-    MediaAdmission, MediaPlan, MediaProfileId, ModelOutput, NewRequest, OpId, OpStatus, Operation,
-    Point, PointRange, ProductKind, ProductPayload, ProductRef, RequestKey, ResourceClass, RouteId,
-    RowGeometry, SamplingState, ShapeBound, StorageClass, TimingCounters, UndAdmission, VersionRef,
-    WorkerForwardStats, WorkerInfo,
+    CachePageAllocation, CloseReason, CompletionReport, Control, DType, DimBound, Disposition,
+    ForwardMode, GenAdmission, LatentPlacement, MediaAdmission, MediaGeometry, MediaProfileId,
+    ModelOutput, NewRequest, OpId, OpStatus, Operation, Point, PointRange, ProductKind,
+    ProductPayload, ProductRef, ReconstructionKind, ReconstructionPlacement, RequestKey,
+    ResourceClass, RouteId, RowGeometry, SamplingState, ShapeBound, StorageClass, TimingCounters,
+    UndAdmission, VersionRef, WorkerForwardStats, WorkerInfo,
 };
 
 use crate::executor::{WorkerExecError, WorkerLossError};
@@ -424,28 +424,29 @@ struct MediaCursor {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MediaQuantum {
-    Transition,
-    Flow { step: u32 },
-    Video { start_unit: u32, unit_count: u32 },
-    Audio,
+    Prepare,
+    Denoise { step: u32 },
+    ReconstructVideo { start_unit: u32, unit_count: u32 },
+    ReconstructAudio,
     Materialize,
 }
 
-fn next_media_quantum(cursor: MediaCursor, plan: MediaPlan) -> Option<MediaQuantum> {
+fn next_media_quantum(cursor: MediaCursor, geometry: MediaGeometry) -> Option<MediaQuantum> {
     const VIDEO_UNITS_PER_ROUND: u32 = 4;
     if !cursor.prepared {
-        Some(MediaQuantum::Transition)
-    } else if cursor.denoise_step < plan.denoise_steps {
-        Some(MediaQuantum::Flow {
+        Some(MediaQuantum::Prepare)
+    } else if cursor.denoise_step < geometry.denoise_steps {
+        Some(MediaQuantum::Denoise {
             step: cursor.denoise_step,
         })
-    } else if cursor.video_unit < plan.video_decode_units {
-        Some(MediaQuantum::Video {
+    } else if cursor.video_unit < geometry.video_reconstruction_units {
+        Some(MediaQuantum::ReconstructVideo {
             start_unit: cursor.video_unit,
-            unit_count: VIDEO_UNITS_PER_ROUND.min(plan.video_decode_units - cursor.video_unit),
+            unit_count: VIDEO_UNITS_PER_ROUND
+                .min(geometry.video_reconstruction_units - cursor.video_unit),
         })
     } else if !cursor.audio_done {
-        Some(MediaQuantum::Audio)
+        Some(MediaQuantum::ReconstructAudio)
     } else if !cursor.materialized {
         Some(MediaQuantum::Materialize)
     } else {
@@ -455,13 +456,13 @@ fn next_media_quantum(cursor: MediaCursor, plan: MediaPlan) -> Option<MediaQuant
 
 fn advance_media_cursor(mut cursor: MediaCursor, quantum: MediaQuantum) -> MediaCursor {
     match quantum {
-        MediaQuantum::Transition => cursor.prepared = true,
-        MediaQuantum::Flow { step } => cursor.denoise_step = step.saturating_add(1),
-        MediaQuantum::Video {
+        MediaQuantum::Prepare => cursor.prepared = true,
+        MediaQuantum::Denoise { step } => cursor.denoise_step = step.saturating_add(1),
+        MediaQuantum::ReconstructVideo {
             start_unit,
             unit_count,
         } => cursor.video_unit = start_unit.saturating_add(unit_count),
-        MediaQuantum::Audio => cursor.audio_done = true,
+        MediaQuantum::ReconstructAudio => cursor.audio_done = true,
         MediaQuantum::Materialize => cursor.materialized = true,
     }
     cursor
@@ -469,9 +470,11 @@ fn advance_media_cursor(mut cursor: MediaCursor, quantum: MediaQuantum) -> Media
 
 fn media_work(quantum: MediaQuantum) -> ForwardMode {
     match quantum {
-        MediaQuantum::Transition => ForwardMode::GenTransition,
-        MediaQuantum::Flow { .. } => ForwardMode::GenFlow,
-        MediaQuantum::Video { .. } | MediaQuantum::Audio => ForwardMode::GenDecode,
+        MediaQuantum::Prepare => ForwardMode::MediaPrepare,
+        MediaQuantum::Denoise { .. } => ForwardMode::MediaDenoise,
+        MediaQuantum::ReconstructVideo { .. } | MediaQuantum::ReconstructAudio => {
+            ForwardMode::MediaReconstruct
+        }
         MediaQuantum::Materialize => ForwardMode::Materialize,
     }
 }
@@ -652,9 +655,9 @@ fn batch_kind(operation_variant: ForwardMode) -> BatchKind {
         }
         ForwardMode::TokenDecode | ForwardMode::TokenVerify => BatchKind::Decode,
         ForwardMode::Draft
-        | ForwardMode::GenFlow
-        | ForwardMode::GenDecode
-        | ForwardMode::GenTransition
+        | ForwardMode::MediaDenoise
+        | ForwardMode::MediaReconstruct
+        | ForwardMode::MediaPrepare
         | ForwardMode::Materialize
         | ForwardMode::TransferProduct
         | ForwardMode::TransferKvPublish
@@ -664,7 +667,7 @@ fn batch_kind(operation_variant: ForwardMode) -> BatchKind {
 
 fn completion_priority(operation_variant: ForwardMode) -> u8 {
     match operation_variant {
-        ForwardMode::GenFlow | ForwardMode::Materialize | ForwardMode::TransferKvInstall => 0,
+        ForwardMode::MediaDenoise | ForwardMode::Materialize | ForwardMode::TransferKvInstall => 0,
         _ => 1,
     }
 }
@@ -712,7 +715,7 @@ fn transition_kv_lengths(delta: &TransitionIntent) -> Option<KvLengths> {
         TransitionIntent::PublishKv {
             physical_kv_len, ..
         }
-        | TransitionIntent::TransitionGen {
+        | TransitionIntent::PrepareGen {
             physical_kv_len, ..
         }
         | TransitionIntent::DenoiseGen {
@@ -773,7 +776,7 @@ fn ceil_div_u64(value: u64, divisor: u64) -> u64 {
 /// timestep, so its cost multiplies the compiled latent geometry rather than the
 /// scalar per-step token cost.
 fn planned_op_token_cost(transition: &NextOp) -> usize {
-    if transition.operation_variant != ForwardMode::GenFlow {
+    if transition.operation_variant != ForwardMode::MediaDenoise {
         return transition.token_cost;
     }
     let latent_tokens = usize::try_from(transition.resources.latent_units)
@@ -787,7 +790,10 @@ fn planned_op_token_cost(transition: &NextOp) -> usize {
 }
 
 fn tensorized_mixed_runner_work(variant: ForwardMode) -> bool {
-    matches!(variant, ForwardMode::TokenDecode | ForwardMode::GenFlow)
+    matches!(
+        variant,
+        ForwardMode::TokenDecode | ForwardMode::MediaDenoise
+    )
 }
 
 fn flow_matches_mixed_bucket(
@@ -796,7 +802,7 @@ fn flow_matches_mixed_bucket(
     latent_placements: &HashMap<(RequestKey, OpId), LatentPlacement>,
     bucket: &uniserve_worker_ipc::GraphBucket,
 ) -> bool {
-    if operation.work != ForwardMode::GenFlow {
+    if operation.work != ForwardMode::MediaDenoise {
         return false;
     }
     let identity = (operation.request_key, operation.op_id);
@@ -878,9 +884,9 @@ fn partition_attention(operations: &[Operation]) -> AttentionRegime {
             | ForwardMode::TokenDecode
             | ForwardMode::TokenVerify
             | ForwardMode::Draft => AttentionRegime::Causal,
-            ForwardMode::GenFlow => AttentionRegime::Hybrid,
-            ForwardMode::GenTransition
-            | ForwardMode::GenDecode
+            ForwardMode::MediaDenoise => AttentionRegime::Hybrid,
+            ForwardMode::MediaPrepare
+            | ForwardMode::MediaReconstruct
             | ForwardMode::EncodeVision
             | ForwardMode::EncodeLatent
             | ForwardMode::TransferProduct
@@ -908,8 +914,8 @@ fn transition_output_bound(transition: &NextOp) -> usize {
                     .saturating_add(2)
             }),
         ForwardMode::TokenExtend | ForwardMode::TokenDecode => 4,
-        ForwardMode::GenFlow => transition.token_cost.saturating_add(2),
-        ForwardMode::GenDecode => 2,
+        ForwardMode::MediaDenoise => transition.token_cost.saturating_add(2),
+        ForwardMode::MediaReconstruct => 2,
         ForwardMode::Materialize => 3,
         _ => 2,
     }

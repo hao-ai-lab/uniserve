@@ -101,7 +101,6 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         max_batch_tokens,
         max_model_len: effective_max_model_len,
         max_video_seconds: config.engine.max_video_seconds,
-        fixed_graph_cache_capacity: config.engine.media_graph_cache_capacity,
         ..config.engine.worker_process.clone()
     };
     let engine_config = EngineCoreConfig {
