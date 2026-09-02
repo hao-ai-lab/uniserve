@@ -45,11 +45,11 @@ from uniserve_worker.execution.batch import (
     UndAdmission,
     encode_sampling_state_bytes,
 )
-from uniserve_worker.server.completion import (
+from uniserve_worker.execution.output import (
     completion_report_ready,
     finalize_completion_report,
 )
-from uniserve_worker.server.stub import STUB_IMG_START_TOKEN_ID, _next_token
+from uniserve_worker.models.stub import STUB_IMG_START_TOKEN_ID, _next_token
 
 pytestmark = pytest.mark.integration
 
@@ -200,13 +200,15 @@ def test_batched_decode_produces_the_serial_oracle_tokens() -> None:
         decode_ops.append(operation)
         decode_inputs.append(payload)
         commits.append(commit)
-    result = worker.execute(
-        execution_batch(
-            step_id=9,
-            admissions=(),
-            operations=tuple(decode_ops),
-            controls=tuple(commits),
-            input_products=tuple(decode_inputs),
+    result = _materialize(
+        worker.execute(
+            execution_batch(
+                step_id=9,
+                admissions=(),
+                operations=tuple(decode_ops),
+                controls=tuple(commits),
+                input_products=tuple(decode_inputs),
+            )
         )
     )
 
@@ -233,7 +235,6 @@ def test_sampling_batch_returns_serial_tokens_for_mixed_finish_policies() -> Non
         parent=root_parent(first),
         mode=TokenMode.EXTEND,
         tokens=(3, 4),
-        produces_finish_candidate=False,
     )
     second_op, second_input = token_operation(
         second.request_key,
@@ -243,12 +244,14 @@ def test_sampling_batch_returns_serial_tokens_for_mixed_finish_policies() -> Non
         tokens=(3, 4),
     )
 
-    result = worker.execute(
-        execution_batch(
-            step_id=1,
-            admissions=(first, second),
-            operations=(first_op, second_op),
-            input_products=(first_input, second_input),
+    result = _materialize(
+        worker.execute(
+            execution_batch(
+                step_id=1,
+                admissions=(first, second),
+                operations=(first_op, second_op),
+                input_products=(first_input, second_input),
+            )
         )
     )
 
@@ -423,14 +426,16 @@ def test_chunked_prompt_logprobs_preserve_the_preceding_device_logits() -> None:
         tokens=(3, 4),
         logprobs=True,
     )
-    first_result = _materialize(worker.execute(
-        execution_batch(
-            step_id=1,
-            admissions=(admission,),
-            operations=(first,),
-            input_products=(first_input,),
+    first_result = _materialize(
+        worker.execute(
+            execution_batch(
+                step_id=1,
+                admissions=(admission,),
+                operations=(first,),
+                input_products=(first_input,),
+            )
         )
-    ))
+    )
     commit = commit_for_completion(first, first_result)
     second, second_input = token_operation(
         admission.request_key,
@@ -441,15 +446,17 @@ def test_chunked_prompt_logprobs_preserve_the_preceding_device_logits() -> None:
         logprobs=True,
         control_seq=commit.control_seq,
     )
-    second_result = _materialize(worker.execute(
-        execution_batch(
-            step_id=2,
-            admissions=(),
-            operations=(second,),
-            controls=(commit,),
-            input_products=(second_input,),
+    second_result = _materialize(
+        worker.execute(
+            execution_batch(
+                step_id=2,
+                admissions=(),
+                operations=(second,),
+                controls=(commit,),
+                input_products=(second_input,),
+            )
         )
-    ))
+    )
 
     first_blob = next(
         product.payload
@@ -655,12 +662,14 @@ def test_forced_token_schedule_overrides_selection() -> None:
         tokens=(3, 4),
     )
 
-    result = worker.execute(
-        execution_batch(
-            step_id=1,
-            admissions=(admission,),
-            operations=(operation,),
-            input_products=(token_input,),
+    result = _materialize(
+        worker.execute(
+            execution_batch(
+                step_id=1,
+                admissions=(admission,),
+                operations=(operation,),
+                input_products=(token_input,),
+            )
         )
     )
 

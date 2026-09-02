@@ -8,7 +8,6 @@ pub struct MediaSubmission {
     pub prompt_token_ids: Vec<u32>,
     pub seed: u64,
     pub priority: i32,
-    pub output_path: String,
     pub geometry: MediaGeometry,
     pub arrival_time: Option<f64>,
     pub data_parallel_rank: Option<u32>,
@@ -20,7 +19,6 @@ impl MediaSubmission {
         external_request_id: impl Into<String>,
         prompt_token_ids: Vec<u32>,
         seed: u64,
-        output_path: impl Into<String>,
         geometry: MediaGeometry,
     ) -> Self {
         Self {
@@ -28,7 +26,6 @@ impl MediaSubmission {
             prompt_token_ids,
             seed,
             priority: 0,
-            output_path: output_path.into(),
             geometry,
             arrival_time: None,
             data_parallel_rank: None,

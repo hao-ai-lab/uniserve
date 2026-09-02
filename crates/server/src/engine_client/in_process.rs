@@ -178,7 +178,6 @@ impl EngineClient {
             prompt_token_ids,
             seed,
             priority,
-            output_path,
             geometry,
             ..
         } = submission;
@@ -197,7 +196,6 @@ impl EngineClient {
             prompt_token_ids,
             seed,
             priority,
-            output_path,
             geometry,
         };
         let mut scheduler_rx = self.core.handle().submit_media(request).map_err(|error| {

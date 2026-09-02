@@ -1,28 +1,30 @@
-"""Pinned completion staging, immutable step outputs, and retained outcomes."""
+"""Persistent output storage and concrete partition result materialization."""
 
 from __future__ import annotations
 
 import struct
 import time
 import concurrent.futures
-from abc import ABC, abstractmethod
-from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, Final, cast, overload
+from threading import RLock
+from typing import Any, Final, cast
 
 import torch
 
 from ..execution.batch import (
     CompletionReport,
-    DeferredCompletion,
+    CompletionState,
     ErrorCode,
     FinishFlags,
     FixedPoint,
     LogicalLengths,
+    MediaOutput,
     ModelOutput,
     OpStatus,
     PartitionCompletion,
+    RequestKey,
+    TimingCounters,
     TokenSpan,
     VersionRef,
 )
@@ -35,37 +37,25 @@ from ..transfer.tickets import (
     Transport,
     encode_transfer_descriptor,
 )
-from .cpu_tasks import CpuTaskReservation
-from .image_codec import uint8_image_to_png_base64_bytes
-from .profiler import profile_range
-from .request_state import RequestRuntime
-
-if TYPE_CHECKING:
-    from .app import InflightStep, TerminalStep
+from ..media.codec import uint8_image_to_png_base64_bytes
+from ..profiling import profile_range, timing_events_enabled
+from ..runtime.cpu import CpuTaskReservation
+from ..runtime.request import RequestRuntime
 
 __all__ = [
-    "DeferredDerivedInteger",
-    "DeferredCompletionTask",
-    "EventGatedDeferredTask",
-    "DeferredResult",
-    "DeferredImagePayload",
-    "DeferredInteger",
-    "DeferredLogprobBatch",
-    "DeferredLogprobPayload",
-    "DeferredLogprobValue",
-    "DeferredSampleSpan",
-    "DeferredSampleToken",
-    "DeferredSpeculativePoint",
-    "DeferredSpeculativeTokens",
-    "DeferredToken",
-    "DeferredTokenSpan",
-    "DeferredTopLogprobs",
-    "DeferredTransferPayload",
-    "CompletedStepCache",
-    "PinnedByteCapture",
-    "PinnedOutputBuffer",
-    "PinnedTokenCapture",
-    "StepOutputs",
+    "CpuJob",
+    "PendingOutput",
+    "ImagePayload",
+    "LogprobCapture",
+    "LogprobOutputRow",
+    "LogprobPayload",
+    "SamplingCapture",
+    "SamplingOutputRow",
+    "TransferPayload",
+    "ByteCapture",
+    "OutputBuffer",
+    "OutputPool",
+    "TokenCapture",
     "completion_report_ready",
     "finalize_completion_report",
     "partition_completion_ready",
@@ -83,181 +73,11 @@ def _invariant(message: str) -> WorkerError:
     )
 
 
-class CompletedStepCache:
-    """Weighted LRU ownership for quiescent terminal step records."""
-
-    def __init__(self, capacity: int) -> None:
-        value = int(capacity)
-        if value < 1:
-            raise ValueError("completed step cache capacity must be positive")
-        self.capacity = value
-        self._steps: OrderedDict[int, InflightStep | TerminalStep] = OrderedDict()
-        self._weight = 0
-
-    def __contains__(self, step_id: object) -> bool:
-        return step_id in self._steps
-
-    def take(self, step_id: int) -> InflightStep | TerminalStep | None:
-        step = self._steps.pop(int(step_id), None)
-        if step is not None:
-            self._weight -= int(step.weight)
-        return step
-
-    def touch(self, step_id: int) -> None:
-        key = int(step_id)
-        if key in self._steps:
-            self._steps.move_to_end(key)
-
-    def put(
-        self,
-        step: InflightStep | TerminalStep,
-    ) -> tuple[InflightStep | TerminalStep, ...]:
-        key = int(step.step_id)
-        existing = self._steps.pop(key, None)
-        if existing is not None:
-            self._weight -= int(existing.weight)
-        self._steps[key] = step
-        self._weight += int(step.weight)
-        evicted: list[InflightStep | TerminalStep] = []
-        while self._weight > self.capacity:
-            _key, victim = self._steps.popitem(last=False)
-            self._weight -= int(victim.weight)
-            evicted.append(victim)
-        return tuple(evicted)
-
-    def remove(self, step_id: int) -> InflightStep | TerminalStep | None:
-        return self.take(step_id)
-
-    def values(self) -> tuple[InflightStep | TerminalStep, ...]:
-        return tuple(self._steps.values())
-
-
-class StepOutputs:
-    """One independent response cursor over an execution step's partition order."""
-
-    __slots__ = (
-        "_step",
-        "_sent_partitions",
-        "_empty_sent",
-        "_error_sent",
-        "_closed",
-        "_on_close",
-    )
-
-    def __init__(
-        self,
-        step: InflightStep | TerminalStep,
-        on_close: Callable[[StepOutputs], None],
-    ) -> None:
-        self._step = step
-        self._sent_partitions: set[int] = set()
-        self._empty_sent = False
-        self._error_sent = False
-        self._closed = False
-        self._on_close = on_close
-
-    @property
-    def step_id(self) -> int:
-        return int(self._current().step_id)
-
-    @property
-    def session_ids(self) -> frozenset[int]:
-        return frozenset(int(value) for value in self._current().session_ids)
-
-    @property
-    def source(self) -> object | None:
-        return self._current().source
-
-    @property
-    def error(self) -> WorkerError | None:
-        return self._current().error
-
-    @property
-    def complete(self) -> bool:
-        return bool(self._current().complete)
-
-    def _current(self) -> InflightStep | TerminalStep:
-        current = self._step.current()
-        if current is not self._step:
-            self._step = current
-        return current
-
-    def ready(self) -> bool:
-        current = self._current()
-        current.advance_materialization()
-        current = self._current()
-        if current.error is not None:
-            return not self._error_sent
-        partitions = current.materialized_partitions()
-        if any(
-            int(partition.partition_id) not in self._sent_partitions for partition in partitions
-        ):
-            return True
-        return bool(current.complete and not current.partition_order and not self._empty_sent)
-
-    def execution_complete(self) -> bool:
-        current = self._current()
-        complete = bool(current.advance_execution())
-        self._current()
-        return complete
-
-    def take_ready(self) -> CompletionReport:
-        current = self._current()
-        current.advance_materialization()
-        current = self._current()
-        if current.error is not None:
-            raise RuntimeError("terminal error must be consumed through take_error")
-        partitions = tuple(
-            partition
-            for partition in current.materialized_partitions()
-            if int(partition.partition_id) not in self._sent_partitions
-        )
-        if partitions:
-            self._sent_partitions.update(int(partition.partition_id) for partition in partitions)
-            return CompletionReport(step_id=int(current.step_id), partitions=partitions)
-        if current.complete and not current.partition_order and not self._empty_sent:
-            self._empty_sent = True
-            return CompletionReport(step_id=int(current.step_id), partitions=())
-        raise RuntimeError("step output cursor has no query-ready partition")
-
-    def take_error(self) -> WorkerError:
-        error = self.error
-        if error is None or self._error_sent:
-            raise RuntimeError("step output cursor has no unread terminal error")
-        self._error_sent = True
-        return error
-
-    def pending(self) -> bool:
-        current = self._current()
-        if current.error is not None:
-            return not self._error_sent
-        if not current.complete:
-            return True
-        if not current.partition_order:
-            return not self._empty_sent
-        return any(
-            int(partition.partition_id) not in self._sent_partitions
-            for partition in current.materialized_partitions()
-        )
-
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        self._on_close(self)
-
-    def __del__(self) -> None:
-        try:
-            self.close()
-        except Exception:
-            pass
-
-
 @dataclass(frozen=True, slots=True)
-class PinnedTokenCapture:
+class TokenCapture:
     """One token range copied into a partition's pinned output buffer."""
 
-    buffer: PinnedOutputBuffer
+    buffer: OutputBuffer
     offset: int
     count: int
 
@@ -269,10 +89,10 @@ class PinnedTokenCapture:
 
 
 @dataclass(frozen=True, slots=True)
-class PinnedByteCapture:
+class ByteCapture:
     """One shaped byte range copied into a partition's pinned output buffer."""
 
-    buffer: PinnedOutputBuffer
+    buffer: OutputBuffer
     offset: int
     count: int
     shape: tuple[int, ...]
@@ -292,7 +112,7 @@ class PinnedByteCapture:
         return self.tensor().numpy()
 
 
-class PinnedOutputBuffer:
+class OutputBuffer:
     """Pinned host storage and completion events for one partition commit."""
 
     __slots__ = (
@@ -311,14 +131,17 @@ class PinnedOutputBuffer:
         "_sealed",
         "_abandoned",
         "_events_released",
-        "_deferred",
+        "_release_pending",
         "_reserved_ns",
         "_device_started_ns",
         "_copy_started_ns",
         "_sealed_ns",
         "_ready_ns",
         "_timing",
+        "_timing_events",
         "_retained_until_ready",
+        "_release_to_pool",
+        "_released_to_pool",
     )
 
     def __init__(
@@ -328,6 +151,7 @@ class PinnedOutputBuffer:
         token_capacity: int,
         devices: Sequence[torch.device | str] = (),
         event_pool: DeviceEventPool,
+        release_to_pool: Callable[[OutputBuffer], None] | None = None,
     ) -> None:
         global _next_buffer_generation
         count = int(rows)
@@ -362,14 +186,77 @@ class PinnedOutputBuffer:
         self._sealed = False
         self._abandoned = False
         self._events_released = False
-        self._deferred = False
+        self._release_pending = False
         self._reserved_ns = time.perf_counter_ns()
         self._device_started_ns = 0
         self._copy_started_ns = 0
         self._sealed_ns = 0
         self._ready_ns = 0
         self._timing: tuple[int, int, int, int] | None = None
+        self._timing_events = timing_events_enabled()
         self._retained_until_ready: list[object] = []
+        self._release_to_pool = release_to_pool
+        self._released_to_pool = False
+
+    def reset(
+        self,
+        rows: int,
+        *,
+        token_capacity: int,
+        devices: Sequence[torch.device | str],
+    ) -> None:
+        """Begin a new lease over this persistent pinned allocation."""
+
+        global _next_buffer_generation
+        if not self._events_released or self._release_pending:
+            raise _invariant("output storage was leased before its prior events were released")
+        count = int(rows)
+        capacity = int(token_capacity)
+        if count < 1 or capacity < count:
+            raise resource_error("output lease geometry is invalid")
+        normalized: list[torch.device] = []
+        for value in devices:
+            device = canonical_device(value)
+            if device.type == "cuda" and device not in normalized:
+                normalized.append(device)
+        if capacity > int(self._host.numel()):
+            self._host = torch.empty(
+                capacity,
+                dtype=torch.long,
+                device="cpu",
+                pin_memory=bool(normalized),
+            )
+        elif normalized and not bool(self._host.is_pinned()):
+            self._host = torch.empty(
+                int(self._host.numel()),
+                dtype=torch.long,
+                device="cpu",
+                pin_memory=True,
+            )
+        self.devices = tuple(normalized)
+        self._rows = count
+        self._generation = _next_buffer_generation
+        _next_buffer_generation += 1
+        self._token_cursor = 0
+        self._byte_cursor = 0
+        self._token_cache.clear()
+        self._start_events.clear()
+        self._producer_events.clear()
+        self._events.clear()
+        self._observed.clear()
+        self._sealed = False
+        self._abandoned = False
+        self._events_released = False
+        self._release_pending = False
+        self._reserved_ns = time.perf_counter_ns()
+        self._device_started_ns = 0
+        self._copy_started_ns = 0
+        self._sealed_ns = 0
+        self._ready_ns = 0
+        self._timing = None
+        self._timing_events = timing_events_enabled()
+        self._retained_until_ready.clear()
+        self._released_to_pool = False
 
     @property
     def generation(self) -> int:
@@ -395,6 +282,8 @@ class PinnedOutputBuffer:
         if target.type != "cuda":
             return
         self.register_device(target)
+        if not self._timing_events:
+            return
         name = str(target)
         if name in self._start_events:
             return
@@ -407,6 +296,8 @@ class PinnedOutputBuffer:
         if self._copy_started_ns == 0:
             self._copy_started_ns = time.perf_counter_ns()
         name = str(device)
+        if not self._timing_events:
+            return
         if name in self._producer_events:
             return
         if name not in self._start_events:
@@ -416,7 +307,7 @@ class PinnedOutputBuffer:
         self.event_pool.record(event, device)
         self._producer_events[name] = event
 
-    def capture(self, tokens: torch.Tensor) -> PinnedTokenCapture:
+    def capture(self, tokens: torch.Tensor) -> TokenCapture:
         if self._sealed:
             raise _invariant("completion capture was registered after its buffer was sealed")
         flat = tokens.reshape(-1).to(dtype=torch.long)
@@ -436,9 +327,9 @@ class PinnedOutputBuffer:
         else:
             host.copy_(flat.to(device="cpu"))
         self._token_cursor = end
-        return PinnedTokenCapture(self, offset, count)
+        return TokenCapture(self, offset, count)
 
-    def capture_bytes(self, value: torch.Tensor) -> PinnedByteCapture:
+    def capture_bytes(self, value: torch.Tensor) -> ByteCapture:
         if value.dtype is not torch.uint8:
             raise ValueError("completion byte capture requires uint8 storage")
         if self._sealed:
@@ -463,7 +354,7 @@ class PinnedOutputBuffer:
         else:
             host.copy_(flat.to(device="cpu"))
         self._byte_cursor += count
-        return PinnedByteCapture(
+        return ByteCapture(
             self,
             offset,
             count,
@@ -474,7 +365,7 @@ class PinnedOutputBuffer:
         self,
         value: torch.Tensor,
         storage: torch.Tensor,
-    ) -> PinnedByteCapture:
+    ) -> ByteCapture:
         """Copy bytes into caller-owned pinned storage under this buffer's events."""
 
         if value.dtype is not torch.uint8:
@@ -500,7 +391,7 @@ class PinnedOutputBuffer:
             host.copy_(flat, non_blocking=True)
         else:
             host.copy_(flat.to(device="cpu"))
-        return PinnedByteCapture(
+        return ByteCapture(
             self,
             0,
             count,
@@ -516,11 +407,12 @@ class PinnedOutputBuffer:
             return
         for device in self.devices:
             name = str(device)
-            if name not in self._start_events:
-                self.begin_device(device)
-            if name not in self._producer_events:
-                self._mark_copy_started(device)
-            event = self.event_pool.acquire(device, timing=True)
+            if self._timing_events:
+                if name not in self._start_events:
+                    self.begin_device(device)
+                if name not in self._producer_events:
+                    self._mark_copy_started(device)
+            event = self.event_pool.acquire(device, timing=self._timing_events)
             self.event_pool.retain(event, device)
             self.event_pool.record(event, device)
             self._events[name] = event
@@ -546,7 +438,7 @@ class PinnedOutputBuffer:
             return
         self._retained_until_ready.append(owner)
 
-    def read_tokens(self, capture: PinnedTokenCapture) -> tuple[int, ...]:
+    def read_tokens(self, capture: TokenCapture) -> tuple[int, ...]:
         if capture.buffer is not self:
             raise _invariant("completion capture belongs to a different pinned output buffer")
         key = (int(capture.offset), int(capture.count))
@@ -562,7 +454,7 @@ class PinnedOutputBuffer:
         self._token_cache[key] = values
         return values
 
-    def read_bytes(self, capture: PinnedByteCapture) -> torch.Tensor:
+    def read_bytes(self, capture: ByteCapture) -> torch.Tensor:
         if capture.buffer is not self:
             raise _invariant("completion byte capture belongs to a different pinned output buffer")
         if not self.ready():
@@ -594,19 +486,20 @@ class PinnedOutputBuffer:
             )
             device_us = 0
             copy_us = 0
-            for name, end_event in self._events.items():
-                start_event = self._start_events.get(name)
-                producer_event = self._producer_events.get(name)
-                if start_event is None or producer_event is None:
-                    raise _invariant("completion timing events are incomplete")
-                device_us = max(
-                    device_us,
-                    max(0, round(float(start_event.elapsed_time(producer_event)) * 1000.0)),
-                )
-                copy_us = max(
-                    copy_us,
-                    max(0, round(float(producer_event.elapsed_time(end_event)) * 1000.0)),
-                )
+            if self._timing_events:
+                for name, end_event in self._events.items():
+                    start_event = self._start_events.get(name)
+                    producer_event = self._producer_events.get(name)
+                    if start_event is None or producer_event is None:
+                        raise _invariant("completion timing events are incomplete")
+                    device_us = max(
+                        device_us,
+                        max(0, round(float(start_event.elapsed_time(producer_event)) * 1000.0)),
+                    )
+                    copy_us = max(
+                        copy_us,
+                        max(0, round(float(producer_event.elapsed_time(end_event)) * 1000.0)),
+                    )
             if not self._events and self._device_started_ns:
                 copy_started_ns = self._copy_started_ns or self._sealed_ns
                 device_us = max(0, copy_started_ns - self._device_started_ns) // 1000
@@ -655,72 +548,94 @@ class PinnedOutputBuffer:
         )
 
     def _release_events(self) -> None:
-        if self._events_released or self._deferred:
+        if self._events_released or self._release_pending:
             return
         for event in self._all_events():
             self.event_pool.release(event)
         self._events_released = True
+        self._return_to_pool()
 
     def _defer_release(self) -> None:
-        if self._events_released or self._deferred:
+        if self._events_released or self._release_pending:
             return
         events = self._all_events()
         if events:
-            self._deferred = True
+            self._release_pending = True
             self.event_pool.defer_release(events, self)
         else:
             self._events_released = True
+            self._return_to_pool()
+
+    def events_released(self) -> None:
+        """Receive completion of an event-pool asynchronous release."""
+
+        self._release_pending = False
+        self._events_released = True
+        self._return_to_pool()
+
+    def _return_to_pool(self) -> None:
+        if self._released_to_pool or self._release_to_pool is None:
+            return
+        self._released_to_pool = True
+        self._release_to_pool(self)
 
 
-class DeferredTokenSpan:
-    """One token vector backed exclusively by host-observation storage."""
+class OutputPool:
+    """Bounded owner of reusable pinned partition-output allocations."""
 
-    __slots__ = ("capture", "count", "_values")
+    def __init__(
+        self,
+        *,
+        capacity: int,
+        max_words: int,
+        event_pool: DeviceEventPool,
+    ) -> None:
+        self.capacity = int(capacity)
+        self.max_words = int(max_words)
+        if self.capacity < 1 or self.max_words < 1:
+            raise ValueError("output-pool bounds must be positive")
+        self.event_pool = event_pool
+        self._buffers: list[OutputBuffer] = []
+        self._free: list[OutputBuffer] = []
+        self._lock = RLock()
 
-    def __init__(self, capture: PinnedTokenCapture) -> None:
-        self.capture = capture
-        self.count = int(capture.count)
-        self._values: tuple[int, ...] | None = None
+    def acquire(
+        self,
+        rows: int,
+        *,
+        token_capacity: int,
+        devices: Sequence[torch.device | str] = (),
+    ) -> OutputBuffer:
+        words = int(token_capacity)
+        if words > self.max_words:
+            raise resource_error("partition output exceeds its startup storage bound")
+        with self._lock:
+            if self._free:
+                buffer = self._free.pop()
+                buffer.reset(rows, token_capacity=words, devices=devices)
+                return buffer
+            if len(self._buffers) >= self.capacity:
+                raise resource_error("all partition output leases are active")
+            buffer = OutputBuffer(
+                rows,
+                token_capacity=words,
+                devices=devices,
+                event_pool=self.event_pool,
+                release_to_pool=self._release,
+            )
+            self._buffers.append(buffer)
+            return buffer
 
-    def ready(self) -> bool:
-        return self._values is not None or self.capture.ready()
+    def _release(self, buffer: OutputBuffer) -> None:
+        with self._lock:
+            if buffer not in self._buffers or buffer in self._free:
+                raise _invariant("output pool received an invalid lease return")
+            self._free.append(buffer)
 
-    def finalize(self) -> tuple[int, ...]:
-        if self._values is None:
-            self._values = self.capture.values()
-        return self._values
-
-
-class DeferredToken:
-    """An integer finalized only when the worker serializes its result."""
-
-    __slots__ = ("span", "index")
-
-    def __init__(self, span: DeferredTokenSpan, index: int) -> None:
-        self.span = span
-        self.index = int(index)
-
-    def ready(self) -> bool:
-        return self.span.ready()
-
-    def finalize(self) -> int:
-        return self.span.finalize()[self.index]
-
-    def __int__(self) -> int:
-        return self.finalize()
-
-    def __index__(self) -> int:
-        return self.finalize()
-
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, DeferredToken):
-            return self.finalize() == other.finalize()
-        if isinstance(other, int):
-            return self.finalize() == other
-        return NotImplemented
-
-    def __hash__(self) -> int:
-        return hash(self.finalize())
+    def close(self) -> None:
+        with self._lock:
+            self._free.clear()
+            self._buffers.clear()
 
 
 class _InvalidSamplingDistribution(RuntimeError):
@@ -731,14 +646,14 @@ class _PredicatedOperation(RuntimeError):
     pass
 
 
-class DeferredSampleSpan:
-    """Selected tokens, row validity, predicates, and accepted counts."""
+class SamplingCapture:
+    """Contiguous validity, activity, token, and acceptance metadata."""
 
     __slots__ = ("capture", "count", "_values")
 
     def __init__(
         self,
-        capture: PinnedTokenCapture | None,
+        capture: TokenCapture | None,
         count: int,
         values: tuple[int, ...] | None = None,
     ) -> None:
@@ -776,138 +691,35 @@ class DeferredSampleSpan:
         return values[self.count * 3 + index]
 
 
-class DeferredSampleToken(DeferredToken):
-    __slots__ = ("sample_span",)
+@dataclass(frozen=True, slots=True)
+class SamplingOutputRow:
+    """One operation's view of a contiguous sampling metadata capture."""
 
-    def __init__(self, span: DeferredSampleSpan, index: int) -> None:
-        self.sample_span = span
-        self.span = cast(DeferredTokenSpan, span)
-        self.index = int(index)
-
-    def ready(self) -> bool:
-        return self.sample_span.ready()
-
-    def finalize(self) -> int:
-        return self.sample_span.token(self.index)
-
-
-class DeferredInteger:
-    __slots__ = ("span", "index")
-
-    def __init__(self, span: DeferredSampleSpan, index: int) -> None:
-        self.span = span
-        self.index = int(index)
+    capture: SamplingCapture
+    index: int
+    draft_tokens: tuple[int, ...] = ()
+    terminal_prefix: int | None = None
+    logical_base: int | None = None
+    kv_base: int | None = None
 
     def ready(self) -> bool:
-        return self.span.ready()
+        return self.capture.ready()
 
-    def finalize(self) -> int:
-        return self.span.accepted(self.index)
-
-    def __int__(self) -> int:
-        return self.finalize()
-
-    def __index__(self) -> int:
-        return self.finalize()
-
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, DeferredInteger):
-            return self.finalize() == other.finalize()
-        if isinstance(other, int):
-            return self.finalize() == other
-        return NotImplemented
-
-
-class DeferredDerivedInteger:
-    __slots__ = ("source", "offset")
-
-    def __init__(self, source: DeferredInteger, offset: int) -> None:
-        self.source = source
-        self.offset = int(offset)
-
-    def ready(self) -> bool:
-        return self.source.ready()
-
-    def finalize(self) -> int:
-        return int(self.source) + self.offset
-
-    def __int__(self) -> int:
-        return self.finalize()
-
-    def __index__(self) -> int:
-        return self.finalize()
-
-
-class DeferredSpeculativePoint:
-    __slots__ = ("accepted", "terminal_prefix")
-
-    def __init__(self, accepted: DeferredInteger, terminal_prefix: int | None) -> None:
-        self.accepted = accepted
-        self.terminal_prefix = terminal_prefix
-
-    def ready(self) -> bool:
-        return self.accepted.ready()
-
-    def finalize(self) -> int:
-        accepted = int(self.accepted)
+    def materialize(self) -> tuple[tuple[int, ...], int, int]:
+        token = self.capture.token(int(self.index))
+        accepted = self.capture.accepted(int(self.index))
+        if not self.draft_tokens:
+            return (token,), 1, accepted
+        if accepted < 0 or accepted > len(self.draft_tokens):
+            raise RuntimeError("speculative acceptance count is outside the draft span")
         if self.terminal_prefix is not None and accepted >= self.terminal_prefix:
-            return accepted
-        return accepted + 1
-
-    def __int__(self) -> int:
-        return self.finalize()
-
-    def __index__(self) -> int:
-        return self.finalize()
+            tokens = self.draft_tokens[:accepted]
+        else:
+            tokens = (*self.draft_tokens[:accepted], token)
+        return tokens, len(tokens), accepted
 
 
-class DeferredSpeculativeTokens(Sequence[int]):
-    __slots__ = ("draft", "accepted", "continuation", "terminal_prefix", "_value")
-
-    def __init__(
-        self,
-        draft: tuple[int, ...],
-        accepted: DeferredInteger,
-        continuation: int | DeferredToken,
-        terminal_prefix: int | None,
-    ) -> None:
-        self.draft = tuple(int(value) for value in draft)
-        self.accepted = accepted
-        self.continuation = continuation
-        self.terminal_prefix = terminal_prefix
-        self._value: tuple[int, ...] | None = None
-
-    def ready(self) -> bool:
-        continuation = self.continuation
-        return self.accepted.ready() and (
-            not isinstance(continuation, DeferredToken) or continuation.ready()
-        )
-
-    def finalize(self) -> tuple[int, ...]:
-        if self._value is None:
-            accepted = int(self.accepted)
-            if accepted < 0 or accepted > len(self.draft):
-                raise RuntimeError("speculative acceptance count is outside the draft span")
-            if self.terminal_prefix is not None and accepted >= self.terminal_prefix:
-                self._value = self.draft[:accepted]
-            else:
-                self._value = (*self.draft[:accepted], int(self.continuation))
-        return self._value
-
-    def __len__(self) -> int:
-        return len(self.finalize())
-
-    @overload
-    def __getitem__(self, index: int) -> int: ...
-
-    @overload
-    def __getitem__(self, index: slice) -> tuple[int, ...]: ...
-
-    def __getitem__(self, index: int | slice) -> int | tuple[int, ...]:
-        return self.finalize()[index]
-
-
-class DeferredLogprobBatch:
+class LogprobCapture:
     """Packed query-ready logprob tensors shared by a sampling group."""
 
     __slots__ = (
@@ -922,7 +734,7 @@ class DeferredLogprobBatch:
 
     def __init__(
         self,
-        capture: PinnedTokenCapture | None,
+        capture: TokenCapture | None,
         rows: tuple[int, ...],
         counts: tuple[int, ...],
         requested_ids: tuple[tuple[int, ...], ...],
@@ -1014,56 +826,29 @@ class DeferredLogprobBatch:
         return details
 
 
-class DeferredLogprobValue:
-    __slots__ = ("batch", "index")
+@dataclass(frozen=True, slots=True)
+class LogprobOutputRow:
+    """One operation or prompt position in a packed logprob capture."""
 
-    def __init__(self, batch: DeferredLogprobBatch, index: int) -> None:
-        self.batch = batch
-        self.index = int(index)
-
-    def ready(self) -> bool:
-        return self.batch.ready()
-
-    def finalize(self) -> float:
-        return self.batch.finalize()[self.index][0]
-
-    def __float__(self) -> float:
-        return self.finalize()
-
-
-class DeferredTopLogprobs:
-    __slots__ = ("batch", "index")
-
-    def __init__(self, batch: DeferredLogprobBatch, index: int) -> None:
-        self.batch = batch
-        self.index = int(index)
+    capture: LogprobCapture
+    index: int
 
     def ready(self) -> bool:
-        return self.batch.ready()
+        return self.capture.ready()
 
-    def finalize(self) -> tuple[tuple[int, float, int], ...]:
-        return self.batch.finalize()[self.index][1]
+    def finalize(self) -> tuple[float, tuple[tuple[int, float, int], ...]]:
+        return self.capture.finalize()[int(self.index)]
 
     def max_entries(self) -> int:
-        local = self.batch.rows.index(self.index)
-        return 1 + int(self.batch.counts[local]) + len(self.batch.requested_ids[local])
+        local = self.capture.rows.index(int(self.index))
+        return (
+            1
+            + int(self.capture.counts[local])
+            + len(self.capture.requested_ids[local])
+        )
 
 
-class DeferredCompletionTask(ABC):
-    """A completion-owned asynchronous action with nominal readiness semantics."""
-
-    __slots__ = ()
-
-    @abstractmethod
-    def ready(self) -> bool:
-        raise NotImplementedError
-
-    @abstractmethod
-    def finalize(self) -> object:
-        raise NotImplementedError
-
-
-class EventGatedDeferredTask(DeferredCompletionTask):
+class CpuJob:
     """A bounded CPU action gated by dependencies and optional CUDA readiness."""
 
     __slots__ = (
@@ -1084,20 +869,20 @@ class EventGatedDeferredTask(DeferredCompletionTask):
     def __init__(
         self,
         reservation: CpuTaskReservation,
-        action: Callable[[], None],
+        action: Callable[[], object],
         *,
-        capture: PinnedByteCapture | None = None,
-        dependencies: tuple[concurrent.futures.Future[None], ...] = (),
+        capture: ByteCapture | None = None,
+        dependencies: tuple[concurrent.futures.Future[object], ...] = (),
         profile_name: str,
         release: Callable[[], None] | None = None,
-        defer_release: Callable[[PinnedByteCapture], None] | None = None,
+        defer_release: Callable[[ByteCapture], None] | None = None,
     ) -> None:
         self.capture = capture
         self.reservation = reservation
         self.dependencies = dependencies
         self.action = action
-        self._future: concurrent.futures.Future[None] | None = None
-        self.promise: concurrent.futures.Future[None] = concurrent.futures.Future()
+        self._future: concurrent.futures.Future[object] | None = None
+        self.promise: concurrent.futures.Future[object] = concurrent.futures.Future()
         self._submission_error: BaseException | None = None
         self.profile_name = profile_name
         self.ready_event: torch.cuda.Event | None = None
@@ -1120,27 +905,28 @@ class EventGatedDeferredTask(DeferredCompletionTask):
         else:
             self._release()
 
-    def _run(self) -> None:
+    def _run(self) -> object:
         try:
             if self.ready_event is not None:
                 self.ready_event.synchronize()
             for dependency in self.dependencies:
                 dependency.result()
             with profile_range(self.profile_name):
-                self.action()
+                value = self.action()
         except BaseException as error:
             self.promise.set_exception(error)
             raise
         else:
-            self.promise.set_result(None)
+            self.promise.set_result(value)
         finally:
             self._release_now()
+        return value
 
     def start(self, ready_event: torch.cuda.Event | None = None) -> None:
         if self._submission_error is not None:
             return
         if self._future is not None:
-            raise RuntimeError("deferred CPU completion was submitted more than once")
+            raise RuntimeError("output CPU job was submitted more than once")
         self.ready_event = ready_event
         try:
             self._future = self.reservation.submit(self._run)
@@ -1159,14 +945,14 @@ class EventGatedDeferredTask(DeferredCompletionTask):
             self.start()
         return self._future is None or bool(self._future.done())
 
-    def finalize(self) -> None:
+    def finalize(self) -> object:
         if not self.ready():
-            raise RuntimeError("deferred CPU completion was observed before it was ready")
+            raise RuntimeError("output CPU job was observed before it was ready")
         if self._submission_error is not None:
             raise self._submission_error
         if self._future is None:
-            raise RuntimeError("deferred CPU completion lost its submitted future")
-        self._future.result(timeout=0)
+            raise RuntimeError("output CPU job lost its submitted future")
+        return self._future.result(timeout=0)
 
     def __del__(self) -> None:
         self.reservation.abandon()
@@ -1176,51 +962,32 @@ class EventGatedDeferredTask(DeferredCompletionTask):
             self._release_after_capture()
 
 
-class DeferredLogprobPayload(DeferredCompletionTask):
-    __slots__ = ("logprob", "top_logprobs", "prompt_logprobs", "_value")
+class LogprobPayload:
+    __slots__ = ("selected", "prompt", "_value")
 
     def __init__(
         self,
-        logprob: float | DeferredLogprobValue | None,
-        top_logprobs: tuple[tuple[int, float, int], ...] | DeferredTopLogprobs | None,
-        prompt_logprobs: tuple[
-            tuple[tuple[int, float, int], ...] | DeferredTopLogprobs,
-            ...,
-        ] = (),
+        selected: LogprobOutputRow | None,
+        prompt: tuple[LogprobOutputRow, ...] = (),
     ) -> None:
-        self.logprob = logprob
-        self.top_logprobs = top_logprobs
-        self.prompt_logprobs = prompt_logprobs
+        self.selected = selected
+        self.prompt = prompt
         self._value: bytes | None = None
 
     def ready(self) -> bool:
         if self._value is not None:
             return True
-        return (
-            (not isinstance(self.logprob, DeferredLogprobValue) or self.logprob.ready())
-            and (
-                not isinstance(self.top_logprobs, DeferredTopLogprobs) or self.top_logprobs.ready()
-            )
-            and all(
-                not isinstance(position, DeferredTopLogprobs) or position.ready()
-                for position in self.prompt_logprobs
-            )
+        return (self.selected is None or self.selected.ready()) and all(
+            position.ready() for position in self.prompt
         )
 
     def max_encoded_bytes(self) -> int:
-        def entry_bound(
-            entries: tuple[tuple[int, float, int], ...] | DeferredTopLogprobs | None,
-        ) -> int:
-            if isinstance(entries, DeferredTopLogprobs):
-                return entries.max_entries()
-            return len(entries or ())
-
         return (
-            (5 if self.logprob is not None else 1)
+            (5 if self.selected is not None else 1)
             + 4
-            + 12 * entry_bound(self.top_logprobs)
+            + 12 * (0 if self.selected is None else self.selected.max_entries())
             + 4
-            + sum(4 + 12 * entry_bound(position) for position in self.prompt_logprobs)
+            + sum(4 + 12 * position.max_entries() for position in self.prompt)
         )
 
     def finalize(self) -> bytes:
@@ -1228,19 +995,16 @@ class DeferredLogprobPayload(DeferredCompletionTask):
             return self._value
         if not self.ready():
             raise RuntimeError("logprob payload was observed before query-ready")
-        logprob = None if self.logprob is None else float(self.logprob)
-        top = (
-            self.top_logprobs.finalize()
-            if isinstance(self.top_logprobs, DeferredTopLogprobs)
-            else self.top_logprobs or ()
-        )
+        selected = None if self.selected is None else self.selected.finalize()
+        logprob = None if selected is None else selected[0]
+        top = () if selected is None else selected[1]
         out = bytearray(b"\x00" if logprob is None else b"\x01" + struct.pack("<f", logprob))
         out += struct.pack("<I", len(top))
         for token_id, value, rank in top:
             out += struct.pack("<IfI", int(token_id), float(value), int(rank))
-        out += struct.pack("<I", len(self.prompt_logprobs))
-        for position in self.prompt_logprobs:
-            entries = position.finalize() if isinstance(position, DeferredTopLogprobs) else position
+        out += struct.pack("<I", len(self.prompt))
+        for position in self.prompt:
+            entries = position.finalize()[1]
             out += struct.pack("<I", len(entries))
             for token_id, value, rank in entries:
                 out += struct.pack("<IfI", int(token_id), float(value), int(rank))
@@ -1251,7 +1015,7 @@ class DeferredLogprobPayload(DeferredCompletionTask):
         return self.finalize()
 
 
-class DeferredTransferPayload:
+class TransferPayload:
     __slots__ = (
         "kind",
         "descriptor_value",
@@ -1300,7 +1064,7 @@ class DeferredTransferPayload:
         return self.finalize()
 
 
-class DeferredImagePayload(DeferredCompletionTask):
+class ImagePayload:
     """Pinned D2H image capture followed by bounded asynchronous PNG encoding."""
 
     __slots__ = (
@@ -1314,7 +1078,7 @@ class DeferredImagePayload(DeferredCompletionTask):
 
     def __init__(
         self,
-        capture: PinnedByteCapture,
+        capture: ByteCapture,
         reservation: CpuTaskReservation,
         max_bytes: int,
     ) -> None:
@@ -1368,7 +1132,25 @@ class DeferredImagePayload(DeferredCompletionTask):
         self.reservation.abandon()
 
 
-class DeferredResult(DeferredCompletion):
+@dataclass(frozen=True, slots=True)
+class OutputRecord:
+    """One unresolved output row retained outside the public wire model."""
+
+    request_key: RequestKey
+    op_id: int
+    completion_slot_generation: int
+    status: OpStatus
+    selected_point: int
+    logical_lengths: LogicalLengths
+    token_span: TokenSpan
+    committed_tokens: tuple[int, ...]
+    sampling: SamplingOutputRow | None
+    finish_flags: FinishFlags
+    product_generations: tuple[int, ...]
+    error_code: ErrorCode | None
+
+
+class PendingOutput:
     """A query-ready completion backed by one pinned output-buffer row."""
 
     __slots__ = (
@@ -1388,23 +1170,25 @@ class DeferredResult(DeferredCompletion):
         "_resolved_callback",
         "_completion_tasks",
         "_completion_error",
+        "_media_output",
+        "_value",
     )
 
     def __init__(
         self,
-        parent: DeferredCompletion | None,
-        buffer: PinnedOutputBuffer,
+        parent: CompletionState | None,
+        buffer: OutputBuffer,
         row: int,
         predicated_parent: Callable[[], tuple[VersionRef, RequestRuntime]],
         *,
         status: OpStatus,
         selected_point: int,
         resolved_callback: Callable[[ModelOutput], None] | None = None,
-        completion_tasks: tuple[DeferredCompletionTask, ...] = (),
+        completion_tasks: tuple[CpuJob | ImagePayload | LogprobPayload, ...] = (),
     ) -> None:
-        self._record: ModelOutput | None = None
+        self._record: OutputRecord | None = None
         self._parent = parent
-        self._buffer: PinnedOutputBuffer | None = buffer
+        self._buffer: OutputBuffer | None = buffer
         self._row = int(row)
         self._generation = int(buffer.generation)
         self._completion_timing: tuple[int, int, int, int] | None = None
@@ -1420,14 +1204,14 @@ class DeferredResult(DeferredCompletion):
         self._resolved_callback = resolved_callback
         self._completion_tasks = completion_tasks
         self._completion_error = False
+        self._media_output: MediaOutput | None = None
+        self._value: ModelOutput | None = None
 
-    def bind_record(self, record: ModelOutput) -> ModelOutput:
-        """Bind the one record backed by this deferred result."""
+    def bind_record(self, record: OutputRecord) -> PendingOutput:
+        """Bind the one record backed by this pending output row."""
 
         if self._record is not None:
             raise RuntimeError("completion record was bound more than once")
-        if record.deferred is not self:
-            raise RuntimeError("completion record does not carry its deferred result")
         if int(record.completion_slot_generation) != self._generation:
             raise RuntimeError("completion record generation does not match its output buffer")
         if (record.status is OpStatus.PREDICATED) != self._predicated:
@@ -1435,7 +1219,25 @@ class DeferredResult(DeferredCompletion):
         if int(record.selected_point) != int(self._selected_point):
             raise RuntimeError("completion selected point changed during binding")
         self._record = record
-        return record
+        return self
+
+    @property
+    def request_key(self) -> object:
+        if self._record is None:
+            raise RuntimeError("completion has no bound record")
+        return self._record.request_key
+
+    @property
+    def op_id(self) -> int:
+        if self._record is None:
+            raise RuntimeError("completion has no bound record")
+        return self._record.op_id
+
+    @property
+    def status(self) -> OpStatus:
+        if self._record is None:
+            raise RuntimeError("completion has no bound record")
+        return self._record.status
 
     def ready(self) -> bool:
         if self._record is None:
@@ -1451,7 +1253,7 @@ class DeferredResult(DeferredCompletion):
                 return False
         return True
 
-    def finalize(self) -> None:
+    def finalize(self) -> ModelOutput:
         if not self._done:
             if not self.ready():
                 raise RuntimeError("completion was resolved before query-ready")
@@ -1467,14 +1269,18 @@ class DeferredResult(DeferredCompletion):
             else:
                 try:
                     for task in self._completion_tasks:
-                        task.finalize()
+                        result = task.finalize()
+                        if isinstance(result, MediaOutput):
+                            if self._media_output is not None:
+                                raise RuntimeError("completion produced more than one media output")
+                            self._media_output = result
                 except Exception:
                     self._completion_error = True
                 else:
                     try:
-                        tuple(int(value) for value in record.committed_tokens)
+                        concrete = _concrete_record(record)
                         if self._resolved_callback is not None:
-                            self._resolved_callback(record)
+                            self._resolved_callback(concrete)
                     except _PredicatedOperation:
                         self._predicated = True
                         self._resolve_predicated()
@@ -1488,6 +1294,40 @@ class DeferredResult(DeferredCompletion):
             self._observed = True
             self._buffer = None
             self._done = True
+            timing = TimingCounters(
+                queued_us=self._completion_timing[0],
+                device_us=self._completion_timing[1],
+                copy_us=self._completion_timing[2],
+                host_us=self._completion_timing[3],
+            )
+            materialized_record = (
+                replace(record, committed_tokens=(), sampling=None)
+                if self._completion_error or self._invalid_sampling or self._predicated
+                else record
+            )
+            concrete = _concrete_record(
+                materialized_record,
+                timing=timing,
+                media_output=self._media_output,
+            )
+            if self._completion_error:
+                concrete = _completion_error_record(concrete)
+            elif self._invalid_sampling:
+                concrete = _invalid_sampling_record(concrete)
+            elif self._predicated:
+                selected_runtime = self._selected_runtime
+                if selected_runtime is None:
+                    raise RuntimeError("predicated operation lost its selected runtime state")
+                concrete = _predicated_record(
+                    concrete,
+                    self._selected_point,
+                    selected_runtime,
+                )
+            concrete.validate()
+            self._value = concrete
+        if self._value is None:
+            raise RuntimeError("completion output was not materialized")
+        return self._value
 
     def _resolve_predicated(self) -> None:
         predicated_parent = self._predicated_parent
@@ -1503,6 +1343,11 @@ class DeferredResult(DeferredCompletion):
     def completion_timing(self) -> tuple[int, int, int, int]:
         self.finalize()
         return self._completion_timing or (0, 0, 0, 0)
+
+    @property
+    def media_output(self) -> MediaOutput | None:
+        self.finalize()
+        return self._media_output
 
     @property
     def invalid_sampling(self) -> bool:
@@ -1531,7 +1376,7 @@ class DeferredResult(DeferredCompletion):
             raise RuntimeError("predicated operation lost its selected runtime state")
         return self._selected_runtime
 
-    def __deepcopy__(self, memo: dict[int, object]) -> DeferredResult:
+    def __deepcopy__(self, memo: dict[int, object]) -> PendingOutput:
         memo[id(self)] = self
         return self
 
@@ -1541,51 +1386,40 @@ class DeferredResult(DeferredCompletion):
             buffer.discard(self._row, self._generation)
 
 
-def _record_ready(record: ModelOutput) -> bool:
-    """Whether a completion's deferred device and CPU work has landed."""
+def _record_ready(record: ModelOutput | PendingOutput) -> bool:
+    """Whether a completion's device and CPU output work has landed."""
 
-    if record.deferred is not None:
-        return record.deferred.ready()
-    for value in cast(tuple[object, ...], record.committed_tokens):
-        if isinstance(value, DeferredToken) and not value.ready():
-            return False
-    return True
+    return record.ready() if isinstance(record, PendingOutput) else True
 
 
-def _finalized_record(record: ModelOutput) -> ModelOutput:
-    deferred = record.deferred
-    if isinstance(deferred, DeferredResult):
-        deferred.finalize()
-        queued_us, device_us, copy_us, host_us = deferred.completion_timing()
-        timing = replace(
-            record.timing_counters,
-            queued_us=queued_us,
-            device_us=device_us,
-            copy_us=copy_us,
-            host_us=host_us,
-        )
-        if deferred.completion_error:
-            return replace(
-                _completion_error_record(record),
-                timing_counters=timing,
-                deferred=None,
-            )
-        if deferred.invalid_sampling:
-            return replace(
-                _invalid_sampling_record(record),
-                timing_counters=timing,
-                deferred=None,
-            )
-        if deferred.predicated:
-            return replace(
-                _predicated_record(record, deferred.selected_point, deferred.selected_runtime),
-                timing_counters=timing,
-                deferred=None,
-            )
-    else:
-        timing = record.timing_counters
+def _finalized_record(record: ModelOutput | PendingOutput) -> ModelOutput:
+    return record.finalize() if isinstance(record, PendingOutput) else record
+
+
+def _concrete_record(
+    record: OutputRecord,
+    *,
+    timing: TimingCounters = TimingCounters(),
+    media_output: MediaOutput | None = None,
+) -> ModelOutput:
     lengths = record.logical_lengths
     span = record.token_span
+    selected_point = int(record.selected_point)
+    tokens = record.committed_tokens
+    sampling = record.sampling
+    if sampling is not None:
+        tokens, selected_point, _accepted = sampling.materialize()
+        if sampling.logical_base is not None:
+            lengths = replace(
+                lengths,
+                token_len=int(sampling.logical_base) + selected_point,
+            )
+        if sampling.kv_base is not None:
+            lengths = replace(
+                lengths,
+                kv_visible_len=int(sampling.kv_base) + selected_point,
+            )
+        span = replace(span, len=selected_point)
     if type(lengths.token_len) is not int or any(
         type(value) is not int
         for value in (
@@ -1602,17 +1436,20 @@ def _finalized_record(record: ModelOutput) -> ModelOutput:
         )
     if type(span.base) is not int or type(span.len) is not int:
         span = TokenSpan(base=int(span.base), len=int(span.len))
-    tokens = record.committed_tokens
-    if type(tokens) is not tuple or any(type(value) is not int for value in tokens):
-        tokens = tuple(int(value) for value in tokens)
-    return replace(
-        record,
-        selected_point=int(record.selected_point),
+    return ModelOutput(
+        request_key=record.request_key,
+        op_id=record.op_id,
+        completion_slot_generation=record.completion_slot_generation,
+        status=record.status,
+        selected_point=selected_point,
         logical_lengths=lengths,
         token_span=span,
         committed_tokens=tokens,
+        finish_flags=record.finish_flags,
+        product_generations=record.product_generations,
+        error_code=record.error_code,
         timing_counters=timing,
-        deferred=None,
+        media_output=media_output,
     )
 
 
@@ -1665,7 +1502,7 @@ def _predicated_record(
 
 
 def completion_report_ready(report: CompletionReport) -> bool:
-    """True once every completion's deferred token and artifact can be read
+    """True once every completion token and artifact can be read
     without a stall."""
 
     for record in report.completions:
@@ -1691,7 +1528,7 @@ def _completion_payload_ready(payload: object) -> bool:
     return (
         not isinstance(
             payload,
-            (DeferredImagePayload, DeferredLogprobPayload, DeferredTransferPayload),
+            (ImagePayload, LogprobPayload, TransferPayload),
         )
         or payload.ready()
     )
@@ -1703,9 +1540,13 @@ def finalize_completion_report(report: CompletionReport) -> CompletionReport:
     changed = False
     partitions: list[PartitionCompletion] = []
     for partition in report.partitions:
+        completions = tuple(
+            _finalized_record(record) if _record_ready(record) else record
+            for record in partition.completions
+        )
         nonpublishing_ops = {
             int(record.op_id)
-            for record in partition.completions
+            for record in completions
             if record.status is not OpStatus.OK
         }
         retained_products = tuple(
@@ -1718,18 +1559,14 @@ def finalize_completion_report(report: CompletionReport) -> CompletionReport:
             if isinstance(
                 product.payload,
                 (
-                    DeferredImagePayload,
-                    DeferredLogprobPayload,
-                    DeferredTransferPayload,
+                    ImagePayload,
+                    LogprobPayload,
+                    TransferPayload,
                 ),
             )
             and product.payload.ready()
             else product
             for product in retained_products
-        )
-        completions = tuple(
-            _finalized_record(record) if _record_ready(record) else record
-            for record in partition.completions
         )
         for product in products:
             if (
@@ -1740,12 +1577,32 @@ def finalize_completion_report(report: CompletionReport) -> CompletionReport:
                 raise invalid_descriptor(
                     "completion product exceeds its registered product byte bound"
                 )
+        publication = partition.publication
+        publication_ready = (
+            publication is not None
+            and all(isinstance(record, ModelOutput) for record in completions)
+            and all(
+                not isinstance(
+                    product.payload,
+                    (ImagePayload, LogprobPayload, TransferPayload),
+                )
+                for product in products
+            )
+        )
+        if publication_ready:
+            publication.finish(cast(tuple[ModelOutput, ...], completions))
         if (
             not all(new is old for new, old in zip(completions, partition.completions, strict=True))
             or len(products) != len(partition.products)
             or not all(new is old for new, old in zip(products, partition.products))
+            or publication_ready
         ):
             changed = True
-            partition = replace(partition, completions=completions, products=products)
+            partition = replace(
+                partition,
+                completions=completions,
+                products=products,
+                publication=None if publication_ready else publication,
+            )
         partitions.append(partition)
     return replace(report, partitions=tuple(partitions)) if changed else report

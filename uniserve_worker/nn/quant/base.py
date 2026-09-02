@@ -15,7 +15,6 @@ __all__ = [
     "process_quantized_modules",
 ]
 
-
 class QuantizeMethodBase(abc.ABC):
     # Cross-cutting flag read by consumers to decide quantized-only handling.
     is_quantized: ClassVar[bool] = False

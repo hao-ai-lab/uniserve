@@ -7,117 +7,18 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use uniserve_core::{CommandWaker, RequestId};
+#[cfg(test)]
+use uniserve_worker_ipc::Operation;
+pub use uniserve_worker_ipc::WorkerRole;
 use uniserve_worker_ipc::{
-    Batch, CompletionReport, ForwardMode, Operation, RequestKind, WorkerInfo, WorkerRequest,
+    Batch, CompletionReport, ForwardMode, RequestKind, WorkerInfo, WorkerRequest,
 };
-
-/// Which pipeline stage a worker pool serves.
-///
-/// A pool is fully determined by the typed operations it accepts, the worker
-/// implementation that executes those operations, and its device profile. The
-/// control plane routes on the closed operation union and its nested mode.
-///
-/// `Full` holds the whole model and runs every model op. The other kinds are
-/// model-backed stages with explicit weight-materialization scopes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkerKind {
-    /// Whole model; runs ALL model ops in one mixed-batch forward.
-    Full,
-    /// Vision encode only — `vit_encode`/`vae_encode`; embedding handoff.
-    Encoder,
-    /// Prefill phase only — `prefill_und`; KV handoff to a Decode pool.
-    Prefill,
-    /// Decode/generation phase.
-    Decode,
-    /// Understanding tower — text + vision-encode + sampling. The und half of
-    /// the local MoT understanding/generation stage split; routes
-    /// every non-generation model op so a `--workers und:1,gen:1` topology
-    /// composes the und/gen split through the general `StagedExecutor::new` path.
-    Und,
-    /// Generation tower — image denoise/commit + frame encode. The gen half of
-    /// the Und/Gen stage split.
-    Gen,
-}
-
-const FULL_WORK: &[ForwardMode] = &ForwardMode::ALL;
-const ENCODER_WORK: &[ForwardMode] = &[ForwardMode::EncodeVision, ForwardMode::EncodeLatent];
-const PREFILL_WORK: &[ForwardMode] = &[ForwardMode::TokenExtend];
-const DECODE_WORK: &[ForwardMode] = &[
-    ForwardMode::TokenDecode,
-    ForwardMode::TokenVerify,
-    ForwardMode::MediaPrepare,
-    ForwardMode::MediaDenoise,
-    ForwardMode::MediaReconstruct,
-    ForwardMode::Materialize,
-    ForwardMode::TransferKvPublish,
-    ForwardMode::TransferKvInstall,
-];
-const UND_WORK: &[ForwardMode] = &[
-    ForwardMode::TokenExtend,
-    ForwardMode::TokenDecode,
-    ForwardMode::TokenVerify,
-    ForwardMode::EncodeVision,
-    ForwardMode::EncodeLatent,
-    ForwardMode::TransferKvPublish,
-    ForwardMode::TransferKvInstall,
-];
-const GEN_WORK: &[ForwardMode] = &[
-    ForwardMode::MediaPrepare,
-    ForwardMode::MediaDenoise,
-    ForwardMode::MediaReconstruct,
-    ForwardMode::Materialize,
-];
-
-impl WorkerKind {
-    /// IPC/config name (matches the Python `--worker-kind` vocabulary).
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Full => "full",
-            Self::Encoder => "encoder",
-            Self::Prefill => "prefill",
-            Self::Decode => "decode",
-            Self::Und => "und",
-            Self::Gen => "gen",
-        }
-    }
-
-    /// Parse a `--worker-kind`/`--workers` token.
-    pub fn from_token(s: &str) -> Option<Self> {
-        Some(match s {
-            "full" => Self::Full,
-            "encoder" => Self::Encoder,
-            "prefill" => Self::Prefill,
-            "decode" => Self::Decode,
-            "und" => Self::Und,
-            "gen" => Self::Gen,
-            _ => return None,
-        })
-    }
-
-    /// Exact work variants accepted by this worker role.
-    pub fn supported_work(self) -> &'static [ForwardMode] {
-        match self {
-            Self::Full => FULL_WORK,
-            Self::Encoder => ENCODER_WORK,
-            Self::Prefill => PREFILL_WORK,
-            Self::Decode => DECODE_WORK,
-            Self::Und => UND_WORK,
-            Self::Gen => GEN_WORK,
-        }
-    }
-
-    /// Whether this role accepts this operation's work variant.
-    pub fn handles(self, operation: &Operation) -> bool {
-        self.supported_work().contains(&operation.work)
-    }
-}
 
 /// One pool in a staged topology: `count` instances of `kind`, each with the
 /// given tensor-parallel size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pool {
-    pub kind: WorkerKind,
+    pub kind: WorkerRole,
     /// Number of data-parallel pool instances of this kind (e.g. `encoder:2`).
     pub count: usize,
     /// Tensor-parallel rank count within each pool instance (`tp=N`).
@@ -136,7 +37,7 @@ impl WorkerTopology {
     pub fn single_full(tp: usize) -> Self {
         Self {
             pools: vec![Pool {
-                kind: WorkerKind::Full,
+                kind: WorkerRole::Full,
                 count: 1,
                 tp: tp.max(1),
             }],
@@ -150,7 +51,7 @@ impl WorkerTopology {
         for entry in s.split(',').map(str::trim).filter(|e| !e.is_empty()) {
             let mut parts = entry.split(':');
             let kind_str = parts.next().unwrap_or("").trim();
-            let kind = WorkerKind::from_token(kind_str).ok_or_else(|| {
+            let kind = WorkerRole::from_token(kind_str).ok_or_else(|| {
                 WorkerTopologyError::message(format!("unknown worker kind {kind_str:?}"))
             })?;
             let mut count = 1usize;
@@ -190,7 +91,7 @@ impl WorkerTopology {
     /// Whether this is the trivial single-Full-pool topology (the default, which
     /// composes a plain executor rather than a `StagedExecutor`).
     pub fn is_single_full(&self) -> bool {
-        self.pools.len() == 1 && self.pools[0].kind == WorkerKind::Full && self.pools[0].count == 1
+        self.pools.len() == 1 && self.pools[0].kind == WorkerRole::Full && self.pools[0].count == 1
     }
 
     /// Total pool instances (sum of `count` across entries).
@@ -262,7 +163,7 @@ impl FromStr for TransferBackend {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransportMap {
     /// (producer kind, consumer kind) → backend name.
-    pub edges: std::collections::BTreeMap<(WorkerKind, WorkerKind), TransferBackend>,
+    pub edges: std::collections::BTreeMap<(WorkerRole, WorkerRole), TransferBackend>,
 }
 
 impl TransportMap {
@@ -275,13 +176,13 @@ impl TransportMap {
             let (src, dst) = edge.split_once("->").ok_or_else(|| {
                 TransportMapError::message(format!("transfer edge {edge:?} must be src->dst"))
             })?;
-            let src = WorkerKind::from_token(src.trim()).ok_or_else(|| {
+            let src = WorkerRole::from_token(src.trim()).ok_or_else(|| {
                 TransportMapError::message(format!(
                     "unknown worker kind {:?} in transfer edge",
                     src.trim()
                 ))
             })?;
-            let dst = WorkerKind::from_token(dst.trim()).ok_or_else(|| {
+            let dst = WorkerRole::from_token(dst.trim()).ok_or_else(|| {
                 TransportMapError::message(format!(
                     "unknown worker kind {:?} in transfer edge",
                     dst.trim()
@@ -479,16 +380,16 @@ mod tests {
     use uniserve_worker_ipc::{Bounds, ForwardMode, OpId, RequestKey, RouteId, VersionRef};
 
     #[test]
-    fn worker_kind_round_trips_and_maps_work() {
+    fn worker_role_round_trips_and_maps_work() {
         for kind in [
-            WorkerKind::Full,
-            WorkerKind::Encoder,
-            WorkerKind::Prefill,
-            WorkerKind::Decode,
-            WorkerKind::Und,
-            WorkerKind::Gen,
+            WorkerRole::Full,
+            WorkerRole::Encoder,
+            WorkerRole::Prefill,
+            WorkerRole::Decode,
+            WorkerRole::Und,
+            WorkerRole::Gen,
         ] {
-            assert_eq!(WorkerKind::from_token(kind.as_str()), Some(kind));
+            assert_eq!(WorkerRole::from_token(kind.as_str()), Some(kind));
             assert!(!kind.supported_work().is_empty());
         }
         let extend = op(ForwardMode::TokenExtend);
@@ -496,17 +397,17 @@ mod tests {
         let prepare = op(ForwardMode::MediaPrepare);
         let materialize = op(ForwardMode::Materialize);
 
-        assert!(WorkerKind::Full.handles(&extend));
-        assert!(WorkerKind::Prefill.handles(&extend));
-        assert!(!WorkerKind::Prefill.handles(&decode));
-        assert!(WorkerKind::Decode.handles(&decode));
-        assert!(WorkerKind::Decode.handles(&prepare));
-        assert!(WorkerKind::Decode.handles(&materialize));
-        assert!(WorkerKind::Und.handles(&decode));
-        assert!(!WorkerKind::Und.handles(&materialize));
-        assert!(WorkerKind::Gen.handles(&materialize));
-        assert!(!WorkerKind::Gen.handles(&decode));
-        assert_eq!(WorkerKind::from_token("nope"), None);
+        assert!(WorkerRole::Full.handles(&extend));
+        assert!(WorkerRole::Prefill.handles(&extend));
+        assert!(!WorkerRole::Prefill.handles(&decode));
+        assert!(WorkerRole::Decode.handles(&decode));
+        assert!(WorkerRole::Decode.handles(&prepare));
+        assert!(WorkerRole::Decode.handles(&materialize));
+        assert!(WorkerRole::Und.handles(&decode));
+        assert!(!WorkerRole::Und.handles(&materialize));
+        assert!(WorkerRole::Gen.handles(&materialize));
+        assert!(!WorkerRole::Gen.handles(&decode));
+        assert_eq!(WorkerRole::from_token("nope"), None);
     }
 
     fn op(work: ForwardMode) -> Operation {
@@ -537,7 +438,7 @@ mod tests {
         assert_eq!(
             epd.pools[0],
             Pool {
-                kind: WorkerKind::Encoder,
+                kind: WorkerRole::Encoder,
                 count: 2,
                 tp: 1
             }
@@ -545,7 +446,7 @@ mod tests {
         assert_eq!(
             epd.pools[1],
             Pool {
-                kind: WorkerKind::Prefill,
+                kind: WorkerRole::Prefill,
                 count: 1,
                 tp: 4
             }
@@ -553,7 +454,7 @@ mod tests {
         assert_eq!(
             epd.pools[2],
             Pool {
-                kind: WorkerKind::Decode,
+                kind: WorkerRole::Decode,
                 count: 1,
                 tp: 4
             }
@@ -566,8 +467,8 @@ mod tests {
         // The Und/Gen topology composes through the general staged path.
         let und_gen = WorkerTopology::parse("und:1,gen:1").unwrap();
         assert_eq!(und_gen.pools.len(), 2);
-        assert_eq!(und_gen.pools[0].kind, WorkerKind::Und);
-        assert_eq!(und_gen.pools[1].kind, WorkerKind::Gen);
+        assert_eq!(und_gen.pools[0].kind, WorkerRole::Und);
+        assert_eq!(und_gen.pools[1].kind, WorkerRole::Gen);
         assert!(!und_gen.is_single_full());
     }
 
@@ -575,11 +476,11 @@ mod tests {
     fn transport_map_parses_edges() {
         let t = TransportMap::parse("encoder->prefill=cuda_ipc,prefill->decode=shm").unwrap();
         assert_eq!(
-            t.edges.get(&(WorkerKind::Encoder, WorkerKind::Prefill)),
+            t.edges.get(&(WorkerRole::Encoder, WorkerRole::Prefill)),
             Some(&TransferBackend::CudaIpc)
         );
         assert_eq!(
-            t.edges.get(&(WorkerKind::Prefill, WorkerKind::Decode)),
+            t.edges.get(&(WorkerRole::Prefill, WorkerRole::Decode)),
             Some(&TransferBackend::Shm)
         );
         assert!(TransportMap::parse("bad-entry").is_err());

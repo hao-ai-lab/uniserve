@@ -1,4 +1,4 @@
-"""Deterministic raw-output model used by worker-process simulation."""
+"""Deterministic execution model used by worker-process simulation."""
 
 from __future__ import annotations
 

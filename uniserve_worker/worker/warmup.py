@@ -36,7 +36,6 @@ from ..execution.batch import (
     StorageClass,
 )
 from ..execution.step import (
-    complete_startup,
     execute_startup,
     parent_runtime,
 )
@@ -44,11 +43,11 @@ from ..foundation.errors import invalid_descriptor
 from ..foundation.math import ceil_div
 from ..models.generation import GenerationPipeline
 from ..nn.diffusion.cfg import build_flow_cfg_plan
-from ..server.completion import (
+from ..execution.output import (
     completion_report_ready,
     finalize_completion_report,
 )
-from ..worker_info import (
+from ..bootstrap.worker_info import (
     GraphBucket,
 )
 
@@ -56,6 +55,47 @@ if TYPE_CHECKING:
     from .worker import Worker
 
 logger = logging.getLogger(__name__)
+
+
+class WarmupContext:
+    """Startup-only execution resources and scratch state."""
+
+    def __init__(self, worker: Worker) -> None:
+        self._worker = worker
+        self._effective_work_variants = worker._effective_work_variants
+        self._execution = worker._execution
+        self._flow_cfg_branches = worker._flow_cfg_branches
+        self._flow_graph_buckets = worker._flow_graph_buckets
+        self._info = worker._info
+        self._mixed_flow_graph_buckets = worker._mixed_flow_graph_buckets
+        self._prefill_graph_row_sizes = worker._prefill_graph_row_sizes
+        self._prefill_graph_token_sizes = worker._prefill_graph_token_sizes
+        self.cache_pool = worker.cache_pool
+        self.deployment = worker.deployment
+        self.device_products = worker.device_products
+        self.execution = worker.execution
+        self.model = worker.model
+        self.requests = worker.requests
+        self.runner = worker.runner
+        self._warmup_kv_pages: dict[tuple[RequestKey, int], list[int]] = {}
+        self._warmup_prefix_pages: dict[RequestKey, list[int]] = {}
+        self._warmup_prefix_slots: dict[RequestKey, int] = {}
+        self._warmup_latent_pages: dict[RequestKey, list[int]] = {}
+        self._warmup_step_id = 0
+
+    def drop_session(self, session_id: int) -> None:
+        session = self.requests.peek(int(session_id))
+        self._worker.drop_session(session_id)
+        if session is None:
+            return
+        for group_id in range(0 if self.cache_pool is None else self.cache_pool.group_count):
+            self._warmup_kv_pages.pop((session.request_key, group_id), None)
+        self._warmup_prefix_pages.pop(session.request_key, None)
+        self._warmup_prefix_slots.pop(session.request_key, None)
+        self._warmup_latent_pages.pop(session.request_key, None)
+
+    def release_products(self, handles: tuple[int, ...]) -> None:
+        self._worker.release_products(handles)
 
 
 @dataclass(frozen=True, slots=True)
@@ -255,8 +295,6 @@ def _warmup_token_outputs(
     request_key: RequestKey,
     op_id: int,
     first_generation: int,
-    *,
-    finish_candidate: bool = False,
 ) -> tuple[ProductRef, ...]:
     from ..execution.batch import (
         DType,
@@ -267,8 +305,6 @@ def _warmup_token_outputs(
     )
 
     definitions = [(0, ProductKind.TOKEN, DType.U32, ShapeBound())]
-    if finish_candidate:
-        definitions.append((4, ProductKind.FINISH, DType.U8, ShapeBound()))
     return tuple(
         ProductRef(
             request_key=request_key,
@@ -276,7 +312,7 @@ def _warmup_token_outputs(
             output_index=output_index,
             generation=first_generation + generation_offset,
             kind=kind,
-            storage_class=StorageClass.DEVICE_TENSOR,
+            storage_class=StorageClass.REQUEST_RELAY,
             dtype=dtype,
             shape_bound=shape,
             point_range=PointRange(base_point=0, max_points=1),
@@ -286,7 +322,7 @@ def _warmup_token_outputs(
 
 
 def _execute_warmup(
-    self: Worker,
+    self: WarmupContext,
     batch: Batch,
     *,
     retain_device_outputs: bool = False,
@@ -300,7 +336,8 @@ def _execute_warmup(
         int(output.generation)
         for operation in batch.operations
         for output in operation.outputs
-        if output.storage_class is StorageClass.DEVICE_TENSOR
+        if output.storage_class
+        in {StorageClass.DEVICE_TENSOR, StorageClass.REQUEST_RELAY}
     )
     failures = tuple(
         completion for completion in finalized.completions if completion.status is OpStatus.ERROR
@@ -318,7 +355,7 @@ def _execute_warmup(
 
 
 def _build_warmup_batch(
-    self: Worker,
+    self: WarmupContext,
     *,
     admissions: tuple[NewRequest, ...],
     operations: tuple[Operation, ...],
@@ -348,7 +385,6 @@ def _build_warmup_batch(
             ForwardMode.TOKEN_EXTEND,
             ForwardMode.TOKEN_DECODE,
             ForwardMode.TOKEN_VERIFY,
-            ForwardMode.DRAFT,
             ForwardMode.TRANSFER_KV_PUBLISH,
             ForwardMode.TRANSFER_KV_INSTALL,
             ForwardMode.MEDIA_PREPARE,
@@ -373,7 +409,6 @@ def _build_warmup_batch(
                 ForwardMode.TOKEN_EXTEND,
                 ForwardMode.TOKEN_DECODE,
                 ForwardMode.TOKEN_VERIFY,
-                ForwardMode.DRAFT,
             }
             else 0
         )
@@ -499,7 +534,7 @@ def _build_warmup_batch(
 
 
 def _warmup_flow_tables(
-    self: Worker,
+    self: WarmupContext,
     operation: Operation,
     main_slot: int,
     height: int,
@@ -604,8 +639,8 @@ def _warmup_flow_tables(
     return tables, allocations, tuple(rows)
 
 
-def warmup(self: Worker) -> None:
-    """Complete pre-admission kernel JIT and open the serving epoch.
+def warmup(self: WarmupContext) -> None:
+    """Complete capability-selected pre-admission kernel work.
 
     The ``fa4_cute`` attention backend JIT-compiles its CUTLASS kernels the
     first time each variant runs, costing tens of seconds on the first real
@@ -627,11 +662,9 @@ def warmup(self: Worker) -> None:
     elif self._info.mixed_buckets:
         _warmup_flow(self)
         logger.info("completed mixed execution warmup")
-    complete_startup(self.execution)
-    logger.info("completed execution partition startup verification")
 
 
-def _warmup_image_geometry(self: Worker) -> tuple[int, int]:
+def _warmup_image_geometry(self: WarmupContext) -> tuple[int, int]:
     """Largest square image whose latent grid fits the declared capacity."""
 
     import math
@@ -645,7 +678,7 @@ def _warmup_image_geometry(self: Worker) -> tuple[int, int]:
     return side * downsample, side * downsample
 
 
-def _warmup_sequence(self: Worker) -> None:
+def _warmup_sequence(self: WarmupContext) -> None:
     """Warm the real token forward paths and capture the configured graphs.
 
     One prompt extend across the largest configured decode batch pays the
@@ -827,7 +860,8 @@ def _warmup_sequence(self: Worker) -> None:
                         int(output.generation)
                         for sid in selected
                         for output in predecessors[sid].outputs
-                        if output.storage_class is StorageClass.DEVICE_TENSOR
+                        if output.storage_class
+                        in {StorageClass.DEVICE_TENSOR, StorageClass.REQUEST_RELAY}
                     )
                 )
                 predecessors.update(zip(selected, operations, strict=True))
@@ -839,7 +873,7 @@ def _warmup_sequence(self: Worker) -> None:
             self.drop_session(sid)
 
 
-def _warmup_prefill_graphs(self: Worker) -> None:
+def _warmup_prefill_graphs(self: WarmupContext) -> None:
     """Capture the paged-prefill CUDA graph for every configured token bucket."""
 
     from ..execution.batch import (
@@ -970,7 +1004,7 @@ def _warmup_prefill_graphs(self: Worker) -> None:
                     self.drop_session(active_session)
 
 
-def _warmup_flow(self: Worker) -> None:
+def _warmup_flow(self: WarmupContext) -> None:
     """Drive one denoise quantum through the real flow forward path."""
 
     from ..execution.batch import (
@@ -1205,7 +1239,7 @@ def _warmup_flow(self: Worker) -> None:
                     output_index=1,
                     generation=next_generation,
                     kind=ProductKind.COMPLETION,
-                    storage_class=StorageClass.DEVICE_TENSOR,
+                    storage_class=StorageClass.REQUEST_RELAY,
                     dtype=DType.U32,
                     shape_bound=ShapeBound((StaticDim(1),)),
                     point_range=PointRange(),
@@ -1392,7 +1426,8 @@ def _warmup_flow(self: Worker) -> None:
                             int(output.generation)
                             for session_id in selected_text
                             for output in text_predecessors[session_id].outputs
-                            if output.storage_class is StorageClass.DEVICE_TENSOR
+                            if output.storage_class
+                            in {StorageClass.DEVICE_TENSOR, StorageClass.REQUEST_RELAY}
                         )
                     )
                     text_predecessors.update(zip(selected_text, text_operations, strict=True))

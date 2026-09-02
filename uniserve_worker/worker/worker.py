@@ -3,12 +3,9 @@
 from __future__ import annotations
 
 import logging
-import os
-import tempfile
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import replace
-from pathlib import Path
 from threading import Condition, RLock
 from typing import TYPE_CHECKING
 
@@ -25,6 +22,7 @@ from ..bootstrap.execution_config import (
     graph_memory_budget_bytes,
 )
 from ..bootstrap.worker_info import build_worker_info
+from ..bootstrap.role import WorkerRole
 from ..execution.batch import (
     Batch,
     CompletionReport,
@@ -35,6 +33,7 @@ from ..execution.batch import (
 from ..execution.cuda_graph import CudaGraphRunner
 from ..execution.forward_batch import AttentionMode, AttentionSelection
 from ..execution.model_runner import ModelRunner
+from ..execution.output import OutputPool
 from ..execution.step import (
     PreparedExecution,
     close_execution,
@@ -53,12 +52,6 @@ from ..foundation.errors import invalid_descriptor, unsupported_setup
 from ..foundation.math import ceil_div
 from ..loader.update import WeightUpdater
 from ..loader.weight_set import WeightSet
-from ..models.minimax_h3 import MiniMaxH3Model
-from ..models.minimax_h3.execution import (
-    H3MuxCoordinator,
-    H3OutputRing,
-    require_h3_codecs,
-)
 from ..models.runtime import ExecutionModel, WorkerDeployment
 from ..nn.diffusion.cfg import build_flow_cfg_plan
 from ..nn.mesh import DeviceMesh
@@ -69,10 +62,10 @@ from ..runtime.encoder_cache import EncoderCache
 from ..runtime.latent_pool import LatentPool
 from ..runtime.req_to_token_pool import ReqToTokenPool
 from ..runtime.runtime_states import RuntimeStates
-from ..server.cpu_tasks import BoundedCpuTaskPool
-from ..server.request_state import RequestTable
+from ..runtime.cpu import CpuPool
+from ..runtime.request import RequestPool
 from ..transfer.connector import TransferConnector
-from ..worker_info import (
+from ..bootstrap.worker_info import (
     GraphBucket,
     ResourceClass,
     WorkerInfo,
@@ -98,7 +91,7 @@ logger = logging.getLogger(__name__)
 class Worker:
     """Own one configured process and its sole model execution root."""
 
-    model: ExecutionModel | MiniMaxH3Model
+    model: ExecutionModel
     deployment: WorkerDeployment
     weights: WeightSet
     runner: ModelRunner | None
@@ -106,10 +99,6 @@ class Worker:
     cache_pool: CachePool | None
     req_to_token_pool: ReqToTokenPool | None
     latent_pool: LatentPool | None
-    _warmup_kv_pages: dict[tuple[RequestKey, int], list[int]]
-    _warmup_prefix_pages: dict[RequestKey, list[int]]
-    _warmup_prefix_slots: dict[RequestKey, int]
-    _warmup_latent_pages: dict[RequestKey, list[int]]
 
     @classmethod
     def from_config(cls, config: WorkerProcessArgs) -> Worker:
@@ -118,10 +107,9 @@ class Worker:
         from ..bootstrap.model_loader import materialize_worker_model
         from ..bootstrap.plan import resolve_worker_plan
         from ..nn.placement import place_towers
-        from ..server.distributed import build_device_mesh
-        from ..server.worker_kind import WorkerKind
+        from ..runtime.distributed import build_device_mesh
 
-        plan = resolve_worker_plan(config.worker_kind)
+        plan = resolve_worker_plan(config.worker_role)
         configure_triton_toolchain()
         mesh = build_device_mesh(
             tp_rank=config.placement.tp_rank,
@@ -140,7 +128,7 @@ class Worker:
                 tuning=config.execution.flashinfer,
                 block_size=loaded.deployment.block_size,
             )
-            if isinstance(loaded.model, ExecutionModel) and loaded.model.resource_geometry.kv
+            if loaded.model.resource_geometry.kv
             else None
         )
         return cls(
@@ -152,19 +140,17 @@ class Worker:
             tokenizer=loaded.tokenizer,
             allowed_work_variants=plan.allowed_work_variants,
             transfer_backend=config.data_plane.backend,
-            cross_process=config.worker_kind is not WorkerKind.FULL,
+            cross_process=config.worker_role is not WorkerRole.FULL,
             weights=loaded.weights,
             weight_sidecars=loaded.weight_sidecars,
             pipeline_depth=config.ipc.pipeline_depth,
             completion_payload_bytes=config.ipc.max_payload_bytes,
-            media_spool=(
-                None if config.media_spool is None else Path(config.media_spool).expanduser()
-            ),
+            worker_role=config.worker_role,
         )
 
     def __init__(
         self,
-        model: ExecutionModel | MiniMaxH3Model,
+        model: ExecutionModel,
         *,
         mesh: DeviceMesh,
         deployment: WorkerDeployment,
@@ -178,16 +164,15 @@ class Worker:
         weight_sidecars: tuple[str, ...] = ("config.json",),
         pipeline_depth: int,
         completion_payload_bytes: int,
-        media_spool: Path | None = None,
+        worker_role: WorkerRole = WorkerRole.FULL,
     ) -> None:
-        if not isinstance(model, (ExecutionModel, MiniMaxH3Model)):
+        if not isinstance(model, ExecutionModel):
             raise unsupported_setup("worker model has no supported execution surface")
         if not isinstance(deployment, WorkerDeployment):
             raise unsupported_setup("model worker requires a worker deployment")
         self.model = model
         self.mesh = mesh
         self.deployment = deployment
-        self.media_spool = media_spool
         self._weight_condition = Condition(RLock())
         self._active_model_calls = 0
         self._weight_update_active = False
@@ -202,6 +187,7 @@ class Worker:
             weight_version=self.weight_version,
             pipeline_depth=int(pipeline_depth),
             completion_payload_bytes=int(completion_payload_bytes),
+            worker_role=worker_role,
         )
         arena = model_arena_capacity(
             model,
@@ -251,22 +237,16 @@ class Worker:
             max_batch_tokens=min(int(declared.max_batch_tokens), lane_token_bound),
         )
         owns_kv = bool(model.resource_geometry.kv)
-        packed_model = model if isinstance(model, ExecutionModel) else None
+        packed_model = model
         if owns_kv != (attention is not None):
             raise unsupported_setup(
                 "attention selection must exactly match model-owned KV resources"
             )
-        if isinstance(model, MiniMaxH3Model):
-            if media_spool is None or not media_spool.is_absolute():
-                raise unsupported_setup("MiniMax H3 requires an absolute shared media spool")
-        elif media_spool is not None:
-            raise unsupported_setup("packed-forward models do not own a media spool")
-        cache = packed_model.cache_geometry if owns_kv and packed_model is not None else None
+        cache = packed_model.cache_geometry if owns_kv else None
         self.cache_pool = None
         self.req_to_token_pool = None
         max_blocks_per_row = 0
         if cache is not None:
-            assert packed_model is not None
             cache_dtype = getattr(torch, str(cache.dtype).removeprefix("torch."), None)
             if not isinstance(cache_dtype, torch.dtype):
                 raise unsupported_setup(f"unsupported cache dtype {cache.dtype!r}")
@@ -312,7 +292,7 @@ class Worker:
                 staging_depth=int(pipeline_depth),
             )
             packed_model.bind_cache_pool(self.cache_pool, attention)
-        self.requests = RequestTable(int(self._info.max_request_pool_size))
+        self.requests = RequestPool(int(self._info.max_request_pool_size))
         torch_dtype = getattr(
             torch,
             str(deployment.model_dtype).removeprefix("torch."),
@@ -321,7 +301,6 @@ class Worker:
         if not isinstance(torch_dtype, torch.dtype):
             raise unsupported_setup(f"unsupported model dtype {deployment.model_dtype!r}")
         if self.req_to_token_pool is not None:
-            assert packed_model is not None
             self.runtime_states = RuntimeStates(
                 request_pool_size=int(self._info.max_request_pool_size),
                 vocab_size=int(packed_model.vocab_size),
@@ -366,9 +345,17 @@ class Worker:
             )
         )
         self.device_events = DeviceEventPool()
+        self.output_pool = OutputPool(
+            capacity=int(pipeline_depth) * int(self._info.max_batch_operations),
+            max_words=int(self._info.max_batch_operations)
+            * (4 + (int(completion_payload_bytes) + 3) // 4),
+            event_pool=self.device_events,
+        )
         self.device_products = DeviceProducts(
             capacity=arena.device_products,
             byte_capacity=arena.device_product_bytes,
+            request_capacity=int(self._info.max_request_pool_size),
+            relay_depth=int(self._info.max_unresolved_window) + 1,
             event_pool=self.device_events,
         )
         self.encoder_cache = EncoderCache(
@@ -381,7 +368,7 @@ class Worker:
             devices=owner_devices,
             event_pool=self.device_events,
         )
-        self.cpu_tasks = BoundedCpuTaskPool(
+        self.cpu_tasks = CpuPool(
             capacity=int(arena.cpu_tasks),
             workers=min(4, int(arena.cpu_tasks)),
         )
@@ -456,7 +443,7 @@ class Worker:
                 int(packed_model.text_max_tokens),
                 max(0, int(self._info.num_blocks) - 1) * int(deployment.block_size),
             )
-            if owns_kv and packed_model is not None
+            if owns_kv
             else 0
         )
         prefill_graph_token_sizes = tuple(
@@ -531,7 +518,6 @@ class Worker:
             ()
             if (
                 not flow_graph_buckets
-                or packed_model is None
                 or not packed_model.tensorized_mixed
                 or not _has_decode_flow_partition(execution.lanes)
                 or not {
@@ -566,7 +552,7 @@ class Worker:
         flow_prefix_lengths: dict[int, tuple[int, ...]] = {}
         if (
             flow is not None
-            and packed_model is not None
+            and owns_kv
             and packed_model.tensorized_mixed
             and flow_graph_buckets
         ):
@@ -776,24 +762,12 @@ class Worker:
                 max_inflight=int(pipeline_depth),
                 graph_factory=graph_factory,
             )
-            if owns_kv and packed_model is not None
+            if owns_kv
             else None
         )
         self.runner = runner
-        self.h3_mux = (
-            H3MuxCoordinator()
-            if isinstance(model, MiniMaxH3Model) and mesh.coord("sp") == 0
-            else None
-        )
-        self.h3_output_ring = (
-            H3OutputRing(
-                state_slots=model.states.slot_count,
-                unresolved_window=self._info.max_unresolved_window,
-                max_video_frames_per_round=model.layout.video_round_frames,
-                max_frame_count=model.layout.frame_count,
-            )
-            if isinstance(model, MiniMaxH3Model) and mesh.coord("sp") == 0
-            else None
+        self.h3_mux, self.h3_output_ring = model.create_media_runtime(
+            self._info.max_unresolved_window
         )
         self.execution = create_execution_resources(
             runner=runner,
@@ -808,6 +782,7 @@ class Worker:
             device_products=self.device_products,
             encoder_cache=self.encoder_cache,
             device_events=self.device_events,
+            outputs=self.output_pool,
             cpu_tasks=self.cpu_tasks,
             weights=self.weights,
             mesh=mesh,
@@ -820,13 +795,7 @@ class Worker:
             trace=self.trace,
             h3_mux=self.h3_mux,
             h3_output_ring=self.h3_output_ring,
-            media_spool=media_spool,
         )
-        self._warmup_kv_pages = {}
-        self._warmup_prefix_pages = {}
-        self._warmup_prefix_slots = {}
-        self._warmup_latent_pages = {}
-        self._warmup_step_id = 0
         self.weight_updater = (
             WeightUpdater(
                 self.model,
@@ -837,7 +806,7 @@ class Worker:
                 publish=self._publish_weight_set,
                 exclusive=self._exclusive_weight_update,
             )
-            if isinstance(self.model, ExecutionModel)
+            if self.model.supports_weight_updates
             else None
         )
 
@@ -847,7 +816,7 @@ class Worker:
 
     def _decode_context_blocks(self) -> int:
         model = self.model
-        if not isinstance(model, ExecutionModel):
+        if not model.resource_geometry.kv:
             return 0
         deployment = self.deployment
         max_tokens = int(model.text_max_tokens)
@@ -932,52 +901,28 @@ class Worker:
         self._info = replace(self._info, weight_version=weights.version)
 
     def warmup(self) -> None:
-        if not isinstance(self.model, MiniMaxH3Model):
-            packed_warmup.warmup(self)
-            return
-        spool = self.media_spool
-        if spool is None:
-            raise RuntimeError("MiniMax H3 has no configured media spool")
-        try:
-            spool = spool.resolve(strict=True)
-        except OSError as error:
-            raise RuntimeError(f"media spool {spool} is unavailable") from error
-        if not spool.is_dir():
-            raise RuntimeError(f"media spool {spool} is not a directory")
-        try:
-            descriptor, probe = tempfile.mkstemp(
-                dir=spool,
-                prefix=f".uniserve-worker-{self.mesh.coord('sp')}-",
-            )
-            os.close(descriptor)
-            Path(probe).unlink()
-        except OSError as error:
-            raise RuntimeError(f"media spool {spool} is not writable") from error
-        self.media_spool = spool
-        self.execution._media_spool = spool
-        if self.mesh.coord("sp") == 0:
-            require_h3_codecs()
-        self.model.warmup()
+        context = packed_warmup.WarmupContext(self)
+        packed_warmup.warmup(context)
+        self.model.warmup(context)
         complete_startup(self.execution)
+        self._info = replace(
+            self._info,
+            mixed_buckets=tuple(
+                bucket
+                for bucket in self._info.mixed_buckets
+                if bucket in self.execution.mixed_buckets
+            ),
+        )
 
     def drop_session(self, session_id: int) -> None:
         session_id = int(session_id)
         session = self.requests.peek(session_id)
         drop_execution_session(self.execution, session_id)
         self.device_products.drop_session(session_id)
-        if isinstance(self.model, MiniMaxH3Model):
-            self.model.states.drop_session(session_id)
-            if self.h3_mux is not None:
-                self.h3_mux.drop(session_id)
+        self.model.drop_runtime(session_id, self.h3_mux)
         if session is not None and self.latent_pool is not None:
             self.latent_pool.release_slots((int(session.request_pool_idx),))
         self.requests.drop(session_id)
-        if session is not None and self.cache_pool is not None:
-            for group_id in range(self.cache_pool.group_count):
-                self._warmup_kv_pages.pop((session.request_key, group_id), None)
-            self._warmup_prefix_pages.pop(session.request_key, None)
-            self._warmup_prefix_slots.pop(session.request_key, None)
-            self._warmup_latent_pages.pop(session.request_key, None)
         if session is not None:
             self.trace.emit(
                 ExecutionPhase.CLEANUP,
@@ -998,15 +943,11 @@ class Worker:
         self.encoder_cache.release_generations(generations)
 
     def resource_pressure(self) -> list[dict[str, object]]:
-        if isinstance(self.model, MiniMaxH3Model):
-            used_slots = sum(slot.active for slot in self.model.states.slots)
-            bytes_per_slot = self.model.states.bytes_per_slot(self.model.layout)
+        model_usage = self.model.resource_usage()
+        if model_usage:
             return [
-                _pressure(
-                    ResourceClass.IMAGE_LATENT.value,
-                    used_slots * bytes_per_slot,
-                    self.model.states.slot_count * bytes_per_slot,
-                )
+                _pressure(resource, used, total)
+                for resource, used, total in model_usage
             ]
         info = self._info
         counts = {
@@ -1034,8 +975,7 @@ class Worker:
         close_execution(self.execution)
         if runner is not None:
             runner.close()
-        if isinstance(self.model, MiniMaxH3Model):
-            torch.cuda.synchronize(self.model.mesh.local_device)
+        self.model.synchronize_runtime()
         if self.h3_mux is not None:
             self.h3_mux.close()
         self.cpu_tasks.close()
@@ -1044,6 +984,7 @@ class Worker:
             self.latent_pool.close()
         self.encoder_cache.close()
         self.device_products.close()
+        self.output_pool.close()
         self.device_events.close()
 
     def set_completion_wake(

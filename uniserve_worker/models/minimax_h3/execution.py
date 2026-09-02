@@ -3,18 +3,18 @@
 from __future__ import annotations
 
 import concurrent.futures
-from pathlib import Path
 from threading import RLock
 from typing import Callable
 
 import numpy as np
 import torch
 
-from ...execution.batch import RequestKey
+from ...execution.batch import MediaOutput, RequestKey
 from ...foundation.errors import resource_error
-from ...server.completion import EventGatedDeferredTask, PinnedByteCapture
-from ...server.cpu_tasks import CpuTaskReservation
-from ...server.media_output import AvMuxConfig, AvMuxSession, require_media_codecs
+from ...execution.output import CpuJob, ByteCapture
+from ...media.mux import AvMuxConfig, AvMuxSession, require_media_codecs
+from ...runtime.cpu import CpuTaskReservation
+from ...transfer.tickets import ShmTransport
 from .state import PROFILE_AUDIO_RATE, PROFILE_FPS, PROFILE_HEIGHT, PROFILE_WIDTH
 
 __all__ = [
@@ -112,7 +112,7 @@ class H3OutputRingLease:
         self._released = True
         self._ring._release(self.kind, self.index)
 
-    def defer_until_capture_ready(self, capture: PinnedByteCapture) -> None:
+    def defer_until_capture_ready(self, capture: ByteCapture) -> None:
         if self._released:
             return
         if capture.ready():
@@ -142,13 +142,12 @@ class H3MuxCoordinator:
 
     def __init__(self) -> None:
         self._sessions: dict[RequestKey, AvMuxSession] = {}
-        self._video_tails: dict[RequestKey, concurrent.futures.Future[None] | None] = {}
-        self._audio_tails: dict[RequestKey, concurrent.futures.Future[None] | None] = {}
+        self._video_tails: dict[RequestKey, concurrent.futures.Future[object] | None] = {}
+        self._audio_tails: dict[RequestKey, concurrent.futures.Future[object] | None] = {}
 
     def open(
         self,
         request_key: RequestKey,
-        path: Path,
         *,
         frame_count: int,
         video_unit_frames: tuple[int, ...],
@@ -163,7 +162,7 @@ class H3MuxCoordinator:
             audio_rate=PROFILE_AUDIO_RATE,
             video_unit_frames=video_unit_frames,
         )
-        self._sessions[request_key] = AvMuxSession(path, config)
+        self._sessions[request_key] = AvMuxSession(config)
         self._video_tails[request_key] = None
         self._audio_tails[request_key] = None
 
@@ -171,17 +170,17 @@ class H3MuxCoordinator:
         self,
         request_key: RequestKey,
         reservation: CpuTaskReservation,
-        action: Callable[[AvMuxSession], None],
-        capture: PinnedByteCapture | None,
-        dependencies: tuple[concurrent.futures.Future[None], ...],
+        action: Callable[[AvMuxSession], object],
+        capture: ByteCapture | None,
+        dependencies: tuple[concurrent.futures.Future[object], ...],
         ring_lease: H3OutputRingLease | None = None,
         *,
         profile_name: str,
-    ) -> EventGatedDeferredTask:
+    ) -> CpuJob:
         session = self._sessions.get(request_key)
         if session is None:
             raise RuntimeError("H3 mux session is not active")
-        return EventGatedDeferredTask(
+        return CpuJob(
             reservation,
             lambda: action(session),
             capture=capture,
@@ -196,11 +195,11 @@ class H3MuxCoordinator:
         request_key: RequestKey,
         start_unit: int,
         unit_count: int,
-        capture: PinnedByteCapture,
+        capture: ByteCapture,
         reservation: CpuTaskReservation,
         ring_lease: H3OutputRingLease,
         operation_id: int,
-    ) -> EventGatedDeferredTask:
+    ) -> CpuJob:
         dependency = self._video_tails[request_key]
         task = self._task(
             request_key,
@@ -221,11 +220,11 @@ class H3MuxCoordinator:
     def audio(
         self,
         request_key: RequestKey,
-        capture: PinnedByteCapture,
+        capture: ByteCapture,
         reservation: CpuTaskReservation,
         ring_lease: H3OutputRingLease,
         operation_id: int,
-    ) -> EventGatedDeferredTask:
+    ) -> CpuJob:
         dependency = self._audio_tails[request_key]
         task = self._task(
             request_key,
@@ -249,16 +248,24 @@ class H3MuxCoordinator:
         request_key: RequestKey,
         reservation: CpuTaskReservation,
         operation_id: int,
-    ) -> EventGatedDeferredTask:
+    ) -> CpuJob:
         dependencies = tuple(
             tail
             for tail in (self._video_tails[request_key], self._audio_tails[request_key])
             if tail is not None
         )
+        def publish(session: AvMuxSession) -> MediaOutput:
+            payload = session.close()
+            locator = ShmTransport.publish_bytes(payload)
+            self._sessions.pop(request_key, None)
+            self._video_tails.pop(request_key, None)
+            self._audio_tails.pop(request_key, None)
+            return MediaOutput(handle=locator.handle.decode(), bytes=locator.nbytes)
+
         return self._task(
             request_key,
             reservation,
-            lambda session: session.close(),
+            publish,
             None,
             dependencies,
             profile_name=(

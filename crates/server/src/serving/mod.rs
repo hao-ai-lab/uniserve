@@ -276,7 +276,6 @@ pub struct VideoGenerationInput {
     pub prompt: String,
     pub seed: u64,
     pub seconds: f64,
-    pub output_path: String,
 }
 
 impl ServingRuntime {
@@ -340,7 +339,6 @@ impl ServingRuntime {
             request.request_id.to_string(),
             prompt_token_ids,
             request.seed,
-            request.output_path,
             geometry,
         );
         self.engine

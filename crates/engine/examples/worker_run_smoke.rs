@@ -104,7 +104,7 @@ fn main() -> anyhow::Result<()> {
         max_batch_operations: 32,
         max_batch_tokens: 8192,
         attention_backend: uniserve_engine::AttentionBackend::Auto,
-        worker_kind: None,
+        worker_role: None,
         transfer_backend: uniserve_engine::TransferBackend::Inproc,
         ..worker_config
     })?;

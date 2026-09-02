@@ -5,7 +5,6 @@ from __future__ import annotations
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 import torch
@@ -21,6 +20,7 @@ from uniserve_worker.execution.batch import (
 )
 from uniserve_worker.execution.forward_batch import AttentionSelection, ModelPhase
 from uniserve_worker.execution.model_runner import ForwardResult, ModelRunner
+from uniserve_worker.execution.output import OutputPool
 from uniserve_worker.execution.rows import (
     ForwardRow,
     LatentExecution,
@@ -32,7 +32,6 @@ from uniserve_worker.foundation.errors import invalid_descriptor, unsupported_se
 from uniserve_worker.loader.weight_set import WeightSet
 from uniserve_worker.models.generation import GenerationPipeline
 from uniserve_worker.models.inputs import ImageProcessor
-from uniserve_worker.models.minimax_h3 import MiniMaxH3Model
 from uniserve_worker.models.minimax_h3.execution import H3MuxCoordinator, H3OutputRing
 from uniserve_worker.models.runtime import ExecutionModel, WorkerDeployment
 from uniserve_worker.nn.mesh import DeviceMesh
@@ -43,20 +42,20 @@ from uniserve_worker.runtime.encoder_cache import EncoderCache, EncoderRead
 from uniserve_worker.runtime.latent_pool import LatentPool
 from uniserve_worker.runtime.req_to_token_pool import ReqToTokenPool
 from uniserve_worker.runtime.runtime_states import RuntimeStates
-from uniserve_worker.server.cpu_tasks import BoundedCpuTaskPool
-from uniserve_worker.server.request_state import RequestRow, RequestRuntime, RequestTable
+from uniserve_worker.runtime.cpu import CpuPool
+from uniserve_worker.runtime.request import RequestDraft, RequestRuntime, RequestPool
 from uniserve_worker.transfer.connector import CachePublications
 from uniserve_worker.transfer.tickets import Locator, Transport
-from uniserve_worker.worker_info import GraphBucket
+from uniserve_worker.bootstrap.worker_info import GraphBucket
 
 
 @dataclass(slots=True)
 class ExecutionResources:
     runner: ModelRunner | None
-    model: ExecutionModel | MiniMaxH3Model
+    model: ExecutionModel
     deployment: WorkerDeployment
     attention: AttentionSelection | None
-    requests: RequestTable
+    requests: RequestPool
     runtime_states: RuntimeStates | None
     cache_pool: CachePool | None
     req_to_token_pool: ReqToTokenPool | None
@@ -64,11 +63,11 @@ class ExecutionResources:
     latent_pool: LatentPool | None
     _h3_mux: H3MuxCoordinator | None
     _h3_output_ring: H3OutputRing | None
-    _media_spool: Path | None
     device_products: DeviceProducts
     encoder_cache: EncoderCache
     _device_events: DeviceEventPool
-    _cpu_tasks: BoundedCpuTaskPool
+    _outputs: OutputPool
+    _cpu_tasks: CpuPool
     weights: WeightSet
     mesh: DeviceMesh
     transport: Transport | None
@@ -91,7 +90,7 @@ class ExecutionResources:
     def operation_identity(operation: Operation) -> OperationIdentity:
         return operation.request_key, int(operation.op_id)
 
-    def request_row(self, scope: PartitionState, session_id: int) -> RequestRow:
+    def request_row(self, scope: PartitionState, session_id: int) -> RequestDraft:
         try:
             return scope.request_rows[int(session_id)]
         except KeyError:
@@ -112,12 +111,12 @@ class ExecutionResources:
         return value
 
     def h3_mux(self) -> H3MuxCoordinator:
-        if not isinstance(self.model, MiniMaxH3Model) or self._h3_mux is None:
+        if self._h3_mux is None:
             raise unsupported_setup("operation requires MiniMax H3 mux resources")
         return self._h3_mux
 
     def h3_output_ring(self) -> H3OutputRing:
-        if not isinstance(self.model, MiniMaxH3Model) or self._h3_output_ring is None:
+        if self._h3_output_ring is None:
             raise unsupported_setup("operation requires a rank-zero H3 output ring")
         return self._h3_output_ring
 
@@ -160,7 +159,7 @@ class ExecutionResources:
     def logical_lengths(
         self,
         operation: Operation,
-        session: RequestRow,
+        session: RequestDraft,
         cache: tuple[int, int, int, int] | None,
         *,
         latent_len: int | None = None,
@@ -263,7 +262,7 @@ class ExecutionResources:
         elapsed_us = max(0, (time.perf_counter_ns() - int(started_ns)) // 1000)
         scope.component_us[name] = scope.component_us.get(name, 0) + elapsed_us
 
-    def parent_runtime(self, operation: Operation, request: RequestRow) -> RequestRuntime:
+    def parent_runtime(self, operation: Operation, request: RequestDraft) -> RequestRuntime:
         parent = operation.parent
         point = parent.point
         runtime = (

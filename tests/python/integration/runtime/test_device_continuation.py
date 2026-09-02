@@ -25,8 +25,8 @@ from uniserve_worker.execution.batch import (
     TokenMode,
     VersionRef,
 )
-from uniserve_worker.server.completion import finalize_completion_report
-from uniserve_worker.server.stub import _next_token
+from uniserve_worker.execution.output import finalize_completion_report
+from uniserve_worker.models.stub import _next_token
 
 pytestmark = [
     pytest.mark.integration,
@@ -190,6 +190,66 @@ def test_device_continuation_chain_matches_serial_token_sequence() -> None:
     torch.cuda.synchronize()
     tokens = tuple(
         finalize_completion_report(report).completions[0].committed_tokens[0] for report in reports
+    )
+    expected = []
+    current = 4
+    for _ in range(4):
+        current = _next_token(current)
+        expected.append(current)
+    assert tokens == tuple(expected)
+
+
+def test_relay_window_retains_a_consumer_fenced_predecessor() -> None:
+    worker = execution_worker(device="cuda:0", pipeline_depth=3)
+    admission = und_admission(33, block_ids=(0,))
+    operation, token_input = token_operation(
+        admission.request_key,
+        op_id=1,
+        parent=root_parent(admission),
+        mode=TokenMode.EXTEND,
+        tokens=(3, 4),
+    )
+    reports = [
+        worker.execute(
+            execution_batch(
+                step_id=1,
+                admissions=(admission,),
+                operations=(operation,),
+                input_products=(token_input,),
+            )
+        )
+    ]
+    operations = [operation]
+    for step_id in range(2, 5):
+        parent = operations[-1]
+        operation, token_input = token_operation(
+            admission.request_key,
+            op_id=step_id,
+            parent=VersionRef(
+                admission.request_key,
+                parent.op_id,
+                DevicePoint(1, None),
+            ),
+            mode=TokenMode.DECODE,
+            tokens=(0,),
+            predicate=next(output for output in parent.outputs if output.kind is ProductKind.TOKEN),
+        )
+        reports.append(
+            worker.execute(
+                execution_batch(
+                    step_id=step_id,
+                    operations=(operation,),
+                    controls=(Release(admission.request_key, parent.op_id),),
+                    input_products=(token_input,),
+                )
+            )
+        )
+        operations.append(operation)
+
+    torch.cuda.synchronize()
+    tokens = tuple(
+        finalize_completion_report(report).completions[0].committed_tokens[0]
+        for report in reports
     )
     expected = []
     current = 4

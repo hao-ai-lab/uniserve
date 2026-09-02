@@ -62,8 +62,8 @@ from uniserve_worker.execution.forward_batch import (
     ForwardOutput,
 )
 from uniserve_worker.foundation.errors import WorkerError, WorkerErrorCode
-from uniserve_worker.server.completion import completion_report_ready, finalize_completion_report
-from uniserve_worker.server.stub import StubModel, _next_token
+from uniserve_worker.execution.output import completion_report_ready, finalize_completion_report
+from uniserve_worker.models.stub import StubModel, _next_token
 from uniserve_worker.transfer.tickets import (
     TRANSFER_DESCRIPTOR_PREFIX,
     decode_transfer_descriptor,
@@ -231,13 +231,15 @@ def test_extend_then_decode_commit_the_serial_oracle_tokens():
         tokens=(first_token,),
         control_seq=commit.control_seq,
     )
-    decoded = worker.execute(
-        execution_batch(
-            step_id=2,
-            admissions=(),
-            operations=(decode,),
-            controls=(commit,),
-            input_products=(decode_input,),
+    decoded = finalized_report(
+        worker.execute(
+            execution_batch(
+                step_id=2,
+                admissions=(),
+                operations=(decode,),
+                controls=(commit,),
+                input_products=(decode_input,),
+            )
         )
     )
 
@@ -1651,24 +1653,13 @@ def test_generated_feedback_commits_absolute_visual_token_state():
         shape_bound=ShapeBound((StaticDim(len(sampling_bytes)),)),
         point_range=PointRange(),
     )
-    finish_product = ProductRef(
-        request_key=admission.request_key,
-        producer_op_id=state.op_id,
-        output_index=2,
-        generation=state.op_id * 8 + 8,
-        kind=ProductKind.FINISH,
-        storage_class=StorageClass.DEVICE_TENSOR,
-        dtype=DType.U8,
-        shape_bound=ShapeBound(),
-        point_range=PointRange(),
-    )
     transition_product = ProductRef(
         request_key=admission.request_key,
         producer_op_id=state.op_id,
-        output_index=4,
+        output_index=3,
         generation=state.op_id * 8 + 9,
         kind=ProductKind.COMPLETION,
-        storage_class=StorageClass.DEVICE_TENSOR,
+        storage_class=StorageClass.REQUEST_RELAY,
         dtype=DType.U8,
         shape_bound=ShapeBound(),
         point_range=PointRange(),
@@ -1682,7 +1673,7 @@ def test_generated_feedback_commits_absolute_visual_token_state():
         domain=state.domain,
         bounds=state.bounds,
         inputs=(*state.inputs, sampling_product),
-        outputs=(*state.outputs, finish_product, transition_product),
+        outputs=(*state.outputs, transition_product),
         predicate=state.predicate,
         rng=state.rng,
         control_seq=state.control_seq,

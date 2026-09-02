@@ -1,4 +1,4 @@
-"""Worker-side profiling spans and per-step capture."""
+"""Optional worker profiling spans and per-step capture."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
-from ..foundation.env import flag_from_value, int_from_value
+from .foundation.env import flag_from_value, int_from_value
 
 torch: Any | None
 try:  # torch is an optional import for CPU-only control-plane tests.
@@ -25,6 +25,7 @@ __all__ = [
     "WorkerProfiler",
     "WorkerProfileConfig",
     "profile_range",
+    "timing_events_enabled",
     "synchronize_profile_range",
 ]
 
@@ -194,6 +195,17 @@ def profile_range(debug_name: str):
     if not record and not nvtx:
         return _NULL_CONTEXT
     return _profile_range_impl(debug_name, record=record, nvtx=nvtx)
+
+
+def timing_events_enabled() -> bool:
+    """Return whether optional CUDA interval timing is configured."""
+
+    env = os.environ
+    return bool(env.get(_TORCH_PROFILE_DIR_ENV) or env.get(_PROFILE_DIR_ENV)) or bool(
+        flag_from_value(env.get(_PROFILE_NVTX_ENV))
+        or flag_from_value(env.get(_NVTX_ENV))
+        or flag_from_value(env.get(_CUDA_PROFILER_ENV))
+    )
 
 
 def synchronize_profile_range(device: Any) -> None:

@@ -13,7 +13,7 @@ mod worker;
 pub use crate::core::{EngineCore, EngineCoreConfig};
 pub use crate::executor::{
     ControlAck, ControlOp, Executor, Pool, TransferBackend, TransportMap, TransportMapError,
-    WorkerExecError, WorkerKind, WorkerLossError, WorkerTopology, WorkerTopologyError,
+    WorkerExecError, WorkerLossError, WorkerRole, WorkerTopology, WorkerTopologyError,
 };
 pub use crate::handle::{
     Command, EVENT_BUFFER_CAPACITY, EngineHandle, EventRx, EventSendError, EventTx, MediaEventRx,

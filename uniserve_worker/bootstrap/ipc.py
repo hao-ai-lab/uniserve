@@ -1,4 +1,4 @@
-"""Native worker IPC bridge.
+"""Native worker IPC endpoint construction.
 
 `_uniserve_ipc` is the PyO3 extension built from the `uniserve-ipc-py` crate.
 ``WorkerIpcEndpoint`` is the worker-side request/response endpoint.

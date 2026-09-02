@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..models.generation import GenerationPipeline
-from ..models.minimax_h3 import MiniMaxH3Model
 from ..models.runtime import ExecutionModel, WorkerDeployment
 from ..runtime.device_products import device_product_capacity_bytes
 
@@ -14,6 +13,8 @@ _DEVICE_PRODUCTS_PER_OPERATION = 6
 _DEVICE_PRODUCT_RETIREMENT_BATCHES = 1
 _MAX_TRANSFER_ENTRIES = 256
 _CPU_TASKS = 256
+_REQUEST_RELAY_ROW_BYTES = 18
+_REQUEST_RELAY_RETIREMENT_LANES = 1
 
 DEFAULT_NUM_BLOCKS_FALLBACK = 4096
 DEFAULT_MAX_BATCH_OPS = 1024
@@ -97,7 +98,7 @@ def operation_window(pipeline_depth: int, max_operations: int) -> int:
 
 
 def model_arena_capacity(
-    model: ExecutionModel | MiniMaxH3Model,
+    model: ExecutionModel,
     deployment: WorkerDeployment,
     *,
     pipeline_depth: int,
@@ -118,21 +119,30 @@ def model_arena_capacity(
         raise ValueError("model arena sizing requires positive runtime bounds")
 
     slots = depth * max_operations
-    if isinstance(model, MiniMaxH3Model):
+    state_geometry = model.dedicated_state_geometry
+    if state_geometry is not None:
         transfer_tickets = min(slots, _MAX_TRANSFER_ENTRIES)
-        state_slots = int(model.states.slot_count)
+        state_slots = int(state_geometry.slot_count)
         unresolved_window = depth // state_slots - 1
         device_products = _DEVICE_PRODUCTS_PER_OPERATION * (
             slots + _DEVICE_PRODUCT_RETIREMENT_BATCHES * max_operations
         )
+        relay_bytes = (
+            (int(request_pool_size) + 1)
+            * (max(1, unresolved_window) + _REQUEST_RELAY_RETIREMENT_LANES)
+            * _REQUEST_RELAY_ROW_BYTES
+        )
         return ArenaCapacity(
             latent_pool_bytes=0,
             device_products=device_products,
-            device_product_bytes=device_product_capacity_bytes(
-                device_products,
-                1,
-                selected_points_per_operation=1,
-                max_value_bytes=1,
+            device_product_bytes=(
+                device_product_capacity_bytes(
+                    device_products,
+                    1,
+                    selected_points_per_operation=1,
+                    max_value_bytes=1,
+                )
+                + relay_bytes
             ),
             transfer_bytes=max(1, transfer_tickets),
             transfer_tickets=max(1, transfer_tickets),
@@ -192,6 +202,12 @@ def model_arena_capacity(
         device_count,
         selected_points_per_operation=1,
         max_value_bytes=max_product_bytes,
+    )
+    device_product_bytes += (
+        (int(request_pool_size) + 1)
+        * (operation_window(depth, max_operations) + _REQUEST_RELAY_RETIREMENT_LANES)
+        * _REQUEST_RELAY_ROW_BYTES
+        * device_count
     )
 
     return ArenaCapacity(

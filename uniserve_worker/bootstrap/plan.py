@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from ..execution.batch import ForwardMode
-from ..server.worker_kind import WorkerKind
+from .role import WorkerRole
 
 
 class ModelLoadScope(StrEnum):
@@ -17,24 +17,24 @@ class ModelLoadScope(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class WorkerPlan:
-    worker_kind: WorkerKind
+    worker_role: WorkerRole
     model_scope: ModelLoadScope
     allowed_work_variants: frozenset[ForwardMode]
 
 
-def resolve_worker_plan(worker_kind: WorkerKind) -> WorkerPlan:
-    if worker_kind in {WorkerKind.FULL, WorkerKind.PREFILL, WorkerKind.DECODE, WorkerKind.ENCODER}:
+def resolve_worker_plan(worker_role: WorkerRole) -> WorkerPlan:
+    if worker_role in {WorkerRole.FULL, WorkerRole.PREFILL, WorkerRole.DECODE, WorkerRole.ENCODER}:
         scope = ModelLoadScope.WHOLE
-    elif worker_kind is WorkerKind.UND:
+    elif worker_role is WorkerRole.UND:
         scope = ModelLoadScope.UNDERSTANDING
-    elif worker_kind is WorkerKind.GEN:
+    elif worker_role is WorkerRole.GEN:
         scope = ModelLoadScope.GENERATION
     else:
-        raise AssertionError(f"unhandled worker kind {worker_kind!r}")
+        raise AssertionError(f"unhandled worker role {worker_role!r}")
     return WorkerPlan(
-        worker_kind=worker_kind,
+        worker_role=worker_role,
         model_scope=scope,
-        allowed_work_variants=worker_kind.allowed_work_variants,
+        allowed_work_variants=worker_role.allowed_work_variants,
     )
 
 

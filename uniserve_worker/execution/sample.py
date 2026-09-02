@@ -19,14 +19,12 @@ from uniserve_worker.runtime.device_products import (
     DeviceProductScalarBatch,
     DeviceProductWrite,
 )
-from uniserve_worker.server.completion import (
-    DeferredInteger,
-    DeferredLogprobBatch,
-    DeferredLogprobValue,
-    DeferredSampleSpan,
-    DeferredSampleToken,
-    DeferredTopLogprobs,
-    PinnedOutputBuffer,
+from uniserve_worker.execution.output import (
+    LogprobCapture,
+    LogprobOutputRow,
+    SamplingCapture,
+    SamplingOutputRow,
+    OutputBuffer,
 )
 
 from .cuda_graph import GraphGreedyOutput
@@ -157,7 +155,7 @@ def graph_greedy_compatible(
 @torch.inference_mode()
 def sample(
     tasks: Sequence[SampleWork],
-    completion: PinnedOutputBuffer | None = None,
+    completion: OutputBuffer | None = None,
     *,
     device_products: DeviceProducts | None = None,
     device_reads: tuple[DeviceProductRead, ...] = (),
@@ -275,7 +273,7 @@ def sample(
 
 def sample_device_greedy_group(
     tasks: tuple[SampleWork, ...],
-    completion: PinnedOutputBuffer | None,
+    completion: OutputBuffer | None,
     *,
     apply_suppression: bool,
     device_products: DeviceProducts | None,
@@ -312,15 +310,6 @@ def sample_device_greedy_group(
         product_table.producer_scalar_batch(product_writes) if product_table is not None else None
     )
     packed_output = product_batch.tensor if product_batch is not None else None
-    finish_indexes = tuple(
-        index for index, task in enumerate(tasks) if task.finish_product is not None
-    )
-    finish_writes = tuple(
-        cast(DeviceProductWrite, tasks[index].finish_product) for index in finish_indexes
-    )
-    finish_batch: DeviceProductScalarBatch | None = None
-    if finish_writes and device_products is not None:
-        finish_batch = device_products.producer_scalar_batch(finish_writes)
     transition_writes = tuple(
         cast(DeviceProductWrite, task.transition_product)
         for task in tasks
@@ -332,7 +321,6 @@ def sample_device_greedy_group(
     grouped_publication = (
         product_table is not None
         and product_batch is not None
-        and (not finish_writes or finish_batch is not None)
         and (not transition_writes or transition_batch is not None)
     )
     if preselected is not None:
@@ -389,14 +377,12 @@ def sample_device_greedy_group(
             device_finish = _device_finish_values(tasks, device_tokens, valid & active)
             continuation_values = active & valid & ~device_finish
     else:
-        device_finish, continuation_values, _producer_event = _resolve_sampled_finish_values(
+        device_finish, continuation_values = _resolve_sampled_finish_values(
             tasks,
             device_tokens,
             valid,
             active,
             torch.zeros_like(active, dtype=torch.bool),
-            device_products,
-            device_reads,
         )
     resolved_transition_writes, transition_values = _sampled_transition_values(
         tasks,
@@ -444,16 +430,6 @@ def sample_device_greedy_group(
             cast(DeviceProducts, device_products),
             device_reads,
         )
-    if preselected is not None and finish_writes and not grouped_publication:
-        if device_products is None:
-            raise RuntimeError("sampling finish outputs have no device-product owner")
-        publish_device_writes(
-            finish_writes,
-            select_device_values(preselected.finish, finish_indexes),
-            device_products,
-            device_reads,
-        )
-        device_finish = None
     span = (
         capture_preselected_span(preselected, completion)
         if preselected is not None
@@ -482,13 +458,6 @@ def sample_device_greedy_group(
             side_batches: tuple[DeviceProductScalarBatch, ...] = (
                 (transition_batch,) if transition_batch is not None else ()
             )
-            if finish_batch is not None:
-                if device_finish is None:
-                    raise RuntimeError("grouped sampling has no device finish values")
-                finish_batch.tensor.copy_(
-                    select_device_values(device_finish, finish_indexes),
-                )
-                side_batches = (*side_batches, finish_batch)
             product_table.publish_scalar_group(
                 (*side_batches, cast(DeviceProductScalarBatch, product_batch)),
                 after_reads=device_reads,
@@ -523,10 +492,9 @@ def sample_device_greedy_group(
     )
     return tuple(
         SampleResult(
-            token_id=DeferredSampleToken(span, index),
+            completion=SamplingOutputRow(span, index),
             device_token=device_tokens[index : index + 1],
-            logprob=None,
-            top_logprobs=None,
+            logprobs=None,
             device_valid=valid[index : index + 1],
             device_active=active[index : index + 1],
             device_finish=(None if device_finish is None else device_finish[index : index + 1]),
@@ -573,7 +541,7 @@ def _fused_top_k(task: SampleWork, vocab: int) -> int:
 def _sample_fused_top_k_group(
     tasks: tuple[SampleWork, ...],
     top_k: int,
-    completion: PinnedOutputBuffer | None,
+    completion: OutputBuffer | None,
     *,
     device_products: DeviceProducts | None,
     device_reads: tuple[DeviceProductRead, ...],
@@ -602,14 +570,12 @@ def _sample_fused_top_k_group(
     if selection_broadcast is not None:
         selection_broadcast(tokens)
     active = _sample_predicates(tasks, tokens.device)
-    device_finish, continuation_values, _producer_event = _resolve_sampled_finish_values(
+    device_finish, continuation_values = _resolve_sampled_finish_values(
         tasks,
         tokens,
         valid,
         active,
         torch.zeros_like(active, dtype=torch.bool),
-        device_products,
-        device_reads,
     )
     _publish_sampled_transition_values(
         tasks,
@@ -629,9 +595,8 @@ def _sample_fused_top_k_group(
     span = _capture_sample_span(valid, active, tokens, torch.zeros_like(tokens), completion)
     return tuple(
         SampleResult(
-            DeferredSampleToken(span, index),
+            SamplingOutputRow(span, index),
             tokens[index : index + 1],
-            None,
             None,
             device_valid=valid[index : index + 1],
             device_active=active[index : index + 1],
@@ -667,7 +632,7 @@ def _run_fused_top_k_sampling(
 
 def _sample_task_group(
     tasks: tuple[SampleWork, ...],
-    completion: PinnedOutputBuffer | None,
+    completion: OutputBuffer | None,
     *,
     device_products: DeviceProducts | None,
     device_reads: tuple[DeviceProductRead, ...],
@@ -759,14 +724,12 @@ def _sample_task_group(
         )
     )
     active = _sample_predicates(tasks, task_tokens.device)
-    device_finish, continuation_values, _producer_event = _resolve_sampled_finish_values(
+    device_finish, continuation_values = _resolve_sampled_finish_values(
         tasks,
         task_tokens,
         task_valid,
         active,
         terminal_finish,
-        device_products,
-        device_reads,
     )
     _publish_sampled_transition_values(
         tasks,
@@ -793,11 +756,9 @@ def _sample_task_group(
     )
     return tuple(
         SampleResult(
-            token_id=(DeferredSampleToken(span, index)),
+            completion=SamplingOutputRow(span, index),
             device_token=task_tokens[index : index + 1],
-            logprob=None if index not in details else details[index][0],
-            top_logprobs=None if index not in details else details[index][1],
-            num_accepted_tokens=(DeferredInteger(span, index)),
+            logprobs=details.get(index),
             device_accepted_tokens=counts[index : index + 1],
             device_selected_point=points[index : index + 1],
             device_valid=task_valid[index : index + 1],
@@ -815,8 +776,8 @@ def _capture_sample_span(
     active: torch.Tensor,
     tokens: torch.Tensor,
     accepted: torch.Tensor,
-    completion: PinnedOutputBuffer | None,
-) -> DeferredSampleSpan:
+    completion: OutputBuffer | None,
+) -> SamplingCapture:
     count = int(tokens.numel())
     if (
         int(valid.numel()) != count
@@ -841,26 +802,26 @@ def _capture_sample_span(
             bool(values[index]) or not bool(values[count + index]) for index in range(count)
         ):
             raise invalid_descriptor("sampling policy masked every vocabulary entry")
-        return DeferredSampleSpan(None, count, values)
+        return SamplingCapture(None, count, values)
     if completion is None:
         raise RuntimeError("CUDA sampling requires a server completion lease")
-    span = DeferredSampleSpan(completion.capture(metadata), count)
+    span = SamplingCapture(completion.capture(metadata), count)
     return span
 
 
 def capture_preselected_span(
     output: GraphGreedyOutput,
-    completion: PinnedOutputBuffer | None,
-) -> DeferredSampleSpan:
+    completion: OutputBuffer | None,
+) -> SamplingCapture:
     count = int(output.tokens.numel())
     if int(output.completion.numel()) != SAMPLING_COMPLETION_FIELDS * count:
         raise RuntimeError("graph sampling completion vectors do not align")
     if output.completion.device.type != "cuda":
         values = tuple(int(value) for value in output.completion.tolist())
-        return DeferredSampleSpan(None, count, values)
+        return SamplingCapture(None, count, values)
     if completion is None:
         raise RuntimeError("CUDA graph sampling requires a server completion lease")
-    return DeferredSampleSpan(completion.capture(output.completion), count)
+    return SamplingCapture(completion.capture(output.completion), count)
 
 
 def _device_finish_values(
@@ -1129,32 +1090,12 @@ def _resolve_sampled_finish_values(
     valid: torch.Tensor,
     active: torch.Tensor,
     terminal_finish: torch.Tensor,
-    device_products: DeviceProducts | None,
-    device_reads: tuple[DeviceProductRead, ...],
-) -> tuple[torch.Tensor | None, torch.Tensor, torch.cuda.Event | None]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     finish_values = _device_finish_values(tasks, device_tokens, valid & active) | (
         terminal_finish.reshape(-1).to(dtype=torch.bool) & valid & active
     )
     continuation_values = active & valid & ~finish_values
-    if device_products is None:
-        return finish_values, continuation_values, None
-    selected = tuple(
-        (index, task, task.finish_product)
-        for index, task in enumerate(tasks)
-        if task.finish_product is not None
-    )
-    if not selected:
-        return None, continuation_values, None
-    indexes = tuple(index for index, _task, _write in selected)
-    writes = tuple(write for _index, _task, write in selected)
-    selected_finish_values = select_device_values(finish_values, indexes)
-    producer_event = publish_device_writes(
-        writes,
-        selected_finish_values,
-        device_products,
-        device_reads,
-    )
-    return None, continuation_values, producer_event
+    return finish_values, continuation_values
 
 
 def select_device_values(values: torch.Tensor, indexes: tuple[int, ...]) -> torch.Tensor:
@@ -1444,14 +1385,8 @@ def logprob_details(
     output_rows: torch.Tensor,
     output_tokens: torch.Tensor,
     rows: Sequence[SampleRow],
-    completion: PinnedOutputBuffer | None,
-) -> Mapping[
-    int,
-    tuple[
-        float | DeferredLogprobValue,
-        tuple[tuple[int, float, int], ...] | DeferredTopLogprobs,
-    ],
-]:
+    completion: OutputBuffer | None,
+) -> Mapping[int, LogprobOutputRow]:
     vocab = int(work.shape[1])
     requested_rows = tuple(
         index
@@ -1569,7 +1504,7 @@ def logprob_details(
     )
     if packed.device.type != "cuda":
         values = tuple(int(value) for value in packed.tolist())
-        batch = DeferredLogprobBatch(
+        batch = LogprobCapture(
             None,
             requested_rows,
             counts,
@@ -1581,7 +1516,7 @@ def logprob_details(
     else:
         if completion is None:
             raise RuntimeError("CUDA logprob materialization requires a server completion lease")
-        batch = DeferredLogprobBatch(
+        batch = LogprobCapture(
             completion.capture(packed),
             requested_rows,
             counts,
@@ -1589,12 +1524,7 @@ def logprob_details(
             max_count,
             max_requested,
         )
-    if packed.device.type != "cuda":
-        return batch.finalize()
     return {
-        result_index: (
-            DeferredLogprobValue(batch, result_index),
-            DeferredTopLogprobs(batch, result_index),
-        )
+        result_index: LogprobOutputRow(batch, result_index)
         for result_index in requested_rows
     }

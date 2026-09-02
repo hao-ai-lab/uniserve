@@ -20,7 +20,7 @@ from uniserve_worker.execution.batch import (
     ProductPayload,
     TokenMode,
 )
-from uniserve_worker.server.app import WorkerServer
+from uniserve_worker.process import WorkerProcess
 
 pytestmark = pytest.mark.integration
 
@@ -98,7 +98,7 @@ def test_inflight_and_terminal_duplicates_return_one_terminal_report() -> None:
             {"kind": "shutdown", "call_id": 4},
         )
     )
-    server = WorkerServer(execution_worker(pipeline_depth=2), endpoint)
+    server = WorkerProcess(execution_worker(pipeline_depth=2), endpoint)
 
     server.serve()
 
@@ -147,7 +147,7 @@ def test_conflicting_step_identity_fails_before_new_admission() -> None:
             {"kind": "shutdown", "call_id": 4},
         )
     )
-    server = WorkerServer(execution_worker(pipeline_depth=3), endpoint)
+    server = WorkerProcess(execution_worker(pipeline_depth=3), endpoint)
 
     server.serve()
 
@@ -178,23 +178,21 @@ def test_completed_report_remains_retained_after_later_execution() -> None:
             {
                 "kind": "release_products",
                 "call_id": 2,
-                "product_handles": [
-                    int(output.generation) for output in first_operation.outputs
-                ],
+                "product_handles": [int(output.generation) for output in first_operation.outputs],
             },
             _request(3, second_batch),
             _request(4, first_batch),
             {"kind": "shutdown", "call_id": 5},
         )
     )
-    server = WorkerServer(
+    server = WorkerProcess(
         execution_worker(
             pipeline_depth=1,
             max_batch_operations=1,
             max_request_pool_size=8,
         ),
         endpoint,
-        step_cache_capacity=4,
+        replay_capacity=4,
     )
 
     server.serve()
@@ -220,7 +218,7 @@ def test_prompt_launches_after_an_earlier_queued_same_session_control() -> None:
             {"kind": "shutdown", "call_id": 3},
         )
     )
-    server = WorkerServer(execution_worker(pipeline_depth=2), endpoint)
+    server = WorkerProcess(execution_worker(pipeline_depth=2), endpoint)
 
     server.serve()
 
@@ -256,7 +254,7 @@ def test_atomic_step_remains_available_until_every_participant_epoch_ends() -> N
             {"kind": "shutdown", "call_id": 4},
         )
     )
-    server = WorkerServer(
+    server = WorkerProcess(
         execution_worker(
             pipeline_depth=1,
             max_batch_operations=2,

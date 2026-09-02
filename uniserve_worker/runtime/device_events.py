@@ -212,6 +212,9 @@ class DeviceEventPool:
                     raise _invariant("deferred device event lost its ownership")
                 state.references = 0
                 self._recycle_locked(state)
+            callback = getattr(deferred.owner, "events_released", None)
+            if callable(callback):
+                callback()
         self._deferred = pending
 
     def _recycle_locked(self, state: _EventState) -> None:

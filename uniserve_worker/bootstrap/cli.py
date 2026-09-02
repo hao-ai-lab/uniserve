@@ -6,7 +6,7 @@ import argparse
 import json
 from collections.abc import Sequence
 
-from ..server.worker_kind import WorkerKind
+from .role import WorkerRole
 from .capacity import DEFAULT_BLOCK_SIZE, DEFAULT_MAX_BATCH_OPS
 from .config import WorkerProcessArgs
 
@@ -29,9 +29,10 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ipc-max-inflight", type=int, default=1)
     parser.add_argument("--model", default="")
     parser.add_argument(
-        "--worker-kind",
-        default=WorkerKind.FULL.value,
-        choices=WorkerKind.values(),
+        "--worker-role",
+        dest="worker_role",
+        default=WorkerRole.FULL.value,
+        choices=WorkerRole.values(),
         help="deployment role served by this worker process",
     )
     parser.add_argument("--device", default="cuda")
@@ -138,7 +139,6 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--no-model", action="store_true")
     parser.add_argument("--allow-stub", action="store_true", default=False)
-    parser.add_argument("--media-spool", default=None)
     parser.add_argument("--max-model-len", type=int, default=8192)
     parser.add_argument("--max-video-seconds", type=float, default=15.0)
     return parser

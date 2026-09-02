@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from uniserve_worker.server.distributed import build_device_mesh
+from uniserve_worker.runtime.distributed import build_device_mesh
 
 pytestmark = pytest.mark.unit
 

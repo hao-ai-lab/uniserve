@@ -46,7 +46,7 @@ class WorkerModelLoadRequest:
 
 @dataclass(frozen=True)
 class LoadedWorkerModel:
-    model: ExecutionModel | MiniMaxH3Model
+    model: ExecutionModel
     tokenizer: Any | None
     deployment: WorkerDeployment
     architecture: str
@@ -59,7 +59,6 @@ def load_worker_model(
     *,
     mesh: DeviceMesh | None = None,
     pipeline_depth: int | None = None,
-    media_spool: str | None = None,
 ) -> LoadedWorkerModel:
     model_root, repository_id = resolve_model_root(request.model_path, request.load)
     config = read_model_config(model_root)
@@ -72,7 +71,6 @@ def load_worker_model(
             entry,
             mesh=mesh,
             pipeline_depth=pipeline_depth,
-            media_spool=media_spool,
         )
 
     quantization_config = request.quantization_config or {}
@@ -131,7 +129,6 @@ def materialize_worker_model(
         _checkpoint_request(config, plan, mesh),
         mesh=mesh,
         pipeline_depth=config.ipc.pipeline_depth,
-        media_spool=config.media_spool,
     )
 
 
@@ -141,10 +138,7 @@ def _load_h3_worker_model(
     *,
     mesh: DeviceMesh | None,
     pipeline_depth: int | None,
-    media_spool: str | None,
 ) -> LoadedWorkerModel:
-    from pathlib import Path
-
     if mesh is None or pipeline_depth is None:
         raise unsupported_setup("MiniMax H3 loading requires the worker device mesh")
     if request.parallel.size != 4 or mesh.size("tp") != 4 or mesh.size("sp") != 4:
@@ -154,8 +148,6 @@ def _load_h3_worker_model(
         0,
     ):
         raise unsupported_setup("MiniMax H3 requires an SM100-class CUDA device")
-    if not media_spool or not Path(media_spool).expanduser().is_absolute():
-        raise unsupported_setup("MiniMax H3 requires an absolute shared media spool")
     unresolved_window = 2
     max_state_slots = min(
         int(request.max_batch_operations),
@@ -236,7 +228,7 @@ def _checkpoint_request(
 
 
 def _stub_worker_model(config: WorkerProcessArgs, plan: WorkerPlan) -> LoadedWorkerModel:
-    from ..server.stub import StubModel, stub_deployment
+    from ..models.stub import StubModel, stub_deployment
 
     stub = StubModel()
     weights = WeightSet.from_module(stub)

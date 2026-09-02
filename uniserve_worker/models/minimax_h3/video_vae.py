@@ -26,7 +26,11 @@ class MiniMaxH3VideoVAE(nn.Module):
         self.vae = vae.float()
         self.linear_precision = linear_precision
         self.autocast_dtype = torch.float16 if linear_precision == "fp16" else torch.bfloat16
-        if linear_precision == "nvfp4":
+        if linear_precision in {"fp16", "bf16"}:
+            for module in self.vae.modules():
+                if isinstance(module, (nn.Linear, nn.Conv3d)):
+                    module.to(dtype=self.autocast_dtype)
+        else:
             replaced = replace_nvfp4_linears(self.vae.decoder)
             if replaced != 217:
                 raise RuntimeError(
@@ -265,9 +269,6 @@ class MiniMaxH3VideoVAE(nn.Module):
         pixels = (body.float() * self.pixel_std + self.pixel_mean).clamp_(0.0, 1.0)
         rgb24 = pixels[0].permute(1, 2, 3, 0).mul_(255.0).round_().to(torch.uint8).contiguous()
         return rgb24, next_overlap[:, :, :5].contiguous()
-
-    def compile_decoder(self) -> None:
-        self.vae = torch.compile(self.vae, fullgraph=True)
 
     @torch.inference_mode()
     def capture_decoder(self, normalized_latents: torch.Tensor) -> torch.Tensor:

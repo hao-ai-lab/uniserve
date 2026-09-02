@@ -9,7 +9,6 @@ from collections import OrderedDict, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
 from functools import partial
-from pathlib import Path
 from typing import Any, cast
 
 import torch
@@ -18,7 +17,7 @@ from uniserve_worker.execution.batch import (
     Batch,
     BatchPartition,
     CompletionReport,
-    DeferredCompletion,
+    CompletionState,
     DevicePoint,
     Domain,
     DType,
@@ -71,7 +70,6 @@ from uniserve_worker.models.generation import (
     GenerationPipeline,
 )
 from uniserve_worker.models.inputs import ImageProcessor
-from uniserve_worker.models.minimax_h3 import MiniMaxH3Model
 from uniserve_worker.models.minimax_h3.execution import H3MuxCoordinator, H3OutputRing
 from uniserve_worker.models.runtime import (
     ExecutionModel,
@@ -104,20 +102,23 @@ from uniserve_worker.runtime.latent_pool import (
 )
 from uniserve_worker.runtime.req_to_token_pool import ReqToTokenPool
 from uniserve_worker.runtime.runtime_states import RuntimeStates
-from uniserve_worker.server.completion import (
-    DeferredImagePayload,
-    DeferredLogprobPayload,
-    DeferredResult,
-    DeferredTransferPayload,
-    PinnedOutputBuffer,
-    PinnedTokenCapture,
+from uniserve_worker.execution.output import (
+    ImagePayload,
+    LogprobPayload,
+    OutputRecord,
+    PendingOutput,
+    TransferPayload,
+    OutputPool,
+    OutputBuffer,
+    TokenCapture,
 )
-from uniserve_worker.server.cpu_tasks import BoundedCpuTaskPool
-from uniserve_worker.server.profiler import profile_range
-from uniserve_worker.server.request_state import (
-    RequestRow,
+from uniserve_worker.profiling import profile_range
+from uniserve_worker.runtime.cpu import CpuPool
+from uniserve_worker.runtime.request import (
+    RequestDraft,
     RequestRuntime,
-    RequestTable,
+    RequestPool,
+    SpeculativeCommit,
 )
 from uniserve_worker.transfer.connector import CachePublication, CachePublications
 from uniserve_worker.transfer.tickets import (
@@ -126,7 +127,7 @@ from uniserve_worker.transfer.tickets import (
     Transport,
     decode_transfer_descriptor,
 )
-from uniserve_worker.worker_info import GraphBucket
+from uniserve_worker.bootstrap.worker_info import GraphBucket
 
 from .attention import columns as _attention_columns
 from .attention import dense_columns as _dense_attention_columns
@@ -146,7 +147,6 @@ from .rows import (
     PreparedPredicateBatch,
     PreparedTransferInput,
     SampleWork,
-    SpeculativeSelection,
     dependencies_ready,
 )
 from .sample import (
@@ -169,17 +169,16 @@ _GENERATION_WORK_VARIANTS = frozenset(
         ForwardMode.MATERIALIZE,
     }
 )
-MIXED_SERVICE_SERIAL_NUMERATOR = 5
-MIXED_SERVICE_SERIAL_DENOMINATOR = 4
+_MIN_MIXED_SERVICE_SPEEDUP = 1.03
 
 
 def create_execution_resources(
     *,
     runner: ModelRunner | None,
-    model: ExecutionModel | MiniMaxH3Model,
+    model: ExecutionModel,
     deployment: WorkerDeployment,
     attention: AttentionSelection | None,
-    requests: RequestTable,
+    requests: RequestPool,
     runtime_states: RuntimeStates | None,
     cache_pool: CachePool | None,
     req_to_token_pool: ReqToTokenPool | None,
@@ -187,7 +186,8 @@ def create_execution_resources(
     device_products: DeviceProducts,
     encoder_cache: EncoderCache,
     device_events: DeviceEventPool,
-    cpu_tasks: BoundedCpuTaskPool,
+    outputs: OutputPool,
+    cpu_tasks: CpuPool,
     weights: WeightSet,
     mesh: DeviceMesh,
     transport: Transport | None,
@@ -199,7 +199,6 @@ def create_execution_resources(
     trace: ExecutionTrace,
     h3_mux: H3MuxCoordinator | None = None,
     h3_output_ring: H3OutputRing | None = None,
-    media_spool: Path | None = None,
 ) -> ExecutionResources:
     if not allowed_work_variants:
         raise ValueError("execution step must accept at least one work variant")
@@ -222,12 +221,10 @@ def create_execution_resources(
         raise unsupported_setup("execution resources disagree with model KV ownership")
     if cache_pool is not None and attention is None:
         raise unsupported_setup("packed-forward execution requires attention selection")
-    h3_model = isinstance(model, MiniMaxH3Model)
-    if h3_model != (media_spool is not None):
-        raise unsupported_setup("H3 execution resources require one configured media spool")
-    if h3_model and mesh.coord("sp") == 0 and (h3_mux is None or h3_output_ring is None):
+    media_model = model.media_profile is not None
+    if media_model and mesh.coord("sp") == 0 and (h3_mux is None or h3_output_ring is None):
         raise unsupported_setup("rank-zero H3 execution requires mux and output-ring resources")
-    if not h3_model and (h3_mux is not None or h3_output_ring is not None):
+    if not media_model and (h3_mux is not None or h3_output_ring is not None):
         raise unsupported_setup("packed-forward execution cannot own H3 output resources")
     device = canonical_device(deployment.device)
     generation_device = (
@@ -252,10 +249,10 @@ def create_execution_resources(
         latent_pool=latent_pool,
         _h3_mux=h3_mux,
         _h3_output_ring=h3_output_ring,
-        _media_spool=media_spool,
         device_products=device_products,
         encoder_cache=encoder_cache,
         _device_events=device_events,
+        _outputs=outputs,
         _cpu_tasks=cpu_tasks,
         weights=weights,
         mesh=mesh,
@@ -544,13 +541,12 @@ def _prepare_predicates(
     if not operations:
         return None
     transferred = {transfer.product: transfer for transfer in transfers}
-    buffer = PinnedOutputBuffer(
+    buffer = runtime._outputs.acquire(
         len(operations),
         token_capacity=len(operations),
         devices=tuple(_operation_device(runtime, operation) for operation in operations),
-        event_pool=runtime._device_events,
     )
-    captures: list[tuple[OperationIdentity, PinnedTokenCapture, int]] = []
+    captures: list[tuple[OperationIdentity, TokenCapture, int]] = []
     pending: list[tuple[OperationIdentity, PreparedTransferInput, int]] = []
     recorded: list[DeviceProductRead] = []
     try:
@@ -618,12 +614,7 @@ def execute_prepared(runtime, prepared: PreparedExecution) -> CompletionReport:
 def complete_startup(runtime) -> None:
     """Retire pre-admission collective identities before serving traffic."""
 
-    missing_mixed = runtime.mixed_buckets - runtime._qualified_mixed_buckets
-    if missing_mixed:
-        raise GraphExecutionError(
-            "mixed execution buckets lack a matched serving-path interference proof: "
-            f"{sorted(missing_mixed, key=repr)!r}"
-        )
+    runtime.mixed_buckets = frozenset(runtime._qualified_mixed_buckets)
     if runtime.runner is not None:
         runtime.runner.complete_startup()
     if runtime.requests.request_ids():
@@ -706,8 +697,8 @@ def _execute(
             "completion-predicated operations require exact prepared predicate values"
         )
     runtime.requests.apply_controls(batch.controls)
+    _apply_release_controls(runtime, batch, before_execution=True)
     if not batch.operations:
-        _apply_release_controls(runtime, batch)
         return CompletionReport(
             step_id=batch.step_id,
             partitions=(),
@@ -847,7 +838,7 @@ def _execute(
                     started,
                 )
 
-    _apply_release_controls(runtime, batch)
+    _apply_release_controls(runtime, batch, before_execution=False)
     report = CompletionReport(
         step_id=batch.step_id,
         partitions=tuple(reports[partition.partition_id] for partition in batch.partitions),
@@ -976,6 +967,7 @@ def _open_partition(
     input_products = tuple(
         payload for payload in batch.input_products if payload.product in declared_inputs
     )
+    completion: OutputBuffer | None = None
     try:
         admission_slots = {
             admission.request_key: int(admission.request_pool_idx) for admission in admissions
@@ -1000,13 +992,14 @@ def _open_partition(
         )
         for operation, request in zip(operations, candidates, strict=True):
             request.install_runtime(_parent_runtime(runtime, operation, request))
-        completion = PinnedOutputBuffer(
+        completion = runtime._outputs.acquire(
             len(operations),
             token_capacity=_partition_completion_words(runtime, operations),
             devices=_completion_devices(runtime, operations),
-            event_pool=runtime._device_events,
         )
     except BaseException as error:
+        if completion is not None:
+            completion.abandon()
         runtime.trace.emit(
             ExecutionPhase.CANDIDATE_STAGE,
             traced,
@@ -1014,6 +1007,7 @@ def _open_partition(
             error=error,
         )
         raise
+    assert completion is not None
     scope = PartitionState(
         partition=partition,
         started_ns=started,
@@ -1400,9 +1394,10 @@ def _commit_partition(
             scope.latent_releases,
         )
     scope.completion.seal()
-    records: list[ModelOutput] = []
+    records: list[PendingOutput] = []
     selected_versions: dict[int, VersionRef] = {}
-    pending_completions: dict[int, DeferredCompletion] = {}
+    pending_completions: dict[int, CompletionState] = {}
+    speculative_commits: dict[int, SpeculativeCommit] = {}
     report_products: list[ProductPayload] = []
     resolved_runtime: dict[int, RequestRuntime] = {}
     layout = scope.layout
@@ -1419,7 +1414,7 @@ def _commit_partition(
         _validate_completion_products(runtime, operation, outcome.products)
         if int(runtime.deployment.tp_rank) == 0:
             report_products.extend(outcome.products)
-        pending = DeferredResult(
+        pending = PendingOutput(
             (
                 request.pending_operations.get(int(operation.parent.producer_op_id))
                 if isinstance(operation.parent.point, DevicePoint)
@@ -1430,22 +1425,17 @@ def _commit_partition(
             partial(_finalize_predicated_runtime, runtime, operation),
             status=outcome.status,
             selected_point=cast(int, outcome.selected_point),
-            resolved_callback=(
-                partial(_finalize_speculative_runtime, runtime, operation, outcome.selection)
-                if outcome.selection is not None
-                else None
-            ),
             completion_tasks=(
                 *outcome.completion_tasks,
                 *(
-                    cast(DeferredLogprobPayload, product.payload)
+                    cast(LogprobPayload, product.payload)
                     for product in outcome.products
-                    if isinstance(product.payload, DeferredLogprobPayload)
+                    if isinstance(product.payload, LogprobPayload)
                 ),
             ),
         )
         record = pending.bind_record(
-            ModelOutput(
+            OutputRecord(
                 request_key=operation.request_key,
                 op_id=operation.op_id,
                 completion_slot_generation=scope.completion.generation,
@@ -1453,22 +1443,27 @@ def _commit_partition(
                 selected_point=cast(int, outcome.selected_point),
                 logical_lengths=outcome.logical_lengths,
                 token_span=outcome.token_span,
-                committed_tokens=cast(tuple[int, ...], outcome.committed_tokens),
+                committed_tokens=outcome.committed_tokens,
+                sampling=outcome.sampling,
                 finish_flags=outcome.finish_flags,
                 product_generations=outcome.product_generations,
                 error_code=None,
-                timing_counters=TimingCounters(),
-                deferred=pending,
             )
         )
         records.append(record)
         if operation.advances_state:
             pending_completions[operation.request_key.session_id] = pending
-            selected_versions[operation.request_key.session_id] = VersionRef(
-                request_key=operation.request_key,
-                producer_op_id=operation.op_id,
-                point=FixedPoint(cast(int, outcome.selected_point)),
-            )
+            if outcome.status is OpStatus.PREDICATED:
+                selected = request.resolve_version(operation.parent)
+                if selected is None:
+                    raise RuntimeError("predicated operation lost its selected parent")
+                selected_versions[operation.request_key.session_id] = selected
+            else:
+                selected_versions[operation.request_key.session_id] = VersionRef(
+                    request_key=operation.request_key,
+                    producer_op_id=operation.op_id,
+                    point=FixedPoint(cast(int, outcome.selected_point)),
+                )
         else:
             selected = request.resolve_version(operation.parent)
             if selected is None:
@@ -1482,6 +1477,16 @@ def _commit_partition(
             kv_visible_len=outcome.logical_lengths.kv_visible_len,
             kv_computed_len=outcome.logical_lengths.kv_computed_len,
         )
+        selection = outcome.selection
+        if selection is not None:
+            speculative_commits[operation.request_key.session_id] = SpeculativeCommit(
+                draft_tokens=selection.draft_tokens,
+                terminal_prefix=selection.terminal_prefix,
+                base_logical_position=selection.base_logical_position,
+                base_rng_counter=selection.base_rng_counter,
+                base_kv_visible=selection.base_kv_visible,
+                initialized_kv=selection.initialized_kv,
+            )
     _record_component(scope, "commit_partition", commit_started)
     partition_report = PartitionCompletion(
         partition_id=partition.partition_id,
@@ -1510,6 +1515,7 @@ def _commit_partition(
         selected_versions=selected_versions,
         runtimes=resolved_runtime,
         completions=pending_completions,
+        speculative=speculative_commits,
     )
     for identity, locators in scope.stage_publications.items():
         existing = runtime._transport_publications.get(identity)
@@ -1528,8 +1534,8 @@ def _commit_partition(
     for publication_identity, locators in scope.stage_publications.items():
         runtime._transport_publications[publication_identity] = locators
     _commit_runtime_states(runtime, scope)
-    runtime.requests.publish(request_publication)
-    return partition_report
+    request_publication.reserve()
+    return replace(partition_report, publication=request_publication)
 
 
 def _commit_runtime_states(runtime, scope: PartitionState) -> None:
@@ -1611,21 +1617,8 @@ def _discard_partition(
         lease.release()
     if scope.publication_started:
         raise RuntimeError("published partition state cannot be discarded")
-    if isinstance(runtime.model, MiniMaxH3Model) and scope.admissions:
-        admitted_slots = tuple(
-            (
-                admission,
-                runtime.model.states.get(int(admission.request_pool_idx)),
-            )
-            for admission in scope.admissions.values()
-        )
-        for admission, slot in admitted_slots:
-            if slot.request_key not in (None, admission.request_key):
-                raise RuntimeError("discarded H3 admission no longer owns its state slot")
-        for admission, slot in admitted_slots:
-            if runtime._h3_mux is not None:
-                runtime._h3_mux.drop(int(admission.request_key.session_id))
-            slot.clear()
+    if scope.admissions:
+        runtime.model.abort_admissions(tuple(scope.admissions.values()), runtime._h3_mux)
     scope.completion.abandon()
     runtime.device_products.abandon_writes(tuple(scope.device_writes))
     runtime.encoder_cache.abandon_writes(tuple(scope.encoder_writes))
@@ -1644,9 +1637,7 @@ def _reserve_cpu_tasks(
     operations: tuple[Operation, ...],
     scope: PartitionState,
 ) -> None:
-    from uniserve_worker.models.minimax_h3 import MiniMaxH3Model
-
-    h3_model = isinstance(runtime.model, MiniMaxH3Model)
+    h3_model = runtime.model.media_profile == "minimax_h3"
     rank_zero = runtime.mesh.coord("sp") == 0 if h3_model else True
     for operation in operations:
         if operation.work is not ForwardMode.MATERIALIZE and not (
@@ -1777,62 +1768,12 @@ def _finalize_predicated_runtime(
     runtime,
     operation: Operation,
 ) -> tuple[VersionRef, RequestRuntime]:
-    selected, runtime = runtime.requests.finalize_predicated(
+    selected, runtime = runtime.requests.resolve_predicated(
         operation.request_key.session_id,
         operation.op_id,
         operation.parent,
     )
     return selected, runtime
-
-
-def _finalize_speculative_runtime(
-    runtime,
-    operation: Operation,
-    selection: SpeculativeSelection,
-    record: ModelOutput,
-) -> None:
-    tokens = tuple(int(value) for value in record.committed_tokens)
-    selected_point = len(tokens)
-    accepted = int(selection.accepted)
-    expected_point = int(selection.selected_point)
-    if (
-        selected_point != expected_point
-        or accepted > len(selection.draft_tokens)
-        or int(record.selected_point) != expected_point
-    ):
-        raise RuntimeError("speculative completion selection is inconsistent")
-    selected_kv = selection.base_kv_visible + selected_point
-    if (
-        record.logical_lengths.kv_computed_len != selection.initialized_kv
-        or selected_kv > record.logical_lengths.kv_computed_len
-    ):
-        raise RuntimeError("speculative KV selection is outside initialized state")
-    prefixes: list[tuple[VersionRef, RequestRuntime]] = []
-    for point_index in range(1, selected_point + 1):
-        request = runtime.requests.get(operation.request_key.session_id)
-        prefix_runtime = RequestRuntime(
-            logical_position=selection.base_logical_position + point_index,
-            rng_counter=selection.base_rng_counter + point_index,
-            latent_product=request.latent_product,
-            flow_step=request.flow_step,
-            kv_visible_len=selection.base_kv_visible + point_index,
-            kv_computed_len=record.logical_lengths.kv_computed_len,
-        )
-        prefixes.append(
-            (
-                VersionRef(
-                    request_key=operation.request_key,
-                    producer_op_id=operation.op_id,
-                    point=FixedPoint(point_index),
-                ),
-                prefix_runtime,
-            )
-        )
-    runtime.requests.finalize_prefixes(
-        operation.request_key.session_id,
-        operation.op_id,
-        prefixes,
-    )
 
 
 def _validate_batch(runtime, batch: Batch) -> None:
@@ -1870,7 +1811,7 @@ def _validate_batch(runtime, batch: Batch) -> None:
         bucket = _mixed_bucket(runtime, tuple(partitions))
         if bucket not in runtime.mixed_buckets:
             raise invalid_descriptor("tensorized mixed submission has no exact qualified bucket")
-    if isinstance(runtime.model, MiniMaxH3Model):
+    if runtime.model.media_profile == "minimax_h3":
         from .h3 import validate_batch
 
         validate_batch(runtime, batch)
@@ -2036,7 +1977,14 @@ def _reserve_outputs(
     groups = tuple(tuple(group) for group in scalar_groups.values())
     if general_bindings:
         groups = (*groups, tuple(general_bindings))
-    bound_groups = runtime.device_products.bind_output_groups(groups)
+    request_slots = {
+        request.request_key: int(request.request_pool_idx)
+        for request in scope.request_candidates
+    }
+    bound_groups = runtime.device_products.bind_output_groups(
+        groups,
+        request_slots=request_slots,
+    )
     scope.device_writes.extend(write for binding in bound_groups for write in binding.writes)
     scope.encoder_writes.extend(runtime.encoder_cache.bind_outputs(tuple(encoder_bindings)))
     operation_identities = {_operation_identity(operation) for operation in operations}
@@ -2054,16 +2002,10 @@ def _reserve_outputs(
             scope.operation_writes.setdefault(operation_identity, write)
         elif write.reference.kind is ProductKind.SELECTED_POINT:
             scope.selected_point_writes[operation_identity] = write
-        elif write.reference.kind is ProductKind.ACCEPTED_SPAN:
-            scope.accepted_span_writes[operation_identity] = write
-        elif write.reference.kind is ProductKind.CONTINUATION:
-            scope.state_continuation_writes[operation_identity] = write
-        elif write.reference.kind is ProductKind.FINISH:
-            scope.finish_writes[operation_identity] = write
         elif (
             write.reference.kind is ProductKind.COMPLETION
             and operation_identity in token_operation_identities
-            and int(write.reference.output_index) in {4, 6}
+            and int(write.reference.output_index) == 3
         ):
             scope.transition_writes[operation_identity] = write
         else:
@@ -2107,14 +2049,14 @@ def _validate_completion_products(
             if isinstance(
                 product.payload,
                 (
-                    DeferredImagePayload,
-                    DeferredLogprobPayload,
-                    DeferredTransferPayload,
+                    ImagePayload,
+                    LogprobPayload,
+                    TransferPayload,
                 ),
             )
             else len(product.payload)
         )
-        transferred = isinstance(product.payload, DeferredTransferPayload)
+        transferred = isinstance(product.payload, TransferPayload)
         if transferred and reference.storage_class in {
             StorageClass.HOST_STAGING,
             StorageClass.PINNED_OUTPUT,
@@ -2270,23 +2212,33 @@ def _finish_device_reads(
     scope.encoder_reads.clear()
 
 
-def _apply_release_controls(runtime, batch: Batch) -> None:
+def _apply_release_controls(runtime, batch: Batch, *, before_execution: bool) -> None:
+    consumed = {
+        (reference.request_key, int(reference.producer_op_id))
+        for operation in batch.operations
+        for reference in (
+            *operation.inputs,
+            *(() if operation.predicate is None else (operation.predicate,)),
+        )
+    }
     releases = tuple(
         (control.request_key, control.op_id)
         for control in batch.controls
         if isinstance(control, Release)
+        and (((control.request_key, int(control.op_id)) not in consumed) == before_execution)
     )
     runtime.device_products.release_operations(releases)
     runtime.encoder_cache.release_operations(releases)
     if runtime.cache_publications is not None:
         runtime.cache_publications.release_operations(releases)
-    consumed_predicates = tuple(
-        int(predicate.generation)
-        for operation in batch.operations
-        if (predicate := operation.predicate) is not None
-        and predicate.producer_op_id != operation.parent.producer_op_id
-    )
-    runtime.device_products.release_generations(consumed_predicates)
+    if not before_execution:
+        consumed_predicates = tuple(
+            int(predicate.generation)
+            for operation in batch.operations
+            if (predicate := operation.predicate) is not None
+            and predicate.producer_op_id != operation.parent.producer_op_id
+        )
+        runtime.device_products.release_generations(consumed_predicates)
     if runtime.transport is not None:
         for identity in releases:
             _release_locators(runtime, runtime._transport_publications.pop(identity, ()))
@@ -2506,7 +2458,7 @@ def _bind_cache_tables(
     _record_component(scope, "bc_tables", started)
 
 
-def _request_row(runtime, scope: PartitionState, session_id: int) -> RequestRow:
+def _request_row(runtime, scope: PartitionState, session_id: int) -> RequestDraft:
     try:
         return scope.request_rows[int(session_id)]
     except KeyError:
@@ -2560,7 +2512,7 @@ def _consume_encoder_feature(
 def _parent_runtime(
     runtime,
     operation: Operation,
-    session: RequestRow,
+    session: RequestDraft,
 ) -> RequestRuntime:
     parent = operation.parent
     point = parent.point
@@ -2577,7 +2529,7 @@ def _parent_runtime(
     return runtime
 
 
-def parent_runtime(runtime, operation: Operation, request: RequestRow) -> RequestRuntime:
+def parent_runtime(runtime, operation: Operation, request: RequestDraft) -> RequestRuntime:
     return _parent_runtime(runtime, operation, request)
 
 
@@ -2607,7 +2559,7 @@ def _cache_coordinates(
 def _logical_lengths(
     runtime,
     operation: Operation,
-    session: RequestRow,
+    session: RequestDraft,
     cache: tuple[int, int, int, int] | None,
     *,
     latent_len: int | None = None,
@@ -2878,26 +2830,20 @@ def _run_partitioned_wave(
             service_paths = {RunPath.EAGER, RunPath.GRAPH_REPLAY}
             if observation.path in service_paths:
                 serial_us = sum(homogeneous_us)
-                if (
-                    serial_us < 1
-                    or mixed_us * MIXED_SERVICE_SERIAL_DENOMINATOR
-                    > serial_us * MIXED_SERVICE_SERIAL_NUMERATOR
-                ):
-                    raise GraphExecutionError(
-                        "mixed service exceeds the 5/4 serial homogeneous envelope: "
-                        f"mixed_us={mixed_us} homogeneous_us={tuple(homogeneous_us)!r}"
-                    )
                 bucket = _mixed_bucket(
                     runtime, tuple(scope.partition for scope in _unique_scopes(group_scopes))
                 )
-                runtime._qualified_mixed_buckets.add(bucket)
+                speedup = serial_us / max(1, mixed_us)
+                if target.type != "cuda" or speedup >= _MIN_MIXED_SERVICE_SPEEDUP:
+                    runtime._qualified_mixed_buckets.add(bucket)
                 logger.info(
-                    "qualified mixed execution bucket=%r mixed_us=%d homogeneous_us=%r "
-                    "serial_over_mixed=%.3f",
+                    "evaluated mixed execution bucket=%r mixed_us=%d homogeneous_us=%r "
+                    "serial_over_mixed=%.3f service_eligible=%s",
                     bucket,
                     mixed_us,
                     tuple(homogeneous_us),
-                    serial_us / mixed_us,
+                    speedup,
+                    bucket in runtime._qualified_mixed_buckets,
                 )
             output = mixed_output
             output_event = None

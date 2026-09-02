@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import math
 import struct
-from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from functools import lru_cache
-from typing import Any, TypeAlias, TypeVar, cast
+from typing import Any, Protocol, TypeAlias, TypeVar, cast
 
 from ..foundation.errors import invalid_descriptor
 
@@ -17,14 +16,23 @@ TRANSFER_DESCRIPTOR_PREFIX = b"uniserve-transfer\0"
 MAX_TRANSFER_DESCRIPTOR_BYTES = 64 * 1024
 
 
-class DeferredCompletion(ABC):
-    """Query-ready completion work owned by a model-output record."""
+class CompletionState(Protocol):
+    """Structural interface for one pending output row."""
 
-    @abstractmethod
     def ready(self) -> bool: ...
 
-    @abstractmethod
-    def finalize(self) -> None: ...
+    def finalize(self) -> object: ...
+
+
+class PartitionPublication(Protocol):
+    """One-shot request-state publication owned by a partition result."""
+
+    def finish(self, completions: tuple[ModelOutput, ...]) -> None: ...
+
+    def cancel(self) -> None: ...
+
+    @property
+    def successors_ready(self) -> bool: ...
 
 
 def is_transfer_descriptor(value: bytes) -> bool:
@@ -74,7 +82,6 @@ class ForwardMode(StrEnum):
     TOKEN_EXTEND = "token_extend"
     TOKEN_DECODE = "token_decode"
     TOKEN_VERIFY = "token_verify"
-    DRAFT = "draft"
     ENCODE_VISION = "encode_vision"
     ENCODE_LATENT = "encode_latent"
     TRANSFER_PRODUCT = "transfer_product"
@@ -173,7 +180,6 @@ _DOMAIN_BY_WORK_VARIANT = {
     ForwardMode.TOKEN_EXTEND: Domain.PREFILL,
     ForwardMode.TOKEN_DECODE: Domain.DECODE,
     ForwardMode.TOKEN_VERIFY: Domain.DECODE,
-    ForwardMode.DRAFT: Domain.DECODE,
     ForwardMode.ENCODE_VISION: Domain.PREFILL,
     ForwardMode.ENCODE_LATENT: Domain.PREFILL,
     ForwardMode.TRANSFER_PRODUCT: Domain.PREFILL,
@@ -205,7 +211,6 @@ class SamplingOwnership(StrEnum):
 class ProductKind(StrEnum):
     TOKEN = "token"
     LOGPROB = "logprob"
-    DRAFT = "draft"
     VISION_FEATURE = "vision_feature"
     LATENT_FEATURE = "latent_feature"
     KV = "kv"
@@ -213,14 +218,12 @@ class ProductKind(StrEnum):
     ARTIFACT = "artifact"
     COMPLETION = "completion"
     SAMPLING_STATE = "sampling_state"
-    FINISH = "finish"
     SELECTED_POINT = "selected_point"
-    ACCEPTED_SPAN = "accepted_span"
-    CONTINUATION = "continuation"
 
 
 class StorageClass(StrEnum):
     DEVICE_TENSOR = "device_tensor"
+    REQUEST_RELAY = "request_relay"
     PAGED_KV = "paged_kv"
     LATENT_ARENA = "latent_arena"
     HOST_STAGING = "host_staging"
@@ -1044,7 +1047,8 @@ class Operation:
                     )
                 if (
                     selected.kind is not ProductKind.SELECTED_POINT
-                    or selected.storage_class is not StorageClass.DEVICE_TENSOR
+                    or selected.storage_class
+                    not in {StorageClass.DEVICE_TENSOR, StorageClass.REQUEST_RELAY}
                     or selected.dtype is not DType.U32
                     or selected.shape_bound.max_elements != 1
                 ):
@@ -1061,7 +1065,8 @@ class Operation:
             )
             if (
                 self.predicate.generation < 1
-                or self.predicate.storage_class is not StorageClass.DEVICE_TENSOR
+                or self.predicate.storage_class
+                not in {StorageClass.DEVICE_TENSOR, StorageClass.REQUEST_RELAY}
                 or not (self.predicate.kind is ProductKind.COMPLETION or continuation_token)
             ):
                 raise invalid_descriptor(
@@ -1258,6 +1263,27 @@ class TimingCounters:
 
 
 @dataclass(frozen=True, slots=True)
+class MediaOutput:
+    handle: str
+    bytes: int
+
+    def __post_init__(self) -> None:
+        if not self.handle or self.bytes < 1:
+            raise invalid_descriptor("media output locator is invalid")
+
+    @classmethod
+    def from_mapping(cls, value: object, where: str = "media_output") -> MediaOutput:
+        data = _map(value, where)
+        return cls(
+            handle=_str(data.get("handle"), f"{where}.handle"),
+            bytes=_uint(data.get("bytes"), f"{where}.bytes"),
+        )
+
+    def to_mapping(self) -> dict[str, object]:
+        return {"handle": self.handle, "bytes": self.bytes}
+
+
+@dataclass(frozen=True, slots=True)
 class ModelOutput:
     request_key: RequestKey
     op_id: int
@@ -1271,7 +1297,7 @@ class ModelOutput:
     product_generations: tuple[int, ...]
     error_code: ErrorCode | None
     timing_counters: TimingCounters
-    deferred: DeferredCompletion | None = field(default=None, compare=False, repr=False)
+    media_output: MediaOutput | None = None
 
     def validate(self) -> None:
         if self.op_id < 1:
@@ -1327,6 +1353,11 @@ class ModelOutput:
             timing_counters=TimingCounters.from_mapping(
                 data.get("timing_counters"), f"{where}.timing_counters"
             ),
+            media_output=(
+                None
+                if data.get("media_output") is None
+                else MediaOutput.from_mapping(data["media_output"], f"{where}.media_output")
+            ),
         )
         record.validate()
         return record
@@ -1365,6 +1396,9 @@ class ModelOutput:
                 "copy_us": timing.copy_us,
                 "host_us": timing.host_us,
             },
+            "media_output": (
+                None if self.media_output is None else self.media_output.to_mapping()
+            ),
         }
 
 
@@ -1595,15 +1629,12 @@ class MediaAdmission:
     prompt_token_ids: tuple[int, ...]
     seed: int
     profile: MediaProfileId
-    output_path: str
     geometry: MediaGeometry
 
     def __post_init__(self) -> None:
         if not self.prompt_token_ids:
             raise invalid_descriptor("media admission prompt tokens must not be empty")
         _nonnegative(self.seed, "media admission seed")
-        if not self.output_path:
-            raise invalid_descriptor("media admission output path must not be empty")
         if len(self.prompt_token_ids) != self.geometry.prompt_tokens:
             raise invalid_descriptor("media admission prompt tokens disagree with its geometry")
 
@@ -1614,7 +1645,6 @@ class MediaAdmission:
             prompt_token_ids=_uints(data.get("prompt_token_ids", ()), f"{where}.prompt_token_ids"),
             seed=_uint(data.get("seed"), f"{where}.seed"),
             profile=_enum(MediaProfileId, data.get("profile"), f"{where}.profile"),
-            output_path=_str(data.get("output_path"), f"{where}.output_path"),
             geometry=MediaGeometry.from_mapping(data.get("geometry"), f"{where}.geometry"),
         )
 
@@ -1623,7 +1653,6 @@ class MediaAdmission:
             "prompt_token_ids": list(self.prompt_token_ids),
             "seed": self.seed,
             "profile": self.profile.value,
-            "output_path": self.output_path,
             "geometry": self.geometry.to_mapping(),
         }
 
@@ -2572,11 +2601,16 @@ class WorkerForwardStats:
 @dataclass(frozen=True, slots=True)
 class PartitionCompletion:
     partition_id: int
-    completions: tuple[ModelOutput, ...]
+    completions: tuple[ModelOutput | CompletionState, ...]
     products: tuple[ProductPayload, ...] = ()
     registration: RegistrationAck = field(default_factory=RegistrationAck)
     worker_exec_us: int | None = None
     forward_stats: WorkerForwardStats | None = None
+    publication: PartitionPublication | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     @classmethod
     def from_mapping(
@@ -2613,7 +2647,7 @@ class PartitionCompletion:
     def to_mapping(self) -> dict[str, object]:
         return {
             "partition_id": self.partition_id,
-            "completions": [value.to_mapping() for value in self.completions],
+            "completions": [cast(ModelOutput, value).to_mapping() for value in self.completions],
             "products": [value.to_mapping() for value in self.products],
             "registration": self.registration.to_mapping(),
             "worker_exec_us": self.worker_exec_us,
@@ -2629,7 +2663,7 @@ class CompletionReport:
     partitions: tuple[PartitionCompletion, ...]
 
     @property
-    def completions(self) -> tuple[ModelOutput, ...]:
+    def completions(self) -> tuple[ModelOutput | CompletionState, ...]:
         return tuple(
             completion for partition in self.partitions for completion in partition.completions
         )

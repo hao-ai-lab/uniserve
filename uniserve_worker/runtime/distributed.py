@@ -1,4 +1,4 @@
-"""Runtime construction of the worker's device mesh.
+"""Distributed worker process-group construction and teardown.
 
 Builds the :class:`DeviceMesh` for this worker process from the parallel layout:
 a tensor-parallel (``tp``) axis backed by a ``torch.distributed`` collective, and

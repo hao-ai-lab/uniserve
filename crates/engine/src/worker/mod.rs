@@ -25,7 +25,7 @@ pub struct WorkerProcessArgs {
     pub max_batch_operations: u32,
     pub max_batch_tokens: u32,
     pub attention_backend: uniserve_worker_ipc::AttentionBackend,
-    pub worker_kind: Option<crate::executor::WorkerKind>,
+    pub worker_role: Option<crate::executor::WorkerRole>,
     pub transfer_backend: crate::executor::TransferBackend,
     pub stub: bool,
     pub load_format: String,
@@ -53,7 +53,6 @@ pub struct WorkerProcessArgs {
     pub flashinfer_prefill_split_tile_size: Option<u32>,
     pub flashinfer_disable_split_kv: bool,
     pub flashinfer_fast_decode_plan: bool,
-    pub media_spool: Option<std::path::PathBuf>,
     pub max_model_len: u32,
     pub max_video_seconds: f64,
 }

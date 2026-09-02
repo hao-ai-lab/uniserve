@@ -264,6 +264,10 @@ class TransferTicket(ABC):
     def result(self) -> "torch.Tensor":
         """Return the completed value, rejecting observation before readiness."""
 
+    @abstractmethod
+    def add_done_callback(self, callback: Any) -> None:
+        """Schedule a non-blocking owner notification after completion."""
+
 
 class _ImmediateTransferTicket(TransferTicket):
     def __init__(self, value: "torch.Tensor") -> None:
@@ -274,6 +278,9 @@ class _ImmediateTransferTicket(TransferTicket):
 
     def result(self) -> "torch.Tensor":
         return self._value
+
+    def add_done_callback(self, callback: Any) -> None:
+        callback()
 
 
 class _FutureTransferTicket(TransferTicket):
@@ -287,6 +294,9 @@ class _FutureTransferTicket(TransferTicket):
         if not self.ready():
             raise RuntimeError("transfer ticket was observed before readiness")
         return self._future.result()
+
+    def add_done_callback(self, callback: Any) -> None:
+        self._future.add_done_callback(lambda _future: callback())
 
 
 class _ByteCapacity:
@@ -528,6 +538,9 @@ class _ShmReadTicket(TransferTicket):
             raise RuntimeError("transfer ticket was observed before readiness")
         return self._inner.result()
 
+    def add_done_callback(self, callback: Any) -> None:
+        self._inner.add_done_callback(callback)
+
 
 class ShmTransport(Transport):
     """Same-node snapshot transport over producer-owned POSIX shared memory.
@@ -697,6 +710,32 @@ class ShmTransport(Transport):
             shape=tuple(tensor.shape),
             device=str(tensor.device),
             handle=shm.name.encode(),
+        )
+
+    @staticmethod
+    def publish_bytes(payload: bytes) -> Locator:
+        """Publish bytes with ownership transferred to one external consumer."""
+
+        from multiprocessing import resource_tracker, shared_memory
+
+        value = bytes(payload)
+        if not value:
+            raise ValueError("shared-memory media publication must not be empty")
+        shm = shared_memory.SharedMemory(create=True, size=len(value))
+        try:
+            shm.buf[: len(value)] = value
+            name = shm.name
+        finally:
+            shm.close()
+        resource_tracker.unregister(shm._name, "shared_memory")
+        return Locator(
+            transport="shm",
+            session="media",
+            nbytes=len(value),
+            dtype="uint8",
+            shape=(len(value),),
+            device="cpu",
+            handle=name.encode(),
         )
 
     def publish_async(self, tensor: "torch.Tensor") -> Locator:

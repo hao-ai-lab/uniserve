@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::ffi::CString;
 use std::sync::Arc;
 
 use crate::openai::VideoGenerationRequest;
@@ -8,25 +8,106 @@ use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use tokio::io::AsyncReadExt as _;
-use uniserve_core::MediaEvent;
+use uniserve_core::{MediaArtifact, MediaEvent};
 
 use crate::AppState;
 use crate::http::routes::openai::utils::validated_json::ValidatedJson;
 use crate::http::utils::resolve_request_context;
 use crate::openai::ApiError;
 
-struct MediaFile {
-    path: PathBuf,
+struct SharedMedia {
+    address: *mut libc::c_void,
+    bytes: usize,
 }
 
-impl Drop for MediaFile {
-    fn drop(&mut self) {
-        if let Err(error) = std::fs::remove_file(&self.path)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(path = %self.path.display(), %error, "failed to remove media spool file");
+// The mapping is immutable after publication and remains valid until the final Arc drops.
+unsafe impl Send for SharedMedia {}
+unsafe impl Sync for SharedMedia {}
+
+impl SharedMedia {
+    fn open(artifact: &MediaArtifact) -> Result<Self, String> {
+        let bytes = usize::try_from(artifact.bytes)
+            .map_err(|_| "generated media is too large for this host".to_string())?;
+        if bytes == 0 || artifact.handle.is_empty() || artifact.handle.contains('/') {
+            return Err("generated media has an invalid shared-memory locator".to_string());
         }
+        let name = CString::new(format!("/{}", artifact.handle))
+            .map_err(|_| "generated media has an invalid shared-memory name".to_string())?;
+        // SAFETY: name is a valid NUL-terminated POSIX shm name.
+        let descriptor = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
+        if descriptor < 0 {
+            return Err(format!(
+                "failed to open generated media shared memory: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // The response is the sole consumer. Claim the object as soon as it is open; the
+        // descriptor keeps the bytes alive across inspection and mapping failures.
+        // SAFETY: name identifies the object opened above.
+        if unsafe { libc::shm_unlink(name.as_ptr()) } != 0 {
+            let error = std::io::Error::last_os_error();
+            // SAFETY: descriptor is open.
+            unsafe { libc::close(descriptor) };
+            return Err(format!(
+                "failed to claim generated media shared memory: {error}"
+            ));
+        }
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: descriptor is open and stat points to writable storage.
+        let stat_result = unsafe { libc::fstat(descriptor, stat.as_mut_ptr()) };
+        if stat_result != 0 {
+            let error = std::io::Error::last_os_error();
+            // SAFETY: descriptor is open.
+            unsafe { libc::close(descriptor) };
+            return Err(format!(
+                "failed to inspect generated media shared memory: {error}"
+            ));
+        }
+        // SAFETY: fstat initialized stat on success.
+        let extent = unsafe { stat.assume_init() }.st_size;
+        if extent < 0
+            || u64::try_from(extent)
+                .ok()
+                .is_none_or(|value| value < artifact.bytes)
+        {
+            // SAFETY: descriptor is open.
+            unsafe { libc::close(descriptor) };
+            return Err("generated media shared memory is shorter than its locator".to_string());
+        }
+        // SAFETY: descriptor names a readable shared-memory object of at least `bytes` bytes.
+        let address = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                bytes,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                descriptor,
+                0,
+            )
+        };
+        // SAFETY: descriptor is no longer needed after mmap.
+        unsafe { libc::close(descriptor) };
+        if address == libc::MAP_FAILED {
+            return Err(format!(
+                "failed to map generated media shared memory: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(Self { address, bytes })
+    }
+
+    fn chunk(&self, offset: usize, count: usize) -> Bytes {
+        // SAFETY: caller bounds offset/count to the mapping extent and the mapping is immutable.
+        let value =
+            unsafe { std::slice::from_raw_parts((self.address as *const u8).add(offset), count) };
+        Bytes::copy_from_slice(value)
+    }
+}
+
+impl Drop for SharedMedia {
+    fn drop(&mut self) {
+        // SAFETY: address is the live mapping created in `open` with exactly this extent.
+        unsafe { libc::munmap(self.address, self.bytes) };
     }
 }
 
@@ -37,16 +118,7 @@ pub(crate) async fn videos_sync(
 ) -> Response {
     let started_at = std::time::Instant::now();
     let context = resolve_request_context(&headers);
-    let path = state
-        .media_spool()
-        .join(format!("{}.mp4", uuid::Uuid::new_v4().simple()));
-    let guard = MediaFile { path: path.clone() };
-    let input = match lower_video_generation_request(
-        body,
-        state.served_model_name(),
-        context,
-        path.to_string_lossy().into_owned(),
-    ) {
+    let input = match lower_video_generation_request(body, state.served_model_name(), context) {
         Ok(input) => input,
         Err(error) => return ApiError::from(error).into_response(),
     };
@@ -58,7 +130,7 @@ pub(crate) async fn videos_sync(
     tokio::spawn(async move {
         tokio::select! {
             event = stream.next() => {
-                let _ = event_tx.send((event, guard));
+                let _ = event_tx.send(event);
             }
             _ = event_tx.closed() => {
                 stream.cancel();
@@ -66,7 +138,7 @@ pub(crate) async fn videos_sync(
             }
         }
     });
-    let (event, guard) = match event_rx.await {
+    let event = match event_rx.await {
         Ok(result) => result,
         Err(_) => {
             return ApiError::server_error("video generation task stopped".to_string())
@@ -74,32 +146,27 @@ pub(crate) async fn videos_sync(
         }
     };
     match event {
-        Some(MediaEvent::Completed { bytes }) => {
-            let file = match tokio::fs::File::open(&path).await {
-                Ok(file) => file,
-                Err(error) => {
-                    return ApiError::server_error(format!(
-                        "failed to open generated media: {error}"
-                    ))
-                    .into_response();
-                }
+        Some(MediaEvent::Completed { artifact }) => {
+            let media = match SharedMedia::open(&artifact) {
+                Ok(media) => Arc::new(media),
+                Err(message) => return ApiError::server_error(message).into_response(),
             };
+            let length = artifact.bytes;
             let body_stream =
-                futures::stream::try_unfold((file, guard), |(mut file, guard)| async move {
-                    let mut buffer = vec![0_u8; 64 * 1024];
-                    let count = file.read(&mut buffer).await?;
-                    if count == 0 {
-                        Ok::<_, std::io::Error>(None)
+                futures::stream::try_unfold((media, 0_usize), |(media, offset)| async move {
+                    if offset == media.bytes {
+                        Ok::<_, std::convert::Infallible>(None)
                     } else {
-                        buffer.truncate(count);
-                        Ok::<_, std::io::Error>(Some((Bytes::from(buffer), (file, guard))))
+                        let count = (media.bytes - offset).min(64 * 1024);
+                        let chunk = media.chunk(offset, count);
+                        Ok(Some((chunk, (media, offset + count))))
                     }
                 });
             let generation_ms = started_at.elapsed().as_secs_f64() * 1_000.0;
             Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "video/mp4")
-                .header(header::CONTENT_LENGTH, bytes)
+                .header(header::CONTENT_LENGTH, length)
                 .header(
                     "server-timing",
                     format!("generation;dur={generation_ms:.1}"),

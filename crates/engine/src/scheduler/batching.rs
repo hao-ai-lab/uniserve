@@ -287,8 +287,7 @@ impl Scheduler {
             ) => 1,
             Some(ForwardMode::MediaDenoise | ForwardMode::MediaReconstruct) => 2,
             Some(
-                ForwardMode::Draft
-                | ForwardMode::MediaPrepare
+                ForwardMode::MediaPrepare
                 | ForwardMode::TransferProduct
                 | ForwardMode::TransferKvPublish,
             )
@@ -771,6 +770,7 @@ impl Scheduler {
                 "operation_types": operation_types,
                 "request_ids": req_ids,
                 "admitted_session_ids": admitted_session_ids,
+                "controls": controls,
                 "ops": trace_ops,
                 "scheduler": {
                     "policy": self.config.policy,

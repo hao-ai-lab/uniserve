@@ -38,8 +38,8 @@ from uniserve_worker.execution.batch import (
     VersionRef,
     encode_sampling_state_bytes,
 )
-from uniserve_worker.server.completion import finalize_completion_report
-from uniserve_worker.server.stub import _next_token
+from uniserve_worker.execution.output import finalize_completion_report
+from uniserve_worker.models.stub import _next_token
 
 
 def _with_transition_predicate(
@@ -62,7 +62,7 @@ def _with_transition_predicate(
     transition = ProductRef(
         request_key=selected.request_key,
         producer_op_id=selected.op_id,
-        output_index=6,
+        output_index=3,
         generation=selected.op_id * 8 + 8,
         kind=ProductKind.COMPLETION,
         storage_class=StorageClass.DEVICE_TENSOR,
@@ -87,6 +87,86 @@ def _with_transition_predicate(
         ),
         ProductPayload(product=state, payload=payload),
     )
+
+
+def _release_relay_outputs(worker, *operations: Operation) -> None:
+    worker.release_products(
+        tuple(
+            int(output.generation)
+            for operation in operations
+            for output in operation.outputs
+            if output.storage_class is StorageClass.REQUEST_RELAY
+        )
+    )
+
+
+def test_feedback_operation_publishes_distinct_completion_relay_outputs() -> None:
+    worker = execution_worker(device="cpu", pipeline_depth=2)
+    admission = und_admission(50, block_ids=(0,))
+    base, token_input = token_operation(
+        admission.request_key,
+        op_id=1,
+        parent=root_parent(admission),
+        mode=TokenMode.EXTEND,
+        tokens=(3, 4),
+    )
+    with_transition, sampling_input = _with_transition_predicate(base, _next_token(4))
+    token = replace(
+        next(output for output in with_transition.outputs if output.kind is ProductKind.TOKEN),
+        output_index=1,
+    )
+    transition = replace(
+        next(
+            output
+            for output in with_transition.outputs
+            if output.kind is ProductKind.COMPLETION
+        ),
+        storage_class=StorageClass.REQUEST_RELAY,
+    )
+    completion = ProductRef(
+        request_key=base.request_key,
+        producer_op_id=base.op_id,
+        output_index=0,
+        generation=base.op_id * 8 + 6,
+        kind=ProductKind.COMPLETION,
+        storage_class=StorageClass.REQUEST_RELAY,
+        dtype=DType.U8,
+        shape_bound=ShapeBound(),
+        point_range=PointRange(),
+    )
+    operation = Operation.registered(
+        request_key=base.request_key,
+        op_id=base.op_id,
+        parent=base.parent,
+        work=base.work,
+        route=base.route,
+        domain=base.domain,
+        bounds=base.bounds,
+        inputs=with_transition.inputs,
+        outputs=(completion, token, transition),
+        predicate=base.predicate,
+        rng=base.rng,
+        control_seq=base.control_seq,
+    )
+
+    report = finalize_completion_report(
+        worker.execute(
+            execution_batch(
+                step_id=1,
+                admissions=(admission,),
+                operations=(operation,),
+                input_products=(token_input, sampling_input),
+            )
+        )
+    )
+
+    assert report.completions[0].status is OpStatus.OK
+    assert set(report.completions[0].product_generations) == {
+        completion.generation,
+        token.generation,
+        transition.generation,
+    }
+    _release_relay_outputs(worker, operation)
 
 
 def test_false_device_predicate_preserves_parent_cutoff_across_registered_descendants() -> None:
@@ -192,6 +272,7 @@ def test_false_device_predicate_preserves_parent_cutoff_across_registered_descen
             controls=(commit,),
         )
     )
+    _release_relay_outputs(worker, parent, successor, descendant)
     later, later_input = token_operation(
         admission.request_key,
         op_id=4,
@@ -347,6 +428,7 @@ def test_false_generation_predicate_preserves_the_selected_text_state_and_latent
     assert candidate_completion.product_generations == ()
 
     parent_commit = commit_for_completion(parent, parent_report)
+    _release_relay_outputs(worker, initial, parent, candidate)
     selected, _selected_latent = media_prepare_operation(
         admission.request_key,
         op_id=5,

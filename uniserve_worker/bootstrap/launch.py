@@ -12,8 +12,8 @@ logger = logging.getLogger(__name__)
 def run_worker(config: WorkerProcessArgs) -> None:
     """Open the IPC endpoint, create the worker, and serve until shutdown."""
 
-    from ..server.app import WorkerServer
-    from ..server.ipc import WorkerIpcEndpoint
+    from ..process import WorkerProcess
+    from .ipc import WorkerIpcEndpoint
     from ..worker import Worker
 
     endpoint = WorkerIpcEndpoint(
@@ -27,14 +27,14 @@ def run_worker(config: WorkerProcessArgs) -> None:
             "service": config.ipc.service_name,
             "max_payload_bytes": config.ipc.max_payload_bytes,
             "max_inflight": config.ipc.max_inflight,
-            "worker_kind": config.worker_kind.value,
+            "worker_role": config.worker_role.value,
         },
     )
     worker = Worker.from_config(config)
     # Request admission begins only after the configured first-use kernel work succeeds
     # and the worker opens a clean serving collective epoch.
     worker.warmup()
-    WorkerServer(worker, endpoint).serve()
+    WorkerProcess(worker, endpoint).serve()
 
 
 __all__ = ["run_worker"]

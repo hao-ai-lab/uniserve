@@ -501,6 +501,7 @@ impl SimEngine {
             product_generations: operation.outputs.iter().map(|out| out.generation).collect(),
             error_code: None,
             timing_counters: TimingCounters::default(),
+            media_output: None,
         };
         record.logical_lengths.token_len = session.logical_position;
         set_kv_lengths(
@@ -673,7 +674,6 @@ impl SimEngine {
                     }
                 }
             }
-            ForwardMode::Draft => {}
             ForwardMode::EncodeVision | ForwardMode::EncodeLatent => {}
             work @ (ForwardMode::TransferProduct
             | ForwardMode::TransferKvPublish
@@ -773,6 +773,7 @@ impl SimEngine {
             product_generations: Vec::new(),
             error_code: None,
             timing_counters: TimingCounters::default(),
+            media_output: None,
         }
     }
 
@@ -1106,7 +1107,7 @@ mod tests {
             output_index: index as u16,
             generation: index as u32 + 1,
             kind,
-            storage_class: StorageClass::DeviceTensor,
+            storage_class: StorageClass::RequestRelay,
             dtype,
             shape_bound: ShapeBound { dims },
             point_range: PointRange {

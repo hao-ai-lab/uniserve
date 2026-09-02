@@ -58,16 +58,15 @@ pub enum ForwardMode {
     TokenExtend = 0,
     TokenDecode = 1,
     TokenVerify = 2,
-    Draft = 3,
-    EncodeVision = 4,
-    EncodeLatent = 5,
-    TransferProduct = 6,
-    TransferKvPublish = 7,
-    TransferKvInstall = 8,
-    MediaPrepare = 9,
-    MediaDenoise = 10,
-    Materialize = 11,
-    MediaReconstruct = 12,
+    EncodeVision = 3,
+    EncodeLatent = 4,
+    TransferProduct = 5,
+    TransferKvPublish = 6,
+    TransferKvInstall = 7,
+    MediaPrepare = 8,
+    MediaDenoise = 9,
+    Materialize = 10,
+    MediaReconstruct = 11,
 }
 
 /// Configured or resolved worker attention implementation.
@@ -166,11 +165,10 @@ impl<'de> Deserialize<'de> for AttentionBackend {
 pub struct AttentionBackendParseError(String);
 
 impl ForwardMode {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 12] = [
         Self::TokenExtend,
         Self::TokenDecode,
         Self::TokenVerify,
-        Self::Draft,
         Self::EncodeVision,
         Self::EncodeLatent,
         Self::TransferProduct,
@@ -203,7 +201,7 @@ impl ForwardMode {
     /// The device execution domain that owns this work leaf.
     pub const fn domain(self) -> Domain {
         match self {
-            Self::TokenDecode | Self::TokenVerify | Self::Draft => Domain::Decode,
+            Self::TokenDecode | Self::TokenVerify => Domain::Decode,
             Self::MediaPrepare
             | Self::MediaDenoise
             | Self::MediaReconstruct
@@ -222,7 +220,6 @@ impl ForwardMode {
             Self::TokenExtend => "token_extend",
             Self::TokenDecode => "token_decode",
             Self::TokenVerify => "token_verify",
-            Self::Draft => "draft",
             Self::EncodeVision => "encode_vision",
             Self::EncodeLatent => "encode_latent",
             Self::TransferProduct => "transfer_product",
@@ -301,7 +298,10 @@ impl VersionRef {
                     );
                     ensure_valid!(
                         selected_point.kind == ProductKind::SelectedPoint
-                            && selected_point.storage_class == StorageClass::DeviceTensor
+                            && matches!(
+                                selected_point.storage_class,
+                                StorageClass::DeviceTensor | StorageClass::RequestRelay
+                            )
                             && selected_point.dtype == DType::U32
                             && selected_point.shape_bound.max_elements() == 1,
                         "device version does not name a scalar selected-point product"
@@ -483,7 +483,10 @@ impl Operation {
                 && predicate.shape_bound.max_elements() == 1;
             ensure_valid!(
                 predicate.generation > 0
-                    && predicate.storage_class == StorageClass::DeviceTensor
+                    && matches!(
+                        predicate.storage_class,
+                        StorageClass::DeviceTensor | StorageClass::RequestRelay
+                    )
                     && (predicate.kind == ProductKind::Completion || continuation_token),
                 "operation predicate is not a generation-tagged device decision product"
             );
@@ -564,6 +567,12 @@ pub struct TimingCounters {
     pub host_us: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MediaOutput {
+    pub handle: String,
+    pub bytes: u64,
+}
+
 /// The fixed-layout record a worker emits once for every operation, after its
 /// copy event is query-ready and its pinned fields are validated on the host.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -583,6 +592,7 @@ pub struct ModelOutput {
     pub product_generations: Vec<u32>,
     pub error_code: Option<ErrorCode>,
     pub timing_counters: TimingCounters,
+    pub media_output: Option<MediaOutput>,
 }
 
 impl ModelOutput {
@@ -766,7 +776,6 @@ pub struct MediaAdmission {
     pub prompt_token_ids: Vec<u32>,
     pub seed: u64,
     pub profile: MediaProfileId,
-    pub output_path: String,
     pub geometry: MediaGeometry,
 }
 
@@ -847,10 +856,6 @@ impl NewRequest {
             ensure_valid!(
                 !media.prompt_token_ids.is_empty(),
                 "media admission prompt tokens must not be empty"
-            );
-            ensure_valid!(
-                !media.output_path.is_empty(),
-                "media admission output path must not be empty"
             );
             ensure_valid!(
                 media.geometry.frame_count >= 22

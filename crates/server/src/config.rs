@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::profile::ModelDescription;
@@ -108,8 +107,6 @@ pub struct Config {
     /// Single model name exposed to clients via the OpenAI API. When absent,
     /// the resolved model identifier is used.
     pub served_model_name: Option<String>,
-    /// Shared filesystem namespace used for media outputs.
-    pub media_spool: PathBuf,
     /// HTTP listener setup.
     pub listener_mode: HttpListenerMode,
     /// Server-default chat template override, as a file path or inline
@@ -149,7 +146,6 @@ impl Default for Config {
             model: String::new(),
             model_description: ModelDescription::Qwen3,
             served_model_name: None,
-            media_spool: PathBuf::from("/tmp/uniserve-media"),
             listener_mode: HttpListenerMode::BindTcp {
                 host: "127.0.0.1".to_string(),
                 port: 8000,
@@ -175,10 +171,6 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         self.validate_listener()?;
         self.engine.validate()?;
-        anyhow::ensure!(
-            self.media_spool.is_absolute(),
-            "media spool path must be absolute"
-        );
         Ok(())
     }
 
@@ -213,7 +205,7 @@ impl EngineSettings {
     pub const DEFAULT_RESP_SLOT_CAP: usize = 64 << 20;
 
     /// H3 carries prompt tokens and compact media descriptors over worker IPC;
-    /// encoded media remains in the shared spool.
+    /// encoded media remains in its shared-memory segment.
     pub const MEDIA_IPC_SLOT_CAP: usize = 256 << 10;
 
     /// Reject numeric engine settings that are structurally required to be

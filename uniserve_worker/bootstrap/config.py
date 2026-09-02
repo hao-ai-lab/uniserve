@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..loader.config import LoadConfig
-from ..server.worker_kind import WorkerKind
+from .role import WorkerRole
 from .execution_config import ExecutionConfig, execution_config_from_namespace
 from .plan import ModelLoadScope, resolve_worker_plan
 
@@ -61,7 +61,7 @@ class DataPlaneConfig:
 
 @dataclass(frozen=True)
 class WorkerProcessArgs:
-    worker_kind: WorkerKind
+    worker_role: WorkerRole
     ipc: WorkerIpcConfig
     placement: WorkerPlacement
     resources: WorkerResourceConfig
@@ -70,12 +70,11 @@ class WorkerProcessArgs:
     execution: ExecutionConfig
     load: LoadConfig
     use_stub_model: bool
-    media_spool: str | None
 
     @classmethod
     def from_namespace(cls, namespace: argparse.Namespace) -> "WorkerProcessArgs":
-        worker_kind = WorkerKind(str(namespace.worker_kind))
-        plan = resolve_worker_plan(worker_kind)
+        worker_role = WorkerRole(str(namespace.worker_role))
+        plan = resolve_worker_plan(worker_role)
         device = _normalize_device(namespace.device)
         tower_devices = _parse_mesh(
             str(namespace.mesh or ""),
@@ -91,14 +90,14 @@ class WorkerProcessArgs:
         if use_stub_model and plan.model_scope is not ModelLoadScope.WHOLE:
             raise ValueError("--no-model cannot emulate partial model materialization")
         if not use_stub_model and not model_path:
-            raise ValueError(f"--model is required for worker kind {worker_kind.value!r}")
+            raise ValueError(f"--model is required for worker role {worker_role.value!r}")
         _validate_data_plane(
-            worker_kind,
+            worker_role,
             backend=backend,
         )
 
         return cls(
-            worker_kind=worker_kind,
+            worker_role=worker_role,
             ipc=WorkerIpcConfig(
                 service_name=str(namespace.service_name),
                 max_payload_bytes=int(namespace.ipc_payload_cap),
@@ -140,7 +139,6 @@ class WorkerProcessArgs:
             execution=execution_config_from_namespace(namespace),
             load=_load_config(namespace),
             use_stub_model=use_stub_model,
-            media_spool=_optional_absolute_path(namespace.media_spool, "--media-spool"),
         )
 
 
@@ -170,16 +168,6 @@ def _validate_scalars(namespace: argparse.Namespace) -> None:
         raise ValueError("--tp-rank must satisfy 0 <= rank < tp-size")
 
 
-def _optional_absolute_path(value: object, option: str) -> str | None:
-    text = _optional_text(value)
-    if text is None:
-        return None
-    path = Path(text).expanduser()
-    if not path.is_absolute():
-        raise ValueError(f"{option} must be an absolute path")
-    return str(path)
-
-
 def _load_config(namespace: argparse.Namespace) -> LoadConfig:
     threads = getattr(namespace, "load_threads", None)
     load_format = str(getattr(namespace, "load_format", "auto"))
@@ -200,14 +188,14 @@ def _load_config(namespace: argparse.Namespace) -> LoadConfig:
 
 
 def _validate_data_plane(
-    worker_kind: WorkerKind,
+    worker_role: WorkerRole,
     *,
     backend: str,
 ) -> None:
     if backend not in {"local", "shm", "cuda_ipc"}:
         raise ValueError(f"unknown --transfer-backend {backend!r}")
-    if worker_kind in {WorkerKind.UND, WorkerKind.GEN} and backend != "cuda_ipc":
-        raise ValueError(f"{worker_kind.value!r} requires same-node CUDA IPC transport")
+    if worker_role in {WorkerRole.UND, WorkerRole.GEN} and backend != "cuda_ipc":
+        raise ValueError(f"{worker_role.value!r} requires same-node CUDA IPC transport")
 
 
 def _parse_mesh(

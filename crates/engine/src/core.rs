@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use crate::executor::{Executor, TransferBackend, TransportMap, WorkerKind, WorkerTopology};
+use crate::executor::{Executor, TransferBackend, TransportMap, WorkerRole, WorkerTopology};
 use crate::handle::{EngineHandle, EventRx, SubmitError};
 use crate::scheduler::{
     ControlTokens, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
@@ -136,12 +136,12 @@ impl EngineCore {
     }
 
     /// Spawn the single Full pool. `tp == 1`
-    /// is a `UniprocExecutor`; `tp > 1` a `MultiprocExecutor`. No `--worker-kind`
+    /// is a `UniprocExecutor`; `tp > 1` a `MultiprocExecutor`. No `--worker-role`
     /// is passed because the worker starts in Full mode by default.
     fn spawn_full_pool(config: &EngineCoreConfig, tp: usize) -> anyhow::Result<Box<dyn Executor>> {
         let args = WorkerProcessArgs {
             world_size: tp,
-            worker_kind: None,
+            worker_role: None,
             transfer_backend: TransferBackend::Inproc,
             ..config.worker_process.clone()
         };
@@ -158,7 +158,7 @@ impl EngineCore {
 
     /// Compose a `StagedExecutor` over the heterogeneous pools of a staged topology.
     /// Each pool instance is a (tp-sized) `MultiprocExecutor` spawned with its
-    /// `--worker-kind`; the router fans the scheduler's batch across them by
+    /// `--worker-role`; the router fans the scheduler's batch across them by
     /// exact operation type and merges the results.
     fn spawn_staged(
         config: &EngineCoreConfig,
@@ -169,7 +169,7 @@ impl EngineCore {
         // the worker-side data plane (read-driven fetch).
         // A pool uses the transport of any edge it participates in — as producer
         // (src) OR consumer (dst) — so both ends of an edge agree on the backend.
-        let backend_for = |kind: WorkerKind| -> Option<TransferBackend> {
+        let backend_for = |kind: WorkerRole| -> Option<TransferBackend> {
             config
                 .transfer
                 .edges
@@ -183,13 +183,13 @@ impl EngineCore {
         let is_tower = workers
             .pools
             .iter()
-            .any(|p| matches!(p.kind, WorkerKind::Und | WorkerKind::Gen));
+            .any(|p| matches!(p.kind, WorkerRole::Und | WorkerRole::Gen));
         let mut next_gpu = 0usize;
-        let mut pools: Vec<(WorkerKind, Box<dyn Executor>)> =
+        let mut pools: Vec<(WorkerRole, Box<dyn Executor>)> =
             Vec::with_capacity(workers.total_pools());
         for pool in &workers.pools {
             let backend = backend_for(pool.kind).or_else(|| {
-                if is_tower && matches!(pool.kind, WorkerKind::Und | WorkerKind::Gen) {
+                if is_tower && matches!(pool.kind, WorkerRole::Und | WorkerRole::Gen) {
                     Some(TransferBackend::CudaIpc)
                 } else {
                     None
@@ -205,7 +205,7 @@ impl EngineCore {
                 let exec = MultiprocExecutor::spawn(WorkerProcessArgs {
                     device: pool_device,
                     world_size: pool.tp.max(1),
-                    worker_kind: Some(pool.kind),
+                    worker_role: Some(pool.kind),
                     transfer_backend: backend.unwrap_or_default(),
                     ..config.worker_process.clone()
                 })
@@ -303,7 +303,6 @@ impl EngineCore {
                 mode,
                 uniserve_worker_ipc::ForwardMode::TokenDecode
                     | uniserve_worker_ipc::ForwardMode::TokenVerify
-                    | uniserve_worker_ipc::ForwardMode::Draft
             )
         })
     }

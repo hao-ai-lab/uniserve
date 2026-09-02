@@ -648,7 +648,6 @@ impl Scheduler {
             },
             ForwardMode::TokenDecode
             | ForwardMode::TokenVerify
-            | ForwardMode::Draft
             | ForwardMode::MediaPrepare
             | ForwardMode::TransferProduct
             | ForwardMode::TransferKvPublish

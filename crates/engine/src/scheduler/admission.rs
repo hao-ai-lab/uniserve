@@ -173,7 +173,6 @@ impl Scheduler {
                     prompt_token_ids: submission.request.prompt_token_ids.clone(),
                     seed: submission.request.seed,
                     profile: MediaProfileId::MinimaxH3T2va,
-                    output_path: submission.request.output_path.clone(),
                     geometry: MediaGeometry {
                         frame_count: submission.request.geometry.frame_count,
                         video_reconstruction_units: submission
@@ -201,6 +200,7 @@ impl Scheduler {
                     fixed_parent: root.clone(),
                     projected_parent: root,
                     terminal_intent: MediaTerminalIntent::None,
+                    artifact: None,
                 },
             );
             self.order.push(id);

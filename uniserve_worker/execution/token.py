@@ -31,17 +31,12 @@ from uniserve_worker.runtime.device_products import (
     DeviceProductScalarBatch,
     DeviceProductWrite,
 )
-from uniserve_worker.server.completion import (
-    DeferredDerivedInteger,
-    DeferredInteger,
-    DeferredLogprobPayload,
-    DeferredSampleToken,
-    DeferredSpeculativePoint,
-    DeferredSpeculativeTokens,
-    DeferredToken,
-    DeferredTopLogprobs,
+from uniserve_worker.execution.output import (
+    LogprobOutputRow,
+    LogprobPayload,
+    SamplingOutputRow,
 )
-from uniserve_worker.server.request_state import RequestRow
+from uniserve_worker.runtime.request import Request
 
 from . import encode
 from . import sample as sampling
@@ -261,7 +256,8 @@ def consume_sample(runtime: ExecutionResources, state: OperationState, value: ob
             sampling_positions=(session.rng_counter,),
         )
         state.data["state_outcome"] = StateOutcome(
-            (sampled.token_id,), sample_product_payloads(operation, sampled)
+            sampling=sampled.completion,
+            products=sample_product_payloads(operation, sampled),
         )
         _finish_visual(runtime, state)
         return
@@ -297,7 +293,7 @@ def consume_sample(runtime: ExecutionResources, state: OperationState, value: ob
             partition,
             base=start,
             tokens=len(state.data["tokens"]),
-            committed_tokens=(sampled.token_id,),
+            sampling=sampled.completion,
             sample=sampled,
         )
     elif mode == "decode":
@@ -320,17 +316,19 @@ def consume_sample(runtime: ExecutionResources, state: OperationState, value: ob
             partition,
             base=start,
             tokens=1,
-            committed_tokens=(sampled.token_id,),
+            sampling=sampled.completion,
             sample=sampled,
         )
     else:
         draft = state.data["draft"]
         initialized = task.seq_len + task.query_tokens
         publish_token_product(runtime, operation, sampled, partition)
-        accepted = sampled.num_accepted_tokens
-        selected_point = DeferredSpeculativePoint(accepted, sample_work.terminal_draft_prefix)
-        committed_tokens = DeferredSpeculativeTokens(
-            draft, accepted, sampled.token_id, sample_work.terminal_draft_prefix
+        sampling_row = replace(
+            sampled.completion,
+            draft_tokens=draft,
+            terminal_prefix=sample_work.terminal_draft_prefix,
+            logical_base=start,
+            kv_base=initialized - task.query_tokens,
         )
         device_selected = sampled.device_selected_point
         if device_selected is None:
@@ -356,12 +354,11 @@ def consume_sample(runtime: ExecutionResources, state: OperationState, value: ob
             operation,
             partition,
             base=start,
-            tokens=selected_point,
-            committed_tokens=cast(tuple[object, ...], committed_tokens),
+            tokens=0,
+            sampling=sampling_row,
             sample=sampled,
             selection=SpeculativeSelection(
-                accepted=accepted,
-                selected_point=selected_point,
+                completion=sampling_row,
                 draft_tokens=draft,
                 terminal_prefix=sample_work.terminal_draft_prefix,
                 base_logical_position=start,
@@ -613,7 +610,7 @@ def decode_batch(
     ):
         session.rng_counter += 1
         session.logical_position = start + 1
-        # Keep the sampled token deferred: materializing it here (``int()``)
+        # Keep the sampled token in the output row: materializing it here (``int()``)
         # blocks on the copy event and stalls the decode pipeline. It is
         # finalized when the response is serialized, after the next forward
         # has launched.
@@ -626,7 +623,7 @@ def decode_batch(
                 task=task,
                 base=start,
                 tokens=1,
-                committed_tokens=(sampled.token_id,),
+                sampling=sampled.completion,
                 sample=sampled,
             )
         )
@@ -648,7 +645,7 @@ def decode_batch(
 def _decode_forward_tasks(
     runtime: ExecutionResources,
     operations: tuple[Operation, ...],
-    requests: tuple[RequestRow, ...],
+    requests: tuple[Request, ...],
     seq_lens: tuple[int, ...],
     weights: tuple[WeightSet, ...],
     starts: list[int],
@@ -732,7 +729,7 @@ def _decode_forward_tasks(
 def project_graph_decode(
     runtime: ExecutionResources,
     operations: tuple[Operation, ...],
-    requests: tuple[RequestRow, ...],
+    requests: tuple[Request, ...],
     seq_lens: tuple[int, ...],
     tasks: tuple[ForwardRow, ...],
     starts: list[int],
@@ -793,29 +790,12 @@ def project_graph_decode(
         token_writes.append(write)
 
     token_batch = runtime.device_products.producer_scalar_batch(tuple(token_writes))
-    finish_indexes = tuple(
-        index
-        for index, operation in enumerate(operations)
-        if runtime.operation_identity(operation) in scope.finish_writes
-    )
-    finish_batch: DeviceProductScalarBatch | None = None
-    if finish_indexes:
-        finish_writes = tuple(
-            scope.finish_writes[runtime.operation_identity(operations[index])]
-            for index in finish_indexes
-        )
-        finish_batch = runtime.device_products.producer_scalar_batch(finish_writes)
-
     runtime.broadcast_tp_selection(output.tokens)
     span = sampling.capture_preselected_span(output, scope.completion)
-    if token_batch is not None and (not finish_indexes or finish_batch is not None):
+    if token_batch is not None:
         token_batch.tensor.copy_(output.tagged_tokens)
-        batches: tuple[DeviceProductScalarBatch, ...] = (token_batch,)
-        if finish_batch is not None:
-            finish_batch.tensor.copy_(sampling.select_device_values(output.finish, finish_indexes))
-            batches = (finish_batch, token_batch)
         runtime.device_products.publish_scalar_group(
-            batches,
+            (token_batch,),
             after_reads=tuple(scope.device_reads),
         )
     else:
@@ -825,18 +805,6 @@ def project_graph_decode(
             runtime.device_products,
             tuple(scope.device_reads),
         )
-    if finish_indexes and not (token_batch is not None and finish_batch is not None):
-        finish_writes = tuple(
-            scope.finish_writes[runtime.operation_identity(operations[index])]
-            for index in finish_indexes
-        )
-        sampling.publish_device_writes(
-            finish_writes,
-            sampling.select_device_values(output.finish, finish_indexes),
-            runtime.device_products,
-            tuple(scope.device_reads),
-        )
-
     states = runtime.runtime_states
     if states is None:
         raise RuntimeError("graph decode has no request runtime-state owner")
@@ -885,7 +853,7 @@ def project_graph_decode(
                 token_span=TokenSpan(base=int(start), len=1),
                 finish_flags=FinishFlags(),
                 product_generations=runtime.output_generations(operation),
-                committed_tokens=(DeferredSampleToken(span, index),),
+                sampling=SamplingOutputRow(span, index),
             )
         )
     return tuple(outcomes)
@@ -893,15 +861,12 @@ def project_graph_decode(
 
 def prompt_logprob_details(
     runtime: ExecutionResources,
-    session: RequestRow,
+    session: Request,
     start: int,
     tokens: torch.Tensor,
     logits: torch.Tensor,
     scope: PartitionState,
-) -> tuple[
-    tuple[tuple[int, float, int], ...] | DeferredTopLogprobs,
-    ...,
-]:
+) -> tuple[LogprobOutputRow, ...]:
     tokens = tokens.reshape(-1).to(device=logits.device, dtype=torch.long)
     if logits.ndim != 2 or int(logits.shape[0]) != int(tokens.numel()):
         raise invalid_descriptor("prompt scoring logits do not align with input tokens")
@@ -964,7 +929,7 @@ def prompt_logprob_details(
         rows,
         scope.completion,
     )
-    return tuple(details[index][1] for index in range(int(targets.numel())))
+    return tuple(details[index] for index in range(int(targets.numel())))
 
 
 def token_outcome(
@@ -972,11 +937,12 @@ def token_outcome(
     operation: Operation,
     scope: PartitionState,
     *,
-    session: RequestRow | None = None,
+    session: Request | None = None,
     task: ForwardRow | None = None,
     base: int,
-    tokens: int | DeferredDerivedInteger | DeferredSpeculativePoint,
-    committed_tokens: tuple[int | DeferredToken, ...],
+    tokens: int,
+    committed_tokens: tuple[int, ...] = (),
+    sampling: SamplingOutputRow | None = None,
     sample: SampleResult | None = None,
     selection: SpeculativeSelection | None = None,
 ) -> Outcome:
@@ -991,13 +957,10 @@ def token_outcome(
         )
         if isinstance(published_length, torch.Tensor):
             raise RuntimeError("dynamic KV length requires a speculative selection")
-        visible_value: int | DeferredDerivedInteger = int(published_length)
+        visible_value = int(published_length)
         initialized = visible_value
     else:
-        visible_value = DeferredDerivedInteger(
-            cast(DeferredInteger, selection.selected_point),
-            selection.base_kv_visible,
-        )
+        visible_value = int(selection.base_kv_visible)
         initialized = selection.initialized_kv
     lengths = runtime.logical_lengths(
         operation,
@@ -1005,21 +968,9 @@ def token_outcome(
         (cache[0], cache[1], cache[2] if selection is not None else int(visible_value), cache[3]),
         computed_len=initialized,
     )
-    visible = (
-        visible_value
-        if selection is None
-        else DeferredDerivedInteger(
-            cast(DeferredInteger, selection.selected_point),
-            selection.base_kv_visible,
-        )
-    )
+    visible = visible_value
     token_len = (
-        session.logical_position
-        if selection is None
-        else DeferredDerivedInteger(
-            cast(DeferredInteger, selection.selected_point),
-            selection.base_logical_position,
-        )
+        session.logical_position if selection is None else selection.base_logical_position
     )
     if sample is not None and selection is not None:
         _publish_selection_products(
@@ -1027,13 +978,10 @@ def token_outcome(
             operation,
             sample,
             scope,
-            logical_position=session.logical_position,
-            kv_visible=cache[2],
-            selection=selection,
         )
     return Outcome(
         status=OpStatus.OK,
-        selected_point=(1 if selection is None else selection.selected_point),
+        selected_point=(1 if selection is None else 0),
         logical_lengths=LogicalLengths(
             token_len=cast(int, token_len),
             kv_visible_len=cast(int, visible),
@@ -1043,6 +991,7 @@ def token_outcome(
         finish_flags=FinishFlags(),
         product_generations=runtime.output_generations(operation),
         committed_tokens=committed_tokens,
+        sampling=sampling,
         products=sample_product_payloads(operation, sample),
         selection=selection,
     )
@@ -1051,7 +1000,7 @@ def token_outcome(
 def token_task(
     runtime: ExecutionResources,
     operation: Operation,
-    session: RequestRow,
+    session: Request,
     token_ids: tuple[int | torch.Tensor, ...],
     positions: tuple[int, ...] | torch.Tensor,
     selection: TokenSelection,
@@ -1144,7 +1093,7 @@ def operation_token_ids(
 def resolve_decode_token(
     runtime: ExecutionResources,
     operation: Operation,
-    session: RequestRow,
+    session: Request,
     scope: PartitionState,
 ) -> int | torch.Tensor:
     point = operation.parent.point
@@ -1231,7 +1180,7 @@ def publish_token_product(
     device_token = sample.device_token
     if device_token is None:
         device_token = torch.tensor(
-            (int(sample.token_id),),
+            sample.completion.materialize()[0][-1:],
             dtype=torch.long,
             device=runtime.operation_device(operation),
         )
@@ -1247,7 +1196,7 @@ def publish_token_product(
 def publish_runtime_samples(
     runtime: ExecutionResources,
     operations: Sequence[Operation],
-    sessions: Sequence[RequestRow],
+    sessions: Sequence[Request],
     samples: Sequence[SampleResult],
     *,
     scope: PartitionState,
@@ -1414,10 +1363,6 @@ def _publish_selection_products(
     operation: Operation,
     sample: SampleResult,
     scope: PartitionState,
-    *,
-    logical_position: int,
-    kv_visible: int,
-    selection: SpeculativeSelection | None,
 ) -> None:
     device_token = sample.device_token
     if device_token is None:
@@ -1428,64 +1373,18 @@ def _publish_selection_products(
     selected_point = sample.device_selected_point
     if selected_point is None:
         selected_point = accepted.to(dtype=torch.long) + 1
-    semantic_token = (
-        device_token.reshape(-1).to(dtype=torch.long).bitwise_and(sampling.TOKEN_VALUE_MASK)
-    )
     operation_identity = runtime.operation_identity(operation)
     selected_write = scope.selected_point_writes.get(operation_identity)
-    span_write = scope.accepted_span_writes.get(operation_identity)
-    continuation_write = scope.state_continuation_writes.get(operation_identity)
     if selected_write is None:
         raise invalid_descriptor("token operation is missing its selected-point product")
     runtime.device_products.publish_write(selected_write, selected_point)
-    if span_write is None and continuation_write is None and int(operation.bounds.max_points) == 1:
-        return
-    if span_write is None or continuation_write is None:
-        raise invalid_descriptor("multi-point token operation is missing its branch products")
-    if selection is None:
-        candidates = semantic_token
-        logical = torch.full_like(selected_point, int(logical_position))
-        visible = torch.full_like(selected_point, int(kv_visible))
-    else:
-        draft = torch.tensor(
-            selection.draft_tokens,
-            dtype=torch.long,
-            device=device_token.device,
-        )
-        candidates = torch.cat((draft, semantic_token))
-        logical = selected_point + int(selection.base_logical_position)
-        visible = selected_point + int(selection.base_kv_visible)
-    max_points = int(operation.bounds.max_points)
-    if int(candidates.numel()) != max_points:
-        raise RuntimeError("selection candidates do not match the operation point bound")
-    indexes = torch.arange(max_points, dtype=torch.long, device=device_token.device)
-    visible_tokens = torch.where(
-        indexes < selected_point.reshape(()),
-        candidates,
-        torch.zeros_like(candidates),
-    )
-    runtime.device_products.publish_write(
-        span_write,
-        torch.cat((selected_point.reshape(-1), visible_tokens)),
-    )
-    runtime.device_products.publish_write(
-        continuation_write,
-        torch.stack(
-            (
-                semantic_token[0],
-                selected_point.reshape(-1)[0],
-                visible.reshape(-1)[0],
-                logical.reshape(-1)[0],
-            )
-        ),
-    )
 
 
 def build_sample_work(
     runtime: ExecutionResources,
     operation: Operation,
     logits: torch.Tensor,
-    session: RequestRow,
+    session: Request,
     scope: PartitionState,
     *,
     positions: tuple[int, ...],
@@ -1606,7 +1505,6 @@ def build_sample_work(
             device=rows.device,
         )
     token_product = scope.token_writes.get(operation_identity)
-    finish_product = scope.finish_writes.get(operation_identity)
     transition_product = scope.transition_writes.get(operation_identity)
     predicate_value = scope.predicate_values.get(operation_identity)
     finish_set = set(descriptor_rows[0].finish_token_ids)
@@ -1625,7 +1523,6 @@ def build_sample_work(
         draft_token_ids=tuple(int(value) for value in draft_token_ids),
         terminal_draft_prefix=terminal_draft_prefix,
         token_product=token_product,
-        finish_product=finish_product,
         transition_product=transition_product,
         predicate=None if predicate_value is None else predicate_value[0],
         tagged_predicate=False if predicate_value is None else predicate_value[1],
@@ -1636,7 +1533,7 @@ def build_sample_work(
 
 def _session_penalty_base(
     runtime: ExecutionResources,
-    session: RequestRow,
+    session: Request,
     vocab: int,
     device: torch.device,
 ) -> torch.Tensor:
@@ -1652,7 +1549,7 @@ def _session_penalty_base(
 
 def _candidate_penalty_counts(
     runtime: ExecutionResources,
-    session: RequestRow,
+    session: Request,
     committed: torch.Tensor,
     scope: PartitionState,
 ) -> torch.Tensor:
@@ -1692,16 +1589,13 @@ def sample_product_payloads(
     operation: Operation,
     sample: SampleResult | None,
 ) -> tuple[ProductPayload, ...]:
-    if sample is None or (
-        (sample.logprob is None or sample.top_logprobs is None) and not sample.prompt_logprobs
-    ):
+    if sample is None or (sample.logprobs is None and not sample.prompt_logprobs):
         return ()
     reference = _logprob_product_ref(operation)
     if reference is None:
         raise invalid_descriptor("sampler produced undeclared logprob output")
-    payload = DeferredLogprobPayload(
-        sample.logprob,
-        sample.top_logprobs,
+    payload = LogprobPayload(
+        sample.logprobs,
         sample.prompt_logprobs,
     )
     return (ProductPayload(product=reference, payload=cast(bytes, payload)),)
@@ -1713,7 +1607,7 @@ def token_logits(output: torch.Tensor) -> torch.Tensor:
     return output
 
 
-def require_sampling(session: RequestRow) -> SamplingParams:
+def require_sampling(session: Request) -> SamplingParams:
     if session.sampling is None:
         raise invalid_descriptor("sequence execution requires admitted sampling parameters")
     return session.sampling

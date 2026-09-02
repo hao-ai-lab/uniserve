@@ -137,7 +137,7 @@ impl Default for WorkerProcessArgs {
             max_batch_operations: 128,
             max_batch_tokens: 16_384,
             attention_backend: uniserve_worker_ipc::AttentionBackend::Auto,
-            worker_kind: None,
+            worker_role: None,
             transfer_backend: crate::executor::TransferBackend::Inproc,
             stub: false,
             load_format: "auto".to_string(),
@@ -165,7 +165,6 @@ impl Default for WorkerProcessArgs {
             flashinfer_prefill_split_tile_size: None,
             flashinfer_disable_split_kv: false,
             flashinfer_fast_decode_plan: true,
-            media_spool: None,
             max_model_len: 8192,
             max_video_seconds: 15.0,
         }
@@ -246,9 +245,6 @@ impl WorkerProcessArgs {
         }
         if !self.flashinfer_fast_decode_plan {
             cmd.arg("--no-flashinfer-fast-decode-plan");
-        }
-        if let Some(value) = &self.media_spool {
-            cmd.arg("--media-spool").arg(value);
         }
         cmd.arg("--max-model-len")
             .arg(self.max_model_len.to_string());
@@ -347,8 +343,8 @@ impl UniprocExecutor {
         // Staged topology: tell the worker which pipeline stage it serves.
         // Omitted for the default `full` worker so the command line stays
         // identical to the direct full-pool command shape.
-        if let Some(kind) = args.worker_kind {
-            cmd.arg("--worker-kind").arg(kind.as_str());
+        if let Some(kind) = args.worker_role {
+            cmd.arg("--worker-role").arg(kind.as_str());
         }
         // Data-plane Tier-2 backend for this stage's tensor handoffs. The
         // default (in-process) is omitted so the full-pool worker command

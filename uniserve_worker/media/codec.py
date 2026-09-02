@@ -1,4 +1,4 @@
-"""Shared image output helpers."""
+"""Image encoding helpers for concrete model outputs."""
 
 from __future__ import annotations
 

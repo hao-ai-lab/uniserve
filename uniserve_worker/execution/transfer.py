@@ -27,7 +27,7 @@ from uniserve_worker.execution.batch import (
 from uniserve_worker.foundation.errors import invalid_descriptor, unsupported_setup
 from uniserve_worker.runtime.device_products import ImageRange, device_product_storage
 from uniserve_worker.runtime.latent_pool import LatentPublication
-from uniserve_worker.server.completion import DeferredTransferPayload
+from uniserve_worker.execution.output import TransferPayload
 from uniserve_worker.transfer.tickets import Locator
 
 from . import flow
@@ -42,7 +42,7 @@ def run_action(runtime: ExecutionResources, state: OperationState) -> bool:
     if work is ForwardMode.MEDIA_PREPARE and runtime.latent_pool is not None:
         _prepare_media(runtime, state)
         return True
-    if work.transfer_mode is not None or work is ForwardMode.DRAFT:
+    if work.transfer_mode is not None:
         _transfer(runtime, state)
         return True
     return False
@@ -166,7 +166,7 @@ def _transfer(runtime: ExecutionResources, state: OperationState) -> None:
         partition.cache_publications.append((outputs[0], snapshot))
         for encoded in snapshot.locators:
             partition.published.append(Locator.from_json(encoded))
-        payload = DeferredTransferPayload(
+        payload = TransferPayload(
             "kv",
             {"generation": int(outputs[0].generation), "snapshot": snapshot.to_mapping()},
             tuple(Locator.from_json(encoded) for encoded in snapshot.locators),
@@ -300,7 +300,7 @@ def publish_product(
     scope.published.append(locator)
     scope.stage_publications[runtime.operation_identity(operation)] = (locator,)
     descriptor_value["locator"] = locator.to_mapping()
-    descriptor = DeferredTransferPayload(
+    descriptor = TransferPayload(
         descriptor_kind,
         descriptor_value,
         (locator,),
@@ -337,7 +337,10 @@ def fetch_product(
                 "step": int(row.placement.start_step),
                 "generation": int(reference.generation),
             }
-        if reference.storage_class is StorageClass.DEVICE_TENSOR:
+        if reference.storage_class in {
+            StorageClass.DEVICE_TENSOR,
+            StorageClass.REQUEST_RELAY,
+        }:
             device_read = runtime.consume_device_product(
                 reference,
                 scope,
@@ -386,7 +389,10 @@ def metadata_uint(metadata: Mapping[str, object], name: str, default: int) -> in
 
 
 def requires_device_product_binding(reference: ProductRef) -> bool:
-    return reference.storage_class is StorageClass.DEVICE_TENSOR or (
+    return reference.storage_class in {
+        StorageClass.DEVICE_TENSOR,
+        StorageClass.REQUEST_RELAY,
+    } or (
         reference.storage_class is StorageClass.LATENT_ARENA
         and reference.kind is ProductKind.ARTIFACT
     )
@@ -396,7 +402,11 @@ def transferable(reference: ProductRef) -> bool:
     return (
         reference.kind is ProductKind.LATENT
         or reference.kind in {ProductKind.VISION_FEATURE, ProductKind.LATENT_FEATURE}
-        or requires_device_product_binding(reference)
+        or reference.storage_class is StorageClass.DEVICE_TENSOR
+        or (
+            reference.storage_class is StorageClass.LATENT_ARENA
+            and reference.kind is ProductKind.ARTIFACT
+        )
     )
 
 

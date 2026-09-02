@@ -24,11 +24,11 @@ use uniserve_worker_ipc::{
     AttentionRegime, Batch, BatchPartition, BlockTable, CachePageAllocation, CloseReason,
     CompletionReport, Control, DType, DimBound, Disposition, Domain, DrawLayout, ErrorCode,
     ErrorOperationIdentity, FinishFlags, ForwardMode, GenAdmission, LatentPlacement,
-    LogicalLengths, MediaAdmission, MediaProfileId, ModelOutput, NewRequest, OpId, OpStatus,
-    Operation, PartitionCompletion, Point, PointRange, ProductKind, ProductPayload, ProductRef,
-    ReconstructionKind, ReconstructionPlacement, RegistrationAck, RequestKey, RequestKind,
-    RowGeometry, ShapeBound, StorageClass, TimingCounters, TokenSpan, UndAdmission, VersionRef,
-    WorkerForwardStats, WorkerRequest, WorkerResponse, WorkerResponseError,
+    LogicalLengths, MediaAdmission, MediaOutput, MediaProfileId, ModelOutput, NewRequest, OpId,
+    OpStatus, Operation, PartitionCompletion, Point, PointRange, ProductKind, ProductPayload,
+    ProductRef, ReconstructionKind, ReconstructionPlacement, RegistrationAck, RequestKey,
+    RequestKind, RowGeometry, ShapeBound, StorageClass, TimingCounters, TokenSpan, UndAdmission,
+    VersionRef, WorkerForwardStats, WorkerRequest, WorkerResponse, WorkerResponseError,
 };
 
 #[cfg(test)]
@@ -99,14 +99,14 @@ struct NativeRequestTypes {
     native_partition: Py<PyAny>,
     native_batch: Py<PyAny>,
     domains: [Py<PyAny>; 3],
-    product_kinds: [Py<PyAny>; 14],
-    storage_classes: [Py<PyAny>; 5],
+    product_kinds: [Py<PyAny>; 10],
+    storage_classes: [Py<PyAny>; 6],
     dtypes: [Py<PyAny>; 8],
     dispositions: [Py<PyAny>; 3],
     close_reasons: [Py<PyAny>; 4],
     draw_layouts: [Py<PyAny>; 3],
     attention_regimes: [Py<PyAny>; 4],
-    works: [Py<PyAny>; 13],
+    works: [Py<PyAny>; 12],
 }
 
 static NATIVE_REQUEST_TYPES: std::sync::OnceLock<NativeRequestTypes> = std::sync::OnceLock::new();
@@ -158,7 +158,6 @@ impl NativeRequestTypes {
                 [
                     "token",
                     "logprob",
-                    "draft",
                     "vision_feature",
                     "latent_feature",
                     "kv",
@@ -166,10 +165,7 @@ impl NativeRequestTypes {
                     "artifact",
                     "completion",
                     "sampling_state",
-                    "finish",
                     "selected_point",
-                    "accepted_span",
-                    "continuation",
                 ],
             )?,
             storage_classes: enum_members(
@@ -177,6 +173,7 @@ impl NativeRequestTypes {
                 "StorageClass",
                 [
                     "device_tensor",
+                    "request_relay",
                     "paged_kv",
                     "latent_arena",
                     "host_staging",
@@ -211,7 +208,6 @@ impl NativeRequestTypes {
                     "token_extend",
                     "token_decode",
                     "token_verify",
-                    "draft",
                     "encode_vision",
                     "encode_latent",
                     "transfer_product",
@@ -252,18 +248,14 @@ impl NativeRequestTypes {
         let index = match kind {
             ProductKind::Token => 0,
             ProductKind::Logprob => 1,
-            ProductKind::Draft => 2,
-            ProductKind::VisionFeature => 3,
-            ProductKind::LatentFeature => 4,
-            ProductKind::Kv => 5,
-            ProductKind::Latent => 6,
-            ProductKind::Artifact => 7,
-            ProductKind::Completion => 8,
-            ProductKind::SamplingState => 9,
-            ProductKind::Finish => 10,
-            ProductKind::SelectedPoint => 11,
-            ProductKind::AcceptedSpan => 12,
-            ProductKind::Continuation => 13,
+            ProductKind::VisionFeature => 2,
+            ProductKind::LatentFeature => 3,
+            ProductKind::Kv => 4,
+            ProductKind::Latent => 5,
+            ProductKind::Artifact => 6,
+            ProductKind::Completion => 7,
+            ProductKind::SamplingState => 8,
+            ProductKind::SelectedPoint => 9,
         };
         self.product_kinds[index].bind(py).clone()
     }
@@ -271,10 +263,11 @@ impl NativeRequestTypes {
     fn storage_class<'py>(&self, py: Python<'py>, class: StorageClass) -> Bound<'py, PyAny> {
         let index = match class {
             StorageClass::DeviceTensor => 0,
-            StorageClass::PagedKv => 1,
-            StorageClass::LatentArena => 2,
-            StorageClass::HostStaging => 3,
-            StorageClass::PinnedOutput => 4,
+            StorageClass::RequestRelay => 1,
+            StorageClass::PagedKv => 2,
+            StorageClass::LatentArena => 3,
+            StorageClass::HostStaging => 4,
+            StorageClass::PinnedOutput => 5,
         };
         self.storage_classes[index].bind(py).clone()
     }
@@ -843,7 +836,6 @@ fn media_admission_to_py<'py>(
             MediaProfileId::MinimaxH3T2va => "minimax_h3_t2va",
         },
     )?;
-    dict.set_item(intern!(py, "output_path"), media.output_path.as_str())?;
     let geometry = PyDict::new(py);
     geometry.set_item(intern!(py, "frame_count"), media.geometry.frame_count)?;
     geometry.set_item(
@@ -1042,7 +1034,6 @@ fn product_kind_py<'py>(py: Python<'py>, kind: ProductKind) -> &'py Bound<'py, P
     match kind {
         ProductKind::Token => intern!(py, "token"),
         ProductKind::Logprob => intern!(py, "logprob"),
-        ProductKind::Draft => intern!(py, "draft"),
         ProductKind::VisionFeature => intern!(py, "vision_feature"),
         ProductKind::LatentFeature => intern!(py, "latent_feature"),
         ProductKind::Kv => intern!(py, "kv"),
@@ -1050,16 +1041,14 @@ fn product_kind_py<'py>(py: Python<'py>, kind: ProductKind) -> &'py Bound<'py, P
         ProductKind::Artifact => intern!(py, "artifact"),
         ProductKind::Completion => intern!(py, "completion"),
         ProductKind::SamplingState => intern!(py, "sampling_state"),
-        ProductKind::Finish => intern!(py, "finish"),
         ProductKind::SelectedPoint => intern!(py, "selected_point"),
-        ProductKind::AcceptedSpan => intern!(py, "accepted_span"),
-        ProductKind::Continuation => intern!(py, "continuation"),
     }
 }
 
 fn storage_class_py<'py>(py: Python<'py>, class: StorageClass) -> &'py Bound<'py, PyString> {
     match class {
         StorageClass::DeviceTensor => intern!(py, "device_tensor"),
+        StorageClass::RequestRelay => intern!(py, "request_relay"),
         StorageClass::PagedKv => intern!(py, "paged_kv"),
         StorageClass::LatentArena => intern!(py, "latent_arena"),
         StorageClass::HostStaging => intern!(py, "host_staging"),
@@ -1349,6 +1338,16 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<ModelOutput> {
         copy_us: u64_of(&get(timing, intern!(py, "copy_us"))?)?,
         host_us: u64_of(&get(timing, intern!(py, "host_us"))?)?,
     };
+    let media_output = if absent_or_none(dict, intern!(py, "media_output"))? {
+        None
+    } else {
+        let output = get(dict, intern!(py, "media_output"))?;
+        let output = output.cast::<PyDict>().ok()?;
+        Some(MediaOutput {
+            handle: string_of(&get(output, intern!(py, "handle"))?)?,
+            bytes: u64_of(&get(output, intern!(py, "bytes"))?)?,
+        })
+    };
     Some(ModelOutput {
         request_key: request_key_from_py(&get(dict, intern!(py, "request_key"))?)?,
         op_id: OpId(u64_of(&get(dict, intern!(py, "op_id"))?)?),
@@ -1362,6 +1361,7 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<ModelOutput> {
         product_generations: u32_vec(&get(dict, intern!(py, "product_generations"))?)?,
         error_code,
         timing_counters,
+        media_output,
     })
 }
 
@@ -1383,7 +1383,6 @@ fn product_ref_from_py(value: &Bound<'_, PyAny>) -> Option<ProductRef> {
     let kind = match kind.to_str().ok()? {
         "token" => ProductKind::Token,
         "logprob" => ProductKind::Logprob,
-        "draft" => ProductKind::Draft,
         "vision_feature" => ProductKind::VisionFeature,
         "latent_feature" => ProductKind::LatentFeature,
         "kv" => ProductKind::Kv,
@@ -1391,15 +1390,13 @@ fn product_ref_from_py(value: &Bound<'_, PyAny>) -> Option<ProductRef> {
         "artifact" => ProductKind::Artifact,
         "completion" => ProductKind::Completion,
         "sampling_state" => ProductKind::SamplingState,
-        "finish" => ProductKind::Finish,
         "selected_point" => ProductKind::SelectedPoint,
-        "accepted_span" => ProductKind::AcceptedSpan,
-        "continuation" => ProductKind::Continuation,
         _ => return None,
     };
     let storage_class = str_field(dict, intern!(py, "storage_class"))?;
     let storage_class = match storage_class.to_str().ok()? {
         "device_tensor" => StorageClass::DeviceTensor,
+        "request_relay" => StorageClass::RequestRelay,
         "paged_kv" => StorageClass::PagedKv,
         "latent_arena" => StorageClass::LatentArena,
         "host_staging" => StorageClass::HostStaging,
@@ -1640,24 +1637,13 @@ mod tests {
             output_index: 0,
             generation: 5,
             kind: ProductKind::Token,
-            storage_class: StorageClass::DeviceTensor,
+            storage_class: StorageClass::RequestRelay,
             dtype: DType::U32,
             shape_bound: ShapeBound::default(),
             point_range: PointRange {
                 base_point: 0,
                 max_points: 1,
             },
-        };
-        let finish = ProductRef {
-            request_key,
-            producer_op_id: OpId(1),
-            output_index: 1,
-            generation: 6,
-            kind: ProductKind::Finish,
-            storage_class: StorageClass::DeviceTensor,
-            dtype: DType::U8,
-            shape_bound: ShapeBound::default(),
-            point_range: PointRange::default(),
         };
         let operation = Operation {
             request_key,
@@ -1674,7 +1660,7 @@ mod tests {
                 ..Bounds::default()
             },
             inputs: vec![input.clone()],
-            outputs: vec![token, finish],
+            outputs: vec![token],
             predicate: None,
             rng: None,
             control_seq: 0,
@@ -1718,7 +1704,6 @@ mod tests {
                 prompt_token_ids: media_prompt_token_ids,
                 seed: 29,
                 profile: MediaProfileId::MinimaxH3T2va,
-                output_path: "/tmp/media.mp4".to_string(),
                 geometry: MediaGeometry {
                     frame_count: 22,
                     video_reconstruction_units: 1,
@@ -1808,9 +1793,10 @@ mod tests {
                     token_span: TokenSpan { base: 0, len: 1 },
                     committed_tokens: vec![42],
                     finish_flags: FinishFlags::default(),
-                    product_generations: vec![5, 6],
+                    product_generations: vec![5],
                     error_code: None,
                     timing_counters: TimingCounters::default(),
+                    media_output: None,
                 }],
                 products: Vec::new(),
                 registration: RegistrationAck { visible: true },

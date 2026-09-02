@@ -190,14 +190,13 @@ fn logprob_blob_bound(
 /// the worker masks that bit before the token reaches model input.
 fn token_outputs(
     logprob_bound: Option<u64>,
-    produces_finish_candidate: bool,
     produces_transition_candidate: bool,
     max_points: u32,
 ) -> Result<Vec<ProductRef>, PlanningError> {
     let mut token = output_product(
         0,
         ProductKind::Token,
-        StorageClass::DeviceTensor,
+        StorageClass::RequestRelay,
         DType::U32,
     );
     token.point_range = PointRange {
@@ -210,43 +209,15 @@ fn token_outputs(
         let mut selected_point = output_product(
             1,
             ProductKind::SelectedPoint,
-            StorageClass::DeviceTensor,
+            StorageClass::RequestRelay,
             DType::U32,
         );
         selected_point.point_range = point_range;
-        let mut accepted_span = bounded_product(
-            2,
-            ProductKind::AcceptedSpan,
-            StorageClass::DeviceTensor,
-            DType::U32,
-            ShapeBound {
-                dims: vec![DimBound::Static(max_points.saturating_add(1))],
-            },
-        );
-        accepted_span.point_range = point_range;
-        let mut continuation = bounded_product(
-            3,
-            ProductKind::Continuation,
-            StorageClass::DeviceTensor,
-            DType::I64,
-            ShapeBound {
-                dims: vec![DimBound::Static(4)],
-            },
-        );
-        continuation.point_range = point_range;
-        outputs.extend([selected_point, accepted_span, continuation]);
-    }
-    if produces_finish_candidate {
-        outputs.push(output_product(
-            4,
-            ProductKind::Finish,
-            StorageClass::DeviceTensor,
-            DType::U8,
-        ));
+        outputs.push(selected_point);
     }
     if let Some(bytes) = logprob_bound {
         outputs.push(bounded_product(
-            5,
+            2,
             ProductKind::Logprob,
             StorageClass::HostStaging,
             DType::U8,
@@ -255,9 +226,9 @@ fn token_outputs(
     }
     if produces_transition_candidate {
         outputs.push(output_product(
-            6,
+            3,
             ProductKind::Completion,
-            StorageClass::DeviceTensor,
+            StorageClass::RequestRelay,
             DType::U8,
         ));
     }
@@ -270,33 +241,24 @@ fn token_outputs(
 fn feedback_state_outputs(
     logprob_bound: Option<u64>,
     sample_continuation: bool,
-    produces_finish_candidate: bool,
     produces_transition_candidate: bool,
 ) -> Result<Vec<ProductRef>, PlanningError> {
     let mut outputs = vec![output_product(
         0,
         ProductKind::Completion,
-        StorageClass::DeviceTensor,
+        StorageClass::RequestRelay,
         DType::U8,
     )];
     if sample_continuation {
         outputs.push(output_product(
             1,
             ProductKind::Token,
-            StorageClass::DeviceTensor,
+            StorageClass::RequestRelay,
             DType::U32,
         ));
-        if produces_finish_candidate {
-            outputs.push(output_product(
-                2,
-                ProductKind::Finish,
-                StorageClass::DeviceTensor,
-                DType::U8,
-            ));
-        }
         if let Some(bytes) = logprob_bound {
             outputs.push(bounded_product(
-                3,
+                2,
                 ProductKind::Logprob,
                 StorageClass::HostStaging,
                 DType::U8,
@@ -305,18 +267,14 @@ fn feedback_state_outputs(
         }
         if produces_transition_candidate {
             outputs.push(output_product(
-                4,
+                3,
                 ProductKind::Completion,
-                StorageClass::DeviceTensor,
+                StorageClass::RequestRelay,
                 DType::U8,
             ));
         }
     }
     Ok(outputs)
-}
-
-fn produces_finish_candidate(state: &SamplingState) -> bool {
-    state.force_finish || !state.finish_token_ids.is_empty()
 }
 
 fn operation_sampling_delta(
@@ -1102,7 +1060,6 @@ fn plan_token_extend(
                 .min(u32::MAX as usize) as u32;
             let outputs = token_outputs(
                 logprob_blob_bound(&request.sampling, prompt_positions)?,
-                produces_finish_candidate(sampling_state),
                 !sampling_state.transition_token_ids.is_empty(),
                 1,
             )?;
@@ -1143,7 +1100,7 @@ fn plan_token_extend(
             vec![output_product(
                 0,
                 ProductKind::Completion,
-                StorageClass::DeviceTensor,
+                StorageClass::RequestRelay,
                 DType::U8,
             )],
         ),
@@ -1169,7 +1126,6 @@ fn plan_token_extend(
                     .transpose()?
                     .flatten(),
                 *sample_continuation,
-                *sample_continuation && produces_finish_candidate(sampling_state),
                 *sample_continuation && !sampling_state.transition_token_ids.is_empty(),
             )?;
             let inputs = vec![feature.clone()];
@@ -1215,7 +1171,6 @@ fn plan_token_decode(
     let max_points = 1_usize.saturating_add(draft_count).min(u32::MAX as usize) as u32;
     let outputs = token_outputs(
         logprob_blob_bound(&request.sampling, 0)?,
-        produces_finish_candidate(sampling_state),
         !sampling_state.transition_token_ids.is_empty(),
         max_points,
     )?;
@@ -1256,7 +1211,7 @@ fn plan_encode(
         outputs.push(output_product(
             1,
             ProductKind::Completion,
-            StorageClass::DeviceTensor,
+            StorageClass::RequestRelay,
             DType::U8,
         ));
     }
@@ -1286,7 +1241,7 @@ fn plan_kv_publish(
             output_product(
                 1,
                 ProductKind::Completion,
-                StorageClass::DeviceTensor,
+                StorageClass::RequestRelay,
                 DType::U8,
             ),
         ],
@@ -1321,7 +1276,7 @@ fn plan_media_prepare(
             output_product(
                 1,
                 ProductKind::Completion,
-                StorageClass::DeviceTensor,
+                StorageClass::RequestRelay,
                 DType::U8,
             ),
         ],
@@ -1361,7 +1316,7 @@ fn plan_media_denoise(
             output_product(
                 1,
                 ProductKind::Completion,
-                StorageClass::DeviceTensor,
+                StorageClass::RequestRelay,
                 DType::U8,
             ),
         ],
@@ -1389,7 +1344,7 @@ fn plan_materialize(
     outputs.push(output_product(
         2,
         ProductKind::Completion,
-        StorageClass::DeviceTensor,
+        StorageClass::RequestRelay,
         DType::U8,
     ));
     finish_plan(

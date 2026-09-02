@@ -9,7 +9,7 @@ from uniserve_worker.bootstrap.capacity import operation_window
 from uniserve_worker.bootstrap.worker_info import build_worker_info
 from uniserve_worker.execution.batch import ForwardMode, SamplingOwnership
 from uniserve_worker.models.runtime import ExecutionModel, ResourceGeometry, WorkerDeployment
-from uniserve_worker.server.app import dispatch
+from uniserve_worker.process import dispatch
 
 pytestmark = pytest.mark.integration
 

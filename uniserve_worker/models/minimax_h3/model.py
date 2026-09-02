@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
-from torch import nn
 
 from ...execution.batch import (
     ForwardMode,
@@ -18,8 +18,8 @@ from ...execution.batch import (
 )
 from ...nn.diffusion.modulation import modulation_plan_shapes
 from ...nn.mesh import DeviceMesh
-from ...server.profiler import profile_range, synchronize_profile_range
-from ..runtime import ResourceGeometry
+from ...profiling import profile_range, synchronize_profile_range
+from ..runtime import DedicatedStateGeometry, ExecutionModel, ResourceGeometry
 from .packing import audio_latent_frames, patchify_video, unpatchify_video_into
 from .precision import H3LinearPrecisionPolicy
 from .schedule import solver_step
@@ -35,6 +35,9 @@ from .state import (
 )
 from .weights import H3Components, load_h3_components
 
+if TYPE_CHECKING:
+    from ...worker.warmup import WarmupContext
+
 __all__ = ["MiniMaxH3Model"]
 
 
@@ -49,7 +52,7 @@ class _H3PageExecution:
     prompt_prefix_counts: torch.Tensor
 
 
-class MiniMaxH3Model(nn.Module):
+class MiniMaxH3Model(ExecutionModel):
     """One SP4 replica with TP4 conditioning and a serial shared scratch lane."""
 
     architecture = "MiniMaxH3Transformer3DModel"
@@ -66,6 +69,8 @@ class MiniMaxH3Model(nn.Module):
     generation = None
     image_processor = None
     tensorized_mixed = False
+    media_profile = "minimax_h3"
+    supports_weight_updates = False
 
     def __init__(
         self,
@@ -87,7 +92,7 @@ class MiniMaxH3Model(nn.Module):
         self.preparation_stream = torch.cuda.Stream(device=mesh.local_device)
         block_plan_shape, final_plan_shape = modulation_plan_shapes(
             tuple(
-                getattr(block, "_orig_mod", block).adaln_proj.linear
+                block.adaln_proj.linear
                 for block in self.transformer.transformer_blocks
             ),
             self.transformer.norm_out.linear,
@@ -138,6 +143,13 @@ class MiniMaxH3Model(nn.Module):
             block_plan_shape=block_plan_shape,
             final_plan_shape=final_plan_shape,
         )
+        self.dedicated_state_geometry = DedicatedStateGeometry(
+            slot_count=int(self.states.slot_count),
+            persistent_units=int(layout.persistent_units),
+            max_vae_grid_tokens=int(layout.packed.video_indices.numel()),
+            rank=int(mesh.coord("sp")),
+            size=int(mesh.size("sp")),
+        )
 
     def _build_page_execution(self, layout: H3Layout) -> _H3PageExecution:
         text_tiles = int(layout.packed.text_indices.numel()) // 64
@@ -161,6 +173,53 @@ class MiniMaxH3Model(nn.Module):
                 device=self.mesh.local_device,
             ),
         )
+
+    def create_media_runtime(self, unresolved_window: int) -> tuple[object | None, object | None]:
+        from .execution import H3MuxCoordinator, H3OutputRing, require_h3_codecs
+
+        if self.mesh.coord("sp") != 0:
+            return None, None
+        require_h3_codecs()
+        return (
+            H3MuxCoordinator(),
+            H3OutputRing(
+                state_slots=self.states.slot_count,
+                unresolved_window=int(unresolved_window),
+                max_video_frames_per_round=self.layout.video_round_frames,
+                max_frame_count=self.layout.frame_count,
+            ),
+        )
+
+    def drop_runtime(self, session_id: int, media_runtime: object | None) -> None:
+        self.states.drop_session(int(session_id))
+        if media_runtime is not None:
+            media_runtime.drop(int(session_id))
+
+    def abort_admissions(
+        self, admissions: Sequence[object], media_runtime: object | None
+    ) -> None:
+        typed = tuple(admission for admission in admissions if isinstance(admission, NewRequest))
+        if len(typed) != len(admissions):
+            raise RuntimeError("H3 admission rollback received an invalid value")
+        slots = tuple(
+            (admission, self.states.get(int(admission.request_pool_idx)))
+            for admission in typed
+        )
+        for admission, slot in slots:
+            if slot.request_key not in (None, admission.request_key):
+                raise RuntimeError("discarded H3 admission no longer owns its state slot")
+        for admission, slot in slots:
+            if media_runtime is not None:
+                media_runtime.drop(int(admission.request_key.session_id))
+            slot.clear()
+
+    def resource_usage(self) -> tuple[tuple[str, int, int], ...]:
+        used_slots = sum(slot.active for slot in self.states.slots)
+        bytes_per_slot = self.states.bytes_per_slot(self.layout)
+        return (("image_latent", used_slots * bytes_per_slot, self.states.slot_count * bytes_per_slot),)
+
+    def synchronize_runtime(self) -> None:
+        torch.cuda.synchronize(self.mesh.local_device)
 
     @classmethod
     def from_pretrained(
@@ -408,8 +467,7 @@ class MiniMaxH3Model(nn.Module):
         self.transformer.select_adaln_step(slot, scratch, start_step)
         self.transformer.bind_execution(execution.transformer_execution)
         with profile_range("uniserve.h3.denoise"):
-            with torch.compiler.set_stance("fail_on_recompile"):
-                self.transformer.forward_local_prepared(slot, scratch)
+            self.transformer.forward_local_prepared(slot, scratch)
             video_velocity = scratch.video_velocity
             audio_velocity = scratch.audio_velocity
             solver_step(
@@ -580,8 +638,7 @@ class MiniMaxH3Model(nn.Module):
         return pcm[:target_samples]
 
     @torch.inference_mode()
-    def warmup(self) -> None:
-        self.video_vae.compile_decoder()
+    def warmup(self, context: WarmupContext) -> None:
         schedule = self.layout.schedule
         max_rows = int(self.layout.packed.text_indices.numel())
 
@@ -609,14 +666,13 @@ class MiniMaxH3Model(nn.Module):
                 schedule.video_timesteps,
                 schedule.audio_timesteps,
             )
-        self.transformer.compile_blocks()
         warmup_executions = (
             generic_execution,
             min_execution,
             *residue_executions,
             max_execution,
         )
-        for execution_index, execution in enumerate(warmup_executions):
+        for execution in warmup_executions:
             page_rows = int(execution.layout.packed.text_indices.numel())
             self.transformer.bind_execution(execution.transformer_execution)
             for slot in self.states.slots:
@@ -628,11 +684,7 @@ class MiniMaxH3Model(nn.Module):
                 self._prepare_rotary(execution, slot, page_rows)
             slot = self.states.slots[0]
             self.transformer.select_adaln_step(slot, execution.scratch, 0)
-            if execution_index == 0:
-                self.transformer.forward_local_prepared(slot, execution.scratch)
-            else:
-                with torch.compiler.set_stance("fail_on_recompile"):
-                    self.transformer.forward_local_prepared(slot, execution.scratch)
+            self.transformer.forward_local_prepared(slot, execution.scratch)
         self.transformer.bind_execution(max_execution.transformer_execution)
         video_latents = torch.zeros(
             (1, 24, 7, 48, 84),

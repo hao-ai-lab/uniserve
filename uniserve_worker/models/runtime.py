@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import torch
@@ -15,6 +16,7 @@ from ..foundation.errors import invalid_descriptor
 
 if TYPE_CHECKING:
     from ..runtime.cache_pool import CachePool
+    from ..worker.warmup import WarmupContext
     from .generation import GenerationPipeline
     from .inputs import ImageProcessor
 
@@ -70,6 +72,26 @@ class ResourceGeometry:
 
 
 @dataclass(frozen=True, slots=True)
+class DedicatedStateGeometry:
+    """Fixed request-state geometry for models with a dedicated execution arena."""
+
+    slot_count: int
+    persistent_units: int
+    max_vae_grid_tokens: int
+    rank: int
+    size: int
+
+    def __post_init__(self) -> None:
+        if min(
+            self.slot_count,
+            self.persistent_units,
+            self.max_vae_grid_tokens,
+            self.size,
+        ) < 1 or not 0 <= self.rank < self.size:
+            raise invalid_descriptor("dedicated model-state geometry is invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class WorkerDeployment:
     device: str
     model_scope: str
@@ -121,6 +143,29 @@ class ExecutionModel(nn.Module):
     tensorized_mixed: bool = False
     image_processor: ImageProcessor | None = None
     generation: GenerationPipeline | None = None
+    media_profile: str | None = None
+    supports_weight_updates: bool = True
+    dedicated_state_geometry: DedicatedStateGeometry | None = None
+
+    def warmup(self, context: WarmupContext) -> None:
+        """Run model-owned first-use work before request admission."""
+
+    def create_media_runtime(self, unresolved_window: int) -> tuple[object | None, object | None]:
+        return None, None
+
+    def drop_runtime(self, session_id: int, media_runtime: object | None) -> None:
+        return None
+
+    def abort_admissions(
+        self, admissions: Sequence[object], media_runtime: object | None
+    ) -> None:
+        return None
+
+    def resource_usage(self) -> tuple[tuple[str, int, int], ...]:
+        return ()
+
+    def synchronize_runtime(self) -> None:
+        return None
 
     def forward(
         self,
@@ -179,6 +224,7 @@ def active_latent_capacity_tokens(
 
 __all__ = [
     "CacheGeometry",
+    "DedicatedStateGeometry",
     "ExecutionModel",
     "PositionLayout",
     "ResourceGeometry",

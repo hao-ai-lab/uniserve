@@ -1,4 +1,4 @@
-"""Bounded worker-side CPU task execution."""
+"""Bounded worker-owned CPU job execution."""
 
 from __future__ import annotations
 
@@ -9,13 +9,13 @@ from typing import ParamSpec, TypeVar
 
 from ..foundation.errors import resource_error
 
-__all__ = ["BoundedCpuTaskPool", "CpuTaskReservation"]
+__all__ = ["CpuPool", "CpuTaskReservation"]
 
 _P = ParamSpec("_P")
 _T = TypeVar("_T")
 
 
-class BoundedCpuTaskPool:
+class CpuPool:
     """A fixed worker set with bounded registered tasks."""
 
     def __init__(self, *, capacity: int, workers: int) -> None:
@@ -66,6 +66,7 @@ class BoundedCpuTaskPool:
         except BaseException:
             reservation.release()
             raise
+
         def completed(_future: object) -> None:
             reservation.release()
             wake = self._completion_wake
@@ -93,7 +94,7 @@ class CpuTaskReservation:
 
     __slots__ = ("_pool", "_submitted", "_released")
 
-    def __init__(self, pool: BoundedCpuTaskPool) -> None:
+    def __init__(self, pool: CpuPool) -> None:
         self._pool = pool
         self._submitted = False
         self._released = False

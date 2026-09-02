@@ -8,7 +8,7 @@ from uniserve_worker.backends.attention import FlashInferTuningConfig, resolve_a
 from uniserve_worker.bootstrap.execution_config import ExecutionConfig
 from uniserve_worker.models.runtime import ExecutionModel
 from uniserve_worker.nn.mesh import DeviceMesh
-from uniserve_worker.server.stub import StubModel, stub_deployment
+from uniserve_worker.models.stub import StubModel, stub_deployment
 from uniserve_worker.worker import Worker
 
 

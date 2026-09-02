@@ -19,7 +19,7 @@ CUDA_VISIBLE_DEVICES = "0"
 [servers.minimax-h3]
 host = "127.0.0.1"
 port = 18083
-command = ["target/release/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--model-description", "minimax-h3", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--tp-size", "4", "--pipeline-depth", "6", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--media-spool", "/tmp/uniserve-eval-minimax-h3", "--dtype", "bfloat16", "--quantization-config", '{"mode":"quality"}']
+command = ["target/release/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--model-description", "minimax-h3", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-python", ".venv/bin/python", "--tp-size", "4", "--pipeline-depth", "6", "--max-batch", "2", "--max-running-requests", "2", "--max-num-batched-tokens", "2", "--chunked-prefill-size", "1", "--max-model-len", "16384", "--max-video-seconds", "15", "--dtype", "bfloat16", "--quantization-config", '{"mode":"quality"}']
 
 [servers.minimax-h3.environment]
 CUDA_VISIBLE_DEVICES = "0,1,2,3"
@@ -375,5 +375,5 @@ points = ["qwen-uniserve-sharegpt-r16", "sensenova-uniserve-i2t-c32", "sensenova
 [suites.serving-runtime]
 points = ["qwen-uniserve-sharegpt-r16", "sensenova-uniserve-i2t-stream", "sensenova-uniserve-t2i-image", "sensenova-uniserve-interleave-c4"]
 
-[suites.minimax-h3]
+[suites.fast_h3]
 points = ["minimax-h3-5s-1k", "minimax-h3-5s-10k", "minimax-h3-15s-1k", "minimax-h3-15s-10k"]

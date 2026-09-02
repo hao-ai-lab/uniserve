@@ -28,8 +28,8 @@ from uniserve_worker.nn.diffusion.integrator import euler_step
 from uniserve_worker.nn.diffusion.schedule import x_pred_to_velocity
 from uniserve_worker.nn.vision import get_flattened_position_ids_extrapolate
 from uniserve_worker.runtime.latent_pool import LatentPublication
-from uniserve_worker.server.completion import DeferredTransferPayload
-from uniserve_worker.server.request_state import RequestRow
+from uniserve_worker.execution.output import TransferPayload
+from uniserve_worker.runtime.request import Request
 
 from . import token
 from .forward_batch import FlowPatches, ModelPhase, TokenSelection
@@ -385,7 +385,7 @@ def publish_latent_transfer(
     locator = replace(locator, meta={**locator.meta, **metadata})
     scope.published.append(locator)
     scope.stage_publications[runtime.operation_identity(operation)] = (locator,)
-    descriptor = DeferredTransferPayload(
+    descriptor = TransferPayload(
         "latent",
         {"locator": locator.to_mapping(), **metadata},
         (locator,),
@@ -427,7 +427,7 @@ def flow_prefix(
     runtime: ExecutionResources,
     source: BranchSource,
     image_prompt: str,
-    session: RequestRow,
+    session: Request,
 ) -> tuple[tuple[int, ...], bool]:
     return runtime.generation().prefix(
         source,
@@ -553,7 +553,7 @@ def image_token_count(
     return runtime.generation().image_tokens(height, width)
 
 
-def require_image(session: RequestRow) -> ImageParams:
+def require_image(session: Request) -> ImageParams:
     if session.image is None:
         raise invalid_descriptor("flow execution requires admitted image parameters")
     return session.image

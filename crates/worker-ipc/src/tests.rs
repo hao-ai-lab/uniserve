@@ -22,7 +22,7 @@ fn output_product(op: OpId) -> ProductRef {
         output_index: 0,
         generation: 3,
         kind: ProductKind::Token,
-        storage_class: StorageClass::DeviceTensor,
+        storage_class: StorageClass::RequestRelay,
         dtype: DType::U32,
         shape_bound: ShapeBound {
             dims: vec![DimBound::Static(1)],
@@ -41,48 +41,10 @@ fn selected_point_product(op: OpId) -> ProductRef {
         output_index: 1,
         generation: 4,
         kind: ProductKind::SelectedPoint,
-        storage_class: StorageClass::DeviceTensor,
+        storage_class: StorageClass::RequestRelay,
         dtype: DType::U32,
         shape_bound: ShapeBound {
             dims: vec![DimBound::Static(1)],
-        },
-        point_range: PointRange {
-            base_point: 0,
-            max_points: 1,
-        },
-    }
-}
-
-fn accepted_span_product(op: OpId) -> ProductRef {
-    ProductRef {
-        request_key: request_key(),
-        producer_op_id: op,
-        output_index: 2,
-        generation: 5,
-        kind: ProductKind::AcceptedSpan,
-        storage_class: StorageClass::DeviceTensor,
-        dtype: DType::U32,
-        shape_bound: ShapeBound {
-            dims: vec![DimBound::Static(2)],
-        },
-        point_range: PointRange {
-            base_point: 0,
-            max_points: 1,
-        },
-    }
-}
-
-fn continuation_product(op: OpId) -> ProductRef {
-    ProductRef {
-        request_key: request_key(),
-        producer_op_id: op,
-        output_index: 3,
-        generation: 6,
-        kind: ProductKind::Continuation,
-        storage_class: StorageClass::DeviceTensor,
-        dtype: DType::I64,
-        shape_bound: ShapeBound {
-            dims: vec![DimBound::Static(4)],
         },
         point_range: PointRange {
             base_point: 0,
@@ -107,12 +69,7 @@ fn token_decode_operation() -> Operation {
             ..Bounds::default()
         },
         inputs: Vec::new(),
-        outputs: vec![
-            output_product(OpId(11)),
-            selected_point_product(OpId(11)),
-            accepted_span_product(OpId(11)),
-            continuation_product(OpId(11)),
-        ],
+        outputs: vec![output_product(OpId(11)), selected_point_product(OpId(11))],
         predicate: None,
         rng: Some(Rng {
             seed: 99,
@@ -167,7 +124,8 @@ fn completion_record() -> ModelOutput {
             length: false,
             stop: false,
         },
-        product_generations: vec![3, 4, 5, 6],
+        product_generations: vec![3, 4],
+        media_output: None,
         error_code: None,
         timing_counters: TimingCounters::default(),
     }
@@ -203,7 +161,6 @@ fn media_admission(prompt_token_ids: Vec<u32>) -> NewRequest {
             prompt_token_ids,
             seed: 17,
             profile: MediaProfileId::MinimaxH3T2va,
-            output_path: "/tmp/media.mp4".to_string(),
         },
     )
     .unwrap()
@@ -350,7 +307,6 @@ fn every_work_variant_round_trips_through_ipc() {
         (ForwardMode::TokenExtend, true, Domain::Prefill),
         (ForwardMode::TokenDecode, true, Domain::Decode),
         (ForwardMode::TokenVerify, true, Domain::Decode),
-        (ForwardMode::Draft, false, Domain::Decode),
         (ForwardMode::EncodeVision, false, Domain::Prefill),
         (ForwardMode::EncodeLatent, false, Domain::Prefill),
         (ForwardMode::TransferProduct, false, Domain::Prefill),
@@ -829,14 +785,13 @@ fn product_for(key: RequestKey, op: OpId, output_index: u16, kind: ProductKind) 
         storage_class: match kind {
             ProductKind::Kv => StorageClass::PagedKv,
             ProductKind::Latent | ProductKind::LatentFeature => StorageClass::LatentArena,
-            ProductKind::Completion => StorageClass::DeviceTensor,
+            ProductKind::Token | ProductKind::Completion | ProductKind::SelectedPoint => {
+                StorageClass::RequestRelay
+            }
             _ => StorageClass::DeviceTensor,
         },
         dtype: match kind {
-            ProductKind::Token | ProductKind::SelectedPoint | ProductKind::AcceptedSpan => {
-                DType::U32
-            }
-            ProductKind::Continuation => DType::I64,
+            ProductKind::Token | ProductKind::SelectedPoint => DType::U32,
             ProductKind::Kv => DType::BF16,
             ProductKind::Logprob => DType::F32,
             ProductKind::Completion => DType::U8,
@@ -844,11 +799,9 @@ fn product_for(key: RequestKey, op: OpId, output_index: u16, kind: ProductKind) 
         },
         shape_bound: ShapeBound {
             dims: match kind {
-                ProductKind::Token | ProductKind::SelectedPoint | ProductKind::Finish => {
+                ProductKind::Token | ProductKind::SelectedPoint => {
                     vec![DimBound::Static(1)]
                 }
-                ProductKind::AcceptedSpan => vec![DimBound::Static(2)],
-                ProductKind::Continuation => vec![DimBound::Static(4)],
                 _ => vec![DimBound::Static(2), DimBound::Device { max: 16 }],
             },
         },
@@ -910,7 +863,6 @@ fn comprehensive_batch() -> Batch {
         ForwardMode::TokenExtend,
         ForwardMode::TokenDecode,
         ForwardMode::TokenVerify,
-        ForwardMode::Draft,
         ForwardMode::EncodeVision,
         ForwardMode::EncodeLatent,
         ForwardMode::TransferProduct,
@@ -1159,6 +1111,7 @@ fn full_completion_report() -> CompletionReport {
             stop: false,
         },
         product_generations: vec![3, 5],
+        media_output: None,
         error_code: None,
         timing_counters: TimingCounters {
             queued_us: 41,

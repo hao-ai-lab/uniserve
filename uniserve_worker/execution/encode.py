@@ -32,11 +32,11 @@ from uniserve_worker.runtime.device_products import (
 )
 from uniserve_worker.runtime.encoder_cache import EncoderMetadata, EncoderWrite
 from uniserve_worker.runtime.latent_pool import LatentRelease
-from uniserve_worker.server.completion import (
-    DeferredImagePayload,
-    DeferredTransferPayload,
+from uniserve_worker.execution.output import (
+    ImagePayload,
+    TransferPayload,
 )
-from uniserve_worker.server.image_codec import quantize_image_hwc
+from uniserve_worker.media.codec import quantize_image_hwc
 
 from . import transfer
 from .forward_batch import ModelPhase, TokenSelection
@@ -165,7 +165,7 @@ def _consume_encode(
         )
         partition.published.append(locator)
         partition.stage_publications[runtime.operation_identity(operation)] = (locator,)
-        descriptor = DeferredTransferPayload(
+        descriptor = TransferPayload(
             "encoder",
             {
                 "generation": int(feature_output.generation),
@@ -334,6 +334,7 @@ def state_outcome(
         finish_flags=FinishFlags(),
         product_generations=runtime.output_generations(operation),
         committed_tokens=outcome.committed_tokens,
+        sampling=outcome.sampling,
         products=(*products, *outcome.products),
     )
 
@@ -344,7 +345,7 @@ def non_state_outcome(
     scope: PartitionState,
     *,
     products: tuple[ProductPayload, ...] = (),
-    completion_tasks: tuple[DeferredImagePayload, ...] = (),
+    completion_tasks: tuple[ImagePayload, ...] = (),
 ) -> Outcome:
     session = runtime.request_row(scope, operation.request_key.session_id)
     base = session.logical_position
@@ -611,7 +612,7 @@ def defer_image_encoding(
     scope: PartitionState,
     *,
     max_bytes: int,
-) -> DeferredImagePayload:
+) -> ImagePayload:
     if max_bytes < 1:
         raise invalid_descriptor("image materialization requires a positive completion bound")
     quantized = quantize_image_hwc(
@@ -625,7 +626,7 @@ def defer_image_encoding(
     reservation = scope.cpu_tasks.get(identity)
     if reservation is None:
         raise RuntimeError("materialization has no registered CPU task slot")
-    return DeferredImagePayload(
+    return ImagePayload(
         capture,
         reservation,
         max_bytes,

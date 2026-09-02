@@ -11,18 +11,14 @@ use super::*;
 pub enum ProductKind {
     Token = 0,
     Logprob = 1,
-    Draft = 2,
-    VisionFeature = 3,
-    LatentFeature = 4,
-    Kv = 5,
-    Latent = 6,
-    Artifact = 7,
-    Completion = 8,
-    SamplingState = 9,
-    Finish = 10,
-    SelectedPoint = 11,
-    AcceptedSpan = 12,
-    Continuation = 13,
+    VisionFeature = 2,
+    LatentFeature = 3,
+    Kv = 4,
+    Latent = 5,
+    Artifact = 6,
+    Completion = 7,
+    SamplingState = 8,
+    SelectedPoint = 9,
 }
 
 /// The worker store family that backs a product.
@@ -31,10 +27,11 @@ pub enum ProductKind {
 #[repr(u8)]
 pub enum StorageClass {
     DeviceTensor = 0,
-    PagedKv = 1,
-    LatentArena = 2,
-    HostStaging = 3,
-    PinnedOutput = 4,
+    RequestRelay = 1,
+    PagedKv = 2,
+    LatentArena = 3,
+    HostStaging = 4,
+    PinnedOutput = 5,
 }
 
 /// Element type of a product's backing storage.

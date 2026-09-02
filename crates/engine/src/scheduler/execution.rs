@@ -82,20 +82,31 @@ impl Scheduler {
                 }
                 break;
             }
-            // A prompt batch carries its own state-mutating controls plus
-            // terminal closes, whose sessions have no remaining operations.
-            // Other foreign controls stay pending so the prompt session set
-            // remains disjoint from in-flight decode work.
+            // A prompt batch carries its own state-mutating controls plus a
+            // foreign terminal close only when no earlier control for that
+            // session remains queued. Other foreign controls stay pending so
+            // the prompt session set remains disjoint from in-flight decode
+            // work without reordering a request's control stream.
             let prompt_batch = ops
                 .iter()
                 .all(|op| batch_kind(op.operation_variant) == BatchKind::Prefill);
             let controls: Vec<Control> = if prompt_batch {
                 let sessions: HashSet<RequestId> = ops.iter().map(|op| op.request_id).collect();
-                let (own, foreign): (VecDeque<Control>, VecDeque<Control>) =
-                    self.pending_controls.drain(..).partition(|control| {
-                        matches!(control, Control::Close { .. })
-                            || sessions.contains(&control.request_key().session_id)
-                    });
+                let mut blocked_foreign = HashSet::new();
+                let mut own = VecDeque::new();
+                let mut foreign = VecDeque::new();
+                for control in self.pending_controls.drain(..) {
+                    let request_id = control.request_key().session_id;
+                    if sessions.contains(&request_id)
+                        || (matches!(control, Control::Close { .. })
+                            && !blocked_foreign.contains(&request_id))
+                    {
+                        own.push_back(control);
+                    } else {
+                        blocked_foreign.insert(request_id);
+                        foreign.push_back(control);
+                    }
+                }
                 self.pending_controls = foreign;
                 own.into()
             } else {
@@ -132,7 +143,7 @@ impl Scheduler {
             output_index: 0,
             generation,
             kind: ProductKind::Completion,
-            storage_class: StorageClass::DeviceTensor,
+            storage_class: StorageClass::RequestRelay,
             dtype: DType::U32,
             shape_bound: ShapeBound {
                 dims: vec![DimBound::Static(1)],
@@ -1104,10 +1115,14 @@ impl Scheduler {
             return;
         };
         let already_failed = matches!(state.terminal_intent, MediaTerminalIntent::Failure(_));
+        let media_output = record.media_output.clone();
+        let media_output_valid =
+            (operation.work == ForwardMode::Materialize) == media_output.is_some();
         let valid = record.status == OpStatus::Ok
             && record.request_key == operation.request_key
             && record.op_id == operation.op_id
-            && (!operation.advances_state || record.selected_point > 0);
+            && (!operation.advances_state || record.selected_point > 0)
+            && media_output_valid;
         if valid
             && let Some(state) = self.media_state_mut(id)
             && state.admission_state == MediaAdmissionState::InFlight
@@ -1122,6 +1137,12 @@ impl Scheduler {
                 }
             } else if let Some(state) = self.media_state_mut(id) {
                 state.committed = cursor_after;
+                if let Some(output) = media_output {
+                    state.artifact = Some(MediaArtifact {
+                        handle: output.handle,
+                        bytes: output.bytes,
+                    });
+                }
                 if operation.advances_state {
                     state.fixed_parent = VersionRef {
                         request_key: record.request_key,
@@ -1150,14 +1171,12 @@ impl Scheduler {
             {
                 Some((MediaEvent::Aborted, CloseReason::Cancelled))
             } else if state.committed.materialized {
-                let event = match std::fs::metadata(&state.request.output_path) {
-                    Ok(metadata) => MediaEvent::Completed {
-                        bytes: metadata.len(),
+                let event = state.artifact.clone().map_or_else(
+                    || MediaEvent::Failed {
+                        message: "media output was not materialized".to_string(),
                     },
-                    Err(error) => MediaEvent::Failed {
-                        message: format!("media output was not materialized: {error}"),
-                    },
-                };
+                    |artifact| MediaEvent::Completed { artifact },
+                );
                 let reason = if matches!(event, MediaEvent::Completed { .. }) {
                     CloseReason::Completed
                 } else {
@@ -1184,6 +1203,23 @@ impl Scheduler {
             return;
         };
         self.order.retain(|candidate| *candidate != id);
+        if !matches!(event, MediaEvent::Completed { .. })
+            && let Some(artifact) = state.artifact.as_ref()
+        {
+            if let Ok(name) = std::ffi::CString::new(format!("/{}", artifact.handle)) {
+                // SAFETY: the worker-provided handle was validated before it entered media state.
+                let result = unsafe { libc::shm_unlink(name.as_ptr()) };
+                if result != 0
+                    && std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT)
+                {
+                    tracing::warn!(
+                        request_id = id.0,
+                        handle = artifact.handle,
+                        "failed to discard unclaimed media shared memory"
+                    );
+                }
+            }
+        }
         let _ = state.event_tx.send(event);
         match state.admission_state {
             MediaAdmissionState::Unsubmitted => {
@@ -1645,7 +1681,7 @@ impl Scheduler {
                         .find(|output| {
                             output.kind == ProductKind::Token
                                 && output.storage_class
-                                    == uniserve_worker_ipc::StorageClass::DeviceTensor
+                                    == uniserve_worker_ipc::StorageClass::RequestRelay
                         })
                         .cloned();
                     token.map(|token| ResidentDeviceVersion {

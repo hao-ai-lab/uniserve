@@ -51,7 +51,7 @@ from uniserve_worker.execution.batch import (
     encode_token_product_bytes,
     execution_domain,
 )
-from uniserve_worker.server.completion import (
+from uniserve_worker.execution.output import (
     completion_report_ready,
     finalize_completion_report,
 )
@@ -497,7 +497,6 @@ def token_operation(
     tokens: Sequence[int],
     block_table_delta: Sequence[int] = (),
     predicate: ProductRef | None = None,
-    produces_finish_candidate: bool = True,
     logprobs: bool = False,
     rng: Rng | None = None,
     control_seq: int = 0,
@@ -533,7 +532,7 @@ def token_operation(
         output_index=0,
         generation=op_id * 4 + 1,
         kind=ProductKind.TOKEN,
-        storage_class=StorageClass.DEVICE_TENSOR,
+        storage_class=StorageClass.REQUEST_RELAY,
         dtype=DType.U32,
         shape_bound=ShapeBound(),
         point_range=PointRange(
@@ -548,55 +547,20 @@ def token_operation(
         output_index=1,
         generation=op_id * 6 + 2,
         kind=ProductKind.SELECTED_POINT,
-        storage_class=StorageClass.DEVICE_TENSOR,
+        storage_class=StorageClass.REQUEST_RELAY,
         dtype=DType.U32,
         shape_bound=ShapeBound(),
         point_range=PointRange(base_point=0, max_points=max_points),
-    )
-    accepted_span_output = ProductRef(
-        request_key=rk,
-        producer_op_id=op_id,
-        output_index=2,
-        generation=op_id * 6 + 3,
-        kind=ProductKind.ACCEPTED_SPAN,
-        storage_class=StorageClass.DEVICE_TENSOR,
-        dtype=DType.U32,
-        shape_bound=ShapeBound((StaticDim(max_points + 1),)),
-        point_range=PointRange(base_point=0, max_points=max_points),
-    )
-    continuation_output = ProductRef(
-        request_key=rk,
-        producer_op_id=op_id,
-        output_index=3,
-        generation=op_id * 6 + 4,
-        kind=ProductKind.CONTINUATION,
-        storage_class=StorageClass.DEVICE_TENSOR,
-        dtype=DType.I64,
-        shape_bound=ShapeBound((StaticDim(4),)),
-        point_range=PointRange(base_point=0, max_points=max_points),
-    )
-    finish_output = ProductRef(
-        request_key=rk,
-        producer_op_id=op_id,
-        output_index=4,
-        generation=op_id * 6 + 5,
-        kind=ProductKind.FINISH,
-        storage_class=StorageClass.DEVICE_TENSOR,
-        dtype=DType.U8,
-        shape_bound=ShapeBound(),
-        point_range=PointRange(),
     )
     outputs = [token_output]
     if mode is TokenMode.VERIFY:
-        outputs.extend((selected_point_output, accepted_span_output, continuation_output))
-    if produces_finish_candidate:
-        outputs.append(finish_output)
+        outputs.append(selected_point_output)
     if logprobs:
         outputs.append(
             ProductRef(
                 request_key=rk,
                 producer_op_id=op_id,
-                output_index=5,
+                output_index=2,
                 generation=op_id * 6 + 6,
                 kind=ProductKind.LOGPROB,
                 storage_class=StorageClass.HOST_STAGING,
@@ -723,7 +687,7 @@ def media_prepare_operation(
         output_index=1,
         generation=op_id * 3 + 2,
         kind=ProductKind.COMPLETION,
-        storage_class=StorageClass.DEVICE_TENSOR,
+        storage_class=StorageClass.REQUEST_RELAY,
         dtype=DType.U32,
         shape_bound=ShapeBound(),
         point_range=PointRange(),
@@ -891,7 +855,7 @@ def visual_state_operation(
             output_index=0,
             generation=op_id * 3,
             kind=ProductKind.COMPLETION,
-            storage_class=StorageClass.DEVICE_TENSOR,
+            storage_class=StorageClass.REQUEST_RELAY,
             dtype=DType.U8,
             shape_bound=ShapeBound(),
             point_range=PointRange(),
@@ -905,7 +869,7 @@ def visual_state_operation(
                 output_index=1,
                 generation=op_id * 3 + 1,
                 kind=ProductKind.TOKEN,
-                storage_class=StorageClass.DEVICE_TENSOR,
+                storage_class=StorageClass.REQUEST_RELAY,
                 dtype=DType.U32,
                 shape_bound=ShapeBound(),
                 point_range=PointRange(),

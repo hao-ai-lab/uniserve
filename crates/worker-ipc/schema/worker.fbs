@@ -6,7 +6,6 @@ enum ForwardMode : ubyte {
   TokenExtend,
   TokenDecode,
   TokenVerify,
-  Draft,
   EncodeVision,
   EncodeLatent,
   TransferProduct,
@@ -24,11 +23,11 @@ enum MediaProfileId : ubyte { MinimaxH3T2va }
 enum Domain : ubyte { Prefill, Decode, Flow }
 enum AttentionRegime : ubyte { None, Causal, Bidirectional, Hybrid }
 enum SamplingOwnership : ubyte { DesignatedRank, DeterministicSharded }
+enum WorkerRole : ubyte { Full, Encoder, Prefill, Decode, Und, Gen }
 
 enum ProductKind : ubyte {
   Token,
   Logprob,
-  Draft,
   VisionFeature,
   LatentFeature,
   Kv,
@@ -36,14 +35,12 @@ enum ProductKind : ubyte {
   Artifact,
   Completion,
   SamplingState,
-  Finish,
-  SelectedPoint,
-  AcceptedSpan,
-  Continuation
+  SelectedPoint
 }
 
 enum StorageClass : ubyte {
   DeviceTensor,
+  RequestRelay,
   PagedKv,
   LatentArena,
   HostStaging,
@@ -157,6 +154,7 @@ table GraphBucket {
 }
 
 table WorkerInfo {
+  worker_role:WorkerRole;
   block_size:uint;
   num_blocks:uint;
   num_layers:uint;
@@ -341,6 +339,11 @@ table TimingCounters {
   host_us:ulong;
 }
 
+table MediaOutput {
+  handle:string;
+  bytes:ulong;
+}
+
 table ModelOutput {
   request_key:RequestKey;
   op_id:ulong;
@@ -354,6 +357,7 @@ table ModelOutput {
   product_generations:[uint];
   error_code:ErrorCode = null;
   timing_counters:TimingCounters;
+  media_output:MediaOutput;
 }
 
 table ControlCommit {
@@ -404,7 +408,6 @@ table MediaAdmission {
   prompt_token_ids:[uint];
   seed:ulong;
   profile:MediaProfileId;
-  output_path:string;
   geometry:MediaGeometry;
 }
 

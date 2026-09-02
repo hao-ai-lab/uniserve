@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from threading import RLock
@@ -50,14 +50,13 @@ _TORCH_DTYPE_BYTES: Final[dict[torch.dtype, int]] = {
 _DEVICE_PRODUCT_KINDS: Final[frozenset[ProductKind]] = frozenset(
     {
         ProductKind.TOKEN,
-        ProductKind.DRAFT,
         ProductKind.ARTIFACT,
         ProductKind.COMPLETION,
-        ProductKind.FINISH,
         ProductKind.SELECTED_POINT,
-        ProductKind.ACCEPTED_SPAN,
-        ProductKind.CONTINUATION,
     }
+)
+_REQUEST_RELAY_KINDS: Final[frozenset[ProductKind]] = frozenset(
+    {ProductKind.TOKEN, ProductKind.COMPLETION, ProductKind.SELECTED_POINT}
 )
 
 
@@ -83,13 +82,7 @@ def device_product_capacity_bytes(
     if min(slots, devices, points, value_bytes) < 1:
         raise ValueError("device-product geometry must be positive")
     scalar_bytes = slots * devices * sum(dict(_DTYPE_STORAGE.values()).values())
-    accepted_span_bytes = (points + 1) * device_product_storage(DType.U32)[1]
-    continuation_bytes = 4 * device_product_storage(DType.I64)[1]
-    return scalar_bytes + slots * devices * max(
-        value_bytes,
-        accepted_span_bytes,
-        continuation_bytes,
-    )
+    return scalar_bytes + slots * devices * value_bytes
 
 
 def _invariant(message: str) -> WorkerError:
@@ -141,12 +134,13 @@ def _resolved_device(device: torch.device | str) -> torch.device:
 def _validate_owner(reference: ProductRef) -> None:
     if reference.kind not in _DEVICE_PRODUCT_KINDS:
         raise invalid_descriptor("product kind does not belong to DeviceProducts")
-    expected = (
-        StorageClass.LATENT_ARENA
-        if reference.kind is ProductKind.ARTIFACT
-        else StorageClass.DEVICE_TENSOR
-    )
-    if reference.storage_class is not expected:
+    if reference.kind is ProductKind.ARTIFACT:
+        valid = reference.storage_class is StorageClass.LATENT_ARENA
+    elif reference.storage_class is StorageClass.REQUEST_RELAY:
+        valid = reference.kind in _REQUEST_RELAY_KINDS
+    else:
+        valid = reference.storage_class is StorageClass.DEVICE_TENSOR
+    if not valid:
         raise invalid_descriptor("device product has an incompatible storage class")
 
 
@@ -159,6 +153,7 @@ class _DeviceSlot:
     tensor: torch.Tensor | None = None
     shape: tuple[int, ...] | None = None
     dtype: torch.dtype | None = None
+    relay_lane: tuple[str, int, RequestKey, int, int] | None = None
 
 
 class ImageRange(StrEnum):
@@ -267,12 +262,20 @@ class DeviceProducts:
         *,
         capacity: int,
         byte_capacity: int,
+        request_capacity: int = 0,
+        relay_depth: int = 0,
         event_pool: DeviceEventPool | None = None,
     ) -> None:
         self.capacity = max(1, int(capacity))
         self.byte_capacity = int(byte_capacity)
         if self.byte_capacity < 1:
             raise ValueError("device-product byte capacity must be positive")
+        self.request_capacity = int(request_capacity)
+        self.relay_depth = int(relay_depth)
+        if (self.request_capacity == 0) != (self.relay_depth == 0):
+            raise ValueError("request-relay geometry must be complete")
+        if self.request_capacity < 0 or self.relay_depth < 0:
+            raise ValueError("request-relay geometry must not be negative")
         self._allocated_bytes = 0
         self._slots: dict[str, list[_DeviceSlot]] = {}
         self._occupied_slots: dict[str, int] = {}
@@ -280,6 +283,15 @@ class DeviceProducts:
         self._free_slot_queues: dict[str, deque[int]] = {}
         self._compatible_free_slots: dict[_SlotStorageKey, deque[int]] = {}
         self._scalar_arenas: dict[tuple[str, torch.dtype], torch.Tensor] = {}
+        self._relay_arenas: dict[
+            tuple[str, ProductKind, torch.dtype, int], torch.Tensor
+        ] = {}
+        self._relay_slots: dict[
+            tuple[str, int, int, ProductKind, torch.dtype, int], _DeviceSlot
+        ] = {}
+        self._relay_operation_lanes: dict[
+            tuple[str, int, RequestKey, int], int
+        ] = {}
         self.event_pool = DeviceEventPool() if event_pool is None else event_pool
         self._entries: dict[_ReferenceKey, DeviceProductWrite] = {}
         self._candidates: dict[int, DeviceProductWrite] = {}
@@ -297,6 +309,9 @@ class DeviceProducts:
             self._candidates.clear()
             self._operation_writes.clear()
             self._scalar_arenas.clear()
+            self._relay_arenas.clear()
+            self._relay_slots.clear()
+            self._relay_operation_lanes.clear()
             self._slots.clear()
             self._occupied_slots.clear()
             self._free_slots.clear()
@@ -349,8 +364,10 @@ class DeviceProducts:
     def bind_outputs(
         self,
         bindings: tuple[tuple[ProductRef, torch.device | str], ...],
+        *,
+        request_slots: Mapping[RequestKey, int] | None = None,
     ) -> tuple[DeviceProductWrite, ...]:
-        return self.bind_output_batch(bindings).writes
+        return self.bind_output_batch(bindings, request_slots=request_slots).writes
 
     def snapshot_entries(self, session_ids: set[int]) -> tuple[DeviceProductSnapshot, ...]:
         selected = {int(value) for value in session_ids}
@@ -359,6 +376,7 @@ class DeviceProducts:
             for entry in self._entries.values():
                 if (
                     int(entry.reference.request_key.session_id) not in selected
+                    or entry.reference.storage_class is StorageClass.REQUEST_RELAY
                     or entry.released
                     or not entry.producer_recorded
                 ):
@@ -407,6 +425,8 @@ class DeviceProducts:
     def bind_output_batch(
         self,
         bindings: tuple[tuple[ProductRef, torch.device | str], ...],
+        *,
+        request_slots: Mapping[RequestKey, int] | None = None,
     ) -> DeviceProductBindingBatch:
         """Atomically bind outputs and retain their direct scalar range."""
 
@@ -415,6 +435,16 @@ class DeviceProducts:
             return DeviceProductBindingBatch(())
         for reference, _device in device_bindings:
             _validate_owner(reference)
+        relay = tuple(
+            reference.storage_class is StorageClass.REQUEST_RELAY
+            for reference, _device in device_bindings
+        )
+        if any(relay):
+            if not all(relay):
+                raise invalid_descriptor("request-relay bindings cannot share a generic group")
+            if request_slots is None:
+                raise invalid_descriptor("request-relay binding has no stable request slot")
+            return self._bind_relay_outputs(device_bindings, request_slots)
         first_reference, first_raw_device = device_bindings[0]
         first_device_object = _resolved_device(first_raw_device)
         first_shape = _device_shape(first_reference)
@@ -537,12 +567,204 @@ class DeviceProducts:
                 raise
             return DeviceProductBindingBatch(tuple(writes))
 
+    def _bind_relay_outputs(
+        self,
+        bindings: tuple[tuple[ProductRef, torch.device | str], ...],
+        request_slots: Mapping[RequestKey, int],
+    ) -> DeviceProductBindingBatch:
+        if self.request_capacity < 1 or self.relay_depth < 1:
+            raise resource_error("worker has no request-relay arena")
+        fields: dict[tuple[str, int, RequestKey, int, ProductKind, torch.dtype], int] = {}
+        requested_rows = []
+        for reference, raw_device in bindings:
+            device = _resolved_device(raw_device)
+            request_slot = int(request_slots.get(reference.request_key, 0))
+            dtype = _device_dtype(reference.dtype)
+            field_key = (
+                str(device),
+                request_slot,
+                reference.request_key,
+                int(reference.producer_op_id),
+                reference.kind,
+                dtype,
+            )
+            field = fields.get(field_key, 0)
+            fields[field_key] = field + 1
+            requested_rows.append((reference, device, request_slot, dtype, field))
+        requested = tuple(requested_rows)
+        if any(
+            slot < 1
+            or slot > self.request_capacity
+            or math.prod(_device_shape(reference)) != 1
+            for reference, _device, slot, _dtype, _field in requested
+        ):
+            raise invalid_descriptor("request-relay output has invalid slot or scalar geometry")
+        keys = tuple(
+            _reference_key(reference)
+            for reference, _device, _slot, _dtype, _field in requested
+        )
+        if len(set(keys)) != len(keys):
+            raise invalid_descriptor("request-relay registration repeats an output identity")
+        with self._lock:
+            self._reclaim_ready_locked()
+            candidate_keys = {
+                _reference_key(candidate.reference) for candidate in self._candidates.values()
+            }
+            for (reference, _device, _slot, _dtype, _field), key in zip(
+                requested, keys, strict=True
+            ):
+                if int(reference.generation) < 1:
+                    raise invalid_descriptor(
+                        "request-relay registration requires a positive logical generation"
+                    )
+                existing = self._entries.get(key)
+                if existing is not None:
+                    if existing.reference != reference:
+                        raise invalid_descriptor("stale request-relay logical generation")
+                    raise invalid_descriptor("request-relay output is already registered")
+                if key in candidate_keys:
+                    raise invalid_descriptor("request-relay output already has a candidate")
+
+            operation_lanes: dict[tuple[str, int, RequestKey, int], int] = {}
+            for reference, device, request_slot, _dtype, _field in requested:
+                operation = (
+                    str(device),
+                    request_slot,
+                    reference.request_key,
+                    int(reference.producer_op_id),
+                )
+                lane = self._relay_operation_lanes.get(operation)
+                if lane is None:
+                    lane = operation_lanes.get(operation)
+                if lane is None:
+                    lane = next(
+                        (
+                            candidate
+                            for candidate in range(self.relay_depth)
+                            if self._relay_lane_free_locked(
+                                str(device), request_slot, candidate
+                            )
+                        ),
+                        None,
+                    )
+                    if lane is None:
+                        raise resource_error(
+                            "request-relay unresolved window is exhausted"
+                        )
+                operation_lanes[operation] = lane
+
+            writes: list[DeviceProductWrite] = []
+            installed_operations: set[tuple[str, int, RequestKey, int]] = set()
+            try:
+                for reference, device, request_slot, dtype, field in requested:
+                    operation = (
+                        str(device),
+                        request_slot,
+                        reference.request_key,
+                        int(reference.producer_op_id),
+                    )
+                    lane = operation_lanes[operation]
+                    slot = self._relay_slot_locked(
+                        device,
+                        request_slot,
+                        lane,
+                        reference.kind,
+                        dtype,
+                        field,
+                        operation,
+                    )
+                    if slot.owner is not None:
+                        raise _invariant("request-relay lane was assigned more than once")
+                    generation = slot.generation + 1
+                    slot.generation = 1 if generation > _MAX_GENERATION else generation
+                    write = DeviceProductWrite(
+                        reference=reference,
+                        slot=slot,
+                        physical_generation=slot.generation,
+                        binding_id=self._next_binding_id,
+                    )
+                    self._next_binding_id += 1
+                    slot.owner = write.binding_id
+                    self._candidates[write.binding_id] = write
+                    self._relay_operation_lanes[operation] = lane
+                    installed_operations.add(operation)
+                    writes.append(write)
+            except BaseException:
+                for write in reversed(writes):
+                    self._candidates.pop(write.binding_id, None)
+                    self._return_slot_locked(write.slot)
+                for operation in installed_operations:
+                    self._release_relay_operation_locked(operation)
+                raise
+            return DeviceProductBindingBatch(tuple(writes))
+
+    def _relay_lane_free_locked(
+        self,
+        device_name: str,
+        request_slot: int,
+        lane: int,
+    ) -> bool:
+        return not any(
+            slot.owner is not None
+            for (name, row, candidate, _kind, _dtype, _field), slot in self._relay_slots.items()
+            if name == device_name and row == request_slot and candidate == lane
+        )
+
+    def _relay_slot_locked(
+        self,
+        device: torch.device,
+        request_slot: int,
+        lane: int,
+        kind: ProductKind,
+        dtype: torch.dtype,
+        field: int,
+        operation: tuple[str, int, RequestKey, int],
+    ) -> _DeviceSlot:
+        device_name = str(device)
+        key = (device_name, request_slot, lane, kind, dtype, int(field))
+        slot = self._relay_slots.get(key)
+        if slot is None:
+            arena_key = (device_name, kind, dtype, int(field))
+            arena = self._relay_arenas.get(arena_key)
+            if arena is None:
+                elements = (self.request_capacity + 1) * self.relay_depth
+                projected = self._allocated_bytes + elements * _TORCH_DTYPE_BYTES[dtype]
+                self._require_byte_capacity_locked(projected)
+                arena = torch.empty((elements,), dtype=dtype, device=device)
+                self._relay_arenas[arena_key] = arena
+                self._allocated_bytes = projected
+            index = request_slot * self.relay_depth + lane
+            slot = _DeviceSlot(
+                index=index,
+                device_name=device_name,
+                tensor=arena[index : index + 1],
+                shape=(1,),
+                dtype=dtype,
+            )
+            self._relay_slots[key] = slot
+        if slot.relay_lane is not None and slot.relay_lane[:4] != operation:
+            raise _invariant("request-relay slot retained a conflicting operation identity")
+        slot.relay_lane = (*operation, lane)
+        return slot
+
+    def _release_relay_operation_locked(
+        self,
+        operation: tuple[str, int, RequestKey, int],
+    ) -> None:
+        lane = self._relay_operation_lanes.get(operation)
+        if lane is None:
+            return
+        if self._relay_lane_free_locked(operation[0], operation[1], lane):
+            self._relay_operation_lanes.pop(operation, None)
+
     def bind_output_groups(
         self,
         groups: tuple[
             tuple[tuple[ProductRef, torch.device | str], ...],
             ...,
         ],
+        *,
+        request_slots: Mapping[RequestKey, int] | None = None,
     ) -> tuple[DeviceProductBindingBatch, ...]:
         """Atomically bind output groups while preserving direct producer ranges."""
 
@@ -551,7 +773,9 @@ class DeviceProducts:
             try:
                 for group in groups:
                     if group:
-                        bindings.append(self.bind_output_batch(group))
+                        bindings.append(
+                            self.bind_output_batch(group, request_slots=request_slots)
+                        )
             except BaseException:
                 self.abandon_writes(
                     tuple(write for binding in bindings for write in binding.writes)
@@ -898,7 +1122,11 @@ class DeviceProducts:
 
         source = flat.to(dtype=first.dtype)
         slots = tuple(entry.slot.index for entry in entries)
-        arena = self._scalar_arenas.get((str(first.device), first.dtype))
+        arena = (
+            None
+            if entries[0].slot.relay_lane is not None
+            else self._scalar_arenas.get((str(first.device), first.dtype))
+        )
         contiguous = slots == tuple(range(slots[0], slots[0] + len(slots)))
         if arena is not None and contiguous:
             destination = arena.narrow(0, slots[0], len(slots))
@@ -1518,6 +1746,8 @@ class DeviceProducts:
         if any(entry.producer_recorded for entry in entries):
             raise _invariant("device product was published more than once")
         first_slot = entries[0].slot
+        if first_slot.relay_lane is not None:
+            return None
         first = first_slot.tensor
         if first is None:
             raise _invariant("device product has no physical tensor")
@@ -1745,6 +1975,16 @@ class DeviceProducts:
         self._allocated_bytes = projected
 
     def _return_slot_locked(self, slot: _DeviceSlot) -> None:
+        relay_lane = slot.relay_lane
+        if relay_lane is not None:
+            slot.owner = None
+            operation = relay_lane[:4]
+            self._release_relay_operation_locked(operation)
+            if operation not in self._relay_operation_lanes:
+                for candidate in self._relay_slots.values():
+                    if candidate.relay_lane is not None and candidate.relay_lane[:4] == operation:
+                        candidate.relay_lane = None
+            return
         if slot.owner is not None:
             occupied = self._occupied_slots.get(slot.device_name, 0)
             if occupied < 1:

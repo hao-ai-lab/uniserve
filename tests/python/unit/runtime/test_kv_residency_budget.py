@@ -7,7 +7,7 @@ import pytest
 from tests.python.fixtures.model_execution import TEST_DEPLOYMENT
 from uniserve_worker.bootstrap.worker_info import build_worker_info
 from uniserve_worker.models.runtime import CacheGeometry
-from uniserve_worker.server.stub import StubModel
+from uniserve_worker.models.stub import StubModel
 
 pytestmark = pytest.mark.unit
 

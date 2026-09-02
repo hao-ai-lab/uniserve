@@ -116,14 +116,13 @@ impl MediaGeometry {
     }
 }
 
-/// Media request. Media bytes stay in the shared spool at `output_path`.
+/// Media request. Final media bytes are returned through shared memory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaRequest {
     pub request_id: RequestId,
     pub prompt_token_ids: Vec<u32>,
     pub seed: u64,
     pub priority: i32,
-    pub output_path: String,
     pub geometry: MediaGeometry,
 }
 
@@ -131,9 +130,6 @@ impl MediaRequest {
     pub fn validate(&self) -> Result<(), MediaRequestError> {
         if self.prompt_token_ids.is_empty() {
             return Err(MediaRequestError::EmptyPromptTokens);
-        }
-        if self.output_path.is_empty() {
-            return Err(MediaRequestError::EmptyOutputPath);
         }
         if self.geometry.frame_count < 22
             || self.geometry.frame_count % 17 != 5
@@ -155,8 +151,6 @@ impl MediaRequest {
 pub enum MediaRequestError {
     #[error("media prompt tokens must not be empty")]
     EmptyPromptTokens,
-    #[error("media output path must not be empty")]
-    EmptyOutputPath,
     #[error("media geometry is invalid")]
     InvalidGeometry,
 }
@@ -164,8 +158,14 @@ pub enum MediaRequestError {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MediaEvent {
-    Completed { bytes: u64 },
+    Completed { artifact: MediaArtifact },
     Rejected { message: String },
     Failed { message: String },
     Aborted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaArtifact {
+    pub handle: String,
+    pub bytes: u64,
 }

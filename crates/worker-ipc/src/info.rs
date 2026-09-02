@@ -6,6 +6,87 @@ use super::*;
 // Worker handshake and startup agreement
 // ---------------------------------------------------------------------------
 
+/// Which pipeline stage a worker process serves.
+#[derive(
+    Debug, Default, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerRole {
+    #[default]
+    Full,
+    Encoder,
+    Prefill,
+    Decode,
+    Und,
+    Gen,
+}
+
+impl WorkerRole {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Encoder => "encoder",
+            Self::Prefill => "prefill",
+            Self::Decode => "decode",
+            Self::Und => "und",
+            Self::Gen => "gen",
+        }
+    }
+
+    pub fn from_token(value: &str) -> Option<Self> {
+        Some(match value {
+            "full" => Self::Full,
+            "encoder" => Self::Encoder,
+            "prefill" => Self::Prefill,
+            "decode" => Self::Decode,
+            "und" => Self::Und,
+            "gen" => Self::Gen,
+            _ => return None,
+        })
+    }
+
+    pub const fn work(self) -> &'static [ForwardMode] {
+        match self {
+            Self::Full => &ForwardMode::ALL,
+            Self::Encoder => &[ForwardMode::EncodeVision, ForwardMode::EncodeLatent],
+            Self::Prefill => &[ForwardMode::TokenExtend],
+            Self::Decode => &[
+                ForwardMode::TokenDecode,
+                ForwardMode::TokenVerify,
+                ForwardMode::MediaPrepare,
+                ForwardMode::MediaDenoise,
+                ForwardMode::MediaReconstruct,
+                ForwardMode::Materialize,
+                ForwardMode::TransferKvPublish,
+                ForwardMode::TransferKvInstall,
+            ],
+            Self::Und => &[
+                ForwardMode::TokenExtend,
+                ForwardMode::TokenDecode,
+                ForwardMode::TokenVerify,
+                ForwardMode::EncodeVision,
+                ForwardMode::EncodeLatent,
+                ForwardMode::TransferKvPublish,
+                ForwardMode::TransferKvInstall,
+            ],
+            Self::Gen => &[
+                ForwardMode::MediaPrepare,
+                ForwardMode::MediaDenoise,
+                ForwardMode::MediaReconstruct,
+                ForwardMode::Materialize,
+            ],
+        }
+    }
+
+    pub const fn supported_work(self) -> &'static [ForwardMode] {
+        self.work()
+    }
+
+    pub fn handles(self, operation: &Operation) -> bool {
+        self.work().contains(&operation.work)
+    }
+}
+
 /// One exact decode-and-flow row combination qualified for a single physical call.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GraphBucket {
@@ -18,6 +99,7 @@ pub struct GraphBucket {
 /// Post-load worker geometry, limits, supported work, and model identity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkerInfo {
+    pub worker_role: WorkerRole,
     pub block_size: u32,
     pub num_blocks: u32,
     pub num_layers: u32,
@@ -69,7 +151,6 @@ impl WorkerInfo {
                 ForwardMode::TokenExtend
                     | ForwardMode::TokenDecode
                     | ForwardMode::TokenVerify
-                    | ForwardMode::Draft
                     | ForwardMode::TransferKvPublish
                     | ForwardMode::TransferKvInstall
             )
@@ -242,6 +323,7 @@ impl WorkerInfo {
 impl Default for WorkerInfo {
     fn default() -> Self {
         Self {
+            worker_role: WorkerRole::Full,
             block_size: 64,
             num_blocks: 4096,
             num_layers: 28,

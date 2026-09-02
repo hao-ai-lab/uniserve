@@ -157,7 +157,6 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
             .with_request_id_headers(config.enable_request_id_headers)
             .with_api_key(config.api_key.clone())
             .with_request_timeout(config.request_timeout)
-            .with_max_concurrent_requests(config.max_concurrent_requests)
-            .with_media_spool(config.media_spool.clone()),
+            .with_max_concurrent_requests(config.max_concurrent_requests),
     ))
 }

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from threading import Lock
 from typing import TYPE_CHECKING, Any, TypeAlias
 
 import torch
@@ -37,18 +38,16 @@ from uniserve_worker.runtime.device_products import (
 )
 from uniserve_worker.runtime.encoder_cache import EncoderRead, EncoderWrite
 from uniserve_worker.runtime.latent_pool import LatentPublication, LatentRelease, LatentStaging
-from uniserve_worker.server.completion import (
-    DeferredCompletionTask,
-    DeferredInteger,
-    DeferredLogprobValue,
-    DeferredSpeculativePoint,
-    DeferredToken,
-    DeferredTopLogprobs,
-    PinnedOutputBuffer,
-    PinnedTokenCapture,
+from uniserve_worker.execution.output import (
+    CpuJob,
+    ImagePayload,
+    LogprobOutputRow,
+    SamplingOutputRow,
+    OutputBuffer,
+    TokenCapture,
 )
-from uniserve_worker.server.cpu_tasks import CpuTaskReservation
-from uniserve_worker.server.request_state import RequestRow
+from uniserve_worker.runtime.cpu import CpuTaskReservation
+from uniserve_worker.runtime.request import Request, RequestDraft
 from uniserve_worker.transfer.connector import CachePublication
 from uniserve_worker.transfer.tickets import Locator, TransferTicket
 
@@ -63,7 +62,7 @@ OperationIdentity: TypeAlias = tuple[RequestKey, int]
 @dataclass(slots=True)
 class ForwardRow:
     operation: Operation
-    request: RequestRow
+    request: RequestDraft
     weights: WeightSet
     phase: ModelPhase
     token_ids: torch.Tensor | None = None
@@ -140,7 +139,6 @@ class SampleWork:
     draft_token_ids: tuple[int, ...] = ()
     terminal_draft_prefix: int | None = None
     token_product: DeviceProductWrite | None = None
-    finish_product: DeviceProductWrite | None = None
     transition_product: DeviceProductWrite | None = None
     predicate: torch.Tensor | None = None
     tagged_predicate: bool = False
@@ -164,19 +162,14 @@ class SampleBatchVectors:
 
 @dataclass(frozen=True, slots=True)
 class SampleResult:
-    token_id: int | DeferredToken
+    completion: SamplingOutputRow
     device_token: torch.Tensor | None
-    logprob: float | DeferredLogprobValue | None
-    top_logprobs: tuple[tuple[int, float, int], ...] | DeferredTopLogprobs | None
-    num_accepted_tokens: int | DeferredInteger = 0
+    logprobs: LogprobOutputRow | None
     device_accepted_tokens: torch.Tensor | None = None
     device_selected_point: torch.Tensor | None = None
     device_valid: torch.Tensor | None = None
     device_active: torch.Tensor | None = None
-    prompt_logprobs: tuple[
-        tuple[tuple[int, float, int], ...] | DeferredTopLogprobs,
-        ...,
-    ] = ()
+    prompt_logprobs: tuple[LogprobOutputRow, ...] = ()
     device_finish: torch.Tensor | None = None
     device_continuation: torch.Tensor | None = None
     device_product_published: bool = False
@@ -249,8 +242,8 @@ class PreparedTransferInput:
 
 @dataclass(slots=True)
 class PreparedPredicateBatch:
-    buffer: PinnedOutputBuffer
-    entries: list[tuple[OperationIdentity, PinnedTokenCapture, int]]
+    buffer: OutputBuffer
+    entries: list[tuple[OperationIdentity, TokenCapture, int]]
     transferred: tuple[tuple[OperationIdentity, PreparedTransferInput, int], ...]
     sealed: bool
     _values: dict[OperationIdentity, bool] | None = None
@@ -327,6 +320,28 @@ class PreparedExecution:
     def predicate_values(self) -> dict[OperationIdentity, bool]:
         return {} if self.predicates is None else self.predicates.resolve()
 
+    def on_transfer_completion(self, callback: Callable[[], None]) -> None:
+        tickets = tuple(ticket for transfer in self.transfers for ticket in transfer.tickets)
+        if not tickets:
+            callback()
+            return
+        lock = Lock()
+        fired = False
+
+        def notify_if_ready() -> None:
+            nonlocal fired
+            if not all(ticket.ready() for ticket in tickets):
+                return
+            with lock:
+                if fired:
+                    return
+                fired = True
+            callback()
+
+        for ticket in tickets:
+            ticket.add_done_callback(notify_if_ready)
+        notify_if_ready()
+
     def bind(
         self,
         execute: Callable[[PreparedExecution], CompletionReport],
@@ -376,7 +391,7 @@ class PreparedExecution:
 @dataclass(frozen=True, slots=True)
 class PartitionLayout:
     operations: tuple[Operation, ...]
-    requests: tuple[RequestRow, ...]
+    requests: tuple[RequestDraft, ...]
     seq_lens: tuple[int, ...]
     weights: tuple[WeightSet, ...]
     identities: tuple[OperationIdentity, ...]
@@ -407,10 +422,10 @@ class PartitionState:
     partition: BatchPartition
     started_ns: int
     graph_eligible: bool
-    request_candidates: tuple[RequestRow, ...]
-    request_bases: tuple[RequestRow | None, ...]
-    request_rows: dict[int, RequestRow]
-    completion: PinnedOutputBuffer
+    request_candidates: tuple[RequestDraft, ...]
+    request_bases: tuple[Request | None, ...]
+    request_rows: dict[int, RequestDraft]
+    completion: OutputBuffer
     admissions: dict[RequestKey, NewRequest] = field(default_factory=dict)
     input_tokens: dict[ProductRef, tuple[int, ...]] = field(default_factory=dict)
     input_images: dict[ProductRef, str] = field(default_factory=dict)
@@ -435,11 +450,6 @@ class PartitionState:
     operation_writes: dict[OperationIdentity, DeviceProductWrite] = field(default_factory=dict)
     token_writes: dict[OperationIdentity, DeviceProductWrite] = field(default_factory=dict)
     selected_point_writes: dict[OperationIdentity, DeviceProductWrite] = field(default_factory=dict)
-    accepted_span_writes: dict[OperationIdentity, DeviceProductWrite] = field(default_factory=dict)
-    state_continuation_writes: dict[OperationIdentity, DeviceProductWrite] = field(
-        default_factory=dict
-    )
-    finish_writes: dict[OperationIdentity, DeviceProductWrite] = field(default_factory=dict)
     transition_writes: dict[OperationIdentity, DeviceProductWrite] = field(default_factory=dict)
     propagated_predicate_writes: dict[OperationIdentity, tuple[DeviceProductWrite, ...]] = field(
         default_factory=dict
@@ -466,8 +476,7 @@ class PartitionState:
 
 @dataclass(frozen=True, slots=True)
 class SpeculativeSelection:
-    accepted: DeferredInteger
-    selected_point: DeferredSpeculativePoint
+    completion: SamplingOutputRow
     draft_tokens: tuple[int, ...]
     terminal_prefix: int | None
     base_logical_position: int
@@ -488,27 +497,29 @@ class Outcome:
     """
 
     status: OpStatus
-    selected_point: int | DeferredSpeculativePoint
+    selected_point: int
     logical_lengths: LogicalLengths
     token_span: TokenSpan
     finish_flags: FinishFlags
     product_generations: tuple[int, ...]
-    committed_tokens: tuple[int | DeferredToken, ...] = ()
+    committed_tokens: tuple[int, ...] = ()
+    sampling: SamplingOutputRow | None = None
     products: tuple[ProductPayload, ...] = ()
     selection: SpeculativeSelection | None = None
-    completion_tasks: tuple[DeferredCompletionTask, ...] = ()
+    completion_tasks: tuple[CpuJob | ImagePayload, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
 class StateOutcome:
     """Semantic tokens and products committed while publishing image state."""
 
-    committed_tokens: tuple[int | DeferredToken, ...] = ()
+    committed_tokens: tuple[int, ...] = ()
+    sampling: SamplingOutputRow | None = None
     products: tuple[ProductPayload, ...] = ()
 
     @property
     def sampled_tokens(self) -> int:
-        return len(self.committed_tokens)
+        return len(self.committed_tokens) + int(self.sampling is not None)
 
 
 @dataclass(slots=True)

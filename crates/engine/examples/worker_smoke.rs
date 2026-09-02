@@ -35,7 +35,7 @@ fn main() -> anyhow::Result<()> {
         max_batch_operations: 32,
         max_batch_tokens: 8192,
         attention_backend: AttentionBackend::Auto,
-        worker_kind: None,
+        worker_role: None,
         transfer_backend: TransferBackend::Inproc,
         ..worker_config
     })?;

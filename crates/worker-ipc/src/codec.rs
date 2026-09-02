@@ -10,12 +10,13 @@ use crate::{
     AttentionRegime, Batch, BatchPartition, BlockTable, Bounds, CachePageAllocation, CloseReason,
     CompletionReport, Control, DType, DimBound, Disposition, Domain, DrawLayout, ErrorCode,
     ErrorOperationIdentity, FinishFlags, ForwardMode, GenAdmission, GraphBucket, LatentPlacement,
-    LogicalLengths, MediaAdmission, MediaGeometry, MediaProfileId, ModelOutput, NewRequest, OpId,
-    OpStatus, Operation, PartitionCompletion, Point, PointRange, ProductKind, ProductPayload,
-    ProductRef, ReconstructionKind, ReconstructionPlacement, RegistrationAck, RequestKey,
-    RequestKind, ResourceClass, ResourcePressure, ResponseKind, Rng, RouteId, RowGeometry,
-    SamplingOwnership, ShapeBound, StorageClass, TimingCounters, TokenSpan, UndAdmission,
-    VersionRef, WorkerForwardStats, WorkerInfo, WorkerRequest, WorkerResponse, WorkerResponseError,
+    LogicalLengths, MediaAdmission, MediaGeometry, MediaOutput, MediaProfileId, ModelOutput,
+    NewRequest, OpId, OpStatus, Operation, PartitionCompletion, Point, PointRange, ProductKind,
+    ProductPayload, ProductRef, ReconstructionKind, ReconstructionPlacement, RegistrationAck,
+    RequestKey, RequestKind, ResourceClass, ResourcePressure, ResponseKind, Rng, RouteId,
+    RowGeometry, SamplingOwnership, ShapeBound, StorageClass, TimingCounters, TokenSpan,
+    UndAdmission, VersionRef, WorkerForwardStats, WorkerInfo, WorkerRequest, WorkerResponse,
+    WorkerResponseError, WorkerRole,
 };
 
 pub type CodecResult<T> = std::result::Result<T, CodecError>;
@@ -437,7 +438,6 @@ fn media_admission_from_table(admission: fbs::MediaAdmission<'_>) -> CodecResult
             .unwrap_or_default(),
         seed: admission.seed(),
         profile: media_profile_from_fb(admission.profile())?,
-        output_path: required_str(admission.output_path(), "media admission.output_path")?,
         geometry: MediaGeometry {
             frame_count: geometry.frame_count(),
             video_reconstruction_units: geometry.video_reconstruction_units(),
@@ -830,6 +830,15 @@ fn completion_record_from_table(record: fbs::ModelOutput<'_>) -> CodecResult<Mod
             copy_us: timing_counters.copy_us(),
             host_us: timing_counters.host_us(),
         },
+        media_output: record
+            .media_output()
+            .map(|output| {
+                Ok::<MediaOutput, CodecError>(MediaOutput {
+                    handle: required_str(output.handle(), "completion.media_output.handle")?,
+                    bytes: output.bytes(),
+                })
+            })
+            .transpose()?,
     };
     record.validate()?;
     Ok(record)
@@ -865,6 +874,7 @@ fn error_operation_from_table(
 
 fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
     let info = WorkerInfo {
+        worker_role: worker_role_from_fb(info.worker_role())?,
         block_size: info.block_size(),
         num_blocks: info.num_blocks(),
         num_layers: info.num_layers(),
@@ -1348,7 +1358,6 @@ fn media_admission_to_fb(admission: &MediaAdmission) -> fbs::MediaAdmissionT {
         prompt_token_ids: Some(admission.prompt_token_ids.clone()),
         seed: admission.seed,
         profile: media_profile_to_fb(admission.profile),
-        output_path: Some(admission.output_path.clone()),
         geometry: Some(Box::new(fbs::MediaGeometryT {
             frame_count: admission.geometry.frame_count,
             video_reconstruction_units: admission.geometry.video_reconstruction_units,
@@ -1632,6 +1641,12 @@ fn completion_record_to_fb(record: &ModelOutput) -> fbs::ModelOutputT {
             copy_us: record.timing_counters.copy_us,
             host_us: record.timing_counters.host_us,
         })),
+        media_output: record.media_output.as_ref().map(|output| {
+            Box::new(fbs::MediaOutputT {
+                handle: Some(output.handle.clone()),
+                bytes: output.bytes,
+            })
+        }),
     }
 }
 
@@ -1676,6 +1691,7 @@ fn mixed_bucket_to_fb(bucket: &GraphBucket) -> fbs::GraphBucketT {
 fn info_to_fb(info: &WorkerInfo) -> CodecResult<fbs::WorkerInfoT> {
     info.validate()?;
     Ok(fbs::WorkerInfoT {
+        worker_role: worker_role_to_fb(info.worker_role),
         block_size: info.block_size,
         num_blocks: info.num_blocks,
         num_layers: info.num_layers,
@@ -1918,7 +1934,6 @@ fn work_to_fb(variant: ForwardMode) -> fbs::ForwardMode {
         ForwardMode::TokenExtend => fbs::ForwardMode::TokenExtend,
         ForwardMode::TokenDecode => fbs::ForwardMode::TokenDecode,
         ForwardMode::TokenVerify => fbs::ForwardMode::TokenVerify,
-        ForwardMode::Draft => fbs::ForwardMode::Draft,
         ForwardMode::EncodeVision => fbs::ForwardMode::EncodeVision,
         ForwardMode::EncodeLatent => fbs::ForwardMode::EncodeLatent,
         ForwardMode::TransferProduct => fbs::ForwardMode::TransferProduct,
@@ -2017,6 +2032,29 @@ fn sampling_ownership_to_fb(ownership: SamplingOwnership) -> fbs::SamplingOwners
     }
 }
 
+fn worker_role_to_fb(role: WorkerRole) -> fbs::WorkerRole {
+    match role {
+        WorkerRole::Full => fbs::WorkerRole::Full,
+        WorkerRole::Encoder => fbs::WorkerRole::Encoder,
+        WorkerRole::Prefill => fbs::WorkerRole::Prefill,
+        WorkerRole::Decode => fbs::WorkerRole::Decode,
+        WorkerRole::Und => fbs::WorkerRole::Und,
+        WorkerRole::Gen => fbs::WorkerRole::Gen,
+    }
+}
+
+fn worker_role_from_fb(role: fbs::WorkerRole) -> CodecResult<WorkerRole> {
+    Ok(match role {
+        fbs::WorkerRole::Full => WorkerRole::Full,
+        fbs::WorkerRole::Encoder => WorkerRole::Encoder,
+        fbs::WorkerRole::Prefill => WorkerRole::Prefill,
+        fbs::WorkerRole::Decode => WorkerRole::Decode,
+        fbs::WorkerRole::Und => WorkerRole::Und,
+        fbs::WorkerRole::Gen => WorkerRole::Gen,
+        _ => codec_bail!("unknown worker role {:?}", role),
+    })
+}
+
 fn sampling_ownership_from_fb(ownership: fbs::SamplingOwnership) -> CodecResult<SamplingOwnership> {
     Ok(match ownership {
         fbs::SamplingOwnership::DesignatedRank => SamplingOwnership::DesignatedRank,
@@ -2029,7 +2067,6 @@ fn product_kind_to_fb(kind: ProductKind) -> fbs::ProductKind {
     match kind {
         ProductKind::Token => fbs::ProductKind::Token,
         ProductKind::Logprob => fbs::ProductKind::Logprob,
-        ProductKind::Draft => fbs::ProductKind::Draft,
         ProductKind::VisionFeature => fbs::ProductKind::VisionFeature,
         ProductKind::LatentFeature => fbs::ProductKind::LatentFeature,
         ProductKind::Kv => fbs::ProductKind::Kv,
@@ -2037,10 +2074,7 @@ fn product_kind_to_fb(kind: ProductKind) -> fbs::ProductKind {
         ProductKind::Artifact => fbs::ProductKind::Artifact,
         ProductKind::Completion => fbs::ProductKind::Completion,
         ProductKind::SamplingState => fbs::ProductKind::SamplingState,
-        ProductKind::Finish => fbs::ProductKind::Finish,
         ProductKind::SelectedPoint => fbs::ProductKind::SelectedPoint,
-        ProductKind::AcceptedSpan => fbs::ProductKind::AcceptedSpan,
-        ProductKind::Continuation => fbs::ProductKind::Continuation,
     }
 }
 
@@ -2048,7 +2082,6 @@ fn product_kind_from_fb(kind: fbs::ProductKind) -> CodecResult<ProductKind> {
     Ok(match kind {
         fbs::ProductKind::Token => ProductKind::Token,
         fbs::ProductKind::Logprob => ProductKind::Logprob,
-        fbs::ProductKind::Draft => ProductKind::Draft,
         fbs::ProductKind::VisionFeature => ProductKind::VisionFeature,
         fbs::ProductKind::LatentFeature => ProductKind::LatentFeature,
         fbs::ProductKind::Kv => ProductKind::Kv,
@@ -2056,10 +2089,7 @@ fn product_kind_from_fb(kind: fbs::ProductKind) -> CodecResult<ProductKind> {
         fbs::ProductKind::Artifact => ProductKind::Artifact,
         fbs::ProductKind::Completion => ProductKind::Completion,
         fbs::ProductKind::SamplingState => ProductKind::SamplingState,
-        fbs::ProductKind::Finish => ProductKind::Finish,
         fbs::ProductKind::SelectedPoint => ProductKind::SelectedPoint,
-        fbs::ProductKind::AcceptedSpan => ProductKind::AcceptedSpan,
-        fbs::ProductKind::Continuation => ProductKind::Continuation,
         other => codec_bail!("unknown product kind {}", other.0),
     })
 }
@@ -2067,6 +2097,7 @@ fn product_kind_from_fb(kind: fbs::ProductKind) -> CodecResult<ProductKind> {
 fn storage_class_to_fb(class: StorageClass) -> fbs::StorageClass {
     match class {
         StorageClass::DeviceTensor => fbs::StorageClass::DeviceTensor,
+        StorageClass::RequestRelay => fbs::StorageClass::RequestRelay,
         StorageClass::PagedKv => fbs::StorageClass::PagedKv,
         StorageClass::LatentArena => fbs::StorageClass::LatentArena,
         StorageClass::HostStaging => fbs::StorageClass::HostStaging,
@@ -2077,6 +2108,7 @@ fn storage_class_to_fb(class: StorageClass) -> fbs::StorageClass {
 fn storage_class_from_fb(class: fbs::StorageClass) -> CodecResult<StorageClass> {
     Ok(match class {
         fbs::StorageClass::DeviceTensor => StorageClass::DeviceTensor,
+        fbs::StorageClass::RequestRelay => StorageClass::RequestRelay,
         fbs::StorageClass::PagedKv => StorageClass::PagedKv,
         fbs::StorageClass::LatentArena => StorageClass::LatentArena,
         fbs::StorageClass::HostStaging => StorageClass::HostStaging,

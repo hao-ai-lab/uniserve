@@ -9,6 +9,15 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from .video_vae_fusions import (
+    qk_rmsnorm_partial_rope_,
+    scaled_residual_,
+    scaled_residual_layernorm,
+    scaled_residual_rmsnorm_,
+    value_first_swiglu,
+    video_rmsnorm,
+)
+
 __all__ = ["MiniMaxH3VideoDecoder"]
 
 
@@ -71,11 +80,8 @@ class _Attention(nn.Module):
         query = self.to_q(hidden).view(batch, sequence, self.heads, self.head_dim)
         key = self.to_k(hidden).view(batch, sequence, self.heads, self.head_dim)
         value = self.to_v(hidden).view(batch, sequence, self.heads, self.head_dim)
-        query = self.norm_q(query.float()).to(query.dtype)
-        key = self.norm_k(key.float()).to(key.dtype)
-        cosine, sine = (tensor.to(query.dtype) for tensor in rotary)
-        query = _apply_rotary(query, cosine, sine)
-        key = _apply_rotary(key, cosine, sine)
+        cosine, sine = rotary
+        qk_rmsnorm_partial_rope_(query, key, cosine, sine)
         attended = F.scaled_dot_product_attention(
             query.transpose(1, 2),
             key.transpose(1, 2),
@@ -92,8 +98,7 @@ class _SwiGLU(nn.Module):
         self.proj = nn.Linear(width, intermediate * 2, bias=True)
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        value, gate = self.proj(hidden).chunk(2, dim=-1)
-        return value * F.silu(gate)
+        return value_first_swiglu(self.proj(hidden))
 
 
 class _FeedForward(nn.Module):
@@ -124,10 +129,24 @@ class _TransformerBlock(nn.Module):
         hidden: torch.Tensor,
         rotary: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        normalized = self.norm1(hidden.float()).to(hidden.dtype)
-        hidden = hidden + self.attn(normalized, rotary) * self.scale1
-        normalized = self.norm2(hidden.float()).to(hidden.dtype)
-        return hidden + self.ff(normalized) * self.scale2
+        normalized = video_rmsnorm(hidden, self.norm1.weight, eps=float(self.norm1.eps))
+        hidden, feed_forward = self.forward_normalized(hidden, normalized, rotary)
+        return scaled_residual_(hidden, feed_forward, self.scale2)
+
+    def forward_normalized(
+        self,
+        hidden: torch.Tensor,
+        normalized: torch.Tensor,
+        rotary: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden, normalized = scaled_residual_rmsnorm_(
+            hidden,
+            self.attn(normalized, rotary),
+            self.scale1,
+            self.norm2.weight,
+            eps=float(self.norm2.eps),
+        )
+        return hidden, self.ff(normalized)
 
 
 class MiniMaxH3VideoDecoder(nn.Module):
@@ -252,6 +271,7 @@ class MiniMaxH3VideoDecoder(nn.Module):
             channels,
         )
         hidden = self.decoder.proj_in(hidden)
+        compute_dtype = hidden.dtype
         patch_count = hidden.shape[1]
         registers = self.decoder.register_tokens.expand(batch, -1, -1)
         hidden = torch.cat((hidden, registers, torch.zeros_like(hidden[:, :1])), dim=1)
@@ -263,9 +283,30 @@ class MiniMaxH3VideoDecoder(nn.Module):
         positions = positions.unsqueeze(0).expand(batch, -1, -1)
         suffix = positions.new_zeros((batch, 5, 3))
         rotary = self.decoder.rope(torch.cat((positions, suffix), dim=1))
-        for block in self.decoder.transformer_blocks:
-            hidden = block(hidden, rotary)
-        hidden = self.decoder.proj_out(self.decoder.norm_out(hidden))[:, :patch_count]
+        rotary = tuple(value.to(compute_dtype) for value in rotary)
+        first = self.decoder.transformer_blocks[0]
+        normalized = video_rmsnorm(hidden, first.norm1.weight, eps=float(first.norm1.eps))
+        hidden, feed_forward = first.forward_normalized(hidden, normalized, rotary)
+        previous = first
+        for block in self.decoder.transformer_blocks[1:]:
+            hidden, normalized = scaled_residual_rmsnorm_(
+                hidden,
+                feed_forward,
+                previous.scale2,
+                block.norm1.weight,
+                eps=float(block.norm1.eps),
+            )
+            hidden, feed_forward = block.forward_normalized(hidden, normalized, rotary)
+            previous = block
+        hidden = scaled_residual_layernorm(
+            hidden,
+            feed_forward,
+            previous.scale2,
+            self.decoder.norm_out.weight,
+            self.decoder.norm_out.bias,
+            eps=float(self.decoder.norm_out.eps),
+        )
+        hidden = self.decoder.proj_out(hidden)[:, :patch_count]
         hidden = hidden.view(batch, frames, height, width, 3, 4, 16, 16)
         return (
             hidden.permute(0, 4, 1, 5, 2, 6, 3, 7)

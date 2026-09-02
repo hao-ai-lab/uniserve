@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
-use crate::executor::{ControlAck, ControlOp, Executor, WorkerKind};
+use crate::executor::{ControlAck, ControlOp, Executor, WorkerRole};
 use anyhow::Context;
 use uniserve_core::{CommandWaker, RequestId};
 use uniserve_worker_ipc::{
@@ -108,7 +108,7 @@ fn extend_unique<T: Clone + Eq + std::hash::Hash>(target: &mut Vec<T>, incoming:
 
 impl StagedExecutor {
     /// Build a staged router after validating exact, non-overlapping pool claims.
-    pub fn try_new(pools: Vec<(WorkerKind, Box<dyn Executor>)>) -> anyhow::Result<Self> {
+    pub fn try_new(pools: Vec<(WorkerRole, Box<dyn Executor>)>) -> anyhow::Result<Self> {
         anyhow::ensure!(!pools.is_empty(), "StagedExecutor needs at least one pool");
         anyhow::ensure!(
             pools.len() <= u64::BITS as usize,

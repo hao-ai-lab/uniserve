@@ -7,7 +7,7 @@ from typing import Any, Mapping, TypeAlias
 
 import torch
 
-from ..server.profiler import profile_range
+from ..profiling import profile_range
 
 
 @torch.library.custom_op(

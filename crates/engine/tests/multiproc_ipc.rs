@@ -16,7 +16,7 @@ use base64::Engine as _;
 use uniserve_core::{BlockId, MediaEvent, MediaGeometry, MediaRequest, RequestId, SamplingParams};
 use uniserve_engine::{
     ControlOp, ControlTokens, EngineHandle, Executor, MultiprocExecutor, Scheduler,
-    TransferBackend, WorkerExecError, WorkerKind, WorkerLossError, WorkerProcessArgs,
+    TransferBackend, WorkerExecError, WorkerLossError, WorkerProcessArgs, WorkerRole,
 };
 use uniserve_worker_ipc::{
     AttentionRegime, Batch, BatchPartition, BlockTable, Bounds, CachePageAllocation, CloseReason,
@@ -70,7 +70,6 @@ fn qualify_failed_media_admission_reclamation() -> anyhow::Result<()> {
                 prompt_token_ids,
                 seed: index as u64,
                 priority: 0,
-                output_path: format!("/tmp/uniserve-media-{request_id:?}.mp4"),
                 geometry: MediaGeometry {
                     frame_count: 22,
                     video_reconstruction_units: 1,
@@ -360,7 +359,7 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         max_batch_operations: 256,
         max_batch_tokens: 256,
         attention_backend: uniserve_worker_ipc::AttentionBackend::TorchSdpa,
-        worker_kind: Some(WorkerKind::Full),
+        worker_role: Some(WorkerRole::Full),
         transfer_backend: TransferBackend::Shm,
         ..config
     })?;
@@ -648,7 +647,7 @@ fn spawn_rank_group_with_capacities(
         max_batch_operations: 256,
         max_batch_tokens: 256,
         attention_backend: uniserve_worker_ipc::AttentionBackend::TorchSdpa,
-        worker_kind: None,
+        worker_role: None,
         transfer_backend: TransferBackend::Inproc,
         ..config
     })
@@ -743,24 +742,13 @@ fn token_batch(
         output_index: 0,
         generation: (op_id.0 as u32).saturating_mul(4).saturating_add(1),
         kind: ProductKind::Token,
-        storage_class: StorageClass::DeviceTensor,
+        storage_class: StorageClass::RequestRelay,
         dtype: DType::U32,
         shape_bound: ShapeBound::default(),
         point_range: PointRange {
             base_point: 0,
             max_points: 1,
         },
-    };
-    let finish_output = ProductRef {
-        request_key,
-        producer_op_id: op_id,
-        output_index: 4,
-        generation: (op_id.0 as u32).saturating_mul(6).saturating_add(5),
-        kind: ProductKind::Finish,
-        storage_class: StorageClass::DeviceTensor,
-        dtype: DType::U8,
-        shape_bound: ShapeBound::default(),
-        point_range: PointRange::default(),
     };
     let operation = Operation {
         request_key,
@@ -777,7 +765,7 @@ fn token_batch(
             ..Bounds::default()
         },
         inputs: vec![input.clone()],
-        outputs: vec![token_output, finish_output],
+        outputs: vec![token_output],
         predicate: None,
         rng: None,
         control_seq,

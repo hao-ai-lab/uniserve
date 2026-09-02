@@ -8,7 +8,7 @@
 //! trait-object tower in front of it.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::config::EngineSettings;
@@ -199,7 +199,6 @@ impl ResolvedAssets {
             .clone()
             .unwrap_or_else(|| config.model.clone());
         if config.model_description == ModelDescription::MiniMaxH3 {
-            prepare_media_spool(&config.media_spool)?;
             let tokenizer_path =
                 resolve_model_file(&config.model, "tokenizer/tokenizer.json").await?;
             let tokenizer: DynTokenizer = Arc::new(HuggingFaceTokenizer::new(&tokenizer_path)?);
@@ -346,37 +345,6 @@ impl ResolvedAssets {
             Self::Text { .. } | Self::Media { .. } => None,
         }
     }
-}
-
-fn prepare_media_spool(path: &Path) -> std::result::Result<(), ModelResolutionError> {
-    std::fs::create_dir_all(path).map_err(|source| ModelResolutionError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(
-            |source| ModelResolutionError::Io {
-                path: path.to_path_buf(),
-                source,
-            },
-        )?;
-    }
-    let probe = path.join(format!(".probe-{}", uuid::Uuid::new_v4()));
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&probe)
-        .map_err(|source| ModelResolutionError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    std::fs::remove_file(&probe).map_err(|source| ModelResolutionError::Io {
-        path: probe,
-        source,
-    })?;
-    Ok(())
 }
 
 /// Text chat description: HF tokenization + chat template + fixed Qwen3 parser

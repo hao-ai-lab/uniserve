@@ -1,10 +1,10 @@
-"""Shared encoded audio/video output sessions."""
+"""In-memory encoded audio/video mux sessions."""
 
 from __future__ import annotations
 
+import io
 from dataclasses import dataclass
 from fractions import Fraction
-from pathlib import Path
 from threading import RLock
 
 import numpy as np
@@ -60,9 +60,9 @@ class AvMuxConfig:
 class AvMuxSession:
     """One request-owned H.264/AAC-style container with split A/V locking."""
 
-    def __init__(self, path: Path, config: AvMuxConfig) -> None:
-        self.path = path
+    def __init__(self, config: AvMuxConfig) -> None:
         self.config = config
+        self._buffer = io.BytesIO()
         self._container = None
         self._video = None
         self._audio = None
@@ -82,8 +82,7 @@ class AvMuxSession:
             import av
 
             config = self.config
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            container = av.open(str(self.path), mode="w", format="mp4")
+            container = av.open(self._buffer, mode="w", format="mp4")
             video = container.add_stream(config.video_codec, rate=config.frame_rate)
             video.width = config.width
             video.height = config.height
@@ -168,11 +167,14 @@ class AvMuxSession:
             self._audio_packets = packets
             self._audio_written = True
 
-    def close(self) -> None:
+    def close(self) -> bytes:
         config = self.config
         with self._video_lock, self._audio_lock:
             if self._closed:
-                return
+                value = self._buffer.getvalue()
+                if not value:
+                    raise RuntimeError("media mux produced an empty container")
+                return value
             if self._video_frames != config.frame_count or not self._audio_written:
                 raise RuntimeError("media materialization is incomplete")
             container, video, audio = self._container, self._video, self._audio
@@ -188,6 +190,10 @@ class AvMuxSession:
                     container.mux(packet)
                 container.close()
             self._closed = True
+            value = self._buffer.getvalue()
+            if not value:
+                raise RuntimeError("media mux produced an empty container")
+            return value
 
     def abort(self) -> None:
         with self._video_lock, self._audio_lock:
@@ -200,7 +206,4 @@ class AvMuxSession:
                     pass
             self._closed = True
         if not completed:
-            try:
-                self.path.unlink(missing_ok=True)
-            except OSError:
-                pass
+            self._buffer.close()

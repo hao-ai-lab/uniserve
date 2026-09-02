@@ -597,6 +597,10 @@ fn merge_completion_record(
             && canonical.finish_flags == rank_completion.finish_flags,
         "completion result fields diverged"
     );
+    anyhow::ensure!(
+        rank_completion.media_output.is_none(),
+        "non-designated rank returned a media artifact"
+    );
     match ownership {
         SamplingOwnership::DesignatedRank => anyhow::ensure!(
             canonical.product_generations == rank_completion.product_generations,

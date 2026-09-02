@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+from typing import cast
 
 import torch
 
@@ -12,7 +12,6 @@ from uniserve_worker.execution.batch import (
     FinishFlags,
     FixedPoint,
     ForwardMode,
-    NewRequest,
     Operation,
     OpStatus,
     ReconstructionKind,
@@ -27,9 +26,9 @@ from uniserve_worker.models.minimax_h3.execution import (
 )
 from uniserve_worker.models.minimax_h3.state import H3StateSlot
 from uniserve_worker.nn.mesh import DeviceMesh
-from uniserve_worker.server.completion import EventGatedDeferredTask, PinnedOutputBuffer
-from uniserve_worker.server.cpu_tasks import CpuTaskReservation
-from uniserve_worker.server.profiler import profile_range
+from uniserve_worker.execution.output import CpuJob, OutputBuffer
+from uniserve_worker.profiling import profile_range
+from uniserve_worker.runtime.cpu import CpuTaskReservation
 
 from .resources import ExecutionResources
 from .rows import OperationState, Outcome, PartitionState
@@ -64,10 +63,11 @@ def reconstruction_placement(
 
 
 def validate_batch(runtime: ExecutionResources, batch: Batch) -> None:
-    """Validate fixed H3 admission and spool requirements before staging state."""
+    """Validate fixed H3 admission requirements before staging state."""
 
-    if not isinstance(runtime.model, MiniMaxH3Model):
+    if runtime.model.media_profile != "minimax_h3":
         return
+    model = cast(MiniMaxH3Model, runtime.model)
     admissions = {admission.request_key: admission for admission in batch.admissions}
     preparations = {
         operation.request_key: operation
@@ -77,8 +77,7 @@ def validate_batch(runtime: ExecutionResources, batch: Batch) -> None:
     if set(admissions) != set(preparations):
         raise invalid_descriptor("H3 admissions must exactly match preparation operations")
     for request_key, admission in admissions.items():
-        output_path = _output_path(runtime, admission)
-        slot = runtime.model.states.get(int(admission.request_pool_idx))
+        slot = model.states.get(int(admission.request_pool_idx))
         if slot.active:
             raise invalid_descriptor("H3 admission targets an occupied request slot")
         operation = preparations[request_key]
@@ -89,8 +88,6 @@ def validate_batch(runtime: ExecutionResources, batch: Batch) -> None:
             or int(point.point_index) != 0
         ):
             raise invalid_descriptor("H3 preparation does not name its admission root")
-        if output_path.name in {".", ".."}:
-            raise invalid_descriptor("H3 output has an invalid filename")
 
 
 def execute_action(
@@ -100,10 +97,10 @@ def execute_action(
     operation: Operation,
     partition: BatchPartition,
     slot: H3StateSlot,
-    buffer: PinnedOutputBuffer,
+    buffer: OutputBuffer,
     reservation: CpuTaskReservation | None,
     ring_lease: H3OutputRingLease | None,
-) -> tuple[EventGatedDeferredTask, ...]:
+) -> tuple[CpuJob, ...]:
     """Run one H3 quantum after its resident request state has been bound."""
 
     variant = operation.work
@@ -182,7 +179,7 @@ def execute_action(
 def run_action(runtime: ExecutionResources, state: OperationState) -> bool:
     """Land one ready H3 action without constructing a packed forward row."""
 
-    if state.phase != "initial" or not isinstance(runtime.model, MiniMaxH3Model):
+    if state.phase != "initial" or runtime.model.media_profile != "minimax_h3":
         return False
     operation = state.operation
     if operation.work not in {
@@ -195,7 +192,7 @@ def run_action(runtime: ExecutionResources, state: OperationState) -> bool:
     scope = state.partition
     if not isinstance(scope, PartitionState):
         raise RuntimeError("H3 action lost its partition state")
-    model = runtime.model
+    model = cast(MiniMaxH3Model, runtime.model)
     session = runtime.request_row(scope, operation.request_key.session_id)
     slot = model.states.get(int(session.request_pool_idx))
     mux = runtime._h3_mux
@@ -207,7 +204,6 @@ def run_action(runtime: ExecutionResources, state: OperationState) -> bool:
         if admission is None:
             raise invalid_descriptor("H3 preparation has no matching admission")
         model.prepare(slot, admission)
-        output_path = _output_path(runtime, admission)
         if runtime.mesh.coord("sp") == 0:
             assert mux is not None
             media = admission.media
@@ -216,7 +212,6 @@ def run_action(runtime: ExecutionResources, state: OperationState) -> bool:
             execution = model._page_execution_for_slot(slot)
             mux.open(
                 operation.request_key,
-                output_path,
                 frame_count=media.geometry.frame_count,
                 video_unit_frames=execution.layout.reconstruction_unit_frames,
             )
@@ -250,21 +245,6 @@ def run_action(runtime: ExecutionResources, state: OperationState) -> bool:
     )
     state.phase = "done"
     return True
-
-
-def _output_path(runtime: ExecutionResources, admission: NewRequest) -> Path:
-    media = admission.media
-    spool = runtime._media_spool
-    if media is None or spool is None:
-        raise invalid_descriptor("H3 admission is missing its media output")
-    output_path = Path(media.output_path).expanduser()
-    try:
-        output_parent = output_path.parent.resolve(strict=True)
-    except OSError as error:
-        raise invalid_descriptor("H3 output directory is unavailable") from error
-    if output_parent != spool or output_path.suffix != ".mp4":
-        raise invalid_descriptor("H3 output must be an MP4 in the configured media spool")
-    return output_parent / output_path.name
 
 
 def _request_label(operation: Operation) -> str:

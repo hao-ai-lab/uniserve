@@ -118,10 +118,6 @@ pub(crate) struct SharedRuntimeArgs {
     #[arg(long)]
     pub model_description: ModelDescription,
 
-    /// Shared absolute directory used for generated media files.
-    #[arg(long, default_value = "/tmp/uniserve-media")]
-    pub media_spool: std::path::PathBuf,
-
     /// Override the maximum model context length. When unset, the model's real
     /// context length (`max_position_embeddings`) is used.
     #[arg(long = "max-model-len")]
@@ -257,7 +253,6 @@ impl SharedRuntimeArgs {
     pub(crate) fn engine_settings(&self) -> EngineSettings {
         let is_media = self.model_description == ModelDescription::MiniMaxH3;
         let mut worker_process = self.worker_process.to_args();
-        worker_process.media_spool = is_media.then(|| self.media_spool.clone());
         worker_process.python = self.worker_python.clone();
         worker_process.model = self.model.clone();
         worker_process.device = self.device.clone();
@@ -307,7 +302,6 @@ impl SharedRuntimeArgs {
             model,
             model_description: self.model_description,
             served_model_name: self.served_model_name,
-            media_spool: self.media_spool,
             listener_mode,
             chat_template: self.chat_template,
             default_chat_template_kwargs: self.default_chat_template_kwargs,
@@ -425,7 +419,6 @@ impl WorkerProcessOptions {
             flashinfer_prefill_split_tile_size: self.flashinfer_prefill_split_tile_size,
             flashinfer_disable_split_kv: self.flashinfer_disable_split_kv,
             flashinfer_fast_decode_plan: self.flashinfer_fast_decode_plan,
-            media_spool: None,
             ..WorkerProcessArgs::default()
         }
     }

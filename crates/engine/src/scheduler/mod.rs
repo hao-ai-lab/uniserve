@@ -83,8 +83,8 @@ use crossbeam_channel::Receiver;
 use uniserve_core::product_blob::{LogprobBlob, RankedToken};
 use uniserve_core::{BlockId, CfgParams, ImageIngestStep, encoder_cache_key};
 use uniserve_core::{
-    FinishReason, GenerationEvent, GenerationRequest, MediaEvent, MediaRequest, PositionLogprobs,
-    TokenLogprob,
+    FinishReason, GenerationEvent, GenerationRequest, MediaArtifact, MediaEvent, MediaRequest,
+    PositionLogprobs, TokenLogprob,
 };
 use uniserve_core::{HashAlgo, RequestId};
 use uniserve_worker_ipc::{
@@ -490,6 +490,7 @@ struct MediaFlowState {
     fixed_parent: VersionRef,
     projected_parent: VersionRef,
     terminal_intent: MediaTerminalIntent,
+    artifact: Option<MediaArtifact>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -654,8 +655,7 @@ fn batch_kind(operation_variant: ForwardMode) -> BatchKind {
             BatchKind::Prefill
         }
         ForwardMode::TokenDecode | ForwardMode::TokenVerify => BatchKind::Decode,
-        ForwardMode::Draft
-        | ForwardMode::MediaDenoise
+        ForwardMode::MediaDenoise
         | ForwardMode::MediaReconstruct
         | ForwardMode::MediaPrepare
         | ForwardMode::Materialize
@@ -880,10 +880,9 @@ fn partition_attention(operations: &[Operation]) -> AttentionRegime {
     let regimes = operations
         .iter()
         .map(|operation| match operation.work {
-            ForwardMode::TokenExtend
-            | ForwardMode::TokenDecode
-            | ForwardMode::TokenVerify
-            | ForwardMode::Draft => AttentionRegime::Causal,
+            ForwardMode::TokenExtend | ForwardMode::TokenDecode | ForwardMode::TokenVerify => {
+                AttentionRegime::Causal
+            }
             ForwardMode::MediaDenoise => AttentionRegime::Hybrid,
             ForwardMode::MediaPrepare
             | ForwardMode::MediaReconstruct

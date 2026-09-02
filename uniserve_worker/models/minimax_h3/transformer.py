@@ -13,7 +13,6 @@ from ...backends.attention.video_sparse import (
     VideoSparseAttentionBackend,
     VideoSparseAttentionWorkspace,
     build_video_sparse_metadata,
-    video_sparse_selected_tiles,
 )
 from ...nn.diffusion.modulation import prepare_modulation_plan, select_modulation_step
 from ...nn.layer import LayerConfig
@@ -28,12 +27,14 @@ from ...nn.quant import (
 )
 from ...ops import qk_norm_rope
 from .fusions import (
+    attention_residual_modulated_rmsnorm,
+    dual_gated_residual,
     row_modulated_rmsnorm,
     value_first_swiglu,
 )
-from .packing import AUDIO_TAG, audio_latent_frames
+from .packing import AUDIO_TAG
 from .precision import LinearPrecision
-from .state import MIN_H3_FRAMES, H3Layout, H3Scratch, H3StateSlot
+from .state import H3Layout, H3Scratch, H3StateSlot
 
 __all__ = [
     "H3TransformerConfig",
@@ -540,7 +541,7 @@ class _TransformerBlock(nn.Module):
             adaln_indices,
             eps=self.norm1.eps,
         )
-        hidden = hidden + gate_attn.index_select(0, adaln_indices) * self.attn(
+        attention = self.attn(
             normalized,
             rotary,
             tile_valid_sizes,
@@ -562,15 +563,25 @@ class _TransformerBlock(nn.Module):
             compressed_tiles,
             topk_indices_i32,
         )
-        normalized = row_modulated_rmsnorm(
+        normalized = attention_residual_modulated_rmsnorm(
             hidden,
+            attention,
+            gate_attn,
             self.norm2.weight,
             shift_ffn,
             scale_ffn,
             adaln_indices,
             eps=self.norm2.eps,
         )
-        return hidden + gate_ffn.index_select(0, adaln_indices) * self.ff(normalized)
+        feed_forward = self.ff(normalized)
+        return dual_gated_residual(
+            hidden,
+            attention,
+            feed_forward,
+            gate_attn,
+            gate_ffn,
+            adaln_indices,
+        )
 
 
 class _OutputNorm(nn.Module):
@@ -729,8 +740,7 @@ class MiniMaxH3Transformer(nn.Module):
             "non_text_mask",
         ):
             setattr(self, name, getattr(execution, name))
-        for compiled_block in self.transformer_blocks:
-            block = getattr(compiled_block, "_orig_mod", compiled_block)
+        for block in self.transformer_blocks:
             block.attn.vsa = execution.vsa
 
     def refine_text(self, encoder_hidden: torch.Tensor) -> torch.Tensor:
@@ -756,8 +766,7 @@ class MiniMaxH3Transformer(nn.Module):
         prepare_modulation_plan(
             activated_time,
             tuple(
-                getattr(compiled_block, "_orig_mod", compiled_block).adaln_proj.linear
-                for compiled_block in self.transformer_blocks
+                block.adaln_proj.linear for block in self.transformer_blocks
             ),
             self.norm_out.linear,
             slot.block_adaln_plan,
@@ -807,72 +816,7 @@ class MiniMaxH3Transformer(nn.Module):
             hidden[0].index_copy_(0, indices, projected_bf16)
 
         rotary = (slot.rotary_cosine, slot.rotary_sine)
-        mark_dynamic = torch._dynamo.mark_dynamic
-        local_min, local_max = self.dynamic_local_rows
-        global_min, global_max = self.dynamic_global_rows
-        tile_min, tile_max = self.dynamic_tiles
-        prefix_min, prefix_max = self.dynamic_prefix_tiles
-        dense_min, dense_max = self.dynamic_dense_tiles
-        mark_dynamic(self.adaln_indices, 0, min=local_min, max=local_max)
-        for value in rotary:
-            mark_dynamic(value, 0, min=global_min, max=global_max)
-        mark_dynamic(slot.tile_valid_sizes, 0, min=tile_min, max=tile_max)
-        mark_dynamic(
-            slot.prefix_key_indices,
-            0,
-            min=prefix_min,
-            max=prefix_max,
-        )
-        mark_dynamic(
-            slot.dense_key_indices,
-            0,
-            min=dense_min,
-            max=dense_max,
-        )
-        for value in scratch.projection_peers:
-            mark_dynamic(value, 0, min=local_min, max=local_max)
-        mark_dynamic(
-            scratch.attention_workspace,
-            0,
-            min=global_min * self.config.hidden_size,
-            max=global_max * self.config.hidden_size,
-        )
-        mark_dynamic(
-            scratch.attention_output,
-            0,
-            min=global_min,
-            max=global_max,
-        )
-        mark_dynamic(scratch.tile_scores, (1, 2), min=tile_min, max=tile_max)
-        mark_dynamic(scratch.block_counts, 1, min=tile_min, max=tile_max)
-        mark_dynamic(scratch.block_indices, 1, min=tile_min, max=tile_max)
-        mark_dynamic(scratch.block_indices, 2, min=dense_min, max=dense_max)
-        for value in (
-            scratch.pooled_query,
-            scratch.pooled_key,
-            scratch.pooled_value,
-        ):
-            mark_dynamic(value, 0, min=tile_min, max=tile_max)
-        mark_dynamic(scratch.compressed_tiles, 1, min=tile_min, max=tile_max)
-        mark_dynamic(
-            scratch.topk_indices_i32,
-            1,
-            min=self.dynamic_video_tiles[0],
-            max=self.dynamic_video_tiles[1],
-        )
-        mark_dynamic(
-            scratch.topk_indices_i32,
-            2,
-            min=self.dynamic_keep_video_tiles[0],
-            max=self.dynamic_keep_video_tiles[1],
-        )
         for layer, block in enumerate(self.transformer_blocks):
-            torch._dynamo.mark_dynamic(
-                hidden,
-                1,
-                min=self.dynamic_local_rows[0],
-                max=self.dynamic_local_rows[1],
-            )
             hidden = block(
                 hidden,
                 scratch.block_adaln_params[layer],
@@ -919,40 +863,3 @@ class MiniMaxH3Transformer(nn.Module):
                 out=velocity,
             )
         return scratch.video_velocity, scratch.audio_velocity
-
-    def compile_blocks(self) -> None:
-        min_layout = H3Layout.build(
-            self.mesh,
-            frames=MIN_H3_FRAMES,
-            text_rows=64,
-            audio_frames=audio_latent_frames(MIN_H3_FRAMES),
-            schedule=self.layout.schedule,
-        )
-        min_video_tiles = int(min_layout.packed.video_tiles)
-        max_video_tiles = int(self.layout.packed.video_tiles)
-        max_prefix_tiles = int(self.layout.packed.prefix_tiles)
-        min_prefix_tiles = int(min_layout.packed.prefix_tiles)
-        min_tiles = int(min_layout.packed.padded_rows) // 64
-        max_tiles = int(self.layout.packed.padded_rows) // 64
-        self.dynamic_local_rows = (min_layout.local_rows, self.layout.local_rows)
-        self.dynamic_global_rows = (
-            min_layout.packed.padded_rows,
-            self.layout.packed.padded_rows,
-        )
-        self.dynamic_tiles = (min_tiles, max_tiles)
-        self.dynamic_prefix_tiles = (min_prefix_tiles, max_prefix_tiles)
-        self.dynamic_dense_tiles = (
-            min_prefix_tiles + min_video_tiles,
-            max_prefix_tiles + max_video_tiles,
-        )
-        self.dynamic_video_tiles = (min_video_tiles, max_video_tiles)
-        self.dynamic_keep_video_tiles = (
-            video_sparse_selected_tiles(min_video_tiles),
-            video_sparse_selected_tiles(max_video_tiles),
-        )
-        for index, block in enumerate(self.transformer_blocks):
-            self.transformer_blocks[index] = torch.compile(
-                block,
-                fullgraph=True,
-                dynamic=True,
-            )
