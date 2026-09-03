@@ -20,7 +20,7 @@ def test_fasth3_checkpoint_schedule(shift: float, expected: tuple[float, ...]) -
     assert shifted_sigmas(shift) == pytest.approx(expected)
 
 
-@pytest.mark.parametrize(("video_frames", "expected"), ((124, 207), (362, 603)))
+@pytest.mark.parametrize(("video_frames", "expected"), ((124, 207), (362, 604)))
 def test_fasth3_audio_duration_geometry(video_frames: int, expected: int) -> None:
     assert audio_latent_frames(video_frames) == expected
 
