@@ -1,43 +1,29 @@
-//! Administrative request/response framing around batches and worker information.
+//! Four-operation worker request/response framing.
 
 use super::*;
 
 // ---------------------------------------------------------------------------
-// Administrative request and response framing
+// Worker request and response framing
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestKind {
-    GetInfo,
-    Execute,
-    PollCompletions,
-    DropSession,
-    Shutdown,
-    ReleaseProducts,
-    GetPressure,
+    Info,
+    Submit,
+    Poll,
+    Close,
 }
 
 impl RequestKind {
-    pub const ALL: [Self; 7] = [
-        Self::GetInfo,
-        Self::Execute,
-        Self::PollCompletions,
-        Self::DropSession,
-        Self::Shutdown,
-        Self::ReleaseProducts,
-        Self::GetPressure,
-    ];
+    pub const ALL: [Self; 4] = [Self::Info, Self::Submit, Self::Poll, Self::Close];
 
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::GetInfo => "get_info",
-            Self::Execute => "execute",
-            Self::PollCompletions => "poll_completions",
-            Self::DropSession => "drop_session",
-            Self::Shutdown => "shutdown",
-            Self::ReleaseProducts => "release_products",
-            Self::GetPressure => "get_pressure",
+            Self::Info => "info",
+            Self::Submit => "submit",
+            Self::Poll => "poll",
+            Self::Close => "close",
         }
     }
 }
@@ -45,81 +31,61 @@ impl RequestKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkerRequest {
-    GetInfo { call_id: Option<u64> },
-    Execute { call_id: Option<u64>, batch: Batch },
-    PollCompletions { call_id: Option<u64>, step_id: u64 },
-    DropSession { session_id: RequestId },
-    ReleaseProducts { product_handles: Vec<u64> },
-    GetPressure { call_id: Option<u64> },
-    Shutdown,
+    Info { call_id: Option<u64> },
+    Submit { call_id: Option<u64>, run: Run },
+    Poll { call_id: Option<u64>, run_id: u64 },
+    Close { call_id: Option<u64> },
 }
 
 impl WorkerRequest {
     pub const fn kind(&self) -> RequestKind {
         match self {
-            Self::GetInfo { .. } => RequestKind::GetInfo,
-            Self::Execute { .. } => RequestKind::Execute,
-            Self::PollCompletions { .. } => RequestKind::PollCompletions,
-            Self::DropSession { .. } => RequestKind::DropSession,
-            Self::ReleaseProducts { .. } => RequestKind::ReleaseProducts,
-            Self::GetPressure { .. } => RequestKind::GetPressure,
-            Self::Shutdown => RequestKind::Shutdown,
+            Self::Info { .. } => RequestKind::Info,
+            Self::Submit { .. } => RequestKind::Submit,
+            Self::Poll { .. } => RequestKind::Poll,
+            Self::Close { .. } => RequestKind::Close,
         }
     }
 
     pub const fn call_id(&self) -> Option<u64> {
         match self {
-            Self::GetInfo { call_id }
-            | Self::Execute { call_id, .. }
-            | Self::PollCompletions { call_id, .. }
-            | Self::GetPressure { call_id } => *call_id,
-            Self::DropSession { .. } | Self::ReleaseProducts { .. } | Self::Shutdown => None,
+            Self::Info { call_id }
+            | Self::Submit { call_id, .. }
+            | Self::Poll { call_id, .. }
+            | Self::Close { call_id } => *call_id,
         }
     }
 
     pub fn set_call_id(&mut self, value: Option<u64>) {
         match self {
-            Self::GetInfo { call_id }
-            | Self::Execute { call_id, .. }
-            | Self::PollCompletions { call_id, .. }
-            | Self::GetPressure { call_id } => *call_id = value,
-            _ => {}
+            Self::Info { call_id }
+            | Self::Submit { call_id, .. }
+            | Self::Poll { call_id, .. }
+            | Self::Close { call_id } => *call_id = value,
         }
     }
 
-    pub const fn batch(&self) -> Option<&Batch> {
+    pub const fn run(&self) -> Option<&Run> {
         match self {
-            Self::Execute { batch, .. } => Some(batch),
+            Self::Submit { run, .. } => Some(run),
             _ => None,
         }
     }
 
-    pub fn get_info() -> Self {
-        Self::GetInfo { call_id: None }
+    pub fn info() -> Self {
+        Self::Info { call_id: None }
     }
-    pub fn execute(batch: Batch) -> Self {
-        Self::Execute {
+    pub fn submit(run: Run) -> Self {
+        Self::Submit { call_id: None, run }
+    }
+    pub fn poll(run_id: u64) -> Self {
+        Self::Poll {
             call_id: None,
-            batch,
+            run_id,
         }
     }
-    pub fn poll_completions(step_id: u64) -> Self {
-        Self::PollCompletions {
-            call_id: None,
-            step_id,
-        }
-    }
-    pub fn drop_session(session_id: RequestId) -> Self {
-        Self::DropSession { session_id }
-    }
-    pub fn shutdown() -> Self {
-        Self::Shutdown
-    }
-    pub fn release_products(product_handles: Vec<u64>) -> Self {
-        Self::ReleaseProducts { product_handles }
-    }
-    pub fn get_pressure() -> Self {
-        Self::GetPressure { call_id: None }
+    pub fn close() -> Self {
+        Self::Close { call_id: None }
     }
 }
 
@@ -130,7 +96,6 @@ pub enum ResponseKind {
     Result,
     Ok,
     Error,
-    Pressure,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,7 +124,7 @@ pub enum WorkerResponse {
     },
     Result {
         call_id: Option<u64>,
-        completion_report: CompletionReport,
+        result: RunResult,
     },
     Ok {
         call_id: Option<u64>,
@@ -167,10 +132,6 @@ pub enum WorkerResponse {
     Error {
         call_id: Option<u64>,
         error: WorkerResponseError,
-    },
-    Pressure {
-        call_id: Option<u64>,
-        pressure: Vec<ResourcePressure>,
     },
 }
 
@@ -181,7 +142,6 @@ impl WorkerResponse {
             Self::Result { .. } => ResponseKind::Result,
             Self::Ok { .. } => ResponseKind::Ok,
             Self::Error { .. } => ResponseKind::Error,
-            Self::Pressure { .. } => ResponseKind::Pressure,
         }
     }
 
@@ -190,8 +150,7 @@ impl WorkerResponse {
             Self::Info { call_id, .. }
             | Self::Result { call_id, .. }
             | Self::Ok { call_id }
-            | Self::Error { call_id, .. }
-            | Self::Pressure { call_id, .. } => *call_id,
+            | Self::Error { call_id, .. } => *call_id,
         }
     }
 
@@ -200,16 +159,13 @@ impl WorkerResponse {
             Self::Info { call_id, .. }
             | Self::Result { call_id, .. }
             | Self::Ok { call_id }
-            | Self::Error { call_id, .. }
-            | Self::Pressure { call_id, .. } => *call_id = value,
+            | Self::Error { call_id, .. } => *call_id = value,
         }
     }
 
-    pub const fn report(&self) -> Option<&CompletionReport> {
+    pub const fn report(&self) -> Option<&RunResult> {
         match self {
-            Self::Result {
-                completion_report, ..
-            } => Some(completion_report),
+            Self::Result { result, .. } => Some(result),
             _ => None,
         }
     }
@@ -221,10 +177,10 @@ impl WorkerResponse {
         }
     }
 
-    pub fn completion_report(completion_report: CompletionReport) -> Self {
+    pub fn result(result: RunResult) -> Self {
         Self::Result {
             call_id: None,
-            completion_report,
+            result,
         }
     }
 

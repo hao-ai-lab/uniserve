@@ -16,15 +16,15 @@ from typing import cast
 import pytest
 
 from tests.python.fixtures.depth_one import (
+    ar_params,
     commit_for_completion,
-    execution_batch,
+    execution_run,
     root_parent,
     token_operation,
-    und_admission,
 )
 from tests.python.fixtures.execution_worker import execution_worker
 from uniserve_worker.execution.batch import (
-    CompletionReport,
+    ArRequestParams,
     DrawLayout,
     DType,
     ErrorCode,
@@ -36,18 +36,18 @@ from uniserve_worker.execution.batch import (
     ProductPayload,
     ProductRef,
     Rng,
+    RunResult,
     SamplingParams,
     SamplingState,
     ShapeBound,
     StaticDim,
     StorageClass,
     TokenMode,
-    UndAdmission,
     encode_sampling_state_bytes,
 )
 from uniserve_worker.execution.output import (
-    completion_report_ready,
-    finalize_completion_report,
+    finalize_run_result,
+    run_result_ready,
 )
 from uniserve_worker.models.stub import STUB_IMG_START_TOKEN_ID, _next_token
 
@@ -80,12 +80,12 @@ def _logprob_positions(payload: bytes) -> tuple[tuple[tuple[int, float, int], ..
     return positions
 
 
-def _materialize(report: CompletionReport) -> CompletionReport:
+def _resolved_report(report: RunResult) -> RunResult:
     deadline = time.monotonic() + 5.0
-    while not completion_report_ready(report) and time.monotonic() < deadline:
+    while not run_result_ready(report) and time.monotonic() < deadline:
         time.sleep(0.0001)
-    assert completion_report_ready(report)
-    return finalize_completion_report(report)
+    assert run_result_ready(report)
+    return finalize_run_result(report)
 
 
 def _with_sampling_state(
@@ -108,9 +108,7 @@ def _with_sampling_state(
         request_key=operation.request_key,
         op_id=operation.op_id,
         parent=operation.parent,
-        work=operation.work,
-        route=operation.route,
-        domain=operation.domain,
+        kind=operation.kind,
         bounds=operation.bounds,
         inputs=(*operation.inputs, reference),
         outputs=operation.outputs,
@@ -124,8 +122,8 @@ def _with_sampling_state(
 def test_logprob_reporting_does_not_change_sample_selection() -> None:
     worker = execution_worker()
     sampling = SamplingParams(temperature=0.8, top_k=4, top_p=0.9, seed=71)
-    first = und_admission(11, block_ids=(2,), sampling=sampling)
-    second = und_admission(
+    first = ar_params(11, block_ids=(2,), sampling=sampling)
+    second = ar_params(
         12,
         block_ids=(3,),
         sampling=replace(sampling, return_logprobs=True, n_logprobs=2),
@@ -148,10 +146,10 @@ def test_logprob_reporting_does_not_change_sample_selection() -> None:
         rng=Rng(seed=71, semantic_index_base=2, draw_layout=DrawLayout.TARGET_SAMPLING),
     )
 
-    result = _materialize(
+    result = _resolved_report(
         worker.execute(
-            execution_batch(
-                step_id=1,
+            execution_run(
+                run_id=1,
                 admissions=(first, second),
                 operations=(first_op, second_op),
                 input_products=(first_input, second_input),
@@ -164,8 +162,8 @@ def test_logprob_reporting_does_not_change_sample_selection() -> None:
 
 def test_batched_decode_produces_the_serial_oracle_tokens() -> None:
     worker = execution_worker()
-    admissions = (und_admission(21, block_ids=(0,)), und_admission(22, block_ids=(1,)))
-    primed: list[tuple[Operation, CompletionReport]] = []
+    admissions = (ar_params(21, block_ids=(0,)), ar_params(22, block_ids=(1,)))
+    primed: list[tuple[Operation, RunResult]] = []
     for index, admission in enumerate(admissions):
         extend, extend_input = token_operation(
             admission.request_key,
@@ -175,8 +173,8 @@ def test_batched_decode_produces_the_serial_oracle_tokens() -> None:
             tokens=(3, 4),
         )
         report = worker.execute(
-            execution_batch(
-                step_id=1 + index,
+            execution_run(
+                run_id=1 + index,
                 admissions=(admission,),
                 operations=(extend,),
                 input_products=(extend_input,),
@@ -200,13 +198,13 @@ def test_batched_decode_produces_the_serial_oracle_tokens() -> None:
         decode_ops.append(operation)
         decode_inputs.append(payload)
         commits.append(commit)
-    result = _materialize(
+    result = _resolved_report(
         worker.execute(
-            execution_batch(
-                step_id=9,
+            execution_run(
+                run_id=9,
                 admissions=(),
                 operations=tuple(decode_ops),
-                controls=tuple(commits),
+                commands=tuple(commits),
                 input_products=tuple(decode_inputs),
             )
         )
@@ -220,14 +218,14 @@ def test_batched_decode_produces_the_serial_oracle_tokens() -> None:
 
 def test_sampling_batch_returns_serial_tokens_for_mixed_finish_policies() -> None:
     worker = execution_worker()
-    first = und_admission(24, block_ids=(3,))
-    second_base = und_admission(25, block_ids=(4,))
+    first = ar_params(24, block_ids=(3,))
+    second_base = ar_params(25, block_ids=(4,))
     expected = _next_token(4)
-    assert second_base.und is not None
+    assert second_base.ar is not None
     second = NewRequest.create(
         second_base.request_key,
         request_pool_idx=second_base.request_pool_idx,
-        und=replace(second_base.und, finish_token_ids=(expected,)),
+        ar=replace(second_base.ar, finish_token_ids=(expected,)),
     )
     first_op, first_input = token_operation(
         first.request_key,
@@ -244,10 +242,10 @@ def test_sampling_batch_returns_serial_tokens_for_mixed_finish_policies() -> Non
         tokens=(3, 4),
     )
 
-    result = _materialize(
+    result = _resolved_report(
         worker.execute(
-            execution_batch(
-                step_id=1,
+            execution_run(
+                run_id=1,
                 admissions=(first, second),
                 operations=(first_op, second_op),
                 input_products=(first_input, second_input),
@@ -267,7 +265,7 @@ def test_sampling_batch_returns_serial_tokens_for_mixed_finish_policies() -> Non
 
 def test_verify_commits_every_accepted_position() -> None:
     worker = execution_worker()
-    admission = und_admission(
+    admission = ar_params(
         4, block_ids=(3,), sampling=SamplingParams(return_logprobs=True, n_logprobs=2, seed=31)
     )
     # Prime the request, then carry its selected token explicitly with the draft.
@@ -280,8 +278,8 @@ def test_verify_commits_every_accepted_position() -> None:
         logprobs=True,
     )
     prime = worker.execute(
-        execution_batch(
-            step_id=1, admissions=(admission,), operations=(extend,), input_products=(extend_input,)
+        execution_run(
+            run_id=1, admissions=(admission,), operations=(extend,), input_products=(extend_input,)
         )
     )
     commit = commit_for_completion(extend, prime)
@@ -294,13 +292,13 @@ def test_verify_commits_every_accepted_position() -> None:
         logprobs=True,
         control_seq=commit.control_seq,
     )
-    result = _materialize(
+    result = _resolved_report(
         worker.execute(
-            execution_batch(
-                step_id=2,
+            execution_run(
+                run_id=2,
                 admissions=(),
                 operations=(verify,),
-                controls=(commit,),
+                commands=(commit,),
                 input_products=(verify_input,),
             )
         )
@@ -314,7 +312,7 @@ def test_verify_commits_every_accepted_position() -> None:
 
 def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span() -> None:
     worker = execution_worker()
-    admission = und_admission(5, block_ids=(4,))
+    admission = ar_params(5, block_ids=(4,))
     extend, extend_input = token_operation(
         admission.request_key,
         op_id=1,
@@ -322,10 +320,10 @@ def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span() -
         mode=TokenMode.EXTEND,
         tokens=(3, 4),
     )
-    prime = _materialize(
+    prime = _resolved_report(
         worker.execute(
-            execution_batch(
-                step_id=1,
+            execution_run(
+                run_id=1,
                 admissions=(admission,),
                 operations=(extend,),
                 input_products=(extend_input,),
@@ -342,13 +340,13 @@ def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span() -
         control_seq=commit.control_seq,
     )
 
-    result = _materialize(
+    result = _resolved_report(
         worker.execute(
-            execution_batch(
-                step_id=2,
+            execution_run(
+                run_id=2,
                 admissions=(),
                 operations=(verify,),
-                controls=(commit,),
+                commands=(commit,),
                 input_products=(verify_input,),
             )
         )
@@ -363,11 +361,11 @@ def test_verify_selects_the_exact_target_kv_prefix_from_the_initialized_span() -
 
 def test_verify_commits_the_accepted_terminal_draft_as_its_exact_prefix() -> None:
     worker = execution_worker()
-    base = und_admission(6, block_ids=(5,))
+    base = ar_params(6, block_ids=(5,))
     admission = NewRequest.create(
         base.request_key,
         request_pool_idx=base.request_pool_idx,
-        und=replace(cast(UndAdmission, base.und), finish_token_ids=(1001,)),
+        ar=replace(cast(ArRequestParams, base.ar), finish_token_ids=(1001,)),
     )
     extend, extend_input = token_operation(
         admission.request_key,
@@ -377,8 +375,8 @@ def test_verify_commits_the_accepted_terminal_draft_as_its_exact_prefix() -> Non
         tokens=(3, 4),
     )
     prime = worker.execute(
-        execution_batch(
-            step_id=1,
+        execution_run(
+            run_id=1,
             admissions=(admission,),
             operations=(extend,),
             input_products=(extend_input,),
@@ -394,13 +392,13 @@ def test_verify_commits_the_accepted_terminal_draft_as_its_exact_prefix() -> Non
         control_seq=commit.control_seq,
     )
 
-    result = _materialize(
+    result = _resolved_report(
         worker.execute(
-            execution_batch(
-                step_id=2,
+            execution_run(
+                run_id=2,
                 admissions=(),
                 operations=(verify,),
-                controls=(commit,),
+                commands=(commit,),
                 input_products=(verify_input,),
             )
         )
@@ -413,7 +411,7 @@ def test_verify_commits_the_accepted_terminal_draft_as_its_exact_prefix() -> Non
 
 def test_chunked_prompt_logprobs_preserve_the_preceding_device_logits() -> None:
     worker = execution_worker()
-    admission = und_admission(
+    admission = ar_params(
         31,
         block_ids=(7,),
         sampling=SamplingParams(return_prompt_logprobs=True, n_prompt_logprobs=2),
@@ -426,10 +424,10 @@ def test_chunked_prompt_logprobs_preserve_the_preceding_device_logits() -> None:
         tokens=(3, 4),
         logprobs=True,
     )
-    first_result = _materialize(
+    first_result = _resolved_report(
         worker.execute(
-            execution_batch(
-                step_id=1,
+            execution_run(
+                run_id=1,
                 admissions=(admission,),
                 operations=(first,),
                 input_products=(first_input,),
@@ -446,13 +444,13 @@ def test_chunked_prompt_logprobs_preserve_the_preceding_device_logits() -> None:
         logprobs=True,
         control_seq=commit.control_seq,
     )
-    second_result = _materialize(
+    second_result = _resolved_report(
         worker.execute(
-            execution_batch(
-                step_id=2,
+            execution_run(
+                run_id=2,
                 admissions=(),
                 operations=(second,),
-                controls=(commit,),
+                commands=(commit,),
                 input_products=(second_input,),
             )
         )
@@ -479,7 +477,7 @@ def test_chunked_prompt_logprobs_preserve_the_preceding_device_logits() -> None:
 
 def test_failed_prompt_chunk_preserves_the_preceding_logits() -> None:
     sampling = SamplingParams(return_prompt_logprobs=True, n_prompt_logprobs=2)
-    admission = und_admission(32, block_ids=(8,), sampling=sampling)
+    admission = ar_params(32, block_ids=(8,), sampling=sampling)
     worker = execution_worker()
     first, first_input = token_operation(
         admission.request_key,
@@ -489,10 +487,10 @@ def test_failed_prompt_chunk_preserves_the_preceding_logits() -> None:
         tokens=(3, 4),
         logprobs=True,
     )
-    first_result = _materialize(
+    first_result = _resolved_report(
         worker.execute(
-            execution_batch(
-                step_id=1,
+            execution_run(
+                run_id=1,
                 admissions=(admission,),
                 operations=(first,),
                 input_products=(first_input,),
@@ -519,9 +517,7 @@ def test_failed_prompt_chunk_preserves_the_preceding_logits() -> None:
         request_key=invalid.request_key,
         op_id=invalid.op_id,
         parent=invalid.parent,
-        work=invalid.work,
-        route=invalid.route,
-        domain=invalid.domain,
+        kind=invalid.kind,
         bounds=invalid.bounds,
         inputs=invalid.inputs,
         outputs=invalid_outputs,
@@ -529,12 +525,12 @@ def test_failed_prompt_chunk_preserves_the_preceding_logits() -> None:
         rng=invalid.rng,
         control_seq=invalid.control_seq,
     )
-    failed = _materialize(
+    failed = _resolved_report(
         worker.execute(
-            execution_batch(
-                step_id=2,
+            execution_run(
+                run_id=2,
                 operations=(invalid,),
-                controls=(commit,),
+                commands=(commit,),
                 input_products=(invalid_input,),
             )
         )
@@ -551,10 +547,10 @@ def test_failed_prompt_chunk_preserves_the_preceding_logits() -> None:
         logprobs=True,
         control_seq=commit.control_seq,
     )
-    recovered = _materialize(
+    recovered = _resolved_report(
         worker.execute(
-            execution_batch(
-                step_id=3,
+            execution_run(
+                run_id=3,
                 operations=(continued,),
                 input_products=(continued_input,),
             )
@@ -570,10 +566,10 @@ def test_failed_prompt_chunk_preserves_the_preceding_logits() -> None:
         tokens=(3, 4),
         logprobs=True,
     )
-    oracle_result = _materialize(
+    oracle_result = _resolved_report(
         oracle.execute(
-            execution_batch(
-                step_id=1,
+            execution_run(
+                run_id=1,
                 admissions=(admission,),
                 operations=(oracle_first,),
                 input_products=(oracle_first_input,),
@@ -590,12 +586,12 @@ def test_failed_prompt_chunk_preserves_the_preceding_logits() -> None:
         logprobs=True,
         control_seq=oracle_commit.control_seq,
     )
-    expected = _materialize(
+    expected = _resolved_report(
         oracle.execute(
-            execution_batch(
-                step_id=3,
+            execution_run(
+                run_id=3,
                 operations=(oracle_continued,),
-                controls=(oracle_commit,),
+                commands=(oracle_commit,),
                 input_products=(oracle_continued_input,),
             )
         )
@@ -616,7 +612,7 @@ def test_failed_prompt_chunk_preserves_the_preceding_logits() -> None:
 
 def test_worker_samples_with_the_operation_branch_state() -> None:
     worker = execution_worker()
-    admission = und_admission(41, block_ids=(9,))
+    admission = ar_params(41, block_ids=(9,))
     operation, token_input = token_operation(
         admission.request_key,
         op_id=1,
@@ -629,10 +625,10 @@ def test_worker_samples_with_the_operation_branch_state() -> None:
         SamplingState(allowed_token_ids=(7,)),
     )
 
-    result = _materialize(
+    result = _resolved_report(
         worker.execute(
-            execution_batch(
-                step_id=1,
+            execution_run(
+                run_id=1,
                 admissions=(admission,),
                 operations=(operation,),
                 input_products=(token_input, sampling_input),
@@ -645,7 +641,7 @@ def test_worker_samples_with_the_operation_branch_state() -> None:
 
 def test_forced_token_schedule_overrides_selection() -> None:
     worker = execution_worker()
-    admission = und_admission(
+    admission = ar_params(
         43,
         block_ids=(11,),
         sampling=SamplingParams(
@@ -662,10 +658,10 @@ def test_forced_token_schedule_overrides_selection() -> None:
         tokens=(3, 4),
     )
 
-    result = _materialize(
+    result = _resolved_report(
         worker.execute(
-            execution_batch(
-                step_id=1,
+            execution_run(
+                run_id=1,
                 admissions=(admission,),
                 operations=(operation,),
                 input_products=(token_input,),
@@ -678,7 +674,7 @@ def test_forced_token_schedule_overrides_selection() -> None:
 
 def test_all_masked_branch_state_produces_an_error_completion() -> None:
     worker = execution_worker()
-    admission = und_admission(42, block_ids=(10,))
+    admission = ar_params(42, block_ids=(10,))
     operation, token_input = token_operation(
         admission.request_key,
         op_id=1,
@@ -691,10 +687,10 @@ def test_all_masked_branch_state_produces_an_error_completion() -> None:
         SamplingState(allowed_token_ids=()),
     )
 
-    result = _materialize(
+    result = _resolved_report(
         worker.execute(
-            execution_batch(
-                step_id=1,
+            execution_run(
+                run_id=1,
                 admissions=(admission,),
                 operations=(operation,),
                 input_products=(token_input, sampling_input),

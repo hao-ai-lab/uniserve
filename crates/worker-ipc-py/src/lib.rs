@@ -11,10 +11,10 @@
 //!    ([`PyServer::recv`] / [`PyServer::try_recv`]) and once on the outbound
 //!    path ([`PyServer::respond`]).
 //!
-//! The steady-state `execute` and `result` frames use typed converters with
+//! The steady-state `submit` and `result` frames use typed converters with
 //! interned keys, preallocated lists, and direct scalar extraction. Worker-info,
-//! control, pressure, snapshot, and error frames use the schema-derived serde
-//! converter. Frame kind determines exactly one conversion path.
+//! acknowledgment, and error frames use the schema-derived serde converter.
+//! Frame kind determines exactly one conversion path.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -304,10 +304,9 @@ impl PyServer {
 }
 
 fn pythonize_request(py: Python<'_>, request: &WorkerRequest) -> PyResult<Py<PyAny>> {
-    // Execute batches use the typed converter, which constructs the worker's
-    // Python operation objects directly: the decoded Rust batch has already passed
-    // `Batch::validate`.
-    if request.kind() == RequestKind::Execute {
+    // Submitted runs use the typed converter, which constructs the worker's
+    // Python operation objects directly after Rust validation.
+    if request.kind() == RequestKind::Submit {
         let object = convert::execute_request_to_py(py, request)?;
         return Ok(object.into_any().unbind());
     }

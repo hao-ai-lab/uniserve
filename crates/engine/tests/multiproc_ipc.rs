@@ -2,7 +2,6 @@
 
 #![cfg(target_os = "linux")]
 
-use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::fs::{OpenOptions, remove_file};
 use std::os::unix::fs::FileExt;
@@ -12,18 +11,20 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use base64::Engine as _;
-use uniserve_core::{BlockId, MediaEvent, MediaGeometry, MediaRequest, RequestId, SamplingParams};
+use uniserve_core::{
+    BlockId, DiffusionRequest, Event, MediaGeometry, Request, RequestId, RuntimeFamily,
+    SamplingParams,
+};
 use uniserve_engine::{
-    ControlOp, ControlTokens, EngineHandle, Executor, MultiprocExecutor, Scheduler,
-    TransferBackend, WorkerExecError, WorkerLossError, WorkerProcessArgs, WorkerRole,
+    ControlTokens, EngineHandle, EngineLoop, Executor, MultiprocExecutor, PhysicalExecutor,
+    SchedulerConfig, TransferBackend, WorkerExecError, WorkerLossError, WorkerProcessArgs,
 };
 use uniserve_worker_ipc::{
-    AttentionRegime, Batch, BatchPartition, BlockTable, Bounds, CachePageAllocation, CloseReason,
-    Control, DType, DimBound, Disposition, ErrorCode, ForwardMode, NewRequest, OpId, OpStatus,
-    Operation, Point, PointRange, ProductKind, ProductPayload, ProductRef, RequestKey, RouteId,
-    RowGeometry, SamplingOwnership, ShapeBound, StorageClass, TRANSFER_DESCRIPTOR_PREFIX,
-    UndAdmission, VersionRef, encode_token_product_bytes,
+    ArRequestParams, BatchCommand, BlockTable, Bounds, CachePageAllocation, Checkpoint,
+    CheckpointPoint, CloseReason, DType, DimBound, Disposition, ErrorCode, InlineValue, NewRequest,
+    OpId, OpPayload, OpStatus, Operation, PointRange, ProductKind, ProductPayload, ProductRef,
+    RequestKey, RowGeometry, Run as Batch, RunKind, ShapeBound, StorageClass, TransferHandle,
+    TransferLocator, TransferTransport, encode_token_product_bytes,
 };
 
 const WORLD_SIZE: usize = 2;
@@ -40,11 +41,15 @@ fn multiprocess_topology_handles_rank_failure_and_capacity_limits() -> anyhow::R
 
 fn qualify_failed_media_admission_reclamation() -> anyhow::Result<()> {
     let executor = spawn_rank_group_with_slot_capacity(128 << 10)?;
-    let request_capacity = usize::try_from(executor.info().max_request_pool_size)?;
-    let scheduler = Scheduler::new(
+    let request_capacity = usize::try_from(executor.info().single_pool().request_slots)?;
+    let scheduler = EngineLoop::with_config_for_family(
         Box::new(executor),
         ControlTokens::default(),
-        PIPELINE_DEPTH * 8,
+        SchedulerConfig {
+            max_batch: PIPELINE_DEPTH * 8,
+            ..SchedulerConfig::default()
+        },
+        RuntimeFamily::Diffusion,
     );
     let (command_tx, command_rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(command_tx);
@@ -65,19 +70,18 @@ fn qualify_failed_media_admission_reclamation() -> anyhow::Result<()> {
                 vec![100_000 + index as u32]
             };
             let prompt_tokens = u32::try_from(prompt_token_ids.len())?;
-            let events = handle.submit_media(MediaRequest {
+            let events = handle.submit(Request::Diffusion(DiffusionRequest {
                 request_id,
                 prompt_token_ids,
                 seed: index as u64,
                 priority: 0,
                 geometry: MediaGeometry {
                     frame_count: 22,
-                    video_reconstruction_units: 1,
-                    audio_latent_frames: 37,
+                    decode_units: 3,
                     prompt_tokens,
                     denoise_steps: 4,
                 },
-            })?;
+            }))?;
             requests.push((request_id, events));
         }
         for (request_id, mut events) in requests {
@@ -88,7 +92,7 @@ fn qualify_failed_media_admission_reclamation() -> anyhow::Result<()> {
                 anyhow::anyhow!("media event stream closed for request {request_id:?}")
             })?;
             assert!(
-                matches!(event, MediaEvent::Failed { .. }),
+                matches!(event, Event::Error { .. }),
                 "request {request_id:?} did not reach terminal failure: {event:?}"
             );
         }
@@ -106,32 +110,32 @@ fn qualify_failed_media_admission_reclamation() -> anyhow::Result<()> {
 
 fn check_rank_ipc() -> anyhow::Result<()> {
     let mut executor = spawn_rank_group()?;
-    let info = executor.info();
+    let info = executor.info().single_pool();
     assert_eq!(info.rank.tp_rank, 0);
     assert_eq!(info.rank.tp_size, WORLD_SIZE as u32);
-    assert_eq!(info.sampling_ownership, SamplingOwnership::DesignatedRank);
-    assert_eq!(info.max_batch_operations, 256);
+    assert_eq!(info.max_batch_ops, 256);
     assert_eq!(info.max_batch_tokens, 256);
-    assert_eq!(executor.pipeline_depth(), PIPELINE_DEPTH);
+    assert_eq!(info.queue_depth as usize, PIPELINE_DEPTH);
 
     let admission = text_admission(11, 1, 1)?;
-    let root = VersionRef::admission_root(admission.request_key, OpId(0));
+    let root = Checkpoint::admission_root(OpId(0));
     let initial = token_batch(
         1,
         1,
+        admission.request_key,
         Some(admission.clone()),
         OpId(1),
         root.clone(),
-        ForwardMode::TokenExtend,
+        RunKind::ArExtend,
         &[7, 8],
         0,
         BlockId(1),
         0,
     );
     let first = execute(&mut executor, initial.clone())?;
-    let first_record = &first.partitions[0].completions[0];
+    let first_record = &first.completions[0];
     assert_eq!(first_record.status, OpStatus::Ok);
-    assert_eq!(first_record.committed_tokens.len(), 1);
+    assert_eq!(first_record.committed_tokens().len(), 1);
 
     let replayed = execute(&mut executor, initial.clone())?;
     assert_eq!(replayed, first);
@@ -139,19 +143,20 @@ fn check_rank_ipc() -> anyhow::Result<()> {
     let conflicting = token_batch(
         1,
         1,
+        admission.request_key,
         Some(admission.clone()),
         OpId(1),
         root.clone(),
-        ForwardMode::TokenExtend,
+        RunKind::ArExtend,
         &[7, 8, 9],
         0,
         BlockId(1),
         0,
     );
-    assert_execution_error(&mut executor, conflicting, "submitted batch")?;
+    assert_execution_error(&mut executor, conflicting, "submitted run")?;
 
     let selected = fixed_completion(first_record);
-    let commit = Control::Commit {
+    let commit = BatchCommand::Commit {
         request_key: admission.request_key,
         control_seq: 1,
         expected_parent: root.clone(),
@@ -159,43 +164,42 @@ fn check_rank_ipc() -> anyhow::Result<()> {
         public_event_limit: 1,
         disposition: Disposition::Publish,
     };
-    let commit_batch = control_batch(2, commit.clone());
+    let commit_batch = command_batch(2, commit.clone());
     assert!(
         execute(&mut executor, commit_batch.clone())?
-            .partitions
+            .completions
             .is_empty()
     );
-    assert!(execute(&mut executor, commit_batch)?.partitions.is_empty());
+    assert!(execute(&mut executor, commit_batch)?.completions.is_empty());
 
-    let gap = Control::Close {
+    let gap = BatchCommand::Finish {
         request_key: admission.request_key,
         control_seq: 3,
         cutoff: selected.clone(),
         reason: CloseReason::Cancelled,
     };
-    assert_execution_error(&mut executor, control_batch(3, gap), "does not follow")?;
+    assert_execution_error(&mut executor, command_batch(3, gap), "does not follow")?;
 
     let stale_key = RequestKey::new(
         admission.request_key.authority_id,
-        admission.request_key.session_id,
+        admission.request_key.request_id,
         admission.request_key.epoch + 1,
     );
-    let stale = Control::Commit {
+    let stale = BatchCommand::Commit {
         request_key: stale_key,
         control_seq: 2,
-        expected_parent: with_request_key(&selected, stale_key),
-        selected: with_request_key(&selected, stale_key),
+        expected_parent: selected.clone(),
+        selected: selected.clone(),
         public_event_limit: 1,
         disposition: Disposition::Publish,
     };
-    assert_execution_error(&mut executor, control_batch(4, stale), "stale request key")?;
+    assert_execution_error(&mut executor, command_batch(4, stale), "stale request key")?;
 
-    let cutoff = VersionRef {
-        request_key: admission.request_key,
-        producer_op_id: OpId(99),
-        point: Point::Fixed { point_index: 1 },
+    let cutoff = Checkpoint {
+        op_id: OpId(99),
+        point: CheckpointPoint::Fixed(1),
     };
-    let unreachable = Control::Close {
+    let unreachable = BatchCommand::Finish {
         request_key: admission.request_key,
         control_seq: 2,
         cutoff,
@@ -203,24 +207,24 @@ fn check_rank_ipc() -> anyhow::Result<()> {
     };
     assert_execution_error(
         &mut executor,
-        control_batch(5, unreachable),
+        command_batch(5, unreachable),
         "resolved lineage",
     )?;
 
-    let close = Control::Close {
+    let close = BatchCommand::Finish {
         request_key: admission.request_key,
         control_seq: 2,
         cutoff: selected.clone(),
         reason: CloseReason::Cancelled,
     };
-    let close_batch = control_batch(6, close.clone());
+    let close_batch = command_batch(6, close.clone());
     assert!(
         execute(&mut executor, close_batch.clone())?
-            .partitions
+            .completions
             .is_empty()
     );
-    assert!(execute(&mut executor, close_batch)?.partitions.is_empty());
-    let conflicting_close = Control::Close {
+    assert!(execute(&mut executor, close_batch)?.completions.is_empty());
+    let conflicting_close = BatchCommand::Finish {
         request_key: admission.request_key,
         control_seq: 2,
         cutoff: selected.clone(),
@@ -228,39 +232,29 @@ fn check_rank_ipc() -> anyhow::Result<()> {
     };
     assert_execution_error(
         &mut executor,
-        control_batch(7, conflicting_close),
+        command_batch(7, conflicting_close),
         "conflicts with its committed content",
     )?;
 
     let descendant = token_batch(
         8,
         2,
+        admission.request_key,
         None,
         OpId(2),
         selected,
-        ForwardMode::TokenDecode,
-        &[first_record.committed_tokens[0]],
+        RunKind::ArDecode,
+        &[first_record.committed_tokens()[0]],
         2,
         BlockId(1),
         2,
     );
     let closed = execute(&mut executor, descendant)?;
-    let closed_record = &closed.partitions[0].completions[0];
+    let closed_record = &closed.completions[0];
     assert_eq!(closed_record.status, OpStatus::Error);
     assert_eq!(closed_record.error_code, Some(ErrorCode::InvalidOperation));
 
-    let acknowledgements = executor.control_wait(
-        ControlOp::DropSession(admission.request_key.session_id),
-        None,
-    )?;
-    assert_eq!(acknowledgements.len(), WORLD_SIZE);
-    assert!(
-        acknowledgements
-            .iter()
-            .all(|acknowledgement| acknowledgement.result.is_ok())
-    );
-    assert_eq!(executor.in_flight(), 0);
-    executor.shutdown();
+    executor.close_physical()?;
     Ok(())
 }
 
@@ -279,16 +273,17 @@ fn qualify_peer_replacement() -> anyhow::Result<()> {
     }
 
     let first_admission = text_admission(21, 1, 1)?;
-    let first_root = VersionRef::admission_root(first_admission.request_key, OpId(0));
+    let first_root = Checkpoint::admission_root(OpId(0));
     execute(
         &mut executor,
         token_batch(
             1,
             1,
+            first_admission.request_key,
             Some(first_admission),
             OpId(1),
             first_root,
-            ForwardMode::TokenExtend,
+            RunKind::ArExtend,
             &[3],
             0,
             BlockId(1),
@@ -297,44 +292,45 @@ fn qualify_peer_replacement() -> anyhow::Result<()> {
     )?;
 
     let lost_admission = text_admission(22, 1, 2)?;
-    let lost_root = VersionRef::admission_root(lost_admission.request_key, OpId(0));
-    executor.submit(token_batch(
+    let lost_root = Checkpoint::admission_root(OpId(0));
+    executor.submit_run(token_batch(
         2,
         2,
+        lost_admission.request_key,
         Some(lost_admission),
         OpId(2),
         lost_root,
-        ForwardMode::TokenExtend,
+        RunKind::ArExtend,
         &[4],
         0,
         BlockId(2),
         0,
     ))?;
     let loss = executor
-        .next_result()
+        .poll_run(Duration::from_secs(30))
         .expect_err("rank loss must be reported");
     assert!(loss.downcast_ref::<WorkerLossError>().is_some(), "{loss:#}");
-    assert_eq!(executor.in_flight(), 0);
 
     let recovered_admission = text_admission(23, 1, 1)?;
-    let recovered_root = VersionRef::admission_root(recovered_admission.request_key, OpId(0));
+    let recovered_root = Checkpoint::admission_root(OpId(0));
     let recovered = execute(
         &mut executor,
         token_batch(
             3,
             3,
+            recovered_admission.request_key,
             Some(recovered_admission),
             OpId(3),
             recovered_root,
-            ForwardMode::TokenExtend,
+            RunKind::ArExtend,
             &[5],
             0,
             BlockId(1),
             0,
         ),
     )?;
-    assert_eq!(recovered.partitions[0].completions[0].status, OpStatus::Ok);
-    executor.shutdown();
+    assert_eq!(recovered.completions[0].status, OpStatus::Ok);
+    executor.close_physical()?;
     Ok(())
 }
 
@@ -359,20 +355,21 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         max_batch_operations: 256,
         max_batch_tokens: 256,
         attention_backend: uniserve_worker_ipc::AttentionBackend::TorchSdpa,
-        worker_role: Some(WorkerRole::Full),
+        supported_ops: uniserve_worker_ipc::OpKind::ALL.to_vec(),
         transfer_backend: TransferBackend::Shm,
         ..config
     })?;
 
     let slow_admission = text_admission(31, 1, 1)?;
-    let slow_root = VersionRef::admission_root(slow_admission.request_key, OpId(0));
+    let slow_root = Checkpoint::admission_root(OpId(0));
     let mut slow = token_batch(
         1,
         2,
+        slow_admission.request_key,
         Some(slow_admission.clone()),
         OpId(1),
         slow_root,
-        ForwardMode::TokenExtend,
+        RunKind::ArExtend,
         &[6],
         0,
         BlockId(1),
@@ -390,41 +387,45 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         point_range: PointRange::default(),
     };
     let mut publication = SlowShmPublication::start()?;
-    slow.partitions[0].operations[0].predicate = Some(predicate.clone());
+    slow.operations[0].set_predicate(Some(predicate.clone()));
     slow.input_products.push(ProductPayload {
         product: predicate,
-        bytes: publication.descriptor(91)?,
+        value: InlineValue::Transfer(publication.descriptor(91)?),
     });
 
     let fast_admission = text_admission(32, 1, 2)?;
-    let fast_root = VersionRef::admission_root(fast_admission.request_key, OpId(0));
+    let fast_root = Checkpoint::admission_root(OpId(0));
     let fast = token_batch(
         2,
         1,
+        fast_admission.request_key,
         Some(fast_admission),
         OpId(1),
         fast_root,
-        ForwardMode::TokenExtend,
+        RunKind::ArExtend,
         &[9],
         0,
         BlockId(2),
         0,
     );
 
-    executor.submit(slow)?;
-    assert!(executor.can_submit());
-    executor.submit(fast)?;
-    let first = executor.next_result()?;
-    assert_eq!(first.step_id, 2);
+    executor.submit_run(slow)?;
+    executor.submit_run(fast)?;
+    let first = executor
+        .poll_run(Duration::from_secs(30))?
+        .ok_or_else(|| anyhow::anyhow!("fast submission did not complete"))?;
+    assert_eq!(first.run_id, 2);
     assert!(!publication.published.load(Ordering::Acquire));
-    assert_eq!(first.partitions[0].completions[0].status, OpStatus::Ok);
+    assert_eq!(first.completions[0].status, OpStatus::Ok);
 
     publication.publish()?;
-    let second = executor.next_result()?;
-    assert_eq!(second.step_id, 1);
-    assert_eq!(second.partitions[0].completions[0].status, OpStatus::Ok);
+    let second = executor
+        .poll_run(Duration::from_secs(30))?
+        .ok_or_else(|| anyhow::anyhow!("slow submission did not complete"))?;
+    assert_eq!(second.run_id, 1);
+    assert_eq!(second.completions[0].status, OpStatus::Ok);
     publication.finish()?;
-    executor.shutdown();
+    executor.close_physical()?;
     assert!(publication.path.is_file());
     Ok(())
 }
@@ -531,46 +532,24 @@ impl SlowShmPublication {
         Ok(())
     }
 
-    fn descriptor(&self, generation: u32) -> anyhow::Result<Vec<u8>> {
-        let mut metadata = BTreeMap::new();
-        metadata.insert("generation", serde_json::json!(generation));
-        metadata.insert("height", serde_json::json!(0));
-        metadata.insert("ready_header_bytes", serde_json::json!(1));
-        metadata.insert(
-            "ready_semaphore",
-            serde_json::json!(self.semaphore_name.to_string_lossy()),
-        );
-        metadata.insert("value_range", serde_json::json!(""));
-        metadata.insert("width", serde_json::json!(0));
-
-        let mut locator = BTreeMap::new();
-        locator.insert("device", serde_json::json!("cpu"));
-        locator.insert("dtype", serde_json::json!("uint8"));
-        locator.insert(
-            "handle_b64",
-            serde_json::json!(base64::engine::general_purpose::STANDARD.encode(&self.name)),
-        );
-        locator.insert("meta", serde_json::to_value(metadata)?);
-        locator.insert("nbytes", serde_json::json!(1));
-        locator.insert("session", serde_json::json!("shm"));
-        locator.insert("shape", serde_json::json!([1]));
-        locator.insert("transport", serde_json::json!("shm"));
-        locator.insert("version", serde_json::json!(1));
-
-        let mut value = BTreeMap::new();
-        value.insert("generation", serde_json::json!(generation));
-        value.insert("height", serde_json::json!(0));
-        value.insert("locator", serde_json::to_value(locator)?);
-        value.insert("value_range", serde_json::json!(""));
-        value.insert("width", serde_json::json!(0));
-
-        let mut envelope = BTreeMap::new();
-        envelope.insert("kind", serde_json::json!("device_product"));
-        envelope.insert("value", serde_json::to_value(value)?);
-
-        let mut descriptor = TRANSFER_DESCRIPTOR_PREFIX.to_vec();
-        descriptor.extend(serde_json::to_vec(&envelope)?);
-        Ok(descriptor)
+    fn descriptor(&self, generation: u32) -> anyhow::Result<TransferHandle> {
+        Ok(TransferHandle::DeviceProduct {
+            generation,
+            height: 0,
+            width: 0,
+            value_range: String::new(),
+            locator: TransferLocator {
+                transport: TransferTransport::PosixShm {
+                    name: self.name.clone(),
+                    ready_header_bytes: 1,
+                    ready_semaphore: Some(self.semaphore_name.to_string_lossy().into_owned()),
+                },
+                nbytes: 1,
+                dtype: "uint8".to_owned(),
+                shape: vec![1],
+                device: "cpu".to_owned(),
+            },
+        })
     }
 
     fn finish(&mut self) -> anyhow::Result<()> {
@@ -647,7 +626,7 @@ fn spawn_rank_group_with_capacities(
         max_batch_operations: 256,
         max_batch_tokens: 256,
         attention_backend: uniserve_worker_ipc::AttentionBackend::TorchSdpa,
-        worker_role: None,
+        supported_ops: uniserve_worker_ipc::OpKind::ALL.to_vec(),
         transfer_backend: TransferBackend::Inproc,
         ..config
     })
@@ -662,10 +641,11 @@ fn worker_python() -> PathBuf {
 fn execute(
     executor: &mut MultiprocExecutor,
     batch: Batch,
-) -> anyhow::Result<uniserve_worker_ipc::CompletionReport> {
-    assert!(executor.can_submit());
-    executor.submit(batch)?;
-    executor.next_result()
+) -> anyhow::Result<uniserve_worker_ipc::RunResult> {
+    executor.submit_run(batch)?;
+    executor
+        .poll_run(Duration::from_secs(30))?
+        .ok_or_else(|| anyhow::anyhow!("submission did not complete"))
 }
 
 fn assert_execution_error(
@@ -673,29 +653,27 @@ fn assert_execution_error(
     batch: Batch,
     message: &str,
 ) -> anyhow::Result<()> {
-    assert!(executor.can_submit());
-    executor.submit(batch)?;
+    executor.submit_run(batch)?;
     let error = executor
-        .next_result()
+        .poll_run(Duration::from_secs(30))
         .expect_err("submission must be rejected");
     let execution = error
         .downcast_ref::<WorkerExecError>()
         .ok_or_else(|| anyhow::anyhow!("expected a typed worker execution error: {error:#}"))?;
     assert_eq!(execution.code.as_deref(), Some("InvalidDescriptor"));
     assert!(execution.message.contains(message), "{execution}");
-    assert_eq!(executor.in_flight(), 0);
     Ok(())
 }
 
 fn text_admission(
-    session_id: u64,
+    request_id: u64,
     epoch: u64,
     request_pool_idx: u32,
 ) -> anyhow::Result<NewRequest> {
     Ok(NewRequest::new(
-        RequestKey::new(1, RequestId(session_id), epoch),
+        RequestKey::new(1, RequestId(request_id), epoch),
         request_pool_idx,
-        Some(UndAdmission {
+        Some(ArRequestParams {
             sampling: SamplingParams {
                 temperature: 0.0,
                 ignore_eos: true,
@@ -710,18 +688,18 @@ fn text_admission(
 }
 
 fn token_batch(
-    step_id: u64,
+    run_id: u64,
     collective_seq: u64,
+    request_key: RequestKey,
     admission: Option<NewRequest>,
     op_id: OpId,
-    parent: VersionRef,
-    mode: ForwardMode,
+    parent: Checkpoint,
+    mode: RunKind,
     tokens: &[u32],
     control_seq: u64,
     page: BlockId,
     prefix_length: u32,
 ) -> Batch {
-    let request_key = parent.request_key;
     let request_pool_idx = admission.as_ref().map_or(1, |value| value.request_pool_idx);
     let input = ProductRef {
         request_key,
@@ -754,83 +732,60 @@ fn token_batch(
         request_key,
         op_id,
         parent,
-        work: mode,
-        route: RouteId(0),
-        domain: mode.domain(),
-        advances_state: false,
-        bounds: Bounds {
-            max_points: 1,
-            max_tokens: tokens.len().max(1) as u32,
-            max_kv_pages: u32::from(prefix_length == 0),
-            ..Bounds::default()
-        },
-        inputs: vec![input.clone()],
-        outputs: vec![token_output],
-        predicate: None,
-        rng: None,
-        control_seq,
+        kind: mode,
+        payload: OpPayload::new(
+            mode,
+            Bounds {
+                max_points: 1,
+                max_tokens: tokens.len().max(1) as u32,
+                max_kv_pages: u32::from(prefix_length == 0),
+                ..Bounds::default()
+            },
+            vec![input.clone()],
+            vec![token_output],
+            None,
+            None,
+            control_seq,
+        ),
     }
     .sealed();
     let input_length = tokens.len() as u32;
-    let partition = BatchPartition {
-        partition_id: 1,
-        submission_group: 1,
-        collective_seq,
-        domain: operation.domain,
-        route: operation.route,
-        attention: AttentionRegime::Causal,
-        shape_class: 0,
-        operations: vec![operation],
-        block_tables: vec![BlockTable {
+    let mut batch = Batch::new(run_id, admission.into_iter().collect(), vec![operation]);
+    batch.collective_seq = collective_seq;
+    batch.block_tables = vec![BlockTable {
+        request_pool_idx,
+        group_id: 0,
+        page_ids: vec![page],
+        allocated_tokens: prefix_length + input_length,
+    }];
+    batch.new_cache_pages = if prefix_length == 0 {
+        vec![CachePageAllocation {
             request_pool_idx,
             group_id: 0,
             page_ids: vec![page],
-            allocated_tokens: prefix_length + input_length,
-        }],
-        new_cache_pages: if prefix_length == 0 {
-            vec![CachePageAllocation {
-                request_pool_idx,
-                group_id: 0,
-                page_ids: vec![page],
-            }]
-        } else {
-            Vec::new()
-        },
-        forward_rows: vec![RowGeometry {
-            operation_index: 0,
-            request_pool_index: request_pool_idx,
-            seq_len: prefix_length,
-            query_len: input_length.max(1),
-        }],
-        latent_placements: Vec::new(),
-        reconstruction_placements: Vec::new(),
+        }]
+    } else {
+        Vec::new()
     };
-    Batch::new(step_id, admission.into_iter().collect(), vec![partition]).with_input_products(vec![
-        ProductPayload {
-            product: input,
-            bytes: encode_token_product_bytes(tokens),
-        },
-    ])
+    batch.forward_rows = vec![RowGeometry {
+        operation_index: 0,
+        request_pool_index: request_pool_idx,
+        seq_len: prefix_length,
+        query_len: input_length.max(1),
+    }];
+    batch.with_input_products(vec![ProductPayload {
+        product: input,
+        value: InlineValue::Bytes(encode_token_product_bytes(tokens)),
+    }])
 }
 
-fn control_batch(step_id: u64, control: Control) -> Batch {
-    Batch::new(step_id, Vec::new(), Vec::new()).with_controls(vec![control])
+fn command_batch(run_id: u64, command: BatchCommand) -> Batch {
+    Batch::new(run_id, Vec::new(), Vec::new()).with_commands(vec![command])
 }
 
-fn fixed_completion(record: &uniserve_worker_ipc::ModelOutput) -> VersionRef {
-    VersionRef {
-        request_key: record.request_key,
-        producer_op_id: record.op_id,
-        point: Point::Fixed {
-            point_index: record.selected_point,
-        },
-    }
-}
-
-fn with_request_key(version: &VersionRef, request_key: RequestKey) -> VersionRef {
-    VersionRef {
-        request_key,
-        producer_op_id: version.producer_op_id,
-        point: version.point.clone(),
+fn fixed_completion(record: &uniserve_worker_ipc::ModelOutput) -> Checkpoint {
+    Checkpoint {
+        op_id: record.op_id,
+        point: CheckpointPoint::Fixed(record.selected_point),
     }
 }

@@ -4,7 +4,7 @@ fn decode_capacity_target(pos: usize, spec_len: usize) -> usize {
     pos.saturating_add(1).saturating_add(spec_len)
 }
 
-impl Scheduler {
+impl EngineLoop {
     /// Assemble the per-step batch: walk the priority order, ask each request for at most one op, clip prefill chunks to the remaining token budget, and pair first-dispatch requests with their typed admission record.
     pub(super) fn assemble(&mut self) -> (Vec<NewRequest>, Vec<NextOp>) {
         let ids = self.assembly_order();
@@ -23,33 +23,87 @@ impl Scheduler {
 
     fn reserve_transition_resources(&mut self, transition: &mut NextOp) -> bool {
         let id = transition.request_id;
-        if transition.operation_variant == ForwardMode::MediaDenoise && !self.ensure_flow_prefix(id)
-        {
+        if transition.operation_variant == RunKind::DiffusionStep && !self.ensure_flow_prefix(id) {
             return false;
         }
         let resources = &transition.resources;
-        if resources.latent_units > 0
-            && self.worker_tracks_image_latent()
-            && !self
-                .kv_budget
-                .latent_pages
-                .can_reserve(id, resources.latent_units)
-        {
-            return false;
-        }
         let uses_transfer = transition.bounds.max_transfer_bytes > 0;
         if uses_transfer && self.inflight.inflight_transfers >= self.inflight.transfer_capacity {
             return false;
         }
-        if resources.latent_units > 0
-            && self.worker_tracks_image_latent()
-            && !self
-                .kv_budget
-                .latent_pages
-                .reserve(id, resources.latent_units)
-        {
+        let request_key = self
+            .running
+            .get(&id)
+            .map(|state| RequestKey::new(self.authority_id, id, state.epoch));
+        let Some(request_key) = request_key else {
             return false;
+        };
+        let mut buffer_allocations = Vec::new();
+        for bytes in transition
+            .outputs
+            .iter()
+            .filter(|output| output.uses_persistent_buffer())
+            .map(ProductRef::max_bytes)
+        {
+            let allocation = match self.memory.alloc(
+                request_key,
+                MemoryLayout::Buffer {
+                    bytes,
+                    alignment: 256,
+                },
+            ) {
+                Ok(allocation) => allocation,
+                Err(_) => {
+                    for allocation in buffer_allocations {
+                        self.memory.free(allocation);
+                    }
+                    if let Some(product) = self.memory.encoder_cache.evict_one() {
+                        self.free_products(vec![product]);
+                    }
+                    return false;
+                }
+            };
+            buffer_allocations.push(allocation);
         }
+        if resources.latent_units > 0 && self.worker_tracks_image_latent() {
+            let (runtime, memory) = (&mut self.runtime, &mut self.memory);
+            let authority_id = runtime.state().authority_id;
+            let Some(state) = runtime.state_mut().running.get_mut(&id) else {
+                return false;
+            };
+            let request_key = RequestKey::new(authority_id, id, state.epoch);
+            let allocations = state.allocations_mut();
+            if let Some(allocation) = allocations.latent.as_mut() {
+                if memory
+                    .grow(
+                        allocation,
+                        MemoryLayout::Latent {
+                            units: resources.latent_units,
+                        },
+                    )
+                    .is_err()
+                {
+                    for allocation in buffer_allocations {
+                        memory.free(allocation);
+                    }
+                    return false;
+                }
+            } else {
+                let Ok(allocation) = memory.alloc(
+                    request_key,
+                    MemoryLayout::Latent {
+                        units: resources.latent_units,
+                    },
+                ) else {
+                    for allocation in buffer_allocations {
+                        memory.free(allocation);
+                    }
+                    return false;
+                };
+                allocations.latent = Some(allocation);
+            }
+        }
+        transition.buffer_allocations = buffer_allocations;
         if uses_transfer {
             self.inflight.inflight_transfers += 1;
         }
@@ -67,7 +121,7 @@ impl Scheduler {
         let mut selected: HashSet<RequestId> = HashSet::new();
         // vLLM's per-step token budget with the clip rule: the budget, not the
         // chunk threshold, is the binding constraint.
-        let mut budget: usize = self.config.max_num_batched_tokens;
+        let mut budget: usize = self.scheduler.config.max_num_batched_tokens;
         // Text prefill tokens may ride along inside a decode batch (mixed
         // extend+decode forward): the prompt work then shares the decode
         // step's weight sweep instead of paying a full sweep of its own.
@@ -75,7 +129,7 @@ impl Scheduler {
         // keeps an extend row last (graph token-bucket padding extends the
         // last row).
         let mut mixed_left: usize = if lane == Some(BatchKind::Decode) {
-            self.config.mixed_prefill_tokens
+            self.scheduler.config.mixed_prefill_tokens
         } else {
             0
         };
@@ -83,7 +137,7 @@ impl Scheduler {
         let denoise_occupies_decode_pipeline =
             lane == Some(BatchKind::Decode) && self.inflight.any_denoise();
         for id in ids.iter().copied() {
-            if ops.len() + mixed_ops.len() >= self.config.max_batch {
+            if ops.len() + mixed_ops.len() >= self.scheduler.config.max_batch {
                 break;
             }
             if budget == 0 {
@@ -114,7 +168,7 @@ impl Scheduler {
                 }
             {
                 mixed_prefill = target == BatchKind::Decode
-                    && operation_variant == ForwardMode::TokenExtend
+                    && operation_variant == RunKind::ArExtend
                     && mixed_left > 0
                     && self.running.get(&id).is_some_and(|st| {
                         st.is_replayable_text() && !st.req.sampling.prompt_logprobs_requested()
@@ -123,10 +177,8 @@ impl Scheduler {
                     continue;
                 }
             }
-            if next_type == Some(ForwardMode::MediaDenoise)
-                && (denoise_occupies_decode_pipeline
-                    || !self.flow_prefix_is_schedulable(id)
-                    || !self.can_schedule_denoise(id))
+            if next_type == Some(RunKind::DiffusionStep)
+                && (denoise_occupies_decode_pipeline || !self.flow_prefix_is_schedulable(id))
             {
                 continue;
             }
@@ -135,7 +187,7 @@ impl Scheduler {
             // the flag is set a flow op only opens an empty batch, and the loop
             // below closes the batch as soon as one is placed.
             if self.flow_exclusive_batch
-                && next_type == Some(ForwardMode::MediaDenoise)
+                && next_type == Some(RunKind::DiffusionStep)
                 && !(ops.is_empty() && mixed_ops.is_empty())
             {
                 continue;
@@ -152,7 +204,7 @@ impl Scheduler {
                 }
                 budget = budget.saturating_sub(planned_op_token_cost(&op));
                 if !self.reserve_transition_resources(&mut op) {
-                    self.record_domain_backpressure(op.domain);
+                    self.record_domain_backpressure(op.kind.domain());
                     self.return_unsent_blocks(id, &op);
                     tracing::debug!(
                         request_id = id.0,
@@ -165,21 +217,22 @@ impl Scheduler {
                     .get(&id)
                     .map(|state| state.finish_token_ids.clone())
                     .unwrap_or_default();
-                if let Some(st) = self.running.get_mut(&id)
+                let authority_id = self.runtime.state().authority_id;
+                if let Some(st) = self.runtime.state_mut().running.get_mut(&id)
                     && !st.cursor.resources.worker_registered
                 {
                     st.cursor.resources.worker_registered = true;
-                    let request_key = RequestKey::new(self.authority_id, id, st.epoch);
+                    let request_key = RequestKey::new(authority_id, id, st.epoch);
                     let admission = NewRequest::new(
                         request_key,
-                        st.request_pool_idx,
-                        Some(UndAdmission {
+                        st.request_pool_idx(),
+                        Some(ArRequestParams {
                             sampling: st.req.sampling.clone(),
                             negative_token_ids: st.context.negative_prompt_ids.clone(),
                             finish_token_ids,
                             initial_position: st.cursor.ingest.prompt_cursor,
                         }),
-                        st.req.behavior.gen_output.then(|| GenAdmission {
+                        st.req.behavior.gen_output.then(|| UmmRequestParams {
                             image: st.req.image.clone(),
                         }),
                     )
@@ -194,16 +247,15 @@ impl Scheduler {
                     st.token_cutoffs.clear();
                     st.token_cutoffs.insert(
                         st.output.tokens_sent,
-                        VersionRef {
-                            request_key,
-                            producer_op_id: OpId(0),
-                            point: Point::Fixed { point_index: 0 },
+                        Checkpoint {
+                            op_id: OpId(0),
+                            point: CheckpointPoint::Fixed(0),
                         },
                     );
                     admissions.push(admission);
                 }
                 selected.insert(id);
-                let placed_denoise = op.operation_variant == ForwardMode::MediaDenoise;
+                let placed_denoise = op.operation_variant == RunKind::DiffusionStep;
                 if mixed_prefill {
                     mixed_ops.push(op);
                 } else {
@@ -265,7 +317,8 @@ impl Scheduler {
 
     pub(super) fn assembly_order(&self) -> Vec<RequestId> {
         let mut ids: Vec<(usize, RequestId)> = self
-            .order
+            .scheduler
+            .running_order
             .iter()
             .enumerate()
             .filter_map(|(index, id)| self.running.get(id).is_some().then_some((index, *id)))
@@ -276,26 +329,22 @@ impl Scheduler {
 
     pub(super) fn assembly_priority(&self, id: RequestId) -> u8 {
         match self.peek_next_operation_variant(id) {
+            Some(RunKind::EncoderVision | RunKind::EncoderLatent | RunKind::ArExtend) => 0,
             Some(
-                ForwardMode::EncodeVision | ForwardMode::EncodeLatent | ForwardMode::TokenExtend,
-            ) => 0,
-            Some(
-                ForwardMode::TokenDecode
-                | ForwardMode::TokenVerify
-                | ForwardMode::Materialize
-                | ForwardMode::TransferKvInstall,
+                RunKind::ArDecode
+                | RunKind::ArVerify
+                | RunKind::DiffusionFinalize
+                | RunKind::TransferKvInstall,
             ) => 1,
-            Some(ForwardMode::MediaDenoise | ForwardMode::MediaReconstruct) => 2,
+            Some(RunKind::DiffusionStep | RunKind::DiffusionDecode) => 2,
             Some(
-                ForwardMode::MediaPrepare
-                | ForwardMode::TransferProduct
-                | ForwardMode::TransferKvPublish,
+                RunKind::DiffusionPrepare | RunKind::TransferProduct | RunKind::TransferKvPublish,
             )
             | None => 3,
         }
     }
 
-    pub(super) fn peek_next_operation_variant(&self, id: RequestId) -> Option<ForwardMode> {
+    pub(super) fn peek_next_operation_variant(&self, id: RequestId) -> Option<RunKind> {
         let st = self.running.get(&id)?;
         if st.cursor.image_gen.branch_pending {
             return None;
@@ -315,34 +364,34 @@ impl Scheduler {
             })
         {
             return st.pending_image_step().map(|step| match step {
-                ImageIngestStep::VaeEncode => ForwardMode::EncodeLatent,
-                ImageIngestStep::VitEncode => ForwardMode::EncodeVision,
+                ImageIngestStep::VaeEncode => RunKind::EncoderLatent,
+                ImageIngestStep::VitEncode => RunKind::EncoderVision,
             });
         }
         Some(match st.cursor.phase {
             Phase::Encode => match st.pending_image_step()? {
-                ImageIngestStep::VaeEncode => ForwardMode::EncodeLatent,
-                ImageIngestStep::VitEncode => ForwardMode::EncodeVision,
+                ImageIngestStep::VaeEncode => RunKind::EncoderLatent,
+                ImageIngestStep::VitEncode => RunKind::EncoderVision,
             },
-            Phase::IngestState => ForwardMode::TokenExtend,
-            Phase::Prefill => ForwardMode::TokenExtend,
-            Phase::DecodeUnd => ForwardMode::TokenDecode,
-            Phase::CloseKv => ForwardMode::TokenExtend,
-            Phase::PublishKv => ForwardMode::TransferKvPublish,
-            Phase::PrepareGen => ForwardMode::MediaPrepare,
+            Phase::IngestState => RunKind::ArExtend,
+            Phase::Prefill => RunKind::ArExtend,
+            Phase::DecodeUnd => RunKind::ArDecode,
+            Phase::CloseKv => RunKind::ArExtend,
+            Phase::PublishKv => RunKind::TransferKvPublish,
+            Phase::PrepareGen => RunKind::DiffusionPrepare,
             Phase::DenoiseGen if st.cursor.image_gen.steps_done >= st.req.image.steps => {
-                ForwardMode::Materialize
+                RunKind::DiffusionFinalize
             }
-            Phase::DenoiseGen => ForwardMode::MediaDenoise,
-            Phase::CommitGen => ForwardMode::Materialize,
+            Phase::DenoiseGen => RunKind::DiffusionStep,
+            Phase::CommitGen => RunKind::DiffusionFinalize,
             Phase::FeedbackEncode => {
                 let feedback = st.req.policy.feedback.as_ref()?;
                 match feedback.ingest.steps.get(st.cursor.feedback.ingest_step)? {
-                    ImageIngestStep::VaeEncode => ForwardMode::EncodeLatent,
-                    ImageIngestStep::VitEncode => ForwardMode::EncodeVision,
+                    ImageIngestStep::VaeEncode => RunKind::EncoderLatent,
+                    ImageIngestStep::VitEncode => RunKind::EncoderVision,
                 }
             }
-            Phase::FeedbackState => ForwardMode::TokenExtend,
+            Phase::FeedbackState => RunKind::ArExtend,
         })
     }
 
@@ -350,11 +399,11 @@ impl Scheduler {
         &mut self,
         admissions: Vec<NewRequest>,
         transitions: Vec<NextOp>,
-        mut controls: Vec<Control>,
+        commands: Vec<BatchCommand>,
     ) -> bool {
         let _span =
             tracing::trace_span!("scheduler.submit_batch", ops = transitions.len()).entered();
-        let step = self.inflight.next_step();
+        let batch_id = self.inflight.next_batch_id();
         let submit_at = Instant::now();
         let mut operations = Vec::with_capacity(transitions.len());
         let mut input_products = Vec::new();
@@ -369,6 +418,7 @@ impl Scheduler {
         let mut new_cache_pages = HashMap::with_capacity(transitions.len());
         let mut forward_rows = HashMap::with_capacity(transitions.len());
         let mut latent_placements = HashMap::with_capacity(transitions.len());
+        let mut buffer_placements = HashMap::with_capacity(transitions.len());
         for mut transition in transitions {
             let oid = self.next_op_id;
             self.next_op_id += 1;
@@ -384,7 +434,7 @@ impl Scheduler {
             else {
                 tracing::error!(
                     request_id = request_id.0,
-                    "planned operation lost its session"
+                    "planned operation lost its request"
                 );
                 self.fatal = true;
                 return false;
@@ -434,7 +484,7 @@ impl Scheduler {
                     self.fatal = true;
                     return false;
                 };
-                let predicate_kind = if transition.operation_variant == ForwardMode::TokenDecode {
+                let predicate_kind = if transition.operation_variant == RunKind::ArDecode {
                     ProductKind::Token
                 } else {
                     ProductKind::Completion
@@ -442,7 +492,7 @@ impl Scheduler {
                 (
                     parent,
                     predecessor
-                        .outputs
+                        .outputs()
                         .iter()
                         .find(|output| output.kind == predicate_kind)
                         .cloned(),
@@ -469,24 +519,26 @@ impl Scheduler {
             if let Some(lengths) = kv_lengths {
                 let table_changed =
                     admitted_request_keys.contains(&request_key) || new_page_count > 0;
-                for group_id in 0..self.kv_budget.cache().block_pool.num_groups() {
+                for group_id in 0..self.memory.cache().block_pool.num_groups() {
                     let page_ids = self
                         .running
                         .get(&request_id)
-                        .and_then(|state| state.block_tables.get(group_id))
+                        .and_then(|state| state.block_tables().get(group_id))
                         .map(BlockTable::page_ids)
                         .unwrap_or_default();
                     let request_pool_idx = self
                         .running
                         .get(&request_id)
-                        .map(|state| state.request_pool_idx)
+                        .map(|state| state.request_pool_idx())
                         .expect("registered request has a live slot");
                     if table_changed {
                         operation_block_tables.push(IpcBlockTable {
                             request_pool_idx,
                             group_id: group_id as u32,
                             allocated_tokens: u32::try_from(
-                                page_ids.len().saturating_mul(self.info.block_size as usize),
+                                page_ids
+                                    .len()
+                                    .saturating_mul(self.info.kv_block_size() as usize),
                             )
                             .unwrap_or(u32::MAX),
                             page_ids: page_ids.clone(),
@@ -498,7 +550,7 @@ impl Scheduler {
                                 .get(&request_id)
                                 .map(|state| {
                                     (state.cursor.ingest.prompt_cursor as usize)
-                                        .div_ceil(self.info.block_size as usize)
+                                        .div_ceil(self.info.kv_block_size() as usize)
                                 })
                                 .unwrap_or_default()
                                 .min(page_ids.len())
@@ -525,7 +577,7 @@ impl Scheduler {
                         request_pool_index: self
                             .running
                             .get(&request_id)
-                            .map(|state| state.request_pool_idx)
+                            .map(|state| state.request_pool_idx())
                             .expect("registered request has a live slot"),
                         seq_len: lengths.visible,
                         query_len: lengths.input,
@@ -534,6 +586,7 @@ impl Scheduler {
             }
             let output_event_bound = transition_output_bound(&transition);
             let planned_us = transition.planned_us;
+            let reserved_buffers = std::mem::take(&mut transition.buffer_allocations);
             let registered = transition.register(
                 request_key,
                 OpId(oid),
@@ -544,6 +597,9 @@ impl Scheduler {
             let (operation, apply, payloads) = match registered {
                 Ok(registered) => registered,
                 Err(error) => {
+                    for allocation in reserved_buffers {
+                        self.memory.free(allocation);
+                    }
                     tracing::error!(
                         request_id = request_id.0,
                         ?error,
@@ -555,7 +611,49 @@ impl Scheduler {
                 }
             };
             let operation_identity = (operation.request_key, operation.op_id);
-            if operation.work == ForwardMode::MediaDenoise {
+            let persistent_outputs = operation
+                .outputs()
+                .iter()
+                .filter(|output| output.uses_persistent_buffer())
+                .map(ProductRef::buffer_id)
+                .collect::<Vec<_>>();
+            if persistent_outputs.len() != reserved_buffers.len() {
+                for allocation in reserved_buffers {
+                    self.memory.free(allocation);
+                }
+                tracing::error!(
+                    request_id = request_id.0,
+                    "registered operation changed its persistent buffer set"
+                );
+                self.fatal = true;
+                self.fail_all_running("registered operation changed its persistent buffer set");
+                return false;
+            }
+            let mut operation_buffers = Vec::with_capacity(reserved_buffers.len());
+            let Some(state) = self.running.get_mut(&request_id) else {
+                for allocation in reserved_buffers {
+                    self.memory.free(allocation);
+                }
+                self.fatal = true;
+                return false;
+            };
+            for (buffer, allocation) in persistent_outputs.into_iter().zip(reserved_buffers) {
+                let (offset, bytes) = match allocation.placement() {
+                    Placement::Buffer { offset, bytes } => (*offset, *bytes),
+                    _ => unreachable!("persistent output allocation has a non-buffer placement"),
+                };
+                let replaced = state.allocations_mut().buffers.insert(buffer, allocation);
+                debug_assert!(replaced.is_none(), "buffer identity was reused");
+                operation_buffers.push(BufferPlacement {
+                    buffer,
+                    offset,
+                    bytes,
+                });
+            }
+            if !operation_buffers.is_empty() {
+                buffer_placements.insert(operation_identity, operation_buffers);
+            }
+            if operation.kind == RunKind::DiffusionStep {
                 let conditioning_tokens = match &apply.intent {
                     TransitionIntent::DenoiseGen {
                         physical_kv_len, ..
@@ -567,25 +665,27 @@ impl Scheduler {
                         .get(&request_id)
                         .map(|state| self.num_vae(&state.req.image))
                         .unwrap_or_default()
-                        .saturating_add(u64::from(self.info.commit_marker_tokens)),
+                        .saturating_add(u64::from(
+                            self.profile.generation_limits.commit_marker_tokens,
+                        )),
                 )
                 .unwrap_or(u32::MAX);
                 let Some(state) = self.running.get_mut(&request_id) else {
                     self.fatal = true;
                     return false;
                 };
-                let main_slot = state.request_pool_idx;
+                let main_slot = state.request_pool_idx();
                 let mut alternative = None;
                 if let Some(prefix) = state.flow_prefix.as_mut() {
                     let allocated_tokens = prefix
-                        .block_tables
+                        .block_tables()
                         .first()
                         .map(|table| table.capacity_tokens())
                         .unwrap_or_default();
-                    if !prefix.materialized || !prefix.new_pages.is_empty() {
-                        for table in &prefix.block_tables {
+                    if !prefix.diffusion_finalized || !prefix.new_pages.is_empty() {
+                        for table in prefix.block_tables() {
                             operation_block_tables.push(IpcBlockTable {
-                                request_pool_idx: prefix.request_pool_idx,
+                                request_pool_idx: prefix.request_pool_idx(),
                                 group_id: table.group_id() as u32,
                                 page_ids: table.page_ids(),
                                 allocated_tokens: u32::try_from(allocated_tokens)
@@ -596,22 +696,22 @@ impl Scheduler {
                     for (group_id, pages) in std::mem::take(&mut prefix.new_pages) {
                         if !pages.is_empty() {
                             operation_new_cache_pages.push(CachePageAllocation {
-                                request_pool_idx: prefix.request_pool_idx,
+                                request_pool_idx: prefix.request_pool_idx(),
                                 group_id,
                                 page_ids: pages,
                             });
                         }
                     }
                     let prefix_len = state.context.negative_prompt_ids.len() as u32;
-                    if prefix_len > 0 && !prefix.materialized {
+                    if prefix_len > 0 && !prefix.diffusion_finalized {
                         operation_forward_rows.push(RowGeometry {
                             operation_index: 0,
-                            request_pool_index: prefix.request_pool_idx,
+                            request_pool_index: prefix.request_pool_idx(),
                             seq_len: 0,
                             query_len: prefix_len,
                         });
                     }
-                    alternative = Some((prefix.request_pool_idx, prefix_len));
+                    alternative = Some((prefix.request_pool_idx(), prefix_len));
                 }
                 for branch in 0..usize::from(cfg_branch_count(&state.req.image).max(1)) {
                     let (request_pool_index, seq_len) = if branch == 0 {
@@ -637,10 +737,10 @@ impl Scheduler {
                 forward_rows.insert(operation_identity, operation_forward_rows);
             }
             if matches!(
-                operation.work,
-                ForwardMode::MediaPrepare | ForwardMode::MediaDenoise
+                operation.kind,
+                RunKind::DiffusionPrepare | RunKind::DiffusionStep
             ) || operation
-                .inputs
+                .inputs()
                 .iter()
                 .any(|reference| reference.kind == uniserve_worker_ipc::ProductKind::Latent)
             {
@@ -648,7 +748,15 @@ impl Scheduler {
                     self.fatal = true;
                     return false;
                 };
-                let page_table = self.kv_budget.latent_pages.pages_for(request_id).to_vec();
+                let page_table = state
+                    .allocations()
+                    .latent
+                    .as_ref()
+                    .and_then(|allocation| match allocation.placement() {
+                        Placement::Latent { pages, .. } => Some(pages.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
                 let latent_units = self.worker_image_latent_units_for(state).max(1);
                 let (start_step, step_count) = match &apply.intent {
                     TransitionIntent::DenoiseGen {
@@ -661,7 +769,7 @@ impl Scheduler {
                     _ => {
                         tracing::error!(
                             request_id = request_id.0,
-                            operation = operation.work.as_str(),
+                            operation = operation.kind.as_str(),
                             "latent operation has no declared schedule placement"
                         );
                         self.fatal = true;
@@ -682,7 +790,7 @@ impl Scheduler {
                     },
                 );
             }
-            let operation_variant = operation.work.as_str();
+            let operation_variant = operation.kind.as_str();
             if let Some(trace_ops) = trace_ops.as_mut() {
                 let phase = self
                     .running
@@ -696,7 +804,7 @@ impl Scheduler {
                     "operation": operation_trace(&operation, &apply),
                     "transition": &apply.intent,
                     "resources": {
-                        "release_on_apply": apply.release_on_apply,
+                        "free_latent_on_apply": apply.free_latent_on_apply,
                         "replayability_after_apply": apply.replayability_after_apply,
                     },
                     "visibility": {
@@ -735,53 +843,53 @@ impl Scheduler {
         self.stats
             .kv_cache
             .free_blocks
-            .store(self.kv_budget.free_blocks(), Ordering::Relaxed);
+            .store(self.memory.free_blocks(), Ordering::Relaxed);
         let mixed = operations.first().is_some_and(|first| {
             operations
                 .iter()
-                .any(|operation| operation.work != first.work)
+                .any(|operation| operation.kind != first.kind)
         });
-        self.inflight.batch_started.insert(step, submit_at);
+        self.inflight.batch_started.insert(batch_id, submit_at);
         if operations
             .iter()
-            .any(|operation| batch_kind(operation.work) == BatchKind::Prefill)
+            .any(|operation| batch_kind(operation.kind) == BatchKind::Prefill)
         {
-            self.inflight.prefill_steps.insert(step);
+            self.inflight.prefill_steps.insert(batch_id);
         }
         if let Some(trace_ops) = trace_ops {
             let operation_types: Vec<&'static str> = operations
                 .iter()
-                .map(|operation| operation.work.as_str())
+                .map(|operation| operation.kind.as_str())
                 .collect();
             let req_ids: Vec<u64> = operations
                 .iter()
-                .map(|operation| operation.request_key.session_id.0)
+                .map(|operation| operation.request_key.request_id.0)
                 .collect();
-            let admitted_session_ids: Vec<u64> = admissions
+            let admitted_request_ids: Vec<u64> = admissions
                 .iter()
-                .map(|admission| admission.request_key.session_id.0)
+                .map(|admission| admission.request_key.request_id.0)
                 .collect();
             self.trace_record(json!({
                 "event": "batch_submitted",
                 "at_s": now(),
-                "step_id": step,
+                "batch_id": batch_id,
                 "batch_size": operations.len(),
                 "mixed": mixed,
                 "operation_types": operation_types,
                 "request_ids": req_ids,
-                "admitted_session_ids": admitted_session_ids,
-                "controls": controls,
+                "admitted_request_ids": admitted_request_ids,
+                "commands": commands,
                 "ops": trace_ops,
                 "scheduler": {
-                    "policy": self.config.policy,
-                    "max_batch": self.config.max_batch,
-                    "max_num_batched_tokens": self.config.max_num_batched_tokens,
+                    "policy": self.scheduler.config.policy,
+                    "max_batch": self.scheduler.config.max_batch,
+                    "max_num_batched_tokens": self.scheduler.config.max_num_batched_tokens,
                 },
                 "running": self.running.len(),
-                "pending": self.pending.len(),
-                "in_flight_before_submit": self.executor.in_flight(),
-                "free_blocks": self.kv_budget.free_blocks(),
-                "reserved_blocks": self.kv_budget.reserved_blocks,
+                "pending": self.scheduler.waiting_len(),
+                "in_flight_before_submit": self.inflight.batch_started.len(),
+                "free_blocks": self.memory.free_blocks(),
+                "reserved_blocks": self.memory.reserved_blocks,
                 "worker_image_latent_active": self.worker_image_latent_used(),
                 "worker_image_latent_capacity": self.info.latent_capacity_units(),
             }));
@@ -789,289 +897,83 @@ impl Scheduler {
         if mixed {
             let operation_types: Vec<&'static str> = operations
                 .iter()
-                .map(|operation| operation.work.as_str())
+                .map(|operation| operation.kind.as_str())
                 .collect();
             let req_ids: Vec<u64> = operations
                 .iter()
-                .map(|operation| operation.request_key.session_id.0)
+                .map(|operation| operation.request_key.request_id.0)
                 .collect();
             tracing::debug!(
-                step_id = step,
+                batch_id,
                 ?operation_types,
                 ?req_ids,
                 "submitting mixed forward batch"
             );
         }
-        let releases = operations
-            .iter()
-            .filter(|operation| operation.parent.producer_op_id.0 > 0)
-            .map(|operation| Control::Release {
-                request_key: operation.request_key,
-                op_id: operation.parent.producer_op_id,
-            })
-            .collect::<Vec<_>>();
-        controls.extend(releases);
-        let partitions = self.partition_batch(
-            operations,
-            &block_tables,
-            &new_cache_pages,
-            &forward_rows,
-            &latent_placements,
-        );
-        let mut group_sizes = HashMap::new();
-        for partition in &partitions {
-            *group_sizes
-                .entry(partition.submission_group)
-                .or_insert(0_usize) += 1;
-        }
-        let partition_accounting = partitions
-            .iter()
-            .map(|partition| {
-                (
-                    partition.partition_id,
-                    SubmittedPartitionAccounting {
-                        domain: partition.domain,
-                        mixed: group_sizes[&partition.submission_group] > 1,
-                        submission_group: partition.submission_group,
-                        operation_count: partition.operations.len(),
+        let logical_ops = operations
+            .into_iter()
+            .map(|operation| {
+                let identity = (operation.request_key, operation.op_id);
+                LogicalOp::new(
+                    operation,
+                    OpPlacement {
+                        block_tables: block_tables.remove(&identity).unwrap_or_default(),
+                        new_cache_pages: new_cache_pages.remove(&identity).unwrap_or_default(),
+                        forward_rows: forward_rows.remove(&identity).unwrap_or_default(),
+                        latent: latent_placements.remove(&identity),
+                        decode: None,
+                        buffers: buffer_placements.remove(&identity).unwrap_or_default(),
                     },
                 )
             })
-            .collect::<HashMap<_, _>>();
-        self.inflight
-            .batch_partitions
-            .insert(step, partition_accounting);
+            .collect::<Vec<_>>();
+        self.inflight.batch_operations.insert(
+            batch_id,
+            logical_ops
+                .iter()
+                .map(|op| (op.request_key(), op.id()))
+                .collect(),
+        );
         self.inflight
             .batch_group_worker_exec_us
-            .insert(step, HashMap::new());
-        let batch = Batch::new(step, admissions, partitions)
-            .with_controls(controls.clone())
-            .with_input_products(input_products);
-        if let Err(e) = self.executor.submit(batch) {
-            self.inflight.batch_started.remove(&step);
-            self.inflight.prefill_steps.remove(&step);
-            self.inflight.batch_partitions.remove(&step);
-            self.inflight.batch_group_worker_exec_us.remove(&step);
-            self.trace_record(json!({
-                "event": "batch_submit_failed",
-                "at_s": now(),
-                "step_id": step,
-                "error": format!("{e}"),
-            }));
-            tracing::error!("executor submit failed: {e}");
-            if e.downcast_ref::<WorkerLossError>().is_some() {
-                self.on_executor_error(e);
-            } else {
-                self.fatal = true;
-                self.fail_all_inflight(&format!("{e}"));
-            }
-            false
-        } else {
-            if !controls.is_empty() {
-                self.inflight.control_batches.insert(step, controls);
-            }
-            true
+            .insert(batch_id, HashMap::new());
+        let mut batch_commands = admissions
+            .into_iter()
+            .map(|request| BatchCommand::Start { request })
+            .collect::<Vec<_>>();
+        batch_commands.extend(commands.clone());
+        let batch = Batch::new(batch_id, logical_ops, batch_commands, input_products);
+        if !commands.is_empty() {
+            self.inflight.command_batches.insert(batch_id, commands);
         }
-    }
-
-    pub(super) fn partition_batch(
-        &mut self,
-        operations: Vec<Operation>,
-        block_tables: &HashMap<(RequestKey, OpId), Vec<IpcBlockTable>>,
-        new_cache_pages: &HashMap<(RequestKey, OpId), Vec<CachePageAllocation>>,
-        forward_rows: &HashMap<(RequestKey, OpId), Vec<RowGeometry>>,
-        latent_placements: &HashMap<(RequestKey, OpId), LatentPlacement>,
-    ) -> Vec<BatchPartition> {
-        let mut routes: RouteDomainOperations = Vec::new();
-        for operation in operations {
-            let route = operation.route;
-            let domain = operation.domain;
-            let groups = if let Some((_, groups)) =
-                routes.iter_mut().find(|(candidate, _)| *candidate == route)
-            {
-                groups
-            } else {
-                routes.push((route, Vec::new()));
-                &mut routes.last_mut().expect("route was inserted").1
-            };
-            if let Some((_, members)) = groups
-                .iter_mut()
-                .find(|(candidate, _)| *candidate == domain)
-            {
-                members.push(operation);
-            } else {
-                groups.push((domain, vec![operation]));
+        match self.executor.submit(batch) {
+            Ok(()) => true,
+            Err(ExecutorSubmitError::WouldBlock(batch)) => {
+                self.pending_submission = Some(batch);
+                false
+            }
+            Err(ExecutorSubmitError::Failed(error)) => {
+                self.inflight.batch_started.remove(&batch_id);
+                self.inflight.prefill_steps.remove(&batch_id);
+                self.inflight.batch_operations.remove(&batch_id);
+                self.inflight.batch_group_worker_exec_us.remove(&batch_id);
+                self.inflight.command_batches.remove(&batch_id);
+                self.trace_record(json!({
+                    "event": "batch_submit_failed",
+                    "at_s": now(),
+                    "batch_id": batch_id,
+                    "error": format!("{error}"),
+                }));
+                tracing::error!("executor submit failed: {error}");
+                if error.downcast_ref::<WorkerLossError>().is_some() {
+                    self.on_executor_error(error);
+                } else {
+                    self.fatal = true;
+                    self.fail_all_inflight(&format!("{error}"));
+                }
+                false
             }
         }
-        let mut partitions = Vec::new();
-        let mut next_partition_id = 1u32;
-        let mut next_submission_group = 1u32;
-        for (route, groups) in routes {
-            let mixed_capable = !self.info.mixed_buckets.is_empty();
-            let mut mixed_candidates = Vec::new();
-            let mut homogeneous = Vec::new();
-            for (domain, operations) in groups {
-                if !mixed_capable {
-                    homogeneous.push((domain, operations));
-                    continue;
-                }
-                let (candidates, independent): (Vec<_>, Vec<_>) = operations
-                    .into_iter()
-                    .partition(|operation| tensorized_mixed_runner_work(operation.work));
-                if !candidates.is_empty() {
-                    mixed_candidates.push((domain, candidates));
-                }
-                if !independent.is_empty() {
-                    homogeneous.push((domain, independent));
-                }
-            }
-            while let Some(mixed_group) = extract_mixed_group(
-                &mut mixed_candidates,
-                &self.info.mixed_buckets,
-                forward_rows,
-                latent_placements,
-            ) {
-                let collective_seq = {
-                    let value = self.next_collective_seq.max(1);
-                    self.next_collective_seq = value.saturating_add(1);
-                    value
-                };
-                let attention = partition_attention(
-                    &mixed_group
-                        .iter()
-                        .flat_map(|(_, operations)| operations.iter().cloned())
-                        .collect::<Vec<_>>(),
-                );
-                for (domain, operations) in mixed_group {
-                    let partition_block_tables = self.block_tables(&operations, block_tables);
-                    let partition_new_cache_pages =
-                        self.new_cache_pages(&operations, new_cache_pages);
-                    let partition_forward_rows = self.forward_rows(&operations, forward_rows);
-                    let latent_placements = self.latent_placements(&operations, latent_placements);
-                    partitions.push(BatchPartition {
-                        partition_id: next_partition_id,
-                        submission_group: next_submission_group,
-                        collective_seq,
-                        domain,
-                        route,
-                        attention,
-                        shape_class: 0,
-                        operations,
-                        block_tables: partition_block_tables,
-                        new_cache_pages: partition_new_cache_pages,
-                        forward_rows: partition_forward_rows,
-                        latent_placements,
-                        reconstruction_placements: Vec::new(),
-                    });
-                    next_partition_id = next_partition_id.saturating_add(1);
-                }
-                next_submission_group = next_submission_group.saturating_add(1);
-            }
-            homogeneous.extend(
-                mixed_candidates
-                    .into_iter()
-                    .filter(|(_, operations)| !operations.is_empty()),
-            );
-            for (domain, operations) in homogeneous {
-                let collective_seq = {
-                    let value = self.next_collective_seq.max(1);
-                    self.next_collective_seq = value.saturating_add(1);
-                    value
-                };
-                let partition_block_tables = self.block_tables(&operations, block_tables);
-                let partition_new_cache_pages = self.new_cache_pages(&operations, new_cache_pages);
-                let partition_forward_rows = self.forward_rows(&operations, forward_rows);
-                let latent_placements = self.latent_placements(&operations, latent_placements);
-                partitions.push(BatchPartition {
-                    partition_id: next_partition_id,
-                    submission_group: next_submission_group,
-                    collective_seq,
-                    domain,
-                    route,
-                    attention: partition_attention(&operations),
-                    shape_class: 0,
-                    operations,
-                    block_tables: partition_block_tables,
-                    new_cache_pages: partition_new_cache_pages,
-                    forward_rows: partition_forward_rows,
-                    latent_placements,
-                    reconstruction_placements: Vec::new(),
-                });
-                next_partition_id = next_partition_id.saturating_add(1);
-                next_submission_group = next_submission_group.saturating_add(1);
-            }
-        }
-        partitions
-    }
-
-    pub(super) fn block_tables(
-        &self,
-        operations: &[Operation],
-        tables: &HashMap<(RequestKey, OpId), Vec<IpcBlockTable>>,
-    ) -> Vec<IpcBlockTable> {
-        operations
-            .iter()
-            .flat_map(|operation| {
-                tables
-                    .get(&(operation.request_key, operation.op_id))
-                    .into_iter()
-                    .flatten()
-                    .cloned()
-            })
-            .collect()
-    }
-
-    pub(super) fn new_cache_pages(
-        &self,
-        operations: &[Operation],
-        allocations: &HashMap<(RequestKey, OpId), Vec<CachePageAllocation>>,
-    ) -> Vec<CachePageAllocation> {
-        operations
-            .iter()
-            .flat_map(|operation| {
-                allocations
-                    .get(&(operation.request_key, operation.op_id))
-                    .into_iter()
-                    .flatten()
-                    .cloned()
-            })
-            .collect()
-    }
-
-    pub(super) fn forward_rows(
-        &self,
-        operations: &[Operation],
-        rows: &HashMap<(RequestKey, OpId), Vec<RowGeometry>>,
-    ) -> Vec<RowGeometry> {
-        operations
-            .iter()
-            .enumerate()
-            .flat_map(|(operation_index, operation)| {
-                rows.get(&(operation.request_key, operation.op_id))
-                    .into_iter()
-                    .flatten()
-                    .copied()
-                    .map(move |mut row| {
-                        row.operation_index = operation_index as u32;
-                        row
-                    })
-            })
-            .collect()
-    }
-
-    pub(super) fn latent_placements(
-        &self,
-        operations: &[Operation],
-        placements: &HashMap<(RequestKey, OpId), LatentPlacement>,
-    ) -> Vec<LatentPlacement> {
-        operations
-            .iter()
-            .filter_map(|operation| {
-                placements
-                    .get(&(operation.request_key, operation.op_id))
-                    .cloned()
-            })
-            .collect()
     }
 
     pub(super) fn generated_trigger_matches(st: &ReqState) -> bool {
@@ -1115,19 +1017,26 @@ impl Scheduler {
     }
 
     pub(super) fn ensure_request_capacity(&mut self, id: RequestId, total_tokens: usize) -> bool {
-        let kv = self.kv_budget.cache();
-        let Some(state) = self.running.get_mut(&id) else {
+        let (runtime, memory) = (&mut self.runtime, &mut self.memory);
+        let Some(state) = runtime.state_mut().running.get_mut(&id) else {
             return false;
         };
-        kv.coordinator
-            .ensure_capacity(&kv.block_pool, &mut state.block_tables, total_tokens)
-            .is_some()
+        let groups = state.block_tables().len() as u32;
+        memory
+            .grow(
+                &mut state.allocations_mut().kv,
+                MemoryLayout::Kv {
+                    tokens: total_tokens.min(u32::MAX as usize) as u32,
+                    groups,
+                },
+            )
+            .is_ok()
     }
 
     pub(super) fn activate_request_tables(&self, id: RequestId) {
-        let kv = self.kv_budget.cache();
+        let kv = self.memory.cache();
         if let Some(state) = self.running.get(&id) {
-            for table in &state.block_tables {
+            for table in state.block_tables() {
                 table.activate(&kv.block_pool);
             }
         }
@@ -1139,7 +1048,7 @@ impl Scheduler {
         let Some(st) = self.running.get_mut(&id) else {
             return Vec::new();
         };
-        let all = st.block_tables[0].page_ids();
+        let all = st.block_tables()[0].page_ids();
         let sent = st.cursor.resources.blocks_sent.min(all.len());
         let new = all[sent..].to_vec();
         st.cursor.resources.blocks_sent = all.len();
@@ -1164,7 +1073,18 @@ impl Scheduler {
     ) -> Option<NextOp> {
         let planned = {
             let request = &self.running.get(&id)?.req;
-            plan(self.latent_dtype, request, cursor, intent)
+            let kv_bytes_per_token = self
+                .info
+                .kv_cache
+                .as_ref()
+                .map_or(0, |cache| cache.bytes_per_token);
+            plan(
+                self.latent_dtype,
+                kv_bytes_per_token,
+                request,
+                cursor,
+                intent,
+            )
         };
         match planned {
             Ok(transition) => Some(transition),
@@ -1205,7 +1125,7 @@ impl Scheduler {
                 // Chunked prefill with the clip rule: the chunk is bounded by
                 // the remaining step budget and the long-prefill threshold.
                 let chunk_cap = (n - cursor)
-                    .min(self.config.long_prefill_threshold)
+                    .min(self.scheduler.config.long_prefill_threshold)
                     .min(budget.max(1));
                 let end = (cursor + chunk_cap.max(1))
                     .min(n)
@@ -1464,7 +1384,9 @@ impl Scheduler {
                         uniserve_core::ImageIngestStep::VaeEncode => {
                             self.cap_max_vae_grid_tokens().min(u32::MAX as usize) as u32
                         }
-                        uniserve_core::ImageIngestStep::VitEncode => self.info.max_vit_grid_tokens,
+                        uniserve_core::ImageIngestStep::VitEncode => {
+                            self.profile.generation_limits.max_vit_grid_tokens
+                        }
                     },
                 };
                 if !self.ensure_request_capacity(
@@ -1497,17 +1419,17 @@ impl Scheduler {
             let cache_write = state.req.cache.write;
             let cache_key = encoder_cache_key(image.hash, step_index, step);
             let cached = if cache_read {
-                self.kv_budget.encoder_cache.lookup_product(cache_key)
+                self.memory.encoder_cache.lookup_product(cache_key)
             } else {
                 None
             };
             if let Some(cached_product) = cached {
-                let product = self.kv_budget.encoder_cache.acquire(cache_key)?;
+                let product = self.memory.encoder_cache.acquire(cache_key)?;
                 if product != cached_product {
                     return None;
                 }
                 let Some(state) = self.running.get_mut(&id) else {
-                    let _ = self.kv_budget.encoder_cache.release(cache_key, &product);
+                    let _ = self.memory.encoder_cache.release(cache_key, &product);
                     return None;
                 };
                 state
@@ -1553,7 +1475,11 @@ impl Scheduler {
             return None;
         }
         let end = cursor
-            .saturating_add(budget.max(1).min(self.config.long_prefill_threshold))
+            .saturating_add(
+                budget
+                    .max(1)
+                    .min(self.scheduler.config.long_prefill_threshold),
+            )
             .min(prompt.len())
             .min(segment_end)
             .min(next_image.max(cursor + 1));
@@ -1636,13 +1562,13 @@ impl Scheduler {
             Some(s) => s,
             None => return (None, None),
         };
-        let ctx = crate::scheduler::logits::ProcCtx {
+        let ctx = crate::runtime::logits::ProcCtx {
             n_generated,
             eos: &self.ctrl.eos,
             generated: &st.cursor.replay.generated_ids,
             sampling: &st.req.sampling,
         };
-        let masks = crate::scheduler::logits::run_pipeline(&self.logits_pipeline, &ctx);
+        let masks = crate::runtime::logits::run_pipeline(&self.logits_pipeline, &ctx);
         let allowed = masks.allowed;
         let mut suppress = masks.suppress;
         // Image-budget enforcement: once a request has produced max_images, a

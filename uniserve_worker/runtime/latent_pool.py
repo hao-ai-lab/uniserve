@@ -8,8 +8,8 @@ from dataclasses import dataclass
 
 import torch
 
-from .device import fill_cpu_ints
 from ..foundation.errors import invalid_descriptor
+from .device import fill_cpu_ints
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,7 +38,7 @@ class LatentSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class LatentPublication:
-    """Validated visibility change applied at the partition commit point."""
+    """Validated visibility change applied at the lane commit point."""
 
     request_pool_idx: int
     page_table: tuple[int, ...]
@@ -53,7 +53,7 @@ class LatentPublication:
 
 @dataclass(frozen=True, slots=True)
 class LatentRelease:
-    """Validated trajectory release applied at the partition commit point."""
+    """Validated trajectory release applied at the lane commit point."""
 
     request_pool_idx: int
     page_table: tuple[int, ...]
@@ -295,7 +295,7 @@ class LatentPool:
         publications: Sequence[LatentPublication],
         releases: Sequence[LatentRelease],
     ) -> None:
-        """Validate an entire partition's visibility changes without mutation."""
+        """Validate an entire lane's visibility changes without mutation."""
 
         slots = (
             *(int(value.request_pool_idx) for value in publications),

@@ -365,10 +365,18 @@ class H3StatePool:
             raise ValueError(f"H3 request-pool index {index} is outside resident capacity")
         return self.slots[index - 1]
 
-    def drop_session(self, session_id: int) -> None:
+    def drop_request(self, request_id: int) -> None:
         for slot in self.slots:
-            if slot.request_key is not None and slot.request_key.session_id == int(session_id):
+            if slot.request_key is not None and slot.request_key.request_id == int(request_id):
                 slot.clear()
+
+    def abort_admissions(self, admissions) -> None:
+        slots = tuple((admission, self.get(int(admission.request_pool_idx))) for admission in admissions)
+        for admission, slot in slots:
+            if slot.request_key not in (None, admission.request_key):
+                raise RuntimeError("discarded request admission no longer owns its state slot")
+        for _admission, slot in slots:
+            slot.clear()
 
 
 @dataclass(slots=True)

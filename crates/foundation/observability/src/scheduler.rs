@@ -148,20 +148,20 @@ pub struct SchedulerMetrics {
     )]
     pub scheduler_domain_reclaimed_credits: Family<EngineDomainLabels, U64Counter>,
     #[metric(
-        name = "uniserve:scheduler_domain_completed_partitions",
-        help = "Completed physical partitions by execution domain."
+        name = "uniserve:scheduler_domain_completed_runs",
+        help = "Completed physical runs by execution domain."
     )]
-    pub scheduler_domain_completed_partitions: Family<EngineDomainLabels, U64Counter>,
+    pub scheduler_domain_completed_runs: Family<EngineDomainLabels, U64Counter>,
     #[metric(
         name = "uniserve:scheduler_domain_time_us",
         help = "Cumulative execution-domain time in microseconds by phase: queue, launch, device, completion, or co_resident."
     )]
     pub scheduler_domain_time_us: Family<EngineDomainKindLabels, U64Counter>,
     #[metric(
-        name = "uniserve:scheduler_domain_co_resident_partitions",
-        help = "Physical partitions served in a qualified tensorized mixed call by execution domain."
+        name = "uniserve:scheduler_domain_co_resident_runs",
+        help = "Physical runs served in a qualified tensorized mixed call by execution domain."
     )]
-    pub scheduler_domain_co_resident_partitions: Family<EngineDomainLabels, U64Counter>,
+    pub scheduler_domain_co_resident_runs: Family<EngineDomainLabels, U64Counter>,
 
     // Prefix-cache counters, including the connector-backed external cache path.
     #[metric(

@@ -673,7 +673,7 @@ pub(super) async fn assemble_event_stream(
     }
     while let Some(event) = stream.next().await {
         match event {
-            GenerationEvent::Scheduled {
+            Event::Scheduled {
                 queued_at,
                 scheduled_at,
             } => {
@@ -695,7 +695,7 @@ pub(super) async fn assemble_event_stream(
                     .scheduled
                     .fetch_add(1, Ordering::Relaxed);
             }
-            GenerationEvent::PromptLogprobs { positions } => {
+            Event::PromptLogprobs { positions } => {
                 state.prompt_positions.extend(positions);
                 if state.prompt_positions.len() > expected_prompt_positions {
                     return Err(malformed_output(
@@ -727,7 +727,7 @@ pub(super) async fn assemble_event_stream(
                         .await;
                 }
             }
-            GenerationEvent::TextToken { id, .. } => {
+            Event::TextToken { id, .. } => {
                 if !state.accepted {
                     return Err(malformed_output(
                         request_id.clone(),
@@ -757,7 +757,7 @@ pub(super) async fn assemble_event_stream(
                     }
                 }
             }
-            GenerationEvent::TokenLogprobs { id, candidates } => {
+            Event::TokenLogprobs { id, candidates } => {
                 let pending = state.pending_token.take().ok_or_else(|| {
                     malformed_output(
                         request_id.clone(),
@@ -797,7 +797,7 @@ pub(super) async fn assemble_event_stream(
                     return Ok(());
                 }
             }
-            GenerationEvent::ImageBegin {
+            Event::ImageBegin {
                 image_id,
                 height,
                 width,
@@ -817,7 +817,7 @@ pub(super) async fn assemble_event_stream(
                 })
                 .await;
             }
-            GenerationEvent::ImageStep { image_id, step } => {
+            Event::ImageStep { image_id, step } => {
                 state.ensure_output_ready(&request_id, "image-step event")?;
                 state.image_steps = state.image_steps.saturating_add(1);
                 y.yield_ok(ServeEvent::ImageStep {
@@ -828,7 +828,7 @@ pub(super) async fn assemble_event_stream(
                 })
                 .await;
             }
-            GenerationEvent::ImageCommit { image_id } => {
+            Event::ImageCommit { image_id } => {
                 state.ensure_output_ready(&request_id, "image-commit event")?;
                 state.pending_image_events.push(ServeEvent::ImageCommit {
                     candidate_id: CandidateId::PRIMARY,
@@ -836,7 +836,7 @@ pub(super) async fn assemble_event_stream(
                     elapsed_us: started.elapsed().as_micros() as u64,
                 });
             }
-            GenerationEvent::ImageDone {
+            Event::ImageDone {
                 image_id,
                 height,
                 width,
@@ -857,7 +857,7 @@ pub(super) async fn assemble_event_stream(
                     elapsed_us: started.elapsed().as_micros() as u64,
                 });
             }
-            GenerationEvent::Finished {
+            Event::Finished {
                 reason,
                 stop_reason,
                 prompt_tokens,
@@ -914,7 +914,7 @@ pub(super) async fn assemble_event_stream(
                 .await;
                 return Ok(());
             }
-            GenerationEvent::Rejected { message } => {
+            Event::Rejected { message } => {
                 state.flush_pending_images(&mut y).await;
                 y.yield_ok(ServeEvent::Rejected {
                     request_id: request_id.clone(),
@@ -923,7 +923,7 @@ pub(super) async fn assemble_event_stream(
                 .await;
                 return Ok(());
             }
-            GenerationEvent::Error { message } => {
+            Event::Error { message } => {
                 state.flush_pending_images(&mut y).await;
                 y.yield_ok(ServeEvent::Failed {
                     request_id: request_id.clone(),
@@ -932,9 +932,7 @@ pub(super) async fn assemble_event_stream(
                 .await;
                 return Ok(());
             }
-            GenerationEvent::MediaCompleted { .. }
-            | GenerationEvent::MediaFailed { .. }
-            | GenerationEvent::MediaAborted => {
+            Event::Artifact(_) => {
                 return Err(malformed_output(
                     request_id,
                     "generation request received a media lifecycle event",
@@ -968,6 +966,7 @@ fn generation_text_finish_reason(
 
 fn generation_finish_detail(reason: &uniserve_core::FinishReason) -> &'static str {
     match reason {
+        uniserve_core::FinishReason::Completed => "completed",
         uniserve_core::FinishReason::Eos => "eos",
         uniserve_core::FinishReason::MaxTokens => "max_tokens",
         uniserve_core::FinishReason::Stop => "stop",

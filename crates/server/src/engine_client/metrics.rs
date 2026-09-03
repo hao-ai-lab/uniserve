@@ -95,9 +95,9 @@ pub fn record_scheduler_stats(
             .get_or_create(&domain_labels)
             .inc_by(domain.reclaimed_credits);
         metrics
-            .scheduler_domain_completed_partitions
+            .scheduler_domain_completed_runs
             .get_or_create(&domain_labels)
-            .inc_by(domain.completed_partitions);
+            .inc_by(domain.completed_runs);
         for (kind, value) in [
             ("queue", domain.queue_us),
             ("launch", domain.launch_us),
@@ -116,9 +116,9 @@ pub fn record_scheduler_stats(
                 .inc_by(value);
         }
         metrics
-            .scheduler_domain_co_resident_partitions
+            .scheduler_domain_co_resident_runs
             .get_or_create(&domain_labels)
-            .inc_by(domain.co_resident_partitions);
+            .inc_by(domain.co_resident_runs);
     }
 
     // Prefix-cache counters, including the connector-backed external cache path.
@@ -379,8 +379,8 @@ mod tests {
                 error_operations: 1,
                 backpressure_events: 3,
                 reclaimed_credits: 6,
-                completed_partitions: 4,
-                co_resident_partitions: 2,
+                completed_runs: 4,
+                co_resident_runs: 2,
                 queue_us: 11,
                 launch_us: 13,
                 device_us: 17,

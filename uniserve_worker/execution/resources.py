@@ -10,43 +10,42 @@ from typing import Any
 import torch
 
 from uniserve_worker.execution.batch import (
-    DevicePoint,
-    FixedPoint,
-    ForwardMode,
+    DeviceSelected,
+    FixedCheckpoint,
     LogicalLengths,
     Operation,
     ProductRef,
     RequestKey,
+    RunKind,
 )
 from uniserve_worker.execution.forward_batch import AttentionSelection, ModelPhase
+from uniserve_worker.execution.graph_bucket import GraphBucket
 from uniserve_worker.execution.model_runner import ForwardResult, ModelRunner
 from uniserve_worker.execution.output import OutputPool
 from uniserve_worker.execution.rows import (
     ForwardRow,
+    LaneState,
     LatentExecution,
     OperationIdentity,
-    PartitionState,
 )
 from uniserve_worker.execution.trace import ExecutionTrace
 from uniserve_worker.foundation.errors import invalid_descriptor, unsupported_setup
 from uniserve_worker.loader.weight_set import WeightSet
 from uniserve_worker.models.generation import GenerationPipeline
 from uniserve_worker.models.inputs import ImageProcessor
-from uniserve_worker.models.minimax_h3.execution import H3MuxCoordinator, H3OutputRing
 from uniserve_worker.models.runtime import ExecutionModel, WorkerDeployment
 from uniserve_worker.nn.mesh import DeviceMesh
 from uniserve_worker.runtime.cache_pool import CachePool
+from uniserve_worker.runtime.cpu import CpuPool
 from uniserve_worker.runtime.device_events import DeviceEventPool
 from uniserve_worker.runtime.device_products import DeviceProductRead, DeviceProducts
 from uniserve_worker.runtime.encoder_cache import EncoderCache, EncoderRead
 from uniserve_worker.runtime.latent_pool import LatentPool
 from uniserve_worker.runtime.req_to_token_pool import ReqToTokenPool
+from uniserve_worker.runtime.request import RequestDraft, RequestPool, RequestRuntime
 from uniserve_worker.runtime.runtime_states import RuntimeStates
-from uniserve_worker.runtime.cpu import CpuPool
-from uniserve_worker.runtime.request import RequestDraft, RequestRuntime, RequestPool
 from uniserve_worker.transfer.connector import CachePublications
 from uniserve_worker.transfer.tickets import Locator, Transport
-from uniserve_worker.bootstrap.worker_info import GraphBucket
 
 
 @dataclass(slots=True)
@@ -61,8 +60,8 @@ class ExecutionResources:
     req_to_token_pool: ReqToTokenPool | None
     cache_publications: CachePublications | None
     latent_pool: LatentPool | None
-    _h3_mux: H3MuxCoordinator | None
-    _h3_output_ring: H3OutputRing | None
+    _media_mux: Any | None
+    _media_output_ring: Any | None
     device_products: DeviceProducts
     encoder_cache: EncoderCache
     _device_events: DeviceEventPool
@@ -74,7 +73,7 @@ class ExecutionResources:
     tokenizer: Any | None
     model_name: str
     weight_version: int
-    allowed_work_variants: frozenset[ForwardMode]
+    allowed_work_variants: frozenset[RunKind]
     mixed_buckets: frozenset[GraphBucket]
     trace: ExecutionTrace
     _device: torch.device
@@ -90,12 +89,12 @@ class ExecutionResources:
     def operation_identity(operation: Operation) -> OperationIdentity:
         return operation.request_key, int(operation.op_id)
 
-    def request_row(self, scope: PartitionState, session_id: int) -> RequestDraft:
+    def request_row(self, scope: LaneState, request_id: int) -> RequestDraft:
         try:
-            return scope.request_rows[int(session_id)]
+            return scope.request_rows[int(request_id)]
         except KeyError:
             raise invalid_descriptor(
-                f"partition has no request row for session {session_id}"
+                f"lane has no request row for request {request_id}"
             ) from None
 
     def generation(self) -> GenerationPipeline:
@@ -110,24 +109,24 @@ class ExecutionResources:
             raise invalid_descriptor("operation requires model image processing")
         return value
 
-    def h3_mux(self) -> H3MuxCoordinator:
-        if self._h3_mux is None:
-            raise unsupported_setup("operation requires MiniMax H3 mux resources")
-        return self._h3_mux
+    def media_mux(self) -> Any:
+        if self._media_mux is None:
+            raise unsupported_setup("operation requires media mux resources")
+        return self._media_mux
 
-    def h3_output_ring(self) -> H3OutputRing:
-        if self._h3_output_ring is None:
-            raise unsupported_setup("operation requires a rank-zero H3 output ring")
-        return self._h3_output_ring
+    def media_output_ring(self) -> Any:
+        if self._media_output_ring is None:
+            raise unsupported_setup("operation requires a rank-zero media output ring")
+        return self._media_output_ring
 
     def cache_coordinates(
         self,
         operation: Operation,
-        scope: PartitionState,
+        scope: LaneState,
         *,
         group_id: int = 0,
     ) -> tuple[int, int, int, int]:
-        request = self.request_row(scope, operation.request_key.session_id)
+        request = self.request_row(scope, operation.request_key.request_id)
         slot = int(request.request_pool_idx)
         rows = scope.forward_rows.get(self.operation_identity(operation), ())
         descriptor = next(
@@ -145,7 +144,7 @@ class ExecutionResources:
             raise invalid_descriptor("operation visibility exceeds scheduler block table")
         return slot, int(group_id), visible, capacity
 
-    def latent_row(self, operation: Operation, scope: PartitionState) -> LatentExecution:
+    def latent_row(self, operation: Operation, scope: LaneState) -> LatentExecution:
         row = scope.latent_rows.get(self.operation_identity(operation))
         if row is None:
             raise invalid_descriptor("trajectory operation has no staged latent placement")
@@ -159,13 +158,13 @@ class ExecutionResources:
     def logical_lengths(
         self,
         operation: Operation,
-        session: RequestDraft,
+        request: RequestDraft,
         cache: tuple[int, int, int, int] | None,
         *,
         latent_len: int | None = None,
         computed_len: int | None = None,
     ) -> LogicalLengths:
-        parent = self.parent_runtime(operation, session)
+        parent = self.parent_runtime(operation, request)
         if cache is None:
             visible = parent.kv_visible_len
             computed = parent.kv_computed_len
@@ -173,10 +172,10 @@ class ExecutionResources:
             _slot, _group, visible, _capacity = cache
             computed = visible if computed_len is None else int(computed_len)
         return LogicalLengths(
-            token_len=session.logical_position,
+            token_len=request.logical_position,
             kv_visible_len=visible,
             kv_computed_len=computed,
-            latent_len=session.flow_step if latent_len is None else int(latent_len),
+            latent_len=request.flow_step if latent_len is None else int(latent_len),
         )
 
     @staticmethod
@@ -184,11 +183,11 @@ class ExecutionResources:
         return tuple(int(reference.generation) for reference in operation.outputs)
 
     def operation_device(self, operation: Operation) -> torch.device:
-        if operation.work in {
-            ForwardMode.MEDIA_PREPARE,
-            ForwardMode.MEDIA_DENOISE,
-            ForwardMode.MEDIA_RECONSTRUCT,
-            ForwardMode.MATERIALIZE,
+        if operation.kind in {
+            RunKind.DIFFUSION_PREPARE,
+            RunKind.DIFFUSION_STEP,
+            RunKind.DIFFUSION_DECODE,
+            RunKind.DIFFUSION_FINALIZE,
         }:
             return self._generation_device
         return self._device
@@ -201,7 +200,7 @@ class ExecutionResources:
     def consume_device_product(
         self,
         reference: ProductRef,
-        scope: PartitionState,
+        scope: LaneState,
         *,
         consumer_op_id: int,
         device: torch.device | str | None = None,
@@ -222,7 +221,7 @@ class ExecutionResources:
     def consume_encoder_feature(
         self,
         reference: ProductRef,
-        scope: PartitionState,
+        scope: LaneState,
         *,
         consumer_op_id: int,
         device: torch.device | str | None = None,
@@ -249,7 +248,7 @@ class ExecutionResources:
     def run_observed_forward_group(
         self,
         tasks: tuple[ForwardRow, ...],
-        scope: PartitionState,
+        scope: LaneState,
     ) -> ForwardResult:
         from .step import _run_forward_group
 
@@ -258,7 +257,7 @@ class ExecutionResources:
         return result
 
     @staticmethod
-    def record_component(scope: PartitionState, name: str, started_ns: int) -> None:
+    def record_component(scope: LaneState, name: str, started_ns: int) -> None:
         elapsed_us = max(0, (time.perf_counter_ns() - int(started_ns)) // 1000)
         scope.component_us[name] = scope.component_us.get(name, 0) + elapsed_us
 
@@ -266,8 +265,8 @@ class ExecutionResources:
         parent = operation.parent
         point = parent.point
         runtime = (
-            request.execution_runtime_for_operation(parent.producer_op_id, point.point_index)
-            if isinstance(point, DevicePoint) and point.selected_point is None
+            request.execution_runtime_for_operation(parent.op_id, 1)
+            if isinstance(point, DeviceSelected)
             else None
         )
         if runtime is None:
@@ -278,9 +277,9 @@ class ExecutionResources:
         return runtime
 
     @staticmethod
-    def fixed_parent(operation: Operation) -> FixedPoint:
+    def fixed_parent(operation: Operation) -> FixedCheckpoint:
         point = operation.parent.point
-        if not isinstance(point, FixedPoint):
+        if not isinstance(point, FixedCheckpoint):
             raise invalid_descriptor("operation names a device parent; depth one commits fixed")
         return point
 

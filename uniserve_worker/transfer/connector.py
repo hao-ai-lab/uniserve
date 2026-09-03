@@ -7,8 +7,8 @@ from dataclasses import dataclass
 
 import torch
 
-from ..execution.batch import FixedPoint, ProductKind, ProductRef, RequestKey, VersionRef
-from ..foundation.errors import unsupported_setup, invalid_descriptor
+from ..execution.batch import Checkpoint, FixedCheckpoint, ProductKind, ProductRef, RequestKey
+from ..foundation.errors import invalid_descriptor, unsupported_setup
 from ..runtime.cache_pool import CachePool
 from ..runtime.req_to_token_pool import ReqToTokenPool
 from .tickets import Locator, Transport, fetch_locator, make_transport
@@ -56,17 +56,17 @@ class TransferConnector:
 
 @dataclass(frozen=True, slots=True)
 class CachePublication:
-    locators: tuple[str, ...]
-    source_version: VersionRef
+    locators: tuple[Locator, ...]
+    source_version: Checkpoint
     destination: str
-    base_version: VersionRef | None
+    base_version: Checkpoint | None
     base_extent: int
     published_extent: int
     group_id: int
     scale_identity: str
 
     def __post_init__(self) -> None:
-        if not isinstance(self.source_version.point, FixedPoint):
+        if not isinstance(self.source_version.point, FixedCheckpoint):
             raise invalid_descriptor("KV publication source identity is not exact")
         if not self.destination or self.base_extent < 0 or self.published_extent < self.base_extent:
             raise invalid_descriptor("KV publication extent or destination is invalid")
@@ -77,7 +77,7 @@ class CachePublication:
 
     def to_mapping(self) -> dict[str, object]:
         return {
-            "locators": list(self.locators),
+            "locators": [locator.to_mapping() for locator in self.locators],
             "source_version": self.source_version.to_mapping(),
             "destination": self.destination,
             "base_version": None if self.base_version is None else self.base_version.to_mapping(),
@@ -99,15 +99,15 @@ class CachePublication:
             raise invalid_descriptor("KV publication locators are not a sequence")
         base = value.get("base_version")
         return cls(
-            locators=tuple(str(item) for item in raw_locators),
-            source_version=VersionRef.from_mapping(
+            locators=tuple(Locator.from_mapping(item) for item in raw_locators),
+            source_version=Checkpoint.from_mapping(
                 value.get("source_version"),
                 "KV publication.source_version",
             ),
             destination=str(value.get("destination", "")),
             base_version=None
             if base is None
-            else VersionRef.from_mapping(base, "KV publication.base_version"),
+            else Checkpoint.from_mapping(base, "KV publication.base_version"),
             base_extent=int(value.get("base_extent", 0)),
             published_extent=int(value.get("published_extent", 0)),
             group_id=int(value.get("group_id", 0)),
@@ -117,17 +117,17 @@ class CachePublication:
 
 @dataclass(frozen=True, slots=True)
 class CachePublicationState:
-    session_id: int
+    request_id: int
     products: tuple[tuple[ProductRef, CachePublication], ...]
-    destination_bases: tuple[tuple[str, VersionRef, int], ...]
-    installed_bases: tuple[tuple[str, VersionRef, int], ...]
+    destination_bases: tuple[tuple[str, Checkpoint, int], ...]
+    installed_bases: tuple[tuple[str, Checkpoint, int], ...]
 
 
 @dataclass(frozen=True, slots=True)
 class _CachePublicationCommit:
     products: dict[ProductRef, CachePublication]
-    destination_bases: dict[tuple[int, str], tuple[VersionRef, int]]
-    installed_bases: dict[tuple[int, str], tuple[VersionRef, int]]
+    destination_bases: dict[tuple[int, str], tuple[Checkpoint, int]]
+    installed_bases: dict[tuple[int, str], tuple[Checkpoint, int]]
     locators: dict[tuple[int, int], tuple[tuple[Locator, ...], Transport]]
 
 
@@ -138,19 +138,19 @@ class CachePublications:
         self.pool = pool
         self.request_tables = request_tables
         self._products: dict[ProductRef, CachePublication] = {}
-        self._destination_bases: dict[tuple[int, str], tuple[VersionRef, int]] = {}
-        self._installed_bases: dict[tuple[int, str], tuple[VersionRef, int]] = {}
+        self._destination_bases: dict[tuple[int, str], tuple[Checkpoint, int]] = {}
+        self._installed_bases: dict[tuple[int, str], tuple[Checkpoint, int]] = {}
         self._locators: dict[tuple[int, int], tuple[tuple[Locator, ...], Transport]] = {}
 
-    def destination_base(self, session_id: int, destination: str) -> VersionRef | None:
-        value = self._destination_bases.get((int(session_id), str(destination)))
+    def destination_base(self, request_id: int, destination: str) -> Checkpoint | None:
+        value = self._destination_bases.get((int(request_id), str(destination)))
         return None if value is None else value[0]
 
-    def published_extent(self, session_id: int) -> int:
+    def published_extent(self, request_id: int) -> int:
         selected = (
             extent
             for (candidate, _destination), (_version, extent) in self._destination_bases.items()
-            if candidate == int(session_id)
+            if candidate == int(request_id)
         )
         return max(selected, default=0)
 
@@ -160,19 +160,19 @@ class CachePublications:
         request_pool_idx: int,
         group_id: int,
         visible_length: int,
-        source_version: VersionRef,
+        source_version: Checkpoint,
         destination: str,
-        expected_base: VersionRef | None,
+        expected_base: Checkpoint | None,
         product: ProductRef,
         transport: Transport,
     ) -> CachePublication:
-        if product.kind is not ProductKind.KV or product.request_key != source_version.request_key:
+        if product.kind is not ProductKind.KV:
             raise invalid_descriptor("KV publication product identity is invalid")
         point = source_version.point
-        if not isinstance(point, FixedPoint):
+        if not isinstance(point, FixedCheckpoint):
             raise invalid_descriptor("KV publication source identity is invalid")
-        session_id = int(source_version.request_key.session_id)
-        installed = self._destination_bases.get((session_id, destination))
+        request_id = int(product.request_key.request_id)
+        installed = self._destination_bases.get((request_id, destination))
         if installed is None:
             if expected_base is not None:
                 raise invalid_descriptor("KV publication expected base is not installed")
@@ -214,7 +214,7 @@ class CachePublications:
                 transport.release(locator)
             raise
         publication = CachePublication(
-            locators=tuple(locator.to_json() for locator in locators),
+            locators=tuple(locators),
             source_version=source_version,
             destination=destination,
             base_version=expected_base,
@@ -236,7 +236,7 @@ class CachePublications:
 
     def validate_conditioning(
         self,
-        session_id: int,
+        request_id: int,
         product: ProductRef,
         *,
         request_pool_idx: int,
@@ -245,8 +245,8 @@ class CachePublications:
         publication: CachePublication | None = None,
     ) -> CachePublication:
         publication = self.publication(product) if publication is None else publication
-        if int(product.request_key.session_id) != int(session_id):
-            raise invalid_descriptor("KV conditioning product belongs to another session")
+        if int(product.request_key.request_id) != int(request_id):
+            raise invalid_descriptor("KV conditioning product belongs to another request")
         if (
             int(visible_length) < publication.published_extent
             or int(group_id) != publication.group_id
@@ -261,7 +261,7 @@ class CachePublications:
         *,
         request_pool_idx: int,
         group_id: int,
-        session_id: int,
+        request_id: int,
         source: ProductRef,
         installed_product: ProductRef,
         transport: Transport,
@@ -274,7 +274,7 @@ class CachePublications:
             or installed_product.request_key != source.request_key
         ):
             raise invalid_descriptor("installed KV product identity is invalid")
-        installed = self._installed_bases.get((int(session_id), publication.destination))
+        installed = self._installed_bases.get((int(request_id), publication.destination))
         if publication.base_version is None:
             if installed is not None or publication.base_extent != 0:
                 raise invalid_descriptor("KV installation base is invalid")
@@ -293,8 +293,8 @@ class CachePublications:
             if getattr(transport, "blocking_fetch", False):
                 raise unsupported_setup("KV installation requires prepared transfer tensors")
             transferred_tensors = tuple(
-                fetch_locator(transport, Locator.from_json(raw))
-                for raw in publication.locators
+                fetch_locator(transport, locator)
+                for locator in publication.locators
             )
         if len(transferred_tensors) != expected_locators:
             raise invalid_descriptor("KV transfer tensor count does not match publication")
@@ -334,14 +334,13 @@ class CachePublications:
         for product, publication in publications:
             if (
                 product.kind is not ProductKind.KV
-                or product.request_key != publication.source_version.request_key
             ):
                 raise invalid_descriptor("KV publication product identity is invalid")
             existing = products.get(product)
             if existing is not None and existing != publication:
                 raise invalid_descriptor("KV publication conflicts with its product identity")
-            session_id = int(product.request_key.session_id)
-            destination_key = (session_id, publication.destination)
+            request_id = int(product.request_key.request_id)
+            destination_key = (request_id, publication.destination)
             current = destination_bases.get(destination_key)
             expected = (
                 None
@@ -358,9 +357,9 @@ class CachePublications:
             if publication.locators:
                 if transport is None:
                     raise unsupported_setup("KV publication has no configured transport")
-                identity = (session_id, int(product.producer_op_id))
+                identity = (request_id, int(product.producer_op_id))
                 held = (
-                    tuple(Locator.from_json(raw) for raw in publication.locators),
+                    tuple(publication.locators),
                     transport,
                 )
                 if identity in locators and locators[identity] != held:
@@ -370,12 +369,11 @@ class CachePublications:
             if (
                 source.kind is not ProductKind.KV
                 or installed_product.kind is not ProductKind.KV
-                or source.request_key != publication.source_version.request_key
                 or installed_product.request_key != source.request_key
             ):
                 raise invalid_descriptor("installed KV product identity is invalid")
-            session_id = int(installed_product.request_key.session_id)
-            destination_key = (session_id, publication.destination)
+            request_id = int(installed_product.request_key.request_id)
+            destination_key = (request_id, publication.destination)
             current = installed_bases.get(destination_key)
             expected = (
                 None
@@ -413,7 +411,7 @@ class CachePublications:
         for product in products:
             self._products.pop(product, None)
             held = self._locators.pop(
-                (int(product.request_key.session_id), int(product.producer_op_id)),
+                (int(product.request_key.request_id), int(product.producer_op_id)),
                 None,
             )
             if held is not None:
@@ -421,14 +419,14 @@ class CachePublications:
                 for locator in locators:
                     transport.release(locator)
 
-    def drop(self, session_id: int) -> None:
-        self.discard(session_id, release_locators=True)
+    def drop(self, request_id: int) -> None:
+        self.discard(request_id, release_locators=True)
 
-    def discard(self, session_id: int, *, release_locators: bool) -> None:
+    def discard(self, request_id: int, *, release_locators: bool) -> None:
         selected = tuple(
             product
             for product in self._products
-            if int(product.request_key.session_id) == int(session_id)
+            if int(product.request_key.request_id) == int(request_id)
         )
         if release_locators:
             self.release_operations(
@@ -438,21 +436,21 @@ class CachePublications:
             for product in selected:
                 self._products.pop(product, None)
                 self._locators.pop(
-                    (int(product.request_key.session_id), int(product.producer_op_id)),
+                    (int(product.request_key.request_id), int(product.producer_op_id)),
                     None,
                 )
         for table in (self._destination_bases, self._installed_bases):
-            for key in tuple(key for key in table if key[0] == int(session_id)):
+            for key in tuple(key for key in table if key[0] == int(request_id)):
                 table.pop(key, None)
 
-    def snapshot(self, session_id: int) -> CachePublicationState:
-        selected = int(session_id)
+    def snapshot(self, request_id: int) -> CachePublicationState:
+        selected = int(request_id)
         return CachePublicationState(
-            session_id=selected,
+            request_id=selected,
             products=tuple(
                 (product, publication)
                 for product, publication in self._products.items()
-                if int(product.request_key.session_id) == selected
+                if int(product.request_key.request_id) == selected
             ),
             destination_bases=tuple(
                 (destination, version, extent)
@@ -472,7 +470,7 @@ class CachePublications:
         request_pool_idx: int,
         transport: Transport,
     ) -> None:
-        self.drop(state.session_id)
+        self.drop(state.request_id)
         for product, publication in state.products:
             if (
                 self.request_tables.allocated_length(request_pool_idx)
@@ -482,11 +480,11 @@ class CachePublications:
             self.request_tables.pages(request_pool_idx, publication.group_id)
             self._products[product] = publication
             if publication.locators:
-                self._locators[(state.session_id, int(product.producer_op_id))] = (
-                    tuple(Locator.from_json(raw) for raw in publication.locators),
+                self._locators[(state.request_id, int(product.producer_op_id))] = (
+                    tuple(publication.locators),
                     transport,
                 )
         for destination, version, extent in state.destination_bases:
-            self._destination_bases[(state.session_id, destination)] = (version, extent)
+            self._destination_bases[(state.request_id, destination)] = (version, extent)
         for destination, version, extent in state.installed_bases:
-            self._installed_bases[(state.session_id, destination)] = (version, extent)
+            self._installed_bases[(state.request_id, destination)] = (version, extent)

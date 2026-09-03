@@ -13,11 +13,11 @@ use serde::Serialize;
 
 const TRACE_DIR_ENV: &str = "UNISERVE_SCHED_TRACE_DIR";
 
-pub(crate) struct SchedulerTraceSink {
+pub(crate) struct RuntimeTraceSink {
     writer: BufWriter<File>,
 }
 
-impl SchedulerTraceSink {
+impl RuntimeTraceSink {
     pub(crate) fn from_env() -> Option<Self> {
         let dir = std::env::var_os(TRACE_DIR_ENV).map(PathBuf::from)?;
         if let Err(error) = create_dir_all(&dir) {
@@ -53,7 +53,7 @@ impl SchedulerTraceSink {
     }
 }
 
-impl Drop for SchedulerTraceSink {
+impl Drop for RuntimeTraceSink {
     fn drop(&mut self) {
         if let Err(error) = self.writer.flush() {
             tracing::warn!(%error, "failed to flush scheduler trace");

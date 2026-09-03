@@ -1,6 +1,6 @@
 use super::*;
 
-impl Scheduler {
+impl EngineLoop {
     pub fn new(executor: Box<dyn Executor>, ctrl: ControlTokens, max_batch: usize) -> Self {
         Self::with_config(
             executor,
@@ -32,18 +32,65 @@ impl Scheduler {
     pub fn with_config(
         executor: Box<dyn Executor>,
         ctrl: ControlTokens,
-        mut config: SchedulerConfig,
+        config: SchedulerConfig,
     ) -> Self {
-        let info = executor.info().clone();
-        let max_batch_ops = info.max_batch_operations as usize;
+        let info = executor
+            .info()
+            .runtime_info()
+            .expect("executor exposes a valid runtime capacity view");
+        let work = &info.supported_ops;
+        let family = if work.contains(&OpKind::DiffusionPrepare)
+            && !work.contains(&OpKind::ArDecode)
+        {
+            RuntimeFamily::Diffusion
+        } else if work.contains(&OpKind::DiffusionStep) || work.contains(&OpKind::EncoderExecute) {
+            RuntimeFamily::Umm
+        } else {
+            RuntimeFamily::Ar
+        };
+        Self::with_config_for_family(executor, ctrl, config, family)
+    }
+
+    pub fn with_config_for_family(
+        executor: Box<dyn Executor>,
+        ctrl: ControlTokens,
+        config: SchedulerConfig,
+        family: RuntimeFamily,
+    ) -> Self {
+        let profile = match family {
+            RuntimeFamily::Ar => RuntimeProfile::ar(uniserve_core::ModelDtype::BFloat16),
+            RuntimeFamily::Diffusion => {
+                RuntimeProfile::diffusion(uniserve_core::ModelDtype::BFloat16)
+            }
+            RuntimeFamily::Umm => RuntimeProfile::umm(
+                uniserve_core::ModelDtype::BFloat16,
+                sim_umm_generation_limits(),
+            ),
+        };
+        Self::with_runtime_profile(executor, ctrl, config, family, profile)
+    }
+
+    pub fn with_runtime_profile(
+        executor: Box<dyn Executor>,
+        ctrl: ControlTokens,
+        mut config: SchedulerConfig,
+        family: RuntimeFamily,
+        profile: RuntimeProfile,
+    ) -> Self {
+        let info = executor
+            .info()
+            .runtime_info()
+            .expect("executor exposes a valid runtime capacity view");
+        let profile = profile.resolved(&info);
+        let max_batch_ops = info.max_batch_ops as usize;
         let max_batch_tokens = info.max_batch_tokens as usize;
-        let transfer_capacity = (info.pipeline_depth as usize)
+        let transfer_capacity = (info.queue_depth as usize)
             .saturating_mul(max_batch_ops)
             .clamp(1, MAX_INFLIGHT_TRANSFERS);
         config.max_num_waiting = config.max_num_waiting.clamp(1, MAX_NUM_WAITING);
         let flow_slot_reserve =
-            usize::from(info.uses_kv() && info.supported_work.contains(&ForwardMode::MediaDenoise));
-        let request_pool_capacity = info.max_request_pool_size as usize;
+            usize::from(info.uses_kv() && info.supported_ops.contains(&OpKind::DiffusionStep));
+        let request_pool_capacity = info.request_slots as usize;
         let main_request_capacity = request_pool_capacity
             .saturating_sub(flow_slot_reserve)
             .max(1);
@@ -61,18 +108,15 @@ impl Scheduler {
             kv.as_ref().map_or(0, |state| state.usable_blocks),
             Ordering::Relaxed,
         );
-        let encoder_budget = info.encoder_cache_budget as usize;
-        let kv_budget = KvBudget::new(
-            kv,
-            encoder_budget,
-            request_pool_capacity,
-            info.num_latent_pages,
-            info.latent_page_units,
+        let memory = Memory::with_buffer_capacity(
+            &info,
+            info.buffer_pool_bytes,
+            profile.encoder_cache_entries,
         );
         let denoise_step_burst = denoise_step_burst_from_env();
         let flow_exclusive_batch = env::var(FLOW_EXCLUSIVE_BATCH_ENV)
             .is_ok_and(|raw| matches!(raw.trim(), "1" | "true" | "TRUE"));
-        let mut trace_sink = crate::scheduler::bench_trace::SchedulerTraceSink::from_env();
+        let mut trace_sink = crate::runtime::bench_trace::RuntimeTraceSink::from_env();
         if let Some(sink) = trace_sink.as_mut() {
             sink.record(&json!({
                 "event": "run_started",
@@ -88,55 +132,57 @@ impl Scheduler {
                     "denoise_step_burst": denoise_step_burst,
                 },
                 "info": {
-                    "block_size": info.block_size,
-                    "num_blocks": info.num_blocks,
-                    "supported_work": &info.supported_work,
-                    "max_batch_operations": info.max_batch_operations,
+                    "block_size": info.kv_block_size(),
+                    "num_blocks": info.kv_num_blocks(),
+                    "supported_ops": &info.supported_ops,
+                    "max_batch_ops": info.max_batch_ops,
                     "max_batch_tokens": info.max_batch_tokens,
-                    "max_request_pool_size": info.max_request_pool_size,
-                    "pipeline_depth": info.pipeline_depth,
+                    "request_slots": info.request_slots,
+                    "queue_depth": info.queue_depth,
                     "latent_page_units": info.latent_page_units,
-                    "num_latent_pages": info.num_latent_pages,
-                    "latent_width": info.latent_width,
-                    "latent_dtype": &info.latent_dtype,
-                    "latent_downsample": info.latent_downsample,
-                    "max_vae_grid_tokens": info.max_vae_grid_tokens,
-                    "max_vit_grid_tokens": info.max_vit_grid_tokens,
-                    "commit_marker_tokens": info.commit_marker_tokens,
-                    "gen_rope_advance": info.gen_rope_advance,
-                    "max_cfg_branches": info.max_cfg_branches,
-                    "resource_classes": &info.resource_classes,
+                    "latent_pages": info.latent_pages,
+                    "latent_dtype": &profile.latent_dtype,
+                    "latent_downsample": profile.generation_limits.latent_downsample,
+                    "max_vae_grid_tokens": profile.generation_limits.max_vae_grid_tokens,
+                    "max_vit_grid_tokens": profile.generation_limits.max_vit_grid_tokens,
+                    "commit_marker_tokens": profile.generation_limits.commit_marker_tokens,
+                    "max_cfg_branches": profile.generation_limits.max_cfg_branches,
                 },
             }));
         }
-        let latent_dtype = worker_float_dtype(info.latent_dtype);
+        let latent_dtype = profile.latent_dtype;
+        let runtime = Runtime::new(
+            family,
+            RuntimeState {
+                ctrl,
+                logits_pipeline: crate::runtime::logits::default_pipeline(),
+                waiting: HashMap::new(),
+                waiting_media: HashMap::new(),
+                running: HashMap::new(),
+                running_media: HashMap::new(),
+                retiring_requests: HashMap::new(),
+                retiring_media: HashMap::new(),
+                inflight: InflightWindow::new(transfer_capacity),
+                denoise_step_burst,
+                latent_dtype,
+                pending_commands: VecDeque::new(),
+                pending_buffer_frees: HashMap::new(),
+                authority_id: 1,
+                next_op_id: 1,
+                next_product_generation: 1,
+                next_epoch: 1,
+            },
+        );
         Self {
             executor,
+            pending_submission: None,
             info,
-            kv_budget,
-            ctrl,
-            pending: RequestQueue::new(config.policy),
-            config,
-            logits_pipeline: crate::scheduler::logits::default_pipeline(),
-            running: HashMap::new(),
-            running_media: HashMap::new(),
-            output: OutputSender::default(),
-            retiring_sessions: HashMap::new(),
-            order: Vec::new(),
-            pending_media: VecDeque::new(),
-            retiring_media: HashMap::new(),
-            prefer_media: true,
-            inflight: InflightWindow::new(transfer_capacity),
-            denoise_step_burst,
+            profile,
+            memory,
+            runtime,
+            scheduler: Scheduler::new(config),
             flow_exclusive_batch,
             fatal: false,
-            latent_dtype,
-            pending_controls: VecDeque::new(),
-            authority_id: 1,
-            next_op_id: 1,
-            next_product_generation: 1,
-            next_collective_seq: 1,
-            next_epoch: 1,
             trace_sink,
             peak_ops_in_batch: 0,
             stats,
@@ -144,46 +190,45 @@ impl Scheduler {
     }
 
     pub fn policy(&self) -> SchedulingPolicy {
-        self.config.policy
+        self.scheduler.config.policy
     }
     pub fn config(&self) -> &SchedulerConfig {
-        &self.config
+        &self.scheduler.config
     }
     pub fn set_prefix_cache(&mut self, on: bool) {
-        self.kv_budget.set_prefix_cache(on);
+        self.memory.set_prefix_cache(on);
     }
     pub fn set_hash_algo(&mut self, algo: HashAlgo) {
-        self.kv_budget.set_hash_algo(algo);
+        self.memory.set_hash_algo(algo);
     }
     /// Configure the per-step token budget.
     pub fn set_token_budget(&mut self, tokens: usize) {
-        self.config.max_num_batched_tokens = tokens.max(1);
+        self.scheduler.config.max_num_batched_tokens = tokens.max(1);
     }
     pub fn set_long_prefill_threshold(&mut self, n: usize) {
-        self.config.long_prefill_threshold = n.max(1);
+        self.scheduler.config.long_prefill_threshold = n.max(1);
     }
     pub fn set_max_num_seqs(&mut self, n: usize) {
         let flow_slot_reserve = usize::from(
-            self.info.uses_kv()
-                && self
-                    .info
-                    .supported_work
-                    .contains(&ForwardMode::MediaDenoise),
+            self.info.uses_kv() && self.info.supported_ops.contains(&OpKind::DiffusionStep),
         );
         let capacity = self
-            .kv_budget
+            .memory
             .request_slots
             .capacity()
             .saturating_sub(flow_slot_reserve)
             .max(1);
-        self.config.max_num_seqs = n.clamp(1, capacity);
+        self.scheduler.config.max_num_seqs = n.clamp(1, capacity);
     }
     /// Cap waiting and terminal-output-retained request state.
     pub fn set_max_num_waiting(&mut self, n: usize) {
-        self.config.max_num_waiting = n.clamp(1, MAX_NUM_WAITING);
+        self.scheduler.config.max_num_waiting = n.clamp(1, MAX_NUM_WAITING);
     }
     pub fn info(&self) -> &WorkerInfo {
         &self.info
+    }
+    pub fn runtime_profile(&self) -> &RuntimeProfile {
+        &self.profile
     }
     pub fn stats_handle(&self) -> Arc<SchedStats> {
         self.stats.clone()
@@ -210,7 +255,9 @@ impl Scheduler {
     }
 
     pub(super) fn pending_request_count(&self) -> usize {
-        self.pending.len().saturating_add(self.pending_media.len())
+        self.scheduler
+            .waiting_len()
+            .saturating_add(self.scheduler.waiting_media_len())
     }
 
     /// The owner thread: block on the command channel when fully idle, else
@@ -243,7 +290,7 @@ impl Scheduler {
             if self.fatal {
                 tracing::error!("engine fatal: executor/worker died; stopping the control loop");
                 self.abort_all_requests();
-                self.executor.shutdown();
+                let _ = self.executor.close();
                 return true;
             }
 
@@ -254,7 +301,7 @@ impl Scheduler {
                         "engine fatal: executor/worker died during park; stopping the control loop"
                     );
                     self.abort_all_requests();
-                    self.executor.shutdown();
+                    let _ = self.executor.close();
                     return true;
                 }
             }
@@ -263,7 +310,7 @@ impl Scheduler {
         // running before tearing the executor down (staged drain happened at
         // the HTTP layer; nothing in flight should just see a closed channel).
         self.abort_all_requests();
-        self.executor.shutdown();
+        let _ = self.executor.close();
         false
     }
 
@@ -271,20 +318,15 @@ impl Scheduler {
     /// output-capacity wakes. The timeout is solely a liveness deadline.
     pub(super) fn park_for_progress(&mut self) {
         let _span = tracing::trace_span!("scheduler.park").entered();
-        if let Err(e) = self.executor.park_for_event(IDLE_LIVENESS_POLL) {
-            self.on_executor_error(e);
-            return;
-        }
-        // The death watcher wakes the park instantly on child exit; confirm and
-        // latch it here (also the only death signal when fully idle, where no
-        // result drain would otherwise surface it).
-        if let Err(e) = self.executor.check_liveness() {
-            self.on_executor_error(e);
+        match self.executor.poll(IDLE_LIVENESS_POLL) {
+            Ok(Some(result)) => self.apply_result(result),
+            Ok(None) => {}
+            Err(error) => self.on_executor_error(error),
         }
         self.stats
             .general
             .in_flight
-            .store(self.executor.in_flight(), Ordering::Relaxed);
+            .store(self.inflight.batch_started.len(), Ordering::Relaxed);
         self.publish_cache_stats();
     }
 }

@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use uniserve_core::{BlockId, CfgRenorm, KvGroupKind, ModelDtype, RequestId};
+use uniserve_core::{BlockId, CfgRenorm, KvGroupKind, RequestId};
 
 use super::*;
 use crate::codec::{decode_request, decode_response, encode_request, encode_response};
@@ -11,8 +11,8 @@ fn request_key() -> RequestKey {
     RequestKey::new(4, RequestId(7), 2)
 }
 
-fn fixed_parent() -> VersionRef {
-    VersionRef::admission_root(request_key(), OpId(1))
+fn fixed_parent() -> Checkpoint {
+    Checkpoint::admission_root(OpId(1))
 }
 
 fn output_product(op: OpId) -> ProductRef {
@@ -24,9 +24,7 @@ fn output_product(op: OpId) -> ProductRef {
         kind: ProductKind::Token,
         storage_class: StorageClass::RequestRelay,
         dtype: DType::U32,
-        shape_bound: ShapeBound {
-            dims: vec![DimBound::Static(1)],
-        },
+        shape_bound: ShapeBound::default(),
         point_range: PointRange {
             base_point: 0,
             max_points: 1,
@@ -43,9 +41,7 @@ fn selected_point_product(op: OpId) -> ProductRef {
         kind: ProductKind::SelectedPoint,
         storage_class: StorageClass::RequestRelay,
         dtype: DType::U32,
-        shape_bound: ShapeBound {
-            dims: vec![DimBound::Static(1)],
-        },
+        shape_bound: ShapeBound::default(),
         point_range: PointRange {
             base_point: 0,
             max_points: 1,
@@ -53,52 +49,53 @@ fn selected_point_product(op: OpId) -> ProductRef {
     }
 }
 
-fn token_decode_operation() -> Operation {
+fn ar_decode_operation() -> Operation {
+    let kind = RunKind::ArDecode;
     Operation {
         request_key: request_key(),
         op_id: OpId(11),
         parent: fixed_parent(),
-        work: ForwardMode::TokenDecode,
-        route: RouteId(1),
-        domain: Domain::Decode,
-        advances_state: false,
-        bounds: Bounds {
-            max_points: 1,
-            max_tokens: 1,
-            max_kv_pages: 1,
-            ..Bounds::default()
-        },
-        inputs: Vec::new(),
-        outputs: vec![output_product(OpId(11)), selected_point_product(OpId(11))],
-        predicate: None,
-        rng: Some(Rng {
-            seed: 99,
-            semantic_index_base: 4,
-            draw_layout: DrawLayout::TargetSampling,
-        }),
-        control_seq: 0,
+        kind,
+        payload: OpPayload::new(
+            kind,
+            Bounds {
+                max_points: 1,
+                max_tokens: 1,
+                max_kv_pages: 1,
+                ..Bounds::default()
+            },
+            Vec::new(),
+            vec![output_product(OpId(11)), selected_point_product(OpId(11))],
+            None,
+            Some(Rng {
+                seed: 99,
+                semantic_index_base: 4,
+                draw_layout: DrawLayout::TargetSampling,
+            }),
+            0,
+        ),
     }
     .sealed()
 }
 
-fn operation_for(work: ForwardMode, op_id: OpId, advances: bool) -> Operation {
+fn operation_for(kind: RunKind, op_id: OpId, advances: bool) -> Operation {
     Operation {
         request_key: request_key(),
         op_id,
         parent: fixed_parent(),
-        work,
-        route: RouteId(1),
-        domain: work.domain(),
-        advances_state: false,
-        bounds: Bounds {
-            max_points: if advances { 1 } else { 0 },
-            ..Bounds::default()
-        },
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        predicate: None,
-        rng: None,
-        control_seq: 0,
+        kind,
+        payload: OpPayload::new(
+            kind,
+            Bounds {
+                max_points: if advances { 1 } else { 0 },
+                ..Bounds::default()
+            },
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            0,
+        ),
     }
     .sealed()
 }
@@ -110,32 +107,29 @@ fn completion_record() -> ModelOutput {
         completion_slot_generation: 2,
         status: OpStatus::Ok,
         selected_point: 1,
-        logical_lengths: LogicalLengths {
-            token_len: 5,
-            kv_visible_len: 5,
-            kv_computed_len: 5,
-            latent_len: 0,
-            ..LogicalLengths::default()
-        },
-        token_span: TokenSpan { base: 4, len: 1 },
-        committed_tokens: vec![271],
-        finish_flags: FinishFlags {
-            eos: false,
-            length: false,
-            stop: false,
-        },
         product_generations: vec![3, 4],
-        media_output: None,
         error_code: None,
         timing_counters: TimingCounters::default(),
+        payload: ResultPayload::Ar(ResultData {
+            logical_lengths: LogicalLengths {
+                token_len: 5,
+                kv_visible_len: 5,
+                kv_computed_len: 5,
+                latent_len: 0,
+            },
+            token_span: TokenSpan { base: 4, len: 1 },
+            committed_tokens: vec![271],
+            finish_flags: FinishFlags::default(),
+            media_output: None,
+        }),
     }
 }
 
 fn admission() -> NewRequest {
     NewRequest::new(
         request_key(),
-        u32::try_from(request_key().session_id.0).unwrap(),
-        Some(UndAdmission {
+        u32::try_from(request_key().request_id.0).unwrap(),
+        Some(ArRequestParams {
             sampling: SamplingParams::default(),
             negative_token_ids: Vec::new(),
             finish_token_ids: vec![2, 7],
@@ -149,173 +143,137 @@ fn admission() -> NewRequest {
 fn media_admission(prompt_token_ids: Vec<u32>) -> NewRequest {
     NewRequest::new_media(
         request_key(),
-        u32::try_from(request_key().session_id.0).unwrap(),
-        MediaAdmission {
+        u32::try_from(request_key().request_id.0).unwrap(),
+        DiffusionRequestParams {
             geometry: MediaGeometry {
                 frame_count: 22,
-                video_reconstruction_units: 1,
-                audio_latent_frames: 37,
+                decode_units: 3,
                 prompt_tokens: u32::try_from(prompt_token_ids.len()).unwrap(),
                 denoise_steps: 4,
             },
             prompt_token_ids,
             seed: 17,
-            profile: MediaProfileId::MinimaxH3T2va,
         },
     )
     .unwrap()
 }
 
-fn execute_round_trip(batch: Batch) -> Batch {
-    let request = WorkerRequest::execute(batch);
+fn execute_round_trip(batch: Run) -> Run {
+    let request = WorkerRequest::submit(batch);
     let decoded = decode_request(&encode_request(&request).unwrap()).unwrap();
-    decoded.batch().unwrap().clone()
-}
-
-fn partitions_for_operations(operations: Vec<Operation>) -> Vec<BatchPartition> {
-    let mut groups: Vec<(Domain, RouteId, Vec<Operation>)> = Vec::new();
-    for operation in operations {
-        if let Some((_, _, members)) = groups
-            .iter_mut()
-            .find(|(domain, route, _)| *domain == operation.domain && *route == operation.route)
-        {
-            members.push(operation);
-        } else {
-            groups.push((operation.domain, operation.route, vec![operation]));
-        }
-    }
-    groups
-        .into_iter()
-        .enumerate()
-        .map(|(index, (domain, route, operations))| {
-            let mut block_tables = Vec::new();
-            let mut new_cache_pages = Vec::new();
-            let mut forward_rows = Vec::new();
-            for (operation_index, operation) in operations.iter().enumerate() {
-                let capacity_pages = operation.bounds.max_kv_pages;
-                if capacity_pages == 0 {
-                    continue;
-                }
-                let request_pool_idx = u32::try_from(operation.request_key.session_id.0).unwrap();
-                let page_ids = (1..=capacity_pages).map(BlockId).collect::<Vec<_>>();
-                if !block_tables.iter().any(|table: &BlockTable| {
-                    table.request_pool_idx == request_pool_idx && table.group_id == 0
-                }) {
-                    block_tables.push(BlockTable {
-                        request_pool_idx,
-                        group_id: 0,
-                        page_ids: page_ids.clone(),
-                        allocated_tokens: operation.bounds.max_tokens.max(1),
-                    });
-                    new_cache_pages.push(CachePageAllocation {
-                        request_pool_idx,
-                        group_id: 0,
-                        page_ids,
-                    });
-                }
-                forward_rows.push(RowGeometry {
-                    operation_index: operation_index as u32,
-                    request_pool_index: request_pool_idx,
-                    seq_len: 0,
-                    query_len: operation.bounds.max_tokens.max(1),
-                });
-            }
-            let latent_placements = operations
-                .iter()
-                .filter(|operation| {
-                    matches!(
-                        operation.work,
-                        ForwardMode::MediaPrepare | ForwardMode::MediaDenoise
-                    ) || operation
-                        .inputs
-                        .iter()
-                        .any(|reference| reference.kind == ProductKind::Latent)
-                })
-                .map(|operation| LatentPlacement {
-                    request_key: operation.request_key,
-                    op_id: operation.op_id,
-                    page_table: vec![1],
-                    latent_units: 1,
-                    height: 1,
-                    width: 1,
-                    start_step: 0,
-                    step_count: u32::from(operation.work == ForwardMode::MediaDenoise),
-                })
-                .collect();
-            let reconstruction_placements = operations
-                .iter()
-                .filter(|operation| operation.work == ForwardMode::MediaReconstruct)
-                .map(|operation| ReconstructionPlacement {
-                    request_key: operation.request_key,
-                    op_id: operation.op_id,
-                    kind: ReconstructionKind::Video,
-                    start_unit: 0,
-                    unit_count: 1,
-                })
-                .collect();
-            BatchPartition {
-                partition_id: index as u32 + 1,
-                submission_group: index as u32 + 1,
-                collective_seq: index as u64 + 1,
-                domain,
-                route,
-                attention: AttentionRegime::Hybrid,
-                shape_class: 0,
-                operations,
-                block_tables,
-                new_cache_pages,
-                forward_rows,
-                latent_placements,
-                reconstruction_placements,
-            }
-        })
-        .collect()
+    decoded.run().unwrap().clone()
 }
 
 fn batch_with_operations(
-    step_id: u64,
+    run_id: u64,
     admissions: Vec<NewRequest>,
     operations: Vec<Operation>,
-) -> Batch {
-    Batch::new(step_id, admissions, partitions_for_operations(operations))
+) -> Run {
+    let mut run = Run::new(run_id, admissions, operations);
+    let mut next_buffer_offset = 0_u64;
+    for (operation_index, operation) in run.operations.iter().enumerate() {
+        for output in operation
+            .outputs()
+            .iter()
+            .filter(|output| output.uses_persistent_buffer())
+        {
+            next_buffer_offset = next_buffer_offset.div_ceil(256) * 256;
+            let bytes = output.max_bytes();
+            run.buffer_placements.push(BufferPlacement {
+                buffer: output.buffer_id(),
+                offset: next_buffer_offset,
+                bytes,
+            });
+            next_buffer_offset += bytes;
+        }
+        let capacity_pages = operation.bounds().max_kv_pages;
+        if capacity_pages > 0 {
+            let request_pool_idx = u32::try_from(operation.request_key.request_id.0).unwrap();
+            let page_ids = (1..=capacity_pages).map(BlockId).collect::<Vec<_>>();
+            run.block_tables.push(BlockTable {
+                request_pool_idx,
+                group_id: 0,
+                page_ids: page_ids.clone(),
+                allocated_tokens: operation.bounds().max_tokens.max(1),
+            });
+            run.new_cache_pages.push(CachePageAllocation {
+                request_pool_idx,
+                group_id: 0,
+                page_ids,
+            });
+            run.forward_rows.push(RowGeometry {
+                operation_index: operation_index as u32,
+                request_pool_index: request_pool_idx,
+                seq_len: 0,
+                query_len: operation.bounds().max_tokens.max(1),
+            });
+        }
+        if matches!(
+            operation.kind,
+            RunKind::DiffusionPrepare | RunKind::DiffusionStep
+        ) || operation
+            .inputs()
+            .iter()
+            .any(|reference| reference.kind == ProductKind::Latent)
+        {
+            run.latent_placements.push(LatentPlacement {
+                request_key: operation.request_key,
+                op_id: operation.op_id,
+                page_table: vec![u32::try_from(operation.op_id.0).unwrap()],
+                latent_units: 1,
+                height: 1,
+                width: 1,
+                start_step: 0,
+                step_count: u32::from(operation.kind == RunKind::DiffusionStep),
+            });
+        }
+        if operation.kind == RunKind::DiffusionDecode {
+            run.decode_placements.push(DecodePlacement {
+                request_key: operation.request_key,
+                op_id: operation.op_id,
+                cursor: 0,
+                max_units: 1,
+            });
+        }
+    }
+    run
 }
 
-fn partition_report(
-    step_id: u64,
+fn lane_report(
+    run_id: u64,
     completions: Vec<ModelOutput>,
     products: Vec<ProductPayload>,
     visible: bool,
     worker_exec_us: Option<u64>,
     forward_stats: Option<WorkerForwardStats>,
-) -> CompletionReport {
-    CompletionReport {
-        step_id,
-        partitions: vec![PartitionCompletion {
-            partition_id: 1,
-            completions,
-            products,
-            registration: RegistrationAck { visible },
-            worker_exec_us,
-            forward_stats,
-        }],
+) -> RunResult {
+    RunResult {
+        batch_id: run_id,
+        run_id,
+        completions,
+        products,
+        registration: RegistrationAck { visible },
+        worker_exec_us,
+        forward_stats,
+        done: true,
     }
 }
 
 #[test]
 fn every_work_variant_round_trips_through_ipc() {
     let variants = [
-        (ForwardMode::TokenExtend, true, Domain::Prefill),
-        (ForwardMode::TokenDecode, true, Domain::Decode),
-        (ForwardMode::TokenVerify, true, Domain::Decode),
-        (ForwardMode::EncodeVision, false, Domain::Prefill),
-        (ForwardMode::EncodeLatent, false, Domain::Prefill),
-        (ForwardMode::TransferProduct, false, Domain::Prefill),
-        (ForwardMode::TransferKvPublish, false, Domain::Prefill),
-        (ForwardMode::TransferKvInstall, false, Domain::Prefill),
-        (ForwardMode::MediaPrepare, true, Domain::Flow),
-        (ForwardMode::MediaDenoise, true, Domain::Flow),
-        (ForwardMode::MediaReconstruct, true, Domain::Flow),
-        (ForwardMode::Materialize, false, Domain::Flow),
+        (RunKind::ArExtend, true, Domain::Prefill),
+        (RunKind::ArDecode, true, Domain::Decode),
+        (RunKind::ArVerify, true, Domain::Decode),
+        (RunKind::EncoderVision, false, Domain::Prefill),
+        (RunKind::EncoderLatent, false, Domain::Prefill),
+        (RunKind::TransferProduct, false, Domain::Prefill),
+        (RunKind::TransferKvPublish, false, Domain::Prefill),
+        (RunKind::TransferKvInstall, false, Domain::Prefill),
+        (RunKind::DiffusionPrepare, true, Domain::Flow),
+        (RunKind::DiffusionStep, true, Domain::Flow),
+        (RunKind::DiffusionDecode, true, Domain::Flow),
+        (RunKind::DiffusionFinalize, false, Domain::Flow),
     ];
     for (index, (work, advances, domain)) in variants.into_iter().enumerate() {
         assert_eq!(
@@ -331,37 +289,33 @@ fn every_work_variant_round_trips_through_ipc() {
             vec![operation.clone()],
         ));
         assert_eq!(batch.operations().next().unwrap(), &operation);
-        assert_eq!(batch.operations().next().unwrap().work, work);
+        assert_eq!(batch.operations().next().unwrap().kind, work);
     }
 }
 
 #[test]
-fn version_ref_device_point_round_trips() {
-    let device_parent = VersionRef {
-        request_key: request_key(),
-        producer_op_id: OpId(9),
-        point: Point::Device {
-            point_index: 0,
-            selected_point: Some(selected_point_product(OpId(9))),
-        },
+fn device_selected_checkpoint_round_trips() {
+    let device_parent = Checkpoint {
+        op_id: OpId(9),
+        point: CheckpointPoint::DeviceSelected,
     };
     let operation = Operation {
         request_key: request_key(),
         op_id: OpId(12),
         parent: device_parent.clone(),
-        work: ForwardMode::TokenDecode,
-        route: RouteId(1),
-        domain: Domain::Decode,
-        advances_state: false,
-        bounds: Bounds {
-            max_points: 1,
-            ..Bounds::default()
-        },
-        inputs: Vec::new(),
-        outputs: vec![output_product(OpId(12))],
-        predicate: None,
-        rng: None,
-        control_seq: 0,
+        kind: RunKind::ArDecode,
+        payload: OpPayload::new(
+            RunKind::ArDecode,
+            Bounds {
+                max_points: 1,
+                ..Bounds::default()
+            },
+            Vec::new(),
+            vec![output_product(OpId(12))],
+            None,
+            None,
+            0,
+        ),
     }
     .sealed();
     let batch = execute_round_trip(batch_with_operations(2, Vec::new(), vec![operation]));
@@ -370,32 +324,32 @@ fn version_ref_device_point_round_trips() {
 
 #[test]
 fn block_table_placement_round_trips_with_the_operation() {
-    let base = token_decode_operation();
+    let base = ar_decode_operation();
     let batch = execute_round_trip(batch_with_operations(9, Vec::new(), vec![base.clone()]));
     assert_eq!(batch.operations().next().unwrap(), &base);
-    assert_eq!(
-        batch.partitions[0].block_tables[0].page_ids,
-        vec![BlockId(1)]
-    );
+    assert_eq!(batch.block_tables[0].page_ids, vec![BlockId(1)]);
 }
 
 #[test]
-fn completion_report_round_trips_records_and_product_payloads() {
+fn run_result_round_trips_records_and_product_payloads() {
     let mut logprob = output_product(OpId(11));
     logprob.output_index = 2;
     logprob.kind = ProductKind::Logprob;
-    let report = partition_report(
+    logprob.storage_class = StorageClass::HostStaging;
+    logprob.dtype = DType::F32;
+    logprob.shape_bound = ShapeBound::default();
+    let report = lane_report(
         5,
         vec![completion_record()],
         vec![ProductPayload {
             product: logprob,
-            bytes: vec![1, 2, 3, 4],
+            value: InlineValue::Bytes(vec![1, 2, 3, 4]),
         }],
         true,
         Some(10),
         None,
     );
-    let response = WorkerResponse::completion_report(report.clone());
+    let response = WorkerResponse::result(report.clone());
     let decoded = decode_response(&encode_response(&response).unwrap()).unwrap();
     assert_eq!(decoded.report().unwrap(), &report);
 }
@@ -410,12 +364,12 @@ fn completion_product_value_respects_its_registered_bound() {
     logprob.shape_bound = ShapeBound {
         dims: vec![DimBound::Static(3)],
     };
-    let report = partition_report(
+    let report = lane_report(
         5,
         vec![completion_record()],
         vec![ProductPayload {
             product: logprob,
-            bytes: vec![1, 2, 3, 4],
+            value: InlineValue::Bytes(vec![1, 2, 3, 4]),
         }],
         true,
         Some(10),
@@ -430,10 +384,9 @@ fn error_completion_round_trips_with_its_error_code() {
     let mut record = completion_record();
     record.status = OpStatus::Error;
     record.error_code = Some(ErrorCode::ComputeError);
-    let report = partition_report(6, vec![record.clone()], Vec::new(), false, None, None);
+    let report = lane_report(6, vec![record.clone()], Vec::new(), false, None, None);
     let decoded =
-        decode_response(&encode_response(&WorkerResponse::completion_report(report)).unwrap())
-            .unwrap();
+        decode_response(&encode_response(&WorkerResponse::result(report)).unwrap()).unwrap();
     assert_eq!(
         decoded.report().unwrap().completions().next().unwrap(),
         &record
@@ -441,8 +394,8 @@ fn error_completion_round_trips_with_its_error_code() {
 }
 
 #[test]
-fn every_control_variant_round_trips_through_ipc() {
-    let commit = Control::Commit {
+fn every_batch_command_variant_round_trips_through_ipc() {
+    let commit = BatchCommand::Commit {
         request_key: request_key(),
         control_seq: 1,
         expected_parent: fixed_parent(),
@@ -450,20 +403,25 @@ fn every_control_variant_round_trips_through_ipc() {
         public_event_limit: 7,
         disposition: Disposition::Publish,
     };
-    let close = Control::Close {
+    let close = BatchCommand::Finish {
         request_key: request_key(),
         control_seq: 2,
         cutoff: fixed_parent(),
         reason: CloseReason::Completed,
     };
-    let release = Control::Release {
-        request_key: request_key(),
-        op_id: OpId(11),
-    };
-    let batch = batch_with_operations(3, vec![admission()], vec![token_decode_operation()])
-        .with_controls(vec![commit.clone(), close.clone(), release.clone()]);
+    let batch = batch_with_operations(3, vec![admission()], vec![ar_decode_operation()])
+        .with_commands(vec![commit.clone(), close.clone()]);
     let decoded = execute_round_trip(batch);
-    assert_eq!(decoded.controls, vec![commit, close, release]);
+    assert_eq!(
+        decoded.commands,
+        vec![
+            BatchCommand::Start {
+                request: admission(),
+            },
+            commit,
+            close,
+        ]
+    );
 }
 
 #[test]
@@ -471,49 +429,31 @@ fn new_request_round_trips() {
     let batch = execute_round_trip(batch_with_operations(
         4,
         vec![admission()],
-        vec![token_decode_operation()],
+        vec![ar_decode_operation()],
     ));
-    assert_eq!(batch.admissions[0], admission());
+    assert_eq!(batch.admissions().next(), Some(&admission()));
 }
 
 #[test]
 fn maximum_media_prompt_round_trips() {
     let prompt_token_ids = (0..16_384_u32).map(|index| 100_000 + index).collect();
     let admission = media_admission(prompt_token_ids);
-    let request = WorkerRequest::execute(batch_with_operations(
+    let request = WorkerRequest::submit(batch_with_operations(
         5,
         vec![admission.clone()],
-        vec![operation_for(ForwardMode::MediaPrepare, OpId(12), true)],
+        vec![operation_for(RunKind::DiffusionPrepare, OpId(12), true)],
     ));
 
     let decoded = decode_request(&encode_request(&request).unwrap()).unwrap();
-    assert_eq!(decoded.batch().unwrap().admissions, vec![admission]);
-}
-
-#[test]
-fn validation_rejects_inconsistent_advances_state() {
-    let mut operation = token_decode_operation();
-    operation.advances_state = false;
-    assert!(operation.validate().is_err());
-}
-
-#[test]
-fn validation_rejects_a_work_domain_mismatch() {
-    let mut operation = token_decode_operation();
-    operation.domain = Domain::Flow;
-    assert!(operation.validate().is_err());
+    assert_eq!(decoded.run().unwrap().admissions().next(), Some(&admission));
 }
 
 #[test]
 fn kv_publication_requires_a_fixed_semantic_parent() {
-    let mut operation = operation_for(ForwardMode::TransferKvPublish, OpId(12), false);
-    operation.parent = VersionRef {
-        request_key: request_key(),
-        producer_op_id: OpId(9),
-        point: Point::Device {
-            point_index: 1,
-            selected_point: None,
-        },
+    let mut operation = operation_for(RunKind::TransferKvPublish, OpId(12), false);
+    operation.parent = Checkpoint {
+        op_id: OpId(9),
+        point: CheckpointPoint::DeviceSelected,
     };
 
     assert!(operation.validate().is_err());
@@ -521,8 +461,8 @@ fn kv_publication_requires_a_fixed_semantic_parent() {
 
 #[test]
 fn validation_rejects_an_output_owned_by_another_operation() {
-    let mut operation = token_decode_operation();
-    operation.outputs[0].producer_op_id = OpId(999);
+    let mut operation = ar_decode_operation();
+    operation.outputs_mut()[0].producer_op_id = OpId(999);
     assert!(operation.validate().is_err());
 }
 
@@ -532,11 +472,11 @@ fn validation_allows_shared_encoder_features_and_rejects_foreign_lineage_state()
     let mut feature = output_product(OpId(3));
     feature.request_key = foreign_key;
     feature.kind = ProductKind::VisionFeature;
-    let mut operation = token_decode_operation();
-    operation.inputs = vec![feature];
+    let mut operation = ar_decode_operation();
+    operation.inputs_mut().push(feature);
     operation.validate().unwrap();
 
-    operation.inputs[0].kind = ProductKind::Token;
+    operation.inputs_mut()[0].kind = ProductKind::Token;
     assert!(operation.validate().is_err());
 }
 
@@ -552,14 +492,18 @@ fn product_validation_enforces_generation_and_shape_bounds() {
 
 #[test]
 fn batch_rejects_two_operations_for_one_request() {
-    let batch = Batch {
-        step_id: 1,
-        admissions: Vec::new(),
-        partitions: partitions_for_operations(vec![
-            token_decode_operation(),
-            token_decode_operation(),
-        ]),
-        controls: Vec::new(),
+    let batch = Run {
+        batch_id: 1,
+        run_id: 1,
+        collective_seq: 1,
+        operations: vec![ar_decode_operation(), ar_decode_operation()],
+        block_tables: Vec::new(),
+        new_cache_pages: Vec::new(),
+        forward_rows: Vec::new(),
+        latent_placements: Vec::new(),
+        decode_placements: Vec::new(),
+        buffer_placements: Vec::new(),
+        commands: Vec::new(),
         input_products: Vec::new(),
     };
     assert!(batch.validate().is_err());
@@ -611,23 +555,23 @@ fn batch_carries_host_supplied_input_product_values() {
     };
     let payload = ProductPayload {
         product: token_input.clone(),
-        bytes: encode_token_product_bytes(&[7, 8, 9]),
+        value: InlineValue::Bytes(encode_token_product_bytes(&[7, 8, 9])),
     };
-    let mut operation = token_decode_operation();
-    operation.inputs.push(token_input);
+    let mut operation = ar_decode_operation();
+    operation.inputs_mut().push(token_input);
     let batch = batch_with_operations(1, vec![admission()], vec![operation])
         .with_input_products(vec![payload.clone()]);
     let decoded = execute_round_trip(batch);
     assert_eq!(decoded.input_products, vec![payload.clone()]);
     assert_eq!(
-        decode_token_product_bytes(&decoded.input_products[0].bytes).unwrap(),
+        decode_token_product_bytes(decoded.input_products[0].value.bytes().unwrap()).unwrap(),
         vec![7, 8, 9]
     );
 }
 
 #[test]
-fn batch_rejects_a_conflicting_control_identity() {
-    let commit = |limit| Control::Commit {
+fn batch_rejects_a_conflicting_command_identity() {
+    let commit = |limit| BatchCommand::Commit {
         request_key: request_key(),
         control_seq: 1,
         expected_parent: fixed_parent(),
@@ -635,14 +579,14 @@ fn batch_rejects_a_conflicting_control_identity() {
         public_event_limit: limit,
         disposition: Disposition::Publish,
     };
-    let batch = batch_with_operations(1, vec![admission()], vec![token_decode_operation()])
-        .with_controls(vec![commit(1), commit(2)]);
+    let batch = batch_with_operations(1, vec![admission()], vec![ar_decode_operation()])
+        .with_commands(vec![commit(1), commit(2)]);
     assert!(batch.validate().is_err());
 }
 
 #[test]
-fn batch_allows_a_duplicate_identical_control() {
-    let commit = Control::Commit {
+fn batch_allows_a_duplicate_identical_command() {
+    let commit = BatchCommand::Commit {
         request_key: request_key(),
         control_seq: 1,
         expected_parent: fixed_parent(),
@@ -650,22 +594,18 @@ fn batch_allows_a_duplicate_identical_control() {
         public_event_limit: 1,
         disposition: Disposition::Publish,
     };
-    let batch = batch_with_operations(1, vec![admission()], vec![token_decode_operation()])
-        .with_controls(vec![commit.clone(), commit]);
+    let batch = batch_with_operations(1, vec![admission()], vec![ar_decode_operation()])
+        .with_commands(vec![commit.clone(), commit]);
     assert!(batch.validate().is_ok());
 }
 
 #[test]
-fn commit_control_requires_a_fixed_selected_version() {
-    let device_selected = VersionRef {
-        request_key: request_key(),
-        producer_op_id: OpId(9),
-        point: Point::Device {
-            point_index: 0,
-            selected_point: Some(selected_point_product(OpId(9))),
-        },
+fn commit_command_requires_a_fixed_selected_version() {
+    let device_selected = Checkpoint {
+        op_id: OpId(9),
+        point: CheckpointPoint::DeviceSelected,
     };
-    let control = Control::Commit {
+    let command = BatchCommand::Commit {
         request_key: request_key(),
         control_seq: 1,
         expected_parent: fixed_parent(),
@@ -673,7 +613,7 @@ fn commit_control_requires_a_fixed_selected_version() {
         public_event_limit: 1,
         disposition: Disposition::Publish,
     };
-    assert!(control.validate().is_err());
+    assert!(command.validate().is_err());
 }
 
 #[test]
@@ -690,20 +630,10 @@ fn worker_info_round_trips() {
 #[test]
 fn kv_free_worker_info_round_trips() {
     let info = WorkerInfo {
-        block_size: 0,
-        num_blocks: 0,
-        num_layers: 0,
-        num_kv_heads: 0,
-        head_dim: 0,
-        supported_work: vec![ForwardMode::MediaPrepare, ForwardMode::MediaDenoise],
+        supported_ops: vec![OpKind::DiffusionPrepare, OpKind::DiffusionStep],
+        kv_cache: None,
         latent_page_units: 64,
-        num_latent_pages: 3,
-        latent_width: 1,
-        latent_dtype: Some(ModelDtype::Float32),
-        bytes_per_token: 0,
-        groups: Vec::new(),
-        kv_dtype: None,
-        resource_classes: vec![ResourceClass::ImageLatent],
+        latent_pages: 3,
         ..WorkerInfo::default()
     };
     let response = WorkerResponse::info(info.clone());
@@ -717,23 +647,7 @@ fn kv_free_worker_info_round_trips() {
 #[test]
 fn worker_info_rejects_duplicate_set_members() {
     let info = WorkerInfo {
-        supported_work: vec![
-            ForwardMode::TokenExtend,
-            ForwardMode::TokenDecode,
-            ForwardMode::TokenExtend,
-        ],
-        ..Default::default()
-    };
-    assert!(encode_response(&WorkerResponse::info(info)).is_err());
-
-    let info = WorkerInfo {
-        supported_controls: vec![RequestKind::Execute, RequestKind::Execute],
-        ..Default::default()
-    };
-    assert!(encode_response(&WorkerResponse::info(info)).is_err());
-
-    let info = WorkerInfo {
-        resource_classes: vec![ResourceClass::KvBlock, ResourceClass::KvBlock],
+        supported_ops: vec![OpKind::ArExtend, OpKind::ArDecode, OpKind::ArExtend],
         ..Default::default()
     };
     assert!(encode_response(&WorkerResponse::info(info)).is_err());
@@ -742,37 +656,18 @@ fn worker_info_rejects_duplicate_set_members() {
 #[test]
 fn worker_info_requires_group_totals_to_match_the_cache() {
     let mut info = full_caps();
-    info.groups[1].num_blocks = 2047;
+    info.kv_cache.as_mut().unwrap().groups[1].num_blocks = 2047;
     assert!(encode_response(&WorkerResponse::info(info)).is_err());
 }
 
-#[test]
-fn image_generation_requires_incremental_kv_publication() {
-    let mut info = full_caps();
-    info.incremental_kv_publication = false;
-    assert!(
-        !info
-            .generation_limits()
-            .features
-            .contains(uniserve_core::GenerationFeatures::IMAGE_GENERATION)
-    );
-
-    info.incremental_kv_publication = true;
-    assert!(
-        info.generation_limits()
-            .features
-            .contains(uniserve_core::GenerationFeatures::IMAGE_GENERATION)
-    );
-}
-
 // ---------------------------------------------------------------------------
-// Canonical IPC fixtures cover every request and response kind, every `ForwardMode`
-// and `Control` variant, fixed and device parents, full admissions, and non-empty
+// Canonical IPC fixtures cover every request and response kind, every `RunKind`
+// and `BatchCommand` variant, fixed and device parents, full admissions, and non-empty
 // product payloads. Distinct scalar values expose transposed field mappings.
 // ---------------------------------------------------------------------------
 
-fn session_key(session: u64) -> RequestKey {
-    RequestKey::new(4, RequestId(session), 2)
+fn key_for_request(request: u64) -> RequestKey {
+    RequestKey::new(4, RequestId(request), 2)
 }
 
 fn product_for(key: RequestKey, op: OpId, output_index: u16, kind: ProductKind) -> ProductRef {
@@ -784,23 +679,32 @@ fn product_for(key: RequestKey, op: OpId, output_index: u16, kind: ProductKind) 
         kind,
         storage_class: match kind {
             ProductKind::Kv => StorageClass::PagedKv,
-            ProductKind::Latent | ProductKind::LatentFeature => StorageClass::LatentArena,
+            ProductKind::Latent | ProductKind::LatentFeature | ProductKind::VisionFeature => {
+                StorageClass::LatentArena
+            }
             ProductKind::Token | ProductKind::Completion | ProductKind::SelectedPoint => {
                 StorageClass::RequestRelay
             }
-            _ => StorageClass::DeviceTensor,
+            ProductKind::Logprob | ProductKind::SamplingState | ProductKind::Artifact => {
+                StorageClass::HostStaging
+            }
         },
         dtype: match kind {
             ProductKind::Token | ProductKind::SelectedPoint => DType::U32,
             ProductKind::Kv => DType::BF16,
             ProductKind::Logprob => DType::F32,
-            ProductKind::Completion => DType::U8,
+            ProductKind::Completion | ProductKind::SamplingState | ProductKind::Artifact => {
+                DType::U8
+            }
             _ => DType::F16,
         },
         shape_bound: ShapeBound {
             dims: match kind {
-                ProductKind::Token | ProductKind::SelectedPoint => {
-                    vec![DimBound::Static(1)]
+                ProductKind::Token | ProductKind::Completion | ProductKind::SelectedPoint => {
+                    Vec::new()
+                }
+                ProductKind::Logprob | ProductKind::SamplingState | ProductKind::Artifact => {
+                    vec![DimBound::Device { max: 32 }]
                 }
                 _ => vec![DimBound::Static(2), DimBound::Device { max: 16 }],
             },
@@ -856,81 +760,76 @@ fn full_image() -> ImageParams {
     }
 }
 
-/// One operation per closed `ForwardMode` variant, each on its own request key so the
+/// One operation per closed `RunKind` variant, each on its own request key so the
 /// batch admits them together; the first two keys also carry admissions.
-fn comprehensive_batch() -> Batch {
+fn comprehensive_batch() -> Run {
     let variants = [
-        ForwardMode::TokenExtend,
-        ForwardMode::TokenDecode,
-        ForwardMode::TokenVerify,
-        ForwardMode::EncodeVision,
-        ForwardMode::EncodeLatent,
-        ForwardMode::TransferProduct,
-        ForwardMode::TransferKvPublish,
-        ForwardMode::TransferKvInstall,
-        ForwardMode::MediaPrepare,
-        ForwardMode::MediaDenoise,
-        ForwardMode::MediaReconstruct,
-        ForwardMode::Materialize,
+        RunKind::ArExtend,
+        RunKind::ArDecode,
+        RunKind::ArVerify,
+        RunKind::EncoderVision,
+        RunKind::EncoderLatent,
+        RunKind::TransferProduct,
+        RunKind::TransferKvPublish,
+        RunKind::TransferKvInstall,
+        RunKind::DiffusionPrepare,
+        RunKind::DiffusionStep,
+        RunKind::DiffusionDecode,
+        RunKind::DiffusionFinalize,
     ];
     let mut operations = Vec::new();
-    for (index, work) in variants.into_iter().enumerate() {
-        let key = session_key(100 + index as u64);
+    for (index, kind) in variants.into_iter().enumerate() {
+        let key = key_for_request(100 + index as u64);
         let op_id = OpId(11 + index as u64);
-        let parent = if work.requires_fixed_parent() || index % 2 == 0 {
-            VersionRef::admission_root(key, OpId(1))
+        let parent = if kind.requires_fixed_parent() || index % 2 == 0 {
+            Checkpoint::admission_root(OpId(1))
         } else {
-            VersionRef {
-                request_key: key,
-                producer_op_id: OpId(9),
-                point: Point::Device {
-                    point_index: 0,
-                    selected_point: Some(product_for(key, OpId(9), 0, ProductKind::SelectedPoint)),
-                },
+            Checkpoint {
+                op_id: OpId(9),
+                point: CheckpointPoint::DeviceSelected,
             }
         };
-        let domain = work.domain();
         operations.push(
             Operation {
                 request_key: key,
                 op_id,
                 parent,
-                work,
-                route: RouteId(1 + index as u32),
-                domain,
-                advances_state: false,
-                bounds: Bounds {
-                    max_points: if work.advances_state() { 1 } else { 0 },
-                    max_tokens: 7 + index as u32,
-                    max_kv_pages: 3,
-                    max_latent_bytes: 1 << 20,
-                    max_completion_bytes: 4096,
-                    max_transfer_bytes: 1 << 16,
-                },
-                inputs: vec![product_for(key, OpId(2), 0, ProductKind::VisionFeature)],
-                outputs: vec![
-                    product_for(key, op_id, 0, ProductKind::Token),
-                    product_for(key, op_id, 1, ProductKind::Kv),
-                ],
-                predicate: Some(product_for(key, OpId(3), 0, ProductKind::Completion)),
-                rng: Some(Rng {
-                    seed: 99 + index as u64,
-                    semantic_index_base: 4,
-                    draw_layout: match index % 3 {
-                        0 => DrawLayout::TargetSampling,
-                        1 => DrawLayout::SpeculativeProposal,
-                        _ => DrawLayout::FlowNoise,
+                kind,
+                payload: OpPayload::new(
+                    kind,
+                    Bounds {
+                        max_points: if kind.advances_state() { 1 } else { 0 },
+                        max_tokens: 7 + index as u32,
+                        max_kv_pages: 3,
+                        max_latent_bytes: 1 << 20,
+                        max_completion_bytes: 4096,
+                        max_transfer_bytes: 1 << 16,
                     },
-                }),
-                control_seq: index as u64,
+                    vec![product_for(key, OpId(2), 0, ProductKind::VisionFeature)],
+                    vec![
+                        product_for(key, op_id, 0, ProductKind::Token),
+                        product_for(key, op_id, 1, ProductKind::Kv),
+                    ],
+                    Some(product_for(key, OpId(3), 0, ProductKind::Completion)),
+                    Some(Rng {
+                        seed: 99 + index as u64,
+                        semantic_index_base: 4,
+                        draw_layout: match index % 3 {
+                            0 => DrawLayout::TargetSampling,
+                            1 => DrawLayout::SpeculativeProposal,
+                            _ => DrawLayout::FlowNoise,
+                        },
+                    }),
+                    index as u64,
+                ),
             }
             .sealed(),
         );
     }
-    let und_admission = NewRequest::new(
-        session_key(100),
+    let ar_params = NewRequest::new(
+        key_for_request(100),
         100,
-        Some(UndAdmission {
+        Some(ArRequestParams {
             sampling: full_sampling(),
             negative_token_ids: vec![100, 101],
             finish_token_ids: vec![2, 7],
@@ -939,33 +838,29 @@ fn comprehensive_batch() -> Batch {
         None,
     )
     .unwrap();
-    let gen_admission = NewRequest::new(
-        session_key(110),
+    let umm_params = NewRequest::new(
+        key_for_request(110),
         110,
         None,
-        Some(GenAdmission {
+        Some(UmmRequestParams {
             image: full_image(),
         }),
     )
     .unwrap();
-    let controls = vec![
-        Control::Commit {
-            request_key: session_key(200),
+    let commands = vec![
+        BatchCommand::Commit {
+            request_key: key_for_request(200),
             control_seq: 1,
-            expected_parent: VersionRef::admission_root(session_key(200), OpId(1)),
-            selected: VersionRef::admission_root(session_key(200), OpId(2)),
+            expected_parent: Checkpoint::admission_root(OpId(1)),
+            selected: Checkpoint::admission_root(OpId(2)),
             public_event_limit: 7,
             disposition: Disposition::Retain,
         },
-        Control::Close {
-            request_key: session_key(201),
+        BatchCommand::Finish {
+            request_key: key_for_request(201),
             control_seq: 2,
-            cutoff: VersionRef::admission_root(session_key(201), OpId(1)),
+            cutoff: Checkpoint::admission_root(OpId(1)),
             reason: CloseReason::Preempted,
-        },
-        Control::Release {
-            request_key: session_key(202),
-            op_id: OpId(33),
         },
     ];
     let mut input_product = product_for(
@@ -978,71 +873,58 @@ fn comprehensive_batch() -> Batch {
     input_product.shape_bound = ShapeBound {
         dims: vec![DimBound::Static(4)],
     };
-    operations[0].inputs.push(input_product.clone());
+    operations[0].inputs_mut().push(input_product.clone());
     let input_products = vec![ProductPayload {
         product: input_product,
-        bytes: encode_token_product_bytes(&[7, 8, 9, 10]),
+        value: InlineValue::Bytes(encode_token_product_bytes(&[7, 8, 9, 10])),
     }];
-    batch_with_operations(42, vec![und_admission, gen_admission], operations)
-        .with_controls(controls)
+    batch_with_operations(42, vec![ar_params, umm_params], operations)
+        .with_commands(commands)
         .with_input_products(input_products)
 }
 
-/// One fixture per `RequestKind`, plus call-id coverage on the execute frame.
+/// One fixture per `RequestKind`, plus call-id coverage on the submit frame.
 fn request_fixtures() -> Vec<WorkerRequest> {
-    let mut execute = WorkerRequest::execute(comprehensive_batch());
-    execute.set_call_id(Some(91));
+    let mut submit = WorkerRequest::submit(comprehensive_batch());
+    submit.set_call_id(Some(91));
     vec![
-        WorkerRequest::get_info(),
-        execute,
-        WorkerRequest::poll_completions(42),
-        WorkerRequest::drop_session(RequestId(42)),
-        WorkerRequest::shutdown(),
-        WorkerRequest::release_products(vec![1, 2, 3]),
-        WorkerRequest::get_pressure(),
+        WorkerRequest::info(),
+        submit,
+        WorkerRequest::poll(42),
+        WorkerRequest::close(),
     ]
 }
 
 fn full_caps() -> WorkerInfo {
     WorkerInfo {
-        supported_work: ForwardMode::ALL.to_vec(),
-        groups: vec![
-            KvCacheGroup {
-                num_blocks: 2048,
-                kind: KvGroupKind::Full,
-            },
-            KvCacheGroup {
-                num_blocks: 2048,
-                kind: KvGroupKind::SlidingWindow {
-                    window: 4096,
-                    sink: 64,
+        supported_ops: OpKind::ALL.to_vec(),
+        kv_cache: Some(KvCacheConfig {
+            groups: vec![
+                KvCacheGroup {
+                    num_blocks: 2048,
+                    kind: KvGroupKind::Full,
                 },
-            },
-        ],
+                KvCacheGroup {
+                    num_blocks: 2048,
+                    kind: KvGroupKind::SlidingWindow {
+                        window: 4096,
+                        sink: 64,
+                    },
+                },
+            ],
+            ..WorkerInfo::default().kv_cache.unwrap()
+        }),
         rank: RankInfo {
             tp_rank: 1,
             tp_size: 2,
         },
-        pipeline_depth: 2,
-        encoder_cache_budget: 77,
-        supported_controls: vec![RequestKind::Execute, RequestKind::DropSession],
-        max_batch_operations: 64,
+        queue_depth: 2,
+        max_batch_ops: 64,
         max_batch_tokens: 4096,
-        max_request_pool_size: 96,
-        max_unresolved_window: 3,
-        mixed_buckets: vec![GraphBucket {
-            decode_rows: 1,
-            flow_rows: 1,
-            height: 1152,
-            width: 2048,
-            cfg_branches: 3,
-        }],
-        sampling_ownership: SamplingOwnership::DesignatedRank,
-        resource_classes: vec![ResourceClass::KvBlock, ResourceClass::ImageLatent],
+        request_slots: 96,
+        max_unresolved_ops: 3,
         latent_page_units: 64,
-        num_latent_pages: 17,
-        latent_width: 16,
-        latent_dtype: Some(ModelDtype::BFloat16),
+        latent_pages: 17,
         model_name: "test-model".into(),
         weight_version: 7,
         ..WorkerInfo::default()
@@ -1090,28 +972,14 @@ fn full_forward_stats() -> WorkerForwardStats {
     }
 }
 
-fn full_completion_report() -> CompletionReport {
+fn full_run_result() -> RunResult {
     let ok_record = ModelOutput {
-        request_key: session_key(100),
+        request_key: key_for_request(100),
         op_id: OpId(11),
         completion_slot_generation: 2,
         status: OpStatus::Ok,
         selected_point: 1,
-        logical_lengths: LogicalLengths {
-            token_len: 5,
-            kv_visible_len: 6,
-            latent_len: 7,
-            kv_computed_len: 8,
-        },
-        token_span: TokenSpan { base: 4, len: 2 },
-        committed_tokens: vec![271, 272],
-        finish_flags: FinishFlags {
-            eos: true,
-            length: false,
-            stop: false,
-        },
         product_generations: vec![3, 5],
-        media_output: None,
         error_code: None,
         timing_counters: TimingCounters {
             queued_us: 41,
@@ -1119,26 +987,42 @@ fn full_completion_report() -> CompletionReport {
             copy_us: 43,
             host_us: 44,
         },
+        payload: ResultPayload::Ar(ResultData {
+            logical_lengths: LogicalLengths {
+                token_len: 5,
+                kv_visible_len: 6,
+                latent_len: 7,
+                kv_computed_len: 8,
+            },
+            token_span: TokenSpan { base: 4, len: 2 },
+            committed_tokens: vec![271, 272],
+            finish_flags: FinishFlags {
+                eos: true,
+                length: false,
+                stop: false,
+            },
+            media_output: None,
+        }),
     };
     let mut predicated_record = ok_record.clone();
-    predicated_record.request_key = session_key(101);
+    predicated_record.request_key = key_for_request(101);
     predicated_record.op_id = OpId(12);
     predicated_record.status = OpStatus::Predicated;
-    predicated_record.token_span.len = 0;
-    predicated_record.committed_tokens = Vec::new();
-    predicated_record.finish_flags = FinishFlags::default();
+    predicated_record.token_span_mut().len = 0;
+    predicated_record.committed_tokens_mut().clear();
+    *predicated_record.finish_flags_mut() = FinishFlags::default();
     predicated_record.product_generations = Vec::new();
     let mut error_record = ok_record.clone();
-    error_record.request_key = session_key(102);
+    error_record.request_key = key_for_request(102);
     error_record.op_id = OpId(13);
     error_record.status = OpStatus::Error;
     error_record.error_code = Some(ErrorCode::ResourceExhausted);
-    error_record.finish_flags = FinishFlags {
+    *error_record.finish_flags_mut() = FinishFlags {
         eos: false,
         length: false,
         stop: true,
     };
-    let mut artifact = product_for(session_key(102), OpId(13), 3, ProductKind::Artifact);
+    let mut artifact = product_for(key_for_request(102), OpId(13), 3, ProductKind::Artifact);
     artifact.storage_class = StorageClass::PinnedOutput;
     artifact.dtype = DType::U8;
     artifact.shape_bound = ShapeBound {
@@ -1146,15 +1030,15 @@ fn full_completion_report() -> CompletionReport {
     };
     let products = vec![
         ProductPayload {
-            product: product_for(session_key(100), OpId(11), 2, ProductKind::Logprob),
-            bytes: vec![1, 2, 3, 4, 5],
+            product: product_for(key_for_request(100), OpId(11), 2, ProductKind::Logprob),
+            value: InlineValue::Bytes(vec![1, 2, 3, 4, 5]),
         },
         ProductPayload {
             product: artifact,
-            bytes: (0..=255).collect(),
+            value: InlineValue::Bytes((0..=255).collect()),
         },
     ];
-    partition_report(
+    lane_report(
         5,
         vec![ok_record, predicated_record, error_record],
         products,
@@ -1178,7 +1062,7 @@ fn response_fixtures() -> Vec<WorkerResponse> {
         },
         WorkerResponse::Result {
             call_id: Some(17),
-            completion_report: full_completion_report(),
+            result: full_run_result(),
         },
         WorkerResponse::Ok { call_id: Some(17) },
         WorkerResponse::Error {
@@ -1192,34 +1076,15 @@ fn response_fixtures() -> Vec<WorkerResponse> {
                 route: Some("und.decode".into()),
                 operations: vec![
                     ErrorOperationIdentity {
-                        request_key: session_key(100),
+                        request_key: key_for_request(100),
                         op_id: OpId(11),
                     },
                     ErrorOperationIdentity {
-                        request_key: session_key(101),
+                        request_key: key_for_request(101),
                         op_id: OpId(12),
                     },
                 ],
             },
-        },
-        WorkerResponse::Pressure {
-            call_id: Some(17),
-            pressure: vec![
-                ResourcePressure {
-                    class: ResourceClass::KvBlock,
-                    total: 81,
-                    used: 82,
-                    evictable: 83,
-                    free: 84,
-                },
-                ResourcePressure {
-                    class: ResourceClass::ImageLatent,
-                    total: 85,
-                    used: 86,
-                    evictable: 87,
-                    free: 88,
-                },
-            ],
         },
     ]
 }
@@ -1252,7 +1117,6 @@ fn every_response_kind_round_trips_through_ipc() {
         ResponseKind::Result,
         ResponseKind::Ok,
         ResponseKind::Error,
-        ResponseKind::Pressure,
     ] {
         assert!(
             fixtures.iter().any(|response| response.kind() == kind),
@@ -1276,7 +1140,7 @@ fn ipc_decode_rejects_malformed_frames() {
     assert!(decode_request(garbage).is_err());
     assert!(decode_response(garbage).is_err());
 
-    let mut request = encode_request(&WorkerRequest::get_info()).unwrap();
+    let mut request = encode_request(&WorkerRequest::info()).unwrap();
     request.truncate(request.len() / 2);
     assert!(decode_request(&request).is_err());
 

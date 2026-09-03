@@ -1,10 +1,9 @@
 """Data plane, Tier 2: the pluggable, register-once byte transport.
 
-A :class:`Transport` is **one per worker** and follows the register-once +
-reference-by-(session, addr, len) model: a producer registers a buffer once and
-hands out a compact :class:`Locator` describing a (sub)region of it; a consumer
-materializes that locator over the real transport. The locator rides the control
-plane opaquely — the host never parses it.
+A :class:`Transport` is one per worker and follows the register-once,
+reference-by-endpoint model. A producer registers a buffer once and hands out a
+typed :class:`Locator` describing a bounded region; a consumer resolves that
+locator over the selected transport.
 
 Backends (one chosen per worker via :func:`make_transport`):
 
@@ -16,14 +15,11 @@ Backends (one chosen per worker via :func:`make_transport`):
 
 from __future__ import annotations
 
-import base64
 import concurrent.futures
 import ctypes
 import errno
-import json
 import mmap
 import os
-import pickle
 import queue
 import selectors
 import socket
@@ -34,8 +30,20 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
-from ..execution.batch import MAX_TRANSFER_DESCRIPTOR_BYTES, TRANSFER_DESCRIPTOR_PREFIX
-from ..foundation.errors import unsupported_setup, invalid_descriptor, resource_error
+from ..execution.batch import (
+    CudaIpcTransfer,
+    DeviceProductTransferValue,
+    EncoderTransferValue,
+    KvTransferValue,
+    LatentTransferValue,
+    LocalTransfer,
+    PosixShmTransfer,
+    ProductKind,
+    TransferHandle,
+    TransferKind,
+    TransferLocator,
+)
+from ..foundation.errors import invalid_descriptor, resource_error, unsupported_setup
 
 if TYPE_CHECKING:
     import torch
@@ -51,9 +59,8 @@ __all__ = [
     "make_transport",
     "TransportKind",
     "TRANSPORTS",
-    "TRANSFER_DESCRIPTOR_PREFIX",
-    "decode_transfer_descriptor",
-    "encode_transfer_descriptor",
+    "decode_transfer_handle",
+    "encode_transfer_handle",
 ]
 
 
@@ -76,7 +83,7 @@ class Locator:
     """
 
     transport: str
-    session: str
+    endpoint: str
     nbytes: int
     dtype: str
     shape: tuple[int, ...]
@@ -84,108 +91,192 @@ class Locator:
     handle: bytes = b""
     meta: dict[str, Any] = field(default_factory=dict)
 
-    def to_bytes(self) -> bytes:
-        return pickle.dumps(self, protocol=pickle.HIGHEST_PROTOCOL)
-
-    @staticmethod
-    def from_bytes(raw: bytes) -> "Locator":
-        loc = pickle.loads(raw)
-        if not isinstance(loc, Locator):
-            raise invalid_descriptor("decoded object is not a Locator")
-        return loc
-
     def to_mapping(self) -> dict[str, Any]:
-        return {
-            "version": 1,
-            "transport": self.transport,
-            "session": self.session,
-            "nbytes": self.nbytes,
-            "dtype": self.dtype,
-            "shape": list(self.shape),
-            "device": self.device,
-            "handle_b64": base64.b64encode(self.handle).decode("ascii"),
-            "meta": self.meta,
-        }
+        if self.transport == "local":
+            transport = LocalTransfer(endpoint=self.endpoint, key=int(self.handle.decode()))
+        elif self.transport == "shm":
+            semaphore = self.meta.get("ready_semaphore")
+            transport = PosixShmTransfer(
+                name=self.handle.decode(),
+                ready_header_bytes=int(self.meta.get("ready_header_bytes", 0)),
+                ready_semaphore=None if semaphore is None else str(semaphore),
+            )
+        elif self.transport == "cuda_ipc":
+            transport = CudaIpcTransfer(
+                endpoint=self.endpoint,
+                publication_id=str(self.meta["publication_id"]),
+                storage_handle=self.handle,
+                storage_size_bytes=int(self.meta["storage_size_bytes"]),
+                storage_offset_bytes=int(self.meta["storage_offset_bytes"]),
+                tensor_offset=int(self.meta["tensor_offset"]),
+                tensor_stride=tuple(int(value) for value in self.meta["tensor_stride"]),
+                ref_counter_handle=bytes(self.meta["ref_counter_handle"]),
+                ref_counter_offset=int(self.meta["ref_counter_offset"]),
+                event_handle=bytes(self.meta["event_handle"]),
+                event_sync_required=bool(self.meta["event_sync_required"]),
+                ready_event_handle=bytes(self.meta["ready_event_handle"]),
+            )
+        else:
+            raise invalid_descriptor(f"unsupported locator transport {self.transport!r}")
+        return TransferLocator(
+            transport=transport,
+            nbytes=self.nbytes,
+            dtype=self.dtype,
+            shape=self.shape,
+            device=self.device,
+        ).to_mapping()
 
     @staticmethod
     def from_mapping(raw: dict[str, Any]) -> "Locator":
-        if int(raw.get("version", 1)) != 1:
-            raise invalid_descriptor("unsupported locator version")
+        locator = TransferLocator.from_mapping(raw)
+        transport = locator.transport
+        if isinstance(transport, LocalTransfer):
+            name = "local"
+            endpoint = transport.endpoint
+            handle = str(transport.key).encode()
+            meta: dict[str, Any] = {}
+        elif isinstance(transport, PosixShmTransfer):
+            name = "shm"
+            endpoint = "shm"
+            handle = transport.name.encode()
+            meta = {
+                "ready_header_bytes": transport.ready_header_bytes,
+                "ready_semaphore": transport.ready_semaphore,
+            }
+        else:
+            name = "cuda_ipc"
+            endpoint = transport.endpoint
+            handle = transport.storage_handle
+            meta = {
+                "publication_id": transport.publication_id,
+                "storage_size_bytes": transport.storage_size_bytes,
+                "storage_offset_bytes": transport.storage_offset_bytes,
+                "tensor_offset": transport.tensor_offset,
+                "tensor_stride": transport.tensor_stride,
+                "ref_counter_handle": transport.ref_counter_handle,
+                "ref_counter_offset": transport.ref_counter_offset,
+                "event_handle": transport.event_handle,
+                "event_sync_required": transport.event_sync_required,
+                "ready_event_handle": transport.ready_event_handle,
+            }
         return Locator(
-            transport=str(raw["transport"]),
-            session=str(raw["session"]),
-            nbytes=int(raw["nbytes"]),
-            dtype=str(raw["dtype"]),
-            shape=tuple(int(v) for v in raw["shape"]),
-            device=str(raw["device"]),
-            handle=base64.b64decode(str(raw.get("handle_b64", "")).encode("ascii")),
-            meta=dict(raw.get("meta") or {}),
+            transport=name,
+            endpoint=endpoint,
+            nbytes=locator.nbytes,
+            dtype=locator.dtype,
+            shape=locator.shape,
+            device=locator.device,
+            handle=handle,
+            meta=meta,
         )
 
-    def to_json(self) -> str:
-        return json.dumps(self.to_mapping(), separators=(",", ":"), sort_keys=True)
 
-    @staticmethod
-    def from_json(raw: str) -> "Locator":
-        value = json.loads(raw)
-        if not isinstance(value, dict):
-            raise invalid_descriptor("locator value must be a JSON object")
-        return Locator.from_mapping(value)
-
-
-def encode_transfer_descriptor(
+def encode_transfer_handle(
     kind: str,
     value: dict[str, object],
-) -> bytes:
-    if kind not in {"encoder", "device_product", "kv", "latent"}:
-        raise invalid_descriptor("transport entry kind is invalid")
-    encoded = TRANSFER_DESCRIPTOR_PREFIX + _canonical_json(
-        {
-            "kind": kind,
-            "value": value,
-        }
-    )
-    if len(encoded) > MAX_TRANSFER_DESCRIPTOR_BYTES:
-        raise invalid_descriptor("transport entry exceeds its descriptor bound")
-    return encoded
-
-
-def decode_transfer_descriptor(raw: bytes) -> tuple[str, dict[str, object]]:
-    if not raw.startswith(TRANSFER_DESCRIPTOR_PREFIX):
-        raise invalid_descriptor("transport entry prefix is invalid")
-    if len(raw) > MAX_TRANSFER_DESCRIPTOR_BYTES:
-        raise invalid_descriptor("transport entry exceeds its descriptor bound")
+) -> TransferHandle:
     try:
-        value = json.loads(raw[len(TRANSFER_DESCRIPTOR_PREFIX) :])
-    except json.JSONDecodeError as error:
-        raise invalid_descriptor(f"transport entry JSON is invalid: {error}") from error
-    if _canonical_json(value) != raw[len(TRANSFER_DESCRIPTOR_PREFIX) :]:
-        raise invalid_descriptor("transport entry JSON is not canonical")
-    if not isinstance(value, dict) or set(value) != {"kind", "value"}:
-        raise invalid_descriptor("transport entry has an invalid shape")
-    kind = value["kind"]
-    if kind not in {"encoder", "device_product", "kv", "latent"}:
+        transfer_kind = TransferKind(kind)
+    except ValueError:
         raise invalid_descriptor("transport entry kind is invalid")
-    descriptor_value = value["value"]
-    if not isinstance(descriptor_value, dict):
-        raise invalid_descriptor("transport entry value is invalid")
-    return kind, descriptor_value
+    generation = int(value.get("generation", 0))
+    if transfer_kind is TransferKind.ENCODER:
+        typed = EncoderTransferValue(
+            generation=generation,
+            height=int(value["height"]),
+            width=int(value["width"]),
+            payload_kind=ProductKind(str(value["payload_kind"])).value,
+            locator=TransferLocator.from_mapping(value["locator"]),
+        )
+    elif transfer_kind is TransferKind.DEVICE_PRODUCT:
+        typed = DeviceProductTransferValue(
+            generation=generation,
+            height=int(value.get("height", 0)),
+            width=int(value.get("width", 0)),
+            value_range=str(value.get("value_range", "")),
+            locator=TransferLocator.from_mapping(value["locator"]),
+        )
+    elif transfer_kind is TransferKind.LATENT:
+        typed = LatentTransferValue(
+            generation=generation,
+            height=int(value["height"]),
+            width=int(value["width"]),
+            latent_units=int(value["latent_units"]),
+            step=int(value["step"]),
+            locator=TransferLocator.from_mapping(value["locator"]),
+        )
+    else:
+        snapshot = value.get("snapshot")
+        if not isinstance(snapshot, dict):
+            raise invalid_descriptor("KV transfer snapshot is invalid")
+        raw_locators = snapshot.get("locators")
+        if not isinstance(raw_locators, (list, tuple)):
+            raise invalid_descriptor("KV transfer locators are invalid")
+        from ..execution.batch import Checkpoint
+
+        raw_base = snapshot.get("base_version")
+        typed = KvTransferValue(
+            generation=generation,
+            locators=tuple(TransferLocator.from_mapping(item) for item in raw_locators),
+            source=Checkpoint.from_mapping(snapshot.get("source_version")),
+            destination=str(snapshot.get("destination", "")),
+            base=None if raw_base is None else Checkpoint.from_mapping(raw_base),
+            base_extent=int(snapshot.get("base_extent", 0)),
+            published_extent=int(snapshot.get("published_extent", 0)),
+            group_id=int(snapshot.get("group_id", 0)),
+            scale_identity=str(snapshot.get("scale_identity", "")),
+        )
+    return TransferHandle(value=typed)
+
+
+def decode_transfer_handle(handle: TransferHandle) -> tuple[str, dict[str, object]]:
+    typed = handle.value
+    if isinstance(typed, EncoderTransferValue):
+        value: dict[str, object] = {
+            "generation": typed.generation,
+            "height": typed.height,
+            "width": typed.width,
+            "payload_kind": typed.payload_kind,
+            "locator": typed.locator.to_mapping(),
+        }
+    elif isinstance(typed, DeviceProductTransferValue):
+        value = {
+            "generation": typed.generation,
+            "height": typed.height,
+            "width": typed.width,
+            "value_range": typed.value_range,
+            "locator": typed.locator.to_mapping(),
+        }
+    elif isinstance(typed, LatentTransferValue):
+        value = {
+            "generation": typed.generation,
+            "height": typed.height,
+            "width": typed.width,
+            "latent_units": typed.latent_units,
+            "step": typed.step,
+            "locator": typed.locator.to_mapping(),
+        }
+    else:
+        value = {
+            "generation": typed.generation,
+            "snapshot": {
+                "locators": [locator.to_mapping() for locator in typed.locators],
+                "source_version": typed.source.to_mapping(),
+                "destination": typed.destination,
+                "base_version": None if typed.base is None else typed.base.to_mapping(),
+                "base_extent": typed.base_extent,
+                "published_extent": typed.published_extent,
+                "group_id": typed.group_id,
+                "scale_identity": typed.scale_identity,
+            },
+        }
+    return handle.kind.value, value
 
 
 def fetch_locator(transport: "Transport", locator: Locator) -> "torch.Tensor":
     """Resolve a live transport locator."""
 
     return transport.fetch(locator)
-
-
-def _canonical_json(value: object) -> bytes:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        allow_nan=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
 
 
 def _dtype_to_str(dtype: "torch.dtype") -> str:
@@ -212,8 +303,8 @@ class Transport(ABC):
     #: synchronously; they submit :meth:`fetch_async` tickets gated by :meth:`ready`.
     blocking_fetch: bool = False
 
-    def session(self) -> str:
-        """This worker's transport session id (for the locator)."""
+    def endpoint(self) -> str:
+        """This worker's stable transport endpoint identity."""
         return self.name
 
     @abstractmethod
@@ -467,11 +558,11 @@ class LocalTransport(Transport):
         self._table: dict[int, "torch.Tensor"] = {}
         self._next = 0
         self._lock = threading.Lock()
-        self._session = f"local:{uuid.uuid4().hex}"
+        self._endpoint = f"local:{uuid.uuid4().hex}"
         self._bytes = _ByteCapacity(byte_capacity)
 
-    def session(self) -> str:
-        return self._session
+    def endpoint(self) -> str:
+        return self._endpoint
 
     def publish(self, tensor: "torch.Tensor") -> Locator:
         t = tensor.detach()
@@ -483,7 +574,7 @@ class LocalTransport(Transport):
             self._table[key] = t
         return Locator(
             transport="local",
-            session=self._session,
+            endpoint=self._endpoint,
             nbytes=nbytes,
             dtype=_dtype_to_str(t.dtype),
             shape=tuple(t.shape),
@@ -492,8 +583,8 @@ class LocalTransport(Transport):
         )
 
     def fetch(self, locator: Locator) -> "torch.Tensor":
-        if locator.session != self._session:
-            raise invalid_descriptor("local locator belongs to another transport session")
+        if locator.endpoint != self._endpoint:
+            raise invalid_descriptor("local locator belongs to another transport endpoint")
         key = int(locator.handle.decode())
         with self._lock:
             t = self._table.get(key)
@@ -505,7 +596,7 @@ class LocalTransport(Transport):
         return _ImmediateTransferTicket(self.fetch(locator))
 
     def release(self, locator: Locator) -> None:
-        if locator.session != self._session:
+        if locator.endpoint != self._endpoint:
             return
         with self._lock:
             removed = self._table.pop(int(locator.handle.decode()), None)
@@ -704,7 +795,7 @@ class ShmTransport(Transport):
             self._publication_bytes[shm.name] = nbytes
         return Locator(
             transport="shm",
-            session=self.name,
+            endpoint=self.name,
             nbytes=nbytes,
             dtype=_dtype_to_str(tensor.dtype),
             shape=tuple(tensor.shape),
@@ -730,7 +821,7 @@ class ShmTransport(Transport):
         resource_tracker.unregister(shm._name, "shared_memory")
         return Locator(
             transport="shm",
-            session="media",
+            endpoint="media",
             nbytes=len(value),
             dtype="uint8",
             shape=(len(value),),
@@ -802,7 +893,7 @@ class ShmTransport(Transport):
         self._queue_publication((shm.name, shm, nbytes, host, signal, completed))
         return Locator(
             transport="shm",
-            session=self.name,
+            endpoint=self.name,
             nbytes=nbytes,
             dtype=_dtype_to_str(source.dtype),
             shape=tuple(source.shape),
@@ -930,11 +1021,10 @@ class CudaIpcTransport(Transport):
         self._bytes = _ByteCapacity(byte_capacity)
 
     def publish(self, tensor: "torch.Tensor") -> Locator:
-        from torch.multiprocessing.reductions import reduce_tensor
-
         if not tensor.is_cuda:
             raise invalid_descriptor("cuda_ipc transport requires a CUDA tensor")
         import torch
+        from torch.multiprocessing.reductions import StorageWeakRef, shared_cache
 
         source = tensor.detach().contiguous()
         nbytes = _nbytes(source)
@@ -953,7 +1043,18 @@ class CudaIpcTransport(Transport):
                 raise resource_error("CUDA IPC publication capacity is exhausted")
             self._alive[publication_id] = (t, event)
         try:
-            rebuild, args = reduce_tensor(t)
+            storage = t._typed_storage()
+            (
+                storage_device,
+                storage_handle,
+                storage_size_bytes,
+                storage_offset_bytes,
+                ref_counter_handle,
+                ref_counter_offset,
+                allocator_event_handle,
+                event_sync_required,
+            ) = storage._share_cuda_()
+            shared_cache[storage_handle] = StorageWeakRef(storage)
         except BaseException:
             with self._lock:
                 self._alive.pop(publication_id, None)
@@ -961,31 +1062,58 @@ class CudaIpcTransport(Transport):
             raise
         return Locator(
             transport="cuda_ipc",
-            session=self.name,
+            endpoint=self.name,
             nbytes=nbytes,
             dtype=_dtype_to_str(t.dtype),
             shape=tuple(t.shape),
             device=str(t.device),
-            handle=pickle.dumps((rebuild, args), protocol=pickle.HIGHEST_PROTOCOL),
+            handle=bytes(storage_handle),
             meta={
-                "event_handle_b64": base64.b64encode(event.ipc_handle()).decode("ascii"),
                 "publication_id": publication_id,
+                "storage_device": int(storage_device),
+                "storage_size_bytes": int(storage_size_bytes),
+                "storage_offset_bytes": int(storage_offset_bytes),
+                "tensor_offset": int(t.storage_offset()),
+                "tensor_stride": tuple(int(value) for value in t.stride()),
+                "ref_counter_handle": bytes(ref_counter_handle),
+                "ref_counter_offset": int(ref_counter_offset),
+                "event_handle": bytes(allocator_event_handle),
+                "event_sync_required": bool(event_sync_required),
+                "ready_event_handle": bytes(event.ipc_handle()),
             },
         )
 
     def _open(self, locator: Locator) -> "torch.Tensor":
-        rebuild, args = pickle.loads(locator.handle)
-        return rebuild(*args)  # view into the producer's VRAM
+        import torch
+        from torch.multiprocessing.reductions import rebuild_cuda_tensor
+
+        return rebuild_cuda_tensor(
+            torch.Tensor,
+            locator.shape,
+            tuple(int(value) for value in locator.meta["tensor_stride"]),
+            int(locator.meta["tensor_offset"]),
+            torch.storage.TypedStorage,
+            _dtype_from_str(locator.dtype),
+            int(locator.meta.get("storage_device", torch.device(locator.device).index or 0)),
+            locator.handle,
+            int(locator.meta["storage_size_bytes"]),
+            int(locator.meta["storage_offset_bytes"]),
+            False,
+            bytes(locator.meta["ref_counter_handle"]),
+            int(locator.meta["ref_counter_offset"]),
+            bytes(locator.meta["event_handle"]),
+            bool(locator.meta["event_sync_required"]),
+        )
 
     def fetch(self, locator: Locator) -> "torch.Tensor":
         import torch
 
-        event_handle = locator.meta.get("event_handle_b64")
-        if not isinstance(event_handle, str):
+        event_handle = locator.meta.get("ready_event_handle")
+        if not isinstance(event_handle, bytes):
             raise invalid_descriptor("CUDA IPC locator has no producer event")
         event = torch.cuda.Event.from_ipc_handle(
             torch.device(locator.device),
-            base64.b64decode(event_handle.encode("ascii")),
+            event_handle,
         )
         torch.cuda.current_stream(torch.device(locator.device)).wait_event(event)
         return self._open(locator).clone()

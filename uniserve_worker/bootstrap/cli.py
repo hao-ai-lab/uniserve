@@ -6,7 +6,7 @@ import argparse
 import json
 from collections.abc import Sequence
 
-from .role import WorkerRole
+from ..execution.batch import RunKind
 from .capacity import DEFAULT_BLOCK_SIZE, DEFAULT_MAX_BATCH_OPS
 from .config import WorkerProcessArgs
 
@@ -29,11 +29,9 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ipc-max-inflight", type=int, default=1)
     parser.add_argument("--model", default="")
     parser.add_argument(
-        "--worker-role",
-        dest="worker_role",
-        default=WorkerRole.FULL.value,
-        choices=WorkerRole.values(),
-        help="deployment role served by this worker process",
+        "--supported-ops",
+        default=",".join(value.value for value in RunKind),
+        help="comma-separated operation kinds assigned to this pool",
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument(

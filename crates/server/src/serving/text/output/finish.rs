@@ -42,6 +42,7 @@ impl FinishReason {
     pub fn as_str(&self) -> &'static str {
         match &self.reason {
             uniserve_core::FinishReason::Eos
+            | uniserve_core::FinishReason::Completed
             | uniserve_core::FinishReason::Stop
             | uniserve_core::FinishReason::ImageDone => "stop",
             uniserve_core::FinishReason::MaxTokens => "length",

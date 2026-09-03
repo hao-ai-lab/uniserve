@@ -1,4 +1,4 @@
-//! Scheduler-stats reporter: the mapping from live [`SchedStats`] counters onto
+//! EngineLoop-stats reporter: the mapping from live [`SchedStats`] counters onto
 //! the [`SchedulerStats`] snapshot consumed by the HTTP process.
 
 use std::collections::BTreeMap;
@@ -19,8 +19,8 @@ struct DomainCumulative {
     error_operations: u64,
     backpressure_events: u64,
     reclaimed_credits: u64,
-    completed_partitions: u64,
-    co_resident_partitions: u64,
+    completed_runs: u64,
+    co_resident_runs: u64,
     queue_us: u64,
     launch_us: u64,
     device_us: u64,
@@ -155,12 +155,12 @@ impl SchedStatsReporter {
                     reclaimed_credits: current
                         .reclaimed_credits
                         .saturating_sub(previous.reclaimed_credits),
-                    completed_partitions: current
-                        .completed_partitions
-                        .saturating_sub(previous.completed_partitions),
-                    co_resident_partitions: current
-                        .co_resident_partitions
-                        .saturating_sub(previous.co_resident_partitions),
+                    completed_runs: current
+                        .completed_runs
+                        .saturating_sub(previous.completed_runs),
+                    co_resident_runs: current
+                        .co_resident_runs
+                        .saturating_sub(previous.co_resident_runs),
                     queue_us: current.queue_us.saturating_sub(previous.queue_us),
                     launch_us: current.launch_us.saturating_sub(previous.launch_us),
                     device_us: current.device_us.saturating_sub(previous.device_us),
@@ -191,8 +191,8 @@ fn domain_cumulative(stats: &crate::scheduler::DomainStats) -> DomainCumulative 
         error_operations: stats.error_operations.load(Ordering::Relaxed),
         backpressure_events: stats.backpressure_events.load(Ordering::Relaxed),
         reclaimed_credits: stats.reclaimed_credits.load(Ordering::Relaxed),
-        completed_partitions: stats.completed_partitions.load(Ordering::Relaxed),
-        co_resident_partitions: stats.co_resident_partitions.load(Ordering::Relaxed),
+        completed_runs: stats.completed_runs.load(Ordering::Relaxed),
+        co_resident_runs: stats.co_resident_runs.load(Ordering::Relaxed),
         queue_us: stats.queue_us.load(Ordering::Relaxed),
         launch_us: stats.launch_us.load(Ordering::Relaxed),
         device_us: stats.device_us.load(Ordering::Relaxed),

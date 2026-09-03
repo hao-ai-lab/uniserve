@@ -1,53 +1,38 @@
 namespace uniserve.ipc;
 
-// Closed forward-mode tag for one operation. Declaration order is the
-// canonical index in IPC and worker selection.
-enum ForwardMode : ubyte {
-  TokenExtend,
-  TokenDecode,
-  TokenVerify,
-  EncodeVision,
-  EncodeLatent,
+// Stable logical operation algebra used for pool capability and routing.
+enum OpKind : ubyte {
+  ArExtend,
+  ArDecode,
+  ArVerify,
+  EncoderExecute,
+  DiffusionPrepare,
+  DiffusionStep,
+  DiffusionDecode
+}
+
+// Physical worker execution modes. These never enter scheduler policy.
+enum RunKind : ubyte {
+  ArExtend,
+  ArDecode,
+  ArVerify,
+  EncoderVision,
+  EncoderLatent,
   TransferProduct,
   TransferKvPublish,
   TransferKvInstall,
-  MediaPrepare,
-  MediaDenoise,
-  Materialize,
-  MediaReconstruct
-}
-
-enum ReconstructionKind : ubyte { Video, Audio }
-enum MediaProfileId : ubyte { MinimaxH3T2va }
-
-enum Domain : ubyte { Prefill, Decode, Flow }
-enum AttentionRegime : ubyte { None, Causal, Bidirectional, Hybrid }
-enum SamplingOwnership : ubyte { DesignatedRank, DeterministicSharded }
-enum WorkerRole : ubyte { Full, Encoder, Prefill, Decode, Und, Gen }
-
-enum ProductKind : ubyte {
-  Token,
-  Logprob,
-  VisionFeature,
-  LatentFeature,
-  Kv,
-  Latent,
-  Artifact,
-  Completion,
-  SamplingState,
-  SelectedPoint
-}
-
-enum StorageClass : ubyte {
-  DeviceTensor,
-  RequestRelay,
-  PagedKv,
-  LatentArena,
-  HostStaging,
-  PinnedOutput
+  DiffusionPrepare,
+  DiffusionStep,
+  DiffusionFinalize,
+  DiffusionDecode
 }
 
 enum DType : ubyte { U8, U16, U32, I32, I64, F16, BF16, F32 }
+enum FeatureKind : ubyte { Vision, Latent }
+enum TokenDelivery : ubyte { Inline, Relay }
+enum LogprobFormat : ubyte { PackedBytes, F32Values }
+enum CompletionDelivery : ubyte { Relay, DevicePredicate }
+enum ArtifactUse : ubyte { Inline, Feedback, Encoded }
 
 enum OpStatus : ubyte { Ok, Predicated, Error }
 
@@ -65,20 +50,11 @@ enum Disposition : ubyte { Publish, Retain, Discard }
 
 enum CloseReason : ubyte { Completed, Cancelled, Error, Preempted }
 
-// Administrative worker command channel (separate from request `Control`).
-enum ReqKind : ubyte {
-  GetInfo,
-  Execute,
-  PollCompletions,
-  DropSession,
-  Shutdown,
-  ReleaseProducts,
-  GetPressure
-}
+enum ReqKind : ubyte { Info, Submit, Poll, Close }
 
-enum RespKind : ubyte { Info, Result, Ok, Error, Pressure }
-enum ResourceClass : ubyte { KvBlock, EncoderOutput, ImageLatent }
+enum RespKind : ubyte { Info, Result, Ok, Error }
 enum KvGroupKind : ubyte { Full, SlidingWindow }
+enum TransferTransportKind : ubyte { Local, PosixShm, CudaIpc }
 
 table U32List { items:[uint]; }
 table TokenBias { token_id:uint; bias:float; }
@@ -132,126 +108,160 @@ table KvGroup {
   sink:uint;
 }
 
-table RankInfo {
-  tp_rank:uint;
-  tp_size:uint = 1;
-}
-
-table ResourcePressure {
-  class:ResourceClass;
-  total:ulong;
-  used:ulong;
-  evictable:ulong;
-  free:ulong;
-}
-
-table GraphBucket {
-  decode_rows:uint;
-  flow_rows:uint;
-  height:uint;
-  width:uint;
-  cfg_branches:uint;
-}
-
-table WorkerInfo {
-  worker_role:WorkerRole;
+table KvCacheConfig {
   block_size:uint;
   num_blocks:uint;
   num_layers:uint;
   num_kv_heads:uint;
   head_dim:uint;
-  supported_work:[ForwardMode];
-  latent_page_units:uint;
-  num_latent_pages:uint;
-  latent_width:uint;
-  latent_dtype:string;
-  latent_downsample:uint;
   bytes_per_token:ulong;
-  max_vae_grid_tokens:uint;
-  max_vit_grid_tokens:uint;
-  max_latent_feature_bytes:ulong;
-  max_vision_feature_bytes:ulong;
-  commit_marker_tokens:uint;
-  gen_rope_advance:uint;
-  max_cfg_branches:uint;
   groups:[KvGroup];
-  kv_dtype:string;
-  model_dtype:string;
-  rank:RankInfo;
-  pipeline_depth:uint;
-  encoder_cache_budget:uint;
-  supported_controls:[ReqKind];
-  max_batch_operations:uint;
-  max_batch_tokens:uint;
-  max_request_pool_size:uint;
-  max_unresolved_window:uint = 1;
-  incremental_kv_publication:bool;
-  mixed_buckets:[GraphBucket];
-  sampling_ownership:SamplingOwnership;
-  resource_classes:[ResourceClass];
+  dtype:string;
+}
+
+table RankInfo {
+  tp_rank:uint;
+  tp_size:uint = 1;
+}
+
+table WorkerInfo {
   model_name:string;
   weight_version:ulong;
+  rank:RankInfo;
+  supported_ops:[OpKind];
+  queue_depth:uint;
+  max_batch_ops:uint;
+  max_batch_tokens:uint;
+  request_slots:uint;
+  kv_cache:KvCacheConfig;
+  latent_page_units:uint;
+  latent_pages:uint;
+  buffer_pool_bytes:ulong;
+  max_unresolved_ops:uint = 1;
 }
 
 // ---- Identities and the four operation records ----------------------------
 
 table RequestKey {
   authority_id:ulong;
-  session_id:ulong;
+  request_id:ulong;
   epoch:ulong;
 }
 
-table PointFixed {
-  point_index:uint;
+table CheckpointFixed { point:uint; }
+table CheckpointDeviceSelected {}
+union CheckpointPoint { CheckpointFixed, CheckpointDeviceSelected }
+
+table Checkpoint {
+  op_id:ulong;
+  point:CheckpointPoint;
 }
 
-table PointDevice {
-  point_index:uint;
-  selected_point:ProductRef;
-}
-
-union Point { PointFixed, PointDevice }
-
-table VersionRef {
-  request_key:RequestKey;
-  producer_op_id:ulong;
-  point:Point;
-}
-
-// One dimension of a bounded shape: a host-static extent when `device` is
-// false, or the fixed maximum of the single device-actual axis when true.
-table DimBound {
-  device:bool;
-  value:uint;
-}
-
-table ShapeBound { dims:[DimBound]; }
-
-table PointRange {
-  base_point:uint;
-  max_points:uint;
-}
-
-table ProductRef {
+table ScalarId {
   request_key:RequestKey;
   producer_op_id:ulong;
   output_index:ushort;
   generation:uint;
-  kind:ProductKind;
-  storage_class:StorageClass;
-  dtype:DType;
-  shape_bound:ShapeBound;
-  point_range:PointRange;
 }
 
-table Bounds {
-  max_points:uint;
-  max_tokens:uint;
-  max_kv_pages:uint;
-  max_latent_bytes:ulong;
-  max_completion_bytes:ulong;
-  max_transfer_bytes:ulong;
+table BufferId {
+  owner:RequestKey;
+  producer_op_id:ulong;
+  output_index:ushort;
+  generation:uint;
 }
+
+table BufferDescriptor {
+  id:BufferId;
+  max_bytes:ulong;
+}
+
+table TokenValue {
+  id:ScalarId;
+  delivery:TokenDelivery;
+  max_tokens:uint;
+  base_point:uint;
+  max_points:uint;
+}
+
+table LogprobValue {
+  id:ScalarId;
+  format:LogprobFormat;
+  max_count:uint;
+  base_point:uint;
+  max_points:uint;
+}
+
+table FeatureBuffer {
+  buffer:BufferDescriptor;
+  feature:FeatureKind;
+  dtype:DType;
+  extents:[uint];
+  dynamic_axis:int = -1;
+  base_point:uint;
+  max_points:uint;
+}
+
+table KvBuffer {
+  buffer:BufferDescriptor;
+  dtype:DType;
+  extents:[uint];
+  dynamic_axis:int = -1;
+  base_point:uint;
+  max_points:uint;
+}
+
+table LatentBuffer {
+  buffer:BufferDescriptor;
+  dtype:DType;
+  extents:[uint];
+  dynamic_axis:int = -1;
+  base_point:uint;
+  max_points:uint;
+}
+
+table ArtifactValue {
+  id:ScalarId;
+  buffer:BufferDescriptor;
+  use:ArtifactUse;
+  dtype:DType;
+  extents:[uint];
+  dynamic_axis:int = -1;
+  base_point:uint;
+  max_points:uint;
+}
+
+table CompletionValue {
+  id:ScalarId;
+  delivery:CompletionDelivery;
+  base_point:uint;
+  max_points:uint;
+}
+
+table SamplingValue {
+  id:ScalarId;
+  max_bytes:ulong;
+}
+
+table SelectedPointValue {
+  id:ScalarId;
+  base_point:uint;
+  max_points:uint;
+}
+
+union ValueReference {
+  TokenValue,
+  LogprobValue,
+  FeatureBuffer,
+  KvBuffer,
+  LatentBuffer,
+  ArtifactValue,
+  CompletionValue,
+  SamplingValue,
+  SelectedPointValue
+}
+
+table ValueRef { value:ValueReference; }
 
 table Rng {
   seed:ulong;
@@ -259,20 +269,70 @@ table Rng {
   draw_layout:DrawLayout;
 }
 
+table ArOpPayload {
+  max_points:uint;
+  max_tokens:uint;
+  max_kv_pages:uint;
+  max_latent_bytes:ulong;
+  max_completion_bytes:ulong;
+  max_transfer_bytes:ulong;
+  inputs:[ValueRef];
+  outputs:[ValueRef];
+  predicate:ValueRef;
+  rng:Rng;
+  control_seq:ulong;
+}
+
+table EncoderOpPayload {
+  max_points:uint;
+  max_tokens:uint;
+  max_kv_pages:uint;
+  max_latent_bytes:ulong;
+  max_completion_bytes:ulong;
+  max_transfer_bytes:ulong;
+  inputs:[ValueRef];
+  outputs:[ValueRef];
+  predicate:ValueRef;
+  rng:Rng;
+  control_seq:ulong;
+}
+
+table DiffusionOpPayload {
+  max_points:uint;
+  max_tokens:uint;
+  max_kv_pages:uint;
+  max_latent_bytes:ulong;
+  max_completion_bytes:ulong;
+  max_transfer_bytes:ulong;
+  inputs:[ValueRef];
+  outputs:[ValueRef];
+  predicate:ValueRef;
+  rng:Rng;
+  control_seq:ulong;
+}
+
+table TransferOpPayload {
+  max_points:uint;
+  max_tokens:uint;
+  max_kv_pages:uint;
+  max_latent_bytes:ulong;
+  max_completion_bytes:ulong;
+  max_transfer_bytes:ulong;
+  inputs:[ValueRef];
+  outputs:[ValueRef];
+  predicate:ValueRef;
+  rng:Rng;
+  control_seq:ulong;
+}
+
+union OpPayload { ArOpPayload, EncoderOpPayload, DiffusionOpPayload, TransferOpPayload }
+
 table Operation {
   request_key:RequestKey;
   op_id:ulong;
-  parent:VersionRef;
-  work:ForwardMode;
-  route:uint;
-  domain:Domain;
-  advances_state:bool;
-  bounds:Bounds;
-  inputs:[ProductRef];
-  outputs:[ProductRef];
-  predicate:ProductRef;
-  rng:Rng;
-  control_seq:ulong;
+  parent:Checkpoint;
+  kind:RunKind;
+  payload:OpPayload;
 }
 
 table BlockTable {
@@ -306,12 +366,17 @@ table LatentPlacement {
   step_count:uint;
 }
 
-table ReconstructionPlacement {
+table DecodePlacement {
   request_key:RequestKey;
   op_id:ulong;
-  kind:ReconstructionKind;
-  start_unit:uint;
-  unit_count:uint;
+  cursor:uint;
+  max_units:uint;
+}
+
+table BufferPlacement {
+  buffer:BufferId;
+  offset:ulong;
+  bytes:ulong;
 }
 
 table LogicalLengths {
@@ -339,10 +404,54 @@ table TimingCounters {
   host_us:ulong;
 }
 
+table PosixShmArtifact {
+  name:string;
+}
+
+union ArtifactHandle {
+  PosixShmArtifact
+}
+
 table MediaOutput {
-  handle:string;
+  handle:ArtifactHandle;
   bytes:ulong;
 }
+
+table ArResult {
+  logical_lengths:LogicalLengths;
+  token_span:TokenSpan;
+  committed_tokens:[uint];
+  finish_flags:FinishFlags;
+  media_output:MediaOutput;
+}
+
+table EncoderResult {
+  logical_lengths:LogicalLengths;
+  token_span:TokenSpan;
+  committed_tokens:[uint];
+  finish_flags:FinishFlags;
+  media_output:MediaOutput;
+}
+
+table DiffusionResult {
+  logical_lengths:LogicalLengths;
+  token_span:TokenSpan;
+  committed_tokens:[uint];
+  finish_flags:FinishFlags;
+  media_output:MediaOutput;
+  next_cursor:uint;
+  done:bool;
+}
+
+table TransferResult {
+  logical_lengths:LogicalLengths;
+  token_span:TokenSpan;
+  committed_tokens:[uint];
+  finish_flags:FinishFlags;
+  media_output:MediaOutput;
+}
+
+union ResultPayload { ArResult, EncoderResult, DiffusionResult, TransferResult }
 
 table ModelOutput {
   request_key:RequestKey;
@@ -350,96 +459,80 @@ table ModelOutput {
   completion_slot_generation:uint;
   status:OpStatus;
   selected_point:uint;
-  logical_lengths:LogicalLengths;
-  token_span:TokenSpan;
-  committed_tokens:[uint];
-  finish_flags:FinishFlags;
   product_generations:[uint];
   error_code:ErrorCode = null;
   timing_counters:TimingCounters;
-  media_output:MediaOutput;
+  payload:ResultPayload;
 }
 
-table ControlCommit {
+table CommitCommand {
   request_key:RequestKey;
   control_seq:ulong;
-  expected_parent:VersionRef;
-  selected:VersionRef;
+  expected_parent:Checkpoint;
+  selected:Checkpoint;
   public_event_limit:ulong;
   disposition:Disposition;
 }
 
-table ControlClose {
+table StartCommand { request:NewRequest; }
+
+table FinishCommand {
   request_key:RequestKey;
   control_seq:ulong;
-  cutoff:VersionRef;
+  cutoff:Checkpoint;
   reason:CloseReason;
 }
 
-table ControlRelease {
-  request_key:RequestKey;
-  op_id:ulong;
-}
+table FreeCommand { buffer:BufferId; }
 
-union Control { ControlCommit, ControlClose, ControlRelease }
+union BatchCommand { StartCommand, CommitCommand, FinishCommand, FreeCommand }
 
-table ControlEnvelope { control:Control; }
+table BatchCommandEnvelope { command:BatchCommand; }
 
-// ---- NewRequest framing (session establishment) ----------------------------
+// ---- NewRequest framing (request start) ------------------------------------
 
-table UndAdmission {
+table ArRequestParams {
   sampling:SamplingParams;
   negative_token_ids:[uint];
   finish_token_ids:[uint];
   initial_position:uint;
 }
 
-table GenAdmission { image:ImageParams; }
+table UmmRequestParams { image:ImageParams; }
 
 table MediaGeometry {
   frame_count:uint;
-  video_reconstruction_units:uint;
-  audio_latent_frames:uint;
+  decode_units:uint;
   prompt_tokens:uint;
   denoise_steps:uint;
 }
 
-table MediaAdmission {
+table DiffusionRequestParams {
   prompt_token_ids:[uint];
   seed:ulong;
-  profile:MediaProfileId;
   geometry:MediaGeometry;
 }
 
 table NewRequest {
   request_key:RequestKey;
   request_pool_idx:uint;
-  und:UndAdmission;
-  gen_admission:GenAdmission;
-  media:MediaAdmission;
+  ar:ArRequestParams;
+  umm:UmmRequestParams;
+  diffusion:DiffusionRequestParams;
 }
 
-table BatchPartition {
-  partition_id:uint;
-  submission_group:uint;
+table Run {
+  batch_id:ulong;
+  run_id:ulong;
   collective_seq:ulong;
-  domain:Domain;
-  route:uint;
-  attention:AttentionRegime;
-  shape_class:ulong;
   operations:[Operation];
   block_tables:[BlockTable];
   new_cache_pages:[CachePageAllocation];
   forward_rows:[RowGeometry];
   latent_placements:[LatentPlacement];
-  reconstruction_placements:[ReconstructionPlacement];
-}
-
-table Batch {
-  step_id:ulong;
-  admissions:[NewRequest];
-  partitions:[BatchPartition];
-  controls:[ControlEnvelope];
+  decode_placements:[DecodePlacement];
+  buffer_placements:[BufferPlacement];
+  commands:[BatchCommandEnvelope];
   input_products:[ProductPayload];
 }
 
@@ -447,26 +540,86 @@ table Batch {
 
 table RegistrationAck { visible:bool; }
 
-// A resolved output-product value the worker delivers for host consumption:
-// requested logprob blobs, materialized image bytes, and similar. The consumer
-// interprets the bytes for its product kind.
-table ProductPayload {
-  product:ProductRef;
-  bytes:[ubyte];
+table BytesValue { bytes:[ubyte]; }
+table TransferLocator {
+  transport:TransferTransportKind;
+  endpoint:string;
+  key:ulong;
+  name:string;
+  ready_header_bytes:uint;
+  ready_semaphore:string;
+  publication_id:string;
+  storage_handle:[ubyte];
+  storage_size_bytes:ulong;
+  storage_offset_bytes:ulong;
+  tensor_offset:ulong;
+  tensor_stride:[long];
+  ref_counter_handle:[ubyte];
+  ref_counter_offset:ulong;
+  event_handle:[ubyte];
+  event_sync_required:bool;
+  ready_event_handle:[ubyte];
+  nbytes:ulong;
+  dtype:string;
+  shape:[ulong];
+  device:string;
 }
 
-table PartitionCompletion {
-  partition_id:uint;
+table EncoderTransfer {
+  generation:uint;
+  height:uint;
+  width:uint;
+  payload_kind:FeatureKind;
+  locator:TransferLocator;
+}
+
+table DeviceProductTransfer {
+  generation:uint;
+  height:uint;
+  width:uint;
+  value_range:string;
+  locator:TransferLocator;
+}
+
+table KvTransfer {
+  generation:uint;
+  locators:[TransferLocator];
+  source:Checkpoint;
+  destination:string;
+  base:Checkpoint;
+  base_extent:uint;
+  published_extent:uint;
+  group_id:uint;
+  scale_identity:string;
+}
+
+table LatentTransfer {
+  generation:uint;
+  height:uint;
+  width:uint;
+  latent_units:uint;
+  step:uint;
+  locator:TransferLocator;
+}
+
+union TransferData { EncoderTransfer, DeviceProductTransfer, KvTransfer, LatentTransfer }
+table TransferHandle { value:TransferData; }
+union InlineValue { BytesValue, TransferHandle }
+
+table ProductPayload {
+  product:ValueRef;
+  value:InlineValue;
+}
+
+table RunResult {
+  batch_id:ulong;
+  run_id:ulong;
   completions:[ModelOutput];
   products:[ProductPayload];
   registration:RegistrationAck;
   worker_exec_us:ulong = null;
   forward_stats:WorkerForwardStats;
-}
-
-table CompletionReport {
-  step_id:ulong;
-  partitions:[PartitionCompletion];
+  done:bool;
 }
 
 table WorkerForwardStats {
@@ -505,10 +658,8 @@ table WorkerForwardStats {
 table WorkerRequest {
   kind:ReqKind;
   call_id:ulong = null;
-  batch:Batch;
-  step_id:ulong = null;
-  session_id:ulong = null;
-  product_handles:[ulong];
+  run:Run;
+  poll_run_id:ulong = null;
 }
 
 table ErrorOperationIdentity {
@@ -520,8 +671,7 @@ table WorkerResponse {
   kind:RespKind;
   call_id:ulong = null;
   info:WorkerInfo;
-  completion_report:CompletionReport;
-  pressure:[ResourcePressure];
+  result:RunResult;
   message:string;
   code:string;
   retryable:bool = null;

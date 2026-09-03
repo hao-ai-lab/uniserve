@@ -137,7 +137,7 @@ class AttentionBackend:
     paged_varlen_cuda_graph: bool = False
     page_size_multiple: int = 1
     min_head_dim: int = 1
-    single_token_decode: bool = False
+    single_ar_decode: bool = False
     head_geometries: frozenset[tuple[int, int, int]] = frozenset()
     cuda_only: bool = False
     min_compute_version: tuple[int, int] | None = None
@@ -257,7 +257,7 @@ class AttentionBackend:
                 return self.supports(AttentionMode.PAGED_VARLEN) and self._paged_storage_supported(req)
             return self.supports_varlen()
         if isinstance(req, PagedDecodeAttention):
-            if self.single_token_decode and not self._is_one_token_decode(req):
+            if self.single_ar_decode and not self._is_one_ar_decode(req):
                 return False
             return (
                 self.supports(AttentionMode.PAGED_DECODE)
@@ -267,7 +267,7 @@ class AttentionBackend:
             return False
         if not self.supports(AttentionMode.DENSE):
             return False
-        if self.single_token_decode or (req.attn_mask is not None and not self.accepts_dense_mask):
+        if self.single_ar_decode or (req.attn_mask is not None and not self.accepts_dense_mask):
             return False
         if req.q.ndim != req.k.ndim or req.q.ndim != req.v.ndim:
             return False
@@ -406,7 +406,7 @@ class AttentionBackend:
         return int(getattr(req, "k").shape[-1]), int(getattr(req, "v").shape[-1])
 
     @staticmethod
-    def _is_one_token_decode(req: object) -> bool:
+    def _is_one_ar_decode(req: object) -> bool:
         from ...ops.requests import PagedDecodeAttention
 
         if not isinstance(req, PagedDecodeAttention):

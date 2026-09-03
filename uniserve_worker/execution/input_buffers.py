@@ -1,4 +1,4 @@
-"""Fixed-address staging tensors for one physical execution partition."""
+"""Fixed-address staging tensors for one physical execution lane."""
 
 from __future__ import annotations
 

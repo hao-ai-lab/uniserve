@@ -75,6 +75,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     let effective_max_model_len = assets.max_model_tokens();
     let request_slot_capacity = assets.request_slot_capacity();
     let control_tokens = runtime_control_tokens(&assets, config.engine.backend);
+    let runtime_profile = assets.runtime_profile(config.engine.worker_process.model_dtype.clone());
 
     let eos = control_tokens.eos.clone();
     info!(
@@ -104,6 +105,12 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         ..config.engine.worker_process.clone()
     };
     let engine_config = EngineCoreConfig {
+        runtime_family: match &assets {
+            ResolvedAssets::Text { .. } => uniserve_core::RuntimeFamily::Ar,
+            ResolvedAssets::Omni { .. } => uniserve_core::RuntimeFamily::Umm,
+            ResolvedAssets::Media { .. } => uniserve_core::RuntimeFamily::Diffusion,
+        },
+        runtime_profile,
         max_batch: config.engine.max_batch,
         max_num_batched_tokens: config.engine.max_num_batched_tokens,
         max_num_seqs: config.engine.max_num_seqs,
@@ -132,7 +139,13 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
             engine_config.eos.first().copied().unwrap_or(151645),
             &special_tokens,
         );
-        EngineClient::connect_with_executor(engine_config, Box::new(SimExecutor::new(sim)))
+        let executor = SimExecutor::new(sim);
+        let command_waker = executor.command_waker();
+        EngineClient::connect_with_executor_and_waker(
+            engine_config,
+            Box::new(executor),
+            command_waker,
+        )
     } else {
         EngineClient::connect(engine_config)
     }

@@ -5,8 +5,8 @@ use tracing::warn;
 
 use super::error::{Error, Result};
 use super::media::MediaSubmission;
-use uniserve_core::{GenerationLimits, ModelDtype, RequestId};
-use uniserve_engine::{EngineCore, EngineHandle, EventRx, Executor, MediaEventRx};
+use uniserve_core::{GenerationLimits, ModelDtype, Request, RequestId, RuntimeFamily};
+use uniserve_engine::{EngineCore, EngineHandle, EventRx, Executor};
 
 use crate::serving::TokenizedGenerateReqInput;
 
@@ -60,6 +60,20 @@ impl EngineClient {
         Self::from_core(core)
     }
 
+    pub fn connect_with_executor_and_waker(
+        config: uniserve_engine::EngineCoreConfig,
+        executor: Box<dyn Executor>,
+        command_waker: uniserve_core::CommandWaker,
+    ) -> Result<Self> {
+        let core =
+            EngineCore::with_executor_and_waker(config, executor, command_waker).map_err(|e| {
+                Error::ClientClosed {
+                    message: format!("failed to start the UniServe engine: {e:?}"),
+                }
+            })?;
+        Self::from_core(core)
+    }
+
     fn from_core(core: EngineCore) -> Result<Self> {
         let core = Arc::new(core);
 
@@ -67,7 +81,7 @@ impl EngineClient {
         let stats_guard = Arc::new(());
         {
             let stats = Arc::clone(core.stats());
-            let block_size = core.info().block_size;
+            let block_size = core.info().kv_block_size();
             let model_name = core.model_name().to_string();
             let guard = Arc::downgrade(&stats_guard);
             tokio::spawn(async move {
@@ -128,7 +142,7 @@ impl EngineClient {
     }
 
     pub fn total_num_gpu_blocks(&self) -> u64 {
-        self.core.info().num_blocks as u64
+        self.core.info().kv_num_blocks() as u64
     }
 
     pub fn is_healthy(&self) -> bool {
@@ -160,6 +174,16 @@ impl EngineClient {
             }
             active.insert(external_request_id.clone(), rid);
         }
+        let request = match self.core.runtime_family() {
+            RuntimeFamily::Ar => Request::Ar(request),
+            RuntimeFamily::Umm => Request::Umm(request),
+            RuntimeFamily::Diffusion => {
+                remove_active_request(&self.active, &external_request_id, rid);
+                return Err(Error::ClientClosed {
+                    message: "text generation is unavailable for a diffusion runtime".to_string(),
+                });
+            }
+        };
         let mut scheduler_rx = self.core.submit(request).map_err(|error| {
             remove_active_request(&self.active, &external_request_id, rid);
             Error::from(error)
@@ -172,7 +196,7 @@ impl EngineClient {
         Ok(scheduler_rx)
     }
 
-    pub async fn submit_media(&self, submission: MediaSubmission) -> Result<MediaEventRx> {
+    pub async fn submit_media(&self, submission: MediaSubmission) -> Result<EventRx> {
         let MediaSubmission {
             external_request_id,
             prompt_token_ids,
@@ -191,17 +215,26 @@ impl EngineClient {
             }
             active.insert(external_request_id.clone(), rid);
         }
-        let request = uniserve_core::MediaRequest {
+        if self.core.runtime_family() != RuntimeFamily::Diffusion {
+            remove_active_request(&self.active, &external_request_id, rid);
+            return Err(Error::ClientClosed {
+                message: "diffusion generation is unavailable for this runtime".to_string(),
+            });
+        }
+        let request = uniserve_core::DiffusionRequest {
             request_id: rid,
             prompt_token_ids,
             seed,
             priority,
             geometry,
         };
-        let mut scheduler_rx = self.core.handle().submit_media(request).map_err(|error| {
-            remove_active_request(&self.active, &external_request_id, rid);
-            Error::from(error)
-        })?;
+        let mut scheduler_rx = self
+            .core
+            .submit(Request::Diffusion(request))
+            .map_err(|error| {
+                remove_active_request(&self.active, &external_request_id, rid);
+                Error::from(error)
+            })?;
         let active = Arc::clone(&self.active);
         let active_id = external_request_id.clone();
         scheduler_rx.set_on_finish(move || {
@@ -250,11 +283,10 @@ impl EngineClient {
 mod tests {
     use crate::engine_client::EngineClient;
     use uniserve_core::{
-        ContextSegment, FeedbackNextToken, FeedbackSource, GeneratedImageFeedbackRecipe,
-        GenerationBehaviorDescriptor, GenerationConstraint, GenerationEvent,
-        GenerationPolicyDescriptor, GenerationRequest, GenerationResourceBounds, ImageIngestRecipe,
-        ImageKvEffect, ImageParams, RequestId, SamplingParams, TriggerPolicyDescriptor,
-        UndVisibility,
+        ContextSegment, Event, FeedbackNextToken, FeedbackSource, GeneratedImageFeedbackRecipe,
+        GenerationBehaviorDescriptor, GenerationConstraint, GenerationPolicyDescriptor,
+        GenerationRequest, GenerationResourceBounds, ImageIngestRecipe, ImageKvEffect, ImageParams,
+        RequestId, SamplingParams, TriggerPolicyDescriptor, UndVisibility,
     };
     use uniserve_engine::EngineCoreConfig;
 
@@ -302,13 +334,13 @@ mod tests {
         let mut finish = None;
         while let Some(event) = stream.next().await {
             match event {
-                GenerationEvent::TextToken { .. } => tokens += 1,
-                GenerationEvent::Finished { reason, .. } => {
+                Event::TextToken { .. } => tokens += 1,
+                Event::Finished { reason, .. } => {
                     finish = Some(reason);
                     break;
                 }
-                GenerationEvent::Rejected { message } => panic!("request rejected: {message}"),
-                GenerationEvent::Error { message } => panic!("engine error: {message}"),
+                Event::Rejected { message } => panic!("request rejected: {message}"),
+                Event::Error { message } => panic!("engine error: {message}"),
                 _ => {}
             }
         }
@@ -398,16 +430,16 @@ mod tests {
         let mut finished = false;
         while let Some(ev) = stream.next().await {
             match ev {
-                GenerationEvent::ImageBegin { .. } => begins += 1,
-                GenerationEvent::ImageStep { .. } => steps += 1,
-                GenerationEvent::ImageDone { .. } => dones += 1,
-                GenerationEvent::Finished { images, .. } => {
+                Event::ImageBegin { .. } => begins += 1,
+                Event::ImageStep { .. } => steps += 1,
+                Event::ImageDone { .. } => dones += 1,
+                Event::Finished { images, .. } => {
                     assert_eq!(images, 1, "expected exactly one image");
                     finished = true;
                     break;
                 }
-                GenerationEvent::Rejected { message } => panic!("request rejected: {message}"),
-                GenerationEvent::Error { message } => panic!("engine error: {message}"),
+                Event::Rejected { message } => panic!("request rejected: {message}"),
+                Event::Error { message } => panic!("engine error: {message}"),
                 _ => {}
             }
         }

@@ -8,19 +8,23 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
-use crate::executor::{ControlAck, ControlOp, Executor, WorkerExecError};
+use crate::executor::{
+    Batch, BatchResult, Executor, ExecutorInfo, ExecutorSubmitError, LogicalResultTracker,
+    PhysicalExecutor, PhysicalSubmitError, PoolId, WorkerExecError, lower_batch,
+};
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use uniserve_core::CommandWaker;
-use uniserve_worker_ipc::{
-    Batch, CompletionReport, Domain, WorkerInfo, WorkerRequest, WorkerResponse,
-};
 use uniserve_worker_ipc::{ClientEndpoint, Frame, Pending, service_name};
+use uniserve_worker_ipc::{
+    Domain, OpId, RequestKey, Run as PhysicalRun, RunResult, WorkerInfo, WorkerRequest,
+    WorkerResponse,
+};
 
 use crate::worker::WorkerProcessArgs;
 use crate::worker::death_watch::DeathWatcher;
 
-fn enqueue_ready(ready: &mut VecDeque<CompletionReport>, report: CompletionReport) {
+fn enqueue_ready(ready: &mut VecDeque<RunResult>, report: RunResult) {
     ready.push_back(report);
 }
 
@@ -137,7 +141,7 @@ impl Default for WorkerProcessArgs {
             max_batch_operations: 128,
             max_batch_tokens: 16_384,
             attention_backend: uniserve_worker_ipc::AttentionBackend::Auto,
-            worker_role: None,
+            supported_ops: uniserve_worker_ipc::OpKind::ALL.to_vec(),
             transfer_backend: crate::executor::TransferBackend::Inproc,
             stub: false,
             load_format: "auto".to_string(),
@@ -257,15 +261,17 @@ impl WorkerProcessArgs {
 pub struct UniprocExecutor {
     client: ClientEndpoint,
     info: WorkerInfo,
+    executor_info: ExecutorInfo,
     child: Child,
     depth: usize,
     rank: u32,
     tp_size: u32,
     pending: HashMap<u64, PendingRecord>,
-    ready: VecDeque<CompletionReport>,
-    acks: HashMap<u64, ControlAck>,
-    awaited: Option<u64>,
+    ready: VecDeque<RunResult>,
     next_call_id: u64,
+    next_collective_seq: u64,
+    logical_results: LogicalResultTracker,
+    command_wake_pending: bool,
     shutdown_sent: bool,
     /// Edge-triggered worker-death watcher: fires the scheduler park's death
     /// wake when the child exits. `None` when polling or when `pidfd` could not
@@ -286,10 +292,9 @@ fn release_consumed_request(record: PendingRecord) -> OutstandingKind {
 
 enum OutstandingKind {
     Batch {
-        step_id: u64,
-        remaining_partitions: HashSet<u32>,
+        run_id: u64,
+        remaining_operations: HashSet<(RequestKey, OpId)>,
     },
-    Control,
 }
 
 impl UniprocExecutor {
@@ -340,11 +345,17 @@ impl UniprocExecutor {
             .arg(tp_rank.to_string())
             .arg("--tp-size")
             .arg(tp_size.to_string());
-        // Staged topology: tell the worker which pipeline stage it serves.
-        // Omitted for the default `full` worker so the command line stays
-        // identical to the direct full-pool command shape.
-        if let Some(kind) = args.worker_role {
-            cmd.arg("--worker-role").arg(kind.as_str());
+        if args.supported_ops != uniserve_worker_ipc::OpKind::ALL {
+            cmd.arg("--supported-ops").arg(
+                args.supported_ops
+                    .iter()
+                    .flat_map(|operation| operation.run_kinds())
+                    .map(|operation| operation.as_str())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
         }
         // Data-plane Tier-2 backend for this stage's tensor handoffs. The
         // default (in-process) is omitted so the full-pool worker command
@@ -386,15 +397,20 @@ impl UniprocExecutor {
         Ok(Self {
             client,
             info: WorkerInfo::default(),
+            executor_info: ExecutorInfo::single(
+                PoolId(format!("rank-{tp_rank}")),
+                WorkerInfo::default(),
+            ),
             child,
             depth,
             rank: tp_rank,
             tp_size,
             pending: HashMap::new(),
             ready: VecDeque::new(),
-            acks: HashMap::new(),
-            awaited: None,
             next_call_id: 1,
+            next_collective_seq: 1,
+            logical_results: LogicalResultTracker::default(),
+            command_wake_pending: false,
             shutdown_sent: false,
             death_watcher,
         })
@@ -407,7 +423,7 @@ impl UniprocExecutor {
             "waiting for worker to load model + report info..."
         );
         let call_id = self.alloc_call_id();
-        let mut req = WorkerRequest::get_info();
+        let mut req = WorkerRequest::info();
         req.set_call_id(Some(call_id));
         let pending =
             self.send_request_with_timeout(&req, "info handshake", WORKER_CONNECT_TIMEOUT)?;
@@ -424,9 +440,9 @@ impl UniprocExecutor {
             .context("worker reported invalid worker info during startup")?;
         let host_depth = self.depth as u32;
         anyhow::ensure!(
-            info.pipeline_depth == host_depth,
+            info.queue_depth == host_depth,
             "worker pipeline_depth {} does not match launched depth {}",
-            info.pipeline_depth,
+            info.queue_depth,
             host_depth
         );
         anyhow::ensure!(
@@ -437,6 +453,8 @@ impl UniprocExecutor {
             self.rank,
             self.tp_size
         );
+        self.executor_info =
+            ExecutorInfo::single(PoolId(format!("rank-{}", self.rank)), info.clone());
         self.info = info;
         tracing::info!(?self.info, "worker ready");
         Ok(())
@@ -509,8 +527,8 @@ impl UniprocExecutor {
         }
     }
 
-    fn drain_ready(&mut self) -> anyhow::Result<usize> {
-        self.client.drain_wakes()?;
+    fn drain_ready(&mut self) -> anyhow::Result<(usize, uniserve_worker_ipc::WakeEvents)> {
+        let wakes = self.client.drain_wakes()?;
         let ids = self.pending.keys().copied().collect::<Vec<_>>();
         let mut drained = 0usize;
         for call_id in ids {
@@ -525,12 +543,12 @@ impl UniprocExecutor {
             })?;
             // Consuming a partial execute response ends this physical IPC
             // request. Release its iceoryx active-request slot before routing
-            // can submit the continuation poll for the remaining partitions.
+            // can submit the continuation poll for the remaining lanes.
             let kind = release_consumed_request(record);
             self.route(call_id, kind, frame)?;
             drained += 1;
         }
-        Ok(drained)
+        Ok((drained, wakes))
     }
 
     fn route(&mut self, call_id: u64, kind: OutstandingKind, frame: Frame) -> anyhow::Result<()> {
@@ -548,68 +566,48 @@ impl UniprocExecutor {
         }
         match kind {
             OutstandingKind::Batch {
-                step_id,
-                remaining_partitions,
-            } => self.route_batch(step_id, remaining_partitions, wr),
-            OutstandingKind::Control => {
-                let result = match wr {
-                    WorkerResponse::Ok { .. } => Ok(()),
-                    WorkerResponse::Error { error, .. } => Err(error.message),
-                    other => bail!("unexpected control response kind: {:?}", other.kind()),
-                };
-                if let Err(error) = &result {
-                    tracing::error!(call_id, %error, "worker control call error");
-                }
-                if self.awaited == Some(call_id) {
-                    self.acks.insert(
-                        call_id,
-                        ControlAck {
-                            rank: self.rank,
-                            result,
-                        },
-                    );
-                }
-                Ok(())
-            }
+                run_id,
+                remaining_operations,
+            } => self.route_batch(run_id, remaining_operations, wr),
         }
     }
 
     fn route_batch(
         &mut self,
-        step_id: u64,
-        mut remaining_partitions: HashSet<u32>,
+        run_id: u64,
+        mut remaining_operations: HashSet<(RequestKey, OpId)>,
         wr: WorkerResponse,
     ) -> anyhow::Result<()> {
         match wr {
-            WorkerResponse::Result {
-                completion_report: r,
-                ..
-            } => {
-                if r.step_id != step_id {
+            WorkerResponse::Result { result: r, .. } => {
+                if r.run_id != run_id {
                     bail!(
-                        "worker result step id mismatch: expected {step_id}, got {}",
-                        r.step_id
+                        "worker result step id mismatch: expected {run_id}, got {}",
+                        r.run_id
                     );
                 }
-                for partition in &r.partitions {
+                for output in &r.completions {
                     anyhow::ensure!(
-                        remaining_partitions.remove(&partition.partition_id),
-                        "worker returned duplicate or unknown partition {} for step {step_id}",
-                        partition.partition_id
+                        remaining_operations.remove(&(output.request_key, output.op_id)),
+                        "worker returned a duplicate or unknown operation for step {run_id}"
                     );
                 }
                 anyhow::ensure!(
-                    !r.partitions.is_empty() || remaining_partitions.is_empty(),
-                    "worker returned an empty partial completion for step {step_id}"
+                    r.done == remaining_operations.is_empty(),
+                    "worker run completion flag disagrees with remaining physical work"
+                );
+                anyhow::ensure!(
+                    !r.completions.is_empty() || remaining_operations.is_empty(),
+                    "worker returned an empty partial completion for step {run_id}"
                 );
                 enqueue_ready(&mut self.ready, r);
-                if !remaining_partitions.is_empty() {
-                    self.submit_completion_poll(step_id, remaining_partitions)?;
+                if !remaining_operations.is_empty() {
+                    self.submit_completion_poll(run_id, remaining_operations)?;
                 }
                 Ok(())
             }
             WorkerResponse::Error { error, .. } => Err(WorkerExecError {
-                step_id: Some(step_id),
+                run_id: Some(run_id),
                 fatal: error.fatal,
                 retryable: error.retryable,
                 code: error.code,
@@ -625,19 +623,19 @@ impl UniprocExecutor {
 
     fn submit_completion_poll(
         &mut self,
-        step_id: u64,
-        remaining_partitions: HashSet<u32>,
+        run_id: u64,
+        remaining_operations: HashSet<(RequestKey, OpId)>,
     ) -> anyhow::Result<()> {
         let call_id = self.alloc_call_id();
-        let mut request = WorkerRequest::poll_completions(step_id);
+        let mut request = WorkerRequest::poll(run_id);
         request.set_call_id(Some(call_id));
         let pending = self.send_request_checked(&request, "completion poll")?;
         self.pending.insert(
             call_id,
             PendingRecord {
                 kind: OutstandingKind::Batch {
-                    step_id,
-                    remaining_partitions,
+                    run_id,
+                    remaining_operations,
                 },
                 pending,
             },
@@ -645,115 +643,44 @@ impl UniprocExecutor {
         Ok(())
     }
 
-    fn wait_for_one_response(&mut self) -> anyhow::Result<()> {
-        if self.pending.is_empty() {
-            bail!("no pending worker requests to wait for");
-        }
-        loop {
-            let drained = self.drain_ready()?;
-            if drained > 0 {
-                return Ok(());
-            }
-            self.check_worker("worker response wait")?;
-            self.client.wait_wake(WORKER_CHECK_INTERVAL)?;
-        }
-    }
-
-    fn ensure_slot(&mut self) -> anyhow::Result<()> {
-        self.drain_ready()?;
-        while self.pending.len() >= self.depth {
-            self.wait_for_one_response()?;
-        }
-        Ok(())
-    }
-
-    fn submit_control_request(&mut self, req: &WorkerRequest, call_id: u64) -> anyhow::Result<()> {
-        if self.shutdown_sent {
-            // The worker is being torn down; drop the control op rather than send onto a
-            // closing IPC channel. Log so this is observable instead of a silent no-op.
-            tracing::debug!(
-                call_id,
-                "dropping control request: executor already shutting down"
-            );
-            return Ok(());
-        }
-        // Control ops deliberately share the pipeline-depth slot budget with batches: the
-        // worker is launched with --ipc-max-inflight = depth, so total outstanding requests
-        // (batch + control) must not exceed `depth` or we would overflow the IPC ring.
-        self.ensure_slot()?;
-        let pending = self.send_request_checked(req, "control request")?;
-        self.pending.insert(
-            call_id,
-            PendingRecord {
-                kind: OutstandingKind::Control,
-                pending,
-            },
-        );
-        Ok(())
-    }
-
-    fn batch_pending_count(&self) -> usize {
-        self.pending
-            .values()
-            .filter(|record| matches!(record.kind, OutstandingKind::Batch { .. }))
-            .count()
-    }
-}
-
-impl Executor for UniprocExecutor {
-    fn info(&self) -> &WorkerInfo {
-        &self.info
-    }
-
-    fn pipeline_depth(&self) -> usize {
-        self.depth
-    }
-
-    fn in_flight(&self) -> usize {
-        self.batch_pending_count() + self.ready.len()
-    }
-
-    fn can_submit(&self) -> bool {
-        self.pending.len() < self.depth
-    }
-
-    fn command_waker(&self) -> CommandWaker {
+    pub fn command_waker(&self) -> CommandWaker {
         let sender = self.client.command_wake();
         CommandWaker::new(move || sender.wake())
     }
 
-    fn wake_file_descriptors(&self) -> Vec<i32> {
-        vec![self.client.wake_file_descriptor()]
+    pub(crate) fn progress_fd(&self) -> i32 {
+        self.client.wake_file_descriptor()
+    }
+}
+
+impl PhysicalExecutor for UniprocExecutor {
+    fn physical_info(&self) -> &ExecutorInfo {
+        &self.executor_info
     }
 
-    fn park_for_event(&mut self, timeout: Duration) -> anyhow::Result<()> {
-        // Park over {result, command, death} without consuming anything: the
-        // scheduler drains results, commands, and liveness after return.
-        self.client.wait_wake(timeout)?;
-        Ok(())
-    }
-
-    fn submit(&mut self, batch: Batch) -> anyhow::Result<()> {
-        self.drain_ready()?;
-        if !self.can_submit() {
-            self.ensure_slot()?;
+    fn submit_run(&mut self, batch: PhysicalRun) -> Result<(), PhysicalSubmitError> {
+        self.drain_ready().map_err(PhysicalSubmitError::Failed)?;
+        if self.pending.len() >= self.depth {
+            return Err(PhysicalSubmitError::WouldBlock(batch));
         }
-        let step_id = batch.step_id;
-        let remaining_partitions = batch
-            .partitions
+        let run_id = batch.run_id;
+        let remaining_operations = batch
+            .operations
             .iter()
-            .map(|partition| partition.partition_id)
+            .map(|operation| (operation.request_key, operation.op_id))
             .collect::<HashSet<_>>();
         let call_id = self.alloc_call_id();
-        let mut req = WorkerRequest::execute(batch);
+        let mut req = WorkerRequest::submit(batch);
         req.set_call_id(Some(call_id));
-        let pending = self.send_request_checked(&req, "batch submit")?;
+        let pending = self
+            .send_request_checked(&req, "batch submit")
+            .map_err(PhysicalSubmitError::Failed)?;
         self.pending.insert(
             call_id,
             PendingRecord {
                 kind: OutstandingKind::Batch {
-                    step_id,
-                    remaining_partitions,
+                    run_id,
+                    remaining_operations,
                 },
                 pending,
             },
@@ -761,93 +688,52 @@ impl Executor for UniprocExecutor {
         Ok(())
     }
 
-    fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
-        self.drain_ready()?;
-        Ok(self.ready.pop_front())
-    }
-
-    fn check_liveness(&mut self) -> anyhow::Result<()> {
-        // Non-blocking reap of the worker child so death is observed even when
-        // no requests are in flight.
-        self.check_worker("idle liveness check")
-    }
-
-    fn wait_result_timeout(
-        &mut self,
-        timeout: Duration,
-    ) -> anyhow::Result<Option<CompletionReport>> {
-        let Some(deadline) = Instant::now().checked_add(timeout) else {
-            self.drain_ready()?;
-            return Ok(self.ready.pop_front());
-        };
+    fn poll_run(&mut self, timeout: Duration) -> anyhow::Result<Option<RunResult>> {
+        if self.command_wake_pending {
+            return Ok(None);
+        }
+        let (_, mut wakes) = self.drain_ready()?;
+        self.command_wake_pending |= wakes.command;
+        self.check_worker("executor poll")?;
+        if self.command_wake_pending || wakes.death {
+            return Ok(None);
+        }
+        if let Some(result) = self.ready.pop_front() {
+            return Ok(Some(result));
+        }
+        if timeout.is_zero() {
+            return Ok(None);
+        }
+        let deadline = Instant::now() + timeout;
         loop {
-            self.drain_ready()?;
-            if let Some(r) = self.ready.pop_front() {
-                return Ok(Some(r));
-            }
-            if self.batch_pending_count() == 0 {
-                return Ok(None);
-            }
-            self.check_worker("worker result timed wait")?;
             let now = Instant::now();
             if now >= deadline {
                 return Ok(None);
             }
-            self.client
+            wakes = self
+                .client
                 .wait_wake((deadline - now).min(WORKER_CHECK_INTERVAL))?;
-        }
-    }
-
-    fn next_result(&mut self) -> anyhow::Result<CompletionReport> {
-        loop {
-            self.drain_ready()?;
-            if let Some(r) = self.ready.pop_front() {
-                return Ok(r);
+            let (_, queued_wakes) = self.drain_ready()?;
+            wakes.command |= queued_wakes.command;
+            wakes.death |= queued_wakes.death;
+            self.command_wake_pending |= wakes.command;
+            self.check_worker("executor poll")?;
+            if self.command_wake_pending || wakes.death {
+                return Ok(None);
             }
-            if self.batch_pending_count() == 0 {
-                bail!("next_result called with no in-flight batches");
+            if let Some(result) = self.ready.pop_front() {
+                return Ok(Some(result));
             }
-            self.wait_for_one_response()?;
         }
     }
 
-    /// Fire-and-forget control op. The returned `u64` MUST be treated as opaque: callers
-    /// should discard it and use [`Executor::control_wait`] when they need to correlate an
-    /// ack. In this single-worker transport the value happens to be the genuine IPC
-    /// call_id the worker echoes, but the multiproc transport returns a private
-    /// counter that matches no worker request, so no caller may assume these semantics.
-    /// `0` is returned for empty copy or product-release controls that are never sent.
-    fn control(&mut self, op: ControlOp) -> anyhow::Result<u64> {
-        match &op {
-            ControlOp::ReleaseProducts(handles) if handles.is_empty() => return Ok(0),
-            _ => {}
-        }
-        let call_id = self.alloc_call_id();
-        self.submit_control_request(&op.to_request(call_id), call_id)?;
-        Ok(call_id)
+    fn take_command_wake(&mut self) -> bool {
+        std::mem::take(&mut self.command_wake_pending)
     }
 
-    fn control_wait(
-        &mut self,
-        op: ControlOp,
-        _targets: Option<&[u32]>,
-    ) -> anyhow::Result<Vec<ControlAck>> {
-        let call_id = self.alloc_call_id();
-        self.awaited = Some(call_id);
-        self.submit_control_request(&op.to_request(call_id), call_id)?;
-        loop {
-            self.drain_ready()?;
-            if let Some(ack) = self.acks.remove(&call_id) {
-                self.awaited = None;
-                return Ok(vec![ack]);
-            }
-            self.wait_for_one_response()?;
-        }
-    }
-
-    fn shutdown(&mut self) {
+    fn close_physical(&mut self) -> anyhow::Result<()> {
         if self.shutdown_sent {
-            return;
+            return Ok(());
         }
         self.shutdown_sent = true;
         // Stop the death watcher before we intentionally tear the worker down,
@@ -868,7 +754,7 @@ impl Executor for UniprocExecutor {
                     break;
                 }
                 match self.drain_ready() {
-                    Ok(0) => {
+                    Ok((0, _)) => {
                         if self.check_worker("shutdown drain").is_err() {
                             break;
                         }
@@ -881,7 +767,7 @@ impl Executor for UniprocExecutor {
             }
             if matches!(self.child.try_wait(), Ok(None)) {
                 let call_id = self.alloc_call_id();
-                let mut req = WorkerRequest::shutdown();
+                let mut req = WorkerRequest::close();
                 req.set_call_id(Some(call_id));
                 if let Ok(pending) = self.send_request_checked(&req, "shutdown") {
                     let _ = self
@@ -904,12 +790,58 @@ impl Executor for UniprocExecutor {
                 }
             }
         }
+        Ok(())
+    }
+}
+
+impl Executor for UniprocExecutor {
+    fn info(&self) -> &ExecutorInfo {
+        &self.executor_info
+    }
+
+    fn submit(&mut self, batch: Batch) -> Result<(), ExecutorSubmitError> {
+        if self.pending.len() >= self.depth {
+            return Err(ExecutorSubmitError::WouldBlock(batch));
+        }
+        let run = lower_batch(&batch, &mut self.next_collective_seq)
+            .map_err(ExecutorSubmitError::Failed)?;
+        self.logical_results
+            .register(&batch)
+            .map_err(ExecutorSubmitError::Failed)?;
+        match self.submit_run(run) {
+            Ok(()) => Ok(()),
+            Err(PhysicalSubmitError::WouldBlock(_)) => {
+                self.logical_results.unregister(batch.id);
+                Err(ExecutorSubmitError::WouldBlock(batch))
+            }
+            Err(PhysicalSubmitError::Failed(error)) => {
+                self.logical_results.unregister(batch.id);
+                Err(ExecutorSubmitError::Failed(error))
+            }
+        }
+    }
+
+    fn poll(&mut self, timeout: Duration) -> anyhow::Result<Option<BatchResult>> {
+        if self.take_command_wake() {
+            return Ok(None);
+        }
+        let report = self.poll_run(timeout)?;
+        if report.is_none() {
+            self.take_command_wake();
+        }
+        report
+            .map(|report| self.logical_results.apply(report))
+            .transpose()
+    }
+
+    fn close(&mut self) -> anyhow::Result<()> {
+        self.close_physical()
     }
 }
 
 impl Drop for UniprocExecutor {
     fn drop(&mut self) {
-        self.shutdown();
+        let _ = self.close_physical();
     }
 }
 

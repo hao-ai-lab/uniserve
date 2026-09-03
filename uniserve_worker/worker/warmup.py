@@ -16,13 +16,11 @@ from ..bootstrap.execution_config import (
 )
 from ..execution.batch import (
     AttentionRegime,
-    Batch,
-    BatchPartition,
     BlockTable,
+    BufferId,
+    BufferPlacement,
     CachePageAllocation,
-    CompletionReport,
     Domain,
-    ForwardMode,
     ImageParams,
     LatentPlacement,
     NewRequest,
@@ -33,7 +31,17 @@ from ..execution.batch import (
     ProductRef,
     RequestKey,
     RowGeometry,
+    Run,
+    RunKind,
+    RunLane,
+    RunResult,
+    Start,
     StorageClass,
+)
+from ..execution.graph_bucket import GraphBucket
+from ..execution.output import (
+    finalize_run_result,
+    run_result_ready,
 )
 from ..execution.step import (
     execute_startup,
@@ -43,13 +51,6 @@ from ..foundation.errors import invalid_descriptor
 from ..foundation.math import ceil_div
 from ..models.generation import GenerationPipeline
 from ..nn.diffusion.cfg import build_flow_cfg_plan
-from ..execution.output import (
-    completion_report_ready,
-    finalize_completion_report,
-)
-from ..bootstrap.worker_info import (
-    GraphBucket,
-)
 
 if TYPE_CHECKING:
     from .worker import Worker
@@ -67,6 +68,8 @@ class WarmupContext:
         self._flow_cfg_branches = worker._flow_cfg_branches
         self._flow_graph_buckets = worker._flow_graph_buckets
         self._info = worker._info
+        self._layout = worker._layout
+        self._mixed_buckets = worker._mixed_buckets
         self._mixed_flow_graph_buckets = worker._mixed_flow_graph_buckets
         self._prefill_graph_row_sizes = worker._prefill_graph_row_sizes
         self._prefill_graph_token_sizes = worker._prefill_graph_token_sizes
@@ -81,21 +84,72 @@ class WarmupContext:
         self._warmup_prefix_pages: dict[RequestKey, list[int]] = {}
         self._warmup_prefix_slots: dict[RequestKey, int] = {}
         self._warmup_latent_pages: dict[RequestKey, list[int]] = {}
-        self._warmup_step_id = 0
+        self._warmup_buffers: dict[int, BufferPlacement] = {}
+        self._warmup_buffer_free: list[tuple[int, int]] = [
+            (0, int(self._info.buffer_pool_bytes))
+        ]
+        self._warmup_run_id = 0
 
-    def drop_session(self, session_id: int) -> None:
-        session = self.requests.peek(int(session_id))
-        self._worker.drop_session(session_id)
-        if session is None:
+    def drop_request(self, request_id: int) -> None:
+        request = self.requests.peek(int(request_id))
+        self._worker.drop_request(request_id)
+        if request is None:
             return
         for group_id in range(0 if self.cache_pool is None else self.cache_pool.group_count):
-            self._warmup_kv_pages.pop((session.request_key, group_id), None)
-        self._warmup_prefix_pages.pop(session.request_key, None)
-        self._warmup_prefix_slots.pop(session.request_key, None)
-        self._warmup_latent_pages.pop(session.request_key, None)
+            self._warmup_kv_pages.pop((request.request_key, group_id), None)
+        self._warmup_prefix_pages.pop(request.request_key, None)
+        self._warmup_prefix_slots.pop(request.request_key, None)
+        self._warmup_latent_pages.pop(request.request_key, None)
+        released = tuple(
+            generation
+            for generation, placement in self._warmup_buffers.items()
+            if int(placement.buffer.owner.request_id) == int(request_id)
+        )
+        self._release_buffer_placements(released)
 
-    def release_products(self, handles: tuple[int, ...]) -> None:
-        self._worker.release_products(handles)
+    def free_products(self, handles: tuple[int, ...]) -> None:
+        self._worker.free_products(handles)
+        self._release_buffer_placements(handles)
+
+    def _release_buffer_placements(self, generations: tuple[int, ...]) -> None:
+        for generation in generations:
+            placement = self._warmup_buffers.pop(int(generation), None)
+            if placement is not None:
+                self._warmup_buffer_free.append((placement.offset, placement.bytes))
+        if not self._warmup_buffer_free:
+            return
+        merged: list[tuple[int, int]] = []
+        for offset, extent in sorted(self._warmup_buffer_free):
+            if merged and merged[-1][0] + merged[-1][1] == offset:
+                previous, size = merged[-1]
+                merged[-1] = (previous, size + extent)
+            else:
+                merged.append((offset, extent))
+        self._warmup_buffer_free = merged
+
+    def buffer_placement(self, product: ProductRef) -> BufferPlacement:
+        existing = self._warmup_buffers.get(int(product.generation))
+        if existing is not None:
+            if existing.buffer != product.buffer_id:
+                raise invalid_descriptor("warmup buffer generation has conflicting identity")
+            return existing
+        alignment = 256
+        required = int(product.max_bytes)
+        for index, (offset, extent) in enumerate(self._warmup_buffer_free):
+            aligned = (offset + alignment - 1) & ~(alignment - 1)
+            end = aligned + required
+            if end > offset + extent:
+                continue
+            replacement: list[tuple[int, int]] = []
+            if aligned > offset:
+                replacement.append((offset, aligned - offset))
+            if end < offset + extent:
+                replacement.append((end, offset + extent - end))
+            self._warmup_buffer_free[index : index + 1] = replacement
+            placement = BufferPlacement(product.buffer_id, aligned, required)
+            self._warmup_buffers[int(product.generation)] = placement
+            return placement
+        raise invalid_descriptor("warmup persistent buffer placement exceeds resident capacity")
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,8 +257,8 @@ def _startup_image_parameters(
     )
 
 
-def _has_decode_flow_partition(lanes: tuple[LaneConfig, ...]) -> bool:
-    """Return whether one physical partition can run tensorized decode+flow."""
+def _has_decode_flow_lane(lanes: tuple[LaneConfig, ...]) -> bool:
+    """Return whether one physical lane can run tensorized decode+flow."""
 
     required = {Domain.DECODE, Domain.FLOW}
     return not lanes or any(required <= set(lane.domains) for lane in lanes)
@@ -212,37 +266,38 @@ def _has_decode_flow_partition(lanes: tuple[LaneConfig, ...]) -> bool:
 
 def _warmup_batch(
     *,
-    step_id: int,
+    run_id: int,
     admissions: tuple[NewRequest, ...],
     operations: tuple[Operation, ...],
     block_tables: dict[tuple[RequestKey, int], tuple[BlockTable, ...]],
     new_cache_pages: dict[tuple[RequestKey, int], tuple[CachePageAllocation, ...]],
     forward_rows: dict[tuple[RequestKey, int], tuple[RowGeometry, ...]],
     latent_placements: dict[tuple[RequestKey, int], LatentPlacement],
+    buffer_placements: tuple[BufferPlacement, ...],
     input_products: tuple[ProductPayload, ...] = (),
     tensorized_mixed: bool = False,
-) -> Batch:
+) -> Run:
     groups: list[tuple[Domain, int, list[Operation]]] = []
     for operation in operations:
         existing = next(
             (
                 members
-                for domain, route, members in groups
-                if domain is operation.domain and route == operation.route
+                for domain, _route, members in groups
+                if domain is operation.domain
             ),
             None,
         )
         if existing is None:
-            groups.append((operation.domain, operation.route, [operation]))
+            groups.append((operation.domain, 0, [operation]))
         else:
             existing.append(operation)
-    partitions = tuple(
-        BatchPartition(
-            partition_id=index,
-            submission_group=1 if tensorized_mixed else index,
+    lanes = tuple(
+        RunLane(
+            lane_id=index,
+            launch_id=1 if tensorized_mixed else index,
             collective_seq=max(
                 1,
-                int(step_id) * 16 + (1 if tensorized_mixed else index),
+                int(run_id) * 16 + (1 if tensorized_mixed else index),
             ),
             domain=domain,
             route=route,
@@ -273,21 +328,35 @@ def _warmup_batch(
             latent_placements=tuple(
                 latent_placements[(operation.request_key, operation.op_id)]
                 for operation in members
-                if operation.work
+                if operation.kind
                 in {
-                    ForwardMode.MEDIA_PREPARE,
-                    ForwardMode.MEDIA_DENOISE,
-                    ForwardMode.MATERIALIZE,
+                    RunKind.DIFFUSION_PREPARE,
+                    RunKind.DIFFUSION_STEP,
+                    RunKind.DIFFUSION_FINALIZE,
                 }
+            ),
+            buffer_placements=tuple(
+                placement
+                for placement in buffer_placements
+                if any(
+                    product.buffer_id == placement.buffer
+                    for operation in members
+                    for product in (
+                        *operation.inputs,
+                        *operation.outputs,
+                        *((operation.predicate,) if operation.predicate is not None else ()),
+                    )
+                )
             ),
         )
         for index, (domain, route, members) in enumerate(groups, start=1)
     )
-    return Batch(
-        step_id=step_id,
-        admissions=admissions,
-        partitions=partitions,
+    return Run(
+        batch_id=run_id,
+        run_id=run_id,
+        lanes=lanes,
         input_products=input_products,
+        commands=tuple(Start(request) for request in admissions),
     )
 
 
@@ -323,15 +392,15 @@ def _warmup_token_outputs(
 
 def _execute_warmup(
     self: WarmupContext,
-    batch: Batch,
+    batch: Run,
     *,
     retain_device_outputs: bool = False,
     catalog_graphs: bool = True,
-) -> CompletionReport:
+) -> RunResult:
     report = execute_startup(self.execution, batch, catalog_graphs=catalog_graphs)
-    while not completion_report_ready(report):
+    while not run_result_ready(report):
         time.sleep(0.00005)
-    finalized = finalize_completion_report(report)
+    finalized = finalize_run_result(report)
     device_generations = tuple(
         int(output.generation)
         for operation in batch.operations
@@ -343,10 +412,10 @@ def _execute_warmup(
         completion for completion in finalized.completions if completion.status is OpStatus.ERROR
     )
     if failures or not retain_device_outputs:
-        self.release_products(device_generations)
+        self.free_products(device_generations)
     if failures:
         details = ", ".join(
-            f"session={completion.request_key.session_id} op={completion.op_id} "
+            f"request={completion.request_key.request_id} op={completion.op_id} "
             f"code={completion.error_code.value if completion.error_code is not None else 'internal'}"
             for completion in failures
         )
@@ -362,8 +431,8 @@ def _build_warmup_batch(
     input_products: tuple[ProductPayload, ...] = (),
     tensorized_mixed: bool = False,
     image_geometry: tuple[int, int] | None = None,
-) -> Batch:
-    self._warmup_step_id += 1
+) -> Run:
+    self._warmup_run_id += 1
     admissions_by_key = {admission.request_key: admission for admission in admissions}
     occupied_blocks = {page for pages in self._warmup_kv_pages.values() for page in pages}
     request_pool_indices: dict[RequestKey, int] = {}
@@ -371,44 +440,55 @@ def _build_warmup_batch(
     new_cache_pages: dict[tuple[RequestKey, int], tuple[CachePageAllocation, ...]] = {}
     forward_rows: dict[tuple[RequestKey, int], tuple[RowGeometry, ...]] = {}
     latent_placements: dict[tuple[RequestKey, int], LatentPlacement] = {}
+    buffer_placements: dict[BufferId, BufferPlacement] = {}
     for operation in operations:
-        session = self.requests.peek(int(operation.request_key.session_id))
+        for product in (
+            *operation.inputs,
+            *operation.outputs,
+            *((operation.predicate,) if operation.predicate is not None else ()),
+        ):
+            if not product.uses_persistent_buffer():
+                continue
+            placement = self.buffer_placement(product)
+            buffer_placements[placement.buffer] = placement
+    for operation in operations:
+        request = self.requests.peek(int(operation.request_key.request_id))
         admission = admissions_by_key.get(operation.request_key)
-        if session is None and admission is None:
+        if request is None and admission is None:
             raise invalid_descriptor("warmup operation has no request-pool binding")
-        if session is None:
+        if request is None:
             assert admission is not None
             request_pool_indices[operation.request_key] = admission.request_pool_idx
         else:
-            request_pool_indices[operation.request_key] = session.request_pool_idx
-        if operation.work not in {
-            ForwardMode.TOKEN_EXTEND,
-            ForwardMode.TOKEN_DECODE,
-            ForwardMode.TOKEN_VERIFY,
-            ForwardMode.TRANSFER_KV_PUBLISH,
-            ForwardMode.TRANSFER_KV_INSTALL,
-            ForwardMode.MEDIA_PREPARE,
-            ForwardMode.MEDIA_DENOISE,
+            request_pool_indices[operation.request_key] = request.request_pool_idx
+        if operation.kind not in {
+            RunKind.AR_EXTEND,
+            RunKind.AR_DECODE,
+            RunKind.AR_VERIFY,
+            RunKind.TRANSFER_KV_PUBLISH,
+            RunKind.TRANSFER_KV_INSTALL,
+            RunKind.DIFFUSION_PREPARE,
+            RunKind.DIFFUSION_STEP,
         }:
             continue
         if (
-            session is None
+            request is None
             and admission is not None
-            and admission.und is not None
-            and admission.und.initial_position != 0
+            and admission.ar is not None
+            and admission.ar.initial_position != 0
         ):
             raise invalid_descriptor("warmup KV admission requires an empty prefix")
         visible = 0
-        if session is not None:
-            runtime = parent_runtime(self.execution, operation, session)
+        if request is not None:
+            runtime = parent_runtime(self.execution, operation, request)
             visible = int(runtime.kv_visible_len)
         input_length = (
             int(operation.bounds.max_tokens)
-            if operation.work
+            if operation.kind
             in {
-                ForwardMode.TOKEN_EXTEND,
-                ForwardMode.TOKEN_DECODE,
-                ForwardMode.TOKEN_VERIFY,
+                RunKind.AR_EXTEND,
+                RunKind.AR_DECODE,
+                RunKind.AR_VERIFY,
             }
             else 0
         )
@@ -464,16 +544,16 @@ def _build_warmup_batch(
     height, width = image_geometry or _warmup_image_geometry(self)
     latent_units = max(
         1,
-        (height // max(1, int(self._info.latent_downsample)))
-        * (width // max(1, int(self._info.latent_downsample))),
+        (height // max(1, int(self._layout.latent_downsample)))
+        * (width // max(1, int(self._layout.latent_downsample))),
     )
     page_units = int(self._info.latent_page_units)
     latent_page_count = (latent_units + page_units - 1) // page_units if page_units > 0 else 0
     occupied_latent_pages = {page for pages in self._warmup_latent_pages.values() for page in pages}
     for operation in operations:
-        if operation.work not in {
-            ForwardMode.MEDIA_PREPARE,
-            ForwardMode.MEDIA_DENOISE,
+        if operation.kind not in {
+            RunKind.DIFFUSION_PREPARE,
+            RunKind.DIFFUSION_STEP,
         } and not any(product.kind is ProductKind.LATENT for product in operation.inputs):
             continue
         page_table = self._warmup_latent_pages.setdefault(operation.request_key, [])
@@ -482,15 +562,15 @@ def _build_warmup_batch(
             raise invalid_descriptor("warmup latent placement regresses its physical extent")
         allocated = tuple(
             page
-            for page in range(1, int(self._info.num_latent_pages))
+            for page in range(1, int(self._info.latent_pages))
             if page not in occupied_latent_pages
         )[:missing]
         if len(allocated) != missing:
             raise invalid_descriptor("warmup latent placement exceeds resident capacity")
         page_table.extend(allocated)
         occupied_latent_pages.update(allocated)
-        session = self.requests.peek(int(operation.request_key.session_id))
-        start_step = 0 if session is None else int(session.flow_step)
+        request = self.requests.peek(int(operation.request_key.request_id))
+        start_step = 0 if request is None else int(request.flow_step)
         latent_placements[(operation.request_key, operation.op_id)] = LatentPlacement(
             request_key=operation.request_key,
             op_id=operation.op_id,
@@ -501,11 +581,11 @@ def _build_warmup_batch(
             start_step=start_step,
             step_count=(
                 int(operation.bounds.max_tokens)
-                if operation.work is ForwardMode.MEDIA_DENOISE
+                if operation.kind is RunKind.DIFFUSION_STEP
                 else 0
             ),
         )
-        if operation.work is ForwardMode.MEDIA_DENOISE:
+        if operation.kind is RunKind.DIFFUSION_STEP:
             extra_tables, extra_allocations, flow_rows = _warmup_flow_tables(
                 self,
                 operation,
@@ -521,13 +601,14 @@ def _build_warmup_batch(
             )
             forward_rows[identity] = flow_rows
     return _warmup_batch(
-        step_id=self._warmup_step_id,
+        run_id=self._warmup_run_id,
         admissions=admissions,
         operations=operations,
         block_tables=block_tables,
         new_cache_pages=new_cache_pages,
         forward_rows=forward_rows,
         latent_placements=latent_placements,
+        buffer_placements=tuple(buffer_placements.values()),
         input_products=input_products,
         tensorized_mixed=tensorized_mixed,
     )
@@ -544,8 +625,8 @@ def _warmup_flow_tables(
     tuple[CachePageAllocation, ...],
     tuple[RowGeometry, ...],
 ]:
-    session = self.requests.get(operation.request_key.session_id)
-    image = session.image
+    request = self.requests.get(operation.request_key.request_id)
+    image = request.image
     generation = self.model.generation
     if image is None or generation is None:
         raise invalid_descriptor("generation warmup has no admitted image runtime")
@@ -557,7 +638,7 @@ def _warmup_flow_tables(
         renorm_min=float(image.cfg_renorm_min),
         use_cfg=True,
     )
-    runtime = parent_runtime(self.execution, operation, session)
+    runtime = parent_runtime(self.execution, operation, request)
     query = generation.physical_tokens(height, width)
     image_prompt = image.image_prompts[0] if image.image_prompts else ""
     branch_prefixes: list[tuple[tuple[int, ...], bool]] = []
@@ -566,7 +647,7 @@ def _warmup_flow_tables(
             generation.branch_source(branch),
             image_prompt=image_prompt,
             negative_prompt=image.negative_prompt,
-            negative_token_ids=session.negative_token_ids,
+            negative_token_ids=request.negative_token_ids,
             tokenizer=self.execution.tokenizer,
         )
         branch_prefixes.append((prefix, copy_conditioning))
@@ -599,7 +680,7 @@ def _warmup_flow_tables(
     if alternative:
         alternative_slot = self._warmup_prefix_slots.setdefault(
             operation.request_key,
-            int(self._info.max_request_pool_size) - len(self._warmup_prefix_slots),
+            int(self._info.request_slots) - len(self._warmup_prefix_slots),
         )
         if alternative_slot == main_slot or alternative_slot < 1:
             raise invalid_descriptor("warmup has no request slot for an alternative prefix")
@@ -659,7 +740,7 @@ def warmup(self: WarmupContext) -> None:
         logger.info("completed token CUDA graph warmup")
         _warmup_flow(self)
         logger.info("completed flow CUDA graph warmup")
-    elif self._info.mixed_buckets:
+    elif self._mixed_buckets:
         _warmup_flow(self)
         logger.info("completed mixed execution warmup")
 
@@ -669,11 +750,10 @@ def _warmup_image_geometry(self: WarmupContext) -> tuple[int, int]:
 
     import math
 
-    info = self._info
-    downsample = max(1, int(info.latent_downsample))
-    capacity = int(info.latent_capacity_units)
-    if int(info.max_vae_grid_tokens) > 0:
-        capacity = min(capacity, int(info.max_vae_grid_tokens))
+    downsample = max(1, int(self._layout.latent_downsample))
+    capacity = int(self._info.latent_capacity_units)
+    if int(self._layout.max_vae_grid_tokens) > 0:
+        capacity = min(capacity, int(self._layout.max_vae_grid_tokens))
     side = max(1, math.isqrt(max(1, capacity)))
     return side * downsample, side * downsample
 
@@ -688,11 +768,13 @@ def _warmup_sequence(self: WarmupContext) -> None:
     """
 
     from ..execution.batch import (
+        ArRequestParams,
         Bounds,
-        DevicePoint,
+        Checkpoint,
+        DeviceSelected,
         Domain,
         DType,
-        FixedPoint,
+        FixedCheckpoint,
         NewRequest,
         Operation,
         PointRange,
@@ -704,13 +786,11 @@ def _warmup_sequence(self: WarmupContext) -> None:
         ShapeBound,
         StaticDim,
         StorageClass,
-        UndAdmission,
-        VersionRef,
         encode_token_product_bytes,
     )
 
     variants = self._effective_work_variants
-    if ForwardMode.TOKEN_EXTEND not in variants:
+    if RunKind.AR_EXTEND not in variants:
         return
     pool = self.cache_pool
     if self.requests.request_ids():
@@ -722,13 +802,13 @@ def _warmup_sequence(self: WarmupContext) -> None:
             sorted(
                 {
                     batch_size
-                    for partition in self.runner.partitions
-                    if Domain.DECODE in partition.domains
-                    for batch_size in partition.graphs.decode_batch_sizes
+                    for lane_runtime in self.runner.execution_lanes
+                    if Domain.DECODE in lane_runtime.domains
+                    for batch_size in lane_runtime.graphs.decode_batch_sizes
                 }
             )
         )
-        if (self._execution.cuda_graph and ForwardMode.TOKEN_DECODE in variants)
+        if (self._execution.cuda_graph and RunKind.AR_DECODE in variants)
         else (1,)
     )
     batch_sizes = tuple(
@@ -740,18 +820,18 @@ def _warmup_sequence(self: WarmupContext) -> None:
     if not batch_sizes:
         return
     logger.info("warming %d decode CUDA graph executables", len(batch_sizes))
-    session_ids = tuple(range(1, max(batch_sizes) + 1))
-    keys = {sid: RequestKey(0, sid, 1) for sid in session_ids}
+    request_ids = tuple(range(1, max(batch_sizes) + 1))
+    keys = {sid: RequestKey(0, sid, 1) for sid in request_ids}
     admissions = {
         sid: NewRequest.create(
             keys[sid],
             request_pool_idx=sid,
-            und=UndAdmission(
+            ar=ArRequestParams(
                 sampling=SamplingParams(temperature=0.0, ignore_eos=True),
                 initial_position=0,
             ),
         )
-        for sid in session_ids
+        for sid in request_ids
     }
 
     next_product_generation = 1
@@ -759,7 +839,7 @@ def _warmup_sequence(self: WarmupContext) -> None:
     def prompt_op(
         sid: int,
         op_id: int,
-        parent: VersionRef,
+        parent: Checkpoint,
         tokens: tuple[int, ...],
     ) -> tuple[Operation, ProductPayload]:
         nonlocal next_product_generation
@@ -780,9 +860,7 @@ def _warmup_sequence(self: WarmupContext) -> None:
             request_key=keys[sid],
             op_id=op_id,
             parent=parent,
-            work=ForwardMode.TOKEN_EXTEND,
-            route=0,
-            domain=Domain.PREFILL,
+            kind=RunKind.AR_EXTEND,
             bounds=Bounds(max_points=1, max_tokens=max(1, len(tokens))),
             inputs=(token_ref,),
             outputs=outputs,
@@ -801,26 +879,23 @@ def _warmup_sequence(self: WarmupContext) -> None:
         return Operation.registered(
             request_key=keys[sid],
             op_id=op_id,
-            parent=VersionRef(
-                keys[sid],
+            parent=Checkpoint(
                 predecessor.op_id,
-                DevicePoint(1, None),
+                DeviceSelected(),
             ),
-            work=ForwardMode.TOKEN_DECODE,
-            route=0,
-            domain=Domain.DECODE,
+            kind=RunKind.AR_DECODE,
             bounds=Bounds(max_points=1, max_tokens=1),
             outputs=outputs,
             predicate=token_output,
         )
 
-    op_ids = {sid: 0 for sid in session_ids}
+    op_ids = {sid: 0 for sid in request_ids}
     predecessors: dict[int, Operation] = {}
     try:
         operations = []
         payloads = []
-        for sid in session_ids:
-            root = VersionRef(keys[sid], 0, FixedPoint(0))
+        for sid in request_ids:
+            root = Checkpoint(0, FixedCheckpoint(0))
             op_ids[sid] += 1
             operation, payload = prompt_op(sid, op_ids[sid], root, (0,))
             operations.append(operation)
@@ -829,19 +904,19 @@ def _warmup_sequence(self: WarmupContext) -> None:
             self,
             _build_warmup_batch(
                 self,
-                admissions=tuple(admissions[sid] for sid in session_ids),
+                admissions=tuple(admissions[sid] for sid in request_ids),
                 operations=tuple(operations),
                 input_products=tuple(payloads),
             ),
-            retain_device_outputs=ForwardMode.TOKEN_DECODE in variants,
+            retain_device_outputs=RunKind.AR_DECODE in variants,
         )
-        predecessors.update(zip(session_ids, operations, strict=True))
-        if ForwardMode.TOKEN_DECODE not in variants:
+        predecessors.update(zip(request_ids, operations, strict=True))
+        if RunKind.AR_DECODE not in variants:
             return
         repeats = 2 if self._execution.cuda_graph else 1
         for _ in range(repeats):
             for batch_size in batch_sizes:
-                selected = session_ids[:batch_size]
+                selected = request_ids[:batch_size]
                 operations = []
                 for sid in selected:
                     op_ids[sid] += 1
@@ -855,7 +930,7 @@ def _warmup_sequence(self: WarmupContext) -> None:
                     ),
                     retain_device_outputs=True,
                 )
-                self.release_products(
+                self.free_products(
                     tuple(
                         int(output.generation)
                         for sid in selected
@@ -869,18 +944,19 @@ def _warmup_sequence(self: WarmupContext) -> None:
         device = torch.device(self.deployment.device)
         if device.type == "cuda":
             torch.cuda.synchronize(device)
-        for sid in session_ids:
-            self.drop_session(sid)
+        for sid in request_ids:
+            self.drop_request(sid)
 
 
 def _warmup_prefill_graphs(self: WarmupContext) -> None:
     """Capture the paged-prefill CUDA graph for every configured token bucket."""
 
     from ..execution.batch import (
+        ArRequestParams,
         Bounds,
-        Domain,
+        Checkpoint,
         DType,
-        FixedPoint,
+        FixedCheckpoint,
         NewRequest,
         Operation,
         PointRange,
@@ -892,8 +968,6 @@ def _warmup_prefill_graphs(self: WarmupContext) -> None:
         ShapeBound,
         StaticDim,
         StorageClass,
-        UndAdmission,
-        VersionRef,
         encode_token_product_bytes,
     )
 
@@ -919,7 +993,7 @@ def _warmup_prefill_graphs(self: WarmupContext) -> None:
         else _paged_prefill_graph_buckets(
             token_buckets,
             self._prefill_graph_row_sizes,
-            max_rows=int(self._info.max_request_pool_size),
+            max_rows=int(self._info.request_slots),
             max_tokens=capacity,
         )
     )
@@ -931,7 +1005,7 @@ def _warmup_prefill_graphs(self: WarmupContext) -> None:
         )
     )
     logger.info("warming %d paged-prefill CUDA graph executables", len(catalog))
-    session_id = 0
+    request_id = 0
     # First warm every configured physical call in descending footprint,
     # then capture every bucket in the same order.
     for _ in range(2):
@@ -944,16 +1018,16 @@ def _warmup_prefill_graphs(self: WarmupContext) -> None:
             admissions: list[NewRequest] = []
             operations: list[Operation] = []
             input_products: list[ProductPayload] = []
-            active_sessions: list[int] = []
+            active_requests: list[int] = []
             for row, token_count in enumerate(token_counts):
                 tokens = (0,) * token_count
-                session_id += 1
-                active_sessions.append(session_id)
-                rk = RequestKey(0, session_id, 1)
+                request_id += 1
+                active_requests.append(request_id)
+                rk = RequestKey(0, request_id, 1)
                 admission = NewRequest.create(
                     rk,
                     request_pool_idx=row + 1,
-                    und=UndAdmission(
+                    ar=ArRequestParams(
                         sampling=SamplingParams(temperature=0.0, ignore_eos=True),
                         initial_position=0,
                     ),
@@ -973,10 +1047,8 @@ def _warmup_prefill_graphs(self: WarmupContext) -> None:
                     Operation.registered(
                         request_key=rk,
                         op_id=1,
-                        parent=VersionRef(rk, 0, FixedPoint(0)),
-                        work=ForwardMode.TOKEN_EXTEND,
-                        route=0,
-                        domain=Domain.PREFILL,
+                        parent=Checkpoint(0, FixedCheckpoint(0)),
+                        kind=RunKind.AR_EXTEND,
                         bounds=Bounds(max_points=1, max_tokens=token_count),
                         inputs=(token_ref,),
                         outputs=_warmup_token_outputs(rk, 1, 2),
@@ -1000,22 +1072,22 @@ def _warmup_prefill_graphs(self: WarmupContext) -> None:
                     ),
                 )
             finally:
-                for active_session in active_sessions:
-                    self.drop_session(active_session)
+                for active_request in active_requests:
+                    self.drop_request(active_request)
 
 
 def _warmup_flow(self: WarmupContext) -> None:
     """Drive one denoise quantum through the real flow forward path."""
 
     from ..execution.batch import (
+        ArRequestParams,
         Bounds,
+        Checkpoint,
         DeviceDim,
-        DevicePoint,
-        Domain,
+        DeviceSelected,
         DrawLayout,
         DType,
-        FixedPoint,
-        GenAdmission,
+        FixedCheckpoint,
         NewRequest,
         Operation,
         PointRange,
@@ -1028,15 +1100,14 @@ def _warmup_flow(self: WarmupContext) -> None:
         ShapeBound,
         StaticDim,
         StorageClass,
-        UndAdmission,
-        VersionRef,
+        UmmRequestParams,
         encode_token_product_bytes,
     )
 
     generation = self.model.generation
     if not {
-        ForwardMode.MEDIA_PREPARE,
-        ForwardMode.MEDIA_DENOISE,
+        RunKind.DIFFUSION_PREPARE,
+        RunKind.DIFFUSION_STEP,
     }.issubset(self._effective_work_variants) or not isinstance(generation, GenerationPipeline):
         return
     if self.requests.request_ids():
@@ -1062,14 +1133,14 @@ def _warmup_flow(self: WarmupContext) -> None:
             _FlowGraphBucket(1, height, width, cfg_branches)
             for cfg_branches in self._flow_cfg_branches
         )
-    next_session_id = 1
+    next_request_id = 1
     next_generation = 1
     for bucket in configured:
         batch_size = bucket.rows
         height = bucket.height
         width = bucket.width
         cfg_branches = bucket.cfg_branches
-        if batch_size > int(self._info.max_request_pool_size):
+        if batch_size > int(self._info.request_slots):
             continue
         mixed_text_sizes = tuple(
             mixed.decode_rows
@@ -1078,17 +1149,17 @@ def _warmup_flow(self: WarmupContext) -> None:
             and mixed.height == height
             and mixed.width == width
             and mixed.cfg_branches == cfg_branches
-            and mixed.decode_rows + batch_size <= int(self._info.max_request_pool_size)
+            and mixed.decode_rows + batch_size <= int(self._info.request_slots)
         )
         mixed_rounds = 3 if self._execution.cuda_graph and self._execution.prefill_cuda_graph else 1
-        session_ids = tuple(range(next_session_id, next_session_id + batch_size))
-        next_session_id += batch_size
-        keys = tuple(RequestKey(0, session_id, 1) for session_id in session_ids)
+        request_ids = tuple(range(next_request_id, next_request_id + batch_size))
+        next_request_id += batch_size
+        keys = tuple(RequestKey(0, request_id, 1) for request_id in request_ids)
         admissions = tuple(
             NewRequest.create(
                 key,
                 request_pool_idx=index,
-                gen_admission=GenAdmission(
+                umm=UmmRequestParams(
                     image=_startup_image_parameters(
                         cfg_branches,
                         steps=2 + mixed_rounds * len(mixed_text_sizes),
@@ -1099,23 +1170,23 @@ def _warmup_flow(self: WarmupContext) -> None:
             )
             for index, key in enumerate(keys, start=1)
         )
-        text_session_count = max(mixed_text_sizes, default=0)
-        text_session_ids = tuple(range(next_session_id, next_session_id + text_session_count))
-        next_session_id += text_session_count
-        text_keys = {session_id: RequestKey(0, session_id, 1) for session_id in text_session_ids}
+        text_request_count = max(mixed_text_sizes, default=0)
+        text_request_ids = tuple(range(next_request_id, next_request_id + text_request_count))
+        next_request_id += text_request_count
+        text_keys = {request_id: RequestKey(0, request_id, 1) for request_id in text_request_ids}
         text_admissions = {
-            session_id: NewRequest.create(
-                text_keys[session_id],
+            request_id: NewRequest.create(
+                text_keys[request_id],
                 request_pool_idx=batch_size + index,
-                und=UndAdmission(
+                ar=ArRequestParams(
                     sampling=SamplingParams(temperature=0.0, ignore_eos=True),
                     initial_position=0,
                 ),
             )
-            for index, session_id in enumerate(text_session_ids, start=1)
+            for index, request_id in enumerate(text_request_ids, start=1)
         }
         roots = tuple(
-            VersionRef(key, 0, FixedPoint(0))
+            Checkpoint(0, FixedCheckpoint(0))
             for key, admission in zip(keys, admissions, strict=True)
         )
         conditionings: list[ProductRef] = []
@@ -1139,9 +1210,7 @@ def _warmup_flow(self: WarmupContext) -> None:
                     request_key=key,
                     op_id=1,
                     parent=root,
-                    work=ForwardMode.TRANSFER_KV_PUBLISH,
-                    route=0,
-                    domain=Domain.PREFILL,
+                    kind=RunKind.TRANSFER_KV_PUBLISH,
                     bounds=Bounds(max_points=1, max_transfer_bytes=1 << 20),
                     outputs=(conditioning,),
                 )
@@ -1157,12 +1226,12 @@ def _warmup_flow(self: WarmupContext) -> None:
                 ),
             )
             text_predecessors: dict[int, Operation] = {}
-            text_op_ids = {session_id: 1 for session_id in text_session_ids}
-            if text_session_ids:
+            text_op_ids = {request_id: 1 for request_id in text_request_ids}
+            if text_request_ids:
                 prompt_operations: list[Operation] = []
                 prompt_payloads: list[ProductPayload] = []
-                for session_id in text_session_ids:
-                    key = text_keys[session_id]
+                for request_id in text_request_ids:
+                    key = text_keys[request_id]
                     token_ref = ProductRef(
                         request_key=key,
                         producer_op_id=1,
@@ -1180,14 +1249,11 @@ def _warmup_flow(self: WarmupContext) -> None:
                     operation = Operation.registered(
                         request_key=key,
                         op_id=1,
-                        parent=VersionRef(
-                            key,
+                        parent=Checkpoint(
                             0,
-                            FixedPoint(0),
+                            FixedCheckpoint(0),
                         ),
-                        work=ForwardMode.TOKEN_EXTEND,
-                        route=0,
-                        domain=Domain.PREFILL,
+                        kind=RunKind.AR_EXTEND,
                         bounds=Bounds(max_points=1, max_tokens=1),
                         inputs=(token_ref,),
                         outputs=prompt_outputs,
@@ -1204,7 +1270,7 @@ def _warmup_flow(self: WarmupContext) -> None:
                     _build_warmup_batch(
                         self,
                         admissions=tuple(
-                            text_admissions[session_id] for session_id in text_session_ids
+                            text_admissions[request_id] for request_id in text_request_ids
                         ),
                         operations=tuple(prompt_operations),
                         input_products=tuple(prompt_payloads),
@@ -1213,7 +1279,7 @@ def _warmup_flow(self: WarmupContext) -> None:
                     retain_device_outputs=True,
                     catalog_graphs=False,
                 )
-                text_predecessors.update(zip(text_session_ids, prompt_operations, strict=True))
+                text_predecessors.update(zip(text_request_ids, prompt_operations, strict=True))
             max_latent_elements = max(
                 1,
                 math.prod(generation.latent_shape(height, width)),
@@ -1251,9 +1317,7 @@ def _warmup_flow(self: WarmupContext) -> None:
                         request_key=key,
                         op_id=2,
                         parent=root,
-                        work=ForwardMode.MEDIA_PREPARE,
-                        route=0,
-                        domain=Domain.FLOW,
+                        kind=RunKind.DIFFUSION_PREPARE,
                         bounds=Bounds(
                             max_points=1,
                             max_tokens=1,
@@ -1278,12 +1342,12 @@ def _warmup_flow(self: WarmupContext) -> None:
                 ),
             )
             current_latents = tuple(initial_latents)
-            flow_predecessors = dict(zip(session_ids, transitions, strict=True))
+            flow_predecessors = dict(zip(request_ids, transitions, strict=True))
             for op_id in (3, 4):
                 outputs: list[ProductRef] = []
                 flows: list[Operation] = []
-                for session_id, key, conditioning, current in zip(
-                    session_ids, keys, conditionings, current_latents, strict=True
+                for request_id, key, conditioning, current in zip(
+                    request_ids, keys, conditionings, current_latents, strict=True
                 ):
                     output = ProductRef(
                         request_key=key,
@@ -1302,14 +1366,11 @@ def _warmup_flow(self: WarmupContext) -> None:
                         Operation.registered(
                             request_key=key,
                             op_id=op_id,
-                            parent=VersionRef(
-                                key,
-                                flow_predecessors[session_id].op_id,
-                                DevicePoint(1, None),
+                            parent=Checkpoint(
+                                flow_predecessors[request_id].op_id,
+                                DeviceSelected(),
                             ),
-                            work=ForwardMode.MEDIA_DENOISE,
-                            route=0,
-                            domain=Domain.FLOW,
+                            kind=RunKind.DIFFUSION_STEP,
                             bounds=Bounds(
                                 max_points=1,
                                 max_tokens=1,
@@ -1329,37 +1390,34 @@ def _warmup_flow(self: WarmupContext) -> None:
                     ),
                 )
                 current_latents = tuple(outputs)
-                flow_predecessors.update(zip(session_ids, flows, strict=True))
+                flow_predecessors.update(zip(request_ids, flows, strict=True))
             flow_op_id = 5
             for text_batch_size in mixed_text_sizes:
-                selected_text = text_session_ids[:text_batch_size]
+                selected_text = text_request_ids[:text_batch_size]
                 for _ in range(mixed_rounds):
                     text_operations: list[Operation] = []
-                    for session_id in selected_text:
-                        predecessor = text_predecessors[session_id]
+                    for request_id in selected_text:
+                        predecessor = text_predecessors[request_id]
                         token_output = next(
                             output
                             for output in predecessor.outputs
                             if output.kind is ProductKind.TOKEN
                         )
-                        text_op_ids[session_id] += 1
-                        op_id = text_op_ids[session_id]
+                        text_op_ids[request_id] += 1
+                        op_id = text_op_ids[request_id]
                         token_outputs = _warmup_token_outputs(
-                            text_keys[session_id], op_id, next_generation
+                            text_keys[request_id], op_id, next_generation
                         )
                         next_generation += len(token_outputs)
                         text_operations.append(
                             Operation.registered(
-                                request_key=text_keys[session_id],
+                                request_key=text_keys[request_id],
                                 op_id=op_id,
-                                parent=VersionRef(
-                                    text_keys[session_id],
+                                parent=Checkpoint(
                                     predecessor.op_id,
-                                    DevicePoint(1, None),
+                                    DeviceSelected(),
                                 ),
-                                work=ForwardMode.TOKEN_DECODE,
-                                route=0,
-                                domain=Domain.DECODE,
+                                kind=RunKind.AR_DECODE,
                                 bounds=Bounds(max_points=1, max_tokens=1),
                                 outputs=token_outputs,
                                 predicate=token_output,
@@ -1368,8 +1426,8 @@ def _warmup_flow(self: WarmupContext) -> None:
 
                     flow_outputs: list[ProductRef] = []
                     flow_operations: list[Operation] = []
-                    for session_id, key, conditioning, current in zip(
-                        session_ids,
+                    for request_id, key, conditioning, current in zip(
+                        request_ids,
                         keys,
                         conditionings,
                         current_latents,
@@ -1392,14 +1450,11 @@ def _warmup_flow(self: WarmupContext) -> None:
                             Operation.registered(
                                 request_key=key,
                                 op_id=flow_op_id,
-                                parent=VersionRef(
-                                    key,
-                                    flow_predecessors[session_id].op_id,
-                                    DevicePoint(1, None),
+                                parent=Checkpoint(
+                                    flow_predecessors[request_id].op_id,
+                                    DeviceSelected(),
                                 ),
-                                work=ForwardMode.MEDIA_DENOISE,
-                                route=0,
-                                domain=Domain.FLOW,
+                                kind=RunKind.DIFFUSION_STEP,
                                 bounds=Bounds(
                                     max_points=1,
                                     max_tokens=1,
@@ -1421,18 +1476,18 @@ def _warmup_flow(self: WarmupContext) -> None:
                         ),
                         retain_device_outputs=True,
                     )
-                    self.release_products(
+                    self.free_products(
                         tuple(
                             int(output.generation)
-                            for session_id in selected_text
-                            for output in text_predecessors[session_id].outputs
+                            for request_id in selected_text
+                            for output in text_predecessors[request_id].outputs
                             if output.storage_class
                             in {StorageClass.DEVICE_TENSOR, StorageClass.REQUEST_RELAY}
                         )
                     )
                     text_predecessors.update(zip(selected_text, text_operations, strict=True))
                     current_latents = tuple(flow_outputs)
-                    flow_predecessors.update(zip(session_ids, flow_operations, strict=True))
+                    flow_predecessors.update(zip(request_ids, flow_operations, strict=True))
         finally:
-            for session_id in (*session_ids, *text_session_ids):
-                self.drop_session(session_id)
+            for request_id in (*request_ids, *text_request_ids):
+                self.drop_request(request_id)

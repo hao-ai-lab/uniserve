@@ -40,7 +40,7 @@ from uniserve_worker.foundation.errors import (
 from uniserve_worker.models.runtime import ExecutionModel, WorkerDeployment
 
 from .input_buffers import InputBuffers
-from .lane import ExecutionPartitionRuntime, LaneConfig, create_green_contexts
+from .lane import ExecutionLaneRuntime, LaneConfig, create_green_contexts
 from .rows import ForwardRow
 
 logger = logging.getLogger(__name__)
@@ -88,7 +88,7 @@ def _invoke(
     elif batch.phase is ModelPhase.ENCODE_VISION:
         result = model.encode(batch.encode_pixels, batch)
     elif batch.phase is ModelPhase.ENCODE_LATENT:
-        result = model.encode_latent(batch.encode_pixels, batch)
+        result = model.encoder_latent(batch.encode_pixels, batch)
     elif batch.phase is ModelPhase.DECODE_LATENT:
         result = model.decode_latent(batch.decode_latents, batch)
     else:
@@ -99,7 +99,7 @@ def _invoke(
 
 
 class ModelRunner:
-    """Own partition-local GPU resources and execute one physical model call."""
+    """Own lane_runtime-local GPU resources and execute one physical model call."""
 
     def __init__(
         self,
@@ -132,8 +132,8 @@ class ModelRunner:
         self.model = model
         self.trace = trace
         self.uses_lanes = bool(lanes)
-        self._partitions: dict[tuple[str, Domain], ExecutionPartitionRuntime] = {}
-        self._owned_partitions: list[ExecutionPartitionRuntime] = []
+        self._execution_lanes: dict[tuple[str, Domain], ExecutionLaneRuntime] = {}
+        self._owned_lanes: list[ExecutionLaneRuntime] = []
 
         def make_buffer(device: str) -> InputBuffers:
             return InputBuffers(
@@ -155,7 +155,7 @@ class ModelRunner:
                     buffer = make_buffer(str(device))
                 graphs = graph_factory(device, green.lane, green.stream, int(green.context))
                 event_slots = int(green.lane.max_inflight or max_inflight) + 1
-                partition = ExecutionPartitionRuntime(
+                lane_runtime = ExecutionLaneRuntime(
                     lane=green.lane,
                     device=device,
                     stream=green.stream,
@@ -165,10 +165,10 @@ class ModelRunner:
                     green=green,
                     event_slots=event_slots,
                 )
-                partition.verify_stream()
-                self._owned_partitions.append(partition)
+                lane_runtime.verify_stream()
+                self._owned_lanes.append(lane_runtime)
                 for domain in green.lane.domains:
-                    self._partitions[(str(device), domain)] = partition
+                    self._execution_lanes[(str(device), domain)] = lane_runtime
             missing = set(Domain).difference(domain for lane in lanes for domain in lane.domains)
             if missing:
                 names = ", ".join(sorted(domain.value for domain in missing))
@@ -186,7 +186,7 @@ class ModelRunner:
                     if device.type == "cuda"
                     else 0
                 )
-                partition = ExecutionPartitionRuntime(
+                lane_runtime = ExecutionLaneRuntime(
                     lane=None,
                     device=device,
                     stream=stream,
@@ -195,59 +195,59 @@ class ModelRunner:
                     graphs=graphs,
                     event_slots=int(max_inflight) + 1,
                 )
-                self._owned_partitions.append(partition)
+                self._owned_lanes.append(lane_runtime)
                 for domain in Domain:
-                    self._partitions[(device_name, domain)] = partition
+                    self._execution_lanes[(device_name, domain)] = lane_runtime
 
     @property
-    def partitions(self) -> tuple[ExecutionPartitionRuntime, ...]:
-        return tuple(self._owned_partitions)
+    def execution_lanes(self) -> tuple[ExecutionLaneRuntime, ...]:
+        return tuple(self._owned_lanes)
 
     def complete_startup(self) -> None:
-        for partition in self._owned_partitions:
-            lane_id = partition.lane_id or "default"
+        for lane_runtime in self._owned_lanes:
+            lane_id = lane_runtime.lane_id or "default"
             logger.info("verifying CUDA graph catalog lane=%s", lane_id)
             try:
-                partition.graphs.complete_startup()
+                lane_runtime.graphs.complete_startup()
             except GraphExecutionError as error:
                 raise GraphExecutionError(
-                    f"execution partition {lane_id} failed startup"
+                    f"execution lane {lane_id} failed startup"
                 ) from error
-            partition.verify_stream()
+            lane_runtime.verify_stream()
             logger.info("verified CUDA graph catalog lane=%s", lane_id)
         signature = tuple(
             (
-                partition.lane_id,
-                partition.sm_count,
-                tuple(domain.value for domain in partition.domains),
-                partition.graphs.startup_signature,
+                lane_runtime.lane_id,
+                lane_runtime.sm_count,
+                tuple(domain.value for domain in lane_runtime.domains),
+                lane_runtime.graphs.startup_signature,
             )
-            for partition in self._owned_partitions
+            for lane_runtime in self._owned_lanes
         )
         if torch.distributed.is_available() and torch.distributed.is_initialized():
-            logger.info("verifying tensor-parallel execution partition agreement")
+            logger.info("verifying tensor-parallel execution lane agreement")
             gathered: list[object] = [None] * torch.distributed.get_world_size()
             torch.distributed.all_gather_object(gathered, signature)
             if any(value != signature for value in gathered):
-                raise GraphExecutionError("tensor-parallel execution partitions disagree")
-            logger.info("verified tensor-parallel execution partition agreement")
+                raise GraphExecutionError("tensor-parallel execution lanes disagree")
+            logger.info("verified tensor-parallel execution lane agreement")
 
     def invalidate_graphs(self, weight_version: int) -> None:
-        for partition in self._owned_partitions:
-            partition.graphs.invalidate(weight_version)
+        for lane_runtime in self._owned_lanes:
+            lane_runtime.graphs.invalidate(weight_version)
 
     def close(self) -> None:
-        for partition in reversed(self._owned_partitions):
-            partition.close()
-        self._partitions.clear()
-        self._owned_partitions.clear()
+        for lane_runtime in reversed(self._owned_lanes):
+            lane_runtime.close()
+        self._execution_lanes.clear()
+        self._owned_lanes.clear()
 
     def synchronize(self) -> None:
-        for partition in self._owned_partitions:
-            if partition.stream is not None:
-                partition.stream.synchronize()
+        for lane_runtime in self._owned_lanes:
+            if lane_runtime.stream is not None:
+                lane_runtime.stream.synchronize()
 
-    def forward(
+    def run(
         self,
         rows: tuple[ForwardRow, ...],
         *,
@@ -273,31 +273,31 @@ class ModelRunner:
         operations = tuple(
             OperationTrace(
                 task.operation.request_key.authority_id,
-                task.operation.request_key.session_id,
+                task.operation.request_key.request_id,
                 task.operation.request_key.epoch,
                 task.operation.op_id,
                 _base_version(task.operation),
             )
             for task in tasks
         )
-        partition = self._partitions.get((str(target), domain))
-        if partition is None:
+        lane_runtime = self._execution_lanes.get((str(target), domain))
+        if lane_runtime is None:
             raise InputError(
-                f"model runner has no {domain.value!r} execution partition for {target}",
+                f"model runner has no {domain.value!r} execution lane for {target}",
                 phase="input_staging",
                 route=phase.value,
                 operations=tuple(
-                    (item.authority_id, item.session_id, item.epoch, item.op_id)
+                    (item.authority_id, item.request_id, item.epoch, item.op_id)
                     for item in operations
                 ),
             )
-        buffers = partition.buffer
+        buffers = lane_runtime.buffer
         counts = _kind_counts(tasks)
         try:
-            if partition.stream is not None:
-                partition.order_after(torch.cuda.current_stream(target))
+            if lane_runtime.stream is not None:
+                lane_runtime.order_after(torch.cuda.current_stream(target))
             stream_context = (
-                nullcontext() if partition.stream is None else torch.cuda.stream(partition.stream)
+                nullcontext() if lane_runtime.stream is None else torch.cuda.stream(lane_runtime.stream)
             )
             with stream_context:
                 batch = buffers.stage(
@@ -428,7 +428,7 @@ class ModelRunner:
                 row_kind_counts=counts,
             )
             with torch.inference_mode():
-                graph_run = partition.graphs.execute(
+                graph_run = lane_runtime.graphs.execute(
                     (phase.value, *graph_shape),
                     batch,
                     invoke,
@@ -445,7 +445,7 @@ class ModelRunner:
             path = RunPath(graph_run.path)
             output.validate_for(batch)
             _validate_outputs(output.values, tasks, target)
-            output_event = partition.record_output()
+            output_event = lane_runtime.record_output()
         except Exception as error:
             self.trace.emit(
                 ExecutionPhase.FORWARD_COMPLETION,
@@ -468,7 +468,7 @@ class ModelRunner:
                 phase="graph_execution",
                 route=phase.value,
                 operations=tuple(
-                    (item.authority_id, item.session_id, item.epoch, item.op_id)
+                    (item.authority_id, item.request_id, item.epoch, item.op_id)
                     for item in operations
                 ),
             )
@@ -551,7 +551,7 @@ def _input_failure(
         phase="input_staging",
         route=phase.value,
         operations=tuple(
-            (item.authority_id, item.session_id, item.epoch, item.op_id) for item in operations
+            (item.authority_id, item.request_id, item.epoch, item.op_id) for item in operations
         ),
     )
 
@@ -565,7 +565,7 @@ def _execution_failure(
         return error
     classified = classify(error)
     identities = tuple(
-        (item.authority_id, item.session_id, item.epoch, item.op_id) for item in operations
+        (item.authority_id, item.request_id, item.epoch, item.op_id) for item in operations
     )
     if isinstance(error, GraphExecutionError) or classified.code in {
         WorkerErrorCode.RESOURCE_ERROR,

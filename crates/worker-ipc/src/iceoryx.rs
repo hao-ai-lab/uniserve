@@ -109,7 +109,7 @@ pub fn is_supported_ipc_version(version: u16) -> bool {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
-    pub step_id: u64,
+    pub run_id: u64,
     pub op_id: u64,
     pub call_id: u64,
     pub len: u32,
@@ -123,7 +123,7 @@ pub struct Header {
 impl Default for Header {
     fn default() -> Self {
         Self {
-            step_id: 0,
+            run_id: 0,
             op_id: 0,
             call_id: 0,
             len: 0,
@@ -461,9 +461,9 @@ impl ServerEndpoint {
 /// Build the IPC header that accompanies `req`.
 ///
 /// `call_id` is the authoritative request/response correlation key. The
-/// `step_id`/`op_id` fields are populated from the batch's `step_id` and the
+/// `run_id`/`op_id` fields are populated from the run's `run_id` and the
 /// *first* op only, as a cheap at-a-glance diagnostic hint (e.g. for tracing);
-/// they are **not** a per-op index. A batch may carry many ops with distinct
+/// they are **not** a per-op index. A run may carry many ops with distinct
 /// `op_id`s, so consumers must read the full decoded payload rather than
 /// treating `header.op_id` as identifying every op in the frame.
 pub fn header_for_request(req: &WorkerRequest) -> Header {
@@ -472,10 +472,10 @@ pub fn header_for_request(req: &WorkerRequest) -> Header {
         call_id: req.call_id().unwrap_or_default(),
         ..Default::default()
     };
-    if let Some(batch) = req.batch() {
-        h.step_id = batch.step_id;
+    if let Some(run) = req.run() {
+        h.run_id = run.run_id;
         // Hint only: first op's id. See the doc comment above.
-        if let Some(operation) = batch.operations().next() {
+        if let Some(operation) = run.operations().next() {
             h.op_id = operation.op_id.0;
         }
     }
@@ -485,7 +485,7 @@ pub fn header_for_request(req: &WorkerRequest) -> Header {
 /// Build the IPC header that accompanies `resp`.
 ///
 /// As in [`header_for_request`], `call_id` is the authoritative correlation
-/// key. `step_id`/`op_id` are populated from the result's `step_id` and the
+/// key. `run_id`/`op_id` are populated from the result's `run_id` and the
 /// *first* per-seq entry only, as a diagnostic hint; a result may aggregate
 /// many sequences with distinct `op_id`s, so consumers must use the decoded
 /// payload to correlate individual sequences.
@@ -496,7 +496,7 @@ pub fn header_for_response(resp: &WorkerResponse) -> Header {
         ..Default::default()
     };
     if let Some(report) = resp.report() {
-        h.step_id = report.step_id;
+        h.run_id = report.run_id;
         // Hint only: first completion's op id. See the doc comment above.
         if let Some(completion) = report.completions().next() {
             h.op_id = completion.op_id.0;
@@ -525,13 +525,10 @@ fn verify_header_len(header: Header, actual: usize) -> IpcResult<()> {
 // Diagnostic-only header byte; the authoritative kind travels in the payload.
 fn request_kind_code(kind: RequestKind) -> u8 {
     match kind {
-        RequestKind::GetInfo => 1,
-        RequestKind::Execute => 2,
-        RequestKind::PollCompletions => 3,
-        RequestKind::DropSession => 4,
-        RequestKind::Shutdown => 5,
-        RequestKind::ReleaseProducts => 7,
-        RequestKind::GetPressure => 8,
+        RequestKind::Info => 1,
+        RequestKind::Submit => 2,
+        RequestKind::Poll => 3,
+        RequestKind::Close => 4,
     }
 }
 
@@ -541,7 +538,6 @@ fn response_kind_code(kind: ResponseKind) -> u8 {
         ResponseKind::Result => 2,
         ResponseKind::Ok => 3,
         ResponseKind::Error => 4,
-        ResponseKind::Pressure => 5,
     }
 }
 
@@ -551,7 +547,7 @@ mod tests {
 
     #[test]
     fn header_len_matches_encoded_request() {
-        let req = WorkerRequest::get_info();
+        let req = WorkerRequest::info();
         let bytes = encode_request(&req).unwrap();
         let mut h = header_for_request(&req);
         h.len = payload_len_u32(bytes.len()).unwrap();

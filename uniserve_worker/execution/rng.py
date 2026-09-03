@@ -32,18 +32,18 @@ DRAW_LAYOUT_FLOW_NOISE = 2
 
 
 def sampling_key(
-    session_seed: int,
+    request_seed: int,
     authority_id: int,
-    session_id: int,
+    request_id: int,
     epoch: int,
     draw_layout: int,
 ) -> int:
     """Return the 64-bit Philox key for one request lineage and draw space."""
 
-    value = int(session_seed) & _U64
+    value = int(request_seed) & _U64
     for coordinate in (
         int(authority_id),
-        int(session_id),
+        int(request_id),
         int(epoch),
         int(draw_layout),
     ):
@@ -90,10 +90,10 @@ def sampling_uniform(
     return (words[0] >> 8) * (1.0 / 16_777_216.0)
 
 
-def flow_noise_seed(session_seed: int, semantic_image_index: int) -> int:
+def flow_noise_seed(request_seed: int, semantic_image_index: int) -> int:
     """Return the schedule-stable seed for one semantic image's initial noise."""
 
-    return _splitmix_coordinate(session_seed, semantic_image_index)
+    return _splitmix_coordinate(request_seed, semantic_image_index)
 
 
 def normal_noise(

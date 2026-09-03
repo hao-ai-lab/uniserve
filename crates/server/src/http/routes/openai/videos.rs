@@ -8,7 +8,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use uniserve_core::{MediaArtifact, MediaEvent};
+use uniserve_core::{ArtifactEvent, Event, FinishReason};
 
 use crate::AppState;
 use crate::http::routes::openai::utils::validated_json::ValidatedJson;
@@ -25,13 +25,16 @@ unsafe impl Send for SharedMedia {}
 unsafe impl Sync for SharedMedia {}
 
 impl SharedMedia {
-    fn open(artifact: &MediaArtifact) -> Result<Self, String> {
+    fn open(artifact: &ArtifactEvent) -> Result<Self, String> {
         let bytes = usize::try_from(artifact.bytes)
             .map_err(|_| "generated media is too large for this host".to_string())?;
-        if bytes == 0 || artifact.handle.is_empty() || artifact.handle.contains('/') {
+        if bytes == 0
+            || artifact.artifact.posix_shm_name().is_empty()
+            || artifact.artifact.posix_shm_name().contains('/')
+        {
             return Err("generated media has an invalid shared-memory locator".to_string());
         }
-        let name = CString::new(format!("/{}", artifact.handle))
+        let name = CString::new(format!("/{}", artifact.artifact.posix_shm_name()))
             .map_err(|_| "generated media has an invalid shared-memory name".to_string())?;
         // SAFETY: name is a valid NUL-terminated POSIX shm name.
         let descriptor = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
@@ -126,63 +129,69 @@ pub(crate) async fn videos_sync(
         Ok(stream) => stream,
         Err(error) => return ApiError::from(serve_error_to_api(error)).into_response(),
     };
-    let (mut event_tx, event_rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
-        tokio::select! {
-            event = stream.next() => {
-                let _ = event_tx.send(event);
-            }
-            _ = event_tx.closed() => {
-                stream.cancel();
-                let _ = stream.next().await;
-            }
-        }
-    });
-    let event = match event_rx.await {
-        Ok(result) => result,
-        Err(_) => {
-            return ApiError::server_error("video generation task stopped".to_string())
+    let mut artifact = None;
+    loop {
+        match stream.next().await {
+            Some(Event::Artifact(value)) => artifact = Some(value),
+            Some(Event::Finished {
+                reason: FinishReason::Completed,
+                ..
+            }) => break,
+            Some(Event::Finished { reason, .. }) => {
+                return ApiError::server_error(format!(
+                    "video generation ended without an artifact: {reason:?}"
+                ))
                 .into_response();
-        }
-    };
-    match event {
-        Some(MediaEvent::Completed { artifact }) => {
-            let media = match SharedMedia::open(&artifact) {
-                Ok(media) => Arc::new(media),
-                Err(message) => return ApiError::server_error(message).into_response(),
-            };
-            let length = artifact.bytes;
-            let body_stream =
-                futures::stream::try_unfold((media, 0_usize), |(media, offset)| async move {
-                    if offset == media.bytes {
-                        Ok::<_, std::convert::Infallible>(None)
-                    } else {
-                        let count = (media.bytes - offset).min(64 * 1024);
-                        let chunk = media.chunk(offset, count);
-                        Ok(Some((chunk, (media, offset + count))))
-                    }
-                });
-            let generation_ms = started_at.elapsed().as_secs_f64() * 1_000.0;
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "video/mp4")
-                .header(header::CONTENT_LENGTH, length)
-                .header(
-                    "server-timing",
-                    format!("generation;dur={generation_ms:.1}"),
+            }
+            Some(Event::Rejected { message }) => {
+                return ApiError::invalid_request(message, None).into_response();
+            }
+            Some(Event::Error { message }) => {
+                return ApiError::server_error(message).into_response();
+            }
+            Some(Event::Scheduled { .. }) => {}
+            Some(_) => {
+                return ApiError::server_error(
+                    "video runtime emitted an incompatible event".to_string(),
                 )
-                .body(Body::from_stream(body_stream))
-                .unwrap_or_else(|error| {
-                    ApiError::server_error(format!("failed to construct media response: {error}"))
-                        .into_response()
-                })
-        }
-        Some(MediaEvent::Rejected { message }) => {
-            ApiError::invalid_request(message, None).into_response()
-        }
-        Some(MediaEvent::Failed { message }) => ApiError::server_error(message).into_response(),
-        Some(MediaEvent::Aborted) | None => {
-            ApiError::server_error("video generation was aborted".to_string()).into_response()
+                .into_response();
+            }
+            None => {
+                return ApiError::server_error("video generation task stopped".to_string())
+                    .into_response();
+            }
         }
     }
+    let Some(artifact) = artifact else {
+        return ApiError::server_error("video generation produced no artifact".to_string())
+            .into_response();
+    };
+    let media = match SharedMedia::open(&artifact) {
+        Ok(media) => Arc::new(media),
+        Err(message) => return ApiError::server_error(message).into_response(),
+    };
+    let length = artifact.bytes;
+    let body_stream = futures::stream::try_unfold((media, 0_usize), |(media, offset)| async move {
+        if offset == media.bytes {
+            Ok::<_, std::convert::Infallible>(None)
+        } else {
+            let count = (media.bytes - offset).min(64 * 1024);
+            let chunk = media.chunk(offset, count);
+            Ok(Some((chunk, (media, offset + count))))
+        }
+    });
+    let generation_ms = started_at.elapsed().as_secs_f64() * 1_000.0;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, &artifact.content_type)
+        .header(header::CONTENT_LENGTH, length)
+        .header(
+            "server-timing",
+            format!("generation;dur={generation_ms:.1}"),
+        )
+        .body(Body::from_stream(body_stream))
+        .unwrap_or_else(|error| {
+            ApiError::server_error(format!("failed to construct media response: {error}"))
+                .into_response()
+        })
 }

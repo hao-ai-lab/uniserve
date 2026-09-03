@@ -12,7 +12,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crate::executor::{ControlAck, ControlOp, Executor};
+use crate::executor::{
+    Batch, BatchResult, Executor, ExecutorInfo, ExecutorSubmitError, LogicalResultTracker,
+    PhysicalExecutor, PhysicalSubmitError, PoolId, lower_batch,
+};
 use base64::Engine as _;
 use crossbeam_channel::{Receiver, Sender};
 use uniserve_core::philox;
@@ -21,10 +24,10 @@ use uniserve_core::{
     CommandWaker, ImageParams, RequestId, SampleOutput, SamplingParams, try_apply_sampling_counts,
 };
 use uniserve_worker_ipc::{
-    Batch, CompletionReport, DrawLayout, ErrorCode, FinishFlags, ForwardMode, GraphBucket,
-    LogicalLengths, ModelOutput, NewRequest, OpStatus, Operation, PartitionCompletion, Point,
-    ProductKind, ProductPayload, ProductRef, RegistrationAck, RequestKind, ResourceClass,
-    SamplingState, TimingCounters, TokenSpan, WorkerInfo, decode_sampling_state_bytes,
+    CheckpointPoint, DrawLayout, ErrorCode, InlineValue, LogicalLengths, ModelOutput, NewRequest,
+    OpKind, OpStatus, Operation, ProductKind, ProductPayload, ProductRef, RegistrationAck,
+    ResultData, ResultPayload, Run as PhysicalRun, RunKind, RunResult, SamplingState,
+    TimingCounters, TokenSpan, WorkerInfo, decode_sampling_state_bytes,
 };
 
 const DEFAULT_TEXT_LEN: usize = 8;
@@ -34,27 +37,27 @@ const DEFAULT_DENOISE_STEPS: u16 = 50;
 const DEFAULT_IMAGE_HW: (u32, u32) = (512, 512);
 
 enum Job {
-    Batch(Batch),
-    Drop(RequestId),
+    Batch(PhysicalRun),
     Shutdown,
 }
 
 /// Runs the deterministic model simulator on a bounded asynchronous executor seam.
 pub struct SimExecutor {
-    info: WorkerInfo,
+    executor_info: ExecutorInfo,
     depth: usize,
     to_worker: Sender<Job>,
-    from_worker: Receiver<anyhow::Result<CompletionReport>>,
+    from_worker: Receiver<anyhow::Result<RunResult>>,
     progress_tx: Sender<()>,
     progress_rx: Receiver<()>,
     in_flight: usize,
-    next_call_id: u64,
     handle: Option<JoinHandle<()>>,
+    next_collective_seq: u64,
+    logical_results: LogicalResultTracker,
 }
 
 impl SimExecutor {
     pub fn new(engine: SimEngine) -> Self {
-        let depth = (engine.info().pipeline_depth as usize).max(1);
+        let depth = (engine.info().queue_depth as usize).max(1);
         Self::with_depth(engine, depth)
     }
 
@@ -64,7 +67,6 @@ impl SimExecutor {
         let (to_worker, jobs) = crossbeam_channel::unbounded();
         let (results_tx, from_worker) = crossbeam_channel::unbounded();
         let (progress_tx, progress_rx) = crossbeam_channel::bounded(1);
-        let worker_progress = progress_tx.clone();
         let handle = std::thread::Builder::new()
             .name("uniserve-sim-executor".into())
             .spawn(move || {
@@ -74,10 +76,6 @@ impl SimExecutor {
                             if results_tx.send(engine.execute(batch)).is_err() {
                                 break;
                             }
-                            let _ = worker_progress.try_send(());
-                        }
-                        Job::Drop(session_id) => {
-                            let _ = engine.drop_session(session_id);
                         }
                         Job::Shutdown => break,
                     }
@@ -85,144 +83,115 @@ impl SimExecutor {
             })
             .expect("spawn sim executor thread");
         Self {
-            info,
+            executor_info: ExecutorInfo::single(PoolId("sim".to_owned()), info.clone()),
             depth,
             to_worker,
             from_worker,
             progress_tx,
             progress_rx,
             in_flight: 0,
-            next_call_id: 1,
             handle: Some(handle),
+            next_collective_seq: 1,
+            logical_results: LogicalResultTracker::default(),
         }
     }
 
-    fn apply_control(&mut self, operation: &ControlOp) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self.info
-                .supported_controls
-                .contains(&operation.request_kind()),
-            "sim executor does not support control {}",
-            operation.method()
-        );
-        match operation {
-            ControlOp::DropSession(session_id) => {
-                self.to_worker
-                    .send(Job::Drop(*session_id))
-                    .map_err(|_| anyhow::anyhow!("sim executor thread gone"))?;
-            }
-            ControlOp::ReleaseProducts(_) => {}
+    pub fn command_waker(&self) -> CommandWaker {
+        let progress = self.progress_tx.clone();
+        CommandWaker::new(move || {
+            let _ = progress.try_send(());
+        })
+    }
+}
+
+impl PhysicalExecutor for SimExecutor {
+    fn physical_info(&self) -> &ExecutorInfo {
+        &self.executor_info
+    }
+
+    fn submit_run(&mut self, batch: PhysicalRun) -> Result<(), PhysicalSubmitError> {
+        if self.in_flight >= self.depth {
+            return Err(PhysicalSubmitError::WouldBlock(batch));
+        }
+        batch
+            .validate()
+            .map_err(anyhow::Error::from)
+            .map_err(PhysicalSubmitError::Failed)?;
+        self.to_worker.send(Job::Batch(batch)).map_err(|_| {
+            PhysicalSubmitError::Failed(anyhow::anyhow!("sim executor thread gone"))
+        })?;
+        self.in_flight += 1;
+        Ok(())
+    }
+
+    fn poll_run(&mut self, timeout: Duration) -> anyhow::Result<Option<RunResult>> {
+        let result = crossbeam_channel::select! {
+            recv(self.from_worker) -> result => match result {
+                Ok(result) => Ok(Some(result?)),
+                Err(_) => Err(anyhow::anyhow!("sim executor thread disconnected")),
+            },
+            recv(self.progress_rx) -> wake => match wake {
+                Ok(()) => Ok(None),
+                Err(_) => Err(anyhow::anyhow!("sim executor progress channel disconnected")),
+            },
+            default(timeout) => Ok(None),
+        }?;
+        if result.is_some() {
+            self.in_flight = self.in_flight.saturating_sub(1);
+        }
+        Ok(result)
+    }
+
+    fn close_physical(&mut self) -> anyhow::Result<()> {
+        let _ = self.to_worker.send(Job::Shutdown);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
         }
         Ok(())
     }
 }
 
 impl Executor for SimExecutor {
-    fn info(&self) -> &WorkerInfo {
-        &self.info
+    fn info(&self) -> &ExecutorInfo {
+        &self.executor_info
     }
 
-    fn pipeline_depth(&self) -> usize {
-        self.depth
-    }
-
-    fn in_flight(&self) -> usize {
-        self.in_flight
-    }
-
-    fn submit(&mut self, batch: Batch) -> anyhow::Result<()> {
-        batch.validate()?;
-        self.to_worker
-            .send(Job::Batch(batch))
-            .map_err(|_| anyhow::anyhow!("sim executor thread gone"))?;
-        self.in_flight += 1;
-        Ok(())
-    }
-
-    fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
-        match self.from_worker.try_recv() {
-            Ok(result) => {
-                self.in_flight = self.in_flight.saturating_sub(1);
-                Ok(Some(result?))
+    fn submit(&mut self, batch: Batch) -> Result<(), ExecutorSubmitError> {
+        if self.in_flight >= self.depth {
+            return Err(ExecutorSubmitError::WouldBlock(batch));
+        }
+        let run = lower_batch(&batch, &mut self.next_collective_seq)
+            .map_err(ExecutorSubmitError::Failed)?;
+        self.logical_results
+            .register(&batch)
+            .map_err(ExecutorSubmitError::Failed)?;
+        match self.submit_run(run) {
+            Ok(()) => Ok(()),
+            Err(PhysicalSubmitError::WouldBlock(_)) => {
+                self.logical_results.unregister(batch.id);
+                Err(ExecutorSubmitError::WouldBlock(batch))
             }
-            Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
-            Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                Err(anyhow::anyhow!("sim executor thread disconnected"))
+            Err(PhysicalSubmitError::Failed(error)) => {
+                self.logical_results.unregister(batch.id);
+                Err(ExecutorSubmitError::Failed(error))
             }
         }
     }
 
-    fn command_waker(&self) -> CommandWaker {
-        let progress = self.progress_tx.clone();
-        CommandWaker::new(move || {
-            let _ = progress.try_send(());
-        })
+    fn poll(&mut self, timeout: Duration) -> anyhow::Result<Option<BatchResult>> {
+        self.poll_run(timeout)?
+            .map(|report| self.logical_results.apply(report))
+            .transpose()
     }
 
-    fn park_for_event(&mut self, timeout: Duration) -> anyhow::Result<()> {
-        match self.progress_rx.recv_timeout(timeout) {
-            Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => Ok(()),
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!(
-                "sim executor progress channel disconnected"
-            )),
-        }
-    }
-
-    fn wait_result_timeout(
-        &mut self,
-        timeout: Duration,
-    ) -> anyhow::Result<Option<CompletionReport>> {
-        match self.from_worker.recv_timeout(timeout) {
-            Ok(result) => {
-                self.in_flight = self.in_flight.saturating_sub(1);
-                Ok(Some(result?))
-            }
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => Ok(None),
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                Err(anyhow::anyhow!("sim executor thread disconnected"))
-            }
-        }
-    }
-
-    fn next_result(&mut self) -> anyhow::Result<CompletionReport> {
-        let result = self
-            .from_worker
-            .recv()
-            .map_err(|_| anyhow::anyhow!("sim executor thread disconnected"))?;
-        self.in_flight = self.in_flight.saturating_sub(1);
-        result
-    }
-
-    fn control(&mut self, operation: ControlOp) -> anyhow::Result<u64> {
-        let call_id = self.next_call_id;
-        self.next_call_id = self.next_call_id.saturating_add(1);
-        self.apply_control(&operation)?;
-        Ok(call_id)
-    }
-
-    fn control_wait(
-        &mut self,
-        operation: ControlOp,
-        _targets: Option<&[u32]>,
-    ) -> anyhow::Result<Vec<ControlAck>> {
-        self.apply_control(&operation)?;
-        Ok(vec![ControlAck {
-            rank: 0,
-            result: Ok(()),
-        }])
-    }
-
-    fn shutdown(&mut self) {
-        let _ = self.to_worker.send(Job::Shutdown);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+    fn close(&mut self) -> anyhow::Result<()> {
+        self.close_physical()
     }
 }
 
 impl Drop for SimExecutor {
     fn drop(&mut self) {
-        self.shutdown();
+        let _ = self.close_physical();
     }
 }
 
@@ -239,7 +208,7 @@ struct RecordedCompletion {
 /// synthetic token cursor, denoise progress, and the terminal record of every
 /// committed operation for replay.
 #[derive(Clone)]
-struct SimSession {
+struct SimRequestState {
     admission: NewRequest,
     point_index: u32,
     logical_position: u32,
@@ -257,10 +226,10 @@ struct SimSession {
     penalty_counts: BTreeMap<u32, u32>,
 }
 
-impl SimSession {
+impl SimRequestState {
     fn new(admission: NewRequest) -> Self {
         let prefix_len = admission
-            .und
+            .ar
             .as_ref()
             .map_or(0, |branch| branch.initial_position);
         Self {
@@ -295,14 +264,11 @@ impl SimSession {
     }
 
     fn sampling(&self) -> Option<&SamplingParams> {
-        self.admission.und.as_ref().map(|und| &und.sampling)
+        self.admission.ar.as_ref().map(|und| &und.sampling)
     }
 
     fn image(&self) -> Option<&ImageParams> {
-        self.admission
-            .gen_admission
-            .as_ref()
-            .map(|branch| &branch.image)
+        self.admission.umm.as_ref().map(|branch| &branch.image)
     }
 }
 
@@ -312,49 +278,18 @@ pub struct SimEngine {
     text_len: usize,
     fake_eos: u32,
     vocab: usize,
-    sessions: HashMap<RequestId, SimSession>,
+    requests: HashMap<RequestId, SimRequestState>,
 }
 
 impl SimEngine {
     pub fn new() -> Self {
         let info = WorkerInfo {
-            supported_work: vec![
-                ForwardMode::TokenExtend,
-                ForwardMode::TokenDecode,
-                ForwardMode::EncodeVision,
-                ForwardMode::EncodeLatent,
-                ForwardMode::MediaPrepare,
-                ForwardMode::MediaDenoise,
-                ForwardMode::Materialize,
-                ForwardMode::TransferProduct,
-                ForwardMode::TransferKvPublish,
-                ForwardMode::TransferKvInstall,
-            ],
+            supported_ops: OpKind::ALL.to_vec(),
             latent_page_units: 64,
-            num_latent_pages: 1_025,
-            latent_width: 16,
-            latent_dtype: Some(uniserve_core::ModelDtype::BFloat16),
-            latent_downsample: 16,
-            max_vae_grid_tokens: 1_024,
-            max_vit_grid_tokens: 64,
-            max_latent_feature_bytes: 1 << 20,
-            max_vision_feature_bytes: 1 << 20,
-            encoder_cache_budget: 256,
-            supported_controls: vec![RequestKind::DropSession, RequestKind::ReleaseProducts],
-            max_batch_operations: 1024,
-            max_unresolved_window: 2,
-            mixed_buckets: (1..=128)
-                .flat_map(|decode_rows| {
-                    (1..=3).map(move |cfg_branches| GraphBucket {
-                        decode_rows,
-                        flow_rows: 1,
-                        height: DEFAULT_IMAGE_HW.0,
-                        width: DEFAULT_IMAGE_HW.1,
-                        cfg_branches,
-                    })
-                })
-                .collect(),
-            resource_classes: vec![ResourceClass::ImageLatent],
+            latent_pages: 1_025,
+            buffer_pool_bytes: 257_u64 * (256 << 20),
+            max_batch_ops: 1024,
+            max_unresolved_ops: 2,
             model_name: "sim".to_owned(),
             weight_version: 0,
             ..WorkerInfo::default()
@@ -364,7 +299,7 @@ impl SimEngine {
             text_len: DEFAULT_TEXT_LEN,
             fake_eos: FAKE_EOS_TOKEN,
             vocab: SYNTH_VOCAB_SIZE,
-            sessions: HashMap::new(),
+            requests: HashMap::new(),
         }
     }
 
@@ -372,18 +307,18 @@ impl SimEngine {
         vocab: usize,
         text_len: usize,
         fake_eos: u32,
-        session_id: RequestId,
+        request_id: RequestId,
         index: usize,
     ) -> Vec<f32> {
         let mut logits = vec![0.0; vocab];
         let natural = if index >= text_len {
             fake_eos
         } else {
-            1_000 + ((session_id.0 as u32 * 7 + index as u32) % 5_000)
+            1_000 + ((request_id.0 as u32 * 7 + index as u32) % 5_000)
         };
         logits[natural as usize] = 10.0;
-        let alternate_one = 1_000 + ((session_id.0 as u32 * 13 + index as u32 + 1) % 5_000);
-        let alternate_two = 1_000 + ((session_id.0 as u32 * 29 + index as u32 + 2) % 5_000);
+        let alternate_one = 1_000 + ((request_id.0 as u32 * 13 + index as u32 + 1) % 5_000);
+        let alternate_two = 1_000 + ((request_id.0 as u32 * 29 + index as u32 + 2) % 5_000);
         if alternate_one != natural {
             logits[alternate_one as usize] = 8.0;
         }
@@ -399,16 +334,16 @@ impl SimEngine {
         text_len: usize,
         fake_eos: u32,
         operation: &Operation,
-        session: &SimSession,
+        request: &SimRequestState,
         index: usize,
         state: Option<&SamplingState>,
     ) -> anyhow::Result<Option<SampleOutput>> {
-        let session_id = operation.request_key.session_id;
-        let mut logits = Self::synth_logits(vocab, text_len, fake_eos, session_id, index);
-        match session.sampling() {
+        let request_id = operation.request_key.request_id;
+        let mut logits = Self::synth_logits(vocab, text_len, fake_eos, request_id, index);
+        match request.sampling() {
             Some(sampling) => {
                 let draw = if sampling.temperature > 0.0 {
-                    let rng = operation.rng.ok_or_else(|| {
+                    let rng = operation.rng().ok_or_else(|| {
                         anyhow::anyhow!("stochastic sampling operation has no RNG coordinates")
                     })?;
                     anyhow::ensure!(
@@ -422,7 +357,7 @@ impl SimEngine {
                     let key = philox::sampling_key(
                         rng.seed,
                         operation.request_key.authority_id,
-                        session_id.0,
+                        request_id.0,
                         operation.request_key.epoch,
                         philox::DRAW_LAYOUT_TARGET,
                     );
@@ -433,7 +368,7 @@ impl SimEngine {
                 // Penalty counts are device-resident, not carried in the staged
                 // state: the successor reads the committed base folded from
                 // ancestral tokens before any of them is host-observed.
-                let recent_counts = session.recent_counts();
+                let recent_counts = request.recent_counts();
                 let allowed = state
                     .and_then(|value| value.allowed_token_ids.as_deref())
                     .or_else(|| {
@@ -468,7 +403,7 @@ impl SimEngine {
                 token: if index >= text_len {
                     fake_eos
                 } else {
-                    1_000 + ((session_id.0 as u32 * 7 + index as u32) % 5_000)
+                    1_000 + ((request_id.0 as u32 * 7 + index as u32) % 5_000)
                 },
                 logprob: 0.0,
                 top: Vec::new(),
@@ -476,94 +411,92 @@ impl SimEngine {
         }
     }
 
-    /// Execute one operation against its session, producing the terminal
+    /// Execute one operation against its request, producing the terminal
     /// [`ModelOutput`] and any resolved output-product values.
     fn execute_operation(
         vocab: usize,
         text_len: usize,
         fake_eos: u32,
         operation: &Operation,
-        session: &mut SimSession,
+        request: &mut SimRequestState,
         input_products: &[ProductPayload],
     ) -> anyhow::Result<(ModelOutput, Vec<ProductPayload>)> {
-        let point_index = session.point_index;
-        let selected_point = u32::from(operation.advances_state);
+        let point_index = request.point_index;
+        let selected_point = u32::from(operation.advances_state());
         let mut record = ModelOutput {
             request_key: operation.request_key,
             op_id: operation.op_id,
             completion_slot_generation: ((operation.op_id.0 - 1) % u64::from(u32::MAX) + 1) as u32,
             status: OpStatus::Ok,
             selected_point,
-            logical_lengths: LogicalLengths::default(),
-            token_span: TokenSpan::default(),
-            committed_tokens: Vec::new(),
-            finish_flags: FinishFlags::default(),
-            product_generations: operation.outputs.iter().map(|out| out.generation).collect(),
+            product_generations: operation
+                .outputs()
+                .iter()
+                .map(|out| out.generation)
+                .collect(),
             error_code: None,
             timing_counters: TimingCounters::default(),
-            media_output: None,
+            payload: ResultPayload::for_kind(operation.kind, ResultData::default()),
         };
-        record.logical_lengths.token_len = session.logical_position;
+        record.logical_lengths_mut().token_len = request.logical_position;
         set_kv_lengths(
-            &mut record.logical_lengths,
-            session.kv_visible_len,
-            session.kv_visible_len,
-            session.kv_published_len,
+            record.logical_lengths_mut(),
+            request.kv_visible_len,
+            request.kv_visible_len,
+            request.kv_published_len,
         );
         let mut products = Vec::new();
 
-        match operation.work {
-            work @ (ForwardMode::TokenExtend
-            | ForwardMode::TokenDecode
-            | ForwardMode::TokenVerify) => {
-                let visual_state = operation.inputs.iter().any(|input| {
+        match operation.kind {
+            work @ (RunKind::ArExtend | RunKind::ArDecode | RunKind::ArVerify) => {
+                let visual_state = operation.inputs().iter().any(|input| {
                     matches!(
                         input.kind,
                         ProductKind::VisionFeature | ProductKind::LatentFeature
                     )
                 });
                 let samples_token = operation
-                    .outputs
+                    .outputs()
                     .iter()
                     .any(|output| output.kind == ProductKind::Token);
                 if visual_state {
-                    session.kv_visible_len = session
+                    request.kv_visible_len = request
                         .kv_visible_len
-                        .saturating_add(operation.bounds.max_tokens);
+                        .saturating_add(operation.bounds().max_tokens);
                     set_kv_lengths(
-                        &mut record.logical_lengths,
-                        session.kv_visible_len,
-                        session.kv_visible_len,
-                        session.kv_published_len,
+                        record.logical_lengths_mut(),
+                        request.kv_visible_len,
+                        request.kv_visible_len,
+                        request.kv_published_len,
                     );
                     if operation
-                        .outputs
+                        .outputs()
                         .iter()
                         .any(|output| output.kind == ProductKind::Completion)
                     {
-                        session.emitted = 0;
+                        request.emitted = 0;
                     }
                 }
                 if !visual_state && !samples_token {
-                    session.kv_visible_len = session
+                    request.kv_visible_len = request
                         .kv_visible_len
-                        .saturating_add(operation.bounds.max_tokens);
-                    record.logical_lengths.token_len = session.logical_position;
+                        .saturating_add(operation.bounds().max_tokens);
+                    record.logical_lengths_mut().token_len = request.logical_position;
                     set_kv_lengths(
-                        &mut record.logical_lengths,
-                        session.kv_visible_len,
-                        session.kv_visible_len,
-                        session.kv_published_len,
+                        record.logical_lengths_mut(),
+                        request.kv_visible_len,
+                        request.kv_visible_len,
+                        request.kv_published_len,
                     );
                 } else if samples_token {
-                    let index = session.emitted;
+                    let index = request.emitted;
                     let sampling_state = operation_sampling_state(operation, input_products)?;
                     let Some(output) = Self::sample(
                         vocab,
                         text_len,
                         fake_eos,
                         operation,
-                        session,
+                        request,
                         index,
                         sampling_state.as_ref(),
                     )?
@@ -574,16 +507,16 @@ impl SimEngine {
                         record.error_code = Some(ErrorCode::InvalidOperation);
                         return Ok((record, Vec::new()));
                     };
-                    record.finish_flags.eos = output.token == fake_eos;
+                    record.finish_flags_mut().eos = output.token == fake_eos;
                     if let Some(state) = sampling_state.as_ref() {
-                        record.finish_flags.stop =
+                        record.finish_flags_mut().stop =
                             state.finish_token_ids.binary_search(&output.token).is_ok()
-                                && !record.finish_flags.eos;
-                        record.finish_flags.length = state.force_finish;
+                                && !record.finish_flags().eos;
+                        record.finish_flags_mut().length = state.force_finish;
                     }
-                    let admitted_stops = session
+                    let admitted_stops = request
                         .admission
-                        .und
+                        .ar
                         .as_ref()
                         .map_or(&[][..], |und| und.finish_token_ids.as_slice());
                     let continuation = admitted_stops.binary_search(&output.token).is_err()
@@ -592,11 +525,11 @@ impl SimEngine {
                                 && state.finish_token_ids.binary_search(&output.token).is_err()
                         });
                     if let Some(token_product) = operation
-                        .outputs
+                        .outputs()
                         .iter()
                         .find(|output| output.kind == ProductKind::Token)
                     {
-                        session
+                        request
                             .predicate_values
                             .insert(token_product.clone(), continuation);
                     }
@@ -606,52 +539,52 @@ impl SimEngine {
                             .binary_search(&output.token)
                             .is_ok()
                     });
-                    for completion in operation.outputs.iter().filter(|candidate| {
+                    for completion in operation.outputs().iter().filter(|candidate| {
                         candidate.kind == ProductKind::Completion
                             && matches!(candidate.output_index, 4 | 6)
                     }) {
-                        session
+                        request
                             .predicate_values
                             .insert(completion.clone(), transition);
                     }
-                    record.token_span = TokenSpan {
+                    *record.token_span_mut() = TokenSpan {
                         base: index as u32,
                         len: 1,
                     };
-                    record.logical_lengths.token_len = 1;
+                    record.logical_lengths_mut().token_len = 1;
                     if !visual_state {
                         let query_tokens = match work {
-                            ForwardMode::TokenExtend => operation.bounds.max_tokens,
-                            ForwardMode::TokenDecode | ForwardMode::TokenVerify => 1,
+                            RunKind::ArExtend => operation.bounds().max_tokens,
+                            RunKind::ArDecode | RunKind::ArVerify => 1,
                             _ => unreachable!(),
                         };
-                        session.logical_position =
-                            session.logical_position.saturating_add(query_tokens);
-                        session.kv_visible_len =
-                            session.kv_visible_len.saturating_add(query_tokens);
-                        record.logical_lengths.token_len = session.logical_position;
+                        request.logical_position =
+                            request.logical_position.saturating_add(query_tokens);
+                        request.kv_visible_len =
+                            request.kv_visible_len.saturating_add(query_tokens);
+                        record.logical_lengths_mut().token_len = request.logical_position;
                         set_kv_lengths(
-                            &mut record.logical_lengths,
-                            session.kv_visible_len,
-                            session.kv_visible_len,
-                            session.kv_published_len,
+                            record.logical_lengths_mut(),
+                            request.kv_visible_len,
+                            request.kv_visible_len,
+                            request.kv_published_len,
                         );
                     }
                     match work {
-                        ForwardMode::TokenExtend => session.emitted = session.emitted.max(1),
-                        ForwardMode::TokenDecode | ForwardMode::TokenVerify => {
-                            session.emitted = session.emitted.saturating_add(1)
+                        RunKind::ArExtend => request.emitted = request.emitted.max(1),
+                        RunKind::ArDecode | RunKind::ArVerify => {
+                            request.emitted = request.emitted.saturating_add(1)
                         }
                         _ => unreachable!(),
                     }
-                    record.committed_tokens = vec![output.token];
+                    *record.committed_tokens_mut() = vec![output.token];
                     // Fold the generated token into the device-resident penalty
                     // base so the next operation's penalties see it before this
                     // one is host-observed. A false-predicate no-op never reaches
                     // this branch, so a retracted point is never folded.
-                    session.fold_penalty_token(output.token);
+                    request.fold_penalty_token(output.token);
                     let blob = LogprobBlob {
-                        sampled_logprob: session
+                        sampled_logprob: request
                             .sampling()
                             .is_some_and(SamplingParams::generated_logprobs_requested)
                             .then_some(output.logprob),
@@ -669,42 +602,42 @@ impl SimEngine {
                     if !blob.is_empty() {
                         products.push(ProductPayload {
                             product: output_ref(operation, ProductKind::Logprob)?,
-                            bytes: blob.encode(),
+                            value: InlineValue::Bytes(blob.encode()),
                         });
                     }
                 }
             }
-            ForwardMode::EncodeVision | ForwardMode::EncodeLatent => {}
-            work @ (ForwardMode::TransferProduct
-            | ForwardMode::TransferKvPublish
-            | ForwardMode::TransferKvInstall) => {
-                if work == ForwardMode::TransferKvPublish {
-                    session.kv_published_len = session.kv_visible_len;
+            RunKind::EncoderVision | RunKind::EncoderLatent => {}
+            work @ (RunKind::TransferProduct
+            | RunKind::TransferKvPublish
+            | RunKind::TransferKvInstall) => {
+                if work == RunKind::TransferKvPublish {
+                    request.kv_published_len = request.kv_visible_len;
                 }
                 set_kv_lengths(
-                    &mut record.logical_lengths,
-                    session.kv_visible_len,
-                    session.kv_visible_len,
-                    session.kv_published_len,
+                    record.logical_lengths_mut(),
+                    request.kv_visible_len,
+                    request.kv_visible_len,
+                    request.kv_published_len,
                 );
             }
-            ForwardMode::MediaPrepare => {}
-            ForwardMode::MediaDenoise => {
-                let steps = operation.bounds.max_tokens.max(1) as u16;
-                session.flow_step = session.flow_step.saturating_add(steps);
-                let total = session
+            RunKind::DiffusionPrepare => {}
+            RunKind::DiffusionStep => {
+                let steps = operation.bounds().max_tokens.max(1) as u16;
+                request.flow_step = request.flow_step.saturating_add(steps);
+                let total = request
                     .image()
                     .map(|image| image.steps)
                     .unwrap_or(DEFAULT_DENOISE_STEPS);
-                record.logical_lengths.latent_len = u32::from(session.flow_step);
+                record.logical_lengths_mut().latent_len = u32::from(request.flow_step);
                 // Denoise completion surfaces as a length finish once the flow has
                 // advanced through every scheduled step.
-                record.finish_flags.length = session.flow_step >= total;
+                record.finish_flags_mut().length = request.flow_step >= total;
             }
-            ForwardMode::MediaReconstruct => {}
-            ForwardMode::Materialize => {
-                session.flow_step = 0;
-                if let Some(image) = session.image().cloned() {
+            RunKind::DiffusionDecode => {}
+            RunKind::DiffusionFinalize => {
+                request.flow_step = 0;
+                if let Some(image) = request.image().cloned() {
                     let (height, width) = if image.height > 0 && image.width > 0 {
                         (image.height, image.width)
                     } else {
@@ -713,18 +646,18 @@ impl SimEngine {
                     let png_base64 = synthetic_png_b64(width, height)?;
                     products.push(ProductPayload {
                         product: output_ref(operation, ProductKind::Artifact)?,
-                        bytes: png_base64.into_bytes(),
+                        value: InlineValue::Bytes(png_base64.into_bytes()),
                     });
                 }
             }
         }
 
         for completion in operation
-            .outputs
+            .outputs()
             .iter()
             .filter(|output| output.kind == ProductKind::Completion)
         {
-            session
+            request
                 .predicate_values
                 .entry(completion.clone())
                 .or_insert(true);
@@ -735,7 +668,7 @@ impl SimEngine {
         // declared KV, token, latent, and feature references surface as
         // presence-only entries addressed by identity, since the host does not
         // consume their values.
-        for output in &operation.outputs {
+        for output in operation.outputs() {
             if products
                 .iter()
                 .any(|payload| payload.product.output_index == output.output_index)
@@ -744,41 +677,44 @@ impl SimEngine {
             }
             products.push(ProductPayload {
                 product: output.clone(),
-                bytes: Vec::new(),
+                value: InlineValue::Bytes(Vec::new()),
             });
         }
 
         Ok((record, products))
     }
 
-    fn predicated_completion(operation: &Operation, session: &SimSession) -> ModelOutput {
+    fn predicated_completion(operation: &Operation, request: &SimRequestState) -> ModelOutput {
         ModelOutput {
             request_key: operation.request_key,
             op_id: operation.op_id,
             completion_slot_generation: ((operation.op_id.0 - 1) % u64::from(u32::MAX) + 1) as u32,
             status: OpStatus::Predicated,
-            selected_point: session.point_index,
-            logical_lengths: LogicalLengths {
-                token_len: session.logical_position,
-                kv_visible_len: session.kv_visible_len,
-                kv_computed_len: session.kv_visible_len,
-                ..LogicalLengths::default()
-            },
-            token_span: TokenSpan {
-                base: session.emitted.min(u32::MAX as usize) as u32,
-                len: 0,
-            },
-            committed_tokens: Vec::new(),
-            finish_flags: FinishFlags::default(),
+            selected_point: request.point_index,
             product_generations: Vec::new(),
             error_code: None,
             timing_counters: TimingCounters::default(),
-            media_output: None,
+            payload: ResultPayload::for_kind(
+                operation.kind,
+                ResultData {
+                    logical_lengths: LogicalLengths {
+                        token_len: request.logical_position,
+                        kv_visible_len: request.kv_visible_len,
+                        kv_computed_len: request.kv_visible_len,
+                        ..LogicalLengths::default()
+                    },
+                    token_span: TokenSpan {
+                        base: request.emitted.min(u32::MAX as usize) as u32,
+                        len: 0,
+                    },
+                    ..ResultData::default()
+                },
+            ),
         }
     }
 
     pub fn set_pipeline_depth(&mut self, depth: u32) {
-        self.info.pipeline_depth = depth.max(1);
+        self.info.queue_depth = depth.max(1);
     }
 
     pub fn set_text_len(&mut self, length: usize) {
@@ -801,18 +737,31 @@ impl SimEngine {
     }
 
     pub fn set_groups(&mut self, groups: Vec<uniserve_core::KvCacheGroup>) {
-        self.info.groups = groups;
+        self.info
+            .kv_cache
+            .as_mut()
+            .expect("sim AR worker has a KV cache")
+            .groups = groups;
     }
 
     pub fn set_num_blocks(&mut self, count: u32) {
-        self.info.num_blocks = count;
-        if self.info.groups.len() == 1 {
-            self.info.groups[0].num_blocks = count;
+        let kv_cache = self
+            .info
+            .kv_cache
+            .as_mut()
+            .expect("sim AR worker has a KV cache");
+        kv_cache.num_blocks = count;
+        if kv_cache.groups.len() == 1 {
+            kv_cache.groups[0].num_blocks = count;
         }
     }
 
     pub fn set_block_size(&mut self, size: u32) {
-        self.info.block_size = size;
+        self.info
+            .kv_cache
+            .as_mut()
+            .expect("sim AR worker has a KV cache")
+            .block_size = size;
     }
 
     pub fn mut_info_for_test(&mut self) -> &mut WorkerInfo {
@@ -826,7 +775,7 @@ fn operation_sampling_state(
     input_products: &[ProductPayload],
 ) -> anyhow::Result<Option<SamplingState>> {
     let mut references = operation
-        .inputs
+        .inputs()
         .iter()
         .filter(|input| input.kind == ProductKind::SamplingState);
     let Some(reference) = references.next() else {
@@ -840,7 +789,11 @@ fn operation_sampling_state(
         .iter()
         .find(|payload| payload.product == *reference)
         .ok_or_else(|| anyhow::anyhow!("operation sampling-state input has no payload"))?;
-    Ok(Some(decode_sampling_state_bytes(&payload.bytes)?))
+    let bytes = payload
+        .value
+        .bytes()
+        .ok_or_else(|| anyhow::anyhow!("sampling state cannot be a transfer handle"))?;
+    Ok(Some(decode_sampling_state_bytes(bytes)?))
 }
 
 fn set_kv_lengths(lengths: &mut LogicalLengths, visible: u32, _committed: u32, _published: u32) {
@@ -851,7 +804,7 @@ fn set_kv_lengths(lengths: &mut LogicalLengths, visible: u32, _committed: u32, _
 /// The declared output-product reference for a value packed into a completion.
 fn output_ref(operation: &Operation, kind: ProductKind) -> anyhow::Result<ProductRef> {
     operation
-        .outputs
+        .outputs()
         .iter()
         .find(|output| output.kind == kind)
         .cloned()
@@ -896,19 +849,33 @@ impl SimEngine {
         &self.info
     }
 
-    fn execute(&mut self, batch: Batch) -> anyhow::Result<CompletionReport> {
+    fn execute(&mut self, batch: PhysicalRun) -> anyhow::Result<RunResult> {
         batch.validate()?;
-        let step_id = batch.step_id;
-        for admission in batch.admissions {
-            match self.sessions.get(&admission.request_key.session_id) {
-                Some(session) => anyhow::ensure!(
-                    session.admission == admission,
-                    "session {} was readmitted with a different descriptor",
-                    admission.request_key.session_id.0
+        let batch_id = batch.batch_id;
+        let run_id = batch.run_id;
+        let closed = batch
+            .commands
+            .iter()
+            .filter_map(|control| match control {
+                uniserve_worker_ipc::BatchCommand::Finish { request_key, .. } => {
+                    Some(request_key.request_id)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let admissions = batch.admissions().cloned().collect::<Vec<_>>();
+        for admission in admissions {
+            match self.requests.get(&admission.request_key.request_id) {
+                Some(request) => anyhow::ensure!(
+                    request.admission == admission,
+                    "request {} was readmitted with a different descriptor",
+                    admission.request_key.request_id.0
                 ),
                 None => {
-                    self.sessions
-                        .insert(admission.request_key.session_id, SimSession::new(admission));
+                    self.requests.insert(
+                        admission.request_key.request_id,
+                        SimRequestState::new(admission),
+                    );
                 }
             }
         }
@@ -916,153 +883,134 @@ impl SimEngine {
         let vocab = self.vocab;
         let text_len = self.text_len;
         let fake_eos = self.fake_eos;
-        let mut partition_reports = Vec::with_capacity(batch.partitions.len());
-        for partition in batch.partitions {
-            let mut completions = Vec::with_capacity(partition.operations.len());
-            let mut products = Vec::new();
-            for operation in partition.operations {
-                let session = self
-                    .sessions
-                    .get_mut(&operation.request_key.session_id)
-                    .ok_or_else(|| {
+        let mut completions = Vec::with_capacity(batch.operations.len());
+        let mut products = Vec::new();
+        for operation in batch.operations {
+            let request = self
+                .requests
+                .get_mut(&operation.request_key.request_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "request {} has no admission",
+                        operation.request_key.request_id.0
+                    )
+                })?;
+            if let Some(recorded) = request.terminal.get(&operation.op_id.0) {
+                anyhow::ensure!(
+                    recorded.operation == operation,
+                    "operation {} conflicts with its terminal record",
+                    operation.op_id.0
+                );
+                completions.push(recorded.completion.clone());
+                products.extend(recorded.products.clone());
+                continue;
+            }
+            anyhow::ensure!(
+                operation.request_key == request.admission.request_key,
+                "operation identity {:?} does not match its admitted lineage",
+                operation.request_key
+            );
+            match &operation.parent.point {
+                CheckpointPoint::Fixed(point) => {
+                    anyhow::ensure!(
+                        *point == request.point_index,
+                        "operation {} ({}) parent point {} does not match request point {}",
+                        operation.op_id.0,
+                        operation.kind.as_str(),
+                        point,
+                        request.point_index
+                    );
+                }
+                CheckpointPoint::DeviceSelected => {
+                    // A device-relay successor roots on its predecessor's
+                    // selected point before host observation. By the time it
+                    // runs, the predecessor has committed and advanced this
+                    // request, so its point is the current request point and its
+                    // terminal record names the referenced producer. The base
+                    // point is the request's tracked point, not the absent
+                    // device point index.
+                    let producer_op_id = operation.parent.op_id.0;
+                    let recorded = request.terminal.get(&producer_op_id).ok_or_else(|| {
                         anyhow::anyhow!(
-                            "session {} has no admission",
-                            operation.request_key.session_id.0
+                            "device parent names unknown predecessor op {producer_op_id}"
                         )
                     })?;
-                if let Some(recorded) = session.terminal.get(&operation.op_id.0) {
                     anyhow::ensure!(
-                        recorded.operation == operation,
-                        "operation {} conflicts with its terminal record",
-                        operation.op_id.0
+                        recorded.completion.selected_point == request.point_index,
+                        "device parent predecessor is not the request's committed point"
                     );
-                    completions.push(recorded.completion.clone());
-                    products.extend(recorded.products.clone());
+                }
+            }
+
+            if let Some(predicate) = operation.predicate().as_ref() {
+                let predicate_value = request
+                    .predicate_values
+                    .get(predicate)
+                    .copied()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "operation {} predicate names an unresolved product",
+                            operation.op_id.0
+                        )
+                    })?;
+                if !predicate_value {
+                    for output in operation.outputs() {
+                        request.predicate_values.insert(output.clone(), false);
+                    }
+                    let completion = Self::predicated_completion(&operation, request);
+                    request.terminal.insert(
+                        operation.op_id.0,
+                        RecordedCompletion {
+                            operation: operation.clone(),
+                            completion: completion.clone(),
+                            products: Vec::new(),
+                        },
+                    );
+                    completions.push(completion);
                     continue;
                 }
-                anyhow::ensure!(
-                    operation.request_key == session.admission.request_key,
-                    "operation identity {:?} does not match its admitted lineage",
-                    operation.request_key
-                );
-                match &operation.parent.point {
-                    Point::Fixed { point_index } => {
-                        anyhow::ensure!(
-                            *point_index == session.point_index,
-                            "operation {} ({}) parent point {} does not match session point {}",
-                            operation.op_id.0,
-                            operation.work.as_str(),
-                            point_index,
-                            session.point_index
-                        );
-                    }
-                    Point::Device {
-                        point_index,
-                        selected_point,
-                    } => {
-                        // A device-relay successor roots on its predecessor's
-                        // selected point before host observation. By the time it
-                        // runs, the predecessor has committed and advanced this
-                        // session, so its point is the current session point and its
-                        // terminal record names the referenced producer. The base
-                        // point is the session's tracked point, not the absent
-                        // device point index.
-                        let producer_op_id = operation.parent.producer_op_id.0;
-                        let recorded = session.terminal.get(&producer_op_id).ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "device parent names unknown predecessor op {producer_op_id}"
-                            )
-                        })?;
-                        if let Some(selected_point) = selected_point {
-                            anyhow::ensure!(
-                                selected_point.producer_op_id.0 == producer_op_id,
-                                "device parent selected point is not produced by its named predecessor"
-                            );
-                        } else {
-                            anyhow::ensure!(
-                                *point_index == recorded.completion.selected_point,
-                                "static device parent point does not match its predecessor"
-                            );
-                        }
-                        anyhow::ensure!(
-                            recorded.completion.selected_point == session.point_index,
-                            "device parent predecessor is not the session's committed point"
-                        );
-                    }
-                }
-
-                if let Some(predicate) = operation.predicate.as_ref() {
-                    let predicate_value = session
-                        .predicate_values
-                        .get(predicate)
-                        .copied()
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "operation {} predicate names an unresolved product",
-                                operation.op_id.0
-                            )
-                        })?;
-                    if !predicate_value {
-                        for completion in operation
-                            .outputs
-                            .iter()
-                            .filter(|output| output.kind == ProductKind::Completion)
-                        {
-                            session.predicate_values.insert(completion.clone(), false);
-                        }
-                        let completion = Self::predicated_completion(&operation, session);
-                        session.terminal.insert(
-                            operation.op_id.0,
-                            RecordedCompletion {
-                                operation: operation.clone(),
-                                completion: completion.clone(),
-                                products: Vec::new(),
-                            },
-                        );
-                        completions.push(completion);
-                        continue;
-                    }
-                }
-
-                let (completion, op_products) = Self::execute_operation(
-                    vocab,
-                    text_len,
-                    fake_eos,
-                    &operation,
-                    session,
-                    &input_products,
-                )?;
-                if operation.advances_state && completion.status == OpStatus::Ok {
-                    session.point_index = completion.selected_point;
-                }
-                session.terminal.insert(
-                    operation.op_id.0,
-                    RecordedCompletion {
-                        operation,
-                        completion: completion.clone(),
-                        products: op_products.clone(),
-                    },
-                );
-                completions.push(completion);
-                products.extend(op_products);
             }
-            partition_reports.push(PartitionCompletion {
-                partition_id: partition.partition_id,
-                completions,
-                products,
-                registration: RegistrationAck { visible: true },
-                worker_exec_us: None,
-                forward_stats: None,
-            });
+
+            let (completion, op_products) = Self::execute_operation(
+                vocab,
+                text_len,
+                fake_eos,
+                &operation,
+                request,
+                &input_products,
+            )?;
+            if operation.advances_state() && completion.status == OpStatus::Ok {
+                request.point_index = completion.selected_point;
+            }
+            request.terminal.insert(
+                operation.op_id.0,
+                RecordedCompletion {
+                    operation,
+                    completion: completion.clone(),
+                    products: op_products.clone(),
+                },
+            );
+            completions.push(completion);
+            products.extend(op_products);
         }
-        Ok(CompletionReport {
-            step_id,
-            partitions: partition_reports,
-        })
+        let report = RunResult {
+            batch_id,
+            run_id,
+            completions,
+            products,
+            registration: RegistrationAck { visible: true },
+            worker_exec_us: None,
+            forward_stats: None,
+            done: true,
+        };
+        for request_id in closed {
+            self.drop_request(request_id)?;
+        }
+        Ok(report)
     }
 
-    fn drop_session(&mut self, session_id: RequestId) -> anyhow::Result<()> {
-        self.sessions.remove(&session_id);
+    fn drop_request(&mut self, request_id: RequestId) -> anyhow::Result<()> {
+        self.requests.remove(&request_id);
         Ok(())
     }
 }
@@ -1071,8 +1019,8 @@ impl SimEngine {
 mod tests {
     use super::*;
     use uniserve_worker_ipc::{
-        AttentionRegime, BatchPartition, Bounds, DType, Domain, OpId, PointRange, ProductRef,
-        RequestKey, RouteId, ShapeBound, StorageClass, UndAdmission, VersionRef,
+        ArRequestParams, Bounds, Checkpoint, DType, OpId, OpPayload, PointRange, ProductRef,
+        RequestKey, ShapeBound, StorageClass,
     };
 
     fn request_key() -> RequestKey {
@@ -1083,7 +1031,7 @@ mod tests {
         NewRequest::new(
             request_key(),
             1,
-            Some(UndAdmission {
+            Some(ArRequestParams {
                 sampling: SamplingParams::default(),
                 negative_token_ids: Vec::new(),
                 finish_token_ids: Vec::new(),
@@ -1118,49 +1066,31 @@ mod tests {
         .collect()
     }
 
-    fn batch(step_id: u64, op_id: u64) -> Batch {
+    fn batch(run_id: u64, op_id: u64) -> PhysicalRun {
         let request_key = request_key();
         let admission = admission();
-        let parent = VersionRef::admission_root(request_key, OpId(1));
+        let parent = Checkpoint::admission_root(OpId(1));
         let operation = Operation {
             request_key,
             op_id: OpId(op_id),
             parent,
-            work: ForwardMode::TokenExtend,
-            route: RouteId(0),
-            domain: Domain::Prefill,
-            advances_state: false,
-            bounds: Bounds {
-                max_points: 1,
-                max_tokens: 2,
-                ..Bounds::default()
-            },
-            inputs: Vec::new(),
-            outputs: token_outputs(OpId(op_id)),
-            predicate: None,
-            rng: None,
-            control_seq: 0,
+            kind: RunKind::ArExtend,
+            payload: OpPayload::new(
+                RunKind::ArExtend,
+                Bounds {
+                    max_points: 1,
+                    max_tokens: 2,
+                    ..Bounds::default()
+                },
+                Vec::new(),
+                token_outputs(OpId(op_id)),
+                None,
+                None,
+                0,
+            ),
         }
         .sealed();
-        Batch::new(
-            step_id,
-            vec![admission],
-            vec![BatchPartition {
-                partition_id: 1,
-                submission_group: 1,
-                collective_seq: step_id.max(1),
-                domain: Domain::Prefill,
-                route: RouteId(0),
-                attention: AttentionRegime::Causal,
-                shape_class: 0,
-                operations: vec![operation],
-                block_tables: Vec::new(),
-                new_cache_pages: Vec::new(),
-                forward_rows: Vec::new(),
-                latent_placements: Vec::new(),
-                reconstruction_placements: Vec::new(),
-            }],
-        )
+        PhysicalRun::new(run_id, vec![admission], vec![operation])
     }
 
     #[test]
@@ -1168,27 +1098,27 @@ mod tests {
         let mut engine = SimEngine::new();
         let first = engine.execute(batch(4, 17)).expect("first execution");
         let replay = engine.execute(batch(5, 17)).expect("replay execution");
-        assert_eq!(first.partitions, replay.partitions);
+        assert_eq!(first.completions, replay.completions);
     }
 
     #[test]
     fn extend_commits_the_greedy_synthetic_token() {
-        // The synthetic distribution's natural token for session 9 at index 0 is
+        // The synthetic distribution's natural token for request 9 at index 0 is
         // `1000 + (9*7 + 0) % 5000 = 1063`; greedy default sampling commits it.
         let mut engine = SimEngine::new();
         let report = engine.execute(batch(1, 3)).expect("execution");
         let completion = report.completions().next().unwrap();
         assert_eq!(report.completions().count(), 1);
-        assert_eq!(completion.committed_tokens, vec![1063]);
+        assert_eq!(completion.committed_tokens(), vec![1063]);
         assert_eq!(completion.selected_point, 1);
-        assert!(report.partitions[0].registration.visible);
+        assert!(report.registration.visible);
     }
 
     #[test]
     fn default_limits_admit_public_image_geometry() {
         let engine = SimEngine::new();
         let info = engine.info();
-        let latent_units = (2_048 / info.latent_downsample) * (1_152 / info.latent_downsample);
-        assert!(u64::from(latent_units) <= info.latent_capacity_units());
+        let latent_units = (2_048_u64 / 16) * (1_152_u64 / 16);
+        assert!(latent_units <= info.latent_capacity_units());
     }
 }

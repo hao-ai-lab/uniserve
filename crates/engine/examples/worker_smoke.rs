@@ -2,14 +2,14 @@
 //! and drive a few requests through the scheduler over the shared-memory ring.
 use std::collections::HashMap;
 
-use uniserve_core::GenerationEvent;
+use uniserve_core::Event;
 use uniserve_core::{
     ContextSegment, GenerationBehaviorDescriptor, GenerationConstraint, GenerationPolicyDescriptor,
     GenerationRequest, GenerationResourceBounds, ImageParams, RequestId, SamplingParams,
     TriggerPolicyDescriptor, UndVisibility,
 };
 use uniserve_engine::{
-    AttentionBackend, ControlTokens, Executor, Scheduler, TransferBackend, UniprocExecutor,
+    AttentionBackend, ControlTokens, EngineLoop, Executor, TransferBackend, UniprocExecutor,
     WorkerProcessArgs,
 };
 
@@ -35,7 +35,7 @@ fn main() -> anyhow::Result<()> {
         max_batch_operations: 32,
         max_batch_tokens: 8192,
         attention_backend: AttentionBackend::Auto,
-        worker_role: None,
+        supported_ops: uniserve_worker_ipc::OpKind::ALL.to_vec(),
         transfer_backend: TransferBackend::Inproc,
         ..worker_config
     })?;
@@ -44,7 +44,7 @@ fn main() -> anyhow::Result<()> {
     let ctrl = ControlTokens {
         ..ControlTokens::default()
     };
-    let mut sched = Scheduler::new(Box::new(engine), ctrl, 32);
+    let mut sched = EngineLoop::new(Box::new(engine), ctrl, 32);
 
     let mut rxs: HashMap<RequestId, (&str, uniserve_engine::EventRx)> = HashMap::new();
     // we drive step directly here instead of the run thread
@@ -69,9 +69,9 @@ fn main() -> anyhow::Result<()> {
         while let Ok(ev) = rx.try_recv() {
             let e = counts.entry(*id).or_insert((0, 0, false));
             match ev {
-                GenerationEvent::TextToken { .. } => e.0 += 1,
-                GenerationEvent::ImageDone { .. } => e.1 += 1,
-                GenerationEvent::Finished { .. } => e.2 = true,
+                Event::TextToken { .. } => e.0 += 1,
+                Event::ImageDone { .. } => e.1 += 1,
+                Event::Finished { .. } => e.2 = true,
                 _ => {}
             }
         }

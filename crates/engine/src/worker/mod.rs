@@ -25,7 +25,7 @@ pub struct WorkerProcessArgs {
     pub max_batch_operations: u32,
     pub max_batch_tokens: u32,
     pub attention_backend: uniserve_worker_ipc::AttentionBackend,
-    pub worker_role: Option<crate::executor::WorkerRole>,
+    pub supported_ops: Vec<uniserve_worker_ipc::OpKind>,
     pub transfer_backend: crate::executor::TransferBackend,
     pub stub: bool,
     pub load_format: String,

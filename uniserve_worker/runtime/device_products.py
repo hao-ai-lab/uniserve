@@ -13,6 +13,8 @@ from typing import Final, cast
 import torch
 
 from ..execution.batch import (
+    BufferId,
+    BufferPlacement,
     DType,
     ProductKind,
     ProductRef,
@@ -23,6 +25,7 @@ from ..execution.batch import (
 from ..foundation.errors import WorkerError, WorkerErrorCode, invalid_descriptor, resource_error
 from .device import canonical_device
 from .device_events import DeviceEventPool
+from .persistent_buffers import PersistentBufferBinding, PersistentBuffers
 
 _MAX_GENERATION: Final[int] = (1 << 32) - 1
 _DEVICE_DTYPES: Final[dict[DType, torch.dtype]] = {
@@ -102,7 +105,7 @@ def _reference_key(reference: ProductRef) -> _ReferenceKey:
     key = reference.request_key
     return (
         int(key.authority_id),
-        int(key.session_id),
+        int(key.request_id),
         int(key.epoch),
         int(reference.producer_op_id),
         int(reference.output_index),
@@ -154,6 +157,7 @@ class _DeviceSlot:
     shape: tuple[int, ...] | None = None
     dtype: torch.dtype | None = None
     relay_lane: tuple[str, int, RequestKey, int, int] | None = None
+    persistent_buffer: PersistentBufferBinding | None = None
 
 
 class ImageRange(StrEnum):
@@ -172,14 +176,6 @@ class DeviceProductMetadata:
             raise ValueError("device-product image geometry must be non-negative")
         if (self.height == 0) != (self.width == 0):
             raise ValueError("device-product image geometry must be complete")
-
-
-@dataclass(frozen=True, slots=True)
-class DeviceProductSnapshot:
-    reference: ProductRef
-    value: torch.Tensor
-    device: str
-    metadata: DeviceProductMetadata | None
 
 
 @dataclass(slots=True)
@@ -264,6 +260,7 @@ class DeviceProducts:
         byte_capacity: int,
         request_capacity: int = 0,
         relay_depth: int = 0,
+        persistent_buffers: PersistentBuffers,
         event_pool: DeviceEventPool | None = None,
     ) -> None:
         self.capacity = max(1, int(capacity))
@@ -272,6 +269,7 @@ class DeviceProducts:
             raise ValueError("device-product byte capacity must be positive")
         self.request_capacity = int(request_capacity)
         self.relay_depth = int(relay_depth)
+        self.persistent_buffers = persistent_buffers
         if (self.request_capacity == 0) != (self.relay_depth == 0):
             raise ValueError("request-relay geometry must be complete")
         if self.request_capacity < 0 or self.relay_depth < 0:
@@ -351,7 +349,12 @@ class DeviceProducts:
 
     @staticmethod
     def _slot_bytes(slot: _DeviceSlot) -> int:
-        if slot.tensor is None or slot.shape is None or math.prod(slot.shape) == 1:
+        if (
+            slot.persistent_buffer is not None
+            or slot.tensor is None
+            or slot.shape is None
+            or math.prod(slot.shape) == 1
+        ):
             return 0
         return int(slot.tensor.numel()) * int(slot.tensor.element_size())
 
@@ -366,67 +369,20 @@ class DeviceProducts:
         bindings: tuple[tuple[ProductRef, torch.device | str], ...],
         *,
         request_slots: Mapping[RequestKey, int] | None = None,
+        buffer_placements: Mapping[BufferId, BufferPlacement] | None = None,
     ) -> tuple[DeviceProductWrite, ...]:
-        return self.bind_output_batch(bindings, request_slots=request_slots).writes
-
-    def snapshot_entries(self, session_ids: set[int]) -> tuple[DeviceProductSnapshot, ...]:
-        selected = {int(value) for value in session_ids}
-        with self._lock:
-            snapshots: list[DeviceProductSnapshot] = []
-            for entry in self._entries.values():
-                if (
-                    int(entry.reference.request_key.session_id) not in selected
-                    or entry.reference.storage_class is StorageClass.REQUEST_RELAY
-                    or entry.released
-                    or not entry.producer_recorded
-                ):
-                    continue
-                storage = entry.slot.tensor
-                if storage is None:
-                    raise _invariant("published device product has no physical tensor")
-                value = (
-                    storage
-                    if entry.actual_shape == entry.slot.shape
-                    else storage.reshape(-1)[: entry.actual_extent].reshape(entry.actual_shape)
-                )
-                snapshots.append(
-                    DeviceProductSnapshot(
-                        reference=entry.reference,
-                        value=value.detach().cpu().contiguous(),
-                        device=entry.slot.device_name,
-                        metadata=entry.metadata,
-                    )
-                )
-            return tuple(snapshots)
-
-    def restore_entries(
-        self,
-        session_ids: set[int],
-        snapshots: tuple[DeviceProductSnapshot, ...],
-    ) -> None:
-        selected = {int(value) for value in session_ids}
-        if any(int(item.reference.request_key.session_id) not in selected for item in snapshots):
-            raise invalid_descriptor("device-product snapshot contains an undeclared session")
-        for session_id in selected:
-            self.drop_session(session_id)
-        batch = self.bind_output_batch(tuple((item.reference, item.device) for item in snapshots))
-        try:
-            for write, item in zip(batch.writes, snapshots, strict=True):
-                self.publish_write(
-                    write,
-                    item.value.to(write.slot.device_name),
-                    metadata=item.metadata,
-                )
-            self.commit_writes(batch.writes)
-        except BaseException:
-            self.abandon_writes(batch.writes)
-            raise
+        return self.bind_output_batch(
+            bindings,
+            request_slots=request_slots,
+            buffer_placements=buffer_placements,
+        ).writes
 
     def bind_output_batch(
         self,
         bindings: tuple[tuple[ProductRef, torch.device | str], ...],
         *,
         request_slots: Mapping[RequestKey, int] | None = None,
+        buffer_placements: Mapping[BufferId, BufferPlacement] | None = None,
     ) -> DeviceProductBindingBatch:
         """Atomically bind outputs and retain their direct scalar range."""
 
@@ -445,6 +401,20 @@ class DeviceProducts:
             if request_slots is None:
                 raise invalid_descriptor("request-relay binding has no stable request slot")
             return self._bind_relay_outputs(device_bindings, request_slots)
+        persistent = tuple(
+            reference.uses_persistent_buffer() for reference, _device in device_bindings
+        )
+        if any(persistent):
+            if not all(persistent):
+                raise invalid_descriptor(
+                    "persistent-buffer bindings cannot share a generic group"
+                )
+            if buffer_placements is None:
+                raise invalid_descriptor("persistent output has no buffer placement")
+            return self._bind_persistent_outputs(
+                device_bindings,
+                buffer_placements,
+            )
         first_reference, first_raw_device = device_bindings[0]
         first_device_object = _resolved_device(first_raw_device)
         first_shape = _device_shape(first_reference)
@@ -564,6 +534,94 @@ class DeviceProducts:
                 self._restore_planned_slots_locked(
                     slot for slot in planned_slots[len(writes) :] if slot is not None
                 )
+                raise
+            return DeviceProductBindingBatch(tuple(writes))
+
+    def _bind_persistent_outputs(
+        self,
+        bindings: tuple[tuple[ProductRef, torch.device | str], ...],
+        placements: Mapping[BufferId, BufferPlacement],
+    ) -> DeviceProductBindingBatch:
+        requested = tuple(
+            (
+                reference,
+                _resolved_device(device),
+                _device_shape(reference),
+                _device_dtype(reference.dtype),
+            )
+            for reference, device in bindings
+        )
+        keys = tuple(
+            _reference_key(reference)
+            for reference, _device, _shape, _dtype in requested
+        )
+        if len(set(keys)) != len(keys):
+            raise invalid_descriptor(
+                "persistent-buffer registration repeats an output identity"
+            )
+        with self._lock:
+            self._reclaim_ready_locked()
+            candidate_keys = {
+                _reference_key(candidate.reference)
+                for candidate in self._candidates.values()
+            }
+            for (reference, _device, _shape, _dtype), key in zip(
+                requested, keys, strict=True
+            ):
+                if key in self._entries or key in candidate_keys:
+                    raise invalid_descriptor("persistent output is already registered")
+                if reference.buffer_id not in placements:
+                    raise invalid_descriptor("persistent output has no buffer placement")
+            slots: list[_DeviceSlot] = []
+            reclaimed = False
+            try:
+                for _reference, device, _shape, _dtype in requested:
+                    device_name = str(device)
+                    available, reclaimed = self._plan_slots_locked(
+                        device_name,
+                        1,
+                        reclaimed=reclaimed,
+                    )
+                    slots.extend(available)
+            except BaseException:
+                self._restore_planned_slots_locked(slots)
+                raise
+            writes: list[DeviceProductWrite] = []
+            try:
+                for (reference, device, shape, dtype), slot in zip(
+                    requested, slots, strict=True
+                ):
+                    binding = self.persistent_buffers.bind(
+                        reference,
+                        placements[reference.buffer_id],
+                        device=device,
+                        dtype=dtype,
+                        shape=shape,
+                    )
+                    generation = slot.generation + 1
+                    slot.generation = 1 if generation > _MAX_GENERATION else generation
+                    slot.tensor = binding.tensor
+                    slot.shape = shape
+                    slot.dtype = dtype
+                    slot.persistent_buffer = binding
+                    write = DeviceProductWrite(
+                        reference=reference,
+                        slot=slot,
+                        physical_generation=slot.generation,
+                        binding_id=self._next_binding_id,
+                    )
+                    self._next_binding_id += 1
+                    slot.owner = write.binding_id
+                    self._occupied_slots[slot.device_name] = (
+                        self._occupied_slots.get(slot.device_name, 0) + 1
+                    )
+                    self._candidates[write.binding_id] = write
+                    writes.append(write)
+            except BaseException:
+                for write in reversed(writes):
+                    self._candidates.pop(write.binding_id, None)
+                    self._return_slot_locked(write.slot)
+                self._restore_planned_slots_locked(slots[len(writes) :])
                 raise
             return DeviceProductBindingBatch(tuple(writes))
 
@@ -765,6 +823,7 @@ class DeviceProducts:
         ],
         *,
         request_slots: Mapping[RequestKey, int] | None = None,
+        buffer_placements: Mapping[BufferId, BufferPlacement] | None = None,
     ) -> tuple[DeviceProductBindingBatch, ...]:
         """Atomically bind output groups while preserving direct producer ranges."""
 
@@ -774,7 +833,11 @@ class DeviceProducts:
                 for group in groups:
                     if group:
                         bindings.append(
-                            self.bind_output_batch(group, request_slots=request_slots)
+                            self.bind_output_batch(
+                                group,
+                                request_slots=request_slots,
+                                buffer_placements=buffer_placements,
+                            )
                         )
             except BaseException:
                 self.abandon_writes(
@@ -1247,7 +1310,7 @@ class DeviceProducts:
         consumer_op_id: int,
         device: torch.device | str | None = None,
     ) -> DeviceProductRead:
-        """Read one unpublished candidate inside its producing partition."""
+        """Read one unpublished candidate inside its producing lane."""
 
         with self._lock:
             entry = self._require_write_locked(write)
@@ -1586,7 +1649,7 @@ class DeviceProducts:
                 )
                 direct_key = (
                     int(request_key.authority_id),
-                    int(request_key.session_id),
+                    int(request_key.request_id),
                     int(request_key.epoch),
                     op_id,
                     0,
@@ -1621,16 +1684,16 @@ class DeviceProducts:
                 entry.released = True
             self._reclaim_ready_locked()
 
-    def drop_session(
+    def drop_request(
         self,
-        session_id: int,
+        request_id: int,
         *,
         retained_generations: frozenset[int] = frozenset(),
     ) -> None:
         with self._lock:
-            target_session_id = int(session_id)
+            target_request_id = int(request_id)
             for entry in self._entries.values():
-                if int(entry.reference.request_key.session_id) != target_session_id:
+                if int(entry.reference.request_key.request_id) != target_request_id:
                     continue
                 if int(entry.reference.generation) in retained_generations:
                     continue
@@ -1991,6 +2054,12 @@ class DeviceProducts:
                 raise _invariant("device-product occupancy underflow")
             self._occupied_slots[slot.device_name] = occupied - 1
         slot.owner = None
+        if slot.persistent_buffer is not None:
+            self.persistent_buffers.release(slot.persistent_buffer)
+            slot.persistent_buffer = None
+            slot.tensor = None
+            slot.shape = None
+            slot.dtype = None
         self._restore_planned_slots_locked((slot,))
 
     def _detach_write_locked(self, entry: DeviceProductWrite) -> None:
@@ -2199,7 +2268,6 @@ class DeviceProducts:
 
 __all__ = [
     "DeviceProductRead",
-    "DeviceProductSnapshot",
     "DeviceProducts",
     "DeviceProductScalarBatch",
     "DeviceProductBindingBatch",

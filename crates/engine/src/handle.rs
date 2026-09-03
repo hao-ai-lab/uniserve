@@ -2,7 +2,7 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 use tokio::sync::mpsc;
-use uniserve_core::{GenerationEvent, GenerationRequest, MediaEvent, MediaRequest, RequestId};
+use uniserve_core::{Event, Request, RequestId};
 
 /// Maximum number of canonical generation events buffered between one
 /// scheduler request and its immediate consumer.
@@ -11,17 +11,9 @@ pub const EVENT_BUFFER_CAPACITY: usize = 64;
 #[derive(Debug, thiserror::Error)]
 pub enum EventSendError {
     #[error("generation event channel is full")]
-    Full(Box<GenerationEvent>),
+    Full(Box<Event>),
     #[error("generation event channel is closed")]
-    Closed(Box<GenerationEvent>),
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum MediaEventSendError {
-    #[error("media event channel is full")]
-    Full(Box<MediaEvent>),
-    #[error("media event channel is closed")]
-    Closed(Box<MediaEvent>),
+    Closed(Box<Event>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -42,11 +34,11 @@ pub enum SubmitError {
 /// Bounded engine-to-caller event sender.
 #[derive(Clone)]
 pub struct EventTx {
-    inner: mpsc::Sender<GenerationEvent>,
+    inner: mpsc::Sender<Event>,
 }
 
 impl EventTx {
-    pub fn send(&self, event: GenerationEvent) -> Result<(), EventSendError> {
+    pub fn send(&self, event: Event) -> Result<(), EventSendError> {
         self.inner.try_send(event).map_err(|error| match error {
             mpsc::error::TrySendError::Full(event) => EventSendError::Full(Box::new(event)),
             mpsc::error::TrySendError::Closed(event) => EventSendError::Closed(Box::new(event)),
@@ -66,7 +58,7 @@ impl EventTx {
 /// the scheduler so an output-capacity-stalled lineage becomes runnable without
 /// polling.
 pub struct EventRx {
-    inner: mpsc::Receiver<GenerationEvent>,
+    inner: mpsc::Receiver<Event>,
     waker: uniserve_core::CommandWaker,
     cancellation: Option<EventCancellation>,
     text_tokens_received: usize,
@@ -81,7 +73,7 @@ struct EventCancellation {
 }
 
 impl EventRx {
-    pub fn from_receiver(inner: mpsc::Receiver<GenerationEvent>) -> Self {
+    pub fn from_receiver(inner: mpsc::Receiver<Event>) -> Self {
         Self {
             inner,
             waker: uniserve_core::CommandWaker::noop(),
@@ -96,7 +88,7 @@ impl EventRx {
         self.on_finish = Some(Box::new(on_finish));
     }
 
-    pub async fn recv(&mut self) -> Option<GenerationEvent> {
+    pub async fn recv(&mut self) -> Option<Event> {
         let event = self.inner.recv().await;
         match event.as_ref() {
             Some(event) => {
@@ -108,11 +100,11 @@ impl EventRx {
         event
     }
 
-    pub async fn next(&mut self) -> Option<GenerationEvent> {
+    pub async fn next(&mut self) -> Option<Event> {
         self.recv().await
     }
 
-    pub fn try_recv(&mut self) -> Result<GenerationEvent, mpsc::error::TryRecvError> {
+    pub fn try_recv(&mut self) -> Result<Event, mpsc::error::TryRecvError> {
         let event = self.inner.try_recv();
         if let Ok(event) = event.as_ref() {
             self.observe(event);
@@ -121,9 +113,9 @@ impl EventRx {
         event
     }
 
-    fn observe(&mut self, event: &GenerationEvent) {
+    fn observe(&mut self, event: &Event) {
         match event {
-            GenerationEvent::TextToken { .. } => {
+            Event::TextToken { .. } => {
                 self.text_tokens_received = self.text_tokens_received.saturating_add(1);
                 if self
                     .cancellation
@@ -134,12 +126,7 @@ impl EventRx {
                     self.acknowledge_consumed_prefix();
                 }
             }
-            GenerationEvent::Finished { .. }
-            | GenerationEvent::Rejected { .. }
-            | GenerationEvent::Error { .. }
-            | GenerationEvent::MediaCompleted { .. }
-            | GenerationEvent::MediaFailed { .. }
-            | GenerationEvent::MediaAborted => {
+            Event::Finished { .. } | Event::Rejected { .. } | Event::Error { .. } => {
                 self.finish();
             }
             _ => {}
@@ -157,6 +144,11 @@ impl EventRx {
             });
             self.acknowledged_token_count = self.text_tokens_received;
         }
+    }
+
+    /// Cancel the request at its last acknowledged public token prefix.
+    pub fn cancel(&mut self) {
+        self.cancel_at_consumed_prefix(StreamCancelCause::DroppedStream);
     }
 
     pub fn cancel_at_consumed_prefix(&mut self, cause: StreamCancelCause) {
@@ -221,92 +213,11 @@ fn event_channel_with_waker(
     )
 }
 
-#[derive(Clone)]
-pub struct MediaEventTx {
-    inner: mpsc::Sender<MediaEvent>,
-}
-
-impl MediaEventTx {
-    pub fn send(&self, event: MediaEvent) -> Result<(), MediaEventSendError> {
-        self.inner.try_send(event).map_err(|error| match error {
-            mpsc::error::TrySendError::Full(event) => MediaEventSendError::Full(Box::new(event)),
-            mpsc::error::TrySendError::Closed(event) => {
-                MediaEventSendError::Closed(Box::new(event))
-            }
-        })
-    }
-
-    pub fn is_closed(&self) -> bool {
-        self.inner.is_closed()
-    }
-}
-
-pub struct MediaEventRx {
-    inner: mpsc::Receiver<MediaEvent>,
-    waker: uniserve_core::CommandWaker,
-    cancellation: Option<EventCancellation>,
-    on_finish: Option<Box<dyn FnOnce() + Send + 'static>>,
-}
-
-impl MediaEventRx {
-    pub fn set_on_finish(&mut self, on_finish: impl FnOnce() + Send + 'static) {
-        self.on_finish = Some(Box::new(on_finish));
-    }
-
-    pub async fn recv(&mut self) -> Option<MediaEvent> {
-        let event = self.inner.recv().await;
-        if event.is_some() {
-            self.finish();
-            self.waker.wake();
-        }
-        event
-    }
-
-    pub async fn next(&mut self) -> Option<MediaEvent> {
-        self.recv().await
-    }
-
-    pub fn cancel(&mut self) {
-        if let Some(cancellation) = self.cancellation.take() {
-            let _ = cancellation.tx.send(Command::Cancel {
-                request_id: cancellation.request_id,
-                output_token_count: None,
-            });
-        }
-    }
-
-    fn finish(&mut self) {
-        self.cancellation = None;
-        if let Some(on_finish) = self.on_finish.take() {
-            on_finish();
-        }
-    }
-}
-
-impl Drop for MediaEventRx {
-    fn drop(&mut self) {
-        if let Some(cancellation) = self.cancellation.take() {
-            let _ = cancellation.tx.send(Command::Cancel {
-                request_id: cancellation.request_id,
-                output_token_count: None,
-            });
-        }
-        if let Some(on_finish) = self.on_finish.take() {
-            on_finish();
-        }
-        self.waker.wake();
-    }
-}
-
 /// Command sent from a frontend handler to the scheduler thread.
 pub enum Command {
     Submit {
-        request: Box<GenerationRequest>,
+        request: Request,
         event_tx: EventTx,
-    },
-    SubmitMedia {
-        request: MediaRequest,
-        event_tx: MediaEventTx,
     },
     /// Client-side cancel → `FinishReason::Cancelled`.
     Cancel {
@@ -369,9 +280,13 @@ impl EngineHandle {
         r
     }
 
-    pub fn submit(&self, request: GenerationRequest) -> Result<EventRx, SubmitError> {
-        let request_id = request.request_id;
-        let acknowledge_on_receive = request.stop_strings.is_empty();
+    pub fn submit(&self, request: impl Into<Request>) -> Result<EventRx, SubmitError> {
+        let request = request.into();
+        let request_id = request.request_id();
+        let acknowledge_on_receive = match &request {
+            Request::Ar(request) | Request::Umm(request) => request.stop_strings.is_empty(),
+            Request::Diffusion(_) => false,
+        };
         let (event_tx, event_rx) = event_channel_with_waker(
             self.waker.clone(),
             Some(EventCancellation {
@@ -380,32 +295,11 @@ impl EngineHandle {
                 acknowledge_on_receive,
             }),
         );
-        self.send(Command::Submit {
-            request: Box::new(request),
-            event_tx,
-        })
-        .map_err(|_| SubmitError::Closed)?;
-        Ok(event_rx)
-    }
-
-    pub fn submit_media(&self, request: MediaRequest) -> Result<MediaEventRx, SubmitError> {
-        let request_id = request.request_id;
-        let (tx, rx) = mpsc::channel(1);
-        let event_tx = MediaEventTx { inner: tx };
-        let event_rx = MediaEventRx {
-            inner: rx,
-            waker: self.waker.clone(),
-            cancellation: Some(EventCancellation {
-                tx: self.tx.clone(),
-                request_id,
-                acknowledge_on_receive: false,
-            }),
-            on_finish: None,
-        };
-        self.send(Command::SubmitMedia { request, event_tx })
+        self.send(Command::Submit { request, event_tx })
             .map_err(|_| SubmitError::Closed)?;
         Ok(event_rx)
     }
+
     pub fn cancel(&self, id: RequestId) {
         let _ = self.send(Command::Cancel {
             request_id: id,
@@ -444,8 +338,8 @@ mod tests {
     use uniserve_core::FinishReason;
     use uniserve_core::{
         ContextSegment, GenerationBehaviorDescriptor, GenerationConstraint,
-        GenerationPolicyDescriptor, GenerationResourceBounds, ImageParams, RequestId,
-        SamplingParams, UndVisibility,
+        GenerationPolicyDescriptor, GenerationRequest, GenerationResourceBounds, ImageParams,
+        RequestId, SamplingParams, UndVisibility,
     };
 
     use super::*;
@@ -509,7 +403,7 @@ mod tests {
 
         match rx.recv().unwrap() {
             Command::Submit { request, .. } => {
-                assert_eq!(request.request_id, RequestId(11));
+                assert_eq!(request.request_id(), RequestId(11));
             }
             _ => panic!("expected Submit command"),
         }
@@ -525,13 +419,13 @@ mod tests {
             _ => panic!("expected Submit command"),
         };
         event_tx
-            .send(GenerationEvent::TextToken {
+            .send(Event::TextToken {
                 id: 7,
                 logprob: None,
             })
             .unwrap();
         event_tx
-            .send(GenerationEvent::TextToken {
+            .send(Event::TextToken {
                 id: 8,
                 logprob: None,
             })
@@ -539,7 +433,7 @@ mod tests {
 
         assert!(matches!(
             events.try_recv(),
-            Ok(GenerationEvent::TextToken { id: 7, .. })
+            Ok(Event::TextToken { id: 7, .. })
         ));
         drop(events);
 
@@ -684,11 +578,11 @@ mod tests {
         assert_eq!(FinishReason::MaxTokens, FinishReason::MaxTokens);
     }
 
-    /// A `GenerationEvent::Finished` carries the finish reason and terminal token
+    /// A `Event::Finished` carries the finish reason and terminal token
     /// counts as its payload (the type is not `PartialEq`, so match on it).
     #[test]
     fn gen_event_finished_carries_reason_and_counts() {
-        let event = GenerationEvent::Finished {
+        let event = Event::Finished {
             reason: FinishReason::Stop,
             stop_reason: Some(uniserve_core::StopReason::String("</s>".to_string())),
             prompt_tokens: 4,
@@ -697,7 +591,7 @@ mod tests {
         };
 
         match event {
-            GenerationEvent::Finished {
+            Event::Finished {
                 reason,
                 stop_reason,
                 prompt_tokens,

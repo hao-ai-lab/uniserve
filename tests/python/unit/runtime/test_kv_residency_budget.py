@@ -5,7 +5,7 @@ from dataclasses import replace
 import pytest
 
 from tests.python.fixtures.model_execution import TEST_DEPLOYMENT
-from uniserve_worker.bootstrap.worker_info import build_worker_info
+from uniserve_worker.bootstrap.worker_info_builder import build_worker_info
 from uniserve_worker.models.runtime import CacheGeometry
 from uniserve_worker.models.stub import StubModel
 
@@ -51,4 +51,5 @@ def _deployment(*, token_capacity: int | None):
 def test_explicit_kv_capacity_provisions_one_physical_page_pool():
     info = build_worker_info(_model(), _deployment(token_capacity=131072))
 
-    assert info.num_blocks * BLOCK_SIZE == 131072
+    assert info.kv_cache is not None
+    assert info.kv_cache.num_blocks * BLOCK_SIZE == 131072

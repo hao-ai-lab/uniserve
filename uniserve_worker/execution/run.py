@@ -6,66 +6,68 @@ from collections import OrderedDict
 from collections.abc import Callable
 
 from ..foundation.errors import WorkerError, classify, invalid_descriptor
-from .batch import Batch, CompletionReport, PartitionCompletion
-from .output import _completion_payload_ready, _record_ready, finalize_completion_report
+from .batch import LaneResult, Run, RunResult, TransferHandle
+from .output import _completion_payload_ready, _record_ready, finalize_run_result
 from .rows import PreparedExecution
 
 _OperationKey = tuple[int, int, int]
 _EpochKey = tuple[int, int]
 
-__all__ = ["BatchReader", "BatchRun", "PartitionRun", "ReplayWindow"]
+__all__ = ["LaneRun", "RunReader", "WorkerRun", "ReplayWindow"]
 
 
 def _operation_key(operation: object) -> _OperationKey:
     request = getattr(operation, "request_key")
-    return (int(request.session_id), int(request.epoch), int(getattr(operation, "op_id")))
+    return (int(request.request_id), int(request.epoch), int(getattr(operation, "op_id")))
 
 
-def _batch_lineage(batch: Batch) -> tuple[frozenset[int], frozenset[_EpochKey]]:
+def _run_lineage(batch: Run) -> tuple[frozenset[int], frozenset[_EpochKey]]:
     request_keys = (
         *(admission.request_key for admission in batch.admissions),
         *(operation.request_key for operation in batch.operations),
-        *(control.request_key for control in batch.controls),
+        *(command.request_key for command in batch.commands),
     )
-    epochs = frozenset((int(key.session_id), int(key.epoch)) for key in request_keys)
-    return frozenset(session for session, _epoch in epochs), epochs
+    epochs = frozenset((int(key.request_id), int(key.epoch)) for key in request_keys)
+    return frozenset(request for request, _epoch in epochs), epochs
 
 
-def _validate_report(run: BatchRun, report: CompletionReport) -> None:
-    if int(report.step_id) != run.step_id:
-        raise invalid_descriptor("terminal report step identity does not match its submission")
-    if tuple(int(partition.partition_id) for partition in report.partitions) != run.partition_order:
-        raise invalid_descriptor("terminal report partition identity does not match its submission")
-    for partition, expected_keys in zip(
-        report.partitions, run.partition_operation_keys, strict=True
+def _validate_report(run: WorkerRun, report: RunResult) -> None:
+    if int(report.batch_id) != run.batch_id:
+        raise invalid_descriptor("result batch identity does not match its submission")
+    if int(report.run_id) != run.run_id:
+        raise invalid_descriptor("result run identity does not match its submission")
+    if tuple(int(lane.lane_id) for lane in report.lanes) != run.lane_order:
+        raise invalid_descriptor("terminal report lane identity does not match its submission")
+    for lane, expected_keys in zip(
+        report.lanes, run.lane_operation_keys, strict=True
     ):
         actual_keys = tuple(
             (
-                int(record.request_key.session_id),
+                int(record.request_key.request_id),
                 int(record.request_key.epoch),
                 int(record.op_id),
             )
-            for record in partition.completions
+            for record in lane.completions
         )
         if actual_keys != expected_keys:
-            raise invalid_descriptor("terminal report operations do not align with their partition")
+            raise invalid_descriptor("terminal report operations do not align with their lane")
         expected = set(expected_keys)
-        for product in partition.products:
+        for product in lane.products:
             reference = product.product
             key = (
-                int(reference.request_key.session_id),
+                int(reference.request_key.request_id),
                 int(reference.request_key.epoch),
                 int(reference.producer_op_id),
             )
             if key not in expected:
-                raise invalid_descriptor("terminal product does not belong to its completion partition")
+                raise invalid_descriptor("terminal product does not belong to its completion lane")
 
 
-class PartitionRun:
-    """One partition from device launch through immutable host publication."""
+class LaneRun:
+    """One lane from device launch through immutable host publication."""
 
     __slots__ = (
-        "partition_id",
+        "lane_id",
         "state",
         "result",
         "_raw",
@@ -73,20 +75,20 @@ class PartitionRun:
         "_product_cursor",
     )
 
-    def __init__(self, partition_id: int) -> None:
-        self.partition_id = int(partition_id)
+    def __init__(self, lane_id: int) -> None:
+        self.lane_id = int(lane_id)
         self.state = "PREPARED"
-        self.result: PartitionCompletion | None = None
-        self._raw: PartitionCompletion | None = None
+        self.result: LaneResult | None = None
+        self._raw: LaneResult | None = None
         self._record_cursor = 0
         self._product_cursor = 0
 
-    def launch(self, partition: PartitionCompletion) -> None:
+    def launch(self, lane: LaneResult) -> None:
         if self.state != "PREPARED" or self._raw is not None:
-            raise RuntimeError("partition execution source was bound more than once")
-        if int(partition.partition_id) != self.partition_id:
-            raise RuntimeError("partition execution source has the wrong identity")
-        self._raw = partition
+            raise RuntimeError("lane execution source was bound more than once")
+        if int(lane.lane_id) != self.lane_id:
+            raise RuntimeError("lane execution source has the wrong identity")
+        self._raw = lane
         self.state = "LAUNCHED"
 
     def device_ready(self) -> bool:
@@ -113,28 +115,31 @@ class PartitionRun:
         publication = None if raw is None else raw.publication
         return publication is not None and publication.successors_ready
 
-    def finish(self, step_id: int) -> bool:
+    def finish(self, batch_id: int, run_id: int) -> bool:
         if self.result is not None:
             return True
         if not self.device_ready():
             return False
         raw = self._raw
         if raw is None:
-            raise RuntimeError("ready partition lost its execution source")
-        report = finalize_completion_report(
-            CompletionReport(step_id=int(step_id), partitions=(raw,))
+            raise RuntimeError("ready lane lost its execution source")
+        report = finalize_run_result(
+            RunResult(batch_id=int(batch_id), run_id=int(run_id), lanes=(raw,), done=True)
         )
-        if len(report.partitions) != 1:
-            raise RuntimeError("completion materialization changed partition cardinality")
-        result = report.partitions[0]
+        if len(report.lanes) != 1:
+            raise RuntimeError("completion materialization changed lane cardinality")
+        result = report.lanes[0]
         if any(
             type(token) is not int
             for record in result.completions
             for token in record.committed_tokens
         ):
             raise RuntimeError("materialized completion carries an unresolved committed token")
-        if any(type(product.payload) is not bytes for product in result.products):
-            raise RuntimeError("materialized completion contains a non-byte product payload")
+        if any(
+            not isinstance(product.payload, (bytes, TransferHandle))
+            for product in result.products
+        ):
+            raise RuntimeError("materialized completion contains an unresolved product payload")
         self.result = result
         self._raw = None
         self.state = "FINISHED"
@@ -150,17 +155,18 @@ class PartitionRun:
             self.state = "ABORTED"
 
 
-class BatchRun:
-    """One exact-once batch lifecycle retained through replay eviction."""
+class WorkerRun:
+    """One exact-once physical run retained through replay eviction."""
 
     __slots__ = (
-        "step_id",
-        "batch",
-        "session_ids",
+        "batch_id",
+        "run_id",
+        "run",
+        "request_ids",
         "epochs",
-        "partition_order",
-        "partition_operation_keys",
-        "partitions",
+        "lane_order",
+        "lane_operation_keys",
+        "lanes",
         "weight",
         "state",
         "error",
@@ -176,29 +182,30 @@ class BatchRun:
 
     def __init__(
         self,
-        batch: Batch,
+        run: Run,
         *,
-        on_successors_ready: Callable[[BatchRun], None],
-        on_ready: Callable[[BatchRun], None],
-        on_terminal: Callable[[BatchRun], None],
+        on_successors_ready: Callable[[WorkerRun], None],
+        on_ready: Callable[[WorkerRun], None],
+        on_terminal: Callable[[WorkerRun], None],
     ) -> None:
-        sessions, epochs = _batch_lineage(batch)
-        self.step_id = int(batch.step_id)
-        self.batch = batch
-        self.session_ids = sessions
+        requests, epochs = _run_lineage(run)
+        self.batch_id = int(run.batch_id)
+        self.run_id = int(run.run_id)
+        self.run = run
+        self.request_ids = requests
         self.epochs = epochs
-        self.partition_order = tuple(int(partition.partition_id) for partition in batch.partitions)
-        self.partition_operation_keys = tuple(
-            tuple(_operation_key(operation) for operation in partition.operations)
-            for partition in batch.partitions
+        self.lane_order = tuple(int(lane.lane_id) for lane in run.lanes)
+        self.lane_operation_keys = tuple(
+            tuple(_operation_key(operation) for operation in lane.operations)
+            for lane in run.lanes
         )
-        self.partitions = tuple(PartitionRun(value) for value in self.partition_order)
-        self.weight = max(1, len(batch.operations))
+        self.lanes = tuple(LaneRun(value) for value in self.lane_order)
+        self.weight = max(1, len(run.operations))
         self.state = "QUEUED"
         self.error: WorkerError | None = None
-        self.report: CompletionReport | None = None
+        self.report: RunResult | None = None
         self.active_readers = 0
-        self._source: CompletionReport | PreparedExecution | None = None
+        self._source: RunResult | PreparedExecution | None = None
         self._on_successors_ready = on_successors_ready
         self._on_ready = on_ready
         self._on_terminal = on_terminal
@@ -210,12 +217,12 @@ class BatchRun:
         return self.state == "TERMINAL"
 
     @property
-    def source(self) -> CompletionReport | PreparedExecution | None:
+    def source(self) -> RunResult | PreparedExecution | None:
         return self._source
 
-    def attach(self, source: CompletionReport | PreparedExecution) -> None:
+    def attach(self, source: RunResult | PreparedExecution) -> None:
         if self.state != "QUEUED" or self._source is not None:
-            raise RuntimeError("batch run already has an execution source")
+            raise RuntimeError("run already has an execution source")
         self._source = source
         self.state = "RUNNING"
 
@@ -230,37 +237,39 @@ class BatchRun:
             if isinstance(source, PreparedExecution)
             else classify(error, context=context)
         )
-        for partition in self.partitions:
-            partition.abort()
+        for lane in self.lanes:
+            lane.abort()
         self._source = None
         self.state = "TERMINAL"
         self._notify_terminal()
 
     def advance_execution(self) -> bool:
         if self.complete or (
-            self.partitions
-            and all(partition.state != "PREPARED" for partition in self.partitions)
+            self.lanes
+            and all(lane.state != "PREPARED" for lane in self.lanes)
         ):
             return True
         source = self._source
         if source is None:
             return False
         try:
-            if isinstance(source, CompletionReport):
+            if isinstance(source, RunResult):
                 report = source
             else:
                 if not source.ready():
                     return False
                 report = source.resolve()
             _validate_report(self, report)
-            for partition, raw in zip(self.partitions, report.partitions, strict=True):
-                partition.launch(raw)
+            for lane, raw in zip(self.lanes, report.lanes, strict=True):
+                lane.launch(raw)
             self._source = None
             self.state = "FINISHING"
-            if all(partition.successors_ready for partition in self.partitions):
+            if all(lane.successors_ready for lane in self.lanes):
                 self._notify_successors_ready()
-            if not self.partitions:
-                self.report = CompletionReport(step_id=self.step_id, partitions=())
+            if not self.lanes:
+                self.report = RunResult(
+                    batch_id=self.batch_id, run_id=self.run_id, lanes=(), done=True
+                )
                 self.state = "TERMINAL"
                 self._notify_terminal()
             return True
@@ -272,18 +281,20 @@ class BatchRun:
         if self.complete or not self.advance_execution() or self.complete:
             return
         try:
-            published = len(self.published_partitions())
-            for partition in self.partitions:
-                partition.finish(self.step_id)
-            if len(self.published_partitions()) != published:
+            published = len(self.published_lanes())
+            for lane in self.lanes:
+                lane.finish(self.batch_id, self.run_id)
+            if len(self.published_lanes()) != published:
                 self._on_ready(self)
-            if any(partition.result is None for partition in self.partitions):
+            if any(lane.result is None for lane in self.lanes):
                 return
-            report = CompletionReport(
-                step_id=self.step_id,
-                partitions=tuple(
-                    partition.result for partition in self.partitions if partition.result is not None
+            report = RunResult(
+                batch_id=self.batch_id,
+                run_id=self.run_id,
+                lanes=tuple(
+                    lane.result for lane in self.lanes if lane.result is not None
                 ),
+                done=True,
             )
             _validate_report(self, report)
             self.report = report
@@ -292,10 +303,10 @@ class BatchRun:
         except BaseException as error:
             self.fail(error, context="completion materialization")
 
-    def published_partitions(self) -> tuple[PartitionCompletion, ...]:
+    def published_lanes(self) -> tuple[LaneResult, ...]:
         if self.report is not None:
-            return self.report.partitions
-        return tuple(partition.result for partition in self.partitions if partition.result is not None)
+            return self.report.lanes
+        return tuple(lane.result for lane in self.lanes if lane.result is not None)
 
     def _notify_terminal(self) -> None:
         if self._terminal_notified:
@@ -310,12 +321,12 @@ class BatchRun:
         self._on_successors_ready(self)
 
 
-class BatchReader:
-    """Independent wire cursor over the immutable results of one batch run."""
+class RunReader:
+    """Independent wire cursor over the immutable results of one physical run."""
 
     __slots__ = ("run", "_sent", "_empty_sent", "_error_sent", "_closed", "_on_close")
 
-    def __init__(self, run: BatchRun, on_close: Callable[[BatchReader], None]) -> None:
+    def __init__(self, run: WorkerRun, on_close: Callable[[RunReader], None]) -> None:
         self.run = run
         self._sent: set[int] = set()
         self._empty_sent = False
@@ -324,12 +335,12 @@ class BatchReader:
         self._on_close = on_close
 
     @property
-    def step_id(self) -> int:
-        return self.run.step_id
+    def run_id(self) -> int:
+        return self.run.run_id
 
     @property
-    def session_ids(self) -> frozenset[int]:
-        return self.run.session_ids
+    def request_ids(self) -> frozenset[int]:
+        return self.run.request_ids
 
     @property
     def error(self) -> WorkerError | None:
@@ -344,33 +355,41 @@ class BatchReader:
         if self.run.error is not None:
             return not self._error_sent
         if any(
-            int(partition.partition_id) not in self._sent
-            for partition in self.run.published_partitions()
+            int(lane.lane_id) not in self._sent
+            for lane in self.run.published_lanes()
         ):
             return True
-        return bool(self.run.complete and not self.run.partition_order and not self._empty_sent)
+        return bool(self.run.complete and not self.run.lane_order and not self._empty_sent)
 
-    def take_ready(self) -> CompletionReport:
+    def take_ready(self) -> RunResult:
         self.run.advance()
         if self.run.error is not None:
             raise RuntimeError("terminal error must be consumed through take_error")
-        partitions = tuple(
-            partition
-            for partition in self.run.published_partitions()
-            if int(partition.partition_id) not in self._sent
+        lanes = tuple(
+            lane
+            for lane in self.run.published_lanes()
+            if int(lane.lane_id) not in self._sent
         )
-        if partitions:
-            self._sent.update(int(partition.partition_id) for partition in partitions)
-            return CompletionReport(step_id=self.run.step_id, partitions=partitions)
-        if self.run.complete and not self.run.partition_order and not self._empty_sent:
+        if lanes:
+            self._sent.update(int(lane.lane_id) for lane in lanes)
+            done = self.run.complete and len(self._sent) == len(self.run.lane_order)
+            return RunResult(
+                batch_id=self.run.batch_id,
+                run_id=self.run.run_id,
+                lanes=lanes,
+                done=done,
+            )
+        if self.run.complete and not self.run.lane_order and not self._empty_sent:
             self._empty_sent = True
-            return CompletionReport(step_id=self.run.step_id, partitions=())
-        raise RuntimeError("batch reader has no query-ready partition")
+            return RunResult(
+                batch_id=self.run.batch_id, run_id=self.run.run_id, lanes=(), done=True
+            )
+        raise RuntimeError("run reader has no query-ready lane")
 
     def take_error(self) -> WorkerError:
         error = self.run.error
         if error is None or self._error_sent:
-            raise RuntimeError("batch reader has no unread terminal error")
+            raise RuntimeError("run reader has no unread terminal error")
         self._error_sent = True
         return error
 
@@ -379,11 +398,11 @@ class BatchReader:
             return not self._error_sent
         if not self.run.complete:
             return True
-        if not self.run.partition_order:
+        if not self.run.lane_order:
             return not self._empty_sent
         return any(
-            int(partition.partition_id) not in self._sent
-            for partition in self.run.published_partitions()
+            int(lane.lane_id) not in self._sent
+            for lane in self.run.published_lanes()
         )
 
     def close(self) -> None:
@@ -406,31 +425,31 @@ class ReplayWindow:
         self.capacity = int(capacity)
         if self.capacity < 1:
             raise ValueError("replay window capacity must be positive")
-        self._runs: OrderedDict[int, BatchRun] = OrderedDict()
+        self._runs: OrderedDict[int, WorkerRun] = OrderedDict()
         self._weight = 0
 
-    def take(self, step_id: int) -> BatchRun | None:
-        run = self._runs.pop(int(step_id), None)
+    def take(self, run_id: int) -> WorkerRun | None:
+        run = self._runs.pop(int(run_id), None)
         if run is not None:
             self._weight -= run.weight
         return run
 
-    def touch(self, step_id: int) -> None:
-        if int(step_id) in self._runs:
-            self._runs.move_to_end(int(step_id))
+    def touch(self, run_id: int) -> None:
+        if int(run_id) in self._runs:
+            self._runs.move_to_end(int(run_id))
 
-    def put(self, run: BatchRun) -> tuple[BatchRun, ...]:
-        prior = self._runs.pop(run.step_id, None)
+    def put(self, run: WorkerRun) -> tuple[WorkerRun, ...]:
+        prior = self._runs.pop(run.run_id, None)
         if prior is not None:
             self._weight -= prior.weight
-        self._runs[run.step_id] = run
+        self._runs[run.run_id] = run
         self._weight += run.weight
-        evicted: list[BatchRun] = []
+        evicted: list[WorkerRun] = []
         while self._weight > self.capacity:
-            _step_id, victim = self._runs.popitem(last=False)
+            _run_id, victim = self._runs.popitem(last=False)
             self._weight -= victim.weight
             evicted.append(victim)
         return tuple(evicted)
 
-    def remove(self, step_id: int) -> BatchRun | None:
-        return self.take(step_id)
+    def remove(self, run_id: int) -> WorkerRun | None:
+        return self.take(run_id)

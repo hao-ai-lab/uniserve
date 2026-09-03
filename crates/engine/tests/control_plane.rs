@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 //! Full-stack GPU-free control-plane integration tests: drive the
-//! real `Scheduler` over a `LocalExecutor`+`SimEngine` and assert the lifecycle/event
+//! real `EngineLoop` over a `LocalExecutor`+`SimEngine` and assert the lifecycle/event
 //! behavior. This is the regression harness every workstream relies on.
 
 use std::collections::HashMap;
@@ -16,10 +16,10 @@ use uniserve_core::{
     ImageKvEffect, ImageParams, ImageSegment, RequestId, SamplingParams, SegmentPlacement,
     TriggerPolicyDescriptor, UndVisibility,
 };
-use uniserve_core::{FinishReason, GenerationEvent};
+use uniserve_core::{Event, FinishReason};
 use uniserve_engine::{
-    ControlTokens, EngineHandle, Executor, MultiprocExecutor, Scheduler, SchedulingPolicy,
-    SimEngine, SimExecutor,
+    ControlTokens, EngineHandle, EngineLoop, Executor, MultiprocExecutor, PhysicalExecutor,
+    SchedulingPolicy, SimEngine, SimExecutor,
 };
 
 fn ctrl() -> ControlTokens {
@@ -91,12 +91,12 @@ fn generation_request(
         features: uniserve_core::GenerationFeatures::UNDERSTANDING
             | uniserve_core::GenerationFeatures::VISION_ENCODE
             | uniserve_core::GenerationFeatures::IMAGE_GENERATION,
-        max_latent_units: 1_024,
+        max_latent_units: 65_536,
         latent_downsample: 16,
-        max_vae_grid_tokens: 1_024,
-        max_vit_grid_tokens: 64,
-        max_latent_feature_bytes: 1 << 20,
-        max_vision_feature_bytes: 1 << 20,
+        max_vae_grid_tokens: 65_536,
+        max_vit_grid_tokens: 8_192,
+        max_latent_feature_bytes: 256 << 20,
+        max_vision_feature_bytes: 256 << 20,
         commit_marker_tokens: 2,
         max_cfg_branches: 3,
         encoder_cache_entries: 256,
@@ -158,7 +158,7 @@ fn run_requests(
     let mut sim = SimEngine::new();
     sim.set_pipeline_depth(depth);
     let executor = Box::new(SimExecutor::new(sim));
-    let sched = Scheduler::with_policy(executor, ctrl(), 32, policy);
+    let sched = EngineLoop::with_policy(executor, ctrl(), 32, policy);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -198,9 +198,9 @@ fn run_requests(
                     reason: None,
                 });
                 match ev {
-                    GenerationEvent::TextToken { .. } => c.text += 1,
-                    GenerationEvent::ImageDone { .. } => c.images += 1,
-                    GenerationEvent::Finished { reason, .. } if !c.finished => {
+                    Event::TextToken { .. } => c.text += 1,
+                    Event::ImageDone { .. } => c.images += 1,
+                    Event::Finished { reason, .. } if !c.finished => {
                         c.finished = true;
                         c.reason = Some(reason);
                         done += 1;
@@ -239,16 +239,13 @@ fn text_and_image_requests_complete() {
 
 #[test]
 fn cancellation_releases_latent_admission_for_a_waiting_image() {
-    use uniserve_worker_ipc::ResourceClass;
-
     let mut sim = SimEngine::new();
     sim.set_pipeline_depth(4);
-    sim.mut_info_for_test().resource_classes = vec![ResourceClass::ImageLatent];
     sim.mut_info_for_test().latent_page_units = 64;
-    sim.mut_info_for_test().num_latent_pages = 17;
-    sim.mut_info_for_test().latent_downsample = 16;
-    sim.mut_info_for_test().max_batch_operations = 1024;
-    let scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
+    sim.mut_info_for_test().latent_pages = 65;
+    sim.mut_info_for_test().buffer_pool_bytes = 16 << 20;
+    sim.mut_info_for_test().max_batch_ops = 1024;
+    let scheduler = EngineLoop::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let thread = thread::spawn(move || scheduler.run(rx));
@@ -270,7 +267,7 @@ fn cancellation_releases_latent_admission_for_a_waiting_image() {
     let mut began = false;
     while !began && Instant::now() < begin_deadline {
         match first.try_recv() {
-            Ok(GenerationEvent::ImageBegin { .. }) => began = true,
+            Ok(Event::ImageBegin { .. }) => began = true,
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -299,8 +296,8 @@ fn cancellation_releases_latent_admission_for_a_waiting_image() {
         for (id, receiver) in [(RequestId(1), &mut first), (RequestId(2), &mut second)] {
             while let Ok(event) = receiver.try_recv() {
                 match event {
-                    GenerationEvent::ImageDone { .. } if id == RequestId(2) => second_images += 1,
-                    GenerationEvent::Finished { reason, .. } => {
+                    Event::ImageDone { .. } if id == RequestId(2) => second_images += 1,
+                    Event::Finished { reason, .. } => {
                         reasons.insert(id, reason);
                     }
                     _ => {}
@@ -321,7 +318,7 @@ fn cancellation_releases_latent_admission_for_a_waiting_image() {
 #[test]
 fn image_events_cover_declared_denoise_steps() {
     const STEPS: u16 = 3;
-    let scheduler = Scheduler::new(Box::new(SimExecutor::new(SimEngine::new())), ctrl(), 32);
+    let scheduler = EngineLoop::new(Box::new(SimExecutor::new(SimEngine::new())), ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let scheduler_thread = thread::spawn(move || scheduler.run(rx));
@@ -348,26 +345,24 @@ fn image_events_cover_declared_denoise_steps() {
     let deadline = Instant::now() + Duration::from_secs(15);
     while finished.is_none() && Instant::now() < deadline {
         match events.try_recv() {
-            Ok(GenerationEvent::ImageBegin {
+            Ok(Event::ImageBegin {
                 image_id,
                 height,
                 width,
                 steps,
             }) => begin = Some((image_id, height, width, steps)),
-            Ok(GenerationEvent::ImageStep { image_id, step }) => steps.push((image_id, step)),
-            Ok(GenerationEvent::ImageCommit { image_id }) => {
+            Ok(Event::ImageStep { image_id, step }) => steps.push((image_id, step)),
+            Ok(Event::ImageCommit { image_id }) => {
                 assert_eq!(image_id, 1);
                 commits += 1;
             }
-            Ok(GenerationEvent::ImageDone {
+            Ok(Event::ImageDone {
                 image_id,
                 height,
                 width,
                 ..
             }) => image_done = Some((image_id, height, width)),
-            Ok(GenerationEvent::Finished { reason, images, .. }) => {
-                finished = Some((reason, images))
-            }
+            Ok(Event::Finished { reason, images, .. }) => finished = Some((reason, images)),
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -386,8 +381,8 @@ fn image_events_cover_declared_denoise_steps() {
 #[test]
 fn scheduler_clamps_max_batch_to_worker_info() {
     let mut sim = SimEngine::new();
-    sim.mut_info_for_test().max_batch_operations = 3;
-    let sched = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
+    sim.mut_info_for_test().max_batch_ops = 3;
+    let sched = EngineLoop::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
 
     assert_eq!(sched.config().max_batch, 3);
 }
@@ -420,7 +415,7 @@ fn operation_window_metrics_record_the_full_lifecycle() {
     let mut sim = SimEngine::new();
     sim.set_pipeline_depth(2);
     sim.set_text_len(6);
-    let mut scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
+    let mut scheduler = EngineLoop::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
     let request = generation_request(
         RequestId(1),
         text_context(vec![1, 2, 3, 4, 5]),
@@ -434,7 +429,7 @@ fn operation_window_metrics_record_the_full_lifecycle() {
     for _ in 0..512 {
         scheduler.step();
         while let Ok(event) = events.try_recv() {
-            if matches!(event, GenerationEvent::Finished { .. }) {
+            if matches!(event, Event::Finished { .. }) {
                 finished = true;
             }
         }
@@ -466,7 +461,7 @@ fn operation_window_metrics_record_the_full_lifecycle() {
             domain.launched_operations.load(Ordering::Relaxed),
             domain.reclaimed_credits.load(Ordering::Relaxed)
         );
-        assert!(domain.completed_partitions.load(Ordering::Relaxed) > 0);
+        assert!(domain.completed_runs.load(Ordering::Relaxed) > 0);
     }
     let mut reporter = uniserve_engine::SchedStatsReporter::default();
     let snapshot = reporter.snapshot(&scheduler.stats, 16);
@@ -493,7 +488,7 @@ fn relay_run(
     let mut sim = SimEngine::new();
     sim.set_pipeline_depth(depth);
     sim.set_text_len(text_len);
-    let mut scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
+    let mut scheduler = EngineLoop::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
     let mut request = generation_request(
         RequestId(1),
         text_context(vec![1, 2, 3, 4, 5]),
@@ -510,8 +505,8 @@ fn relay_run(
         scheduler.step();
         while let Ok(event) = events.try_recv() {
             match event {
-                GenerationEvent::TextToken { id, .. } => tokens.push(id),
-                GenerationEvent::Finished { .. } => finished = true,
+                Event::TextToken { id, .. } => tokens.push(id),
+                Event::Finished { .. } => finished = true,
                 _ => {}
             }
         }
@@ -601,7 +596,7 @@ fn image_context_decode_is_depth_invariant() {
         let mut sim = SimEngine::new();
         sim.set_pipeline_depth(pipeline_depth);
         sim.set_text_len(8);
-        let mut scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
+        let mut scheduler = EngineLoop::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
         let request = generation_request(
             RequestId(1),
             context_with_image(vec![1, 2], vec![3, 4], 0xD3C0DE, 4, 1),
@@ -617,8 +612,8 @@ fn image_context_decode_is_depth_invariant() {
             scheduler.step();
             while let Ok(event) = events.try_recv() {
                 match event {
-                    GenerationEvent::TextToken { id, .. } => tokens.push(id),
-                    GenerationEvent::Finished { reason, .. } => finish_reason = Some(reason),
+                    Event::TextToken { id, .. } => tokens.push(id),
+                    Event::Finished { reason, .. } => finish_reason = Some(reason),
                     _ => {}
                 }
             }
@@ -639,7 +634,7 @@ fn stop_token_terminates_with_stop() {
     let mut sim = SimEngine::new();
     sim.set_pipeline_depth(2);
     let executor = Box::new(SimExecutor::new(sim));
-    let sched = Scheduler::new(executor, ctrl(), 32);
+    let sched = EngineLoop::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -661,8 +656,8 @@ fn stop_token_terminates_with_stop() {
     while reason.is_none() && Instant::now() < deadline {
         if let Ok(ev) = erx.try_recv() {
             match ev {
-                GenerationEvent::TextToken { .. } => text += 1,
-                GenerationEvent::Finished { reason: r, .. } => reason = Some(r),
+                Event::TextToken { .. } => text += 1,
+                Event::Finished { reason: r, .. } => reason = Some(r),
                 _ => {}
             }
         } else {
@@ -683,7 +678,7 @@ fn run_until_control(abort: bool) -> FinishReason {
     sim.set_text_len(1024);
     sim.set_pipeline_depth(2);
     let executor = Box::new(SimExecutor::new(sim));
-    let sched = Scheduler::new(executor, ctrl(), 32);
+    let sched = EngineLoop::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -702,7 +697,7 @@ fn run_until_control(abort: bool) -> FinishReason {
     let mut saw_token = false;
     let deadline = Instant::now() + Duration::from_secs(10);
     while !saw_token && Instant::now() < deadline {
-        if let Ok(GenerationEvent::TextToken { .. }) = erx.try_recv() {
+        if let Ok(Event::TextToken { .. }) = erx.try_recv() {
             saw_token = true;
         } else {
             thread::sleep(Duration::from_millis(1));
@@ -718,7 +713,7 @@ fn run_until_control(abort: bool) -> FinishReason {
     let deadline = Instant::now() + Duration::from_secs(10);
     while reason.is_none() && Instant::now() < deadline {
         match erx.try_recv() {
-            Ok(GenerationEvent::Finished { reason: r, .. }) => reason = Some(r),
+            Ok(Event::Finished { reason: r, .. }) => reason = Some(r),
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -739,7 +734,7 @@ fn stop_string_cutoff_is_request_local() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1024);
     sim.set_pipeline_depth(2);
-    let scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
+    let scheduler = EngineLoop::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let scheduler_thread = thread::spawn(move || scheduler.run(rx));
@@ -770,7 +765,7 @@ fn stop_string_cutoff_is_request_local() {
     let mut consumed_tokens = 0;
     while consumed_tokens < 2 && Instant::now() < deadline {
         match stopping_events.try_recv() {
-            Ok(GenerationEvent::TextToken { .. }) => {
+            Ok(Event::TextToken { .. }) => {
                 consumed_tokens += 1;
                 if consumed_tokens == 1 {
                     handle.acknowledge_at(RequestId(2), 1);
@@ -788,12 +783,12 @@ fn stop_string_cutoff_is_request_local() {
     let mut unrelated_reason = None;
     while Instant::now() < deadline {
         while let Ok(event) = stopping_events.try_recv() {
-            if let GenerationEvent::Finished { reason, .. } = event {
+            if let Event::Finished { reason, .. } = event {
                 stop_reason = Some(reason);
             }
         }
         while let Ok(event) = unrelated_events.try_recv() {
-            if let GenerationEvent::Finished { reason, .. } = event {
+            if let Event::Finished { reason, .. } = event {
                 unrelated_reason = Some(reason);
             }
         }
@@ -832,7 +827,7 @@ fn hybrid_groups_handshake_runs() {
         },
     ]);
     let executor = Box::new(SimExecutor::new(sim));
-    let sched = Scheduler::new(executor, ctrl(), 32);
+    let sched = EngineLoop::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -852,7 +847,7 @@ fn hybrid_groups_handshake_runs() {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !finished && Instant::now() < deadline {
         match erx.try_recv() {
-            Ok(GenerationEvent::Finished { .. }) => finished = true,
+            Ok(Event::Finished { .. }) => finished = true,
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -873,7 +868,7 @@ fn prefix_cache_reuses_shared_prompt() {
     let mut sim = SimEngine::new();
     sim.set_text_len(4);
     let executor = Box::new(SimExecutor::new(sim));
-    let sched = Scheduler::new(executor, ctrl(), 32); // block_size 256
+    let sched = EngineLoop::new(executor, ctrl(), 32); // block_size 256
     let stats = sched.stats_handle();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
@@ -898,7 +893,7 @@ fn prefix_cache_reuses_shared_prompt() {
         let mut done = false;
         while !done && Instant::now() < deadline {
             match erx.try_recv() {
-                Ok(GenerationEvent::Finished { .. }) => done = true,
+                Ok(Event::Finished { .. }) => done = true,
                 Ok(_) => {}
                 Err(_) => thread::sleep(Duration::from_millis(1)),
             }
@@ -933,7 +928,7 @@ fn prefix_cache_enforces_read_write_and_isolation_policy() {
 
     let mut sim = SimEngine::new();
     sim.set_text_len(2);
-    let sched = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
+    let sched = EngineLoop::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
     let stats = sched.stats_handle();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
@@ -958,7 +953,7 @@ fn prefix_cache_enforces_read_write_and_isolation_policy() {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             match events.try_recv() {
-                Ok(GenerationEvent::Finished { .. }) => return,
+                Ok(Event::Finished { .. }) => return,
                 Ok(_) => {}
                 Err(_) => thread::sleep(Duration::from_millis(1)),
             }
@@ -1010,7 +1005,7 @@ fn chunked_prefill_progresses_with_decode() {
     let mut sim = SimEngine::new();
     sim.set_pipeline_depth(2);
     let executor = Box::new(SimExecutor::new(sim));
-    let mut sched = Scheduler::with_policy(executor, ctrl(), 32, SchedulingPolicy::Fcfs);
+    let mut sched = EngineLoop::with_policy(executor, ctrl(), 32, SchedulingPolicy::Fcfs);
     sched.set_long_prefill_threshold(64); // cap a prefill chunk at 64 tokens
     sched.set_token_budget(256); // leaves room for other decodes per step
     let (tx, rx) = crossbeam_channel::unbounded();
@@ -1046,8 +1041,8 @@ fn chunked_prefill_progresses_with_decode() {
         let deadline = Instant::now() + Duration::from_secs(15);
         while !done && Instant::now() < deadline {
             match erx.try_recv() {
-                Ok(GenerationEvent::TextToken { .. }) => text += 1,
-                Ok(GenerationEvent::Finished { .. }) => done = true,
+                Ok(Event::TextToken { .. }) => text += 1,
+                Ok(Event::Finished { .. }) => done = true,
                 Ok(_) => {}
                 Err(_) => thread::sleep(Duration::from_millis(1)),
             }
@@ -1072,7 +1067,7 @@ fn run_sampling(
     let mut sim = SimEngine::new();
     sim.set_text_len(text_len);
     let executor = Box::new(SimExecutor::new(sim));
-    let sched = Scheduler::new(executor, ctrl(), 32);
+    let sched = EngineLoop::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -1093,13 +1088,13 @@ fn run_sampling(
     let deadline = Instant::now() + Duration::from_secs(10);
     while finished.is_none() && Instant::now() < deadline {
         match erx.try_recv() {
-            Ok(GenerationEvent::TextToken { id, logprob, .. }) => {
+            Ok(Event::TextToken { id, logprob, .. }) => {
                 toks.push(id);
                 if logprob.is_some() {
                     any_logprob = true;
                 }
             }
-            Ok(GenerationEvent::Finished { reason, .. }) => finished = Some(reason),
+            Ok(Event::Finished { reason, .. }) => finished = Some(reason),
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -1199,7 +1194,7 @@ fn multimodal_encode_then_cache_hit() {
     let mut sim = SimEngine::new();
     sim.set_pipeline_depth(2);
     let executor = Box::new(SimExecutor::new(sim));
-    let sched = Scheduler::new(executor, ctrl(), 32);
+    let sched = EngineLoop::new(executor, ctrl(), 32);
     let stats = sched.stats_handle();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
@@ -1221,11 +1216,11 @@ fn multimodal_encode_then_cache_hit() {
         let mut seen = Vec::new();
         while !done && Instant::now() < deadline {
             match erx.try_recv() {
-                Ok(GenerationEvent::ImageDone { .. }) => {
+                Ok(Event::ImageDone { .. }) => {
                     seen.push("image_done".to_string());
                     images += 1;
                 }
-                Ok(GenerationEvent::Finished { reason, .. }) => {
+                Ok(Event::Finished { reason, .. }) => {
                     seen.push(format!("finished:{reason:?}"));
                     done = true;
                 }
@@ -1275,7 +1270,7 @@ fn concurrent_same_image_misses_converge_on_one_exact_cached_product() {
     let mut sim = SimEngine::new();
     sim.set_text_len(6);
     sim.set_pipeline_depth(2);
-    let mut scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
+    let mut scheduler = EngineLoop::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
     let request = |request_id| {
         generation_request(
             RequestId(request_id),
@@ -1299,8 +1294,8 @@ fn concurrent_same_image_misses_converge_on_one_exact_cached_product() {
             while let Ok(event) = events.try_recv() {
                 seen[index].push(format!("{event:?}"));
                 match event {
-                    GenerationEvent::TextToken { .. } => text_tokens[index] += 1,
-                    GenerationEvent::Finished { reason, .. } => reasons[index] = Some(reason),
+                    Event::TextToken { .. } => text_tokens[index] += 1,
+                    Event::Finished { reason, .. } => reasons[index] = Some(reason),
                     _ => {}
                 }
             }
@@ -1332,7 +1327,7 @@ fn und_only_image_context_encodes_then_produces_text_without_gen_output() {
 
     let mut sim = SimEngine::new();
     sim.set_text_len(20);
-    let sched = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
+    let sched = EngineLoop::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
     let stats = sched.stats_handle();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
@@ -1353,9 +1348,9 @@ fn und_only_image_context_encodes_then_produces_text_without_gen_output() {
     let mut finished = false;
     while !finished && Instant::now() < deadline {
         match events.try_recv() {
-            Ok(GenerationEvent::TextToken { .. }) => text_tokens += 1,
-            Ok(GenerationEvent::ImageDone { .. }) => images += 1,
-            Ok(GenerationEvent::Finished { .. }) => finished = true,
+            Ok(Event::TextToken { .. }) => text_tokens += 1,
+            Ok(Event::ImageDone { .. }) => images += 1,
+            Ok(Event::Finished { .. }) => finished = true,
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -1380,7 +1375,7 @@ fn gen_branch_round_trip_preserves_publication_and_step_invariants() {
         sim.set_text_len(1_000_000);
         sim.set_pipeline_depth(pipeline_depth);
         let executor = Box::new(SimExecutor::new(sim));
-        let sched = Scheduler::new(executor, ctrl(), 32);
+        let sched = EngineLoop::new(executor, ctrl(), 32);
         let (tx, rx) = crossbeam_channel::unbounded();
         let handle = EngineHandle::new(tx);
         let jh = thread::spawn(move || sched.run(rx));
@@ -1410,12 +1405,12 @@ fn gen_branch_round_trip_preserves_publication_and_step_invariants() {
         let deadline = Instant::now() + Duration::from_secs(15);
         while finish_reason.is_none() && Instant::now() < deadline {
             match erx.try_recv() {
-                Ok(GenerationEvent::TextToken { id, .. }) => signature.push(('T', id)),
-                Ok(GenerationEvent::ImageBegin { .. }) => image_begins += 1,
-                Ok(GenerationEvent::ImageStep { .. }) => image_steps += 1,
-                Ok(GenerationEvent::ImageCommit { .. }) => image_commits += 1,
-                Ok(GenerationEvent::ImageDone { image_id, .. }) => signature.push(('I', image_id)),
-                Ok(GenerationEvent::Finished { reason, .. }) => finish_reason = Some(reason),
+                Ok(Event::TextToken { id, .. }) => signature.push(('T', id)),
+                Ok(Event::ImageBegin { .. }) => image_begins += 1,
+                Ok(Event::ImageStep { .. }) => image_steps += 1,
+                Ok(Event::ImageCommit { .. }) => image_commits += 1,
+                Ok(Event::ImageDone { image_id, .. }) => signature.push(('I', image_id)),
+                Ok(Event::Finished { reason, .. }) => finish_reason = Some(reason),
                 Ok(_) => {}
                 Err(_) => thread::sleep(Duration::from_millis(1)),
             }
@@ -1457,7 +1452,7 @@ fn interleave_c4_generated_images_complete() {
     let mut sim = SimEngine::new();
     sim.set_pipeline_depth(2);
     sim.set_text_len(1_000_000);
-    let mut scheduler = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
+    let mut scheduler = EngineLoop::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
     let mut events = HashMap::new();
     let mut results = HashMap::new();
 
@@ -1498,9 +1493,9 @@ fn interleave_c4_generated_images_complete() {
             while let Ok(event) = event_rx.try_recv() {
                 let result = results.get_mut(id).expect("request result exists");
                 match event {
-                    GenerationEvent::TextToken { .. } => result.text += 1,
-                    GenerationEvent::ImageDone { .. } => result.images += 1,
-                    GenerationEvent::Finished { reason, .. } if !result.finished => {
+                    Event::TextToken { .. } => result.text += 1,
+                    Event::ImageDone { .. } => result.images += 1,
+                    Event::Finished { reason, .. } if !result.finished => {
                         result.finished = true;
                         result.reason = Some(reason);
                     }
@@ -1530,7 +1525,7 @@ fn generated_image_reingest_runs_declared_encoder_recipe_before_continuation() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
     let executor = Box::new(SimExecutor::new(sim));
-    let sched = Scheduler::new(executor, ctrl(), 32);
+    let sched = EngineLoop::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -1568,9 +1563,9 @@ fn generated_image_reingest_runs_declared_encoder_recipe_before_continuation() {
     let deadline = Instant::now() + Duration::from_secs(15);
     while !finished && Instant::now() < deadline {
         match events.try_recv() {
-            Ok(GenerationEvent::TextToken { .. }) => sequence.push('T'),
-            Ok(GenerationEvent::ImageDone { .. }) => sequence.push('I'),
-            Ok(GenerationEvent::Finished { .. }) => finished = true,
+            Ok(Event::TextToken { .. }) => sequence.push('T'),
+            Ok(Event::ImageDone { .. }) => sequence.push('I'),
+            Ok(Event::Finished { .. }) => finished = true,
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -1596,7 +1591,7 @@ fn gen_branch_waits_for_model_image_starts() {
         let mut sim = SimEngine::new();
         sim.set_text_len(1_000_000);
         sim.set_pipeline_depth(depth);
-        let sched = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
+        let sched = EngineLoop::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
         let (tx, rx) = crossbeam_channel::unbounded();
         let handle = EngineHandle::new(tx);
         let jh = thread::spawn(move || sched.run(rx));
@@ -1622,9 +1617,9 @@ fn gen_branch_waits_for_model_image_starts() {
         let deadline = Instant::now() + Duration::from_secs(15);
         while finish_reason.is_none() && Instant::now() < deadline {
             match events.try_recv() {
-                Ok(GenerationEvent::TextToken { id, .. }) => tokens.push(id),
-                Ok(GenerationEvent::ImageDone { .. }) => images += 1,
-                Ok(GenerationEvent::Finished { reason, .. }) => finish_reason = Some(reason),
+                Ok(Event::TextToken { id, .. }) => tokens.push(id),
+                Ok(Event::ImageDone { .. }) => images += 1,
+                Ok(Event::Finished { reason, .. }) => finish_reason = Some(reason),
                 Ok(_) => {}
                 Err(_) => thread::sleep(Duration::from_millis(1)),
             }
@@ -1646,7 +1641,7 @@ fn gen_branch_waits_for_model_image_starts() {
 fn gen_only_can_discover_its_trigger_with_internal_und_decode() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
-    let sched = Scheduler::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
+    let sched = EngineLoop::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -1679,9 +1674,9 @@ fn gen_only_can_discover_its_trigger_with_internal_und_decode() {
     let mut finished = false;
     while !finished && Instant::now() < deadline {
         match events.try_recv() {
-            Ok(GenerationEvent::TextToken { .. }) => visible_text += 1,
-            Ok(GenerationEvent::ImageDone { .. }) => images += 1,
-            Ok(GenerationEvent::Finished { .. }) => finished = true,
+            Ok(Event::TextToken { .. }) => visible_text += 1,
+            Ok(Event::ImageDone { .. }) => images += 1,
+            Ok(Event::Finished { .. }) => finished = true,
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -1700,7 +1695,7 @@ fn und_only_round_close_trigger_cannot_open_gen() {
     sim.set_text_len(2);
     let control = ctrl();
     let close_token_ids = control.eos.clone();
-    let sched = Scheduler::new(Box::new(SimExecutor::new(sim)), control, 32);
+    let sched = EngineLoop::new(Box::new(SimExecutor::new(sim)), control, 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -1730,9 +1725,9 @@ fn und_only_round_close_trigger_cannot_open_gen() {
     let mut finished = false;
     while !finished && Instant::now() < deadline {
         match events.try_recv() {
-            Ok(GenerationEvent::TextToken { .. }) => text += 1,
-            Ok(GenerationEvent::ImageDone { .. }) => images += 1,
-            Ok(GenerationEvent::Finished { .. }) => finished = true,
+            Ok(Event::TextToken { .. }) => text += 1,
+            Ok(Event::ImageDone { .. }) => images += 1,
+            Ok(Event::Finished { .. }) => finished = true,
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -1753,7 +1748,7 @@ fn gen_branch_model_image_starts_spend_budget() {
     let trig = ControlTokens {
         ..ControlTokens::default()
     };
-    let sched = Scheduler::new(executor, trig, 32);
+    let sched = EngineLoop::new(executor, trig, 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -1783,9 +1778,9 @@ fn gen_branch_model_image_starts_spend_budget() {
     let deadline = Instant::now() + Duration::from_secs(15);
     while !finished && Instant::now() < deadline {
         match erx.try_recv() {
-            Ok(GenerationEvent::TextToken { .. }) => seq.push('T'),
-            Ok(GenerationEvent::ImageDone { .. }) => seq.push('I'),
-            Ok(GenerationEvent::Finished { .. }) => finished = true,
+            Ok(Event::TextToken { .. }) => seq.push('T'),
+            Ok(Event::ImageDone { .. }) => seq.push('I'),
+            Ok(Event::Finished { .. }) => finished = true,
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -1821,7 +1816,7 @@ fn gen_branch_rejects_oversized_worstcase_at_admission() {
     sim.set_num_blocks(128);
     sim.set_block_size(256);
     let executor = Box::new(SimExecutor::new(sim));
-    let sched = Scheduler::new(executor, ctrl(), 32);
+    let sched = EngineLoop::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -1846,8 +1841,8 @@ fn gen_branch_rejects_oversized_worstcase_at_admission() {
     let deadline = Instant::now() + Duration::from_secs(15);
     while finished.is_none() && Instant::now() < deadline {
         match erx.try_recv() {
-            Ok(GenerationEvent::Rejected { .. }) => rejected = true,
-            Ok(GenerationEvent::Finished { reason, .. }) => finished = Some(reason),
+            Ok(Event::Rejected { .. }) => rejected = true,
+            Ok(Event::Finished { reason, .. }) => finished = Some(reason),
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -1872,7 +1867,7 @@ fn commit_eos_finishes_without_spending_remaining_budget() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
     let executor = Box::new(SimExecutor::new(sim));
-    let sched = Scheduler::new(executor, ctrl(), 32);
+    let sched = EngineLoop::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -1906,9 +1901,9 @@ fn commit_eos_finishes_without_spending_remaining_budget() {
     let deadline = Instant::now() + Duration::from_secs(15);
     while finished.is_none() && Instant::now() < deadline {
         match erx.try_recv() {
-            Ok(GenerationEvent::TextToken { .. }) => text += 1,
-            Ok(GenerationEvent::ImageDone { .. }) => images += 1,
-            Ok(GenerationEvent::Finished { reason, .. }) => finished = Some(reason),
+            Ok(Event::TextToken { .. }) => text += 1,
+            Ok(Event::ImageDone { .. }) => images += 1,
+            Ok(Event::Finished { reason, .. }) => finished = Some(reason),
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -1937,12 +1932,12 @@ fn multiworker_executor_drives_scheduler_unchanged() {
         sim.set_pipeline_depth(2);
         sim.mut_info_for_test().rank.tp_rank = rank;
         sim.mut_info_for_test().rank.tp_size = 2;
-        Box::new(SimExecutor::new(sim)) as Box<dyn Executor>
+        Box::new(SimExecutor::new(sim)) as Box<dyn PhysicalExecutor>
     };
     let executor = Box::new(MultiprocExecutor::new(vec![mk(0), mk(1)]).unwrap());
     // rank-aware info reflect the topology at the handshake.
-    assert_eq!(executor.info().rank.tp_size, 2);
-    let sched = Scheduler::new(executor, ctrl(), 32);
+    assert_eq!(executor.info().single_pool().rank.tp_size, 2);
+    let sched = EngineLoop::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -1967,7 +1962,7 @@ fn multiworker_executor_drives_scheduler_unchanged() {
     while done < total && Instant::now() < deadline {
         for erx in rxs.values_mut() {
             while let Ok(ev) = erx.try_recv() {
-                if matches!(ev, GenerationEvent::Finished { .. }) {
+                if matches!(ev, Event::Finished { .. }) {
                     done += 1;
                 }
             }
@@ -2004,7 +1999,7 @@ fn gen_branch_literal_trigger_starts_images() {
     let executor = Box::new(SimExecutor::new(sim));
     // Sim emits 1000 + ((id*7 + n) % 5000) for request id=1: 1007, 1008, 1009…
     // After an image commits, the sim resets and the round repeats from 1007.
-    let sched = Scheduler::new(executor, ctrl(), 32);
+    let sched = EngineLoop::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -2033,9 +2028,9 @@ fn gen_branch_literal_trigger_starts_images() {
     let deadline = Instant::now() + Duration::from_secs(15);
     while !finished && Instant::now() < deadline {
         match erx.try_recv() {
-            Ok(GenerationEvent::TextToken { .. }) => seq.push('T'),
-            Ok(GenerationEvent::ImageDone { .. }) => seq.push('I'),
-            Ok(GenerationEvent::Finished { .. }) => finished = true,
+            Ok(Event::TextToken { .. }) => seq.push('T'),
+            Ok(Event::ImageDone { .. }) => seq.push('I'),
+            Ok(Event::Finished { .. }) => finished = true,
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -2069,7 +2064,7 @@ fn image_start_logit_bias_steers_gen_branch() {
         sim.set_text_len(1_000_000); // never EOS on its own
         let executor = Box::new(SimExecutor::new(sim));
         // an image-start token inside the sim's vocab
-        let sched = Scheduler::new(executor, ctrl(), 32);
+        let sched = EngineLoop::new(executor, ctrl(), 32);
         let (tx, rx) = crossbeam_channel::unbounded();
         let handle = EngineHandle::new(tx);
         let jh = thread::spawn(move || sched.run(rx));
@@ -2101,11 +2096,9 @@ fn image_start_logit_bias_steers_gen_branch() {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !finished && Instant::now() < deadline {
             match erx.try_recv() {
-                Ok(GenerationEvent::TextToken { .. }) if images == 0 => {
-                    text_before_first_image += 1
-                }
-                Ok(GenerationEvent::ImageDone { .. }) => images += 1,
-                Ok(GenerationEvent::Finished { .. }) => finished = true,
+                Ok(Event::TextToken { .. }) if images == 0 => text_before_first_image += 1,
+                Ok(Event::ImageDone { .. }) => images += 1,
+                Ok(Event::Finished { .. }) => finished = true,
                 Ok(_) => {}
                 Err(_) => thread::sleep(Duration::from_millis(1)),
             }
@@ -2135,7 +2128,7 @@ fn gen_branch_prefilled_image_start_begins_without_text() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
     let executor = Box::new(SimExecutor::new(sim));
-    let sched = Scheduler::new(executor, ctrl(), 32);
+    let sched = EngineLoop::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -2163,9 +2156,9 @@ fn gen_branch_prefilled_image_start_begins_without_text() {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !finished && Instant::now() < deadline {
         match erx.try_recv() {
-            Ok(GenerationEvent::TextToken { .. }) if images == 0 => text_before_first_image += 1,
-            Ok(GenerationEvent::ImageDone { .. }) => images += 1,
-            Ok(GenerationEvent::Finished { .. }) => finished = true,
+            Ok(Event::TextToken { .. }) if images == 0 => text_before_first_image += 1,
+            Ok(Event::ImageDone { .. }) => images += 1,
+            Ok(Event::Finished { .. }) => finished = true,
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -2188,7 +2181,7 @@ fn context_image_request_commits_existing_image_context_at_round_close() {
     let executor = Box::new(SimExecutor::new(sim));
     let control = ctrl();
     let close_token_ids = control.eos.clone();
-    let sched = Scheduler::new(executor, control, 32);
+    let sched = EngineLoop::new(executor, control, 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -2218,9 +2211,9 @@ fn context_image_request_commits_existing_image_context_at_round_close() {
     let deadline = Instant::now() + Duration::from_secs(15);
     while !finished && Instant::now() < deadline {
         match erx.try_recv() {
-            Ok(GenerationEvent::TextToken { .. }) => seq.push('T'),
-            Ok(GenerationEvent::ImageDone { .. }) => seq.push('I'),
-            Ok(GenerationEvent::Finished { .. }) => finished = true,
+            Ok(Event::TextToken { .. }) => seq.push('T'),
+            Ok(Event::ImageDone { .. }) => seq.push('I'),
+            Ok(Event::Finished { .. }) => finished = true,
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -2249,7 +2242,7 @@ fn image_budget_suppresses_biased_image_start() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000); // never EOS on its own
     let executor = Box::new(SimExecutor::new(sim));
-    let sched = Scheduler::new(executor, ctrl(), 32);
+    let sched = EngineLoop::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -2281,7 +2274,7 @@ fn image_budget_suppresses_biased_image_start() {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !finished && Instant::now() < deadline {
         match erx.try_recv() {
-            Ok(GenerationEvent::TextToken { id, .. }) => {
+            Ok(Event::TextToken { id, .. }) => {
                 if images >= 2 {
                     if id == 2222 {
                         post_budget_triggers += 1;
@@ -2290,8 +2283,8 @@ fn image_budget_suppresses_biased_image_start() {
                     }
                 }
             }
-            Ok(GenerationEvent::ImageDone { .. }) => images += 1,
-            Ok(GenerationEvent::Finished { .. }) => finished = true,
+            Ok(Event::ImageDone { .. }) => images += 1,
+            Ok(Event::Finished { .. }) => finished = true,
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
@@ -2315,7 +2308,7 @@ fn image_budget_suppresses_biased_image_start() {
 #[test]
 fn kv_resources_return_after_completion() {
     let executor = Box::new(SimExecutor::new(SimEngine::new()));
-    let mut sched = Scheduler::with_policy(executor, ctrl(), 32, SchedulingPolicy::Fcfs);
+    let mut sched = EngineLoop::with_policy(executor, ctrl(), 32, SchedulingPolicy::Fcfs);
 
     // Keep receivers alive — a dropped receiver is treated as a cancellation.
     let mut keep_alive = Vec::new();
@@ -2362,7 +2355,7 @@ fn kv_resources_return_after_completion() {
 #[test]
 fn cancellation_storm_retires_every_request() {
     let executor = Box::new(SimExecutor::new(SimEngine::new()));
-    let mut scheduler = Scheduler::new(executor, ctrl(), 32);
+    let mut scheduler = EngineLoop::new(executor, ctrl(), 32);
     let receivers = (1..=128)
         .map(|request_id| {
             scheduler.submit_for_test(generation_request(
@@ -2398,7 +2391,7 @@ fn slow_client_releases_execution_slots_before_output_capacity_returns() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
     let executor = Box::new(SimExecutor::new(sim));
-    let mut scheduler = Scheduler::with_policy(executor, ctrl(), 32, SchedulingPolicy::Fcfs);
+    let mut scheduler = EngineLoop::with_policy(executor, ctrl(), 32, SchedulingPolicy::Fcfs);
     let slow_events = scheduler.submit_for_test(generation_request(
         RequestId(1),
         text_context(vec![1, 2, 3]),
@@ -2421,7 +2414,7 @@ fn slow_client_releases_execution_slots_before_output_capacity_returns() {
     while Instant::now() < deadline && !fast_finished {
         scheduler.step();
         while let Ok(event) = fast_events.try_recv() {
-            fast_finished |= matches!(event, GenerationEvent::Finished { .. });
+            fast_finished |= matches!(event, Event::Finished { .. });
         }
     }
     assert!(

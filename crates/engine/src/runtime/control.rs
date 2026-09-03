@@ -10,21 +10,41 @@ pub(super) struct FinishedTrace<'a> {
     pub queue: &'static str,
 }
 
-impl Scheduler {
+impl EngineLoop {
     /// Abort every queued/gated/running request with a terminal event.
     pub(super) fn abort_all_requests(&mut self) {
-        while let Some(submission) = self.pending_media.pop_front() {
-            let _ = submission.event_tx.send(MediaEvent::Aborted);
+        self.pending_submission = None;
+        while let Some(id) = self.scheduler.pop_media() {
+            let submission = self
+                .waiting_media
+                .remove(&id)
+                .expect("scheduler media order names runtime state");
+            let _ = submission.event_tx.send(Event::Finished {
+                reason: FinishReason::Aborted,
+                stop_reason: None,
+                prompt_tokens: submission.request.prompt_token_ids.len(),
+                completion_tokens: 0,
+                images: 0,
+            });
         }
         let media = self.media_ids();
         for id in media {
-            self.finish_media(id, MediaEvent::Aborted, CloseReason::Cancelled, None);
+            self.finish_media(
+                id,
+                DiffusionTerminal::Finished(FinishReason::Aborted),
+                CloseReason::Cancelled,
+                None,
+            );
         }
         let queued: Vec<RequestId> = {
             let mut ids = Vec::new();
-            while let Some(st) = self.pending.pop_request() {
+            while let Some(id) = self.scheduler.pop() {
+                let st = self
+                    .waiting
+                    .remove(&id)
+                    .expect("scheduler waiting order names runtime state");
                 ids.push(st.req.request_id);
-                let _ = st.output.event_tx.send(GenerationEvent::Finished {
+                let _ = st.output.event_tx.send(Event::Finished {
                     reason: FinishReason::Aborted,
                     stop_reason: None,
                     prompt_tokens: st.context.prompt_ids.len(),
@@ -44,9 +64,25 @@ impl Scheduler {
     /// Apply one command; returns true on shutdown.
     pub(super) fn handle_command(&mut self, cmd: Command) -> bool {
         match cmd {
-            Command::Submit { request, event_tx } => self.enqueue(*request, event_tx),
-            Command::SubmitMedia { request, event_tx } => {
-                self.enqueue_media(PendingMedia { request, event_tx })
+            Command::Submit { request, event_tx } => {
+                if !self.runtime.accepts(request.family()) {
+                    let _ = event_tx.send(Event::Rejected {
+                        message: format!(
+                            "request family {:?} does not match the {:?} runtime",
+                            request.family(),
+                            self.runtime.family()
+                        ),
+                    });
+                } else {
+                    match request {
+                        Request::Ar(request) | Request::Umm(request) => {
+                            self.enqueue(request, event_tx)
+                        }
+                        Request::Diffusion(request) => {
+                            self.enqueue_media(PendingMedia { request, event_tx })
+                        }
+                    }
+                }
             }
             Command::Cancel {
                 request_id,
@@ -80,23 +116,44 @@ impl Scheduler {
         abort: bool,
         output_token_count: Option<usize>,
     ) {
-        if let Some(index) = self
-            .pending_media
-            .iter()
-            .position(|submission| submission.request.request_id == id)
-            && let Some(submission) = self.pending_media.remove(index)
+        if self.scheduler.remove_media(id)
+            && let Some(submission) = self.waiting_media.remove(&id)
         {
-            let _ = submission.event_tx.send(MediaEvent::Aborted);
+            let reason = if abort {
+                FinishReason::Aborted
+            } else {
+                FinishReason::Cancelled
+            };
+            let _ = submission.event_tx.send(Event::Finished {
+                reason,
+                stop_reason: None,
+                prompt_tokens: submission.request.prompt_token_ids.len(),
+                completion_tokens: 0,
+                images: 0,
+            });
             return;
         }
         if self.media_state(id).is_some() {
             self.media_state_mut(id)
                 .expect("media state exists")
                 .terminal_intent
-                .cancel();
+                .finish(if abort {
+                    FinishReason::Aborted
+                } else {
+                    FinishReason::Cancelled
+                });
             let drained = !self.inflight.contains(id);
             if drained {
-                self.finish_media(id, MediaEvent::Aborted, CloseReason::Cancelled, None);
+                self.finish_media(
+                    id,
+                    DiffusionTerminal::Finished(if abort {
+                        FinishReason::Aborted
+                    } else {
+                        FinishReason::Cancelled
+                    }),
+                    CloseReason::Cancelled,
+                    None,
+                );
             }
             return;
         }
@@ -115,7 +172,9 @@ impl Scheduler {
             };
         }
         // also drop from the waiting queue if not yet admitted (reporting the reason)
-        if let Some(st) = self.pending.remove_request(id) {
+        if self.scheduler.remove(id)
+            && let Some(st) = self.waiting.remove(&id)
+        {
             let reason = if abort {
                 FinishReason::Aborted
             } else {
@@ -130,7 +189,7 @@ impl Scheduler {
                 images: 0,
                 queue: "pending",
             });
-            let _ = st.output.event_tx.send(GenerationEvent::Finished {
+            let _ = st.output.event_tx.send(Event::Finished {
                 reason,
                 stop_reason: None,
                 prompt_tokens: st.context.prompt_ids.len(),
@@ -204,30 +263,6 @@ impl Scheduler {
         state.terminal_intent = TerminalIntent::StopMatched;
     }
 
-    /// Accept only controls declared by the worker.
-    pub(super) fn control_allowed(&self, op: &ControlOp) -> bool {
-        self.info.supported_controls.contains(&op.request_kind())
-    }
-
-    /// Dispatch a control only if the worker declares support; otherwise drop it
-    /// (logged) instead of fire-and-forgetting into an UnsupportedControl error.
-    pub(super) fn gated_control(&mut self, op: ControlOp) {
-        if self.control_allowed(&op) {
-            if let Err(error) = self.executor.control(op) {
-                if self.fatal {
-                    tracing::error!(%error, "executor control failed during shutdown");
-                } else {
-                    self.on_executor_error(error);
-                }
-            }
-        } else {
-            tracing::debug!(
-                control = op.method(),
-                "skipping control absent from worker supported_controls"
-            );
-        }
-    }
-
     pub(super) fn trace_record(&mut self, record: serde_json::Value) {
         if let Some(sink) = self.trace_sink.as_mut() {
             sink.record(&record);
@@ -259,7 +294,7 @@ impl Scheduler {
                 "width": st.req.image.width,
                 "retain_images": st.req.image.retain_images,
             },
-            "pending": self.pending.len(),
+            "pending": self.scheduler.waiting_len(),
             "running": self.running.len(),
         }));
     }
@@ -284,9 +319,9 @@ impl Scheduler {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "images": images,
-            "pending": self.pending.len(),
+            "pending": self.scheduler.waiting_len(),
             "running": self.running.len(),
-            "in_flight": self.executor.in_flight(),
+            "in_flight": self.inflight.batch_started.len(),
         }));
     }
 }

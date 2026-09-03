@@ -7,17 +7,17 @@ from collections import deque
 import pytest
 
 from tests.python.fixtures.depth_one import (
-    execution_batch,
+    ar_params,
+    execution_run,
     root_parent,
     token_operation,
-    und_admission,
 )
 from tests.python.fixtures.execution_worker import execution_worker
 from uniserve_worker.execution.batch import (
-    Batch,
     NewRequest,
     Operation,
     ProductPayload,
+    Run,
     TokenMode,
 )
 from uniserve_worker.process import WorkerProcess
@@ -43,18 +43,18 @@ class _Endpoint:
         self.responses.append(response)
 
 
-def _request(call_id: int, batch: Batch) -> dict[str, object]:
-    return {"kind": "execute", "call_id": call_id, "batch": batch}
+def _request(call_id: int, run: Run) -> dict[str, object]:
+    return {"kind": "submit", "call_id": call_id, "run": run}
 
 
-def _token_batch(
+def _token_run(
     *,
-    session_id: int,
+    request_id: int,
     op_id: int,
-    step_id: int,
+    run_id: int,
     tokens: tuple[int, ...],
-) -> tuple[NewRequest, Operation, ProductPayload, Batch]:
-    admission = und_admission(session_id, block_ids=(session_id,))
+) -> tuple[NewRequest, Operation, ProductPayload, Run]:
+    admission = ar_params(request_id, block_ids=(request_id,))
     operation, payload = token_operation(
         admission.request_key,
         op_id=op_id,
@@ -66,8 +66,8 @@ def _token_batch(
         admission,
         operation,
         payload,
-        execution_batch(
-            step_id=step_id,
+        execution_run(
+            run_id=run_id,
             admissions=(admission,),
             operations=(operation,),
             input_products=(payload,),
@@ -83,19 +83,35 @@ def _by_call(endpoint: _Endpoint) -> dict[int, dict[str, object]]:
     }
 
 
+def test_info_request_is_served_by_the_process_queue() -> None:
+    endpoint = _Endpoint(
+        (
+            {"kind": "info", "call_id": 1},
+            {"kind": "close", "call_id": 2},
+        )
+    )
+    server = WorkerProcess(execution_worker(pipeline_depth=1), endpoint)
+
+    server.serve()
+
+    responses = _by_call(endpoint)
+    assert responses[1]["kind"] == "info"
+    assert responses[1]["info"] == server.worker.info.to_mapping()
+
+
 def test_inflight_and_terminal_duplicates_return_one_terminal_report() -> None:
-    _admission, _operation, _payload, batch = _token_batch(
-        session_id=11,
+    _admission, _operation, _payload, run = _token_run(
+        request_id=11,
         op_id=21,
-        step_id=7,
+        run_id=7,
         tokens=(8, 9),
     )
     endpoint = _Endpoint(
         (
-            _request(1, batch),
-            _request(2, batch),
-            _request(3, batch),
-            {"kind": "shutdown", "call_id": 4},
+            _request(1, run),
+            _request(2, run),
+            _request(3, run),
+            {"kind": "close", "call_id": 4},
         )
     )
     server = WorkerProcess(execution_worker(pipeline_depth=2), endpoint)
@@ -103,16 +119,16 @@ def test_inflight_and_terminal_duplicates_return_one_terminal_report() -> None:
     server.serve()
 
     responses = _by_call(endpoint)
-    first = responses[1]["completion_report"]
-    assert responses[2]["completion_report"] == first
-    assert responses[3]["completion_report"] == first
+    first = responses[1]["result"]
+    assert responses[2]["result"] == first
+    assert responses[3]["result"] == first
 
 
-def test_conflicting_step_identity_fails_before_new_admission() -> None:
-    admission, operation, payload, batch = _token_batch(
-        session_id=12,
+def test_conflicting_run_identity_fails_before_new_admission() -> None:
+    admission, operation, payload, run = _token_run(
+        request_id=12,
         op_id=31,
-        step_id=8,
+        run_id=8,
         tokens=(4, 5),
     )
     conflicting, conflicting_payload = token_operation(
@@ -122,29 +138,29 @@ def test_conflicting_step_identity_fails_before_new_admission() -> None:
         mode=TokenMode.EXTEND,
         tokens=(4, 5, 6),
     )
-    conflicting_batch = execution_batch(
-        step_id=8,
+    conflicting_run = execution_run(
+        run_id=8,
         operations=(conflicting,),
         input_products=(conflicting_payload,),
     )
-    next_admission, next_operation, next_payload, _next_batch = _token_batch(
-        session_id=13,
+    next_admission, next_operation, next_payload, _next_run = _token_run(
+        request_id=13,
         op_id=32,
-        step_id=8,
+        run_id=8,
         tokens=(7,),
     )
-    mixed_batch = execution_batch(
-        step_id=8,
+    mixed_run = execution_run(
+        run_id=8,
         admissions=(next_admission,),
         operations=(operation, next_operation),
         input_products=(payload, next_payload),
     )
     endpoint = _Endpoint(
         (
-            _request(1, batch),
-            _request(2, conflicting_batch),
-            _request(3, mixed_batch),
-            {"kind": "shutdown", "call_id": 4},
+            _request(1, run),
+            _request(2, conflicting_run),
+            _request(3, mixed_run),
+            {"kind": "close", "call_id": 4},
         )
     )
     server = WorkerProcess(execution_worker(pipeline_depth=3), endpoint)
@@ -160,35 +176,30 @@ def test_conflicting_step_identity_fails_before_new_admission() -> None:
 
 
 def test_completed_report_remains_retained_after_later_execution() -> None:
-    _first_admission, first_operation, _first_payload, first_batch = _token_batch(
-        session_id=5,
+    _first_admission, first_operation, _first_payload, first_run = _token_run(
+        request_id=5,
         op_id=41,
-        step_id=11,
+        run_id=11,
         tokens=(1, 2),
     )
-    _second_admission, _second_operation, _second_payload, second_batch = _token_batch(
-        session_id=6,
+    _second_admission, _second_operation, _second_payload, second_run = _token_run(
+        request_id=6,
         op_id=42,
-        step_id=12,
+        run_id=12,
         tokens=(3, 4),
     )
     endpoint = _Endpoint(
         (
-            _request(1, first_batch),
-            {
-                "kind": "release_products",
-                "call_id": 2,
-                "product_handles": [int(output.generation) for output in first_operation.outputs],
-            },
-            _request(3, second_batch),
-            _request(4, first_batch),
-            {"kind": "shutdown", "call_id": 5},
+            _request(1, first_run),
+            _request(2, second_run),
+            _request(3, first_run),
+            {"kind": "close", "call_id": 4},
         )
     )
     server = WorkerProcess(
         execution_worker(
             pipeline_depth=1,
-            max_batch_operations=1,
+                max_batch_operations=1,
             max_request_pool_size=8,
         ),
         endpoint,
@@ -198,73 +209,7 @@ def test_completed_report_remains_retained_after_later_execution() -> None:
     server.serve()
 
     responses = _by_call(endpoint)
-    first = responses[1]["completion_report"]
-    retained = responses[4]["completion_report"]
-    assert responses[3]["kind"] == "result"
-    assert retained == first
-
-
-def test_prompt_launches_after_an_earlier_queued_same_session_control() -> None:
-    _admission, _operation, _payload, batch = _token_batch(
-        session_id=19,
-        op_id=43,
-        step_id=14,
-        tokens=(3, 5),
-    )
-    endpoint = _Endpoint(
-        (
-            {"kind": "drop_session", "call_id": 1, "session_id": 19},
-            _request(2, batch),
-            {"kind": "shutdown", "call_id": 3},
-        )
-    )
-    server = WorkerProcess(execution_worker(pipeline_depth=2), endpoint)
-
-    server.serve()
-
-    responses = _by_call(endpoint)
-    assert responses[1]["kind"] == "ok"
+    first = responses[1]["result"]
+    retained = responses[3]["result"]
     assert responses[2]["kind"] == "result"
-
-
-def test_atomic_step_remains_available_until_every_participant_epoch_ends() -> None:
-    first_admission, first_operation, first_payload, _first_batch = _token_batch(
-        session_id=6,
-        op_id=51,
-        step_id=13,
-        tokens=(5,),
-    )
-    second_admission, second_operation, second_payload, _second_batch = _token_batch(
-        session_id=7,
-        op_id=52,
-        step_id=13,
-        tokens=(6,),
-    )
-    batch = execution_batch(
-        step_id=13,
-        admissions=(first_admission, second_admission),
-        operations=(first_operation, second_operation),
-        input_products=(first_payload, second_payload),
-    )
-    endpoint = _Endpoint(
-        (
-            _request(1, batch),
-            {"kind": "drop_session", "call_id": 2, "session_id": 6},
-            _request(3, batch),
-            {"kind": "shutdown", "call_id": 4},
-        )
-    )
-    server = WorkerProcess(
-        execution_worker(
-            pipeline_depth=1,
-            max_batch_operations=2,
-            max_request_pool_size=8,
-        ),
-        endpoint,
-    )
-
-    server.serve()
-
-    responses = _by_call(endpoint)
-    assert responses[2]["kind"] == "ok"
-    assert responses[3]["completion_report"] == responses[1]["completion_report"]
+    assert retained == first

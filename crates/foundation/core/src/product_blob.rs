@@ -1,5 +1,5 @@
-//! Byte encodings for completion product values a worker packs
-//! into `CompletionReport.products` and the host decodes for output.
+//! Byte encodings for bounded result values a worker packs into
+//! `RunResult.products` and the host decodes for output.
 //!
 //! These are host-facing payloads addressed by their `ProductRef`. The encoding is a
 //! deterministic little-endian, length-prefixed layout so a producer and a

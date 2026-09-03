@@ -1,34 +1,58 @@
 from __future__ import annotations
 
-import pytest
-
-from uniserve_worker.foundation.errors import WorkerError
-from uniserve_worker.execution.batch import (
-    MAX_TRANSFER_DESCRIPTOR_BYTES,
-    TRANSFER_DESCRIPTOR_PREFIX,
-)
-from uniserve_worker.transfer.tickets import (
-    decode_transfer_descriptor,
-    encode_transfer_descriptor,
-)
+from uniserve_worker.transfer.tickets import decode_transfer_handle, encode_transfer_handle
 
 
-def test_transfer_descriptor_round_trips() -> None:
-    for kind in ("encoder", "device_product", "kv", "latent"):
-        encoded = encode_transfer_descriptor(kind, {"height": 16, "width": 24})
-        assert decode_transfer_descriptor(encoded) == (kind, {"height": 16, "width": 24})
+def _locator() -> dict[str, object]:
+    return {
+        "transport": "local",
+        "endpoint": "worker-a",
+        "key": 7,
+        "nbytes": 4,
+        "dtype": "float32",
+        "shape": [1],
+        "device": "cpu",
+    }
 
 
-def test_transfer_descriptor_rejects_noncanonical_or_unbounded_frames() -> None:
-    canonical = encode_transfer_descriptor("kv", {"snapshot": {}})
-    noncanonical = canonical.replace(b'"kind":"kv"', b'"kind": "kv"')
-    oversized = TRANSFER_DESCRIPTOR_PREFIX + b"{" + b" " * MAX_TRANSFER_DESCRIPTOR_BYTES
-
-    with pytest.raises(WorkerError, match="not canonical"):
-        decode_transfer_descriptor(noncanonical)
-    with pytest.raises(WorkerError, match="descriptor bound"):
-        decode_transfer_descriptor(oversized)
-    with pytest.raises(WorkerError, match="descriptor bound"):
-        encode_transfer_descriptor(
-            "device_product", {"payload": "x" * MAX_TRANSFER_DESCRIPTOR_BYTES}
-        )
+def test_typed_transfer_handles_round_trip() -> None:
+    fixed = {"op_id": 3, "point": {"kind": "fixed", "value": 1}}
+    cases = {
+        "encoder": {
+            "generation": 2,
+            "height": 16,
+            "width": 24,
+            "payload_kind": "vision_feature",
+            "locator": _locator(),
+        },
+        "device_product": {
+            "generation": 2,
+            "height": 0,
+            "width": 0,
+            "value_range": "",
+            "locator": _locator(),
+        },
+        "kv": {
+            "generation": 2,
+            "snapshot": {
+                "locators": [_locator()],
+                "source_version": fixed,
+                "destination": "decode",
+                "base_version": None,
+                "base_extent": 0,
+                "published_extent": 1,
+                "group_id": 0,
+                "scale_identity": "bfloat16",
+            },
+        },
+        "latent": {
+            "generation": 2,
+            "height": 16,
+            "width": 24,
+            "latent_units": 1,
+            "step": 4,
+            "locator": _locator(),
+        },
+    }
+    for kind, value in cases.items():
+        assert decode_transfer_handle(encode_transfer_handle(kind, value)) == (kind, value)

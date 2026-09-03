@@ -54,7 +54,7 @@ class TRTLLMMHAAttentionBackend(AttentionBackend):
     paged_varlen = available
     paged_varlen_only = True
     min_head_dim = 64
-    single_token_decode = True
+    single_ar_decode = True
     paged_varlen_cuda_graph = available
     cuda_only = True
     min_compute_version = (10, 0)

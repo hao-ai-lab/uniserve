@@ -1,4 +1,4 @@
-"""Immutable CUDA execution-partition resources."""
+"""Immutable CUDA execution-lane resources."""
 
 from __future__ import annotations
 
@@ -8,12 +8,12 @@ from typing import Any
 
 import torch
 
-from uniserve_worker.execution.batch import Domain
 from uniserve_worker.bootstrap.execution_config import LaneConfig
+from uniserve_worker.execution.batch import Domain
 
 
-class ExecutionPartitionError(RuntimeError):
-    """A deployment-static execution partition could not be realized exactly."""
+class ExecutionLaneError(RuntimeError):
+    """A deployment-static execution lane could not be realized exactly."""
 
 
 @dataclass(slots=True)
@@ -28,8 +28,8 @@ class _GreenContext:
     component_path: tuple[int, ...]
 
 
-class ExecutionPartitionRuntime:
-    """Own streams, buffers, graphs, and events for one physical partition."""
+class ExecutionLaneRuntime:
+    """Own streams, buffers, graphs, and events for one physical lane."""
 
     def __init__(
         self,
@@ -44,7 +44,7 @@ class ExecutionPartitionRuntime:
         event_slots: int = 2,
     ) -> None:
         if int(event_slots) < 1:
-            raise ValueError("execution partition requires a positive event bound")
+            raise ValueError("execution lane requires a positive event bound")
         self.lane = lane
         self.device = device
         self.stream = stream
@@ -81,7 +81,7 @@ class ExecutionPartitionRuntime:
             cu.cuStreamGetGreenCtx(self._green.raw_stream), "query stream lane"
         )
         if int(associated) != int(self._green.green):
-            raise ExecutionPartitionError("lane origin stream is detached from its Green Context")
+            raise ExecutionLaneError("lane origin stream is detached from its Green Context")
         resource = _cuda_value(
             cu.cuGreenCtxGetDevResource(
                 self._green.green,
@@ -90,7 +90,7 @@ class ExecutionPartitionRuntime:
             "query Green Context SM resource",
         )
         if int(resource.sm.smCount) != self.sm_count:
-            raise ExecutionPartitionError("lane Green Context SM resource changed after startup")
+            raise ExecutionLaneError("lane Green Context SM resource changed after startup")
 
     def order_after(self, producer: torch.cuda.Stream) -> None:
         if self.stream is None or int(producer.cuda_stream) == int(self.stream.cuda_stream):
@@ -136,15 +136,15 @@ def create_green_contexts(
     if not lanes:
         return ()
     if device.type != "cuda":
-        raise ExecutionPartitionError("execution lanes require a CUDA device")
+        raise ExecutionLaneError("execution lanes require a CUDA device")
     if len({lane.lane_id for lane in lanes}) != len(lanes):
-        raise ExecutionPartitionError("lane ids must be unique")
+        raise ExecutionLaneError("lane ids must be unique")
     bound_domains: set[Domain] = set()
     for lane in lanes:
         overlap = bound_domains.intersection(lane.domains)
         if overlap:
             names = ", ".join(sorted(value.value for value in overlap))
-            raise ExecutionPartitionError(f"execution domains have multiple lane bindings: {names}")
+            raise ExecutionLaneError(f"execution domains have multiple lane bindings: {names}")
         bound_domains.update(lane.domains)
 
     torch.cuda.init()
@@ -159,7 +159,7 @@ def create_green_contexts(
     requested = sum(int(lane.sm_budget) for lane in lanes)
     available = int(full.sm.smCount)
     if requested > available:
-        raise ExecutionPartitionError(
+        raise ExecutionLaneError(
             f"lane SM budgets require {requested} SMs but the device exposes {available}"
         )
 
@@ -189,7 +189,7 @@ def create_green_contexts(
                 resolved = _green_resource(cu, lane_green)
                 sm_count = int(resolved.sm.smCount)
                 if sm_count != int(lane.sm_budget):
-                    raise ExecutionPartitionError(
+                    raise ExecutionLaneError(
                         f"lane {lane.lane_id!r} resolved {sm_count} SMs, expected {lane.sm_budget}"
                     )
                 associated = _cuda_value(
@@ -197,7 +197,7 @@ def create_green_contexts(
                     "query lane origin stream",
                 )
                 if int(associated) != int(lane_green):
-                    raise ExecutionPartitionError("lane origin stream has the wrong Green Context")
+                    raise ExecutionLaneError("lane origin stream has the wrong Green Context")
                 realized.append(
                     _GreenContext(
                         lane=lane,
@@ -218,7 +218,7 @@ def create_green_contexts(
                 intermediate.append(remainder_green)
                 current_resource = _green_resource(cu, remainder_green)
         if sum(item.sm_count for item in realized) != requested:
-            raise ExecutionPartitionError(
+            raise ExecutionLaneError(
                 "lane SM resources do not form the configured disjoint total"
             )
         return tuple(realized)
@@ -233,7 +233,7 @@ def create_green_contexts(
 
 
 def verify_graph_context(graph: torch.cuda.CUDAGraph, expected_context: int | None) -> int:
-    """Prove every kernel node in a captured graph belongs to its partition."""
+    """Prove every kernel node in a captured graph belongs to its lane."""
 
     if expected_context is None:
         return 0
@@ -250,10 +250,10 @@ def verify_graph_context(graph: torch.cuda.CUDAGraph, expected_context: int | No
             continue
         params = _cuda_value(cu.cuGraphKernelNodeGetParams(node), "query kernel node context")
         if int(params.ctx) != int(expected_context):
-            raise ExecutionPartitionError("captured compute node escaped its owning context")
+            raise ExecutionLaneError("captured compute node escaped its owning context")
         kernels += 1
     if kernels == 0:
-        raise ExecutionPartitionError("captured CUDA graph contains no compute node")
+        raise ExecutionLaneError("captured CUDA graph contains no compute node")
     return kernels
 
 
@@ -262,10 +262,10 @@ def _split_one(cu: Any, resource: Any, count: int) -> tuple[Any, Any]:
     _cuda_status(result, "split SM resource")
     groups, group_count, remainder = result[1], int(result[2]), result[3]
     if group_count != 1 or not groups:
-        raise ExecutionPartitionError("CUDA could not realize the requested SM resource")
+        raise ExecutionLaneError("CUDA could not realize the requested SM resource")
     group = groups[0]
     if int(group.sm.smCount) != int(count):
-        raise ExecutionPartitionError(
+        raise ExecutionLaneError(
             f"CUDA rounded an exact SM request from {count} to {int(group.sm.smCount)}"
         )
     return group, remainder
@@ -297,7 +297,7 @@ def _driver() -> Any:
     try:
         from cuda.bindings import driver  # pyright: ignore[reportAttributeAccessIssue]
     except ImportError as error:  # pragma: no cover - CUDA deployments install cuda-python.
-        raise ExecutionPartitionError("CUDA execution lanes require cuda-python") from error
+        raise ExecutionLaneError("CUDA execution lanes require cuda-python") from error
     return driver
 
 
@@ -307,7 +307,7 @@ def _cuda_status(result: tuple[Any, ...], operation: str) -> None:
         return
     name_result = cu.cuGetErrorName(result[0])
     name = str(name_result[1]) if name_result[0] == cu.CUresult.CUDA_SUCCESS else str(result[0])
-    raise ExecutionPartitionError(f"{operation} failed: {name}")
+    raise ExecutionLaneError(f"{operation} failed: {name}")
 
 
 def _cuda_value(result: tuple[Any, ...], operation: str) -> Any:
@@ -316,8 +316,8 @@ def _cuda_value(result: tuple[Any, ...], operation: str) -> Any:
 
 
 __all__ = [
-    "ExecutionPartitionError",
-    "ExecutionPartitionRuntime",
+    "ExecutionLaneError",
+    "ExecutionLaneRuntime",
     "LaneConfig",
     "create_green_contexts",
     "verify_graph_context",

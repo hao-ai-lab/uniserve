@@ -1,10 +1,10 @@
-"""Persistent output storage and concrete partition result materialization."""
+"""Persistent output storage and concrete lane result materialization."""
 
 from __future__ import annotations
 
+import concurrent.futures
 import struct
 import time
-import concurrent.futures
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from threading import RLock
@@ -13,34 +13,35 @@ from typing import Any, Final, cast
 import torch
 
 from ..execution.batch import (
-    CompletionReport,
+    ArResult,
+    Checkpoint,
     CompletionState,
+    DiffusionResult,
+    EncoderResult,
     ErrorCode,
     FinishFlags,
-    FixedPoint,
+    FixedCheckpoint,
+    LaneResult,
     LogicalLengths,
     MediaOutput,
     ModelOutput,
     OpStatus,
-    PartitionCompletion,
     RequestKey,
+    RunKind,
+    RunResult,
     TimingCounters,
     TokenSpan,
-    VersionRef,
+    TransferHandle,
+    TransferResult,
 )
 from ..foundation.errors import WorkerError, WorkerErrorCode, invalid_descriptor, resource_error
-from ..runtime.device import canonical_device
-from ..runtime.device_events import DeviceEventPool
-from ..transfer.tickets import (
-    TRANSFER_DESCRIPTOR_PREFIX,
-    Locator,
-    Transport,
-    encode_transfer_descriptor,
-)
 from ..media.codec import uint8_image_to_png_base64_bytes
 from ..profiling import profile_range, timing_events_enabled
 from ..runtime.cpu import CpuTaskReservation
+from ..runtime.device import canonical_device
+from ..runtime.device_events import DeviceEventPool
 from ..runtime.request import RequestRuntime
+from ..transfer.tickets import Locator, Transport, encode_transfer_handle
 
 __all__ = [
     "CpuJob",
@@ -56,9 +57,9 @@ __all__ = [
     "OutputBuffer",
     "OutputPool",
     "TokenCapture",
-    "completion_report_ready",
-    "finalize_completion_report",
-    "partition_completion_ready",
+    "run_result_ready",
+    "finalize_run_result",
+    "lane_completion_ready",
 ]
 
 _SAMPLING_FIELDS_PER_OPERATION: Final[int] = 4
@@ -75,7 +76,7 @@ def _invariant(message: str) -> WorkerError:
 
 @dataclass(frozen=True, slots=True)
 class TokenCapture:
-    """One token range copied into a partition's pinned output buffer."""
+    """One token range copied into a lane's pinned output buffer."""
 
     buffer: OutputBuffer
     offset: int
@@ -90,7 +91,7 @@ class TokenCapture:
 
 @dataclass(frozen=True, slots=True)
 class ByteCapture:
-    """One shaped byte range copied into a partition's pinned output buffer."""
+    """One shaped byte range copied into a lane's pinned output buffer."""
 
     buffer: OutputBuffer
     offset: int
@@ -113,7 +114,7 @@ class ByteCapture:
 
 
 class OutputBuffer:
-    """Pinned host storage and completion events for one partition commit."""
+    """Pinned host storage and completion events for one lane commit."""
 
     __slots__ = (
         "event_pool",
@@ -581,7 +582,7 @@ class OutputBuffer:
 
 
 class OutputPool:
-    """Bounded owner of reusable pinned partition-output allocations."""
+    """Bounded owner of reusable pinned lane-output allocations."""
 
     def __init__(
         self,
@@ -598,6 +599,7 @@ class OutputPool:
         self._buffers: list[OutputBuffer] = []
         self._free: list[OutputBuffer] = []
         self._lock = RLock()
+        self._closed = False
 
     def acquire(
         self,
@@ -608,14 +610,16 @@ class OutputPool:
     ) -> OutputBuffer:
         words = int(token_capacity)
         if words > self.max_words:
-            raise resource_error("partition output exceeds its startup storage bound")
+            raise resource_error("lane output exceeds its startup storage bound")
         with self._lock:
+            if self._closed:
+                raise resource_error("output pool is closed")
             if self._free:
                 buffer = self._free.pop()
                 buffer.reset(rows, token_capacity=words, devices=devices)
                 return buffer
             if len(self._buffers) >= self.capacity:
-                raise resource_error("all partition output leases are active")
+                raise resource_error("all lane output leases are active")
             buffer = OutputBuffer(
                 rows,
                 token_capacity=words,
@@ -628,12 +632,15 @@ class OutputPool:
 
     def _release(self, buffer: OutputBuffer) -> None:
         with self._lock:
+            if self._closed:
+                return
             if buffer not in self._buffers or buffer in self._free:
                 raise _invariant("output pool received an invalid lease return")
             self._free.append(buffer)
 
     def close(self) -> None:
         with self._lock:
+            self._closed = True
             self._free.clear()
             self._buffers.clear()
 
@@ -972,7 +979,7 @@ class LogprobPayload:
     ) -> None:
         self.selected = selected
         self.prompt = prompt
-        self._value: bytes | None = None
+        self._value: TransferHandle | None = None
 
     def ready(self) -> bool:
         if self._value is not None:
@@ -1035,7 +1042,7 @@ class TransferPayload:
         self.descriptor_value = descriptor_value
         self.locators = locators
         self.transport = transport
-        self._value: bytes | None = None
+        self._value: TransferHandle | None = None
 
     def ready(self) -> bool:
         return self._value is not None or all(
@@ -1043,25 +1050,17 @@ class TransferPayload:
         )
 
     def max_encoded_bytes(self) -> int:
-        return len(
-            encode_transfer_descriptor(
-                self.kind,
-                self.descriptor_value,
-            )
-        )
+        return encode_transfer_handle(self.kind, self.descriptor_value).encoded_size_bound()
 
-    def finalize(self) -> bytes:
+    def finalize(self) -> TransferHandle:
         if self._value is None:
             if not self.ready():
                 raise RuntimeError("transport descriptor was observed before producer readiness")
-            self._value = encode_transfer_descriptor(
+            self._value = encode_transfer_handle(
                 self.kind,
                 self.descriptor_value,
             )
         return self._value
-
-    def __bytes__(self) -> bytes:
-        return self.finalize()
 
 
 class ImagePayload:
@@ -1138,6 +1137,7 @@ class OutputRecord:
 
     request_key: RequestKey
     op_id: int
+    kind: RunKind
     completion_slot_generation: int
     status: OpStatus
     selected_point: int
@@ -1148,6 +1148,8 @@ class OutputRecord:
     finish_flags: FinishFlags
     product_generations: tuple[int, ...]
     error_code: ErrorCode | None
+    next_cursor: int = 0
+    done: bool = False
 
 
 class PendingOutput:
@@ -1179,7 +1181,7 @@ class PendingOutput:
         parent: CompletionState | None,
         buffer: OutputBuffer,
         row: int,
-        predicated_parent: Callable[[], tuple[VersionRef, RequestRuntime]],
+        predicated_parent: Callable[[], tuple[Checkpoint, RequestRuntime]],
         *,
         status: OpStatus,
         selected_point: int,
@@ -1196,7 +1198,7 @@ class PendingOutput:
         self._observed = False
         self._invalid_sampling = False
         self._predicated = status is OpStatus.PREDICATED
-        self._predicated_parent: Callable[[], tuple[VersionRef, RequestRuntime]] | None = (
+        self._predicated_parent: Callable[[], tuple[Checkpoint, RequestRuntime]] | None = (
             predicated_parent
         )
         self._selected_point = int(selected_point)
@@ -1335,7 +1337,7 @@ class PendingOutput:
             raise RuntimeError("predicated completion lost its parent resolver")
         selected, runtime = predicated_parent()
         point = selected.point
-        if not isinstance(point, FixedPoint):
+        if not isinstance(point, FixedCheckpoint):
             raise RuntimeError("predicated operation selected a non-fixed parent")
         self._selected_point = int(point.point_index)
         self._selected_runtime = runtime
@@ -1436,20 +1438,40 @@ def _concrete_record(
         )
     if type(span.base) is not int or type(span.len) is not int:
         span = TokenSpan(base=int(span.base), len=int(span.len))
+    payload_type = (
+        ArResult
+        if record.kind in {RunKind.AR_EXTEND, RunKind.AR_DECODE, RunKind.AR_VERIFY}
+        else EncoderResult
+        if record.kind in {RunKind.ENCODER_VISION, RunKind.ENCODER_LATENT}
+        else DiffusionResult
+        if record.kind in {
+            RunKind.DIFFUSION_PREPARE,
+            RunKind.DIFFUSION_STEP,
+            RunKind.DIFFUSION_DECODE,
+            RunKind.DIFFUSION_FINALIZE,
+        }
+        else TransferResult
+    )
+    payload_args = (lengths, span, tokens, record.finish_flags, media_output)
+    payload = (
+        DiffusionResult(
+            *payload_args,
+            next_cursor=int(record.next_cursor),
+            done=bool(record.done),
+        )
+        if payload_type is DiffusionResult
+        else payload_type(*payload_args)
+    )
     return ModelOutput(
         request_key=record.request_key,
         op_id=record.op_id,
         completion_slot_generation=record.completion_slot_generation,
         status=record.status,
         selected_point=selected_point,
-        logical_lengths=lengths,
-        token_span=span,
-        committed_tokens=tokens,
-        finish_flags=record.finish_flags,
         product_generations=record.product_generations,
         error_code=record.error_code,
         timing_counters=timing,
-        media_output=media_output,
+        payload=payload,
     )
 
 
@@ -1458,9 +1480,12 @@ def _invalid_sampling_record(record: ModelOutput) -> ModelOutput:
         record,
         status=OpStatus.ERROR,
         selected_point=max(0, int(record.selected_point) - 1),
-        token_span=replace(record.token_span, len=0),
-        committed_tokens=(),
-        finish_flags=FinishFlags(),
+        payload=replace(
+            record.payload,
+            token_span=replace(record.token_span, len=0),
+            committed_tokens=(),
+            finish_flags=FinishFlags(),
+        ),
         product_generations=(),
         error_code=ErrorCode.INVALID_OPERATION,
     )
@@ -1470,9 +1495,12 @@ def _completion_error_record(record: ModelOutput) -> ModelOutput:
     return replace(
         record,
         status=OpStatus.ERROR,
-        token_span=replace(record.token_span, len=0),
-        committed_tokens=(),
-        finish_flags=FinishFlags(),
+        payload=replace(
+            record.payload,
+            token_span=replace(record.token_span, len=0),
+            committed_tokens=(),
+            finish_flags=FinishFlags(),
+        ),
         product_generations=(),
         error_code=ErrorCode.COMPUTE_ERROR,
     )
@@ -1487,21 +1515,24 @@ def _predicated_record(
         record,
         status=OpStatus.PREDICATED,
         selected_point=int(selected_point),
-        logical_lengths=LogicalLengths(
-            token_len=runtime.logical_position,
-            kv_visible_len=runtime.kv_visible_len,
-            kv_computed_len=runtime.kv_computed_len,
-            latent_len=0,
+        payload=replace(
+            record.payload,
+            logical_lengths=LogicalLengths(
+                token_len=runtime.logical_position,
+                kv_visible_len=runtime.kv_visible_len,
+                kv_computed_len=runtime.kv_computed_len,
+                latent_len=0,
+            ),
+            token_span=replace(record.token_span, len=0),
+            committed_tokens=(),
+            finish_flags=FinishFlags(),
         ),
-        token_span=replace(record.token_span, len=0),
-        committed_tokens=(),
-        finish_flags=FinishFlags(),
         product_generations=(),
         error_code=None,
     )
 
 
-def completion_report_ready(report: CompletionReport) -> bool:
+def run_result_ready(report: RunResult) -> bool:
     """True once every completion token and artifact can be read
     without a stall."""
 
@@ -1514,11 +1545,11 @@ def completion_report_ready(report: CompletionReport) -> bool:
     return True
 
 
-def partition_completion_ready(partition: PartitionCompletion) -> bool:
-    for record in partition.completions:
+def lane_completion_ready(lane: LaneResult) -> bool:
+    for record in lane.completions:
         if not _record_ready(record):
             return False
-    for product in partition.products:
+    for product in lane.products:
         if not _completion_payload_ready(product.payload):
             return False
     return True
@@ -1534,15 +1565,15 @@ def _completion_payload_ready(payload: object) -> bool:
     )
 
 
-def finalize_completion_report(report: CompletionReport) -> CompletionReport:
-    """Materialize query-ready partitions into host-owned values."""
+def finalize_run_result(report: RunResult) -> RunResult:
+    """Materialize query-ready lanes into host-owned values."""
 
     changed = False
-    partitions: list[PartitionCompletion] = []
-    for partition in report.partitions:
+    lanes: list[LaneResult] = []
+    for lane in report.lanes:
         completions = tuple(
             _finalized_record(record) if _record_ready(record) else record
-            for record in partition.completions
+            for record in lane.completions
         )
         nonpublishing_ops = {
             int(record.op_id)
@@ -1551,7 +1582,7 @@ def finalize_completion_report(report: CompletionReport) -> CompletionReport:
         }
         retained_products = tuple(
             product
-            for product in partition.products
+            for product in lane.products
             if int(product.product.producer_op_id) not in nonpublishing_ops
         )
         products = tuple(
@@ -1571,13 +1602,12 @@ def finalize_completion_report(report: CompletionReport) -> CompletionReport:
         for product in products:
             if (
                 isinstance(product.payload, bytes)
-                and not product.payload.startswith(TRANSFER_DESCRIPTOR_PREFIX)
                 and len(product.payload) > int(product.product.max_bytes)
             ):
                 raise invalid_descriptor(
                     "completion product exceeds its registered product byte bound"
                 )
-        publication = partition.publication
+        publication = lane.publication
         publication_ready = (
             publication is not None
             and all(isinstance(record, ModelOutput) for record in completions)
@@ -1592,17 +1622,17 @@ def finalize_completion_report(report: CompletionReport) -> CompletionReport:
         if publication_ready:
             publication.finish(cast(tuple[ModelOutput, ...], completions))
         if (
-            not all(new is old for new, old in zip(completions, partition.completions, strict=True))
-            or len(products) != len(partition.products)
-            or not all(new is old for new, old in zip(products, partition.products))
+            not all(new is old for new, old in zip(completions, lane.completions, strict=True))
+            or len(products) != len(lane.products)
+            or not all(new is old for new, old in zip(products, lane.products))
             or publication_ready
         ):
             changed = True
-            partition = replace(
-                partition,
+            lane = replace(
+                lane,
                 completions=completions,
                 products=products,
                 publication=None if publication_ready else publication,
             )
-        partitions.append(partition)
-    return replace(report, partitions=tuple(partitions)) if changed else report
+        lanes.append(lane)
+    return replace(report, lanes=tuple(lanes)) if changed else report

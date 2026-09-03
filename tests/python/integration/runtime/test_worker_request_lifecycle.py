@@ -3,24 +3,31 @@ from __future__ import annotations
 import pytest
 
 from tests.python.fixtures.depth_one import (
+    ar_params,
     bind_request_placement,
     commit_for_completion,
-    execution_batch,
+    execution_run,
     finalized_report,
     root_parent,
     token_operation,
-    und_admission,
 )
 from tests.python.fixtures.execution_worker import execution_worker
-from uniserve_worker.execution.batch import Close, CloseReason, ErrorCode, NewRequest, OpStatus, TokenMode
+from uniserve_worker.execution.batch import (
+    CloseReason,
+    ErrorCode,
+    Finish,
+    NewRequest,
+    OpStatus,
+    TokenMode,
+)
 
 pytestmark = pytest.mark.integration
 
 
 def test_close_rejects_descendants_without_affecting_another_request() -> None:
     worker = execution_worker()
-    closed_admission = und_admission(81, block_ids=(0,))
-    active_admission = und_admission(82, block_ids=(1,))
+    closed_admission = ar_params(81, block_ids=(0,))
+    active_admission = ar_params(82, block_ids=(1,))
     closed_extend, closed_input = token_operation(
         closed_admission.request_key,
         op_id=1,
@@ -37,8 +44,8 @@ def test_close_rejects_descendants_without_affecting_another_request() -> None:
     )
     report = finalized_report(
         worker.execute(
-            execution_batch(
-                step_id=1,
+            execution_run(
+                run_id=1,
                 admissions=(closed_admission, active_admission),
                 operations=(closed_extend, active_extend),
                 input_products=(closed_input, active_input),
@@ -47,14 +54,14 @@ def test_close_rejects_descendants_without_affecting_another_request() -> None:
     )
     closed_commit = commit_for_completion(closed_extend, report)
     active_commit = commit_for_completion(active_extend, report)
-    worker.execute(execution_batch(step_id=2, controls=(closed_commit, active_commit)))
-    close = Close(
+    worker.execute(execution_run(run_id=2, commands=(closed_commit, active_commit)))
+    close = Finish(
         request_key=closed_admission.request_key,
         control_seq=closed_commit.control_seq + 1,
         cutoff=closed_commit.selected,
         reason=CloseReason.CANCELLED,
     )
-    worker.execute(execution_batch(step_id=3, controls=(close,)))
+    worker.execute(execution_run(run_id=3, commands=(close,)))
 
     closed_decode, closed_decode_input = token_operation(
         closed_admission.request_key,
@@ -66,8 +73,8 @@ def test_close_rejects_descendants_without_affecting_another_request() -> None:
     )
     closed_report = finalized_report(
         worker.execute(
-            execution_batch(
-                step_id=4,
+            execution_run(
+                run_id=4,
                 operations=(closed_decode,),
                 input_products=(closed_decode_input,),
             )
@@ -86,8 +93,8 @@ def test_close_rejects_descendants_without_affecting_another_request() -> None:
     )
     active_report = finalized_report(
         worker.execute(
-            execution_batch(
-                step_id=5,
+            execution_run(
+                run_id=5,
                 operations=(active_decode,),
                 input_products=(active_decode_input,),
             )
@@ -100,7 +107,7 @@ def test_close_rejects_descendants_without_affecting_another_request() -> None:
 
 def test_drop_reuses_the_slot_and_rejects_the_retired_request_key() -> None:
     worker = execution_worker()
-    retired = und_admission(83, block_ids=(0,))
+    retired = ar_params(83, block_ids=(0,))
     retired_operation, retired_input = token_operation(
         retired.request_key,
         op_id=1,
@@ -109,20 +116,20 @@ def test_drop_reuses_the_slot_and_rejects_the_retired_request_key() -> None:
         tokens=(3, 4),
     )
     worker.execute(
-        execution_batch(
-            step_id=1,
+        execution_run(
+            run_id=1,
             admissions=(retired,),
             operations=(retired_operation,),
             input_products=(retired_input,),
         )
     )
-    worker.drop_session(retired.request_key.session_id)
+    worker.drop_request(retired.request_key.request_id)
 
-    replacement_template = und_admission(84, block_ids=(1,))
+    replacement_template = ar_params(84, block_ids=(1,))
     replacement = NewRequest.create(
         replacement_template.request_key,
         request_pool_idx=retired.request_pool_idx,
-        und=replacement_template.und,
+        ar=replacement_template.ar,
     )
     bind_request_placement(
         replacement.request_key,
@@ -138,8 +145,8 @@ def test_drop_reuses_the_slot_and_rejects_the_retired_request_key() -> None:
     )
     replacement_report = finalized_report(
         worker.execute(
-            execution_batch(
-                step_id=2,
+            execution_run(
+                run_id=2,
                 admissions=(replacement,),
                 operations=(replacement_operation,),
                 input_products=(replacement_input,),
@@ -150,8 +157,8 @@ def test_drop_reuses_the_slot_and_rejects_the_retired_request_key() -> None:
 
     retired_report = finalized_report(
         worker.execute(
-            execution_batch(
-                step_id=3,
+            execution_run(
+                run_id=3,
                 operations=(retired_operation,),
                 input_products=(retired_input,),
             )

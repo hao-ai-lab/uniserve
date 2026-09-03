@@ -1,14 +1,15 @@
 use serde::{Deserialize, Serialize};
 use uniserve_core::{
     FeedbackNextToken, FeedbackSource, GenOnlyStartPolicyDescriptor, GeneratedImageFeedbackRecipe,
-    GenerationConstraint, GenerationPolicyDescriptor, ImageIngestRecipe, ImageIngestStep,
-    ImageKvEffect, Modality, TriggerPolicyDescriptor,
+    GenerationConstraint, GenerationFeatures, GenerationLimits, GenerationPolicyDescriptor,
+    ImageIngestRecipe, ImageIngestStep, ImageKvEffect, Modality, ModelDtype,
+    TriggerPolicyDescriptor,
 };
 
 use super::resolution::{ResolutionBucket, ResolutionName, ResolutionPolicy};
 use super::{
     DelimitedTextPolicy, GenerationControls, ImageGenerationDefaults, OutputFilterPolicy, chatml,
-    encode, pixel_bound_tokens, required_token, required_token_id,
+    encode, model_dtype_bytes, pixel_bound_tokens, required_token, required_token_id,
 };
 use crate::profile::assets;
 use crate::profile::tokenizer::HuggingFaceTokenizer;
@@ -30,6 +31,26 @@ pub struct SenseNovaProfile {
 
 impl SenseNovaProfile {
     pub const ID: &'static str = "sensenova";
+    pub const LATENT_DOWNSAMPLE: u32 = 32;
+    pub const ENCODER_CACHE_ENTRIES: usize = 256;
+
+    pub fn runtime_limits(model_dtype: ModelDtype) -> GenerationLimits {
+        let dtype_bytes = model_dtype_bytes(model_dtype);
+        GenerationLimits {
+            features: GenerationFeatures::UNDERSTANDING
+                | GenerationFeatures::VISION_ENCODE
+                | GenerationFeatures::IMAGE_GENERATION,
+            max_latent_units: 4_096,
+            latent_downsample: Self::LATENT_DOWNSAMPLE,
+            max_vae_grid_tokens: 4_096,
+            max_vit_grid_tokens: 4_900,
+            max_latent_feature_bytes: 4_096 * 3 * 32 * 32 * dtype_bytes,
+            max_vision_feature_bytes: 4_900 * 4_096 * dtype_bytes,
+            commit_marker_tokens: 0,
+            max_cfg_branches: 3,
+            encoder_cache_entries: Self::ENCODER_CACHE_ENTRIES as u32,
+        }
+    }
 
     pub fn resolve(tokenizer: &HuggingFaceTokenizer) -> assets::Result<Self> {
         let (start_of_image, start_of_image_text) =

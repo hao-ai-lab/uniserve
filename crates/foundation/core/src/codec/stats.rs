@@ -213,7 +213,7 @@ impl WorkerForwardStats {
 
 /// Per-domain scheduler accounting for one stats update.
 ///
-/// Operation, partition, pressure, reclaim, and time fields are interval
+/// Operation, run, pressure, reclaim, and time fields are interval
 /// deltas. Credit fields are gauges. Device and co-residency time describe the
 /// full interval visible to the named domain; values from co-resident domains
 /// therefore must not be summed to estimate aggregate GPU busy time.
@@ -237,9 +237,9 @@ pub struct DomainSchedulerStats {
     #[serde(default)]
     pub reclaimed_credits: u64,
     #[serde(default)]
-    pub completed_partitions: u64,
+    pub completed_runs: u64,
     #[serde(default)]
-    pub co_resident_partitions: u64,
+    pub co_resident_runs: u64,
     #[serde(default)]
     pub queue_us: u64,
     #[serde(default)]

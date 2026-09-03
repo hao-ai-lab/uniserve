@@ -245,12 +245,13 @@ impl EngineSettings {
         );
         anyhow::ensure!(
             !self.workers.pools.is_empty()
-                && self
-                    .workers
-                    .pools
-                    .iter()
-                    .all(|pool| pool.count > 0 && pool.tp > 0),
-            "workers must contain positive pool counts and tensor-parallel sizes"
+                && self.workers.pools.iter().all(|pool| {
+                    !pool.id.0.is_empty()
+                        && !pool.device.is_empty()
+                        && pool.tensor_parallel_size > 0
+                        && !pool.supported_ops.is_empty()
+                }),
+            "workers must contain explicit ids, devices, supported operations, and positive tensor-parallel sizes"
         );
         Ok(())
     }

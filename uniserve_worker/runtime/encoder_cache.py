@@ -3,17 +3,27 @@
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from threading import RLock
 from typing import Final
 
 import torch
 
-from ..execution.batch import DType, ProductKind, ProductRef, RequestKey, StaticDim, StorageClass
+from ..execution.batch import (
+    BufferId,
+    BufferPlacement,
+    DType,
+    ProductKind,
+    ProductRef,
+    RequestKey,
+    StaticDim,
+    StorageClass,
+)
 from ..foundation.errors import WorkerError, WorkerErrorCode, invalid_descriptor, resource_error
 from .device import canonical_device
 from .device_events import DeviceEventPool
+from .persistent_buffers import PersistentBufferBinding, PersistentBuffers
 
 _MAX_GENERATION: Final[int] = (1 << 32) - 1
 _DTYPES: Final[dict[DType, torch.dtype]] = {
@@ -33,7 +43,7 @@ def _reference_key(reference: ProductRef) -> _ReferenceKey:
     key = reference.request_key
     return (
         int(key.authority_id),
-        int(key.session_id),
+        int(key.request_id),
         int(key.epoch),
         int(reference.producer_op_id),
         int(reference.output_index),
@@ -72,6 +82,7 @@ class EncoderWrite:
     slot: _EncoderSlot
     physical_generation: int
     binding_id: int
+    buffer_binding: PersistentBufferBinding
     producer_event: torch.cuda.Event | None = None
     producer_stream: int | None = None
     reader_events: list[torch.cuda.Event] = field(default_factory=list)
@@ -94,14 +105,6 @@ class EncoderRead:
         return self._write.reference
 
 
-@dataclass(frozen=True, slots=True)
-class EncoderSnapshot:
-    reference: ProductRef
-    value: torch.Tensor
-    device: str
-    metadata: EncoderMetadata
-
-
 class EncoderCache:
     """Own immutable encoded features behind fixed entry and byte capacities."""
 
@@ -111,6 +114,7 @@ class EncoderCache:
         entry_capacity: int,
         max_entry_bytes: int,
         devices: tuple[torch.device | str, ...],
+        persistent_buffers: PersistentBuffers,
         event_pool: DeviceEventPool | None = None,
     ) -> None:
         self.entry_capacity = int(entry_capacity)
@@ -125,17 +129,9 @@ class EncoderCache:
         if not normalized:
             normalized.append(torch.device("cpu"))
         self.devices = tuple(normalized)
-        self.slot_bytes = ((self.max_entry_bytes + 7) // 8) * 8
-        self.byte_capacity = self.entry_capacity * self.slot_bytes * len(self.devices)
+        self.byte_capacity = persistent_buffers.byte_capacity
+        self.persistent_buffers = persistent_buffers
         self.event_pool = DeviceEventPool() if event_pool is None else event_pool
-        self._slabs = {
-            str(device): torch.empty(
-                (self.entry_capacity, self.slot_bytes),
-                dtype=torch.uint8,
-                device=device,
-            )
-            for device in self.devices
-        }
         self._slots = {
             str(device): tuple(
                 _EncoderSlot(index=index, device=device) for index in range(self.entry_capacity)
@@ -167,6 +163,8 @@ class EncoderCache:
     def bind_outputs(
         self,
         bindings: tuple[tuple[ProductRef, torch.device | str], ...],
+        *,
+        buffer_placements: Mapping[BufferId, BufferPlacement],
     ) -> tuple[EncoderWrite, ...]:
         if not bindings:
             return ()
@@ -177,7 +175,7 @@ class EncoderCache:
             keys = tuple(_reference_key(reference) for reference, _device in bindings)
             if len(set(keys)) != len(keys):
                 raise invalid_descriptor("encoder cache registration repeats a product identity")
-            validated: list[tuple[ProductRef, torch.device]] = []
+            validated: list[tuple[ProductRef, torch.device, BufferPlacement]] = []
             requested_by_device: dict[str, int] = {}
             for (reference, raw_device), key in zip(bindings, keys, strict=True):
                 if reference.kind not in {
@@ -192,6 +190,9 @@ class EncoderCache:
                     raise invalid_descriptor("encoder feature dtype is unsupported")
                 if int(reference.max_bytes) > self.max_entry_bytes:
                     raise resource_error("encoder feature exceeds the fixed entry byte capacity")
+                placement = buffer_placements.get(reference.buffer_id)
+                if placement is None:
+                    raise invalid_descriptor("encoder feature has no buffer placement")
                 existing = self._entries.get(key)
                 if existing is not None:
                     if existing.reference != reference:
@@ -209,38 +210,53 @@ class EncoderCache:
                 requested_by_device[str(device)] = requested_by_device.get(str(device), 0) + 1
                 if requested_by_device[str(device)] > len(free):
                     raise resource_error("encoder cache has no query-ready device slot")
-                validated.append((reference, device))
-            prepared: list[tuple[ProductRef, torch.device, _EncoderSlot]] = []
+                validated.append((reference, device, placement))
+            prepared: list[
+                tuple[ProductRef, torch.device, BufferPlacement, _EncoderSlot]
+            ] = []
             try:
-                for reference, device in validated:
+                for reference, device, placement in validated:
                     slot = self._slots[str(device)][self._free[str(device)].popleft()]
-                    prepared.append((reference, device, slot))
+                    prepared.append((reference, device, placement, slot))
             except BaseException:
-                for _reference, device, slot in reversed(prepared):
+                for _reference, device, _placement, slot in reversed(prepared):
                     self._free[str(device)].appendleft(slot.index)
                 raise
             writes: list[EncoderWrite] = []
             try:
-                for (reference, _device, slot), key in zip(prepared, keys, strict=True):
+                for (reference, device, placement, slot), key in zip(
+                    prepared, keys, strict=True
+                ):
                     generation = slot.generation + 1
                     slot.generation = 1 if generation > _MAX_GENERATION else generation
                     binding_id = self._next_binding_id
                     self._next_binding_id += 1
+                    buffer_binding = self.persistent_buffers.bind(
+                        reference,
+                        placement,
+                        device=device,
+                        dtype=_DTYPES[reference.dtype],
+                        shape=_shape(reference),
+                    )
                     slot.owner = binding_id
                     write = EncoderWrite(
                         reference=reference,
                         slot=slot,
                         physical_generation=slot.generation,
                         binding_id=binding_id,
+                        buffer_binding=buffer_binding,
                     )
                     self._candidates[write.binding_id] = write
                     writes.append(write)
             except BaseException:
                 for write in writes:
                     self._candidates.pop(write.binding_id, None)
+                    self.persistent_buffers.release(write.buffer_binding)
                     write.slot.owner = 0
                     self._free[str(write.slot.device)].appendleft(write.slot.index)
-                for _reference, device, slot in reversed(prepared[len(writes) :]):
+                for _reference, device, _placement, slot in reversed(
+                    prepared[len(writes) :]
+                ):
                     self._free[str(device)].appendleft(slot.index)
                 raise
             return tuple(writes)
@@ -257,9 +273,9 @@ class EncoderCache:
                 raise _invariant("encoder feature was published more than once")
             dtype = _DTYPES[entry.reference.dtype]
             shape = _shape(entry.reference)
-            slab = self._slabs[str(entry.slot.device)][entry.slot.index]
-            storage_bytes = int(entry.reference.max_bytes)
-            target = slab[:storage_bytes].view(dtype).reshape(shape)
+            target = entry.buffer_binding.tensor
+            if target.dtype != dtype or tuple(target.shape) != shape:
+                raise _invariant("encoder feature buffer has incompatible physical geometry")
             flat = value.detach().reshape(-1)
             if int(flat.numel()) > int(target.numel()):
                 raise _invariant("encoder feature exceeds its registered shape bound")
@@ -314,7 +330,7 @@ class EncoderCache:
         consumer_op_id: int,
         device: torch.device | str | None = None,
     ) -> EncoderRead:
-        """Read one unpublished feature inside its consuming partition."""
+        """Read one unpublished feature inside its consuming lane."""
 
         with self._lock:
             entry = self._require_write_locked(write)
@@ -404,11 +420,11 @@ class EncoderCache:
                     self._detach_locked(entry)
             self._reclaim_ready_locked()
 
-    def drop_session(self, session_id: int) -> None:
-        target = int(session_id)
+    def drop_request(self, request_id: int) -> None:
+        target = int(request_id)
         with self._lock:
             for entry in self._entries.values():
-                if int(entry.reference.request_key.session_id) == target:
+                if int(entry.reference.request_key.request_id) == target:
                     entry.released = True
                     self._detach_locked(entry)
             self._reclaim_ready_locked()
@@ -431,52 +447,6 @@ class EncoderCache:
                 self._detach_locked(entry)
             self._reclaim_ready_locked()
 
-    def snapshot_entries(self, session_ids: set[int]) -> tuple[EncoderSnapshot, ...]:
-        selected = {int(value) for value in session_ids}
-        with self._lock:
-            result: list[EncoderSnapshot] = []
-            for entry in self._entries.values():
-                if (
-                    int(entry.reference.request_key.session_id) not in selected
-                    or entry.released
-                    or not entry.published
-                    or entry.tensor is None
-                    or entry.metadata is None
-                ):
-                    continue
-                result.append(
-                    EncoderSnapshot(
-                        reference=entry.reference,
-                        value=entry.tensor.detach().cpu().contiguous(),
-                        device=str(entry.tensor.device),
-                        metadata=entry.metadata,
-                    )
-                )
-            return tuple(result)
-
-    def restore_entries(
-        self,
-        session_ids: set[int],
-        snapshots: tuple[EncoderSnapshot, ...],
-    ) -> None:
-        selected = {int(value) for value in session_ids}
-        if any(int(item.reference.request_key.session_id) not in selected for item in snapshots):
-            raise invalid_descriptor("encoder snapshot contains an undeclared session")
-        with self._lock:
-            for entry in self._entries.values():
-                if int(entry.reference.request_key.session_id) in selected:
-                    entry.released = True
-                    self._detach_locked(entry)
-            self._reclaim_ready_locked()
-        writes = self.bind_outputs(tuple((item.reference, item.device) for item in snapshots))
-        try:
-            for write, item in zip(writes, snapshots, strict=True):
-                self.publish(write, item.value.to(write.slot.device), item.metadata)
-            self.commit_writes(writes)
-        except BaseException:
-            self.abandon_writes(writes)
-            raise
-
     def close(self) -> None:
         with self._lock:
             self._entries.clear()
@@ -484,7 +454,6 @@ class EncoderCache:
             self._operations.clear()
             self._free.clear()
             self._slots.clear()
-            self._slabs.clear()
 
     def _require_locked(self, reference: ProductRef) -> EncoderWrite:
         entry = self._entries.get(_reference_key(reference))
@@ -543,6 +512,7 @@ class EncoderCache:
             for event in entry.reader_events:
                 release(event)
             entry.slot.owner = 0
+            self.persistent_buffers.release(entry.buffer_binding)
             self._free[str(entry.slot.device)].append(entry.slot.index)
             reclaimed += 1
         for binding_id, entry in tuple(self._candidates.items()):
@@ -558,6 +528,7 @@ class EncoderCache:
             for event in entry.reader_events:
                 release(event)
             entry.slot.owner = 0
+            self.persistent_buffers.release(entry.buffer_binding)
             self._free[str(entry.slot.device)].append(entry.slot.index)
             reclaimed += 1
         for event, count in event_releases.values():
@@ -569,6 +540,5 @@ __all__ = [
     "EncoderCache",
     "EncoderMetadata",
     "EncoderRead",
-    "EncoderSnapshot",
     "EncoderWrite",
 ]

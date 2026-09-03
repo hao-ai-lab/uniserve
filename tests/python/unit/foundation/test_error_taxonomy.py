@@ -125,7 +125,7 @@ def test_to_mapping_emits_canonical_error_context():
     assert snapshot["route"] == "language"
     assert snapshot["operations"] == [
         {
-            "request_key": {"authority_id": 5, "session_id": 42, "epoch": 3},
+            "request_key": {"authority_id": 5, "request_id": 42, "epoch": 3},
             "op_id": 7,
         }
     ]

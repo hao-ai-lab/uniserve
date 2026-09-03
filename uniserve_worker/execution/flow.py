@@ -11,15 +11,16 @@ import torch
 from uniserve_worker.execution.batch import (
     DrawLayout,
     FinishFlags,
-    ForwardMode,
     ImageParams,
     Operation,
     OpStatus,
     ProductKind,
     ProductPayload,
     ProductRef,
+    RunKind,
     TokenSpan,
 )
+from uniserve_worker.execution.output import TransferPayload
 from uniserve_worker.foundation.errors import invalid_descriptor
 from uniserve_worker.models.generation import BranchSource, LatentLayout
 from uniserve_worker.models.inputs import PatchTransform
@@ -28,18 +29,17 @@ from uniserve_worker.nn.diffusion.integrator import euler_step
 from uniserve_worker.nn.diffusion.schedule import x_pred_to_velocity
 from uniserve_worker.nn.vision import get_flattened_position_ids_extrapolate
 from uniserve_worker.runtime.latent_pool import LatentPublication
-from uniserve_worker.execution.output import TransferPayload
 from uniserve_worker.runtime.request import Request
 
 from . import token
 from .forward_batch import FlowPatches, ModelPhase, TokenSelection
 from .resources import ExecutionResources
 from .rng import flow_noise_seed, normal_noise
-from .rows import ForwardRow, LatentExecution, OperationState, Outcome, PartitionState
+from .rows import ForwardRow, LaneState, LatentExecution, OperationState, Outcome
 
 
 def pack_forward(runtime: ExecutionResources, state: OperationState) -> tuple[object, ...]:
-    if state.operation.work is not ForwardMode.MEDIA_DENOISE:
+    if state.operation.kind is not RunKind.DIFFUSION_STEP:
         return ()
     if state.phase == "initial":
         _initialize(runtime, state)
@@ -72,7 +72,7 @@ def consume_forward(
                 runtime,
                 task,
                 task.query_tokens,
-                state.partition,
+                state.lane,
                 publish_runtime=False,
             )
             entry = state.data["entries"][branch]
@@ -107,7 +107,7 @@ def integrate(runtime: ExecutionResources, state: OperationState) -> bool:
     elif flow.prediction != "velocity":
         raise invalid_descriptor(f"unsupported flow prediction {flow.prediction!r}")
     current.copy_(euler_step(current, velocity, timestep, state.data["t_next"]))
-    state.data["session"].flow_step = state.data["step"] + 1
+    state.data["request"].flow_step = state.data["step"] + 1
     state.data["step"] += 1
     if state.data["step"] < state.data["end_step"]:
         state.phase = "step"
@@ -120,9 +120,9 @@ def integrate(runtime: ExecutionResources, state: OperationState) -> bool:
 def _initialize(runtime: ExecutionResources, state: OperationState) -> None:
 
     operation = state.operation
-    partition = state.partition
+    scope = state.lane
     flow = runtime.generation()
-    session_id = operation.request_key.session_id
+    request_id = operation.request_key.request_id
     conditioning = tuple(
         reference for reference in operation.inputs if reference.kind is ProductKind.KV
     )
@@ -136,17 +136,17 @@ def _initialize(runtime: ExecutionResources, state: OperationState) -> None:
         raise invalid_descriptor(
             "flow operation requires exact conditioning and one latent input/output generation"
         )
-    cache = runtime.cache_coordinates(operation, partition)
-    session = runtime.request_row(partition, session_id)
+    cache = runtime.cache_coordinates(operation, scope)
+    request = runtime.request_row(scope, request_id)
     runtime.cache_publications.validate_conditioning(
-        session_id,
+        request_id,
         conditioning[0],
-        request_pool_idx=session.request_pool_idx,
+        request_pool_idx=request.request_pool_idx,
         group_id=cache[1],
         visible_length=cache[2],
-        publication=partition.cache_publication_inputs.get(conditioning[0]),
+        publication=scope.cache_publication_inputs.get(conditioning[0]),
     )
-    image = session.image
+    image = request.image
     if image is None:
         raise invalid_descriptor("flow operation has no admitted image parameters")
     if operation.rng is not None:
@@ -159,9 +159,9 @@ def _initialize(runtime: ExecutionResources, state: OperationState) -> None:
         or latent_input == latent_output
     ):
         raise invalid_descriptor("flow latent generations are invalid")
-    if session.latent_product != latent_input:
+    if request.latent_product != latent_input:
         raise invalid_descriptor("flow operation does not name the current latent generation")
-    row = runtime.latent_row(operation, partition)
+    row = runtime.latent_row(operation, scope)
     pool = runtime.require_latent_pool()
     start_step = int(row.placement.start_step)
     end_step = start_step + int(row.placement.step_count)
@@ -177,7 +177,7 @@ def _initialize(runtime: ExecutionResources, state: OperationState) -> None:
     state.data.update(
         flow=flow,
         cache=cache,
-        session=session,
+        request=request,
         image=image,
         latent_input=latent_input,
         latent_output=latent_output,
@@ -187,7 +187,7 @@ def _initialize(runtime: ExecutionResources, state: OperationState) -> None:
         step=start_step,
         start_step=start_step,
         end_step=end_step,
-        conditioning_position=int(session.logical_position),
+        conditioning_position=int(request.logical_position),
         image_prompt=image.image_prompts[0] if image.image_prompts else "",
         entries={},
     )
@@ -197,7 +197,7 @@ def _initialize(runtime: ExecutionResources, state: OperationState) -> None:
 def _prepare_step(runtime: ExecutionResources, state: OperationState) -> None:
 
     operation = state.operation
-    partition = state.partition
+    scope = state.lane
     data = state.data
     image = data["image"]
     step = data["step"]
@@ -218,7 +218,7 @@ def _prepare_step(runtime: ExecutionResources, state: OperationState) -> None:
     prefix_rows = []
     prefix_branches = []
     entries = data["entries"]
-    descriptors = partition.forward_rows.get(runtime.operation_identity(operation), ())
+    descriptors = scope.forward_rows.get(runtime.operation_identity(operation), ())
     if len(descriptors) < len(guide.branches):
         raise invalid_descriptor("media denoise has incomplete forward-row metadata")
     denoise_descriptors = descriptors[-len(guide.branches) :]
@@ -227,7 +227,7 @@ def _prepare_step(runtime: ExecutionResources, state: OperationState) -> None:
             continue
         source = branch_source(runtime, branch)
         prefix, copy_conditioning = flow_prefix(
-            runtime, source, data["image_prompt"], data["session"]
+            runtime, source, data["image_prompt"], data["request"]
         )
         descriptor = denoise_descriptors[branch_index]
         if copy_conditioning:
@@ -253,7 +253,7 @@ def _prepare_step(runtime: ExecutionResources, state: OperationState) -> None:
         initialize_prefix = entry[2] == 0 and prefix_length > 0
         entries[branch] = entry
         if initialize_prefix and prefix:
-            prefix_rows.append(prefix_row(runtime, operation, prefix, entry, branch, partition))
+            prefix_rows.append(prefix_row(runtime, operation, prefix, entry, branch, scope))
             prefix_branches.append(branch)
     data.update(guide=guide, t=t, t_next=t_next)
     if prefix_rows:
@@ -279,7 +279,7 @@ def _pack_denoise(runtime: ExecutionResources, state: OperationState) -> None:
             data["t"],
             int(row.placement.height),
             int(row.placement.width),
-            state.partition,
+            state.lane,
         )
         for branch in data["guide"].branches
     )
@@ -288,7 +288,7 @@ def _pack_denoise(runtime: ExecutionResources, state: OperationState) -> None:
 def _finish(runtime: ExecutionResources, state: OperationState) -> None:
 
     operation = state.operation
-    partition = state.partition
+    scope = state.lane
     data = state.data
     row = data["row"]
     final_step = data["end_step"]
@@ -301,7 +301,7 @@ def _finish(runtime: ExecutionResources, state: OperationState) -> None:
         height=int(row.placement.height),
         width=int(row.placement.width),
     )
-    partition.latent_publications.append(
+    scope.latent_publications.append(
         LatentPublication(
             request_pool_idx=row.request_pool_idx,
             page_table=row.placement.page_table,
@@ -314,7 +314,7 @@ def _finish(runtime: ExecutionResources, state: OperationState) -> None:
             width=int(row.placement.width),
         )
     )
-    data["session"].latent_product = data["latent_output"]
+    data["request"].latent_product = data["latent_output"]
     products = publish_latent_transfer(
         runtime,
         operation,
@@ -322,29 +322,29 @@ def _finish(runtime: ExecutionResources, state: OperationState) -> None:
         data["current"],
         row,
         step=final_step,
-        scope=partition,
+        scope=scope,
     )
     state.outcome = Outcome(
         status=OpStatus.OK,
         selected_point=1,
         logical_lengths=runtime.logical_lengths(
             operation,
-            data["session"],
+            data["request"],
             data["cache"],
             latent_len=final_step,
         ),
-        token_span=TokenSpan(base=data["session"].logical_position, len=0),
+        token_span=TokenSpan(base=data["request"].logical_position, len=0),
         finish_flags=FinishFlags(),
         product_generations=runtime.output_generations(operation),
         products=products,
     )
-    main_slot = int(data["session"].request_pool_idx)
+    main_slot = int(data["request"].request_pool_idx)
     alternative_slots = {
         int(entry[0]) for entry in data["entries"].values() if int(entry[0]) != main_slot
     }
     if alternative_slots and final_step >= int(data["image"].steps):
         for slot in alternative_slots:
-            partition.runtime_cache_lengths.pop(slot, None)
+            scope.runtime_cache_lengths.pop(slot, None)
         runtime.req_to_token_pool.release(tuple(alternative_slots))
         tracked = runtime._flow_prefix_slots.get(operation.request_key)
         if tracked is not None:
@@ -363,7 +363,7 @@ def publish_latent_transfer(
     row: LatentExecution,
     *,
     step: int,
-    scope: PartitionState,
+    scope: LaneState,
 ) -> tuple[ProductPayload, ...]:
     """Publish a committed-candidate trajectory for an exact staged consumer."""
 
@@ -427,13 +427,13 @@ def flow_prefix(
     runtime: ExecutionResources,
     source: BranchSource,
     image_prompt: str,
-    session: Request,
+    request: Request,
 ) -> tuple[tuple[int, ...], bool]:
     return runtime.generation().prefix(
         source,
         image_prompt=image_prompt,
-        negative_prompt=require_image(session).negative_prompt,
-        negative_token_ids=session.negative_token_ids,
+        negative_prompt=require_image(request).negative_prompt,
+        negative_token_ids=request.negative_token_ids,
         tokenizer=runtime.tokenizer,
     )
 
@@ -444,13 +444,13 @@ def prefix_row(
     tokens: tuple[int, ...],
     entry: tuple[int, int, int, int],
     branch: Branch,
-    scope: PartitionState,
+    scope: LaneState,
 ) -> ForwardRow:
-    session = runtime.request_row(scope, operation.request_key.session_id)
+    request = runtime.request_row(scope, operation.request_key.request_id)
     positions = torch.arange(entry[2], entry[2] + len(tokens), dtype=torch.long)
     return ForwardRow(
         operation=operation,
-        request=session,
+        request=request,
         weights=runtime.weights,
         phase=ModelPhase.TEXT,
         token_ids=torch.tensor(tokens, dtype=torch.long),
@@ -477,9 +477,9 @@ def denoise_row(
     timestep: torch.Tensor,
     height: int,
     width: int,
-    scope: PartitionState,
+    scope: LaneState,
 ) -> ForwardRow:
-    session = runtime.request_row(scope, operation.request_key.session_id)
+    request = runtime.request_row(scope, operation.request_key.request_id)
     flow = runtime.generation()
     image_tokens = image_token_count(runtime, latent, height, width)
     text_local: tuple[int, ...]
@@ -515,7 +515,7 @@ def denoise_row(
         text_local = ()
     return ForwardRow(
         operation=operation,
-        request=session,
+        request=request,
         weights=runtime.weights,
         phase=ModelPhase.DENOISE,
         flow_conditioning=conditioning,
@@ -553,10 +553,10 @@ def image_token_count(
     return runtime.generation().image_tokens(height, width)
 
 
-def require_image(session: Request) -> ImageParams:
-    if session.image is None:
+def require_image(request: Request) -> ImageParams:
+    if request.image is None:
         raise invalid_descriptor("flow execution requires admitted image parameters")
-    return session.image
+    return request.image
 
 
 def prediction(output: torch.Tensor) -> torch.Tensor:

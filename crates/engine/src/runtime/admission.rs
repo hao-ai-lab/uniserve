@@ -1,32 +1,59 @@
 use super::*;
 
-impl Scheduler {
+impl EngineLoop {
     pub(super) fn enqueue(&mut self, req: GenerationRequest, event_tx: EventTx) {
-        if self.kv_budget.cache.is_none() {
-            let _ = event_tx.send(GenerationEvent::Rejected {
+        if self.memory.cache.is_none() {
+            self.trace_record(json!({
+                "event": "request_rejected",
+                "at_s": now(),
+                "request_id": req.request_id.0,
+                "reason": "missing_kv_resources",
+            }));
+            let _ = event_tx.send(Event::Rejected {
                 message: "generation request requires worker KV resources".into(),
             });
             return;
         }
-        let context = match SchedulerContext::lower(&req) {
+        let context = match RuntimeContext::lower(&req) {
             Ok(context) => context,
             Err(error) => {
-                let _ = event_tx.send(GenerationEvent::Rejected {
+                self.trace_record(json!({
+                    "event": "request_rejected",
+                    "at_s": now(),
+                    "request_id": req.request_id.0,
+                    "reason": "invalid_request",
+                    "detail": format!("{error:?}"),
+                }));
+                let _ = event_tx.send(Event::Rejected {
                     message: format!("invalid generation request: {error:?}"),
                 });
                 return;
             }
         };
         if let Some(feature) = self.missing_required_feature(&req) {
-            let _ = event_tx.send(GenerationEvent::Rejected {
+            self.trace_record(json!({
+                "event": "request_rejected",
+                "at_s": now(),
+                "request_id": req.request_id.0,
+                "reason": "missing_worker_feature",
+                "detail": format!("{feature}"),
+            }));
+            let _ = event_tx.send(Event::Rejected {
                 message: format!(
                     "generation request requires worker feature `{feature}`, but the worker does not support it"
                 ),
             });
             return;
         }
-        if let Err(error) = req.validate_resources(&self.info.generation_limits()) {
-            let _ = event_tx.send(GenerationEvent::Rejected {
+        if let Err(error) = req.validate_resources(&self.profile.generation_limits) {
+            self.trace_record(json!({
+                "event": "request_rejected",
+                "at_s": now(),
+                "request_id": req.request_id.0,
+                "reason": "invalid_resource_declaration",
+                "detail": error.to_string(),
+            }));
+            let _ = event_tx.send(Event::Rejected {
                 message: format!("invalid generation resource declaration: {error}"),
             });
             return;
@@ -35,15 +62,15 @@ impl Scheduler {
         // queue grow without bound under overload —
         // an unbounded burst would otherwise OOM the process and take down every
         // in-flight request. Reject the new submit with a typed event.
-        let waiting = self.pending_request_count() + self.output.retained_len();
-        if waiting >= self.config.max_num_waiting {
+        let waiting = self.pending_request_count() + self.scheduler.output.retained_len();
+        if waiting >= self.scheduler.config.max_num_waiting {
             self.trace_record(json!({
                 "event": "request_rejected",
                 "at_s": now(),
                 "request_id": req.request_id.0,
                 "reason": "queue_full",
                 "waiting": waiting,
-                "max_num_waiting": self.config.max_num_waiting,
+                "max_num_waiting": self.scheduler.config.max_num_waiting,
                 "behavior": {
                     "und_decode": req.behavior.und_decode,
                     "und_tokens": format!("{:?}", req.behavior.und_tokens),
@@ -52,7 +79,7 @@ impl Scheduler {
                 },
                 "prompt_tokens": context.prompt_ids.len(),
             }));
-            let _ = event_tx.send(GenerationEvent::Rejected {
+            let _ = event_tx.send(Event::Rejected {
                 message: "scheduler waiting queue is full".into(),
             });
             return;
@@ -60,7 +87,7 @@ impl Scheduler {
         let worst = req
             .resources
             .max_kv_tokens
-            .div_ceil(self.info.block_size as usize);
+            .div_ceil(self.info.kv_block_size() as usize);
         // Multimodal requests reserve their configured bounded KV envelope at
         // admission so excess concurrency queues instead of exhausting KV.
         let reserve_worstcase = !context.images.is_empty() || req.behavior.gen_output;
@@ -71,11 +98,8 @@ impl Scheduler {
         let finish_token_ids = finish_token_ids(&req, &self.ctrl.eos);
         let st = ReqState {
             finish_token_ids,
-            block_tables: (0..self.kv_budget.cache().block_pool.num_groups())
-                .map(|group| BlockTable::new(group, self.info.block_size as usize))
-                .collect(),
+            allocations: None,
             flow_prefix: None,
-            request_pool_idx: 0,
             epoch: self.next_epoch,
             version: 0,
             resolved_producer_op_id: 0,
@@ -87,6 +111,7 @@ impl Scheduler {
             pending_commits: VecDeque::new(),
             cancel_cutoff: None,
             latest_device_version: None,
+            speculative_chain_invalidated: false,
             cursor: GenerationCursor::new(phase0, worst, reserve_worstcase),
             context,
             output: RequestOutput::new(event_tx),
@@ -96,105 +121,115 @@ impl Scheduler {
         };
         self.next_epoch = self.next_epoch.saturating_add(1);
         self.trace_request_queued(&st, "pending");
-        self.pending.add_request(st);
+        let request_id = st.req.request_id;
+        self.scheduler
+            .enqueue(request_id, st.req.priority, st.queued_at);
+        self.waiting.insert(request_id, st);
     }
 
     pub(super) fn enqueue_media(&mut self, submission: PendingMedia) {
         let request = &submission.request;
         if let Err(message) = request.validate() {
-            let _ = submission.event_tx.send(MediaEvent::Rejected {
+            let _ = submission.event_tx.send(Event::Rejected {
                 message: message.to_string(),
             });
             return;
         }
         let required = [
-            ForwardMode::MediaPrepare,
-            ForwardMode::MediaDenoise,
-            ForwardMode::MediaReconstruct,
-            ForwardMode::Materialize,
+            OpKind::DiffusionPrepare,
+            OpKind::DiffusionStep,
+            OpKind::DiffusionDecode,
         ];
         if required
             .iter()
-            .any(|variant| !self.info.supported_work.contains(variant))
+            .any(|variant| !self.info.supported_ops.contains(variant))
         {
-            let _ = submission.event_tx.send(MediaEvent::Rejected {
+            let _ = submission.event_tx.send(Event::Rejected {
                 message: "worker does not support the fixed media flow".to_string(),
             });
             return;
         }
-        if self.info.max_request_pool_size < 2
-            || self.info.num_latent_pages < 3
+        if self.info.request_slots < 2
+            || self.info.latent_pages < 3
             || self.info.latent_page_units == 0
         {
-            let _ = submission.event_tx.send(MediaEvent::Rejected {
+            let _ = submission.event_tx.send(Event::Rejected {
                 message: "worker does not provide two resident media state slots".to_string(),
             });
             return;
         }
-        if self.pending.len() + self.pending_media.len() + self.output.retained_len()
-            >= self.config.max_num_waiting
+        if self.scheduler.waiting_len()
+            + self.scheduler.waiting_media_len()
+            + self.scheduler.output.retained_len()
+            >= self.scheduler.config.max_num_waiting
         {
-            let _ = submission.event_tx.send(MediaEvent::Rejected {
+            let _ = submission.event_tx.send(Event::Rejected {
                 message: "scheduler waiting queue is full".to_string(),
             });
             return;
         }
-        self.pending_media.push_back(submission);
+        let request_id = submission.request.request_id;
+        self.waiting_media.insert(request_id, submission);
+        self.scheduler.enqueue_media(request_id);
     }
 
     pub(super) fn admit_media(&mut self) {
-        while !self.kv_budget.request_slots.is_empty()
-            && self.running_request_count() < self.config.max_num_seqs
-        {
-            let Some(submission) = self.pending_media.pop_front() else {
+        while self.running_request_count() < self.scheduler.config.max_num_seqs {
+            let Some(id) = self.scheduler.pop_media() else {
                 break;
             };
-            let id = submission.request.request_id;
-            let Some(request_pool_idx) = self.kv_budget.request_slots.acquire() else {
-                self.pending_media.push_front(submission);
-                break;
-            };
-            if !self
-                .kv_budget
-                .latent_pages
-                .reserve(id, u64::from(self.info.latent_page_units))
-            {
-                let _ = self.kv_budget.request_slots.release(request_pool_idx);
-                self.pending_media.push_front(submission);
-                break;
-            }
+            let submission = self
+                .waiting_media
+                .remove(&id)
+                .expect("scheduler media order names runtime state");
             let epoch = self.next_epoch;
-            self.next_epoch = self.next_epoch.saturating_add(1);
             let request_key = RequestKey::new(self.authority_id, id, epoch);
+            let Ok(request_slot) = self.memory.alloc(request_key, MemoryLayout::RequestSlot) else {
+                self.waiting_media.insert(id, submission);
+                self.scheduler.push_media_front(id);
+                break;
+            };
+            let Ok(latent) = self.memory.alloc(
+                request_key,
+                MemoryLayout::Latent {
+                    units: u64::from(self.info.latent_page_units),
+                },
+            ) else {
+                self.memory.free(request_slot);
+                self.waiting_media.insert(id, submission);
+                self.scheduler.push_media_front(id);
+                break;
+            };
+            let allocations = MediaAllocations {
+                request_slot,
+                latent,
+            };
+            let request_pool_idx = allocations.request_slot();
+            self.next_epoch = self.next_epoch.saturating_add(1);
             let admission = NewRequest::new_media(
                 request_key,
                 request_pool_idx,
-                MediaAdmission {
+                DiffusionRequestParams {
                     prompt_token_ids: submission.request.prompt_token_ids.clone(),
                     seed: submission.request.seed,
-                    profile: MediaProfileId::MinimaxH3T2va,
                     geometry: MediaGeometry {
                         frame_count: submission.request.geometry.frame_count,
-                        video_reconstruction_units: submission
-                            .request
-                            .geometry
-                            .video_reconstruction_units,
-                        audio_latent_frames: submission.request.geometry.audio_latent_frames,
+                        decode_units: submission.request.geometry.decode_units,
                         prompt_tokens: submission.request.geometry.prompt_tokens,
                         denoise_steps: submission.request.geometry.denoise_steps,
                     },
                 },
             )
             .expect("validated media admission");
-            let root = VersionRef::admission_root(request_key, OpId(0));
+            let root = Checkpoint::admission_root(OpId(0));
             self.running_media.insert(
                 id,
                 MediaFlowState {
                     request: submission.request,
                     event_tx: submission.event_tx,
-                    request_pool_idx,
+                    allocations,
                     admission,
-                    admission_state: MediaAdmissionState::Unsubmitted,
+                    admission_state: DiffusionRequestParamsState::Unsubmitted,
                     committed: MediaCursor::default(),
                     projected: MediaCursor::default(),
                     fixed_parent: root.clone(),
@@ -203,18 +238,18 @@ impl Scheduler {
                     artifact: None,
                 },
             );
-            self.order.push(id);
+            self.scheduler.running_order.push(id);
         }
     }
 
     pub(super) fn num_vae(&self, ip: &uniserve_core::ImageParams) -> u64 {
-        let dl = u64::from(self.info.latent_downsample).max(1);
+        let dl = u64::from(self.profile.generation_limits.latent_downsample).max(1);
         (ip.height as u64 / dl) * (ip.width as u64 / dl)
     }
 
     pub(super) fn cap_max_vae_grid_tokens(&self) -> usize {
-        if self.info.max_vae_grid_tokens > 0 {
-            self.info.max_vae_grid_tokens as usize
+        if self.profile.generation_limits.max_vae_grid_tokens > 0 {
+            self.profile.generation_limits.max_vae_grid_tokens as usize
         } else {
             self.info.latent_capacity_units().min(usize::MAX as u64) as usize
         }
@@ -231,39 +266,23 @@ impl Scheduler {
         let needs = request
             .behavior
             .required_features(&request.policy, context_steps);
-        self.info.generation_limits().covers(needs).err()
+        self.profile.generation_limits.covers(needs).err()
     }
 
     pub(super) fn worker_tracks_image_latent(&self) -> bool {
-        self.info.latent_page_units > 0
-            && self.info.num_latent_pages > 1
-            && self
-                .info
-                .resource_classes
-                .contains(&ResourceClass::ImageLatent)
+        self.info.latent_page_units > 0 && self.info.latent_pages > 1
     }
 
     pub(super) fn worker_image_latent_used(&self) -> u64 {
-        (self.kv_budget.latent_pages.used_pages() as u64)
+        (self.memory.latent_pages.used_pages() as u64)
             .saturating_mul(u64::from(self.info.latent_page_units))
     }
 
     pub(super) fn worker_image_latent_units_for(&self, st: &ReqState) -> u64 {
-        let downsample = (self.info.latent_downsample as u64).max(1);
+        let downsample = (self.profile.generation_limits.latent_downsample as u64).max(1);
         let (height, width) = (st.req.image.height, st.req.image.width);
         ceil_div_u64((height as u64).max(1), downsample)
             * ceil_div_u64((width as u64).max(1), downsample)
-    }
-
-    pub(super) fn can_schedule_denoise(&self, id: RequestId) -> bool {
-        let requested_units = self
-            .running
-            .get(&id)
-            .map(|st| self.worker_image_latent_units_for(st).max(1))
-            .unwrap_or(0);
-        let worker_capacity_ok = !self.worker_tracks_image_latent()
-            || self.kv_budget.latent_pages.can_reserve(id, requested_units);
-        worker_capacity_ok
     }
 
     pub(super) fn ensure_flow_prefix(&mut self, id: RequestId) -> bool {
@@ -285,51 +304,55 @@ impl Scheduler {
         {
             return true;
         }
-        let Some(request_pool_idx) = self.kv_budget.request_slots.acquire() else {
+        let Some(state) = self.running.get(&id) else {
             return false;
         };
-        let mut block_tables = (0..self.kv_budget.cache().block_pool.num_groups())
-            .map(|group| BlockTable::new(group, self.info.block_size as usize))
-            .collect::<Vec<_>>();
-        let Some(new_pages) = self.kv_budget.cache().coordinator.ensure_capacity(
-            &self.kv_budget.cache().block_pool,
-            &mut block_tables,
-            prefix_tokens,
-        ) else {
-            let _ = self.kv_budget.request_slots.release(request_pool_idx);
+        let request_key = RequestKey::new(self.authority_id, id, state.epoch);
+        let Ok(request_slot) = self.memory.alloc(request_key, MemoryLayout::RequestSlot) else {
             return false;
+        };
+        let groups = self.memory.cache().block_pool.num_groups() as u32;
+        let Ok(kv) = self.memory.alloc(
+            request_key,
+            MemoryLayout::Kv {
+                tokens: prefix_tokens as u32,
+                groups,
+            },
+        ) else {
+            self.memory.free(request_slot);
+            return false;
+        };
+        let new_pages = kv
+            .kv_tables()
+            .expect("flow prefix KV allocation")
+            .iter()
+            .map(|table| (table.group_id() as u32, table.page_ids()))
+            .collect();
+        let allocations = RequestAllocations {
+            request_slot,
+            kv,
+            latent: None,
+            buffers: HashMap::new(),
         };
         let Some(state) = self.running.get_mut(&id) else {
-            let _ = self.kv_budget.request_slots.release(request_pool_idx);
+            allocations.free(&mut self.memory);
             return false;
         };
         state.flow_prefix = Some(FlowPrefixState {
-            request_pool_idx,
-            block_tables,
+            allocations,
             new_pages,
-            materialized: false,
+            diffusion_finalized: false,
         });
         true
     }
 
-    pub(super) fn release_flow_prefix(&mut self, id: RequestId) {
+    pub(super) fn free_flow_prefix(&mut self, id: RequestId) {
         let prefix = self
             .running
             .get_mut(&id)
             .and_then(|state| state.flow_prefix.take());
-        if let Some(prefix) = prefix
-            && let Err(error) = self
-                .kv_budget
-                .request_slots
-                .release(prefix.request_pool_idx)
-        {
-            tracing::error!(
-                request_id = id.0,
-                request_pool_idx = prefix.request_pool_idx,
-                error,
-                "failed to release scheduler flow-prefix slot"
-            );
-            self.fatal = true;
+        if let Some(prefix) = prefix {
+            prefix.allocations.free(&mut self.memory);
         }
     }
 
@@ -338,7 +361,7 @@ impl Scheduler {
     pub(super) fn reap_cancellations(&mut self) {
         // A cancelled request closes only after every submitted descendant has
         // resolved. Host KV ownership then remains pinned through the close
-        // acknowledgement and ordered worker session retirement.
+        // acknowledgement and ordered worker request retirement.
         let cancelled: Vec<(RequestId, TerminalIntent)> = self
             .running
             .iter()
@@ -357,7 +380,8 @@ impl Scheduler {
             self.finish(id, reason);
         }
         let media = self
-            .order
+            .scheduler
+            .running_order
             .iter()
             .filter_map(|id| {
                 self.media_state(*id)
@@ -371,9 +395,11 @@ impl Scheduler {
         for (id, intent) in media {
             let (event, reason) = match intent {
                 MediaTerminalIntent::Failure(message) => {
-                    (MediaEvent::Failed { message }, CloseReason::Error)
+                    (DiffusionTerminal::Failed(message), CloseReason::Error)
                 }
-                MediaTerminalIntent::Cancel => (MediaEvent::Aborted, CloseReason::Cancelled),
+                MediaTerminalIntent::Finish(reason) => {
+                    (DiffusionTerminal::Finished(reason), CloseReason::Cancelled)
+                }
                 MediaTerminalIntent::None => continue,
             };
             self.finish_media(id, event, reason, None);
@@ -385,76 +411,83 @@ impl Scheduler {
     /// allocate their full worst-case KV here, which is what makes them
     /// resident for its complete lifetime.
     pub(super) fn admit(&mut self) {
-        let bs = self.info.block_size as usize;
+        let bs = self.info.kv_block_size() as usize;
         loop {
-            if self.running_request_count() >= self.config.max_num_seqs
-                || self.kv_budget.request_slots.is_empty()
+            if self.running_request_count() >= self.scheduler.config.max_num_seqs
+                || self.memory.request_slots.is_empty()
             {
                 break;
             }
-            let Some(head) = self.pending.peek_request() else {
+            let Some(head_id) = self.scheduler.peek() else {
                 break;
             };
+            let head = self
+                .waiting
+                .get(&head_id)
+                .expect("scheduler waiting order names runtime state");
             if head.cursor.resources.reserve_worstcase {
                 let need = head.cursor.resources.worstcase_blocks;
                 let encoder_entries = head.req.resources.encoder_cache_keys.len();
                 let encoder_ok = self
-                    .kv_budget
+                    .memory
                     .reserved_encoder_entries
                     .saturating_add(encoder_entries)
-                    <= self.kv_budget.encoder_cache.budget();
-                if need > self.kv_budget.usable_blocks() {
-                    let st = self.pending.pop_request().unwrap();
+                    <= self.memory.encoder_cache.budget();
+                if need > self.memory.usable_blocks() {
+                    let id = self.scheduler.pop().unwrap();
+                    let st = self.waiting.remove(&id).unwrap();
                     self.trace_record(json!({
                         "event": "request_rejected",
                         "at_s": now(),
                         "request_id": st.req.request_id.0,
                         "reason": "too_large",
                         "needed_blocks": need,
-                        "usable_blocks": self.kv_budget.usable_blocks(),
+                        "usable_blocks": self.memory.usable_blocks(),
                         "generation": &st.req.behavior,
                         "prompt_tokens": st.context.prompt_ids.len(),
                     }));
-                    let _ = st.output.event_tx.send(GenerationEvent::Rejected {
+                    let _ = st.output.event_tx.send(Event::Rejected {
                         message: "request exceeds total KV capacity".into(),
                     });
                     continue;
                 }
-                if self.kv_budget.free_blocks() >= need && encoder_ok {
-                    let st = self.pending.pop_request().unwrap();
+                if self.memory.free_blocks() >= need && encoder_ok {
+                    let id = self.scheduler.pop().unwrap();
+                    let st = self.waiting.remove(&id).unwrap();
                     let id = st.req.request_id;
                     self.admit_running(st);
                     // Physically allocate the worst case now: nothing can take
                     // these blocks, so this request can never fail mid-flight.
                     self.ensure_request_capacity(id, need * bs);
-                    self.kv_budget.reserved_blocks += need;
+                    self.memory.reserved_blocks += need;
                     continue;
                 }
             } else {
                 let n = head.context.prompt_ids.len();
-                let text_usable_blocks = (0..self.kv_budget.cache().block_pool.num_groups())
-                    .map(|group| self.kv_budget.cache().block_pool.group_capacity(group))
+                let text_usable_blocks = (0..self.memory.cache().block_pool.num_groups())
+                    .map(|group| self.memory.cache().block_pool.group_capacity(group))
                     .min()
                     .unwrap_or_default();
                 let prefix_hit = prefix_hit(
-                    &self.kv_budget.cache().coordinator,
+                    &self.memory.cache().coordinator,
                     head,
-                    &self.kv_budget.cache().block_pool,
+                    &self.memory.cache().block_pool,
                 );
                 let cached_prefix_blocks = prefix_hit.cached_blocks;
                 let cached_prefix_blocks = cached_prefix_blocks.min(n.div_ceil(bs));
                 let cached_prefix_tokens = cached_prefix_blocks.saturating_mul(bs);
                 let uncached_remaining = n.saturating_sub(cached_prefix_tokens);
                 let first_uncached_chunk = uncached_remaining
-                    .min(self.config.long_prefill_threshold)
-                    .min(self.config.max_num_batched_tokens)
+                    .min(self.scheduler.config.long_prefill_threshold)
+                    .min(self.scheduler.config.max_num_batched_tokens)
                     .max(1);
                 let first_chunk_blocks = cached_prefix_tokens
                     .saturating_add(first_uncached_chunk)
                     .div_ceil(bs)
                     .saturating_sub(cached_prefix_blocks);
                 if n > text_usable_blocks * bs {
-                    let st = self.pending.pop_request().unwrap();
+                    let id = self.scheduler.pop().unwrap();
+                    let st = self.waiting.remove(&id).unwrap();
                     self.trace_record(json!({
                         "event": "request_rejected",
                         "at_s": now(),
@@ -465,16 +498,16 @@ impl Scheduler {
                         "generation": &st.req.behavior,
                         "prompt_tokens": st.context.prompt_ids.len(),
                     }));
-                    let _ = st.output.event_tx.send(GenerationEvent::Rejected {
+                    let _ = st.output.event_tx.send(Event::Rejected {
                         message: "request exceeds total KV capacity".into(),
                     });
                     continue;
                 }
                 let capacity_available = prefix_hit.cached_free_blocks.len()
-                    == self.kv_budget.cache().block_pool.num_groups()
+                    == self.memory.cache().block_pool.num_groups()
                     && prefix_hit.cached_free_blocks.iter().enumerate().all(
                         |(group, cached_free)| {
-                            self.kv_budget
+                            self.memory
                                 .cache()
                                 .block_pool
                                 .free_blocks_in_group(group)
@@ -483,7 +516,8 @@ impl Scheduler {
                         },
                     );
                 if capacity_available {
-                    let st = self.pending.pop_request().unwrap();
+                    let id = self.scheduler.pop().unwrap();
+                    let st = self.waiting.remove(&id).unwrap();
                     self.admit_running(st);
                     continue;
                 }
@@ -497,12 +531,28 @@ impl Scheduler {
     }
 
     pub(super) fn admit_running(&mut self, mut st: ReqState) {
-        st.request_pool_idx = self
-            .kv_budget
-            .request_slots
-            .acquire()
-            .expect("admission checked request-slot capacity");
         let id = st.req.request_id;
+        let request_key = RequestKey::new(self.authority_id, id, st.epoch);
+        let request_slot = self
+            .memory
+            .alloc(request_key, MemoryLayout::RequestSlot)
+            .expect("admission checked request-slot capacity");
+        let kv = self
+            .memory
+            .alloc(
+                request_key,
+                MemoryLayout::Kv {
+                    tokens: 0,
+                    groups: self.memory.cache().block_pool.num_groups() as u32,
+                },
+            )
+            .expect("empty KV allocation is valid");
+        st.allocations = Some(RequestAllocations {
+            request_slot,
+            kv,
+            latent: None,
+            buffers: HashMap::new(),
+        });
         let q = st.queued_at;
         let scheduled_at = now();
         let queue_wait_us = ((scheduled_at - q).max(0.0) * 1_000_000.0) as u64;
@@ -526,16 +576,16 @@ impl Scheduler {
         let reserve_worstcase = st.cursor.resources.reserve_worstcase;
         let worstcase_blocks = st.cursor.resources.worstcase_blocks;
         let encoder_entries = st.req.resources.encoder_cache_keys.len();
-        if st.output.enqueue(GenerationEvent::Scheduled {
+        if st.output.enqueue(Event::Scheduled {
             queued_at: q,
             scheduled_at,
         }) {
             st.terminal_intent = TerminalIntent::Cancel;
         }
         self.running.insert(id, st);
-        self.order.push(id);
-        self.kv_budget.reserved_encoder_entries = self
-            .kv_budget
+        self.scheduler.running_order.push(id);
+        self.memory.reserved_encoder_entries = self
+            .memory
             .reserved_encoder_entries
             .saturating_add(encoder_entries);
         self.trace_record(json!({
@@ -552,13 +602,14 @@ impl Scheduler {
             "reserve_worstcase": reserve_worstcase,
             "worstcase_blocks": worstcase_blocks,
             "running": self.running.len(),
-            "pending": self.pending.len(),
-            "free_blocks": self.kv_budget.free_blocks(),
-            "reserved_blocks": self.kv_budget.reserved_blocks,
-            "reserved_encoder_entries": self.kv_budget.reserved_encoder_entries,
+            "pending": self.scheduler.waiting_len(),
+            "free_blocks": self.memory.free_blocks(),
+            "reserved_blocks": self.memory.reserved_blocks,
+            "reserved_encoder_entries": self.memory.reserved_encoder_entries,
         }));
-        if let Some(st) = self.running.get_mut(&id) {
-            let kv = self.kv_budget.cache();
+        let (runtime, memory) = (&mut self.runtime, &self.memory);
+        if let Some(st) = runtime.state_mut().running.get_mut(&id) {
+            let kv = memory.cache();
             acquire_cached_prefix(&kv.coordinator, st, &kv.block_pool, &self.stats);
         }
     }
@@ -586,14 +637,16 @@ fn acquire_cached_prefix(
 ) {
     let prompt = state.effective_prompt().to_vec();
     let has_context_images = state.has_context_images();
+    let cache_read = state.req.cache.read;
+    let isolation_key = state.req.cache.isolation_key;
     let hit = coordinator
         .acquire_prefix(
             pool,
-            &mut state.block_tables,
+            state.block_tables_mut(),
             &prompt,
-            state.req.cache.read,
+            cache_read,
             has_context_images,
-            state.req.cache.isolation_key,
+            isolation_key,
         )
         .expect("request cache groups match the KV coordinator");
     let block_size = pool.block_size();

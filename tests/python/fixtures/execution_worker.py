@@ -6,9 +6,10 @@ from dataclasses import replace
 
 from uniserve_worker.backends.attention import FlashInferTuningConfig, resolve_attention_selection
 from uniserve_worker.bootstrap.execution_config import ExecutionConfig
+from uniserve_worker.models.generation import LatentLayout
 from uniserve_worker.models.runtime import ExecutionModel
-from uniserve_worker.nn.mesh import DeviceMesh
 from uniserve_worker.models.stub import StubModel, stub_deployment
+from uniserve_worker.nn.mesh import DeviceMesh
 from uniserve_worker.worker import Worker
 
 
@@ -62,14 +63,19 @@ def execution_worker(
     )
     from .depth_one import configure_physical_pool
 
+    flow = worker.model.generation
     configure_physical_pool(
         cache_pages=worker.cache_pool.num_pages,
-        request_pool_size=worker.info.max_request_pool_size,
+        request_pool_size=worker.info.request_slots,
         block_size=worker.cache_pool.block_size,
-        commit_marker_tokens=worker.info.commit_marker_tokens,
-        max_cfg_branches=worker.info.max_cfg_branches,
+        commit_marker_tokens=(
+            int(flow.commit_marker_tokens)
+            if flow is not None and flow.latent_layout is LatentLayout.PATCH_TOKENS
+            else 0
+        ),
+        max_cfg_branches=1 if flow is None else flow.max_cfg_branches,
         latent_page_units=worker.info.latent_page_units,
-        latent_downsample=worker.info.latent_downsample,
+        latent_downsample=1 if flow is None else flow.latent_downsample,
     )
     return worker
 

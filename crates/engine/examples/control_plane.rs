@@ -1,22 +1,22 @@
-//! GPU-free control-plane test in Rust: drive the Scheduler with
+//! GPU-free control-plane test in Rust: drive the EngineLoop with
 //! SimEngine over concurrent text + image requests; check lifecycle events.
 use std::collections::HashMap;
 use std::thread;
 use std::time::Duration;
 
-use uniserve_core::GenerationEvent;
+use uniserve_core::Event;
 use uniserve_core::{
     ContextSegment, FeedbackNextToken, FeedbackSource, GeneratedImageFeedbackRecipe,
     GenerationBehaviorDescriptor, GenerationConstraint, GenerationLimits,
     GenerationPolicyDescriptor, GenerationRequest, GenerationResourceBounds, ImageIngestRecipe,
     ImageKvEffect, ImageParams, RequestId, SamplingParams, TriggerPolicyDescriptor, UndVisibility,
 };
-use uniserve_engine::{ControlTokens, EngineHandle, Scheduler, SimEngine, SimExecutor};
+use uniserve_engine::{ControlTokens, EngineHandle, EngineLoop, SimEngine, SimExecutor};
 
 fn main() {
     let ctrl = ControlTokens::default();
     let executor = Box::new(SimExecutor::new(SimEngine::new()));
-    let sched = Scheduler::new(executor, ctrl, 32);
+    let sched = EngineLoop::new(executor, ctrl, 32);
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(cmd_tx);
     let jh = thread::spawn(move || sched.run(cmd_rx));
@@ -111,9 +111,9 @@ fn main() {
             while let Ok(ev) = rx.try_recv() {
                 let e = counts.entry(*id).or_insert((kind.clone(), 0, 0, false));
                 match ev {
-                    GenerationEvent::TextToken { .. } => e.1 += 1,
-                    GenerationEvent::ImageDone { .. } => e.2 += 1,
-                    GenerationEvent::Finished { .. } if !e.3 => {
+                    Event::TextToken { .. } => e.1 += 1,
+                    Event::ImageDone { .. } => e.2 += 1,
+                    Event::Finished { .. } if !e.3 => {
                         e.3 = true;
                         done += 1;
                     }

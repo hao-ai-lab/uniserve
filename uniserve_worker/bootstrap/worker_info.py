@@ -7,19 +7,15 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, TypeVar, cast
 
-from ..execution.batch import ForwardMode, SamplingOwnership
+from ..execution.batch import OpKind
 from ..foundation.errors import invalid_descriptor
-from .role import WorkerRole
 
 
 class RequestKind(StrEnum):
-    GET_INFO = "get_info"
-    EXECUTE = "execute"
-    POLL_COMPLETIONS = "poll_completions"
-    DROP_SESSION = "drop_session"
-    SHUTDOWN = "shutdown"
-    RELEASE_PRODUCTS = "release_products"
-    GET_PRESSURE = "get_pressure"
+    INFO = "info"
+    SUBMIT = "submit"
+    POLL = "poll"
+    CLOSE = "close"
 
 
 class ResponseKind(StrEnum):
@@ -27,13 +23,6 @@ class ResponseKind(StrEnum):
     RESULT = "result"
     OK = "ok"
     ERROR = "error"
-    PRESSURE = "pressure"
-
-
-class ResourceClass(StrEnum):
-    KV_BLOCK = "kv_block"
-    ENCODER_OUTPUT = "encoder_output"
-    IMAGE_LATENT = "image_latent"
 
 
 class KvGroupKind(StrEnum):
@@ -70,6 +59,62 @@ class KvGroup:
 
 
 @dataclass(frozen=True, slots=True)
+class KvCacheConfig:
+    block_size: int
+    num_blocks: int
+    num_layers: int
+    num_kv_heads: int
+    head_dim: int
+    bytes_per_token: int
+    groups: tuple[KvGroup, ...]
+    dtype: str
+
+    def __post_init__(self) -> None:
+        if min(
+            self.block_size,
+            self.num_blocks,
+            self.num_layers,
+            self.num_kv_heads,
+            self.head_dim,
+            self.bytes_per_token,
+        ) < 1 or not self.groups or not self.dtype:
+            raise invalid_descriptor("worker info declares incomplete KV geometry")
+        if any(group.num_blocks < 1 for group in self.groups):
+            raise invalid_descriptor("worker info KV groups must be physical page partitions")
+        if sum(group.num_blocks for group in self.groups) != self.num_blocks:
+            raise invalid_descriptor("worker info KV groups must cover the physical page pool")
+
+    @classmethod
+    def from_mapping(cls, value: object, where: str) -> KvCacheConfig:
+        data = _map(value, where)
+        return cls(
+            block_size=_uint(data.get("block_size"), f"{where}.block_size"),
+            num_blocks=_uint(data.get("num_blocks"), f"{where}.num_blocks"),
+            num_layers=_uint(data.get("num_layers"), f"{where}.num_layers"),
+            num_kv_heads=_uint(data.get("num_kv_heads"), f"{where}.num_kv_heads"),
+            head_dim=_uint(data.get("head_dim"), f"{where}.head_dim"),
+            bytes_per_token=_uint(data.get("bytes_per_token"), f"{where}.bytes_per_token"),
+            groups=tuple(
+                KvGroup.from_mapping(item, f"{where}.groups[{index}]")
+                for index, item in enumerate(_seq(data.get("groups"), f"{where}.groups"))
+            ),
+            dtype=_str(data.get("dtype"), f"{where}.dtype"),
+        )
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "block_size": self.block_size,
+            "num_blocks": self.num_blocks,
+            "num_layers": self.num_layers,
+            "num_kv_heads": self.num_kv_heads,
+            "head_dim": self.head_dim,
+            "bytes_per_token": self.bytes_per_token,
+            "groups": [group.to_mapping() for group in self.groups],
+            "dtype": self.dtype,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class RankInfo:
     tp_rank: int = 0
     tp_size: int = 1
@@ -94,199 +139,71 @@ class RankInfo:
 
 
 @dataclass(frozen=True, slots=True)
-class GraphBucket:
-    decode_rows: int
-    flow_rows: int
-    height: int
-    width: int
-    cfg_branches: int
-
-    def __post_init__(self) -> None:
-        if (
-            min(
-                self.decode_rows,
-                self.flow_rows,
-                self.height,
-                self.width,
-                self.cfg_branches,
-            )
-            < 1
-        ):
-            raise invalid_descriptor("mixed execution bucket dimensions must be positive")
-
-    @classmethod
-    def from_mapping(cls, value: object, where: str) -> GraphBucket:
-        data = _map(value, where)
-        return cls(
-            decode_rows=_uint(data.get("decode_rows"), f"{where}.decode_rows"),
-            flow_rows=_uint(data.get("flow_rows"), f"{where}.flow_rows"),
-            height=_uint(data.get("height"), f"{where}.height"),
-            width=_uint(data.get("width"), f"{where}.width"),
-            cfg_branches=_uint(data.get("cfg_branches"), f"{where}.cfg_branches"),
-        )
-
-    def to_mapping(self) -> dict[str, int]:
-        return {
-            "decode_rows": self.decode_rows,
-            "flow_rows": self.flow_rows,
-            "height": self.height,
-            "width": self.width,
-            "cfg_branches": self.cfg_branches,
-        }
-
-
-@dataclass(frozen=True, slots=True)
 class WorkerInfo:
-    worker_role: WorkerRole
-    block_size: int
-    num_blocks: int
-    num_layers: int
-    num_kv_heads: int
-    head_dim: int
-    supported_work: tuple[ForwardMode, ...]
-    latent_page_units: int
-    num_latent_pages: int
-    latent_width: int
-    latent_dtype: str
-    latent_downsample: int
-    max_vae_grid_tokens: int
-    max_vit_grid_tokens: int
-    max_latent_feature_bytes: int
-    max_vision_feature_bytes: int
-    commit_marker_tokens: int
-    gen_rope_advance: int
-    max_cfg_branches: int
-    bytes_per_token: int
-    groups: tuple[KvGroup, ...]
-    kv_dtype: str
-    model_dtype: str
-    rank: RankInfo
-    pipeline_depth: int
-    encoder_cache_budget: int
-    supported_controls: tuple[RequestKind, ...]
-    max_batch_operations: int
-    max_batch_tokens: int
-    max_request_pool_size: int
-    max_unresolved_window: int
-    incremental_kv_publication: bool
-    mixed_buckets: tuple[GraphBucket, ...]
-    sampling_ownership: SamplingOwnership
-    resource_classes: tuple[ResourceClass, ...]
     model_name: str
     weight_version: int
+    rank: RankInfo
+    supported_ops: tuple[OpKind, ...]
+    queue_depth: int
+    max_batch_ops: int
+    max_batch_tokens: int
+    request_slots: int
+    kv_cache: KvCacheConfig | None
+    latent_page_units: int
+    latent_pages: int
+    buffer_pool_bytes: int
+    max_unresolved_ops: int
 
     @property
     def latent_capacity_units(self) -> int:
-        return max(0, self.num_latent_pages - 1) * self.latent_page_units
+        return max(0, self.latent_pages - 1) * self.latent_page_units
 
     @property
     def uses_kv(self) -> bool:
-        return (
-            any(
-                variant
-                in {
-                    ForwardMode.TOKEN_EXTEND,
-                    ForwardMode.TOKEN_DECODE,
-                    ForwardMode.TOKEN_VERIFY,
-                    ForwardMode.TRANSFER_KV_PUBLISH,
-                    ForwardMode.TRANSFER_KV_INSTALL,
-                }
-                for variant in self.supported_work
-            )
-            or ResourceClass.KV_BLOCK in self.resource_classes
-        )
+        return self.kv_cache is not None
 
     def __post_init__(self) -> None:
-        if self.model_dtype not in {"float16", "bfloat16", "float32"}:
-            raise invalid_descriptor("model_dtype must use the canonical runtime vocabulary")
         for name in (
-            "latent_downsample",
-            "pipeline_depth",
-            "gen_rope_advance",
-            "max_cfg_branches",
-            "max_batch_operations",
+            "queue_depth",
+            "max_batch_ops",
             "max_batch_tokens",
-            "max_request_pool_size",
-            "max_unresolved_window",
+            "request_slots",
+            "max_unresolved_ops",
         ):
             if getattr(self, name) < 1:
                 raise invalid_descriptor(f"worker info.{name} must be positive")
-        kv_values = (
-            self.block_size,
-            self.num_blocks,
-            self.num_layers,
-            self.num_kv_heads,
-            self.head_dim,
-            self.bytes_per_token,
+        requires_kv = any(
+            variant in {OpKind.AR_EXTEND, OpKind.AR_DECODE, OpKind.AR_VERIFY}
+            for variant in self.supported_ops
         )
-        if self.uses_kv:
-            if any(value < 1 for value in kv_values) or not self.groups or not self.kv_dtype:
-                raise invalid_descriptor("worker info declares incomplete KV geometry")
-            total_blocks = 0
-            for group in self.groups:
-                if group.num_blocks < 1:
-                    raise invalid_descriptor(
-                        "worker info.groups must be a canonical physical page partition"
-                    )
-                total_blocks += group.num_blocks
-            if total_blocks != self.num_blocks:
-                raise invalid_descriptor(
-                    "worker info.groups must cover the physical request page pool"
-                )
-        elif any(kv_values) or self.groups or self.kv_dtype:
-            raise invalid_descriptor("KV-free worker info must carry zero KV geometry")
+        if requires_kv and self.kv_cache is None:
+            raise invalid_descriptor("worker advertises AR work without a KV cache")
         for name in (
             "latent_page_units",
-            "num_latent_pages",
-            "latent_width",
-            "max_vae_grid_tokens",
-            "max_vit_grid_tokens",
-            "max_latent_feature_bytes",
-            "max_vision_feature_bytes",
-            "encoder_cache_budget",
+            "latent_pages",
+            "buffer_pool_bytes",
         ):
             if getattr(self, name) < 0:
                 raise invalid_descriptor(f"worker info.{name} must not be negative")
-        if not self.supported_work:
+        if not self.supported_ops:
             raise invalid_descriptor("worker info must support a work variant")
-        if len(set(self.supported_work)) != len(self.supported_work):
+        if len(set(self.supported_ops)) != len(self.supported_ops):
             raise invalid_descriptor("worker info repeats a work variant")
-        if len(set(self.supported_controls)) != len(self.supported_controls):
-            raise invalid_descriptor("worker info repeats a control")
-        if len(set(self.resource_classes)) != len(self.resource_classes):
-            raise invalid_descriptor("worker info repeats a resource class")
-        if len(set(self.mixed_buckets)) != len(self.mixed_buckets):
-            raise invalid_descriptor("worker info repeats a mixed-execution bucket")
-        if any(
-            bucket.decode_rows + bucket.flow_rows > self.max_batch_operations
-            for bucket in self.mixed_buckets
-        ):
-            raise invalid_descriptor("mixed-execution bucket exceeds the operation bound")
-        has_latent_geometry = bool(
-            self.latent_page_units
-            or self.num_latent_pages
-            or self.latent_width
-            or self.latent_dtype
-        )
-        if has_latent_geometry or ResourceClass.IMAGE_LATENT in self.resource_classes:
-            if (
-                self.latent_page_units < 1
-                or self.num_latent_pages < 2
-                or self.latent_width < 1
-                or self.latent_dtype not in {"float16", "bfloat16", "float32"}
-            ):
+        has_latent_geometry = bool(self.latent_page_units or self.latent_pages)
+        if has_latent_geometry:
+            if self.latent_page_units < 1 or self.latent_pages < 2:
                 raise invalid_descriptor(
-                    "worker worker info declares incomplete latent pool geometry"
+                    "worker info declares incomplete latent pool capacity"
                 )
         addresses_latent = any(
             variant
             in {
-                ForwardMode.MEDIA_PREPARE,
-                ForwardMode.MEDIA_DENOISE,
+                OpKind.DIFFUSION_PREPARE,
+                OpKind.DIFFUSION_STEP,
             }
-            for variant in self.supported_work
+            for variant in self.supported_ops
         )
-        if addresses_latent and ResourceClass.IMAGE_LATENT not in self.resource_classes:
+        if addresses_latent and not has_latent_geometry:
             raise invalid_descriptor("worker info advertise latent work without a latent page pool")
         if not self.model_name or self.weight_version < 0:
             raise invalid_descriptor("worker model name and weight version are invalid")
@@ -295,129 +212,49 @@ class WorkerInfo:
     def from_mapping(cls, value: object, where: str = "info") -> WorkerInfo:
         data = _map(value, where)
         return cls(
-            worker_role=_enum(WorkerRole, data.get("worker_role"), f"{where}.worker_role"),
-            block_size=_uint(data.get("block_size"), f"{where}.block_size"),
-            num_blocks=_uint(data.get("num_blocks"), f"{where}.num_blocks"),
-            num_layers=_uint(data.get("num_layers"), f"{where}.num_layers"),
-            num_kv_heads=_uint(data.get("num_kv_heads"), f"{where}.num_kv_heads"),
-            head_dim=_uint(data.get("head_dim"), f"{where}.head_dim"),
-            supported_work=tuple(
-                _enum(ForwardMode, item, f"{where}.supported_work[{index}]")
-                for index, item in enumerate(
-                    _seq(data.get("supported_work"), f"{where}.supported_work")
-                )
-            ),
-            latent_page_units=_uint(data.get("latent_page_units"), f"{where}.latent_page_units"),
-            num_latent_pages=_uint(data.get("num_latent_pages"), f"{where}.num_latent_pages"),
-            latent_width=_uint(data.get("latent_width"), f"{where}.latent_width"),
-            latent_dtype=_str(data.get("latent_dtype", ""), f"{where}.latent_dtype"),
-            latent_downsample=_uint(data.get("latent_downsample"), f"{where}.latent_downsample"),
-            max_vae_grid_tokens=_uint(
-                data.get("max_vae_grid_tokens"), f"{where}.max_vae_grid_tokens"
-            ),
-            max_vit_grid_tokens=_uint(
-                data.get("max_vit_grid_tokens"), f"{where}.max_vit_grid_tokens"
-            ),
-            max_latent_feature_bytes=_uint(
-                data.get("max_latent_feature_bytes"), f"{where}.max_latent_feature_bytes"
-            ),
-            max_vision_feature_bytes=_uint(
-                data.get("max_vision_feature_bytes"), f"{where}.max_vision_feature_bytes"
-            ),
-            commit_marker_tokens=_uint(
-                data.get("commit_marker_tokens"), f"{where}.commit_marker_tokens"
-            ),
-            gen_rope_advance=_uint(data.get("gen_rope_advance"), f"{where}.gen_rope_advance"),
-            max_cfg_branches=_uint(data.get("max_cfg_branches"), f"{where}.max_cfg_branches"),
-            bytes_per_token=_uint(data.get("bytes_per_token"), f"{where}.bytes_per_token"),
-            groups=tuple(
-                KvGroup.from_mapping(item, f"{where}.groups[{index}]")
-                for index, item in enumerate(_seq(data.get("groups", ()), f"{where}.groups"))
-            ),
-            kv_dtype=_str(data.get("kv_dtype"), f"{where}.kv_dtype"),
-            model_dtype=_str(data.get("model_dtype"), f"{where}.model_dtype"),
-            rank=RankInfo.from_mapping(data.get("rank"), f"{where}.rank"),
-            pipeline_depth=_uint(data.get("pipeline_depth"), f"{where}.pipeline_depth"),
-            encoder_cache_budget=_uint(
-                data.get("encoder_cache_budget"), f"{where}.encoder_cache_budget"
-            ),
-            supported_controls=tuple(
-                _enum(RequestKind, item, f"{where}.supported_controls[{index}]")
-                for index, item in enumerate(
-                    _seq(data.get("supported_controls", ()), f"{where}.supported_controls")
-                )
-            ),
-            max_batch_operations=_uint(
-                data.get("max_batch_operations"), f"{where}.max_batch_operations"
-            ),
-            max_batch_tokens=_uint(data.get("max_batch_tokens"), f"{where}.max_batch_tokens"),
-            max_request_pool_size=_uint(
-                data.get("max_request_pool_size"), f"{where}.max_request_pool_size"
-            ),
-            max_unresolved_window=_uint(
-                data.get("max_unresolved_window"), f"{where}.max_unresolved_window"
-            ),
-            incremental_kv_publication=_bool(
-                data.get("incremental_kv_publication"), f"{where}.incremental_kv_publication"
-            ),
-            mixed_buckets=tuple(
-                GraphBucket.from_mapping(item, f"{where}.mixed_buckets[{index}]")
-                for index, item in enumerate(
-                    _seq(data.get("mixed_buckets", ()), f"{where}.mixed_buckets")
-                )
-            ),
-            sampling_ownership=_enum(
-                SamplingOwnership, data.get("sampling_ownership"), f"{where}.sampling_ownership"
-            ),
-            resource_classes=tuple(
-                _enum(ResourceClass, item, f"{where}.resource_classes[{index}]")
-                for index, item in enumerate(
-                    _seq(data.get("resource_classes", ()), f"{where}.resource_classes")
-                )
-            ),
             model_name=_str(data.get("model_name", ""), f"{where}.model_name"),
             weight_version=_uint(data.get("weight_version", 0), f"{where}.weight_version"),
+            rank=RankInfo.from_mapping(data.get("rank"), f"{where}.rank"),
+            supported_ops=tuple(
+                _enum(OpKind, item, f"{where}.supported_ops[{index}]")
+                for index, item in enumerate(
+                    _seq(data.get("supported_ops"), f"{where}.supported_ops")
+                )
+            ),
+            queue_depth=_uint(data.get("queue_depth"), f"{where}.queue_depth"),
+            max_batch_ops=_uint(data.get("max_batch_ops"), f"{where}.max_batch_ops"),
+            max_batch_tokens=_uint(data.get("max_batch_tokens"), f"{where}.max_batch_tokens"),
+            request_slots=_uint(data.get("request_slots"), f"{where}.request_slots"),
+            kv_cache=(
+                None
+                if data.get("kv_cache") is None
+                else KvCacheConfig.from_mapping(data.get("kv_cache"), f"{where}.kv_cache")
+            ),
+            latent_page_units=_uint(data.get("latent_page_units"), f"{where}.latent_page_units"),
+            latent_pages=_uint(data.get("latent_pages"), f"{where}.latent_pages"),
+            buffer_pool_bytes=_uint(
+                data.get("buffer_pool_bytes"), f"{where}.buffer_pool_bytes"
+            ),
+            max_unresolved_ops=_uint(
+                data.get("max_unresolved_ops"), f"{where}.max_unresolved_ops"
+            ),
         )
 
     def to_mapping(self) -> dict[str, object]:
         return {
-            "worker_role": self.worker_role.value,
-            "block_size": self.block_size,
-            "num_blocks": self.num_blocks,
-            "num_layers": self.num_layers,
-            "num_kv_heads": self.num_kv_heads,
-            "head_dim": self.head_dim,
-            "supported_work": [value.value for value in self.supported_work],
-            "latent_page_units": self.latent_page_units,
-            "num_latent_pages": self.num_latent_pages,
-            "latent_width": self.latent_width,
-            "latent_dtype": self.latent_dtype or None,
-            "latent_downsample": self.latent_downsample,
-            "max_vae_grid_tokens": self.max_vae_grid_tokens,
-            "max_vit_grid_tokens": self.max_vit_grid_tokens,
-            "max_latent_feature_bytes": self.max_latent_feature_bytes,
-            "max_vision_feature_bytes": self.max_vision_feature_bytes,
-            "commit_marker_tokens": self.commit_marker_tokens,
-            "gen_rope_advance": self.gen_rope_advance,
-            "max_cfg_branches": self.max_cfg_branches,
-            "bytes_per_token": self.bytes_per_token,
-            "groups": [value.to_mapping() for value in self.groups],
-            "kv_dtype": self.kv_dtype or None,
-            "model_dtype": self.model_dtype,
-            "rank": self.rank.to_mapping(),
-            "pipeline_depth": self.pipeline_depth,
-            "encoder_cache_budget": self.encoder_cache_budget,
-            "supported_controls": [value.value for value in self.supported_controls],
-            "max_batch_operations": self.max_batch_operations,
-            "max_batch_tokens": self.max_batch_tokens,
-            "max_request_pool_size": self.max_request_pool_size,
-            "max_unresolved_window": self.max_unresolved_window,
-            "incremental_kv_publication": self.incremental_kv_publication,
-            "mixed_buckets": [bucket.to_mapping() for bucket in self.mixed_buckets],
-            "sampling_ownership": self.sampling_ownership.value,
-            "resource_classes": [value.value for value in self.resource_classes],
             "model_name": self.model_name,
             "weight_version": self.weight_version,
+            "rank": self.rank.to_mapping(),
+            "supported_ops": [value.value for value in self.supported_ops],
+            "queue_depth": self.queue_depth,
+            "max_batch_ops": self.max_batch_ops,
+            "max_batch_tokens": self.max_batch_tokens,
+            "request_slots": self.request_slots,
+            "kv_cache": None if self.kv_cache is None else self.kv_cache.to_mapping(),
+            "latent_page_units": self.latent_page_units,
+            "latent_pages": self.latent_pages,
+            "buffer_pool_bytes": self.buffer_pool_bytes,
+            "max_unresolved_ops": self.max_unresolved_ops,
         }
 
 
@@ -467,17 +304,12 @@ def _str(value: object, where: str) -> str:
     return value
 
 
-from .worker_info_builder import build_worker_info
-
-
 __all__ = [
-    "GraphBucket",
+    "KvCacheConfig",
     "KvGroup",
     "KvGroupKind",
     "RankInfo",
     "RequestKind",
-    "ResourceClass",
     "ResponseKind",
     "WorkerInfo",
-    "build_worker_info",
 ]

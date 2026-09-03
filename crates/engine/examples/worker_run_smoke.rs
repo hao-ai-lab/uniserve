@@ -1,7 +1,7 @@
 //! Event-driven `run` smoke test against the stub Python worker.
 //!
 //! Unlike `worker_smoke` (which drives `step` directly), this exercises the
-//! production owner-thread reactor `Scheduler::run` over the iceoryx2
+//! production owner-thread reactor `EngineLoop::run` over the iceoryx2
 //! event-driven boundary: the worker parks on its request listener, the
 //! scheduler parks on {result, command, death}, and the command ingress wakes
 //! the park via the executor's command waker. It also exercises the idle path
@@ -12,14 +12,14 @@ use std::collections::HashMap;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use uniserve_core::GenerationEvent;
+use uniserve_core::Event;
 use uniserve_core::{
     ContextSegment, GenerationBehaviorDescriptor, GenerationConstraint, GenerationPolicyDescriptor,
     GenerationRequest, GenerationResourceBounds, ImageParams, RequestId, SamplingParams,
     UndVisibility,
 };
 use uniserve_engine::{
-    Command, ControlTokens, EngineHandle, Executor, Scheduler, UniprocExecutor, WorkerProcessArgs,
+    Command, ControlTokens, EngineHandle, EngineLoop, UniprocExecutor, WorkerProcessArgs,
 };
 
 type Rxs = HashMap<RequestId, uniserve_engine::EventRx>;
@@ -68,7 +68,7 @@ fn await_finished(rxs: &mut Rxs, ids: &[RequestId], deadline: Instant) -> Vec<Re
             if let Some(rx) = rxs.get_mut(id) {
                 while let Ok(ev) = rx.try_recv() {
                     saw_any = true;
-                    if matches!(ev, GenerationEvent::Finished { .. }) {
+                    if matches!(ev, Event::Finished { .. }) {
                         finished.push(*id);
                         break;
                     }
@@ -89,6 +89,7 @@ fn main() -> anyhow::Result<()> {
 
     let worker_config = WorkerProcessArgs {
         stub: true,
+        cuda_graph: false,
         ..WorkerProcessArgs::default()
     };
     let engine = UniprocExecutor::spawn(uniserve_engine::WorkerProcessArgs {
@@ -104,12 +105,12 @@ fn main() -> anyhow::Result<()> {
         max_batch_operations: 32,
         max_batch_tokens: 8192,
         attention_backend: uniserve_engine::AttentionBackend::Auto,
-        worker_role: None,
+        supported_ops: uniserve_worker_ipc::OpKind::ALL.to_vec(),
         transfer_backend: uniserve_engine::TransferBackend::Inproc,
         ..worker_config
     })?;
     let waker = engine.command_waker();
-    let sched = Scheduler::new(Box::new(engine), ControlTokens::default(), 32);
+    let sched = EngineLoop::new(Box::new(engine), ControlTokens::default(), 32);
 
     let (tx, rx) = crossbeam_channel::unbounded::<Command>();
     let handle = EngineHandle::with_waker(tx, waker);

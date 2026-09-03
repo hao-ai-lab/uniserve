@@ -5,15 +5,15 @@ from __future__ import annotations
 import copy
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import cast
+from typing import Any, cast
 
 from ..execution.batch import (
-    Close,
+    BatchCommand,
+    Checkpoint,
     Commit,
-    Control,
     CompletionState,
-    DevicePoint,
-    FixedPoint,
+    Finish,
+    FixedCheckpoint,
     ImageParams,
     ModelOutput,
     NewRequest,
@@ -22,7 +22,6 @@ from ..execution.batch import (
     ProductRef,
     RequestKey,
     SamplingParams,
-    VersionRef,
 )
 from ..foundation.errors import invalid_descriptor
 
@@ -64,7 +63,7 @@ class _RequestCommit:
     operation: Operation
     candidate: RequestDraft
     base: Request | None
-    selected: VersionRef
+    selected: Checkpoint
     runtime: RequestRuntime
     completion: CompletionState | None
     speculative: SpeculativeCommit | None
@@ -74,15 +73,15 @@ class _RequestCommit:
 class _ResolvedCommit:
     assignment: _RequestCommit
     record: ModelOutput
-    selected: VersionRef
+    selected: Checkpoint
     runtime: RequestRuntime
-    prefixes: tuple[tuple[VersionRef, RequestRuntime], ...]
+    prefixes: tuple[tuple[Checkpoint, RequestRuntime], ...]
 
 
 @dataclass(frozen=True, slots=True)
 class RequestPublication:
     table_token: object
-    step_id: int
+    run_id: int
     assignments: tuple[_RequestCommit, ...]
     _finished: bool = field(default=False, init=False, repr=False, compare=False)
     _reserved: bool = field(default=False, init=False, repr=False, compare=False)
@@ -143,47 +142,46 @@ class Request:
     committed_op_id: int = 0
     public_event_limit: int = 0
     applied_control_seq: int = 0
-    control_history: dict[tuple[int, str], Commit | Close] = field(default_factory=dict)
-    resolved_versions: dict[tuple[int, int], VersionRef] = field(default_factory=dict)
+    control_history: dict[tuple[int, str], Commit | Finish] = field(default_factory=dict)
+    resolved_versions: dict[tuple[int, int], Checkpoint] = field(default_factory=dict)
     resolved_runtime: dict[tuple[int, int], RequestRuntime] = field(default_factory=dict)
-    resolved_operations: dict[int, VersionRef] = field(default_factory=dict)
+    resolved_operations: dict[int, Checkpoint] = field(default_factory=dict)
     projected_runtime: dict[int, RequestRuntime] = field(default_factory=dict)
     pending_operations: dict[int, CompletionState] = field(default_factory=dict)
     unresolved_operations: dict[int, _RequestCommit] = field(default_factory=dict)
-    declared_parents: dict[int, VersionRef] = field(default_factory=dict)
-    terminal_cutoff: VersionRef | None = None
+    declared_parents: dict[int, Checkpoint] = field(default_factory=dict)
+    terminal_cutoff: Checkpoint | None = None
+    retired: bool = False
     latent_product: ProductRef | None = None
     prompt_logits_ready: bool = False
     logical_position: int = 0
     flow_step: int = 0
     rng_counter: int = 0
     last_op_id: int | None = None
-    last_step_id: int | None = None
+    last_run_id: int | None = None
 
     def __post_init__(self) -> None:
         if self.request_pool_idx < 1:
             raise invalid_descriptor("request row has an invalid scheduler slot")
 
     @property
-    def session_id(self) -> int:
-        return self.request_key.session_id
+    def request_id(self) -> int:
+        return self.request_key.request_id
 
     @property
     def epoch(self) -> int:
         return self.request_key.epoch
 
-    def committed_version(self) -> VersionRef:
-        return VersionRef(
-            request_key=self.request_key,
-            producer_op_id=self.committed_op_id,
-            point=FixedPoint(self.committed_point),
+    def committed_version(self) -> Checkpoint:
+        return Checkpoint(
+            op_id=self.committed_op_id,
+            point=FixedCheckpoint(self.committed_point),
         )
 
-    def resolved_version(self) -> VersionRef:
-        return VersionRef(
-            request_key=self.request_key,
-            producer_op_id=self.resolved_op_id,
-            point=FixedPoint(self.version),
+    def resolved_version(self) -> Checkpoint:
+        return Checkpoint(
+            op_id=self.resolved_op_id,
+            point=FixedCheckpoint(self.version),
         )
 
     def install_runtime(self, runtime: RequestRuntime) -> None:
@@ -198,30 +196,30 @@ class Request:
         self.flow_step = runtime.flow_step
 
     @staticmethod
-    def point_key(version: VersionRef) -> tuple[int, int]:
+    def point_key(version: Checkpoint) -> tuple[int, int]:
         point = version.point
-        if not isinstance(point, FixedPoint):
+        if not isinstance(point, FixedCheckpoint):
             raise invalid_descriptor("request runtime requires a fixed version")
-        return int(version.producer_op_id), int(point.point_index)
+        return int(version.op_id), int(point.point_index)
 
-    def runtime_for(self, version: VersionRef) -> RequestRuntime | None:
+    def runtime_for(self, version: Checkpoint) -> RequestRuntime | None:
         runtime = self.resolved_runtime.get(self.point_key(version))
         if runtime is not None:
             return runtime
-        pending = self.unresolved_operations.get(int(version.producer_op_id))
+        pending = self.unresolved_operations.get(int(version.op_id))
         return pending.runtime if pending is not None and pending.selected == version else None
 
-    def selected_for_operation(self, op_id: int) -> VersionRef | None:
+    def selected_for_operation(self, op_id: int) -> Checkpoint | None:
         selected = self.resolved_operations.get(int(op_id))
         if selected is not None:
             return selected
         pending = self.unresolved_operations.get(int(op_id))
         return None if pending is None else pending.selected
 
-    def resolve_version(self, version: VersionRef) -> VersionRef | None:
-        if isinstance(version.point, FixedPoint):
+    def resolve_version(self, version: Checkpoint) -> Checkpoint | None:
+        if isinstance(version.point, FixedCheckpoint):
             return version
-        return self.selected_for_operation(version.producer_op_id)
+        return self.selected_for_operation(version.op_id)
 
     def execution_runtime_for_operation(
         self,
@@ -240,11 +238,11 @@ class Request:
         point = pending.selected.point
         return (
             pending.runtime
-            if isinstance(point, FixedPoint) and int(point.point_index) == int(point_index)
+            if isinstance(point, FixedCheckpoint) and int(point.point_index) == int(point_index)
             else None
         )
 
-    def semantic_parent_for_operation(self, op_id: int) -> VersionRef | None:
+    def semantic_parent_for_operation(self, op_id: int) -> Checkpoint | None:
         parent = self.declared_parents.get(int(op_id))
         if parent is None:
             pending = self.unresolved_operations.get(int(op_id))
@@ -256,17 +254,17 @@ class Request:
         draft: RequestDraft,
         *,
         operation: Operation,
-        selected: VersionRef,
+        selected: Checkpoint,
         runtime: RequestRuntime,
         completion: CompletionState | None,
-        step_id: int,
+        run_id: int,
     ) -> None:
         """Commit one prepared output row to this stable request slot."""
 
         if draft.request is not self or operation.request_key != self.request_key:
             raise RuntimeError("request finish crossed stable slot ownership")
         point = selected.point
-        if not isinstance(point, FixedPoint):
+        if not isinstance(point, FixedCheckpoint):
             raise RuntimeError("request finish requires a fixed selected point")
         self.logical_position = int(runtime.logical_position)
         self.rng_counter = int(runtime.rng_counter)
@@ -274,7 +272,7 @@ class Request:
         self.flow_step = int(runtime.flow_step)
         self.prompt_logits_ready = bool(draft.prompt_logits_ready)
         self.version = int(point.point_index)
-        self.resolved_op_id = int(selected.producer_op_id)
+        self.resolved_op_id = int(selected.op_id)
         if operation.advances_state:
             key = self.point_key(selected)
             self.resolved_versions[key] = selected
@@ -287,7 +285,7 @@ class Request:
             self.pending_operations[int(operation.op_id)] = completion
         self.declared_parents[int(operation.op_id)] = operation.parent
         self.last_op_id = int(operation.op_id)
-        self.last_step_id = int(step_id)
+        self.last_run_id = int(run_id)
         self.unresolved_operations.pop(int(operation.op_id), None)
 
 
@@ -342,25 +340,55 @@ class RequestPool:
         self.max_request_pool_size = size
         self.history_capacity = history
         self._rows: list[Request | None] = [None] * (size + 1)
-        self._slots_by_session: dict[int, int] = {}
+        self._slots_by_request: dict[int, int] = {}
+        self._model_state: object | None = None
 
-    def get(self, session_id: int) -> Request:
-        row = self.peek(session_id)
+    def attach_model_state(self, state: object | None) -> None:
+        if state is None:
+            return
+        if self._model_state is not None:
+            raise RuntimeError("request pool already owns model request state")
+        slot_count = getattr(state, "slot_count", None)
+        if slot_count is None or int(slot_count) != self.max_request_pool_size:
+            raise invalid_descriptor("model request-state capacity does not match request slots")
+        self._model_state = state
+
+    @property
+    def model_state(self) -> object | None:
+        return self._model_state
+
+    def model_state_slot(self, request_pool_idx: int) -> Any:
+        state = self._model_state
+        get = None if state is None else getattr(state, "get", None)
+        if not callable(get):
+            raise invalid_descriptor("request has no model-owned state pool")
+        return get(self._validate_slot(request_pool_idx))
+
+    def abort_model_admissions(self, admissions: Sequence[NewRequest]) -> None:
+        if self._model_state is None:
+            return
+        abort = getattr(self._model_state, "abort_admissions", None)
+        if not callable(abort):
+            raise invalid_descriptor("model request-state pool cannot roll back admissions")
+        abort(tuple(admissions))
+
+    def get(self, request_id: int) -> Request:
+        row = self.peek(request_id)
         if row is None:
-            raise invalid_descriptor(f"unknown session {session_id}")
+            raise invalid_descriptor(f"unknown request {request_id}")
         return row
 
-    def peek(self, session_id: int) -> Request | None:
-        slot = self._slots_by_session.get(int(session_id))
+    def peek(self, request_id: int) -> Request | None:
+        slot = self._slots_by_request.get(int(request_id))
         return None if slot is None else self._rows[slot]
 
     def request_ids(self) -> tuple[int, ...]:
-        return tuple(sorted(self._slots_by_session))
+        return tuple(sorted(self._slots_by_request))
 
-    def __contains__(self, session_id: object) -> bool:
-        return isinstance(session_id, int) and session_id in self._slots_by_session
+    def __contains__(self, request_id: object) -> bool:
+        return isinstance(request_id, int) and request_id in self._slots_by_request
 
-    def stage_partition(
+    def stage_lane(
         self,
         operations: Sequence[Operation],
         admissions: Sequence[NewRequest],
@@ -370,44 +398,60 @@ class RequestPool:
 
         if len(operations) != len(request_pool_indices):
             raise invalid_descriptor("request-pool indices are not aligned with operations")
-        if len({operation.request_key.session_id for operation in operations}) != len(operations):
-            raise invalid_descriptor("a partition repeats a request")
+        if len({operation.request_key.request_id for operation in operations}) != len(operations):
+            raise invalid_descriptor("a lane repeats a request")
         slots = tuple(self._validate_slot(value) for value in request_pool_indices)
         if len(set(slots)) != len(slots):
-            raise invalid_descriptor("a partition repeats a request-pool index")
-        admitted = {value.request_key.session_id: value for value in admissions}
+            raise invalid_descriptor("a lane repeats a request-pool index")
+        admitted = {value.request_key.request_id: value for value in admissions}
         if len(admitted) != len(admissions):
-            raise invalid_descriptor("a partition repeats an admission")
-        operation_sessions = {operation.request_key.session_id for operation in operations}
-        if set(admitted) - operation_sessions:
-            raise invalid_descriptor("a partition admission has no operation")
+            raise invalid_descriptor("a lane repeats an admission")
+        operation_requests = {operation.request_key.request_id for operation in operations}
+        if set(admitted) - operation_requests:
+            raise invalid_descriptor("a lane admission has no operation")
 
         candidates: list[RequestDraft] = []
         bases: list[Request | None] = []
         for operation, slot in zip(operations, slots, strict=True):
-            session_id = int(operation.request_key.session_id)
-            admission = admitted.get(session_id)
-            base = self.peek(session_id)
+            request_id = int(operation.request_key.request_id)
+            admission = admitted.get(request_id)
+            base = self.peek(request_id)
+            if (
+                admission is not None
+                and base is not None
+                and base.retired
+                and base.request_key != admission.request_key
+            ):
+                self._evict_retired_slot(int(base.request_pool_idx))
+                base = None
             occupant = self._rows[slot]
+            if (
+                admission is not None
+                and occupant is not None
+                and occupant.retired
+                and occupant.request_key != admission.request_key
+            ):
+                self._evict_retired_slot(slot)
+                occupant = None
             if base is None:
                 if admission is None:
                     raise invalid_descriptor(
-                        f"operation {operation.op_id} references an unknown session"
+                        f"operation {operation.op_id} references an unknown request"
                     )
                 if occupant is not None:
                     raise invalid_descriptor(
-                        f"request-pool index {slot} is occupied by session {occupant.session_id}"
+                        f"request-pool index {slot} is occupied by request {occupant.request_id}"
                     )
                 request = self._admission_row(admission)
             else:
                 if occupant is not base or int(base.request_pool_idx) != slot:
                     raise invalid_descriptor(
                         f"operation {operation.op_id} names request-pool index {slot}; "
-                        f"session index is {base.request_pool_idx}"
+                        f"request index is {base.request_pool_idx}"
                     )
                 if admission is not None and admission != base.admission:
                     raise invalid_descriptor(
-                        f"session {session_id} admission conflicts with committed state"
+                        f"request {request_id} admission conflicts with committed state"
                     )
                 request = base
             source: RequestDraft | None = None
@@ -431,11 +475,11 @@ class RequestPool:
     def prepare_publication(
         self,
         *,
-        step_id: int,
+        run_id: int,
         operations: Sequence[Operation],
         candidates: Sequence[RequestDraft],
         bases: Sequence[Request | None],
-        selected_versions: Mapping[int, VersionRef],
+        selected_versions: Mapping[int, Checkpoint],
         runtimes: Mapping[int, RequestRuntime],
         completions: Mapping[int, CompletionState],
         speculative: Mapping[int, SpeculativeCommit],
@@ -446,20 +490,20 @@ class RequestPool:
             raise RuntimeError("request-row publication columns are not aligned")
         assignments: list[_RequestCommit] = []
         for operation, row, base in zip(operations, candidates, bases, strict=True):
-            session_id = int(operation.request_key.session_id)
+            request_id = int(operation.request_key.request_id)
             slot = int(row.request_pool_idx)
             current = self._rows[slot]
-            if current is not base or (base is not None and self.peek(session_id) is not base):
-                raise RuntimeError(f"request {session_id} changed before row publication")
-            selected = selected_versions.get(session_id)
-            runtime = runtimes.get(session_id)
+            if current is not base or (base is not None and self.peek(request_id) is not base):
+                raise RuntimeError(f"request {request_id} changed before row publication")
+            selected = selected_versions.get(request_id)
+            runtime = runtimes.get(request_id)
             if selected is None or runtime is None:
                 raise RuntimeError("request-row publication is missing its resolved outcome")
-            completion = completions.get(session_id)
+            completion = completions.get(request_id)
             if operation.advances_state and completion is None:
                 raise RuntimeError("request-row publication is missing its pending completion")
             point = selected.point
-            if not isinstance(point, FixedPoint):
+            if not isinstance(point, FixedCheckpoint):
                 raise RuntimeError("published request version must be fixed")
             additions = 1 if operation.advances_state and isinstance(point.point_index, int) else 0
             if (
@@ -477,7 +521,7 @@ class RequestPool:
                 else resolved_parent is not None
             )
             if row.request_key != operation.request_key or not parent_matches:
-                raise RuntimeError(f"request {session_id} candidate has a stale parent")
+                raise RuntimeError(f"request {request_id} candidate has a stale parent")
             if not operation.advances_state and selected != resolved_parent:
                 raise RuntimeError("non-state request publication changed its resolved parent")
             assignments.append(
@@ -488,12 +532,12 @@ class RequestPool:
                     selected=selected,
                     runtime=runtime,
                     completion=completion,
-                    speculative=speculative.get(session_id),
+                    speculative=speculative.get(request_id),
                 )
             )
         return RequestPublication(
             table_token=self,
-            step_id=int(step_id),
+            run_id=int(run_id),
             assignments=tuple(assignments),
         )
 
@@ -523,7 +567,7 @@ class RequestPool:
             slot = int(row.request_pool_idx)
             if assignment.base is None and self._rows[slot] is None:
                 self._rows[slot] = row
-                self._slots_by_session[int(row.session_id)] = slot
+                self._slots_by_request[int(row.request_id)] = slot
             operation_id = int(assignment.operation.op_id)
             row.unresolved_operations[operation_id] = assignment
             row.projected_runtime[operation_id] = assignment.runtime
@@ -546,7 +590,7 @@ class RequestPool:
             (record.request_key, int(record.op_id)): record for record in completions
         }
         if len(by_operation) != len(completions):
-            raise RuntimeError("partition completion repeats an operation identity")
+            raise RuntimeError("lane completion repeats an operation identity")
         resolved: list[_ResolvedCommit] = []
         for assignment in publication.assignments:
             record = by_operation.get(
@@ -563,14 +607,13 @@ class RequestPool:
             slot = int(row.request_pool_idx)
             expected = row if publication._reserved else base
             if self._rows[slot] is not expected:
-                raise RuntimeError(f"request {row.session_id} changed before row assignment")
+                raise RuntimeError(f"request {row.request_id} changed before row assignment")
             selected = assignment.selected
             unresolved_runtime = assignment.runtime
             if assignment.speculative is not None:
-                selected = VersionRef(
-                    request_key=assignment.operation.request_key,
-                    producer_op_id=int(assignment.operation.op_id),
-                    point=FixedPoint(int(record.selected_point)),
+                selected = Checkpoint(
+                    op_id=int(assignment.operation.op_id),
+                    point=FixedCheckpoint(int(record.selected_point)),
                 )
                 unresolved_runtime = RequestRuntime(
                     logical_position=int(record.logical_lengths.token_len),
@@ -593,12 +636,11 @@ class RequestPool:
                 selected = selected_parent
                 unresolved_runtime = parent_runtime
             point = selected.point
-            if not isinstance(point, FixedPoint):
+            if not isinstance(point, FixedCheckpoint):
                 raise RuntimeError("request publication selected a non-fixed version")
-            selected = VersionRef(
-                request_key=selected.request_key,
-                producer_op_id=int(selected.producer_op_id),
-                point=FixedPoint(int(point.point_index)),
+            selected = Checkpoint(
+                op_id=int(selected.op_id),
+                point=FixedCheckpoint(int(point.point_index)),
             )
             resolved_runtime = RequestRuntime(
                 logical_position=int(unresolved_runtime.logical_position),
@@ -632,14 +674,14 @@ class RequestPool:
             if assignment.base is None and not publication._reserved:
                 slot = int(row.request_pool_idx)
                 self._rows[slot] = row
-                self._slots_by_session[int(row.session_id)] = slot
+                self._slots_by_request[int(row.request_id)] = slot
             row.finish(
                 draft,
                 operation=assignment.operation,
                 selected=commit.selected,
                 runtime=commit.runtime,
                 completion=assignment.completion,
-                step_id=publication.step_id,
+                run_id=publication.run_id,
             )
             if commit.prefixes:
                 self._install_prefixes(
@@ -672,14 +714,14 @@ class RequestPool:
             and self._rows[int(row.request_pool_idx)] is row
         ):
             self._rows[int(row.request_pool_idx)] = None
-            self._slots_by_session.pop(int(row.session_id), None)
+            self._slots_by_request.pop(int(row.request_id), None)
 
     def _speculative_prefixes(
         self,
         row: Request,
         assignment: _RequestCommit,
         record: ModelOutput,
-    ) -> tuple[tuple[VersionRef, RequestRuntime], ...]:
+    ) -> tuple[tuple[Checkpoint, RequestRuntime], ...]:
         plan = assignment.speculative
         if plan is None:
             return ()
@@ -695,10 +737,9 @@ class RequestPool:
             raise RuntimeError("speculative KV selection is outside initialized state")
         return tuple(
             (
-                VersionRef(
-                    request_key=assignment.operation.request_key,
-                    producer_op_id=int(assignment.operation.op_id),
-                    point=FixedPoint(point_index),
+                Checkpoint(
+                    op_id=int(assignment.operation.op_id),
+                    point=FixedCheckpoint(point_index),
                 ),
                 RequestRuntime(
                     logical_position=int(plan.base_logical_position) + point_index,
@@ -712,51 +753,50 @@ class RequestPool:
             for point_index in range(1, selected_point + 1)
         )
 
-    def apply_controls(self, controls: Sequence[Control]) -> None:
-        for control in controls:
-            if isinstance(control, Commit):
-                self._apply_commit(control)
-            elif isinstance(control, Close):
-                self._apply_close(control)
+    def apply_commands(self, commands: Sequence[BatchCommand]) -> None:
+        for command in commands:
+            if isinstance(command, Commit):
+                self._apply_commit(command)
+            elif isinstance(command, Finish):
+                self._apply_finish(command)
 
     def resolve_predicated(
         self,
-        session_id: int,
+        request_id: int,
         op_id: int,
-        parent: VersionRef,
-    ) -> tuple[VersionRef, RequestRuntime]:
-        row = self.get(session_id)
+        parent: Checkpoint,
+    ) -> tuple[Checkpoint, RequestRuntime]:
+        row = self.get(request_id)
         selected = row.resolve_version(parent)
         runtime = None if selected is None else row.runtime_for(selected)
         if selected is None or runtime is None:
             raise invalid_descriptor(f"predicated operation {op_id} lost its resolved parent")
         point = selected.point
-        if not isinstance(point, FixedPoint):
+        if not isinstance(point, FixedCheckpoint):
             raise invalid_descriptor(f"predicated operation {op_id} resolved to a device point")
-        selected = VersionRef(
-            request_key=selected.request_key,
-            producer_op_id=selected.producer_op_id,
-            point=FixedPoint(point.point_index),
+        selected = Checkpoint(
+            op_id=selected.op_id,
+            point=FixedCheckpoint(point.point_index),
         )
         return selected, runtime
 
     def finalize_prefixes(
         self,
-        session_id: int,
+        request_id: int,
         op_id: int,
-        prefixes: Sequence[tuple[VersionRef, RequestRuntime]],
-    ) -> tuple[VersionRef, RequestRuntime]:
+        prefixes: Sequence[tuple[Checkpoint, RequestRuntime]],
+    ) -> tuple[Checkpoint, RequestRuntime]:
         if not prefixes:
             raise invalid_descriptor("resolved token operation has no prefix states")
-        row = self.get(session_id)
+        row = self.get(request_id)
         return self._install_prefixes(row, op_id, prefixes)
 
     def _install_prefixes(
         self,
         row: Request,
         op_id: int,
-        prefixes: Sequence[tuple[VersionRef, RequestRuntime]],
-    ) -> tuple[VersionRef, RequestRuntime]:
+        prefixes: Sequence[tuple[Checkpoint, RequestRuntime]],
+    ) -> tuple[Checkpoint, RequestRuntime]:
         if not prefixes:
             raise invalid_descriptor("resolved token operation has no prefix states")
         new_keys = {
@@ -768,33 +808,57 @@ class RequestPool:
             raise invalid_descriptor("request history capacity is exhausted")
         previous_point = 0
         for version, runtime in prefixes:
-            if version.request_key != row.request_key or version.producer_op_id != int(op_id):
+            if version.op_id != int(op_id):
                 raise invalid_descriptor("resolved token prefix has the wrong lineage")
             point = version.point
-            if not isinstance(point, FixedPoint) or int(point.point_index) != previous_point + 1:
+            if not isinstance(point, FixedCheckpoint) or int(point.point_index) != previous_point + 1:
                 raise invalid_descriptor("resolved token prefixes are not contiguous")
             key = row.point_key(version)
             row.resolved_versions[key] = version
             row.resolved_runtime[key] = runtime
             previous_point = int(point.point_index)
         selected, runtime = prefixes[-1]
-        point = cast(FixedPoint, selected.point)
+        point = cast(FixedCheckpoint, selected.point)
         row.resolved_operations[int(op_id)] = selected
         row.version = int(point.point_index)
         row.resolved_op_id = int(op_id)
         row.install_runtime(runtime)
         return selected, runtime
 
-    def drop(self, session_id: int) -> None:
-        selected = int(session_id)
-        slot = self._slots_by_session.pop(selected, None)
+    def drop(self, request_id: int) -> None:
+        selected = int(request_id)
+        slot = self._slots_by_request.pop(selected, None)
+        row = None if slot is None else self._rows[slot]
         if slot is not None:
             self._rows[slot] = None
+        state = self._model_state
+        drop = None if state is None else getattr(state, "drop_request", None)
+        if callable(drop) and row is not None and not row.retired:
+            drop(selected)
 
-    def snapshot_committed(self, session_ids: set[int]) -> tuple[Request, ...]:
+    def retire(self, request_id: int) -> None:
+        row = self.get(request_id)
+        if row.retired:
+            return
+        if row.terminal_cutoff is None:
+            raise RuntimeError("request retirement requires an applied finish command")
+        state = self._model_state
+        drop = None if state is None else getattr(state, "drop_request", None)
+        if callable(drop):
+            drop(int(request_id))
+        row.retired = True
+
+    def _evict_retired_slot(self, slot: int) -> None:
+        row = self._rows[slot]
+        if row is None or not row.retired:
+            return
+        self._slots_by_request.pop(int(row.request_id), None)
+        self._rows[slot] = None
+
+    def snapshot_committed(self, request_ids: set[int]) -> tuple[Request, ...]:
         snapshots: list[Request] = []
-        for session_id in sorted(int(value) for value in session_ids):
-            snapshot = copy.deepcopy(self.get(session_id))
+        for request_id in sorted(int(value) for value in request_ids):
+            snapshot = copy.deepcopy(self.get(request_id))
             snapshot.version = snapshot.committed_point
             snapshot.resolved_op_id = snapshot.committed_op_id
             committed = snapshot.committed_version()
@@ -816,28 +880,28 @@ class RequestPool:
     def restore_rows(
         self,
         rows: Sequence[Request],
-        session_ids: set[int] | None = None,
+        request_ids: set[int] | None = None,
     ) -> None:
-        staged = {int(row.session_id): copy.deepcopy(row) for row in rows}
+        staged = {int(row.request_id): copy.deepcopy(row) for row in rows}
         if len(staged) != len(rows):
-            raise invalid_descriptor("request snapshot repeats a session identity")
-        selected = set(staged) if session_ids is None else {int(value) for value in session_ids}
+            raise invalid_descriptor("request snapshot repeats a request identity")
+        selected = set(staged) if request_ids is None else {int(value) for value in request_ids}
         if not set(staged) <= selected:
-            raise invalid_descriptor("request snapshot contains an undeclared session")
+            raise invalid_descriptor("request snapshot contains an undeclared request")
 
         retained_slots = {
-            slot: row.session_id
+            slot: row.request_id
             for slot, row in enumerate(self._rows)
-            if row is not None and row.session_id not in selected
+            if row is not None and row.request_id not in selected
         }
-        for session_id, row in staged.items():
+        for request_id, row in staged.items():
             slot = self._validate_slot(row.request_pool_idx)
             occupant = retained_slots.get(slot)
             if occupant is not None:
                 raise invalid_descriptor(
-                    f"request snapshot slot {slot} is occupied by session {occupant}"
+                    f"request snapshot slot {slot} is occupied by request {occupant}"
                 )
-            retained_slots[slot] = session_id
+            retained_slots[slot] = request_id
             if row.epoch < 0 or row.version < 0 or row.committed_point < 0:
                 raise invalid_descriptor("request snapshot version is invalid")
             if row.admission.request_key != row.request_key:
@@ -852,12 +916,12 @@ class RequestPool:
             ):
                 raise invalid_descriptor("request snapshot lineage state is incomplete")
 
-        for session_id in selected:
-            self.drop(session_id)
-        for session_id, row in staged.items():
+        for request_id in selected:
+            self.drop(request_id)
+        for request_id, row in staged.items():
             slot = int(row.request_pool_idx)
             self._rows[slot] = row
-            self._slots_by_session[session_id] = slot
+            self._slots_by_request[request_id] = slot
 
     def _validate_slot(self, request_pool_idx: int) -> int:
         slot = int(request_pool_idx)
@@ -869,15 +933,15 @@ class RequestPool:
 
     def _admission_row(self, admission: NewRequest) -> Request:
         slot = self._validate_slot(admission.request_pool_idx)
-        prefix_len = 0 if admission.und is None else int(admission.und.initial_position)
+        prefix_len = 0 if admission.ar is None else int(admission.ar.initial_position)
         row = Request(
             request_key=admission.request_key,
             request_pool_idx=slot,
             admission=admission,
-            sampling=None if admission.und is None else admission.und.sampling,
-            image=None if admission.gen_admission is None else admission.gen_admission.image,
-            negative_token_ids=() if admission.und is None else admission.und.negative_token_ids,
-            finish_token_ids=() if admission.und is None else admission.und.finish_token_ids,
+            sampling=None if admission.ar is None else admission.ar.sampling,
+            image=None if admission.umm is None else admission.umm.image,
+            negative_token_ids=() if admission.ar is None else admission.ar.negative_token_ids,
+            finish_token_ids=() if admission.ar is None else admission.ar.finish_token_ids,
             logical_position=prefix_len,
         )
         root = row.committed_version()
@@ -922,9 +986,9 @@ class RequestPool:
     def _control_identity(
         self,
         row: Request,
-        control: Commit | Close,
+        control: Commit | Finish,
     ) -> tuple[bool, tuple[int, str]]:
-        kind = "commit" if isinstance(control, Commit) else "close"
+        kind = "commit" if isinstance(control, Commit) else "finish"
         identity = (int(control.control_seq), kind)
         existing = row.control_history.get(identity)
         if existing is not None:
@@ -937,13 +1001,13 @@ class RequestPool:
             raise invalid_descriptor("request control history capacity is exhausted")
         if int(control.control_seq) != row.applied_control_seq + 1:
             raise invalid_descriptor(
-                f"control sequence {control.control_seq} for request {row.session_id} "
+                f"control sequence {control.control_seq} for request {row.request_id} "
                 f"does not follow {row.applied_control_seq}"
             )
         return False, identity
 
     def _apply_commit(self, control: Commit) -> None:
-        row = self.get(control.request_key.session_id)
+        row = self.get(control.request_key.request_id)
         if control.request_key != row.request_key:
             raise invalid_descriptor("commit control has a stale request key")
         duplicate, identity = self._control_identity(row, control)
@@ -958,18 +1022,18 @@ class RequestPool:
             raise invalid_descriptor("commit control selected point is not fixed")
         if (
             row.resolved_versions.get(row.point_key(selected)) != selected
-            and row.selected_for_operation(selected.producer_op_id) != selected
+            and row.selected_for_operation(selected.op_id) != selected
         ):
             raise invalid_descriptor("commit control selected point was not resolved")
-        if row.semantic_parent_for_operation(selected.producer_op_id) != control.expected_parent:
+        if row.semantic_parent_for_operation(selected.op_id) != control.expected_parent:
             raise invalid_descriptor("commit control selected point has a different parent")
         if row.runtime_for(selected) is None:
             raise invalid_descriptor("commit control selected point lost its runtime")
-        point = cast(FixedPoint, selected.point)
+        point = cast(FixedCheckpoint, selected.point)
         if int(control.public_event_limit) < row.public_event_limit:
             raise invalid_descriptor("commit control regresses the public event limit")
         row.committed_point = int(point.point_index)
-        row.committed_op_id = int(selected.producer_op_id)
+        row.committed_op_id = int(selected.op_id)
         row.public_event_limit = int(control.public_event_limit)
         row.applied_control_seq = int(control.control_seq)
         row.control_history[identity] = control
@@ -979,7 +1043,7 @@ class RequestPool:
     def _prune_committed(row: Request) -> None:
         frontier = int(row.committed_op_id)
         referenced = {
-            int(parent.producer_op_id)
+            int(parent.op_id)
             for op_id, parent in row.declared_parents.items()
             if int(op_id) > frontier
         }
@@ -1007,30 +1071,30 @@ class RequestPool:
             if int(op_id) > frontier
         }
 
-    def _apply_close(self, control: Close) -> None:
-        row = self.get(control.request_key.session_id)
+    def _apply_finish(self, control: Finish) -> None:
+        row = self.get(control.request_key.request_id)
         if control.request_key != row.request_key:
-            raise invalid_descriptor("close control has a stale request key")
+            raise invalid_descriptor("finish command has a stale request key")
         duplicate, identity = self._control_identity(row, control)
         if duplicate:
             return
         cutoff = control.cutoff
         if not cutoff.is_fixed():
-            raise invalid_descriptor("close control cutoff is not fixed")
-        point = cast(FixedPoint, cutoff.point)
+            raise invalid_descriptor("finish command cutoff is not fixed")
+        point = cast(FixedCheckpoint, cutoff.point)
         reachable = cutoff == row.committed_version() or (
             row.resolved_versions.get(row.point_key(cutoff)) == cutoff
-            or row.selected_for_operation(cutoff.producer_op_id) == cutoff
+            or row.selected_for_operation(cutoff.op_id) == cutoff
         )
         if not reachable:
-            raise invalid_descriptor("close control cutoff is not on the resolved lineage")
+            raise invalid_descriptor("finish command cutoff is not on the resolved lineage")
         runtime = row.runtime_for(cutoff)
         if runtime is None:
-            raise invalid_descriptor("close control cutoff lost its runtime")
+            raise invalid_descriptor("finish command cutoff lost its runtime")
         row.committed_point = int(point.point_index)
-        row.committed_op_id = int(cutoff.producer_op_id)
+        row.committed_op_id = int(cutoff.op_id)
         row.version = int(point.point_index)
-        row.resolved_op_id = int(cutoff.producer_op_id)
+        row.resolved_op_id = int(cutoff.op_id)
         row.install_runtime(runtime)
         row.terminal_cutoff = cutoff
         row.applied_control_seq = int(control.control_seq)
@@ -1038,11 +1102,11 @@ class RequestPool:
         key = row.point_key(cutoff)
         row.resolved_versions = {key: cutoff}
         row.resolved_runtime = {key: runtime}
-        row.resolved_operations = {int(cutoff.producer_op_id): cutoff}
+        row.resolved_operations = {int(cutoff.op_id): cutoff}
         row.projected_runtime = {}
         row.pending_operations = {}
         row.unresolved_operations = {}
-        row.declared_parents = {int(cutoff.producer_op_id): cutoff}
+        row.declared_parents = {int(cutoff.op_id): cutoff}
 
 
 __all__ = [

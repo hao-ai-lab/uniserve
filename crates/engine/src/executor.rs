@@ -2,60 +2,637 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 use std::str::FromStr;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
-use uniserve_core::{CommandWaker, RequestId};
-#[cfg(test)]
-use uniserve_worker_ipc::Operation;
-pub use uniserve_worker_ipc::WorkerRole;
 use uniserve_worker_ipc::{
-    Batch, CompletionReport, ForwardMode, RequestKind, WorkerInfo, WorkerRequest,
+    BatchCommand, BlockTable, BufferPlacement, CachePageAllocation, DecodePlacement,
+    LatentPlacement, NewRequest, OpId, OpKind, OpPayload, Operation, ProductPayload, RequestKey,
+    RowGeometry, Run as PhysicalRun, RunKind, RunResult, WorkerInfo,
 };
 
-/// One pool in a staged topology: `count` instances of `kind`, each with the
-/// given tensor-parallel size.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Pool {
-    pub kind: WorkerRole,
-    /// Number of data-parallel pool instances of this kind (e.g. `encoder:2`).
-    pub count: usize,
-    /// Tensor-parallel rank count within each pool instance (`tp=N`).
-    pub tp: usize,
+/// Immutable worker placement for one logical operation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpPlacement {
+    pub block_tables: Vec<BlockTable>,
+    pub new_cache_pages: Vec<CachePageAllocation>,
+    pub forward_rows: Vec<RowGeometry>,
+    pub latent: Option<LatentPlacement>,
+    pub decode: Option<DecodePlacement>,
+    pub buffers: Vec<BufferPlacement>,
 }
 
-/// The `--workers` topology: an ordered list of pool entries. `full:1` (one Full
-/// pool, tp = `--worker-ranks`) is the default.
+impl OpPlacement {
+    pub fn empty() -> Self {
+        Self {
+            block_tables: Vec::new(),
+            new_cache_pages: Vec::new(),
+            forward_rows: Vec::new(),
+            latent: None,
+            decode: None,
+            buffers: Vec::new(),
+        }
+    }
+}
+
+/// One logical operation and its scheduler-authoritative physical placement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Op {
+    pub id: OpId,
+    pub request: RequestKey,
+    pub parent: Option<uniserve_worker_ipc::Checkpoint>,
+    pub kind: OpKind,
+    pub payload: OpPayload,
+    pub placement: OpPlacement,
+    run_kind: RunKind,
+}
+
+impl Op {
+    pub fn new(operation: Operation, placement: OpPlacement) -> Self {
+        Self {
+            id: operation.op_id,
+            request: operation.request_key,
+            parent: Some(operation.parent),
+            kind: operation.kind.op_kind(),
+            payload: operation.payload,
+            placement,
+            run_kind: operation.kind,
+        }
+    }
+
+    pub const fn request_key(&self) -> RequestKey {
+        self.request
+    }
+
+    pub const fn id(&self) -> OpId {
+        self.id
+    }
+
+    pub(crate) fn into_operation(self) -> Operation {
+        Operation {
+            request_key: self.request,
+            op_id: self.id,
+            parent: self
+                .parent
+                .unwrap_or_else(|| uniserve_worker_ipc::Checkpoint::admission_root(OpId(0))),
+            kind: self.run_kind,
+            payload: self.payload,
+        }
+    }
+}
+
+/// One logical executor submission. Physical runs are derived only inside an executor.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Batch {
+    pub id: u64,
+    pub ops: Vec<Op>,
+    pub commands: Vec<BatchCommand>,
+    pub inline: Vec<ProductPayload>,
+}
+
+impl Batch {
+    pub fn new(
+        id: u64,
+        ops: Vec<Op>,
+        commands: Vec<BatchCommand>,
+        inline: Vec<ProductPayload>,
+    ) -> Self {
+        Self {
+            id,
+            ops,
+            commands,
+            inline,
+        }
+    }
+
+    pub fn admissions(&self) -> impl Iterator<Item = &NewRequest> {
+        self.commands.iter().filter_map(|command| match command {
+            BatchCommand::Start { request } => Some(request),
+            _ => None,
+        })
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.ops.is_empty() || !self.commands.is_empty(),
+            "logical batch must carry at least one operation or command"
+        );
+        let mut requests = std::collections::HashSet::with_capacity(self.ops.len());
+        let mut identities = std::collections::HashSet::with_capacity(self.ops.len());
+        for op in &self.ops {
+            let operation = op.clone().into_operation();
+            operation.validate()?;
+            anyhow::ensure!(
+                requests.insert(op.request_key()),
+                "logical batch carries multiple operations for one request"
+            );
+            anyhow::ensure!(
+                identities.insert((op.request_key(), op.id())),
+                "logical batch repeats an operation identity"
+            );
+            for table in &op.placement.block_tables {
+                table.validate()?;
+            }
+            for pages in &op.placement.new_cache_pages {
+                pages.validate()?;
+            }
+            if let Some(latent) = &op.placement.latent {
+                latent.validate()?;
+                anyhow::ensure!(
+                    (latent.request_key, latent.op_id) == (op.request_key(), op.id()),
+                    "logical operation carries another operation's latent placement"
+                );
+            }
+            if let Some(decode) = &op.placement.decode {
+                decode.validate()?;
+                anyhow::ensure!(
+                    (decode.request_key, decode.op_id) == (op.request_key(), op.id()),
+                    "logical operation carries another operation's decode placement"
+                );
+            }
+            for buffer in &op.placement.buffers {
+                buffer.validate()?;
+                anyhow::ensure!(
+                    operation
+                        .outputs()
+                        .iter()
+                        .any(|output| output.buffer_id() == buffer.buffer),
+                    "logical operation carries a buffer placement for another output"
+                );
+            }
+        }
+        let mut admitted = std::collections::HashSet::new();
+        for admission in self.admissions() {
+            admission.validate()?;
+            anyhow::ensure!(
+                admitted.insert(admission.request_key),
+                "logical batch repeats a request start"
+            );
+            anyhow::ensure!(
+                requests.contains(&admission.request_key),
+                "logical batch starts a request without an operation"
+            );
+        }
+        for command in &self.commands {
+            command.validate()?;
+        }
+        for inline in &self.inline {
+            inline.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// Concrete pool information reported through the execution boundary.
+#[derive(Debug, Clone)]
+pub struct ExecutorInfo {
+    pub pools: Vec<(PoolId, WorkerInfo)>,
+}
+
+impl ExecutorInfo {
+    pub fn single(id: PoolId, info: WorkerInfo) -> Self {
+        Self {
+            pools: vec![(id, info)],
+        }
+    }
+
+    pub fn from_pools(pools: Vec<(PoolId, WorkerInfo)>) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !pools.is_empty(),
+            "executor info must contain at least one pool"
+        );
+        let mut ids = std::collections::HashSet::new();
+        for (id, info) in &pools {
+            anyhow::ensure!(ids.insert(id), "executor info repeats pool id {id}");
+            info.validate()?;
+        }
+        Ok(Self { pools })
+    }
+
+    pub fn single_pool(&self) -> &WorkerInfo {
+        assert_eq!(
+            self.pools.len(),
+            1,
+            "executor does not contain exactly one physical pool"
+        );
+        &self.pools[0].1
+    }
+
+    /// Derive the runtime's immutable capacity view from concrete pools.
+    /// The returned value is not part of executor identity and is never
+    /// reported as a physical worker.
+    pub fn runtime_info(&self) -> anyhow::Result<WorkerInfo> {
+        anyhow::ensure!(!self.pools.is_empty(), "executor exposes no physical pools");
+        if self.pools.len() == 1 {
+            return Ok(self.pools[0].1.clone());
+        }
+        let routed = |variant: OpKind| {
+            self.pools
+                .iter()
+                .find(|(_, info)| info.supported_ops.contains(&variant))
+                .map(|(_, info)| info)
+        };
+        let mut kv_indices = [OpKind::ArExtend, OpKind::ArDecode, OpKind::ArVerify]
+            .into_iter()
+            .filter_map(|variant| {
+                self.pools
+                    .iter()
+                    .position(|(_, info)| info.supported_ops.contains(&variant))
+            })
+            .collect::<Vec<_>>();
+        kv_indices.sort_unstable();
+        kv_indices.dedup();
+
+        let seed_index = kv_indices.first().copied().unwrap_or(0);
+        let mut merged = self.pools[seed_index].1.clone();
+        let identity = (&self.pools[0].1.model_name, self.pools[0].1.weight_version);
+        anyhow::ensure!(
+            self.pools.iter().all(|(_, info)| {
+                info.model_name == *identity.0 && info.weight_version == identity.1
+            }),
+            "executor pools expose different model names or weight versions"
+        );
+
+        if let Some(first_index) = kv_indices.first().copied() {
+            let first = &self.pools[first_index].1;
+            let first_kv = first
+                .kv_cache
+                .as_ref()
+                .context("executor routes KV work to a pool without a KV cache")?;
+            for index in kv_indices.iter().copied().skip(1) {
+                let other = &self.pools[index].1;
+                let other_kv = other
+                    .kv_cache
+                    .as_ref()
+                    .context("executor routes KV work to a pool without a KV cache")?;
+                anyhow::ensure!(
+                    other_kv.block_size == first_kv.block_size,
+                    "executor KV pools disagree on block size"
+                );
+                anyhow::ensure!(
+                    other_kv.num_layers == first_kv.num_layers
+                        && other_kv.num_kv_heads == first_kv.num_kv_heads
+                        && other_kv.head_dim == first_kv.head_dim
+                        && other_kv.dtype == first_kv.dtype
+                        && other_kv.groups == first_kv.groups,
+                    "executor KV pools expose incompatible cache layouts"
+                );
+            }
+            let mut kv_cache = first_kv.clone();
+            kv_cache.num_blocks = kv_indices
+                .iter()
+                .filter_map(|index| self.pools[*index].1.kv_cache.as_ref())
+                .map(|config| config.num_blocks)
+                .min()
+                .unwrap_or(first_kv.num_blocks);
+            kv_cache.bytes_per_token = kv_indices
+                .iter()
+                .filter_map(|index| self.pools[*index].1.kv_cache.as_ref())
+                .map(|config| config.bytes_per_token)
+                .max()
+                .unwrap_or(first_kv.bytes_per_token);
+            merged.kv_cache = Some(kv_cache);
+        } else {
+            merged.kv_cache = None;
+        }
+
+        merged.supported_ops = OpKind::ALL
+            .into_iter()
+            .filter(|variant| routed(*variant).is_some())
+            .collect();
+        merged.queue_depth = self
+            .pools
+            .iter()
+            .map(|(_, info)| info.queue_depth.max(1))
+            .min()
+            .unwrap_or(1);
+        merged.max_batch_ops = self
+            .pools
+            .iter()
+            .map(|(_, info)| info.max_batch_ops)
+            .filter(|limit| *limit > 0)
+            .min()
+            .unwrap_or(0);
+        merged.max_batch_tokens = self
+            .pools
+            .iter()
+            .map(|(_, info)| info.max_batch_tokens)
+            .filter(|limit| *limit > 0)
+            .min()
+            .unwrap_or(0);
+        merged.request_slots = self
+            .pools
+            .iter()
+            .map(|(_, info)| info.request_slots)
+            .filter(|limit| *limit > 0)
+            .min()
+            .unwrap_or(0);
+        merged.max_unresolved_ops = self
+            .pools
+            .iter()
+            .map(|(_, info)| info.max_unresolved_ops)
+            .filter(|limit| *limit > 0)
+            .min()
+            .unwrap_or(0);
+        let flow = routed(OpKind::DiffusionStep);
+        merged.latent_page_units = flow.map_or(0, |info| info.latent_page_units);
+        merged.latent_pages = flow.map_or(0, |info| info.latent_pages);
+        merged.buffer_pool_bytes = self
+            .pools
+            .iter()
+            .map(|(_, info)| info.buffer_pool_bytes)
+            .filter(|capacity| *capacity > 0)
+            .min()
+            .unwrap_or(0);
+        merged.validate()?;
+        Ok(merged)
+    }
+}
+
+/// One operation result returned from an executor-owned physical run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpResult {
+    pub output: uniserve_worker_ipc::ModelOutput,
+    pub products: Vec<ProductPayload>,
+}
+
+/// Acknowledgement of one logical batch command after every target pool applied it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandResult {
+    pub command_index: u32,
+    pub request_key: RequestKey,
+}
+
+/// One independently ready subset of a logical batch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatchResult {
+    pub batch_id: u64,
+    pub results: Vec<OpResult>,
+    pub command_results: Vec<CommandResult>,
+    pub done: bool,
+    pub worker_exec_us: Vec<u64>,
+    pub forward_stats: Vec<uniserve_worker_ipc::WorkerForwardStats>,
+}
+
+pub(crate) fn logical_result(
+    report: RunResult,
+    done: bool,
+    commands: &[BatchCommand],
+) -> BatchResult {
+    let mut results = Vec::new();
+    let mut worker_exec_us = Vec::new();
+    let mut forward_stats = Vec::new();
+    if let Some(value) = report.worker_exec_us {
+        worker_exec_us.push(value);
+    }
+    if let Some(value) = report.forward_stats {
+        forward_stats.push(value);
+    }
+    for output in report.completions {
+        let products = report
+            .products
+            .iter()
+            .filter(|payload| {
+                payload.product.request_key == output.request_key
+                    && payload.product.producer_op_id == output.op_id
+            })
+            .cloned()
+            .collect();
+        results.push(OpResult { output, products });
+    }
+    BatchResult {
+        batch_id: report.batch_id,
+        results,
+        command_results: done
+            .then(|| {
+                commands
+                    .iter()
+                    .enumerate()
+                    .map(|(index, command)| CommandResult {
+                        command_index: index as u32,
+                        request_key: command.request_key(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        done,
+        worker_exec_us,
+        forward_stats,
+    }
+}
+
+struct PendingLogicalResult {
+    remaining: std::collections::HashMap<(RequestKey, OpId), RunKind>,
+    commands: Vec<BatchCommand>,
+}
+
+/// Executor-local reconciliation from physical partial reports to logical batch results.
+#[derive(Default)]
+pub(crate) struct LogicalResultTracker {
+    pending: std::collections::HashMap<u64, PendingLogicalResult>,
+}
+
+impl LogicalResultTracker {
+    pub(crate) fn register(&mut self, batch: &Batch) -> anyhow::Result<()> {
+        let state = PendingLogicalResult {
+            remaining: batch
+                .ops
+                .iter()
+                .map(|op| ((op.request_key(), op.id()), op.run_kind))
+                .collect(),
+            commands: batch.commands.clone(),
+        };
+        anyhow::ensure!(
+            self.pending.insert(batch.id, state).is_none(),
+            "logical batch {} is already registered",
+            batch.id
+        );
+        Ok(())
+    }
+
+    pub(crate) fn unregister(&mut self, batch_id: u64) {
+        self.pending.remove(&batch_id);
+    }
+
+    pub(crate) fn apply(&mut self, report: RunResult) -> anyhow::Result<BatchResult> {
+        report.validate()?;
+        let state = self.pending.get_mut(&report.batch_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "physical result names unknown logical batch {}",
+                report.batch_id
+            )
+        })?;
+        for output in report.completions() {
+            let kind = state
+                .remaining
+                .remove(&(output.request_key, output.op_id))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "physical result repeats or invents operation {:?}/{} in logical batch {}",
+                        output.request_key,
+                        output.op_id.0,
+                        report.batch_id
+                    )
+                })?;
+            anyhow::ensure!(
+                output.payload.family_matches(kind),
+                "physical result payload family disagrees with operation {:?}/{}",
+                output.request_key,
+                output.op_id.0
+            );
+        }
+        anyhow::ensure!(
+            !report.done || state.remaining.is_empty(),
+            "physical run ended before every logical operation completed"
+        );
+        let done = report.done && state.remaining.is_empty();
+        let commands = state.commands.clone();
+        if done {
+            self.pending.remove(&report.batch_id);
+        }
+        Ok(logical_result(report, done, &commands))
+    }
+}
+
+pub type ExecutorError = anyhow::Error;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ExecutorSubmitError {
+    #[error("executor queue is full")]
+    WouldBlock(Batch),
+    #[error(transparent)]
+    Failed(#[from] anyhow::Error),
+}
+
+#[doc(hidden)]
+#[derive(Debug, thiserror::Error)]
+pub enum PhysicalSubmitError {
+    #[error("physical executor queue is full")]
+    WouldBlock(PhysicalRun),
+    #[error(transparent)]
+    Failed(anyhow::Error),
+}
+
+/// Internal worker-pool boundary used after logical routing and lowering.
+#[doc(hidden)]
+pub trait PhysicalExecutor: Send {
+    fn physical_info(&self) -> &ExecutorInfo;
+    fn submit_run(&mut self, run: PhysicalRun) -> Result<(), PhysicalSubmitError>;
+    fn poll_run(&mut self, timeout: Duration) -> Result<Option<RunResult>, ExecutorError>;
+    fn take_command_wake(&mut self) -> bool {
+        false
+    }
+    fn close_physical(&mut self) -> Result<(), ExecutorError>;
+}
+
+/// Stable identity of one explicitly configured physical worker pool.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PoolId(pub String);
+
+impl PoolId {
+    pub fn new(value: impl Into<String>) -> Result<Self, WorkerTopologyError> {
+        let value = value.into();
+        if value.is_empty()
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(WorkerTopologyError::message(format!(
+                "invalid pool id {value:?}"
+            )));
+        }
+        Ok(Self(value))
+    }
+}
+
+impl std::fmt::Display for PoolId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// One concrete physical pool. Routing consumes only this explicit operation
+/// set; profile names are discarded during CLI expansion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolConfig {
+    pub id: PoolId,
+    pub device: String,
+    pub tensor_parallel_size: usize,
+    pub supported_ops: Vec<OpKind>,
+    pub queue_depth: usize,
+}
+
+/// The fully expanded worker topology consumed by engine construction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerTopology {
-    pub pools: Vec<Pool>,
+    pub pools: Vec<PoolConfig>,
 }
 
 impl WorkerTopology {
-    /// The default single-Full-pool topology with the given tp size.
+    /// The default single-pool topology with the given tensor-parallel size.
     pub fn single_full(tp: usize) -> Self {
         Self {
-            pools: vec![Pool {
-                kind: WorkerRole::Full,
-                count: 1,
-                tp: tp.max(1),
+            pools: vec![PoolConfig {
+                id: PoolId("full".to_owned()),
+                device: "cuda".to_owned(),
+                tensor_parallel_size: tp.max(1),
+                supported_ops: OpKind::ALL.to_vec(),
+                queue_depth: 0,
             }],
         }
     }
 
-    /// Parse `--workers`, e.g. `encoder:2,prefill:1:tp=4,decode:1:tp=4`.
-    /// Each entry is `kind[:count[:tp=N]]`; `count` and `tp` default to 1.
+    /// Apply process-level defaults while producing concrete pool values.
+    pub fn with_process_defaults(mut self, device: &str, queue_depth: usize) -> Self {
+        for pool in &mut self.pools {
+            if pool.device == "cuda" {
+                pool.device = device.to_owned();
+            }
+            if pool.queue_depth == 0 {
+                pool.queue_depth = queue_depth.max(1);
+            }
+        }
+        self
+    }
+
+    /// Expand CLI convenience profiles such as
+    /// `prefill:1:tp=4,decode:1:tp=4` into concrete pool configuration.
     pub fn parse(s: &str) -> Result<Self, WorkerTopologyError> {
+        if s.trim_start().starts_with('[') {
+            let pools: Vec<PoolConfig> = serde_json::from_str(s).map_err(|error| {
+                WorkerTopologyError::message(format!("invalid explicit worker topology: {error}"))
+            })?;
+            let topology = Self { pools };
+            topology.validate()?;
+            return Ok(topology);
+        }
         let mut pools = Vec::new();
         for entry in s.split(',').map(str::trim).filter(|e| !e.is_empty()) {
             let mut parts = entry.split(':');
-            let kind_str = parts.next().unwrap_or("").trim();
-            let kind = WorkerRole::from_token(kind_str).ok_or_else(|| {
-                WorkerTopologyError::message(format!("unknown worker kind {kind_str:?}"))
-            })?;
+            let profile = parts.next().unwrap_or("").trim();
+            let supported_ops = match profile {
+                "full" => OpKind::ALL.to_vec(),
+                "prefill" => vec![OpKind::ArExtend],
+                "decode" => vec![
+                    OpKind::ArDecode,
+                    OpKind::ArVerify,
+                    OpKind::DiffusionPrepare,
+                    OpKind::DiffusionStep,
+                    OpKind::DiffusionDecode,
+                ],
+                _ => {
+                    return Err(WorkerTopologyError::message(format!(
+                        "unknown worker profile {profile:?}"
+                    )));
+                }
+            };
             let mut count = 1usize;
             let mut tp = 1usize;
+            let mut device = "cuda".to_owned();
+            let mut queue_depth = 0usize;
             for part in parts {
                 let part = part.trim();
                 if let Some(tp_str) = part.strip_prefix("tp=") {
@@ -67,6 +644,19 @@ impl WorkerTopology {
                             ))
                         })?
                         .max(1);
+                } else if let Some(value) = part.strip_prefix("device=") {
+                    if value.is_empty() {
+                        return Err(WorkerTopologyError::message(format!(
+                            "empty device in entry {entry:?}"
+                        )));
+                    }
+                    device = value.to_owned();
+                } else if let Some(value) = part.strip_prefix("depth=") {
+                    queue_depth = value.parse::<usize>().map_err(|_| {
+                        WorkerTopologyError::message(format!(
+                            "invalid queue depth in entry {entry:?}"
+                        ))
+                    })?;
                 } else {
                     count = part
                         .parse::<usize>()
@@ -78,25 +668,75 @@ impl WorkerTopology {
                         .max(1);
                 }
             }
-            pools.push(Pool { kind, count, tp });
+            for instance in 0..count {
+                let name = if count == 1 {
+                    profile.to_owned()
+                } else {
+                    format!("{profile}-{instance}")
+                };
+                pools.push(PoolConfig {
+                    id: PoolId::new(name)?,
+                    device: device.clone(),
+                    tensor_parallel_size: tp,
+                    supported_ops: supported_ops.clone(),
+                    queue_depth,
+                });
+            }
         }
-        if pools.is_empty() {
+        let topology = Self { pools };
+        topology.validate()?;
+        Ok(topology)
+    }
+
+    pub fn validate(&self) -> Result<(), WorkerTopologyError> {
+        if self.pools.is_empty() {
             return Err(WorkerTopologyError::message(
                 "workers must list at least one pool",
             ));
         }
-        Ok(Self { pools })
+        let mut ids = std::collections::HashSet::new();
+        for pool in &self.pools {
+            PoolId::new(pool.id.0.clone())?;
+            if !ids.insert(&pool.id) {
+                return Err(WorkerTopologyError::message(format!(
+                    "worker topology repeats pool id {}",
+                    pool.id
+                )));
+            }
+            if pool.device.is_empty() || pool.tensor_parallel_size == 0 {
+                return Err(WorkerTopologyError::message(format!(
+                    "pool {} has an invalid device or tensor-parallel size",
+                    pool.id
+                )));
+            }
+            if pool.supported_ops.is_empty()
+                || pool
+                    .supported_ops
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len()
+                    != pool.supported_ops.len()
+            {
+                return Err(WorkerTopologyError::message(format!(
+                    "pool {} must declare a unique, non-empty operation set",
+                    pool.id
+                )));
+            }
+        }
+        Ok(())
     }
 
-    /// Whether this is the trivial single-Full-pool topology (the default, which
-    /// composes a plain executor rather than a `StagedExecutor`).
+    /// Whether this is one pool capable of every logical operation.
     pub fn is_single_full(&self) -> bool {
-        self.pools.len() == 1 && self.pools[0].kind == WorkerRole::Full && self.pools[0].count == 1
+        self.pools.len() == 1
+            && OpKind::ALL
+                .iter()
+                .all(|operation| self.pools[0].supported_ops.contains(operation))
     }
 
-    /// Total pool instances (sum of `count` across entries).
+    /// Total concrete pool count.
     pub fn total_pools(&self) -> usize {
-        self.pools.iter().map(|p| p.count).sum()
+        self.pools.len()
     }
 }
 
@@ -118,7 +758,7 @@ impl WorkerTopologyError {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransferBackend {
     #[default]
@@ -158,17 +798,23 @@ impl FromStr for TransferBackend {
     }
 }
 
-/// Per-edge local data-plane transfer selection (`--transfer`), e.g.
-/// `encoder->prefill=shm,prefill->decode=cuda_ipc`.
+/// One explicit directed transfer edge between configured pool identities.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferEdge {
+    pub source_pool: PoolId,
+    pub destination_pool: PoolId,
+    pub transport: TransferBackend,
+}
+
+/// Per-edge local data-plane transfer selection (`--transfer`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransportMap {
-    /// (producer kind, consumer kind) → backend name.
-    pub edges: std::collections::BTreeMap<(WorkerRole, WorkerRole), TransferBackend>,
+    pub edges: Vec<TransferEdge>,
 }
 
 impl TransportMap {
     pub fn parse(s: &str) -> Result<Self, TransportMapError> {
-        let mut edges = std::collections::BTreeMap::new();
+        let mut edges = Vec::new();
         for entry in s.split(',').map(str::trim).filter(|e| !e.is_empty()) {
             let (edge, backend) = entry.split_once('=').ok_or_else(|| {
                 TransportMapError::message(format!("transfer entry {entry:?} must be edge=backend"))
@@ -176,17 +822,11 @@ impl TransportMap {
             let (src, dst) = edge.split_once("->").ok_or_else(|| {
                 TransportMapError::message(format!("transfer edge {edge:?} must be src->dst"))
             })?;
-            let src = WorkerRole::from_token(src.trim()).ok_or_else(|| {
-                TransportMapError::message(format!(
-                    "unknown worker kind {:?} in transfer edge",
-                    src.trim()
-                ))
+            let src = PoolId::new(src.trim()).map_err(|error| {
+                TransportMapError::message(format!("invalid source pool: {error}"))
             })?;
-            let dst = WorkerRole::from_token(dst.trim()).ok_or_else(|| {
-                TransportMapError::message(format!(
-                    "unknown worker kind {:?} in transfer edge",
-                    dst.trim()
-                ))
+            let dst = PoolId::new(dst.trim()).map_err(|error| {
+                TransportMapError::message(format!("invalid destination pool: {error}"))
             })?;
             let backend = TransferBackend::from_str(backend.trim())?;
             if backend == TransferBackend::Inproc {
@@ -194,11 +834,18 @@ impl TransportMap {
                     "inproc is the implicit backend and cannot be assigned to an edge",
                 ));
             }
-            if edges.insert((src, dst), backend).is_some() {
+            if edges.iter().any(|existing: &TransferEdge| {
+                existing.source_pool == src && existing.destination_pool == dst
+            }) {
                 return Err(TransportMapError::message(format!(
                     "duplicate transfer edge {edge:?}"
                 )));
             }
+            edges.push(TransferEdge {
+                source_pool: src,
+                destination_pool: dst,
+                transport: backend,
+            });
         }
         Ok(Self { edges })
     }
@@ -222,45 +869,6 @@ impl TransportMapError {
     }
 }
 
-/// One typed control operation carried over the executor control plane.
-#[derive(Debug, Clone)]
-pub enum ControlOp {
-    DropSession(RequestId),
-    ReleaseProducts(Vec<u64>),
-}
-
-impl ControlOp {
-    pub const fn request_kind(&self) -> RequestKind {
-        match self {
-            Self::DropSession(_) => RequestKind::DropSession,
-            Self::ReleaseProducts(_) => RequestKind::ReleaseProducts,
-        }
-    }
-
-    pub fn method(&self) -> &'static str {
-        match self {
-            Self::DropSession(_) => "drop_session",
-            Self::ReleaseProducts(_) => "release_products",
-        }
-    }
-
-    pub fn to_request(&self, call_id: u64) -> WorkerRequest {
-        let mut req = match self {
-            Self::DropSession(id) => WorkerRequest::drop_session(*id),
-            Self::ReleaseProducts(handles) => WorkerRequest::release_products(handles.clone()),
-        };
-        req.set_call_id(Some(call_id));
-        req
-    }
-}
-
-/// One rank's acknowledgment of a control call.
-#[derive(Debug, Clone)]
-pub struct ControlAck {
-    pub rank: u32,
-    pub result: Result<(), String>,
-}
-
 /// A worker-reported execution error classified for scheduler failure policy.
 ///
 /// The typed taxonomy and execution context cross the IPC together so failure
@@ -271,7 +879,7 @@ pub struct WorkerExecError {
     /// Physical submission whose response carried this error. Composite
     /// executors use it to join the same terminal outcome across ranks before
     /// returning the failure to the scheduler.
-    pub step_id: Option<u64>,
+    pub run_id: Option<u64>,
     pub fatal: bool,
     /// Whether retrying the same op could succeed (e.g. transient OOM).
     /// Defaults to `false` when the worker did not classify the error.
@@ -283,7 +891,7 @@ pub struct WorkerExecError {
     pub operations: Vec<uniserve_worker_ipc::ErrorOperationIdentity>,
 }
 
-/// A worker process was replaced without session snapshots, so every session
+/// A worker process was replaced without request snapshots, so every request
 /// assigned to that executor must terminate explicitly before new work begins.
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
@@ -291,198 +899,133 @@ pub struct WorkerLossError {
     pub message: String,
 }
 
+pub(crate) fn physical_run(
+    batch_id: u64,
+    run_id: u64,
+    collective_seq: u64,
+    ops: Vec<Op>,
+    commands: Vec<BatchCommand>,
+    inline: Vec<ProductPayload>,
+) -> anyhow::Result<PhysicalRun> {
+    let mut block_tables = Vec::new();
+    let mut new_cache_pages = Vec::new();
+    let mut forward_rows = Vec::new();
+    let mut latent_placements = Vec::new();
+    let mut decode_placements = Vec::new();
+    let mut buffer_placements = Vec::new();
+    let mut operations = Vec::with_capacity(ops.len());
+    for (operation_index, op) in ops.into_iter().enumerate() {
+        let Op {
+            id,
+            request,
+            parent,
+            payload,
+            placement,
+            run_kind,
+            ..
+        } = op;
+        block_tables.extend(placement.block_tables);
+        new_cache_pages.extend(placement.new_cache_pages);
+        forward_rows.extend(placement.forward_rows.into_iter().map(|mut row| {
+            row.operation_index = operation_index as u32;
+            row
+        }));
+        latent_placements.extend(placement.latent);
+        decode_placements.extend(placement.decode);
+        buffer_placements.extend(placement.buffers);
+        operations.push(Operation {
+            request_key: request,
+            op_id: id,
+            parent: parent
+                .unwrap_or_else(|| uniserve_worker_ipc::Checkpoint::admission_root(OpId(0))),
+            kind: run_kind,
+            payload,
+        });
+    }
+    let run = PhysicalRun {
+        batch_id,
+        run_id,
+        collective_seq,
+        operations,
+        block_tables,
+        new_cache_pages,
+        forward_rows,
+        latent_placements,
+        decode_placements,
+        buffer_placements,
+        commands,
+        input_products: inline,
+    };
+    run.validate()?;
+    Ok(run)
+}
+
+/// Lower one logical batch into the physical worker framing without changing its work shape.
+pub(crate) fn lower_batch(
+    batch: &Batch,
+    next_collective_seq: &mut u64,
+) -> anyhow::Result<PhysicalRun> {
+    batch.validate()?;
+    let collective_seq = (*next_collective_seq).max(1);
+    *next_collective_seq = collective_seq.saturating_add(1);
+    physical_run(
+        batch.id,
+        batch.id,
+        collective_seq,
+        batch.ops.clone(),
+        batch.commands.clone(),
+        batch.inline.clone(),
+    )
+}
+
 /// The asynchronous, pipelined boundary the scheduler drives.
 pub trait Executor: Send {
-    fn info(&self) -> &WorkerInfo;
-    fn pipeline_depth(&self) -> usize;
-    fn in_flight(&self) -> usize;
-
-    fn can_submit(&self) -> bool {
-        self.in_flight() < self.pipeline_depth()
-    }
-
-    fn submit(&mut self, batch: Batch) -> anyhow::Result<()>;
-    fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>>;
-
-    /// Whether the executor can preserve an exact device product from the
-    /// producer through registration of the consumer. A local staged executor
-    /// may retain the consumer until the producing
-    /// pool publishes its bounded transfer descriptor.
-    fn device_products_reachable(&self, _producer: ForwardMode, _consumer: ForwardMode) -> bool {
-        true
-    }
-
-    /// Liveness probe independent of in-flight work. Returns `Err` if the
-    /// backing worker has died so the scheduler can latch fatal even while idle.
-    /// Sim/local executors with no separate worker process always return `Ok`.
-    fn check_liveness(&mut self) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    /// Whether a reported [`WorkerLossError`] means the complete executor-side
-    /// session and routing epoch was replaced before the error was returned.
-    fn resets_all_state_after_worker_loss(&self) -> bool {
-        false
-    }
-
-    /// Cloneable waker the command ingress fires after enqueuing a command.
-    /// In-process test executors may retain the default when they never drive
-    /// the threaded scheduler loop.
-    fn command_waker(&self) -> CommandWaker {
-        CommandWaker::noop()
-    }
-
-    /// Native progress descriptors included in a composite executor's single
-    /// park. Production process executors return one descriptor per worker.
-    fn wake_file_descriptors(&self) -> Vec<i32> {
-        Vec::new()
-    }
-
-    /// Block until a result may be ready, a command may have arrived, the worker
-    /// died, or `timeout` elapses, without consuming a result.
-    fn park_for_event(&mut self, timeout: Duration) -> anyhow::Result<()> {
-        std::thread::park_timeout(timeout);
-        Ok(())
-    }
-
-    fn wait_result_timeout(
-        &mut self,
-        timeout: Duration,
-    ) -> anyhow::Result<Option<CompletionReport>> {
-        let Some(deadline) = Instant::now().checked_add(timeout) else {
-            return self.poll();
-        };
-        loop {
-            if let Some(result) = self.poll()? {
-                return Ok(Some(result));
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                return Ok(None);
-            }
-            self.park_for_event(deadline.saturating_duration_since(now))?;
-        }
-    }
-    fn next_result(&mut self) -> anyhow::Result<CompletionReport>;
-    fn control(&mut self, op: ControlOp) -> anyhow::Result<u64>;
-    fn control_wait(
-        &mut self,
-        op: ControlOp,
-        targets: Option<&[u32]>,
-    ) -> anyhow::Result<Vec<ControlAck>>;
-    fn shutdown(&mut self) {}
+    fn info(&self) -> &ExecutorInfo;
+    fn submit(&mut self, batch: Batch) -> Result<(), ExecutorSubmitError>;
+    fn poll(&mut self, timeout: Duration) -> Result<Option<BatchResult>, ExecutorError>;
+    fn close(&mut self) -> Result<(), ExecutorError>;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uniserve_core::RequestId;
-    use uniserve_worker_ipc::{Bounds, ForwardMode, OpId, RequestKey, RouteId, VersionRef};
-
-    #[test]
-    fn worker_role_round_trips_and_maps_work() {
-        for kind in [
-            WorkerRole::Full,
-            WorkerRole::Encoder,
-            WorkerRole::Prefill,
-            WorkerRole::Decode,
-            WorkerRole::Und,
-            WorkerRole::Gen,
-        ] {
-            assert_eq!(WorkerRole::from_token(kind.as_str()), Some(kind));
-            assert!(!kind.supported_work().is_empty());
-        }
-        let extend = op(ForwardMode::TokenExtend);
-        let decode = op(ForwardMode::TokenDecode);
-        let prepare = op(ForwardMode::MediaPrepare);
-        let materialize = op(ForwardMode::Materialize);
-
-        assert!(WorkerRole::Full.handles(&extend));
-        assert!(WorkerRole::Prefill.handles(&extend));
-        assert!(!WorkerRole::Prefill.handles(&decode));
-        assert!(WorkerRole::Decode.handles(&decode));
-        assert!(WorkerRole::Decode.handles(&prepare));
-        assert!(WorkerRole::Decode.handles(&materialize));
-        assert!(WorkerRole::Und.handles(&decode));
-        assert!(!WorkerRole::Und.handles(&materialize));
-        assert!(WorkerRole::Gen.handles(&materialize));
-        assert!(!WorkerRole::Gen.handles(&decode));
-        assert_eq!(WorkerRole::from_token("nope"), None);
-    }
-
-    fn op(work: ForwardMode) -> Operation {
-        let request_key = RequestKey::new(1, RequestId(1), 1);
-        Operation {
-            request_key,
-            op_id: OpId(1),
-            parent: VersionRef::admission_root(request_key, OpId(1)),
-            work,
-            route: RouteId(0),
-            domain: work.domain(),
-            advances_state: false,
-            bounds: Bounds::default(),
-            inputs: Vec::new(),
-            outputs: Vec::new(),
-            predicate: None,
-            rng: None,
-            control_seq: 0,
-        }
-        .sealed()
-    }
+    use uniserve_worker_ipc::OpKind;
 
     #[test]
     fn worker_topology_parses_pool_layouts() {
-        assert!(WorkerTopology::single_full(4).is_single_full());
-        let epd = WorkerTopology::parse("encoder:2,prefill:1:tp=4,decode:1:tp=4").unwrap();
-        assert_eq!(epd.pools.len(), 3);
+        let single = WorkerTopology::single_full(4);
+        assert!(single.is_single_full());
         assert_eq!(
-            epd.pools[0],
-            Pool {
-                kind: WorkerRole::Encoder,
-                count: 2,
-                tp: 1
-            }
+            single.with_process_defaults("cuda:1", 3).pools[0].queue_depth,
+            3
         );
-        assert_eq!(
-            epd.pools[1],
-            Pool {
-                kind: WorkerRole::Prefill,
-                count: 1,
-                tp: 4
-            }
-        );
-        assert_eq!(
-            epd.pools[2],
-            Pool {
-                kind: WorkerRole::Decode,
-                count: 1,
-                tp: 4
-            }
-        );
-        assert_eq!(epd.total_pools(), 4);
+        let epd = WorkerTopology::parse("prefill:1:tp=4,decode:1:tp=4").unwrap();
+        assert_eq!(epd.pools.len(), 2);
+        assert_eq!(epd.pools[0].id, PoolId("prefill".to_owned()));
+        assert_eq!(epd.pools[0].tensor_parallel_size, 4);
+        assert_eq!(epd.pools[0].supported_ops, vec![OpKind::ArExtend]);
+        assert_eq!(epd.pools[1].id, PoolId("decode".to_owned()));
+        assert_eq!(epd.pools[1].tensor_parallel_size, 4);
+        assert!(epd.pools[1].supported_ops.contains(&OpKind::ArDecode));
+        assert_eq!(epd.total_pools(), 2);
         assert!(!epd.is_single_full());
         assert!(WorkerTopology::parse("full:1").unwrap().is_single_full());
         assert!(WorkerTopology::parse("bogus:1").is_err());
         assert!(WorkerTopology::parse("").is_err());
-        // The Und/Gen topology composes through the general staged path.
-        let und_gen = WorkerTopology::parse("und:1,gen:1").unwrap();
-        assert_eq!(und_gen.pools.len(), 2);
-        assert_eq!(und_gen.pools[0].kind, WorkerRole::Und);
-        assert_eq!(und_gen.pools[1].kind, WorkerRole::Gen);
-        assert!(!und_gen.is_single_full());
     }
 
     #[test]
     fn transport_map_parses_edges() {
         let t = TransportMap::parse("encoder->prefill=cuda_ipc,prefill->decode=shm").unwrap();
         assert_eq!(
-            t.edges.get(&(WorkerRole::Encoder, WorkerRole::Prefill)),
-            Some(&TransferBackend::CudaIpc)
+            t.edges[0],
+            TransferEdge {
+                source_pool: PoolId("encoder".to_owned()),
+                destination_pool: PoolId("prefill".to_owned()),
+                transport: TransferBackend::CudaIpc,
+            }
         );
-        assert_eq!(
-            t.edges.get(&(WorkerRole::Prefill, WorkerRole::Decode)),
-            Some(&TransferBackend::Shm)
-        );
+        assert_eq!(t.edges[1].transport, TransferBackend::Shm);
         assert!(TransportMap::parse("bad-entry").is_err());
         assert!(TransportMap::parse("prefill->decode=tcp").is_err());
         assert!(TransportMap::parse("prefill->decode=shm,prefill->decode=cuda_ipc").is_err());

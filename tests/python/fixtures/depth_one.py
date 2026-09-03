@@ -1,4 +1,4 @@
-"""Depth-one ``Operation``/``Batch`` builders for worker forward-behavior tests.
+"""Depth-one ``Operation``/``Run`` builders for worker forward-behavior tests.
 
 Each builder produces the records the scheduler supplies at depth one: an
 :class:`NewRequest`, an :class:`Operation` whose ``parent`` names committed state,
@@ -11,24 +11,23 @@ import time
 from collections.abc import Sequence
 
 from uniserve_worker.execution.batch import (
+    ArRequestParams,
     AttentionRegime,
-    Batch,
-    BatchPartition,
+    BatchCommand,
     BlockTable,
     Bounds,
+    BufferId,
+    BufferPlacement,
     CachePageAllocation,
+    Checkpoint,
     Commit,
-    CompletionReport,
-    Control,
     DeviceDim,
     Disposition,
     Domain,
     DrawLayout,
     DType,
     EncodeMode,
-    FixedPoint,
-    ForwardMode,
-    GenAdmission,
+    FixedCheckpoint,
     ImageParams,
     LatentPlacement,
     NewRequest,
@@ -41,19 +40,22 @@ from uniserve_worker.execution.batch import (
     RequestKey,
     Rng,
     RowGeometry,
+    Run,
+    RunKind,
+    RunLane,
+    RunResult,
     SamplingParams,
     ShapeBound,
+    Start,
     StaticDim,
     StorageClass,
     TokenMode,
-    UndAdmission,
-    VersionRef,
+    UmmRequestParams,
     encode_token_product_bytes,
-    execution_domain,
 )
 from uniserve_worker.execution.output import (
-    completion_report_ready,
-    finalize_completion_report,
+    finalize_run_result,
+    run_result_ready,
 )
 
 AUTHORITY = 0
@@ -75,6 +77,7 @@ _LATENT_PAGE_UNITS = 1
 _LATENT_DOWNSAMPLE = 1
 _ALTERNATIVE_SLOTS: dict[RequestKey, int] = {}
 _ALTERNATIVE_PAGES: dict[RequestKey, tuple[int, ...]] = {}
+_BUFFER_PLACEMENTS: dict[BufferId, BufferPlacement] = {}
 
 
 def configure_physical_pool(
@@ -110,6 +113,8 @@ def _reset_request(rk: RequestKey) -> None:
             table.pop(identity, None)
     for product in tuple(product for product in _LATENT_STEPS if product.request_key == rk):
         _LATENT_STEPS.pop(product, None)
+    for buffer in tuple(buffer for buffer in _BUFFER_PLACEMENTS if buffer.owner == rk):
+        _BUFFER_PLACEMENTS.pop(buffer, None)
     _OP_KV_RESULTS[(rk, 0)] = 0
 
 
@@ -138,13 +143,13 @@ def _latent_placement(operation: Operation) -> LatentPlacement:
         width=int(image.width),
         start_step=start_step,
         step_count=(
-            int(operation.bounds.max_tokens) if operation.work is ForwardMode.MEDIA_DENOISE else 0
+            int(operation.bounds.max_tokens) if operation.kind is RunKind.DIFFUSION_STEP else 0
         ),
     )
 
 
-def _parent_kv_length(parent: VersionRef) -> int:
-    identity = (parent.request_key, int(parent.producer_op_id))
+def _parent_kv_length(rk: RequestKey, parent: Checkpoint) -> int:
+    identity = (rk, int(parent.op_id))
     if identity in _OP_KV_VERIFY_BASES:
         return _OP_KV_VERIFY_BASES[identity] + int(parent.point.point_index)
     return _OP_KV_RESULTS.get(identity, 0)
@@ -173,10 +178,10 @@ def bind_request_placement(
 def _record_existing_kv(
     rk: RequestKey,
     op_id: int,
-    parent: VersionRef,
+    parent: Checkpoint,
     input_length: int,
 ) -> int:
-    prefix = _parent_kv_length(parent)
+    prefix = _parent_kv_length(rk, parent)
     resulting = prefix + int(input_length)
     block_table = _BLOCK_TABLES.get(rk, ())
     _OP_KV_LENGTHS[(rk, op_id)] = (prefix, int(input_length), prefix, resulting)
@@ -216,26 +221,43 @@ def _alternative_pages(rk: RequestKey, tokens: int) -> tuple[int, ...]:
     return selected
 
 
-def execution_batch(
+def execution_run(
     *,
-    step_id: int,
+    run_id: int,
     admissions: Sequence[NewRequest] = (),
     operations: Sequence[Operation] = (),
     input_products: Sequence[ProductPayload] = (),
-    controls: Sequence[Control] = (),
+    commands: Sequence[BatchCommand] = (),
     block_tables: Sequence[BlockTable] = (),
     new_cache_pages: Sequence[CachePageAllocation] = (),
-) -> Batch:
-    """Build the explicit physical partitions used by ModelRunner behavior tests."""
+) -> Run:
+    """Build the explicit physical lanes used by ModelRunner behavior tests."""
 
     for admission in admissions:
-        if admission.gen_admission is not None:
-            _IMAGE_PARAMS[admission.request_key] = admission.gen_admission.image
+        if admission.umm is not None:
+            _IMAGE_PARAMS[admission.request_key] = admission.umm.image
         _REQUEST_POOL_INDICES[admission.request_key] = int(admission.request_pool_idx)
-    by_route: dict[int, list[Operation]] = {}
     for operation in operations:
-        by_route.setdefault(int(operation.route), []).append(operation)
-    partitions: list[BatchPartition] = []
+        for output in operation.outputs:
+            if not output.uses_persistent_buffer() or output.buffer_id in _BUFFER_PLACEMENTS:
+                continue
+            required = int(output.max_bytes)
+            offset = 0
+            for placement in sorted(
+                _BUFFER_PLACEMENTS.values(), key=lambda value: value.offset
+            ):
+                offset = (offset + 255) & ~255
+                if offset + required <= placement.offset:
+                    break
+                offset = max(offset, placement.offset + placement.bytes)
+            offset = (offset + 255) & ~255
+            _BUFFER_PLACEMENTS[output.buffer_id] = BufferPlacement(
+                output.buffer_id,
+                offset,
+                required,
+            )
+    by_route: dict[int, list[Operation]] = {0: list(operations)} if operations else {}
+    lanes: list[RunLane] = []
     explicit_tables = {
         (int(table.request_pool_idx), int(table.group_id)): table for table in block_tables
     }
@@ -243,7 +265,7 @@ def execution_batch(
     def table_for(operation: Operation) -> BlockTable | None:
         slot = _REQUEST_POOL_INDICES.get(
             operation.request_key,
-            int(operation.request_key.session_id) + 1,
+            int(operation.request_key.request_id) + 1,
         )
         explicit = explicit_tables.get((slot, 0))
         if explicit is not None:
@@ -254,13 +276,13 @@ def execution_batch(
         pages = tuple(_BLOCK_TABLES.get(operation.request_key, ()))
         return BlockTable(slot, 0, pages, len(pages) * _BLOCK_SIZE)
 
-    partition_id = 1
+    lane_id = 1
     for group_id, (route, routed) in enumerate(sorted(by_route.items()), start=1):
         domains = tuple(domain for domain in Domain if any(op.domain is domain for op in routed))
-        variants = {operation.work for operation in routed}
+        variants = {operation.kind for operation in routed}
         attention = (
             AttentionRegime.HYBRID
-            if any(variant.value == "media_denoise" for variant in variants)
+            if any(variant.value == "diffusion_step" for variant in variants)
             else AttentionRegime.CAUSAL
             if any(
                 variant.value.startswith("token_") or variant.value == "draft"
@@ -293,7 +315,7 @@ def execution_batch(
                             lengths[1],
                         )
                     )
-                if operation.work is ForwardMode.MEDIA_DENOISE:
+                if operation.kind is RunKind.DIFFUSION_STEP:
                     image = _IMAGE_PARAMS[operation.request_key]
                     main_slot = _REQUEST_POOL_INDICES[operation.request_key]
                     main_len = 0 if lengths is None else lengths[2]
@@ -311,10 +333,10 @@ def execution_batch(
                         alt_slot = _alternative_slot(operation.request_key)
                         negative = next(
                             (
-                                admission.und.negative_token_ids
+                                admission.ar.negative_token_ids
                                 for admission in admissions
                                 if admission.request_key == operation.request_key
-                                and admission.und is not None
+                                and admission.ar is not None
                             ),
                             (),
                         )
@@ -343,11 +365,11 @@ def execution_batch(
             for allocation in new_cache_pages:
                 identity = (allocation.request_pool_idx, allocation.group_id)
                 allocations.setdefault(identity, set()).update(allocation.page_ids)
-            partitions.append(
-                BatchPartition(
-                    partition_id=partition_id,
-                    submission_group=group_id,
-                    collective_seq=int(step_id) * 1024 + group_id + 1,
+            lanes.append(
+                RunLane(
+                    lane_id=lane_id,
+                    launch_id=group_id,
+                    collective_seq=int(run_id) * 1024 + group_id + 1,
                     domain=domain,
                     route=route,
                     attention=attention,
@@ -363,43 +385,51 @@ def execution_batch(
                     latent_placements=tuple(
                         _latent_placement(operation)
                         for operation in domain_operations
-                        if operation.work in {ForwardMode.MEDIA_PREPARE, ForwardMode.MEDIA_DENOISE}
+                        if operation.kind in {RunKind.DIFFUSION_PREPARE, RunKind.DIFFUSION_STEP}
                         or any(product.kind is ProductKind.LATENT for product in operation.inputs)
+                    ),
+                    buffer_placements=tuple(
+                        {
+                            product.buffer_id: _BUFFER_PLACEMENTS[product.buffer_id]
+                            for operation in domain_operations
+                            for product in (*operation.inputs, *operation.outputs)
+                            if product.uses_persistent_buffer()
+                        }.values()
                     ),
                 )
             )
-            partition_id += 1
-    return Batch(
-        step_id=int(step_id),
-        admissions=tuple(admissions),
-        partitions=tuple(partitions),
+            lane_id += 1
+    return Run(
+        batch_id=int(run_id),
+        run_id=int(run_id),
+        lanes=tuple(lanes),
         input_products=tuple(input_products),
-        controls=tuple(controls),
+        commands=tuple(Start(request) for request in admissions) + tuple(commands),
     )
 
 
-def request_key(session_id: int, epoch: int = 1) -> RequestKey:
-    return RequestKey(AUTHORITY, session_id, epoch)
+def request_key(request_id: int, epoch: int = 1) -> RequestKey:
+    return RequestKey(AUTHORITY, request_id, epoch)
 
 
-def und_admission(
-    session_id: int,
+def ar_params(
+    request_id: int,
     *,
     block_ids: Sequence[int] = (),
     prefix_len: int = 0,
     epoch: int = 1,
     sampling: SamplingParams | None = None,
 ) -> NewRequest:
-    rk = request_key(session_id, epoch)
+    rk = request_key(request_id, epoch)
     _reset_request(rk)
     _BLOCK_TABLES[rk] = [_kv_page(value) for value in block_ids]
     _UNBOUND_PAGES[rk] = list(_BLOCK_TABLES[rk])
-    _REQUEST_POOL_INDICES[rk] = session_id + 1
+    _REQUEST_POOL_INDICES[rk] = request_id + 1
     _OP_KV_RESULTS[(rk, 0)] = int(prefix_len)
     return NewRequest.create(
         rk,
-        request_pool_idx=session_id + 1,
-        und=UndAdmission(
+        request_pool_idx=request_id + 1,
+        ar=ArRequestParams(
             sampling=(
                 sampling
                 if sampling is not None
@@ -410,38 +440,38 @@ def und_admission(
     )
 
 
-def gen_admission(session_id: int, image: ImageParams, *, epoch: int = 1) -> NewRequest:
-    rk = request_key(session_id, epoch)
+def umm_params(request_id: int, image: ImageParams, *, epoch: int = 1) -> NewRequest:
+    rk = request_key(request_id, epoch)
     _reset_request(rk)
     _IMAGE_PARAMS[rk] = image
-    _REQUEST_POOL_INDICES[rk] = session_id + 1
+    _REQUEST_POOL_INDICES[rk] = request_id + 1
     return NewRequest.create(
         rk,
-        request_pool_idx=session_id + 1,
-        gen_admission=GenAdmission(image=image),
+        request_pool_idx=request_id + 1,
+        umm=UmmRequestParams(image=image),
     )
 
 
-def root_parent(admission: NewRequest) -> VersionRef:
+def root_parent(admission: NewRequest) -> Checkpoint:
     """The admission-root fixed version a request's first operation parents on."""
 
-    return VersionRef(admission.request_key, 0, FixedPoint(0))
+    return Checkpoint(0, FixedCheckpoint(0))
 
 
-def finalized_report(report: CompletionReport) -> CompletionReport:
+def finalized_report(report: RunResult) -> RunResult:
     deadline = time.monotonic() + 10.0
-    while not completion_report_ready(report):
+    while not run_result_ready(report):
         if time.monotonic() >= deadline:
             raise TimeoutError("worker completion did not become query-ready")
         time.sleep(0.00005)
-    return finalize_completion_report(report)
+    return finalize_run_result(report)
 
 
 def commit_for_completion(
     operation: Operation,
-    report: CompletionReport,
+    report: RunResult,
     *,
-    expected_parent: VersionRef | None = None,
+    expected_parent: Checkpoint | None = None,
     control_seq: int | None = None,
     public_event_limit: int = 0,
 ) -> Commit:
@@ -456,10 +486,9 @@ def commit_for_completion(
     if len(matches) != 1 or matches[0].status is not OpStatus.OK:
         raise ValueError("operation has no unique successful completion")
     record = matches[0]
-    selected = VersionRef(
-        operation.request_key,
+    selected = Checkpoint(
         int(operation.op_id),
-        FixedPoint(int(record.selected_point)),
+        FixedCheckpoint(int(record.selected_point)),
     )
     _OP_KV_RESULTS[(operation.request_key, int(operation.op_id))] = int(
         record.logical_lengths.kv_visible_len
@@ -492,7 +521,7 @@ def token_operation(
     rk: RequestKey,
     *,
     op_id: int,
-    parent: VersionRef,
+    parent: Checkpoint,
     mode: TokenMode,
     tokens: Sequence[int],
     block_table_delta: Sequence[int] = (),
@@ -512,7 +541,7 @@ def token_operation(
     pending.extend(added)
     _PAGES_TO_ZERO[(rk, op_id)] = tuple(pending)
     pending.clear()
-    prefix_length = _parent_kv_length(parent)
+    prefix_length = _parent_kv_length(rk, parent)
     input_length = len(tokens)
     _OP_KV_LENGTHS[(rk, op_id)] = (
         prefix_length,
@@ -573,9 +602,7 @@ def token_operation(
         request_key=rk,
         op_id=op_id,
         parent=parent,
-        work=ForwardMode.token(mode),
-        route=0,
-        domain=execution_domain(ForwardMode.token(mode)),
+        kind=RunKind.token(mode),
         bounds=Bounds(
             max_points=max_points,
             max_tokens=max(1, len(tokens)),
@@ -599,7 +626,7 @@ def encode_operation(
     rk: RequestKey,
     *,
     op_id: int,
-    parent: VersionRef,
+    parent: Checkpoint,
     image_base64: str | None,
     encoder_handle: int,
     mode: EncodeMode = EncodeMode.VISION,
@@ -646,9 +673,7 @@ def encode_operation(
         request_key=rk,
         op_id=op_id,
         parent=parent,
-        work=ForwardMode.encode(mode),
-        route=0,
-        domain=Domain.PREFILL,
+        kind=RunKind.encode(mode),
         bounds=Bounds(max_points=1, max_tokens=64, max_latent_bytes=8_192),
         inputs=(image_ref,),
         outputs=(output_ref,),
@@ -660,11 +685,11 @@ def encode_operation(
     return operation, payload
 
 
-def media_prepare_operation(
+def diffusion_prepare_operation(
     rk: RequestKey,
     *,
     op_id: int,
-    parent: VersionRef,
+    parent: Checkpoint,
     conditioning: ProductRef,
     seed: int = 29,
     image_index: int = 1,
@@ -697,9 +722,7 @@ def media_prepare_operation(
         request_key=rk,
         op_id=op_id,
         parent=parent,
-        work=ForwardMode.MEDIA_PREPARE,
-        route=0,
-        domain=Domain.FLOW,
+        kind=RunKind.DIFFUSION_PREPARE,
         bounds=Bounds(max_points=1, max_tokens=1, max_latent_bytes=8_192),
         inputs=(conditioning,),
         outputs=(latent, ready),
@@ -714,11 +737,11 @@ def media_prepare_operation(
     return operation, latent
 
 
-def media_denoise_operation(
+def diffusion_step_operation(
     rk: RequestKey,
     *,
     op_id: int,
-    parent: VersionRef,
+    parent: Checkpoint,
     conditioning: ProductRef,
     latent: ProductRef,
     steps: int,
@@ -740,9 +763,7 @@ def media_denoise_operation(
         request_key=rk,
         op_id=op_id,
         parent=parent,
-        work=ForwardMode.MEDIA_DENOISE,
-        route=0,
-        domain=Domain.FLOW,
+        kind=RunKind.DIFFUSION_STEP,
         bounds=Bounds(max_points=1, max_tokens=int(steps), max_latent_bytes=8_192),
         inputs=(conditioning, latent),
         outputs=(output,),
@@ -756,7 +777,7 @@ def kv_publication_operation(
     rk: RequestKey,
     *,
     op_id: int,
-    parent: VersionRef,
+    parent: Checkpoint,
     control_seq: int = 0,
 ) -> tuple[Operation, ProductRef]:
     product = ProductRef(
@@ -775,9 +796,7 @@ def kv_publication_operation(
         request_key=rk,
         op_id=op_id,
         parent=parent,
-        work=ForwardMode.TRANSFER_KV_PUBLISH,
-        route=0,
-        domain=Domain.PREFILL,
+        kind=RunKind.TRANSFER_KV_PUBLISH,
         bounds=Bounds(max_points=1, max_transfer_bytes=1 << 20),
         outputs=(product,),
         control_seq=control_seq,
@@ -785,11 +804,11 @@ def kv_publication_operation(
     return operation, product
 
 
-def materialize_operation(
+def diffusion_finalize_operation(
     rk: RequestKey,
     *,
     op_id: int,
-    parent: VersionRef,
+    parent: Checkpoint,
     latent: ProductRef,
     feedback_source: bool = False,
     control_seq: int = 0,
@@ -825,9 +844,7 @@ def materialize_operation(
         request_key=rk,
         op_id=op_id,
         parent=parent,
-        work=ForwardMode.MATERIALIZE,
-        route=0,
-        domain=Domain.FLOW,
+        kind=RunKind.DIFFUSION_FINALIZE,
         bounds=Bounds(
             max_latent_bytes=(3 * 16 * 16 * 2 if feedback_source else 0),
             max_completion_bytes=65_536,
@@ -842,7 +859,7 @@ def visual_state_operation(
     rk: RequestKey,
     *,
     op_id: int,
-    parent: VersionRef,
+    parent: Checkpoint,
     feature: ProductRef,
     sample_continuation: bool,
     max_tokens: int,
@@ -880,9 +897,7 @@ def visual_state_operation(
         request_key=rk,
         op_id=op_id,
         parent=parent,
-        work=ForwardMode.token(TokenMode.EXTEND),
-        route=0,
-        domain=Domain.PREFILL,
+        kind=RunKind.token(TokenMode.EXTEND),
         bounds=Bounds(max_points=1, max_tokens=max_tokens),
         inputs=(feature,),
         outputs=outputs,
@@ -895,17 +910,17 @@ __all__ = [
     "bind_request_placement",
     "commit_for_completion",
     "encode_operation",
-    "execution_batch",
+    "execution_run",
     "finalized_report",
-    "media_denoise_operation",
-    "media_prepare_operation",
-    "gen_admission",
-    "materialize_operation",
+    "diffusion_step_operation",
+    "diffusion_prepare_operation",
+    "umm_params",
+    "diffusion_finalize_operation",
     "kv_publication_operation",
     "record_kv_result",
     "request_key",
     "root_parent",
     "token_operation",
-    "und_admission",
+    "ar_params",
     "visual_state_operation",
 ]

@@ -1,12 +1,11 @@
-"""Pure compilation of a deployment role into one worker plan."""
+"""Pure compilation of configured operation support into one worker plan."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
 
-from ..execution.batch import ForwardMode
-from .role import WorkerRole
+from ..execution.batch import RunKind
 
 
 class ModelLoadScope(StrEnum):
@@ -17,24 +16,16 @@ class ModelLoadScope(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class WorkerPlan:
-    worker_role: WorkerRole
     model_scope: ModelLoadScope
-    allowed_work_variants: frozenset[ForwardMode]
+    allowed_work_variants: frozenset[RunKind]
 
 
-def resolve_worker_plan(worker_role: WorkerRole) -> WorkerPlan:
-    if worker_role in {WorkerRole.FULL, WorkerRole.PREFILL, WorkerRole.DECODE, WorkerRole.ENCODER}:
-        scope = ModelLoadScope.WHOLE
-    elif worker_role is WorkerRole.UND:
-        scope = ModelLoadScope.UNDERSTANDING
-    elif worker_role is WorkerRole.GEN:
-        scope = ModelLoadScope.GENERATION
-    else:
-        raise AssertionError(f"unhandled worker role {worker_role!r}")
+def resolve_worker_plan(supported_ops: frozenset[RunKind]) -> WorkerPlan:
+    if not supported_ops:
+        raise ValueError("worker pool must support at least one operation")
     return WorkerPlan(
-        worker_role=worker_role,
-        model_scope=scope,
-        allowed_work_variants=worker_role.allowed_work_variants,
+        model_scope=ModelLoadScope.WHOLE,
+        allowed_work_variants=supported_ops,
     )
 
 

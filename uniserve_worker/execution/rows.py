@@ -10,9 +10,6 @@ from typing import TYPE_CHECKING, Any, TypeAlias
 import torch
 
 from uniserve_worker.execution.batch import (
-    Batch,
-    BatchPartition,
-    CompletionReport,
     FinishFlags,
     LatentPlacement,
     LogicalLengths,
@@ -24,13 +21,25 @@ from uniserve_worker.execution.batch import (
     ProductRef,
     RequestKey,
     RowGeometry,
+    Run,
+    RunLane,
+    RunResult,
     SamplingParams,
     SamplingState,
     TokenSpan,
 )
 from uniserve_worker.execution.forward_batch import FlowPatches, ModelPhase, TokenSelection
+from uniserve_worker.execution.output import (
+    CpuJob,
+    ImagePayload,
+    LogprobOutputRow,
+    OutputBuffer,
+    SamplingOutputRow,
+    TokenCapture,
+)
 from uniserve_worker.foundation.errors import WorkerError, classify, invalid_descriptor
 from uniserve_worker.loader.weight_set import WeightSet
+from uniserve_worker.runtime.cpu import CpuTaskReservation
 from uniserve_worker.runtime.device_products import (
     DeviceProductMetadata,
     DeviceProductRead,
@@ -38,21 +47,11 @@ from uniserve_worker.runtime.device_products import (
 )
 from uniserve_worker.runtime.encoder_cache import EncoderRead, EncoderWrite
 from uniserve_worker.runtime.latent_pool import LatentPublication, LatentRelease, LatentStaging
-from uniserve_worker.execution.output import (
-    CpuJob,
-    ImagePayload,
-    LogprobOutputRow,
-    SamplingOutputRow,
-    OutputBuffer,
-    TokenCapture,
-)
-from uniserve_worker.runtime.cpu import CpuTaskReservation
 from uniserve_worker.runtime.request import Request, RequestDraft
 from uniserve_worker.transfer.connector import CachePublication
 from uniserve_worker.transfer.tickets import Locator, TransferTicket
 
 if TYPE_CHECKING:
-    from uniserve_worker.models.minimax_h3.execution import H3OutputRingLease
 
     from .model_runner import RunObservation
 
@@ -302,10 +301,10 @@ class PreparedPredicateBatch:
 
 @dataclass(slots=True)
 class PreparedExecution:
-    batch: Batch
+    batch: Run
     transfers: tuple[PreparedTransferInput, ...]
     predicates: PreparedPredicateBatch | None = None
-    _execute: Callable[[PreparedExecution], CompletionReport] | None = field(
+    _execute: Callable[[PreparedExecution], RunResult] | None = field(
         default=None,
         repr=False,
     )
@@ -344,7 +343,7 @@ class PreparedExecution:
 
     def bind(
         self,
-        execute: Callable[[PreparedExecution], CompletionReport],
+        execute: Callable[[PreparedExecution], RunResult],
         release: Callable[[], None],
     ) -> PreparedExecution:
         if self._execute is not None or self._release is not None:
@@ -353,7 +352,7 @@ class PreparedExecution:
         self._release = release
         return self
 
-    def resolve(self) -> CompletionReport:
+    def resolve(self) -> RunResult:
         if not self.ready():
             raise RuntimeError("prepared execution was observed before transfer readiness")
         execute = self._execute
@@ -389,7 +388,7 @@ class PreparedExecution:
 
 
 @dataclass(frozen=True, slots=True)
-class PartitionLayout:
+class LaneLayout:
     operations: tuple[Operation, ...]
     requests: tuple[RequestDraft, ...]
     seq_lens: tuple[int, ...]
@@ -407,7 +406,7 @@ class PartitionLayout:
                 self.identities,
             )
         ):
-            raise RuntimeError("partition layout columns are not aligned")
+            raise RuntimeError("lane layout columns are not aligned")
 
 
 @dataclass(frozen=True, slots=True)
@@ -418,8 +417,8 @@ class LatentExecution:
 
 
 @dataclass(slots=True)
-class PartitionState:
-    partition: BatchPartition
+class LaneState:
+    lane: RunLane
     started_ns: int
     graph_eligible: bool
     request_candidates: tuple[RequestDraft, ...]
@@ -430,7 +429,7 @@ class PartitionState:
     input_tokens: dict[ProductRef, tuple[int, ...]] = field(default_factory=dict)
     input_images: dict[ProductRef, str] = field(default_factory=dict)
     forward_rows: dict[OperationIdentity, tuple[RowGeometry, ...]] = field(default_factory=dict)
-    layout: PartitionLayout | None = None
+    layout: LaneLayout | None = None
     prepared_transfers: dict[ProductRef, PreparedTransferInput] = field(default_factory=dict)
     transferred_device_products: dict[ProductRef, DeviceProductWrite] = field(default_factory=dict)
     transferred_encoder_features: dict[ProductRef, EncoderWrite] = field(default_factory=dict)
@@ -466,7 +465,7 @@ class PartitionState:
     runtime_cache_lengths: dict[int, int | torch.Tensor] = field(default_factory=dict)
     registration_visible: bool = False
     cpu_tasks: dict[OperationIdentity, CpuTaskReservation] = field(default_factory=dict)
-    h3_output_leases: dict[OperationIdentity, H3OutputRingLease] = field(default_factory=dict)
+    media_output_leases: dict[OperationIdentity, Any] = field(default_factory=dict)
     latent_rows: dict[OperationIdentity, LatentExecution] = field(default_factory=dict)
     latent_publications: list[LatentPublication] = field(default_factory=list)
     latent_releases: list[LatentRelease] = field(default_factory=list)
@@ -507,6 +506,8 @@ class Outcome:
     products: tuple[ProductPayload, ...] = ()
     selection: SpeculativeSelection | None = None
     completion_tasks: tuple[CpuJob | ImagePayload, ...] = ()
+    next_cursor: int = 0
+    done: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -525,7 +526,7 @@ class StateOutcome:
 @dataclass(slots=True)
 class OperationState:
     operation: Operation
-    partition: Any
+    lane: Any
     phase: str = "initial"
     data: dict[str, Any] = field(default_factory=dict)
     rows: tuple[Any, ...] = ()
@@ -551,8 +552,8 @@ __all__ = [
     "OperationIdentity",
     "OperationState",
     "Outcome",
-    "PartitionLayout",
-    "PartitionState",
+    "LaneLayout",
+    "LaneState",
     "PreparedExecution",
     "PreparedPredicateBatch",
     "PreparedTransferInput",

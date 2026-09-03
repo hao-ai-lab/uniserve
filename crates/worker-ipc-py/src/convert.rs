@@ -1,13 +1,13 @@
 //! Typed conversions for steady-state worker IPC frames.
 //!
 //! The serve loop crosses the FFI boundary once per direction per batch. The
-//! typed converters materialize the canonical `execute` request and `result`
+//! typed converters materialize the canonical `submit` request and `result`
 //! response shapes directly: every dict key and enum string is interned
 //! ([`pyo3::intern!`]), lists are preallocated at their known lengths, and byte
 //! payloads stay on the `bytes` path.
 //!
 //! [`execute_request_to_py`] produces the mapping consumed by
-//! `Batch.from_mapping`. [`try_completion_response_from_py`] accepts the exact
+//! `Run.from_mapping`. [`try_completion_response_from_py`] accepts the exact
 //! completion-report mapping emitted by the Python worker. Administrative frame
 //! kinds are handled by the schema-derived converter in the caller.
 
@@ -21,14 +21,15 @@ use uniserve_core::{ImageParams, SamplingParams};
 #[cfg(test)]
 use uniserve_worker_ipc::MediaGeometry;
 use uniserve_worker_ipc::{
-    AttentionRegime, Batch, BatchPartition, BlockTable, CachePageAllocation, CloseReason,
-    CompletionReport, Control, DType, DimBound, Disposition, Domain, DrawLayout, ErrorCode,
-    ErrorOperationIdentity, FinishFlags, ForwardMode, GenAdmission, LatentPlacement,
-    LogicalLengths, MediaAdmission, MediaOutput, MediaProfileId, ModelOutput, NewRequest, OpId,
-    OpStatus, Operation, PartitionCompletion, Point, PointRange, ProductKind, ProductPayload,
-    ProductRef, ReconstructionKind, ReconstructionPlacement, RegistrationAck, RequestKey,
-    RequestKind, RowGeometry, ShapeBound, StorageClass, TimingCounters, TokenSpan, UndAdmission,
-    VersionRef, WorkerForwardStats, WorkerRequest, WorkerResponse, WorkerResponseError,
+    ArRequestParams, ArtifactHandle, BatchCommand, BlockTable, BufferId, BufferPlacement,
+    CachePageAllocation, Checkpoint, CheckpointPoint, CloseReason, DType, DecodePlacement,
+    DiffusionRequestParams, DiffusionResult, DimBound, Disposition, DrawLayout, ErrorCode,
+    ErrorOperationIdentity, FinishFlags, InlineValue, LatentPlacement, LogicalLengths, MediaOutput,
+    ModelOutput, NewRequest, OpId, OpPayload, OpStatus, Operation, PointRange, ProductKind,
+    ProductPayload, ProductRef, RegistrationAck, RequestKey, RequestKind, ResultData,
+    ResultPayload, RowGeometry, Run, RunKind, RunResult, ShapeBound, StorageClass, TimingCounters,
+    TokenSpan, TransferHandle, TransferLocator, TransferTransport, UmmRequestParams,
+    WorkerForwardStats, WorkerRequest, WorkerResponse, WorkerResponseError,
 };
 
 #[cfg(test)]
@@ -38,30 +39,20 @@ use uniserve_worker_ipc::Bounds;
 // Request -> Python (recv hot path)
 // ---------------------------------------------------------------------------
 
-/// Convert an `execute` [`WorkerRequest`] into the canonical Python IPC mapping.
+/// Convert a `submit` [`WorkerRequest`] into the canonical Python IPC mapping.
 pub(crate) fn execute_request_to_py<'py>(
     py: Python<'py>,
     request: &WorkerRequest,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let WorkerRequest::Execute { call_id, batch } = request else {
+    let WorkerRequest::Submit { call_id, run } = request else {
         return Err(PyValueError::new_err(
-            "native execute conversion requires an execute request",
+            "native submit conversion requires a submit request",
         ));
     };
     let dict = PyDict::new(py);
     dict.set_item(intern!(py, "kind"), request_kind_py(py, request.kind()))?;
     dict.set_item(intern!(py, "call_id"), call_id)?;
-    dict.set_item(intern!(py, "batch"), batch_to_py(py, batch)?)?;
-    for key in [
-        intern!(py, "step_id"),
-        intern!(py, "session_id"),
-        intern!(py, "copies"),
-        intern!(py, "product_handles"),
-        intern!(py, "snapshot"),
-        intern!(py, "recovery_placement"),
-    ] {
-        dict.set_item(key, py.None())?;
-    }
+    dict.set_item(intern!(py, "run"), run_to_py(py, run)?)?;
     Ok(dict)
 }
 
@@ -71,19 +62,24 @@ pub(crate) fn execute_request_to_py<'py>(
 
 /// Cached handles to the worker's operation types and enum members.
 ///
-/// The serve loop constructs one `Batch` object per submission; every hot
+/// The serve loop constructs one `Run` object per submission; every hot
 /// record (operations, KV placements, commit/close/release controls) is built
 /// by calling the operation dataclass constructors positionally, so the worker
 /// never re-decodes those records from IPC maps. Rare members (admissions,
-/// input products, branch and latent placements) still cross as IPC maps and
-/// are decoded by `native_batch`/`native_partition` on the Python side.
+/// input products and placements) still cross as IPC maps and are decoded by
+/// `native_run` on the Python side.
 struct NativeRequestTypes {
     operation: Py<PyAny>,
+    ar_payload: Py<PyAny>,
+    encoder_payload: Py<PyAny>,
+    diffusion_payload: Py<PyAny>,
+    transfer_payload: Py<PyAny>,
     request_key: Py<PyAny>,
     version_ref: Py<PyAny>,
     fixed_point: Py<PyAny>,
     device_point: Py<PyAny>,
     product_ref: Py<PyAny>,
+    buffer_id: Py<PyAny>,
     shape_bound: Py<PyAny>,
     static_dim: Py<PyAny>,
     device_dim: Py<PyAny>,
@@ -93,19 +89,17 @@ struct NativeRequestTypes {
     block_table: Py<PyAny>,
     cache_page_allocation: Py<PyAny>,
     row_geometry: Py<PyAny>,
+    start: Py<PyAny>,
     commit: Py<PyAny>,
-    close: Py<PyAny>,
-    release: Py<PyAny>,
-    native_partition: Py<PyAny>,
-    native_batch: Py<PyAny>,
-    domains: [Py<PyAny>; 3],
+    finish: Py<PyAny>,
+    free: Py<PyAny>,
+    native_run: Py<PyAny>,
     product_kinds: [Py<PyAny>; 10],
     storage_classes: [Py<PyAny>; 6],
     dtypes: [Py<PyAny>; 8],
     dispositions: [Py<PyAny>; 3],
     close_reasons: [Py<PyAny>; 4],
     draw_layouts: [Py<PyAny>; 3],
-    attention_regimes: [Py<PyAny>; 4],
     works: [Py<PyAny>; 12],
 }
 
@@ -132,11 +126,16 @@ impl NativeRequestTypes {
         let class = |name: &str| -> PyResult<Py<PyAny>> { Ok(module.getattr(name)?.unbind()) };
         Ok(Self {
             operation: class("Operation")?,
+            ar_payload: class("ArOpPayload")?,
+            encoder_payload: class("EncoderOpPayload")?,
+            diffusion_payload: class("DiffusionOpPayload")?,
+            transfer_payload: class("TransferOpPayload")?,
             request_key: class("RequestKey")?,
-            version_ref: class("VersionRef")?,
-            fixed_point: class("FixedPoint")?,
-            device_point: class("DevicePoint")?,
+            version_ref: class("Checkpoint")?,
+            fixed_point: class("FixedCheckpoint")?,
+            device_point: class("DeviceSelected")?,
             product_ref: class("ProductRef")?,
+            buffer_id: class("BufferId")?,
             shape_bound: class("ShapeBound")?,
             static_dim: class("StaticDim")?,
             device_dim: class("DeviceDim")?,
@@ -146,12 +145,11 @@ impl NativeRequestTypes {
             block_table: class("BlockTable")?,
             cache_page_allocation: class("CachePageAllocation")?,
             row_geometry: class("RowGeometry")?,
+            start: class("Start")?,
             commit: class("Commit")?,
-            close: class("Close")?,
-            release: class("Release")?,
-            native_partition: class("native_partition")?,
-            native_batch: class("native_batch")?,
-            domains: enum_members(&module, "Domain", ["prefill", "decode", "flow"])?,
+            finish: class("Finish")?,
+            free: class("Free")?,
+            native_run: class("native_run")?,
             product_kinds: enum_members(
                 &module,
                 "ProductKind",
@@ -196,27 +194,22 @@ impl NativeRequestTypes {
                 "DrawLayout",
                 ["target_sampling", "speculative_proposal", "flow_noise"],
             )?,
-            attention_regimes: enum_members(
-                &module,
-                "AttentionRegime",
-                ["none", "causal", "bidirectional", "hybrid"],
-            )?,
             works: enum_members(
                 &module,
-                "ForwardMode",
+                "RunKind",
                 [
-                    "token_extend",
-                    "token_decode",
-                    "token_verify",
-                    "encode_vision",
-                    "encode_latent",
+                    "ar_extend",
+                    "ar_decode",
+                    "ar_verify",
+                    "encoder_vision",
+                    "encoder_latent",
                     "transfer_product",
                     "transfer_kv_publish",
                     "transfer_kv_install",
-                    "media_prepare",
-                    "media_denoise",
-                    "materialize",
-                    "media_reconstruct",
+                    "diffusion_prepare",
+                    "diffusion_step",
+                    "diffusion_finalize",
+                    "diffusion_decode",
                 ],
             )?,
         })
@@ -230,17 +223,8 @@ impl NativeRequestTypes {
         Ok(NATIVE_REQUEST_TYPES.get_or_init(|| built))
     }
 
-    fn domain<'py>(&self, py: Python<'py>, domain: Domain) -> Bound<'py, PyAny> {
-        let index = match domain {
-            Domain::Prefill => 0,
-            Domain::Decode => 1,
-            Domain::Flow => 2,
-        };
-        self.domains[index].bind(py).clone()
-    }
-
-    fn work<'py>(&self, py: Python<'py>, work: ForwardMode) -> Bound<'py, PyAny> {
-        let index = work as usize;
+    fn kind<'py>(&self, py: Python<'py>, kind: RunKind) -> Bound<'py, PyAny> {
+        let index = kind as usize;
         self.works[index].bind(py).clone()
     }
 
@@ -314,7 +298,7 @@ impl<'py> NativeRequestConversion<'py> {
         }
         let value = self.types.request_key.bind(self.py).call1((
             key.authority_id,
-            key.session_id.0,
+            key.request_id.0,
             key.epoch,
         ))?;
         self.request_keys.insert(key, value.clone().unbind());
@@ -373,62 +357,57 @@ impl<'py> NativeRequestConversion<'py> {
         ))
     }
 
-    fn version_ref(&mut self, version: &VersionRef) -> PyResult<Bound<'py, PyAny>> {
-        let point = match &version.point {
-            Point::Fixed { point_index } => self
-                .types
-                .fixed_point
-                .bind(self.py)
-                .call1((*point_index,))?,
-            Point::Device {
-                point_index,
-                selected_point,
-            } => {
-                let selected = selected_point
-                    .as_ref()
-                    .map(|selected| self.product_ref(selected))
-                    .transpose()?;
-                self.types
-                    .device_point
-                    .bind(self.py)
-                    .call1((*point_index, selected))?
+    fn buffer_id(&mut self, buffer: BufferId) -> PyResult<Bound<'py, PyAny>> {
+        let owner = self.request_key(buffer.owner)?;
+        self.types.buffer_id.bind(self.py).call1((
+            owner,
+            buffer.producer_op_id.0,
+            buffer.output_index,
+            buffer.generation,
+        ))
+    }
+
+    fn checkpoint(&mut self, checkpoint: &Checkpoint) -> PyResult<Bound<'py, PyAny>> {
+        let point = match checkpoint.point {
+            CheckpointPoint::Fixed(point) => {
+                self.types.fixed_point.bind(self.py).call1((point,))?
             }
+            CheckpointPoint::DeviceSelected => self.types.device_point.bind(self.py).call0()?,
         };
-        let request_key = self.request_key(version.request_key)?;
         self.types
             .version_ref
             .bind(self.py)
-            .call1((request_key, version.producer_op_id.0, point))
+            .call1((checkpoint.op_id.0, point))
     }
 
     fn operation(&mut self, operation: &Operation) -> PyResult<Bound<'py, PyAny>> {
         let request_key = self.request_key(operation.request_key)?;
-        let parent = self.version_ref(&operation.parent)?;
+        let parent = self.checkpoint(&operation.parent)?;
         let bounds = self.types.bounds.bind(self.py).call1((
-            operation.bounds.max_points,
-            operation.bounds.max_tokens,
-            operation.bounds.max_kv_pages,
-            operation.bounds.max_latent_bytes,
-            operation.bounds.max_completion_bytes,
-            operation.bounds.max_transfer_bytes,
+            operation.bounds().max_points,
+            operation.bounds().max_tokens,
+            operation.bounds().max_kv_pages,
+            operation.bounds().max_latent_bytes,
+            operation.bounds().max_completion_bytes,
+            operation.bounds().max_transfer_bytes,
         ))?;
         let inputs = operation
-            .inputs
+            .inputs()
             .iter()
             .map(|product| self.product_ref(product))
             .collect::<PyResult<Vec<_>>>()?;
         let outputs = operation
-            .outputs
+            .outputs()
             .iter()
             .map(|product| self.product_ref(product))
             .collect::<PyResult<Vec<_>>>()?;
         let predicate = operation
-            .predicate
+            .predicate()
             .as_ref()
             .map(|predicate| self.product_ref(predicate))
             .transpose()?;
         let rng = operation
-            .rng
+            .rng()
             .as_ref()
             .map(|rng| {
                 let layout = match rng.draw_layout {
@@ -444,27 +423,31 @@ impl<'py> NativeRequestConversion<'py> {
             })
             .transpose()?;
         let py = self.py;
+        let payload_type = match operation.payload {
+            OpPayload::Ar { .. } => &self.types.ar_payload,
+            OpPayload::Encoder { .. } => &self.types.encoder_payload,
+            OpPayload::Diffusion { .. } => &self.types.diffusion_payload,
+            OpPayload::Transfer { .. } => &self.types.transfer_payload,
+        };
+        let payload = payload_type.bind(py).call1((
+            bounds,
+            pyo3::types::PyTuple::new(py, inputs)?,
+            pyo3::types::PyTuple::new(py, outputs)?,
+            predicate
+                .map(Bound::into_any)
+                .unwrap_or_else(|| py.None().into_bound(py)),
+            rng.map(Bound::into_any)
+                .unwrap_or_else(|| py.None().into_bound(py)),
+            operation.control_seq(),
+        ))?;
         let arguments = pyo3::types::PyTuple::new(
             py,
             [
                 request_key.into_any(),
                 operation.op_id.0.into_pyobject(py)?.into_any(),
                 parent.into_any(),
-                self.types.work(py, operation.work),
-                operation.route.0.into_pyobject(py)?.into_any(),
-                self.types.domain(py, operation.domain),
-                PyBool::new(py, operation.advances_state)
-                    .to_owned()
-                    .into_any(),
-                bounds.into_any(),
-                pyo3::types::PyTuple::new(py, inputs)?.into_any(),
-                pyo3::types::PyTuple::new(py, outputs)?.into_any(),
-                predicate
-                    .map(Bound::into_any)
-                    .unwrap_or_else(|| py.None().into_bound(py)),
-                rng.map(Bound::into_any)
-                    .unwrap_or_else(|| py.None().into_bound(py)),
-                operation.control_seq.into_pyobject(py)?.into_any(),
+                self.types.kind(py, operation.kind),
+                payload.into_any(),
             ],
         )?;
         self.types.operation.bind(py).call1(arguments)
@@ -499,9 +482,19 @@ impl<'py> NativeRequestConversion<'py> {
         ))
     }
 
-    fn control(&mut self, control: &Control) -> PyResult<Bound<'py, PyAny>> {
-        match control {
-            Control::Commit {
+    fn command(&mut self, command: &BatchCommand) -> PyResult<Bound<'py, PyAny>> {
+        match command {
+            BatchCommand::Start { request } => {
+                let request =
+                    admission_to_py(self.py, request, &mut RequestConversion::new(self.py))?;
+                let value = PyDict::new(self.py);
+                value.set_item(intern!(self.py, "request"), request)?;
+                self.types
+                    .start
+                    .bind(self.py)
+                    .call_method1("from_mapping", (value,))
+            }
+            BatchCommand::Commit {
                 request_key,
                 control_seq,
                 expected_parent,
@@ -509,9 +502,10 @@ impl<'py> NativeRequestConversion<'py> {
                 public_event_limit,
                 disposition,
             } => {
-                let request_key = self.request_key(*request_key)?;
-                let expected_parent = self.version_ref(expected_parent)?;
-                let selected = self.version_ref(selected)?;
+                let request = *request_key;
+                let expected_parent = self.checkpoint(expected_parent)?;
+                let selected = self.checkpoint(selected)?;
+                let request_key = self.request_key(request)?;
                 let disposition = match disposition {
                     Disposition::Publish => 0,
                     Disposition::Retain => 1,
@@ -526,121 +520,85 @@ impl<'py> NativeRequestConversion<'py> {
                     self.types.dispositions[disposition].bind(self.py).clone(),
                 ))
             }
-            Control::Close {
+            BatchCommand::Finish {
                 request_key,
                 control_seq,
                 cutoff,
                 reason,
             } => {
-                let request_key = self.request_key(*request_key)?;
-                let cutoff = self.version_ref(cutoff)?;
+                let request = *request_key;
+                let cutoff = self.checkpoint(cutoff)?;
+                let request_key = self.request_key(request)?;
                 let reason = match reason {
                     CloseReason::Completed => 0,
                     CloseReason::Cancelled => 1,
                     CloseReason::Error => 2,
                     CloseReason::Preempted => 3,
                 };
-                self.types.close.bind(self.py).call1((
+                self.types.finish.bind(self.py).call1((
                     request_key,
                     *control_seq,
                     cutoff,
                     self.types.close_reasons[reason].bind(self.py).clone(),
                 ))
             }
-            Control::Release { request_key, op_id } => {
-                let request_key = self.request_key(*request_key)?;
-                self.types
-                    .release
-                    .bind(self.py)
-                    .call1((request_key, op_id.0))
+            BatchCommand::Free { buffer } => {
+                let buffer = self.buffer_id(*buffer)?;
+                self.types.free.bind(self.py).call1((buffer,))
             }
         }
     }
-
-    fn partition(
-        &mut self,
-        partition: &BatchPartition,
-        context: &mut RequestConversion<'py>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let operations = partition
-            .operations
-            .iter()
-            .map(|operation| self.operation(operation))
-            .collect::<PyResult<Vec<_>>>()?;
-        let block_tables = partition
-            .block_tables
-            .iter()
-            .map(|table| self.block_table(table))
-            .collect::<PyResult<Vec<_>>>()?;
-        let new_cache_pages = partition
-            .new_cache_pages
-            .iter()
-            .map(|allocation| self.cache_page_allocation(allocation))
-            .collect::<PyResult<Vec<_>>>()?;
-        let forward_rows = partition
-            .forward_rows
-            .iter()
-            .map(|row| self.row_geometry(row))
-            .collect::<PyResult<Vec<_>>>()?;
-        let attention = match partition.attention {
-            AttentionRegime::None => 0,
-            AttentionRegime::Causal => 1,
-            AttentionRegime::Bidirectional => 2,
-            AttentionRegime::Hybrid => 3,
-        };
-        let py = self.py;
-        let arguments = pyo3::types::PyTuple::new(
-            py,
-            [
-                partition.partition_id.into_pyobject(py)?.into_any(),
-                partition.submission_group.into_pyobject(py)?.into_any(),
-                partition.collective_seq.into_pyobject(py)?.into_any(),
-                self.types.domain(py, partition.domain),
-                partition.route.0.into_pyobject(py)?.into_any(),
-                self.types.attention_regimes[attention].bind(py).clone(),
-                partition.shape_class.into_pyobject(py)?.into_any(),
-                pyo3::types::PyTuple::new(py, operations)?.into_any(),
-                pyo3::types::PyTuple::new(py, block_tables)?.into_any(),
-                pyo3::types::PyTuple::new(py, new_cache_pages)?.into_any(),
-                pyo3::types::PyTuple::new(py, forward_rows)?.into_any(),
-                dict_list(py, &partition.latent_placements, |placement| {
-                    latent_placement_to_py(py, placement, context)
-                })?
-                .into_any(),
-                dict_list(py, &partition.reconstruction_placements, |placement| {
-                    reconstruction_placement_to_py(py, placement, context)
-                })?
-                .into_any(),
-            ],
-        )?;
-        self.types.native_partition.bind(py).call1(arguments)
-    }
 }
 
-fn batch_to_py<'py>(py: Python<'py>, batch: &Batch) -> PyResult<Bound<'py, PyAny>> {
+fn run_to_py<'py>(py: Python<'py>, run: &Run) -> PyResult<Bound<'py, PyAny>> {
     let mut context = RequestConversion::new(py);
     let mut native = NativeRequestConversion::new(py)?;
-    let partitions = batch
-        .partitions
+    let operations = run
+        .operations
         .iter()
-        .map(|partition| native.partition(partition, &mut context))
+        .map(|operation| native.operation(operation))
         .collect::<PyResult<Vec<_>>>()?;
-    let controls = batch
-        .controls
+    let block_tables = run
+        .block_tables
         .iter()
-        .map(|control| native.control(control))
+        .map(|table| native.block_table(table))
         .collect::<PyResult<Vec<_>>>()?;
-    let admissions = dict_list(py, &batch.admissions, |admission| {
-        admission_to_py(py, admission, &mut context)
-    })?;
-    let input_products = dict_list(py, &batch.input_products, |payload| {
+    let new_cache_pages = run
+        .new_cache_pages
+        .iter()
+        .map(|allocation| native.cache_page_allocation(allocation))
+        .collect::<PyResult<Vec<_>>>()?;
+    let forward_rows = run
+        .forward_rows
+        .iter()
+        .map(|row| native.row_geometry(row))
+        .collect::<PyResult<Vec<_>>>()?;
+    let commands = run
+        .commands
+        .iter()
+        .map(|command| native.command(command))
+        .collect::<PyResult<Vec<_>>>()?;
+    let input_products = dict_list(py, &run.input_products, |payload| {
         product_payload_to_py(py, payload, &mut context)
     })?;
-    native.types.native_batch.bind(py).call1((
-        batch.step_id,
-        admissions,
-        pyo3::types::PyTuple::new(py, partitions)?,
-        pyo3::types::PyTuple::new(py, controls)?,
+    native.types.native_run.bind(py).call1((
+        run.batch_id,
+        run.run_id,
+        run.collective_seq,
+        pyo3::types::PyTuple::new(py, operations)?,
+        pyo3::types::PyTuple::new(py, block_tables)?,
+        pyo3::types::PyTuple::new(py, new_cache_pages)?,
+        pyo3::types::PyTuple::new(py, forward_rows)?,
+        dict_list(py, &run.latent_placements, |placement| {
+            latent_placement_to_py(py, placement, &mut context)
+        })?,
+        dict_list(py, &run.decode_placements, |placement| {
+            decode_placement_to_py(py, placement, &mut context)
+        })?,
+        dict_list(py, &run.buffer_placements, |placement| {
+            buffer_placement_to_py(py, placement, &mut context)
+        })?,
+        pyo3::types::PyTuple::new(py, commands)?,
         input_products,
     ))
 }
@@ -668,9 +626,9 @@ fn latent_placement_to_py<'py>(
     Ok(dict)
 }
 
-fn reconstruction_placement_to_py<'py>(
+fn decode_placement_to_py<'py>(
     py: Python<'py>,
-    placement: &ReconstructionPlacement,
+    placement: &DecodePlacement,
     context: &mut RequestConversion<'py>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
@@ -679,15 +637,26 @@ fn reconstruction_placement_to_py<'py>(
         context.request_key(placement.request_key)?,
     )?;
     dict.set_item(intern!(py, "op_id"), placement.op_id.0)?;
-    dict.set_item(
-        intern!(py, "kind"),
-        match placement.kind {
-            ReconstructionKind::Video => "video",
-            ReconstructionKind::Audio => "audio",
-        },
-    )?;
-    dict.set_item(intern!(py, "start_unit"), placement.start_unit)?;
-    dict.set_item(intern!(py, "unit_count"), placement.unit_count)?;
+    dict.set_item(intern!(py, "cursor"), placement.cursor)?;
+    dict.set_item(intern!(py, "max_units"), placement.max_units)?;
+    Ok(dict)
+}
+
+fn buffer_placement_to_py<'py>(
+    py: Python<'py>,
+    placement: &BufferPlacement,
+    context: &mut RequestConversion<'py>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    let id = placement.buffer;
+    let buffer = PyDict::new(py);
+    buffer.set_item(intern!(py, "owner"), context.request_key(id.owner)?)?;
+    buffer.set_item(intern!(py, "producer_op_id"), id.producer_op_id.0)?;
+    buffer.set_item(intern!(py, "output_index"), id.output_index)?;
+    buffer.set_item(intern!(py, "generation"), id.generation)?;
+    dict.set_item(intern!(py, "buffer"), buffer)?;
+    dict.set_item(intern!(py, "offset"), placement.offset)?;
+    dict.set_item(intern!(py, "bytes"), placement.bytes)?;
     Ok(dict)
 }
 
@@ -729,7 +698,7 @@ impl<'py> RequestConversion<'py> {
         }
         let dict = PyDict::new(self.py);
         dict.set_item(intern!(self.py, "authority_id"), key.authority_id)?;
-        dict.set_item(intern!(self.py, "session_id"), key.session_id.0)?;
+        dict.set_item(intern!(self.py, "request_id"), key.request_id.0)?;
         dict.set_item(intern!(self.py, "epoch"), key.epoch)?;
         self.request_keys.insert(key, dict.clone());
         Ok(dict)
@@ -770,84 +739,77 @@ fn admission_to_py<'py>(
     )?;
     dict.set_item(intern!(py, "request_pool_idx"), admission.request_pool_idx)?;
     dict.set_item(
-        intern!(py, "und"),
+        intern!(py, "ar"),
         admission
-            .und
+            .ar
             .as_ref()
-            .map(|und| und_admission_to_py(py, und))
+            .map(|ar| ar_params_to_py(py, ar))
             .transpose()?,
     )?;
     dict.set_item(
-        intern!(py, "gen_admission"),
+        intern!(py, "umm"),
         admission
-            .gen_admission
+            .umm
             .as_ref()
-            .map(|branch| gen_admission_to_py(py, branch))
+            .map(|branch| umm_params_to_py(py, branch))
             .transpose()?,
     )?;
     dict.set_item(
-        intern!(py, "media"),
+        intern!(py, "diffusion"),
         admission
-            .media
+            .diffusion
             .as_ref()
-            .map(|media| media_admission_to_py(py, media))
+            .map(|diffusion| diffusion_params_to_py(py, diffusion))
             .transpose()?,
     )?;
     Ok(dict)
 }
 
-fn und_admission_to_py<'py>(py: Python<'py>, und: &UndAdmission) -> PyResult<Bound<'py, PyDict>> {
+fn ar_params_to_py<'py>(py: Python<'py>, ar: &ArRequestParams) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
-    dict.set_item(intern!(py, "sampling"), sampling_to_py(py, &und.sampling)?)?;
+    dict.set_item(intern!(py, "sampling"), sampling_to_py(py, &ar.sampling)?)?;
     dict.set_item(
         intern!(py, "negative_token_ids"),
-        u32_list(py, &und.negative_token_ids)?,
+        u32_list(py, &ar.negative_token_ids)?,
     )?;
     dict.set_item(
         intern!(py, "finish_token_ids"),
-        u32_list(py, &und.finish_token_ids)?,
+        u32_list(py, &ar.finish_token_ids)?,
     )?;
-    dict.set_item(intern!(py, "initial_position"), und.initial_position)?;
+    dict.set_item(intern!(py, "initial_position"), ar.initial_position)?;
     Ok(dict)
 }
 
-fn gen_admission_to_py<'py>(
+fn umm_params_to_py<'py>(
     py: Python<'py>,
-    branch: &GenAdmission,
+    branch: &UmmRequestParams,
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item(intern!(py, "image"), image_to_py(py, &branch.image)?)?;
     Ok(dict)
 }
 
-fn media_admission_to_py<'py>(
+fn diffusion_params_to_py<'py>(
     py: Python<'py>,
-    media: &MediaAdmission,
+    diffusion: &DiffusionRequestParams,
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item(
         intern!(py, "prompt_token_ids"),
-        u32_list(py, &media.prompt_token_ids)?,
+        u32_list(py, &diffusion.prompt_token_ids)?,
     )?;
-    dict.set_item(intern!(py, "seed"), media.seed)?;
-    dict.set_item(
-        intern!(py, "profile"),
-        match media.profile {
-            MediaProfileId::MinimaxH3T2va => "minimax_h3_t2va",
-        },
-    )?;
+    dict.set_item(intern!(py, "seed"), diffusion.seed)?;
     let geometry = PyDict::new(py);
-    geometry.set_item(intern!(py, "frame_count"), media.geometry.frame_count)?;
+    geometry.set_item(intern!(py, "frame_count"), diffusion.geometry.frame_count)?;
+    geometry.set_item(intern!(py, "decode_units"), diffusion.geometry.decode_units)?;
     geometry.set_item(
-        intern!(py, "video_reconstruction_units"),
-        media.geometry.video_reconstruction_units,
+        intern!(py, "prompt_tokens"),
+        diffusion.geometry.prompt_tokens,
     )?;
     geometry.set_item(
-        intern!(py, "audio_latent_frames"),
-        media.geometry.audio_latent_frames,
+        intern!(py, "denoise_steps"),
+        diffusion.geometry.denoise_steps,
     )?;
-    geometry.set_item(intern!(py, "prompt_tokens"), media.geometry.prompt_tokens)?;
-    geometry.set_item(intern!(py, "denoise_steps"), media.geometry.denoise_steps)?;
     dict.set_item(intern!(py, "geometry"), geometry)?;
     Ok(dict)
 }
@@ -1013,20 +975,207 @@ fn product_payload_to_py<'py>(
         intern!(py, "product"),
         product_ref_to_py(py, &payload.product, context)?,
     )?;
-    // `serde_bytes` pythonizes to `bytes`; one buffer copy, no per-element walk.
-    dict.set_item(intern!(py, "bytes"), PyBytes::new(py, &payload.bytes))?;
+    let value = PyDict::new(py);
+    match &payload.value {
+        InlineValue::Bytes(bytes) => {
+            value.set_item(intern!(py, "kind"), "bytes")?;
+            value.set_item(intern!(py, "value"), PyBytes::new(py, bytes))?;
+        }
+        InlineValue::Transfer(handle) => {
+            value.set_item(intern!(py, "kind"), "transfer")?;
+            value.set_item(intern!(py, "value"), transfer_handle_to_py(py, handle)?)?;
+        }
+    }
+    dict.set_item(intern!(py, "value"), value)?;
+    Ok(dict)
+}
+
+fn transfer_locator_to_py<'py>(
+    py: Python<'py>,
+    locator: &TransferLocator,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item(intern!(py, "nbytes"), locator.nbytes)?;
+    dict.set_item(intern!(py, "dtype"), locator.dtype.as_str())?;
+    dict.set_item(intern!(py, "shape"), PyList::new(py, &locator.shape)?)?;
+    dict.set_item(intern!(py, "device"), locator.device.as_str())?;
+    match &locator.transport {
+        TransferTransport::Local { endpoint, key } => {
+            dict.set_item(intern!(py, "transport"), "local")?;
+            dict.set_item(intern!(py, "endpoint"), endpoint.as_str())?;
+            dict.set_item(intern!(py, "key"), key)?;
+        }
+        TransferTransport::PosixShm {
+            name,
+            ready_header_bytes,
+            ready_semaphore,
+        } => {
+            dict.set_item(intern!(py, "transport"), "posix_shm")?;
+            dict.set_item(intern!(py, "name"), name.as_str())?;
+            dict.set_item(intern!(py, "ready_header_bytes"), ready_header_bytes)?;
+            dict.set_item(intern!(py, "ready_semaphore"), ready_semaphore.as_deref())?;
+        }
+        TransferTransport::CudaIpc {
+            endpoint,
+            publication_id,
+            storage_handle,
+            storage_size_bytes,
+            storage_offset_bytes,
+            tensor_offset,
+            tensor_stride,
+            ref_counter_handle,
+            ref_counter_offset,
+            event_handle,
+            event_sync_required,
+            ready_event_handle,
+        } => {
+            dict.set_item(intern!(py, "transport"), "cuda_ipc")?;
+            dict.set_item(intern!(py, "endpoint"), endpoint.as_str())?;
+            dict.set_item(intern!(py, "publication_id"), publication_id.as_str())?;
+            dict.set_item(
+                intern!(py, "storage_handle"),
+                PyBytes::new(py, storage_handle),
+            )?;
+            dict.set_item(intern!(py, "storage_size_bytes"), storage_size_bytes)?;
+            dict.set_item(intern!(py, "storage_offset_bytes"), storage_offset_bytes)?;
+            dict.set_item(intern!(py, "tensor_offset"), tensor_offset)?;
+            dict.set_item(
+                intern!(py, "tensor_stride"),
+                PyList::new(py, tensor_stride)?,
+            )?;
+            dict.set_item(
+                intern!(py, "ref_counter_handle"),
+                PyBytes::new(py, ref_counter_handle),
+            )?;
+            dict.set_item(intern!(py, "ref_counter_offset"), ref_counter_offset)?;
+            dict.set_item(intern!(py, "event_handle"), PyBytes::new(py, event_handle))?;
+            dict.set_item(intern!(py, "event_sync_required"), event_sync_required)?;
+            dict.set_item(
+                intern!(py, "ready_event_handle"),
+                PyBytes::new(py, ready_event_handle),
+            )?;
+        }
+    }
+    Ok(dict)
+}
+
+fn checkpoint_mapping_to_py<'py>(
+    py: Python<'py>,
+    checkpoint: &Checkpoint,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item(intern!(py, "op_id"), checkpoint.op_id.0)?;
+    let point = PyDict::new(py);
+    match checkpoint.point {
+        CheckpointPoint::Fixed(value) => {
+            point.set_item(intern!(py, "kind"), "fixed")?;
+            point.set_item(intern!(py, "value"), value)?;
+        }
+        CheckpointPoint::DeviceSelected => {
+            point.set_item(intern!(py, "kind"), "device_selected")?;
+            point.set_item(intern!(py, "value"), py.None())?;
+        }
+    }
+    dict.set_item(intern!(py, "point"), point)?;
+    Ok(dict)
+}
+
+fn transfer_handle_to_py<'py>(
+    py: Python<'py>,
+    handle: &TransferHandle,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    let value = PyDict::new(py);
+    match handle {
+        TransferHandle::Encoder {
+            generation,
+            height,
+            width,
+            payload_kind,
+            locator,
+        } => {
+            dict.set_item(intern!(py, "kind"), "encoder")?;
+            value.set_item(intern!(py, "generation"), generation)?;
+            value.set_item(intern!(py, "height"), height)?;
+            value.set_item(intern!(py, "width"), width)?;
+            value.set_item(
+                intern!(py, "payload_kind"),
+                product_kind_py(py, *payload_kind),
+            )?;
+            value.set_item(intern!(py, "locator"), transfer_locator_to_py(py, locator)?)?;
+        }
+        TransferHandle::DeviceProduct {
+            generation,
+            height,
+            width,
+            value_range,
+            locator,
+        } => {
+            dict.set_item(intern!(py, "kind"), "device_product")?;
+            value.set_item(intern!(py, "generation"), generation)?;
+            value.set_item(intern!(py, "height"), height)?;
+            value.set_item(intern!(py, "width"), width)?;
+            value.set_item(intern!(py, "value_range"), value_range.as_str())?;
+            value.set_item(intern!(py, "locator"), transfer_locator_to_py(py, locator)?)?;
+        }
+        TransferHandle::Kv {
+            generation,
+            locators,
+            source,
+            destination,
+            base,
+            base_extent,
+            published_extent,
+            group_id,
+            scale_identity,
+        } => {
+            dict.set_item(intern!(py, "kind"), "kv")?;
+            value.set_item(intern!(py, "generation"), generation)?;
+            let locators = locators
+                .iter()
+                .map(|locator| transfer_locator_to_py(py, locator))
+                .collect::<PyResult<Vec<_>>>()?;
+            value.set_item(intern!(py, "locators"), PyList::new(py, locators)?)?;
+            value.set_item(intern!(py, "source"), checkpoint_mapping_to_py(py, source)?)?;
+            value.set_item(intern!(py, "destination"), destination.as_str())?;
+            value.set_item(
+                intern!(py, "base"),
+                base.as_ref()
+                    .map(|checkpoint| checkpoint_mapping_to_py(py, checkpoint))
+                    .transpose()?,
+            )?;
+            value.set_item(intern!(py, "base_extent"), base_extent)?;
+            value.set_item(intern!(py, "published_extent"), published_extent)?;
+            value.set_item(intern!(py, "group_id"), group_id)?;
+            value.set_item(intern!(py, "scale_identity"), scale_identity.as_str())?;
+        }
+        TransferHandle::Latent {
+            generation,
+            height,
+            width,
+            latent_units,
+            step,
+            locator,
+        } => {
+            dict.set_item(intern!(py, "kind"), "latent")?;
+            value.set_item(intern!(py, "generation"), generation)?;
+            value.set_item(intern!(py, "height"), height)?;
+            value.set_item(intern!(py, "width"), width)?;
+            value.set_item(intern!(py, "latent_units"), latent_units)?;
+            value.set_item(intern!(py, "step"), step)?;
+            value.set_item(intern!(py, "locator"), transfer_locator_to_py(py, locator)?)?;
+        }
+    }
+    dict.set_item(intern!(py, "value"), value)?;
     Ok(dict)
 }
 
 fn request_kind_py<'py>(py: Python<'py>, kind: RequestKind) -> &'py Bound<'py, PyString> {
     match kind {
-        RequestKind::GetInfo => intern!(py, "get_info"),
-        RequestKind::Execute => intern!(py, "execute"),
-        RequestKind::PollCompletions => intern!(py, "poll_completions"),
-        RequestKind::DropSession => intern!(py, "drop_session"),
-        RequestKind::Shutdown => intern!(py, "shutdown"),
-        RequestKind::ReleaseProducts => intern!(py, "release_products"),
-        RequestKind::GetPressure => intern!(py, "get_pressure"),
+        RequestKind::Info => intern!(py, "info"),
+        RequestKind::Submit => intern!(py, "submit"),
+        RequestKind::Poll => intern!(py, "poll"),
+        RequestKind::Close => intern!(py, "close"),
     }
 }
 
@@ -1100,17 +1249,13 @@ fn decode_completion_response_from_py(response: &Bound<'_, PyAny>) -> Option<Wor
     if kind.to_str().ok()? != "result" {
         return None;
     }
-    // Result reports reserve these fields for their respective response kinds.
-    for key in [
-        intern!(py, "info"),
-        intern!(py, "pressure"),
-        intern!(py, "snapshot"),
-    ] {
+    // Result reports reserve worker information for its response kind.
+    for key in [intern!(py, "info")] {
         if !absent_or_none(dict, key)? {
             return None;
         }
     }
-    let report = completion_report_from_py(&get(dict, intern!(py, "completion_report"))?)?;
+    let report = run_result_from_py(&get(dict, intern!(py, "result"))?)?;
     let identities = error_operations_from_py(dict)?;
     if !identities.is_empty()
         || opt_string(dict, intern!(py, "message"))?.is_some()
@@ -1124,7 +1269,7 @@ fn decode_completion_response_from_py(response: &Bound<'_, PyAny>) -> Option<Wor
     }
     Some(WorkerResponse::Result {
         call_id: opt_u64(dict, intern!(py, "call_id"))?,
-        completion_report: report,
+        result: report,
     })
 }
 
@@ -1134,12 +1279,7 @@ fn decode_error_response_from_py(response: &Bound<'_, PyAny>) -> Option<WorkerRe
     if str_field(dict, intern!(py, "kind"))?.to_str().ok()? != "error" {
         return None;
     }
-    for key in [
-        intern!(py, "info"),
-        intern!(py, "completion_report"),
-        intern!(py, "pressure"),
-        intern!(py, "snapshot"),
-    ] {
+    for key in [intern!(py, "info"), intern!(py, "result")] {
         if !absent_or_none(dict, key)? {
             return None;
         }
@@ -1159,22 +1299,7 @@ fn decode_error_response_from_py(response: &Bound<'_, PyAny>) -> Option<WorkerRe
     })
 }
 
-fn completion_report_from_py(value: &Bound<'_, PyAny>) -> Option<CompletionReport> {
-    let py = value.py();
-    let dict = value.cast::<PyDict>().ok()?;
-    let partitions = get(dict, intern!(py, "partitions"))?;
-    let partitions = partitions.cast::<PyList>().ok()?;
-    let mut partition_reports = Vec::with_capacity(partitions.len());
-    for item in partitions.iter() {
-        partition_reports.push(partition_completion_from_py(&item)?);
-    }
-    Some(CompletionReport {
-        step_id: u64_of(&get(dict, intern!(py, "step_id"))?)?,
-        partitions: partition_reports,
-    })
-}
-
-fn partition_completion_from_py(value: &Bound<'_, PyAny>) -> Option<PartitionCompletion> {
+fn run_result_from_py(value: &Bound<'_, PyAny>) -> Option<RunResult> {
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
     let completions = get(dict, intern!(py, "completions"))?;
@@ -1199,13 +1324,15 @@ fn partition_completion_from_py(value: &Bound<'_, PyAny>) -> Option<PartitionCom
         Some(value) if value.is_none() => None,
         Some(value) => Some(forward_stats_from_py(&value)?),
     };
-    Some(PartitionCompletion {
-        partition_id: u32_of(&get(dict, intern!(py, "partition_id"))?)?,
+    Some(RunResult {
+        batch_id: u64_of(&get(dict, intern!(py, "batch_id"))?)?,
+        run_id: u64_of(&get(dict, intern!(py, "run_id"))?)?,
         completions: records,
         products: payloads,
         registration,
         worker_exec_us: opt_u64(dict, intern!(py, "worker_exec_us"))?,
         forward_stats,
+        done: bool_of(&get(dict, intern!(py, "done"))?)?,
     })
 }
 
@@ -1309,7 +1436,15 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<ModelOutput> {
             _ => return None,
         }),
     };
-    let lengths = get(dict, intern!(py, "logical_lengths"))?;
+    let payload = get(dict, intern!(py, "payload"))?;
+    let payload = payload.cast::<PyDict>().ok()?;
+    let family = string_of(&get(payload, intern!(py, "family"))?)?;
+    let payload_value = payload.get_item(intern!(py, "value")).ok()?;
+    let payload = match &payload_value {
+        Some(value) => value.cast::<PyDict>().ok()?,
+        None => payload,
+    };
+    let lengths = get(payload, intern!(py, "logical_lengths"))?;
     let lengths = lengths.cast::<PyDict>().ok()?;
     let logical_lengths = LogicalLengths {
         token_len: u32_of(&get(lengths, intern!(py, "token_len"))?)?,
@@ -1317,13 +1452,13 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<ModelOutput> {
         kv_computed_len: u32_of(&get(lengths, intern!(py, "kv_computed_len"))?)?,
         latent_len: u32_of(&get(lengths, intern!(py, "latent_len"))?)?,
     };
-    let span = get(dict, intern!(py, "token_span"))?;
+    let span = get(payload, intern!(py, "token_span"))?;
     let span = span.cast::<PyDict>().ok()?;
     let token_span = TokenSpan {
         base: u32_of(&get(span, intern!(py, "base"))?)?,
         len: u32_of(&get(span, intern!(py, "len"))?)?,
     };
-    let flags = get(dict, intern!(py, "finish_flags"))?;
+    let flags = get(payload, intern!(py, "finish_flags"))?;
     let flags = flags.cast::<PyDict>().ok()?;
     let finish_flags = FinishFlags {
         eos: bool_of(&get(flags, intern!(py, "eos"))?)?,
@@ -1338,15 +1473,42 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<ModelOutput> {
         copy_us: u64_of(&get(timing, intern!(py, "copy_us"))?)?,
         host_us: u64_of(&get(timing, intern!(py, "host_us"))?)?,
     };
-    let media_output = if absent_or_none(dict, intern!(py, "media_output"))? {
+    let media_output = if absent_or_none(payload, intern!(py, "media_output"))? {
         None
     } else {
-        let output = get(dict, intern!(py, "media_output"))?;
+        let output = get(payload, intern!(py, "media_output"))?;
         let output = output.cast::<PyDict>().ok()?;
+        let handle = get(output, intern!(py, "handle"))?;
+        let handle = handle.cast::<PyDict>().ok()?;
+        if string_of(&get(handle, intern!(py, "transport"))?)? != "posix_shm" {
+            return None;
+        }
+        let value = get(handle, intern!(py, "value"))?;
+        let value = value.cast::<PyDict>().ok()?;
         Some(MediaOutput {
-            handle: string_of(&get(output, intern!(py, "handle"))?)?,
+            handle: ArtifactHandle::PosixShm {
+                name: string_of(&get(value, intern!(py, "name"))?)?,
+            },
             bytes: u64_of(&get(output, intern!(py, "bytes"))?)?,
         })
+    };
+    let data = ResultData {
+        logical_lengths,
+        token_span,
+        committed_tokens: u32_vec(&get(payload, intern!(py, "committed_tokens"))?)?,
+        finish_flags,
+        media_output,
+    };
+    let result_payload = match family.as_str() {
+        "ar" => ResultPayload::Ar(data),
+        "encoder" => ResultPayload::Encoder(data),
+        "diffusion" => ResultPayload::Diffusion(DiffusionResult {
+            data,
+            next_cursor: u32_of(&get(payload, intern!(py, "next_cursor"))?)?,
+            done: bool_of(&get(payload, intern!(py, "done"))?)?,
+        }),
+        "transfer" => ResultPayload::Transfer(data),
+        _ => return None,
     };
     Some(ModelOutput {
         request_key: request_key_from_py(&get(dict, intern!(py, "request_key"))?)?,
@@ -1354,45 +1516,157 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<ModelOutput> {
         completion_slot_generation: u32_of(&get(dict, intern!(py, "completion_slot_generation"))?)?,
         status,
         selected_point: u32_of(&get(dict, intern!(py, "selected_point"))?)?,
-        logical_lengths,
-        token_span,
-        committed_tokens: u32_vec(&get(dict, intern!(py, "committed_tokens"))?)?,
-        finish_flags,
         product_generations: u32_vec(&get(dict, intern!(py, "product_generations"))?)?,
         error_code,
         timing_counters,
-        media_output,
+        payload: result_payload,
     })
 }
 
 fn product_payload_from_py(value: &Bound<'_, PyAny>) -> Option<ProductPayload> {
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
-    let bytes = get(dict, intern!(py, "bytes"))?;
-    let bytes = bytes.cast::<PyBytes>().ok()?.as_bytes().to_vec();
+    let value = get(dict, intern!(py, "value"))?;
+    let value = value.cast::<PyDict>().ok()?;
+    let kind = str_field(value, intern!(py, "kind"))?;
+    let value = match kind.to_str().ok()? {
+        "bytes" => {
+            let bytes = get(value, intern!(py, "value"))?;
+            InlineValue::Bytes(bytes.cast::<PyBytes>().ok()?.as_bytes().to_vec())
+        }
+        "transfer" => {
+            let transfer = get(value, intern!(py, "value"))?;
+            let transfer = transfer.cast::<PyDict>().ok()?;
+            let kind = str_field(transfer, intern!(py, "kind"))?;
+            let payload = get(transfer, intern!(py, "value"))?;
+            let payload = payload.cast::<PyDict>().ok()?;
+            let generation = u32_of(&get(payload, intern!(py, "generation"))?)?;
+            let handle = match kind.to_str().ok()? {
+                "encoder" => TransferHandle::Encoder {
+                    generation,
+                    height: u32_of(&get(payload, intern!(py, "height"))?)?,
+                    width: u32_of(&get(payload, intern!(py, "width"))?)?,
+                    payload_kind: product_kind_from_py(&get(
+                        payload,
+                        intern!(py, "payload_kind"),
+                    )?)?,
+                    locator: transfer_locator_from_py(&get(payload, intern!(py, "locator"))?)?,
+                },
+                "device_product" => TransferHandle::DeviceProduct {
+                    generation,
+                    height: u32_of(&get(payload, intern!(py, "height"))?)?,
+                    width: u32_of(&get(payload, intern!(py, "width"))?)?,
+                    value_range: string_of(&get(payload, intern!(py, "value_range"))?)?,
+                    locator: transfer_locator_from_py(&get(payload, intern!(py, "locator"))?)?,
+                },
+                "kv" => {
+                    let raw_locators = get(payload, intern!(py, "locators"))?;
+                    let raw_locators = raw_locators.cast::<PyList>().ok()?;
+                    let mut locators = Vec::with_capacity(raw_locators.len());
+                    for locator in raw_locators.iter() {
+                        locators.push(transfer_locator_from_py(&locator)?);
+                    }
+                    TransferHandle::Kv {
+                        generation,
+                        locators,
+                        source: checkpoint_mapping_from_py(&get(payload, intern!(py, "source"))?)?,
+                        destination: string_of(&get(payload, intern!(py, "destination"))?)?,
+                        base: if absent_or_none(payload, intern!(py, "base"))? {
+                            None
+                        } else {
+                            Some(checkpoint_mapping_from_py(&get(
+                                payload,
+                                intern!(py, "base"),
+                            )?)?)
+                        },
+                        base_extent: u32_of(&get(payload, intern!(py, "base_extent"))?)?,
+                        published_extent: u32_of(&get(payload, intern!(py, "published_extent"))?)?,
+                        group_id: u32_of(&get(payload, intern!(py, "group_id"))?)?,
+                        scale_identity: string_of(&get(payload, intern!(py, "scale_identity"))?)?,
+                    }
+                }
+                "latent" => TransferHandle::Latent {
+                    generation,
+                    height: u32_of(&get(payload, intern!(py, "height"))?)?,
+                    width: u32_of(&get(payload, intern!(py, "width"))?)?,
+                    latent_units: u32_of(&get(payload, intern!(py, "latent_units"))?)?,
+                    step: u32_of(&get(payload, intern!(py, "step"))?)?,
+                    locator: transfer_locator_from_py(&get(payload, intern!(py, "locator"))?)?,
+                },
+                _ => return None,
+            };
+            InlineValue::Transfer(handle)
+        }
+        _ => return None,
+    };
     Some(ProductPayload {
         product: product_ref_from_py(&get(dict, intern!(py, "product"))?)?,
-        bytes,
+        value,
+    })
+}
+
+fn transfer_locator_from_py(value: &Bound<'_, PyAny>) -> Option<TransferLocator> {
+    let py = value.py();
+    let dict = value.cast::<PyDict>().ok()?;
+    let transport = match string_of(&get(dict, intern!(py, "transport"))?)?.as_str() {
+        "local" => TransferTransport::Local {
+            endpoint: string_of(&get(dict, intern!(py, "endpoint"))?)?,
+            key: u64_of(&get(dict, intern!(py, "key"))?)?,
+        },
+        "posix_shm" => TransferTransport::PosixShm {
+            name: string_of(&get(dict, intern!(py, "name"))?)?,
+            ready_header_bytes: u32_of(&get(dict, intern!(py, "ready_header_bytes"))?)?,
+            ready_semaphore: if absent_or_none(dict, intern!(py, "ready_semaphore"))? {
+                None
+            } else {
+                Some(string_of(&get(dict, intern!(py, "ready_semaphore"))?)?)
+            },
+        },
+        "cuda_ipc" => TransferTransport::CudaIpc {
+            endpoint: string_of(&get(dict, intern!(py, "endpoint"))?)?,
+            publication_id: string_of(&get(dict, intern!(py, "publication_id"))?)?,
+            storage_handle: bytes_of(&get(dict, intern!(py, "storage_handle"))?)?,
+            storage_size_bytes: u64_of(&get(dict, intern!(py, "storage_size_bytes"))?)?,
+            storage_offset_bytes: u64_of(&get(dict, intern!(py, "storage_offset_bytes"))?)?,
+            tensor_offset: u64_of(&get(dict, intern!(py, "tensor_offset"))?)?,
+            tensor_stride: i64_vec(&get(dict, intern!(py, "tensor_stride"))?)?,
+            ref_counter_handle: bytes_of(&get(dict, intern!(py, "ref_counter_handle"))?)?,
+            ref_counter_offset: u64_of(&get(dict, intern!(py, "ref_counter_offset"))?)?,
+            event_handle: bytes_of(&get(dict, intern!(py, "event_handle"))?)?,
+            event_sync_required: bool_of(&get(dict, intern!(py, "event_sync_required"))?)?,
+            ready_event_handle: bytes_of(&get(dict, intern!(py, "ready_event_handle"))?)?,
+        },
+        _ => return None,
+    };
+    Some(TransferLocator {
+        transport,
+        nbytes: u64_of(&get(dict, intern!(py, "nbytes"))?)?,
+        dtype: string_of(&get(dict, intern!(py, "dtype"))?)?,
+        shape: u64_vec(&get(dict, intern!(py, "shape"))?)?,
+        device: string_of(&get(dict, intern!(py, "device"))?)?,
+    })
+}
+
+fn checkpoint_mapping_from_py(value: &Bound<'_, PyAny>) -> Option<Checkpoint> {
+    let py = value.py();
+    let dict = value.cast::<PyDict>().ok()?;
+    let point = get(dict, intern!(py, "point"))?;
+    let point = point.cast::<PyDict>().ok()?;
+    let point = match string_of(&get(point, intern!(py, "kind"))?)?.as_str() {
+        "fixed" => CheckpointPoint::Fixed(u32_of(&get(point, intern!(py, "value"))?)?),
+        "device_selected" => CheckpointPoint::DeviceSelected,
+        _ => return None,
+    };
+    Some(Checkpoint {
+        op_id: OpId(u64_of(&get(dict, intern!(py, "op_id"))?)?),
+        point,
     })
 }
 
 fn product_ref_from_py(value: &Bound<'_, PyAny>) -> Option<ProductRef> {
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
-    let kind = str_field(dict, intern!(py, "kind"))?;
-    let kind = match kind.to_str().ok()? {
-        "token" => ProductKind::Token,
-        "logprob" => ProductKind::Logprob,
-        "vision_feature" => ProductKind::VisionFeature,
-        "latent_feature" => ProductKind::LatentFeature,
-        "kv" => ProductKind::Kv,
-        "latent" => ProductKind::Latent,
-        "artifact" => ProductKind::Artifact,
-        "completion" => ProductKind::Completion,
-        "sampling_state" => ProductKind::SamplingState,
-        "selected_point" => ProductKind::SelectedPoint,
-        _ => return None,
-    };
+    let kind = product_kind_from_py(&get(dict, intern!(py, "kind"))?)?;
     let storage_class = str_field(dict, intern!(py, "storage_class"))?;
     let storage_class = match storage_class.to_str().ok()? {
         "device_tensor" => StorageClass::DeviceTensor,
@@ -1457,12 +1731,28 @@ fn product_ref_from_py(value: &Bound<'_, PyAny>) -> Option<ProductRef> {
     })
 }
 
+fn product_kind_from_py(value: &Bound<'_, PyAny>) -> Option<ProductKind> {
+    Some(match string_of(value)?.as_str() {
+        "token" => ProductKind::Token,
+        "logprob" => ProductKind::Logprob,
+        "vision_feature" => ProductKind::VisionFeature,
+        "latent_feature" => ProductKind::LatentFeature,
+        "kv" => ProductKind::Kv,
+        "latent" => ProductKind::Latent,
+        "artifact" => ProductKind::Artifact,
+        "completion" => ProductKind::Completion,
+        "sampling_state" => ProductKind::SamplingState,
+        "selected_point" => ProductKind::SelectedPoint,
+        _ => return None,
+    })
+}
+
 fn request_key_from_py(value: &Bound<'_, PyAny>) -> Option<RequestKey> {
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
     Some(RequestKey {
         authority_id: u64_of(&get(dict, intern!(py, "authority_id"))?)?,
-        session_id: uniserve_core::RequestId(u64_of(&get(dict, intern!(py, "session_id"))?)?),
+        request_id: uniserve_core::RequestId(u64_of(&get(dict, intern!(py, "request_id"))?)?),
         epoch: u64_of(&get(dict, intern!(py, "epoch"))?)?,
     })
 }
@@ -1562,6 +1852,31 @@ fn u32_vec(value: &Bound<'_, PyAny>) -> Option<Vec<u32>> {
     Some(values)
 }
 
+fn u64_vec(value: &Bound<'_, PyAny>) -> Option<Vec<u64>> {
+    let list = value.cast::<PyList>().ok()?;
+    let mut values = Vec::with_capacity(list.len());
+    for item in list.iter() {
+        values.push(u64_of(&item)?);
+    }
+    Some(values)
+}
+
+fn i64_vec(value: &Bound<'_, PyAny>) -> Option<Vec<i64>> {
+    let list = value.cast::<PyList>().ok()?;
+    let mut values = Vec::with_capacity(list.len());
+    for item in list.iter() {
+        if item.cast::<PyBool>().is_ok() {
+            return None;
+        }
+        values.push(item.extract().ok()?);
+    }
+    Some(values)
+}
+
+fn bytes_of(value: &Bound<'_, PyAny>) -> Option<Vec<u8>> {
+    Some(value.cast::<PyBytes>().ok()?.as_bytes().to_vec())
+}
+
 fn opt_u64(dict: &Bound<'_, PyDict>, key: &Bound<'_, PyString>) -> Option<Option<u64>> {
     match dict.get_item(key).ok()? {
         None => Some(None),
@@ -1605,7 +1920,7 @@ mod tests {
         let admission = NewRequest::new(
             request_key,
             1,
-            Some(UndAdmission {
+            Some(ArRequestParams {
                 sampling: SamplingParams {
                     temperature: 0.0,
                     ignore_eos: true,
@@ -1648,66 +1963,52 @@ mod tests {
         let operation = Operation {
             request_key,
             op_id: OpId(1),
-            parent: VersionRef::admission_root(request_key, OpId(0)),
-            work: ForwardMode::TokenExtend,
-            route: uniserve_worker_ipc::RouteId(0),
-            domain: Domain::Prefill,
-            advances_state: false,
-            bounds: Bounds {
-                max_points: 1,
-                max_tokens: 2,
-                max_kv_pages: 1,
-                ..Bounds::default()
-            },
-            inputs: vec![input.clone()],
-            outputs: vec![token],
-            predicate: None,
-            rng: None,
-            control_seq: 0,
+            parent: Checkpoint::admission_root(OpId(0)),
+            kind: RunKind::ArExtend,
+            payload: OpPayload::new(
+                RunKind::ArExtend,
+                Bounds {
+                    max_points: 1,
+                    max_tokens: 2,
+                    max_kv_pages: 1,
+                    ..Bounds::default()
+                },
+                vec![input.clone()],
+                vec![token],
+                None,
+                None,
+                0,
+            ),
         }
         .sealed();
-        let partition = BatchPartition {
-            partition_id: 1,
-            submission_group: 1,
-            collective_seq: 1,
-            domain: Domain::Prefill,
-            route: uniserve_worker_ipc::RouteId(0),
-            attention: AttentionRegime::Causal,
-            shape_class: 0,
-            operations: vec![operation],
-            block_tables: vec![BlockTable {
-                request_pool_idx: 1,
-                group_id: 0,
-                page_ids: vec![BlockId(1)],
-                allocated_tokens: 2,
-            }],
-            new_cache_pages: vec![CachePageAllocation {
-                request_pool_idx: 1,
-                group_id: 0,
-                page_ids: vec![BlockId(1)],
-            }],
-            forward_rows: vec![RowGeometry {
-                operation_index: 0,
-                request_pool_index: 1,
-                seq_len: 0,
-                query_len: 2,
-            }],
-            latent_placements: Vec::new(),
-            reconstruction_placements: Vec::new(),
-        };
+        let block_tables = vec![BlockTable {
+            request_pool_idx: 1,
+            group_id: 0,
+            page_ids: vec![BlockId(1)],
+            allocated_tokens: 2,
+        }];
+        let new_cache_pages = vec![CachePageAllocation {
+            request_pool_idx: 1,
+            group_id: 0,
+            page_ids: vec![BlockId(1)],
+        }];
+        let forward_rows = vec![RowGeometry {
+            operation_index: 0,
+            request_pool_index: 1,
+            seq_len: 0,
+            query_len: 2,
+        }];
         let media_key = RequestKey::new(1, RequestId(3), 1);
         let media_prompt_token_ids = vec![17, 23, 65_537];
         let media_admission = NewRequest::new_media(
             media_key,
             2,
-            MediaAdmission {
+            DiffusionRequestParams {
                 prompt_token_ids: media_prompt_token_ids,
                 seed: 29,
-                profile: MediaProfileId::MinimaxH3T2va,
                 geometry: MediaGeometry {
                     frame_count: 22,
-                    video_reconstruction_units: 1,
-                    audio_latent_frames: 37,
+                    decode_units: 3,
                     prompt_tokens: 3,
                     denoise_steps: 4,
                 },
@@ -1717,73 +2018,64 @@ mod tests {
         let media_operation = Operation {
             request_key: media_key,
             op_id: OpId(2),
-            parent: VersionRef::admission_root(media_key, OpId(0)),
-            work: ForwardMode::MediaPrepare,
-            route: uniserve_worker_ipc::RouteId(0),
-            domain: Domain::Flow,
-            advances_state: false,
-            bounds: Bounds {
-                max_points: 1,
-                ..Bounds::default()
-            },
-            inputs: Vec::new(),
-            outputs: Vec::new(),
-            predicate: None,
-            rng: None,
-            control_seq: 0,
+            parent: Checkpoint::admission_root(OpId(0)),
+            kind: RunKind::DiffusionPrepare,
+            payload: OpPayload::new(
+                RunKind::DiffusionPrepare,
+                Bounds {
+                    max_points: 1,
+                    ..Bounds::default()
+                },
+                Vec::new(),
+                Vec::new(),
+                None,
+                None,
+                0,
+            ),
         }
         .sealed();
-        let media_partition = BatchPartition {
-            partition_id: 2,
-            submission_group: 2,
-            collective_seq: 2,
-            domain: Domain::Flow,
-            route: uniserve_worker_ipc::RouteId(0),
-            attention: AttentionRegime::None,
-            shape_class: 0,
-            operations: vec![media_operation],
-            block_tables: Vec::new(),
-            new_cache_pages: Vec::new(),
-            forward_rows: Vec::new(),
-            latent_placements: vec![LatentPlacement {
-                request_key: media_key,
-                op_id: OpId(2),
-                page_table: vec![1],
-                latent_units: 64,
-                height: 768,
-                width: 1344,
-                start_step: 0,
-                step_count: 0,
-            }],
-            reconstruction_placements: Vec::new(),
-        };
-        let mut request = WorkerRequest::execute(
-            Batch::new(
-                11,
-                vec![admission, media_admission],
-                vec![partition, media_partition],
-            )
-            .with_input_products(vec![ProductPayload {
-                product: input,
-                bytes: uniserve_worker_ipc::encode_token_product_bytes(&[7, 8]),
-            }]),
+        let latent_placements = vec![LatentPlacement {
+            request_key: media_key,
+            op_id: OpId(2),
+            page_table: vec![1],
+            latent_units: 64,
+            height: 768,
+            width: 1344,
+            start_step: 0,
+            step_count: 0,
+        }];
+        let mut run = Run::new(
+            11,
+            vec![admission, media_admission],
+            vec![operation, media_operation],
         );
+        run.block_tables = block_tables;
+        run.new_cache_pages = new_cache_pages;
+        run.forward_rows = forward_rows;
+        run.latent_placements = latent_placements;
+        let mut request = WorkerRequest::submit(run.with_input_products(vec![ProductPayload {
+            product: input,
+            value: InlineValue::Bytes(uniserve_worker_ipc::encode_token_product_bytes(&[7, 8])),
+        }]));
         request.set_call_id(Some(9));
         request
     }
 
     fn result_response() -> WorkerResponse {
         let request_key = RequestKey::new(1, RequestId(2), 1);
-        let mut response = WorkerResponse::completion_report(CompletionReport {
-            step_id: 11,
-            partitions: vec![PartitionCompletion {
-                partition_id: 1,
-                completions: vec![ModelOutput {
-                    request_key,
-                    op_id: OpId(1),
-                    completion_slot_generation: 1,
-                    status: OpStatus::Ok,
-                    selected_point: 1,
+        let mut response = WorkerResponse::result(RunResult {
+            batch_id: 11,
+            run_id: 11,
+            completions: vec![ModelOutput {
+                request_key,
+                op_id: OpId(1),
+                completion_slot_generation: 1,
+                status: OpStatus::Ok,
+                selected_point: 1,
+                product_generations: vec![5],
+                error_code: None,
+                timing_counters: TimingCounters::default(),
+                payload: ResultPayload::Ar(ResultData {
                     logical_lengths: LogicalLengths {
                         token_len: 2,
                         kv_visible_len: 2,
@@ -1793,16 +2085,14 @@ mod tests {
                     token_span: TokenSpan { base: 0, len: 1 },
                     committed_tokens: vec![42],
                     finish_flags: FinishFlags::default(),
-                    product_generations: vec![5],
-                    error_code: None,
-                    timing_counters: TimingCounters::default(),
                     media_output: None,
-                }],
-                products: Vec::new(),
-                registration: RegistrationAck { visible: true },
-                worker_exec_us: Some(12),
-                forward_stats: None,
+                }),
             }],
+            products: Vec::new(),
+            registration: RegistrationAck { visible: true },
+            worker_exec_us: Some(12),
+            forward_stats: None,
+            done: true,
         });
         response.set_call_id(Some(9));
         response
@@ -1824,7 +2114,7 @@ mod tests {
 
         Python::attach(|py| {
             let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../..")
+                .join("../..")
                 .canonicalize()
                 .unwrap();
             py.import("sys")
@@ -1835,21 +2125,22 @@ mod tests {
                 .unwrap();
             let native_request = server.recv(py).unwrap();
             let request_dict = native_request.bind(py).cast::<PyDict>().unwrap();
-            let native_batch = request_dict.get_item("batch").unwrap().unwrap();
+            let native_run = request_dict.get_item("run").unwrap().unwrap();
             assert_eq!(
-                native_batch
-                    .getattr("step_id")
+                native_run
+                    .getattr("run_id")
                     .unwrap()
                     .extract::<u64>()
                     .unwrap(),
                 11
             );
-            assert_eq!(
-                native_batch.getattr("operations").unwrap().len().unwrap(),
-                2
-            );
-            let admissions = native_batch.getattr("admissions").unwrap();
-            let media = admissions.get_item(1).unwrap().getattr("media").unwrap();
+            assert_eq!(native_run.getattr("operations").unwrap().len().unwrap(), 2);
+            let admissions = native_run.getattr("admissions").unwrap();
+            let media = admissions
+                .get_item(1)
+                .unwrap()
+                .getattr("diffusion")
+                .unwrap();
             assert_eq!(
                 media
                     .getattr("prompt_token_ids")
@@ -1863,15 +2154,15 @@ mod tests {
             let round_tripped = py
                 .import("uniserve_worker.execution.batch")
                 .unwrap()
-                .getattr("Batch")
+                .getattr("Run")
                 .unwrap()
                 .call_method1(
                     "from_mapping",
-                    (native_batch.call_method0("to_mapping").unwrap(),),
+                    (native_run.call_method0("to_mapping").unwrap(),),
                 )
                 .unwrap();
             assert!(
-                round_tripped.eq(&native_batch).unwrap(),
+                round_tripped.eq(&native_run).unwrap(),
                 "native batch construction diverged from the canonical codec"
             );
 

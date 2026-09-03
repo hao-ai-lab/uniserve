@@ -6,17 +6,14 @@ use uniserve_core::{
     ImageKvEffect, RequestId, SamplingParams, SegmentPlacement, UndTokenAction,
 };
 use uniserve_worker_ipc::{
-    Bounds, DType, DimBound, Domain, DrawLayout, ForwardMode, ModelOutput, OpId, OpStatus,
-    Operation, Point, PointRange, ProductKind, ProductPayload, ProductRef, RequestKey,
-    ResourceClass, Rng, RouteId, SamplingState, ShapeBound, StorageClass, VersionRef,
-    encode_sampling_state_bytes, encode_token_product_bytes,
+    Bounds, Checkpoint, CheckpointPoint, DType, DimBound, DrawLayout, InlineValue, ModelOutput,
+    OpId, OpPayload, OpStatus, Operation, PointRange, ProductKind, ProductPayload, ProductRef,
+    RequestKey, Rng, RunKind, SamplingState, ShapeBound, StorageClass, encode_sampling_state_bytes,
+    encode_token_product_bytes,
 };
 
-use crate::scheduler::image_artifact::png_artifact_dims_b64;
-
-/// The scheduler's single route identity; worker selection collapses to one
-/// route in this control plane.
-const ROUTE: RouteId = RouteId(0);
+use crate::memory::Allocation;
+use crate::runtime::image_artifact::png_artifact_dims_b64;
 
 /// A product reference minted by the planner for an operation output. The
 /// owning `request_key` and `producer_op_id` are placeholder until
@@ -289,25 +286,25 @@ fn operation_sampling_delta(
     (delta != SamplingState::default()).then_some(delta)
 }
 
-/// Scheduler-private flattened context derived once at admission from ordered
+/// Runtime-private flattened context derived once at admission from ordered
 /// canonical context segments.
 #[derive(Debug, Clone)]
-pub(crate) struct SchedulerContext {
+pub(crate) struct RuntimeContext {
     pub(crate) prompt_ids: Vec<u32>,
     pub(crate) negative_prompt_ids: Vec<u32>,
-    pub(crate) images: Vec<SchedulerImage>,
-    token_segments: Vec<SchedulerTokenSegment>,
+    pub(crate) images: Vec<RuntimeImage>,
+    token_segments: Vec<RuntimeTokenSegment>,
 }
 
 #[derive(Debug, Clone)]
-struct SchedulerTokenSegment {
+struct RuntimeTokenSegment {
     segment_index: usize,
     start: usize,
     end: usize,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct SchedulerImage {
+pub(crate) struct RuntimeImage {
     pub(crate) segment_index: usize,
     pub(crate) hash: u64,
     pub(crate) position: u32,
@@ -315,7 +312,7 @@ pub(crate) struct SchedulerImage {
     pub(crate) ingest: ImageIngestRecipe,
 }
 
-impl SchedulerContext {
+impl RuntimeContext {
     pub(crate) fn lower(request: &GenerationRequest) -> Result<Self, ContextLoweringError> {
         request
             .validate()
@@ -328,7 +325,7 @@ impl SchedulerContext {
                 ContextSegment::UndTokens { token_ids, .. } => {
                     let start = prompt_ids.len();
                     prompt_ids.extend_from_slice(token_ids);
-                    token_segments.push(SchedulerTokenSegment {
+                    token_segments.push(RuntimeTokenSegment {
                         segment_index,
                         start,
                         end: prompt_ids.len(),
@@ -345,7 +342,7 @@ impl SchedulerContext {
                             token_count: prompt_ids.len(),
                         });
                     }
-                    images.push(SchedulerImage {
+                    images.push(RuntimeImage {
                         segment_index,
                         hash: image.hash,
                         position,
@@ -406,7 +403,7 @@ pub(crate) enum GenerationPhase {
     FeedbackState,
 }
 
-/// Scheduler-owned cursor for one running request. Each mutable concern has a
+/// Runtime-owned cursor for one running request. Each mutable concern has a
 /// single typed owner; transition application is the only operation that
 /// commits worker-derived lifecycle progress.
 #[derive(Debug, Clone, PartialEq)]
@@ -485,7 +482,7 @@ impl GenerationCursor {
     pub(crate) fn apply(
         &mut self,
         operation: &Operation,
-        apply: &SchedulerApply,
+        apply: &RuntimeApply,
         outcome: Option<(&ModelOutput, &[ProductPayload])>,
     ) -> Result<(), CursorApplyError> {
         if let Some((record, _)) = outcome {
@@ -531,7 +528,7 @@ impl GenerationCursor {
             } => {
                 self.und.physical_kv_len = outcome.map_or_else(
                     || projected_kv_len(*physical_start, *physical_kv_tokens),
-                    |(record, _)| Ok(record.logical_lengths.kv_visible_len),
+                    |(record, _)| Ok(record.logical_lengths().kv_visible_len),
                 )?;
                 if *is_final_step {
                     self.und.logical_pos = self
@@ -554,7 +551,11 @@ impl GenerationCursor {
                 ..
             } => {
                 let actual_count = outcome.map_or(1, |(record, _)| {
-                    record.committed_tokens.len().max(1).min(u32::MAX as usize) as u32
+                    record
+                        .committed_tokens()
+                        .len()
+                        .max(1)
+                        .min(u32::MAX as usize) as u32
                 });
                 self.und.logical_pos = self
                     .und
@@ -573,7 +574,7 @@ impl GenerationCursor {
             } => {
                 self.und.physical_kv_len = outcome.map_or_else(
                     || Ok(physical_position.saturating_add(1)),
-                    |(record, _)| Ok(record.logical_lengths.kv_visible_len),
+                    |(record, _)| Ok(record.logical_lengths().kv_visible_len),
                 )?;
                 self.image_gen.image_id = *image_id;
                 self.image_gen.cond_pos = *logical_position;
@@ -592,7 +593,7 @@ impl GenerationCursor {
                     })
                     .or_else(|| {
                         operation
-                            .outputs
+                            .outputs()
                             .iter()
                             .find(|product| product.kind == ProductKind::Kv)
                             .cloned()
@@ -604,7 +605,7 @@ impl GenerationCursor {
             }
             TransitionIntent::PrepareGen { .. } => {
                 self.image_gen.latent = operation
-                    .outputs
+                    .outputs()
                     .iter()
                     .find(|product| product.kind == ProductKind::Latent)
                     .cloned();
@@ -619,16 +620,16 @@ impl GenerationCursor {
                 step_count,
                 ..
             } => {
-                let steps_completed = outcome
-                    .map_or(start_step.saturating_add(*step_count), |(record, _)| {
-                        record.logical_lengths.latent_len.min(u32::from(u16::MAX)) as u16
+                let steps_completed =
+                    outcome.map_or(start_step.saturating_add(*step_count), |(record, _)| {
+                        record.logical_lengths().latent_len.min(u32::from(u16::MAX)) as u16
                     });
                 self.image_gen.steps_done = self
                     .image_gen
                     .steps_done
                     .max(steps_completed.max(start_step.saturating_add(*step_count)));
                 self.image_gen.latent = operation
-                    .outputs
+                    .outputs()
                     .iter()
                     .find(|product| product.kind == ProductKind::Latent)
                     .cloned();
@@ -639,7 +640,7 @@ impl GenerationCursor {
             TransitionIntent::CommitGen { image_id, .. } => {
                 self.image_gen.image_id = *image_id;
                 self.feedback.source_product = operation
-                    .outputs
+                    .outputs()
                     .iter()
                     .find(|output| {
                         output.kind == ProductKind::Artifact
@@ -658,7 +659,7 @@ impl GenerationCursor {
                 self.image_gen.image_id = *image_id;
                 self.feedback.ingest_step = *step_index;
                 self.feedback.encoded_product = operation
-                    .outputs
+                    .outputs()
                     .iter()
                     .find(|output| {
                         matches!(
@@ -680,7 +681,7 @@ impl GenerationCursor {
             } => {
                 self.und.physical_kv_len = outcome.map_or_else(
                     || projected_kv_len(*physical_start, *physical_kv_tokens),
-                    |(record, _)| Ok(record.logical_lengths.kv_visible_len),
+                    |(record, _)| Ok(record.logical_lengths().kv_visible_len),
                 )?;
                 if *is_final_step {
                     self.und.logical_pos = self
@@ -711,7 +712,7 @@ impl GenerationCursor {
 
     pub(crate) fn project<'a>(
         &self,
-        inflight: impl IntoIterator<Item = (&'a Operation, &'a SchedulerApply)>,
+        inflight: impl IntoIterator<Item = (&'a Operation, &'a RuntimeApply)>,
     ) -> Option<Self> {
         let mut projection = self.clone();
         for (operation, apply) in inflight {
@@ -932,7 +933,6 @@ pub(crate) enum TransitionIntent {
 /// operation's declared output indices so the worker keys it distinctly.
 const HOST_INPUT_OUTPUT_INDEX: u16 = u16::MAX;
 const SAMPLING_INPUT_OUTPUT_INDEX: u16 = u16::MAX - 1;
-const KV_PUBLICATION_DESCRIPTOR_BYTES: u64 = 1 << 20;
 
 /// The immutable auxiliary feature product an encode operation produces.
 fn encode_outputs(
@@ -981,6 +981,7 @@ fn latent_output(
 /// Side-effect-free lowering from one scheduler decision to its next operation.
 pub(crate) fn plan(
     latent_dtype: Option<DType>,
+    kv_bytes_per_token: u64,
     request: &GenerationRequest,
     cursor: &GenerationCursor,
     mut intent: TransitionIntent,
@@ -1008,25 +1009,29 @@ pub(crate) fn plan(
         | intent @ TransitionIntent::IngestImageState { .. }
         | intent @ TransitionIntent::CloseKv { .. }
         | intent @ TransitionIntent::FeedbackState { .. } => {
-            plan_token_extend(request, cursor, intent)
+            plan_ar_extend(request, cursor, intent)
         }
-        intent @ TransitionIntent::DecodeUnd { .. } => plan_token_decode(request, cursor, intent),
+        intent @ TransitionIntent::DecodeUnd { .. } => plan_ar_decode(request, cursor, intent),
         intent @ TransitionIntent::EncodeImageStep { .. }
         | intent @ TransitionIntent::EncodeFeedbackStep { .. } => {
             plan_encode(request, cursor, intent)
         }
-        intent @ TransitionIntent::PublishKv { .. } => plan_kv_publish(request, cursor, intent),
+        intent @ TransitionIntent::PublishKv { .. } => {
+            plan_kv_publish(kv_bytes_per_token, request, cursor, intent)
+        }
         intent @ TransitionIntent::PrepareGen { .. } => {
-            plan_media_prepare(latent_dtype, request, cursor, intent)
+            plan_diffusion_prepare(latent_dtype, request, cursor, intent)
         }
         intent @ TransitionIntent::DenoiseGen { .. } => {
-            plan_media_denoise(latent_dtype, request, cursor, intent)
+            plan_diffusion_step(latent_dtype, request, cursor, intent)
         }
-        intent @ TransitionIntent::CommitGen { .. } => plan_materialize(request, cursor, intent),
+        intent @ TransitionIntent::CommitGen { .. } => {
+            plan_diffusion_finalize(request, cursor, intent)
+        }
     }
 }
 
-fn plan_token_extend(
+fn plan_ar_extend(
     request: &GenerationRequest,
     cursor: &GenerationCursor,
     intent: TransitionIntent,
@@ -1067,7 +1072,7 @@ fn plan_token_extend(
                 request,
                 cursor,
                 intent,
-                ForwardMode::TokenExtend,
+                RunKind::ArExtend,
                 Vec::new(),
                 outputs,
             )
@@ -1086,7 +1091,7 @@ fn plan_token_extend(
                 request,
                 cursor,
                 intent,
-                ForwardMode::TokenExtend,
+                RunKind::ArExtend,
                 inputs,
                 Vec::new(),
             )
@@ -1095,7 +1100,7 @@ fn plan_token_extend(
             request,
             cursor,
             intent,
-            ForwardMode::TokenExtend,
+            RunKind::ArExtend,
             Vec::new(),
             vec![output_product(
                 0,
@@ -1129,20 +1134,13 @@ fn plan_token_extend(
                 *sample_continuation && !sampling_state.transition_token_ids.is_empty(),
             )?;
             let inputs = vec![feature.clone()];
-            finish_plan(
-                request,
-                cursor,
-                intent,
-                ForwardMode::TokenExtend,
-                inputs,
-                outputs,
-            )
+            finish_plan(request, cursor, intent, RunKind::ArExtend, inputs, outputs)
         }
         _ => unreachable!("token-extend planner received another forward mode"),
     }
 }
 
-fn plan_token_decode(
+fn plan_ar_decode(
     request: &GenerationRequest,
     cursor: &GenerationCursor,
     intent: TransitionIntent,
@@ -1164,9 +1162,9 @@ fn plan_token_decode(
     }
     let draft_count = spec_token_ids.as_ref().map_or(0, Vec::len);
     let work = if draft_count == 0 {
-        ForwardMode::TokenDecode
+        RunKind::ArDecode
     } else {
-        ForwardMode::TokenVerify
+        RunKind::ArVerify
     };
     let max_points = 1_usize.saturating_add(draft_count).min(u32::MAX as usize) as u32;
     let outputs = token_outputs(
@@ -1203,8 +1201,8 @@ fn plan_encode(
         _ => unreachable!("encode planner received another forward mode"),
     };
     let work = match step {
-        ImageIngestStep::VaeEncode => ForwardMode::EncodeLatent,
-        ImageIngestStep::VitEncode => ForwardMode::EncodeVision,
+        ImageIngestStep::VaeEncode => RunKind::EncoderLatent,
+        ImageIngestStep::VitEncode => RunKind::EncoderVision,
     };
     let mut outputs = encode_outputs(step, 0, &request.resources)?;
     if adds_completion {
@@ -1219,22 +1217,45 @@ fn plan_encode(
 }
 
 fn plan_kv_publish(
+    kv_bytes_per_token: u64,
     request: &GenerationRequest,
     cursor: &GenerationCursor,
     intent: TransitionIntent,
 ) -> Result<NextOp, PlanningError> {
+    let TransitionIntent::PublishKv {
+        image_id,
+        physical_kv_len,
+    } = intent
+    else {
+        unreachable!("KV publication planner received another transition")
+    };
+    let bytes_per_token =
+        u32::try_from(kv_bytes_per_token).map_err(|_| PlanningError::ProductBoundTooLarge {
+            bytes: kv_bytes_per_token,
+        })?;
+    if physical_kv_len == 0 || bytes_per_token == 0 {
+        return Err(PlanningError::MissingProductBound);
+    }
     let kv = bounded_product(
         0,
         ProductKind::Kv,
         StorageClass::PagedKv,
         DType::U8,
-        dynamic_element_bound(KV_PUBLICATION_DESCRIPTOR_BYTES, DType::U8)?,
+        ShapeBound {
+            dims: vec![
+                DimBound::Static(physical_kv_len),
+                DimBound::Static(bytes_per_token),
+            ],
+        },
     );
     finish_plan(
         request,
         cursor,
-        intent,
-        ForwardMode::TransferKvPublish,
+        TransitionIntent::PublishKv {
+            image_id,
+            physical_kv_len,
+        },
+        RunKind::TransferKvPublish,
         Vec::new(),
         vec![
             kv,
@@ -1248,7 +1269,7 @@ fn plan_kv_publish(
     )
 }
 
-fn plan_media_prepare(
+fn plan_diffusion_prepare(
     latent_dtype: Option<DType>,
     request: &GenerationRequest,
     cursor: &GenerationCursor,
@@ -1265,7 +1286,7 @@ fn plan_media_prepare(
         request,
         cursor,
         intent,
-        ForwardMode::MediaPrepare,
+        RunKind::DiffusionPrepare,
         inputs,
         vec![
             latent_output(
@@ -1283,7 +1304,7 @@ fn plan_media_prepare(
     )
 }
 
-fn plan_media_denoise(
+fn plan_diffusion_step(
     latent_dtype: Option<DType>,
     request: &GenerationRequest,
     cursor: &GenerationCursor,
@@ -1305,7 +1326,7 @@ fn plan_media_denoise(
         request,
         cursor,
         intent,
-        ForwardMode::MediaDenoise,
+        RunKind::DiffusionStep,
         inputs,
         vec![
             latent_output(
@@ -1323,7 +1344,7 @@ fn plan_media_denoise(
     )
 }
 
-fn plan_materialize(
+fn plan_diffusion_finalize(
     request: &GenerationRequest,
     cursor: &GenerationCursor,
     intent: TransitionIntent,
@@ -1332,7 +1353,7 @@ fn plan_materialize(
         return Err(PlanningError::GenerationBranchDisabled);
     }
     let TransitionIntent::CommitGen { latent, .. } = &intent else {
-        unreachable!("materialize planner received another forward mode")
+        unreachable!("diffusion_finalize planner received another forward mode")
     };
     let inputs = vec![latent.clone()];
     let feedback = request
@@ -1340,7 +1361,7 @@ fn plan_materialize(
         .generated_image_feedback
         .then_some(request.policy.feedback.as_ref())
         .flatten();
-    let mut outputs = materialize_outputs(request, feedback)?;
+    let mut outputs = diffusion_finalize_outputs(request, feedback)?;
     outputs.push(output_product(
         2,
         ProductKind::Completion,
@@ -1351,7 +1372,7 @@ fn plan_materialize(
         request,
         cursor,
         intent,
-        ForwardMode::Materialize,
+        RunKind::DiffusionFinalize,
         inputs,
         outputs,
     )
@@ -1361,16 +1382,16 @@ fn finish_plan(
     request: &GenerationRequest,
     cursor: &GenerationCursor,
     intent: TransitionIntent,
-    work: ForwardMode,
+    kind: RunKind,
     inputs: Vec<ProductRef>,
     outputs: Vec<ProductRef>,
 ) -> Result<NextOp, PlanningError> {
-    let operation_variant = work;
+    let operation_variant = kind;
     let produces_latent = matches!(
         operation_variant,
-        ForwardMode::MediaPrepare | ForwardMode::MediaDenoise
+        RunKind::DiffusionPrepare | RunKind::DiffusionStep
     );
-    let is_materialize = operation_variant == ForwardMode::Materialize;
+    let is_diffusion_finalize = operation_variant == RunKind::DiffusionFinalize;
     let produces_token = outputs
         .iter()
         .any(|output| output.kind == ProductKind::Token);
@@ -1525,11 +1546,7 @@ fn finish_plan(
         cfg_branches,
         encoder_pins,
         replayability_after_apply,
-        release_on_apply: if is_materialize {
-            vec![ResourceClass::ImageLatent]
-        } else {
-            Vec::new()
-        },
+        free_latent_on_apply: is_diffusion_finalize,
     };
     let validation = TransitionValidation {
         expected_denoise_step: match &intent {
@@ -1542,12 +1559,13 @@ fn finish_plan(
         },
         expects_encoder_handle: matches!(
             operation_variant,
-            ForwardMode::EncodeLatent | ForwardMode::EncodeVision
+            RunKind::EncoderLatent | RunKind::EncoderVision
         ),
         expects_latent_generation: produces_latent,
-        expects_image_artifact: is_materialize,
-        expected_image_hw: is_materialize.then_some((request.image.height, request.image.width)),
-        requires_kv_publication: operation_variant == ForwardMode::TransferKvPublish,
+        expects_image_artifact: is_diffusion_finalize,
+        expected_image_hw: is_diffusion_finalize
+            .then_some((request.image.height, request.image.width)),
+        requires_kv_publication: operation_variant == RunKind::TransferKvPublish,
         expected_image_kv: match &intent {
             TransitionIntent::IngestImageState {
                 physical_start,
@@ -1588,12 +1606,12 @@ fn finish_plan(
             && request.sampling.generated_logprobs_requested()
             && matches!(
                 operation_variant,
-                ForwardMode::TokenExtend | ForwardMode::TokenDecode | ForwardMode::TokenVerify
+                RunKind::ArExtend | RunKind::ArDecode | RunKind::ArVerify
             ),
         expected_prompt_token_ids,
     };
     let bounds = Bounds {
-        max_points: if operation_variant == ForwardMode::TokenVerify {
+        max_points: if operation_variant == RunKind::ArVerify {
             token_cost.min(u32::MAX as usize) as u32
         } else {
             1
@@ -1618,9 +1636,7 @@ fn finish_plan(
         _ => None,
     };
     Ok(NextOp {
-        work,
-        route: ROUTE,
-        domain: work.domain(),
+        kind,
         bounds,
         inputs,
         outputs,
@@ -1636,6 +1652,7 @@ fn finish_plan(
         input_tokens,
         input_image_bytes,
         sampling_state,
+        buffer_allocations: Vec::new(),
         intent,
         resources,
         validation,
@@ -1651,7 +1668,7 @@ fn finish_plan(
 /// Public PNG bytes and a device-resident feedback source are independent
 /// products. The latter is present only for the device-product feedback route;
 /// it is consumed by a later non-state encode operation.
-fn materialize_outputs(
+fn diffusion_finalize_outputs(
     request: &GenerationRequest,
     feedback: Option<&uniserve_core::GeneratedImageFeedbackRecipe>,
 ) -> Result<Vec<ProductRef>, PlanningError> {
@@ -1802,16 +1819,14 @@ pub(crate) enum PlanningError {
 /// Ephemeral scheduler builder consumed when an operation is registered.
 #[derive(Debug)]
 pub(crate) struct NextOp {
-    pub(crate) work: ForwardMode,
-    pub(crate) route: RouteId,
-    pub(crate) domain: Domain,
+    pub(crate) kind: RunKind,
     pub(crate) bounds: Bounds,
     pub(crate) inputs: Vec<ProductRef>,
     pub(crate) outputs: Vec<ProductRef>,
     pub(crate) predicate: Option<ProductRef>,
     pub(crate) rng: Option<Rng>,
     pub(crate) control_seq: u64,
-    pub(crate) operation_variant: ForwardMode,
+    pub(crate) operation_variant: RunKind,
     pub(crate) request_id: RequestId,
     /// Monotonic microsecond stamps for the two pre-registration lifecycle
     /// phases. They are carried here because an operation gains its canonical
@@ -1827,22 +1842,24 @@ pub(crate) struct NextOp {
     pub(crate) input_image_bytes: Option<Vec<u8>>,
     /// Branch-local processor state consumed by this operation's sampler.
     pub(crate) sampling_state: Option<SamplingState>,
+    /// Memory-owned persistent output spans reserved before registration.
+    pub(crate) buffer_allocations: Vec<Allocation>,
     pub(crate) intent: TransitionIntent,
     pub(crate) resources: TransitionResources,
     pub(crate) validation: TransitionValidation,
     pub(crate) visibility: OutputVisibilityPlan,
 }
 
-/// Scheduler-owned completion policy and validation state paired with an
+/// Runtime-owned completion policy and validation state paired with an
 /// immutable registered operation.
 #[derive(Debug)]
-pub(crate) struct SchedulerApply {
+pub(crate) struct RuntimeApply {
     pub(crate) intent: TransitionIntent,
     pub(crate) validation: TransitionValidation,
     pub(crate) visibility: OutputVisibilityPlan,
     pub(crate) replayability_after_apply: Replayability,
     pub(crate) new_blocks: usize,
-    pub(crate) release_on_apply: Vec<ResourceClass>,
+    pub(crate) free_latent_on_apply: bool,
     pub(crate) output_event_bound: usize,
 }
 
@@ -1853,10 +1870,10 @@ impl NextOp {
         self,
         request_key: RequestKey,
         op_id: OpId,
-        parent: VersionRef,
+        parent: Checkpoint,
         next_product_generation: &mut u64,
         output_event_bound: usize,
-    ) -> Result<(Operation, SchedulerApply, Vec<ProductPayload>), PlanningError> {
+    ) -> Result<(Operation, RuntimeApply, Vec<ProductPayload>), PlanningError> {
         let required_generations = self
             .outputs
             .iter()
@@ -1944,16 +1961,16 @@ impl NextOp {
             request_key,
             op_id,
             parent,
-            work: self.work,
-            route: self.route,
-            domain: self.domain,
-            advances_state: false,
-            bounds: self.bounds,
-            inputs,
-            outputs,
-            predicate: self.predicate,
-            rng: self.rng,
-            control_seq: self.control_seq,
+            kind: self.kind,
+            payload: OpPayload::new(
+                self.kind,
+                self.bounds,
+                inputs,
+                outputs,
+                self.predicate,
+                self.rng,
+                self.control_seq,
+            ),
         }
         .sealed();
         let mut input_products = Vec::with_capacity(2);
@@ -1963,25 +1980,31 @@ impl NextOp {
             } else {
                 self.input_image_bytes.unwrap_or_default()
             };
-            input_products.push(ProductPayload { product, bytes });
+            input_products.push(ProductPayload {
+                product,
+                value: InlineValue::Bytes(bytes),
+            });
         }
         if let (Some(product), Some(bytes)) = (sampling_input, sampling_bytes) {
-            input_products.push(ProductPayload { product, bytes });
+            input_products.push(ProductPayload {
+                product,
+                value: InlineValue::Bytes(bytes),
+            });
         }
-        let apply = SchedulerApply {
+        let apply = RuntimeApply {
             intent: self.intent,
             validation: self.validation,
             visibility: self.visibility,
             replayability_after_apply: self.resources.replayability_after_apply,
             new_blocks: self.resources.new_blocks,
-            release_on_apply: self.resources.release_on_apply,
+            free_latent_on_apply: self.resources.free_latent_on_apply,
             output_event_bound,
         };
         Ok((operation, apply, input_products))
     }
 }
 
-impl SchedulerApply {
+impl RuntimeApply {
     pub(crate) fn validate_result(
         &self,
         operation: &Operation,
@@ -1991,7 +2014,7 @@ impl SchedulerApply {
     ) -> Result<(), TransitionValidationError> {
         if record.request_key != operation.request_key {
             return Err(TransitionValidationError::Identity {
-                detail: "session_mismatch",
+                detail: "request_mismatch",
             });
         }
         if operation.op_id.0 == 0 || record.op_id != operation.op_id {
@@ -2001,13 +2024,14 @@ impl SchedulerApply {
         }
         if record.status == OpStatus::Predicated {
             let declared_parent_point = match operation.parent.point {
-                Point::Fixed { point_index, .. } | Point::Device { point_index, .. } => point_index,
+                CheckpointPoint::Fixed(point) => point,
+                CheckpointPoint::DeviceSelected => predicated_parent_point.unwrap_or(0),
             };
             let expected_point = predicated_parent_point.unwrap_or(declared_parent_point);
-            if operation.predicate.is_none()
+            if operation.predicate().is_none()
                 || record.selected_point != expected_point
-                || record.token_span.len != 0
-                || !record.committed_tokens.is_empty()
+                || record.token_span().len != 0
+                || !record.committed_tokens().is_empty()
                 || !record.product_generations.is_empty()
                 || products
                     .iter()
@@ -2019,8 +2043,8 @@ impl SchedulerApply {
             }
             return Ok(());
         }
-        let point_valid = if operation.advances_state {
-            (1..=operation.bounds.max_points.max(1)).contains(&record.selected_point)
+        let point_valid = if operation.advances_state() {
+            (1..=operation.bounds().max_points.max(1)).contains(&record.selected_point)
         } else {
             record.selected_point == 0
         };
@@ -2029,7 +2053,7 @@ impl SchedulerApply {
                 detail: "selected_point_mismatch",
             });
         }
-        self.validation.validate(operation.work, record, products)
+        self.validation.validate(operation.kind, record, products)
     }
 }
 
@@ -2049,7 +2073,7 @@ pub(crate) struct TransitionResources {
     pub(crate) cfg_branches: usize,
     pub(crate) encoder_pins: Vec<u64>,
     pub(crate) replayability_after_apply: Replayability,
-    pub(crate) release_on_apply: Vec<ResourceClass>,
+    pub(crate) free_latent_on_apply: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -2094,7 +2118,7 @@ pub(crate) struct TextTokenCountRange {
 impl TransitionValidation {
     fn validate(
         &self,
-        operation_variant: ForwardMode,
+        operation_variant: RunKind,
         record: &ModelOutput,
         products: &[ProductPayload],
     ) -> Result<(), TransitionValidationError> {
@@ -2104,7 +2128,7 @@ impl TransitionValidation {
             });
         }
         if let Some(expected_step) = self.expected_denoise_step {
-            let steps_done = record.logical_lengths.latent_len.min(u32::from(u16::MAX)) as u16;
+            let steps_done = record.logical_lengths().latent_len.min(u32::from(u16::MAX)) as u16;
             if steps_done != expected_step {
                 return Err(TransitionValidationError::Progress {
                     detail: "denoise_step_mismatch",
@@ -2136,7 +2160,8 @@ impl TransitionValidation {
         // here costs hundreds of milliseconds per generated image on the
         // response path; end-to-end decodability is enforced by the consumer.
         let image_png = find_product(products, record.op_id, ProductKind::Artifact)
-            .and_then(|payload| std::str::from_utf8(&payload.bytes).ok());
+            .and_then(|payload| payload.value.bytes())
+            .and_then(|bytes| std::str::from_utf8(bytes).ok());
         if let Some(expected) = self.expected_image_hw {
             let actual = image_png.and_then(png_artifact_dims_b64).ok_or(
                 TransitionValidationError::Product {
@@ -2176,7 +2201,7 @@ impl TransitionValidation {
         if let Some(expected) = self.expected_image_kv
             && !self.requires_kv_publication
         {
-            let actual = record.logical_lengths.kv_visible_len;
+            let actual = record.logical_lengths().kv_visible_len;
             match expected.effect {
                 ImageKvEffect::Exact { tokens }
                     if actual != expected.base.saturating_add(tokens) =>
@@ -2198,7 +2223,7 @@ impl TransitionValidation {
                 | ImageKvEffect::Bounded { .. } => {}
             }
         }
-        let sampled_tokens = record.committed_tokens.as_slice();
+        let sampled_tokens = record.committed_tokens();
         if !self.allows_sampled_tokens && !sampled_tokens.is_empty() {
             return Err(TransitionValidationError::Token {
                 detail: "unexpected_sampled_token",
@@ -2209,9 +2234,9 @@ impl TransitionValidation {
                 detail: "missing_sampled_token",
             });
         }
-        let accepted_draft_tokens = if operation_variant == ForwardMode::TokenVerify {
+        let accepted_draft_tokens = if operation_variant == RunKind::ArVerify {
             let drafts = self.draft_token_ids.as_deref().unwrap_or_default();
-            let listed = record.committed_tokens.as_slice();
+            let listed = record.committed_tokens();
             let terminal_prefix = !listed.is_empty()
                 && listed.len() <= drafts.len()
                 && listed == &drafts[..listed.len()]
@@ -2262,7 +2287,8 @@ impl TransitionValidation {
             });
         }
         let logprobs = find_product(products, record.op_id, ProductKind::Logprob)
-            .and_then(|payload| LogprobBlob::decode(&payload.bytes).ok())
+            .and_then(|payload| payload.value.bytes())
+            .and_then(|bytes| LogprobBlob::decode(bytes).ok())
             .unwrap_or_default();
         let sampled_token = sampled_tokens.last().copied();
         let generated_candidates = logprobs.top_logprobs.as_slice();

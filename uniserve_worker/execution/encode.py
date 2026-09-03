@@ -11,16 +11,21 @@ import torch
 from uniserve_worker.execution.batch import (
     EncodeMode,
     FinishFlags,
-    ForwardMode,
     Operation,
     OpStatus,
     ProductKind,
     ProductPayload,
     ProductRef,
+    RunKind,
     StorageClass,
     TokenSpan,
 )
-from uniserve_worker.foundation.errors import unsupported_setup, invalid_descriptor
+from uniserve_worker.execution.output import (
+    ImagePayload,
+    TransferPayload,
+)
+from uniserve_worker.foundation.errors import invalid_descriptor, unsupported_setup
+from uniserve_worker.media.codec import quantize_image_hwc
 from uniserve_worker.models.generation import LatentLayout, Materialization
 from uniserve_worker.models.inputs import FeatureLayout, PatchTransform
 from uniserve_worker.models.runtime import PositionLayout
@@ -32,11 +37,6 @@ from uniserve_worker.runtime.device_products import (
 )
 from uniserve_worker.runtime.encoder_cache import EncoderMetadata, EncoderWrite
 from uniserve_worker.runtime.latent_pool import LatentRelease
-from uniserve_worker.execution.output import (
-    ImagePayload,
-    TransferPayload,
-)
-from uniserve_worker.media.codec import quantize_image_hwc
 
 from . import transfer
 from .forward_batch import ModelPhase, TokenSelection
@@ -44,9 +44,9 @@ from .image_input import PreparedImage, patch_grid_shape, prepare_image, prepare
 from .resources import ExecutionResources
 from .rows import (
     ForwardRow,
+    LaneState,
     OperationState,
     Outcome,
-    PartitionState,
     StateOutcome,
 )
 
@@ -54,10 +54,10 @@ from .rows import (
 def pack_forward(runtime: ExecutionResources, state: OperationState) -> tuple[object, ...]:
     if state.phase != "initial":
         return ()
-    if state.operation.work.encode_mode is not None:
+    if state.operation.kind.encode_mode is not None:
         return _pack_encode(runtime, state)
-    if state.operation.work is ForwardMode.MATERIALIZE:
-        return _pack_materialize(runtime, state)
+    if state.operation.kind is RunKind.DIFFUSION_FINALIZE:
+        return _pack_diffusion_finalize(runtime, state)
     return ()
 
 
@@ -73,26 +73,26 @@ def consume_forward(
     else:
         state.data["image_tensor"] = decoded_tensor(outputs[0]).detach()
         state.data["image_range"] = ImageRange.UNIT
-        _finish_materialize(runtime, state)
+        _finish_diffusion_finalize(runtime, state)
 
 
 def run_action(runtime: ExecutionResources, state: OperationState) -> bool:
     if state.phase != "action":
         return False
     if state.data["mode"] == "frames":
-        state.outcome = materialize_frames(runtime, state.operation, state.partition)
+        state.outcome = diffusion_finalize_frames(runtime, state.operation, state.lane)
         state.phase = "done"
         return True
-    _finish_materialize(runtime, state)
+    _finish_diffusion_finalize(runtime, state)
     return True
 
 
 def _pack_encode(runtime: ExecutionResources, state: OperationState) -> tuple[object, ...]:
 
     operation = state.operation
-    partition = state.partition
+    scope = state.lane
     image_processor = runtime.image_processor()
-    mode = operation.work.encode_mode
+    mode = operation.kind.encode_mode
     if mode is None:
         raise invalid_descriptor("encode operation is missing an encode mode")
     feature_outputs = tuple(
@@ -106,7 +106,7 @@ def _pack_encode(runtime: ExecutionResources, state: OperationState) -> tuple[ob
     feature_output = feature_outputs[0]
     if int(feature_output.generation) < 1:
         raise invalid_descriptor("encode feature output requires a positive generation")
-    source = encode_source(runtime, operation, partition)
+    source = encode_source(runtime, operation, scope)
     target_device = runtime._generation_device if mode is EncodeMode.LATENT else runtime._device
     if isinstance(source, tuple):
         source_tensor, source_metadata = source
@@ -119,7 +119,7 @@ def _pack_encode(runtime: ExecutionResources, state: OperationState) -> tuple[ob
         )
     else:
         prepared = prepare_image(image_processor, mode, source, device=target_device)
-    task = encode_row(runtime, operation, mode, prepared, partition)
+    task = encode_row(runtime, operation, mode, prepared, scope)
     state.data.update(
         mode="encode",
         prepared=prepared,
@@ -136,11 +136,11 @@ def _consume_encode(
 ) -> None:
 
     operation = state.operation
-    partition = state.partition
+    scope = state.lane
     prepared = state.data["prepared"]
     feature_output = state.data["feature_output"]
     features = encode_features(output).detach()
-    write = bound_encoder_write(partition, feature_output)
+    write = bound_encoder_write(scope, feature_output)
     resident = runtime.encoder_cache.publish(
         write,
         features,
@@ -163,8 +163,8 @@ def _consume_encode(
                 "width": int(prepared.width),
             },
         )
-        partition.published.append(locator)
-        partition.stage_publications[runtime.operation_identity(operation)] = (locator,)
+        scope.published.append(locator)
+        scope.stage_publications[runtime.operation_identity(operation)] = (locator,)
         descriptor = TransferPayload(
             "encoder",
             {
@@ -178,15 +178,15 @@ def _consume_encode(
             runtime.transport,
         )
         products = (ProductPayload(product=feature_output, payload=cast(bytes, descriptor)),)
-    state.outcome = non_state_outcome(runtime, operation, partition, products=products)
+    state.outcome = non_state_outcome(runtime, operation, scope, products=products)
     state.phase = "done"
 
 
-def _pack_materialize(runtime: ExecutionResources, state: OperationState) -> tuple[object, ...]:
+def _pack_diffusion_finalize(runtime: ExecutionResources, state: OperationState) -> tuple[object, ...]:
 
     operation = state.operation
-    partition = state.partition
-    session = runtime.request_row(partition, operation.request_key.session_id)
+    scope = state.lane
+    request = runtime.request_row(scope, operation.request_key.request_id)
     latent_inputs = tuple(
         reference for reference in operation.inputs if reference.kind is ProductKind.LATENT
     )
@@ -197,13 +197,13 @@ def _pack_materialize(runtime: ExecutionResources, state: OperationState) -> tup
     if len(latent_inputs) != 1:
         raise invalid_descriptor("materialization requires one exact latent generation")
     latent_input = latent_inputs[0]
-    if int(latent_input.generation) < 1 or session.latent_product != latent_input:
+    if int(latent_input.generation) < 1 or request.latent_product != latent_input:
         raise invalid_descriptor("materialization does not name the current latent generation")
     flow = runtime.generation()
-    image_params = session.image
+    image_params = request.image
     if image_params is None:
         raise invalid_descriptor("image materialization has no admitted image parameters")
-    row = runtime.latent_row(operation, partition)
+    row = runtime.latent_row(operation, scope)
     if int(row.placement.start_step) != int(image_params.steps):
         raise invalid_descriptor("image materialization requires a completed latent trajectory")
     current = runtime.require_latent_pool().gather_current(
@@ -219,15 +219,15 @@ def _pack_materialize(runtime: ExecutionResources, state: OperationState) -> tup
         current, int(row.placement.height), int(row.placement.width)
     )
     state.data.update(
-        mode="materialize",
-        session=session,
+        mode="diffusion_finalize",
+        request=request,
         latent_input=latent_input,
         row=row,
     )
     if flow.materialization is Materialization.DECODE_ROUTE:
         task = ForwardRow(
             operation=operation,
-            request=session,
+            request=request,
             weights=runtime.weights,
             phase=ModelPhase.DECODE_LATENT,
             latent=latent,
@@ -246,11 +246,11 @@ def _pack_materialize(runtime: ExecutionResources, state: OperationState) -> tup
     return ()
 
 
-def _finish_materialize(runtime: ExecutionResources, state: OperationState) -> None:
+def _finish_diffusion_finalize(runtime: ExecutionResources, state: OperationState) -> None:
 
     operation = state.operation
-    partition = state.partition
-    session = state.data["session"]
+    scope = state.lane
+    request = state.data["request"]
     row = state.data["row"]
     latent_input = state.data["latent_input"]
     image_tensor = state.data["image_tensor"]
@@ -262,12 +262,12 @@ def _finish_materialize(runtime: ExecutionResources, state: OperationState) -> N
         if output.storage_class is StorageClass.LATENT_ARENA and output.kind is ProductKind.ARTIFACT
     )
     if len(resident_outputs) > 1:
-        raise invalid_descriptor("materialize operation repeats its resident image product")
+        raise invalid_descriptor("diffusion_finalize operation repeats its resident image product")
     if resident_outputs:
         resident_output = resident_outputs[0]
         if int(resident_output.generation) < 1:
-            raise invalid_descriptor("materialized resident image requires a positive generation")
-        write = bound_device_write(partition, resident_output)
+            raise invalid_descriptor("finalized resident image requires a positive generation")
+        write = bound_device_write(scope, resident_output)
         runtime.device_products.publish_write(
             write,
             image_tensor,
@@ -277,18 +277,18 @@ def _finish_materialize(runtime: ExecutionResources, state: OperationState) -> N
                 value_range=image_range,
             ),
         )
-        partition.operation_writes.setdefault(runtime.operation_identity(operation), write)
+        scope.operation_writes.setdefault(runtime.operation_identity(operation), write)
     image_task = defer_image_encoding(
         runtime,
         operation,
         image_tensor,
         image_range,
-        partition,
+        scope,
         max_bytes=int(artifact.max_bytes),
     )
-    session.latent_product = None
-    session.flow_step = 0
-    partition.latent_releases.append(
+    request.latent_product = None
+    request.flow_step = 0
+    scope.latent_releases.append(
         LatentRelease(
             request_pool_idx=row.request_pool_idx,
             page_table=row.placement.page_table,
@@ -303,7 +303,7 @@ def _finish_materialize(runtime: ExecutionResources, state: OperationState) -> N
     state.outcome = non_state_outcome(
         runtime,
         operation,
-        partition,
+        scope,
         products=products,
         completion_tasks=(image_task,),
     )
@@ -314,22 +314,22 @@ def state_outcome(
     runtime: ExecutionResources,
     operation: Operation,
     outcome: StateOutcome,
-    scope: PartitionState,
+    scope: LaneState,
     *,
     base: int | None = None,
     products: tuple[ProductPayload, ...] = (),
 ) -> Outcome:
-    session = runtime.request_row(scope, operation.request_key.session_id)
+    request = runtime.request_row(scope, operation.request_key.request_id)
     cache = runtime.cache_coordinates(operation, scope)
     selected = scope.runtime_cache_lengths.get(cache[0], cache[2])
     if not isinstance(selected, int):
         raise RuntimeError("visual state completion has a dynamic KV length")
     cache = (cache[0], cache[1], selected, cache[3])
-    span_base = session.logical_position if base is None else int(base)
+    span_base = request.logical_position if base is None else int(base)
     return Outcome(
         status=OpStatus.OK,
         selected_point=1 if operation.advances_state else 0,
-        logical_lengths=runtime.logical_lengths(operation, session, cache),
+        logical_lengths=runtime.logical_lengths(operation, request, cache),
         token_span=TokenSpan(base=span_base, len=outcome.sampled_tokens),
         finish_flags=FinishFlags(),
         product_generations=runtime.output_generations(operation),
@@ -342,17 +342,17 @@ def state_outcome(
 def non_state_outcome(
     runtime: ExecutionResources,
     operation: Operation,
-    scope: PartitionState,
+    scope: LaneState,
     *,
     products: tuple[ProductPayload, ...] = (),
     completion_tasks: tuple[ImagePayload, ...] = (),
 ) -> Outcome:
-    session = runtime.request_row(scope, operation.request_key.session_id)
-    base = session.logical_position
+    request = runtime.request_row(scope, operation.request_key.request_id)
+    base = request.logical_position
     return Outcome(
         status=OpStatus.OK,
         selected_point=1 if operation.advances_state else 0,
-        logical_lengths=runtime.logical_lengths(operation, session, None),
+        logical_lengths=runtime.logical_lengths(operation, request, None),
         token_span=TokenSpan(base=base, len=0),
         finish_flags=FinishFlags(),
         product_generations=runtime.output_generations(operation),
@@ -364,7 +364,7 @@ def non_state_outcome(
 def encode_source(
     runtime: ExecutionResources,
     operation: Operation,
-    scope: PartitionState,
+    scope: LaneState,
 ) -> str | tuple[torch.Tensor, DeviceProductMetadata]:
     for reference in operation.inputs:
         inline = scope.input_images.get(reference)
@@ -396,12 +396,12 @@ def encode_row(
     operation: Operation,
     mode: EncodeMode,
     prepared: PreparedImage,
-    scope: PartitionState,
+    scope: LaneState,
 ) -> ForwardRow:
-    session = runtime.request_row(scope, operation.request_key.session_id)
+    request = runtime.request_row(scope, operation.request_key.request_id)
     return ForwardRow(
         operation=operation,
-        request=session,
+        request=request,
         weights=runtime.weights,
         phase=(ModelPhase.ENCODE_VISION if mode is EncodeMode.VISION else ModelPhase.ENCODE_LATENT),
         encode_pixels=prepared.pixels,
@@ -417,12 +417,12 @@ def vision_state_row(
     height: int,
     width: int,
     conditioning_position: int,
-    scope: PartitionState,
+    scope: LaneState,
     *,
     close_image: bool,
     logits: bool,
 ) -> ForwardRow:
-    session = runtime.request_row(scope, operation.request_key.session_id)
+    request = runtime.request_row(scope, operation.request_key.request_id)
     cache = runtime.cache_coordinates(operation, scope)
     injection = runtime.image_processor().feature_injection
     if injection is None:
@@ -458,7 +458,7 @@ def vision_state_row(
     )
     return ForwardRow(
         operation=operation,
-        request=session,
+        request=request,
         weights=runtime.weights,
         phase=ModelPhase.TEXT,
         token_ids=token_ids,
@@ -540,9 +540,9 @@ def latent_state_row(
     height: int,
     width: int,
     conditioning_position: int,
-    scope: PartitionState,
+    scope: LaneState,
 ) -> ForwardRow:
-    session = runtime.request_row(scope, operation.request_key.session_id)
+    request = runtime.request_row(scope, operation.request_key.request_id)
     flow = runtime.generation()
     if flow.latent_layout is not LatentLayout.PATCH_TOKENS:
         raise invalid_descriptor("flow state publication requires patch-token latents")
@@ -563,7 +563,7 @@ def latent_state_row(
     cache = runtime.cache_coordinates(operation, scope)
     return ForwardRow(
         operation=operation,
-        request=session,
+        request=request,
         weights=runtime.weights,
         phase=ModelPhase.DENOISE,
         positions=positions,
@@ -582,10 +582,10 @@ def latent_state_row(
     )
 
 
-def materialize_frames(
+def diffusion_finalize_frames(
     runtime: ExecutionResources,
     operation: Operation,
-    scope: PartitionState,
+    scope: LaneState,
 ) -> Outcome:
     image, metadata = transfer.fetch_product(runtime, operation, scope)
     if transfer.metadata_string(metadata, "payload_kind", "") != "image_nchw":
@@ -609,7 +609,7 @@ def defer_image_encoding(
     operation: Operation,
     image: torch.Tensor,
     value_range: ImageRange,
-    scope: PartitionState,
+    scope: LaneState,
     *,
     max_bytes: int,
 ) -> ImagePayload:
@@ -640,10 +640,10 @@ def artifact_product(operation: Operation) -> ProductRef:
             and output.storage_class is StorageClass.PINNED_OUTPUT
         ):
             return output
-    raise invalid_descriptor("materialize operation has no host-visible artifact output")
+    raise invalid_descriptor("diffusion_finalize operation has no host-visible artifact output")
 
 
-def bound_device_write(scope: PartitionState, reference: ProductRef) -> DeviceProductWrite:
+def bound_device_write(scope: LaneState, reference: ProductRef) -> DeviceProductWrite:
     matches = tuple(write for write in scope.device_writes if write.reference == reference)
     if len(matches) != 1:
         raise invalid_descriptor(
@@ -652,7 +652,7 @@ def bound_device_write(scope: PartitionState, reference: ProductRef) -> DevicePr
     return matches[0]
 
 
-def bound_encoder_write(scope: PartitionState, reference: ProductRef) -> EncoderWrite:
+def bound_encoder_write(scope: LaneState, reference: ProductRef) -> EncoderWrite:
     matches = tuple(write for write in scope.encoder_writes if write.reference == reference)
     if len(matches) != 1:
         raise invalid_descriptor(

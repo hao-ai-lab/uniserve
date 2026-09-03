@@ -4,13 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
 
-from ..execution.batch import ForwardMode
+from ..execution.batch import RunKind
 from ..execution.forward_batch import AttentionSelection, ForwardBatch, ForwardOutput
 from ..foundation.errors import invalid_descriptor
 
@@ -135,7 +134,7 @@ class ExecutionModel(nn.Module):
     serving_dtype: str = "bfloat16"
     cache_geometry: CacheGeometry
     resource_geometry: ResourceGeometry
-    supported_work: frozenset[ForwardMode]
+    supported_work: frozenset[RunKind]
     vocab_size: int
     hidden_size: int
     text_max_tokens: int
@@ -153,16 +152,14 @@ class ExecutionModel(nn.Module):
     def create_media_runtime(self, unresolved_window: int) -> tuple[object | None, object | None]:
         return None, None
 
-    def drop_runtime(self, session_id: int, media_runtime: object | None) -> None:
+    def create_request_state(self) -> object | None:
         return None
 
-    def abort_admissions(
-        self, admissions: Sequence[object], media_runtime: object | None
-    ) -> None:
+    def validate_run(self, runtime, batch) -> None:
         return None
 
-    def resource_usage(self) -> tuple[tuple[str, int, int], ...]:
-        return ()
+    def run_operation(self, runtime, state) -> bool:
+        return False
 
     def synchronize_runtime(self) -> None:
         return None
@@ -185,7 +182,7 @@ class ExecutionModel(nn.Module):
     ) -> ForwardOutput:
         raise NotImplementedError("model does not implement vision encoding")
 
-    def encode_latent(
+    def encoder_latent(
         self,
         pixels: tuple[torch.Tensor, ...],
         batch: ForwardBatch,

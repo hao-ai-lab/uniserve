@@ -4,7 +4,7 @@ use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer, IncrementalD
 use asynk_strim_attr::{TryYielder, try_stream};
 use serde::{Deserialize, Serialize};
 use tracing::{Level, debug, trace};
-use uniserve_core::{GenerationEvent, PositionLogprobs};
+use uniserve_core::{Event, PositionLogprobs};
 use uniserve_engine::EventRx;
 
 use super::finish::{FinishReason, StopReason};
@@ -59,7 +59,7 @@ pub enum DecodedTextEvent {
     },
 }
 
-struct TokenDecode {
+struct ArDecode {
     delta: String,
     stop: Option<(String, usize)>,
 }
@@ -206,7 +206,7 @@ fn decode_one_token(
     output_token_count: usize,
     options: &mut TextDecodeOptions,
     intermediate: bool,
-) -> Result<TokenDecode, Error> {
+) -> Result<ArDecode, Error> {
     let new_bytes = decoder.push_token(token_id)?;
     let stop = if output_token_count + 1 > options.min_tokens as usize {
         if let Some(stops) = options.stop_strings.as_mut()
@@ -224,7 +224,7 @@ fn decode_one_token(
     } else {
         String::new()
     };
-    Ok(TokenDecode { delta, stop })
+    Ok(ArDecode { delta, stop })
 }
 
 /// Decode one canonical generation event stream into text-runtime events.
@@ -267,7 +267,7 @@ pub async fn decoded_text_event_stream(
 
     while let Some(event) = raw_stream.next().await {
         match event {
-            GenerationEvent::Scheduled {
+            Event::Scheduled {
                 queued_at: queued,
                 scheduled_at: scheduled,
             } => {
@@ -284,7 +284,7 @@ pub async fn decoded_text_event_stream(
                     )
                     .await?;
             }
-            GenerationEvent::PromptLogprobs { positions } => {
+            Event::PromptLogprobs { positions } => {
                 if !prompt_logprobs_requested {
                     return Err(Error::MalformedOutput {
                         request_id: request_id.clone(),
@@ -309,7 +309,7 @@ pub async fn decoded_text_event_stream(
                     )
                     .await?;
             }
-            GenerationEvent::TextToken { id, .. } => {
+            Event::TextToken { id, .. } => {
                 state
                     .emit_start_if_ready(
                         &request_id,
@@ -350,7 +350,7 @@ pub async fn decoded_text_event_stream(
                     return Ok(());
                 }
             }
-            GenerationEvent::TokenLogprobs { id, candidates } => {
+            Event::TokenLogprobs { id, candidates } => {
                 let pending = state
                     .pending_token
                     .take()
@@ -382,7 +382,7 @@ pub async fn decoded_text_event_stream(
                     return Ok(());
                 }
             }
-            GenerationEvent::Finished {
+            Event::Finished {
                 reason,
                 stop_reason,
                 completion_tokens,
@@ -440,19 +440,17 @@ pub async fn decoded_text_event_stream(
                 .await;
                 return Ok(());
             }
-            GenerationEvent::Rejected { message } | GenerationEvent::Error { message } => {
+            Event::Rejected { message } | Event::Error { message } => {
                 return Err(Error::MalformedOutput {
                     request_id: request_id.clone(),
                     message,
                 });
             }
-            GenerationEvent::ImageBegin { .. }
-            | GenerationEvent::ImageStep { .. }
-            | GenerationEvent::ImageCommit { .. }
-            | GenerationEvent::ImageDone { .. }
-            | GenerationEvent::MediaCompleted { .. }
-            | GenerationEvent::MediaFailed { .. }
-            | GenerationEvent::MediaAborted => {
+            Event::ImageBegin { .. }
+            | Event::ImageStep { .. }
+            | Event::ImageCommit { .. }
+            | Event::ImageDone { .. }
+            | Event::Artifact(_) => {
                 return Err(Error::MalformedOutput {
                     request_id: request_id.clone(),
                     message: "text-only request received a non-text lifecycle event".to_string(),

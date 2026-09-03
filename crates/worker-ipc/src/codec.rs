@@ -7,16 +7,16 @@ use uniserve_core::{BlockId, KvCacheGroup, KvGroupKind, RankInfo, RequestId, Sam
 
 use crate::schema::uniserve::ipc as fbs;
 use crate::{
-    AttentionRegime, Batch, BatchPartition, BlockTable, Bounds, CachePageAllocation, CloseReason,
-    CompletionReport, Control, DType, DimBound, Disposition, Domain, DrawLayout, ErrorCode,
-    ErrorOperationIdentity, FinishFlags, ForwardMode, GenAdmission, GraphBucket, LatentPlacement,
-    LogicalLengths, MediaAdmission, MediaGeometry, MediaOutput, MediaProfileId, ModelOutput,
-    NewRequest, OpId, OpStatus, Operation, PartitionCompletion, Point, PointRange, ProductKind,
-    ProductPayload, ProductRef, ReconstructionKind, ReconstructionPlacement, RegistrationAck,
-    RequestKey, RequestKind, ResourceClass, ResourcePressure, ResponseKind, Rng, RouteId,
-    RowGeometry, SamplingOwnership, ShapeBound, StorageClass, TimingCounters, TokenSpan,
-    UndAdmission, VersionRef, WorkerForwardStats, WorkerInfo, WorkerRequest, WorkerResponse,
-    WorkerResponseError, WorkerRole,
+    ArRequestParams, ArtifactHandle, BatchCommand, BlockTable, Bounds, BufferId, BufferPlacement,
+    CachePageAllocation, Checkpoint, CheckpointPoint, CloseReason, DType, DecodePlacement,
+    DiffusionRequestParams, DiffusionResult, DimBound, Disposition, DrawLayout, ErrorCode,
+    ErrorOperationIdentity, FinishFlags, InlineValue, KvCacheConfig, LatentPlacement,
+    LogicalLengths, MediaGeometry, MediaOutput, ModelOutput, NewRequest, OpId, OpKind, OpPayload,
+    OpStatus, Operation, PointRange, ProductKind, ProductPayload, ProductRef, RegistrationAck,
+    RequestKey, RequestKind, ResponseKind, ResultData, ResultPayload, Rng, RowGeometry, Run,
+    RunKind, RunResult, ShapeBound, StorageClass, TimingCounters, TokenSpan, TransferHandle,
+    TransferLocator, TransferTransport, UmmRequestParams, WorkerForwardStats, WorkerInfo,
+    WorkerRequest, WorkerResponse, WorkerResponseError,
 };
 
 pub type CodecResult<T> = std::result::Result<T, CodecError>;
@@ -123,57 +123,31 @@ pub fn decode_response(bytes: &[u8]) -> CodecResult<WorkerResponse> {
 fn request_from_table(request: fbs::WorkerRequest<'_>) -> CodecResult<WorkerRequest> {
     let kind = request_kind_from_fb(request.kind())?;
     let call_id = request.call_id();
-    let batch = request.batch().map(batch_from_table).transpose()?;
-    let step_id = request.step_id();
-    let session_id = request.session_id().map(RequestId);
-    let product_handles = request
-        .product_handles()
-        .map(|items| items.iter().collect());
-    let payload_count = usize::from(batch.is_some())
-        + usize::from(step_id.is_some())
-        + usize::from(session_id.is_some())
-        + usize::from(product_handles.is_some());
+    let run = request.run().map(run_from_table).transpose()?;
+    let run_id = request.poll_run_id();
+    let payload_count = usize::from(run.is_some()) + usize::from(run_id.is_some());
     Ok(match kind {
-        RequestKind::GetInfo => {
-            codec_ensure!(payload_count == 0, "get_info carries a payload");
-            WorkerRequest::GetInfo { call_id }
+        RequestKind::Info => {
+            codec_ensure!(payload_count == 0, "info carries a payload");
+            WorkerRequest::Info { call_id }
         }
-        RequestKind::Execute => {
-            codec_ensure!(payload_count == 1, "execute requires exactly one batch");
-            WorkerRequest::Execute {
+        RequestKind::Submit => {
+            codec_ensure!(payload_count == 1, "submit requires exactly one run");
+            WorkerRequest::Submit {
                 call_id,
-                batch: batch.context("execute request has no batch")?,
+                run: run.context("submit request has no run")?,
             }
         }
-        RequestKind::PollCompletions => {
-            codec_ensure!(payload_count == 1, "poll_completions requires one step id");
-            WorkerRequest::PollCompletions {
+        RequestKind::Poll => {
+            codec_ensure!(payload_count == 1, "poll requires one run id");
+            WorkerRequest::Poll {
                 call_id,
-                step_id: step_id.context("poll_completions has no step id")?,
+                run_id: run_id.context("poll request has no run id")?,
             }
         }
-        RequestKind::DropSession => {
-            codec_ensure!(payload_count == 1, "drop_session requires one session id");
-            WorkerRequest::DropSession {
-                session_id: session_id.context("drop_session has no session id")?,
-            }
-        }
-        RequestKind::ReleaseProducts => {
-            codec_ensure!(
-                payload_count == 1,
-                "release_products requires one handle list"
-            );
-            WorkerRequest::ReleaseProducts {
-                product_handles: product_handles.context("release_products has no handle list")?,
-            }
-        }
-        RequestKind::GetPressure => {
-            codec_ensure!(payload_count == 0, "get_pressure carries a payload");
-            WorkerRequest::GetPressure { call_id }
-        }
-        RequestKind::Shutdown => {
-            codec_ensure!(payload_count == 0, "shutdown carries a payload");
-            WorkerRequest::Shutdown
+        RequestKind::Close => {
+            codec_ensure!(payload_count == 0, "close carries a payload");
+            WorkerRequest::Close { call_id }
         }
     })
 }
@@ -182,17 +156,8 @@ fn response_from_table(response: fbs::WorkerResponse<'_>) -> CodecResult<WorkerR
     let kind = response_kind_from_fb(response.kind())?;
     let call_id = response.call_id();
     let info = response.info().map(info_from_table).transpose()?;
-    let completion_report = response
-        .completion_report()
-        .map(completion_report_from_table)
-        .transpose()?;
-    let pressure = response
-        .pressure()
-        .map(|items| items.iter().map(pressure_from_table).collect())
-        .transpose()?;
-    let payload_count = usize::from(info.is_some())
-        + usize::from(completion_report.is_some())
-        + usize::from(pressure.is_some());
+    let result = response.result().map(run_result_from_table).transpose()?;
+    let payload_count = usize::from(info.is_some()) + usize::from(result.is_some());
     let message = response.message().map(str::to_owned);
     let code = response.code().map(str::to_owned);
     let retryable = response.retryable();
@@ -234,7 +199,7 @@ fn response_from_table(response: fbs::WorkerResponse<'_>) -> CodecResult<WorkerR
             );
             WorkerResponse::Result {
                 call_id,
-                completion_report: completion_report.context("result response has no report")?,
+                result: result.context("result response has no result")?,
             }
         }
         ResponseKind::Ok => {
@@ -263,53 +228,77 @@ fn response_from_table(response: fbs::WorkerResponse<'_>) -> CodecResult<WorkerR
                 },
             }
         }
-        ResponseKind::Pressure => {
-            codec_ensure!(
-                payload_count == 1 && !carries_error,
-                "invalid pressure response"
-            );
-            WorkerResponse::Pressure {
-                call_id,
-                pressure: pressure.context("pressure response has no pressure values")?,
-            }
-        }
     })
 }
 
-fn batch_from_table(batch: fbs::Batch<'_>) -> CodecResult<Batch> {
-    let batch = Batch {
-        step_id: batch.step_id(),
-        admissions: batch
-            .admissions()
+fn run_from_table(run: fbs::Run<'_>) -> CodecResult<Run> {
+    let run = Run {
+        batch_id: run.batch_id(),
+        run_id: run.run_id(),
+        collective_seq: run.collective_seq(),
+        operations: run
+            .operations()
             .map(|items| {
                 items
                     .iter()
-                    .map(admission_from_table)
+                    .map(operation_from_table)
                     .collect::<CodecResult<_>>()
             })
             .transpose()?
             .unwrap_or_default(),
-        partitions: batch
-            .partitions()
+        block_tables: run
+            .block_tables()
+            .map(|items| items.iter().map(block_table_from_table).collect())
+            .unwrap_or_default(),
+        new_cache_pages: run
+            .new_cache_pages()
+            .map(|items| items.iter().map(cache_page_allocation_from_table).collect())
+            .unwrap_or_default(),
+        forward_rows: run
+            .forward_rows()
+            .map(|items| items.iter().map(row_geometry_from_table).collect())
+            .unwrap_or_default(),
+        latent_placements: run
+            .latent_placements()
             .map(|items| {
                 items
                     .iter()
-                    .map(partition_from_table)
+                    .map(latent_placement_from_table)
                     .collect::<CodecResult<_>>()
             })
             .transpose()?
             .unwrap_or_default(),
-        controls: batch
-            .controls()
+        decode_placements: run
+            .decode_placements()
             .map(|items| {
                 items
                     .iter()
-                    .map(control_from_table)
+                    .map(decode_placement_from_table)
                     .collect::<CodecResult<_>>()
             })
             .transpose()?
             .unwrap_or_default(),
-        input_products: batch
+        buffer_placements: run
+            .buffer_placements()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(buffer_placement_from_table)
+                    .collect::<CodecResult<_>>()
+            })
+            .transpose()?
+            .unwrap_or_default(),
+        commands: run
+            .commands()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(command_from_table)
+                    .collect::<CodecResult<_>>()
+            })
+            .transpose()?
+            .unwrap_or_default(),
+        input_products: run
             .input_products()
             .map(|items| {
                 items
@@ -320,90 +309,31 @@ fn batch_from_table(batch: fbs::Batch<'_>) -> CodecResult<Batch> {
             .transpose()?
             .unwrap_or_default(),
     };
-    batch.validate()?;
-    Ok(batch)
-}
-
-fn partition_from_table(partition: fbs::BatchPartition<'_>) -> CodecResult<BatchPartition> {
-    let partition = BatchPartition {
-        partition_id: partition.partition_id(),
-        submission_group: partition.submission_group(),
-        collective_seq: partition.collective_seq(),
-        domain: domain_from_fb(partition.domain())?,
-        route: RouteId(partition.route()),
-        attention: attention_regime_from_fb(partition.attention())?,
-        shape_class: partition.shape_class(),
-        operations: partition
-            .operations()
-            .map(|items| {
-                items
-                    .iter()
-                    .map(operation_from_table)
-                    .collect::<CodecResult<_>>()
-            })
-            .transpose()?
-            .unwrap_or_default(),
-        block_tables: partition
-            .block_tables()
-            .map(|items| items.iter().map(block_table_from_table).collect())
-            .unwrap_or_default(),
-        new_cache_pages: partition
-            .new_cache_pages()
-            .map(|items| items.iter().map(cache_page_allocation_from_table).collect())
-            .unwrap_or_default(),
-        forward_rows: partition
-            .forward_rows()
-            .map(|items| items.iter().map(row_geometry_from_table).collect())
-            .unwrap_or_default(),
-        latent_placements: partition
-            .latent_placements()
-            .map(|items| {
-                items
-                    .iter()
-                    .map(latent_placement_from_table)
-                    .collect::<CodecResult<_>>()
-            })
-            .transpose()?
-            .unwrap_or_default(),
-        reconstruction_placements: partition
-            .reconstruction_placements()
-            .map(|items| {
-                items
-                    .iter()
-                    .map(reconstruction_placement_from_table)
-                    .collect::<CodecResult<_>>()
-            })
-            .transpose()?
-            .unwrap_or_default(),
-    };
-    partition.validate()?;
-    Ok(partition)
+    run.validate()?;
+    Ok(run)
 }
 
 fn admission_from_table(admission: fbs::NewRequest<'_>) -> CodecResult<NewRequest> {
     let admission = NewRequest {
         request_key: request_key_from_table(admission.request_key(), "admission.request_key")?,
         request_pool_idx: admission.request_pool_idx(),
-        und: admission.und().map(und_admission_from_table).transpose()?,
-        gen_admission: admission
-            .gen_admission()
-            .map(gen_admission_from_table)
-            .transpose()?,
-        media: admission
-            .media()
-            .map(media_admission_from_table)
+        ar: admission.ar().map(ar_params_from_table).transpose()?,
+        umm: admission.umm().map(umm_params_from_table).transpose()?,
+        diffusion: admission
+            .diffusion()
+            .map(diffusion_params_from_table)
             .transpose()?,
     };
     admission.validate()?;
     Ok(admission)
 }
 
-fn und_admission_from_table(admission: fbs::UndAdmission<'_>) -> CodecResult<UndAdmission> {
-    Ok(UndAdmission {
+fn ar_params_from_table(admission: fbs::ArRequestParams<'_>) -> CodecResult<ArRequestParams> {
+    Ok(ArRequestParams {
         sampling: sampling_from_table(
             admission
                 .sampling()
-                .context("und admission has no sampling parameters")?,
+                .context("autoregressive request has no sampling parameters")?,
         )?,
         negative_token_ids: admission
             .negative_token_ids()
@@ -417,31 +347,31 @@ fn und_admission_from_table(admission: fbs::UndAdmission<'_>) -> CodecResult<Und
     })
 }
 
-fn gen_admission_from_table(admission: fbs::GenAdmission<'_>) -> CodecResult<GenAdmission> {
-    Ok(GenAdmission {
+fn umm_params_from_table(admission: fbs::UmmRequestParams<'_>) -> CodecResult<UmmRequestParams> {
+    Ok(UmmRequestParams {
         image: image_from_table(
             admission
                 .image()
-                .context("gen admission has no image parameters")?,
+                .context("unified-multimodal request has no image parameters")?,
         )?,
     })
 }
 
-fn media_admission_from_table(admission: fbs::MediaAdmission<'_>) -> CodecResult<MediaAdmission> {
+fn diffusion_params_from_table(
+    admission: fbs::DiffusionRequestParams<'_>,
+) -> CodecResult<DiffusionRequestParams> {
     let geometry = admission
         .geometry()
-        .context("media admission has no resolved geometry")?;
-    Ok(MediaAdmission {
+        .context("diffusion request has no resolved geometry")?;
+    Ok(DiffusionRequestParams {
         prompt_token_ids: admission
             .prompt_token_ids()
             .map(|items| items.iter().collect())
             .unwrap_or_default(),
         seed: admission.seed(),
-        profile: media_profile_from_fb(admission.profile())?,
         geometry: MediaGeometry {
             frame_count: geometry.frame_count(),
-            video_reconstruction_units: geometry.video_reconstruction_units(),
-            audio_latent_frames: geometry.audio_latent_frames(),
+            decode_units: geometry.decode_units(),
             prompt_tokens: geometry.prompt_tokens(),
             denoise_steps: geometry.denoise_steps(),
         },
@@ -503,79 +433,136 @@ fn latent_placement_from_table(
     })
 }
 
-fn reconstruction_placement_from_table(
-    placement: fbs::ReconstructionPlacement<'_>,
-) -> CodecResult<ReconstructionPlacement> {
-    Ok(ReconstructionPlacement {
+fn decode_placement_from_table(
+    placement: fbs::DecodePlacement<'_>,
+) -> CodecResult<DecodePlacement> {
+    Ok(DecodePlacement {
         request_key: request_key_from_table(
             placement.request_key(),
-            "reconstruction placement.request_key",
+            "decode placement.request_key",
         )?,
         op_id: OpId(placement.op_id()),
-        kind: reconstruction_kind_from_fb(placement.kind())?,
-        start_unit: placement.start_unit(),
-        unit_count: placement.unit_count(),
+        cursor: placement.cursor(),
+        max_units: placement.max_units(),
+    })
+}
+
+fn buffer_placement_from_table(
+    placement: fbs::BufferPlacement<'_>,
+) -> CodecResult<BufferPlacement> {
+    Ok(BufferPlacement {
+        buffer: buffer_id_from_table(
+            placement
+                .buffer()
+                .context("buffer placement has no buffer identity")?,
+        )?,
+        offset: placement.offset(),
+        bytes: placement.bytes(),
     })
 }
 
 fn operation_from_table(operation: fbs::Operation<'_>) -> CodecResult<Operation> {
+    macro_rules! decode_payload {
+        ($payload:expr, $variant:ident) => {{
+            let payload = $payload.context("operation payload table is missing")?;
+            let bounds = Bounds {
+                max_points: payload.max_points(),
+                max_tokens: payload.max_tokens(),
+                max_kv_pages: payload.max_kv_pages(),
+                max_latent_bytes: payload.max_latent_bytes(),
+                max_completion_bytes: payload.max_completion_bytes(),
+                max_transfer_bytes: payload.max_transfer_bytes(),
+            };
+            let inputs = payload
+                .inputs()
+                .map(|items| {
+                    items
+                        .iter()
+                        .map(product_ref_from_table)
+                        .collect::<CodecResult<Vec<_>>>()
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let outputs = payload
+                .outputs()
+                .map(|items| {
+                    items
+                        .iter()
+                        .map(product_ref_from_table)
+                        .collect::<CodecResult<Vec<_>>>()
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let predicate = payload
+                .predicate()
+                .map(product_ref_from_table)
+                .transpose()?;
+            let rng = payload.rng().map(rng_from_table).transpose()?;
+            OpPayload::$variant {
+                bounds,
+                inputs,
+                outputs,
+                predicate,
+                rng,
+                control_seq: payload.control_seq(),
+            }
+        }};
+    }
+
+    let payload = match operation.payload_type() {
+        fbs::OpPayload::ArOpPayload => {
+            decode_payload!(operation.payload_as_ar_op_payload(), Ar)
+        }
+        fbs::OpPayload::EncoderOpPayload => {
+            decode_payload!(operation.payload_as_encoder_op_payload(), Encoder)
+        }
+        fbs::OpPayload::DiffusionOpPayload => {
+            decode_payload!(operation.payload_as_diffusion_op_payload(), Diffusion)
+        }
+        fbs::OpPayload::TransferOpPayload => {
+            decode_payload!(operation.payload_as_transfer_op_payload(), Transfer)
+        }
+        _ => return Err(CodecError::invalid("operation payload is missing")),
+    };
     let operation = Operation {
         request_key: request_key_from_table(operation.request_key(), "operation.request_key")?,
         op_id: OpId(operation.op_id()),
-        parent: version_ref_from_table(operation.parent().context("operation has no parent")?)?,
-        work: work_from_fb(operation.work())?,
-        route: RouteId(operation.route()),
-        domain: domain_from_fb(operation.domain())?,
-        advances_state: operation.advances_state(),
-        bounds: bounds_from_table(operation.bounds().context("operation has no bounds")?),
-        inputs: operation
-            .inputs()
-            .map(|items| {
-                items
-                    .iter()
-                    .map(product_ref_from_table)
-                    .collect::<CodecResult<_>>()
-            })
-            .transpose()?
-            .unwrap_or_default(),
-        outputs: operation
-            .outputs()
-            .map(|items| {
-                items
-                    .iter()
-                    .map(product_ref_from_table)
-                    .collect::<CodecResult<_>>()
-            })
-            .transpose()?
-            .unwrap_or_default(),
-        predicate: operation
-            .predicate()
-            .map(product_ref_from_table)
-            .transpose()?,
-        rng: operation.rng().map(rng_from_table).transpose()?,
-        control_seq: operation.control_seq(),
+        parent: checkpoint_from_table(operation.parent().context("operation has no parent")?)?,
+        kind: run_kind_from_fb(operation.kind())?,
+        payload,
     };
+    operation.validate()?;
     Ok(operation)
 }
 
-fn control_from_table(envelope: fbs::ControlEnvelope<'_>) -> CodecResult<Control> {
-    let control = match envelope.control_type() {
-        fbs::Control::ControlCommit => {
+fn command_from_table(envelope: fbs::BatchCommandEnvelope<'_>) -> CodecResult<BatchCommand> {
+    let command = match envelope.command_type() {
+        fbs::BatchCommand::StartCommand => {
+            let start = envelope
+                .command_as_start_command()
+                .context("start command table is missing")?;
+            BatchCommand::Start {
+                request: admission_from_table(
+                    start.request().context("start control has no request")?,
+                )?,
+            }
+        }
+        fbs::BatchCommand::CommitCommand => {
             let commit = envelope
-                .control_as_control_commit()
-                .context("commit control table is missing")?;
-            Control::Commit {
+                .command_as_commit_command()
+                .context("commit command table is missing")?;
+            BatchCommand::Commit {
                 request_key: request_key_from_table(
                     commit.request_key(),
                     "control.commit.request_key",
                 )?,
                 control_seq: commit.control_seq(),
-                expected_parent: version_ref_from_table(
+                expected_parent: checkpoint_from_table(
                     commit
                         .expected_parent()
                         .context("commit control has no expected parent")?,
                 )?,
-                selected: version_ref_from_table(
+                selected: checkpoint_from_table(
                     commit
                         .selected()
                         .context("commit control has no selected version")?,
@@ -584,38 +571,36 @@ fn control_from_table(envelope: fbs::ControlEnvelope<'_>) -> CodecResult<Control
                 disposition: disposition_from_fb(commit.disposition())?,
             }
         }
-        fbs::Control::ControlClose => {
-            let close = envelope
-                .control_as_control_close()
-                .context("close control table is missing")?;
-            Control::Close {
+        fbs::BatchCommand::FinishCommand => {
+            let finish = envelope
+                .command_as_finish_command()
+                .context("finish command table is missing")?;
+            BatchCommand::Finish {
                 request_key: request_key_from_table(
-                    close.request_key(),
-                    "control.close.request_key",
+                    finish.request_key(),
+                    "control.finish.request_key",
                 )?,
-                control_seq: close.control_seq(),
-                cutoff: version_ref_from_table(
-                    close.cutoff().context("close control has no cutoff")?,
+                control_seq: finish.control_seq(),
+                cutoff: checkpoint_from_table(
+                    finish.cutoff().context("finish control has no cutoff")?,
                 )?,
-                reason: close_reason_from_fb(close.reason())?,
+                reason: close_reason_from_fb(finish.reason())?,
             }
         }
-        fbs::Control::ControlRelease => {
-            let release = envelope
-                .control_as_control_release()
-                .context("release control table is missing")?;
-            Control::Release {
-                request_key: request_key_from_table(
-                    release.request_key(),
-                    "control.release.request_key",
+        fbs::BatchCommand::FreeCommand => {
+            let free = envelope
+                .command_as_free_command()
+                .context("free command table is missing")?;
+            BatchCommand::Free {
+                buffer: buffer_id_from_table(
+                    free.buffer().context("free control has no buffer id")?,
                 )?,
-                op_id: OpId(release.op_id()),
             }
         }
-        _ => codec_bail!("control union is empty"),
+        _ => codec_bail!("batch command union is empty"),
     };
-    control.validate()?;
-    Ok(control)
+    command.validate()?;
+    Ok(command)
 }
 
 fn request_key_from_table(
@@ -625,94 +610,356 @@ fn request_key_from_table(
     let request_key = request_key.with_context(|| format!("{label} is missing"))?;
     Ok(RequestKey {
         authority_id: request_key.authority_id(),
-        session_id: RequestId(request_key.session_id()),
+        request_id: RequestId(request_key.request_id()),
         epoch: request_key.epoch(),
     })
 }
 
-fn version_ref_from_table(version: fbs::VersionRef<'_>) -> CodecResult<VersionRef> {
+fn checkpoint_from_table(version: fbs::Checkpoint<'_>) -> CodecResult<Checkpoint> {
     let point = match version.point_type() {
-        fbs::Point::PointFixed => {
+        fbs::CheckpointPoint::CheckpointFixed => {
             let fixed = version
-                .point_as_point_fixed()
+                .point_as_checkpoint_fixed()
                 .context("fixed point table is missing")?;
-            Point::Fixed {
-                point_index: fixed.point_index(),
-            }
+            CheckpointPoint::Fixed(fixed.point())
         }
-        fbs::Point::PointDevice => {
-            let device = version
-                .point_as_point_device()
-                .context("device point table is missing")?;
-            Point::Device {
-                point_index: device.point_index(),
-                selected_point: device
-                    .selected_point()
-                    .map(product_ref_from_table)
-                    .transpose()?,
-            }
+        fbs::CheckpointPoint::CheckpointDeviceSelected => {
+            version
+                .point_as_checkpoint_device_selected()
+                .context("device-selected point table is missing")?;
+            CheckpointPoint::DeviceSelected
         }
-        _ => codec_bail!("version reference point union is empty"),
+        _ => codec_bail!("checkpoint point union is empty"),
     };
-    Ok(VersionRef {
-        request_key: request_key_from_table(version.request_key(), "version_ref.request_key")?,
-        producer_op_id: OpId(version.producer_op_id()),
+    Ok(Checkpoint {
+        op_id: OpId(version.op_id()),
         point,
     })
 }
 
-fn product_ref_from_table(product: fbs::ProductRef<'_>) -> CodecResult<ProductRef> {
-    let point_range = product
-        .point_range()
-        .context("product reference has no point range")?;
-    Ok(ProductRef {
-        request_key: request_key_from_table(product.request_key(), "product_ref.request_key")?,
-        producer_op_id: OpId(product.producer_op_id()),
-        output_index: product.output_index(),
-        generation: product.generation(),
-        kind: product_kind_from_fb(product.kind())?,
-        storage_class: storage_class_from_fb(product.storage_class())?,
-        dtype: dtype_from_fb(product.dtype())?,
-        shape_bound: shape_bound_from_table(
-            product
-                .shape_bound()
-                .context("product reference has no shape bound")?,
-        ),
-        point_range: PointRange {
-            base_point: point_range.base_point(),
-            max_points: point_range.max_points(),
-        },
+fn scalar_id_from_table(
+    id: fbs::ScalarId<'_>,
+    label: &str,
+) -> CodecResult<(RequestKey, OpId, u16, u32)> {
+    Ok((
+        request_key_from_table(id.request_key(), &format!("{label}.request_key"))?,
+        OpId(id.producer_op_id()),
+        id.output_index(),
+        id.generation(),
+    ))
+}
+
+fn buffer_descriptor_from_table(
+    descriptor: fbs::BufferDescriptor<'_>,
+    label: &str,
+) -> CodecResult<(RequestKey, OpId, u16, u32, u64)> {
+    let id = descriptor
+        .id()
+        .with_context(|| format!("{label}.id is missing"))?;
+    let id = buffer_id_from_table(id)?;
+    Ok((
+        id.owner,
+        id.producer_op_id,
+        id.output_index,
+        id.generation,
+        descriptor.max_bytes(),
+    ))
+}
+
+fn shape_bound_from_parts(
+    extents: Option<flatbuffers::Vector<'_, u32>>,
+    dynamic_axis: i32,
+) -> CodecResult<ShapeBound> {
+    let extents = extents
+        .map(|items| items.iter().collect::<Vec<_>>())
+        .unwrap_or_default();
+    codec_ensure!(
+        dynamic_axis >= -1 && dynamic_axis < extents.len() as i32,
+        "typed value has an invalid dynamic axis"
+    );
+    Ok(ShapeBound {
+        dims: extents
+            .into_iter()
+            .enumerate()
+            .map(|(index, extent)| {
+                if index as i32 == dynamic_axis {
+                    DimBound::Device { max: extent }
+                } else {
+                    DimBound::Static(extent)
+                }
+            })
+            .collect(),
     })
 }
 
-fn shape_bound_from_table(shape: fbs::ShapeBound<'_>) -> ShapeBound {
-    ShapeBound {
-        dims: shape
-            .dims()
-            .map(|dims| {
-                dims.iter()
-                    .map(|dim| {
-                        if dim.device() {
-                            DimBound::Device { max: dim.value() }
-                        } else {
-                            DimBound::Static(dim.value())
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
-    }
-}
-
-fn bounds_from_table(bounds: fbs::Bounds<'_>) -> Bounds {
-    Bounds {
-        max_points: bounds.max_points(),
-        max_tokens: bounds.max_tokens(),
-        max_kv_pages: bounds.max_kv_pages(),
-        max_latent_bytes: bounds.max_latent_bytes(),
-        max_completion_bytes: bounds.max_completion_bytes(),
-        max_transfer_bytes: bounds.max_transfer_bytes(),
-    }
+fn product_ref_from_table(reference: fbs::ValueRef<'_>) -> CodecResult<ProductRef> {
+    let scalar = |id: Option<fbs::ScalarId<'_>>, label: &str| {
+        scalar_id_from_table(id.with_context(|| format!("{label}.id is missing"))?, label)
+    };
+    let buffer = |descriptor: Option<fbs::BufferDescriptor<'_>>, label: &str| {
+        buffer_descriptor_from_table(
+            descriptor.with_context(|| format!("{label}.buffer is missing"))?,
+            label,
+        )
+    };
+    let product = match reference.value_type() {
+        fbs::ValueReference::TokenValue => {
+            let value = reference
+                .value_as_token_value()
+                .context("token value reference is missing")?;
+            let (request_key, producer_op_id, output_index, generation) =
+                scalar(value.id(), "token_value")?;
+            ProductRef {
+                request_key,
+                producer_op_id,
+                output_index,
+                generation,
+                kind: ProductKind::Token,
+                storage_class: match value.delivery() {
+                    fbs::TokenDelivery::Inline => StorageClass::HostStaging,
+                    fbs::TokenDelivery::Relay => StorageClass::RequestRelay,
+                    _ => codec_bail!("unknown token delivery"),
+                },
+                dtype: DType::U32,
+                shape_bound: ShapeBound {
+                    dims: (value.max_tokens() > 1)
+                        .then_some(DimBound::Static(value.max_tokens()))
+                        .into_iter()
+                        .collect(),
+                },
+                point_range: PointRange {
+                    base_point: value.base_point(),
+                    max_points: value.max_points(),
+                },
+            }
+        }
+        fbs::ValueReference::LogprobValue => {
+            let value = reference
+                .value_as_logprob_value()
+                .context("logprob value reference is missing")?;
+            let (request_key, producer_op_id, output_index, generation) =
+                scalar(value.id(), "logprob_value")?;
+            ProductRef {
+                request_key,
+                producer_op_id,
+                output_index,
+                generation,
+                kind: ProductKind::Logprob,
+                storage_class: StorageClass::HostStaging,
+                dtype: match value.format() {
+                    fbs::LogprobFormat::PackedBytes => DType::U8,
+                    fbs::LogprobFormat::F32Values => DType::F32,
+                    _ => codec_bail!("unknown logprob format"),
+                },
+                shape_bound: ShapeBound {
+                    dims: (value.max_count() > 1)
+                        .then_some(DimBound::Device {
+                            max: value.max_count(),
+                        })
+                        .into_iter()
+                        .collect(),
+                },
+                point_range: PointRange {
+                    base_point: value.base_point(),
+                    max_points: value.max_points(),
+                },
+            }
+        }
+        fbs::ValueReference::FeatureBuffer => {
+            let value = reference
+                .value_as_feature_buffer()
+                .context("feature buffer reference is missing")?;
+            let (request_key, producer_op_id, output_index, generation, max_bytes) =
+                buffer(value.buffer(), "feature_buffer")?;
+            let shape_bound = shape_bound_from_parts(value.extents(), value.dynamic_axis())?;
+            let product = ProductRef {
+                request_key,
+                producer_op_id,
+                output_index,
+                generation,
+                kind: match value.feature() {
+                    fbs::FeatureKind::Vision => ProductKind::VisionFeature,
+                    fbs::FeatureKind::Latent => ProductKind::LatentFeature,
+                    _ => codec_bail!("unknown feature kind"),
+                },
+                storage_class: StorageClass::LatentArena,
+                dtype: dtype_from_fb(value.dtype())?,
+                shape_bound,
+                point_range: PointRange {
+                    base_point: value.base_point(),
+                    max_points: value.max_points(),
+                },
+            };
+            codec_ensure!(
+                product.max_bytes() == max_bytes,
+                "feature buffer byte bound disagrees with its typed shape"
+            );
+            product
+        }
+        fbs::ValueReference::KvBuffer => {
+            let value = reference
+                .value_as_kv_buffer()
+                .context("KV buffer reference is missing")?;
+            let (request_key, producer_op_id, output_index, generation, max_bytes) =
+                buffer(value.buffer(), "kv_buffer")?;
+            let product = ProductRef {
+                request_key,
+                producer_op_id,
+                output_index,
+                generation,
+                kind: ProductKind::Kv,
+                storage_class: StorageClass::PagedKv,
+                dtype: dtype_from_fb(value.dtype())?,
+                shape_bound: shape_bound_from_parts(value.extents(), value.dynamic_axis())?,
+                point_range: PointRange {
+                    base_point: value.base_point(),
+                    max_points: value.max_points(),
+                },
+            };
+            codec_ensure!(
+                product.max_bytes() == max_bytes,
+                "KV buffer byte bound disagrees with its typed shape"
+            );
+            product
+        }
+        fbs::ValueReference::LatentBuffer => {
+            let value = reference
+                .value_as_latent_buffer()
+                .context("latent buffer reference is missing")?;
+            let (request_key, producer_op_id, output_index, generation, max_bytes) =
+                buffer(value.buffer(), "latent_buffer")?;
+            let product = ProductRef {
+                request_key,
+                producer_op_id,
+                output_index,
+                generation,
+                kind: ProductKind::Latent,
+                storage_class: StorageClass::LatentArena,
+                dtype: dtype_from_fb(value.dtype())?,
+                shape_bound: shape_bound_from_parts(value.extents(), value.dynamic_axis())?,
+                point_range: PointRange {
+                    base_point: value.base_point(),
+                    max_points: value.max_points(),
+                },
+            };
+            codec_ensure!(
+                product.max_bytes() == max_bytes,
+                "latent buffer byte bound disagrees with its typed shape"
+            );
+            product
+        }
+        fbs::ValueReference::ArtifactValue => {
+            let value = reference
+                .value_as_artifact_value()
+                .context("artifact value reference is missing")?;
+            let (request_key, producer_op_id, output_index, generation) =
+                scalar(value.id(), "artifact_value")?;
+            let storage_class = match value.use_() {
+                fbs::ArtifactUse::Inline => StorageClass::HostStaging,
+                fbs::ArtifactUse::Feedback => StorageClass::LatentArena,
+                fbs::ArtifactUse::Encoded => StorageClass::PinnedOutput,
+                _ => codec_bail!("unknown artifact use"),
+            };
+            let product = ProductRef {
+                request_key,
+                producer_op_id,
+                output_index,
+                generation,
+                kind: ProductKind::Artifact,
+                storage_class,
+                dtype: dtype_from_fb(value.dtype())?,
+                shape_bound: shape_bound_from_parts(value.extents(), value.dynamic_axis())?,
+                point_range: PointRange {
+                    base_point: value.base_point(),
+                    max_points: value.max_points(),
+                },
+            };
+            if value.use_() == fbs::ArtifactUse::Feedback {
+                let (_, _, _, _, max_bytes) = buffer(value.buffer(), "artifact_value")?;
+                codec_ensure!(
+                    product.max_bytes() == max_bytes,
+                    "artifact buffer byte bound disagrees with its typed shape"
+                );
+            }
+            product
+        }
+        fbs::ValueReference::CompletionValue => {
+            let value = reference
+                .value_as_completion_value()
+                .context("completion value reference is missing")?;
+            let (request_key, producer_op_id, output_index, generation) =
+                scalar(value.id(), "completion_value")?;
+            ProductRef {
+                request_key,
+                producer_op_id,
+                output_index,
+                generation,
+                kind: ProductKind::Completion,
+                storage_class: match value.delivery() {
+                    fbs::CompletionDelivery::Relay => StorageClass::RequestRelay,
+                    fbs::CompletionDelivery::DevicePredicate => StorageClass::DeviceTensor,
+                    _ => codec_bail!("unknown completion delivery"),
+                },
+                dtype: DType::U8,
+                shape_bound: ShapeBound::default(),
+                point_range: PointRange {
+                    base_point: value.base_point(),
+                    max_points: value.max_points(),
+                },
+            }
+        }
+        fbs::ValueReference::SamplingValue => {
+            let value = reference
+                .value_as_sampling_value()
+                .context("sampling value reference is missing")?;
+            let (request_key, producer_op_id, output_index, generation) =
+                scalar(value.id(), "sampling_value")?;
+            let max_bytes = value.max_bytes();
+            codec_ensure!(
+                max_bytes > 0 && max_bytes <= u64::from(u32::MAX),
+                "sampling value has an invalid byte bound"
+            );
+            ProductRef {
+                request_key,
+                producer_op_id,
+                output_index,
+                generation,
+                kind: ProductKind::SamplingState,
+                storage_class: StorageClass::HostStaging,
+                dtype: DType::U8,
+                shape_bound: ShapeBound {
+                    dims: vec![DimBound::Device {
+                        max: max_bytes as u32,
+                    }],
+                },
+                point_range: PointRange::default(),
+            }
+        }
+        fbs::ValueReference::SelectedPointValue => {
+            let value = reference
+                .value_as_selected_point_value()
+                .context("selected-point value reference is missing")?;
+            let (request_key, producer_op_id, output_index, generation) =
+                scalar(value.id(), "selected_point_value")?;
+            ProductRef {
+                request_key,
+                producer_op_id,
+                output_index,
+                generation,
+                kind: ProductKind::SelectedPoint,
+                storage_class: StorageClass::RequestRelay,
+                dtype: DType::U32,
+                shape_bound: ShapeBound::default(),
+                point_range: PointRange {
+                    base_point: value.base_point(),
+                    max_points: value.max_points(),
+                },
+            }
+        }
+        _ => codec_bail!("value reference union is empty"),
+    };
+    product.validate()?;
+    Ok(product)
 }
 
 fn rng_from_table(rng: fbs::Rng<'_>) -> CodecResult<Rng> {
@@ -723,31 +970,10 @@ fn rng_from_table(rng: fbs::Rng<'_>) -> CodecResult<Rng> {
     })
 }
 
-fn completion_report_from_table(
-    report: fbs::CompletionReport<'_>,
-) -> CodecResult<CompletionReport> {
-    let report = CompletionReport {
-        step_id: report.step_id(),
-        partitions: report
-            .partitions()
-            .map(|items| {
-                items
-                    .iter()
-                    .map(partition_completion_from_table)
-                    .collect::<CodecResult<_>>()
-            })
-            .transpose()?
-            .unwrap_or_default(),
-    };
-    report.validate()?;
-    Ok(report)
-}
-
-fn partition_completion_from_table(
-    report: fbs::PartitionCompletion<'_>,
-) -> CodecResult<PartitionCompletion> {
-    let report = PartitionCompletion {
-        partition_id: report.partition_id(),
+fn run_result_from_table(report: fbs::RunResult<'_>) -> CodecResult<RunResult> {
+    let report = RunResult {
+        batch_id: report.batch_id(),
+        run_id: report.run_id(),
         completions: report
             .completions()
             .map(|items| {
@@ -776,21 +1002,94 @@ fn partition_completion_from_table(
         },
         worker_exec_us: report.worker_exec_us(),
         forward_stats: report.forward_stats().map(forward_stats_from_table),
+        done: report.done(),
     };
     report.validate()?;
     Ok(report)
 }
 
 fn completion_record_from_table(record: fbs::ModelOutput<'_>) -> CodecResult<ModelOutput> {
-    let logical_lengths = record
-        .logical_lengths()
-        .context("completion record has no logical lengths")?;
-    let token_span = record
-        .token_span()
-        .context("completion record has no token span")?;
-    let finish_flags = record
-        .finish_flags()
-        .context("completion record has no finish flags")?;
+    macro_rules! result_data {
+        ($payload:expr) => {{
+            let payload = $payload.context("completion result payload table is missing")?;
+            let logical_lengths = payload
+                .logical_lengths()
+                .context("completion result has no logical lengths")?;
+            let token_span = payload
+                .token_span()
+                .context("completion result has no token span")?;
+            let finish_flags = payload
+                .finish_flags()
+                .context("completion result has no finish flags")?;
+            let media_output = payload
+                .media_output()
+                .map(|output| {
+                    let handle = match output.handle_type() {
+                        fbs::ArtifactHandle::PosixShmArtifact => {
+                            let handle = output.handle_as_posix_shm_artifact().context(
+                                "completion media output POSIX shared-memory handle is missing",
+                            )?;
+                            ArtifactHandle::PosixShm {
+                                name: required_str(
+                                    handle.name(),
+                                    "completion.media_output.handle.value.name",
+                                )?,
+                            }
+                        }
+                        _ => codec_bail!("completion media output handle union is empty"),
+                    };
+                    Ok::<MediaOutput, CodecError>(MediaOutput {
+                        handle,
+                        bytes: output.bytes(),
+                    })
+                })
+                .transpose()?;
+            ResultData {
+                logical_lengths: LogicalLengths {
+                    token_len: logical_lengths.token_len(),
+                    kv_visible_len: logical_lengths.kv_visible_len(),
+                    kv_computed_len: logical_lengths.kv_computed_len(),
+                    latent_len: logical_lengths.latent_len(),
+                },
+                token_span: TokenSpan {
+                    base: token_span.base(),
+                    len: token_span.len(),
+                },
+                committed_tokens: payload
+                    .committed_tokens()
+                    .map(|items| items.iter().collect())
+                    .unwrap_or_default(),
+                finish_flags: FinishFlags {
+                    eos: finish_flags.eos(),
+                    length: finish_flags.length(),
+                    stop: finish_flags.stop(),
+                },
+                media_output,
+            }
+        }};
+    }
+    let payload = match record.payload_type() {
+        fbs::ResultPayload::ArResult => {
+            ResultPayload::Ar(result_data!(record.payload_as_ar_result()))
+        }
+        fbs::ResultPayload::EncoderResult => {
+            ResultPayload::Encoder(result_data!(record.payload_as_encoder_result()))
+        }
+        fbs::ResultPayload::DiffusionResult => {
+            let table = record
+                .payload_as_diffusion_result()
+                .context("completion diffusion result table is missing")?;
+            ResultPayload::Diffusion(DiffusionResult {
+                data: result_data!(Some(table)),
+                next_cursor: table.next_cursor(),
+                done: table.done(),
+            })
+        }
+        fbs::ResultPayload::TransferResult => {
+            ResultPayload::Transfer(result_data!(record.payload_as_transfer_result()))
+        }
+        _ => return Err(CodecError::invalid("completion result payload is missing")),
+    };
     let timing_counters = record
         .timing_counters()
         .context("completion record has no timing counters")?;
@@ -800,25 +1099,6 @@ fn completion_record_from_table(record: fbs::ModelOutput<'_>) -> CodecResult<Mod
         completion_slot_generation: record.completion_slot_generation(),
         status: op_status_from_fb(record.status())?,
         selected_point: record.selected_point(),
-        logical_lengths: LogicalLengths {
-            token_len: logical_lengths.token_len(),
-            kv_visible_len: logical_lengths.kv_visible_len(),
-            kv_computed_len: logical_lengths.kv_computed_len(),
-            latent_len: logical_lengths.latent_len(),
-        },
-        token_span: TokenSpan {
-            base: token_span.base(),
-            len: token_span.len(),
-        },
-        committed_tokens: record
-            .committed_tokens()
-            .map(|items| items.iter().collect())
-            .unwrap_or_default(),
-        finish_flags: FinishFlags {
-            eos: finish_flags.eos(),
-            length: finish_flags.length(),
-            stop: finish_flags.stop(),
-        },
         product_generations: record
             .product_generations()
             .map(|items| items.iter().collect())
@@ -830,31 +1110,40 @@ fn completion_record_from_table(record: fbs::ModelOutput<'_>) -> CodecResult<Mod
             copy_us: timing_counters.copy_us(),
             host_us: timing_counters.host_us(),
         },
-        media_output: record
-            .media_output()
-            .map(|output| {
-                Ok::<MediaOutput, CodecError>(MediaOutput {
-                    handle: required_str(output.handle(), "completion.media_output.handle")?,
-                    bytes: output.bytes(),
-                })
-            })
-            .transpose()?,
+        payload,
     };
     record.validate()?;
     Ok(record)
 }
 
 fn product_payload_from_table(payload: fbs::ProductPayload<'_>) -> CodecResult<ProductPayload> {
+    let value = match payload.value_type() {
+        fbs::InlineValue::BytesValue => {
+            let value = payload
+                .value_as_bytes_value()
+                .context("product payload byte value is missing")?;
+            InlineValue::Bytes(
+                value
+                    .bytes()
+                    .map(|bytes| bytes.bytes().to_vec())
+                    .unwrap_or_default(),
+            )
+        }
+        fbs::InlineValue::TransferHandle => {
+            let value = payload
+                .value_as_transfer_handle()
+                .context("product payload transfer handle is missing")?;
+            InlineValue::Transfer(transfer_handle_from_table(value)?)
+        }
+        _ => codec_bail!("product payload value union is empty"),
+    };
     let payload = ProductPayload {
         product: product_ref_from_table(
             payload
                 .product()
                 .context("product payload has no product reference")?,
         )?,
-        bytes: payload
-            .bytes()
-            .map(|bytes| bytes.bytes().to_vec())
-            .unwrap_or_default(),
+        value,
     };
     payload.validate()?;
     Ok(payload)
@@ -874,80 +1163,31 @@ fn error_operation_from_table(
 
 fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
     let info = WorkerInfo {
-        worker_role: worker_role_from_fb(info.worker_role())?,
-        block_size: info.block_size(),
-        num_blocks: info.num_blocks(),
-        num_layers: info.num_layers(),
-        num_kv_heads: info.num_kv_heads(),
-        head_dim: info.head_dim(),
-        supported_work: info
-            .supported_work()
-            .map(|items| items.iter().map(work_from_fb).collect::<CodecResult<_>>())
-            .transpose()?
-            .unwrap_or_default(),
-        latent_page_units: info.latent_page_units(),
-        num_latent_pages: info.num_latent_pages(),
-        latent_width: info.latent_width(),
-        latent_dtype: optional_parse(info.latent_dtype(), "info.latent_dtype")?,
-        latent_downsample: info.latent_downsample(),
-        bytes_per_token: info.bytes_per_token(),
-        max_vae_grid_tokens: info.max_vae_grid_tokens(),
-        max_vit_grid_tokens: info.max_vit_grid_tokens(),
-        max_latent_feature_bytes: info.max_latent_feature_bytes(),
-        max_vision_feature_bytes: info.max_vision_feature_bytes(),
-        commit_marker_tokens: info.commit_marker_tokens(),
-        gen_rope_advance: info.gen_rope_advance(),
-        max_cfg_branches: info.max_cfg_branches(),
-        groups: info
-            .groups()
-            .map(|items| {
-                items
-                    .iter()
-                    .map(kv_group_from_table)
-                    .collect::<CodecResult<_>>()
-            })
-            .transpose()?
-            .unwrap_or_default(),
-        kv_dtype: optional_parse(info.kv_dtype(), "info.kv_dtype")?,
-        model_dtype: required_parse(info.model_dtype(), "info.model_dtype")?,
+        model_name: required_str(info.model_name(), "info.model_name")?,
+        weight_version: info.weight_version(),
         rank: info
             .rank()
             .map(rank_from_table)
             .context("info have no rank")?,
-        pipeline_depth: info.pipeline_depth(),
-        encoder_cache_budget: info.encoder_cache_budget(),
-        supported_controls: info
-            .supported_controls()
+        supported_ops: info
+            .supported_ops()
             .map(|items| {
                 items
                     .iter()
-                    .map(request_kind_from_fb)
+                    .map(op_kind_from_fb)
                     .collect::<CodecResult<_>>()
             })
             .transpose()?
             .unwrap_or_default(),
-        max_batch_operations: info.max_batch_operations(),
+        queue_depth: info.queue_depth(),
+        max_batch_ops: info.max_batch_ops(),
         max_batch_tokens: info.max_batch_tokens(),
-        max_request_pool_size: info.max_request_pool_size(),
-        max_unresolved_window: info.max_unresolved_window(),
-        incremental_kv_publication: info.incremental_kv_publication(),
-        mixed_buckets: info
-            .mixed_buckets()
-            .map(|items| items.iter().map(mixed_bucket_from_table).collect())
-            .unwrap_or_default(),
-        sampling_ownership: sampling_ownership_from_fb(info.sampling_ownership())?,
-        resource_classes: info
-            .resource_classes()
-            .map(|items| {
-                items
-                    .iter()
-                    .map(resource_class_from_fb)
-                    .collect::<CodecResult<_>>()
-            })
-            .transpose()?
-            .unwrap_or_default(),
-        model_name: required_str(info.model_name(), "info.model_name")?,
-        weight_version: info.weight_version(),
+        request_slots: info.request_slots(),
+        kv_cache: info.kv_cache().map(kv_cache_from_table).transpose()?,
+        latent_page_units: info.latent_page_units(),
+        latent_pages: info.latent_pages(),
+        buffer_pool_bytes: info.buffer_pool_bytes(),
+        max_unresolved_ops: info.max_unresolved_ops(),
     };
     info.validate()?;
     Ok(info)
@@ -1116,16 +1356,6 @@ fn rank_from_table(rank: fbs::RankInfo<'_>) -> RankInfo {
     }
 }
 
-fn pressure_from_table(pressure: fbs::ResourcePressure<'_>) -> CodecResult<ResourcePressure> {
-    Ok(ResourcePressure {
-        class: resource_class_from_fb(pressure.class())?,
-        total: pressure.total(),
-        used: pressure.used(),
-        evictable: pressure.evictable(),
-        free: pressure.free(),
-    })
-}
-
 fn required_str(value: Option<&str>, label: &str) -> CodecResult<String> {
     value
         .filter(|value| !value.is_empty())
@@ -1143,65 +1373,39 @@ where
         .with_context(|| format!("{label} is invalid"))
 }
 
-fn optional_parse<T>(value: Option<&str>, label: &str) -> CodecResult<Option<T>>
-where
-    T: std::str::FromStr,
-    T::Err: std::error::Error + Send + Sync + 'static,
-{
-    value
-        .filter(|value| !value.is_empty())
-        .map(|value| value.parse().with_context(|| format!("{label} is invalid")))
-        .transpose()
-}
-
 // ---------------------------------------------------------------------------
 // Request / response framing
 // ---------------------------------------------------------------------------
 
 fn request_to_fb(request: &WorkerRequest) -> CodecResult<fbs::WorkerRequestT> {
-    let (batch, step_id, session_id, product_handles) = match request {
-        WorkerRequest::GetInfo { .. }
-        | WorkerRequest::GetPressure { .. }
-        | WorkerRequest::Shutdown => (None, None, None, None),
-        WorkerRequest::Execute { batch, .. } => {
-            batch.validate()?;
-            (Some(batch), None, None, None)
+    let (run, run_id) = match request {
+        WorkerRequest::Info { .. } | WorkerRequest::Close { .. } => (None, None),
+        WorkerRequest::Submit { run, .. } => {
+            run.validate()?;
+            (Some(run), None)
         }
-        WorkerRequest::PollCompletions { step_id, .. } => (None, Some(*step_id), None, None),
-        WorkerRequest::DropSession { session_id } => (None, None, Some(*session_id), None),
-        WorkerRequest::ReleaseProducts { product_handles } => {
-            (None, None, None, Some(product_handles))
-        }
+        WorkerRequest::Poll { run_id, .. } => (None, Some(*run_id)),
     };
     Ok(fbs::WorkerRequestT {
         kind: request_kind_to_fb(request.kind()),
         call_id: request.call_id(),
-        batch: batch.map(batch_to_fb).transpose()?.map(Box::new),
-        step_id,
-        session_id: session_id.map(|id| id.0),
-        product_handles: product_handles.cloned(),
+        run: run.map(run_to_fb).transpose()?.map(Box::new),
+        poll_run_id: run_id,
     })
 }
 
 fn response_to_fb(response: &WorkerResponse) -> CodecResult<fbs::WorkerResponseT> {
-    let (info, completion_report, pressure, error) = match response {
-        WorkerResponse::Info { info, .. } => (Some(info), None, None, None),
-        WorkerResponse::Result {
-            completion_report, ..
-        } => (None, Some(completion_report), None, None),
-        WorkerResponse::Ok { .. } => (None, None, None, None),
-        WorkerResponse::Error { error, .. } => (None, None, None, Some(error)),
-        WorkerResponse::Pressure { pressure, .. } => (None, None, Some(pressure), None),
+    let (info, result, error) = match response {
+        WorkerResponse::Info { info, .. } => (Some(info), None, None),
+        WorkerResponse::Result { result, .. } => (None, Some(result), None),
+        WorkerResponse::Ok { .. } => (None, None, None),
+        WorkerResponse::Error { error, .. } => (None, None, Some(error)),
     };
     Ok(fbs::WorkerResponseT {
         kind: response_kind_to_fb(response.kind()),
         call_id: response.call_id(),
         info: info.map(info_to_fb).transpose()?.map(Box::new),
-        completion_report: completion_report
-            .map(completion_report_to_fb)
-            .transpose()?
-            .map(Box::new),
-        pressure: pressure.map(|items| items.iter().map(pressure_to_fb).collect()),
+        result: result.map(run_result_to_fb).transpose()?.map(Box::new),
         message: error.map(|error| error.message.clone()),
         code: error.and_then(|error| error.code.clone()),
         retryable: error.map(|error| error.retryable),
@@ -1219,97 +1423,60 @@ fn response_to_fb(response: &WorkerResponse) -> CodecResult<fbs::WorkerResponseT
 }
 
 // ---------------------------------------------------------------------------
-// Batch, operations, admissions, controls
+// Run, operations, admissions, controls
 // ---------------------------------------------------------------------------
 
-fn batch_to_fb(batch: &Batch) -> CodecResult<fbs::BatchT> {
-    batch.validate()?;
-    Ok(fbs::BatchT {
-        step_id: batch.step_id,
-        admissions: Some(
-            batch
-                .admissions
-                .iter()
-                .map(admission_to_fb)
-                .collect::<CodecResult<_>>()?,
-        ),
-        partitions: Some(
-            batch
-                .partitions
-                .iter()
-                .map(partition_to_fb)
-                .collect::<CodecResult<_>>()?,
-        ),
-        controls: Some(
-            batch
-                .controls
-                .iter()
-                .map(|control| fbs::ControlEnvelopeT {
-                    control: control_to_fb(control),
-                })
-                .collect(),
-        ),
-        input_products: Some(
-            batch
-                .input_products
-                .iter()
-                .map(product_payload_to_fb)
-                .collect(),
-        ),
-    })
-}
-
-fn partition_to_fb(partition: &BatchPartition) -> CodecResult<fbs::BatchPartitionT> {
-    partition.validate()?;
-    Ok(fbs::BatchPartitionT {
-        partition_id: partition.partition_id,
-        submission_group: partition.submission_group,
-        collective_seq: partition.collective_seq,
-        domain: domain_to_fb(partition.domain),
-        route: partition.route.0,
-        attention: attention_regime_to_fb(partition.attention),
-        shape_class: partition.shape_class,
+fn run_to_fb(run: &Run) -> CodecResult<fbs::RunT> {
+    run.validate()?;
+    Ok(fbs::RunT {
+        batch_id: run.batch_id,
+        run_id: run.run_id,
+        collective_seq: run.collective_seq,
         operations: Some(
-            partition
-                .operations
+            run.operations
                 .iter()
                 .map(operation_to_fb)
                 .collect::<CodecResult<_>>()?,
         ),
-        block_tables: Some(
-            partition
-                .block_tables
-                .iter()
-                .map(block_table_to_fb)
-                .collect(),
-        ),
+        block_tables: Some(run.block_tables.iter().map(block_table_to_fb).collect()),
         new_cache_pages: Some(
-            partition
-                .new_cache_pages
+            run.new_cache_pages
                 .iter()
                 .map(cache_page_allocation_to_fb)
                 .collect(),
         ),
-        forward_rows: Some(
-            partition
-                .forward_rows
-                .iter()
-                .map(row_geometry_to_fb)
-                .collect(),
-        ),
+        forward_rows: Some(run.forward_rows.iter().map(row_geometry_to_fb).collect()),
         latent_placements: Some(
-            partition
-                .latent_placements
+            run.latent_placements
                 .iter()
                 .map(latent_placement_to_fb)
                 .collect(),
         ),
-        reconstruction_placements: Some(
-            partition
-                .reconstruction_placements
+        decode_placements: Some(
+            run.decode_placements
                 .iter()
-                .map(reconstruction_placement_to_fb)
+                .map(decode_placement_to_fb)
                 .collect(),
+        ),
+        buffer_placements: Some(
+            run.buffer_placements
+                .iter()
+                .map(buffer_placement_to_fb)
+                .collect(),
+        ),
+        commands: Some(
+            run.commands
+                .iter()
+                .map(|command| fbs::BatchCommandEnvelopeT {
+                    command: command_to_fb(command),
+                })
+                .collect(),
+        ),
+        input_products: Some(
+            run.input_products
+                .iter()
+                .map(product_payload_to_fb)
+                .collect::<CodecResult<_>>()?,
         ),
     })
 }
@@ -1319,27 +1486,23 @@ fn admission_to_fb(admission: &NewRequest) -> CodecResult<fbs::NewRequestT> {
     Ok(fbs::NewRequestT {
         request_key: Some(Box::new(request_key_to_fb(admission.request_key))),
         request_pool_idx: admission.request_pool_idx,
-        und: admission
-            .und
+        ar: admission
+            .ar
             .as_ref()
-            .map(und_admission_to_fb)
+            .map(ar_params_to_fb)
             .transpose()?
             .map(Box::new),
-        gen_admission: admission
-            .gen_admission
+        umm: admission.umm.as_ref().map(umm_params_to_fb).map(Box::new),
+        diffusion: admission
+            .diffusion
             .as_ref()
-            .map(gen_admission_to_fb)
-            .map(Box::new),
-        media: admission
-            .media
-            .as_ref()
-            .map(media_admission_to_fb)
+            .map(diffusion_params_to_fb)
             .map(Box::new),
     })
 }
 
-fn und_admission_to_fb(admission: &UndAdmission) -> CodecResult<fbs::UndAdmissionT> {
-    Ok(fbs::UndAdmissionT {
+fn ar_params_to_fb(admission: &ArRequestParams) -> CodecResult<fbs::ArRequestParamsT> {
+    Ok(fbs::ArRequestParamsT {
         sampling: Some(Box::new(sampling_to_fb(&admission.sampling)?)),
         negative_token_ids: Some(admission.negative_token_ids.clone()),
         finish_token_ids: Some(admission.finish_token_ids.clone()),
@@ -1347,21 +1510,19 @@ fn und_admission_to_fb(admission: &UndAdmission) -> CodecResult<fbs::UndAdmissio
     })
 }
 
-fn gen_admission_to_fb(admission: &GenAdmission) -> fbs::GenAdmissionT {
-    fbs::GenAdmissionT {
+fn umm_params_to_fb(admission: &UmmRequestParams) -> fbs::UmmRequestParamsT {
+    fbs::UmmRequestParamsT {
         image: Some(Box::new(image_to_fb(&admission.image))),
     }
 }
 
-fn media_admission_to_fb(admission: &MediaAdmission) -> fbs::MediaAdmissionT {
-    fbs::MediaAdmissionT {
+fn diffusion_params_to_fb(admission: &DiffusionRequestParams) -> fbs::DiffusionRequestParamsT {
+    fbs::DiffusionRequestParamsT {
         prompt_token_ids: Some(admission.prompt_token_ids.clone()),
         seed: admission.seed,
-        profile: media_profile_to_fb(admission.profile),
         geometry: Some(Box::new(fbs::MediaGeometryT {
             frame_count: admission.geometry.frame_count,
-            video_reconstruction_units: admission.geometry.video_reconstruction_units,
-            audio_latent_frames: admission.geometry.audio_latent_frames,
+            decode_units: admission.geometry.decode_units,
             prompt_tokens: admission.geometry.prompt_tokens,
             denoise_steps: admission.geometry.denoise_steps,
         })),
@@ -1407,73 +1568,169 @@ fn latent_placement_to_fb(placement: &LatentPlacement) -> fbs::LatentPlacementT 
     }
 }
 
-fn reconstruction_placement_to_fb(
-    placement: &ReconstructionPlacement,
-) -> fbs::ReconstructionPlacementT {
-    fbs::ReconstructionPlacementT {
+fn decode_placement_to_fb(placement: &DecodePlacement) -> fbs::DecodePlacementT {
+    fbs::DecodePlacementT {
         request_key: Some(Box::new(request_key_to_fb(placement.request_key))),
         op_id: placement.op_id.0,
-        kind: reconstruction_kind_to_fb(placement.kind),
-        start_unit: placement.start_unit,
-        unit_count: placement.unit_count,
+        cursor: placement.cursor,
+        max_units: placement.max_units,
+    }
+}
+
+fn buffer_placement_to_fb(placement: &BufferPlacement) -> fbs::BufferPlacementT {
+    fbs::BufferPlacementT {
+        buffer: Some(Box::new(buffer_id_to_fb(placement.buffer))),
+        offset: placement.offset,
+        bytes: placement.bytes,
     }
 }
 
 fn operation_to_fb(operation: &Operation) -> CodecResult<fbs::OperationT> {
     operation.validate()?;
+    macro_rules! payload_fields {
+        ($table:ident, $bounds:expr, $inputs:expr, $outputs:expr, $predicate:expr, $rng:expr, $control_seq:expr) => {
+            fbs::$table {
+                max_points: $bounds.max_points,
+                max_tokens: $bounds.max_tokens,
+                max_kv_pages: $bounds.max_kv_pages,
+                max_latent_bytes: $bounds.max_latent_bytes,
+                max_completion_bytes: $bounds.max_completion_bytes,
+                max_transfer_bytes: $bounds.max_transfer_bytes,
+                inputs: Some(
+                    $inputs
+                        .iter()
+                        .map(product_ref_to_fb)
+                        .collect::<CodecResult<_>>()?,
+                ),
+                outputs: Some(
+                    $outputs
+                        .iter()
+                        .map(product_ref_to_fb)
+                        .collect::<CodecResult<_>>()?,
+                ),
+                predicate: $predicate
+                    .as_ref()
+                    .map(product_ref_to_fb)
+                    .transpose()?
+                    .map(Box::new),
+                rng: $rng.as_ref().map(rng_to_fb).map(Box::new),
+                control_seq: *$control_seq,
+            }
+        };
+    }
+    let payload = match &operation.payload {
+        OpPayload::Ar {
+            bounds,
+            inputs,
+            outputs,
+            predicate,
+            rng,
+            control_seq,
+        } => fbs::OpPayloadT::ArOpPayload(Box::new(payload_fields!(
+            ArOpPayloadT,
+            bounds,
+            inputs,
+            outputs,
+            predicate,
+            rng,
+            control_seq
+        ))),
+        OpPayload::Encoder {
+            bounds,
+            inputs,
+            outputs,
+            predicate,
+            rng,
+            control_seq,
+        } => fbs::OpPayloadT::EncoderOpPayload(Box::new(payload_fields!(
+            EncoderOpPayloadT,
+            bounds,
+            inputs,
+            outputs,
+            predicate,
+            rng,
+            control_seq
+        ))),
+        OpPayload::Diffusion {
+            bounds,
+            inputs,
+            outputs,
+            predicate,
+            rng,
+            control_seq,
+        } => fbs::OpPayloadT::DiffusionOpPayload(Box::new(payload_fields!(
+            DiffusionOpPayloadT,
+            bounds,
+            inputs,
+            outputs,
+            predicate,
+            rng,
+            control_seq
+        ))),
+        OpPayload::Transfer {
+            bounds,
+            inputs,
+            outputs,
+            predicate,
+            rng,
+            control_seq,
+        } => fbs::OpPayloadT::TransferOpPayload(Box::new(payload_fields!(
+            TransferOpPayloadT,
+            bounds,
+            inputs,
+            outputs,
+            predicate,
+            rng,
+            control_seq
+        ))),
+    };
     Ok(fbs::OperationT {
         request_key: Some(Box::new(request_key_to_fb(operation.request_key))),
         op_id: operation.op_id.0,
-        parent: Some(Box::new(version_ref_to_fb(&operation.parent))),
-        work: work_to_fb(operation.work),
-        route: operation.route.0,
-        domain: domain_to_fb(operation.domain),
-        advances_state: operation.advances_state,
-        bounds: Some(Box::new(bounds_to_fb(&operation.bounds))),
-        inputs: Some(operation.inputs.iter().map(product_ref_to_fb).collect()),
-        outputs: Some(operation.outputs.iter().map(product_ref_to_fb).collect()),
-        predicate: operation
-            .predicate
-            .as_ref()
-            .map(product_ref_to_fb)
-            .map(Box::new),
-        rng: operation.rng.as_ref().map(rng_to_fb).map(Box::new),
-        control_seq: operation.control_seq,
+        parent: Some(Box::new(checkpoint_to_fb(&operation.parent))),
+        kind: run_kind_to_fb(operation.kind),
+        payload,
     })
 }
 
-fn control_to_fb(control: &Control) -> fbs::ControlT {
-    match control {
-        Control::Commit {
+fn command_to_fb(command: &BatchCommand) -> fbs::BatchCommandT {
+    match command {
+        BatchCommand::Start { request } => {
+            fbs::BatchCommandT::StartCommand(Box::new(fbs::StartCommandT {
+                request: Some(Box::new(
+                    admission_to_fb(request).expect("validated start request"),
+                )),
+            }))
+        }
+        BatchCommand::Commit {
             request_key,
             control_seq,
             expected_parent,
             selected,
             public_event_limit,
             disposition,
-        } => fbs::ControlT::ControlCommit(Box::new(fbs::ControlCommitT {
+        } => fbs::BatchCommandT::CommitCommand(Box::new(fbs::CommitCommandT {
             request_key: Some(Box::new(request_key_to_fb(*request_key))),
             control_seq: *control_seq,
-            expected_parent: Some(Box::new(version_ref_to_fb(expected_parent))),
-            selected: Some(Box::new(version_ref_to_fb(selected))),
+            expected_parent: Some(Box::new(checkpoint_to_fb(expected_parent))),
+            selected: Some(Box::new(checkpoint_to_fb(selected))),
             public_event_limit: *public_event_limit,
             disposition: disposition_to_fb(*disposition),
         })),
-        Control::Close {
+        BatchCommand::Finish {
             request_key,
             control_seq,
             cutoff,
             reason,
-        } => fbs::ControlT::ControlClose(Box::new(fbs::ControlCloseT {
+        } => fbs::BatchCommandT::FinishCommand(Box::new(fbs::FinishCommandT {
             request_key: Some(Box::new(request_key_to_fb(*request_key))),
             control_seq: *control_seq,
-            cutoff: Some(Box::new(version_ref_to_fb(cutoff))),
+            cutoff: Some(Box::new(checkpoint_to_fb(cutoff))),
             reason: close_reason_to_fb(*reason),
         })),
-        Control::Release { request_key, op_id } => {
-            fbs::ControlT::ControlRelease(Box::new(fbs::ControlReleaseT {
-                request_key: Some(Box::new(request_key_to_fb(*request_key))),
-                op_id: op_id.0,
+        BatchCommand::Free { buffer } => {
+            fbs::BatchCommandT::FreeCommand(Box::new(fbs::FreeCommandT {
+                buffer: Some(Box::new(buffer_id_to_fb(*buffer))),
             }))
         }
     }
@@ -1486,79 +1743,240 @@ fn control_to_fb(control: &Control) -> fbs::ControlT {
 fn request_key_to_fb(request_key: RequestKey) -> fbs::RequestKeyT {
     fbs::RequestKeyT {
         authority_id: request_key.authority_id,
-        session_id: request_key.session_id.0,
+        request_id: request_key.request_id.0,
         epoch: request_key.epoch,
     }
 }
 
-fn version_ref_to_fb(version: &VersionRef) -> fbs::VersionRefT {
-    fbs::VersionRefT {
-        request_key: Some(Box::new(request_key_to_fb(version.request_key))),
-        producer_op_id: version.producer_op_id.0,
+fn buffer_id_from_table(buffer: fbs::BufferId<'_>) -> CodecResult<BufferId> {
+    let id = BufferId {
+        owner: request_key_from_table(buffer.owner(), "buffer_id.owner")?,
+        producer_op_id: OpId(buffer.producer_op_id()),
+        output_index: buffer.output_index(),
+        generation: buffer.generation(),
+    };
+    id.validate()?;
+    Ok(id)
+}
+
+fn buffer_id_to_fb(buffer: BufferId) -> fbs::BufferIdT {
+    fbs::BufferIdT {
+        owner: Some(Box::new(request_key_to_fb(buffer.owner))),
+        producer_op_id: buffer.producer_op_id.0,
+        output_index: buffer.output_index,
+        generation: buffer.generation,
+    }
+}
+
+fn checkpoint_to_fb(version: &Checkpoint) -> fbs::CheckpointT {
+    fbs::CheckpointT {
+        op_id: version.op_id.0,
         point: match &version.point {
-            Point::Fixed { point_index } => fbs::PointT::PointFixed(Box::new(fbs::PointFixedT {
-                point_index: *point_index,
-            })),
-            Point::Device {
-                point_index,
-                selected_point,
-            } => fbs::PointT::PointDevice(Box::new(fbs::PointDeviceT {
-                point_index: *point_index,
-                selected_point: selected_point
-                    .as_ref()
-                    .map(|value| Box::new(product_ref_to_fb(value))),
-            })),
+            CheckpointPoint::Fixed(point) => {
+                fbs::CheckpointPointT::CheckpointFixed(Box::new(fbs::CheckpointFixedT {
+                    point: *point,
+                }))
+            }
+            CheckpointPoint::DeviceSelected => fbs::CheckpointPointT::CheckpointDeviceSelected(
+                Box::new(fbs::CheckpointDeviceSelectedT {}),
+            ),
         },
     }
 }
 
-fn product_ref_to_fb(product: &ProductRef) -> fbs::ProductRefT {
-    fbs::ProductRefT {
+fn scalar_id_to_fb(product: &ProductRef) -> fbs::ScalarIdT {
+    fbs::ScalarIdT {
         request_key: Some(Box::new(request_key_to_fb(product.request_key))),
         producer_op_id: product.producer_op_id.0,
         output_index: product.output_index,
         generation: product.generation,
-        kind: product_kind_to_fb(product.kind),
-        storage_class: storage_class_to_fb(product.storage_class),
-        dtype: dtype_to_fb(product.dtype),
-        shape_bound: Some(Box::new(shape_bound_to_fb(&product.shape_bound))),
-        point_range: Some(Box::new(fbs::PointRangeT {
-            base_point: product.point_range.base_point,
-            max_points: product.point_range.max_points,
-        })),
     }
 }
 
-fn shape_bound_to_fb(shape: &ShapeBound) -> fbs::ShapeBoundT {
-    fbs::ShapeBoundT {
-        dims: Some(
-            shape
-                .dims
-                .iter()
-                .map(|dim| match dim {
-                    DimBound::Static(extent) => fbs::DimBoundT {
-                        device: false,
-                        value: *extent,
-                    },
-                    DimBound::Device { max } => fbs::DimBoundT {
-                        device: true,
-                        value: *max,
-                    },
-                })
-                .collect(),
-        ),
+fn buffer_descriptor_to_fb(product: &ProductRef) -> fbs::BufferDescriptorT {
+    fbs::BufferDescriptorT {
+        id: Some(Box::new(buffer_id_to_fb(product.buffer_id()))),
+        max_bytes: product.max_bytes(),
     }
 }
 
-fn bounds_to_fb(bounds: &Bounds) -> fbs::BoundsT {
-    fbs::BoundsT {
-        max_points: bounds.max_points,
-        max_tokens: bounds.max_tokens,
-        max_kv_pages: bounds.max_kv_pages,
-        max_latent_bytes: bounds.max_latent_bytes,
-        max_completion_bytes: bounds.max_completion_bytes,
-        max_transfer_bytes: bounds.max_transfer_bytes,
-    }
+fn shape_bound_to_parts(shape: &ShapeBound) -> (Vec<u32>, i32) {
+    let mut dynamic_axis = -1;
+    let extents = shape
+        .dims
+        .iter()
+        .enumerate()
+        .map(|(index, dim)| match dim {
+            DimBound::Static(extent) => *extent,
+            DimBound::Device { max } => {
+                dynamic_axis = index as i32;
+                *max
+            }
+        })
+        .collect();
+    (extents, dynamic_axis)
+}
+
+fn product_ref_to_fb(product: &ProductRef) -> CodecResult<fbs::ValueRefT> {
+    product.validate()?;
+    let scalar_id = || Some(Box::new(scalar_id_to_fb(product)));
+    let point = &product.point_range;
+    let (extents, dynamic_axis) = shape_bound_to_parts(&product.shape_bound);
+    let value = match product.kind {
+        ProductKind::Token => {
+            codec_ensure!(
+                product.dtype == DType::U32,
+                "token value must use u32 elements"
+            );
+            let delivery = match product.storage_class {
+                StorageClass::HostStaging => fbs::TokenDelivery::Inline,
+                StorageClass::RequestRelay => fbs::TokenDelivery::Relay,
+                _ => codec_bail!("token value has an invalid delivery"),
+            };
+            let max_tokens = u32::try_from(product.shape_bound.max_elements())
+                .context("token value bound exceeds u32")?;
+            fbs::ValueReferenceT::TokenValue(Box::new(fbs::TokenValueT {
+                id: scalar_id(),
+                delivery,
+                max_tokens,
+                base_point: point.base_point,
+                max_points: point.max_points,
+            }))
+        }
+        ProductKind::Logprob => {
+            codec_ensure!(
+                matches!(product.dtype, DType::U8 | DType::F32),
+                "logprob value has an unsupported format"
+            );
+            codec_ensure!(
+                matches!(
+                    product.storage_class,
+                    StorageClass::HostStaging | StorageClass::PinnedOutput
+                ),
+                "logprob value must be host-visible"
+            );
+            let max_count = u32::try_from(product.shape_bound.max_elements())
+                .context("logprob value bound exceeds u32")?;
+            fbs::ValueReferenceT::LogprobValue(Box::new(fbs::LogprobValueT {
+                id: scalar_id(),
+                format: if product.dtype == DType::U8 {
+                    fbs::LogprobFormat::PackedBytes
+                } else {
+                    fbs::LogprobFormat::F32Values
+                },
+                max_count,
+                base_point: point.base_point,
+                max_points: point.max_points,
+            }))
+        }
+        ProductKind::VisionFeature | ProductKind::LatentFeature => {
+            codec_ensure!(
+                matches!(
+                    product.storage_class,
+                    StorageClass::LatentArena | StorageClass::DeviceTensor
+                ),
+                "feature value must use a persistent device buffer"
+            );
+            fbs::ValueReferenceT::FeatureBuffer(Box::new(fbs::FeatureBufferT {
+                buffer: Some(Box::new(buffer_descriptor_to_fb(product))),
+                feature: if product.kind == ProductKind::VisionFeature {
+                    fbs::FeatureKind::Vision
+                } else {
+                    fbs::FeatureKind::Latent
+                },
+                dtype: dtype_to_fb(product.dtype),
+                extents: Some(extents),
+                dynamic_axis,
+                base_point: point.base_point,
+                max_points: point.max_points,
+            }))
+        }
+        ProductKind::Kv => {
+            codec_ensure!(
+                product.storage_class == StorageClass::PagedKv,
+                "KV value must use paged KV storage"
+            );
+            fbs::ValueReferenceT::KvBuffer(Box::new(fbs::KvBufferT {
+                buffer: Some(Box::new(buffer_descriptor_to_fb(product))),
+                dtype: dtype_to_fb(product.dtype),
+                extents: Some(extents),
+                dynamic_axis,
+                base_point: point.base_point,
+                max_points: point.max_points,
+            }))
+        }
+        ProductKind::Latent => {
+            codec_ensure!(
+                product.storage_class == StorageClass::LatentArena,
+                "latent value must use the latent arena"
+            );
+            fbs::ValueReferenceT::LatentBuffer(Box::new(fbs::LatentBufferT {
+                buffer: Some(Box::new(buffer_descriptor_to_fb(product))),
+                dtype: dtype_to_fb(product.dtype),
+                extents: Some(extents),
+                dynamic_axis,
+                base_point: point.base_point,
+                max_points: point.max_points,
+            }))
+        }
+        ProductKind::Artifact => {
+            let use_ = match product.storage_class {
+                StorageClass::HostStaging => fbs::ArtifactUse::Inline,
+                StorageClass::LatentArena | StorageClass::DeviceTensor => {
+                    fbs::ArtifactUse::Feedback
+                }
+                StorageClass::PinnedOutput => fbs::ArtifactUse::Encoded,
+                _ => codec_bail!("artifact value has an invalid use"),
+            };
+            fbs::ValueReferenceT::ArtifactValue(Box::new(fbs::ArtifactValueT {
+                id: scalar_id(),
+                buffer: (use_ == fbs::ArtifactUse::Feedback)
+                    .then(|| Box::new(buffer_descriptor_to_fb(product))),
+                use_,
+                dtype: dtype_to_fb(product.dtype),
+                extents: Some(extents),
+                dynamic_axis,
+                base_point: point.base_point,
+                max_points: point.max_points,
+            }))
+        }
+        ProductKind::Completion => {
+            codec_ensure!(product.dtype == DType::U8, "completion value must use u8");
+            let delivery = match product.storage_class {
+                StorageClass::RequestRelay => fbs::CompletionDelivery::Relay,
+                StorageClass::DeviceTensor => fbs::CompletionDelivery::DevicePredicate,
+                _ => codec_bail!("completion value has an invalid delivery"),
+            };
+            fbs::ValueReferenceT::CompletionValue(Box::new(fbs::CompletionValueT {
+                id: scalar_id(),
+                delivery,
+                base_point: point.base_point,
+                max_points: point.max_points,
+            }))
+        }
+        ProductKind::SamplingState => {
+            codec_ensure!(
+                product.dtype == DType::U8 && product.storage_class == StorageClass::HostStaging,
+                "sampling value must be inline bytes"
+            );
+            fbs::ValueReferenceT::SamplingValue(Box::new(fbs::SamplingValueT {
+                id: scalar_id(),
+                max_bytes: product.max_bytes(),
+            }))
+        }
+        ProductKind::SelectedPoint => {
+            codec_ensure!(
+                product.dtype == DType::U32 && product.storage_class == StorageClass::RequestRelay,
+                "selected point must use the request relay"
+            );
+            fbs::ValueReferenceT::SelectedPointValue(Box::new(fbs::SelectedPointValueT {
+                id: scalar_id(),
+                base_point: point.base_point,
+                max_points: point.max_points,
+            }))
+        }
+    };
+    Ok(fbs::ValueRefT { value })
 }
 
 fn rng_to_fb(rng: &Rng) -> fbs::RngT {
@@ -1573,23 +1991,11 @@ fn rng_to_fb(rng: &Rng) -> fbs::RngT {
 // Completion report and records
 // ---------------------------------------------------------------------------
 
-fn completion_report_to_fb(report: &CompletionReport) -> CodecResult<fbs::CompletionReportT> {
+fn run_result_to_fb(report: &RunResult) -> CodecResult<fbs::RunResultT> {
     report.validate()?;
-    Ok(fbs::CompletionReportT {
-        step_id: report.step_id,
-        partitions: Some(
-            report
-                .partitions
-                .iter()
-                .map(partition_completion_to_fb)
-                .collect(),
-        ),
-    })
-}
-
-fn partition_completion_to_fb(report: &PartitionCompletion) -> fbs::PartitionCompletionT {
-    fbs::PartitionCompletionT {
-        partition_id: report.partition_id,
+    Ok(fbs::RunResultT {
+        batch_id: report.batch_id,
+        run_id: report.run_id,
         completions: Some(
             report
                 .completions
@@ -1597,7 +2003,13 @@ fn partition_completion_to_fb(report: &PartitionCompletion) -> fbs::PartitionCom
                 .map(completion_record_to_fb)
                 .collect(),
         ),
-        products: Some(report.products.iter().map(product_payload_to_fb).collect()),
+        products: Some(
+            report
+                .products
+                .iter()
+                .map(product_payload_to_fb)
+                .collect::<CodecResult<_>>()?,
+        ),
         registration: Some(Box::new(fbs::RegistrationAckT {
             visible: report.registration.visible,
         })),
@@ -1607,32 +2019,62 @@ fn partition_completion_to_fb(report: &PartitionCompletion) -> fbs::PartitionCom
             .as_ref()
             .map(forward_stats_to_fb)
             .map(Box::new),
-    }
+        done: report.done,
+    })
 }
 
 fn completion_record_to_fb(record: &ModelOutput) -> fbs::ModelOutputT {
+    macro_rules! result_fields {
+        ($table:ident, $data:expr) => {
+            fbs::$table {
+                logical_lengths: Some(Box::new(fbs::LogicalLengthsT {
+                    token_len: $data.logical_lengths.token_len,
+                    kv_visible_len: $data.logical_lengths.kv_visible_len,
+                    kv_computed_len: $data.logical_lengths.kv_computed_len,
+                    latent_len: $data.logical_lengths.latent_len,
+                })),
+                token_span: Some(Box::new(fbs::TokenSpanT {
+                    base: $data.token_span.base,
+                    len: $data.token_span.len,
+                })),
+                committed_tokens: Some($data.committed_tokens.clone()),
+                finish_flags: Some(Box::new(fbs::FinishFlagsT {
+                    eos: $data.finish_flags.eos,
+                    length: $data.finish_flags.length,
+                    stop: $data.finish_flags.stop,
+                })),
+                media_output: $data
+                    .media_output
+                    .as_ref()
+                    .map(media_output_to_fb)
+                    .map(Box::new),
+                ..Default::default()
+            }
+        };
+    }
+    let payload = match &record.payload {
+        ResultPayload::Ar(data) => {
+            fbs::ResultPayloadT::ArResult(Box::new(result_fields!(ArResultT, data)))
+        }
+        ResultPayload::Encoder(data) => {
+            fbs::ResultPayloadT::EncoderResult(Box::new(result_fields!(EncoderResultT, data)))
+        }
+        ResultPayload::Diffusion(result) => {
+            let mut table = result_fields!(DiffusionResultT, &result.data);
+            table.next_cursor = result.next_cursor;
+            table.done = result.done;
+            fbs::ResultPayloadT::DiffusionResult(Box::new(table))
+        }
+        ResultPayload::Transfer(data) => {
+            fbs::ResultPayloadT::TransferResult(Box::new(result_fields!(TransferResultT, data)))
+        }
+    };
     fbs::ModelOutputT {
         request_key: Some(Box::new(request_key_to_fb(record.request_key))),
         op_id: record.op_id.0,
         completion_slot_generation: record.completion_slot_generation,
         status: op_status_to_fb(record.status),
         selected_point: record.selected_point,
-        logical_lengths: Some(Box::new(fbs::LogicalLengthsT {
-            token_len: record.logical_lengths.token_len,
-            kv_visible_len: record.logical_lengths.kv_visible_len,
-            kv_computed_len: record.logical_lengths.kv_computed_len,
-            latent_len: record.logical_lengths.latent_len,
-        })),
-        token_span: Some(Box::new(fbs::TokenSpanT {
-            base: record.token_span.base,
-            len: record.token_span.len,
-        })),
-        committed_tokens: Some(record.committed_tokens.clone()),
-        finish_flags: Some(Box::new(fbs::FinishFlagsT {
-            eos: record.finish_flags.eos,
-            length: record.finish_flags.length,
-            stop: record.finish_flags.stop,
-        })),
         product_generations: Some(record.product_generations.clone()),
         error_code: record.error_code.map(error_code_to_fb),
         timing_counters: Some(Box::new(fbs::TimingCountersT {
@@ -1641,20 +2083,37 @@ fn completion_record_to_fb(record: &ModelOutput) -> fbs::ModelOutputT {
             copy_us: record.timing_counters.copy_us,
             host_us: record.timing_counters.host_us,
         })),
-        media_output: record.media_output.as_ref().map(|output| {
-            Box::new(fbs::MediaOutputT {
-                handle: Some(output.handle.clone()),
-                bytes: output.bytes,
-            })
-        }),
+        payload,
     }
 }
 
-fn product_payload_to_fb(payload: &ProductPayload) -> fbs::ProductPayloadT {
-    fbs::ProductPayloadT {
-        product: Some(Box::new(product_ref_to_fb(&payload.product))),
-        bytes: Some(payload.bytes.clone()),
+fn media_output_to_fb(output: &MediaOutput) -> fbs::MediaOutputT {
+    fbs::MediaOutputT {
+        handle: match &output.handle {
+            ArtifactHandle::PosixShm { name } => {
+                fbs::ArtifactHandleT::PosixShmArtifact(Box::new(fbs::PosixShmArtifactT {
+                    name: Some(name.clone()),
+                }))
+            }
+        },
+        bytes: output.bytes,
     }
+}
+
+fn product_payload_to_fb(payload: &ProductPayload) -> CodecResult<fbs::ProductPayloadT> {
+    Ok(fbs::ProductPayloadT {
+        product: Some(Box::new(product_ref_to_fb(&payload.product)?)),
+        value: match &payload.value {
+            InlineValue::Bytes(bytes) => {
+                fbs::InlineValueT::BytesValue(Box::new(fbs::BytesValueT {
+                    bytes: Some(bytes.clone()),
+                }))
+            }
+            InlineValue::Transfer(handle) => {
+                fbs::InlineValueT::TransferHandle(Box::new(transfer_handle_to_fb(handle)))
+            }
+        },
+    })
 }
 
 fn error_operation_to_fb(operation: &ErrorOperationIdentity) -> fbs::ErrorOperationIdentityT {
@@ -1668,99 +2127,68 @@ fn error_operation_to_fb(operation: &ErrorOperationIdentity) -> fbs::ErrorOperat
 // Info
 // ---------------------------------------------------------------------------
 
-fn mixed_bucket_from_table(bucket: fbs::GraphBucket<'_>) -> GraphBucket {
-    GraphBucket {
-        decode_rows: bucket.decode_rows(),
-        flow_rows: bucket.flow_rows(),
-        height: bucket.height(),
-        width: bucket.width(),
-        cfg_branches: bucket.cfg_branches(),
-    }
+fn kv_cache_from_table(config: fbs::KvCacheConfig<'_>) -> CodecResult<KvCacheConfig> {
+    Ok(KvCacheConfig {
+        block_size: config.block_size(),
+        num_blocks: config.num_blocks(),
+        num_layers: config.num_layers(),
+        num_kv_heads: config.num_kv_heads(),
+        head_dim: config.head_dim(),
+        bytes_per_token: config.bytes_per_token(),
+        groups: config
+            .groups()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(kv_group_from_table)
+                    .collect::<CodecResult<_>>()
+            })
+            .transpose()?
+            .unwrap_or_default(),
+        dtype: required_parse(config.dtype(), "info.kv_cache.dtype")?,
+    })
 }
 
-fn mixed_bucket_to_fb(bucket: &GraphBucket) -> fbs::GraphBucketT {
-    fbs::GraphBucketT {
-        decode_rows: bucket.decode_rows,
-        flow_rows: bucket.flow_rows,
-        height: bucket.height,
-        width: bucket.width,
-        cfg_branches: bucket.cfg_branches,
+fn kv_cache_to_fb(config: &KvCacheConfig) -> fbs::KvCacheConfigT {
+    fbs::KvCacheConfigT {
+        block_size: config.block_size,
+        num_blocks: config.num_blocks,
+        num_layers: config.num_layers,
+        num_kv_heads: config.num_kv_heads,
+        head_dim: config.head_dim,
+        bytes_per_token: config.bytes_per_token,
+        groups: Some(config.groups.iter().map(kv_group_to_fb).collect()),
+        dtype: Some(config.dtype.as_str().to_owned()),
     }
 }
 
 fn info_to_fb(info: &WorkerInfo) -> CodecResult<fbs::WorkerInfoT> {
     info.validate()?;
     Ok(fbs::WorkerInfoT {
-        worker_role: worker_role_to_fb(info.worker_role),
-        block_size: info.block_size,
-        num_blocks: info.num_blocks,
-        num_layers: info.num_layers,
-        num_kv_heads: info.num_kv_heads,
-        head_dim: info.head_dim,
-        supported_work: Some(
-            info.supported_work
-                .iter()
-                .copied()
-                .map(work_to_fb)
-                .collect(),
-        ),
-        latent_page_units: info.latent_page_units,
-        num_latent_pages: info.num_latent_pages,
-        latent_width: info.latent_width,
-        latent_dtype: Some(
-            info.latent_dtype
-                .map(uniserve_core::ModelDtype::as_str)
-                .unwrap_or_default()
-                .to_owned(),
-        ),
-        latent_downsample: info.latent_downsample,
-        bytes_per_token: info.bytes_per_token,
-        max_vae_grid_tokens: info.max_vae_grid_tokens,
-        max_vit_grid_tokens: info.max_vit_grid_tokens,
-        max_latent_feature_bytes: info.max_latent_feature_bytes,
-        max_vision_feature_bytes: info.max_vision_feature_bytes,
-        commit_marker_tokens: info.commit_marker_tokens,
-        gen_rope_advance: info.gen_rope_advance,
-        max_cfg_branches: info.max_cfg_branches,
-        groups: Some(info.groups.iter().map(kv_group_to_fb).collect()),
-        kv_dtype: Some(
-            info.kv_dtype
-                .map(uniserve_core::KvCacheDtype::as_str)
-                .unwrap_or_default()
-                .to_owned(),
-        ),
-        model_dtype: Some(info.model_dtype.as_str().to_owned()),
-        rank: Some(Box::new(rank_to_fb(info.rank))),
-        pipeline_depth: info.pipeline_depth,
-        encoder_cache_budget: info.encoder_cache_budget,
-        supported_controls: Some(
-            info.supported_controls
-                .iter()
-                .copied()
-                .map(request_kind_to_fb)
-                .collect(),
-        ),
-        max_batch_operations: info.max_batch_operations,
-        max_batch_tokens: info.max_batch_tokens,
-        max_request_pool_size: info.max_request_pool_size,
-        max_unresolved_window: info.max_unresolved_window,
-        incremental_kv_publication: info.incremental_kv_publication,
-        mixed_buckets: Some(info.mixed_buckets.iter().map(mixed_bucket_to_fb).collect()),
-        sampling_ownership: sampling_ownership_to_fb(info.sampling_ownership),
-        resource_classes: Some(
-            info.resource_classes
-                .iter()
-                .copied()
-                .map(resource_class_to_fb)
-                .collect(),
-        ),
         model_name: Some(info.model_name.clone()),
         weight_version: info.weight_version,
+        rank: Some(Box::new(rank_to_fb(info.rank))),
+        supported_ops: Some(
+            info.supported_ops
+                .iter()
+                .copied()
+                .map(op_kind_to_fb)
+                .collect(),
+        ),
+        queue_depth: info.queue_depth,
+        max_batch_ops: info.max_batch_ops,
+        max_batch_tokens: info.max_batch_tokens,
+        request_slots: info.request_slots,
+        kv_cache: info.kv_cache.as_ref().map(kv_cache_to_fb).map(Box::new),
+        latent_page_units: info.latent_page_units,
+        latent_pages: info.latent_pages,
+        buffer_pool_bytes: info.buffer_pool_bytes,
+        max_unresolved_ops: info.max_unresolved_ops,
     })
 }
 
 // ---------------------------------------------------------------------------
-// Sampling, image, rank, and pressure value encoders
+// Sampling, image, and rank value encoders
 // ---------------------------------------------------------------------------
 
 fn sampling_to_fb(sampling: &SamplingParams) -> CodecResult<fbs::SamplingParamsT> {
@@ -1915,206 +2343,351 @@ fn rank_to_fb(rank: RankInfo) -> fbs::RankInfoT {
     }
 }
 
-fn pressure_to_fb(pressure: &ResourcePressure) -> fbs::ResourcePressureT {
-    fbs::ResourcePressureT {
-        class: resource_class_to_fb(pressure.class),
-        total: pressure.total,
-        used: pressure.used,
-        evictable: pressure.evictable,
-        free: pressure.free,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Enum mappers
 // ---------------------------------------------------------------------------
 
-fn work_to_fb(variant: ForwardMode) -> fbs::ForwardMode {
+fn op_kind_to_fb(variant: OpKind) -> fbs::OpKind {
     match variant {
-        ForwardMode::TokenExtend => fbs::ForwardMode::TokenExtend,
-        ForwardMode::TokenDecode => fbs::ForwardMode::TokenDecode,
-        ForwardMode::TokenVerify => fbs::ForwardMode::TokenVerify,
-        ForwardMode::EncodeVision => fbs::ForwardMode::EncodeVision,
-        ForwardMode::EncodeLatent => fbs::ForwardMode::EncodeLatent,
-        ForwardMode::TransferProduct => fbs::ForwardMode::TransferProduct,
-        ForwardMode::TransferKvPublish => fbs::ForwardMode::TransferKvPublish,
-        ForwardMode::TransferKvInstall => fbs::ForwardMode::TransferKvInstall,
-        ForwardMode::MediaPrepare => fbs::ForwardMode::MediaPrepare,
-        ForwardMode::MediaDenoise => fbs::ForwardMode::MediaDenoise,
-        ForwardMode::Materialize => fbs::ForwardMode::Materialize,
-        ForwardMode::MediaReconstruct => fbs::ForwardMode::MediaReconstruct,
+        OpKind::ArExtend => fbs::OpKind::ArExtend,
+        OpKind::ArDecode => fbs::OpKind::ArDecode,
+        OpKind::ArVerify => fbs::OpKind::ArVerify,
+        OpKind::EncoderExecute => fbs::OpKind::EncoderExecute,
+        OpKind::DiffusionPrepare => fbs::OpKind::DiffusionPrepare,
+        OpKind::DiffusionStep => fbs::OpKind::DiffusionStep,
+        OpKind::DiffusionDecode => fbs::OpKind::DiffusionDecode,
     }
 }
 
-fn reconstruction_kind_to_fb(kind: ReconstructionKind) -> fbs::ReconstructionKind {
-    match kind {
-        ReconstructionKind::Video => fbs::ReconstructionKind::Video,
-        ReconstructionKind::Audio => fbs::ReconstructionKind::Audio,
+fn run_kind_to_fb(variant: RunKind) -> fbs::RunKind {
+    match variant {
+        RunKind::ArExtend => fbs::RunKind::ArExtend,
+        RunKind::ArDecode => fbs::RunKind::ArDecode,
+        RunKind::ArVerify => fbs::RunKind::ArVerify,
+        RunKind::EncoderVision => fbs::RunKind::EncoderVision,
+        RunKind::EncoderLatent => fbs::RunKind::EncoderLatent,
+        RunKind::TransferProduct => fbs::RunKind::TransferProduct,
+        RunKind::TransferKvPublish => fbs::RunKind::TransferKvPublish,
+        RunKind::TransferKvInstall => fbs::RunKind::TransferKvInstall,
+        RunKind::DiffusionPrepare => fbs::RunKind::DiffusionPrepare,
+        RunKind::DiffusionStep => fbs::RunKind::DiffusionStep,
+        RunKind::DiffusionFinalize => fbs::RunKind::DiffusionFinalize,
+        RunKind::DiffusionDecode => fbs::RunKind::DiffusionDecode,
     }
 }
 
-fn reconstruction_kind_from_fb(kind: fbs::ReconstructionKind) -> CodecResult<ReconstructionKind> {
-    if kind == fbs::ReconstructionKind::Video {
-        Ok(ReconstructionKind::Video)
-    } else if kind == fbs::ReconstructionKind::Audio {
-        Ok(ReconstructionKind::Audio)
-    } else {
-        codec_bail!("unknown reconstruction kind {}", kind.0)
+fn run_kind_from_fb(variant: fbs::RunKind) -> CodecResult<RunKind> {
+    for candidate in RunKind::ALL {
+        if run_kind_to_fb(candidate) == variant {
+            return Ok(candidate);
+        }
     }
+    codec_bail!("unknown physical run kind {}", variant.0)
 }
 
-fn media_profile_to_fb(profile: MediaProfileId) -> fbs::MediaProfileId {
-    match profile {
-        MediaProfileId::MinimaxH3T2va => fbs::MediaProfileId::MinimaxH3T2va,
-    }
-}
-
-fn media_profile_from_fb(profile: fbs::MediaProfileId) -> CodecResult<MediaProfileId> {
-    if profile == fbs::MediaProfileId::MinimaxH3T2va {
-        Ok(MediaProfileId::MinimaxH3T2va)
-    } else {
-        codec_bail!("unknown media profile {}", profile.0)
-    }
-}
-
-fn work_from_fb(variant: fbs::ForwardMode) -> CodecResult<ForwardMode> {
-    for candidate in ForwardMode::ALL {
-        if work_to_fb(candidate) == variant {
+fn op_kind_from_fb(variant: fbs::OpKind) -> CodecResult<OpKind> {
+    for candidate in OpKind::ALL {
+        if op_kind_to_fb(candidate) == variant {
             return Ok(candidate);
         }
     }
     codec_bail!("unknown work variant {}", variant.0)
 }
 
-fn domain_to_fb(domain: Domain) -> fbs::Domain {
-    match domain {
-        Domain::Prefill => fbs::Domain::Prefill,
-        Domain::Decode => fbs::Domain::Decode,
-        Domain::Flow => fbs::Domain::Flow,
-    }
-}
-
-fn domain_from_fb(domain: fbs::Domain) -> CodecResult<Domain> {
-    if domain == fbs::Domain::Prefill {
-        Ok(Domain::Prefill)
-    } else if domain == fbs::Domain::Decode {
-        Ok(Domain::Decode)
-    } else if domain == fbs::Domain::Flow {
-        Ok(Domain::Flow)
+fn transfer_locator_from_table(value: fbs::TransferLocator<'_>) -> CodecResult<TransferLocator> {
+    let transport = if value.transport() == fbs::TransferTransportKind::Local {
+        TransferTransport::Local {
+            endpoint: value
+                .endpoint()
+                .context("local transfer endpoint is missing")?
+                .to_owned(),
+            key: value.key(),
+        }
+    } else if value.transport() == fbs::TransferTransportKind::PosixShm {
+        TransferTransport::PosixShm {
+            name: value
+                .name()
+                .context("shared-memory transfer name is missing")?
+                .to_owned(),
+            ready_header_bytes: value.ready_header_bytes(),
+            ready_semaphore: value.ready_semaphore().map(str::to_owned),
+        }
+    } else if value.transport() == fbs::TransferTransportKind::CudaIpc {
+        TransferTransport::CudaIpc {
+            endpoint: value
+                .endpoint()
+                .context("CUDA IPC endpoint is missing")?
+                .to_owned(),
+            publication_id: value
+                .publication_id()
+                .context("CUDA IPC publication identity is missing")?
+                .to_owned(),
+            storage_handle: value
+                .storage_handle()
+                .map(|bytes| bytes.bytes().to_vec())
+                .unwrap_or_default(),
+            storage_size_bytes: value.storage_size_bytes(),
+            storage_offset_bytes: value.storage_offset_bytes(),
+            tensor_offset: value.tensor_offset(),
+            tensor_stride: value
+                .tensor_stride()
+                .map(|items| items.iter().collect())
+                .unwrap_or_default(),
+            ref_counter_handle: value
+                .ref_counter_handle()
+                .map(|bytes| bytes.bytes().to_vec())
+                .unwrap_or_default(),
+            ref_counter_offset: value.ref_counter_offset(),
+            event_handle: value
+                .event_handle()
+                .map(|bytes| bytes.bytes().to_vec())
+                .unwrap_or_default(),
+            event_sync_required: value.event_sync_required(),
+            ready_event_handle: value
+                .ready_event_handle()
+                .map(|bytes| bytes.bytes().to_vec())
+                .unwrap_or_default(),
+        }
     } else {
-        codec_bail!("unknown domain {}", domain.0)
-    }
+        codec_bail!("unknown transfer transport {}", value.transport().0)
+    };
+    let locator = TransferLocator {
+        transport,
+        nbytes: value.nbytes(),
+        dtype: value
+            .dtype()
+            .context("transfer dtype is missing")?
+            .to_owned(),
+        shape: value
+            .shape()
+            .map(|items| items.iter().collect())
+            .unwrap_or_default(),
+        device: value
+            .device()
+            .context("transfer device is missing")?
+            .to_owned(),
+    };
+    Ok(locator)
 }
 
-fn attention_regime_to_fb(regime: AttentionRegime) -> fbs::AttentionRegime {
-    match regime {
-        AttentionRegime::None => fbs::AttentionRegime::None,
-        AttentionRegime::Causal => fbs::AttentionRegime::Causal,
-        AttentionRegime::Bidirectional => fbs::AttentionRegime::Bidirectional,
-        AttentionRegime::Hybrid => fbs::AttentionRegime::Hybrid,
-    }
-}
-
-fn attention_regime_from_fb(regime: fbs::AttentionRegime) -> CodecResult<AttentionRegime> {
-    Ok(match regime {
-        fbs::AttentionRegime::None => AttentionRegime::None,
-        fbs::AttentionRegime::Causal => AttentionRegime::Causal,
-        fbs::AttentionRegime::Bidirectional => AttentionRegime::Bidirectional,
-        fbs::AttentionRegime::Hybrid => AttentionRegime::Hybrid,
-        other => codec_bail!("unknown attention regime {}", other.0),
+fn transfer_handle_from_table(value: fbs::TransferHandle<'_>) -> CodecResult<TransferHandle> {
+    Ok(match value.value_type() {
+        fbs::TransferData::EncoderTransfer => {
+            let transfer = value
+                .value_as_encoder_transfer()
+                .context("encoder transfer payload is missing")?;
+            TransferHandle::Encoder {
+                generation: transfer.generation(),
+                height: transfer.height(),
+                width: transfer.width(),
+                payload_kind: match transfer.payload_kind() {
+                    fbs::FeatureKind::Vision => ProductKind::VisionFeature,
+                    fbs::FeatureKind::Latent => ProductKind::LatentFeature,
+                    other => codec_bail!("unknown encoder feature kind {}", other.0),
+                },
+                locator: transfer_locator_from_table(
+                    transfer
+                        .locator()
+                        .context("encoder transfer locator is missing")?,
+                )?,
+            }
+        }
+        fbs::TransferData::DeviceProductTransfer => {
+            let transfer = value
+                .value_as_device_product_transfer()
+                .context("device-product transfer payload is missing")?;
+            TransferHandle::DeviceProduct {
+                generation: transfer.generation(),
+                height: transfer.height(),
+                width: transfer.width(),
+                value_range: transfer.value_range().unwrap_or_default().to_owned(),
+                locator: transfer_locator_from_table(
+                    transfer
+                        .locator()
+                        .context("device-product transfer locator is missing")?,
+                )?,
+            }
+        }
+        fbs::TransferData::KvTransfer => {
+            let transfer = value
+                .value_as_kv_transfer()
+                .context("KV transfer payload is missing")?;
+            TransferHandle::Kv {
+                generation: transfer.generation(),
+                locators: transfer
+                    .locators()
+                    .map(|items| {
+                        items
+                            .iter()
+                            .map(transfer_locator_from_table)
+                            .collect::<CodecResult<Vec<_>>>()
+                    })
+                    .transpose()?
+                    .unwrap_or_default(),
+                source: checkpoint_from_table(
+                    transfer.source().context("KV transfer source is missing")?,
+                )?,
+                destination: transfer
+                    .destination()
+                    .context("KV transfer destination is missing")?
+                    .to_owned(),
+                base: transfer.base().map(checkpoint_from_table).transpose()?,
+                base_extent: transfer.base_extent(),
+                published_extent: transfer.published_extent(),
+                group_id: transfer.group_id(),
+                scale_identity: transfer
+                    .scale_identity()
+                    .context("KV transfer scale identity is missing")?
+                    .to_owned(),
+            }
+        }
+        fbs::TransferData::LatentTransfer => {
+            let transfer = value
+                .value_as_latent_transfer()
+                .context("latent transfer payload is missing")?;
+            TransferHandle::Latent {
+                generation: transfer.generation(),
+                height: transfer.height(),
+                width: transfer.width(),
+                latent_units: transfer.latent_units(),
+                step: transfer.step(),
+                locator: transfer_locator_from_table(
+                    transfer
+                        .locator()
+                        .context("latent transfer locator is missing")?,
+                )?,
+            }
+        }
+        other => codec_bail!("unknown transfer payload variant {}", other.0),
     })
 }
 
-fn sampling_ownership_to_fb(ownership: SamplingOwnership) -> fbs::SamplingOwnership {
-    match ownership {
-        SamplingOwnership::DesignatedRank => fbs::SamplingOwnership::DesignatedRank,
-        SamplingOwnership::DeterministicSharded => fbs::SamplingOwnership::DeterministicSharded,
+fn transfer_locator_to_fb(value: &TransferLocator) -> fbs::TransferLocatorT {
+    let mut output = fbs::TransferLocatorT {
+        nbytes: value.nbytes,
+        dtype: Some(value.dtype.clone()),
+        shape: Some(value.shape.clone()),
+        device: Some(value.device.clone()),
+        ..Default::default()
+    };
+    match &value.transport {
+        TransferTransport::Local { endpoint, key } => {
+            output.transport = fbs::TransferTransportKind::Local;
+            output.endpoint = Some(endpoint.clone());
+            output.key = *key;
+        }
+        TransferTransport::PosixShm {
+            name,
+            ready_header_bytes,
+            ready_semaphore,
+        } => {
+            output.transport = fbs::TransferTransportKind::PosixShm;
+            output.name = Some(name.clone());
+            output.ready_header_bytes = *ready_header_bytes;
+            output.ready_semaphore = ready_semaphore.clone();
+        }
+        TransferTransport::CudaIpc {
+            endpoint,
+            publication_id,
+            storage_handle,
+            storage_size_bytes,
+            storage_offset_bytes,
+            tensor_offset,
+            tensor_stride,
+            ref_counter_handle,
+            ref_counter_offset,
+            event_handle,
+            event_sync_required,
+            ready_event_handle,
+        } => {
+            output.transport = fbs::TransferTransportKind::CudaIpc;
+            output.endpoint = Some(endpoint.clone());
+            output.publication_id = Some(publication_id.clone());
+            output.storage_handle = Some(storage_handle.clone());
+            output.storage_size_bytes = *storage_size_bytes;
+            output.storage_offset_bytes = *storage_offset_bytes;
+            output.tensor_offset = *tensor_offset;
+            output.tensor_stride = Some(tensor_stride.clone());
+            output.ref_counter_handle = Some(ref_counter_handle.clone());
+            output.ref_counter_offset = *ref_counter_offset;
+            output.event_handle = Some(event_handle.clone());
+            output.event_sync_required = *event_sync_required;
+            output.ready_event_handle = Some(ready_event_handle.clone());
+        }
     }
+    output
 }
 
-fn worker_role_to_fb(role: WorkerRole) -> fbs::WorkerRole {
-    match role {
-        WorkerRole::Full => fbs::WorkerRole::Full,
-        WorkerRole::Encoder => fbs::WorkerRole::Encoder,
-        WorkerRole::Prefill => fbs::WorkerRole::Prefill,
-        WorkerRole::Decode => fbs::WorkerRole::Decode,
-        WorkerRole::Und => fbs::WorkerRole::Und,
-        WorkerRole::Gen => fbs::WorkerRole::Gen,
-    }
-}
-
-fn worker_role_from_fb(role: fbs::WorkerRole) -> CodecResult<WorkerRole> {
-    Ok(match role {
-        fbs::WorkerRole::Full => WorkerRole::Full,
-        fbs::WorkerRole::Encoder => WorkerRole::Encoder,
-        fbs::WorkerRole::Prefill => WorkerRole::Prefill,
-        fbs::WorkerRole::Decode => WorkerRole::Decode,
-        fbs::WorkerRole::Und => WorkerRole::Und,
-        fbs::WorkerRole::Gen => WorkerRole::Gen,
-        _ => codec_bail!("unknown worker role {:?}", role),
-    })
-}
-
-fn sampling_ownership_from_fb(ownership: fbs::SamplingOwnership) -> CodecResult<SamplingOwnership> {
-    Ok(match ownership {
-        fbs::SamplingOwnership::DesignatedRank => SamplingOwnership::DesignatedRank,
-        fbs::SamplingOwnership::DeterministicSharded => SamplingOwnership::DeterministicSharded,
-        other => codec_bail!("unknown sampling ownership {}", other.0),
-    })
-}
-
-fn product_kind_to_fb(kind: ProductKind) -> fbs::ProductKind {
-    match kind {
-        ProductKind::Token => fbs::ProductKind::Token,
-        ProductKind::Logprob => fbs::ProductKind::Logprob,
-        ProductKind::VisionFeature => fbs::ProductKind::VisionFeature,
-        ProductKind::LatentFeature => fbs::ProductKind::LatentFeature,
-        ProductKind::Kv => fbs::ProductKind::Kv,
-        ProductKind::Latent => fbs::ProductKind::Latent,
-        ProductKind::Artifact => fbs::ProductKind::Artifact,
-        ProductKind::Completion => fbs::ProductKind::Completion,
-        ProductKind::SamplingState => fbs::ProductKind::SamplingState,
-        ProductKind::SelectedPoint => fbs::ProductKind::SelectedPoint,
-    }
-}
-
-fn product_kind_from_fb(kind: fbs::ProductKind) -> CodecResult<ProductKind> {
-    Ok(match kind {
-        fbs::ProductKind::Token => ProductKind::Token,
-        fbs::ProductKind::Logprob => ProductKind::Logprob,
-        fbs::ProductKind::VisionFeature => ProductKind::VisionFeature,
-        fbs::ProductKind::LatentFeature => ProductKind::LatentFeature,
-        fbs::ProductKind::Kv => ProductKind::Kv,
-        fbs::ProductKind::Latent => ProductKind::Latent,
-        fbs::ProductKind::Artifact => ProductKind::Artifact,
-        fbs::ProductKind::Completion => ProductKind::Completion,
-        fbs::ProductKind::SamplingState => ProductKind::SamplingState,
-        fbs::ProductKind::SelectedPoint => ProductKind::SelectedPoint,
-        other => codec_bail!("unknown product kind {}", other.0),
-    })
-}
-
-fn storage_class_to_fb(class: StorageClass) -> fbs::StorageClass {
-    match class {
-        StorageClass::DeviceTensor => fbs::StorageClass::DeviceTensor,
-        StorageClass::RequestRelay => fbs::StorageClass::RequestRelay,
-        StorageClass::PagedKv => fbs::StorageClass::PagedKv,
-        StorageClass::LatentArena => fbs::StorageClass::LatentArena,
-        StorageClass::HostStaging => fbs::StorageClass::HostStaging,
-        StorageClass::PinnedOutput => fbs::StorageClass::PinnedOutput,
-    }
-}
-
-fn storage_class_from_fb(class: fbs::StorageClass) -> CodecResult<StorageClass> {
-    Ok(match class {
-        fbs::StorageClass::DeviceTensor => StorageClass::DeviceTensor,
-        fbs::StorageClass::RequestRelay => StorageClass::RequestRelay,
-        fbs::StorageClass::PagedKv => StorageClass::PagedKv,
-        fbs::StorageClass::LatentArena => StorageClass::LatentArena,
-        fbs::StorageClass::HostStaging => StorageClass::HostStaging,
-        fbs::StorageClass::PinnedOutput => StorageClass::PinnedOutput,
-        other => codec_bail!("unknown storage class {}", other.0),
-    })
+fn transfer_handle_to_fb(value: &TransferHandle) -> fbs::TransferHandleT {
+    let value = match value {
+        TransferHandle::Encoder {
+            generation,
+            height,
+            width,
+            payload_kind,
+            locator,
+        } => fbs::TransferDataT::EncoderTransfer(Box::new(fbs::EncoderTransferT {
+            generation: *generation,
+            height: *height,
+            width: *width,
+            payload_kind: match payload_kind {
+                ProductKind::VisionFeature => fbs::FeatureKind::Vision,
+                ProductKind::LatentFeature => fbs::FeatureKind::Latent,
+                _ => unreachable!("validated encoder transfer feature kind"),
+            },
+            locator: Some(Box::new(transfer_locator_to_fb(locator))),
+        })),
+        TransferHandle::DeviceProduct {
+            generation,
+            height,
+            width,
+            value_range,
+            locator,
+        } => fbs::TransferDataT::DeviceProductTransfer(Box::new(fbs::DeviceProductTransferT {
+            generation: *generation,
+            height: *height,
+            width: *width,
+            value_range: Some(value_range.clone()),
+            locator: Some(Box::new(transfer_locator_to_fb(locator))),
+        })),
+        TransferHandle::Kv {
+            generation,
+            locators,
+            source,
+            destination,
+            base,
+            base_extent,
+            published_extent,
+            group_id,
+            scale_identity,
+        } => fbs::TransferDataT::KvTransfer(Box::new(fbs::KvTransferT {
+            generation: *generation,
+            locators: Some(locators.iter().map(transfer_locator_to_fb).collect()),
+            source: Some(Box::new(checkpoint_to_fb(source))),
+            destination: Some(destination.clone()),
+            base: base.as_ref().map(checkpoint_to_fb).map(Box::new),
+            base_extent: *base_extent,
+            published_extent: *published_extent,
+            group_id: *group_id,
+            scale_identity: Some(scale_identity.clone()),
+        })),
+        TransferHandle::Latent {
+            generation,
+            height,
+            width,
+            latent_units,
+            step,
+            locator,
+        } => fbs::TransferDataT::LatentTransfer(Box::new(fbs::LatentTransferT {
+            generation: *generation,
+            height: *height,
+            width: *width,
+            latent_units: *latent_units,
+            step: *step,
+            locator: Some(Box::new(transfer_locator_to_fb(locator))),
+        })),
+    };
+    fbs::TransferHandleT { value }
 }
 
 fn dtype_to_fb(dtype: DType) -> fbs::DType {
@@ -2237,13 +2810,10 @@ fn close_reason_from_fb(reason: fbs::CloseReason) -> CodecResult<CloseReason> {
 
 fn request_kind_to_fb(kind: RequestKind) -> fbs::ReqKind {
     match kind {
-        RequestKind::GetInfo => fbs::ReqKind::GetInfo,
-        RequestKind::Execute => fbs::ReqKind::Execute,
-        RequestKind::PollCompletions => fbs::ReqKind::PollCompletions,
-        RequestKind::DropSession => fbs::ReqKind::DropSession,
-        RequestKind::Shutdown => fbs::ReqKind::Shutdown,
-        RequestKind::ReleaseProducts => fbs::ReqKind::ReleaseProducts,
-        RequestKind::GetPressure => fbs::ReqKind::GetPressure,
+        RequestKind::Info => fbs::ReqKind::Info,
+        RequestKind::Submit => fbs::ReqKind::Submit,
+        RequestKind::Poll => fbs::ReqKind::Poll,
+        RequestKind::Close => fbs::ReqKind::Close,
     }
 }
 
@@ -2266,7 +2836,6 @@ fn response_kind_to_fb(kind: ResponseKind) -> fbs::RespKind {
         ResponseKind::Result => fbs::RespKind::Result,
         ResponseKind::Ok => fbs::RespKind::Ok,
         ResponseKind::Error => fbs::RespKind::Error,
-        ResponseKind::Pressure => fbs::RespKind::Pressure,
     }
 }
 
@@ -2279,29 +2848,7 @@ fn response_kind_from_fb(kind: fbs::RespKind) -> CodecResult<ResponseKind> {
         Ok(ResponseKind::Ok)
     } else if kind == fbs::RespKind::Error {
         Ok(ResponseKind::Error)
-    } else if kind == fbs::RespKind::Pressure {
-        Ok(ResponseKind::Pressure)
     } else {
         codec_bail!("unknown response kind {}", kind.0)
-    }
-}
-
-fn resource_class_to_fb(class: ResourceClass) -> fbs::ResourceClass {
-    match class {
-        ResourceClass::KvBlock => fbs::ResourceClass::KvBlock,
-        ResourceClass::EncoderOutput => fbs::ResourceClass::EncoderOutput,
-        ResourceClass::ImageLatent => fbs::ResourceClass::ImageLatent,
-    }
-}
-
-fn resource_class_from_fb(class: fbs::ResourceClass) -> CodecResult<ResourceClass> {
-    if class == fbs::ResourceClass::KvBlock {
-        Ok(ResourceClass::KvBlock)
-    } else if class == fbs::ResourceClass::EncoderOutput {
-        Ok(ResourceClass::EncoderOutput)
-    } else if class == fbs::ResourceClass::ImageLatent {
-        Ok(ResourceClass::ImageLatent)
-    } else {
-        codec_bail!("unknown resource class {}", class.0)
     }
 }

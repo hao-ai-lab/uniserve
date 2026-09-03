@@ -9,7 +9,7 @@ from typing import Any, Mapping
 import torch
 import torch.nn as nn
 
-from ..execution.batch import ForwardMode
+from ..execution.batch import RunKind
 from ..execution.forward_batch import (
     AttentionMode,
     ForwardBatch,
@@ -554,17 +554,17 @@ class BagelForConditionalGeneration(ExecutionModel):
         )
         self.supported_work = frozenset(
             {
-                ForwardMode.TOKEN_EXTEND,
-                ForwardMode.TOKEN_DECODE,
-                ForwardMode.TOKEN_VERIFY,
-                ForwardMode.MEDIA_PREPARE,
-                ForwardMode.MEDIA_DENOISE,
-                ForwardMode.ENCODE_VISION,
-                ForwardMode.ENCODE_LATENT,
-                ForwardMode.MATERIALIZE,
-                ForwardMode.TRANSFER_PRODUCT,
-                ForwardMode.TRANSFER_KV_PUBLISH,
-                ForwardMode.TRANSFER_KV_INSTALL,
+                RunKind.AR_EXTEND,
+                RunKind.AR_DECODE,
+                RunKind.AR_VERIFY,
+                RunKind.DIFFUSION_PREPARE,
+                RunKind.DIFFUSION_STEP,
+                RunKind.ENCODER_VISION,
+                RunKind.ENCODER_LATENT,
+                RunKind.DIFFUSION_FINALIZE,
+                RunKind.TRANSFER_PRODUCT,
+                RunKind.TRANSFER_KV_PUBLISH,
+                RunKind.TRANSFER_KV_INSTALL,
             }
         )
         self.max_vit_grid_tokens = int(self.cfg.vit_token_capacity) + _BAGEL_IMAGE_MARKER_TOKENS
@@ -712,7 +712,7 @@ class BagelForConditionalGeneration(ExecutionModel):
         features = self.model.vit_encode_batch(torch.stack(pixels, dim=0), batch)
         return ForwardOutput(tuple(features[index] for index in range(len(pixels))))
 
-    def encode_latent(self, pixels: tuple[torch.Tensor, ...], batch: ForwardBatch) -> ForwardOutput:
+    def encoder_latent(self, pixels: tuple[torch.Tensor, ...], batch: ForwardBatch) -> ForwardOutput:
         del batch
         latents, _positions, _shape = self.model.vae_encode_clean_batch(torch.stack(pixels, dim=0))
         return ForwardOutput(tuple(latents[index] for index in range(len(pixels))))

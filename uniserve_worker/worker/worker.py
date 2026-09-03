@@ -21,17 +21,19 @@ from ..bootstrap.execution_config import (
     LaneConfig,
     graph_memory_budget_bytes,
 )
-from ..bootstrap.worker_info import build_worker_info
-from ..bootstrap.role import WorkerRole
+from ..bootstrap.worker_info import WorkerInfo
+from ..bootstrap.worker_info_builder import build_worker_layout
 from ..execution.batch import (
-    Batch,
-    CompletionReport,
     Domain,
-    ForwardMode,
-    RequestKey,
+    Finish,
+    Run,
+    RunKind,
+    RunResult,
+    logical_op_kinds,
 )
 from ..execution.cuda_graph import CudaGraphRunner
 from ..execution.forward_batch import AttentionMode, AttentionSelection
+from ..execution.graph_bucket import GraphBucket
 from ..execution.model_runner import ModelRunner
 from ..execution.output import OutputPool
 from ..execution.step import (
@@ -42,10 +44,11 @@ from ..execution.step import (
     execute_batch,
     execute_prepared,
     install_weights,
+    plan_run,
     prepare_batch,
 )
 from ..execution.step import (
-    drop_session as drop_execution_session,
+    drop_request as drop_execution_request,
 )
 from ..execution.trace import ExecutionPhase, ExecutionTrace, OperationTrace
 from ..foundation.errors import invalid_descriptor, unsupported_setup
@@ -56,27 +59,23 @@ from ..models.runtime import ExecutionModel, WorkerDeployment
 from ..nn.diffusion.cfg import build_flow_cfg_plan
 from ..nn.mesh import DeviceMesh
 from ..runtime.cache_pool import CachePool
+from ..runtime.cpu import CpuPool
 from ..runtime.device_events import DeviceEventPool
 from ..runtime.device_products import DeviceProducts
 from ..runtime.encoder_cache import EncoderCache
 from ..runtime.latent_pool import LatentPool
+from ..runtime.persistent_buffers import PersistentBuffers
 from ..runtime.req_to_token_pool import ReqToTokenPool
-from ..runtime.runtime_states import RuntimeStates
-from ..runtime.cpu import CpuPool
 from ..runtime.request import RequestPool
+from ..runtime.runtime_states import RuntimeStates
 from ..transfer.connector import TransferConnector
-from ..bootstrap.worker_info import (
-    GraphBucket,
-    ResourceClass,
-    WorkerInfo,
-)
 from . import warmup as packed_warmup
 from .warmup import (
     _flow_graph_executable,
     _flow_prefix_graph_executable,
     _FlowGraphBucket,
     _FlowPrefixGraphBucket,
-    _has_decode_flow_partition,
+    _has_decode_flow_lane,
     _mixed_flow_graph_executable,
     _paged_prefill_graph_buckets,
     _startup_image_parameters,
@@ -109,7 +108,7 @@ class Worker:
         from ..nn.placement import place_towers
         from ..runtime.distributed import build_device_mesh
 
-        plan = resolve_worker_plan(config.worker_role)
+        plan = resolve_worker_plan(config.supported_ops)
         configure_triton_toolchain()
         mesh = build_device_mesh(
             tp_rank=config.placement.tp_rank,
@@ -140,12 +139,11 @@ class Worker:
             tokenizer=loaded.tokenizer,
             allowed_work_variants=plan.allowed_work_variants,
             transfer_backend=config.data_plane.backend,
-            cross_process=config.worker_role is not WorkerRole.FULL,
+            cross_process=config.data_plane.backend != "local",
             weights=loaded.weights,
             weight_sidecars=loaded.weight_sidecars,
             pipeline_depth=config.ipc.pipeline_depth,
             completion_payload_bytes=config.ipc.max_payload_bytes,
-            worker_role=config.worker_role,
         )
 
     def __init__(
@@ -157,14 +155,13 @@ class Worker:
         attention: AttentionSelection | None,
         execution: ExecutionConfig,
         tokenizer: object | None,
-        allowed_work_variants: frozenset[ForwardMode],
+        allowed_work_variants: frozenset[RunKind],
         transfer_backend: str = "local",
         cross_process: bool = False,
         weights: WeightSet | None = None,
         weight_sidecars: tuple[str, ...] = ("config.json",),
         pipeline_depth: int,
         completion_payload_bytes: int,
-        worker_role: WorkerRole = WorkerRole.FULL,
     ) -> None:
         if not isinstance(model, ExecutionModel):
             raise unsupported_setup("worker model has no supported execution surface")
@@ -180,28 +177,30 @@ class Worker:
         self.weights = installed_weights
         self.architecture = model.architecture
         self.weight_version = installed_weights.version
-        declared = build_worker_info(
+        layout = build_worker_layout(
             model,
             deployment,
             model_name=self.architecture,
             weight_version=self.weight_version,
-            pipeline_depth=int(pipeline_depth),
+            queue_depth=int(pipeline_depth),
             completion_payload_bytes=int(completion_payload_bytes),
-            worker_role=worker_role,
         )
+        self._layout = layout
+        declared = layout.info
+        declared_kv = declared.kv_cache
         arena = model_arena_capacity(
             model,
             deployment,
             pipeline_depth=int(pipeline_depth),
             completion_payload_bytes=int(completion_payload_bytes),
-            num_blocks=int(declared.num_blocks),
-            request_pool_size=int(declared.max_request_pool_size),
-            num_latent_pages=int(declared.num_latent_pages),
+            num_blocks=0 if declared_kv is None else int(declared_kv.num_blocks),
+            request_pool_size=int(declared.request_slots),
+            num_latent_pages=int(declared.latent_pages),
             latent_page_units=int(declared.latent_page_units),
-            latent_width=int(declared.latent_width),
-            max_latent_feature_bytes=int(declared.max_latent_feature_bytes),
-            max_vision_feature_bytes=int(declared.max_vision_feature_bytes),
-            bytes_per_token=int(declared.bytes_per_token),
+            latent_width=int(layout.latent_width),
+            max_latent_feature_bytes=int(layout.max_latent_feature_bytes),
+            max_vision_feature_bytes=int(layout.max_vision_feature_bytes),
+            bytes_per_token=0 if declared_kv is None else int(declared_kv.bytes_per_token),
         )
         if int(pipeline_depth) <= 0:
             raise unsupported_setup("worker pipeline depth must be positive")
@@ -217,10 +216,10 @@ class Worker:
             raise unsupported_setup(f"{type(self).__name__} advertises no executable work")
         lane_operation_bound = min(
             (
-                int(lane.max_batch_operations or declared.max_batch_operations)
+                int(lane.max_batch_operations or declared.max_batch_ops)
                 for lane in execution.lanes
             ),
-            default=int(declared.max_batch_operations),
+            default=int(declared.max_batch_ops),
         )
         lane_token_bound = min(
             (int(lane.max_batch_tokens or declared.max_batch_tokens) for lane in execution.lanes),
@@ -228,10 +227,10 @@ class Worker:
         )
         self._info = replace(
             declared,
-            supported_work=tuple(variant for variant in ForwardMode if variant in advertised_work),
-            pipeline_depth=int(pipeline_depth),
-            max_batch_operations=min(
-                int(declared.max_batch_operations),
+            supported_ops=logical_op_kinds(tuple(advertised_work)),
+            queue_depth=int(pipeline_depth),
+            max_batch_ops=min(
+                int(declared.max_batch_ops),
                 lane_operation_bound,
             ),
             max_batch_tokens=min(int(declared.max_batch_tokens), lane_token_bound),
@@ -247,6 +246,9 @@ class Worker:
         self.req_to_token_pool = None
         max_blocks_per_row = 0
         if cache is not None:
+            kv_cache = self._info.kv_cache
+            if kv_cache is None:
+                raise unsupported_setup("KV model worker has no KV-cache configuration")
             cache_dtype = getattr(torch, str(cache.dtype).removeprefix("torch."), None)
             if not isinstance(cache_dtype, torch.dtype):
                 raise unsupported_setup(f"unsupported cache dtype {cache.dtype!r}")
@@ -256,13 +258,13 @@ class Worker:
             )
             group_ranges: list[tuple[int, int]] = []
             group_offset = 0
-            for group in self._info.groups:
+            for group in kv_cache.groups:
                 group_ranges.append((group_offset, int(group.num_blocks)))
                 group_offset += int(group.num_blocks)
             self.cache_pool = CachePool(
                 num_layers=int(cache.num_layers),
-                num_pages=int(self._info.num_blocks),
-                page_size=int(self._info.block_size),
+                num_pages=int(kv_cache.num_blocks),
+                page_size=int(kv_cache.block_size),
                 num_kv_heads=int(cache.num_kv_heads),
                 head_dim=int(cache.head_dim),
                 device=deployment.device,
@@ -272,7 +274,7 @@ class Worker:
             )
             assert attention is not None
             if (
-                ForwardMode.MEDIA_DENOISE in self._effective_work_variants
+                RunKind.DIFFUSION_STEP in self._effective_work_variants
                 and not _supports_flow_attention(
                     attention,
                     cache,
@@ -285,14 +287,15 @@ class Worker:
                 )
             self.req_to_token_pool = ReqToTokenPool(
                 group_count=self.cache_pool.group_count,
-                request_pool_size=int(self._info.max_request_pool_size),
+                request_pool_size=int(self._info.request_slots),
                 max_blocks_per_request=max_blocks_per_row,
-                block_size=int(self._info.block_size),
+                block_size=int(kv_cache.block_size),
                 device=deployment.device,
                 staging_depth=int(pipeline_depth),
             )
             packed_model.bind_cache_pool(self.cache_pool, attention)
-        self.requests = RequestPool(int(self._info.max_request_pool_size))
+        self.requests = RequestPool(int(self._info.request_slots))
+        self.requests.attach_model_state(model.create_request_state())
         torch_dtype = getattr(
             torch,
             str(deployment.model_dtype).removeprefix("torch."),
@@ -302,7 +305,7 @@ class Worker:
             raise unsupported_setup(f"unsupported model dtype {deployment.model_dtype!r}")
         if self.req_to_token_pool is not None:
             self.runtime_states = RuntimeStates(
-                request_pool_size=int(self._info.max_request_pool_size),
+                request_pool_size=int(self._info.request_slots),
                 vocab_size=int(packed_model.vocab_size),
                 continuation_width=1,
                 device=deployment.device,
@@ -312,22 +315,18 @@ class Worker:
         else:
             self.runtime_states = None
         flow = None if packed_model is None else packed_model.generation
-        latent_dtype = getattr(
-            torch,
-            str(self._info.latent_dtype).removeprefix("torch."),
-            None,
-        )
+        latent_dtype = getattr(torch, str(layout.latent_dtype).removeprefix("torch."), None)
         if flow is not None and not isinstance(latent_dtype, torch.dtype):
-            raise unsupported_setup(f"unsupported latent dtype {self._info.latent_dtype!r}")
+            raise unsupported_setup(f"unsupported latent dtype {layout.latent_dtype!r}")
         if flow is None:
             self.latent_pool = None
         else:
             assert isinstance(latent_dtype, torch.dtype)
             self.latent_pool = LatentPool(
-                request_pool_size=int(self._info.max_request_pool_size),
-                num_pages=int(self._info.num_latent_pages),
+                request_pool_size=int(self._info.request_slots),
+                num_pages=int(self._info.latent_pages),
                 page_units=int(self._info.latent_page_units),
-                latent_width=int(self._info.latent_width),
+                latent_width=int(layout.latent_width),
                 dtype=latent_dtype,
                 device=deployment.generation_device or deployment.device,
             )
@@ -346,26 +345,32 @@ class Worker:
         )
         self.device_events = DeviceEventPool()
         self.output_pool = OutputPool(
-            capacity=int(pipeline_depth) * int(self._info.max_batch_operations),
-            max_words=int(self._info.max_batch_operations)
+            capacity=int(pipeline_depth) * int(self._info.max_batch_ops),
+            max_words=int(self._info.max_batch_ops)
             * (4 + (int(completion_payload_bytes) + 3) // 4),
             event_pool=self.device_events,
+        )
+        self.persistent_buffers = PersistentBuffers(
+            byte_capacity=int(self._info.buffer_pool_bytes),
+            devices=owner_devices,
         )
         self.device_products = DeviceProducts(
             capacity=arena.device_products,
             byte_capacity=arena.device_product_bytes,
-            request_capacity=int(self._info.max_request_pool_size),
-            relay_depth=int(self._info.max_unresolved_window) + 1,
+            request_capacity=int(self._info.request_slots),
+            relay_depth=int(self._info.max_unresolved_ops) + 1,
+            persistent_buffers=self.persistent_buffers,
             event_pool=self.device_events,
         )
         self.encoder_cache = EncoderCache(
             entry_capacity=int(model.resource_geometry.encoder_cache_entries),
             max_entry_bytes=max(
                 1,
-                int(self._info.max_latent_feature_bytes),
-                int(self._info.max_vision_feature_bytes),
+                int(layout.max_latent_feature_bytes),
+                int(layout.max_vision_feature_bytes),
             ),
             devices=owner_devices,
+            persistent_buffers=self.persistent_buffers,
             event_pool=self.device_events,
         )
         self.cpu_tasks = CpuPool(
@@ -379,8 +384,8 @@ class Worker:
             cross_process=bool(cross_process),
         )
         max_rows = min(
-            int(self._info.max_batch_operations),
-            int(self._info.max_request_pool_size),
+            int(self._info.max_batch_ops),
+            int(self._info.request_slots),
         )
         max_staged_rows = max_rows * (1 if flow is None else int(flow.max_cfg_branches))
         max_text_staged_tokens = int(self._info.max_batch_tokens)
@@ -435,13 +440,14 @@ class Worker:
             for value in execution.decode_graph_batch_sizes
             if 0 < int(value) <= decode_max_operations
             and owns_kv
-            and int(value) < int(self._info.num_blocks)
+            and self._info.kv_cache is not None
+            and int(value) < int(self._info.kv_cache.num_blocks)
         )
         prefill_capacity = (
             min(
                 int(self._info.max_batch_tokens),
                 int(packed_model.text_max_tokens),
-                max(0, int(self._info.num_blocks) - 1) * int(deployment.block_size),
+                max(0, int(self._info.kv_cache.num_blocks) - 1) * int(deployment.block_size),
             )
             if owns_kv
             else 0
@@ -519,10 +525,10 @@ class Worker:
             if (
                 not flow_graph_buckets
                 or not packed_model.tensorized_mixed
-                or not _has_decode_flow_partition(execution.lanes)
+                or not _has_decode_flow_lane(execution.lanes)
                 or not {
-                    ForwardMode.TOKEN_DECODE,
-                    ForwardMode.MEDIA_DENOISE,
+                    RunKind.AR_DECODE,
+                    RunKind.DIFFUSION_STEP,
                 }.issubset(self._effective_work_variants)
             )
             else tuple(
@@ -607,10 +613,7 @@ class Worker:
         self._flow_cfg_branches = flow_cfg_branches
         self._flow_graph_buckets = flow_graph_buckets
         self._mixed_flow_graph_buckets = mixed_flow_graph_buckets
-        self._info = replace(
-            self._info,
-            mixed_buckets=mixed_flow_graph_buckets,
-        )
+        self._mixed_buckets = mixed_flow_graph_buckets
         graph_budget = graph_memory_budget_bytes(device_total_bytes(deployment.device))
 
         def graph_factory(
@@ -681,11 +684,11 @@ class Worker:
             )
             expected_resident_executables = 0
             if execution.cuda_graph:
-                if ForwardMode.TOKEN_DECODE in self._effective_work_variants:
+                if RunKind.AR_DECODE in self._effective_work_variants:
                     expected_resident_executables += len(lane_decode_buckets)
                 if (
                     execution.prefill_cuda_graph
-                    and ForwardMode.TOKEN_EXTEND in self._effective_work_variants
+                    and RunKind.AR_EXTEND in self._effective_work_variants
                 ):
                     expected_resident_executables += (
                         len(lane_prefill_buckets)
@@ -693,13 +696,13 @@ class Worker:
                         else len(lane_prefill_catalog)
                     )
                 if execution.prefill_cuda_graph and {
-                    ForwardMode.MEDIA_PREPARE,
-                    ForwardMode.MEDIA_DENOISE,
+                    RunKind.DIFFUSION_PREPARE,
+                    RunKind.DIFFUSION_STEP,
                 }.issubset(self._effective_work_variants):
                     expected_resident_executables += len(
                         {_flow_graph_executable(bucket) for bucket in lane_flow_buckets}
                     )
-                    if ForwardMode.TOKEN_DECODE in self._effective_work_variants:
+                    if RunKind.AR_DECODE in self._effective_work_variants:
                         expected_resident_executables += len(
                             {
                                 _mixed_flow_graph_executable(bucket)
@@ -766,8 +769,8 @@ class Worker:
             else None
         )
         self.runner = runner
-        self.h3_mux, self.h3_output_ring = model.create_media_runtime(
-            self._info.max_unresolved_window
+        self.media_mux, self.media_output_ring = model.create_media_runtime(
+            self._info.max_unresolved_ops
         )
         self.execution = create_execution_resources(
             runner=runner,
@@ -791,10 +794,10 @@ class Worker:
             model_name=self.architecture,
             weight_version=self.weight_version,
             allowed_work_variants=self._effective_work_variants,
-            mixed_buckets=self._info.mixed_buckets,
+            mixed_buckets=self._mixed_buckets,
             trace=self.trace,
-            h3_mux=self.h3_mux,
-            h3_output_ring=self.h3_output_ring,
+            media_mux=self.media_mux,
+            media_output_ring=self.media_output_ring,
         )
         self.weight_updater = (
             WeightUpdater(
@@ -828,13 +831,26 @@ class Worker:
             return 0
         return min(blocks, max(0, int(pool.num_pages) - 1))
 
-    def execute(self, batch: Batch) -> CompletionReport:
+    def execute(self, batch: Run) -> RunResult:
         with self._model_call():
-            return execute_batch(self.execution, batch)
+            batch = self.plan_run(batch)
+            report = execute_batch(self.execution, batch)
+            return self._finish_closed_requests(batch, report)
 
-    def prepare_execute(self, batch: Batch) -> PreparedExecution | None:
+    def plan_run(self, batch: Run) -> Run:
+        """Derive the worker-private execution lanes for one physical run."""
+
+        return plan_run(self.execution, batch)
+
+    def supports_run_kind(self, kind: RunKind) -> bool:
+        """Return whether this worker can execute one physical run variant."""
+
+        return kind in self._effective_work_variants
+
+    def prepare_execute(self, batch: Run) -> PreparedExecution | None:
         self._begin_model_call()
         try:
+            batch = self.plan_run(batch)
             prepared = prepare_batch(self.execution, batch)
         except BaseException:
             self._end_model_call()
@@ -846,11 +862,28 @@ class Worker:
                 self._end_model_call()
                 return None
         return prepared.bind(
-            lambda value: execute_prepared(self.execution, value),
+            lambda value: self._finish_closed_requests(
+                value.batch,
+                execute_prepared(self.execution, value),
+            ),
             self._end_model_call,
         )
 
-    def execute_prepared(self, prepared: PreparedExecution) -> CompletionReport:
+    def _finish_closed_requests(
+        self,
+        batch: Run,
+        report: RunResult,
+    ) -> RunResult:
+        closed = {
+            int(command.request_key.request_id)
+            for command in batch.commands
+            if isinstance(command, Finish)
+        }
+        for request_id in closed:
+            self.retire_request(request_id)
+        return report
+
+    def execute_prepared(self, prepared: PreparedExecution) -> RunResult:
         if not isinstance(prepared, PreparedExecution):
             raise invalid_descriptor("prepared execution has an invalid type")
         return prepared.resolve()
@@ -905,68 +938,63 @@ class Worker:
         packed_warmup.warmup(context)
         self.model.warmup(context)
         complete_startup(self.execution)
-        self._info = replace(
-            self._info,
-            mixed_buckets=tuple(
-                bucket
-                for bucket in self._info.mixed_buckets
-                if bucket in self.execution.mixed_buckets
-            ),
+        self._mixed_buckets = tuple(
+            bucket for bucket in self._mixed_buckets if bucket in self.execution.mixed_buckets
         )
 
-    def drop_session(self, session_id: int) -> None:
-        session_id = int(session_id)
-        session = self.requests.peek(session_id)
-        drop_execution_session(self.execution, session_id)
-        self.device_products.drop_session(session_id)
-        self.model.drop_runtime(session_id, self.h3_mux)
-        if session is not None and self.latent_pool is not None:
-            self.latent_pool.release_slots((int(session.request_pool_idx),))
-        self.requests.drop(session_id)
-        if session is not None:
+    def drop_request(self, request_id: int) -> None:
+        request_id = int(request_id)
+        request = self.requests.peek(request_id)
+        drop_execution_request(self.execution, request_id)
+        self.device_products.drop_request(request_id)
+        if self.media_mux is not None:
+            self.media_mux.drop(request_id)
+        if request is not None and self.latent_pool is not None:
+            self.latent_pool.release_slots((int(request.request_pool_idx),))
+        self.requests.drop(request_id)
+        if request is not None:
             self.trace.emit(
                 ExecutionPhase.CLEANUP,
                 (
                     OperationTrace(
-                        authority_id=session.request_key.authority_id,
-                        session_id=session.session_id,
-                        epoch=session.epoch,
-                        op_id=0 if session.last_op_id is None else session.last_op_id,
-                        version=session.version,
+                        authority_id=request.request_key.authority_id,
+                        request_id=request.request_id,
+                        epoch=request.epoch,
+                        op_id=0 if request.last_op_id is None else request.last_op_id,
+                        version=request.version,
                     ),
                 ),
             )
 
-    def release_products(self, handles: tuple[int, ...]) -> None:
+    def retire_request(self, request_id: int) -> None:
+        request_id = int(request_id)
+        request = self.requests.peek(request_id)
+        if request is None or request.retired:
+            return
+        drop_execution_request(self.execution, request_id)
+        self.device_products.drop_request(request_id)
+        if self.media_mux is not None:
+            self.media_mux.drop(request_id)
+        if self.latent_pool is not None:
+            self.latent_pool.release_slots((int(request.request_pool_idx),))
+        self.requests.retire(request_id)
+        self.trace.emit(
+            ExecutionPhase.CLEANUP,
+            (
+                OperationTrace(
+                    authority_id=request.request_key.authority_id,
+                    request_id=request.request_id,
+                    epoch=request.epoch,
+                    op_id=0 if request.last_op_id is None else request.last_op_id,
+                    version=request.version,
+                ),
+            ),
+        )
+
+    def free_products(self, handles: tuple[int, ...]) -> None:
         generations = tuple(int(handle) for handle in handles)
         self.device_products.release_generations(generations)
         self.encoder_cache.release_generations(generations)
-
-    def resource_pressure(self) -> list[dict[str, object]]:
-        model_usage = self.model.resource_usage()
-        if model_usage:
-            return [
-                _pressure(resource, used, total)
-                for resource, used, total in model_usage
-            ]
-        info = self._info
-        counts = {
-            "image_latent": (
-                0 if self.latent_pool is None else self.latent_pool.resident_byte_count()
-            ),
-            "encoder_output": self.encoder_cache.resident_entries,
-        }
-        totals = {
-            "image_latent": (
-                0 if self.latent_pool is None else int(self.latent_pool.capacity_bytes)
-            ),
-            "encoder_output": int(info.encoder_cache_budget),
-        }
-        return [
-            _pressure(value.value, counts[value.value], totals[value.value])
-            for value in info.resource_classes
-            if value.value in counts
-        ]
 
     def close(self) -> None:
         runner = self.runner
@@ -976,14 +1004,15 @@ class Worker:
         if runner is not None:
             runner.close()
         self.model.synchronize_runtime()
-        if self.h3_mux is not None:
-            self.h3_mux.close()
+        if self.media_mux is not None:
+            self.media_mux.close()
         self.cpu_tasks.close()
         self.transfers.close()
         if self.latent_pool is not None:
             self.latent_pool.close()
         self.encoder_cache.close()
         self.device_products.close()
+        self.persistent_buffers.close()
         self.output_pool.close()
         self.device_events.close()
 
@@ -1015,20 +1044,6 @@ def _supports_flow_attention(
         ):
             return True
     return False
-
-
-def _pressure(resource_class: str, used: int, total: int) -> dict[str, object]:
-    if used < 0 or total < 0 or used > total:
-        raise RuntimeError(
-            f"resource pressure invariant failed for {resource_class}: used={used}, total={total}"
-        )
-    return {
-        "class": resource_class,
-        "total": total,
-        "used": used,
-        "evictable": 0,
-        "free": total - used,
-    }
 
 
 __all__ = ["Worker"]

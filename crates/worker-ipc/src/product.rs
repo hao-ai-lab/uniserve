@@ -120,7 +120,32 @@ pub struct ProductRef {
     pub point_range: PointRange,
 }
 
+/// Stable identity for one cross-operation buffer, independent of its physical representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct BufferId {
+    pub owner: RequestKey,
+    pub producer_op_id: OpId,
+    pub output_index: u16,
+    pub generation: u32,
+}
+
+impl BufferId {
+    pub fn validate(self) -> ValidationResult<()> {
+        ensure_valid!(self.generation > 0, "buffer id has no logical generation");
+        Ok(())
+    }
+}
+
 impl ProductRef {
+    pub const fn buffer_id(&self) -> BufferId {
+        BufferId {
+            owner: self.request_key,
+            producer_op_id: self.producer_op_id,
+            output_index: self.output_index,
+            generation: self.generation,
+        }
+    }
+
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
             self.generation > 0,
@@ -140,6 +165,23 @@ impl ProductRef {
             .max_elements()
             .saturating_mul(element_bytes)
     }
+
+    /// Whether this value needs an address-stable allocation from the shared
+    /// persistent-buffer pool. KV and diffusion trajectories use their
+    /// dedicated page placements; request-relay scalars and host results do
+    /// not consume persistent-buffer space.
+    pub const fn uses_persistent_buffer(&self) -> bool {
+        matches!(
+            self.kind,
+            ProductKind::VisionFeature | ProductKind::LatentFeature
+        ) || matches!(
+            (self.kind, self.storage_class),
+            (
+                ProductKind::Artifact,
+                StorageClass::DeviceTensor | StorageClass::LatentArena
+            )
+        )
+    }
 }
 
 /// Envelope metadata reporting whether an atomic registration became visible. It
@@ -149,23 +191,156 @@ pub struct RegistrationAck {
     pub visible: bool,
 }
 
-/// A resolved product value carried across the boundary: a host-supplied input
-/// value the worker consumes (prompt, forced, or draft token ids; encode image
-/// bytes) referenced through `Operation::inputs`, or a worker-produced output
-/// value the host consumes (requested logprob blobs, materialized image bytes).
-/// `product` says what the value is; `bytes` carries the value.
-///
-/// The IPC decoder treats other product bytes as opaque. This crate fixes
-/// the cross-language layouts for token inputs and branch-local sampling state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "transport", content = "value")]
+pub enum TransferTransport {
+    Local {
+        endpoint: String,
+        key: u64,
+    },
+    PosixShm {
+        name: String,
+        ready_header_bytes: u32,
+        ready_semaphore: Option<String>,
+    },
+    CudaIpc {
+        endpoint: String,
+        publication_id: String,
+        #[serde(with = "serde_bytes")]
+        storage_handle: Vec<u8>,
+        storage_size_bytes: u64,
+        storage_offset_bytes: u64,
+        tensor_offset: u64,
+        tensor_stride: Vec<i64>,
+        #[serde(with = "serde_bytes")]
+        ref_counter_handle: Vec<u8>,
+        ref_counter_offset: u64,
+        #[serde(with = "serde_bytes")]
+        event_handle: Vec<u8>,
+        event_sync_required: bool,
+        #[serde(with = "serde_bytes")]
+        ready_event_handle: Vec<u8>,
+    },
+}
+
+/// One transport-native reference with explicit tensor bounds. Transport handles
+/// are opaque bytes only where the underlying CUDA API defines an opaque handle;
+/// semantic transfer metadata remains typed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferLocator {
+    pub transport: TransferTransport,
+    pub nbytes: u64,
+    pub dtype: String,
+    pub shape: Vec<u64>,
+    pub device: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferKind {
+    Encoder,
+    DeviceProduct,
+    Kv,
+    Latent,
+}
+
+/// Closed cross-pool transfer algebra. Each variant carries exactly the metadata
+/// required to install that family value on the destination worker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum TransferHandle {
+    Encoder {
+        generation: u32,
+        height: u32,
+        width: u32,
+        payload_kind: ProductKind,
+        locator: TransferLocator,
+    },
+    DeviceProduct {
+        generation: u32,
+        height: u32,
+        width: u32,
+        value_range: String,
+        locator: TransferLocator,
+    },
+    Kv {
+        generation: u32,
+        locators: Vec<TransferLocator>,
+        source: Checkpoint,
+        destination: String,
+        base: Option<Checkpoint>,
+        base_extent: u32,
+        published_extent: u32,
+        group_id: u32,
+        scale_identity: String,
+    },
+    Latent {
+        generation: u32,
+        height: u32,
+        width: u32,
+        latent_units: u32,
+        step: u32,
+        locator: TransferLocator,
+    },
+}
+
+impl TransferHandle {
+    pub const fn kind(&self) -> TransferKind {
+        match self {
+            Self::Encoder { .. } => TransferKind::Encoder,
+            Self::DeviceProduct { .. } => TransferKind::DeviceProduct,
+            Self::Kv { .. } => TransferKind::Kv,
+            Self::Latent { .. } => TransferKind::Latent,
+        }
+    }
+
+    pub const fn generation(&self) -> u32 {
+        match self {
+            Self::Encoder { generation, .. }
+            | Self::DeviceProduct { generation, .. }
+            | Self::Kv { generation, .. }
+            | Self::Latent { generation, .. } => *generation,
+        }
+    }
+
+    fn locators(&self) -> &[TransferLocator] {
+        match self {
+            Self::Encoder { locator, .. }
+            | Self::DeviceProduct { locator, .. }
+            | Self::Latent { locator, .. } => std::slice::from_ref(locator),
+            Self::Kv { locators, .. } => locators,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum InlineValue {
+    Bytes(#[serde(with = "serde_bytes")] Vec<u8>),
+    Transfer(TransferHandle),
+}
+
+impl InlineValue {
+    pub fn bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Bytes(bytes) => Some(bytes),
+            Self::Transfer(_) => None,
+        }
+    }
+
+    pub const fn transfer(&self) -> Option<&TransferHandle> {
+        match self {
+            Self::Bytes(_) => None,
+            Self::Transfer(handle) => Some(handle),
+        }
+    }
+}
+
+/// A resolved inline or transfer value matched to one exact product identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProductPayload {
     pub product: ProductRef,
-    /// Raw value bytes. `serde_bytes` keeps the pyo3 boundary on the
-    /// bytes fast path (one buffer copy) instead of a per-element
-    /// integer-sequence walk, which costs hundreds of milliseconds for a
-    /// multi-megabyte image artifact.
-    #[serde(with = "serde_bytes")]
-    pub bytes: Vec<u8>,
+    pub value: InlineValue,
 }
 
 impl ProductPayload {
@@ -174,31 +349,27 @@ impl ProductPayload {
     }
 
     pub(crate) fn validate_input_value(&self) -> ValidationResult<()> {
-        if is_transfer_descriptor(&self.bytes) {
-            ensure_valid!(
-                self.product.storage_class != StorageClass::HostStaging
-                    && self.bytes.len() <= MAX_TRANSFER_DESCRIPTOR_BYTES,
-                "cross-stage product input has an invalid transfer descriptor frame"
-            );
-            return Ok(());
+        if let InlineValue::Transfer(handle) = &self.value {
+            return validate_transfer_handle(&self.product, handle, false);
         }
+        let bytes = self.value.bytes().expect("inline bytes");
         match self.product.kind {
             ProductKind::Token => {
-                let tokens = decode_token_product_bytes(&self.bytes)?;
+                let tokens = decode_token_product_bytes(bytes)?;
                 ensure_valid!(
                     tokens.len() as u64 <= self.product.shape_bound.max_elements(),
                     "token input product exceeds its registered element bound"
                 );
             }
             ProductKind::SamplingState => {
-                decode_sampling_state_bytes(&self.bytes)?;
+                decode_sampling_state_bytes(bytes)?;
                 ensure_valid!(
-                    self.bytes.len() as u64 <= self.product.max_bytes(),
+                    bytes.len() as u64 <= self.product.max_bytes(),
                     "sampling-state input exceeds its registered byte bound"
                 );
             }
             _ => ensure_valid!(
-                self.bytes.len() as u64 <= self.product.max_bytes(),
+                bytes.len() as u64 <= self.product.max_bytes(),
                 "input product payload exceeds its registered byte bound"
             ),
         }
@@ -207,28 +378,169 @@ impl ProductPayload {
 
     pub(crate) fn validate_output_value(&self) -> ValidationResult<()> {
         self.validate()?;
-        if is_transfer_descriptor(&self.bytes) {
-            ensure_valid!(
-                self.product.storage_class != StorageClass::HostStaging
-                    && self.product.storage_class != StorageClass::PinnedOutput
-                    && self.bytes.len() <= MAX_TRANSFER_DESCRIPTOR_BYTES,
-                "output transfer descriptor has an invalid storage class or byte bound"
-            );
-            return Ok(());
+        match &self.value {
+            InlineValue::Transfer(handle) => validate_transfer_handle(&self.product, handle, true)?,
+            InlineValue::Bytes(bytes) => ensure_valid!(
+                bytes.len() as u64 <= self.product.max_bytes(),
+                "output product payload exceeds its registered byte bound"
+            ),
         }
-        ensure_valid!(
-            self.bytes.len() as u64 <= self.product.max_bytes(),
-            "output product payload exceeds its registered byte bound"
-        );
         Ok(())
     }
 }
 
-pub const TRANSFER_DESCRIPTOR_PREFIX: &[u8] = b"uniserve-transfer\0";
-pub const MAX_TRANSFER_DESCRIPTOR_BYTES: usize = 64 * 1024;
+pub const MAX_TRANSFER_HANDLE_BYTES: usize = 64 * 1024;
 
-pub fn is_transfer_descriptor(bytes: &[u8]) -> bool {
-    bytes.starts_with(TRANSFER_DESCRIPTOR_PREFIX)
+impl TransferLocator {
+    fn validate(&self) -> ValidationResult<()> {
+        ensure_valid!(
+            self.nbytes > 0
+                && !self.dtype.is_empty()
+                && !self.shape.is_empty()
+                && self.shape.iter().all(|extent| *extent > 0)
+                && !self.device.is_empty(),
+            "transfer locator has invalid tensor bounds"
+        );
+        match &self.transport {
+            TransferTransport::Local { endpoint, .. } => {
+                ensure_valid!(!endpoint.is_empty(), "local transfer endpoint is empty");
+            }
+            TransferTransport::PosixShm {
+                name,
+                ready_header_bytes,
+                ready_semaphore,
+            } => {
+                ensure_valid!(!name.is_empty(), "shared-memory transfer name is empty");
+                ensure_valid!(
+                    *ready_header_bytes == 0
+                        || ready_semaphore
+                            .as_ref()
+                            .is_some_and(|name| !name.is_empty()),
+                    "asynchronous shared-memory transfer has no readiness semaphore"
+                );
+            }
+            TransferTransport::CudaIpc {
+                endpoint,
+                publication_id,
+                storage_handle,
+                storage_size_bytes,
+                tensor_stride,
+                ref_counter_handle,
+                event_handle,
+                ready_event_handle,
+                ..
+            } => {
+                ensure_valid!(
+                    !endpoint.is_empty()
+                        && !publication_id.is_empty()
+                        && !storage_handle.is_empty()
+                        && *storage_size_bytes > 0
+                        && tensor_stride.len() == self.shape.len()
+                        && !ref_counter_handle.is_empty()
+                        && !event_handle.is_empty()
+                        && !ready_event_handle.is_empty(),
+                    "CUDA IPC transfer handle is incomplete"
+                );
+                let opaque_bytes = storage_handle
+                    .len()
+                    .saturating_add(ref_counter_handle.len())
+                    .saturating_add(event_handle.len())
+                    .saturating_add(ready_event_handle.len());
+                ensure_valid!(
+                    opaque_bytes <= MAX_TRANSFER_HANDLE_BYTES,
+                    "CUDA IPC transfer handles exceed their byte bound"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_transfer_handle(
+    product: &ProductRef,
+    handle: &TransferHandle,
+    output: bool,
+) -> ValidationResult<()> {
+    ensure_valid!(
+        product.storage_class != StorageClass::HostStaging
+            && (!output || product.storage_class != StorageClass::PinnedOutput),
+        "product transfer handle has an invalid storage class"
+    );
+    ensure_valid!(
+        handle.generation() == product.generation,
+        "transfer generation disagrees with its product"
+    );
+    match handle {
+        TransferHandle::Encoder {
+            payload_kind,
+            height,
+            width,
+            ..
+        } => ensure_valid!(
+            matches!(
+                payload_kind,
+                ProductKind::VisionFeature | ProductKind::LatentFeature
+            ) && *payload_kind == product.kind
+                && *height > 0
+                && *width > 0,
+            "encoder transfer disagrees with its product"
+        ),
+        TransferHandle::DeviceProduct {
+            height,
+            width,
+            value_range,
+            ..
+        } => ensure_valid!(
+            (*height == 0) == (*width == 0) && (*height > 0 || value_range.is_empty()),
+            "device-product transfer geometry is incomplete"
+        ),
+        TransferHandle::Kv {
+            locators,
+            source,
+            destination,
+            base,
+            base_extent,
+            published_extent,
+            scale_identity,
+            ..
+        } => {
+            ensure_valid!(
+                product.kind == ProductKind::Kv,
+                "KV transfer names a non-KV product"
+            );
+            ensure_valid!(!locators.is_empty(), "KV transfer has no physical values");
+            source.validate()?;
+            if let Some(base) = base {
+                base.validate()?;
+            }
+            ensure_valid!(
+                !destination.is_empty()
+                    && !scale_identity.is_empty()
+                    && *base_extent <= *published_extent
+                    && (base.is_some() || *base_extent == 0),
+                "KV transfer publication metadata is invalid"
+            );
+        }
+        TransferHandle::Latent {
+            height,
+            width,
+            latent_units,
+            ..
+        } => ensure_valid!(
+            product.kind == ProductKind::Latent && *height > 0 && *width > 0 && *latent_units > 0,
+            "latent transfer disagrees with its product"
+        ),
+    }
+    let mut total_bytes = 0_u64;
+    for locator in handle.locators() {
+        locator.validate()?;
+        total_bytes = total_bytes.saturating_add(locator.nbytes);
+    }
+    ensure_valid!(
+        total_bytes <= product.max_bytes(),
+        "transfer values exceed their product byte bound"
+    );
+    Ok(())
 }
 
 /// Encode a `ProductKind::Token` product value: a little-endian `u32` count

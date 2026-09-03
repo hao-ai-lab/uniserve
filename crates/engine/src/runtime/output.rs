@@ -2,7 +2,7 @@
 
 use super::*;
 
-fn flush_public_journal(event_tx: &EventTx, journal: &mut VecDeque<GenerationEvent>) -> bool {
+fn flush_public_journal(event_tx: &EventTx, journal: &mut VecDeque<Event>) -> bool {
     while let Some(event) = journal.pop_front() {
         match event_tx.send(event) {
             Ok(()) => {}
@@ -24,7 +24,7 @@ pub(super) struct RequestOutput {
     pub(super) event_seq: u64,
     pub(super) tokens_sent: usize,
     pub(super) tokens_acked: usize,
-    journal: VecDeque<GenerationEvent>,
+    journal: VecDeque<Event>,
 }
 
 impl RequestOutput {
@@ -52,7 +52,7 @@ impl RequestOutput {
         flush_public_journal(&self.event_tx, &mut self.journal)
     }
 
-    pub(super) fn enqueue(&mut self, event: GenerationEvent) -> bool {
+    pub(super) fn enqueue(&mut self, event: Event) -> bool {
         if self.flush() {
             return true;
         }
@@ -79,11 +79,11 @@ impl RequestOutput {
 
 struct RetiredOutput {
     event_tx: EventTx,
-    journal: VecDeque<GenerationEvent>,
+    journal: VecDeque<Event>,
 }
 
 #[derive(Default)]
-pub(super) struct OutputSender {
+pub(crate) struct OutputSender {
     retired: HashMap<RequestId, RetiredOutput>,
 }
 
@@ -116,12 +116,12 @@ impl OutputSender {
     }
 }
 
-impl Scheduler {
+impl EngineLoop {
     pub(super) fn resolve_decode_text(
         &mut self,
         id: RequestId,
         view: SequenceView,
-        prefix_versions: &[VersionRef],
+        prefix_versions: &[Checkpoint],
     ) {
         self.activate_request_tables(id);
         if self
@@ -225,29 +225,29 @@ impl Scheduler {
         &mut self,
         id: RequestId,
         operation: Operation,
-        apply: SchedulerApply,
+        apply: RuntimeApply,
         mut view: SequenceView,
-        prefix_versions: Vec<VersionRef>,
+        prefix_versions: Vec<Checkpoint>,
     ) {
-        let operation_variant = operation.work;
+        let operation_variant = operation.kind;
         if !view.prompt_logprobs.is_empty() {
             let positions = std::mem::take(&mut view.prompt_logprobs);
             self.resolve_prompt_logprobs(id, positions);
         }
-        if operation_variant == ForwardMode::TokenDecode {
+        if operation_variant == RunKind::ArDecode {
             return self.resolve_decode_text(id, view, &prefix_versions);
         }
         match operation_variant {
-            ForwardMode::TokenExtend => {
+            RunKind::ArExtend => {
                 self.activate_request_tables(id);
                 match &apply.intent {
-                    crate::scheduler::generation::TransitionIntent::CloseKv { .. } => return,
-                    crate::scheduler::generation::TransitionIntent::IngestImageState {
+                    crate::runtime::generation::TransitionIntent::CloseKv { .. } => return,
+                    crate::runtime::generation::TransitionIntent::IngestImageState {
                         is_final_step,
                         ..
                     } => {
                         if *is_final_step {
-                            self.release_transient_products(id);
+                            self.free_transient_products(id);
                         }
                         if *is_final_step
                             && self.running.get(&id).is_some_and(|st| {
@@ -265,14 +265,14 @@ impl Scheduler {
                         }
                         return;
                     }
-                    crate::scheduler::generation::TransitionIntent::FeedbackState {
+                    crate::runtime::generation::TransitionIntent::FeedbackState {
                         is_final_step,
                         ..
                     } => {
                         if !is_final_step {
                             return;
                         }
-                        self.release_transient_products(id);
+                        self.free_transient_products(id);
                         let sample_continuation = self
                             .running
                             .get(&id)
@@ -382,8 +382,9 @@ impl Scheduler {
                 }
                 // the prompt is fully prefilled now — publish its full
                 // blocks to the prefix cache for later requests to reuse.
-                if let Some(st) = self.running.get_mut(&id) {
-                    let kv = self.kv_budget.cache();
+                let (runtime, memory) = (&mut self.runtime, &self.memory);
+                if let Some(st) = runtime.state_mut().running.get_mut(&id) {
+                    let kv = memory.cache();
                     cache_prompt_blocks(&kv.coordinator, st, &kv.block_pool);
                 }
                 // A description-lowered prefix may already end at a branch trigger.
@@ -444,11 +445,11 @@ impl Scheduler {
                     self.begin_image(id);
                 }
             }
-            ForwardMode::MediaDenoise => {
+            RunKind::DiffusionStep => {
                 let (image_id, h, w, steps, prev_sd) = {
                     let st = self.running.get_mut(&id).unwrap();
                     let prev = match apply.intent {
-                        crate::scheduler::generation::TransitionIntent::DenoiseGen {
+                        crate::runtime::generation::TransitionIntent::DenoiseGen {
                             start_step,
                             ..
                         } => start_step,
@@ -470,7 +471,7 @@ impl Scheduler {
                 if prev_sd == 0 && sd >= 1 {
                     self.emit(
                         id,
-                        GenerationEvent::ImageBegin {
+                        Event::ImageBegin {
                             image_id,
                             height: h,
                             width: w,
@@ -479,19 +480,19 @@ impl Scheduler {
                     );
                 }
                 for step in prev_sd.saturating_add(1)..=sd {
-                    self.emit(id, GenerationEvent::ImageStep { image_id, step });
+                    self.emit(id, Event::ImageStep { image_id, step });
                 }
                 // The commit phase is entered host-side once the committed step
                 // count reaches `image.steps` (see the `Phase::DenoiseGen`
                 // planner); a worker completion flag does not drive termination.
             }
-            ForwardMode::MediaReconstruct => {}
-            ForwardMode::Materialize => {
+            RunKind::DiffusionDecode => {}
+            RunKind::DiffusionFinalize => {
                 let image_id = self
                     .running
                     .get(&id)
                     .map_or(0, |st| st.cursor.image_gen.image_id);
-                self.emit(id, GenerationEvent::ImageCommit { image_id });
+                self.emit(id, Event::ImageCommit { image_id });
                 let image = view.image_png.clone();
                 if let Some(image_b64) = image.clone() {
                     let Some(event) = image_done_event(image_id, image_b64) else {
@@ -517,7 +518,7 @@ impl Scheduler {
                         return self.finish(id, FinishReason::Error);
                     };
                     let source_product = operation
-                        .outputs
+                        .outputs()
                         .iter()
                         .find(|product| {
                             product.storage_class == uniserve_worker_ipc::StorageClass::LatentArena
@@ -552,13 +553,13 @@ impl Scheduler {
                     self.finish(id, FinishReason::ImageDone);
                 }
             }
-            ForwardMode::EncodeVision | ForwardMode::EncodeLatent => match &apply.intent {
-                crate::scheduler::generation::TransitionIntent::EncodeImageStep {
+            RunKind::EncoderVision | RunKind::EncoderLatent => match &apply.intent {
+                crate::runtime::generation::TransitionIntent::EncodeImageStep {
                     encoder_cache_key,
                     ..
                 } => {
                     let Some(feature) = operation
-                        .outputs
+                        .outputs()
                         .iter()
                         .find(|product| {
                             matches!(
@@ -580,13 +581,34 @@ impl Scheduler {
                     let mut free_products = Vec::new();
                     let selected_product = if let Some(cache_key) = encoder_cache_key {
                         if let Some(freed) = self
-                            .kv_budget
+                            .memory
                             .encoder_cache
                             .insert(*cache_key, feature.clone())
                         {
                             free_products.push(freed);
                         }
-                        let Some(product) = self.kv_budget.encoder_cache.acquire(*cache_key) else {
+                        let stored = self.memory.encoder_cache.peek_product(*cache_key)
+                            == Some(feature.clone());
+                        if stored {
+                            let allocation = self.running.get_mut(&id).and_then(|state| {
+                                state.allocations_mut().take_buffer(feature.buffer_id())
+                            });
+                            let Some(allocation) = allocation else {
+                                return self.finish(id, FinishReason::Error);
+                            };
+                            if let Err(allocation) = self
+                                .memory
+                                .retain_encoder_buffer(feature.buffer_id(), allocation)
+                            {
+                                self.pending_buffer_frees
+                                    .insert(feature.buffer_id(), allocation);
+                                self.pending_commands.push_back(BatchCommand::Free {
+                                    buffer: feature.buffer_id(),
+                                });
+                                return self.finish(id, FinishReason::Error);
+                            }
+                        }
+                        let Some(product) = self.memory.encoder_cache.acquire(*cache_key) else {
                             return self.finish(id, FinishReason::Error);
                         };
                         if let Some(st) = self.running.get_mut(&id) {
@@ -613,12 +635,12 @@ impl Scheduler {
                         st.cursor.phase = Phase::IngestState;
                     }
                     if !free_products.is_empty() {
-                        self.release_products(free_products);
+                        self.free_products(free_products);
                     }
                 }
-                crate::scheduler::generation::TransitionIntent::EncodeFeedbackStep { .. } => {
+                crate::runtime::generation::TransitionIntent::EncodeFeedbackStep { .. } => {
                     let Some(feature) = operation
-                        .outputs
+                        .outputs()
                         .iter()
                         .find(|product| {
                             matches!(
@@ -646,12 +668,12 @@ impl Scheduler {
                 }
                 _ => self.finish(id, FinishReason::Error),
             },
-            ForwardMode::TokenDecode
-            | ForwardMode::TokenVerify
-            | ForwardMode::MediaPrepare
-            | ForwardMode::TransferProduct
-            | ForwardMode::TransferKvPublish
-            | ForwardMode::TransferKvInstall => {}
+            RunKind::ArDecode
+            | RunKind::ArVerify
+            | RunKind::DiffusionPrepare
+            | RunKind::TransferProduct
+            | RunKind::TransferKvPublish
+            | RunKind::TransferKvInstall => {}
         }
     }
 
@@ -677,7 +699,7 @@ impl Scheduler {
         }
         self.emit(
             id,
-            GenerationEvent::PromptLogprobs {
+            Event::PromptLogprobs {
                 positions: selected
                     .into_iter()
                     .map(|entries| PositionLogprobs {
@@ -688,13 +710,13 @@ impl Scheduler {
         );
     }
 
-    pub(super) fn release_transient_products(&mut self, id: RequestId) {
+    pub(super) fn free_transient_products(&mut self, id: RequestId) {
         let products = self
             .running
             .get_mut(&id)
             .map(|state| std::mem::take(&mut state.cursor.ingest.transient_encoder_products))
             .unwrap_or_default();
-        self.release_products(products);
+        self.free_products(products);
     }
 
     pub(super) fn record_gen_trigger_for_replay(&mut self, id: RequestId) {
@@ -726,7 +748,7 @@ impl Scheduler {
         let allocated_blocks = self
             .running
             .get(&id)
-            .and_then(|state| state.block_tables.first())
+            .and_then(|state| state.block_tables().first())
             .map_or(0, BlockTable::len);
         if !reserves_envelope || allocated_blocks < required_blocks {
             self.trace_record(json!({
@@ -748,15 +770,17 @@ impl Scheduler {
             "request_id": id.0,
             "required_blocks": required_blocks,
             "allocated_blocks": allocated_blocks,
-            "free_blocks": self.kv_budget.free_blocks(),
-            "reserved_blocks": self.kv_budget.reserved_blocks,
+            "free_blocks": self.memory.free_blocks(),
+            "reserved_blocks": self.memory.reserved_blocks,
         }));
         true
     }
 
     pub(super) fn begin_image(&mut self, id: RequestId) {
         self.record_gen_trigger_for_replay(id);
+        let has_unresolved_descendants = self.inflight.contains(id);
         if let Some(st) = self.running.get_mut(&id) {
+            st.speculative_chain_invalidated |= has_unresolved_descendants;
             st.cursor.image_gen.cond_pos = st.cursor.und.logical_pos;
             st.cursor.image_gen.steps_done = 0;
             st.cursor.image_gen.image_id += 1;
@@ -780,11 +804,11 @@ impl Scheduler {
             }
             progressed |= state.output.journal.len() != before;
         }
-        progressed |= self.output.flush_retired();
+        progressed |= self.scheduler.output.flush_retired();
         progressed
     }
 
-    pub(super) fn emit(&mut self, id: RequestId, ev: GenerationEvent) {
+    pub(super) fn emit(&mut self, id: RequestId, ev: Event) {
         if let Some(st) = self.running.get_mut(&id) {
             if st.output.enqueue(ev) {
                 st.terminal_intent = TerminalIntent::Cancel;
@@ -795,12 +819,12 @@ impl Scheduler {
     pub(super) fn emit_visible(
         &mut self,
         id: RequestId,
-        event: GenerationEvent,
-        root: Option<&VersionRef>,
+        event: Event,
+        root: Option<&Checkpoint>,
     ) -> bool {
         let root = root.cloned().or_else(|| self.fixed_version(id));
-        let Some(VersionRef {
-            point: Point::Fixed { .. },
+        let Some(Checkpoint {
+            point: CheckpointPoint::Fixed(_),
             ..
         }) = root
         else {
@@ -825,7 +849,7 @@ impl Scheduler {
         id: RequestId,
         tok: u32,
         logprob: Option<f32>,
-        root: Option<&VersionRef>,
+        root: Option<&Checkpoint>,
     ) -> bool {
         let action = if let Some(st) = self.running.get_mut(&id) {
             st.cursor.replay.generated_ids.push(tok);
@@ -836,8 +860,7 @@ impl Scheduler {
         };
         match action {
             uniserve_core::UndTokenAction::Emit => {
-                let published =
-                    self.emit_visible(id, GenerationEvent::TextToken { id: tok, logprob }, root);
+                let published = self.emit_visible(id, Event::TextToken { id: tok, logprob }, root);
                 let first_token = published
                     && self
                         .running
@@ -869,14 +892,14 @@ impl Scheduler {
         tok: u32,
         logprob: Option<f32>,
         top_logprobs: Option<Vec<RankedToken>>,
-        root: Option<&VersionRef>,
+        root: Option<&Checkpoint>,
     ) {
         if self.emit_text(id, tok, logprob, root)
             && let Some(top_logprobs) = top_logprobs.filter(|entries| !entries.is_empty())
         {
             self.emit(
                 id,
-                GenerationEvent::TokenLogprobs {
+                Event::TokenLogprobs {
                     id: tok,
                     candidates: ranked_logprobs(top_logprobs),
                 },
@@ -890,7 +913,7 @@ impl Scheduler {
         token_id: u32,
         logprob: Option<f32>,
         top_logprobs: Option<Vec<RankedToken>>,
-        root: Option<&VersionRef>,
+        root: Option<&Checkpoint>,
     ) {
         if self
             .running
@@ -908,7 +931,7 @@ impl Scheduler {
         logprob: Option<f32>,
         top_logprobs: Option<Vec<RankedToken>>,
         sampled: bool,
-        root: Option<&VersionRef>,
+        root: Option<&Checkpoint>,
     ) -> bool {
         let Some(state) = self.running.get(&id) else {
             return true;
@@ -1029,60 +1052,56 @@ impl Scheduler {
             );
         }
         let mut awaits_close = false;
-        let mut request_pool_idx = None;
-        let mut flow_pool_idx = None;
+        let mut allocations = None;
+        let mut flow_prefix = None;
         if let Some(mut st) = self.running.remove(&id) {
-            request_pool_idx = Some(st.request_pool_idx);
-            flow_pool_idx = st
-                .flow_prefix
-                .as_ref()
-                .map(|prefix| prefix.request_pool_idx);
             if st.cursor.resources.worker_registered {
                 let request_key = RequestKey::new(self.authority_id, id, st.epoch);
-                let cutoff = st.cancel_cutoff.clone().unwrap_or_else(|| VersionRef {
-                    request_key,
-                    producer_op_id: OpId(st.committed_producer_op_id),
-                    point: Point::Fixed {
-                        point_index: st.committed_version as u32,
-                    },
+                let cutoff = st.cancel_cutoff.clone().unwrap_or_else(|| Checkpoint {
+                    op_id: OpId(st.committed_producer_op_id),
+                    point: CheckpointPoint::Fixed(st.committed_version as u32),
                 });
                 st.control_seq = st.control_seq.saturating_add(1);
-                self.pending_controls.push_back(Control::Close {
+                self.pending_commands.push_back(BatchCommand::Finish {
                     request_key,
                     control_seq: st.control_seq,
                     cutoff,
                     reason: close_reason(&reason),
                 });
-                self.retiring_sessions.insert(
+                self.retiring_requests.insert(
                     id,
-                    RetiringSession {
+                    RetiringRequest {
                         request_key,
-                        request_pool_idx: st.request_pool_idx,
-                        _block_tables: std::mem::take(&mut st.block_tables),
+                        allocations: st.allocations.take().expect("admitted allocations"),
                         flow_prefix: st.flow_prefix.take(),
                     },
                 );
                 awaits_close = true;
+            } else {
+                allocations = st.allocations.take();
+                flow_prefix = st.flow_prefix.take();
             }
-            self.order.retain(|request| *request != id);
-            self.kv_budget.reserved_encoder_entries = self
-                .kv_budget
+            self.scheduler
+                .running_order
+                .retain(|request| *request != id);
+            self.memory.reserved_encoder_entries = self
+                .memory
                 .reserved_encoder_entries
                 .saturating_sub(st.req.resources.encoder_cache_keys.len());
             if st.cursor.resources.reserve_worstcase {
-                self.kv_budget.reserved_blocks = self
-                    .kv_budget
+                self.memory.reserved_blocks = self
+                    .memory
                     .reserved_blocks
                     .saturating_sub(st.cursor.resources.worstcase_blocks);
             }
             let mut free_encoder_products =
                 std::mem::take(&mut st.cursor.ingest.transient_encoder_products);
             for pin in &st.cursor.ingest.acquired_encoder_pins {
-                if let Some(product) = self.kv_budget.encoder_cache.release(pin.key, &pin.product) {
+                if let Some(product) = self.memory.encoder_cache.release(pin.key, &pin.product) {
                     free_encoder_products.push(product);
                 }
             }
-            self.release_products(free_encoder_products);
+            self.free_products(free_encoder_products);
             self.trace_request_finished(super::control::FinishedTrace {
                 id,
                 reason: &reason,
@@ -1092,7 +1111,7 @@ impl Scheduler {
                 images: st.cursor.image_gen.images_done,
                 queue: "running",
             });
-            let terminal = GenerationEvent::Finished {
+            let terminal = Event::Finished {
                 reason,
                 stop_reason,
                 prompt_tokens: st.context.prompt_ids.len(),
@@ -1101,24 +1120,15 @@ impl Scheduler {
             };
             let closed = st.output.enqueue(terminal);
             if !closed {
-                self.output.retire(id, st.output);
+                self.scheduler.output.retire(id, st.output);
             }
         }
         if !awaits_close {
-            self.kv_budget.latent_pages.release(id);
-            if let Some(index) = flow_pool_idx {
-                let _ = self.kv_budget.request_slots.release(index);
+            if let Some(prefix) = flow_prefix {
+                prefix.allocations.free(&mut self.memory);
             }
-            if let Some(index) = request_pool_idx
-                && let Err(error) = self.kv_budget.request_slots.release(index)
-            {
-                tracing::error!(
-                    request_id = id.0,
-                    request_pool_idx = index,
-                    error,
-                    "failed to release scheduler request slot"
-                );
-                self.fatal = true;
+            if let Some(allocations) = allocations {
+                allocations.free(&mut self.memory);
             }
         }
     }
@@ -1131,7 +1141,7 @@ fn cache_prompt_blocks(coordinator: &KvCacheCoordinator, state: &mut ReqState, p
     let prompt = state.effective_prompt().to_vec();
     if coordinator.cache_prefix(
         pool,
-        &state.block_tables,
+        state.block_tables(),
         &prompt,
         &state.cursor.replay.block_hashes,
         state.req.cache.write,

@@ -3,23 +3,20 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
 
 from ...execution.batch import (
-    ForwardMode,
-    MediaProfileId,
     NewRequest,
-    ReconstructionKind,
-    ReconstructionPlacement,
+    RunKind,
 )
 from ...nn.diffusion.modulation import modulation_plan_shapes
 from ...nn.mesh import DeviceMesh
 from ...profiling import profile_range, synchronize_profile_range
-from ..runtime import DedicatedStateGeometry, ExecutionModel, ResourceGeometry
+from ..runtime import DedicatedStateGeometry, ResourceGeometry
+from ..video import DecodeKind, DecodeOutput, VideoOutputGeometry, VideoRunner
 from .packing import audio_latent_frames, patchify_video, unpatchify_video_into
 from .precision import H3LinearPrecisionPolicy
 from .schedule import solver_step
@@ -28,6 +25,8 @@ from .state import (
     MIN_H3_FRAMES,
     PROFILE_AUDIO_RATE,
     PROFILE_FPS,
+    PROFILE_HEIGHT,
+    PROFILE_WIDTH,
     H3Layout,
     H3Scratch,
     H3StatePool,
@@ -38,7 +37,7 @@ from .weights import H3Components, load_h3_components
 if TYPE_CHECKING:
     from ...worker.warmup import WarmupContext
 
-__all__ = ["MiniMaxH3Model"]
+__all__ = ["MiniMaxH3Runner"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,7 +51,7 @@ class _H3PageExecution:
     prompt_prefix_counts: torch.Tensor
 
 
-class MiniMaxH3Model(ExecutionModel):
+class MiniMaxH3Runner(VideoRunner):
     """One SP4 replica with TP4 conditioning and a serial shared scratch lane."""
 
     architecture = "MiniMaxH3Transformer3DModel"
@@ -60,10 +59,10 @@ class MiniMaxH3Model(ExecutionModel):
     resource_geometry = ResourceGeometry(kv=False)
     supported_work = frozenset(
         {
-            ForwardMode.MEDIA_PREPARE,
-            ForwardMode.MEDIA_DENOISE,
-            ForwardMode.MEDIA_RECONSTRUCT,
-            ForwardMode.MATERIALIZE,
+            RunKind.DIFFUSION_PREPARE,
+            RunKind.DIFFUSION_STEP,
+            RunKind.DIFFUSION_DECODE,
+            RunKind.DIFFUSION_FINALIZE,
         }
     )
     generation = None
@@ -110,6 +109,8 @@ class MiniMaxH3Model(ExecutionModel):
                 else torch.uint8
             ),
         )
+        self._state_block_plan_shape = block_plan_shape
+        self._state_final_plan_shape = final_plan_shape
         self.page_executions: dict[tuple[int, int, int], _H3PageExecution] = {}
         self.prompt_device = torch.empty(
             (1 + int(layout.packed.text_indices.numel()),),
@@ -136,15 +137,9 @@ class MiniMaxH3Model(ExecutionModel):
         )
         if state_slots < 2:
             raise RuntimeError("MiniMax H3 has insufficient CUDA memory for two state slots")
-        self.states = H3StatePool(
-            layout,
-            state_slots,
-            mesh.local_device,
-            block_plan_shape=block_plan_shape,
-            final_plan_shape=final_plan_shape,
-        )
+        self._state_slot_count = state_slots
         self.dedicated_state_geometry = DedicatedStateGeometry(
-            slot_count=int(self.states.slot_count),
+            slot_count=int(state_slots),
             persistent_units=int(layout.persistent_units),
             max_vae_grid_tokens=int(layout.packed.video_indices.numel()),
             rank=int(mesh.coord("sp")),
@@ -175,48 +170,41 @@ class MiniMaxH3Model(ExecutionModel):
         )
 
     def create_media_runtime(self, unresolved_window: int) -> tuple[object | None, object | None]:
-        from .execution import H3MuxCoordinator, H3OutputRing, require_h3_codecs
+        from ...execution.video import (
+            VideoMuxCoordinator,
+            VideoOutputRing,
+            require_video_codecs,
+        )
 
         if self.mesh.coord("sp") != 0:
             return None, None
-        require_h3_codecs()
+        require_video_codecs()
+        geometry = VideoOutputGeometry(
+            frame_count=self.layout.frame_count,
+            unit_frames=self.layout.reconstruction_unit_frames,
+            width=PROFILE_WIDTH,
+            height=PROFILE_HEIGHT,
+            frame_rate=PROFILE_FPS,
+            audio_rate=PROFILE_AUDIO_RATE,
+        )
         return (
-            H3MuxCoordinator(),
-            H3OutputRing(
-                state_slots=self.states.slot_count,
+            VideoMuxCoordinator(),
+            VideoOutputRing(
+                state_slots=self._state_slot_count,
                 unresolved_window=int(unresolved_window),
                 max_video_frames_per_round=self.layout.max_video_round_frames,
-                max_frame_count=self.layout.frame_count,
+                max_geometry=geometry,
             ),
         )
 
-    def drop_runtime(self, session_id: int, media_runtime: object | None) -> None:
-        self.states.drop_session(int(session_id))
-        if media_runtime is not None:
-            media_runtime.drop(int(session_id))
-
-    def abort_admissions(
-        self, admissions: Sequence[object], media_runtime: object | None
-    ) -> None:
-        typed = tuple(admission for admission in admissions if isinstance(admission, NewRequest))
-        if len(typed) != len(admissions):
-            raise RuntimeError("H3 admission rollback received an invalid value")
-        slots = tuple(
-            (admission, self.states.get(int(admission.request_pool_idx)))
-            for admission in typed
+    def create_request_state(self) -> H3StatePool:
+        return H3StatePool(
+            self.layout,
+            self._state_slot_count,
+            self.mesh.local_device,
+            block_plan_shape=self._state_block_plan_shape,
+            final_plan_shape=self._state_final_plan_shape,
         )
-        for admission, slot in slots:
-            if slot.request_key not in (None, admission.request_key):
-                raise RuntimeError("discarded H3 admission no longer owns its state slot")
-        for admission, slot in slots:
-            if media_runtime is not None:
-                media_runtime.drop(int(admission.request_key.session_id))
-            slot.clear()
-
-    def resource_usage(self) -> tuple[tuple[str, int, int], ...]:
-        used_slots = sum(slot.active for slot in self.states.slots)
-        bytes_per_slot = self.states.bytes_per_slot(self.layout)
-        return (("image_latent", used_slots * bytes_per_slot, self.states.slot_count * bytes_per_slot),)
 
     def synchronize_runtime(self) -> None:
         torch.cuda.synchronize(self.mesh.local_device)
@@ -233,7 +221,7 @@ class MiniMaxH3Model(ExecutionModel):
         cache_dir: str | None = None,
         revision: str | None = None,
         precision_policy: H3LinearPrecisionPolicy,
-    ) -> "MiniMaxH3Model":
+    ) -> "MiniMaxH3Runner":
         text_capacity = ((int(max_text_rows) + 63) // 64) * 64
         raw_frames = math.floor(float(max_video_seconds) * 24.0 + 0.5)
         max_frames = int(raw_frames + (5 - raw_frames) % 17)
@@ -374,8 +362,8 @@ class MiniMaxH3Model(ExecutionModel):
     def prepare(self, slot: H3StateSlot, admission: NewRequest) -> None:
         if slot.active:
             raise RuntimeError("H3 state slot is already active")
-        media = admission.media
-        if media is None or media.profile is not MediaProfileId.MINIMAX_H3_T2VA:
+        media = admission.diffusion
+        if media is None:
             raise ValueError("the H3 worker received an incompatible media profile")
         token_ids = self._token_ids(
             media.prompt_token_ids,
@@ -383,9 +371,12 @@ class MiniMaxH3Model(ExecutionModel):
         )
         execution = self._page_execution_for_geometry(
             frame_count=media.geometry.frame_count,
-            audio_frames=media.geometry.audio_latent_frames,
+            audio_frames=audio_latent_frames(media.geometry.frame_count),
             token_count=media.geometry.prompt_tokens,
         )
+        expected_decode_units = (execution.layout.video_reconstruction_units + 3) // 4 + 2
+        if int(media.geometry.decode_units) != expected_decode_units:
+            raise ValueError("the H3 worker received an invalid decode bound")
         slot.bind(execution.layout)
         layout = execution.layout
         # Diffusers' CPU-generator path draws the full video tensor first and
@@ -536,19 +527,18 @@ class MiniMaxH3Model(ExecutionModel):
 
     @torch.inference_mode()
     def reconstruct_video(
-        self, slot: H3StateSlot, placement: ReconstructionPlacement
+        self, slot: H3StateSlot, start_unit: int, unit_count: int
     ) -> torch.Tensor | None:
         execution = self._page_execution_for_slot(slot)
         layout = execution.layout
-        start_unit = int(placement.start_unit)
-        unit_count = int(placement.unit_count)
+        start_unit = int(start_unit)
+        unit_count = int(unit_count)
         expected_count = min(
             layout.sp_size,
             layout.video_reconstruction_units - start_unit,
         )
         if (
-            placement.kind is not ReconstructionKind.VIDEO
-            or start_unit != slot.next_video_unit
+            start_unit != slot.next_video_unit
             or start_unit % layout.sp_size != 0
             or unit_count != expected_count
             or not 0 <= start_unit < layout.video_reconstruction_units
@@ -596,15 +586,8 @@ class MiniMaxH3Model(ExecutionModel):
         return output[:frame_start]
 
     @torch.inference_mode()
-    def reconstruct_audio(
-        self, slot: H3StateSlot, placement: ReconstructionPlacement
-    ) -> torch.Tensor | None:
-        if (
-            placement.kind is not ReconstructionKind.AUDIO
-            or placement.start_unit != 0
-            or placement.unit_count != 1
-            or slot.audio_reconstructed
-        ):
+    def reconstruct_audio(self, slot: H3StateSlot) -> torch.Tensor | None:
+        if slot.audio_reconstructed:
             raise ValueError("invalid H3 audio reconstruction placement")
         execution = self._page_execution_for_slot(slot)
         layout = execution.layout
@@ -637,8 +620,62 @@ class MiniMaxH3Model(ExecutionModel):
             raise RuntimeError("H3 audio decoder returned less than the fixed video duration")
         return pcm[:target_samples]
 
+    def decode_kind(self, slot: H3StateSlot, cursor: int) -> DecodeKind:
+        layout = self._page_execution_for_slot(slot).layout
+        video_rounds = (layout.video_reconstruction_units + layout.sp_size - 1) // layout.sp_size
+        if 0 <= int(cursor) < video_rounds:
+            return DecodeKind.VIDEO
+        if int(cursor) == video_rounds:
+            return DecodeKind.AUDIO
+        if int(cursor) == video_rounds + 1:
+            return DecodeKind.FINALIZE
+        raise ValueError("H3 decode cursor is outside the request output bound")
+
+    @torch.inference_mode()
+    def decode(
+        self, slot: H3StateSlot, cursor: int, max_units: int
+    ) -> DecodeOutput:
+        if int(max_units) != 1:
+            raise ValueError("H3 decode calls advance exactly one bounded unit")
+        kind = self.decode_kind(slot, cursor)
+        layout = self._page_execution_for_slot(slot).layout
+        if kind is DecodeKind.VIDEO:
+            start_unit = int(cursor) * layout.sp_size
+            unit_count = min(
+                layout.sp_size,
+                layout.video_reconstruction_units - start_unit,
+            )
+            return DecodeOutput(
+                kind=kind,
+                value=self.reconstruct_video(slot, start_unit, unit_count),
+                unit_offset=start_unit,
+                unit_count=unit_count,
+            )
+        if kind is DecodeKind.AUDIO:
+            return DecodeOutput(kind, self.reconstruct_audio(slot), 0, 1)
+        return DecodeOutput(kind, None, 0, 1)
+
+    def finalize(self, request: object) -> None:
+        return None
+
+    def output_geometry(self, request: object) -> VideoOutputGeometry:
+        if not isinstance(request, H3StateSlot):
+            raise TypeError("H3 output geometry requires a state slot")
+        layout = self._page_execution_for_slot(request).layout
+        return VideoOutputGeometry(
+            frame_count=layout.frame_count,
+            unit_frames=layout.reconstruction_unit_frames,
+            width=PROFILE_WIDTH,
+            height=PROFILE_HEIGHT,
+            frame_rate=PROFILE_FPS,
+            audio_rate=PROFILE_AUDIO_RATE,
+        )
+
     @torch.inference_mode()
     def warmup(self, context: WarmupContext) -> None:
+        state_pool = context.requests.model_state
+        if not isinstance(state_pool, H3StatePool):
+            raise RuntimeError("H3 warmup requires request-pool state")
         schedule = self.layout.schedule
         max_rows = int(self.layout.packed.text_indices.numel())
 
@@ -659,7 +696,7 @@ class MiniMaxH3Model(ExecutionModel):
             capacity_execution(token_count) for token_count in (129, 193, 257)
         )
         max_execution = capacity_execution(max_rows)
-        for slot in self.states.slots:
+        for slot in state_pool.slots:
             slot.bind(max_execution.layout)
             self.transformer.prepare_adaln_plan(
                 slot,
@@ -675,14 +712,14 @@ class MiniMaxH3Model(ExecutionModel):
         for execution in warmup_executions:
             page_rows = int(execution.layout.packed.text_indices.numel())
             self.transformer.bind_execution(execution.transformer_execution)
-            for slot in self.states.slots:
+            for slot in state_pool.slots:
                 slot.bind(execution.layout)
                 slot.text_condition.zero_()
                 slot.video_rows.zero_()
                 slot.audio_rows.zero_()
                 self._prepare_tile_metadata(execution, slot, page_rows)
                 self._prepare_rotary(execution, slot, page_rows)
-            slot = self.states.slots[0]
+            slot = state_pool.slots[0]
             self.transformer.select_adaln_step(slot, execution.scratch, 0)
             self.transformer.forward_local_prepared(slot, execution.scratch)
         self.transformer.bind_execution(max_execution.transformer_execution)
@@ -702,5 +739,5 @@ class MiniMaxH3Model(ExecutionModel):
             )
             self.audio_vae.warmup_decoder(audio_latents)
         torch.cuda.synchronize(self.mesh.local_device)
-        for slot in self.states.slots:
+        for slot in state_pool.slots:
             slot.clear()

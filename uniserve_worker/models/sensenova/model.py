@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ...execution.batch import ForwardMode
+from ...execution.batch import RunKind
 from ...execution.forward_batch import (
     AttentionMode,
     ExpertRoute,
@@ -801,16 +801,16 @@ class NEOChatModel(ExecutionModel):
         )
         self.supported_work = frozenset(
             {
-                ForwardMode.TOKEN_EXTEND,
-                ForwardMode.TOKEN_DECODE,
-                ForwardMode.TOKEN_VERIFY,
-                ForwardMode.MEDIA_PREPARE,
-                ForwardMode.MEDIA_DENOISE,
-                ForwardMode.ENCODE_VISION,
-                ForwardMode.MATERIALIZE,
-                ForwardMode.TRANSFER_PRODUCT,
-                ForwardMode.TRANSFER_KV_PUBLISH,
-                ForwardMode.TRANSFER_KV_INSTALL,
+                RunKind.AR_EXTEND,
+                RunKind.AR_DECODE,
+                RunKind.AR_VERIFY,
+                RunKind.DIFFUSION_PREPARE,
+                RunKind.DIFFUSION_STEP,
+                RunKind.ENCODER_VISION,
+                RunKind.DIFFUSION_FINALIZE,
+                RunKind.TRANSFER_PRODUCT,
+                RunKind.TRANSFER_KV_PUBLISH,
+                RunKind.TRANSFER_KV_INSTALL,
             }
         )
         self.max_vit_grid_tokens = _MAX_VISION_TOKENS

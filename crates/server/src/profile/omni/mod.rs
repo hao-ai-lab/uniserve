@@ -9,6 +9,13 @@ use serde::{Deserialize, Serialize};
 use crate::profile::assets::{self, Error as AssetError};
 use crate::profile::tokenizer::HuggingFaceTokenizer;
 
+pub(super) const fn model_dtype_bytes(dtype: uniserve_core::ModelDtype) -> u64 {
+    match dtype {
+        uniserve_core::ModelDtype::Float16 | uniserve_core::ModelDtype::BFloat16 => 2,
+        uniserve_core::ModelDtype::Float32 => 4,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenerationControls {
     pub bos: u32,

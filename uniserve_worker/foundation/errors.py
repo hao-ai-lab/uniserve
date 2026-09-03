@@ -125,12 +125,12 @@ class WorkerError(Exception):
                 {
                     "request_key": {
                         "authority_id": authority_id,
-                        "session_id": session_id,
+                        "request_id": request_id,
                         "epoch": epoch,
                     },
                     "op_id": op_id,
                 }
-                for authority_id, session_id, epoch, op_id in self.operations
+                for authority_id, request_id, epoch, op_id in self.operations
             ],
         }
 

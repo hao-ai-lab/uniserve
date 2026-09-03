@@ -5,31 +5,28 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use crate::executor::{Executor, TransferBackend, TransportMap, WorkerRole, WorkerTopology};
+use crate::executor::{Executor, PoolConfig, TransferBackend, TransportMap, WorkerTopology};
 use crate::handle::{EngineHandle, EventRx, SubmitError};
+use crate::runtime::{ControlTokens, EngineLoop, RuntimeProfile};
 use crate::scheduler::{
-    ControlTokens, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
-    DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS, SchedStats,
-    Scheduler, SchedulingPolicy,
+    DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
+    DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS, SchedStats, SchedulerConfig,
+    SchedulingPolicy,
 };
 use crate::worker::{MultiprocExecutor, StagedExecutor, UniprocExecutor, WorkerProcessArgs};
 use anyhow::Context as _;
-use uniserve_core::{GenerationLimits, GenerationRequest, ModelDtype, RequestId};
+use uniserve_core::{
+    CommandWaker, GenerationLimits, ModelDtype, Request, RequestId, RuntimeFamily,
+};
 use uniserve_worker_ipc::WorkerInfo;
-
-/// Place a staged pool on GPU `gpu`. A plain `cuda`/`gpu`
-/// device becomes `cuda:{gpu}` (distinct GPU per pool); an explicit device
-/// (`cuda:1`, `cpu`) is left as the operator set it.
-fn assign_pool_device(device: &str, gpu: usize) -> String {
-    match device.trim() {
-        "cuda" | "gpu" => format!("cuda:{gpu}"),
-        other => other.to_string(),
-    }
-}
 
 /// Configuration for one in-process engine core.
 #[derive(Debug, Clone)]
 pub struct EngineCoreConfig {
+    /// Request runtime selected for this deployment.
+    pub runtime_family: RuntimeFamily,
+    /// Model-family semantics resolved by the serving profile.
+    pub runtime_profile: RuntimeProfile,
     /// Maximum number of ops assembled into a single forward batch.
     pub max_batch: usize,
     /// Per-step scheduling token budget (vLLM's `max_num_batched_tokens`).
@@ -76,6 +73,11 @@ impl EngineCoreConfig {
             ..WorkerProcessArgs::default()
         };
         Self {
+            runtime_family: RuntimeFamily::Umm,
+            runtime_profile: RuntimeProfile::umm(
+                ModelDtype::BFloat16,
+                crate::runtime::sim_umm_generation_limits(),
+            ),
             max_batch: DEFAULT_MAX_BATCH,
             max_num_batched_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS,
             max_num_seqs: DEFAULT_MAX_NUM_SEQS,
@@ -111,7 +113,9 @@ pub struct EngineCore {
     stats: Arc<SchedStats>,
     model_name: String,
     model_dtype: ModelDtype,
+    generation_limits: GenerationLimits,
     max_model_len: u32,
+    runtime_family: RuntimeFamily,
     /// Engine-dead latch: set when the scheduler loop exits fatally (worker
     /// death) or panics.
     dead: Arc<AtomicBool>,
@@ -127,99 +131,103 @@ impl EngineCore {
     /// worker-info handshake — for the real worker this can take minutes.
     ///
     pub fn new(config: EngineCoreConfig) -> anyhow::Result<Self> {
-        let executor: Box<dyn Executor> = if config.workers.is_single_full() {
-            Self::spawn_full_pool(&config, config.workers.pools[0].tp)?
+        let workers = config.workers.clone().with_process_defaults(
+            &config.worker_process.device,
+            config.worker_process.pipeline_depth,
+        );
+        let (executor, command_waker) = if workers.is_single_full() {
+            Self::spawn_full_pool(&config, &workers.pools[0])?
         } else {
-            Self::spawn_staged(&config, &config.workers)?
+            Self::spawn_staged(&config, &workers)?
         };
-        Self::assemble(config, executor)
+        Self::assemble(config, executor, command_waker)
     }
 
-    /// Spawn the single Full pool. `tp == 1`
-    /// is a `UniprocExecutor`; `tp > 1` a `MultiprocExecutor`. No `--worker-role`
-    /// is passed because the worker starts in Full mode by default.
-    fn spawn_full_pool(config: &EngineCoreConfig, tp: usize) -> anyhow::Result<Box<dyn Executor>> {
+    /// Spawn the single Full pool. `tp == 1` uses a `UniprocExecutor`; `tp > 1`
+    /// uses a `MultiprocExecutor`.
+    fn spawn_full_pool(
+        config: &EngineCoreConfig,
+        pool: &PoolConfig,
+    ) -> anyhow::Result<(Box<dyn Executor>, CommandWaker)> {
         let args = WorkerProcessArgs {
-            world_size: tp,
-            worker_role: None,
+            device: pool.device.clone(),
+            world_size: pool.tensor_parallel_size,
+            pipeline_depth: pool.queue_depth,
+            supported_ops: pool.supported_ops.clone(),
             transfer_backend: TransferBackend::Inproc,
             ..config.worker_process.clone()
         };
-        if tp > 1 {
+        if pool.tensor_parallel_size > 1 {
             let workers = MultiprocExecutor::spawn(args)
                 .context("failed to spawn forward-only worker ranks")?;
-            Ok(Box::new(workers))
+            let waker = workers.command_waker();
+            Ok((Box::new(workers), waker))
         } else {
             let worker =
                 UniprocExecutor::spawn(args).context("failed to spawn forward-only worker")?;
-            Ok(Box::new(worker))
+            let waker = worker.command_waker();
+            Ok((Box::new(worker), waker))
         }
     }
 
-    /// Compose a `StagedExecutor` over the heterogeneous pools of a staged topology.
-    /// Each pool instance is a (tp-sized) `MultiprocExecutor` spawned with its
-    /// `--worker-role`; the router fans the scheduler's batch across them by
-    /// exact operation type and merges the results.
+    /// Compose a staged executor over explicitly configured physical pools.
     fn spawn_staged(
         config: &EngineCoreConfig,
         workers: &WorkerTopology,
-    ) -> anyhow::Result<Box<dyn Executor>> {
-        // Per-edge transfer backends (validated up front so a typo fails at
-        // startup). A pool's worker uses the backend of its incoming edge for
-        // the worker-side data plane (read-driven fetch).
-        // A pool uses the transport of any edge it participates in — as producer
-        // (src) OR consumer (dst) — so both ends of an edge agree on the backend.
-        let backend_for = |kind: WorkerRole| -> Option<TransferBackend> {
-            config
+    ) -> anyhow::Result<(Box<dyn Executor>, CommandWaker)> {
+        for edge in &config.transfer.edges {
+            anyhow::ensure!(
+                workers.pools.iter().any(|pool| pool.id == edge.source_pool),
+                "transfer edge source pool {} is not configured",
+                edge.source_pool
+            );
+            anyhow::ensure!(
+                workers
+                    .pools
+                    .iter()
+                    .any(|pool| pool.id == edge.destination_pool),
+                "transfer edge destination pool {} is not configured",
+                edge.destination_pool
+            );
+        }
+        let mut pools: Vec<(PoolConfig, Box<dyn crate::executor::PhysicalExecutor>)> =
+            Vec::with_capacity(workers.total_pools());
+        let mut command_wakers = Vec::with_capacity(workers.total_pools());
+        let mut progress_fds = Vec::new();
+        for pool in &workers.pools {
+            let incident = config
                 .transfer
                 .edges
                 .iter()
-                .find(|((src, dst), _)| *src == kind || *dst == kind)
-                .map(|(_, backend)| *backend)
-        };
-        // The Und/Gen stage split places each pool on its own GPU so the two
-        // towers run in parallel and the conditioning KV crosses GPU↔GPU over
-        // CUDA IPC. Other staged topologies keep the shared device.
-        let is_tower = workers
-            .pools
-            .iter()
-            .any(|p| matches!(p.kind, WorkerRole::Und | WorkerRole::Gen));
-        let mut next_gpu = 0usize;
-        let mut pools: Vec<(WorkerRole, Box<dyn Executor>)> =
-            Vec::with_capacity(workers.total_pools());
-        for pool in &workers.pools {
-            let backend = backend_for(pool.kind).or_else(|| {
-                if is_tower && matches!(pool.kind, WorkerRole::Und | WorkerRole::Gen) {
-                    Some(TransferBackend::CudaIpc)
-                } else {
-                    None
-                }
-            });
-            for instance in 0..pool.count {
-                let pool_device = if is_tower {
-                    assign_pool_device(&config.worker_process.device, next_gpu)
-                } else {
-                    config.worker_process.device.clone()
-                };
-                next_gpu += pool.tp.max(1);
-                let exec = MultiprocExecutor::spawn(WorkerProcessArgs {
-                    device: pool_device,
-                    world_size: pool.tp.max(1),
-                    worker_role: Some(pool.kind),
-                    transfer_backend: backend.unwrap_or_default(),
-                    ..config.worker_process.clone()
-                })
-                .with_context(|| {
-                    format!(
-                        "failed to spawn staged pool {}#{instance} (tp={})",
-                        pool.kind.as_str(),
-                        pool.tp
-                    )
-                })?;
-                pools.push((pool.kind, Box::new(exec)));
-            }
+                .filter(|edge| edge.source_pool == pool.id || edge.destination_pool == pool.id)
+                .map(|edge| edge.transport)
+                .collect::<std::collections::BTreeSet<_>>();
+            anyhow::ensure!(
+                incident.len() <= 1,
+                "pool {} has transfer edges with incompatible transports",
+                pool.id
+            );
+            let exec = MultiprocExecutor::spawn(WorkerProcessArgs {
+                device: pool.device.clone(),
+                world_size: pool.tensor_parallel_size.max(1),
+                pipeline_depth: pool.queue_depth.max(1),
+                supported_ops: pool.supported_ops.clone(),
+                transfer_backend: incident.first().copied().unwrap_or_default(),
+                ..config.worker_process.clone()
+            })
+            .with_context(|| {
+                format!(
+                    "failed to spawn staged pool {} (tp={})",
+                    pool.id, pool.tensor_parallel_size
+                )
+            })?;
+            command_wakers.push(exec.command_waker());
+            progress_fds.extend_from_slice(exec.progress_fds());
+            pools.push((pool.clone(), Box::new(exec)));
         }
-        Ok(Box::new(StagedExecutor::try_new(pools)?))
+        let executor = StagedExecutor::try_new_with_signals(pools, command_wakers, progress_fds)?;
+        let waker = executor.command_waker();
+        Ok((Box::new(executor), waker))
     }
 
     /// Build the engine core from an executor supplied by a higher composition layer.
@@ -227,19 +235,27 @@ impl EngineCore {
         config: EngineCoreConfig,
         executor: Box<dyn Executor>,
     ) -> anyhow::Result<Self> {
-        Self::assemble(config, executor)
+        Self::assemble(config, executor, CommandWaker::noop())
     }
 
-    fn assemble(config: EngineCoreConfig, executor: Box<dyn Executor>) -> anyhow::Result<Self> {
+    pub fn with_executor_and_waker(
+        config: EngineCoreConfig,
+        executor: Box<dyn Executor>,
+        command_waker: CommandWaker,
+    ) -> anyhow::Result<Self> {
+        Self::assemble(config, executor, command_waker)
+    }
+
+    fn assemble(
+        config: EngineCoreConfig,
+        executor: Box<dyn Executor>,
+        waker: CommandWaker,
+    ) -> anyhow::Result<Self> {
         let ctrl = config.control_tokens();
-        // Capture the command waker before the executor moves into the
-        // scheduler: when the executor is event-driven this fires its park's
-        // command notifier; otherwise it is the no-op waker.
-        let waker = executor.command_waker();
-        let sched = Scheduler::with_config(
+        let sched = EngineLoop::with_runtime_profile(
             executor,
             ctrl,
-            crate::scheduler::SchedulerConfig {
+            SchedulerConfig {
                 max_batch: config.max_batch,
                 max_num_batched_tokens: config.max_num_batched_tokens.max(1),
                 max_num_seqs: config.max_num_seqs.max(1),
@@ -248,9 +264,12 @@ impl EngineCore {
                 policy: config.scheduler_policy,
                 ..Default::default()
             },
+            config.runtime_family,
+            config.runtime_profile,
         );
         let info = sched.info().clone();
-        let model_dtype = info.model_dtype;
+        let model_dtype = sched.runtime_profile().model_dtype;
+        let generation_limits = sched.runtime_profile().generation_limits.clone();
         let stats = sched.stats_handle();
 
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
@@ -275,7 +294,9 @@ impl EngineCore {
             stats,
             model_name: config.worker_process.model,
             model_dtype,
+            generation_limits,
             max_model_len: config.max_model_len,
+            runtime_family: config.runtime_family,
             dead,
             next_id: AtomicU64::new(1),
             sched_thread: Mutex::new(Some(sched_thread)),
@@ -294,15 +315,14 @@ impl EngineCore {
 
     /// Serving-facing projection of post-load worker limits.
     pub fn generation_limits(&self) -> GenerationLimits {
-        self.info.generation_limits()
+        self.generation_limits.clone()
     }
 
     pub fn supports_token_sampling(&self) -> bool {
-        self.info.supported_work.iter().any(|mode| {
+        self.info.supported_ops.iter().any(|mode| {
             matches!(
                 mode,
-                uniserve_worker_ipc::ForwardMode::TokenDecode
-                    | uniserve_worker_ipc::ForwardMode::TokenVerify
+                uniserve_worker_ipc::OpKind::ArDecode | uniserve_worker_ipc::OpKind::ArVerify
             )
         })
     }
@@ -324,6 +344,10 @@ impl EngineCore {
         self.max_model_len
     }
 
+    pub const fn runtime_family(&self) -> RuntimeFamily {
+        self.runtime_family
+    }
+
     /// Allocate the next internal scheduler request id.
     pub fn next_request_id(&self) -> RequestId {
         RequestId(self.next_id.fetch_add(1, Ordering::Relaxed))
@@ -335,7 +359,7 @@ impl EngineCore {
     }
 
     /// Submit one translated request to the scheduler.
-    pub fn submit(&self, request: GenerationRequest) -> Result<EventRx, SubmitError> {
+    pub fn submit(&self, request: Request) -> Result<EventRx, SubmitError> {
         if self.is_dead() {
             return Err(SubmitError::Dead);
         }

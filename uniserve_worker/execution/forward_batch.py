@@ -200,14 +200,14 @@ class FlowPatches:
 class ModelPhase(StrEnum):
     TEXT = "text"
     DENOISE = "denoise"
-    ENCODE_VISION = "encode_vision"
-    ENCODE_LATENT = "encode_latent"
+    ENCODE_VISION = "encoder_vision"
+    ENCODE_LATENT = "encoder_latent"
     DECODE_LATENT = "decode_latent"
 
 
 @dataclass(frozen=True, slots=True)
 class ForwardBatch:
-    """One borrowed columnar view over execution-partition input buffers."""
+    """One borrowed columnar view over execution-lane input buffers."""
 
     phase: ModelPhase
     row_count: int

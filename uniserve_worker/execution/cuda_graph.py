@@ -90,7 +90,7 @@ class _PrefillGeometry:
 
 
 class CudaGraphRunner:
-    """Own the immutable CUDA graph set for one execution partition."""
+    """Own the immutable CUDA graph set for one execution lane."""
 
     def __init__(
         self,
@@ -163,7 +163,7 @@ class CudaGraphRunner:
     def resident_bytes(self) -> int:
         return _private_pool_bytes(self._device)
 
-    def bind_partition(
+    def bind_lane(
         self,
         stream: torch.cuda.Stream | None,
         expected_context: int | None,
@@ -931,7 +931,7 @@ def _normalize_exact_batch(
     """Give exact packed graphs their startup-fixed KV table geometry.
 
     Packed flow and mixed calls use request-variable KV prefix lengths, but the
-    partition input buffer already owns a maximum-width, zero-scrubbed block
+    lane input buffer already owns a maximum-width, zero-scrubbed block
     table.  Capturing the active request-width view makes otherwise identical
     startup and serving calls different graph shapes.  Widening that view here
     keeps the physical kernel launch fixed while ``seqused_k`` and the other

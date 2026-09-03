@@ -5,10 +5,9 @@ from __future__ import annotations
 import argparse
 import math
 from dataclasses import dataclass
-from pathlib import Path
 
+from ..execution.batch import RunKind
 from ..loader.config import LoadConfig
-from .role import WorkerRole
 from .execution_config import ExecutionConfig, execution_config_from_namespace
 from .plan import ModelLoadScope, resolve_worker_plan
 
@@ -61,7 +60,7 @@ class DataPlaneConfig:
 
 @dataclass(frozen=True)
 class WorkerProcessArgs:
-    worker_role: WorkerRole
+    supported_ops: frozenset[RunKind]
     ipc: WorkerIpcConfig
     placement: WorkerPlacement
     resources: WorkerResourceConfig
@@ -73,8 +72,8 @@ class WorkerProcessArgs:
 
     @classmethod
     def from_namespace(cls, namespace: argparse.Namespace) -> "WorkerProcessArgs":
-        worker_role = WorkerRole(str(namespace.worker_role))
-        plan = resolve_worker_plan(worker_role)
+        supported_ops = _parse_supported_ops(namespace.supported_ops)
+        plan = resolve_worker_plan(supported_ops)
         device = _normalize_device(namespace.device)
         tower_devices = _parse_mesh(
             str(namespace.mesh or ""),
@@ -90,14 +89,11 @@ class WorkerProcessArgs:
         if use_stub_model and plan.model_scope is not ModelLoadScope.WHOLE:
             raise ValueError("--no-model cannot emulate partial model materialization")
         if not use_stub_model and not model_path:
-            raise ValueError(f"--model is required for worker role {worker_role.value!r}")
-        _validate_data_plane(
-            worker_role,
-            backend=backend,
-        )
+            raise ValueError("--model is required for a model worker")
+        _validate_data_plane(backend=backend)
 
         return cls(
-            worker_role=worker_role,
+            supported_ops=supported_ops,
             ipc=WorkerIpcConfig(
                 service_name=str(namespace.service_name),
                 max_payload_bytes=int(namespace.ipc_payload_cap),
@@ -187,15 +183,22 @@ def _load_config(namespace: argparse.Namespace) -> LoadConfig:
     )
 
 
-def _validate_data_plane(
-    worker_role: WorkerRole,
-    *,
-    backend: str,
-) -> None:
+def _validate_data_plane(*, backend: str) -> None:
     if backend not in {"local", "shm", "cuda_ipc"}:
         raise ValueError(f"unknown --transfer-backend {backend!r}")
-    if worker_role in {WorkerRole.UND, WorkerRole.GEN} and backend != "cuda_ipc":
-        raise ValueError(f"{worker_role.value!r} requires same-node CUDA IPC transport")
+
+
+def _parse_supported_ops(value: object) -> frozenset[RunKind]:
+    names = tuple(part.strip() for part in str(value).split(",") if part.strip())
+    if not names:
+        raise ValueError("--supported-ops must list at least one operation")
+    try:
+        operations = tuple(RunKind(name) for name in names)
+    except ValueError as error:
+        raise ValueError(f"unknown operation in --supported-ops {value!r}") from error
+    if len(set(operations)) != len(operations):
+        raise ValueError("--supported-ops contains duplicate operations")
+    return frozenset(operations)
 
 
 def _parse_mesh(

@@ -6,8 +6,8 @@ import pytest
 
 from tests.python.fixtures.execution_worker import execution_worker
 from uniserve_worker.bootstrap.capacity import operation_window
-from uniserve_worker.bootstrap.worker_info import build_worker_info
-from uniserve_worker.execution.batch import ForwardMode, SamplingOwnership
+from uniserve_worker.bootstrap.worker_info_builder import build_worker_info
+from uniserve_worker.execution.batch import RunKind
 from uniserve_worker.models.runtime import ExecutionModel, ResourceGeometry, WorkerDeployment
 from uniserve_worker.process import dispatch
 
@@ -16,24 +16,24 @@ pytestmark = pytest.mark.integration
 
 def test_worker_info_reports_schedulable_work_and_bounds() -> None:
     worker = execution_worker()
-    info = dispatch(worker, {"kind": "get_info"})["info"]
+    info = dispatch(worker, {"kind": "info"})["info"]
 
-    assert info["num_layers"] > 0
-    assert info["num_kv_heads"] > 0
-    assert info["head_dim"] > 0
-    assert info["max_batch_operations"] > 0
-    assert info["max_unresolved_window"] == operation_window(
-        info["pipeline_depth"], info["max_batch_operations"]
+    assert info["kv_cache"]["num_layers"] > 0
+    assert info["kv_cache"]["num_kv_heads"] > 0
+    assert info["kv_cache"]["head_dim"] > 0
+    assert info["max_batch_ops"] > 0
+    assert info["max_unresolved_ops"] == operation_window(
+        info["queue_depth"], info["max_batch_ops"]
     )
-    assert info["incremental_kv_publication"] is True
-    assert info["sampling_ownership"] == SamplingOwnership.DESIGNATED_RANK.value
+    assert info["request_slots"] > 0
+    assert info["model_name"]
 
 
 def test_action_model_reports_zero_kv_geometry() -> None:
     class ActionModel(ExecutionModel):
         architecture = "ActionModel"
         resource_geometry = ResourceGeometry(kv=False)
-        supported_work = frozenset({ForwardMode.MEDIA_RECONSTRUCT})
+        supported_work = frozenset({RunKind.DIFFUSION_DECODE})
         generation = None
 
     deployment = WorkerDeployment(
@@ -56,12 +56,6 @@ def test_action_model_reports_zero_kv_geometry() -> None:
     info = build_worker_info(ActionModel(), deployment)
 
     assert info.uses_kv is False
-    assert info.block_size == 0
-    assert info.num_blocks == 0
-    assert info.num_layers == 0
-    assert info.num_kv_heads == 0
-    assert info.head_dim == 0
-    assert info.bytes_per_token == 0
-    assert info.groups == ()
-    assert info.kv_dtype == ""
-    assert info.incremental_kv_publication is False
+    assert info.kv_cache is None
+    assert info.request_slots == 2
+    assert info.max_batch_ops == 2

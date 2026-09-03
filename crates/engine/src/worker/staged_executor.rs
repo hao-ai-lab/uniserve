@@ -1,8 +1,8 @@
 //! Typed control-plane routing across heterogeneous worker pools.
 //!
-//! A staged topology partitions each execution batch by exact [`ForwardMode`],
-//! sends each session's `NewRequest` before that pool's first operation
-//! for the session, and publishes each independently ready partition by identity.
+//! A staged topology routes each logical batch by exact [`OpKind`],
+//! sends each request's `NewRequest` before that pool's first operation
+//! for the request, and publishes each independently ready lane by identity.
 //! A worker-local device product remains resident within its producing pool.
 //! The executor retains a cross-pool consumer by exact product identity until the
 //! producer publishes the bounded transfer descriptor, then submits the
@@ -11,33 +11,33 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
-use crate::executor::{ControlAck, ControlOp, Executor, WorkerRole};
+use crate::executor::{
+    Batch, BatchResult, Executor, ExecutorInfo, ExecutorSubmitError, LogicalResultTracker, Op,
+    PhysicalExecutor, PhysicalSubmitError, PoolConfig, physical_run,
+};
 use anyhow::Context;
 use uniserve_core::{CommandWaker, RequestId};
 use uniserve_worker_ipc::{
-    Batch, BatchPartition, CompletionReport, Control, ForwardMode, NewRequest, Operation,
-    ProductPayload, ProductRef, RequestKey, TRANSFER_DESCRIPTOR_PREFIX, WorkerInfo,
-    is_transfer_descriptor,
+    BatchCommand, BufferId, BufferPlacement, InlineValue, NewRequest, OpKind, Operation,
+    ProductPayload, ProductRef, RequestKey, Run as PhysicalRun, RunResult, TransferKind,
 };
 
 struct PoolEntry {
-    exec: Box<dyn Executor>,
+    config: PoolConfig,
+    exec: Box<dyn PhysicalExecutor>,
 }
 
 struct PendingStep {
     expected_pools: u64,
-    partitions: Vec<BatchPartition>,
-    partition_routes: HashMap<u32, usize>,
-    returned_partitions: HashSet<u32>,
+    operations: HashMap<(RequestKey, uniserve_worker_ipc::OpId), usize>,
+    returned_operations: HashSet<(RequestKey, uniserve_worker_ipc::OpId)>,
+    finished_requests: Vec<RequestId>,
 }
 
+#[derive(Clone)]
 struct PoolSubmission {
-    step_id: u64,
-    partitions: Vec<BatchPartition>,
-    controls: Vec<Control>,
-    input_products: Vec<ProductPayload>,
+    run: PhysicalRun,
     dependencies: Vec<ProductRef>,
-    collective_seqs: Vec<u64>,
 }
 
 #[derive(Clone)]
@@ -45,70 +45,43 @@ struct ProductRoute {
     pool_index: usize,
 }
 
-fn transfer_kind(bytes: &[u8]) -> anyhow::Result<String> {
-    anyhow::ensure!(
-        is_transfer_descriptor(bytes),
-        "cross-stage product has no transfer descriptor frame"
-    );
-    let encoded = &bytes[TRANSFER_DESCRIPTOR_PREFIX.len()..];
-    let value: serde_json::Value = serde_json::from_slice(encoded)?;
-    let object = value
-        .as_object()
-        .ok_or_else(|| anyhow::anyhow!("cross-stage transfer descriptor is not an object"))?;
-    anyhow::ensure!(
-        object.len() == 2 && object.contains_key("kind") && object.contains_key("value"),
-        "cross-stage transfer descriptor has an invalid shape"
-    );
-    let kind = object
-        .get("kind")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("cross-stage transfer descriptor has no kind"))?;
-    anyhow::ensure!(
-        matches!(kind, "encoder" | "device_product" | "latent" | "kv")
-            && object
-                .get("value")
-                .is_some_and(serde_json::Value::is_object),
-        "cross-stage transfer descriptor has an invalid kind or value"
-    );
-    anyhow::ensure!(
-        serde_json::to_vec(&value)? == encoded,
-        "cross-stage transfer descriptor is not canonical JSON"
-    );
-    Ok(kind.to_string())
-}
-
 /// Routes a canonical typed batch across the pools of a staged topology.
 pub struct StagedExecutor {
-    routing: HashMap<ForwardMode, usize>,
+    routing: HashMap<OpKind, usize>,
     pools: Vec<PoolEntry>,
-    info: WorkerInfo,
+    executor_info: ExecutorInfo,
     depth: usize,
+    command_wakers: Vec<CommandWaker>,
+    progress_fds: Vec<i32>,
     pending: BTreeMap<u64, PendingStep>,
-    ready: VecDeque<CompletionReport>,
+    ready: VecDeque<RunResult>,
     admissions: HashMap<RequestKey, NewRequest>,
     admitted_pools: HashSet<(usize, RequestKey)>,
     operation_routes: HashMap<(RequestKey, uniserve_worker_ipc::OpId), usize>,
     product_routes: HashMap<ProductRef, ProductRoute>,
+    buffer_placements: HashMap<BufferId, BufferPlacement>,
+    buffer_pools: HashMap<BufferId, HashSet<usize>>,
     transfer_products: HashMap<ProductRef, ProductPayload>,
     pool_submissions: Vec<VecDeque<PoolSubmission>>,
     pool_collective_seqs: Vec<Option<u64>>,
     observed_collective_seqs: BTreeSet<u64>,
     collective_frontier: u64,
-    next_call_id: u64,
-}
-
-fn extend_unique<T: Clone + Eq + std::hash::Hash>(target: &mut Vec<T>, incoming: Vec<T>) {
-    let mut seen: HashSet<T> = target.iter().cloned().collect();
-    for item in incoming {
-        if seen.insert(item.clone()) {
-            target.push(item);
-        }
-    }
+    next_collective_seq: u64,
+    logical_results: LogicalResultTracker,
+    command_wake_pending: bool,
 }
 
 impl StagedExecutor {
     /// Build a staged router after validating exact, non-overlapping pool claims.
-    pub fn try_new(pools: Vec<(WorkerRole, Box<dyn Executor>)>) -> anyhow::Result<Self> {
+    pub fn try_new(pools: Vec<(PoolConfig, Box<dyn PhysicalExecutor>)>) -> anyhow::Result<Self> {
+        Self::try_new_with_signals(pools, Vec::new(), Vec::new())
+    }
+
+    pub(crate) fn try_new_with_signals(
+        pools: Vec<(PoolConfig, Box<dyn PhysicalExecutor>)>,
+        command_wakers: Vec<CommandWaker>,
+        progress_fds: Vec<i32>,
+    ) -> anyhow::Result<Self> {
         anyhow::ensure!(!pools.is_empty(), "StagedExecutor needs at least one pool");
         anyhow::ensure!(
             pools.len() <= u64::BITS as usize,
@@ -117,20 +90,28 @@ impl StagedExecutor {
         );
 
         let mut routing = HashMap::new();
-        for (index, (kind, executor)) in pools.iter().enumerate() {
-            let info = executor.info();
+        let mut pool_ids = HashSet::new();
+        for (index, (config, executor)) in pools.iter().enumerate() {
+            anyhow::ensure!(
+                pool_ids.insert(config.id.clone()),
+                "duplicate staged pool id {}",
+                config.id
+            );
+            let info = executor.physical_info().single_pool();
             info.validate()
                 .with_context(|| format!("staged pool {index} reported invalid worker info"))?;
             anyhow::ensure!(
-                executor.pipeline_depth() == info.pipeline_depth.max(1) as usize,
-                "staged pool {index} executor depth {} disagrees with worker depth {}",
-                executor.pipeline_depth(),
-                info.pipeline_depth.max(1),
+                config.queue_depth.max(1) == info.queue_depth.max(1) as usize,
+                "staged pool {index} configured depth {} disagrees with worker depth {}",
+                config.queue_depth.max(1),
+                info.queue_depth.max(1)
             );
-            for variant in kind.supported_work() {
-                if !info.supported_work.contains(variant) {
-                    continue;
-                }
+            for variant in &config.supported_ops {
+                anyhow::ensure!(
+                    info.supported_ops.contains(variant),
+                    "staged pool {} does not report configured operation {variant:?}",
+                    config.id
+                );
                 anyhow::ensure!(
                     routing.insert(*variant, index).is_none(),
                     "multiple staged pools claim work variant {variant:?}; replication requires an explicit replica-group executor"
@@ -144,12 +125,23 @@ impl StagedExecutor {
 
         let pools: Vec<_> = pools
             .into_iter()
-            .map(|(_, exec)| PoolEntry { exec })
+            .map(|(config, exec)| PoolEntry { config, exec })
             .collect();
-        let info = Self::merge_info(&pools, &routing)?;
+        let executor_info = ExecutorInfo::from_pools(
+            pools
+                .iter()
+                .map(|pool| {
+                    (
+                        pool.config.id.clone(),
+                        pool.exec.physical_info().single_pool().clone(),
+                    )
+                })
+                .collect(),
+        )?;
+        executor_info.runtime_info()?;
         let depth = pools
             .iter()
-            .map(|pool| pool.exec.pipeline_depth())
+            .map(|pool| pool.config.queue_depth.max(1))
             .min()
             .unwrap_or(1)
             .max(1);
@@ -157,188 +149,27 @@ impl StagedExecutor {
         Ok(Self {
             routing,
             pools,
-            info,
+            executor_info,
             depth,
+            command_wakers,
+            progress_fds,
             pending: BTreeMap::new(),
             ready: VecDeque::new(),
             admissions: HashMap::new(),
             admitted_pools: HashSet::new(),
             operation_routes: HashMap::new(),
             product_routes: HashMap::new(),
+            buffer_placements: HashMap::new(),
+            buffer_pools: HashMap::new(),
             transfer_products: HashMap::new(),
             pool_submissions: (0..pool_count).map(|_| VecDeque::new()).collect(),
             pool_collective_seqs: vec![None; pool_count],
             observed_collective_seqs: BTreeSet::new(),
             collective_frontier: 0,
-            next_call_id: 1,
+            next_collective_seq: 1,
+            logical_results: LogicalResultTracker::default(),
+            command_wake_pending: false,
         })
-    }
-
-    fn merge_info(
-        pools: &[PoolEntry],
-        routing: &HashMap<ForwardMode, usize>,
-    ) -> anyhow::Result<WorkerInfo> {
-        let routed_caps =
-            |variant: ForwardMode| routing.get(&variant).map(|index| pools[*index].exec.info());
-        let mut kv_pool_indices = [
-            ForwardMode::TokenExtend,
-            ForwardMode::TokenDecode,
-            ForwardMode::TokenVerify,
-            ForwardMode::Materialize,
-            ForwardMode::TransferKvPublish,
-            ForwardMode::TransferKvInstall,
-        ]
-        .into_iter()
-        .filter_map(|variant| routing.get(&variant).copied())
-        .collect::<Vec<_>>();
-        kv_pool_indices.sort_unstable();
-        kv_pool_indices.dedup();
-
-        let seed_index = kv_pool_indices.first().copied().unwrap_or(0);
-        let mut merged = pools[seed_index].exec.info().clone();
-        let versions = pools
-            .iter()
-            .map(|pool| pool.exec.info())
-            .map(|info| (info.model_name.clone(), info.weight_version))
-            .collect::<Vec<_>>();
-        if let Some(version) = versions.first() {
-            anyhow::ensure!(
-                versions.iter().all(|candidate| candidate == version),
-                "staged model workers expose different model names or weight versions"
-            );
-            merged.model_name = version.0.clone();
-            merged.weight_version = version.1;
-        }
-
-        if let Some(first_index) = kv_pool_indices.first().copied() {
-            let first = pools[first_index].exec.info();
-            for index in kv_pool_indices.iter().copied().skip(1) {
-                let other = pools[index].exec.info();
-                anyhow::ensure!(
-                    other.block_size == first.block_size,
-                    "staged KV pools disagree on block size"
-                );
-                anyhow::ensure!(
-                    other.num_layers == first.num_layers
-                        && other.num_kv_heads == first.num_kv_heads
-                        && other.head_dim == first.head_dim
-                        && other.kv_dtype == first.kv_dtype
-                        && other.groups == first.groups,
-                    "staged KV pools expose incompatible cache layouts"
-                );
-            }
-            merged.block_size = first.block_size;
-            merged.num_blocks = kv_pool_indices
-                .iter()
-                .map(|index| pools[*index].exec.info().num_blocks)
-                .min()
-                .unwrap_or(first.num_blocks);
-            merged.num_layers = first.num_layers;
-            merged.num_kv_heads = first.num_kv_heads;
-            merged.head_dim = first.head_dim;
-            merged.groups = first.groups.clone();
-            merged.kv_dtype = first.kv_dtype;
-            merged.bytes_per_token = kv_pool_indices
-                .iter()
-                .map(|index| pools[*index].exec.info().bytes_per_token)
-                .max()
-                .unwrap_or(first.bytes_per_token);
-        }
-
-        merged.supported_work = ForwardMode::ALL
-            .into_iter()
-            .filter(|variant| routing.contains_key(variant))
-            .collect();
-        merged.supported_controls.clear();
-        merged.resource_classes.clear();
-        for pool in pools {
-            let info = pool.exec.info();
-            extend_unique(
-                &mut merged.supported_controls,
-                info.supported_controls.clone(),
-            );
-            extend_unique(&mut merged.resource_classes, info.resource_classes.clone());
-        }
-        merged.pipeline_depth = pools
-            .iter()
-            .map(|pool| pool.exec.info().pipeline_depth.max(1))
-            .min()
-            .unwrap_or(1);
-        merged.max_batch_operations = pools
-            .iter()
-            .map(|pool| pool.exec.info().max_batch_operations)
-            .filter(|limit| *limit > 0)
-            .min()
-            .unwrap_or(0);
-        merged.max_batch_tokens = pools
-            .iter()
-            .map(|pool| pool.exec.info().max_batch_tokens)
-            .filter(|limit| *limit > 0)
-            .min()
-            .unwrap_or(0);
-        merged.max_request_pool_size = pools
-            .iter()
-            .map(|pool| pool.exec.info().max_request_pool_size)
-            .filter(|limit| *limit > 0)
-            .min()
-            .unwrap_or(0);
-        merged.max_unresolved_window = pools
-            .iter()
-            .map(|pool| pool.exec.info().max_unresolved_window)
-            .filter(|limit| *limit > 0)
-            .min()
-            .unwrap_or(0);
-        merged.incremental_kv_publication = pools
-            .iter()
-            .all(|pool| pool.exec.info().incremental_kv_publication);
-        let sampling_ownership = pools[0].exec.info().sampling_ownership;
-        anyhow::ensure!(
-            pools
-                .iter()
-                .all(|pool| pool.exec.info().sampling_ownership == sampling_ownership),
-            "staged pools disagree on sampling ownership"
-        );
-        merged.sampling_ownership = sampling_ownership;
-        merged.mixed_buckets = match (
-            routing.get(&ForwardMode::TokenDecode),
-            routing.get(&ForwardMode::MediaDenoise),
-        ) {
-            (Some(decode), Some(flow)) if decode == flow => {
-                pools[*decode].exec.info().mixed_buckets.clone()
-            }
-            _ => Vec::new(),
-        };
-
-        let flow = routed_caps(ForwardMode::MediaDenoise);
-        merged.latent_page_units = flow.as_ref().map_or(0, |info| info.latent_page_units);
-        merged.num_latent_pages = flow.as_ref().map_or(0, |info| info.num_latent_pages);
-        merged.latent_width = flow.as_ref().map_or(0, |info| info.latent_width);
-        merged.latent_dtype = flow.as_ref().and_then(|info| info.latent_dtype);
-        merged.latent_downsample = flow.as_ref().map_or(0, |info| info.latent_downsample);
-        merged.max_cfg_branches = flow.as_ref().map_or(0, |info| info.max_cfg_branches);
-        merged.max_vae_grid_tokens = routed_caps(ForwardMode::EncodeLatent)
-            .as_ref()
-            .map_or(0, |info| info.max_vae_grid_tokens);
-        merged.max_vit_grid_tokens = routed_caps(ForwardMode::EncodeVision)
-            .as_ref()
-            .map_or(0, |info| info.max_vit_grid_tokens);
-        merged.max_latent_feature_bytes = routed_caps(ForwardMode::EncodeLatent)
-            .as_ref()
-            .map_or(0, |info| info.max_latent_feature_bytes);
-        merged.max_vision_feature_bytes = routed_caps(ForwardMode::EncodeVision)
-            .as_ref()
-            .map_or(0, |info| info.max_vision_feature_bytes);
-        if let Some(materialize) = routed_caps(ForwardMode::Materialize) {
-            merged.commit_marker_tokens = materialize.commit_marker_tokens;
-            merged.gen_rope_advance = materialize.gen_rope_advance;
-        }
-        merged.encoder_cache_budget = [ForwardMode::EncodeLatent, ForwardMode::EncodeVision]
-            .into_iter()
-            .filter_map(|variant| routed_caps(variant).map(|info| info.encoder_cache_budget))
-            .min()
-            .unwrap_or(0);
-        merged.validate()?;
-        Ok(merged)
     }
 
     fn pool_bit(index: usize) -> u64 {
@@ -385,24 +216,36 @@ impl StagedExecutor {
         Ok(admissions)
     }
 
-    /// The pools a control command must reach. A commit/close/release rides with
+    /// The pools a control command must reach. A commit or close rides with
     /// the operation that produced the version it names, so it targets the pool
     /// running this request's operation in this batch; a control for a request
     /// with no operation this batch is broadcast to every pool that has admitted
     /// the request.
-    fn control_pools(&self, control: &Control) -> Vec<usize> {
-        let (request_key, producer_op_id) = match control {
-            Control::Commit {
+    fn command_pools(&self, command: &BatchCommand) -> Vec<usize> {
+        if let BatchCommand::Free { buffer } = command {
+            return self
+                .buffer_pools
+                .get(buffer)
+                .map(|pools| {
+                    let mut pools = pools.iter().copied().collect::<Vec<_>>();
+                    pools.sort_unstable();
+                    pools
+                })
+                .unwrap_or_default();
+        }
+        let (request_key, producer_op_id) = match command {
+            BatchCommand::Start { .. } => return Vec::new(),
+            BatchCommand::Commit {
                 request_key,
                 selected,
                 ..
-            } => (*request_key, selected.producer_op_id),
-            Control::Close {
+            } => (*request_key, selected.op_id),
+            BatchCommand::Finish {
                 request_key,
                 cutoff,
                 ..
-            } => (*request_key, cutoff.producer_op_id),
-            Control::Release { request_key, op_id } => (*request_key, *op_id),
+            } => (*request_key, cutoff.op_id),
+            BatchCommand::Free { .. } => unreachable!("buffer free was routed above"),
         };
         if let Some(pool_index) = self
             .operation_routes
@@ -416,54 +259,51 @@ impl StagedExecutor {
             .collect()
     }
 
-    fn submit_partition(
+    fn submit_pool(
         &mut self,
         pool_index: usize,
-        step_id: u64,
-        partitions: Vec<BatchPartition>,
-        controls: Vec<Control>,
-        input_products: Vec<ProductPayload>,
-    ) -> anyhow::Result<()> {
+        submission: &PoolSubmission,
+    ) -> anyhow::Result<bool> {
         anyhow::ensure!(
-            !partitions.is_empty() || !controls.is_empty(),
+            !submission.run.operations.is_empty() || !submission.run.commands.is_empty(),
             "staged pool submission has no work or control"
         );
-        let operations = partitions
-            .iter()
-            .flat_map(|partition| partition.operations.iter())
-            .cloned()
-            .collect::<Vec<_>>();
-        let admissions = self.admissions_for(pool_index, &operations)?;
+        let admissions = self.admissions_for(pool_index, &submission.run.operations)?;
         let request_keys = admissions
             .iter()
             .map(|admission| admission.request_key)
             .collect::<Vec<_>>();
-        let partition = Batch::new(step_id, admissions, partitions)
-            .with_controls(controls)
-            .with_input_products(input_products);
-        partition.validate()?;
-        self.pools[pool_index].exec.submit(partition)?;
+        let mut run = submission.run.clone();
+        let mut commands = admissions
+            .into_iter()
+            .map(|request| BatchCommand::Start { request })
+            .collect::<Vec<_>>();
+        commands.append(&mut run.commands);
+        run.commands = commands;
+        run.validate()?;
+        match self.pools[pool_index].exec.submit_run(run) {
+            Ok(()) => {}
+            Err(PhysicalSubmitError::WouldBlock(_)) => return Ok(false),
+            Err(PhysicalSubmitError::Failed(error)) => return Err(error),
+        }
         self.admitted_pools
             .extend(request_keys.into_iter().map(|key| (pool_index, key)));
-        Ok(())
+        Ok(true)
     }
 
     fn dispatch_ready(&mut self) -> anyhow::Result<()> {
         loop {
             let mut progressed = false;
             for pool_index in 0..self.pools.len() {
-                if !self.pools[pool_index].exec.can_submit() {
-                    continue;
-                }
                 let ready = self.pool_submissions[pool_index]
                     .front()
                     .is_some_and(|submission| {
-                        let sequence_ready =
-                            submission.collective_seqs.first().is_none_or(|first| {
-                                *first <= self.collective_frontier
-                                    && self.pool_collective_seqs[pool_index]
-                                        .is_none_or(|previous| *first > previous)
-                            });
+                        let sequence_ready = {
+                            let sequence = submission.run.collective_seq;
+                            sequence <= self.collective_frontier
+                                && self.pool_collective_seqs[pool_index]
+                                    .is_none_or(|previous| sequence > previous)
+                        };
                         sequence_ready
                             && submission
                                 .dependencies
@@ -473,15 +313,17 @@ impl StagedExecutor {
                 if !ready {
                     continue;
                 }
-                let mut submission = self.pool_submissions[pool_index]
+                let submission = self.pool_submissions[pool_index]
                     .pop_front()
                     .ok_or_else(|| anyhow::anyhow!("ready staged submission disappeared"))?;
-                for dependency in submission.dependencies {
+                let mut physical_submission = submission.clone();
+                for dependency in &submission.dependencies {
                     anyhow::ensure!(
-                        !submission
+                        !physical_submission
+                            .run
                             .input_products
                             .iter()
-                            .any(|payload| payload.product == dependency),
+                            .any(|payload| payload.product == *dependency),
                         "cross-stage input payload is supplied more than once"
                     );
                     let payload = self.transfer_products.get(&dependency).ok_or_else(|| {
@@ -490,18 +332,13 @@ impl StagedExecutor {
                             dependency
                         )
                     })?;
-                    submission.input_products.push(payload.clone());
+                    physical_submission.run.input_products.push(payload.clone());
                 }
-                self.submit_partition(
-                    pool_index,
-                    submission.step_id,
-                    submission.partitions,
-                    submission.controls,
-                    submission.input_products,
-                )?;
-                if let Some(last) = submission.collective_seqs.last() {
-                    self.pool_collective_seqs[pool_index] = Some(*last);
+                if !self.submit_pool(pool_index, &physical_submission)? {
+                    self.pool_submissions[pool_index].push_front(submission);
+                    continue;
                 }
+                self.pool_collective_seqs[pool_index] = Some(submission.run.collective_seq);
                 progressed = true;
             }
             if !progressed {
@@ -514,7 +351,10 @@ impl StagedExecutor {
         self.dispatch_ready()?;
         for pool_index in 0..self.pools.len() {
             loop {
-                let report = self.pools[pool_index].exec.poll()?;
+                let report = self.pools[pool_index].exec.poll_run(Duration::ZERO)?;
+                if self.pools[pool_index].exec.take_command_wake() {
+                    self.command_wake_pending = true;
+                }
                 let Some(report) = report else {
                     break;
                 };
@@ -524,215 +364,180 @@ impl StagedExecutor {
         self.dispatch_ready()
     }
 
-    fn route_result(&mut self, pool_index: usize, report: CompletionReport) -> anyhow::Result<()> {
+    fn route_result(&mut self, pool_index: usize, report: RunResult) -> anyhow::Result<()> {
         report.validate()?;
         let mut report = report;
-        let step_id = report.step_id;
+        let run_id = report.run_id;
         let pool_bit = Self::pool_bit(pool_index);
         {
             let step = self
                 .pending
-                .get_mut(&step_id)
-                .ok_or_else(|| anyhow::anyhow!("stage pool returned unknown step {step_id}"))?;
+                .get_mut(&run_id)
+                .ok_or_else(|| anyhow::anyhow!("stage pool returned unknown step {run_id}"))?;
             anyhow::ensure!(
                 step.expected_pools & pool_bit != 0,
-                "pool {pool_index} returned a duplicate or unexpected result for step {step_id}"
+                "pool {pool_index} returned a duplicate or unexpected result for step {run_id}"
             );
-            let expected_partition_ids = step
-                .partition_routes
+            let expected_operations = step
+                .operations
                 .iter()
-                .filter_map(|(partition_id, route)| (*route == pool_index).then_some(*partition_id))
+                .filter_map(|(identity, route)| (*route == pool_index).then_some(*identity))
                 .collect::<HashSet<_>>();
             anyhow::ensure!(
-                !report.partitions.is_empty() || expected_partition_ids.is_empty(),
-                "pool {pool_index} returned an empty partial report for step {step_id}"
+                !report.completions.is_empty() || expected_operations.is_empty() || report.done,
+                "pool {pool_index} returned an empty partial report for step {run_id}"
             );
-            for partition in &report.partitions {
+            for completion in &report.completions {
+                let identity = (completion.request_key, completion.op_id);
                 anyhow::ensure!(
-                    expected_partition_ids.contains(&partition.partition_id),
-                    "pool {pool_index} returned unexpected partition {} for step {step_id}",
-                    partition.partition_id
-                );
-                let planned = step
-                    .partitions
-                    .iter()
-                    .find(|planned| planned.partition_id == partition.partition_id)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "partition {} disappeared from pending step {step_id}",
-                            partition.partition_id
-                        )
-                    })?;
-                anyhow::ensure!(
-                    planned.operations.len() == partition.completions.len()
-                        && planned.operations.iter().zip(&partition.completions).all(
-                            |(operation, completion)| {
-                                operation.request_key == completion.request_key
-                                    && operation.op_id == completion.op_id
-                            }
-                        ),
-                    "pool {pool_index} completion identities do not match partition {} for step {step_id}",
-                    partition.partition_id
+                    expected_operations.contains(&identity),
+                    "pool {pool_index} returned an unexpected operation for step {run_id}"
                 );
                 anyhow::ensure!(
-                    step.returned_partitions.insert(partition.partition_id),
-                    "pool {pool_index} returned a partition twice for step {step_id}"
+                    step.returned_operations.insert(identity),
+                    "pool {pool_index} returned an operation twice for step {run_id}"
                 );
             }
-            if expected_partition_ids
-                .iter()
-                .all(|partition_id| step.returned_partitions.contains(partition_id))
-            {
+            if report.done {
+                anyhow::ensure!(
+                    expected_operations
+                        .iter()
+                        .all(|identity| step.returned_operations.contains(identity)),
+                    "pool {pool_index} terminated step {run_id} before every operation completed"
+                );
                 step.expected_pools &= !pool_bit;
             }
         }
-        for partition in &mut report.partitions {
-            let mut visible_products = Vec::with_capacity(partition.products.len());
-            for product in partition.products.drain(..) {
-                if !is_transfer_descriptor(&product.bytes) {
-                    visible_products.push(product);
-                    continue;
-                }
-                let route = self.product_routes.get(&product.product).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "pool {pool_index} returned an unplanned cross-stage product {:?}",
-                        product.product
-                    )
-                })?;
+        let mut visible_products = Vec::with_capacity(report.products.len());
+        for product in report.products.drain(..) {
+            let InlineValue::Transfer(handle) = &product.value else {
+                visible_products.push(product);
+                continue;
+            };
+            let route = self.product_routes.get(&product.product).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "pool {pool_index} returned an unplanned cross-stage product {:?}",
+                    product.product
+                )
+            })?;
+            anyhow::ensure!(
+                route.pool_index == pool_index,
+                "pool {pool_index} returned a cross-stage product owned by pool {}",
+                route.pool_index
+            );
+            let kind = handle.kind();
+            if let Some(existing) = self.transfer_products.get(&product.product) {
                 anyhow::ensure!(
-                    route.pool_index == pool_index,
-                    "pool {pool_index} returned a cross-stage product owned by pool {}",
-                    route.pool_index
+                    existing == &product,
+                    "cross-stage product identity was reused with conflicting transport bytes"
                 );
-                let kind = transfer_kind(&product.bytes)?;
-                if let Some(existing) = self.transfer_products.get(&product.product) {
-                    anyhow::ensure!(
-                        existing == &product,
-                        "cross-stage product identity was reused with conflicting transport bytes"
-                    );
-                } else {
-                    self.transfer_products
-                        .insert(product.product.clone(), product.clone());
-                }
-                if kind == "kv" {
-                    visible_products.push(ProductPayload {
-                        product: product.product,
-                        bytes: Vec::new(),
-                    });
-                }
+            } else {
+                self.transfer_products
+                    .insert(product.product.clone(), product.clone());
             }
-            partition.products = visible_products;
+            if kind == TransferKind::Kv {
+                visible_products.push(ProductPayload {
+                    product: product.product,
+                    value: InlineValue::Bytes(Vec::new()),
+                });
+            }
         }
+        report.products = visible_products;
         self.dispatch_ready()?;
-        if !report.partitions.is_empty() {
+        let done = self.try_complete(run_id)?;
+        report.done = done;
+        if !report.completions.is_empty() || done {
             self.ready.push_back(report);
-        }
-        self.try_complete(step_id)
-    }
-
-    fn try_complete(&mut self, step_id: u64) -> anyhow::Result<()> {
-        let complete = self
-            .pending
-            .get(&step_id)
-            .is_some_and(|step| step.expected_pools == 0);
-        if !complete {
-            return Ok(());
-        }
-        let step = self
-            .pending
-            .remove(&step_id)
-            .ok_or_else(|| anyhow::anyhow!("pending step {step_id} disappeared"))?;
-        anyhow::ensure!(
-            step.returned_partitions.len() == step.partitions.len(),
-            "stage execution finished without every planned partition"
-        );
-        if step.partitions.is_empty() {
-            self.ready.push_back(CompletionReport {
-                step_id,
-                partitions: Vec::new(),
-            });
         }
         Ok(())
     }
 
-    fn control_targets(&self, operation: &ControlOp) -> Vec<usize> {
-        if matches!(operation, ControlOp::DropSession(_)) {
-            return (0..self.pools.len()).collect();
+    fn try_complete(&mut self, run_id: u64) -> anyhow::Result<bool> {
+        let complete = self
+            .pending
+            .get(&run_id)
+            .is_some_and(|step| step.expected_pools == 0);
+        if !complete {
+            return Ok(false);
         }
-        self.pools
-            .iter()
-            .enumerate()
-            .filter(|(_, pool)| {
-                pool.exec
-                    .info()
-                    .supported_controls
-                    .contains(&operation.request_kind())
-            })
-            .map(|(index, _)| index)
-            .collect()
+        let step = self
+            .pending
+            .remove(&run_id)
+            .ok_or_else(|| anyhow::anyhow!("pending step {run_id} disappeared"))?;
+        anyhow::ensure!(
+            step.returned_operations.len() == step.operations.len(),
+            "stage execution finished without every planned operation"
+        );
+        for request_id in step.finished_requests {
+            self.forget_request(request_id);
+        }
+        Ok(true)
     }
 
-    fn forget_session(&mut self, session_id: RequestId) {
+    fn forget_request(&mut self, request_id: RequestId) {
         self.admissions
-            .retain(|request_key, _| request_key.session_id != session_id);
+            .retain(|request_key, _| request_key.request_id != request_id);
         self.admitted_pools
-            .retain(|(_, request_key)| request_key.session_id != session_id);
+            .retain(|(_, request_key)| request_key.request_id != request_id);
         self.operation_routes
-            .retain(|(request_key, _), _| request_key.session_id != session_id);
-        self.product_routes
-            .retain(|product, _| product.request_key.session_id != session_id);
-        self.transfer_products
-            .retain(|product, _| product.request_key.session_id != session_id);
+            .retain(|(request_key, _), _| request_key.request_id != request_id);
+        self.product_routes.retain(|product, _| {
+            product.request_key.request_id != request_id || product.uses_persistent_buffer()
+        });
+        self.transfer_products.retain(|product, _| {
+            product.request_key.request_id != request_id || product.uses_persistent_buffer()
+        });
+    }
+
+    pub(crate) fn command_waker(&self) -> CommandWaker {
+        let wakes = self.command_wakers.clone();
+        CommandWaker::new(move || {
+            for wake in &wakes {
+                wake.wake();
+            }
+        })
     }
 }
 
 impl Executor for StagedExecutor {
-    fn info(&self) -> &WorkerInfo {
-        &self.info
+    fn info(&self) -> &ExecutorInfo {
+        &self.executor_info
     }
 
-    fn pipeline_depth(&self) -> usize {
-        self.depth
-    }
+    fn submit(&mut self, batch: Batch) -> Result<(), ExecutorSubmitError> {
+        self.pump().map_err(ExecutorSubmitError::Failed)?;
+        if self.pending.len() >= self.depth {
+            return Err(ExecutorSubmitError::WouldBlock(batch));
+        }
+        batch.validate().map_err(ExecutorSubmitError::Failed)?;
+        let batch_id = batch.id;
+        if self.pending.contains_key(&batch_id) {
+            return Err(ExecutorSubmitError::Failed(anyhow::anyhow!(
+                "stage router already has batch {batch_id} in flight"
+            )));
+        }
+        self.logical_results
+            .register(&batch)
+            .map_err(ExecutorSubmitError::Failed)?;
+        let admissions = batch.admissions().cloned().collect::<Vec<_>>();
+        self.cache_admissions(&admissions)
+            .map_err(ExecutorSubmitError::Failed)?;
 
-    fn in_flight(&self) -> usize {
-        self.pending.len() + self.ready.len()
-    }
-
-    fn device_products_reachable(&self, producer: ForwardMode, consumer: ForwardMode) -> bool {
-        self.routing.contains_key(&producer) && self.routing.contains_key(&consumer)
-    }
-
-    fn can_submit(&self) -> bool {
-        self.pending.len() < self.depth && self.pools.iter().all(|pool| pool.exec.can_submit())
-    }
-
-    fn submit(&mut self, batch: Batch) -> anyhow::Result<()> {
-        batch.validate()?;
-        self.pump()?;
-        anyhow::ensure!(
-            !self.pending.contains_key(&batch.step_id),
-            "stage router already has step {} in flight",
-            batch.step_id
-        );
-        self.cache_admissions(&batch.admissions)?;
-
-        let mut pool_partitions = (0..self.pools.len())
-            .map(|_| Vec::new())
-            .collect::<Vec<Vec<BatchPartition>>>();
-        let mut partition_inputs = (0..self.pools.len())
-            .map(|_| Vec::new())
-            .collect::<Vec<Vec<ProductPayload>>>();
-        let mut pool_dependencies = (0..self.pools.len())
-            .map(|_| Vec::new())
-            .collect::<Vec<Vec<ProductRef>>>();
-        let mut partition_routes = HashMap::with_capacity(batch.partitions.len());
-        let mut input_routes = HashMap::new();
-        let mut group_pools = HashMap::new();
-        for partition in &batch.partitions {
-            let mut pool_index = None;
-            for operation in &partition.operations {
-                let variant = operation.work;
+        let submit_result = (|| -> anyhow::Result<()> {
+            let mut pool_ops = (0..self.pools.len())
+                .map(|_| Vec::new())
+                .collect::<Vec<Vec<Op>>>();
+            let mut pool_inputs = (0..self.pools.len())
+                .map(|_| Vec::new())
+                .collect::<Vec<Vec<ProductPayload>>>();
+            let mut pool_dependencies = (0..self.pools.len())
+                .map(|_| Vec::new())
+                .collect::<Vec<Vec<ProductRef>>>();
+            let mut operation_routes = HashMap::with_capacity(batch.ops.len());
+            let mut input_routes = HashMap::new();
+            for op in &batch.ops {
+                let operation = op.clone().into_operation();
+                let variant = op.kind;
                 let operation_pool = self.routing.get(&variant).copied().ok_or_else(|| {
                     anyhow::anyhow!(
                         "StagedExecutor has no pool for work variant {variant:?} in request {:?}",
@@ -748,7 +553,7 @@ impl Executor for StagedExecutor {
                         "operation identity was routed to conflicting staged pools"
                     );
                 }
-                for output in &operation.outputs {
+                for output in operation.outputs() {
                     let route = ProductRoute {
                         pool_index: operation_pool,
                     };
@@ -760,34 +565,53 @@ impl Executor for StagedExecutor {
                     } else {
                         self.product_routes.insert(output.clone(), route);
                     }
+                    if output.uses_persistent_buffer() {
+                        let placement = op
+                            .placement
+                            .buffers
+                            .iter()
+                            .find(|placement| placement.buffer == output.buffer_id())
+                            .copied()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "persistent product {:?} has no scheduler placement",
+                                    output
+                                )
+                            })?;
+                        if let Some(existing) =
+                            self.buffer_placements.insert(placement.buffer, placement)
+                        {
+                            anyhow::ensure!(
+                                existing == placement,
+                                "buffer identity was assigned conflicting placements"
+                            );
+                        }
+                        self.buffer_pools
+                            .entry(placement.buffer)
+                            .or_default()
+                            .insert(operation_pool);
+                    }
                 }
-                anyhow::ensure!(
-                    pool_index.is_none_or(|index| index == operation_pool),
-                    "partition {} spans staged pools; scheduler partition ownership is not executable",
-                    partition.partition_id
-                );
-                pool_index = Some(operation_pool);
-                if variant == ForwardMode::MediaDenoise {
+                operation_routes.insert((operation.request_key, operation.op_id), operation_pool);
+                if variant == OpKind::DiffusionStep {
                     let token_pool = self
                         .routing
-                        .get(&ForwardMode::TokenDecode)
-                        .or_else(|| self.routing.get(&ForwardMode::TokenExtend));
+                        .get(&OpKind::ArDecode)
+                        .or_else(|| self.routing.get(&OpKind::ArExtend));
                     if token_pool.is_some_and(|token_pool| *token_pool != operation_pool) {
                         anyhow::ensure!(
-                            !operation.inputs.is_empty(),
+                            !operation.inputs().is_empty(),
                             "cross-pool media denoise for request {:?} names no input product for its conditioning",
                             operation.request_key
                         );
                     }
                 }
-                for input in
+                for input in operation.inputs().iter().chain(
                     operation
-                        .inputs
-                        .iter()
-                        .chain(operation.predicate.iter().filter(|predicate| {
-                            !operation.inputs.iter().any(|input| input == *predicate)
-                        }))
-                {
+                        .predicate()
+                        .into_iter()
+                        .filter(|predicate| !operation.inputs().contains(*predicate)),
+                ) {
                     anyhow::ensure!(
                         input_routes
                             .insert(input.clone(), operation_pool)
@@ -795,44 +619,26 @@ impl Executor for StagedExecutor {
                         "one input product is consumed across staged pools"
                     );
                 }
+                pool_ops[operation_pool].push(op.clone());
             }
-            let Some(pool_index) = pool_index else {
-                anyhow::bail!(
-                    "validated partition {} has no routed operation",
-                    partition.partition_id
-                );
-            };
-            anyhow::ensure!(
-                group_pools
-                    .insert(partition.submission_group, pool_index)
-                    .is_none_or(|existing| existing == pool_index),
-                "submission group {} spans staged pools and cannot share one physical runner call",
-                partition.submission_group
-            );
-            partition_routes.insert(partition.partition_id, pool_index);
-            pool_partitions[pool_index].push(partition.clone());
-        }
-        for payload in &batch.input_products {
-            let pool_index = input_routes.get(&payload.product).copied().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "StagedExecutor cannot route undeclared input product {:?}",
-                    payload.product
-                )
-            })?;
-            partition_inputs[pool_index].push(payload.clone());
-        }
-        let mut cross_pool_consumers = HashSet::new();
-        for partition in &batch.partitions {
-            let consumer_pool = partition_routes[&partition.partition_id];
-            for operation in &partition.operations {
-                for input in
+            for payload in &batch.inline {
+                let pool_index = input_routes.get(&payload.product).copied().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "StagedExecutor cannot route undeclared input product {:?}",
+                        payload.product
+                    )
+                })?;
+                pool_inputs[pool_index].push(payload.clone());
+            }
+            for op in &batch.ops {
+                let operation = op.clone().into_operation();
+                let consumer_pool = operation_routes[&(operation.request_key, operation.op_id)];
+                for input in operation.inputs().iter().chain(
                     operation
-                        .inputs
-                        .iter()
-                        .chain(operation.predicate.iter().filter(|predicate| {
-                            !operation.inputs.iter().any(|input| input == *predicate)
-                        }))
-                {
+                        .predicate()
+                        .into_iter()
+                        .filter(|predicate| !operation.inputs().contains(*predicate)),
+                ) {
                     if input.storage_class == uniserve_worker_ipc::StorageClass::HostStaging {
                         continue;
                     }
@@ -843,7 +649,7 @@ impl Executor for StagedExecutor {
                         continue;
                     }
                     anyhow::ensure!(
-                        !partition_inputs[consumer_pool]
+                        !pool_inputs[consumer_pool]
                             .iter()
                             .any(|existing| existing.product == *input),
                         "cross-stage transfer descriptor must be supplied by its producing pool"
@@ -851,216 +657,192 @@ impl Executor for StagedExecutor {
                     if !pool_dependencies[consumer_pool].contains(input) {
                         pool_dependencies[consumer_pool].push(input.clone());
                     }
-                    cross_pool_consumers.insert((input.request_key, input.producer_op_id));
+                    if input.uses_persistent_buffer() {
+                        self.buffer_pools
+                            .entry(input.buffer_id())
+                            .or_default()
+                            .insert(consumer_pool);
+                    }
                 }
             }
-        }
 
-        let mut pool_controls = (0..self.pools.len())
-            .map(|_| Vec::new())
-            .collect::<Vec<Vec<Control>>>();
-        for control in &batch.controls {
-            let request_key = control.request_key();
-            if let Control::Release { request_key, op_id } = control {
+            let mut pool_commands = (0..self.pools.len())
+                .map(|_| Vec::new())
+                .collect::<Vec<Vec<BatchCommand>>>();
+            for command in &batch.commands {
+                if matches!(command, BatchCommand::Start { .. }) {
+                    continue;
+                }
+                let request_key = command.request_key();
+                let targets = self.command_pools(command);
                 anyhow::ensure!(
-                    !cross_pool_consumers.contains(&(*request_key, *op_id)),
-                    "a cross-stage producer cannot be released in its consumer submission"
+                    !targets.is_empty(),
+                    "stage router received a command for request {request_key:?} that is not admitted to any pool"
                 );
+                for pool_index in targets {
+                    pool_commands[pool_index].push(command.clone());
+                }
             }
-            let targets = self.control_pools(control);
-            anyhow::ensure!(
-                !targets.is_empty(),
-                "stage router received a control for request {request_key:?} that is not admitted to any pool"
-            );
-            for pool_index in targets {
-                pool_controls[pool_index].push(control.clone());
-            }
-        }
 
-        let mut expected_pools = 0;
-        for (pool_index, (((partitions, controls), input_products), dependencies)) in
-            pool_partitions
+            let mut expected_pools = 0;
+            for (pool_index, (((ops, commands), input_products), dependencies)) in pool_ops
                 .into_iter()
-                .zip(pool_controls)
-                .zip(partition_inputs)
+                .zip(pool_commands)
+                .zip(pool_inputs)
                 .zip(pool_dependencies)
                 .enumerate()
-        {
-            if partitions.is_empty() && controls.is_empty() {
-                anyhow::ensure!(
-                    dependencies.is_empty(),
-                    "cross-stage dependency has no consuming pool submission"
-                );
-                continue;
-            }
-            expected_pools |= Self::pool_bit(pool_index);
-            let mut collective_seqs = partitions
-                .iter()
-                .map(|partition| partition.collective_seq)
-                .collect::<Vec<_>>();
-            collective_seqs.sort_unstable();
-            collective_seqs.dedup();
-            let submission = PoolSubmission {
-                step_id: batch.step_id,
-                partitions,
-                controls,
-                input_products,
-                dependencies,
-                collective_seqs,
-            };
-            let sequence = submission.collective_seqs.first().copied();
-            self.observed_collective_seqs
-                .extend(submission.collective_seqs.iter().copied());
-            while self
-                .observed_collective_seqs
-                .remove(&self.collective_frontier.saturating_add(1))
             {
-                self.collective_frontier = self.collective_frontier.saturating_add(1);
+                if ops.is_empty() && commands.is_empty() {
+                    anyhow::ensure!(
+                        dependencies.is_empty(),
+                        "cross-stage dependency has no consuming pool submission"
+                    );
+                    continue;
+                }
+                expected_pools |= Self::pool_bit(pool_index);
+                let collective_seq = self.next_collective_seq.max(1);
+                self.next_collective_seq = collective_seq.saturating_add(1);
+                let mut run = physical_run(
+                    batch_id,
+                    batch_id,
+                    collective_seq,
+                    ops,
+                    commands,
+                    input_products,
+                )?;
+                for dependency in &dependencies {
+                    if !dependency.uses_persistent_buffer() {
+                        continue;
+                    }
+                    let placement = self
+                        .buffer_placements
+                        .get(&dependency.buffer_id())
+                        .copied()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "persistent dependency {:?} has no scheduler placement",
+                                dependency
+                            )
+                        })?;
+                    if !run
+                        .buffer_placements
+                        .iter()
+                        .any(|existing| existing.buffer == placement.buffer)
+                    {
+                        run.buffer_placements.push(placement);
+                    }
+                }
+                run.validate()?;
+                let submission = PoolSubmission { run, dependencies };
+                self.observed_collective_seqs.insert(collective_seq);
+                while self
+                    .observed_collective_seqs
+                    .remove(&self.collective_frontier.saturating_add(1))
+                {
+                    self.collective_frontier = self.collective_frontier.saturating_add(1);
+                }
+                let position = self.pool_submissions[pool_index]
+                    .iter()
+                    .position(|queued| collective_seq < queued.run.collective_seq)
+                    .unwrap_or(self.pool_submissions[pool_index].len());
+                self.pool_submissions[pool_index].insert(position, submission);
             }
-            let position = self.pool_submissions[pool_index]
-                .iter()
-                .position(
-                    |queued| match (sequence, queued.collective_seqs.first().copied()) {
-                        (Some(incoming), Some(existing)) => incoming < existing,
-                        (None, Some(_)) => true,
-                        _ => false,
-                    },
-                )
-                .unwrap_or(self.pool_submissions[pool_index].len());
-            self.pool_submissions[pool_index].insert(position, submission);
-        }
-        self.pending.insert(
-            batch.step_id,
-            PendingStep {
-                expected_pools,
-                partitions: batch.partitions,
-                partition_routes,
-                returned_partitions: HashSet::new(),
-            },
-        );
-        self.dispatch_ready()?;
-        self.try_complete(batch.step_id)?;
-        for control in &batch.controls {
-            if let Control::Release { request_key, op_id } = control {
-                self.transfer_products.retain(|product, _| {
-                    product.request_key != *request_key || product.producer_op_id != *op_id
-                });
-                self.product_routes.retain(|product, _| {
-                    product.request_key != *request_key || product.producer_op_id != *op_id
-                });
-            }
-        }
-        Ok(())
-    }
-
-    fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
-        self.pump()?;
-        Ok(self.ready.pop_front())
-    }
-
-    fn check_liveness(&mut self) -> anyhow::Result<()> {
-        for (index, pool) in self.pools.iter_mut().enumerate() {
-            pool.exec
-                .check_liveness()
-                .map_err(|error| anyhow::anyhow!("stage pool {index} liveness: {error}"))?;
-        }
-        Ok(())
-    }
-
-    fn command_waker(&self) -> CommandWaker {
-        let wakes = self
-            .pools
-            .iter()
-            .map(|pool| pool.exec.command_waker())
-            .collect::<Vec<_>>();
-        CommandWaker::new(move || {
-            for wake in &wakes {
-                wake.wake();
-            }
-        })
-    }
-
-    fn wake_file_descriptors(&self) -> Vec<i32> {
-        self.pools
-            .iter()
-            .flat_map(|pool| pool.exec.wake_file_descriptors())
-            .collect()
-    }
-
-    fn park_for_event(&mut self, timeout: Duration) -> anyhow::Result<()> {
-        crate::worker::park_descriptors(&self.wake_file_descriptors(), timeout)
-    }
-
-    fn next_result(&mut self) -> anyhow::Result<CompletionReport> {
-        loop {
-            if let Some(result) = self.poll()? {
-                return Ok(result);
-            }
-            anyhow::ensure!(
-                !self.pending.is_empty(),
-                "next_result called with no in-flight stage batches"
+            self.pending.insert(
+                batch_id,
+                PendingStep {
+                    expected_pools,
+                    operations: operation_routes,
+                    returned_operations: HashSet::new(),
+                    finished_requests: batch
+                        .commands
+                        .iter()
+                        .filter_map(|control| match control {
+                            BatchCommand::Finish { request_key, .. } => {
+                                Some(request_key.request_id)
+                            }
+                            _ => None,
+                        })
+                        .collect(),
+                },
             );
-            self.park_for_event(Duration::from_secs(300))?;
-        }
-    }
-
-    fn control(&mut self, operation: ControlOp) -> anyhow::Result<u64> {
-        let call_id = self.next_call_id;
-        self.next_call_id = self.next_call_id.saturating_add(1);
-        let targets = self.control_targets(&operation);
-        anyhow::ensure!(
-            !targets.is_empty(),
-            "no stage pool accepts control {}",
-            operation.method()
-        );
-        for pool_index in targets {
-            self.pools[pool_index].exec.control(operation.clone())?;
-        }
-        if let ControlOp::DropSession(session_id) = operation {
-            self.forget_session(session_id);
-        }
-        Ok(call_id)
-    }
-
-    fn control_wait(
-        &mut self,
-        operation: ControlOp,
-        targets: Option<&[u32]>,
-    ) -> anyhow::Result<Vec<ControlAck>> {
-        let pool_indices = self.control_targets(&operation);
-        anyhow::ensure!(
-            !pool_indices.is_empty(),
-            "no stage pool accepts control {}",
-            operation.method()
-        );
-        let mut acknowledgements = Vec::new();
-        let mut rank_offset = 0;
-        for pool_index in pool_indices {
-            let mut pool_acknowledgements = self.pools[pool_index]
-                .exec
-                .control_wait(operation.clone(), targets)?;
-            let rank_count = pool_acknowledgements
-                .iter()
-                .map(|ack| ack.rank.saturating_add(1))
-                .max()
-                .unwrap_or(0);
-            for acknowledgement in &mut pool_acknowledgements {
-                acknowledgement.rank = acknowledgement.rank.saturating_add(rank_offset);
+            self.dispatch_ready()?;
+            self.try_complete(batch_id)?;
+            for command in &batch.commands {
+                match command {
+                    BatchCommand::Free { buffer } => {
+                        self.transfer_products
+                            .retain(|product, _| product.buffer_id() != *buffer);
+                        self.product_routes
+                            .retain(|product, _| product.buffer_id() != *buffer);
+                        self.buffer_placements.remove(buffer);
+                        self.buffer_pools.remove(buffer);
+                    }
+                    _ => {}
+                }
             }
-            acknowledgements.extend(pool_acknowledgements);
-            rank_offset = rank_offset.saturating_add(rank_count);
+            Ok(())
+        })();
+        if submit_result.is_err() {
+            self.logical_results.unregister(batch_id);
         }
-        let succeeded =
-            !acknowledgements.is_empty() && acknowledgements.iter().all(|ack| ack.result.is_ok());
-        if succeeded && let ControlOp::DropSession(session_id) = operation {
-            self.forget_session(session_id);
-        }
-        Ok(acknowledgements)
+        submit_result.map_err(ExecutorSubmitError::Failed)
     }
 
-    fn shutdown(&mut self) {
+    fn poll(&mut self, timeout: Duration) -> anyhow::Result<Option<BatchResult>> {
+        if std::mem::take(&mut self.command_wake_pending) {
+            return Ok(None);
+        }
+        self.pump()?;
+        if std::mem::take(&mut self.command_wake_pending) {
+            return Ok(None);
+        }
+        if let Some(result) = self.ready.pop_front() {
+            return self.logical_results.apply(result).map(Some);
+        }
+        if timeout.is_zero() {
+            return Ok(None);
+        }
+        if self.progress_fds.is_empty() {
+            let divisor = u32::try_from(self.pools.len()).unwrap_or(1).max(1);
+            let per_pool = timeout / divisor;
+            for pool_index in 0..self.pools.len() {
+                let report = self.pools[pool_index].exec.poll_run(per_pool)?;
+                if self.pools[pool_index].exec.take_command_wake() {
+                    return Ok(None);
+                }
+                if let Some(report) = report {
+                    self.route_result(pool_index, report)?;
+                    if let Some(result) = self.ready.pop_front() {
+                        return self.logical_results.apply(result).map(Some);
+                    }
+                }
+            }
+            return Ok(None);
+        }
+        crate::worker::park_descriptors(&self.progress_fds, timeout)?;
+        self.pump()?;
+        if std::mem::take(&mut self.command_wake_pending) {
+            return Ok(None);
+        }
+        self.ready
+            .pop_front()
+            .map(|result| self.logical_results.apply(result))
+            .transpose()
+    }
+
+    fn close(&mut self) -> anyhow::Result<()> {
+        let mut first_error = None;
         for pool in &mut self.pools {
-            pool.exec.shutdown();
+            if let Err(error) = pool.exec.close_physical()
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(())
         }
     }
 }

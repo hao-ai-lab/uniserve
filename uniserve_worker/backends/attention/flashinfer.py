@@ -98,7 +98,7 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
     paged_varlen = _BatchPrefillWithPagedKVCacheWrapper is not None
     paged_varlen_only = True
     min_head_dim = 64
-    single_token_decode = True
+    single_ar_decode = True
     cuda_only = True
     dense_ranks = frozenset({3})
 

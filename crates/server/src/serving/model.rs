@@ -345,6 +345,30 @@ impl ResolvedAssets {
             Self::Text { .. } | Self::Media { .. } => None,
         }
     }
+
+    pub(crate) fn runtime_profile(
+        &self,
+        model_dtype: uniserve_core::ModelDtype,
+    ) -> uniserve_engine::RuntimeProfile {
+        match self {
+            Self::Text { .. } => uniserve_engine::RuntimeProfile::ar(model_dtype),
+            Self::Media { .. } => uniserve_engine::RuntimeProfile::diffusion(model_dtype),
+            Self::Omni {
+                preprocessing: OmniPreprocessing::SenseNova(_),
+                ..
+            } => uniserve_engine::RuntimeProfile::umm(
+                model_dtype,
+                SenseNovaProfile::runtime_limits(model_dtype),
+            ),
+            Self::Omni {
+                preprocessing: OmniPreprocessing::Bagel(_),
+                ..
+            } => uniserve_engine::RuntimeProfile::umm(
+                model_dtype,
+                BagelProfile::runtime_limits(model_dtype),
+            ),
+        }
+    }
 }
 
 /// Text chat description: HF tokenization + chat template + fixed Qwen3 parser
@@ -574,20 +598,12 @@ impl ResolvedModel {
                     "video prompt token count exceeds the protocol width".to_string(),
                 ),
             })?;
-        let audio_latent_frames = u32::try_from(
-            uniserve_core::MediaGeometry::required_audio_latent_frames(frame_count),
-        )
-        .map_err(|_| ServeError::Tokenize {
-            request_id: request_id.clone(),
-            source: crate::serving::TokenizeError::Invalid(
-                "video duration exceeds the audio latent protocol width".to_string(),
-            ),
-        })?;
+        let video_units = (frame_count - 5) / 17;
+        let decode_units = video_units.div_ceil(4).saturating_add(2);
         Ok((
             uniserve_core::MediaGeometry {
                 frame_count,
-                video_reconstruction_units: (frame_count - 5) / 17,
-                audio_latent_frames,
+                decode_units,
                 prompt_tokens,
                 denoise_steps: 4,
             },

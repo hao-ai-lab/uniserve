@@ -10,7 +10,7 @@
 //!
 //! Layout:
 //!
-//! - key    = `splitmix` fold of `(session_seed, authority_id, session_id,
+//! - key    = `splitmix` fold of `(session_seed, authority_id, request_id,
 //!   epoch, draw_layout)` split into two 32-bit words. The draw layout enters
 //!   the key so target sampling, speculative proposal, and flow noise occupy
 //!   disjoint draw spaces.
@@ -72,11 +72,11 @@ pub fn philox4x32_10(mut counter: [u32; 4], mut key: [u32; 2]) -> [u32; 4] {
 pub fn sampling_key(
     session_seed: u64,
     authority_id: u64,
-    session_id: u64,
+    request_id: u64,
     epoch: u64,
     draw_layout: u64,
 ) -> u64 {
-    [authority_id, session_id, epoch, draw_layout]
+    [authority_id, request_id, epoch, draw_layout]
         .into_iter()
         .fold(session_seed, splitmix_coordinate)
 }

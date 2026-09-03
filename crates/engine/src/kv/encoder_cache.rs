@@ -103,6 +103,19 @@ impl EncoderCacheManager {
         self.len() < self.budget || !self.evictable.is_empty()
     }
 
+    /// Remove the least-recently-used unpinned entry so its worker buffer can
+    /// be freed before a replacement encoder operation is admitted.
+    pub(crate) fn evict_one(&mut self) -> Option<ProductRef> {
+        let (_, victim) = self.evictable.pop_first()?;
+        let entry = self
+            .entries
+            .remove(&victim)
+            .expect("evictable encoder entry is resident");
+        debug_assert_eq!(entry.ref_cnt, 0);
+        self.stats.evictions += 1;
+        Some(entry.product)
+    }
+
     /// Insert a freshly-computed encoder product, evicting the LRU unreferenced
     /// entry if at budget. Returns any freed product.
     /// `budget` bounds the *evictable* working set, not the live set. The

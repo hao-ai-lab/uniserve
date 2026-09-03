@@ -11,7 +11,7 @@ pub mod metrics;
 pub use error::{Error, Result};
 pub use in_process::EngineClient;
 pub use media::MediaSubmission;
-pub use uniserve_engine::MediaEventRx;
+pub use uniserve_engine::EventRx;
 pub use uniserve_engine::StreamCancelCause;
 
 impl EngineClient {

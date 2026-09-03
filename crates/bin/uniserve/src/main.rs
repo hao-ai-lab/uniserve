@@ -15,6 +15,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const TOKIO_WORKER_THREADS_ENV: &str = "TOKIO_WORKER_THREADS";
 const DEFAULT_MAX_TOKIO_WORKER_THREADS: usize = 32;
+const TOKIO_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
 
 /// Cap the default number of Tokio worker threads if the user did not
 /// explicitly set `TOKIO_WORKER_THREADS` to avoid spawning too many threads on
@@ -83,6 +84,9 @@ fn main() -> Result<()> {
 
     let mut runtime = tokio::runtime::Builder::new_multi_thread();
     runtime.enable_all();
+    // Chat-template rendering runs on Tokio's blocking pool. Complex model
+    // templates require more than the platform's small pthread default.
+    runtime.thread_stack_size(TOKIO_THREAD_STACK_BYTES);
     if let Some(worker_threads) = tokio_worker_threads() {
         runtime.worker_threads(worker_threads);
     }

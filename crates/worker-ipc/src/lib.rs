@@ -1,7 +1,7 @@
 //! Versioned scheduler-to-worker IPC and FlatBuffers transport types.
 //!
-//! A [`NewRequest`] carries static request state once, [`Batch`] carries planned
-//! operations, and [`CompletionReport`] returns resolved outputs. [`WorkerInfo`]
+//! A [`NewRequest`] carries static request state once, [`Run`] carries planned
+//! operations, and [`RunResult`] returns resolved outputs. [`WorkerInfo`]
 //! is the post-load handshake. Runtime identity is numeric and stable across
 //! serialization: request epoch, operation id, point index, and generation.
 
@@ -11,8 +11,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use uniserve_core::{
-    BlockId, GenerationLimits, ImageParams, KvCacheDtype, KvCacheGroup, ModelDtype, RankInfo,
-    RequestId, SamplingParams,
+    BlockId, ImageParams, KvCacheDtype, KvCacheGroup, RankInfo, RequestId, SamplingParams,
 };
 pub use uniserve_core::{OpId, WorkerForwardStats};
 
@@ -62,7 +61,6 @@ macro_rules! ensure_valid {
 
 pub mod codec;
 pub mod iceoryx;
-mod resources;
 #[allow(warnings)]
 pub mod schema {
     include!(concat!(env!("OUT_DIR"), "/flatbuffers/mod.rs"));
@@ -74,7 +72,6 @@ pub use iceoryx::{
     WakeEvents, WakeSender, header_for_request, header_for_response, is_supported_ipc_version,
     service_name,
 };
-pub use resources::{ResourceClass, ResourcePressure};
 
 mod info;
 mod operation;

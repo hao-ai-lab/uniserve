@@ -12,7 +12,7 @@ from torch import nn
 from ..foundation.errors import unsupported_setup
 from ..loader import LoadConfig, LoadRequest, WeightSet, get_model_loader
 from ..loader.source import read_model_config, resolve_model_root
-from ..models.minimax_h3 import MiniMaxH3Model
+from ..models.minimax_h3 import MiniMaxH3Runner
 from ..models.minimax_h3.precision import H3LinearPrecisionPolicy
 from ..models.runtime import ExecutionModel, WorkerDeployment
 from ..nn.mesh import DeviceMesh, TensorParallel
@@ -65,7 +65,7 @@ def load_worker_model(
     entry = resolve_catalog_entry(tuple(str(value) for value in config.get("architectures") or ()))
     _require_supported_scope(entry, request.scope)
 
-    if entry.model_class is MiniMaxH3Model:
+    if entry.model_class is MiniMaxH3Runner:
         return _load_h3_worker_model(
             request,
             entry,
@@ -165,7 +165,7 @@ def _load_h3_worker_model(
         precision_policy.text_encoder,
         precision_policy.video_vae,
     )
-    model = MiniMaxH3Model.from_pretrained(
+    model = MiniMaxH3Runner.from_pretrained(
         request.model_path,
         mesh,
         max_state_slots=max_state_slots,
@@ -175,7 +175,7 @@ def _load_h3_worker_model(
         revision=request.load.revision,
         precision_policy=precision_policy,
     )
-    state_slots = int(model.states.slot_count)
+    state_slots = int(model.dedicated_state_geometry.slot_count)
     max_operations = min(state_slots, int(request.max_batch_operations))
     deployment = replace(
         _deployment(request),

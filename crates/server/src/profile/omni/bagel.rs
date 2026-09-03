@@ -1,14 +1,15 @@
 use serde::{Deserialize, Serialize};
 use uniserve_core::{
     FeedbackNextToken, FeedbackSource, GenOnlyStartPolicyDescriptor, GeneratedImageFeedbackRecipe,
-    GenerationConstraint, GenerationPolicyDescriptor, ImageIngestRecipe, ImageIngestStep,
-    ImageKvEffect, Modality, TriggerPolicyDescriptor,
+    GenerationConstraint, GenerationFeatures, GenerationLimits, GenerationPolicyDescriptor,
+    ImageIngestRecipe, ImageIngestStep, ImageKvEffect, Modality, ModelDtype,
+    TriggerPolicyDescriptor,
 };
 
 use super::resolution::{ResolutionBucket, ResolutionName, ResolutionPolicy};
 use super::{
-    GenerationControls, ImageGenerationDefaults, OutputFilterPolicy, encode, required_token,
-    required_token_id, stride_resize_tokens,
+    GenerationControls, ImageGenerationDefaults, OutputFilterPolicy, encode, model_dtype_bytes,
+    required_token, required_token_id, stride_resize_tokens,
 };
 use crate::profile::assets;
 use crate::profile::tokenizer::HuggingFaceTokenizer;
@@ -28,6 +29,27 @@ pub struct BagelProfile {
 
 impl BagelProfile {
     pub const ID: &'static str = "bagel";
+    pub const LATENT_DOWNSAMPLE: u32 = 16;
+    pub const ENCODER_CACHE_ENTRIES: usize = 256;
+
+    pub fn runtime_limits(model_dtype: ModelDtype) -> GenerationLimits {
+        let dtype_bytes = model_dtype_bytes(model_dtype);
+        GenerationLimits {
+            features: GenerationFeatures::UNDERSTANDING
+                | GenerationFeatures::VISION_ENCODE
+                | GenerationFeatures::LATENT_ENCODE
+                | GenerationFeatures::IMAGE_GENERATION,
+            max_latent_units: 1_024,
+            latent_downsample: Self::LATENT_DOWNSAMPLE,
+            max_vae_grid_tokens: 1_026,
+            max_vit_grid_tokens: 4_902,
+            max_latent_feature_bytes: 1_026 * 16 * 2 * 2 * dtype_bytes,
+            max_vision_feature_bytes: 4_902 * 3_584 * dtype_bytes,
+            commit_marker_tokens: 2,
+            max_cfg_branches: 3,
+            encoder_cache_entries: Self::ENCODER_CACHE_ENTRIES as u32,
+        }
+    }
 
     pub fn resolve(tokenizer: &HuggingFaceTokenizer) -> assets::Result<Self> {
         let (start_of_image, start_of_image_text) =

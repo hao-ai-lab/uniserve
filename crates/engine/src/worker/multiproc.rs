@@ -4,10 +4,13 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::TcpListener;
 use std::time::{Duration, Instant};
 
-use crate::executor::{ControlAck, ControlOp, Executor, WorkerExecError, WorkerLossError};
+use crate::executor::{
+    Batch, BatchResult, Executor, ExecutorInfo, ExecutorSubmitError, LogicalResultTracker,
+    PhysicalExecutor, PhysicalSubmitError, PoolId, WorkerExecError, WorkerLossError, lower_batch,
+};
 use anyhow::Context;
 use uniserve_core::{CommandWaker, RequestId};
-use uniserve_worker_ipc::{Batch, CompletionReport, ModelOutput, SamplingOwnership, WorkerInfo};
+use uniserve_worker_ipc::{ModelOutput, Run as PhysicalRun, RunResult, WorkerInfo};
 
 use crate::worker::WorkerProcessArgs;
 
@@ -18,7 +21,9 @@ use crate::worker::WorkerProcessArgs;
 const NEXT_RESULT_DEADLINE: Duration = Duration::from_secs(300);
 
 impl WorkerProcessArgs {
-    fn launch(&self) -> anyhow::Result<Vec<Box<dyn Executor>>> {
+    fn launch(
+        &self,
+    ) -> anyhow::Result<(Vec<Box<dyn PhysicalExecutor>>, Vec<CommandWaker>, Vec<i32>)> {
         let tp_init_method = if self.world_size > 1 {
             Some(allocate_tp_init_method()?)
         } else {
@@ -35,50 +40,76 @@ impl WorkerProcessArgs {
                 tp_init_method.as_deref(),
             )?);
         }
-        let mut workers: Vec<Box<dyn Executor>> = Vec::with_capacity(self.world_size);
+        let mut workers: Vec<Box<dyn PhysicalExecutor>> = Vec::with_capacity(self.world_size);
+        let mut wakers = Vec::with_capacity(self.world_size);
+        let mut progress_fds = Vec::with_capacity(self.world_size);
         for mut worker in launched {
             worker.finish_startup()?;
+            wakers.push(worker.command_waker());
+            progress_fds.push(worker.progress_fd());
             workers.push(Box::new(worker));
         }
-        Ok(workers)
+        Ok((workers, wakers, progress_fds))
     }
 }
 
 /// W worker processes, one iceoryx2 request-response service each.
 pub struct MultiprocExecutor {
-    workers: Vec<Box<dyn Executor>>,
-    buffers: Vec<VecDeque<CompletionReport>>,
+    workers: Vec<Box<dyn PhysicalExecutor>>,
+    buffers: Vec<VecDeque<RunResult>>,
     info: WorkerInfo,
+    executor_info: ExecutorInfo,
     depth: usize,
     inflight: usize,
-    next_call_id: u64,
-    pending_batches: BTreeMap<u64, Batch>,
-    pending_partitions: BTreeMap<u64, BTreeSet<u32>>,
+    command_wakers: Vec<CommandWaker>,
+    progress_fds: Vec<i32>,
+    last_progress: Instant,
+    pending_batches: BTreeMap<u64, PhysicalRun>,
+    pending_operations: BTreeMap<u64, BTreeSet<OperationIdentity>>,
     rank_errors: Vec<BTreeMap<u64, WorkerExecError>>,
-    rank_returned_partitions: Vec<BTreeMap<u64, BTreeSet<u32>>>,
+    rank_returned_operations: Vec<BTreeMap<u64, BTreeSet<OperationIdentity>>>,
     rank_successes: Vec<BTreeSet<u64>>,
     process_args: Option<WorkerProcessArgs>,
-    known_sessions: BTreeSet<RequestId>,
-    dirty_sessions: BTreeSet<RequestId>,
+    known_requests: BTreeSet<RequestId>,
+    dirty_requests: BTreeSet<RequestId>,
+    next_collective_seq: u64,
+    logical_results: LogicalResultTracker,
+    command_wake_pending: bool,
+}
+
+type OperationIdentity = (u64, u64, u64, u64);
+
+fn operation_identity(
+    request: uniserve_worker_ipc::RequestKey,
+    op: uniserve_worker_ipc::OpId,
+) -> OperationIdentity {
+    (
+        request.authority_id,
+        request.request_id.0,
+        request.epoch,
+        op.0,
+    )
 }
 
 impl MultiprocExecutor {
-    pub fn new(workers: Vec<Box<dyn Executor>>) -> anyhow::Result<Self> {
-        Self::from_workers(workers, None)
+    pub fn new(workers: Vec<Box<dyn PhysicalExecutor>>) -> anyhow::Result<Self> {
+        Self::from_workers(workers, Vec::new(), Vec::new(), None)
     }
 
     fn from_workers(
-        workers: Vec<Box<dyn Executor>>,
+        workers: Vec<Box<dyn PhysicalExecutor>>,
+        command_wakers: Vec<CommandWaker>,
+        progress_fds: Vec<i32>,
         process_args: Option<WorkerProcessArgs>,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(!workers.is_empty(), "need >= 1 worker");
         let n = workers.len();
         let tp_size = u32::try_from(n).context("TP world size exceeds the IPC representation")?;
-        let info = workers[0].info().clone();
+        let info = workers[0].physical_info().single_pool().clone();
         let mut canonical = info.clone();
         canonical.rank.tp_rank = 0;
         for (rank, worker) in workers.iter().enumerate() {
-            let rank_info = worker.info();
+            let rank_info = worker.physical_info().single_pool();
             rank_info
                 .validate()
                 .with_context(|| format!("TP rank {rank} reported invalid worker info"))?;
@@ -88,12 +119,6 @@ impl MultiprocExecutor {
                 rank_info.rank.tp_rank,
                 rank_info.rank.tp_size,
             );
-            anyhow::ensure!(
-                worker.pipeline_depth() == rank_info.pipeline_depth.max(1) as usize,
-                "TP rank {rank} executor depth {} disagrees with worker depth {}",
-                worker.pipeline_depth(),
-                rank_info.pipeline_depth.max(1),
-            );
             let mut normalized = rank_info.clone();
             normalized.rank.tp_rank = 0;
             anyhow::ensure!(
@@ -101,68 +126,80 @@ impl MultiprocExecutor {
                 "TP rank {rank} worker info disagree with rank 0"
             );
         }
-        let depth = info.pipeline_depth.max(1) as usize;
+        let depth = info.queue_depth.max(1) as usize;
         let buffers = (0..n).map(|_| VecDeque::new()).collect();
         Ok(Self {
             workers,
             buffers,
+            executor_info: ExecutorInfo::single(PoolId("local".to_owned()), info.clone()),
             info,
             depth,
             inflight: 0,
-            next_call_id: 1,
+            command_wakers,
+            progress_fds,
+            last_progress: Instant::now(),
             pending_batches: BTreeMap::new(),
-            pending_partitions: BTreeMap::new(),
+            pending_operations: BTreeMap::new(),
             rank_errors: (0..n).map(|_| BTreeMap::new()).collect(),
-            rank_returned_partitions: (0..n).map(|_| BTreeMap::new()).collect(),
+            rank_returned_operations: (0..n).map(|_| BTreeMap::new()).collect(),
             rank_successes: (0..n).map(|_| BTreeSet::new()).collect(),
             process_args,
-            known_sessions: BTreeSet::new(),
-            dirty_sessions: BTreeSet::new(),
+            known_requests: BTreeSet::new(),
+            dirty_requests: BTreeSet::new(),
+            next_collective_seq: 1,
+            logical_results: LogicalResultTracker::default(),
+            command_wake_pending: false,
         })
     }
 
     pub fn spawn(args: WorkerProcessArgs) -> anyhow::Result<Self> {
         anyhow::ensure!(args.world_size > 0, "worker world size must be positive");
-        let workers = args.launch()?;
-        Self::from_workers(workers, Some(args))
+        let (workers, wakers, progress_fds) = args.launch()?;
+        Self::from_workers(workers, wakers, progress_fds, Some(args))
     }
 
     fn pump_once(&mut self) -> anyhow::Result<()> {
         for rank in 0..self.workers.len() {
             loop {
-                match self.workers[rank].poll() {
+                match self.workers[rank].poll_run(Duration::ZERO) {
                     Ok(Some(result)) => {
-                        let step_id = result.step_id;
+                        let run_id = result.run_id;
                         let expected = self
                             .pending_batches
-                            .get(&step_id)
+                            .get(&run_id)
                             .ok_or_else(|| {
-                                anyhow::anyhow!("rank {rank} returned unknown step {step_id}")
+                                anyhow::anyhow!("rank {rank} returned unknown step {run_id}")
                             })?
-                            .partitions
+                            .operations
                             .iter()
-                            .map(|partition| partition.partition_id)
+                            .map(|operation| {
+                                operation_identity(operation.request_key, operation.op_id)
+                            })
                             .collect::<BTreeSet<_>>();
-                        let returned = self.rank_returned_partitions[rank]
-                            .entry(step_id)
+                        let returned = self.rank_returned_operations[rank]
+                            .entry(run_id)
                             .or_default();
-                        for partition_id in report_partition_ids(&result) {
+                        for identity in report_operation_ids(&result) {
                             anyhow::ensure!(
-                                returned.insert(partition_id),
-                                "rank {rank} returned partition {partition_id} more than once for step {step_id}"
+                                returned.insert(identity),
+                                "rank {rank} returned an operation more than once for step {run_id}"
                             );
                         }
                         anyhow::ensure!(
                             returned.is_subset(&expected),
-                            "rank {rank} returned an unplanned partition for step {step_id}"
+                            "rank {rank} returned an unplanned lane for step {run_id}"
                         );
                         if *returned == expected {
-                            self.rank_successes[rank].insert(step_id);
+                            self.rank_successes[rank].insert(run_id);
                         }
                         self.buffers[rank].push_back(result);
                     }
                     Ok(None) => break,
                     Err(error) => self.record_rank_error(rank, &error)?,
+                }
+                if self.workers[rank].take_command_wake() {
+                    self.command_wake_pending = true;
+                    break;
                 }
             }
         }
@@ -173,17 +210,17 @@ impl MultiprocExecutor {
         let execution = error
             .downcast_ref::<WorkerExecError>()
             .ok_or_else(|| anyhow::anyhow!("rank {rank} failed: {error:#}"))?;
-        let step_id = execution.step_id.ok_or_else(|| {
+        let run_id = execution.run_id.ok_or_else(|| {
             anyhow::anyhow!("rank {rank} returned an execution error without a step identity")
         })?;
         anyhow::ensure!(
-            self.pending_batches.contains_key(&step_id),
-            "rank {rank} returned an execution error for unknown step {step_id}"
+            self.pending_batches.contains_key(&run_id),
+            "rank {rank} returned an execution error for unknown step {run_id}"
         );
-        if let Some(existing) = self.rank_errors[rank].insert(step_id, execution.clone()) {
+        if let Some(existing) = self.rank_errors[rank].insert(run_id, execution.clone()) {
             anyhow::ensure!(
                 existing == *execution,
-                "rank {rank} returned conflicting errors for step {step_id}"
+                "rank {rank} returned conflicting errors for step {run_id}"
             );
         }
         Ok(())
@@ -195,16 +232,17 @@ impl MultiprocExecutor {
         })?;
         tracing::warn!(error = %cause, "worker process lost; replacing its complete rank group");
         for worker in &mut self.workers {
-            worker.shutdown();
+            let _ = worker.close_physical();
         }
 
-        let workers = args.launch().context("spawning replacement worker ranks")?;
-        self.install_replacement(workers, &args)?;
+        let (workers, wakers, progress_fds) =
+            args.launch().context("spawning replacement worker ranks")?;
+        self.install_replacement(workers, wakers, progress_fds, &args)?;
         self.process_args = Some(args);
-        self.discard_sessions_after_loss();
+        self.discard_requests_after_loss();
         Err(WorkerLossError {
             message: format!(
-                "worker process was replaced and affected sessions were terminated: {cause:#}"
+                "worker process was replaced and affected requests were terminated: {cause:#}"
             ),
         }
         .into())
@@ -212,7 +250,9 @@ impl MultiprocExecutor {
 
     fn install_replacement(
         &mut self,
-        workers: Vec<Box<dyn Executor>>,
+        workers: Vec<Box<dyn PhysicalExecutor>>,
+        command_wakers: Vec<CommandWaker>,
+        progress_fds: Vec<i32>,
         args: &WorkerProcessArgs,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
@@ -220,56 +260,43 @@ impl MultiprocExecutor {
             "replacement worker rank count changed"
         );
         for (rank, worker) in workers.iter().enumerate() {
-            validate_replacement_info(&self.info, &worker.info(), rank)?;
+            validate_replacement_info(&self.info, worker.physical_info().single_pool(), rank)?;
         }
         self.workers = workers;
+        self.command_wakers = command_wakers;
+        self.progress_fds = progress_fds;
+        self.last_progress = Instant::now();
         self.buffers = (0..args.world_size).map(|_| VecDeque::new()).collect();
         self.rank_errors = (0..args.world_size).map(|_| BTreeMap::new()).collect();
-        self.rank_returned_partitions = (0..args.world_size).map(|_| BTreeMap::new()).collect();
+        self.rank_returned_operations = (0..args.world_size).map(|_| BTreeMap::new()).collect();
         self.rank_successes = (0..args.world_size).map(|_| BTreeSet::new()).collect();
         Ok(())
     }
 
-    fn discard_sessions_after_loss(&mut self) {
+    fn discard_requests_after_loss(&mut self) {
         self.pending_batches.clear();
-        self.pending_partitions.clear();
+        self.pending_operations.clear();
         self.buffers.iter_mut().for_each(VecDeque::clear);
         self.rank_errors.iter_mut().for_each(BTreeMap::clear);
-        self.rank_returned_partitions
+        self.rank_returned_operations
             .iter_mut()
             .for_each(BTreeMap::clear);
         self.rank_successes.iter_mut().for_each(BTreeSet::clear);
         self.inflight = 0;
-        self.known_sessions.clear();
-        self.dirty_sessions.clear();
+        self.known_requests.clear();
+        self.dirty_requests.clear();
     }
 
     fn discard_inflight(&mut self) {
         self.pending_batches.clear();
-        self.pending_partitions.clear();
+        self.pending_operations.clear();
         self.buffers.iter_mut().for_each(VecDeque::clear);
         self.rank_errors.iter_mut().for_each(BTreeMap::clear);
-        self.rank_returned_partitions
+        self.rank_returned_operations
             .iter_mut()
             .for_each(BTreeMap::clear);
         self.rank_successes.iter_mut().for_each(BTreeSet::clear);
         self.inflight = 0;
-    }
-
-    fn apply_control_session_effect(&mut self, operation: &ControlOp, succeeded: bool) {
-        if !succeeded {
-            return;
-        }
-        match operation {
-            ControlOp::DropSession(session_id) => {
-                self.known_sessions.remove(session_id);
-                self.dirty_sessions.remove(session_id);
-            }
-            ControlOp::ReleaseProducts(_) => {
-                self.dirty_sessions
-                    .extend(self.known_sessions.iter().copied());
-            }
-        }
     }
 
     fn pump(&mut self) -> anyhow::Result<()> {
@@ -287,12 +314,12 @@ impl MultiprocExecutor {
         }
     }
 
-    fn try_join(&mut self) -> anyhow::Result<Option<CompletionReport>> {
+    fn try_join(&mut self) -> anyhow::Result<Option<RunResult>> {
         self.join_rank_errors()?;
         if self.buffers.iter().any(|buffer| buffer.is_empty()) {
             return Ok(None);
         }
-        let Some((step_id, partition_ids)) = self.joinable_report_key() else {
+        let Some((run_id, operation_ids)) = self.joinable_report_key() else {
             return Ok(None);
         };
 
@@ -301,41 +328,55 @@ impl MultiprocExecutor {
             let pos = buffer
                 .iter()
                 .position(|report| {
-                    report.step_id == step_id && report_partition_ids(report) == partition_ids
+                    report.run_id == run_id && report_operation_ids(report) == operation_ids
                 })
                 .ok_or_else(|| {
-                    anyhow::anyhow!("joinable step {step_id} disappeared from rank buffer")
+                    anyhow::anyhow!("joinable step {run_id} disappeared from rank buffer")
                 })?;
             per_rank.push(buffer.remove(pos).ok_or_else(|| {
-                anyhow::anyhow!("joinable step {step_id} index disappeared from rank buffer")
+                anyhow::anyhow!("joinable step {run_id} index disappeared from rank buffer")
             })?);
         }
 
         let batch = self
             .pending_batches
-            .get(&step_id)
-            .ok_or_else(|| anyhow::anyhow!("joined step {step_id} has no pending batch"))?;
+            .get(&run_id)
+            .ok_or_else(|| anyhow::anyhow!("joined step {run_id} has no pending batch"))?;
         for (rank, report) in per_rank.iter_mut().enumerate() {
             validate_and_order_rank_report(batch, report, rank)?;
         }
         let mut out = per_rank.remove(0);
         for (rank, report) in per_rank.iter().enumerate() {
-            merge_rank_report(&self.info, batch, &mut out, report, rank + 1)?;
+            merge_rank_report(batch, &mut out, report, rank + 1)?;
         }
         let remaining = self
-            .pending_partitions
-            .get_mut(&step_id)
-            .ok_or_else(|| anyhow::anyhow!("joined step {step_id} has no partition ledger"))?;
-        for partition_id in partition_ids {
+            .pending_operations
+            .get_mut(&run_id)
+            .ok_or_else(|| anyhow::anyhow!("joined step {run_id} has no operation ledger"))?;
+        for identity in operation_ids {
             anyhow::ensure!(
-                remaining.remove(&partition_id),
-                "joined step {step_id} repeated partition {partition_id}"
+                remaining.remove(&identity),
+                "joined step {run_id} repeated an operation"
             );
         }
-        if remaining.is_empty() {
-            self.finish_step(step_id);
+        out.done = remaining.is_empty();
+        if out.done {
+            self.finish_step(run_id);
         }
         Ok(Some(out))
+    }
+
+    pub(crate) fn command_waker(&self) -> CommandWaker {
+        let wakes = self.command_wakers.clone();
+        CommandWaker::new(move || {
+            for wake in &wakes {
+                wake.wake();
+            }
+        })
+    }
+
+    pub(crate) fn progress_fds(&self) -> &[i32] {
+        &self.progress_fds
     }
 
     fn join_rank_errors(&mut self) -> anyhow::Result<()> {
@@ -344,11 +385,11 @@ impl MultiprocExecutor {
             .iter()
             .flat_map(|errors| errors.keys().copied())
             .collect::<BTreeSet<_>>();
-        for step_id in steps {
+        for run_id in steps {
             let terminal = (0..self.workers.len())
                 .map(|rank| {
-                    self.rank_errors[rank].contains_key(&step_id)
-                        || self.rank_successes[rank].contains(&step_id)
+                    self.rank_errors[rank].contains_key(&run_id)
+                        || self.rank_successes[rank].contains(&run_id)
                 })
                 .collect::<Vec<_>>();
             if terminal.iter().any(|value| !value) {
@@ -358,69 +399,69 @@ impl MultiprocExecutor {
                 .rank_errors
                 .iter()
                 .enumerate()
-                .filter_map(|(rank, entries)| entries.get(&step_id).map(|error| (rank, error)))
+                .filter_map(|(rank, entries)| entries.get(&run_id).map(|error| (rank, error)))
                 .collect::<Vec<_>>();
             if errors.len() != self.workers.len() {
-                self.finish_step(step_id);
+                self.finish_step(run_id);
                 anyhow::bail!(
-                    "tensor-parallel ranks disagreed between success and failure for step {step_id}"
+                    "tensor-parallel ranks disagreed between success and failure for step {run_id}"
                 );
             }
             let canonical = errors[0].1.clone();
             for (rank, error) in errors.iter().copied().skip(1) {
                 anyhow::ensure!(
                     *error == canonical,
-                    "rank {rank} returned a different execution error for step {step_id}"
+                    "rank {rank} returned a different execution error for step {run_id}"
                 );
             }
-            self.finish_step(step_id);
+            self.finish_step(run_id);
             return Err(canonical.into());
         }
         Ok(())
     }
 
-    fn finish_step(&mut self, step_id: u64) {
-        self.pending_batches.remove(&step_id);
-        self.pending_partitions.remove(&step_id);
+    fn finish_step(&mut self, run_id: u64) {
+        self.pending_batches.remove(&run_id);
+        self.pending_operations.remove(&run_id);
         for buffer in &mut self.buffers {
-            buffer.retain(|report| report.step_id != step_id);
+            buffer.retain(|report| report.run_id != run_id);
         }
         for errors in &mut self.rank_errors {
-            errors.remove(&step_id);
+            errors.remove(&run_id);
         }
-        for returned in &mut self.rank_returned_partitions {
-            returned.remove(&step_id);
+        for returned in &mut self.rank_returned_operations {
+            returned.remove(&run_id);
         }
         for successes in &mut self.rank_successes {
-            successes.remove(&step_id);
+            successes.remove(&run_id);
         }
         self.inflight = self.inflight.saturating_sub(1);
     }
 
-    fn joinable_report_key(&self) -> Option<(u64, Vec<u32>)> {
+    fn joinable_report_key(&self) -> Option<(u64, Vec<OperationIdentity>)> {
         self.buffers[0]
             .iter()
             .filter_map(|report| {
-                let step_id = report.step_id;
-                let partition_ids = report_partition_ids(report);
+                let run_id = report.run_id;
+                let operation_ids = report_operation_ids(report);
                 self.buffers
                     .iter()
                     .all(|buffer| {
                         buffer.iter().any(|item| {
-                            item.step_id == step_id && report_partition_ids(item) == partition_ids
+                            item.run_id == run_id && report_operation_ids(item) == operation_ids
                         })
                     })
-                    .then_some((step_id, partition_ids))
+                    .then_some((run_id, operation_ids))
             })
             .min()
     }
 }
 
-fn report_partition_ids(report: &CompletionReport) -> Vec<u32> {
+fn report_operation_ids(report: &RunResult) -> Vec<OperationIdentity> {
     let mut ids = report
-        .partitions
+        .completions
         .iter()
-        .map(|partition| partition.partition_id)
+        .map(|output| operation_identity(output.request_key, output.op_id))
         .collect::<Vec<_>>();
     ids.sort_unstable();
     ids
@@ -431,147 +472,109 @@ fn report_partition_ids(report: &CompletionReport) -> Vec<u32> {
 /// semantic completion for each operation; only the per-rank product shards
 /// differ and are concatenated in rank order.
 fn merge_rank_report(
-    info: &WorkerInfo,
-    batch: &Batch,
-    rank0: &mut CompletionReport,
-    rankn: &CompletionReport,
+    batch: &PhysicalRun,
+    rank0: &mut RunResult,
+    rankn: &RunResult,
     rank: usize,
 ) -> anyhow::Result<()> {
-    let step_id = batch.step_id;
-    if rankn.step_id != step_id {
+    let run_id = batch.run_id;
+    if rankn.run_id != run_id {
         anyhow::bail!(
-            "rank {rank} completion report step_id mismatch while joining step {step_id}: got {}",
-            rankn.step_id
+            "rank {rank} completion report run_id mismatch while joining step {run_id}: got {}",
+            rankn.run_id
         );
     }
-    if rankn.partitions.len() != rank0.partitions.len() {
+    anyhow::ensure!(
+        rankn.done == rank0.done,
+        "rank {rank} completion flag differs from rank 0 for step {run_id}"
+    );
+    if rankn.completions.len() != rank0.completions.len() {
         anyhow::bail!(
-            "rank {rank} report for step {step_id} has {} partitions, expected {}",
-            rankn.partitions.len(),
-            rank0.partitions.len()
+            "rank {rank} report for step {run_id} has {} completions, expected {}",
+            rankn.completions.len(),
+            rank0.completions.len()
         );
     }
-    for (partition_index, (canonical_partition, actual_partition)) in rank0
-        .partitions
+    for (completion_index, (canonical, actual)) in rank0
+        .completions
         .iter_mut()
-        .zip(&rankn.partitions)
+        .zip(&rankn.completions)
         .enumerate()
     {
         anyhow::ensure!(
             batch
-                .partitions
+                .operations
                 .iter()
-                .any(|partition| partition.partition_id == canonical_partition.partition_id),
-            "rank join received unplanned partition {} for step {step_id}",
-            canonical_partition.partition_id
+                .any(|operation| operation.request_key == canonical.request_key
+                    && operation.op_id == canonical.op_id),
+            "rank join received an unplanned operation for step {run_id}"
         );
-        let ownership = info.sampling_ownership;
-        anyhow::ensure!(
-            canonical_partition.partition_id == actual_partition.partition_id,
-            "rank {rank} report for step {step_id} partition {partition_index} identity differs from rank 0"
-        );
-        anyhow::ensure!(
-            canonical_partition.completions.len() == actual_partition.completions.len(),
-            "rank {rank} report for step {step_id} partition {} has {} completions, expected {}",
-            canonical_partition.partition_id,
-            actual_partition.completions.len(),
-            canonical_partition.completions.len()
-        );
-        for (completion_index, (canonical, actual)) in canonical_partition
-            .completions
-            .iter_mut()
-            .zip(&actual_partition.completions)
-            .enumerate()
-        {
-            if let Err(error) = merge_completion_record(canonical, actual, ownership) {
-                anyhow::bail!(
-                    "rank {rank} report for step {step_id} partition {} completion {completion_index} differs from rank 0: {error:#}",
-                    canonical_partition.partition_id
-                );
-            }
+        if let Err(error) = merge_completion_record(canonical, actual) {
+            anyhow::bail!(
+                "rank {rank} report for step {run_id} completion {completion_index} differs from rank 0: {error:#}"
+            );
         }
-        match ownership {
-            SamplingOwnership::DesignatedRank => anyhow::ensure!(
-                actual_partition.products.is_empty(),
-                "rank {rank} published host products for designated-rank partition {}",
-                canonical_partition.partition_id
-            ),
-            SamplingOwnership::DeterministicSharded => canonical_partition
-                .products
-                .extend(actual_partition.products.iter().cloned()),
-        }
-        canonical_partition.worker_exec_us = canonical_partition
-            .worker_exec_us
-            .into_iter()
-            .chain(actual_partition.worker_exec_us)
-            .max();
     }
+    anyhow::ensure!(
+        rankn.products.is_empty(),
+        "rank {rank} published host products despite designated-rank ownership"
+    );
+    rank0.worker_exec_us = rank0
+        .worker_exec_us
+        .into_iter()
+        .chain(rankn.worker_exec_us)
+        .max();
     Ok(())
 }
 
 fn validate_and_order_rank_report(
-    batch: &Batch,
-    report: &mut CompletionReport,
+    batch: &PhysicalRun,
+    report: &mut RunResult,
     rank: usize,
 ) -> anyhow::Result<()> {
     report.validate()?;
     anyhow::ensure!(
-        report.step_id == batch.step_id,
+        report.run_id == batch.run_id,
         "rank {rank} returned step {} for pending step {}",
-        report.step_id,
-        batch.step_id
+        report.run_id,
+        batch.run_id
     );
-    let report_count = report.partitions.len();
-    let returned = report_partition_ids(report)
+    let report_count = report.completions.len();
+    let returned = report_operation_ids(report)
         .into_iter()
         .collect::<BTreeSet<_>>();
     anyhow::ensure!(
-        report_count > 0 || batch.partitions.is_empty(),
+        report_count > 0 || batch.operations.is_empty(),
         "rank {rank} returned an empty partial report for step {}",
-        batch.step_id
+        batch.run_id
     );
     let mut ordered = Vec::with_capacity(report_count);
-    for planned in &batch.partitions {
-        if !returned.contains(&planned.partition_id) {
+    for planned in &batch.operations {
+        let identity = operation_identity(planned.request_key, planned.op_id);
+        if !returned.contains(&identity) {
             continue;
         }
         let index = report
-            .partitions
+            .completions
             .iter()
-            .position(|partition| partition.partition_id == planned.partition_id)
+            .position(|completion| {
+                completion.request_key == planned.request_key && completion.op_id == planned.op_id
+            })
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "rank {rank} omitted partition {} for step {} collective {}",
-                    planned.partition_id,
-                    batch.step_id,
-                    planned.collective_seq
+                    "rank {rank} omitted an operation for step {} collective {}",
+                    batch.run_id,
+                    batch.collective_seq
                 )
             })?;
-        let actual = report.partitions.swap_remove(index);
-        anyhow::ensure!(
-            actual.completions.len() == planned.operations.len(),
-            "rank {rank} partition {} returned {} completions for {} operations",
-            planned.partition_id,
-            actual.completions.len(),
-            planned.operations.len()
-        );
-        for (operation, completion) in planned.operations.iter().zip(&actual.completions) {
-            anyhow::ensure!(
-                operation.request_key == completion.request_key
-                    && operation.op_id == completion.op_id,
-                "rank {rank} partition {} completion order disagrees with collective {}",
-                planned.partition_id,
-                planned.collective_seq
-            );
-        }
-        ordered.push(actual);
+        ordered.push(report.completions.swap_remove(index));
     }
     anyhow::ensure!(
         ordered.len() == report_count,
-        "rank {rank} returned an unplanned partition for step {}",
-        batch.step_id
+        "rank {rank} returned an unplanned operation for step {}",
+        batch.run_id
     );
-    report.partitions = ordered;
+    report.completions = ordered;
     Ok(())
 }
 
@@ -581,7 +584,6 @@ fn validate_and_order_rank_report(
 fn merge_completion_record(
     canonical: &mut ModelOutput,
     rank_completion: &ModelOutput,
-    ownership: SamplingOwnership,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         canonical.request_key == rank_completion.request_key
@@ -590,26 +592,21 @@ fn merge_completion_record(
         "completion identity or selected point diverged"
     );
     anyhow::ensure!(
-        canonical.committed_tokens == rank_completion.committed_tokens
+        canonical.committed_tokens() == rank_completion.committed_tokens()
             && canonical.status == rank_completion.status
-            && canonical.logical_lengths == rank_completion.logical_lengths
-            && canonical.token_span == rank_completion.token_span
-            && canonical.finish_flags == rank_completion.finish_flags,
+            && canonical.logical_lengths() == rank_completion.logical_lengths()
+            && canonical.token_span() == rank_completion.token_span()
+            && canonical.finish_flags() == rank_completion.finish_flags(),
         "completion result fields diverged"
     );
     anyhow::ensure!(
-        rank_completion.media_output.is_none(),
+        rank_completion.media_output().is_none(),
         "non-designated rank returned a media artifact"
     );
-    match ownership {
-        SamplingOwnership::DesignatedRank => anyhow::ensure!(
-            canonical.product_generations == rank_completion.product_generations,
-            "designated-rank product generations diverged"
-        ),
-        SamplingOwnership::DeterministicSharded => canonical
-            .product_generations
-            .extend(rank_completion.product_generations.iter().copied()),
-    }
+    anyhow::ensure!(
+        canonical.product_generations == rank_completion.product_generations,
+        "designated-rank product generations diverged"
+    );
     Ok(())
 }
 
@@ -645,276 +642,211 @@ fn device_for_rank(device: &str, rank: usize, world_size: usize) -> String {
     }
 }
 
-impl Executor for MultiprocExecutor {
-    fn info(&self) -> &WorkerInfo {
-        &self.info
+impl PhysicalExecutor for MultiprocExecutor {
+    fn physical_info(&self) -> &ExecutorInfo {
+        &self.executor_info
     }
 
-    fn pipeline_depth(&self) -> usize {
-        self.depth
-    }
-
-    fn in_flight(&self) -> usize {
-        self.inflight
-    }
-
-    fn resets_all_state_after_worker_loss(&self) -> bool {
-        true
-    }
-
-    fn submit(&mut self, batch: Batch) -> anyhow::Result<()> {
-        batch.validate()?;
-        anyhow::ensure!(
-            !self.pending_batches.contains_key(&batch.step_id),
-            "step {} is already in flight",
-            batch.step_id
-        );
-        let step_id = batch.step_id;
-        let sessions = batch
+    fn submit_run(&mut self, batch: PhysicalRun) -> Result<(), PhysicalSubmitError> {
+        if self.inflight >= self.depth {
+            return Err(PhysicalSubmitError::WouldBlock(batch));
+        }
+        batch
+            .validate()
+            .map_err(anyhow::Error::from)
+            .map_err(PhysicalSubmitError::Failed)?;
+        if self.pending_batches.contains_key(&batch.run_id) {
+            return Err(PhysicalSubmitError::Failed(anyhow::anyhow!(
+                "step {} is already in flight",
+                batch.run_id
+            )));
+        }
+        let run_id = batch.run_id;
+        let requests = batch
             .operations()
-            .map(|operation| operation.request_key.session_id)
+            .map(|operation| operation.request_key.request_id)
             .collect::<Vec<_>>();
-        self.pending_batches.insert(step_id, batch.clone());
-        self.pending_partitions.insert(
-            step_id,
+        self.pending_batches.insert(run_id, batch.clone());
+        self.pending_operations.insert(
+            run_id,
             batch
-                .partitions
+                .operations
                 .iter()
-                .map(|partition| partition.partition_id)
+                .map(|operation| operation_identity(operation.request_key, operation.op_id))
                 .collect(),
         );
-        self.known_sessions.extend(sessions);
-        self.dirty_sessions.extend(
+        self.known_requests.extend(requests);
+        self.dirty_requests.extend(
             batch
                 .operations()
-                .map(|operation| operation.request_key.session_id)
+                .map(|operation| operation.request_key.request_id)
                 .chain(
                     batch
-                        .controls
+                        .commands
                         .iter()
-                        .map(|control| control.request_key().session_id),
+                        .map(|control| control.request_key().request_id),
                 ),
         );
         for rank in 0..self.workers.len() {
-            self.rank_returned_partitions[rank].insert(step_id, BTreeSet::new());
+            self.rank_returned_operations[rank].insert(run_id, BTreeSet::new());
         }
         self.inflight += 1;
+        self.last_progress = Instant::now();
         for (rank, worker) in self.workers.iter_mut().enumerate() {
-            if let Err(error) = worker
-                .submit(batch.clone())
-                .with_context(|| format!("submit to rank {rank} failed"))
-            {
-                return self.recover_workers(&error);
+            if let Err(error) = worker.submit_run(batch.clone()) {
+                let error = match error {
+                    PhysicalSubmitError::WouldBlock(_) => {
+                        anyhow::anyhow!("rank {rank} rejected an admitted TP batch as full")
+                    }
+                    PhysicalSubmitError::Failed(error) => {
+                        error.context(format!("submit to rank {rank} failed"))
+                    }
+                };
+                let recovered = self.recover_workers(&error).unwrap_err();
+                return Err(PhysicalSubmitError::Failed(recovered));
             }
         }
         Ok(())
     }
 
-    fn poll(&mut self) -> anyhow::Result<Option<CompletionReport>> {
-        self.pump()?;
-        self.try_join()
-    }
-
-    fn check_liveness(&mut self) -> anyhow::Result<()> {
-        for (rank, worker) in self.workers.iter_mut().enumerate() {
-            if let Err(error) = worker
-                .check_liveness()
-                .with_context(|| format!("rank {rank} liveness check failed"))
-            {
-                return self.recover_workers(&error);
-            }
+    fn poll_run(&mut self, timeout: Duration) -> anyhow::Result<Option<RunResult>> {
+        if self.command_wake_pending {
+            return Ok(None);
         }
-        Ok(())
-    }
-
-    fn command_waker(&self) -> CommandWaker {
-        let wakes = self
-            .workers
-            .iter()
-            .map(|worker| worker.command_waker())
-            .collect::<Vec<_>>();
-        CommandWaker::new(move || {
-            for wake in &wakes {
-                wake.wake();
-            }
-        })
-    }
-
-    fn wake_file_descriptors(&self) -> Vec<i32> {
-        self.workers
-            .iter()
-            .flat_map(|worker| worker.wake_file_descriptors())
-            .collect()
-    }
-
-    fn park_for_event(&mut self, timeout: std::time::Duration) -> anyhow::Result<()> {
-        crate::worker::park_descriptors(&self.wake_file_descriptors(), timeout)
-    }
-
-    fn wait_result_timeout(
-        &mut self,
-        timeout: Duration,
-    ) -> anyhow::Result<Option<CompletionReport>> {
-        let Some(deadline) = Instant::now().checked_add(timeout) else {
-            self.pump()?;
-            return self.try_join();
-        };
-        loop {
-            self.pump()?;
-            if let Some(result) = self.try_join()? {
-                return Ok(Some(result));
-            }
-            if self.inflight == 0 {
+        // With no submitted run, the only useful wake is a command or worker
+        // death. Do not probe the child executors first: probing drains their
+        // shared wake descriptors, which can consume a command wake and make
+        // the engine sleep for the full liveness interval before reading it.
+        if self.inflight == 0 {
+            if timeout.is_zero() {
                 return Ok(None);
             }
+            if self.progress_fds.is_empty() {
+                let _ = self.workers[0].poll_run(timeout)?;
+            } else {
+                crate::worker::park_descriptors(&self.progress_fds, timeout)?;
+                self.pump()?;
+            }
+            if self.command_wake_pending {
+                return Ok(None);
+            }
+            return self.try_join();
+        }
+        self.pump()?;
+        if self.command_wake_pending {
+            return Ok(None);
+        }
+        if let Some(result) = self.try_join()? {
+            self.last_progress = Instant::now();
+            return Ok(Some(result));
+        }
+        if timeout.is_zero() {
+            return Ok(None);
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
             let now = Instant::now();
             if now >= deadline {
                 return Ok(None);
             }
-            let idx = self
-                .workers
-                .iter()
-                .position(|worker| worker.in_flight() > 0)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "tensor-parallel ranks completed without a joinable outcome while {} batch(es) remained in flight",
-                        self.inflight
-                    )
-                })?;
-            match self.workers[idx].wait_result_timeout(deadline - now) {
-                Ok(Some(result)) => self.buffers[idx].push_back(result),
-                Ok(None) => return Ok(None),
-                Err(error) if error.downcast_ref::<WorkerExecError>().is_some() => {
-                    self.record_rank_error(idx, &error)?;
+            if self.progress_fds.is_empty() {
+                let idx = (0..self.workers.len())
+                    .min_by_key(|rank| self.rank_successes[*rank].len())
+                    .unwrap_or(0);
+                match self.workers[idx].poll_run(deadline - now) {
+                    Ok(Some(result)) => {
+                        self.buffers[idx].push_back(result);
+                        self.last_progress = Instant::now();
+                    }
+                    Ok(None) => return Ok(None),
+                    Err(error) if error.downcast_ref::<WorkerExecError>().is_some() => {
+                        self.record_rank_error(idx, &error)?;
+                    }
+                    Err(error) => self.recover_workers(&error)?,
                 }
-                Err(error) => self.recover_workers(&error)?,
+            } else {
+                crate::worker::park_descriptors(&self.progress_fds, deadline - now)?;
             }
-        }
-    }
-
-    fn next_result(&mut self) -> anyhow::Result<CompletionReport> {
-        if self.inflight == 0 {
-            anyhow::bail!("next_result called with no in-flight batches");
-        }
-        // Bound the wait so a single dead/hung rank surfaces as an executor
-        // error instead of wedging the scheduler loop forever. The deadline is
-        // reset whenever any rank makes progress, so a healthy-but-slow batch is
-        // never falsely failed.
-        let mut deadline = Instant::now() + NEXT_RESULT_DEADLINE;
-        loop {
             self.pump()?;
+            if self.command_wake_pending {
+                return Ok(None);
+            }
             if let Some(result) = self.try_join()? {
-                return Ok(result);
+                self.last_progress = Instant::now();
+                return Ok(Some(result));
             }
-            // Wait for fresh output on whichever rank is currently behind. Using
-            // the per-worker bounded wait (rather than the unbounded
-            // next_result) keeps a hung rank from blocking indefinitely.
-            let idx = self
-                .workers
-                .iter()
-                .position(|worker| worker.in_flight() > 0)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "tensor-parallel ranks completed without a joinable outcome while {} batch(es) remained in flight",
-                        self.inflight
-                    )
-                })?;
-            match self.workers[idx]
-                .wait_result_timeout(deadline.saturating_duration_since(Instant::now()))
-            {
-                Ok(Some(result)) => {
-                    self.buffers[idx].push_back(result);
-                    deadline = Instant::now() + NEXT_RESULT_DEADLINE;
-                }
-                Ok(None) if Instant::now() >= deadline => {
-                    let error = anyhow::anyhow!(
-                        "rank {idx} produced no result within {:?} while {} batch(es) were in flight",
-                        NEXT_RESULT_DEADLINE,
-                        self.inflight
-                    );
-                    self.recover_workers(&error)?;
-                    deadline = Instant::now() + NEXT_RESULT_DEADLINE;
-                }
-                Ok(None) => {}
-                Err(error) if error.downcast_ref::<WorkerExecError>().is_some() => {
-                    self.record_rank_error(idx, &error)?;
-                }
-                Err(error) => {
-                    self.recover_workers(&error)?;
-                    deadline = Instant::now() + NEXT_RESULT_DEADLINE;
-                }
-            }
-        }
-    }
-
-    fn control(&mut self, op: ControlOp) -> anyhow::Result<u64> {
-        // NOTE: the returned id is a local fire-and-forget token, NOT a IPC
-        // call_id. Each per-rank worker.control allocates its own real
-        // call_id internally; this counter correlates to none of them. Callers
-        // must not use this value to match a later worker ack — use
-        // control_wait (which fans out and collects per-rank acks) for any
-        // call that needs correlation.
-        let call_id = self.next_call_id;
-        self.next_call_id += 1;
-        loop {
-            let mut failure = None;
-            for rank in 0..self.workers.len() {
-                if let Err(error) = self.workers[rank].control(op.clone()) {
-                    failure = Some(error.context(format!("control call failed on rank {rank}")));
-                    break;
-                }
-            }
-            match failure {
-                Some(error) => self.recover_workers(&error)?,
-                None => break,
-            }
-        }
-        self.apply_control_session_effect(&op, true);
-        Ok(call_id)
-    }
-
-    fn control_wait(
-        &mut self,
-        op: ControlOp,
-        targets: Option<&[u32]>,
-    ) -> anyhow::Result<Vec<ControlAck>> {
-        loop {
-            let mut acks = Vec::new();
-            let mut failure = None;
-            for rank in 0..self.workers.len() {
-                let rank = rank as u32;
-                if let Some(targets) = targets
-                    && !targets.contains(&rank)
-                {
-                    continue;
-                }
-                match self.workers[rank as usize].control_wait(op.clone(), None) {
-                    Ok(rank_acks) => {
-                        for mut ack in rank_acks {
-                            ack.rank = rank;
-                            acks.push(ack);
-                        }
-                    }
-                    Err(error) => {
-                        failure =
-                            Some(error.context(format!("control wait failed on rank {rank}")));
-                        break;
-                    }
-                }
-            }
-            if let Some(error) = failure {
+            if self.inflight > 0 && self.last_progress.elapsed() >= NEXT_RESULT_DEADLINE {
+                let error = anyhow::anyhow!(
+                    "tensor-parallel workers produced no progress within {:?}",
+                    NEXT_RESULT_DEADLINE
+                );
                 self.recover_workers(&error)?;
-                continue;
             }
-            let succeeded = acks.iter().all(|ack| ack.result.is_ok());
-            self.apply_control_session_effect(&op, succeeded);
-            return Ok(acks);
         }
     }
 
-    fn shutdown(&mut self) {
+    fn take_command_wake(&mut self) -> bool {
+        std::mem::take(&mut self.command_wake_pending)
+    }
+
+    fn close_physical(&mut self) -> anyhow::Result<()> {
+        let mut first_error = None;
         for worker in self.workers.iter_mut() {
-            worker.shutdown();
+            if let Err(error) = worker.close_physical()
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
         }
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Executor for MultiprocExecutor {
+    fn info(&self) -> &ExecutorInfo {
+        &self.executor_info
+    }
+
+    fn submit(&mut self, batch: Batch) -> Result<(), ExecutorSubmitError> {
+        if self.inflight >= self.depth {
+            return Err(ExecutorSubmitError::WouldBlock(batch));
+        }
+        let run = lower_batch(&batch, &mut self.next_collective_seq)
+            .map_err(ExecutorSubmitError::Failed)?;
+        self.logical_results
+            .register(&batch)
+            .map_err(ExecutorSubmitError::Failed)?;
+        match self.submit_run(run) {
+            Ok(()) => Ok(()),
+            Err(PhysicalSubmitError::WouldBlock(_)) => {
+                self.logical_results.unregister(batch.id);
+                Err(ExecutorSubmitError::WouldBlock(batch))
+            }
+            Err(PhysicalSubmitError::Failed(error)) => {
+                self.logical_results.unregister(batch.id);
+                Err(ExecutorSubmitError::Failed(error))
+            }
+        }
+    }
+
+    fn poll(&mut self, timeout: Duration) -> anyhow::Result<Option<BatchResult>> {
+        if self.take_command_wake() {
+            return Ok(None);
+        }
+        let report = self.poll_run(timeout)?;
+        if report.is_none() {
+            self.take_command_wake();
+        }
+        report
+            .map(|report| self.logical_results.apply(report))
+            .transpose()
+    }
+
+    fn close(&mut self) -> anyhow::Result<()> {
+        self.close_physical()
     }
 }

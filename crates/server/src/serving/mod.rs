@@ -27,14 +27,13 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Instant;
 
-use crate::engine_client::{EngineClient, MediaEventRx, MediaSubmission, StreamCancelCause};
+use crate::engine_client::{EngineClient, EventRx, MediaSubmission, StreamCancelCause};
 use asynk_strim_attr::{TryYielder, try_stream};
 use futures::{Stream, StreamExt as _};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::Notify;
-use uniserve_core::GenerationEvent;
-use uniserve_engine::EventRx;
+use uniserve_core::Event;
 
 pub use input::{
     CacheBounds, DecodeControls, GenerateReqInput, ImageGenControls, ImageInput, ModalitySelection,
@@ -312,7 +311,7 @@ impl ServingRuntime {
         &self.engine
     }
 
-    pub async fn generate_video(&self, request: VideoGenerationInput) -> Result<MediaEventRx> {
+    pub async fn generate_video(&self, request: VideoGenerationInput) -> Result<EventRx> {
         if !self
             .model
             .support()
@@ -1426,6 +1425,7 @@ impl From<&FinishReason> for FinishStatus {
     fn from(reason: &FinishReason) -> Self {
         match reason.reason() {
             uniserve_core::FinishReason::Eos
+            | uniserve_core::FinishReason::Completed
             | uniserve_core::FinishReason::Stop
             | uniserve_core::FinishReason::ImageDone => Self::Stop {
                 cause: reason.as_stop_reason().map(|value| match value {
@@ -1521,17 +1521,17 @@ mod tests {
     async fn assembler_attaches_ranked_logprobs_to_text_delta() {
         let tokenizer = crate::serving::test_support::configured_tokenizer();
         let (tx, rx) = tokio::sync::mpsc::channel(8);
-        tx.try_send(GenerationEvent::Scheduled {
+        tx.try_send(Event::Scheduled {
             queued_at: 1.0,
             scheduled_at: 2.0,
         })
         .unwrap();
-        tx.try_send(GenerationEvent::TextToken {
+        tx.try_send(Event::TextToken {
             id: b'a' as u32,
             logprob: Some(-0.25),
         })
         .unwrap();
-        tx.try_send(GenerationEvent::TokenLogprobs {
+        tx.try_send(Event::TokenLogprobs {
             id: b'a' as u32,
             candidates: vec![TokenLogprob {
                 token_id: b'a' as u32,
@@ -1540,7 +1540,7 @@ mod tests {
             }],
         })
         .unwrap();
-        tx.try_send(GenerationEvent::Finished {
+        tx.try_send(Event::Finished {
             reason: uniserve_core::FinishReason::MaxTokens,
             stop_reason: None,
             prompt_tokens: 1,
@@ -1597,7 +1597,7 @@ mod tests {
     async fn assembler_publishes_an_image_with_its_next_text_token() {
         let tokenizer = crate::serving::test_support::configured_tokenizer();
         let (tx, rx) = tokio::sync::mpsc::channel(8);
-        tx.try_send(GenerationEvent::Scheduled {
+        tx.try_send(Event::Scheduled {
             queued_at: 1.0,
             scheduled_at: 2.0,
         })
@@ -1627,7 +1627,7 @@ mod tests {
             Some(Ok(ServeEvent::Scheduled { .. }))
         ));
 
-        tx.send(GenerationEvent::TextToken {
+        tx.send(Event::TextToken {
             id: b'a' as u32,
             logprob: None,
         })
@@ -1638,10 +1638,8 @@ mod tests {
             Some(Ok(ServeEvent::TextDelta { text, .. })) if text == "a"
         ));
 
-        tx.send(GenerationEvent::ImageCommit { image_id: 0 })
-            .await
-            .unwrap();
-        tx.send(GenerationEvent::ImageDone {
+        tx.send(Event::ImageCommit { image_id: 0 }).await.unwrap();
+        tx.send(Event::ImageDone {
             image_id: 0,
             height: 1,
             width: 1,
@@ -1658,7 +1656,7 @@ mod tests {
             "the image became public before a continuation token arrived"
         );
 
-        tx.send(GenerationEvent::TextToken {
+        tx.send(Event::TextToken {
             id: b'b' as u32,
             logprob: None,
         })

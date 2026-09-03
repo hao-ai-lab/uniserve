@@ -6,9 +6,9 @@ from dataclasses import dataclass
 
 from torch import nn
 
-from ..foundation.errors import unsupported_setup, invalid_descriptor
+from ..foundation.errors import invalid_descriptor, unsupported_setup
 from ..models.bagel import BagelForConditionalGeneration
-from ..models.minimax_h3 import MiniMaxH3Model
+from ..models.minimax_h3 import MiniMaxH3Runner
 from ..models.qwen3 import Qwen3ForCausalLM
 from ..models.sensenova.model import NEOChatModel
 from .plan import ModelLoadScope
@@ -70,7 +70,7 @@ SENSENOVA_ENTRY = CatalogEntry(
 )
 MINIMAX_H3_ENTRY = CatalogEntry(
     architecture="MiniMaxH3Transformer3DModel",
-    model_class=MiniMaxH3Model,
+    model_class=MiniMaxH3Runner,
     scopes=(ModelLoadScope.WHOLE, ModelLoadScope.GENERATION),
     sidecars=(
         "modular_model_index.json",

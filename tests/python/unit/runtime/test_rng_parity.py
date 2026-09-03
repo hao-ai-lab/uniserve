@@ -46,7 +46,7 @@ def test_sampling_rng_matches_the_rust_reference() -> None:
         key = sampling_key(
             case["session_seed"],
             case["authority_id"],
-            case["session_id"],
+            case["request_id"],
             case["epoch"],
             case["draw_layout"],
         )
