@@ -97,6 +97,44 @@ class DynamicW8A8Fp8LinearMethod(QuantizeMethodBase):
             tensorwise=self.tensorwise,
         )
 
+    def apply_prequantized(
+        self,
+        module: nn.Module,
+        x: torch.Tensor,
+        scale: torch.Tensor,
+        *,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        from ..linear import LinearBase
+
+        linear = cast(LinearBase, module)
+        if linear.weight.dtype != torch.float8_e4m3fn or linear.weight_scale is None:
+            raise RuntimeError("prequantized FP8 execution requires finalized FP8 weights")
+        if x.dtype != torch.float8_e4m3fn:
+            raise RuntimeError("prequantized FP8 execution requires float8_e4m3fn activations")
+        original_shape = x.shape[:-1]
+        x_2d = x.reshape(-1, x.shape[-1])
+        expected_scale_shape = (1, 1) if self.tensorwise else (x_2d.shape[0], 1)
+        if tuple(scale.shape) != expected_scale_shape:
+            raise ValueError(
+                f"prequantized FP8 scale shape {tuple(scale.shape)} != {expected_scale_shape}"
+            )
+        scale_b = (
+            linear.weight_scale.reshape(1, 1)
+            if self.tensorwise
+            else _canonical_scale(linear.weight_scale, linear.weight.shape[0]).t().contiguous()
+        )
+        output = torch._scaled_mm(
+            x_2d,
+            linear.weight.t(),
+            scale_a=scale,
+            scale_b=scale_b,
+            out_dtype=_scaled_mm_output_dtype(output_dtype),
+        )
+        if linear.bias is not None:
+            output = output + linear.bias.to(device=output.device, dtype=output.dtype)
+        return output.reshape(*original_shape, linear.weight.shape[0])
+
     def apply_sequence_parallel(
         self,
         module: nn.Module,

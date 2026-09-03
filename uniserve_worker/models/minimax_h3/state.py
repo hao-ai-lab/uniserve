@@ -95,6 +95,11 @@ class H3Layout:
         )
 
     @property
+    def max_video_round_frames(self) -> int:
+        units = min(self.video_reconstruction_units, VIDEO_ROUND_UNITS)
+        return (units - 1) * 17 + MIN_H3_FRAMES
+
+    @property
     def local_rows(self) -> int:
         return self.local_end - self.local_start
 
@@ -595,7 +600,7 @@ class H3Scratch:
             ),
             rgb_round=(
                 torch.empty(
-                    (layout.video_round_frames, 768, 1344, 3),
+                    (layout.max_video_round_frames, 768, 1344, 3),
                     dtype=torch.uint8,
                     device=device,
                 )

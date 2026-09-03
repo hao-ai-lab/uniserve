@@ -412,13 +412,16 @@ class RequestPool:
                 request = base
             source: RequestDraft | None = None
             if base is not None:
-                pending_parent = base.unresolved_operations.get(
-                    int(operation.parent.producer_op_id)
-                )
-                if pending_parent is not None:
-                    selected_parent = base.resolve_version(operation.parent)
-                    if selected_parent == pending_parent.selected:
-                        source = pending_parent.candidate
+                selected_parent = base.resolve_version(operation.parent)
+                if selected_parent is not None:
+                    source = next(
+                        (
+                            pending.candidate
+                            for pending in reversed(base.unresolved_operations.values())
+                            if pending.selected == selected_parent
+                        ),
+                        None,
+                    )
             candidate = RequestDraft(request, source)
             self._validate_operation(candidate, operation, slot)
             candidates.append(candidate)

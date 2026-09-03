@@ -38,6 +38,17 @@ class QuantizeMethodBase(abc.ABC):
     def process_weights_after_loading(self, module: nn.Module) -> None:
         return None
 
+    def apply_prequantized(
+        self,
+        module: nn.Module,
+        x: torch.Tensor,
+        scale: torch.Tensor,
+        *,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        del module, x, scale, output_dtype
+        raise RuntimeError("linear quantization method cannot consume prequantized activations")
+
 
 class UnquantizedLinearMethod(QuantizeMethodBase):
     def create_weights(

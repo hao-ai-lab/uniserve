@@ -51,7 +51,7 @@ class H3LinearPrecisionPolicy:
         if mode == "maximum":
             return cls(
                 transformer_attention="nvfp4",
-                transformer_mlp="nvfp4",
+                transformer_mlp="mxfp8",
                 text_encoder="bf16",
                 video_vae="nvfp4",
             )

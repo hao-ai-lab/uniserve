@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, cast
 
 import torch
@@ -11,12 +12,21 @@ from .base import QuantizeMethodBase
 
 __all__ = [
     "DynamicW4A4NvFp4LinearMethod",
+    "NvFp4Activation",
     "NvFp4Linear",
     "replace_nvfp4_linears",
 ]
 
 _NVFP4_MAX = float(torch.finfo(torch.float8_e4m3fn).max) * 6.0
 _SCALE_EPS = 1.0e-12
+
+
+@dataclass(frozen=True, slots=True)
+class NvFp4Activation:
+    packed: torch.Tensor
+    block_scale: torch.Tensor
+    scale_2: torch.Tensor
+    shape: tuple[int, ...]
 
 
 def _flashinfer() -> Any:
@@ -217,7 +227,30 @@ class DynamicW4A4NvFp4LinearMethod(QuantizeMethodBase):
         linear.weight_scale = block_scale
         linear.weight_scale_2 = weight_scale_2
 
-    def apply(self, module: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    def quantize_activation(self, x: torch.Tensor) -> NvFp4Activation:
+        if x.dtype != torch.bfloat16:
+            raise RuntimeError("NVFP4 linear execution requires bfloat16 activations")
+        original_shape = tuple(int(size) for size in x.shape[:-1])
+        x_2d = x.reshape(-1, x.shape[-1])
+        input_scale_2 = _global_scale_2(x_2d)
+        packed, block_scale = _nvfp4_quantize_128x4(
+            x_2d,
+            1.0 / input_scale_2,
+        )
+        return NvFp4Activation(
+            packed=packed,
+            block_scale=block_scale,
+            scale_2=input_scale_2,
+            shape=original_shape,
+        )
+
+    def apply_packed(
+        self,
+        module: nn.Module,
+        activation: NvFp4Activation,
+        *,
+        include_bias: bool,
+    ) -> torch.Tensor:
         from ..linear import LinearBase
 
         linear = cast(LinearBase, module)
@@ -225,25 +258,35 @@ class DynamicW4A4NvFp4LinearMethod(QuantizeMethodBase):
         weight_scale_2 = getattr(linear, "weight_scale_2", None)
         if linear.weight.dtype != torch.uint8 or weight_scale is None or weight_scale_2 is None:
             raise RuntimeError("NVFP4 linear execution requires finalized FP4 weights")
-        if x.dtype != torch.bfloat16:
-            raise RuntimeError("NVFP4 linear execution requires bfloat16 activations")
-        original_shape = x.shape[:-1]
-        x_2d = x.reshape(-1, x.shape[-1])
-        input_scale_2 = _global_scale_2(x_2d)
-        packed, block_scale = _nvfp4_quantize_128x4(
-            x_2d,
-            1.0 / input_scale_2,
-        )
         output = _nvfp4_mm_bf16(
-            packed,
+            activation.packed,
             linear.weight.T,
-            block_scale,
+            activation.block_scale,
             weight_scale.T,
-            input_scale_2 * weight_scale_2,
+            activation.scale_2 * weight_scale_2,
         )
-        if linear.bias is not None:
+        if include_bias and linear.bias is not None:
             output = output + linear.bias.to(device=output.device, dtype=output.dtype)
-        return output.reshape(*original_shape, linear.output_size)
+        return output.reshape(*activation.shape, linear.output_size)
+
+    def _apply(
+        self,
+        module: nn.Module,
+        x: torch.Tensor,
+        *,
+        include_bias: bool,
+    ) -> torch.Tensor:
+        return self.apply_packed(
+            module,
+            self.quantize_activation(x),
+            include_bias=include_bias,
+        )
+
+    def apply(self, module: nn.Module, x: torch.Tensor) -> torch.Tensor:
+        return self._apply(module, x, include_bias=True)
+
+    def apply_unbiased(self, module: nn.Module, x: torch.Tensor) -> torch.Tensor:
+        return self._apply(module, x, include_bias=False)
 
     def apply_sequence_parallel(
         self,
@@ -327,6 +370,24 @@ class NvFp4Linear(nn.Module):
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
         return self.quant_method.apply(self, value.to(torch.bfloat16))
+
+    def forward_unbiased(self, value: torch.Tensor) -> torch.Tensor:
+        return self.quant_method.apply_unbiased(self, value.to(torch.bfloat16))
+
+    def quantize_activation(self, value: torch.Tensor) -> NvFp4Activation:
+        return self.quant_method.quantize_activation(value.to(torch.bfloat16))
+
+    def forward_prequantized(
+        self,
+        activation: NvFp4Activation,
+        *,
+        include_bias: bool,
+    ) -> torch.Tensor:
+        return self.quant_method.apply_packed(
+            self,
+            activation,
+            include_bias=include_bias,
+        )
 
 
 def replace_nvfp4_linears(module: nn.Module) -> int:

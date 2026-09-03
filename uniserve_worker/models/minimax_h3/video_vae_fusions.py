@@ -45,10 +45,12 @@ def _video_rmsnorm_kernel(
 def _scaled_residual_rmsnorm_kernel(
     hidden_ptr,
     update_ptr,
+    update_bias_ptr,
     scale_ptr,
     weight_ptr,
     output_ptr,
     eps,
+    HAS_UPDATE_BIAS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -56,6 +58,9 @@ def _scaled_residual_rmsnorm_kernel(
     offsets = row * _WIDTH_TL + columns
     hidden = tl.load(hidden_ptr + offsets).to(tl.float32)
     update = tl.load(update_ptr + offsets).to(tl.float32)
+    if HAS_UPDATE_BIAS:
+        update += tl.load(update_bias_ptr + columns).to(tl.float32)
+        update = update.to(update_ptr.dtype.element_ty).to(tl.float32)
     scale = tl.load(scale_ptr + columns).to(tl.float32)
     residual = hidden + update * scale
     inverse_rms = tl.rsqrt(tl.sum(residual * residual, axis=0) / _WIDTH_TL + eps)
@@ -68,8 +73,10 @@ def _scaled_residual_rmsnorm_kernel(
 def _scaled_residual_kernel(
     hidden_ptr,
     update_ptr,
+    update_bias_ptr,
     scale_ptr,
     elements,
+    HAS_UPDATE_BIAS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -77,6 +84,9 @@ def _scaled_residual_kernel(
     columns = offsets % _WIDTH_TL
     hidden = tl.load(hidden_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
     update = tl.load(update_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    if HAS_UPDATE_BIAS:
+        update += tl.load(update_bias_ptr + columns, mask=mask, other=0.0).to(tl.float32)
+        update = update.to(update_ptr.dtype.element_ty).to(tl.float32)
     scale = tl.load(scale_ptr + columns, mask=mask, other=0.0).to(tl.float32)
     tl.store(hidden_ptr + offsets, hidden + update * scale, mask=mask)
 
@@ -85,11 +95,13 @@ def _scaled_residual_kernel(
 def _scaled_residual_layernorm_kernel(
     hidden_ptr,
     update_ptr,
+    update_bias_ptr,
     scale_ptr,
     weight_ptr,
     bias_ptr,
     output_ptr,
     eps,
+    HAS_UPDATE_BIAS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -97,6 +109,9 @@ def _scaled_residual_layernorm_kernel(
     offsets = row * _WIDTH_TL + columns
     hidden = tl.load(hidden_ptr + offsets).to(tl.float32)
     update = tl.load(update_ptr + offsets).to(tl.float32)
+    if HAS_UPDATE_BIAS:
+        update += tl.load(update_bias_ptr + columns).to(tl.float32)
+        update = update.to(update_ptr.dtype.element_ty).to(tl.float32)
     scale = tl.load(scale_ptr + columns).to(tl.float32)
     residual = hidden + update * scale
     mean = tl.sum(residual, axis=0) / _WIDTH_TL
@@ -111,6 +126,8 @@ def _scaled_residual_layernorm_kernel(
 def _qk_rmsnorm_partial_rope_kernel(
     query_ptr,
     key_ptr,
+    query_bias_ptr,
+    key_bias_ptr,
     cosine_ptr,
     sine_ptr,
     rows: tl.constexpr,
@@ -118,6 +135,7 @@ def _qk_rmsnorm_partial_rope_kernel(
     row_stride: tl.constexpr,
     head_stride: tl.constexpr,
     rotary_row_stride: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
     ROW_BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0) * ROW_BLOCK + tl.arange(0, ROW_BLOCK)
@@ -127,6 +145,12 @@ def _qk_rmsnorm_partial_rope_kernel(
     offsets = row[:, None] * row_stride + head * head_stride + columns[None, :]
     query = tl.load(query_ptr + offsets, mask=valid, other=0.0).to(tl.float32)
     key = tl.load(key_ptr + offsets, mask=valid, other=0.0).to(tl.float32)
+    if HAS_BIAS:
+        bias_offsets = head * _HEAD_DIM_TL + columns[None, :]
+        query += tl.load(query_bias_ptr + bias_offsets).to(tl.float32)
+        key += tl.load(key_bias_ptr + bias_offsets).to(tl.float32)
+        query = query.to(query_ptr.dtype.element_ty).to(tl.float32)
+        key = key.to(key_ptr.dtype.element_ty).to(tl.float32)
     query_rstd = tl.rsqrt(tl.sum(query * query, axis=1) / _HEAD_DIM_TL + 1e-5)
     key_rstd = tl.rsqrt(tl.sum(key * key, axis=1) / _HEAD_DIM_TL + 1e-5)
     query = (query * query_rstd[:, None]).to(query_ptr.dtype.element_ty).to(tl.float32)
@@ -144,6 +168,12 @@ def _qk_rmsnorm_partial_rope_kernel(
     )
     query_partner = tl.load(query_ptr + partner_offsets, mask=valid, other=0.0).to(tl.float32)
     key_partner = tl.load(key_ptr + partner_offsets, mask=valid, other=0.0).to(tl.float32)
+    if HAS_BIAS:
+        partner_bias_offsets = head * _HEAD_DIM_TL + partner_columns[None, :]
+        query_partner += tl.load(query_bias_ptr + partner_bias_offsets).to(tl.float32)
+        key_partner += tl.load(key_bias_ptr + partner_bias_offsets).to(tl.float32)
+        query_partner = query_partner.to(query_ptr.dtype.element_ty).to(tl.float32)
+        key_partner = key_partner.to(key_ptr.dtype.element_ty).to(tl.float32)
     query_partner = (query_partner * query_rstd[:, None]).to(query_ptr.dtype.element_ty).to(
         tl.float32
     )
@@ -165,9 +195,11 @@ def _qk_rmsnorm_partial_rope_kernel(
 @triton.jit
 def _value_first_swiglu_kernel(
     value_gate_ptr,
+    bias_ptr,
     output_ptr,
     elements,
     width: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -182,6 +214,11 @@ def _value_first_swiglu_kernel(
         mask=mask,
         other=0.0,
     ).to(tl.float32)
+    if HAS_BIAS:
+        value += tl.load(bias_ptr + column, mask=mask, other=0.0).to(tl.float32)
+        gate += tl.load(bias_ptr + width + column, mask=mask, other=0.0).to(tl.float32)
+        value = value.to(value_gate_ptr.dtype.element_ty).to(tl.float32)
+        gate = gate.to(value_gate_ptr.dtype.element_ty).to(tl.float32)
     tl.store(output_ptr + offsets, value * gate / (1.0 + tl.exp(-gate)), mask=mask)
 
 
@@ -210,10 +247,13 @@ def scaled_residual_rmsnorm_(
     update: torch.Tensor,
     scale: torch.Tensor,
     weight: torch.Tensor,
+    update_bias: torch.Tensor | None = None,
     *,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if not hidden.is_cuda:
+        if update_bias is not None:
+            update = update + update_bias
         hidden.add_(update.float() * scale.float())
         return hidden, video_rmsnorm(hidden, weight, eps=eps)
     output_dtype = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else update.dtype
@@ -222,10 +262,12 @@ def scaled_residual_rmsnorm_(
     _scaled_residual_rmsnorm_kernel[(rows,)](
         hidden,
         update,
+        update_bias,
         scale,
         weight,
         output,
         eps,
+        HAS_UPDATE_BIAS=update_bias is not None,
         BLOCK=_WIDTH,
         num_warps=8,
     )
@@ -236,16 +278,21 @@ def scaled_residual_(
     hidden: torch.Tensor,
     update: torch.Tensor,
     scale: torch.Tensor,
+    update_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if not hidden.is_cuda:
+        if update_bias is not None:
+            update = update + update_bias
         hidden.add_(update.float() * scale.float())
         return hidden
     elements = hidden.numel()
     _scaled_residual_kernel[(triton.cdiv(elements, 1024),)](
         hidden,
         update,
+        update_bias,
         scale,
         elements,
+        HAS_UPDATE_BIAS=update_bias is not None,
         BLOCK=1024,
         num_warps=4,
     )
@@ -258,10 +305,13 @@ def scaled_residual_layernorm(
     scale: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor,
+    update_bias: torch.Tensor | None = None,
     *,
     eps: float,
 ) -> torch.Tensor:
     if not hidden.is_cuda:
+        if update_bias is not None:
+            update = update + update_bias
         residual = hidden + update.float() * scale.float()
         return F.layer_norm(residual, (_WIDTH,), weight, bias, eps)
     output_dtype = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else update.dtype
@@ -270,11 +320,13 @@ def scaled_residual_layernorm(
     _scaled_residual_layernorm_kernel[(rows,)](
         hidden,
         update,
+        update_bias,
         scale,
         weight,
         bias,
         output,
         eps,
+        HAS_UPDATE_BIAS=update_bias is not None,
         BLOCK=_WIDTH,
         num_warps=8,
     )
@@ -286,8 +338,15 @@ def qk_rmsnorm_partial_rope_(
     key: torch.Tensor,
     cosine: torch.Tensor,
     sine: torch.Tensor,
+    query_bias: torch.Tensor | None = None,
+    key_bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if (query_bias is None) != (key_bias is None):
+        raise ValueError("H3 video Q/K fusion requires both biases or neither")
     if not query.is_cuda:
+        if query_bias is not None and key_bias is not None:
+            query = query + query_bias.view(query.shape[-2], query.shape[-1])
+            key = key + key_bias.view(key.shape[-2], key.shape[-1])
         dtype = query.dtype
         query = query.float() * torch.rsqrt(query.float().pow(2).mean(-1, keepdim=True) + 1e-5)
         key = key.float() * torch.rsqrt(key.float().pow(2).mean(-1, keepdim=True) + 1e-5)
@@ -308,6 +367,8 @@ def qk_rmsnorm_partial_rope_(
     _qk_rmsnorm_partial_rope_kernel[(triton.cdiv(rows, row_block), heads)](
         query,
         key,
+        query_bias,
+        key_bias,
         cosine,
         sine,
         rows,
@@ -315,24 +376,34 @@ def qk_rmsnorm_partial_rope_(
         int(query.stride(-3)),
         int(query.stride(-2)),
         int(cosine.stride(-3)),
+        HAS_BIAS=query_bias is not None,
         ROW_BLOCK=row_block,
         num_warps=4,
     )
     return query, key
 
 
-def value_first_swiglu(value_gate: torch.Tensor) -> torch.Tensor:
+def value_first_swiglu(
+    value_gate: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
     value, gate = value_gate.chunk(2, dim=-1)
     if not value_gate.is_cuda:
+        if bias is not None:
+            value_bias, gate_bias = bias.chunk(2)
+            value = value + value_bias
+            gate = gate + gate_bias
         return value * F.silu(gate)
     width = int(value.shape[-1])
     output = torch.empty_like(value)
     elements = output.numel()
     _value_first_swiglu_kernel[(triton.cdiv(elements, 1024),)](
         value_gate,
+        bias,
         output,
         elements,
         width,
+        HAS_BIAS=bias is not None,
         BLOCK=1024,
         num_warps=4,
     )

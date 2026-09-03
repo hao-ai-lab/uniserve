@@ -21,6 +21,16 @@ from .video_vae_fusions import (
 __all__ = ["MiniMaxH3VideoDecoder"]
 
 
+def _linear_with_deferred_bias(
+    linear: nn.Module,
+    hidden: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    execute = getattr(linear, "forward_unbiased", None)
+    if callable(execute):
+        return execute(hidden), getattr(linear, "bias", None)
+    return linear(hidden), None
+
+
 class _RotaryEmbedding(nn.Module):
     def __init__(
         self,
@@ -75,13 +85,38 @@ class _Attention(nn.Module):
         self,
         hidden: torch.Tensor,
         rotary: tuple[torch.Tensor, torch.Tensor],
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         batch, sequence, _ = hidden.shape
-        query = self.to_q(hidden).view(batch, sequence, self.heads, self.head_dim)
-        key = self.to_k(hidden).view(batch, sequence, self.heads, self.head_dim)
-        value = self.to_v(hidden).view(batch, sequence, self.heads, self.head_dim)
+        quantize = getattr(self.to_q, "quantize_activation", None)
+        q_prequantized = getattr(self.to_q, "forward_prequantized", None)
+        k_prequantized = getattr(self.to_k, "forward_prequantized", None)
+        v_prequantized = getattr(self.to_v, "forward_prequantized", None)
+        if all(
+            callable(execute)
+            for execute in (quantize, q_prequantized, k_prequantized, v_prequantized)
+        ):
+            activation = quantize(hidden)
+            query = q_prequantized(activation, include_bias=False)
+            key = k_prequantized(activation, include_bias=False)
+            value = v_prequantized(activation, include_bias=True)
+            query_bias = getattr(self.to_q, "bias", None)
+            key_bias = getattr(self.to_k, "bias", None)
+        else:
+            query, query_bias = _linear_with_deferred_bias(self.to_q, hidden)
+            key, key_bias = _linear_with_deferred_bias(self.to_k, hidden)
+            value = self.to_v(hidden)
+        query = query.view(batch, sequence, self.heads, self.head_dim)
+        key = key.view(batch, sequence, self.heads, self.head_dim)
+        value = value.view(batch, sequence, self.heads, self.head_dim)
         cosine, sine = rotary
-        qk_rmsnorm_partial_rope_(query, key, cosine, sine)
+        qk_rmsnorm_partial_rope_(
+            query,
+            key,
+            cosine,
+            sine,
+            query_bias=query_bias,
+            key_bias=key_bias,
+        )
         attended = F.scaled_dot_product_attention(
             query.transpose(1, 2),
             key.transpose(1, 2),
@@ -89,7 +124,10 @@ class _Attention(nn.Module):
             dropout_p=0.0,
             is_causal=False,
         )
-        return self.to_out[0](attended.transpose(1, 2).reshape(batch, sequence, -1))
+        return _linear_with_deferred_bias(
+            self.to_out[0],
+            attended.transpose(1, 2).reshape(batch, sequence, -1),
+        )
 
 
 class _SwiGLU(nn.Module):
@@ -98,7 +136,8 @@ class _SwiGLU(nn.Module):
         self.proj = nn.Linear(width, intermediate * 2, bias=True)
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        return value_first_swiglu(self.proj(hidden))
+        projected, bias = _linear_with_deferred_bias(self.proj, hidden)
+        return value_first_swiglu(projected, bias)
 
 
 class _FeedForward(nn.Module):
@@ -108,10 +147,10 @@ class _FeedForward(nn.Module):
             (_SwiGLU(width, intermediate), nn.Dropout(0.0), nn.Linear(intermediate, width))
         )
 
-    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        for layer in self.net:
-            hidden = layer(hidden)
-        return hidden
+    def forward(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        hidden = self.net[0](hidden)
+        hidden = self.net[1](hidden)
+        return _linear_with_deferred_bias(self.net[2], hidden)
 
 
 class _TransformerBlock(nn.Module):
@@ -130,23 +169,35 @@ class _TransformerBlock(nn.Module):
         rotary: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         normalized = video_rmsnorm(hidden, self.norm1.weight, eps=float(self.norm1.eps))
-        hidden, feed_forward = self.forward_normalized(hidden, normalized, rotary)
-        return scaled_residual_(hidden, feed_forward, self.scale2)
+        hidden, feed_forward, feed_forward_bias = self.forward_normalized(
+            hidden,
+            normalized,
+            rotary,
+        )
+        return scaled_residual_(
+            hidden,
+            feed_forward,
+            self.scale2,
+            update_bias=feed_forward_bias,
+        )
 
     def forward_normalized(
         self,
         hidden: torch.Tensor,
         normalized: torch.Tensor,
         rotary: tuple[torch.Tensor, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        attention, attention_bias = self.attn(normalized, rotary)
         hidden, normalized = scaled_residual_rmsnorm_(
             hidden,
-            self.attn(normalized, rotary),
+            attention,
             self.scale1,
             self.norm2.weight,
+            update_bias=attention_bias,
             eps=float(self.norm2.eps),
         )
-        return hidden, self.ff(normalized)
+        feed_forward, feed_forward_bias = self.ff(normalized)
+        return hidden, feed_forward, feed_forward_bias
 
 
 class MiniMaxH3VideoDecoder(nn.Module):
@@ -286,7 +337,11 @@ class MiniMaxH3VideoDecoder(nn.Module):
         rotary = tuple(value.to(compute_dtype) for value in rotary)
         first = self.decoder.transformer_blocks[0]
         normalized = video_rmsnorm(hidden, first.norm1.weight, eps=float(first.norm1.eps))
-        hidden, feed_forward = first.forward_normalized(hidden, normalized, rotary)
+        hidden, feed_forward, feed_forward_bias = first.forward_normalized(
+            hidden,
+            normalized,
+            rotary,
+        )
         previous = first
         for block in self.decoder.transformer_blocks[1:]:
             hidden, normalized = scaled_residual_rmsnorm_(
@@ -294,9 +349,14 @@ class MiniMaxH3VideoDecoder(nn.Module):
                 feed_forward,
                 previous.scale2,
                 block.norm1.weight,
+                update_bias=feed_forward_bias,
                 eps=float(block.norm1.eps),
             )
-            hidden, feed_forward = block.forward_normalized(hidden, normalized, rotary)
+            hidden, feed_forward, feed_forward_bias = block.forward_normalized(
+                hidden,
+                normalized,
+                rotary,
+            )
             previous = block
         hidden = scaled_residual_layernorm(
             hidden,
@@ -304,6 +364,7 @@ class MiniMaxH3VideoDecoder(nn.Module):
             previous.scale2,
             self.decoder.norm_out.weight,
             self.decoder.norm_out.bias,
+            update_bias=feed_forward_bias,
             eps=float(self.decoder.norm_out.eps),
         )
         hidden = self.decoder.proj_out(hidden)[:, :patch_count]

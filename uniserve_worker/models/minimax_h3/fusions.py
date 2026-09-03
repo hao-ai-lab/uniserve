@@ -10,16 +10,20 @@ from torch.nn import functional as F
 __all__ = [
     "apply_partial_rope",
     "attention_residual_modulated_rmsnorm",
+    "attention_residual_modulated_rmsnorm_fp8",
     "dual_gated_residual",
     "qk_rmsnorm_rope",
     "row_modulated_rmsnorm",
     "value_first_swiglu",
+    "value_first_swiglu_fp8",
 ]
 
 _HIDDEN_SIZE = 5376
 _FFN_SIZE = 14336
 _HIDDEN_SIZE_TL = tl.constexpr(5376)
 _FFN_SIZE_TL = tl.constexpr(14336)
+_FP8_MAX_TL = tl.constexpr(448.0)
+_SCALE_EPS_TL = tl.constexpr(1.0e-12)
 
 
 @triton.jit
@@ -124,6 +128,66 @@ def _attention_residual_modulated_rmsnorm_kernel(
 
 
 @triton.jit
+def _attention_residual_modulated_rmsnorm_fp8_kernel(
+    hidden_ptr,
+    attention_ptr,
+    gate_ptr,
+    weight_ptr,
+    shift_ptr,
+    modulation_scale_ptr,
+    row_indices_ptr,
+    output_ptr,
+    output_scale_ptr,
+    eps,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    columns = tl.arange(0, BLOCK)
+    mask = columns < _HIDDEN_SIZE_TL
+    modulation_row = tl.load(row_indices_ptr + row)
+    hidden = tl.load(
+        hidden_ptr + row * _HIDDEN_SIZE_TL + columns,
+        mask=mask,
+        other=0.0,
+        eviction_policy="evict_last",
+    ).to(tl.float32)
+    attention = tl.load(
+        attention_ptr + row * _HIDDEN_SIZE_TL + columns,
+        mask=mask,
+        other=0.0,
+        eviction_policy="evict_last",
+    ).to(tl.float32)
+    gate = tl.load(
+        gate_ptr + modulation_row * _HIDDEN_SIZE_TL + columns,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    residual = hidden + gate * attention
+    inverse_rms = tl.rsqrt(tl.sum(residual * residual, axis=0) / _HIDDEN_SIZE_TL + eps)
+    weight = tl.load(weight_ptr + columns, mask=mask, other=0.0).to(tl.float32)
+    shift = tl.load(
+        shift_ptr + modulation_row * _HIDDEN_SIZE_TL + columns,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    modulation_scale = tl.load(
+        modulation_scale_ptr + modulation_row * _HIDDEN_SIZE_TL + columns,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    output = tl.where(
+        mask,
+        residual * inverse_rms * weight * (1.0 + modulation_scale) + shift,
+        0.0,
+    )
+    output = output.to(tl.bfloat16).to(tl.float32)
+    scale = tl.maximum(tl.max(tl.abs(output), axis=0), _SCALE_EPS_TL) / _FP8_MAX_TL
+    quantized = tl.maximum(tl.minimum(output / scale, _FP8_MAX_TL), -_FP8_MAX_TL)
+    tl.store(output_ptr + row * _HIDDEN_SIZE_TL + columns, quantized, mask=mask)
+    tl.store(output_scale_ptr + row, scale)
+
+
+@triton.jit
 def _value_first_swiglu_kernel(value_gate_ptr, output_ptr, elements, BLOCK: tl.constexpr):
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < elements
@@ -141,6 +205,34 @@ def _value_first_swiglu_kernel(value_gate_ptr, output_ptr, elements, BLOCK: tl.c
     ).to(tl.float32)
     output = value * gate / (1.0 + tl.exp(-gate))
     tl.store(output_ptr + offsets, output, mask=mask)
+
+
+@triton.jit
+def _value_first_swiglu_fp8_kernel(
+    value_gate_ptr,
+    output_ptr,
+    output_scale_ptr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    columns = tl.arange(0, BLOCK)
+    mask = columns < _FFN_SIZE_TL
+    value = tl.load(
+        value_gate_ptr + row * (2 * _FFN_SIZE_TL) + columns,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    gate = tl.load(
+        value_gate_ptr + row * (2 * _FFN_SIZE_TL) + _FFN_SIZE_TL + columns,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    output = tl.where(mask, value * gate / (1.0 + tl.exp(-gate)), 0.0)
+    output = output.to(tl.bfloat16).to(tl.float32)
+    scale = tl.maximum(tl.max(tl.abs(output), axis=0), _SCALE_EPS_TL) / _FP8_MAX_TL
+    quantized = tl.maximum(tl.minimum(output / scale, _FP8_MAX_TL), -_FP8_MAX_TL)
+    tl.store(output_ptr + row * _FFN_SIZE_TL + columns, quantized, mask=mask)
+    tl.store(output_scale_ptr + row, scale)
 
 
 @triton.jit
@@ -240,6 +332,37 @@ def attention_residual_modulated_rmsnorm(
     return output
 
 
+def attention_residual_modulated_rmsnorm_fp8(
+    hidden: torch.Tensor,
+    attention: torch.Tensor,
+    attention_gate: torch.Tensor,
+    weight: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    row_indices: torch.Tensor,
+    *,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rows = hidden.numel() // _HIDDEN_SIZE
+    output = torch.empty_like(hidden, dtype=torch.float8_e4m3fn)
+    output_scale = torch.empty((rows, 1), dtype=torch.float32, device=hidden.device)
+    _attention_residual_modulated_rmsnorm_fp8_kernel[(rows,)](
+        hidden,
+        attention,
+        attention_gate,
+        weight,
+        shift,
+        scale,
+        row_indices,
+        output,
+        output_scale,
+        eps,
+        BLOCK=8192,
+        num_warps=16,
+    )
+    return output, output_scale
+
+
 def dual_gated_residual(
     hidden: torch.Tensor,
     attention: torch.Tensor,
@@ -309,3 +432,25 @@ def value_first_swiglu(value_gate: torch.Tensor) -> torch.Tensor:
         return output
     value, gate = value_gate.chunk(2, dim=-1)
     return value * F.silu(gate.float()).to(gate.dtype)
+
+
+def value_first_swiglu_fp8(value_gate: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    if not value_gate.is_cuda or value_gate.dtype != torch.bfloat16:
+        raise RuntimeError("fused SwiGLU FP8 execution requires bfloat16 CUDA input")
+    if value_gate.shape[-1] != 2 * _FFN_SIZE:
+        raise ValueError(f"fused SwiGLU FP8 width must be {2 * _FFN_SIZE}")
+    rows = value_gate.numel() // (2 * _FFN_SIZE)
+    output = torch.empty(
+        (*value_gate.shape[:-1], _FFN_SIZE),
+        dtype=torch.float8_e4m3fn,
+        device=value_gate.device,
+    )
+    output_scale = torch.empty((rows, 1), dtype=torch.float32, device=value_gate.device)
+    _value_first_swiglu_fp8_kernel[(rows,)](
+        value_gate,
+        output,
+        output_scale,
+        BLOCK=16384,
+        num_warps=16,
+    )
+    return output, output_scale

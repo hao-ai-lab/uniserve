@@ -185,7 +185,7 @@ class MiniMaxH3Model(ExecutionModel):
             H3OutputRing(
                 state_slots=self.states.slot_count,
                 unresolved_window=int(unresolved_window),
-                max_video_frames_per_round=self.layout.video_round_frames,
+                max_video_frames_per_round=self.layout.max_video_round_frames,
                 max_frame_count=self.layout.frame_count,
             ),
         )

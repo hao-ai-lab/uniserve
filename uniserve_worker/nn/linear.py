@@ -63,6 +63,20 @@ class LinearBase(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.quant_method.apply(self, x)
 
+    def forward_prequantized(
+        self,
+        x: torch.Tensor,
+        scale: torch.Tensor,
+        *,
+        output_dtype: torch.dtype = torch.bfloat16,
+    ) -> torch.Tensor:
+        return self.quant_method.apply_prequantized(
+            self,
+            x,
+            scale,
+            output_dtype=output_dtype,
+        )
+
     def forward_sequence_parallel(
         self,
         x: torch.Tensor,

@@ -35,7 +35,7 @@ def test_h3_uses_balanced_mode_when_config_is_empty() -> None:
         ),
         (
             "maximum",
-            H3LinearPrecisionPolicy("nvfp4", "nvfp4", "bf16", "nvfp4"),
+            H3LinearPrecisionPolicy("nvfp4", "mxfp8", "bf16", "nvfp4"),
         ),
     ],
 )
