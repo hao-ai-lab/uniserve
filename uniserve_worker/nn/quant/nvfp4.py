@@ -7,6 +7,8 @@ from typing import Any, cast
 
 import torch
 import torch.nn as nn
+import triton
+import triton.language as tl
 
 from .base import QuantizeMethodBase
 
@@ -19,6 +21,8 @@ __all__ = [
 
 _NVFP4_MAX = float(torch.finfo(torch.float8_e4m3fn).max) * 6.0
 _SCALE_EPS = 1.0e-12
+_FUSED_ABSMAX_MIN_ELEMENTS = 1 << 25
+_FUSED_ABSMAX_BLOCK = 1 << 16
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,8 +39,78 @@ def _flashinfer() -> Any:
     return flashinfer
 
 
+@triton.jit
+def _absmax_partial_kernel(
+    source,
+    partials,
+    elements: tl.constexpr,
+    block: tl.constexpr,
+):
+    offsets = tl.program_id(0) * block + tl.arange(0, block)
+    values = tl.load(source + offsets, mask=offsets < elements, other=0.0)
+    tl.store(partials + tl.program_id(0), tl.max(tl.abs(values), axis=0))
+
+
+@triton.jit
+def _absmax_finish_kernel(
+    partials,
+    output,
+    count: tl.constexpr,
+    block: tl.constexpr,
+):
+    offsets = tl.arange(0, block)
+    values = tl.load(partials + offsets, mask=offsets < count, other=-float("inf"))
+    tl.store(output, tl.max(values, axis=0))
+
+
+@torch.library.custom_op("uniserve_worker::nvfp4_absmax", mutates_args=())
+def _nvfp4_absmax(value: torch.Tensor) -> torch.Tensor:
+    if value.device.type != "cuda" or value.dtype != torch.bfloat16:
+        raise RuntimeError("fused NVFP4 abs-max requires a CUDA bfloat16 tensor")
+    if not value.is_contiguous():
+        raise RuntimeError("fused NVFP4 abs-max requires contiguous storage")
+    elements = int(value.numel())
+    partial_count = triton.cdiv(elements, _FUSED_ABSMAX_BLOCK)
+    partials = torch.empty((partial_count,), dtype=torch.float32, device=value.device)
+    output = torch.empty((), dtype=value.dtype, device=value.device)
+    _absmax_partial_kernel[(partial_count,)](
+        value,
+        partials,
+        elements=elements,
+        block=_FUSED_ABSMAX_BLOCK,
+        num_warps=8,
+    )
+    finish_block = triton.next_power_of_2(partial_count)
+    _absmax_finish_kernel[(1,)](
+        partials,
+        output,
+        count=partial_count,
+        block=finish_block,
+        num_warps=8,
+    )
+    return output
+
+
+@_nvfp4_absmax.register_fake
+def _nvfp4_absmax_fake(value: torch.Tensor) -> torch.Tensor:
+    return value.new_empty(())
+
+
+def _scale_2_from_absmax(maximum: torch.Tensor) -> torch.Tensor:
+    return maximum.float().clamp_min(_SCALE_EPS) / _NVFP4_MAX
+
+
 def _global_scale_2(value: torch.Tensor) -> torch.Tensor:
-    return value.abs().amax().float().clamp_min(_SCALE_EPS) / _NVFP4_MAX
+    if (
+        value.device.type == "cuda"
+        and value.dtype == torch.bfloat16
+        and value.is_contiguous()
+        and value.numel() >= _FUSED_ABSMAX_MIN_ELEMENTS
+    ):
+        maximum = _nvfp4_absmax(value)
+    else:
+        maximum = value.abs().amax()
+    return _scale_2_from_absmax(maximum)
 
 
 @torch.library.custom_op("uniserve_worker::nvfp4_quantize_128x4", mutates_args=())
@@ -227,12 +301,17 @@ class DynamicW4A4NvFp4LinearMethod(QuantizeMethodBase):
         linear.weight_scale = block_scale
         linear.weight_scale_2 = weight_scale_2
 
-    def quantize_activation(self, x: torch.Tensor) -> NvFp4Activation:
+    def quantize_activation(
+        self,
+        x: torch.Tensor,
+        *,
+        absmax: torch.Tensor | None = None,
+    ) -> NvFp4Activation:
         if x.dtype != torch.bfloat16:
             raise RuntimeError("NVFP4 linear execution requires bfloat16 activations")
         original_shape = tuple(int(size) for size in x.shape[:-1])
         x_2d = x.reshape(-1, x.shape[-1])
-        input_scale_2 = _global_scale_2(x_2d)
+        input_scale_2 = _global_scale_2(x_2d) if absmax is None else _scale_2_from_absmax(absmax)
         packed, block_scale = _nvfp4_quantize_128x4(
             x_2d,
             1.0 / input_scale_2,
@@ -329,9 +408,9 @@ class DynamicW4A4NvFp4LinearMethod(QuantizeMethodBase):
             global_rows,
             int(x.shape[1]) // 2,
         )
-        gathered_linear_scale = workspace[
-            packed_elements : packed_elements + scale_elements
-        ].view(global_rows, int(x.shape[1]) // 16)
+        gathered_linear_scale = workspace[packed_elements : packed_elements + scale_elements].view(
+            global_rows, int(x.shape[1]) // 16
+        )
         device_mesh.all_gather_into_tensor(gathered_packed, local_packed, group)
         device_mesh.all_gather_into_tensor(gathered_linear_scale, local_scale, group)
         gathered_scale = _nvfp4_interleave_scale(gathered_linear_scale)
@@ -374,8 +453,16 @@ class NvFp4Linear(nn.Module):
     def forward_unbiased(self, value: torch.Tensor) -> torch.Tensor:
         return self.quant_method.apply_unbiased(self, value.to(torch.bfloat16))
 
-    def quantize_activation(self, value: torch.Tensor) -> NvFp4Activation:
-        return self.quant_method.quantize_activation(value.to(torch.bfloat16))
+    def quantize_activation(
+        self,
+        value: torch.Tensor,
+        *,
+        absmax: torch.Tensor | None = None,
+    ) -> NvFp4Activation:
+        return self.quant_method.quantize_activation(
+            value.to(torch.bfloat16),
+            absmax=absmax,
+        )
 
     def forward_prequantized(
         self,

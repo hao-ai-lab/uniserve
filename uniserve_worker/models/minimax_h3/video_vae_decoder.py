@@ -13,9 +13,14 @@ from .video_vae_fusions import (
     qk_rmsnorm_partial_rope_,
     scaled_residual_,
     scaled_residual_layernorm,
+    scaled_residual_layernorm_absmax,
     scaled_residual_rmsnorm_,
+    scaled_residual_rmsnorm_absmax_,
     value_first_swiglu,
+    value_first_swiglu_absmax,
+    video_patch_output,
     video_rmsnorm,
+    video_rmsnorm_absmax,
 )
 
 __all__ = ["MiniMaxH3VideoDecoder"]
@@ -24,7 +29,14 @@ __all__ = ["MiniMaxH3VideoDecoder"]
 def _linear_with_deferred_bias(
     linear: nn.Module,
     hidden: torch.Tensor,
+    *,
+    absmax: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    quantize = getattr(linear, "quantize_activation", None)
+    prequantized = getattr(linear, "forward_prequantized", None)
+    if absmax is not None and callable(quantize) and callable(prequantized):
+        activation = quantize(hidden, absmax=absmax)
+        return prequantized(activation, include_bias=False), getattr(linear, "bias", None)
     execute = getattr(linear, "forward_unbiased", None)
     if callable(execute):
         return execute(hidden), getattr(linear, "bias", None)
@@ -85,6 +97,8 @@ class _Attention(nn.Module):
         self,
         hidden: torch.Tensor,
         rotary: tuple[torch.Tensor, torch.Tensor],
+        *,
+        hidden_absmax: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         batch, sequence, _ = hidden.shape
         quantize = getattr(self.to_q, "quantize_activation", None)
@@ -95,16 +109,18 @@ class _Attention(nn.Module):
             callable(execute)
             for execute in (quantize, q_prequantized, k_prequantized, v_prequantized)
         ):
-            activation = quantize(hidden)
+            activation = quantize(hidden, absmax=hidden_absmax)
             query = q_prequantized(activation, include_bias=False)
             key = k_prequantized(activation, include_bias=False)
-            value = v_prequantized(activation, include_bias=True)
+            value = v_prequantized(activation, include_bias=False)
             query_bias = getattr(self.to_q, "bias", None)
             key_bias = getattr(self.to_k, "bias", None)
+            value_bias = getattr(self.to_v, "bias", None)
         else:
             query, query_bias = _linear_with_deferred_bias(self.to_q, hidden)
             key, key_bias = _linear_with_deferred_bias(self.to_k, hidden)
             value = self.to_v(hidden)
+            value_bias = None
         query = query.view(batch, sequence, self.heads, self.head_dim)
         key = key.view(batch, sequence, self.heads, self.head_dim)
         value = value.view(batch, sequence, self.heads, self.head_dim)
@@ -116,6 +132,8 @@ class _Attention(nn.Module):
             sine,
             query_bias=query_bias,
             key_bias=key_bias,
+            value=value if value_bias is not None else None,
+            value_bias=value_bias,
         )
         attended = F.scaled_dot_product_attention(
             query.transpose(1, 2),
@@ -135,9 +153,31 @@ class _SwiGLU(nn.Module):
         super().__init__()
         self.proj = nn.Linear(width, intermediate * 2, bias=True)
 
-    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        projected, bias = _linear_with_deferred_bias(self.proj, hidden)
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        *,
+        hidden_absmax: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        projected, bias = _linear_with_deferred_bias(
+            self.proj,
+            hidden,
+            absmax=hidden_absmax,
+        )
         return value_first_swiglu(projected, bias)
+
+    def forward_with_absmax(
+        self,
+        hidden: torch.Tensor,
+        *,
+        hidden_absmax: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        projected, bias = _linear_with_deferred_bias(
+            self.proj,
+            hidden,
+            absmax=hidden_absmax,
+        )
+        return value_first_swiglu_absmax(projected, bias)
 
 
 class _FeedForward(nn.Module):
@@ -147,10 +187,26 @@ class _FeedForward(nn.Module):
             (_SwiGLU(width, intermediate), nn.Dropout(0.0), nn.Linear(intermediate, width))
         )
 
-    def forward(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
-        hidden = self.net[0](hidden)
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        *,
+        hidden_absmax: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        linear = self.net[2]
+        quantize = getattr(linear, "quantize_activation", None)
+        prequantized = getattr(linear, "forward_prequantized", None)
+        if callable(quantize) and callable(prequantized):
+            hidden, absmax = self.net[0].forward_with_absmax(
+                hidden,
+                hidden_absmax=hidden_absmax,
+            )
+            hidden = self.net[1](hidden)
+            activation = quantize(hidden, absmax=absmax)
+            return prequantized(activation, include_bias=False), getattr(linear, "bias", None)
+        hidden = self.net[0](hidden, hidden_absmax=hidden_absmax)
         hidden = self.net[1](hidden)
-        return _linear_with_deferred_bias(self.net[2], hidden)
+        return _linear_with_deferred_bias(linear, hidden)
 
 
 class _TransformerBlock(nn.Module):
@@ -168,11 +224,21 @@ class _TransformerBlock(nn.Module):
         hidden: torch.Tensor,
         rotary: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        normalized = video_rmsnorm(hidden, self.norm1.weight, eps=float(self.norm1.eps))
+        quantized_attention = callable(getattr(self.attn.to_q, "quantize_activation", None))
+        if quantized_attention:
+            normalized, normalized_absmax = video_rmsnorm_absmax(
+                hidden,
+                self.norm1.weight,
+                eps=float(self.norm1.eps),
+            )
+        else:
+            normalized = video_rmsnorm(hidden, self.norm1.weight, eps=float(self.norm1.eps))
+            normalized_absmax = None
         hidden, feed_forward, feed_forward_bias = self.forward_normalized(
             hidden,
             normalized,
             rotary,
+            normalized_absmax=normalized_absmax,
         )
         return scaled_residual_(
             hidden,
@@ -186,17 +252,38 @@ class _TransformerBlock(nn.Module):
         hidden: torch.Tensor,
         normalized: torch.Tensor,
         rotary: tuple[torch.Tensor, torch.Tensor],
+        *,
+        normalized_absmax: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        attention, attention_bias = self.attn(normalized, rotary)
-        hidden, normalized = scaled_residual_rmsnorm_(
-            hidden,
-            attention,
-            self.scale1,
-            self.norm2.weight,
-            update_bias=attention_bias,
-            eps=float(self.norm2.eps),
+        attention, attention_bias = self.attn(
+            normalized,
+            rotary,
+            hidden_absmax=normalized_absmax,
         )
-        feed_forward, feed_forward_bias = self.ff(normalized)
+        quantized_feed_forward = callable(getattr(self.ff.net[0].proj, "quantize_activation", None))
+        if quantized_feed_forward:
+            hidden, normalized, feed_forward_absmax = scaled_residual_rmsnorm_absmax_(
+                hidden,
+                attention,
+                self.scale1,
+                self.norm2.weight,
+                update_bias=attention_bias,
+                eps=float(self.norm2.eps),
+            )
+        else:
+            hidden, normalized = scaled_residual_rmsnorm_(
+                hidden,
+                attention,
+                self.scale1,
+                self.norm2.weight,
+                update_bias=attention_bias,
+                eps=float(self.norm2.eps),
+            )
+            feed_forward_absmax = None
+        feed_forward, feed_forward_bias = self.ff(
+            normalized,
+            hidden_absmax=feed_forward_absmax,
+        )
         return hidden, feed_forward, feed_forward_bias
 
 
@@ -323,7 +410,6 @@ class MiniMaxH3VideoDecoder(nn.Module):
         )
         hidden = self.decoder.proj_in(hidden)
         compute_dtype = hidden.dtype
-        patch_count = hidden.shape[1]
         registers = self.decoder.register_tokens.expand(batch, -1, -1)
         hidden = torch.cat((hidden, registers, torch.zeros_like(hidden[:, :1])), dim=1)
         axes = tuple(
@@ -336,41 +422,85 @@ class MiniMaxH3VideoDecoder(nn.Module):
         rotary = self.decoder.rope(torch.cat((positions, suffix), dim=1))
         rotary = tuple(value.to(compute_dtype) for value in rotary)
         first = self.decoder.transformer_blocks[0]
-        normalized = video_rmsnorm(hidden, first.norm1.weight, eps=float(first.norm1.eps))
+        quantized_attention = callable(getattr(first.attn.to_q, "quantize_activation", None))
+        if quantized_attention:
+            normalized, normalized_absmax = video_rmsnorm_absmax(
+                hidden,
+                first.norm1.weight,
+                eps=float(first.norm1.eps),
+            )
+        else:
+            normalized = video_rmsnorm(hidden, first.norm1.weight, eps=float(first.norm1.eps))
+            normalized_absmax = None
         hidden, feed_forward, feed_forward_bias = first.forward_normalized(
             hidden,
             normalized,
             rotary,
+            normalized_absmax=normalized_absmax,
         )
         previous = first
         for block in self.decoder.transformer_blocks[1:]:
-            hidden, normalized = scaled_residual_rmsnorm_(
-                hidden,
-                feed_forward,
-                previous.scale2,
-                block.norm1.weight,
-                update_bias=feed_forward_bias,
-                eps=float(block.norm1.eps),
-            )
+            quantized_attention = callable(getattr(block.attn.to_q, "quantize_activation", None))
+            if quantized_attention:
+                hidden, normalized, normalized_absmax = scaled_residual_rmsnorm_absmax_(
+                    hidden,
+                    feed_forward,
+                    previous.scale2,
+                    block.norm1.weight,
+                    update_bias=feed_forward_bias,
+                    eps=float(block.norm1.eps),
+                )
+            else:
+                hidden, normalized = scaled_residual_rmsnorm_(
+                    hidden,
+                    feed_forward,
+                    previous.scale2,
+                    block.norm1.weight,
+                    update_bias=feed_forward_bias,
+                    eps=float(block.norm1.eps),
+                )
+                normalized_absmax = None
             hidden, feed_forward, feed_forward_bias = block.forward_normalized(
                 hidden,
                 normalized,
                 rotary,
+                normalized_absmax=normalized_absmax,
             )
             previous = block
-        hidden = scaled_residual_layernorm(
+        quantized_output = callable(getattr(self.decoder.proj_out, "quantize_activation", None))
+        if quantized_output:
+            hidden, hidden_absmax = scaled_residual_layernorm_absmax(
+                hidden,
+                feed_forward,
+                previous.scale2,
+                self.decoder.norm_out.weight,
+                self.decoder.norm_out.bias,
+                update_bias=feed_forward_bias,
+                eps=float(self.decoder.norm_out.eps),
+            )
+            hidden, output_bias = _linear_with_deferred_bias(
+                self.decoder.proj_out,
+                hidden,
+                absmax=hidden_absmax,
+            )
+        else:
+            hidden = scaled_residual_layernorm(
+                hidden,
+                feed_forward,
+                previous.scale2,
+                self.decoder.norm_out.weight,
+                self.decoder.norm_out.bias,
+                update_bias=feed_forward_bias,
+                eps=float(self.decoder.norm_out.eps),
+            )
+            hidden, output_bias = _linear_with_deferred_bias(
+                self.decoder.proj_out,
+                hidden,
+            )
+        return video_patch_output(
             hidden,
-            feed_forward,
-            previous.scale2,
-            self.decoder.norm_out.weight,
-            self.decoder.norm_out.bias,
-            update_bias=feed_forward_bias,
-            eps=float(self.decoder.norm_out.eps),
-        )
-        hidden = self.decoder.proj_out(hidden)[:, :patch_count]
-        hidden = hidden.view(batch, frames, height, width, 3, 4, 16, 16)
-        return (
-            hidden.permute(0, 4, 1, 5, 2, 6, 3, 7)
-            .contiguous()
-            .reshape(batch, 3, frames * 4, height * 16, width * 16)
+            output_bias,
+            frames=frames,
+            height=height,
+            width=width,
         )
