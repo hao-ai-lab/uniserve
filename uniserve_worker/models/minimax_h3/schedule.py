@@ -8,7 +8,7 @@ import torch
 
 __all__ = ["FASTH3_LADDER", "H3Schedule", "shifted_sigmas", "solver_step"]
 
-FASTH3_LADDER = (999, 749, 500, 250)
+FASTH3_LADDER = (1000, 750, 500, 250)
 
 
 def shifted_sigmas(shift: float) -> tuple[float, ...]:

@@ -26,14 +26,7 @@ from ...nn.quant import (
     UnquantizedLinearMethod,
 )
 from ...ops import qk_norm_rope
-from .fusions import (
-    attention_residual_modulated_rmsnorm,
-    attention_residual_modulated_rmsnorm_fp8,
-    dual_gated_residual,
-    row_modulated_rmsnorm,
-    value_first_swiglu,
-    value_first_swiglu_fp8,
-)
+from .fusions import row_modulated_rmsnorm, value_first_swiglu
 from .packing import AUDIO_TAG
 from .precision import LinearPrecision
 from .state import H3Layout, H3Scratch, H3StateSlot
@@ -190,30 +183,7 @@ class _FeedForward(nn.Module):
         )
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
-        if self.accepts_prequantized_fp8:
-            value_gate = self.net[0].proj(value)
-            activated, activated_scale = value_first_swiglu_fp8(value_gate)
-            return self.net[2].forward_prequantized(activated, activated_scale)
         return self.net[2](self.net[0](value))
-
-    @property
-    def accepts_prequantized_fp8(self) -> bool:
-        return all(
-            isinstance(linear.quant_method, DynamicW8A8Fp8LinearMethod)
-            and not linear.quant_method.tensorwise
-            for linear in (self.net[0].proj, self.net[2])
-        )
-
-    def forward_prequantized_fp8(
-        self,
-        value: torch.Tensor,
-        scale: torch.Tensor,
-    ) -> torch.Tensor:
-        if not self.accepts_prequantized_fp8:
-            raise RuntimeError("feed-forward precision cannot consume prequantized FP8 input")
-        value_gate = self.net[0].proj.forward_prequantized(value, scale)
-        activated, activated_scale = value_first_swiglu_fp8(value_gate)
-        return self.net[2].forward_prequantized(activated, activated_scale)
 
 
 class _RotaryEmbedding(nn.Module):
@@ -566,7 +536,7 @@ class _TransformerBlock(nn.Module):
             adaln_indices,
             eps=self.norm1.eps,
         )
-        attention = self.attn(
+        hidden = hidden + gate_attn.index_select(0, adaln_indices) * self.attn(
             normalized,
             rotary,
             tile_valid_sizes,
@@ -588,41 +558,15 @@ class _TransformerBlock(nn.Module):
             compressed_tiles,
             topk_indices_i32,
         )
-        if self.ff.accepts_prequantized_fp8:
-            normalized, normalized_scale = attention_residual_modulated_rmsnorm_fp8(
-                hidden,
-                attention,
-                gate_attn,
-                self.norm2.weight,
-                shift_ffn,
-                scale_ffn,
-                adaln_indices,
-                eps=self.norm2.eps,
-            )
-            feed_forward = self.ff.forward_prequantized_fp8(
-                normalized,
-                normalized_scale,
-            )
-        else:
-            normalized = attention_residual_modulated_rmsnorm(
-                hidden,
-                attention,
-                gate_attn,
-                self.norm2.weight,
-                shift_ffn,
-                scale_ffn,
-                adaln_indices,
-                eps=self.norm2.eps,
-            )
-            feed_forward = self.ff(normalized)
-        return dual_gated_residual(
+        normalized = row_modulated_rmsnorm(
             hidden,
-            attention,
-            feed_forward,
-            gate_attn,
-            gate_ffn,
+            self.norm2.weight,
+            shift_ffn,
+            scale_ffn,
             adaln_indices,
+            eps=self.norm2.eps,
         )
+        return hidden + gate_ffn.index_select(0, adaln_indices) * self.ff(normalized)
 
 
 class _OutputNorm(nn.Module):

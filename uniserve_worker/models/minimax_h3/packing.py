@@ -40,7 +40,7 @@ def video_latent_frames(num_frames: int) -> int:
 
 
 def audio_latent_frames(num_frames: int) -> int:
-    return math.ceil(num_frames / FPS * AUDIO_LATENTS_PER_SECOND)
+    return round(num_frames / FPS * AUDIO_LATENTS_PER_SECOND)
 
 
 @dataclass(frozen=True, slots=True)
