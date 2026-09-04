@@ -1,4 +1,5 @@
 """Generic paged-attention plan-pool seam."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -14,6 +15,8 @@ __all__ = [
 
 @dataclass(frozen=True)
 class PagedAttentionPlan:
+    """Pairs a plan cache key with its workspace and backend wrapper."""
+
     kind: str
     key: tuple[Any, ...]
     workspace: torch.Tensor | None = None
@@ -29,15 +32,23 @@ class PagedAttentionPlanPool:
     workspaces: dict[tuple[str, int], torch.Tensor] = field(default_factory=dict)
 
     def plan_decode(self, key: tuple[Any, ...], *, workspace: torch.Tensor | None = None, wrapper: Any | None = None) -> PagedAttentionPlan:
+        """Intern a decode plan by backend key and retain its workspace and wrapper."""
+
         return self._plan("decode", key, workspace=workspace, wrapper=wrapper)
 
     def plan_prefill(self, key: tuple[Any, ...], *, workspace: torch.Tensor | None = None, wrapper: Any | None = None) -> PagedAttentionPlan:
+        """Intern a prefill plan by backend key and retain its workspace and wrapper."""
+
         return self._plan("prefill", key, workspace=workspace, wrapper=wrapper)
 
     def bind_graph(self, key: tuple[Any, ...], binding: Any) -> None:
+        """Associate a plan key with the stable buffers owned by one CUDA graph."""
+
         self.graph_bindings[tuple(key)] = binding
 
     def workspace(self, device: torch.device | str, size: int, *, dtype: torch.dtype = torch.uint8) -> torch.Tensor:
+        """Return a reusable device workspace with at least the requested byte capacity."""
+
         target = torch.device(device)
         key = (str(target), int(size))
         cached = self.workspaces.get(key)
@@ -55,6 +66,8 @@ class PagedAttentionPlanPool:
         workspace: torch.Tensor | None,
         wrapper: Any | None,
     ) -> PagedAttentionPlan:
+        """Return or create a bounded decode or prefill plan for one cache key."""
+
         cache_key = (str(kind), *tuple(key))
         plan = self.plans.get(cache_key)
         if plan is None:

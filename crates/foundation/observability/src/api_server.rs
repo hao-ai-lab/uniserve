@@ -1,3 +1,5 @@
+//! HTTP request counters and latency metrics for the API server.
+
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::histogram::Histogram;
@@ -11,39 +13,52 @@ const HTTP_REQUEST_DURATION_HIGHR_BUCKETS: [f64; 21] = [
     7.5, 10.0, 30.0, 60.0,
 ];
 
+/// Builds the standard request-latency histogram for aggregate HTTP metrics.
 fn http_request_duration_histogram() -> Histogram {
     Histogram::new(HTTP_REQUEST_DURATION_BUCKETS.iter().copied())
 }
 
+/// Builds the high-resolution request-latency histogram used by handler metrics.
 fn http_request_duration_highr_histogram() -> Histogram {
     Histogram::new(HTTP_REQUEST_DURATION_HIGHR_BUCKETS.iter().copied())
 }
 
+/// Labels identifying an HTTP request by method, status, and handler.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct HttpRequestLabels {
+    /// HTTP request method.
     pub method: String,
+    /// HTTP response status.
     pub status: &'static str,
+    /// Logical route handler.
     pub handler: String,
 }
 
+/// Labels identifying an HTTP handler latency series.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct HttpHandlerLabels {
+    /// HTTP request method.
     pub method: String,
+    /// Logical route handler.
     pub handler: String,
 }
 
+/// Counter family keyed by HTTP request labels.
 pub(crate) type HttpRequestCounterFamily = Family<HttpRequestLabels, U64Counter>;
+/// Latency histogram family keyed by HTTP handler labels.
 pub(crate) type HttpHandlerHistogramFamily =
     Family<HttpHandlerLabels, Histogram, fn() -> Histogram>;
 
 /// API-server Prometheus families exported from the HTTP middleware layer.
 #[derive(MetricFamily)]
 pub struct ApiServerMetrics {
+    /// HTTP request count grouped by method, status, and handler.
     #[metric(
         name = "http_requests",
         help = "Total number of HTTP requests by method, status, and handler."
     )]
     pub http_requests: HttpRequestCounterFamily,
+    /// HTTP request latency grouped by method and handler.
     #[metric(
         name = "http_request_duration_seconds",
         help = "Duration of HTTP requests in seconds grouped by method and handler.",
@@ -52,6 +67,7 @@ pub struct ApiServerMetrics {
         )
     )]
     pub http_request_duration_seconds: HttpHandlerHistogramFamily,
+    /// High-resolution HTTP request latency across handlers.
     #[metric(
         name = "http_request_duration_highr_seconds",
         help = "High-resolution duration of HTTP requests in seconds.",

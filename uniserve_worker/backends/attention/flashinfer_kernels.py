@@ -1,4 +1,5 @@
 """FlashInfer paged-KV plan-tensor kernels and index gathering."""
+
 from __future__ import annotations
 
 from typing import Any
@@ -35,6 +36,8 @@ if triton is not None:
         stride_col: tl.constexpr,
         block_size: tl.constexpr,
     ) -> None:
+        """Flatten valid block-table prefixes into the decode plan page-index vector."""
+
         row = tl.program_id(0)
         page_count = tl.load(page_counts + row)
         base = tl.load(indptr + row)
@@ -56,6 +59,8 @@ def _paged_decode_indices(
     seq_lens: torch.Tensor,
     page_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build decode indptr, flattened page indices, and last-page lengths from block tables."""
+
     page_counts = torch.div(
         seq_lens + int(page_size) - 1,
         int(page_size),
@@ -128,6 +133,8 @@ def _fill_paged_decode_plan_tensors(
     page_size: int,
     workspace: _DecodePlanWorkspace,
 ) -> bool:
+    """Fill decode indptr, page indices, and last-page lengths in reusable workspace."""
+
     if not _triton_decode_indices_enabled(block_table.device):
         return False
     batch_size = int(seq_lens.shape[0])
@@ -163,6 +170,8 @@ def _fill_paged_prefill_plan_tensors(
     page_size: int,
     workspace: _PrefillPlanWorkspace,
 ) -> bool:
+    """Fill packed-query and paged-KV plan tensors in reusable workspace."""
+
     if not _triton_decode_indices_enabled(block_table.device):
         return False
     batch_size = int(kv_seqlens.shape[0])
@@ -195,6 +204,8 @@ def _fill_paged_prefill_plan_tensors(
 
 
 def _triton_decode_indices_enabled(device: torch.device | str) -> bool:
+    """Return whether Triton may fill decode plan metadata on the requested device."""
+
     if triton is None:
         return False
     if env_optional_flag(_TRITON_DECODE_INDICES_ENV) is False:
@@ -211,6 +222,8 @@ def _write_decode_token(
     v_current: torch.Tensor,
     plan: Any,
 ) -> None:
+    """Scatter current decode K/V rows using plan-provided or derived cache locations."""
+
     page_ids, offsets = _decode_write_locations_from_plan(
         block_table,
         cache_seqlens,
@@ -254,6 +267,8 @@ def _decode_write_locations_from_plan(
     device: torch.device,
     plan: Any,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Derive physical page and offset vectors for the current decode token rows."""
+
     locations = getattr(plan, "out_cache_loc", None)
     if (
         isinstance(locations, torch.Tensor)

@@ -14,6 +14,8 @@ from .device import canonical_device
 
 
 def _invariant(message: str) -> WorkerError:
+    """Construct a classified invariant error for persistent-buffer misuse."""
+
     return WorkerError(
         code=WorkerErrorCode.INVARIANT_VIOLATION,
         message=message,
@@ -23,6 +25,8 @@ def _invariant(message: str) -> WorkerError:
 
 @dataclass(frozen=True, slots=True)
 class PersistentBufferBinding:
+    """Binds a logical buffer placement to its validated tensor view."""
+
     buffer: BufferId
     offset: int
     bytes: int
@@ -40,6 +44,8 @@ class PersistentBuffers:
         byte_capacity: int,
         devices: tuple[torch.device | str, ...],
     ) -> None:
+        """Allocate one byte-addressed persistent arena for each distinct device."""
+
         self.byte_capacity = int(byte_capacity)
         if self.byte_capacity < 0:
             raise ValueError("persistent buffer capacity must not be negative")
@@ -70,6 +76,8 @@ class PersistentBuffers:
         dtype: torch.dtype,
         shape: tuple[int, ...],
     ) -> PersistentBufferBinding:
+        """Validate a buffer placement and return its device tensor view with generation ownership."""
+
         target = canonical_device(device)
         device_name = str(target)
         arena = self._arenas.get(device_name)
@@ -110,6 +118,8 @@ class PersistentBuffers:
             return binding
 
     def release(self, binding: PersistentBufferBinding) -> None:
+        """Release one generation-tagged persistent buffer binding."""
+
         key = (binding.device_name, binding.buffer)
         with self._lock:
             current = self._active.get(key)
@@ -118,6 +128,8 @@ class PersistentBuffers:
             self._active.pop(key)
 
     def close(self) -> None:
+        """Drop all logical bindings and release every persistent device arena."""
+
         with self._lock:
             self._active.clear()
             self._arenas.clear()

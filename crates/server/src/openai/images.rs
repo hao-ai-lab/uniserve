@@ -1,3 +1,5 @@
+//! Image-generation request lowering and response collection.
+
 use crate::serving::{
     GenerateReqInput, ImageGenControls, ModalitySelection, OutputDetail, PromptInput,
     SchedulingBounds, ServeEvent, ServeRequestId,
@@ -8,7 +10,7 @@ use crate::openai::error::{ApiError, serve_error_to_api};
 use crate::openai::types::{GeneratedImageData, ImageGenerationRequest, ImageGenerationResponse};
 use crate::openai::utils::{ResolvedRequestContext, check_model_served};
 
-/// Lower one image-generation request into the sole generate admission
+/// Lowers one image-generation request into the sole generate admission
 /// value.
 pub fn lower_image_generation_request(
     request: ImageGenerationRequest,
@@ -70,6 +72,7 @@ pub fn lower_image_generation_request(
     })
 }
 
+/// Parses a positive `WIDTHxHEIGHT` image-size string.
 fn parse_size(size: &str) -> Result<(u32, u32), ApiError> {
     let Some((width, height)) = size.split_once('x') else {
         return Err(ApiError::invalid_request(
@@ -93,6 +96,7 @@ fn parse_size(size: &str) -> Result<(u32, u32), ApiError> {
     })
 }
 
+/// Collects image events into one OpenAI-compatible response.
 pub async fn collect_image_generation(
     stream: impl Stream<Item = crate::serving::Result<ServeEvent>> + Send,
     created: u64,
@@ -164,6 +168,7 @@ pub async fn collect_image_generation(
     Ok(ImageGenerationResponse { created, data })
 }
 
+/// Returns a required image field or a validation error.
 fn required_image_field<T>(value: Option<T>, field: &str) -> Result<T, ApiError> {
     value.ok_or_else(|| {
         ApiError::server_error(format!(

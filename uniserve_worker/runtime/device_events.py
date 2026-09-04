@@ -14,12 +14,16 @@ from .device import canonical_device
 
 
 def _resolved_device(device: torch.device | str) -> torch.device:
+    """Resolve a concrete torch device with an explicit CUDA index."""
+
     if isinstance(device, torch.device) and (device.type != "cuda" or device.index is not None):
         return device
     return canonical_device(device)
 
 
 def _invariant(message: str) -> WorkerError:
+    """Construct a classified invariant error for event-pool misuse."""
+
     return WorkerError(
         code=WorkerErrorCode.INVARIANT_VIOLATION,
         message=message,
@@ -29,6 +33,8 @@ def _invariant(message: str) -> WorkerError:
 
 @dataclass(slots=True)
 class _EventState:
+    """Tracks one CUDA event’s device, producer stream, timing mode, recording state, and reference count."""
+
     event: torch.cuda.Event
     device_name: str
     timing: bool
@@ -40,6 +46,8 @@ class _EventState:
 
 @dataclass(slots=True)
 class _DeferredRelease:
+    """Retains event-pool references until stream completion permits safe release."""
+
     events: tuple[torch.cuda.Event, ...]
     owner: object
 
@@ -48,6 +56,8 @@ class DeviceEventPool:
     """Own CUDA events until every store reference is query-ready and released."""
 
     def __init__(self) -> None:
+        """Initialize reusable CUDA-event pools and generation-tagged active ownership."""
+
         self._available: dict[tuple[str, bool], deque[torch.cuda.Event]] = {}
         self._active: dict[int, _EventState] = {}
         self._deferred: list[_DeferredRelease] = []
@@ -56,6 +66,8 @@ class DeviceEventPool:
         self._lock = RLock()
 
     def set_completion_wake(self, wake_on_stream: Callable[[int], None]) -> None:
+        """Install the callback used to wake a device-specific completion stream."""
+
         self._wake_on_stream = wake_on_stream
 
     def schedule_completion_wake(
@@ -63,6 +75,8 @@ class DeviceEventPool:
         device: torch.device | str,
         event: torch.cuda.Event,
     ) -> None:
+        """Schedule the registered wake callback after a producer event on the target device."""
+
         wake_on_stream = self._wake_on_stream
         if wake_on_stream is None:
             return
@@ -84,6 +98,8 @@ class DeviceEventPool:
         *,
         timing: bool = False,
     ) -> torch.cuda.Event:
+        """Lease an unrecorded CUDA event for one device and timing mode."""
+
         target = _resolved_device(device)
         if target.type != "cuda":
             raise _invariant("device event requires a CUDA device")
@@ -111,6 +127,8 @@ class DeviceEventPool:
         event: torch.cuda.Event,
         device: torch.device | str,
     ) -> int:
+        """Bind an event to the current producer stream without recording it."""
+
         target = _resolved_device(device)
         stream = torch.cuda.current_stream(target)
         stream_id = int(stream.cuda_stream)
@@ -127,6 +145,8 @@ class DeviceEventPool:
         event: torch.cuda.Event,
         device: torch.device | str,
     ) -> int:
+        """Record a leased event exactly once on its declared or current stream."""
+
         target = _resolved_device(device)
         with self._lock:
             state = self._require_locked(event, target)
@@ -148,6 +168,8 @@ class DeviceEventPool:
         device: torch.device | str,
         count: int = 1,
     ) -> None:
+        """Add references that keep a leased event active across asynchronous owners."""
+
         target = _resolved_device(device)
         references = int(count)
         if references < 1:
@@ -157,6 +179,8 @@ class DeviceEventPool:
             state.references += references
 
     def release(self, event: torch.cuda.Event, count: int = 1) -> None:
+        """Drop event references and recycle the event after its producer work becomes query-ready."""
+
         references = int(count)
         if references < 1:
             raise _invariant("device event release count must be positive")
@@ -176,6 +200,8 @@ class DeviceEventPool:
         events: Sequence[torch.cuda.Event],
         owner: object,
     ) -> None:
+        """Retain an owner and its events until every event reports completion."""
+
         retained = tuple(events)
         if not retained:
             return
@@ -188,10 +214,14 @@ class DeviceEventPool:
             self._reap_locked()
 
     def reap(self) -> None:
+        """Recycle deferred events whose recorded CUDA work has completed."""
+
         with self._lock:
             self._reap_locked()
 
     def close(self) -> None:
+        """Release pooled event and deferred-owner references."""
+
         for stream in self._wake_streams.values():
             stream.synchronize()
         with self._lock:
@@ -201,6 +231,8 @@ class DeviceEventPool:
             self._available.clear()
 
     def _reap_locked(self) -> None:
+        """Return deferred CUDA events to their reusable pools once query-ready."""
+
         pending: list[_DeferredRelease] = []
         for deferred in self._deferred:
             if not all(bool(event.query()) for event in deferred.events):
@@ -218,6 +250,8 @@ class DeviceEventPool:
         self._deferred = pending
 
     def _recycle_locked(self, state: _EventState) -> None:
+        """Remove an active event state and return its event to the reusable pool."""
+
         self._active.pop(id(state.event))
         self._available.setdefault((state.device_name, state.timing), deque()).append(state.event)
 
@@ -226,6 +260,8 @@ class DeviceEventPool:
         event: torch.cuda.Event,
         device: torch.device,
     ) -> _EventState:
+        """Require active ownership of an event on the specified device."""
+
         state = self._active.get(id(event))
         if state is None or state.event is not event or state.device_name != str(device):
             raise _invariant("device event is not owned by its declared device")

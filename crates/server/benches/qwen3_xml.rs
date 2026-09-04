@@ -1,4 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+//! Throughput benchmarks for incremental Qwen XML tool-call parsing.
 
 use std::time::Duration;
 

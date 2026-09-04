@@ -18,6 +18,8 @@ class LayerConfig:
     quantization: QuantizationConfig | None
 
     def quant_method(self, prefix: str) -> QuantizeMethodBase:
+        """Resolve a parameter prefix to its configured quantized linear implementation."""
+
         if self.quantization is None:
             return UnquantizedLinearMethod()
         return self.quantization.get_quant_method(prefix)

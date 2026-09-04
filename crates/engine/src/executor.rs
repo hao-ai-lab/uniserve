@@ -1,4 +1,8 @@
-//! Executor types shared by scheduler, worker IPC, and local engines.
+//! Logical execution batches, physical placement, and executor contracts.
+//!
+//! The scheduler submits logical operations through [`Executor`]. Physical
+//! executors lower those operations into worker protocol batches while retaining
+//! the request and product identities needed to correlate completions.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 use std::str::FromStr;
@@ -16,15 +20,22 @@ use uniserve_worker_ipc::{
 /// Immutable worker placement for one logical operation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpPlacement {
+    /// KV page tables visible to the operation.
     pub block_tables: Vec<BlockTable>,
+    /// KV pages allocated for this operation.
     pub new_cache_pages: Vec<CachePageAllocation>,
+    /// Per-operation row geometry in the physical forward.
     pub forward_rows: Vec<RowGeometry>,
+    /// Latent arena placement for trajectory operations.
     pub latent: Option<LatentPlacement>,
+    /// Output placement for media decoding.
     pub decode: Option<DecodePlacement>,
+    /// Persistent output-buffer placements.
     pub buffers: Vec<BufferPlacement>,
 }
 
 impl OpPlacement {
+    /// Constructs an operation placement with no physical resources.
     pub fn empty() -> Self {
         Self {
             block_tables: Vec::new(),
@@ -40,16 +51,23 @@ impl OpPlacement {
 /// One logical operation and its scheduler-authoritative physical placement.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Op {
+    /// Operation identity within the request lineage.
     pub id: OpId,
+    /// Request lineage that owns the operation.
     pub request: RequestKey,
+    /// Expected committed parent checkpoint.
     pub parent: Option<uniserve_worker_ipc::Checkpoint>,
+    /// Coarse operation family used for routing.
     pub kind: OpKind,
+    /// Typed operation parameters.
     pub payload: OpPayload,
+    /// Scheduler-authoritative physical placement.
     pub placement: OpPlacement,
     run_kind: RunKind,
 }
 
 impl Op {
+    /// Combines a worker operation with its scheduler placement.
     pub fn new(operation: Operation, placement: OpPlacement) -> Self {
         Self {
             id: operation.op_id,
@@ -62,14 +80,17 @@ impl Op {
         }
     }
 
+    /// Returns the owning request lineage.
     pub const fn request_key(&self) -> RequestKey {
         self.request
     }
 
+    /// Returns the operation identity.
     pub const fn id(&self) -> OpId {
         self.id
     }
 
+    /// Returns the parsed command as an executable operation.
     pub(crate) fn into_operation(self) -> Operation {
         Operation {
             request_key: self.request,
@@ -86,13 +107,18 @@ impl Op {
 /// One logical executor submission. Physical runs are derived only inside an executor.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Batch {
+    /// Logical batch identity used to correlate partial completions.
     pub id: u64,
+    /// Operations in scheduler submission order.
     pub ops: Vec<Op>,
+    /// Ordered lifecycle and resource commands.
     pub commands: Vec<BatchCommand>,
+    /// Host-resident input product payloads.
     pub inline: Vec<ProductPayload>,
 }
 
 impl Batch {
+    /// Constructs a logical executor submission.
     pub fn new(
         id: u64,
         ops: Vec<Op>,
@@ -107,6 +133,7 @@ impl Batch {
         }
     }
 
+    /// Iterates over request admissions carried by batch commands.
     pub fn admissions(&self) -> impl Iterator<Item = &NewRequest> {
         self.commands.iter().filter_map(|command| match command {
             BatchCommand::Start { request } => Some(request),
@@ -114,11 +141,13 @@ impl Batch {
         })
     }
 
+    /// Validates operation identities, placement ownership, and command payloads.
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.ops.is_empty() || !self.commands.is_empty(),
             "logical batch must carry at least one operation or command"
         );
+
         let mut requests = std::collections::HashSet::with_capacity(self.ops.len());
         let mut identities = std::collections::HashSet::with_capacity(self.ops.len());
         for op in &self.ops {
@@ -163,6 +192,7 @@ impl Batch {
                 );
             }
         }
+
         let mut admitted = std::collections::HashSet::new();
         for admission in self.admissions() {
             admission.validate()?;
@@ -175,9 +205,11 @@ impl Batch {
                 "logical batch starts a request without an operation"
             );
         }
+
         for command in &self.commands {
             command.validate()?;
         }
+
         for inline in &self.inline {
             inline.validate()?;
         }
@@ -188,16 +220,19 @@ impl Batch {
 /// Concrete pool information reported through the execution boundary.
 #[derive(Debug, Clone)]
 pub struct ExecutorInfo {
+    /// Physical pool identities and their reported capabilities.
     pub pools: Vec<(PoolId, WorkerInfo)>,
 }
 
 impl ExecutorInfo {
+    /// Constructs capability information for one physical pool.
     pub fn single(id: PoolId, info: WorkerInfo) -> Self {
         Self {
             pools: vec![(id, info)],
         }
     }
 
+    /// Validates and constructs capability information for multiple pools.
     pub fn from_pools(pools: Vec<(PoolId, WorkerInfo)>) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !pools.is_empty(),
@@ -211,6 +246,11 @@ impl ExecutorInfo {
         Ok(Self { pools })
     }
 
+    /// Returns the sole worker capability record.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless the executor contains exactly one physical pool.
     pub fn single_pool(&self) -> &WorkerInfo {
         assert_eq!(
             self.pools.len(),
@@ -220,7 +260,7 @@ impl ExecutorInfo {
         &self.pools[0].1
     }
 
-    /// Derive the runtime's immutable capacity view from concrete pools.
+    /// Derives the runtime's immutable capacity view from concrete pools.
     /// The returned value is not part of executor identity and is never
     /// reported as a physical worker.
     pub fn runtime_info(&self) -> anyhow::Result<WorkerInfo> {
@@ -228,6 +268,9 @@ impl ExecutorInfo {
         if self.pools.len() == 1 {
             return Ok(self.pools[0].1.clone());
         }
+
+        // Route-specific capacities contribute only when a pool implements the
+        // corresponding operation family.
         let routed = |variant: OpKind| {
             self.pools
                 .iter()
@@ -255,6 +298,8 @@ impl ExecutorInfo {
             "executor pools expose different model names or weight versions"
         );
 
+        // Every KV stage must agree on layout. Capacity is the narrowest pool
+        // because a lineage may traverse all routed KV stages.
         if let Some(first_index) = kv_indices.first().copied() {
             let first = &self.pools[first_index].1;
             let first_kv = first
@@ -298,6 +343,7 @@ impl ExecutorInfo {
             merged.kv_cache = None;
         }
 
+        // Aggregate global limits conservatively across all physical pools.
         merged.supported_ops = OpKind::ALL
             .into_iter()
             .filter(|variant| routed(*variant).is_some())
@@ -354,28 +400,39 @@ impl ExecutorInfo {
 /// One operation result returned from an executor-owned physical run.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpResult {
+    /// Validated completion record returned by the worker.
     pub output: uniserve_worker_ipc::ModelOutput,
+    /// Products published by the completed operation.
     pub products: Vec<ProductPayload>,
 }
 
 /// Acknowledgement of one logical batch command after every target pool applied it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandResult {
+    /// Position of the acknowledged command in the logical batch.
     pub command_index: u32,
+    /// Request lineage targeted by the command.
     pub request_key: RequestKey,
 }
 
 /// One independently ready subset of a logical batch.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BatchResult {
+    /// Logical batch identity assigned at submission.
     pub batch_id: u64,
+    /// Operation completions ready in this result fragment.
     pub results: Vec<OpResult>,
+    /// Control commands acknowledged by all target pools.
     pub command_results: Vec<CommandResult>,
+    /// Whether this fragment terminates the logical batch.
     pub done: bool,
+    /// Per-worker execution durations in microseconds.
     pub worker_exec_us: Vec<u64>,
+    /// Per-worker model-forward statistics.
     pub forward_stats: Vec<uniserve_worker_ipc::WorkerForwardStats>,
 }
 
+/// Resolves and validates one logical completion against its submitted operation.
 pub(crate) fn logical_result(
     report: RunResult,
     done: bool,
@@ -435,6 +492,7 @@ pub(crate) struct LogicalResultTracker {
 }
 
 impl LogicalResultTracker {
+    /// Registers the operation executor.
     pub(crate) fn register(&mut self, batch: &Batch) -> anyhow::Result<()> {
         let state = PendingLogicalResult {
             remaining: batch
@@ -452,10 +510,12 @@ impl LogicalResultTracker {
         Ok(())
     }
 
+    /// Unregisters the operation executor.
     pub(crate) fn unregister(&mut self, batch_id: u64) {
         self.pending.remove(&batch_id);
     }
 
+    /// Validates one physical result and merges it into its pending logical batch.
     pub(crate) fn apply(&mut self, report: RunResult) -> anyhow::Result<BatchResult> {
         report.validate()?;
         let state = self.pending.get_mut(&report.batch_id).ok_or_else(|| {
@@ -496,17 +556,22 @@ impl LogicalResultTracker {
     }
 }
 
+/// Dynamic error returned while polling or administering an executor.
 pub type ExecutorError = anyhow::Error;
 
+/// Backpressure and terminal failures returned by logical batch submission.
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutorSubmitError {
     #[error("executor queue is full")]
+    /// Returns ownership of a batch rejected by bounded queue capacity.
     WouldBlock(Batch),
     #[error(transparent)]
+    /// Reports a terminal submission failure.
     Failed(#[from] anyhow::Error),
 }
 
 #[doc(hidden)]
+/// Backpressure and terminal failures returned by a physical executor.
 #[derive(Debug, thiserror::Error)]
 pub enum PhysicalSubmitError {
     #[error("physical executor queue is full")]
@@ -518,12 +583,17 @@ pub enum PhysicalSubmitError {
 /// Internal worker-pool boundary used after logical routing and lowering.
 #[doc(hidden)]
 pub trait PhysicalExecutor: Send {
+    /// Returns physical pool capabilities.
     fn physical_info(&self) -> &ExecutorInfo;
+    /// Submits one fully lowered worker run.
     fn submit_run(&mut self, run: PhysicalRun) -> Result<(), PhysicalSubmitError>;
+    /// Waits up to `timeout` for one partial or terminal run result.
     fn poll_run(&mut self, timeout: Duration) -> Result<Option<RunResult>, ExecutorError>;
+    /// Consumes a pending command wake notification.
     fn take_command_wake(&mut self) -> bool {
         false
     }
+    /// Closes physical workers and releases their transport resources.
     fn close_physical(&mut self) -> Result<(), ExecutorError>;
 }
 
@@ -533,6 +603,7 @@ pub trait PhysicalExecutor: Send {
 pub struct PoolId(pub String);
 
 impl PoolId {
+    /// Validates and constructs a stable pool identifier.
     pub fn new(value: impl Into<String>) -> Result<Self, WorkerTopologyError> {
         let value = value.into();
         if value.is_empty()
@@ -549,6 +620,7 @@ impl PoolId {
 }
 
 impl std::fmt::Display for PoolId {
+    /// Formats the value for diagnostic output.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.0)
     }
@@ -558,21 +630,27 @@ impl std::fmt::Display for PoolId {
 /// set; profile names are discarded during CLI expansion.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PoolConfig {
+    /// Stable identity used by routes and transfer edges.
     pub id: PoolId,
+    /// Device selector forwarded to worker processes.
     pub device: String,
+    /// Number of tensor-parallel worker ranks.
     pub tensor_parallel_size: usize,
+    /// Logical operation families accepted by this pool.
     pub supported_ops: Vec<OpKind>,
+    /// Maximum number of unresolved physical runs.
     pub queue_depth: usize,
 }
 
 /// The fully expanded worker topology consumed by engine construction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerTopology {
+    /// Concrete physical pools in configuration order.
     pub pools: Vec<PoolConfig>,
 }
 
 impl WorkerTopology {
-    /// The default single-pool topology with the given tensor-parallel size.
+    /// Builds the default single-pool topology with the given tensor-parallel size.
     pub fn single_full(tp: usize) -> Self {
         Self {
             pools: vec![PoolConfig {
@@ -585,7 +663,7 @@ impl WorkerTopology {
         }
     }
 
-    /// Apply process-level defaults while producing concrete pool values.
+    /// Applies process-level defaults while producing concrete pool values.
     pub fn with_process_defaults(mut self, device: &str, queue_depth: usize) -> Self {
         for pool in &mut self.pools {
             if pool.device == "cuda" {
@@ -598,9 +676,10 @@ impl WorkerTopology {
         self
     }
 
-    /// Expand CLI convenience profiles such as
+    /// Expands CLI convenience profiles such as
     /// `prefill:1:tp=4,decode:1:tp=4` into concrete pool configuration.
     pub fn parse(s: &str) -> Result<Self, WorkerTopologyError> {
+        // JSON topology input already names every concrete pool.
         if s.trim_start().starts_with('[') {
             let pools: Vec<PoolConfig> = serde_json::from_str(s).map_err(|error| {
                 WorkerTopologyError::message(format!("invalid explicit worker topology: {error}"))
@@ -609,6 +688,9 @@ impl WorkerTopology {
             topology.validate()?;
             return Ok(topology);
         }
+
+        // Compact entries select a capability profile and then override its
+        // instance count, placement, parallelism, and queue depth.
         let mut pools = Vec::new();
         for entry in s.split(',').map(str::trim).filter(|e| !e.is_empty()) {
             let mut parts = entry.split(':');
@@ -633,6 +715,7 @@ impl WorkerTopology {
             let mut tp = 1usize;
             let mut device = "cuda".to_owned();
             let mut queue_depth = 0usize;
+
             for part in parts {
                 let part = part.trim();
                 if let Some(tp_str) = part.strip_prefix("tp=") {
@@ -668,6 +751,8 @@ impl WorkerTopology {
                         .max(1);
                 }
             }
+
+            // Expand repeated profile instances into independently routable pools.
             for instance in 0..count {
                 let name = if count == 1 {
                     profile.to_owned()
@@ -683,11 +768,13 @@ impl WorkerTopology {
                 });
             }
         }
+
         let topology = Self { pools };
         topology.validate()?;
         Ok(topology)
     }
 
+    /// Validates pool identities, devices, parallelism, and routing declarations.
     pub fn validate(&self) -> Result<(), WorkerTopologyError> {
         if self.pools.is_empty() {
             return Err(WorkerTopologyError::message(
@@ -726,7 +813,7 @@ impl WorkerTopology {
         Ok(())
     }
 
-    /// Whether this is one pool capable of every logical operation.
+    /// Returns whether this is one pool capable of every logical operation.
     pub fn is_single_full(&self) -> bool {
         self.pools.len() == 1
             && OpKind::ALL
@@ -734,7 +821,7 @@ impl WorkerTopology {
                 .all(|operation| self.pools[0].supported_ops.contains(operation))
     }
 
-    /// Total concrete pool count.
+    /// Returns the total concrete pool count.
     pub fn total_pools(&self) -> usize {
         self.pools.len()
     }
@@ -743,31 +830,39 @@ impl WorkerTopology {
 impl FromStr for WorkerTopology {
     type Err = WorkerTopologyError;
 
+    /// Parses the value from its string representation.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         Self::parse(value)
     }
 }
 
+/// Error returned for an invalid worker topology string.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
 pub struct WorkerTopologyError(String);
 
 impl WorkerTopologyError {
+    /// Returns the human-readable error message.
     fn message(message: impl Into<String>) -> Self {
         Self(message.into())
     }
 }
 
+/// Transport available for product movement between worker pools.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransferBackend {
+    /// Keeps products within one worker process.
     #[default]
     Inproc,
+    /// Publishes products through POSIX shared memory.
     Shm,
+    /// Publishes device products through CUDA IPC handles.
     CudaIpc,
 }
 
 impl TransferBackend {
+    /// Returns the stable configuration spelling.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Inproc => "inproc",
@@ -778,6 +873,7 @@ impl TransferBackend {
 }
 
 impl std::fmt::Display for TransferBackend {
+    /// Formats the value for diagnostic output.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.as_str())
     }
@@ -786,6 +882,7 @@ impl std::fmt::Display for TransferBackend {
 impl FromStr for TransferBackend {
     type Err = TransportMapError;
 
+    /// Parses the value from its string representation.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "inproc" => Ok(Self::Inproc),
@@ -801,21 +898,29 @@ impl FromStr for TransferBackend {
 /// One explicit directed transfer edge between configured pool identities.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransferEdge {
+    /// Pool that produces the transferred product.
     pub source_pool: PoolId,
+    /// Pool that consumes the transferred product.
     pub destination_pool: PoolId,
+    /// Data-plane mechanism used for the edge.
     pub transport: TransferBackend,
 }
 
 /// Per-edge local data-plane transfer selection (`--transfer`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransportMap {
+    /// Explicit directed transfer edges.
     pub edges: Vec<TransferEdge>,
 }
 
 impl TransportMap {
+    /// Parses a comma-separated list of `source->destination=backend` edges.
     pub fn parse(s: &str) -> Result<Self, TransportMapError> {
         let mut edges = Vec::new();
+
         for entry in s.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+            // Parse and validate both endpoint identities before accepting the
+            // transport so errors remain attributable to one edge.
             let (edge, backend) = entry.split_once('=').ok_or_else(|| {
                 TransportMapError::message(format!("transfer entry {entry:?} must be edge=backend"))
             })?;
@@ -829,6 +934,7 @@ impl TransportMap {
                 TransportMapError::message(format!("invalid destination pool: {error}"))
             })?;
             let backend = TransferBackend::from_str(backend.trim())?;
+
             if backend == TransferBackend::Inproc {
                 return Err(TransportMapError::message(
                     "inproc is the implicit backend and cannot be assigned to an edge",
@@ -841,12 +947,14 @@ impl TransportMap {
                     "duplicate transfer edge {edge:?}"
                 )));
             }
+
             edges.push(TransferEdge {
                 source_pool: src,
                 destination_pool: dst,
                 transport: backend,
             });
         }
+
         Ok(Self { edges })
     }
 }
@@ -854,16 +962,19 @@ impl TransportMap {
 impl FromStr for TransportMap {
     type Err = TransportMapError;
 
+    /// Parses the value from its string representation.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         Self::parse(value)
     }
 }
 
+/// Error returned for an invalid transfer-transport mapping.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
 pub struct TransportMapError(String);
 
 impl TransportMapError {
+    /// Returns the human-readable error message.
     fn message(message: impl Into<String>) -> Self {
         Self(message.into())
     }
@@ -880,14 +991,20 @@ pub struct WorkerExecError {
     /// executors use it to join the same terminal outcome across ranks before
     /// returning the failure to the scheduler.
     pub run_id: Option<u64>,
+    /// Whether the error invalidates the worker process or executor.
     pub fatal: bool,
     /// Whether retrying the same op could succeed (e.g. transient OOM).
     /// Defaults to `false` when the worker did not classify the error.
     pub retryable: bool,
+    /// Stable worker-defined error code, when classified.
     pub code: Option<String>,
+    /// Human-readable failure description.
     pub message: String,
+    /// Execution phase in which the failure occurred, when known.
     pub phase: Option<String>,
+    /// Physical route or worker pool associated with the failure.
     pub route: Option<String>,
+    /// Operations affected by the worker failure.
     pub operations: Vec<uniserve_worker_ipc::ErrorOperationIdentity>,
 }
 
@@ -896,9 +1013,11 @@ pub struct WorkerExecError {
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
 pub struct WorkerLossError {
+    /// Human-readable worker-loss description.
     pub message: String,
 }
 
+/// Lowers a logical batch into a validated physical worker run.
 pub(crate) fn physical_run(
     batch_id: u64,
     run_id: u64,
@@ -960,7 +1079,7 @@ pub(crate) fn physical_run(
     Ok(run)
 }
 
-/// Lower one logical batch into the physical worker framing without changing its work shape.
+/// Lowers one logical batch into the physical worker framing without changing its work shape.
 pub(crate) fn lower_batch(
     batch: &Batch,
     next_collective_seq: &mut u64,
@@ -980,9 +1099,13 @@ pub(crate) fn lower_batch(
 
 /// The asynchronous, pipelined boundary the scheduler drives.
 pub trait Executor: Send {
+    /// Returns the executor's concrete pool capabilities.
     fn info(&self) -> &ExecutorInfo;
+    /// Submits one logical batch without blocking for capacity.
     fn submit(&mut self, batch: Batch) -> Result<(), ExecutorSubmitError>;
+    /// Waits up to `timeout` for one partial or terminal batch result.
     fn poll(&mut self, timeout: Duration) -> Result<Option<BatchResult>, ExecutorError>;
+    /// Closes the executor and its physical workers.
     fn close(&mut self) -> Result<(), ExecutorError>;
 }
 

@@ -1,4 +1,4 @@
-//! Multiprocess IPC framing, replay/control idempotency, and rank-respawn qualification.
+//! Multiprocess framing, replay idempotency, and tensor-parallel rank recovery.
 
 #![cfg(target_os = "linux")]
 

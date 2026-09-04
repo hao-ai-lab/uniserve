@@ -1,15 +1,11 @@
-//! Typed conversions for steady-state worker IPC frames.
+//! Typed conversion between worker IPC frames and Python mappings.
 //!
-//! The serve loop crosses the FFI boundary once per direction per batch. The
-//! typed converters materialize the canonical `submit` request and `result`
-//! response shapes directly: every dict key and enum string is interned
-//! ([`pyo3::intern!`]), lists are preallocated at their known lengths, and byte
-//! payloads stay on the `bytes` path.
+//! The conversion path crosses the FFI boundary once in each direction per
+//! batch. Mapping keys and enum strings are interned, lists are preallocated,
+//! and binary payloads remain Python `bytes`.
 //!
-//! [`execute_request_to_py`] produces the mapping consumed by
-//! `Run.from_mapping`. [`try_completion_response_from_py`] accepts the exact
-//! completion-report mapping emitted by the Python worker. Administrative frame
-//! kinds are handled by the schema-derived converter in the caller.
+//! [`execute_request_to_py`] builds worker input, while
+//! [`try_completion_response_from_py`] strictly decodes worker output.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -35,11 +31,7 @@ use uniserve_worker_ipc::{
 #[cfg(test)]
 use uniserve_worker_ipc::Bounds;
 
-// ---------------------------------------------------------------------------
-// Request -> Python (recv hot path)
-// ---------------------------------------------------------------------------
-
-/// Convert a `submit` [`WorkerRequest`] into the canonical Python IPC mapping.
+/// Converts a submit [`WorkerRequest`] into the Python worker mapping.
 pub(crate) fn execute_request_to_py<'py>(
     py: Python<'py>,
     request: &WorkerRequest,
@@ -55,10 +47,6 @@ pub(crate) fn execute_request_to_py<'py>(
     dict.set_item(intern!(py, "run"), run_to_py(py, run)?)?;
     Ok(dict)
 }
-
-// ---------------------------------------------------------------------------
-// Native typed construction (recv hot path)
-// ---------------------------------------------------------------------------
 
 /// Cached handles to the worker's operation types and enum members.
 ///
@@ -103,8 +91,10 @@ struct NativeRequestTypes {
     works: [Py<PyAny>; 12],
 }
 
+/// Process-wide cache of worker Python constructors and enum members.
 static NATIVE_REQUEST_TYPES: std::sync::OnceLock<NativeRequestTypes> = std::sync::OnceLock::new();
 
+/// Resolves named Python enum members into a fixed-size indexed cache.
 fn enum_members<const N: usize>(
     module: &Bound<'_, PyModule>,
     name: &str,
@@ -121,9 +111,13 @@ fn enum_members<const N: usize>(
 }
 
 impl NativeRequestTypes {
+    /// Imports worker model types and caches every constructor and enum member.
     fn build(py: Python<'_>) -> PyResult<Self> {
+        // Resolve classes once so per-request conversion uses direct constructor
+        // calls without repeated module or attribute lookup.
         let module = py.import("uniserve_worker.execution.batch")?;
         let class = |name: &str| -> PyResult<Py<PyAny>> { Ok(module.getattr(name)?.unbind()) };
+
         Ok(Self {
             operation: class("Operation")?,
             ar_payload: class("ArOpPayload")?,
@@ -150,6 +144,9 @@ impl NativeRequestTypes {
             finish: class("Finish")?,
             free: class("Free")?,
             native_run: class("native_run")?,
+
+            // Enum members follow the stable Rust discriminant order used by
+            // the indexed accessors below.
             product_kinds: enum_members(
                 &module,
                 "ProductKind",
@@ -215,6 +212,7 @@ impl NativeRequestTypes {
         })
     }
 
+    /// Returns the process-wide type cache, initializing it under the GIL.
     fn get(py: Python<'_>) -> PyResult<&'static Self> {
         if let Some(types) = NATIVE_REQUEST_TYPES.get() {
             return Ok(types);
@@ -223,11 +221,13 @@ impl NativeRequestTypes {
         Ok(NATIVE_REQUEST_TYPES.get_or_init(|| built))
     }
 
+    /// Returns the Python enum member for a physical run kind.
     fn kind<'py>(&self, py: Python<'py>, kind: RunKind) -> Bound<'py, PyAny> {
         let index = kind as usize;
         self.works[index].bind(py).clone()
     }
 
+    /// Returns the Python enum member for a product family.
     fn product_kind<'py>(&self, py: Python<'py>, kind: ProductKind) -> Bound<'py, PyAny> {
         let index = match kind {
             ProductKind::Token => 0,
@@ -244,6 +244,7 @@ impl NativeRequestTypes {
         self.product_kinds[index].bind(py).clone()
     }
 
+    /// Returns the Python enum member for a product storage class.
     fn storage_class<'py>(&self, py: Python<'py>, class: StorageClass) -> Bound<'py, PyAny> {
         let index = match class {
             StorageClass::DeviceTensor => 0,
@@ -256,6 +257,7 @@ impl NativeRequestTypes {
         self.storage_classes[index].bind(py).clone()
     }
 
+    /// Returns the Python enum member for an element type.
     fn dtype<'py>(&self, py: Python<'py>, dtype: DType) -> Bound<'py, PyAny> {
         let index = match dtype {
             DType::U8 => 0,
@@ -282,6 +284,7 @@ struct NativeRequestConversion<'py> {
 }
 
 impl<'py> NativeRequestConversion<'py> {
+    /// Starts a batch conversion with shared Python types and empty value caches.
     fn new(py: Python<'py>) -> PyResult<Self> {
         Ok(Self {
             py,
@@ -292,6 +295,7 @@ impl<'py> NativeRequestConversion<'py> {
         })
     }
 
+    /// Returns a canonical Python request identity for this batch.
     fn request_key(&mut self, key: RequestKey) -> PyResult<Bound<'py, PyAny>> {
         if let Some(value) = self.request_keys.get(&key) {
             return Ok(value.bind(self.py).clone());
@@ -305,6 +309,7 @@ impl<'py> NativeRequestConversion<'py> {
         Ok(value)
     }
 
+    /// Returns a canonical Python shape bound for this batch.
     fn shape_bound(&mut self, shape: &ShapeBound) -> PyResult<Bound<'py, PyAny>> {
         if let Some(value) = self.shape_bounds.get(shape) {
             return Ok(value.bind(self.py).clone());
@@ -327,6 +332,7 @@ impl<'py> NativeRequestConversion<'py> {
         Ok(value)
     }
 
+    /// Returns a canonical Python point range for this batch.
     fn point_range(&mut self, range: PointRange) -> PyResult<Bound<'py, PyAny>> {
         if let Some(value) = self.point_ranges.get(&range) {
             return Ok(value.bind(self.py).clone());
@@ -340,6 +346,7 @@ impl<'py> NativeRequestConversion<'py> {
         Ok(value)
     }
 
+    /// Constructs a typed Python product reference from shared leaf objects.
     fn product_ref(&mut self, product: &ProductRef) -> PyResult<Bound<'py, PyAny>> {
         let request_key = self.request_key(product.request_key)?;
         let shape_bound = self.shape_bound(&product.shape_bound)?;
@@ -357,6 +364,7 @@ impl<'py> NativeRequestConversion<'py> {
         ))
     }
 
+    /// Constructs a typed Python persistent-buffer identity.
     fn buffer_id(&mut self, buffer: BufferId) -> PyResult<Bound<'py, PyAny>> {
         let owner = self.request_key(buffer.owner)?;
         self.types.buffer_id.bind(self.py).call1((
@@ -367,6 +375,7 @@ impl<'py> NativeRequestConversion<'py> {
         ))
     }
 
+    /// Constructs a typed Python checkpoint and its point variant.
     fn checkpoint(&mut self, checkpoint: &Checkpoint) -> PyResult<Bound<'py, PyAny>> {
         let point = match checkpoint.point {
             CheckpointPoint::Fixed(point) => {
@@ -380,7 +389,10 @@ impl<'py> NativeRequestConversion<'py> {
             .call1((checkpoint.op_id.0, point))
     }
 
+    /// Constructs a typed Python operation with its family-specific payload.
     fn operation(&mut self, operation: &Operation) -> PyResult<Bound<'py, PyAny>> {
+        // Resolve identity, lineage, resource bounds, and product references
+        // before constructing the family payload.
         let request_key = self.request_key(operation.request_key)?;
         let parent = self.checkpoint(&operation.parent)?;
         let bounds = self.types.bounds.bind(self.py).call1((
@@ -422,6 +434,8 @@ impl<'py> NativeRequestConversion<'py> {
                 ))
             })
             .transpose()?;
+
+        // Select the Python payload class from the closed Rust family enum.
         let py = self.py;
         let payload_type = match operation.payload {
             OpPayload::Ar { .. } => &self.types.ar_payload,
@@ -440,6 +454,8 @@ impl<'py> NativeRequestConversion<'py> {
                 .unwrap_or_else(|| py.None().into_bound(py)),
             operation.control_seq(),
         ))?;
+
+        // Wrap the payload with common operation identity and run-kind data.
         let arguments = pyo3::types::PyTuple::new(
             py,
             [
@@ -453,6 +469,7 @@ impl<'py> NativeRequestConversion<'py> {
         self.types.operation.bind(py).call1(arguments)
     }
 
+    /// Constructs a typed Python KV block table.
     fn block_table(&self, table: &BlockTable) -> PyResult<Bound<'py, PyAny>> {
         self.types.block_table.bind(self.py).call1((
             table.request_pool_idx,
@@ -462,6 +479,7 @@ impl<'py> NativeRequestConversion<'py> {
         ))
     }
 
+    /// Constructs a typed Python KV page allocation.
     fn cache_page_allocation(
         &self,
         allocation: &CachePageAllocation,
@@ -473,6 +491,7 @@ impl<'py> NativeRequestConversion<'py> {
         ))
     }
 
+    /// Constructs typed Python sequence geometry for one forward row.
     fn row_geometry(&self, row: &RowGeometry) -> PyResult<Bound<'py, PyAny>> {
         self.types.row_geometry.bind(self.py).call1((
             row.operation_index,
@@ -482,7 +501,10 @@ impl<'py> NativeRequestConversion<'py> {
         ))
     }
 
+    /// Constructs the typed Python variant for one batch control command.
     fn command(&mut self, command: &BatchCommand) -> PyResult<Bound<'py, PyAny>> {
+        // Start retains its schema-shaped admission mapping; steady-state
+        // controls use their cached typed constructors directly.
         match command {
             BatchCommand::Start { request } => {
                 let request =
@@ -494,6 +516,7 @@ impl<'py> NativeRequestConversion<'py> {
                     .bind(self.py)
                     .call_method1("from_mapping", (value,))
             }
+
             BatchCommand::Commit {
                 request_key,
                 control_seq,
@@ -520,6 +543,7 @@ impl<'py> NativeRequestConversion<'py> {
                     self.types.dispositions[disposition].bind(self.py).clone(),
                 ))
             }
+
             BatchCommand::Finish {
                 request_key,
                 control_seq,
@@ -542,6 +566,7 @@ impl<'py> NativeRequestConversion<'py> {
                     self.types.close_reasons[reason].bind(self.py).clone(),
                 ))
             }
+
             BatchCommand::Free { buffer } => {
                 let buffer = self.buffer_id(*buffer)?;
                 self.types.free.bind(self.py).call1((buffer,))
@@ -550,9 +575,12 @@ impl<'py> NativeRequestConversion<'py> {
     }
 }
 
+/// Constructs one Python run, using typed hot-path objects and mapped rare records.
 fn run_to_py<'py>(py: Python<'py>, run: &Run) -> PyResult<Bound<'py, PyAny>> {
     let mut context = RequestConversion::new(py);
     let mut native = NativeRequestConversion::new(py)?;
+
+    // Materialize the execution-critical records as Python model instances.
     let operations = run
         .operations
         .iter()
@@ -578,9 +606,13 @@ fn run_to_py<'py>(py: Python<'py>, run: &Run) -> PyResult<Bound<'py, PyAny>> {
         .iter()
         .map(|command| native.command(command))
         .collect::<PyResult<Vec<_>>>()?;
+
+    // Rare payloads retain their schema-shaped mapping representation.
     let input_products = dict_list(py, &run.input_products, |payload| {
         product_payload_to_py(py, payload, &mut context)
     })?;
+
+    // `native_run` assembles both representations without reparsing typed leaves.
     native.types.native_run.bind(py).call1((
         run.batch_id,
         run.run_id,
@@ -603,6 +635,7 @@ fn run_to_py<'py>(py: Python<'py>, run: &Run) -> PyResult<Bound<'py, PyAny>> {
     ))
 }
 
+/// Converts a latent-page placement into its Python mapping shape.
 fn latent_placement_to_py<'py>(
     py: Python<'py>,
     placement: &LatentPlacement,
@@ -626,6 +659,7 @@ fn latent_placement_to_py<'py>(
     Ok(dict)
 }
 
+/// Converts a diffusion decoder placement into its Python mapping shape.
 fn decode_placement_to_py<'py>(
     py: Python<'py>,
     placement: &DecodePlacement,
@@ -642,6 +676,7 @@ fn decode_placement_to_py<'py>(
     Ok(dict)
 }
 
+/// Converts a persistent-buffer byte span into its nested Python mapping.
 fn buffer_placement_to_py<'py>(
     py: Python<'py>,
     placement: &BufferPlacement,
@@ -660,6 +695,7 @@ fn buffer_placement_to_py<'py>(
     Ok(dict)
 }
 
+/// Converts a Rust slice into a Python list of mapped dictionaries.
 fn dict_list<'py, T, F>(
     py: Python<'py>,
     items: &[T],
@@ -675,6 +711,7 @@ where
     PyList::new(py, converted)
 }
 
+/// Per-batch cache for schema-shaped dictionary leaves shared by mapped records.
 struct RequestConversion<'py> {
     py: Python<'py>,
     request_keys: HashMap<RequestKey, Bound<'py, PyDict>>,
@@ -683,6 +720,7 @@ struct RequestConversion<'py> {
 }
 
 impl<'py> RequestConversion<'py> {
+    /// Starts a mapped-record conversion with empty identity caches.
     fn new(py: Python<'py>) -> Self {
         Self {
             py,
@@ -692,6 +730,7 @@ impl<'py> RequestConversion<'py> {
         }
     }
 
+    /// Returns a canonical request-identity mapping for this batch.
     fn request_key(&mut self, key: RequestKey) -> PyResult<Bound<'py, PyDict>> {
         if let Some(value) = self.request_keys.get(&key) {
             return Ok(value.clone());
@@ -704,6 +743,7 @@ impl<'py> RequestConversion<'py> {
         Ok(dict)
     }
 
+    /// Returns a canonical shape-bound mapping for this batch.
     fn shape_bound(&mut self, shape: &ShapeBound) -> PyResult<Bound<'py, PyDict>> {
         if let Some(value) = self.shape_bounds.get(shape) {
             return Ok(value.clone());
@@ -713,6 +753,7 @@ impl<'py> RequestConversion<'py> {
         Ok(dict)
     }
 
+    /// Returns a canonical point-range mapping for this batch.
     fn point_range(&mut self, range: PointRange) -> PyResult<Bound<'py, PyDict>> {
         if let Some(value) = self.point_ranges.get(&range) {
             return Ok(value.clone());
@@ -723,10 +764,12 @@ impl<'py> RequestConversion<'py> {
     }
 }
 
+/// Copies `u32` values into a Python list without an intermediate mapping.
 fn u32_list<'py>(py: Python<'py>, values: &[u32]) -> PyResult<Bound<'py, PyList>> {
     PyList::new(py, values.iter().copied())
 }
 
+/// Converts a request admission and its selected parameter family.
 fn admission_to_py<'py>(
     py: Python<'py>,
     admission: &NewRequest,
@@ -765,6 +808,7 @@ fn admission_to_py<'py>(
     Ok(dict)
 }
 
+/// Converts autoregressive admission parameters into a Python mapping.
 fn ar_params_to_py<'py>(py: Python<'py>, ar: &ArRequestParams) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item(intern!(py, "sampling"), sampling_to_py(py, &ar.sampling)?)?;
@@ -780,6 +824,7 @@ fn ar_params_to_py<'py>(py: Python<'py>, ar: &ArRequestParams) -> PyResult<Bound
     Ok(dict)
 }
 
+/// Converts unified-multimodal admission parameters into a Python mapping.
 fn umm_params_to_py<'py>(
     py: Python<'py>,
     branch: &UmmRequestParams,
@@ -789,6 +834,7 @@ fn umm_params_to_py<'py>(
     Ok(dict)
 }
 
+/// Converts diffusion admission parameters and resolved media geometry.
 fn diffusion_params_to_py<'py>(
     py: Python<'py>,
     diffusion: &DiffusionRequestParams,
@@ -814,7 +860,9 @@ fn diffusion_params_to_py<'py>(
     Ok(dict)
 }
 
+/// Converts sampling controls into the worker's Python mapping schema.
 fn sampling_to_py<'py>(py: Python<'py>, sampling: &SamplingParams) -> PyResult<Bound<'py, PyDict>> {
+    // Scalar controls are inserted directly under interned protocol keys.
     let dict = PyDict::new(py);
     dict.set_item(intern!(py, "temperature"), sampling.temperature)?;
     dict.set_item(intern!(py, "top_k"), sampling.top_k)?;
@@ -828,7 +876,8 @@ fn sampling_to_py<'py>(py: Python<'py>, sampling: &SamplingParams) -> PyResult<B
     )?;
     dict.set_item(intern!(py, "frequency_penalty"), sampling.frequency_penalty)?;
     dict.set_item(intern!(py, "presence_penalty"), sampling.presence_penalty)?;
-    // `(u32, f32)` pairs pythonize as Python tuples, not lists.
+
+    // Preserve the tuple shape expected for each token-bias pair.
     dict.set_item(
         intern!(py, "logit_bias"),
         PyList::new(
@@ -851,6 +900,8 @@ fn sampling_to_py<'py>(py: Python<'py>, sampling: &SamplingParams) -> PyResult<B
         intern!(py, "logprob_token_ids"),
         u32_list(py, &sampling.logprob_token_ids)?,
     )?;
+
+    // Materialize nested token collections only after the scalar fields.
     let bad_words = sampling
         .bad_words_ids
         .iter()
@@ -873,6 +924,7 @@ fn sampling_to_py<'py>(py: Python<'py>, sampling: &SamplingParams) -> PyResult<B
     Ok(dict)
 }
 
+/// Converts image-generation controls into the worker's Python mapping schema.
 fn image_to_py<'py>(py: Python<'py>, image: &ImageParams) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item(intern!(py, "steps"), image.steps)?;
@@ -883,7 +935,7 @@ fn image_to_py<'py>(py: Python<'py>, image: &ImageParams) -> PyResult<Bound<'py,
         image.cfg_renorm_type.as_str(),
     )?;
     dict.set_item(intern!(py, "cfg_renorm_min"), image.cfg_renorm_min)?;
-    // `(f32, f32)` pythonizes as a Python tuple.
+    // The interval remains a tuple to match the Python parameter contract.
     dict.set_item(intern!(py, "cfg_interval"), image.cfg_interval)?;
     dict.set_item(intern!(py, "timestep_shift"), image.timestep_shift)?;
     dict.set_item(intern!(py, "height"), image.height)?;
@@ -902,6 +954,7 @@ fn image_to_py<'py>(py: Python<'py>, image: &ImageParams) -> PyResult<Bound<'py,
     Ok(dict)
 }
 
+/// Converts a product identity, storage contract, and bounds into a mapping.
 fn product_ref_to_py<'py>(
     py: Python<'py>,
     product: &ProductRef,
@@ -932,6 +985,7 @@ fn product_ref_to_py<'py>(
     Ok(dict)
 }
 
+/// Converts static and device-bounded dimensions into their tagged mappings.
 fn shape_bound_to_py<'py>(py: Python<'py>, shape: &ShapeBound) -> PyResult<Bound<'py, PyDict>> {
     let dims = shape
         .dims
@@ -958,6 +1012,7 @@ fn shape_bound_to_py<'py>(py: Python<'py>, shape: &ShapeBound) -> PyResult<Bound
     Ok(dict)
 }
 
+/// Converts a semantic point interval into its Python mapping.
 fn point_range_to_py<'py>(py: Python<'py>, range: PointRange) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item(intern!(py, "base_point"), range.base_point)?;
@@ -965,6 +1020,7 @@ fn point_range_to_py<'py>(py: Python<'py>, range: PointRange) -> PyResult<Bound<
     Ok(dict)
 }
 
+/// Converts a product payload into its tagged inline-or-transfer mapping.
 fn product_payload_to_py<'py>(
     py: Python<'py>,
     payload: &ProductPayload,
@@ -990,15 +1046,19 @@ fn product_payload_to_py<'py>(
     Ok(dict)
 }
 
+/// Converts tensor metadata and transport coordinates into a Python mapping.
 fn transfer_locator_to_py<'py>(
     py: Python<'py>,
     locator: &TransferLocator,
 ) -> PyResult<Bound<'py, PyDict>> {
+    // Tensor metadata is common to every transport family.
     let dict = PyDict::new(py);
     dict.set_item(intern!(py, "nbytes"), locator.nbytes)?;
     dict.set_item(intern!(py, "dtype"), locator.dtype.as_str())?;
     dict.set_item(intern!(py, "shape"), PyList::new(py, &locator.shape)?)?;
     dict.set_item(intern!(py, "device"), locator.device.as_str())?;
+
+    // The transport tag determines the remaining coordinate fields.
     match &locator.transport {
         TransferTransport::Local { endpoint, key } => {
             dict.set_item(intern!(py, "transport"), "local")?;
@@ -1056,9 +1116,11 @@ fn transfer_locator_to_py<'py>(
             )?;
         }
     }
+
     Ok(dict)
 }
 
+/// Converts an operation checkpoint into its tagged Python mapping.
 fn checkpoint_mapping_to_py<'py>(
     py: Python<'py>,
     checkpoint: &Checkpoint,
@@ -1080,10 +1142,13 @@ fn checkpoint_mapping_to_py<'py>(
     Ok(dict)
 }
 
+/// Converts a product-family transfer handle into its tagged Python mapping.
 fn transfer_handle_to_py<'py>(
     py: Python<'py>,
     handle: &TransferHandle,
 ) -> PyResult<Bound<'py, PyDict>> {
+    // Preserve the tagged-union shape expected by the worker: the outer mapping
+    // carries the family tag and the inner mapping carries family metadata.
     let dict = PyDict::new(py);
     let value = PyDict::new(py);
     match handle {
@@ -1131,6 +1196,9 @@ fn transfer_handle_to_py<'py>(
         } => {
             dict.set_item(intern!(py, "kind"), "kv")?;
             value.set_item(intern!(py, "generation"), generation)?;
+
+            // KV publications may contain multiple physical tensors but share
+            // one semantic checkpoint and destination contract.
             let locators = locators
                 .iter()
                 .map(|locator| transfer_locator_to_py(py, locator))
@@ -1166,10 +1234,12 @@ fn transfer_handle_to_py<'py>(
             value.set_item(intern!(py, "locator"), transfer_locator_to_py(py, locator)?)?;
         }
     }
+
     dict.set_item(intern!(py, "value"), value)?;
     Ok(dict)
 }
 
+/// Returns the interned Python spelling for a request kind.
 fn request_kind_py<'py>(py: Python<'py>, kind: RequestKind) -> &'py Bound<'py, PyString> {
     match kind {
         RequestKind::Info => intern!(py, "info"),
@@ -1179,6 +1249,7 @@ fn request_kind_py<'py>(py: Python<'py>, kind: RequestKind) -> &'py Bound<'py, P
     }
 }
 
+/// Returns the interned Python spelling for a product family.
 fn product_kind_py<'py>(py: Python<'py>, kind: ProductKind) -> &'py Bound<'py, PyString> {
     match kind {
         ProductKind::Token => intern!(py, "token"),
@@ -1194,6 +1265,7 @@ fn product_kind_py<'py>(py: Python<'py>, kind: ProductKind) -> &'py Bound<'py, P
     }
 }
 
+/// Returns the interned Python spelling for a product storage class.
 fn storage_class_py<'py>(py: Python<'py>, class: StorageClass) -> &'py Bound<'py, PyString> {
     match class {
         StorageClass::DeviceTensor => intern!(py, "device_tensor"),
@@ -1205,6 +1277,7 @@ fn storage_class_py<'py>(py: Python<'py>, class: StorageClass) -> &'py Bound<'py
     }
 }
 
+/// Returns the interned Python spelling for an element type.
 fn dtype_py<'py>(py: Python<'py>, dtype: DType) -> &'py Bound<'py, PyString> {
     match dtype {
         DType::U8 => intern!(py, "u8"),
@@ -1218,6 +1291,9 @@ fn dtype_py<'py>(py: Python<'py>, dtype: DType) -> &'py Bound<'py, PyString> {
     }
 }
 
+/// Decodes a Python result or error mapping with strict field typing.
+///
+/// Returns `None` for response kinds handled by the schema-derived converter.
 pub(crate) fn try_completion_response_from_py(
     response: &Bound<'_, PyAny>,
 ) -> PyResult<Option<WorkerResponse>> {
@@ -1242,6 +1318,7 @@ pub(crate) fn try_completion_response_from_py(
     }
 }
 
+/// Decodes a result response and rejects fields reserved for other variants.
 fn decode_completion_response_from_py(response: &Bound<'_, PyAny>) -> Option<WorkerResponse> {
     let py = response.py();
     let dict = response.cast::<PyDict>().ok()?;
@@ -1255,6 +1332,7 @@ fn decode_completion_response_from_py(response: &Bound<'_, PyAny>) -> Option<Wor
             return None;
         }
     }
+    // Decode the required result before checking that no error fields carry data.
     let report = run_result_from_py(&get(dict, intern!(py, "result"))?)?;
     let identities = error_operations_from_py(dict)?;
     if !identities.is_empty()
@@ -1273,6 +1351,7 @@ fn decode_completion_response_from_py(response: &Bound<'_, PyAny>) -> Option<Wor
     })
 }
 
+/// Decodes an error response and rejects success payloads.
 fn decode_error_response_from_py(response: &Bound<'_, PyAny>) -> Option<WorkerResponse> {
     let py = response.py();
     let dict = response.cast::<PyDict>().ok()?;
@@ -1299,9 +1378,12 @@ fn decode_error_response_from_py(response: &Bound<'_, PyAny>) -> Option<WorkerRe
     })
 }
 
+/// Decodes an ordered run result from its Python mapping.
 fn run_result_from_py(value: &Bound<'_, PyAny>) -> Option<RunResult> {
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
+
+    // Preserve completion and product order while converting owned records.
     let completions = get(dict, intern!(py, "completions"))?;
     let completions = completions.cast::<PyList>().ok()?;
     let mut records = Vec::with_capacity(completions.len());
@@ -1314,6 +1396,7 @@ fn run_result_from_py(value: &Bound<'_, PyAny>) -> Option<RunResult> {
     for item in products.iter() {
         payloads.push(product_payload_from_py(&item)?);
     }
+    // Decode aggregate acknowledgements and optional instrumentation metadata.
     let registration = get(dict, intern!(py, "registration"))?;
     let registration = registration.cast::<PyDict>().ok()?;
     let registration = RegistrationAck {
@@ -1336,17 +1419,23 @@ fn run_result_from_py(value: &Bound<'_, PyAny>) -> Option<RunResult> {
     })
 }
 
+/// Decodes the complete set of worker forward-path counters.
 fn forward_stats_from_py(value: &Bound<'_, PyAny>) -> Option<WorkerForwardStats> {
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
     Some(WorkerForwardStats {
+        // Aggregate execution-mode counters.
         mode_counts: u64_map(dict, intern!(py, "mode_counts"))?,
         mode_tokens: u64_map(dict, intern!(py, "mode_tokens"))?,
         mode_us: u64_map(dict, intern!(py, "mode_us"))?,
         component_us: u64_map(dict, intern!(py, "component_us"))?,
+
+        // Attention backend activity.
         attention_launches: u64_of(&get(dict, intern!(py, "attention_launches"))?)?,
         attention_us: u64_of(&get(dict, intern!(py, "attention_us"))?)?,
         attention_backend_counts: u64_map(dict, intern!(py, "attention_backend_counts"))?,
+
+        // CUDA graph lifecycle and padding behavior.
         cuda_graph_captures: u64_of(&get(dict, intern!(py, "cuda_graph_captures"))?)?,
         cuda_graph_replays: u64_of(&get(dict, intern!(py, "cuda_graph_replays"))?)?,
         cuda_graph_misses: u64_of(&get(dict, intern!(py, "cuda_graph_misses"))?)?,
@@ -1357,6 +1446,8 @@ fn forward_stats_from_py(value: &Bound<'_, PyAny>) -> Option<WorkerForwardStats>
             dict,
             intern!(py, "cuda_graph_runtime_mode_counts"),
         )?,
+
+        // Decode relay cache effectiveness.
         text_decode_token_relay_hits: u64_of(&get(
             dict,
             intern!(py, "text_decode_token_relay_hits"),
@@ -1373,6 +1464,8 @@ fn forward_stats_from_py(value: &Bound<'_, PyAny>) -> Option<WorkerForwardStats>
             dict,
             intern!(py, "text_decode_position_relay_misses"),
         )?)?,
+
+        // FlashInfer planning activity.
         flashinfer_decode_plan_calls: u64_of(&get(
             dict,
             intern!(py, "flashinfer_decode_plan_calls"),
@@ -1397,6 +1490,8 @@ fn forward_stats_from_py(value: &Bound<'_, PyAny>) -> Option<WorkerForwardStats>
             dict,
             intern!(py, "flashinfer_decode_graph_plan_reuses"),
         )?)?,
+
+        // Speculative-verification outcomes.
         spec_verify_rows: u64_of(&get(dict, intern!(py, "spec_verify_rows"))?)?,
         spec_verify_draft_tokens: u64_of(&get(dict, intern!(py, "spec_verify_draft_tokens"))?)?,
         spec_verify_accepted_tokens: u64_of(&get(
@@ -1415,9 +1510,13 @@ fn forward_stats_from_py(value: &Bound<'_, PyAny>) -> Option<WorkerForwardStats>
     })
 }
 
+/// Decodes one model output and its family-specific result data.
 fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<ModelOutput> {
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
+
+    // Decode terminal status and optional error classification before result
+    // data so invalid enum spellings fail the whole record.
     let status = str_field(dict, intern!(py, "status"))?;
     let status = match status.to_str().ok()? {
         "ok" => OpStatus::Ok,
@@ -1436,6 +1535,9 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<ModelOutput> {
             _ => return None,
         }),
     };
+
+    // Accept both the tagged payload envelope and the direct family mapping
+    // used by native Python objects.
     let payload = get(dict, intern!(py, "payload"))?;
     let payload = payload.cast::<PyDict>().ok()?;
     let family = string_of(&get(payload, intern!(py, "family"))?)?;
@@ -1444,6 +1546,8 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<ModelOutput> {
         Some(value) => value.cast::<PyDict>().ok()?,
         None => payload,
     };
+
+    // Decode common result accounting independently of the result family.
     let lengths = get(payload, intern!(py, "logical_lengths"))?;
     let lengths = lengths.cast::<PyDict>().ok()?;
     let logical_lengths = LogicalLengths {
@@ -1473,6 +1577,9 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<ModelOutput> {
         copy_us: u64_of(&get(timing, intern!(py, "copy_us"))?)?,
         host_us: u64_of(&get(timing, intern!(py, "host_us"))?)?,
     };
+
+    // Media metadata is optional, but a present handle must use the supported
+    // shared-memory transport and complete its nested value mapping.
     let media_output = if absent_or_none(payload, intern!(py, "media_output"))? {
         None
     } else {
@@ -1499,6 +1606,8 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<ModelOutput> {
         finish_flags,
         media_output,
     };
+
+    // The family tag selects the final closed Rust result variant.
     let result_payload = match family.as_str() {
         "ar" => ResultPayload::Ar(data),
         "encoder" => ResultPayload::Encoder(data),
@@ -1523,9 +1632,12 @@ fn completion_record_from_py(value: &Bound<'_, PyAny>) -> Option<ModelOutput> {
     })
 }
 
+/// Decodes an inline-byte or external-transfer product payload.
 fn product_payload_from_py(value: &Bound<'_, PyAny>) -> Option<ProductPayload> {
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
+
+    // Product values are either owned byte copies or a nested transfer union.
     let value = get(dict, intern!(py, "value"))?;
     let value = value.cast::<PyDict>().ok()?;
     let kind = str_field(value, intern!(py, "kind"))?;
@@ -1541,6 +1653,9 @@ fn product_payload_from_py(value: &Bound<'_, PyAny>) -> Option<ProductPayload> {
             let payload = get(transfer, intern!(py, "value"))?;
             let payload = payload.cast::<PyDict>().ok()?;
             let generation = u32_of(&get(payload, intern!(py, "generation"))?)?;
+
+            // Transfer-family metadata is decoded only after the common
+            // generation has been established.
             let handle = match kind.to_str().ok()? {
                 "encoder" => TransferHandle::Encoder {
                     generation,
@@ -1560,6 +1675,8 @@ fn product_payload_from_py(value: &Bound<'_, PyAny>) -> Option<ProductPayload> {
                     locator: transfer_locator_from_py(&get(payload, intern!(py, "locator"))?)?,
                 },
                 "kv" => {
+                    // Preserve locator order because it identifies the worker's
+                    // physical KV tensor layout.
                     let raw_locators = get(payload, intern!(py, "locators"))?;
                     let raw_locators = raw_locators.cast::<PyList>().ok()?;
                     let mut locators = Vec::with_capacity(raw_locators.len());
@@ -1599,15 +1716,20 @@ fn product_payload_from_py(value: &Bound<'_, PyAny>) -> Option<ProductPayload> {
         }
         _ => return None,
     };
+
+    // Bind the materialized value to its independently decoded product identity.
     Some(ProductPayload {
         product: product_ref_from_py(&get(dict, intern!(py, "product"))?)?,
         value,
     })
 }
 
+/// Decodes transport coordinates and their common logical tensor metadata.
 fn transfer_locator_from_py(value: &Bound<'_, PyAny>) -> Option<TransferLocator> {
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
+
+    // The transport tag determines which coordinate set must be present.
     let transport = match string_of(&get(dict, intern!(py, "transport"))?)?.as_str() {
         "local" => TransferTransport::Local {
             endpoint: string_of(&get(dict, intern!(py, "endpoint"))?)?,
@@ -1638,6 +1760,7 @@ fn transfer_locator_from_py(value: &Bound<'_, PyAny>) -> Option<TransferLocator>
         },
         _ => return None,
     };
+    // Common tensor metadata remains independent of the selected transport.
     Some(TransferLocator {
         transport,
         nbytes: u64_of(&get(dict, intern!(py, "nbytes"))?)?,
@@ -1647,6 +1770,7 @@ fn transfer_locator_from_py(value: &Bound<'_, PyAny>) -> Option<TransferLocator>
     })
 }
 
+/// Decodes a fixed or device-selected operation checkpoint.
 fn checkpoint_mapping_from_py(value: &Bound<'_, PyAny>) -> Option<Checkpoint> {
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
@@ -1663,9 +1787,12 @@ fn checkpoint_mapping_from_py(value: &Bound<'_, PyAny>) -> Option<Checkpoint> {
     })
 }
 
+/// Decodes a product identity, storage contract, and bounded shape.
 fn product_ref_from_py(value: &Bound<'_, PyAny>) -> Option<ProductRef> {
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
+
+    // Decode closed enums before allocating the shape representation.
     let kind = product_kind_from_py(&get(dict, intern!(py, "kind"))?)?;
     let storage_class = str_field(dict, intern!(py, "storage_class"))?;
     let storage_class = match storage_class.to_str().ok()? {
@@ -1689,6 +1816,7 @@ fn product_ref_from_py(value: &Bound<'_, PyAny>) -> Option<ProductRef> {
         "f32" => DType::F32,
         _ => return None,
     };
+    // Reconstruct each dimension from its tagged static-or-device bound.
     let shape = get(dict, intern!(py, "shape_bound"))?;
     let shape = shape.cast::<PyDict>().ok()?;
     let dims = get(shape, intern!(py, "dims"))?;
@@ -1712,6 +1840,7 @@ fn product_ref_from_py(value: &Bound<'_, PyAny>) -> Option<ProductRef> {
         };
         shape_bound.dims.push(dim);
     }
+    // Attach point semantics and common producer identity to the shape.
     let range = get(dict, intern!(py, "point_range"))?;
     let range = range.cast::<PyDict>().ok()?;
     let point_range = PointRange {
@@ -1731,6 +1860,7 @@ fn product_ref_from_py(value: &Bound<'_, PyAny>) -> Option<ProductRef> {
     })
 }
 
+/// Decodes a Python product-family spelling.
 fn product_kind_from_py(value: &Bound<'_, PyAny>) -> Option<ProductKind> {
     Some(match string_of(value)?.as_str() {
         "token" => ProductKind::Token,
@@ -1747,6 +1877,7 @@ fn product_kind_from_py(value: &Bound<'_, PyAny>) -> Option<ProductKind> {
     })
 }
 
+/// Decodes a request identity from its Python mapping.
 fn request_key_from_py(value: &Bound<'_, PyAny>) -> Option<RequestKey> {
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
@@ -1757,6 +1888,7 @@ fn request_key_from_py(value: &Bound<'_, PyAny>) -> Option<RequestKey> {
     })
 }
 
+/// Decodes one request and operation identity attached to an error.
 fn error_operation_from_py(value: &Bound<'_, PyAny>) -> Option<ErrorOperationIdentity> {
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
@@ -1766,6 +1898,7 @@ fn error_operation_from_py(value: &Bound<'_, PyAny>) -> Option<ErrorOperationIde
     })
 }
 
+/// Decodes an optional ordered list of operation identities attached to an error.
 fn error_operations_from_py(dict: &Bound<'_, PyDict>) -> Option<Vec<ErrorOperationIdentity>> {
     let py = dict.py();
     let Some(operations) = dict.get_item(intern!(py, "operations")).ok()? else {
@@ -1782,12 +1915,12 @@ fn error_operations_from_py(dict: &Bound<'_, PyDict>) -> Option<Vec<ErrorOperati
     Some(identities)
 }
 
-// --- extraction primitives -------------------------------------------------
-
+/// Returns a required mapping value, collapsing lookup errors and absence.
 fn get<'py>(dict: &Bound<'py, PyDict>, key: &Bound<'py, PyString>) -> Option<Bound<'py, PyAny>> {
     dict.get_item(key).ok().flatten()
 }
 
+/// Returns whether a mapping key is absent or explicitly set to `None`.
 fn absent_or_none(dict: &Bound<'_, PyDict>, key: &Bound<'_, PyString>) -> Option<bool> {
     match dict.get_item(key).ok()? {
         Some(value) => Some(value.is_none()),
@@ -1795,6 +1928,7 @@ fn absent_or_none(dict: &Bound<'_, PyDict>, key: &Bound<'_, PyString>) -> Option
     }
 }
 
+/// Extracts a required mapping value as a borrowed Python string.
 fn str_field<'py>(
     dict: &Bound<'py, PyDict>,
     key: &Bound<'py, PyString>,
@@ -1802,15 +1936,16 @@ fn str_field<'py>(
     get(dict, key)?.cast_into::<PyString>().ok()
 }
 
+/// Extracts a `u64` while rejecting Python booleans as integers.
 fn u64_of(value: &Bound<'_, PyAny>) -> Option<u64> {
-    // Integer fields reject Python booleans instead of coercing them
-    // to zero or one.
+    // Integer fields reject Python booleans, which are a distinct protocol type.
     if value.cast::<PyBool>().is_ok() {
         return None;
     }
     value.extract().ok()
 }
 
+/// Extracts a `u32` while rejecting Python booleans as integers.
 fn u32_of(value: &Bound<'_, PyAny>) -> Option<u32> {
     if value.cast::<PyBool>().is_ok() {
         return None;
@@ -1818,6 +1953,7 @@ fn u32_of(value: &Bound<'_, PyAny>) -> Option<u32> {
     value.extract().ok()
 }
 
+/// Extracts a `u16` while rejecting Python booleans as integers.
 fn u16_of(value: &Bound<'_, PyAny>) -> Option<u16> {
     if value.cast::<PyBool>().is_ok() {
         return None;
@@ -1825,14 +1961,17 @@ fn u16_of(value: &Bound<'_, PyAny>) -> Option<u16> {
     value.extract().ok()
 }
 
+/// Extracts a strict Python boolean.
 fn bool_of(value: &Bound<'_, PyAny>) -> Option<bool> {
     Some(value.cast::<PyBool>().ok()?.is_true())
 }
 
+/// Copies a strict Python string into owned Rust storage.
 fn string_of(value: &Bound<'_, PyAny>) -> Option<String> {
     Some(value.cast::<PyString>().ok()?.to_str().ok()?.to_owned())
 }
 
+/// Decodes a required string-to-`u64` mapping with deterministic key order.
 fn u64_map(dict: &Bound<'_, PyDict>, key: &Bound<'_, PyString>) -> Option<BTreeMap<String, u64>> {
     let values = get(dict, key)?;
     let values = values.cast::<PyDict>().ok()?;
@@ -1843,6 +1982,7 @@ fn u64_map(dict: &Bound<'_, PyDict>, key: &Bound<'_, PyString>) -> Option<BTreeM
     Some(result)
 }
 
+/// Copies a Python list into a strictly typed `u32` vector.
 fn u32_vec(value: &Bound<'_, PyAny>) -> Option<Vec<u32>> {
     let list = value.cast::<PyList>().ok()?;
     let mut values = Vec::with_capacity(list.len());
@@ -1852,6 +1992,7 @@ fn u32_vec(value: &Bound<'_, PyAny>) -> Option<Vec<u32>> {
     Some(values)
 }
 
+/// Copies a Python list into a strictly typed `u64` vector.
 fn u64_vec(value: &Bound<'_, PyAny>) -> Option<Vec<u64>> {
     let list = value.cast::<PyList>().ok()?;
     let mut values = Vec::with_capacity(list.len());
@@ -1861,6 +2002,7 @@ fn u64_vec(value: &Bound<'_, PyAny>) -> Option<Vec<u64>> {
     Some(values)
 }
 
+/// Copies a Python list into an `i64` vector while rejecting booleans.
 fn i64_vec(value: &Bound<'_, PyAny>) -> Option<Vec<i64>> {
     let list = value.cast::<PyList>().ok()?;
     let mut values = Vec::with_capacity(list.len());
@@ -1873,10 +2015,12 @@ fn i64_vec(value: &Bound<'_, PyAny>) -> Option<Vec<i64>> {
     Some(values)
 }
 
+/// Copies strict Python `bytes` into owned Rust storage.
 fn bytes_of(value: &Bound<'_, PyAny>) -> Option<Vec<u8>> {
     Some(value.cast::<PyBytes>().ok()?.as_bytes().to_vec())
 }
 
+/// Decodes an absent, `None`, or strict `u64` mapping field.
 fn opt_u64(dict: &Bound<'_, PyDict>, key: &Bound<'_, PyString>) -> Option<Option<u64>> {
     match dict.get_item(key).ok()? {
         None => Some(None),
@@ -1885,6 +2029,7 @@ fn opt_u64(dict: &Bound<'_, PyDict>, key: &Bound<'_, PyString>) -> Option<Option
     }
 }
 
+/// Decodes an absent, `None`, or strict boolean mapping field.
 fn opt_bool(dict: &Bound<'_, PyDict>, key: &Bound<'_, PyString>) -> Option<Option<bool>> {
     match dict.get_item(key).ok()? {
         None => Some(None),
@@ -1893,6 +2038,7 @@ fn opt_bool(dict: &Bound<'_, PyDict>, key: &Bound<'_, PyString>) -> Option<Optio
     }
 }
 
+/// Decodes an absent, `None`, or strict string mapping field.
 fn opt_string(dict: &Bound<'_, PyDict>, key: &Bound<'_, PyString>) -> Option<Option<String>> {
     match dict.get_item(key).ok()? {
         None => Some(None),
@@ -1900,10 +2046,6 @@ fn opt_string(dict: &Bound<'_, PyDict>, key: &Bound<'_, PyString>) -> Option<Opt
         Some(value) => Some(Some(string_of(&value)?)),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Native boundary qualification
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

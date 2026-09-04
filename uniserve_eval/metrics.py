@@ -1,4 +1,4 @@
-"""One summary object for token timing and image measurements."""
+"""Computes request, token, image, and video benchmark metrics."""
 
 from __future__ import annotations
 
@@ -10,28 +10,40 @@ from .types import RequestRecord
 
 
 def percentile(values: list[float], p: float) -> float:
+    """Return a percentile, using zero for an empty population."""
+
     if len(values) == 0:
         return 0.0
     return float(np.percentile(values, p))
 
 
 def _mean(values: list[float]) -> float:
+    """Return the population mean, using zero for an empty population."""
+
     return float(np.mean(values)) if len(values) else 0.0
 
 
 def _std(values: list[float]) -> float:
+    """Return population standard deviation, using zero when empty."""
+
     return float(np.std(values)) if len(values) else 0.0
 
 
 def _max(values: list[float]) -> float:
+    """Return the maximum, using zero for an empty population."""
+
     return float(np.max(values)) if len(values) else 0.0
 
 
 def _min(values: list[float]) -> float:
+    """Return the minimum, using zero for an empty population."""
+
     return float(np.min(values)) if len(values) else 0.0
 
 
 def distribution(values: list[float], *, scale: float = 1.0) -> dict[str, float | int]:
+    """Summarize a population with count, moments, extrema, and percentiles."""
+
     return {
         "count": len(values),
         "mean": _mean(values) * scale,
@@ -51,6 +63,10 @@ def summarize(
     *,
     tokenizer: Any | None = None,
 ) -> dict[str, Any]:
+    """Build aggregate throughput and latency metrics from successful records."""
+
+    # Failed requests remain validation inputs but do not contribute service-rate
+    # or latency populations. Token metrics additionally require stream timing.
     successful = [record for record in records if record.success]
     timed = [record for record in successful if record.token_timing_available is not False]
     output_lens = [record.output_len for record in successful]
@@ -70,6 +86,8 @@ def summarize(
         _peak_per_second(timed_success) if timed_success else (0.0, 0)
     )
 
+    # The measured wall-clock window is the shared denominator for throughput and
+    # time-integrated concurrency; its floor only protects empty synthetic inputs.
     summary: dict[str, Any] = {
         "completed": len(successful),
         "completed_requests": len(successful),
@@ -95,6 +113,8 @@ def summarize(
         "token_timing_request_count": len(timed_success),
     }
 
+    # Retokenization provides a tokenizer-derived count alongside server-reported
+    # output lengths without replacing the primary protocol metric.
     if tokenizer is not None:
         retokenized = sum(
             len(tokenizer.encode(record.generated_text, add_special_tokens=False))
@@ -103,6 +123,7 @@ def summarize(
         summary["total_output_tokens_retokenized"] = retokenized
         summary["output_throughput_retokenized"] = retokenized / duration
 
+    # Media metrics are emitted only for modalities present in successful results.
     image_latencies = [value for record in successful for value in record.image_latencies]
     total_images = sum(record.images for record in successful)
     if total_images:
@@ -134,6 +155,8 @@ def summarize(
 
 
 def _peak_per_second(successful: list[RequestRecord]) -> tuple[float, int]:
+    """Return peak one-second token completions and overlapping requests."""
+
     if not successful:
         return 0.0, 0
     start = min(record.start_time for record in successful)

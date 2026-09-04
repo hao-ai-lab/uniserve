@@ -1,23 +1,31 @@
-use super::*;
+//! Product identities, storage descriptions, transfers, and inline encodings.
 
-// ---------------------------------------------------------------------------
-// Product references and bounded shapes
-// ---------------------------------------------------------------------------
+use super::*;
 
 /// The role a product plays for its consumers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum ProductKind {
+    /// Generated or input token identifiers.
     Token = 0,
+    /// Generated or prompt token log probabilities.
     Logprob = 1,
+    /// Vision encoder features.
     VisionFeature = 2,
+    /// VAE encoder features.
     LatentFeature = 3,
+    /// Paged key/value cache state.
     Kv = 4,
+    /// Diffusion trajectory state.
     Latent = 5,
+    /// Materialized media or feedback artifact.
     Artifact = 6,
+    /// Operation completion marker.
     Completion = 7,
+    /// Encoded branch-local sampling controls.
     SamplingState = 8,
+    /// Device-selected checkpoint point.
     SelectedPoint = 9,
 }
 
@@ -26,11 +34,17 @@ pub enum ProductKind {
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum StorageClass {
+    /// Device tensor with operation-scoped ownership.
     DeviceTensor = 0,
+    /// Small value relayed between operations in one request.
     RequestRelay = 1,
+    /// Page-addressed key/value cache storage.
     PagedKv = 2,
+    /// Page-addressed diffusion latent storage.
     LatentArena = 3,
+    /// Host-resident operation input or intermediate output.
     HostStaging = 4,
+    /// Host-pinned caller-visible output.
     PinnedOutput = 5,
 }
 
@@ -39,14 +53,22 @@ pub enum StorageClass {
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum DType {
+    /// Unsigned 8-bit integer.
     U8 = 0,
+    /// Unsigned 16-bit integer.
     U16 = 1,
+    /// Unsigned 32-bit integer.
     U32 = 2,
+    /// Signed 32-bit integer.
     I32 = 3,
+    /// Signed 64-bit integer.
     I64 = 4,
+    /// IEEE 754 half precision.
     F16 = 5,
+    /// Brain floating-point half precision.
     #[serde(rename = "bf16")]
     BF16 = 6,
+    /// IEEE 754 single precision.
     F32 = 7,
 }
 
@@ -57,17 +79,22 @@ pub enum DimBound {
     /// A host-static extent.
     Static(u32),
     /// The single device-actual axis, bounded by this fixed maximum.
-    Device { max: u32 },
+    Device {
+        /// Maximum device-selected extent.
+        max: u32,
+    },
 }
 
 /// A shape that is host-static except for at most one device-actual axis, which
 /// carries a fixed maximum. A product reference never carries an unbounded shape.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct ShapeBound {
+    /// Ordered tensor dimension bounds.
     pub dims: Vec<DimBound>,
 }
 
 impl ShapeBound {
+    /// Validates rank and positive dimension bounds.
     pub fn validate(&self) -> ValidationResult<()> {
         let device_dims = self
             .dims
@@ -88,6 +115,7 @@ impl ShapeBound {
         Ok(())
     }
 
+    /// Returns the maximum number of elements represented by this shape.
     pub(crate) fn max_elements(&self) -> u64 {
         self.dims.iter().fold(1_u64, |elements, dim| {
             elements.saturating_mul(u64::from(match dim {
@@ -101,7 +129,9 @@ impl ShapeBound {
 /// The state points a product spans, rooted at `base_point`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct PointRange {
+    /// First state point represented by the product.
     pub base_point: u32,
+    /// Maximum number of consecutive represented points.
     pub max_points: u32,
 }
 
@@ -109,27 +139,41 @@ pub struct PointRange {
 /// slots, tensors, and events stay worker-local and never appear here.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProductRef {
+    /// Request lineage that owns the value.
     pub request_key: RequestKey,
+    /// Operation that declares the value.
     pub producer_op_id: OpId,
+    /// Position in the producer's output list.
     pub output_index: u16,
+    /// Nonzero allocation generation preventing identity reuse.
     pub generation: u32,
+    /// Semantic role of the value.
     pub kind: ProductKind,
+    /// Storage family backing the value.
     pub storage_class: StorageClass,
+    /// Element data type.
     pub dtype: DType,
+    /// Maximum logical tensor shape.
     pub shape_bound: ShapeBound,
+    /// State points represented by the value.
     pub point_range: PointRange,
 }
 
 /// Stable identity for one cross-operation buffer, independent of its physical representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BufferId {
+    /// Request lineage that owns the buffer.
     pub owner: RequestKey,
+    /// Operation that first declares the buffer.
     pub producer_op_id: OpId,
+    /// Position in the producer's output list.
     pub output_index: u16,
+    /// Nonzero allocation generation preventing identity reuse.
     pub generation: u32,
 }
 
 impl BufferId {
+    /// Validates a nonzero persistent-buffer identity.
     pub fn validate(self) -> ValidationResult<()> {
         ensure_valid!(self.generation > 0, "buffer id has no logical generation");
         Ok(())
@@ -137,6 +181,7 @@ impl BufferId {
 }
 
 impl ProductRef {
+    /// Returns the persistent-buffer identity for buffer-backed products.
     pub const fn buffer_id(&self) -> BufferId {
         BufferId {
             owner: self.request_key,
@@ -146,6 +191,7 @@ impl ProductRef {
         }
     }
 
+    /// Validates product identity, shape, storage, and point bounds.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
             self.generation > 0,
@@ -154,6 +200,7 @@ impl ProductRef {
         self.shape_bound.validate()
     }
 
+    /// Returns the maximum encoded byte size allowed by the shape and dtype.
     pub fn max_bytes(&self) -> u64 {
         let element_bytes = match self.dtype {
             DType::U8 => 1,
@@ -166,10 +213,10 @@ impl ProductRef {
             .saturating_mul(element_bytes)
     }
 
-    /// Whether this value needs an address-stable allocation from the shared
-    /// persistent-buffer pool. KV and diffusion trajectories use their
-    /// dedicated page placements; request-relay scalars and host results do
-    /// not consume persistent-buffer space.
+    /// Returns whether this value needs an address-stable shared allocation.
+    ///
+    /// KV and diffusion trajectories use dedicated page placements;
+    /// request-relay scalars and host results do not consume this pool.
     pub const fn uses_persistent_buffer(&self) -> bool {
         matches!(
             self.kind,
@@ -188,36 +235,58 @@ impl ProductRef {
 /// carries no semantic lineage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct RegistrationAck {
+    /// Whether the submitted registration is visible to subsequent operations.
     pub visible: bool,
 }
 
+/// Transport used to publish a product between worker pools.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "transport", content = "value")]
 pub enum TransferTransport {
+    /// Process-local publication resolved through a worker endpoint.
     Local {
+        /// Publishing endpoint identity.
         endpoint: String,
+        /// Endpoint-local publication key.
         key: u64,
     },
+    /// POSIX shared-memory publication with optional asynchronous readiness.
     PosixShm {
+        /// Shared-memory object name.
         name: String,
+        /// Bytes reserved for the readiness header.
         ready_header_bytes: u32,
+        /// Semaphore name used when readiness is asynchronous.
         ready_semaphore: Option<String>,
     },
+    /// CUDA IPC publication with shared lifetime and readiness handles.
     CudaIpc {
+        /// Publishing worker endpoint.
         endpoint: String,
+        /// Stable publication identity.
         publication_id: String,
+        /// Opaque CUDA allocation handle.
         #[serde(with = "serde_bytes")]
         storage_handle: Vec<u8>,
+        /// Exported allocation size in bytes.
         storage_size_bytes: u64,
+        /// Byte offset of the exported storage region.
         storage_offset_bytes: u64,
+        /// Element offset of the tensor view.
         tensor_offset: u64,
+        /// Tensor stride in elements.
         tensor_stride: Vec<i64>,
+        /// Opaque CUDA handle for shared reference-count storage.
         #[serde(with = "serde_bytes")]
         ref_counter_handle: Vec<u8>,
+        /// Byte offset of the shared reference counter.
         ref_counter_offset: u64,
+        /// Opaque CUDA completion-event handle.
         #[serde(with = "serde_bytes")]
         event_handle: Vec<u8>,
+        /// Whether consumers must synchronize on the completion event.
         event_sync_required: bool,
+        /// Opaque CUDA event handle signaling publication readiness.
         #[serde(with = "serde_bytes")]
         ready_event_handle: Vec<u8>,
     },
@@ -228,63 +297,105 @@ pub enum TransferTransport {
 /// semantic transfer metadata remains typed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransferLocator {
+    /// Transport-specific publication descriptor.
     pub transport: TransferTransport,
+    /// Tensor payload size in bytes.
     pub nbytes: u64,
+    /// Stable tensor data-type name.
     pub dtype: String,
+    /// Tensor extents in logical order.
     pub shape: Vec<u64>,
+    /// Device containing the published tensor.
     pub device: String,
 }
 
+/// Kind of product carried by a cross-pool transfer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransferKind {
+    /// Encoder feature transfer.
     Encoder,
+    /// Device-resident artifact transfer.
     DeviceProduct,
+    /// Paged KV state transfer.
     Kv,
+    /// Diffusion latent transfer.
     Latent,
 }
 
-/// Closed cross-pool transfer algebra. Each variant carries exactly the metadata
-/// required to install that family value on the destination worker.
+/// Closed cross-pool transfer algebra.
+///
+/// Each variant carries the metadata required to install its product family on
+/// a destination worker.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 pub enum TransferHandle {
+    /// Encoded vision or latent features.
     Encoder {
+        /// Producer allocation generation.
         generation: u32,
+        /// Source image height in pixels.
         height: u32,
+        /// Source image width in pixels.
         width: u32,
+        /// Vision or latent feature product kind.
         payload_kind: ProductKind,
+        /// Published feature tensor.
         locator: TransferLocator,
     },
+    /// Device-resident artifact used by another model stage.
     DeviceProduct {
+        /// Producer allocation generation.
         generation: u32,
+        /// Artifact height in pixels, or zero for non-image tensors.
         height: u32,
+        /// Artifact width in pixels, or zero for non-image tensors.
         width: u32,
+        /// Semantic numeric range of the tensor values.
         value_range: String,
+        /// Published artifact tensor.
         locator: TransferLocator,
     },
+    /// One or more tensors representing paged KV state.
     Kv {
+        /// Producer allocation generation.
         generation: u32,
+        /// Published KV tensors.
         locators: Vec<TransferLocator>,
+        /// Source request checkpoint represented by the publication.
         source: Checkpoint,
+        /// Destination worker or pool identity.
         destination: String,
+        /// Optional checkpoint already installed at the destination.
         base: Option<Checkpoint>,
+        /// KV token extent represented by `base`.
         base_extent: u32,
+        /// Total KV token extent represented by this publication.
         published_extent: u32,
+        /// KV cache group identity.
         group_id: u32,
+        /// Quantization or scale metadata identity.
         scale_identity: String,
     },
+    /// Diffusion trajectory tensor.
     Latent {
+        /// Producer allocation generation.
         generation: u32,
+        /// Output image height in pixels.
         height: u32,
+        /// Output image width in pixels.
         width: u32,
+        /// Logical latent allocation units.
         latent_units: u32,
+        /// Denoising step represented by the tensor.
         step: u32,
+        /// Published latent tensor.
         locator: TransferLocator,
     },
 }
 
 impl TransferHandle {
+    /// Returns the product family carried by this transfer.
     pub const fn kind(&self) -> TransferKind {
         match self {
             Self::Encoder { .. } => TransferKind::Encoder,
@@ -294,6 +405,7 @@ impl TransferHandle {
         }
     }
 
+    /// Returns the producer generation carried by this transfer.
     pub const fn generation(&self) -> u32 {
         match self {
             Self::Encoder { generation, .. }
@@ -303,6 +415,7 @@ impl TransferHandle {
         }
     }
 
+    /// Returns the ordered physical locators carried by this transfer.
     fn locators(&self) -> &[TransferLocator] {
         match self {
             Self::Encoder { locator, .. }
@@ -315,12 +428,16 @@ impl TransferHandle {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+/// Materialized product data carried inline or referenced through a transfer handle.
 pub enum InlineValue {
+    /// Host-resident bytes embedded in the IPC message.
     Bytes(#[serde(with = "serde_bytes")] Vec<u8>),
+    /// Cross-stage data identified by a transport-specific handle.
     Transfer(TransferHandle),
 }
 
 impl InlineValue {
+    /// Returns embedded bytes, or `None` for an external transfer.
     pub fn bytes(&self) -> Option<&[u8]> {
         match self {
             Self::Bytes(bytes) => Some(bytes),
@@ -328,6 +445,7 @@ impl InlineValue {
         }
     }
 
+    /// Returns the external transfer descriptor, if present.
     pub const fn transfer(&self) -> Option<&TransferHandle> {
         match self {
             Self::Bytes(_) => None,
@@ -339,15 +457,19 @@ impl InlineValue {
 /// A resolved inline or transfer value matched to one exact product identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProductPayload {
+    /// Exact product identity and bounds.
     pub product: ProductRef,
+    /// Materialized or transport-referenced product value.
     pub value: InlineValue,
 }
 
 impl ProductPayload {
+    /// Validates product identity and the selected inline value.
     pub fn validate(&self) -> ValidationResult<()> {
         self.product.validate()
     }
 
+    /// Validates this payload as a worker input value.
     pub(crate) fn validate_input_value(&self) -> ValidationResult<()> {
         if let InlineValue::Transfer(handle) = &self.value {
             return validate_transfer_handle(&self.product, handle, false);
@@ -376,6 +498,7 @@ impl ProductPayload {
         Ok(())
     }
 
+    /// Validates this payload as a worker output value.
     pub(crate) fn validate_output_value(&self) -> ValidationResult<()> {
         self.validate()?;
         match &self.value {
@@ -389,10 +512,14 @@ impl ProductPayload {
     }
 }
 
+/// Maximum serialized size accepted for an external transfer handle.
 pub const MAX_TRANSFER_HANDLE_BYTES: usize = 64 * 1024;
 
 impl TransferLocator {
+    /// Validates common tensor bounds and transport-specific opening metadata.
     fn validate(&self) -> ValidationResult<()> {
+        // Tensor metadata is transport-independent and establishes the minimum
+        // shape needed to validate every publication mechanism.
         ensure_valid!(
             self.nbytes > 0
                 && !self.dtype.is_empty()
@@ -401,6 +528,9 @@ impl TransferLocator {
                 && !self.device.is_empty(),
             "transfer locator has invalid tensor bounds"
         );
+
+        // Each transport validates only the handles and readiness metadata its
+        // consumer must use to open the publication.
         match &self.transport {
             TransferTransport::Local { endpoint, .. } => {
                 ensure_valid!(!endpoint.is_empty(), "local transfer endpoint is empty");
@@ -446,6 +576,7 @@ impl TransferLocator {
                     .saturating_add(ref_counter_handle.len())
                     .saturating_add(event_handle.len())
                     .saturating_add(ready_event_handle.len());
+
                 ensure_valid!(
                     opaque_bytes <= MAX_TRANSFER_HANDLE_BYTES,
                     "CUDA IPC transfer handles exceed their byte bound"
@@ -456,11 +587,14 @@ impl TransferLocator {
     }
 }
 
+/// Validates a transfer handle against its declared product and direction.
 fn validate_transfer_handle(
     product: &ProductRef,
     handle: &TransferHandle,
     output: bool,
 ) -> ValidationResult<()> {
+    // The product declaration controls which storage classes may cross a pool
+    // boundary and binds the handle to one allocation generation.
     ensure_valid!(
         product.storage_class != StorageClass::HostStaging
             && (!output || product.storage_class != StorageClass::PinnedOutput),
@@ -470,6 +604,8 @@ fn validate_transfer_handle(
         handle.generation() == product.generation,
         "transfer generation disagrees with its product"
     );
+
+    // Product-family metadata must agree before inspecting physical locators.
     match handle {
         TransferHandle::Encoder {
             payload_kind,
@@ -531,6 +667,9 @@ fn validate_transfer_handle(
             "latent transfer disagrees with its product"
         ),
     }
+
+    // Validate each locator and bound their combined payload by the declared
+    // maximum product shape.
     let mut total_bytes = 0_u64;
     for locator in handle.locators() {
         locator.validate()?;
@@ -543,7 +682,7 @@ fn validate_transfer_handle(
     Ok(())
 }
 
-/// Encode a `ProductKind::Token` product value: a little-endian `u32` count
+/// Encodes a `ProductKind::Token` product value: a little-endian `u32` count
 /// followed by that many little-endian `u32` token ids.
 pub fn encode_token_product_bytes(tokens: &[u32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(4 + tokens.len() * 4);
@@ -554,9 +693,10 @@ pub fn encode_token_product_bytes(tokens: &[u32]) -> Vec<u8> {
     bytes
 }
 
-/// Decode a `ProductKind::Token` product value produced by
+/// Decodes a `ProductKind::Token` product value produced by
 /// [`encode_token_product_bytes`].
 pub fn decode_token_product_bytes(bytes: &[u8]) -> ValidationResult<Vec<u32>> {
+    // Validate the count prefix before interpreting the remaining bytes.
     ensure_valid!(
         bytes.len() >= 4,
         "token product bytes are too short to carry a count"
@@ -568,6 +708,7 @@ pub fn decode_token_product_bytes(bytes: &[u8]) -> ValidationResult<Vec<u32>> {
         "token product byte length {} does not match declared count {count}",
         bytes.len()
     );
+    // Exact length makes every remaining chunk a complete token identifier.
     Ok(bytes[4..]
         .chunks_exact(4)
         .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
@@ -584,14 +725,20 @@ pub fn decode_token_product_bytes(bytes: &[u8]) -> ValidationResult<Vec<u32>> {
 /// token history participates in a successor's sampling input.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SamplingState {
+    /// Optional whitelist of token identifiers eligible for sampling.
     pub allowed_token_ids: Option<Vec<u32>>,
+    /// Token identifiers excluded from sampling.
     pub suppressed_token_ids: Vec<u32>,
+    /// Token identifiers that terminate generation when selected.
     pub finish_token_ids: Vec<u32>,
+    /// Token identifiers that advance a structured-generation transition.
     pub transition_token_ids: Vec<u32>,
+    /// Whether the current grammar state requires immediate termination.
     pub force_finish: bool,
 }
 
 impl SamplingState {
+    /// Sorts and deduplicates token identifier sets for deterministic encoding.
     pub fn canonicalize(&mut self) {
         if let Some(allowed) = &mut self.allowed_token_ids {
             allowed.sort_unstable();
@@ -606,12 +753,13 @@ impl SamplingState {
     }
 }
 
-/// Encode canonical branch-local sampling state.
+/// Encodes canonical branch-local sampling state.
 ///
 /// Layout: one allowed-presence byte; an allowed count and ids when present;
 /// then a suppressed count and ids; a finish count and ids; a transition count
 /// and ids; then one force-finish byte.
 pub fn encode_sampling_state_bytes(state: &SamplingState) -> Vec<u8> {
+    // Canonical ordering makes the byte representation deterministic.
     let mut canonical = state.clone();
     canonical.canonicalize();
     let allowed_len = canonical.allowed_token_ids.as_ref().map_or(0, Vec::len);
@@ -625,6 +773,7 @@ pub fn encode_sampling_state_bytes(state: &SamplingState) -> Vec<u8> {
             + canonical.transition_token_ids.len() * 4
             + 1,
     );
+    // Encode the optional whitelist before the required token-id sets.
     match canonical.allowed_token_ids {
         Some(allowed) => {
             bytes.push(1);
@@ -647,12 +796,14 @@ pub fn encode_sampling_state_bytes(state: &SamplingState) -> Vec<u8> {
     for token in canonical.transition_token_ids {
         bytes.extend_from_slice(&token.to_le_bytes());
     }
+    // A terminal byte keeps the boolean outside all length-prefixed lists.
     bytes.push(u8::from(canonical.force_finish));
     bytes
 }
 
-/// Decode and validate canonical branch-local sampling state.
+/// Decodes and validates canonical branch-local sampling state.
 pub fn decode_sampling_state_bytes(bytes: &[u8]) -> ValidationResult<SamplingState> {
+    /// Takes one little-endian word while advancing a checked cursor.
     fn take_u32(bytes: &[u8], offset: &mut usize) -> ValidationResult<u32> {
         let end = offset
             .checked_add(4)
@@ -662,6 +813,8 @@ pub fn decode_sampling_state_bytes(bytes: &[u8]) -> ValidationResult<SamplingSta
         *offset = end;
         Ok(value)
     }
+
+    /// Takes a canonical strictly increasing token-id sequence.
     fn take_ids(bytes: &[u8], offset: &mut usize, count: u32) -> ValidationResult<Vec<u32>> {
         let mut values = Vec::with_capacity(count as usize);
         for _ in 0..count {
@@ -674,6 +827,7 @@ pub fn decode_sampling_state_bytes(bytes: &[u8]) -> ValidationResult<SamplingSta
         Ok(values)
     }
 
+    // Decode the optional whitelist using its explicit presence byte.
     let mut offset = 0;
     ensure_valid!(
         offset < bytes.len(),
@@ -691,12 +845,14 @@ pub fn decode_sampling_state_bytes(bytes: &[u8]) -> ValidationResult<SamplingSta
         }
         other => bail_invalid!("sampling-state allowed presence {other} is invalid"),
     };
+    // Decode each required canonical set in protocol order.
     let suppressed_len = take_u32(bytes, &mut offset)?;
     let suppressed_token_ids = take_ids(bytes, &mut offset, suppressed_len)?;
     let finish_len = take_u32(bytes, &mut offset)?;
     let finish_token_ids = take_ids(bytes, &mut offset, finish_len)?;
     let transition_len = take_u32(bytes, &mut offset)?;
     let transition_token_ids = take_ids(bytes, &mut offset, transition_len)?;
+    // Require a strict boolean terminator and reject any trailing bytes.
     ensure_valid!(
         offset < bytes.len(),
         "sampling-state bytes omit force-finish"

@@ -24,6 +24,8 @@ class LatentSnapshot:
     value: torch.Tensor
 
     def __post_init__(self) -> None:
+        """Validate committed latent pages, generation, step, units, and raster geometry."""
+
         if min(int(self.generation), int(self.latent_units), int(self.height), int(self.width)) < 1:
             raise ValueError("latent snapshot geometry is invalid")
         if int(self.step) < 0:
@@ -86,6 +88,8 @@ class LatentPool:
         dtype: torch.dtype,
         device: torch.device | str,
     ) -> None:
+        """Allocate double-buffered latent pages and request-indexed progress metadata."""
+
         if (
             min(int(request_pool_size), int(page_units), int(latent_width)) < 1
             or int(num_pages) < 2
@@ -101,6 +105,8 @@ class LatentPool:
         self.device = torch.device(device)
         self.capacity_units = (self.num_pages - 1) * self.page_units
 
+        # Page zero remains outside scheduler capacity; the two banks alternate
+        # source and destination roles across diffusion steps.
         self.storage = torch.zeros(
             (2, self.num_pages, self.page_units, self.latent_width),
             dtype=self.dtype,
@@ -121,6 +127,9 @@ class LatentPool:
             dtype=torch.float32,
             device=self.device,
         )
+
+        # Host metadata is authoritative for ownership and generation checks;
+        # tensors keep it compact and cheap to query from scheduler paths.
         rows = self.request_pool_size + 1
         self._active = torch.zeros(rows, dtype=torch.int8)
         self._steps = torch.zeros(rows, dtype=torch.int32)
@@ -130,6 +139,9 @@ class LatentPool:
         self._widths = torch.zeros(rows, dtype=torch.int32)
         self._owners = torch.zeros(self.num_pages, dtype=torch.int32)
         self._slot_pages: list[tuple[int, ...]] = [() for _ in range(rows)]
+
+        # Retain a pinned source for nonblocking page-index copies into the
+        # fixed gather buffer used by one latent step at a time.
         self._page_table_host = torch.empty(
             self.num_pages - 1,
             dtype=torch.int64,
@@ -139,7 +151,7 @@ class LatentPool:
 
     @property
     def capacity_bytes(self) -> int:
-        """Logical scheduler-visible trajectory capacity."""
+        """Measure scheduler-visible latent payload capacity, excluding pool metadata."""
 
         return self.capacity_units * self.latent_width * self.storage.element_size()
 
@@ -156,6 +168,8 @@ class LatentPool:
         return sum(int(value.numel()) * int(value.element_size()) for value in tensors)
 
     def resident_byte_count(self) -> int:
+        """Measure latent payload bytes owned by active request slots."""
+
         return int(self._units.sum().item()) * self.latent_width * self.storage.element_size()
 
     def stage(
@@ -453,6 +467,8 @@ class LatentPool:
             self._clear_slot(slot, pages)
 
     def close(self) -> None:
+        """Release latent storage, page tables, staging tensors, and request ownership."""
+
         for name, dtype in (
             ("storage", self.dtype),
             ("step_buffer", self.dtype),
@@ -462,6 +478,8 @@ class LatentPool:
             setattr(self, name, torch.empty(0, dtype=dtype, device=self.device))
 
     def _write_pages(self, bank: int, pages: torch.Tensor, value: torch.Tensor) -> None:
+        """Scatter contiguous latent units into the selected physical page bank."""
+
         self.storage[int(bank)].index_copy_(
             0,
             pages,
@@ -469,6 +487,8 @@ class LatentPool:
         )
 
     def _validate_staging(self, staging: LatentStaging, latent_units: int) -> tuple[int, ...]:
+        """Validate staged latent units, bank, pages, tensor shape, and dtype."""
+
         if staging.pages.device != self.device or staging.pages.dtype != torch.int64:
             raise invalid_descriptor("latent page table is not in fixed device staging")
         if (
@@ -487,6 +507,8 @@ class LatentPool:
         return self._validate_page_table(staging.page_table, int(latent_units))
 
     def _validate_page_table(self, page_table: Sequence[int], latent_units: int) -> tuple[int, ...]:
+        """Validate page count, bounds, uniqueness, and capacity for a latent payload."""
+
         units = int(latent_units)
         pages = tuple(int(page) for page in page_table)
         expected = math.ceil(units / self.page_units) if units > 0 else 0
@@ -500,6 +522,8 @@ class LatentPool:
         return pages
 
     def _require_page_owners(self, pages: Sequence[int] | torch.Tensor, owner: int) -> None:
+        """Require every latent page to be owned by the expected request slot."""
+
         canonical = (
             tuple(int(value) for value in pages.detach().cpu().tolist())
             if isinstance(pages, torch.Tensor)
@@ -518,6 +542,8 @@ class LatentPool:
         height: int,
         width: int,
     ) -> None:
+        """Validate slot ownership, generation, step, units, and raster geometry."""
+
         current = (
             int(self._steps[slot].item()),
             int(self._generations[slot].item()),
@@ -530,10 +556,14 @@ class LatentPool:
             raise invalid_descriptor("latent placement does not name the committed trajectory")
 
     def _require_slot_pages(self, slot: int, pages: Sequence[int]) -> None:
+        """Require a slot's committed page table to match the supplied pages."""
+
         if self._slot_pages[slot] != tuple(int(page) for page in pages):
             raise invalid_descriptor("latent page table does not match its committed trajectory")
 
     def _require_empty(self, slot: int) -> None:
+        """Require a request slot to have no active latent trajectory."""
+
         if int(self._generations[slot].item()) != 0 or int(self._units[slot].item()) != 0:
             raise invalid_descriptor("request slot already owns a committed trajectory")
 
@@ -546,12 +576,16 @@ class LatentPool:
         height: int,
         width: int,
     ) -> None:
+        """Validate generation, step, unit count, and raster dimensions."""
+
         if min(int(generation), int(latent_units), int(height), int(width)) < 1 or int(step) < 0:
             raise invalid_descriptor("latent publication metadata is invalid")
         if int(latent_units) > self.capacity_units:
             raise invalid_descriptor("latent publication exceeds physical capacity")
 
     def _clear_slot(self, slot: int, pages: Sequence[int]) -> None:
+        """Release latent page ownership and reset all metadata for one slot."""
+
         for page in pages:
             self._owners[int(page)] = 0
         self._active[slot] = 0
@@ -563,11 +597,15 @@ class LatentPool:
         self._slot_pages[slot] = ()
 
     def _validate_slot(self, slot: int) -> int:
+        """Validate a scheduler-visible latent request slot index."""
+
         if slot < 1 or slot > self.request_pool_size:
             raise invalid_descriptor("latent request slot is outside physical capacity")
         return slot
 
     def _device_pages(self, pages: Sequence[int]) -> torch.Tensor:
+        """Copy host page identifiers into reusable device index storage."""
+
         fill_cpu_ints(self._page_table_host, pages)
         target = self.page_table_buffer[: len(pages)]
         target.copy_(self._page_table_host[: len(pages)], non_blocking=self.device.type == "cuda")

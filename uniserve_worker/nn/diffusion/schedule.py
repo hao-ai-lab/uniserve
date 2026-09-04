@@ -15,11 +15,15 @@ __all__ = [
 
 
 class ScheduleDirection(str, Enum):
+    """Selects ascending or descending traversal of a flow schedule."""
+
     ASCENDING = "ascending"
     DESCENDING = "descending"
 
 
 class ScheduleShiftDomain(str, Enum):
+    """Selects whether schedule shifts operate in time or sigma coordinates."""
+
     TIME = "time"
     SIGMA = "sigma"
 

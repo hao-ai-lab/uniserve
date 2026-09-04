@@ -1,4 +1,5 @@
 """Flow-matching heads and pixel decoders used by served image models."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -48,12 +49,18 @@ def modulate(
     shift: torch.Tensor | None,
     scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    """Apply optional adaptive scale and shift terms to normalized activations."""
+
     scaled = x if scale is None else x * (1 + scale)
     return scaled if shift is None else scaled + shift
 
 
 class ResBlock(nn.Module):
+    """Applies time-conditioned residual convolutions with optional spatial resampling."""
+
     def __init__(self, channels: int, *, layer_config: LayerConfig, mlp_ratio: float = 1.0):
+        """Build a time-modulated residual MLP at a fixed channel width."""
+
         super().__init__()
         self.channels = int(channels)
         self.intermediate_size = int(channels * mlp_ratio)
@@ -69,13 +76,19 @@ class ResBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Apply a timestep-modulated MLP update while preserving the residual stream."""
+
         shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(y).chunk(3, dim=-1)
         h = self.mlp(modulate(self.in_ln(x), shift_mlp, scale_mlp))
         return x + gate_mlp * h
 
 
 class _TimeAdaptiveFinalLayer(nn.Module):
+    """Applies timestep-conditioned normalization and the final flow projection."""
+
     def __init__(self, model_channels: int, out_channels: int, *, layer_config: LayerConfig):
+        """Build adaptive normalization and the terminal flow projection."""
+
         super().__init__()
         self.norm_final = nn.LayerNorm(model_channels, elementwise_affine=False, eps=1e-6)
         self.linear = LinearBase(model_channels, out_channels, layer_config=layer_config, bias=True)
@@ -85,11 +98,15 @@ class _TimeAdaptiveFinalLayer(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        """Normalize hidden rows, apply timestep affine parameters, and project flow values."""
+
         shift, scale = self.adaLN_modulation(c).chunk(2, dim=-1)
         return self.linear(modulate(self.norm_final(x), shift, scale))
 
 
 class _TimeConditionedMLPAdaLN(nn.Module):
+    """Applies adaptive layer normalization and a gated MLP conditioned on timestep embeddings."""
+
     def __init__(
         self,
         input_dim: int,
@@ -101,6 +118,8 @@ class _TimeConditionedMLPAdaLN(nn.Module):
         mlp_ratio: float = _DEFAULT_FLOW_HEAD.mlp_ratio,
         init_weights: bool = False,
     ):
+        """Build the input projection, adaptive residual stack, and flow output layer."""
+
         super().__init__()
         self.input_dim = int(input_dim)
         self.out_dim = int(out_dim)
@@ -124,7 +143,11 @@ class _TimeConditionedMLPAdaLN(nn.Module):
             self.initialize_weights()
 
     def initialize_weights(self) -> None:
+        """Initialize dense layers and zero residual gates for stable flow-head startup."""
+
         def _basic_init(module: nn.Module) -> None:
+            """Initialize linear weights with Xavier scaling and clear their biases."""
+
             if isinstance(module, (nn.Linear, LinearBase)):
                 torch.nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
@@ -151,6 +174,8 @@ class _TimeConditionedMLPAdaLN(nn.Module):
             nn.init.constant_(self.final_layer.linear.bias, 0)
 
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Project input rows, apply time-conditioned residual blocks, and emit patch flow."""
+
         h = self.input_proj(x)
         c = self.time_embed(t.to(device=x.device))
         for block in self.res_blocks:
@@ -159,6 +184,8 @@ class _TimeConditionedMLPAdaLN(nn.Module):
 
 
 class FlowMatchingHead(nn.Module):
+    """Predicts patch-space flow values from image tokens and timestep conditioning."""
+
     def __init__(
         self,
         input_dim: int,
@@ -170,6 +197,8 @@ class FlowMatchingHead(nn.Module):
         mlp_ratio: float = _DEFAULT_FLOW_HEAD.mlp_ratio,
         init_weights: bool = False,
     ):
+        """Build the timestep-conditioned patch-flow prediction network."""
+
         super().__init__()
         self.net = _TimeConditionedMLPAdaLN(
             input_dim=input_dim,
@@ -183,13 +212,19 @@ class FlowMatchingHead(nn.Module):
 
     @property
     def dtype(self):
+        """Expose the activation dtype expected by the flow head's input projection."""
+
         return self.net.input_proj.weight.dtype
 
     @property
     def device(self):
+        """Expose the device that owns the flow head's input projection."""
+
         return self.net.input_proj.weight.device
 
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Predict patch-space flow values for rows paired with diffusion timesteps."""
+
         return self.net(x, t)
 
 
@@ -197,15 +232,21 @@ class FinalLayer(nn.Module):
     """Untimed DiT-style final projection used by patch-space decoders."""
 
     def __init__(self, model_channels: int, out_channels: int, *, layer_config: LayerConfig):
+        """Build untimed normalization and the final patch-space projection."""
+
         super().__init__()
         self.norm_final = nn.LayerNorm(model_channels, elementwise_affine=False, eps=1e-6)
         self.linear = LinearBase(model_channels, out_channels, layer_config=layer_config, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Normalize decoder features and project them to output channels."""
+
         return self.linear(self.norm_final(x))
 
 
 class ConvDecoder(nn.Module):
+    """Reconstructs RGB images from spatial latent feature maps."""
+
     def __init__(
         self,
         input_dim: int = 4096,
@@ -214,6 +255,8 @@ class ConvDecoder(nn.Module):
         out_channels: int = 3,
         final_upscale: int = 8,
     ):
+        """Build the convolutional upsampling stack for RGB reconstruction."""
+
         super().__init__()
         self.out_channels = int(out_channels)
         self.final_upscale = int(final_upscale)
@@ -243,5 +286,7 @@ class ConvDecoder(nn.Module):
         self.ps3 = nn.PixelShuffle(self.final_upscale)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Upscale latent feature maps through pixel shuffles and reconstruct RGB channels."""
+
         x = self.act1(self.conv1(self.ps1(x)))
         return self.ps3(self.conv2(self.ps2(x)))

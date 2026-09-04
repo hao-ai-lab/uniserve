@@ -1,8 +1,8 @@
-//! Encoder-output cache. A hashed, reference-counted,
-//! LRU-evicted cache keyed by image content hash, holding the exact immutable
-//! product reference for a worker-side encoder output. On a hit the encode op is
-//! skipped; evicted products are reported so the worker can reclaim their
-//! physical storage. No embeddings live in the scheduler.
+//! Reference-counted cache of worker-resident encoder products.
+//!
+//! Content-derived keys map to immutable product references. Unpinned entries
+//! participate in LRU eviction, and eviction returns the product identity so the
+//! worker can reclaim its storage.
 
 use std::collections::{BTreeMap, HashMap};
 use uniserve_worker_ipc::ProductRef;
@@ -10,9 +10,11 @@ use uniserve_worker_ipc::ProductRef;
 struct Entry {
     product: ProductRef,
     ref_cnt: u32,
-    lru: u64, // monotonic tick, larger == more recent
+    /// Monotonic access tick; larger values are more recent.
+    lru: u64,
 }
 
+/// Interval counters for encoder-cache lookups and hits.
 #[derive(Default, Debug, Clone, Copy)]
 pub(crate) struct EncoderCacheStats {
     pub(crate) queries: u64,
@@ -26,6 +28,7 @@ pub(crate) struct EncoderCacheStats {
     pub(crate) over_budget_inserts: u64,
 }
 
+/// Scheduler-owned reference and eviction state for encoder products.
 pub(crate) struct EncoderCacheManager {
     budget: usize,                // max cached entries
     entries: HashMap<u64, Entry>, // content hash -> entry
@@ -45,6 +48,7 @@ pub(crate) struct EncoderCacheManager {
 }
 
 impl EncoderCacheManager {
+    /// Creates an initialized instance.
     pub(crate) fn new(budget: usize) -> Self {
         Self {
             budget,
@@ -56,27 +60,31 @@ impl EncoderCacheManager {
         }
     }
 
+    /// Returns the number of entries.
     pub(crate) fn len(&self) -> usize {
         self.entries.len() + self.retired.values().map(Vec::len).sum::<usize>()
     }
+    /// Returns whether the collection contains no entries.
     pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty() && self.retired.is_empty()
     }
+    /// Returns the cache byte budget.
     pub(crate) fn budget(&self) -> usize {
         self.budget
     }
 
-    /// Inspect a resident output without changing LRU order or cache metrics.
+    /// Returns a resident output without changing LRU order or cache metrics.
     pub(crate) fn peek_product(&self, hash: u64) -> Option<ProductRef> {
         self.entries.get(&hash).map(|entry| entry.product.clone())
     }
 
+    /// Returns and advances the cache recency counter.
     fn next_tick(&mut self) -> u64 {
         self.tick += 1;
         self.tick
     }
 
-    /// Look up the exact product and measured KV effect needed to skip encode.
+    /// Looks up the exact product and measured KV effect needed to skip encoding.
     pub(crate) fn lookup_product(&mut self, hash: u64) -> Option<ProductRef> {
         self.stats.queries += 1;
         let tick = self.next_tick();
@@ -96,14 +104,14 @@ impl EncoderCacheManager {
         }
     }
 
-    /// Whether there's room (under budget, counting only unreferenced evictables)
+    /// Returns whether capacity can be made available from unreferenced entries
     /// to insert another entry without exceeding the budget by referenced ones.
     pub(crate) fn can_insert(&self) -> bool {
-        // room exists if under budget, or some entry is unreferenced (evictable).
+        // An unreferenced entry can be evicted even when the nominal budget is full.
         self.len() < self.budget || !self.evictable.is_empty()
     }
 
-    /// Remove the least-recently-used unpinned entry so its worker buffer can
+    /// Removes the least-recently-used unpinned entry so its worker buffer can
     /// be freed before a replacement encoder operation is admitted.
     pub(crate) fn evict_one(&mut self) -> Option<ProductRef> {
         let (_, victim) = self.evictable.pop_first()?;
@@ -116,7 +124,7 @@ impl EncoderCacheManager {
         Some(entry.product)
     }
 
-    /// Insert a freshly-computed encoder product, evicting the LRU unreferenced
+    /// Inserts a freshly-computed encoder product, evicting the LRU unreferenced
     /// entry if at budget. Returns any freed product.
     /// `budget` bounds the *evictable* working set, not the live set. The
     /// encoder output already exists on the worker by the time it reaches here
@@ -192,7 +200,7 @@ impl EncoderCacheManager {
         freed
     }
 
-    /// Reference a cached entry (pins it against eviction while a request uses it).
+    /// Acquires a cached entry, pinning it against eviction while the request uses it.
     pub(crate) fn acquire(&mut self, hash: u64) -> Option<ProductRef> {
         let tick = self.next_tick();
         let e = self.entries.get_mut(&hash)?;
@@ -200,14 +208,14 @@ impl EncoderCacheManager {
         let was_unreferenced = e.ref_cnt == 0;
         e.ref_cnt += 1;
         e.lru = tick;
-        // A pinned entry is no longer evictable.
+        // Pinned entries are excluded from the eviction index.
         if was_unreferenced {
             self.evictable.remove(&old_lru);
         }
         Some(e.product.clone())
     }
 
-    /// Release a reference. Active entries become evictable at zero references;
+    /// Releases a reference. Active entries become evictable at zero references;
     /// retired entries are removed and return their worker handle for reclaim.
     pub(crate) fn release(&mut self, hash: u64, product: &ProductRef) -> Option<ProductRef> {
         if let Some(e) = self.entries.get_mut(&hash)

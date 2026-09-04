@@ -21,6 +21,8 @@ def modulation_plan_shapes(
     steps: int,
     input_rows: int,
 ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Derive resident block and final-projection storage shapes for a timestep ladder."""
+
     if not layer_projections or steps < 1 or input_rows < 1:
         raise ValueError(
             "modulation planning requires projections, steps, and input rows"
@@ -45,6 +47,8 @@ def prepare_modulation_plan(
     block_storage: torch.Tensor,
     final_storage: torch.Tensor,
 ) -> None:
+    """Project all activated timesteps into caller-owned per-step modulation storage."""
+
     expected_block, expected_final = modulation_plan_shapes(
         layer_projections,
         final_projection,
@@ -77,6 +81,8 @@ def select_modulation_step(
     block_output: torch.Tensor,
     final_output: torch.Tensor,
 ) -> None:
+    """Copy one prepared timestep slice into fixed execution output buffers."""
+
     index = int(step)
     if (
         not 0 <= index < block_plan.shape[0]

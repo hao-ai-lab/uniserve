@@ -1,4 +1,4 @@
-"""Model loading and live weight identity."""
+"""Public checkpoint loading configuration, construction, and weight identity APIs."""
 
 from .config import LoadConfig, LoadFormat, LoadRequest
 from .loader import BaseModelLoader, LoadedModel, get_model_loader

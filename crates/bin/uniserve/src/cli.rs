@@ -1,7 +1,7 @@
-//! CLI argument definitions for the `uniserve` (UniServe) binary.
+//! Command-line parsing and runtime configuration for the `uniserve` binary.
 //!
-//! UniServe owns the engine and scheduler in Rust; Python only runs the model
-//! forward pass. There is a single `serve` command.
+//! The parser exposes the serving command and lowers its model, scheduler,
+//! worker, and HTTP options into the typed server configuration.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -42,6 +42,7 @@ pub(crate) struct Cli {
 }
 
 impl Cli {
+    /// Parses arguments from the current process environment.
     pub(crate) fn parse() -> Self {
         <Self as Parser>::parse()
     }
@@ -55,13 +56,17 @@ pub(crate) enum Command {
     Serve(Box<ServeArgs>),
 }
 
+/// Scheduler ordering policy accepted by the command line.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub(crate) enum SchedulerPolicyArg {
+    /// Admit requests in arrival order.
     Fcfs,
+    /// Admit higher-priority requests first while preserving stable ties.
     Priority,
 }
 
 impl From<SchedulerPolicyArg> for SchedulingPolicy {
+    /// Converts the source value into this type.
     fn from(value: SchedulerPolicyArg) -> Self {
         match value {
             SchedulerPolicyArg::Fcfs => SchedulingPolicy::Fcfs,
@@ -91,7 +96,7 @@ pub(crate) struct ServeArgs {
 }
 
 impl ServeArgs {
-    /// Build the UniServe-native server config, binding the HTTP listener
+    /// Builds the UniServe-native server config, binding the HTTP listener
     /// directly.
     pub(crate) fn to_uniserve_config(&self) -> Config {
         let listener_mode = match &self.uds {
@@ -169,13 +174,13 @@ pub(crate) struct SharedRuntimeArgs {
     /// Maximum number of ops assembled into one forward batch.
     #[arg(long, default_value_t = DEFAULT_MAX_BATCH, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..), hide = true)]
     pub max_batch: usize,
-    /// Per-step scheduling token budget (vLLM's max_num_batched_tokens).
+    /// Maximum transformer-token work admitted in one scheduling step.
     #[arg(long, default_value_t = DEFAULT_MAX_NUM_BATCHED_TOKENS, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub max_num_batched_tokens: usize,
-    /// Maximum concurrently running requests (vLLM's max_num_seqs).
+    /// Maximum number of concurrently resident requests.
     #[arg(long = "max-running-requests", default_value_t = DEFAULT_MAX_NUM_SEQS, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub max_num_seqs: usize,
-    /// Per-request ceiling for one prefill chunk (SGLang's chunked prefill size).
+    /// Maximum number of prompt tokens processed per request in one prefill step.
     #[arg(long = "chunked-prefill-size", default_value_t = DEFAULT_LONG_PREFILL_THRESHOLD, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub long_prefill_threshold: usize,
     /// Per-step budget of text prefill tokens allowed to join a decode batch
@@ -237,10 +242,12 @@ pub(crate) struct SharedRuntimeArgs {
 }
 
 impl SharedRuntimeArgs {
+    /// Returns the normalized model identifier used by server configuration.
     pub(crate) fn resolved_model(&self) -> String {
         self.model.clone()
     }
 
+    /// Returns the configured API key, if present.
     fn configured_api_key(&self) -> Option<String> {
         non_empty_secret(self.api_key.as_deref()).or_else(|| {
             std::env::var(API_KEY_ENV)
@@ -249,7 +256,7 @@ impl SharedRuntimeArgs {
         })
     }
 
-    /// Build the UniServe Rust-engine settings from these CLI arguments.
+    /// Builds the UniServe Rust-engine settings from these CLI arguments.
     pub(crate) fn engine_settings(&self) -> EngineSettings {
         let is_media = self.model_description == ModelDescription::MiniMaxH3;
         let mut worker_process = self.worker_process.to_args();
@@ -291,7 +298,7 @@ impl SharedRuntimeArgs {
         }
     }
 
-    /// Build the OpenAI-server config for the in-process UniServe engine.
+    /// Builds the OpenAI-server config for the in-process UniServe engine.
     fn into_config(self, listener_mode: HttpListenerMode) -> Config {
         let engine = self.engine_settings();
         let model = self.resolved_model();
@@ -391,6 +398,7 @@ pub(crate) struct WorkerProcessOptions {
 }
 
 impl WorkerProcessOptions {
+    /// Converts CLI worker options into the engine's process-launch contract.
     fn to_args(&self) -> WorkerProcessArgs {
         WorkerProcessArgs {
             stub: self.worker_stub,
@@ -424,10 +432,12 @@ impl WorkerProcessOptions {
     }
 }
 
+/// Parses the JSON.
 fn parse_json<T: DeserializeOwned>(value: &str) -> Result<T, String> {
     serde_json::from_str(value).map_err(|e| format!("invalid JSON object: {}", e.as_report()))
 }
 
+/// Parses the JSON object.
 fn parse_json_object(value: &str) -> Result<Value, String> {
     let parsed = parse_json::<Value>(value)?;
     if parsed.is_object() {
@@ -437,12 +447,13 @@ fn parse_json_object(value: &str) -> Result<Value, String> {
     }
 }
 
+/// Returns a secret only when it contains a nonempty value.
 fn non_empty_secret(value: Option<&str>) -> Option<String> {
     let trimmed = value?.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-/// Default worker interpreter: a `python3`/`python` next to the running binary
+/// Returns the default worker interpreter next to the running binary
 /// (the env `bin/` for a `pip install`), then `$VIRTUAL_ENV`, then `python3`.
 fn default_worker_python() -> std::path::PathBuf {
     if let Ok(exe) = std::env::current_exe()

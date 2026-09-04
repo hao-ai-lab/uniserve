@@ -1,4 +1,4 @@
-"""Nsight Systems lifecycle for one managed evaluator point."""
+"""Controls an Nsight Systems capture around one measured benchmark window."""
 
 from __future__ import annotations
 
@@ -14,9 +14,11 @@ from .nsys_timeline import transform_timeline
 
 
 class NsysCapture:
-    """Delay collection through warmup, then finalize one managed-server report."""
+    """Profiles post-warmup load and exports a normalized timeline."""
 
     def __init__(self, point_name: str, output_dir: Path, *, trace_cuda: bool = True) -> None:
+        """Create a unique profiler session for a benchmark point."""
+
         executable = shutil.which("nsys")
         if executable is None:
             raise RuntimeError("Nsight Systems is required for --nsys")
@@ -32,6 +34,8 @@ class NsysCapture:
         self._stopped = False
 
     def wrap_launch(self, launch: ServerLaunch) -> ServerLaunch:
+        """Wrap a server launch in a deferred-start profiler command."""
+
         if self.output_dir.exists() and any(self.output_dir.iterdir()):
             raise FileExistsError(f"nsys result directory is not empty: {self.output_dir}")
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -64,18 +68,24 @@ class NsysCapture:
         return ServerLaunch(command, launch.working_directory, environment)
 
     def start(self) -> None:
+        """Start collection for the measured request window."""
+
         if self._started:
             raise RuntimeError("nsys measurement window was started more than once")
         self._run("start", f"--session={self.session}")
         self._started = True
 
     def stop(self) -> None:
+        """Stop an active measurement window."""
+
         if not self._started or self._stopped:
             raise RuntimeError("nsys measurement window is not active")
         self._run("stop", f"--session={self.session}")
         self._stopped = True
 
     def finalize(self) -> None:
+        """Export the report and create its normalized timeline and manifest."""
+
         if not self._started:
             return
         if not self._stopped:
@@ -113,6 +123,8 @@ class NsysCapture:
         )
 
     def describe(self) -> dict[str, object]:
+        """Return the capture configuration recorded with benchmark artifacts."""
+
         return {
             "session": self.session,
             "output_directory": str(self.output_dir),
@@ -124,6 +136,8 @@ class NsysCapture:
         }
 
     def _run(self, *arguments: str) -> None:
+        """Run an Nsight Systems command and append its combined output to the log."""
+
         result = subprocess.run(
             [self.executable, *arguments],
             text=True,

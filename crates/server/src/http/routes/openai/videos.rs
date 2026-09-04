@@ -1,3 +1,8 @@
+//! HTTP handler for synchronous OpenAI-compatible video generation.
+//!
+//! Completed video bytes are streamed from POSIX shared memory and unlinked
+//! after the response acquires its own open descriptor.
+
 use std::ffi::CString;
 use std::sync::Arc;
 
@@ -25,6 +30,7 @@ unsafe impl Send for SharedMedia {}
 unsafe impl Sync for SharedMedia {}
 
 impl SharedMedia {
+    /// Claims and maps a generated shared-memory artifact for response streaming.
     fn open(artifact: &ArtifactEvent) -> Result<Self, String> {
         let bytes = usize::try_from(artifact.bytes)
             .map_err(|_| "generated media is too large for this host".to_string())?;
@@ -88,7 +94,8 @@ impl SharedMedia {
                 0,
             )
         };
-        // SAFETY: descriptor is no longer needed after mmap.
+        // SAFETY: this scope exclusively owns the valid descriptor; the mapping retains its
+        // kernel object independently after the descriptor is closed.
         unsafe { libc::close(descriptor) };
         if address == libc::MAP_FAILED {
             return Err(format!(
@@ -99,6 +106,7 @@ impl SharedMedia {
         Ok(Self { address, bytes })
     }
 
+    /// Wraps bytes as an HTTP response-body frame.
     fn chunk(&self, offset: usize, count: usize) -> Bytes {
         // SAFETY: caller bounds offset/count to the mapping extent and the mapping is immutable.
         let value =
@@ -108,18 +116,22 @@ impl SharedMedia {
 }
 
 impl Drop for SharedMedia {
+    /// Releases resources owned by this value.
     fn drop(&mut self) {
         // SAFETY: address is the live mapping created in `open` with exactly this extent.
         unsafe { libc::munmap(self.address, self.bytes) };
     }
 }
 
+/// Validates and streams one completed video artifact synchronously.
 pub(crate) async fn videos_sync(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     ValidatedJson(body): ValidatedJson<VideoGenerationRequest>,
 ) -> Response {
     let started_at = std::time::Instant::now();
+
+    // Lower and admit the request before constructing any streaming response.
     let context = resolve_request_context(&headers);
     let input = match lower_video_generation_request(body, state.served_model_name(), context) {
         Ok(input) => input,
@@ -129,6 +141,9 @@ pub(crate) async fn videos_sync(
         Ok(stream) => stream,
         Err(error) => return ApiError::from(serve_error_to_api(error)).into_response(),
     };
+
+    // The synchronous endpoint consumes lifecycle events until the runtime
+    // confirms completion and supplies exactly one artifact descriptor.
     let mut artifact = None;
     loop {
         match stream.next().await {
@@ -162,15 +177,21 @@ pub(crate) async fn videos_sync(
             }
         }
     }
+
     let Some(artifact) = artifact else {
         return ApiError::server_error("video generation produced no artifact".to_string())
             .into_response();
     };
+
+    // Map the immutable shared-memory artifact once and retain the mapping for
+    // the lifetime of every response-body chunk.
     let media = match SharedMedia::open(&artifact) {
         Ok(media) => Arc::new(media),
         Err(message) => return ApiError::server_error(message).into_response(),
     };
     let length = artifact.bytes;
+
+    // Copy bounded chunks from the mapping so the HTTP body owns each yielded buffer.
     let body_stream = futures::stream::try_unfold((media, 0_usize), |(media, offset)| async move {
         if offset == media.bytes {
             Ok::<_, std::convert::Infallible>(None)
@@ -180,6 +201,7 @@ pub(crate) async fn videos_sync(
             Ok(Some((chunk, (media, offset + count))))
         }
     });
+
     let generation_ms = started_at.elapsed().as_secs_f64() * 1_000.0;
     Response::builder()
         .status(StatusCode::OK)

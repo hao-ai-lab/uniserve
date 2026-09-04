@@ -25,11 +25,15 @@ SPARSITY = 0.9
 
 
 def video_sparse_selected_tiles(video_tiles: int) -> int:
+    """Return the ten-percent sparse tile budget, rounded up and bounded to one tile."""
+
     return max(1, math.ceil((1.0 - SPARSITY) * int(video_tiles)))
 
 
 @dataclass(frozen=True, slots=True)
 class VideoSparseAttentionMetadata:
+    """Describes padded tile geometry and per-tile valid row counts for sparse video attention."""
+
     padded_rows: int
     prefix_tiles: int
     video_tiles: int
@@ -39,6 +43,8 @@ class VideoSparseAttentionMetadata:
 
 @dataclass(frozen=True, slots=True)
 class VideoSparseAttentionWorkspace:
+    """Owns fixed intermediate buffers for pooled scoring, sparse selection, exchange, and attention output."""
+
     exchange: SymmetricMemoryWorkspace
     exchange_outputs: tuple[torch.Tensor, ...]
     exchange_sync_input: torch.Tensor
@@ -62,6 +68,8 @@ def build_video_sparse_metadata(
     valid_sizes: torch.Tensor,
     device: torch.device,
 ) -> VideoSparseAttentionMetadata:
+    """Validate tile geometry and move per-tile valid-row counts onto the execution device."""
+
     if padded_rows % (TILE * 2):
         raise ValueError("H3 VSA transport requires an even tile-64 count")
     total_tiles = padded_rows // TILE
@@ -101,6 +109,8 @@ class VideoSparseAttentionBackend:
     """Checkpoint VSA: sparse top-k attention plus trained dense compression."""
 
     def __init__(self, metadata: VideoSparseAttentionMetadata) -> None:
+        """Bind immutable tile metadata and resolve the required SM100 sparse kernel."""
+
         self.metadata = metadata
         self.kernel = _resolve_kernel()
 
@@ -110,6 +120,8 @@ class VideoSparseAttentionBackend:
         valid_sizes: torch.Tensor,
         output: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Compute valid-row means for each fixed video tile into optional caller storage."""
+
         tiles, heads = value.shape[0] // TILE, value.shape[1]
         blocked = value.reshape(tiles, TILE, heads, -1)
         if output is None:
@@ -133,6 +145,8 @@ class VideoSparseAttentionBackend:
         scores: torch.Tensor | None = None,
         compressed: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Pool QKV tiles and compute the compressed inter-tile attention representation."""
+
         if scores is None:
             scores = torch.matmul(q_mean, k_mean.transpose(-1, -2))
             scores.mul_(q_mean.shape[-1] ** -0.5)
@@ -228,7 +242,12 @@ class VideoSparseAttentionBackend:
         compressed_tiles: torch.Tensor | None = None,
         topk_indices_i32: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Apply tiled sparse attention and compose dense compression into output shards."""
+
         valid_sizes = self.metadata.valid_sizes if valid_sizes is None else valid_sizes
+
+        # Graph replay supplies fixed index buffers. Eager callers derive the
+        # same prefix and dense tile ranges from immutable layout metadata.
         if prefix_key_indices is None or dense_key_indices is None or prefix_count is None:
             prefix_key_indices = torch.arange(
                 self.metadata.prefix_tiles, dtype=torch.int32, device=query.device
@@ -239,6 +258,8 @@ class VideoSparseAttentionBackend:
             prefix_count = torch.tensor(
                 self.metadata.prefix_tiles, dtype=torch.int32, device=query.device
             )
+        # Reduce each 64-row tile to one Q/K/V vector. Supplying all pooled
+        # buffers selects the allocation-free fused staging path.
         if pooled_query is not None and pooled_key is not None and pooled_value is not None:
             video_sparse_ops.pool_qkv_means(
                 query,
@@ -256,6 +277,8 @@ class VideoSparseAttentionBackend:
             q_mean = self._block_means(query, valid_sizes, pooled_query)
             k_mean = self._block_means(key, valid_sizes, pooled_key)
             v_mean = self._block_means(value, valid_sizes, pooled_value)
+        # Tile similarity drives both sparse block selection and the trained
+        # dense-compression branch.
         if tile_scores is None:
             selection_scores = torch.matmul(q_mean, k_mean.transpose(-1, -2))
         else:
@@ -292,6 +315,8 @@ class VideoSparseAttentionBackend:
             raise RuntimeError(
                 "the H3 sparse attention route requires attention and exchange buffers"
             )
+        # The kernel writes through caller-owned attention and symmetric-memory
+        # exchange buffers, then exposes the rank-local sequence shard.
         output = self.kernel(
             query,
             key,
@@ -323,6 +348,8 @@ class VideoSparseAttentionBackend:
         prefix_count: torch.Tensor,
         workspace: VideoSparseAttentionWorkspace,
     ) -> torch.Tensor:
+        """Run sparse video attention for the rank-local query heads without mesh composition."""
+
         attended = self(
             query,
             key,

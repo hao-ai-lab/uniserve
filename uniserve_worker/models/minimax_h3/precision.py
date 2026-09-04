@@ -20,6 +20,8 @@ H3QuantizationMode: TypeAlias = Literal[
 
 @dataclass(frozen=True, slots=True)
 class H3LinearPrecisionPolicy:
+    """Assigns linear precision independently to transformer attention, MLP, encoder, and VAE components."""
+
     transformer_attention: AttentionLinearPrecision
     transformer_mlp: LinearPrecision
     text_encoder: TextEncoderLinearPrecision
@@ -27,6 +29,8 @@ class H3LinearPrecisionPolicy:
 
     @classmethod
     def from_mode(cls, mode: H3QuantizationMode) -> "H3LinearPrecisionPolicy":
+        """Expand a quality/performance mode into component-specific linear precisions."""
+
         if mode == "quality":
             return cls(
                 transformer_attention="bf16",
@@ -67,6 +71,8 @@ class H3LinearPrecisionPolicy:
         text_encoder: TextEncoderLinearPrecision | None = None,
         video_vae: VideoVAELinearPrecision | None = None,
     ) -> "H3LinearPrecisionPolicy":
+        """Expand a linear shorthand and apply explicit per-component overrides."""
+
         if shorthand == "fp8":
             base = cls(
                 transformer_attention="fp8",
@@ -106,6 +112,8 @@ class H3LinearPrecisionPolicy:
 
     @classmethod
     def from_config(cls, value: Mapping[str, object]) -> "H3LinearPrecisionPolicy":
+        """Validate checkpoint quantization metadata and resolve its component policy."""
+
         unknown = set(value) - {"mode", "quant_method", "components"}
         if unknown:
             raise ValueError(f"quantization_config has unknown fields {sorted(unknown)!r}")
@@ -156,6 +164,8 @@ class H3LinearPrecisionPolicy:
             )
 
         def component(name: str, choices: set[str]) -> str | None:
+            """Validate one optional component precision against its supported modes."""
+
             selected = raw_components.get(name)
             if selected is None:
                 return None

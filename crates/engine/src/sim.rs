@@ -1,10 +1,8 @@
-//! GPU-free execution engine for scheduler and frontend behavior tests.
+//! GPU-free executor for scheduler and frontend behavior.
 //!
-//! The simulator accepts the same requests as the production executor: it
-//! consumes typed admissions and operations, enforces lifecycle, version, and
-//! replay invariants, and returns one [`ModelOutput`] per operation with the
-//! resolved output-product values a host consumes. Every state point is named by
-//! its request epoch, producing operation, and producer-local point index.
+//! The simulator consumes the same typed admissions and operations as worker
+//! executors. It enforces lifecycle, version, and replay invariants and returns
+//! resolved products with stable request, operation, and point identities.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -56,11 +54,17 @@ pub struct SimExecutor {
 }
 
 impl SimExecutor {
+    /// Starts an asynchronous simulator with its advertised queue depth.
     pub fn new(engine: SimEngine) -> Self {
         let depth = (engine.info().queue_depth as usize).max(1);
         Self::with_depth(engine, depth)
     }
 
+    /// Starts an asynchronous simulator with an explicit in-flight run limit.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the simulator thread cannot be spawned.
     pub fn with_depth(mut engine: SimEngine, depth: usize) -> Self {
         let info = engine.info().clone();
         let depth = depth.max(1);
@@ -96,6 +100,7 @@ impl SimExecutor {
         }
     }
 
+    /// Returns a waker that interrupts executor polling after command enqueue.
     pub fn command_waker(&self) -> CommandWaker {
         let progress = self.progress_tx.clone();
         CommandWaker::new(move || {
@@ -105,10 +110,12 @@ impl SimExecutor {
 }
 
 impl PhysicalExecutor for SimExecutor {
+    /// Returns metadata for the physical worker.
     fn physical_info(&self) -> &ExecutorInfo {
         &self.executor_info
     }
 
+    /// Submits the run.
     fn submit_run(&mut self, batch: PhysicalRun) -> Result<(), PhysicalSubmitError> {
         if self.in_flight >= self.depth {
             return Err(PhysicalSubmitError::WouldBlock(batch));
@@ -124,6 +131,7 @@ impl PhysicalExecutor for SimExecutor {
         Ok(())
     }
 
+    /// Returns the result of a submitted physical run.
     fn poll_run(&mut self, timeout: Duration) -> anyhow::Result<Option<RunResult>> {
         let result = crossbeam_channel::select! {
             recv(self.from_worker) -> result => match result {
@@ -142,6 +150,7 @@ impl PhysicalExecutor for SimExecutor {
         Ok(result)
     }
 
+    /// Closes the simulated physical worker.
     fn close_physical(&mut self) -> anyhow::Result<()> {
         let _ = self.to_worker.send(Job::Shutdown);
         if let Some(handle) = self.handle.take() {
@@ -152,10 +161,12 @@ impl PhysicalExecutor for SimExecutor {
 }
 
 impl Executor for SimExecutor {
+    /// Returns the worker metadata.
     fn info(&self) -> &ExecutorInfo {
         &self.executor_info
     }
 
+    /// Lowers and submits a logical batch while preserving executor backpressure semantics.
     fn submit(&mut self, batch: Batch) -> Result<(), ExecutorSubmitError> {
         if self.in_flight >= self.depth {
             return Err(ExecutorSubmitError::WouldBlock(batch));
@@ -178,18 +189,21 @@ impl Executor for SimExecutor {
         }
     }
 
+    /// Polls for the next completed worker operation.
     fn poll(&mut self, timeout: Duration) -> anyhow::Result<Option<BatchResult>> {
         self.poll_run(timeout)?
             .map(|report| self.logical_results.apply(report))
             .transpose()
     }
 
+    /// Closes the component and releases its resources.
     fn close(&mut self) -> anyhow::Result<()> {
         self.close_physical()
     }
 }
 
 impl Drop for SimExecutor {
+    /// Releases resources owned by this value.
     fn drop(&mut self) {
         let _ = self.close_physical();
     }
@@ -218,15 +232,16 @@ struct SimRequestState {
     flow_step: u16,
     predicate_values: HashMap<ProductRef, bool>,
     terminal: BTreeMap<u64, RecordedCompletion>,
-    /// Device-resident committed penalty count base. Each generated token folds
-    /// in as its operation executes; a successor reads it before its
-    /// predecessor is host-observed, so penalties are device-continuous. The
-    /// GPU-free oracle keeps a host histogram; the production worker keeps the
-    /// equivalent device count tensor plus per-operation deltas.
+    /// Committed penalty counts in ascending token order.
+    ///
+    /// Each generated token folds in during execution, allowing a successor to
+    /// observe it before the predecessor is host-visible. Device executors encode
+    /// the same state as a resident count tensor plus per-operation deltas.
     penalty_counts: BTreeMap<u32, u32>,
 }
 
 impl SimRequestState {
+    /// Creates request state from an admitted request.
     fn new(admission: NewRequest) -> Self {
         let prefix_len = admission
             .ar
@@ -246,8 +261,7 @@ impl SimRequestState {
         }
     }
 
-    /// The committed recent-output histogram used for penalties, in canonical
-    /// ascending token order.
+    /// Returns the committed penalty histogram in ascending token order.
     fn recent_counts(&self) -> Vec<(u32, u32)> {
         self.penalty_counts
             .iter()
@@ -255,7 +269,7 @@ impl SimRequestState {
             .collect()
     }
 
-    /// Fold one generated token into the committed penalty base.
+    /// Folds one generated token into the committed penalty base.
     fn fold_penalty_token(&mut self, token: u32) {
         self.penalty_counts
             .entry(token)
@@ -263,16 +277,18 @@ impl SimRequestState {
             .or_insert(1);
     }
 
+    /// Returns shared access to the simulated sampling configuration.
     fn sampling(&self) -> Option<&SamplingParams> {
         self.admission.ar.as_ref().map(|und| &und.sampling)
     }
 
+    /// Returns shared access to the simulated image configuration.
     fn image(&self) -> Option<&ImageParams> {
         self.admission.umm.as_ref().map(|branch| &branch.image)
     }
 }
 
-/// Deterministic local model engine with production-equivalent lifecycle state.
+/// Deterministic local model engine that implements the worker lifecycle protocol.
 pub struct SimEngine {
     info: WorkerInfo,
     text_len: usize,
@@ -282,6 +298,7 @@ pub struct SimEngine {
 }
 
 impl SimEngine {
+    /// Constructs a simulator with deterministic text and image capabilities.
     pub fn new() -> Self {
         let info = WorkerInfo {
             supported_ops: OpKind::ALL.to_vec(),
@@ -303,6 +320,7 @@ impl SimEngine {
         }
     }
 
+    /// Produces deterministic logits for one simulated autoregressive position.
     fn synth_logits(
         vocab: usize,
         text_len: usize,
@@ -329,6 +347,7 @@ impl SimEngine {
         logits
     }
 
+    /// Applies request sampling controls to deterministic simulated logits.
     fn sample(
         vocab: usize,
         text_len: usize,
@@ -411,7 +430,7 @@ impl SimEngine {
         }
     }
 
-    /// Execute one operation against its request, producing the terminal
+    /// Executes one operation against its request, producing the terminal
     /// [`ModelOutput`] and any resolved output-product values.
     fn execute_operation(
         vocab: usize,
@@ -684,6 +703,7 @@ impl SimEngine {
         Ok((record, products))
     }
 
+    /// Builds a completion for an operation resolved entirely by its execution predicate.
     fn predicated_completion(operation: &Operation, request: &SimRequestState) -> ModelOutput {
         ModelOutput {
             request_key: operation.request_key,
@@ -713,14 +733,17 @@ impl SimEngine {
         }
     }
 
+    /// Sets the advertised unresolved-run capacity, clamped to at least one.
     pub fn set_pipeline_depth(&mut self, depth: u32) {
         self.info.queue_depth = depth.max(1);
     }
 
+    /// Sets the number of synthetic tokens emitted before the configured EOS.
     pub fn set_text_len(&mut self, length: usize) {
         self.text_len = length;
     }
 
+    /// Configures EOS and expands the synthetic vocabulary for control tokens.
     pub fn configure_control_tokens(&mut self, eos: u32, control_tokens: &[u32]) {
         self.fake_eos = eos;
         let max_token = control_tokens
@@ -736,6 +759,11 @@ impl SimEngine {
         );
     }
 
+    /// Replaces the simulator's KV cache groups.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the simulated worker does not expose a KV cache.
     pub fn set_groups(&mut self, groups: Vec<uniserve_core::KvCacheGroup>) {
         self.info
             .kv_cache
@@ -744,6 +772,11 @@ impl SimEngine {
             .groups = groups;
     }
 
+    /// Sets the total KV block capacity and its sole group capacity when applicable.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the simulated worker does not expose a KV cache.
     pub fn set_num_blocks(&mut self, count: u32) {
         let kv_cache = self
             .info
@@ -756,6 +789,11 @@ impl SimEngine {
         }
     }
 
+    /// Sets the simulator's KV block size in tokens.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the simulated worker does not expose a KV cache.
     pub fn set_block_size(&mut self, size: u32) {
         self.info
             .kv_cache
@@ -764,12 +802,13 @@ impl SimEngine {
             .block_size = size;
     }
 
+    /// Returns mutable access to the simulator's advertised capabilities.
     pub fn mut_info_for_test(&mut self) -> &mut WorkerInfo {
         &mut self.info
     }
 }
 
-/// Decode the branch-local state declared for one sampling operation.
+/// Decodes the branch-local state declared for one sampling operation.
 fn operation_sampling_state(
     operation: &Operation,
     input_products: &[ProductPayload],
@@ -796,12 +835,13 @@ fn operation_sampling_state(
     Ok(Some(decode_sampling_state_bytes(bytes)?))
 }
 
+/// Sets every logical KV frontier to the visible token position.
 fn set_kv_lengths(lengths: &mut LogicalLengths, visible: u32, _committed: u32, _published: u32) {
     lengths.kv_visible_len = visible;
     lengths.kv_computed_len = visible;
 }
 
-/// The declared output-product reference for a value packed into a completion.
+/// Returns the declared output-product reference for a completion value.
 fn output_ref(operation: &Operation, kind: ProductKind) -> anyhow::Result<ProductRef> {
     operation
         .outputs()
@@ -816,6 +856,7 @@ fn output_ref(operation: &Operation, kind: ProductKind) -> anyhow::Result<Produc
         })
 }
 
+/// Encodes a deterministic RGB gradient as a base64 PNG artifact.
 fn synthetic_png_b64(width: u32, height: u32) -> anyhow::Result<String> {
     let mut bytes = Vec::new();
     {
@@ -839,16 +880,19 @@ fn synthetic_png_b64(width: u32, height: u32) -> anyhow::Result<String> {
 }
 
 impl Default for SimEngine {
+    /// Returns the default value.
     fn default() -> Self {
         Self::new()
     }
 }
 
 impl SimEngine {
+    /// Returns the worker metadata.
     fn info(&self) -> &WorkerInfo {
         &self.info
     }
 
+    /// Executes one physical run against deterministic in-memory model state.
     fn execute(&mut self, batch: PhysicalRun) -> anyhow::Result<RunResult> {
         batch.validate()?;
         let batch_id = batch.batch_id;
@@ -1009,6 +1053,7 @@ impl SimEngine {
         Ok(report)
     }
 
+    /// Removes all simulated state for a request.
     fn drop_request(&mut self, request_id: RequestId) -> anyhow::Result<()> {
         self.requests.remove(&request_id);
         Ok(())

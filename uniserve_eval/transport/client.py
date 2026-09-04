@@ -1,4 +1,4 @@
-"""Issue benchmark HTTP requests and record their outputs."""
+"""Issues benchmark HTTP requests and records normalized observable outputs."""
 
 from __future__ import annotations
 
@@ -25,6 +25,8 @@ async def send_request(
     output_len_fallback: int = 0,
     scheduled_time: float | None = None,
 ) -> RequestRecord:
+    """Dispatch one task request through its endpoint-specific transport."""
+
     payload = {key: value for key, value in request.payload.items() if value is not None}
     url = base_url.rstrip("/") + request.endpoint
     record = RequestRecord(request_id=request_id, task=task)
@@ -53,6 +55,8 @@ async def _send_images(
     payload: dict[str, Any],
     record: RequestRecord,
 ) -> None:
+    """Execute an image-generations request and validate embedded outputs."""
+
     response = await client.post(url, json=payload)
     record.note_http(response.status_code)
     record.close_now()
@@ -88,6 +92,8 @@ async def _send_chat(
     prompt_len: int,
     output_len_fallback: int,
 ) -> None:
+    """Execute a non-streaming chat request and record text, images, and usage."""
+
     response = await client.post(url, json=payload)
     record.note_http(response.status_code)
     record.close_now()
@@ -134,7 +140,10 @@ async def _send_chat_stream(
     prompt_len: int,
     output_len_fallback: int,
 ) -> None:
+    """Execute an SSE chat request and record event-level output timing."""
+
     async with client.stream("POST", url, json=payload) as response:
+        # Reject transport or framing mismatches before interpreting event data.
         record.note_http(response.status_code)
         if response.status_code != 200:
             body = await response.aread()
@@ -154,6 +163,8 @@ async def _send_chat_stream(
             stamp_time=True,
             on_parse_error="record",
         )
+
+    # Classify the complete stream before folding its content and timing fields.
     record.close_at(_last_event_time(events))
     ok, classifier = OpenAIChat.classify_events(events)
     if ok:
@@ -166,6 +177,8 @@ async def _send_chat_stream(
     if any(not isinstance(event, dict) for event in events):
         return
 
+    # Fold deltas in arrival order so text inter-token timing excludes image-only
+    # events while image latency still records every completed image part.
     last_text_time: float | None = None
     image_since_last_text = False
     image_parts: list[dict[str, Any]] = []
@@ -197,6 +210,7 @@ async def _send_chat_stream(
             image_parts.extend(images)
             image_since_last_text = True
             record.add_image_arrival(len(images), timestamp_f)
+
     _attach_images(record, image_parts)
 
 
@@ -206,6 +220,8 @@ async def _send_video(
     payload: dict[str, Any],
     record: RequestRecord,
 ) -> None:
+    """Execute a synchronous video request and validate its raw MP4 body."""
+
     async with client.stream("POST", url, json=payload) as response:
         record.note_http(response.status_code)
         body = await response.aread()
@@ -227,6 +243,8 @@ async def _send_video(
 
 
 def _classify_images(payload: Any) -> tuple[bool, str]:
+    """Classify the structural validity of an image-generations payload."""
+
     data = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(data, list) or not data:
         return False, "empty_image_data"
@@ -242,6 +260,8 @@ def _attach_images(
     *,
     assign_json_latency: bool = False,
 ) -> str | None:
+    """Decode image parts into a record and return any stable error classifier."""
+
     try:
         decoded = decode_openai_image_parts(parts)
     except ImageOutputError as error:
@@ -252,11 +272,15 @@ def _attach_images(
 
 
 def _is_json_content_type(content_type: str) -> bool:
+    """Report whether a response media type denotes JSON."""
+
     media_type = content_type.partition(";")[0].strip().lower()
     return media_type == "application/json" or media_type.endswith("+json")
 
 
 def _last_event_time(events: list[Any]) -> float:
+    """Return the latest stamped event time or the current monotonic time."""
+
     times = [
         float(event["_client_t"])
         for event in events

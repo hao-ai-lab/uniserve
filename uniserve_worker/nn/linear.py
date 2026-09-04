@@ -30,6 +30,8 @@ __all__ = [
 
 
 class LinearBase(nn.Module):
+    """Defines the quantization-aware weight lifecycle and execution interface shared by linear layers."""
+
     weight: nn.Parameter
     bias: nn.Parameter | None
     weight_scale: torch.Tensor | None
@@ -44,6 +46,8 @@ class LinearBase(nn.Module):
         bias: bool = True,
         prefix: str = "",
     ) -> None:
+        """Create loadable weight storage through the layer's selected quantization method."""
+
         super().__init__()
         self.input_size = int(input_size)
         self.output_size = int(output_size)
@@ -58,9 +62,12 @@ class LinearBase(nn.Module):
             output_size=self.output_size,
             bias=self.has_bias,
         )
-        # Weights are created as ``torch.empty`` and are populated by the system loader before use. Skipping an initialization that would immediately be overwritten also makes a missing checkpoint tensor fail validation instead of appearing as a plausible random weight.
+        # Weights remain uninitialized until the loader assigns checkpoint data.
+        # A missing assignment therefore fails validation instead of resembling a valid random weight.
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the layer's selected weight and activation precision method."""
+
         return self.quant_method.apply(self, x)
 
     def forward_prequantized(
@@ -70,6 +77,8 @@ class LinearBase(nn.Module):
         *,
         output_dtype: torch.dtype = torch.bfloat16,
     ) -> torch.Tensor:
+        """Apply a quantized linear to caller-supplied FP8 activation storage and scale."""
+
         return self.quant_method.apply_prequantized(
             self,
             x,
@@ -85,6 +94,8 @@ class LinearBase(nn.Module):
         *,
         group: str,
     ) -> torch.Tensor:
+        """Project rank-local rows and exchange output shards through mesh-owned scratch."""
+
         execute = getattr(self.quant_method, "apply_sequence_parallel", None)
         if not callable(execute):
             raise RuntimeError("linear quantization method has no sequence-parallel execution")
@@ -131,6 +142,8 @@ class ColumnParallelLinear(LinearBase):
         bias: bool = True,
         prefix: str = "",
     ) -> None:
+        """Shard the output dimension across tensor-parallel ranks at construction time."""
+
         parallel = layer_config.parallel
         self.global_input_size = int(input_size)
         self.global_output_size = int(output_size)
@@ -159,6 +172,8 @@ class RowParallelLinear(LinearBase):
         bias: bool = True,
         prefix: str = "",
     ) -> None:
+        """Shard the input dimension and configure tensor-parallel output reduction."""
+
         parallel = layer_config.parallel
         self.global_input_size = int(input_size)
         self.global_output_size = int(output_size)
@@ -187,12 +202,16 @@ class RowParallelLinear(LinearBase):
     def forward(  # type: ignore[override]
         self, x: torch.Tensor, mesh: MeshView, *, reduce: bool = True
     ) -> torch.Tensor:
+        """Project an input shard and optionally sum partial outputs across tensor ranks."""
+
         out = super().forward(x)
         if not reduce:
             return out
         return self.reduce_output(out, mesh)
 
     def reduce_output(self, out: torch.Tensor, mesh: MeshView) -> torch.Tensor:
+        """Sum input-shard partial outputs across the tensor-parallel axis."""
+
         return mesh.all_reduce(out, "tp")
 
 
@@ -210,6 +229,8 @@ class MergedColumnParallelLinear(LinearBase):
         local_output_sizes: list[int] | tuple[int, ...] | None = None,
         weight_mode: WeightMode = WeightMode.VANILLA,
     ):
+        """Pack multiple output branches while retaining their global and local extents."""
+
         parallel = layer_config.parallel
         self.global_output_sizes = tuple(int(s) for s in output_sizes)
         self.output_sizes = (
@@ -262,6 +283,8 @@ class InterleavedMergedColumnParallelLinear(LinearBase):
         bias: bool = True,
         prefix: str = "",
     ) -> None:
+        """Partition fixed-width groups from every branch across tensor-parallel ranks."""
+
         parallel = layer_config.parallel
         branch_output_size = int(branch_output_size)
         branches = int(branches)
@@ -304,12 +327,12 @@ class InterleavedMergedColumnParallelLinear(LinearBase):
 
 
 def local_attention_head_count(total_heads: int, *, parallel: TensorParallel) -> int:
-    """This tensor-parallel rank's query-head count (query heads always shard)."""
+    """Return this tensor-parallel rank's query-head count."""
     return divide(int(total_heads), parallel.size)
 
 
 def local_kv_head_count(total_kv_heads: int, *, parallel: TensorParallel) -> int:
-    """This tensor-parallel rank's KV-head count.
+    """Return this tensor-parallel rank's KV-head count.
 
     The single owner of the attention KV sharding rule: a KV group divides
     across the tp axis when it is large enough and stays whole (replicated)
@@ -325,6 +348,8 @@ def local_kv_head_count(total_kv_heads: int, *, parallel: TensorParallel) -> int
 
 
 class QKVParallelLinear(MergedColumnParallelLinear):
+    """Projects sharded queries, keys, and values with head-aware tensor-parallel partitioning."""
+
     def __init__(
         self,
         hidden_size: int,
@@ -336,6 +361,8 @@ class QKVParallelLinear(MergedColumnParallelLinear):
         bias: bool = True,
         prefix: str = "",
     ) -> None:
+        """Derive rank-local query and KV head counts before packing their projections."""
+
         parallel = layer_config.parallel
         self.head_size = head_size
         self.total_num_heads = total_num_heads

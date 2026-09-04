@@ -1,4 +1,5 @@
 """Patch (de)serialization and per-patch position helpers for vision inputs."""
+
 from __future__ import annotations
 
 import torch

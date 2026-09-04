@@ -1,3 +1,5 @@
+//! Request-ID validation, generation, propagation, and response headers.
+
 use axum::extract::Request;
 use axum::http::HeaderValue;
 use axum::http::header::HeaderName;
@@ -14,7 +16,7 @@ const X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 /// reflect into the response and downstream logs.
 const MAX_REQUEST_ID_LEN: usize = 128;
 
-/// Echo the request's `X-Request-Id` on the response, or generate a fresh
+/// Echoes the request's `X-Request-Id` on the response, or generates a fresh
 /// `uuid4` hex if the request did not provide a usable one.
 ///
 /// The incoming value is attacker-controlled, so we only echo it when it is a
@@ -45,7 +47,7 @@ fn is_safe_request_id(value: &HeaderValue) -> bool {
             .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
-/// Generate a fresh `uuid4` hex request id.
+/// Generates a fresh `uuid4` hex request id.
 fn generate_request_id() -> HeaderValue {
     HeaderValue::from_str(&Uuid::new_v4().simple().to_string())
         .unwrap_or_else(|_| HeaderValue::from_static("00000000000000000000000000000000"))

@@ -32,6 +32,8 @@ if _flashinfer is not None:  # pragma: no cover - availability-specific.
 
 
 class _PagedDecodeInputs(NamedTuple):
+    """Groups normalized queries, page tables, sequence lengths, and layout restoration for paged decode."""
+
     q: torch.Tensor
     block_table: torch.Tensor
     cache_seqlens: torch.Tensor
@@ -39,6 +41,8 @@ class _PagedDecodeInputs(NamedTuple):
 
 
 class _VarlenPrefillInputs(NamedTuple):
+    """Groups packed queries and cumulative sequence offsets for paged variable-length prefill."""
+
     q: torch.Tensor
     block_table: torch.Tensor
     cu_seqlens_q: torch.Tensor
@@ -61,6 +65,8 @@ class TRTLLMMHAAttentionBackend(AttentionBackend):
     dense_ranks = frozenset()
 
     def __init__(self, *, tuning: FlashInferTuningConfig) -> None:
+        """Configure the per-device TensorRT-LLM workspace capacity."""
+
         self._workspaces: dict[torch.device, torch.Tensor] = {}
         self._workspace_size = int(tuning.workspace_size)
 
@@ -75,6 +81,8 @@ class TRTLLMMHAAttentionBackend(AttentionBackend):
         attn_mask: torch.Tensor | None = None,
         context: ForwardBatch | None = None,
     ) -> torch.Tensor:
+        """Compute dense attention through the TensorRT-LLM MHA context kernel."""
+
         del context
         raise RuntimeError("trtllm_mha requires paged KV metadata")
 
@@ -92,6 +100,8 @@ class TRTLLMMHAAttentionBackend(AttentionBackend):
         scale: float,
         context: ForwardBatch | None = None,
     ) -> torch.Tensor:
+        """Write current K/V and execute TensorRT-LLM paged decode on SM100 or newer."""
+
         del causal
         if _trtllm_decode is None:
             raise RuntimeError("FlashInfer TRT-LLM MHA decode is not available")
@@ -147,6 +157,8 @@ class TRTLLMMHAAttentionBackend(AttentionBackend):
         block_table: torch.Tensor | None = None,
         context: ForwardBatch | None = None,
     ) -> torch.Tensor:
+        """Execute TensorRT-LLM paged context attention for packed variable-length queries."""
+
         if _trtllm_context is None:
             raise RuntimeError("FlashInfer TRT-LLM MHA context is not available")
         inputs = self._prepare_varlen_prefill_inputs(q, block_table, cu_seqlens_q, cu_seqlens_k)
@@ -183,6 +195,8 @@ class TRTLLMMHAAttentionBackend(AttentionBackend):
         block_table: torch.Tensor,
         cache_seqlens: torch.Tensor,
     ) -> _PagedDecodeInputs:
+        """Normalize decode query and caches to the TensorRT-LLM paged layout."""
+
         q_bhd, restore = normalize_to(q, QKVLayout.BHD)
         _validate_paged_cache(q_bhd, k_cache, v_cache)
         _require_sm100(q_bhd.device)
@@ -200,6 +214,8 @@ class TRTLLMMHAAttentionBackend(AttentionBackend):
         cu_seqlens_q: torch.Tensor,
         cu_seqlens_k: torch.Tensor,
     ) -> _VarlenPrefillInputs:
+        """Validate packed query bounds and normalize the optional paged cache table."""
+
         if block_table is None:
             raise RuntimeError("trtllm_mha varlen path requires a paged KV block table")
         if q.ndim != 3:
@@ -230,6 +246,8 @@ class TRTLLMMHAAttentionBackend(AttentionBackend):
         v: torch.Tensor | None,
         plan: object | None,
     ) -> int:
+        """Append an optional decode key/value row and return effective cache lengths."""
+
         if k is None and v is None:
             return 0
         if k is None or v is None:
@@ -246,6 +264,8 @@ class TRTLLMMHAAttentionBackend(AttentionBackend):
         return 1
 
     def _workspace(self, device: torch.device | str) -> torch.Tensor:
+        """Return or allocate this backend's persistent workspace on one device."""
+
         resolved = torch.device(device)
         workspace = self._workspaces.get(resolved)
         if workspace is None:
@@ -259,6 +279,8 @@ class TRTLLMMHAAttentionBackend(AttentionBackend):
 
 
 def _validate_paged_cache(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor) -> None:
+    """Validate query and KV cache device, dtype, and rank compatibility."""
+
     if q.shape[0] <= 0:
         raise ValueError("trtllm_mha paged decode requires a non-empty batch")
     if k_cache.shape != v_cache.shape or k_cache.ndim != 4:
@@ -270,6 +292,8 @@ def _validate_paged_cache(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch
 def _hnd_kv_cache(
     k_cache: torch.Tensor, v_cache: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert layer-page-token-head caches to TensorRT-LLM head-major layout."""
+
     if k_cache.ndim != 4 or v_cache.ndim != 4 or k_cache.shape != v_cache.shape:
         raise ValueError("trtllm_mha paged cache expects matching 4D k/v tensors")
     k_hnd = k_cache.permute(0, 2, 1, 3)
@@ -282,6 +306,8 @@ def _hnd_kv_cache(
 
 
 def _metadata_context_len(plan: object | None, default: int) -> int:
+    """Read a plan context bound or use the supplied default."""
+
     value = getattr(plan, "max_seqlen_k", 0)
     try:
         parsed = int(value)
@@ -291,6 +317,8 @@ def _metadata_context_len(plan: object | None, default: int) -> int:
 
 
 def _canonicalize_stride(tensor: torch.Tensor) -> torch.Tensor:
+    """Materialize a contiguous tensor when its stride cannot be represented canonically."""
+
     sizes = tensor.size()
     strides = tensor.stride()
     if not any(
@@ -305,6 +333,8 @@ def _canonicalize_stride(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def _require_sm100(device: torch.device) -> None:
+    """Require an indexed CUDA device with Blackwell compute capability."""
+
     if device.type != "cuda":
         raise RuntimeError("trtllm_mha requires CUDA tensors")
     major, minor = torch.cuda.get_device_capability(device)

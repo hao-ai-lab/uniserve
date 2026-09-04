@@ -1,6 +1,7 @@
-//! Chat assistant output processing.
+//! Assistant output-processor traits and implementations.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+/// Chat output-processing errors.
 pub mod error;
 pub(crate) mod processor;
 mod qwen3;

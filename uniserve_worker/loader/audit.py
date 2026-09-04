@@ -19,6 +19,8 @@ def required_parameter_names(
     included: Iterable[str] | None = None,
     optional: Iterable[str] = (),
 ) -> set[str]:
+    """Return required parameters after applying scope and checkpoint-optional policy."""
+
     expected = (
         {name for name, _ in module.named_parameters()}
         if included is None
@@ -41,6 +43,13 @@ def audit_load_report(
     label: str = "checkpoint",
     require_packed_shards: bool = True,
 ) -> None:
+    """Reject an incomplete or inconsistent load report for the selected model scope.
+
+    Packed parameters are complete only when every logical shard declared by their
+    placement plan has been installed.
+    """
+
+    # Derive the scalar parameter contract before checking packed-shard completeness.
     expected = required_parameter_names(module, included=included, optional=optional)
     missing = sorted(expected.difference(report.loaded))
     for name, parameter in module.named_parameters():
@@ -53,6 +62,8 @@ def audit_load_report(
         required_shards = set(plan.slots)
         if not required_shards.issubset(loaded_shards):
             missing.append(f"{name}[packed shards {sorted(required_shards - loaded_shards, key=str)!r}]")
+
+    # Present both sides of the mismatch together so one load attempt is actionable.
     unexpected = sorted(set(report.unexpected))
     if missing or unexpected:
         raise RuntimeError(
@@ -62,6 +73,8 @@ def audit_load_report(
 
 
 def _preview(names: list[str], limit: int = 50) -> str:
+    """Format a bounded name list while retaining the omitted-item count."""
+
     if len(names) <= limit:
         return repr(names)
     return f"{names[:limit]!r} (+{len(names) - limit} more)"

@@ -22,10 +22,15 @@ class MiniMaxH3VideoVAE(nn.Module):
     def __init__(
         self, vae: MiniMaxH3VideoDecoder, *, linear_precision: VideoVAELinearPrecision
     ) -> None:
+        """Prepare one resident video decoder with fixed precision and normalization buffers."""
+
         super().__init__()
         self.vae = vae.float()
         self.linear_precision = linear_precision
         self.autocast_dtype = torch.float16 if linear_precision == "fp16" else torch.bfloat16
+
+        # Dense modes cast every eligible projection uniformly. NVFP4 replaces
+        # only aligned decoder linears and validates the checkpoint architecture.
         if linear_precision in {"fp16", "bf16"}:
             for module in self.vae.modules():
                 if isinstance(module, (nn.Linear, nn.Conv3d)):
@@ -45,6 +50,9 @@ class MiniMaxH3VideoVAE(nn.Module):
         missing = [name for name in required if not hasattr(vae, name)]
         if missing:
             raise TypeError(f"MiniMax H3 video VAE is missing {missing!r}")
+
+        # Channel-wise latent statistics invert checkpoint normalization before
+        # reconstruction; pixel statistics restore the decoder's RGB domain.
         mean = (
             0.858090341091156,
             -0.9606591463088989,
@@ -127,6 +135,9 @@ class MiniMaxH3VideoVAE(nn.Module):
             ).view(1, 3, 1, 1, 1),
             persistent=False,
         )
+
+        # Graph input storage remains stable for the lifetime of the captured
+        # decoder graph and is installed only when capture is requested.
         self.decode_graph = StaticCudaGraph[torch.Tensor](self.device)
         self.register_buffer("decode_graph_input", None, persistent=False)
 
@@ -139,6 +150,8 @@ class MiniMaxH3VideoVAE(nn.Module):
         local_files_only: bool = False,
         linear_precision: VideoVAELinearPrecision,
     ) -> "MiniMaxH3VideoVAE":
+        """Materialize the indexed decoder checkpoint on one device at the selected precision."""
+
         del local_files_only
         vae = MiniMaxH3VideoDecoder(parameter_device="meta", buffer_device=device)
         component = Path(checkpoint) / "vae"
@@ -170,14 +183,20 @@ class MiniMaxH3VideoVAE(nn.Module):
 
     @property
     def device(self) -> torch.device:
+        """Return the device that owns the decoder's learned parameters."""
+
         return next(self.vae.parameters()).device
 
     def _decode_segment(self, latents: torch.Tensor) -> torch.Tensor:
+        """Decode one temporal latent segment and remove its prepended overlap frames."""
+
         span = int(self.vae.tokens_chunk_size) + int(self.vae.token_overlap)
         clip = self._decode_spatial_tiles(latents[:, :, :span])
         return clip[:, :, int(self.vae.frame_pre_padding) :].contiguous()
 
     def _decode_spatial_tiles(self, latents: torch.Tensor) -> torch.Tensor:
+        """Decode one latent clip directly or tile and blend it across spatial overlap regions."""
+
         if not bool(self.vae.use_tiling):
             return self.vae(self.vae.post_quant_conv(latents))
 
@@ -194,6 +213,8 @@ class MiniMaxH3VideoVAE(nn.Module):
             int(self.vae.tile_sample_min_width),
             int(self.vae.tile_sample_min_overlap_width),
         )
+        # Decode all spatial tiles as one batch, then blend them back into the
+        # full-resolution temporal segment using the decoder's overlap contract.
         tiles = torch.cat(
             tuple(
                 latents[
@@ -219,6 +240,8 @@ class MiniMaxH3VideoVAE(nn.Module):
         self,
         normalized_latents: torch.Tensor,
     ) -> torch.Tensor:
+        """Denormalize one latent segment and decode it through the spatial tiling path."""
+
         latents = normalized_latents.to(device=self.device, dtype=torch.float32)
         latents = latents * self.latents_std + self.latents_mean
         with torch.autocast(
@@ -233,6 +256,8 @@ class MiniMaxH3VideoVAE(nn.Module):
         self,
         normalized_latents: torch.Tensor,
     ) -> torch.Tensor:
+        """Replay the captured decoder for one `[1, 24, 7, 48, 84]` latent segment."""
+
         if normalized_latents.shape != (1, 24, 7, 48, 84):
             raise ValueError("an H3 video decode unit must have shape [1, 24, 7, 48, 84]")
         if self.decode_graph_input is None:

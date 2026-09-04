@@ -40,6 +40,8 @@ class RequestRuntime:
     kv_computed_len: int
 
     def __post_init__(self) -> None:
+        """Validate logical, sampling, cache, and RNG coordinates for one resolved point."""
+
         if self.logical_position < 0 or self.rng_counter < 0 or self.flow_step < 0:
             raise invalid_descriptor("resolved request coordinates are negative")
         if self.latent_product is not None and (
@@ -60,6 +62,8 @@ class RequestRuntime:
 
 @dataclass(frozen=True, slots=True)
 class _RequestCommit:
+    """Holds one prepared request transition before atomic publication."""
+
     operation: Operation
     candidate: RequestDraft
     base: Request | None
@@ -71,6 +75,8 @@ class _RequestCommit:
 
 @dataclass(frozen=True, slots=True)
 class _ResolvedCommit:
+    """Combines a prepared transition with its selected result, runtime state, and checkpoint prefixes."""
+
     assignment: _RequestCommit
     record: ModelOutput
     selected: Checkpoint
@@ -80,6 +86,8 @@ class _ResolvedCommit:
 
 @dataclass(frozen=True, slots=True)
 class RequestPublication:
+    """Owns a prepared request transition until it is finished atomically or cancelled."""
+
     table_token: object
     run_id: int
     assignments: tuple[_RequestCommit, ...]
@@ -88,15 +96,21 @@ class RequestPublication:
 
     @property
     def successors_ready(self) -> bool:
+        """Indicate whether unresolved lineage has been reserved for dependent runs."""
+
         return self._reserved
 
     def reserve(self) -> None:
+        """Reserve this publication's unresolved lineage in its owning request pool."""
+
         table = self.table_token
         if not isinstance(table, RequestPool):
             raise RuntimeError("request reservation lost its request-pool owner")
         table.reserve(self)
 
     def finish(self, completions: tuple[ModelOutput, ...]) -> None:
+        """Commit the prepared request transitions using finalized operation completions."""
+
         if self._finished:
             return
         table = self.table_token
@@ -105,6 +119,8 @@ class RequestPublication:
         table.publish(self, completions)
 
     def cancel(self) -> None:
+        """Discard all prepared request transitions in this publication."""
+
         if self._finished:
             return
         table = self.table_token
@@ -161,30 +177,42 @@ class Request:
     last_run_id: int | None = None
 
     def __post_init__(self) -> None:
+        """Validate the request slot and initialize its immutable history contract."""
+
         if self.request_pool_idx < 1:
             raise invalid_descriptor("request row has an invalid scheduler slot")
 
     @property
     def request_id(self) -> int:
+        """Expose the stable scheduler request identifier."""
+
         return self.request_key.request_id
 
     @property
     def epoch(self) -> int:
+        """Expose the admission epoch that distinguishes reused request identifiers."""
+
         return self.request_key.epoch
 
     def committed_version(self) -> Checkpoint:
+        """Describe the checkpoint whose state is externally committed."""
+
         return Checkpoint(
             op_id=self.committed_op_id,
             point=FixedCheckpoint(self.committed_point),
         )
 
     def resolved_version(self) -> Checkpoint:
+        """Describe the newest host-resolved checkpoint, including unpublished state."""
+
         return Checkpoint(
             op_id=self.resolved_op_id,
             point=FixedCheckpoint(self.version),
         )
 
     def install_runtime(self, runtime: RequestRuntime) -> None:
+        """Install the runtime tensors and logical lengths for this request’s committed checkpoint."""
+
         if (
             runtime.latent_product is not None
             and runtime.latent_product.request_key != self.request_key
@@ -197,12 +225,16 @@ class Request:
 
     @staticmethod
     def point_key(version: Checkpoint) -> tuple[int, int]:
+        """Convert a fixed checkpoint into its operation-and-point runtime key."""
+
         point = version.point
         if not isinstance(point, FixedCheckpoint):
             raise invalid_descriptor("request runtime requires a fixed version")
         return int(version.op_id), int(point.point_index)
 
     def runtime_for(self, version: Checkpoint) -> RequestRuntime | None:
+        """Resolve an exact committed checkpoint to its immutable runtime state."""
+
         runtime = self.resolved_runtime.get(self.point_key(version))
         if runtime is not None:
             return runtime
@@ -210,6 +242,8 @@ class Request:
         return pending.runtime if pending is not None and pending.selected == version else None
 
     def selected_for_operation(self, op_id: int) -> Checkpoint | None:
+        """Return the device-selected checkpoint committed for an operation, if resolved."""
+
         selected = self.resolved_operations.get(int(op_id))
         if selected is not None:
             return selected
@@ -217,6 +251,8 @@ class Request:
         return None if pending is None else pending.selected
 
     def resolve_version(self, version: Checkpoint) -> Checkpoint | None:
+        """Resolve a device-selected checkpoint through its operation publication."""
+
         if isinstance(version.point, FixedCheckpoint):
             return version
         return self.selected_for_operation(version.op_id)
@@ -226,6 +262,8 @@ class Request:
         op_id: int,
         point_index: int,
     ) -> RequestRuntime | None:
+        """Return the initialized runtime state at a specific operation checkpoint point."""
+
         runtime = self.resolved_runtime.get((int(op_id), int(point_index)))
         if runtime is not None:
             return runtime
@@ -243,6 +281,8 @@ class Request:
         )
 
     def semantic_parent_for_operation(self, op_id: int) -> Checkpoint | None:
+        """Return the committed semantic parent checkpoint for an operation."""
+
         parent = self.declared_parents.get(int(op_id))
         if parent is None:
             pending = self.unresolved_operations.get(int(op_id))
@@ -302,6 +342,8 @@ class RequestDraft:
     )
 
     def __init__(self, request: Request, source: RequestDraft | None = None) -> None:
+        """Snapshot mutable request progress while sharing immutable history storage."""
+
         self.request = request
         state = request if source is None else source
         self.logical_position = int(state.logical_position)
@@ -311,9 +353,13 @@ class RequestDraft:
         self.prompt_logits_ready = bool(state.prompt_logits_ready)
 
     def __getattr__(self, name: str) -> object:
+        """Delegate immutable request fields to the underlying committed row."""
+
         return getattr(self.request, name)
 
     def install_runtime(self, runtime: RequestRuntime) -> None:
+        """Replace this draft’s runtime state while preserving its base request identity."""
+
         if runtime.latent_product is not None and (
             runtime.latent_product.request_key != self.request.request_key
         ):
@@ -333,6 +379,8 @@ class RequestPool:
         *,
         history_capacity: int = MAX_REQUEST_HISTORY_POINTS,
     ) -> None:
+        """Allocate fixed request rows plus reserved history capacity for each live slot."""
+
         size = int(max_request_pool_size)
         history = int(history_capacity)
         if size < 1 or history < 1:
@@ -344,6 +392,8 @@ class RequestPool:
         self._model_state: object | None = None
 
     def attach_model_state(self, state: object | None) -> None:
+        """Attach deployment-specific state storage before admitting requests."""
+
         if state is None:
             return
         if self._model_state is not None:
@@ -355,9 +405,13 @@ class RequestPool:
 
     @property
     def model_state(self) -> object | None:
+        """Expose deployment-specific request state owned alongside generic rows."""
+
         return self._model_state
 
     def model_state_slot(self, request_pool_idx: int) -> Any:
+        """Return deployment-specific state for a validated request-pool slot."""
+
         state = self._model_state
         get = None if state is None else getattr(state, "get", None)
         if not callable(get):
@@ -365,6 +419,8 @@ class RequestPool:
         return get(self._validate_slot(request_pool_idx))
 
     def abort_model_admissions(self, admissions: Sequence[NewRequest]) -> None:
+        """Release deployment-specific state reserved for admissions that did not commit."""
+
         if self._model_state is None:
             return
         abort = getattr(self._model_state, "abort_admissions", None)
@@ -373,19 +429,27 @@ class RequestPool:
         abort(tuple(admissions))
 
     def get(self, request_id: int) -> Request:
+        """Resolve a live request or reject an unknown identifier."""
+
         row = self.peek(request_id)
         if row is None:
             raise invalid_descriptor(f"unknown request {request_id}")
         return row
 
     def peek(self, request_id: int) -> Request | None:
+        """Resolve a live request without treating absence as a descriptor error."""
+
         slot = self._slots_by_request.get(int(request_id))
         return None if slot is None else self._rows[slot]
 
     def request_ids(self) -> tuple[int, ...]:
+        """List live scheduler request identifiers in deterministic order."""
+
         return tuple(sorted(self._slots_by_request))
 
     def __contains__(self, request_id: object) -> bool:
+        """Return whether an integer request identifier currently owns a slot."""
+
         return isinstance(request_id, int) and request_id in self._slots_by_request
 
     def stage_lane(
@@ -692,6 +756,8 @@ class RequestPool:
         object.__setattr__(publication, "_finished", True)
 
     def cancel(self, publication: RequestPublication) -> None:
+        """Cancel a prepared publication and restore its request slots."""
+
         if publication.table_token is not self:
             raise RuntimeError("request cancellation belongs to another request pool")
         if publication._finished:
@@ -701,6 +767,8 @@ class RequestPool:
         object.__setattr__(publication, "_finished", True)
 
     def _cancel_assignment(self, assignment: _RequestCommit) -> None:
+        """Cancel a prepared commit and restore any reserved history capacity."""
+
         row = assignment.candidate.request
         operation_id = int(assignment.operation.op_id)
         if row.unresolved_operations.get(operation_id) is assignment:
@@ -722,6 +790,8 @@ class RequestPool:
         assignment: _RequestCommit,
         record: ModelOutput,
     ) -> tuple[tuple[Checkpoint, RequestRuntime], ...]:
+        """Derive request-history checkpoints for accepted speculative draft positions."""
+
         plan = assignment.speculative
         if plan is None:
             return ()
@@ -754,6 +824,8 @@ class RequestPool:
         )
 
     def apply_commands(self, commands: Sequence[BatchCommand]) -> None:
+        """Apply an ordered sequence of start, commit, finish, and free lifecycle commands."""
+
         for command in commands:
             if isinstance(command, Commit):
                 self._apply_commit(command)
@@ -766,6 +838,8 @@ class RequestPool:
         op_id: int,
         parent: Checkpoint,
     ) -> tuple[Checkpoint, RequestRuntime]:
+        """Resolve a predicated operation to the latest committed compatible parent checkpoint."""
+
         row = self.get(request_id)
         selected = row.resolve_version(parent)
         runtime = None if selected is None else row.runtime_for(selected)
@@ -786,6 +860,8 @@ class RequestPool:
         op_id: int,
         prefixes: Sequence[tuple[Checkpoint, RequestRuntime]],
     ) -> tuple[Checkpoint, RequestRuntime]:
+        """Publish fixed checkpoint prefixes derived from a device-selected operation."""
+
         if not prefixes:
             raise invalid_descriptor("resolved token operation has no prefix states")
         row = self.get(request_id)
@@ -797,6 +873,8 @@ class RequestPool:
         op_id: int,
         prefixes: Sequence[tuple[Checkpoint, RequestRuntime]],
     ) -> tuple[Checkpoint, RequestRuntime]:
+        """Install monotonic request-history checkpoints under one producing operation."""
+
         if not prefixes:
             raise invalid_descriptor("resolved token operation has no prefix states")
         new_keys = {
@@ -826,6 +904,8 @@ class RequestPool:
         return selected, runtime
 
     def drop(self, request_id: int) -> None:
+        """Remove a request immediately and release its slot and deployment-specific state."""
+
         selected = int(request_id)
         slot = self._slots_by_request.pop(selected, None)
         row = None if slot is None else self._rows[slot]
@@ -837,6 +917,8 @@ class RequestPool:
             drop(selected)
 
     def retire(self, request_id: int) -> None:
+        """Remove a request after verifying that no unresolved operation state remains."""
+
         row = self.get(request_id)
         if row.retired:
             return
@@ -849,6 +931,8 @@ class RequestPool:
         row.retired = True
 
     def _evict_retired_slot(self, slot: int) -> None:
+        """Remove a retired request row and clear its slot ownership mapping."""
+
         row = self._rows[slot]
         if row is None or not row.retired:
             return
@@ -856,6 +940,8 @@ class RequestPool:
         self._rows[slot] = None
 
     def snapshot_committed(self, request_ids: set[int]) -> tuple[Request, ...]:
+        """Capture committed request rows for rollback around an atomic command batch."""
+
         snapshots: list[Request] = []
         for request_id in sorted(int(value) for value in request_ids):
             snapshot = copy.deepcopy(self.get(request_id))
@@ -882,6 +968,8 @@ class RequestPool:
         rows: Sequence[Request],
         request_ids: set[int] | None = None,
     ) -> None:
+        """Restore captured request rows and rebuild slot and identifier indexes."""
+
         staged = {int(row.request_id): copy.deepcopy(row) for row in rows}
         if len(staged) != len(rows):
             raise invalid_descriptor("request snapshot repeats a request identity")
@@ -924,6 +1012,8 @@ class RequestPool:
             self._slots_by_request[request_id] = slot
 
     def _validate_slot(self, request_pool_idx: int) -> int:
+        """Validate a scheduler-visible request-pool slot index."""
+
         slot = int(request_pool_idx)
         if slot < 1 or slot > self.max_request_pool_size:
             raise invalid_descriptor(
@@ -932,6 +1022,8 @@ class RequestPool:
         return slot
 
     def _admission_row(self, admission: NewRequest) -> Request:
+        """Create bounded host request state from one validated admission descriptor."""
+
         slot = self._validate_slot(admission.request_pool_idx)
         prefix_len = 0 if admission.ar is None else int(admission.ar.initial_position)
         row = Request(
@@ -961,6 +1053,8 @@ class RequestPool:
 
     @staticmethod
     def _validate_operation(row: Request, operation: Operation, slot: int) -> None:
+        """Validate request epoch, slot ownership, and monotonic operation identity."""
+
         if row.request_key != operation.request_key:
             raise invalid_descriptor(f"operation {operation.op_id} has a stale request key")
         if int(row.request_pool_idx) != int(slot):
@@ -988,6 +1082,8 @@ class RequestPool:
         row: Request,
         control: Commit | Finish,
     ) -> tuple[bool, tuple[int, str]]:
+        """Resolve and validate the request identity targeted by a lifecycle control."""
+
         kind = "commit" if isinstance(control, Commit) else "finish"
         identity = (int(control.control_seq), kind)
         existing = row.control_history.get(identity)
@@ -1007,6 +1103,8 @@ class RequestPool:
         return False, identity
 
     def _apply_commit(self, control: Commit) -> None:
+        """Commit one resolved output point and its derived speculative history."""
+
         row = self.get(control.request_key.request_id)
         if control.request_key != row.request_key:
             raise invalid_descriptor("commit control has a stale request key")
@@ -1041,6 +1139,8 @@ class RequestPool:
 
     @staticmethod
     def _prune_committed(row: Request) -> None:
+        """Discard history points older than the request's committed logical position."""
+
         frontier = int(row.committed_op_id)
         referenced = {
             int(parent.op_id)
@@ -1072,6 +1172,8 @@ class RequestPool:
         }
 
     def _apply_finish(self, control: Finish) -> None:
+        """Validate terminal state and release one request slot from host ownership."""
+
         row = self.get(control.request_key.request_id)
         if control.request_key != row.request_key:
             raise invalid_descriptor("finish command has a stale request key")

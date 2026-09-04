@@ -1,4 +1,7 @@
+//! Process-wide Prometheus registry and UniServe metric families.
+
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 use std::fmt;
 use std::sync::LazyLock;
 use std::sync::atomic::AtomicU64;
@@ -23,25 +26,32 @@ pub use scheduler::{
 };
 pub use serving::{ServingMetrics, ServingRequestLabels};
 
-// Note: `prometheus-client` appends the `_total` suffix automatically when
-// encoding counters, so all counter family registration names in this crate
-// must use the base metric name without a trailing `_total`.
+// `prometheus-client` appends `_total` while encoding counters, so registration
+// names use the base metric name.
+/// Unsigned Prometheus counter used by metric families.
 pub type U64Counter = Counter<u64, AtomicU64>;
+/// Unsigned Prometheus gauge used by metric families.
 pub type U64Gauge = Gauge<u64, AtomicU64>;
+/// Floating-point Prometheus gauge used by metric families.
 pub type F64Gauge = Gauge<f64, AtomicU64>;
+/// Histogram family keyed by engine identity.
 pub(crate) type HistogramFamily = Family<EngineLabels, Histogram, fn() -> Histogram>;
 
 /// Shared Prometheus registry for frontend metrics.
 pub struct Metrics {
     registry: Registry,
+    /// Scheduler, cache, and worker execution metric families.
     pub scheduler: SchedulerMetrics,
+    /// Request latency, token, and completion metric families.
     pub request: RequestMetrics,
+    /// HTTP transport metric families.
     pub api_server: ApiServerMetrics,
+    /// Serving-runtime lifecycle metric families.
     pub serving: ServingMetrics,
 }
 
 impl Metrics {
-    /// Construct a new metrics registry.
+    /// Constructs a metrics registry with every UniServe family registered.
     pub fn new() -> Self {
         let mut registry = Registry::default();
         let scheduler = SchedulerMetrics::register(&mut registry);
@@ -58,7 +68,7 @@ impl Metrics {
         }
     }
 
-    /// Render the current metrics registry into Prometheus/OpenMetrics text
+    /// Renders the current metrics registry into Prometheus/OpenMetrics text
     /// format.
     pub fn render(&self) -> Result<String, fmt::Error> {
         let mut output = String::new();
@@ -66,13 +76,14 @@ impl Metrics {
         Ok(output)
     }
 
-    /// Return the registry owned by this metrics object.
+    /// Returns the registry owned by this metrics object.
     pub fn registry(&self) -> &Registry {
         &self.registry
     }
 }
 
 impl Default for Metrics {
+    /// Constructs the fully registered default metrics collection.
     fn default() -> Self {
         Self::new()
     }

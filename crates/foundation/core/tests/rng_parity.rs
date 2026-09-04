@@ -1,12 +1,8 @@
-//! Emits the canonical Rust-computed sampling-RNG parity fixture consumed by
-//! the Python mirror test (`tests/python/unit/runtime/test_rng_parity.py`).
+//! Cross-language fixtures for the sampling RNG and inverse-CDF boundary.
 //!
-//! The fixture pins, for a grid of sampling coordinates, the Philox key, the
-//! four Philox output words, the uniform draw, and the token an ascending
-//! inverse-CDF selects from a fixed dyadic distribution. The Python worker
-//! recomputes each value from the same coordinates and asserts byte-identical
-//! agreement, proving one exact counter-based RNG mapping and one inverse-CDF
-//! boundary are shared across the two implementations.
+//! Each fixture records a Philox key, output words, uniform draw, and selected
+//! token for a semantic sampling coordinate. The Python worker recomputes the
+//! same values to verify byte-identical protocol behavior.
 
 use std::path::PathBuf;
 
@@ -58,6 +54,8 @@ fn emit_sampling_rng_parity_fixture() {
         (5_000_000_000, 2, 7),
     ];
 
+    // Enumerate the protocol coordinate space and record both the raw bijection
+    // output and its derived sampling decisions.
     let mut cases = Vec::new();
     for &session_seed in &session_seeds {
         for &(authority_id, request_id, epoch) in &identities {
@@ -97,6 +95,7 @@ fn emit_sampling_rng_parity_fixture() {
         "cases": cases,
     });
 
+    // Keep the cross-language fixture under the shared Python test-data tree.
     let path = fixture_path();
     std::fs::create_dir_all(path.parent().unwrap()).expect("create fixture directory");
     std::fs::write(&path, serde_json::to_vec_pretty(&fixture).unwrap()).expect("write fixture");

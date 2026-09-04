@@ -1,3 +1,5 @@
+"""Writes durable benchmark metadata and validated media artifacts."""
+
 from __future__ import annotations
 
 import json
@@ -13,13 +15,19 @@ from .types import DecodedImage, DecodedVideo
 
 
 class ArtifactWriter:
+    """Writes one benchmark result bundle with atomic metadata updates."""
+
     def __init__(self, output_dir: str | Path) -> None:
+        """Create the result and media-sample directories."""
+
         self.output_dir = Path(output_dir)
         self.samples_dir = self.output_dir / "samples"
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.samples_dir.mkdir(parents=True, exist_ok=True)
 
     def write_json(self, name: str, payload: Any) -> Path:
+        """Serialize a value as atomically replaced, formatted JSON."""
+
         path = self.output_dir / name
         temporary_path: Path | None = None
         try:
@@ -43,6 +51,8 @@ class ArtifactWriter:
         return path
 
     def write_jsonl(self, name: str, payloads: list[Any]) -> Path:
+        """Serialize values as an atomically replaced JSON Lines file."""
+
         path = self.output_dir / name
         temporary_path: Path | None = None
         try:
@@ -67,6 +77,8 @@ class ArtifactWriter:
         return path
 
     def write_image_sample(self, image: DecodedImage) -> Path:
+        """Validate and store a content-addressed image sample."""
+
         inspected = inspect_image_bytes(image.data, declared_mime=image.mime)
         if inspected.metadata_dict() != image.metadata_dict():
             raise ValueError("generated image metadata does not match its response bytes")
@@ -95,6 +107,8 @@ class ArtifactWriter:
         return path
 
     def write_video_sample(self, video: DecodedVideo) -> Path:
+        """Validate and store a content-addressed MP4 sample."""
+
         inspected = inspect_video_bytes(video.data, declared_mime=video.mime)
         if inspected.metadata_dict() != video.metadata_dict():
             raise ValueError("generated video metadata does not match its response bytes")
@@ -124,6 +138,8 @@ class ArtifactWriter:
 
 
 def _jsonable(payload: Any) -> Any:
+    """Convert supported structured values into JSON-compatible values."""
+
     if is_dataclass(payload) and not isinstance(payload, type):
         return asdict(payload)
     if isinstance(payload, Path):

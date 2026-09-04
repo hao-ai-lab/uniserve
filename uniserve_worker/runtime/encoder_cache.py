@@ -36,10 +36,14 @@ _OperationKey = tuple[RequestKey, int]
 
 
 def _invariant(message: str) -> WorkerError:
+    """Construct a classified invariant error for encoder-cache misuse."""
+
     return WorkerError(code=WorkerErrorCode.INVARIANT_VIOLATION, message=message, fatal=True)
 
 
 def _reference_key(reference: ProductRef) -> _ReferenceKey:
+    """Build the generation-tagged lookup key for an encoder feature."""
+
     key = reference.request_key
     return (
         int(key.authority_id),
@@ -51,6 +55,8 @@ def _reference_key(reference: ProductRef) -> _ReferenceKey:
 
 
 def _shape(reference: ProductRef) -> tuple[int, ...]:
+    """Resolve an encoder feature's bounded dimensions to a concrete shape."""
+
     dims = tuple(
         dim.extent if isinstance(dim, StaticDim) else dim.bound
         for dim in reference.shape_bound.dims
@@ -60,16 +66,22 @@ def _shape(reference: ProductRef) -> tuple[int, ...]:
 
 @dataclass(frozen=True, slots=True)
 class EncoderMetadata:
+    """Describes an encoder feature’s generation, media geometry, payload kind, and tensor geometry."""
+
     height: int
     width: int
 
     def __post_init__(self) -> None:
+        """Validate feature generation, payload kind, media geometry, and tensor shape."""
+
         if min(self.height, self.width) < 1:
             raise ValueError("encoder feature geometry must be positive")
 
 
 @dataclass(slots=True)
 class _EncoderSlot:
+    """Tracks the device, generation, and owner of one encoder-cache slot."""
+
     index: int
     device: torch.device
     generation: int = 0
@@ -78,6 +90,8 @@ class _EncoderSlot:
 
 @dataclass(slots=True)
 class EncoderWrite:
+    """Owns a writable encoder-cache slot and its producer/reader synchronization events."""
+
     reference: ProductRef
     slot: _EncoderSlot
     physical_generation: int
@@ -94,6 +108,8 @@ class EncoderWrite:
 
 @dataclass(slots=True)
 class EncoderRead:
+    """Retains a published encoder feature until its consumer stream is recorded."""
+
     tensor: torch.Tensor
     metadata: EncoderMetadata
     consumer_op_id: int
@@ -102,6 +118,8 @@ class EncoderRead:
 
     @property
     def reference(self) -> ProductRef:
+        """Expose the immutable logical encoder-product identity guarded by this read lease."""
+
         return self._write.reference
 
 
@@ -117,6 +135,8 @@ class EncoderCache:
         persistent_buffers: PersistentBuffers,
         event_pool: DeviceEventPool | None = None,
     ) -> None:
+        """Configure bounded immutable entries across the declared execution devices."""
+
         self.entry_capacity = int(entry_capacity)
         self.max_entry_bytes = int(max_entry_bytes)
         if self.entry_capacity < 0 or self.max_entry_bytes < 1:
@@ -147,11 +167,15 @@ class EncoderCache:
 
     @property
     def resident_entries(self) -> int:
+        """Count published encoder tensors that still retain cache ownership."""
+
         with self._lock:
             return sum(not entry.released for entry in self._entries.values())
 
     @property
     def resident_bytes(self) -> int:
+        """Return bytes held by currently resident encoder tensors."""
+
         with self._lock:
             return sum(
                 0
@@ -166,6 +190,8 @@ class EncoderCache:
         *,
         buffer_placements: Mapping[BufferId, BufferPlacement],
     ) -> tuple[EncoderWrite, ...]:
+        """Reserve shape-compatible encoder slots for operation outputs as one atomic batch."""
+
         if not bindings:
             return ()
         with self._lock:
@@ -267,6 +293,8 @@ class EncoderCache:
         value: torch.Tensor,
         metadata: EncoderMetadata,
     ) -> torch.Tensor:
+        """Commit an immutable encoder tensor and metadata into its reserved slot."""
+
         with self._lock:
             entry = self._require_write_locked(write)
             if entry.published:
@@ -300,6 +328,8 @@ class EncoderCache:
         consumer_op_id: int,
         device: torch.device | str | None = None,
     ) -> EncoderRead:
+        """Acquire a generation-safe encoder feature read on the consumer device."""
+
         with self._lock:
             entry = self._require_locked(reference)
             if entry.released:
@@ -356,6 +386,8 @@ class EncoderCache:
             )
 
     def record_readers(self, reads: tuple[EncoderRead, ...]) -> None:
+        """Record consumer streams and release their retained encoder reads."""
+
         if not reads:
             return
         with self._lock:
@@ -377,6 +409,8 @@ class EncoderCache:
                     read._recorded = True
 
     def validate_writes(self, writes: tuple[EncoderWrite, ...]) -> None:
+        """Verify that encoder writes still refer to active unpublished reservations."""
+
         with self._lock:
             for write in writes:
                 entry = self._require_write_locked(write)
@@ -410,6 +444,8 @@ class EncoderCache:
                 self._candidates.pop(entry.binding_id)
 
     def release_generations(self, generations: Iterable[int]) -> None:
+        """Release resident encoder products belonging to selected generations."""
+
         selected = {int(value) for value in generations}
         if not selected:
             return
@@ -421,6 +457,8 @@ class EncoderCache:
             self._reclaim_ready_locked()
 
     def drop_request(self, request_id: int) -> None:
+        """Release every resident encoder feature owned by one request identifier."""
+
         target = int(request_id)
         with self._lock:
             for entry in self._entries.values():
@@ -430,6 +468,8 @@ class EncoderCache:
             self._reclaim_ready_locked()
 
     def release_operations(self, releases: Iterable[tuple[RequestKey, int]]) -> None:
+        """Release encoder products associated with completed operation identities."""
+
         with self._lock:
             for request_key, raw_op_id in releases:
                 for entry in self._operations.pop((request_key, int(raw_op_id)), ()):
@@ -437,6 +477,8 @@ class EncoderCache:
             self._reclaim_ready_locked()
 
     def abandon_writes(self, writes: tuple[EncoderWrite, ...]) -> None:
+        """Return unpublished encoder reservations to the free pool."""
+
         with self._lock:
             for write in writes:
                 try:
@@ -448,6 +490,8 @@ class EncoderCache:
             self._reclaim_ready_locked()
 
     def close(self) -> None:
+        """Release all encoder slots, resident tensors, and synchronization events."""
+
         with self._lock:
             self._entries.clear()
             self._candidates.clear()
@@ -456,6 +500,8 @@ class EncoderCache:
             self._slots.clear()
 
     def _require_locked(self, reference: ProductRef) -> EncoderWrite:
+        """Resolve a live generation-tagged encoder entry."""
+
         entry = self._entries.get(_reference_key(reference))
         if entry is None:
             raise invalid_descriptor("unknown encoder feature")
@@ -465,6 +511,8 @@ class EncoderCache:
 
     @staticmethod
     def _require_write_locked(write: EncoderWrite) -> EncoderWrite:
+        """Validate an encoder write handle and return its live entry."""
+
         if (
             write.slot.owner != write.binding_id
             or write.slot.generation != write.physical_generation
@@ -474,9 +522,13 @@ class EncoderCache:
 
     @staticmethod
     def _require_read_locked(read: EncoderRead) -> EncoderWrite:
+        """Validate an encoder read handle and return its live write entry."""
+
         return EncoderCache._require_write_locked(read._write)
 
     def _detach_locked(self, entry: EncoderWrite) -> None:
+        """Remove one encoder entry and release its physical storage and events."""
+
         key = (entry.reference.request_key, int(entry.reference.producer_op_id))
         entries = self._operations.get(key)
         if entries is None:
@@ -488,13 +540,19 @@ class EncoderCache:
             self._operations.pop(key, None)
 
     def _reclaim_ready_locked(self) -> int:
+        """Reclaim released feature entries after producer and reader events become ready."""
+
         reclaimed = 0
         event_releases: dict[int, tuple[torch.cuda.Event, int]] = {}
 
         def ready(event: torch.cuda.Event | None) -> bool:
+            """Treat absent synchronization as ready and query recorded CUDA events."""
+
             return event is None or bool(event.query())
 
         def release(event: torch.cuda.Event) -> None:
+            """Accumulate pooled-event references for release after cache reclamation."""
+
             existing = event_releases.get(id(event))
             event_releases[id(event)] = (event, 1 if existing is None else existing[1] + 1)
 

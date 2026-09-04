@@ -1,13 +1,19 @@
+//! Serving-runtime request lifecycle metrics.
+
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::family::Family;
 use uniserve_observability_derive::MetricFamily;
 
 use crate::U64Gauge;
 
+/// Labels identifying a serving request lifecycle series.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct ServingRequestLabels {
+    /// Served model identity.
     pub model_name: String,
+    /// Model description identity.
     pub description: String,
+    /// Request lifecycle state.
     pub state: &'static str,
 }
 
@@ -22,6 +28,7 @@ pub struct ServingMetrics {
 }
 
 impl ServingMetrics {
+    /// Sets every supplied lifecycle-state gauge for a model description.
     pub fn set_request_states(
         &self,
         model_name: &str,

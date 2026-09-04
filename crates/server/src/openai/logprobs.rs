@@ -1,3 +1,5 @@
+//! Conversion from decoded engine logprobs to OpenAI response values.
+
 use std::collections::HashMap;
 
 use crate::serving::text::{
@@ -8,6 +10,7 @@ use itertools::Itertools as _;
 use crate::openai::error::{ApiError, server_error};
 use crate::openai::types::{ChatLogProbs, ChatLogProbsContent, TopLogProb};
 
+/// Converts decoded prompt positions into token-to-logprob maps.
 pub fn decoded_prompt_logprobs_to_maps(
     prompt_logprobs: &DecodedPromptLogprobs,
     return_tokens_as_token_ids: bool,
@@ -22,6 +25,7 @@ pub fn decoded_prompt_logprobs_to_maps(
         .collect()
 }
 
+/// Converts decoded generated-token candidates into chat logprob content.
 pub fn decoded_logprobs_to_openai_chat(
     logprobs: &DecodedLogprobs,
     return_tokens_as_token_ids: bool,
@@ -36,6 +40,7 @@ pub fn decoded_logprobs_to_openai_chat(
     })
 }
 
+/// Formats a token for an OpenAI log-probability response.
 fn format_token(entry: &DecodedTokenLogprob, as_token_id: bool) -> String {
     if as_token_id {
         format!("token_id:{}", entry.token_id)
@@ -44,6 +49,7 @@ fn format_token(entry: &DecodedTokenLogprob, as_token_id: bool) -> String {
     }
 }
 
+/// Returns the top-log-probability map for one token position.
 fn position_top_logprobs_map(
     position: &DecodedPositionLogprobs,
     return_tokens_as_token_ids: bool,
@@ -60,6 +66,7 @@ fn position_top_logprobs_map(
         .collect()
 }
 
+/// Converts one decoded candidate distribution into OpenAI chat log-probability content.
 fn position_to_chat_logprobs_content(
     position: &DecodedPositionLogprobs,
     return_tokens_as_token_ids: bool,
@@ -87,6 +94,7 @@ fn position_to_chat_logprobs_content(
     })
 }
 
+/// Clamps a log probability to the representable output range.
 fn clamp_logprob(logprob: f32) -> f32 {
     logprob.max(-9999.0)
 }

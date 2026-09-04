@@ -62,6 +62,8 @@ class WarmupContext:
     """Startup-only execution resources and scratch state."""
 
     def __init__(self, worker: Worker) -> None:
+        """Borrow startup-owned worker resources needed to exercise every execution shape."""
+
         self._worker = worker
         self._effective_work_variants = worker._effective_work_variants
         self._execution = worker._execution
@@ -91,6 +93,8 @@ class WarmupContext:
         self._warmup_run_id = 0
 
     def drop_request(self, request_id: int) -> None:
+        """Release warmup request, runtime, cache, latent, and product state for one identifier."""
+
         request = self.requests.peek(int(request_id))
         self._worker.drop_request(request_id)
         if request is None:
@@ -108,10 +112,14 @@ class WarmupContext:
         self._release_buffer_placements(released)
 
     def free_products(self, handles: tuple[int, ...]) -> None:
+        """Release warmup products and recycle their synthetic persistent-buffer placements."""
+
         self._worker.free_products(handles)
         self._release_buffer_placements(handles)
 
     def _release_buffer_placements(self, generations: tuple[int, ...]) -> None:
+        """Release persistent warmup placements in descending generation order."""
+
         for generation in generations:
             placement = self._warmup_buffers.pop(int(generation), None)
             if placement is not None:
@@ -128,6 +136,8 @@ class WarmupContext:
         self._warmup_buffer_free = merged
 
     def buffer_placement(self, product: ProductRef) -> BufferPlacement:
+        """Allocate a deterministic aligned slice of warmup persistent storage for a product."""
+
         existing = self._warmup_buffers.get(int(product.generation))
         if existing is not None:
             if existing.buffer != product.buffer_id:
@@ -154,6 +164,8 @@ class WarmupContext:
 
 @dataclass(frozen=True, slots=True)
 class _FlowGraphBucket:
+    """Defines a denoise graph bucket by rows, media geometry, and CFG branch count."""
+
     rows: int
     height: int
     width: int
@@ -162,6 +174,8 @@ class _FlowGraphBucket:
 
 @dataclass(frozen=True, slots=True)
 class _FlowPrefixGraphBucket:
+    """Defines a flow-prefix graph bucket by rows, CFG branches, and prefix lengths."""
+
     rows: int
     cfg_branches: int
     prefix_lengths: tuple[int, ...]
@@ -169,12 +183,16 @@ class _FlowPrefixGraphBucket:
 
 @dataclass(frozen=True, slots=True)
 class _PagedPrefillGraphBucket:
+    """Defines a paged-prefill graph bucket by token capacity, row capacity, and live rows."""
+
     token_bucket: int
     row_bucket: int
     live_rows: int
 
 
 def _flow_graph_executable(bucket: _FlowGraphBucket) -> tuple[object, ...]:
+    """Return whether a flow bucket has every required captured graph."""
+
     return (
         "flow",
         bucket.rows * bucket.cfg_branches,
@@ -184,6 +202,8 @@ def _flow_graph_executable(bucket: _FlowGraphBucket) -> tuple[object, ...]:
 
 
 def _flow_prefix_graph_executable(bucket: _FlowPrefixGraphBucket) -> tuple[object, ...]:
+    """Return whether a flow-prefix bucket has every branch graph."""
+
     return (
         "flow_prefix",
         bucket.prefix_lengths * bucket.rows,
@@ -193,6 +213,8 @@ def _flow_prefix_graph_executable(bucket: _FlowPrefixGraphBucket) -> tuple[objec
 def _mixed_flow_graph_executable(
     bucket: GraphBucket,
 ) -> tuple[object, ...]:
+    """Return whether a mixed flow bucket has all branch and final graphs."""
+
     return (
         "decode_flow",
         bucket.decode_rows,
@@ -209,6 +231,8 @@ def _paged_prefill_graph_buckets(
     max_rows: int,
     max_tokens: int,
 ) -> tuple[_PagedPrefillGraphBucket, ...]:
+    """Pair row and token graph buckets that can represent bounded paged prefill shapes."""
+
     buckets: list[_PagedPrefillGraphBucket] = []
     minimum_rows = 1
     for row_bucket in sorted({int(value) for value in row_sizes if int(value) > 1}):
@@ -236,6 +260,8 @@ def _startup_image_parameters(
     height: int,
     width: int,
 ) -> ImageParams:
+    """Build deterministic bounded image-generation parameters for startup warmup."""
+
     scales = {
         1: (1.0, 1.0),
         2: (4.0, 1.0),
@@ -277,6 +303,10 @@ def _warmup_batch(
     input_products: tuple[ProductPayload, ...] = (),
     tensorized_mixed: bool = False,
 ) -> Run:
+    """Assemble warmup operations into domain lanes with their physical placements."""
+
+    # Preserve operation order within each execution domain while assigning a
+    # shared launch identity only for tensorized mixed qualification.
     groups: list[tuple[Domain, int, list[Operation]]] = []
     for operation in operations:
         existing = next(
@@ -291,6 +321,7 @@ def _warmup_batch(
             groups.append((operation.domain, 0, [operation]))
         else:
             existing.append(operation)
+    # Every lane carries only the tables, rows, and buffers referenced by its members.
     lanes = tuple(
         RunLane(
             lane_id=index,
@@ -365,6 +396,8 @@ def _warmup_token_outputs(
     op_id: int,
     first_generation: int,
 ) -> tuple[ProductRef, ...]:
+    """Declare generation-tagged token and transition products for warmup sampling."""
+
     from ..execution.batch import (
         DType,
         PointRange,
@@ -397,6 +430,8 @@ def _execute_warmup(
     retain_device_outputs: bool = False,
     catalog_graphs: bool = True,
 ) -> RunResult:
+    """Execute a synthetic run and optionally retain outputs or catalog captured graphs."""
+
     report = execute_startup(self.execution, batch, catalog_graphs=catalog_graphs)
     while not run_result_ready(report):
         time.sleep(0.00005)
@@ -432,6 +467,8 @@ def _build_warmup_batch(
     tensorized_mixed: bool = False,
     image_geometry: tuple[int, int] | None = None,
 ) -> Run:
+    """Derive cache, latent, buffer, and row placements for a warmup submission."""
+
     self._warmup_run_id += 1
     admissions_by_key = {admission.request_key: admission for admission in admissions}
     occupied_blocks = {page for pages in self._warmup_kv_pages.values() for page in pages}
@@ -441,6 +478,7 @@ def _build_warmup_batch(
     forward_rows: dict[tuple[RequestKey, int], tuple[RowGeometry, ...]] = {}
     latent_placements: dict[tuple[RequestKey, int], LatentPlacement] = {}
     buffer_placements: dict[BufferId, BufferPlacement] = {}
+    # Persistent products reserve stable buffer placements before lane construction.
     for operation in operations:
         for product in (
             *operation.inputs,
@@ -451,6 +489,7 @@ def _build_warmup_batch(
                 continue
             placement = self.buffer_placement(product)
             buffer_placements[placement.buffer] = placement
+    # Bind request slots and grow reusable KV leases to each operation's maximum shape.
     for operation in operations:
         request = self.requests.peek(int(operation.request_key.request_id))
         admission = admissions_by_key.get(operation.request_key)
@@ -625,6 +664,8 @@ def _warmup_flow_tables(
     tuple[CachePageAllocation, ...],
     tuple[RowGeometry, ...],
 ]:
+    """Build alternative-prefix KV tables and forward rows for all active CFG branches."""
+
     request = self.requests.get(operation.request_key.request_id)
     image = request.image
     generation = self.model.generation
@@ -641,6 +682,7 @@ def _warmup_flow_tables(
     runtime = parent_runtime(self.execution, operation, request)
     query = generation.physical_tokens(height, width)
     image_prompt = image.image_prompts[0] if image.image_prompts else ""
+    # Branches either reuse the conditioned request slot or share one alternative prefix.
     branch_prefixes: list[tuple[tuple[int, ...], bool]] = []
     for branch in guide.branches:
         prefix, copy_conditioning = generation.prefix(
@@ -667,6 +709,7 @@ def _warmup_flow_tables(
         for page in pages
     }
     occupied.update(page for pages in self._warmup_kv_pages.values() for page in pages)
+    # Prefix pages persist across warmup shapes so graph capture observes stable tables.
     allocated = tuple(page for page in self.cache_pool.page_ids(0) if page not in occupied)[
         :missing
     ]
@@ -708,6 +751,7 @@ def _warmup_flow_tables(
                 query_len=len(alternative),
             )
         )
+    # Emit row geometry in exact guidance-branch evaluation order.
     for prefix, copy_conditioning in branch_prefixes:
         rows.append(
             RowGeometry(
@@ -746,7 +790,7 @@ def warmup(self: WarmupContext) -> None:
 
 
 def _warmup_image_geometry(self: WarmupContext) -> tuple[int, int]:
-    """Largest square image whose latent grid fits the declared capacity."""
+    """Derive the largest square image whose latent grid fits the declared capacity."""
 
     import math
 
@@ -842,6 +886,8 @@ def _warmup_sequence(self: WarmupContext) -> None:
         parent: Checkpoint,
         tokens: tuple[int, ...],
     ) -> tuple[Operation, ProductPayload]:
+        """Build one prompt operation and its synthetic token input publication."""
+
         nonlocal next_product_generation
         token_ref = ProductRef(
             request_key=keys[sid],
@@ -870,6 +916,8 @@ def _warmup_sequence(self: WarmupContext) -> None:
         )
 
     def decode_op(sid: int, op_id: int, predecessor: Operation) -> Operation:
+        """Build one decode operation consuming the predecessor's token product."""
+
         nonlocal next_product_generation
         token_output = next(
             output for output in predecessor.outputs if output.kind is ProductKind.TOKEN
@@ -1112,6 +1160,7 @@ def _warmup_flow(self: WarmupContext) -> None:
         return
     if self.requests.request_ids():
         return
+    # Largest buckets run first so resident graph memory pressure is resolved early.
     configured = tuple(
         sorted(
             self._flow_graph_buckets,
@@ -1133,6 +1182,7 @@ def _warmup_flow(self: WarmupContext) -> None:
             _FlowGraphBucket(1, height, width, cfg_branches)
             for cfg_branches in self._flow_cfg_branches
         )
+    # Warmup identities and generations are private to this bounded startup sequence.
     next_request_id = 1
     next_generation = 1
     for bucket in configured:

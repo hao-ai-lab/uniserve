@@ -21,22 +21,30 @@ from .runtime import PositionLayout
 
 
 class LatentLayout(StrEnum):
+    """Selects patch-token or image-tensor representation at the generation boundary."""
+
     PATCH_TOKENS = "patch_tokens"
     IMAGE_NCHW = "image_nchw"
 
 
 class BranchSource(StrEnum):
+    """Selects conditioning, negative conditioning, or start-state input for a guidance branch."""
+
     CONDITIONING = "conditioning"
     NEGATIVE_OR_START = "negative_or_start"
     START = "start"
 
 
 class Materialization(StrEnum):
+    """Selects decoder-route or RGB-latent materialization of generated state."""
+
     DECODE_ROUTE = "decode_route"
     RGB_LATENT = "rgb_latent"
 
 
 class NoiseScaleMode(StrEnum):
+    """Selects constant, resolution-aware, or dynamic latent-noise scaling."""
+
     CONSTANT = "constant"
     RESOLUTION = "resolution"
     DYNAMIC = "dynamic"
@@ -59,6 +67,8 @@ class FlowPrompt:
         system_suffix: str = "",
         add_special_tokens: bool = True,
     ) -> None:
+        """Store model-specific chat framing for conditioned and unconditional flow branches."""
+
         self.user_prefix = user_prefix
         self.user_suffix = user_suffix
         self.assistant_suffix = assistant_suffix
@@ -70,6 +80,8 @@ class FlowPrompt:
         self.add_special_tokens = bool(add_special_tokens)
 
     def encode(self, tokenizer: Any, *, text: str, conditioned: bool) -> tuple[int, ...]:
+        """Frame and tokenize either the conditioned or unconditional diffusion prompt."""
+
         if tokenizer is None:
             raise unsupported_setup("the configured generation prompt requires a tokenizer")
         append = self.conditioned_append if conditioned else self.unconditional_append
@@ -120,6 +132,10 @@ class GenerationPipeline:
         timestep_shift: float | None = None,
         prompt: FlowPrompt | None = None,
     ) -> None:
+        """Validate and freeze latent geometry, flow math, CFG, and prompt semantics."""
+
+        # Geometry and schedule fields define the scheduler-visible trajectory
+        # contract as well as the tensor shapes used by execution.
         self.latent_downsample = int(latent_downsample)
         self.prediction = str(prediction)
         self.prediction_dtype = str(prediction_dtype)
@@ -144,6 +160,9 @@ class GenerationPipeline:
         self.noise_scale_maximum = float(noise_scale_maximum)
         self.timestep_shift = None if timestep_shift is None else float(timestep_shift)
         self.prompt = prompt
+
+        # Reject configurations that cannot describe at least one latent unit,
+        # marker, or guidance branch before any request reaches the pipeline.
         if min(
             self.latent_downsample,
             self.max_latent_tokens,
@@ -182,6 +201,8 @@ class GenerationPipeline:
         return current, following
 
     def branch_source(self, branch: Branch) -> BranchSource:
+        """Map a classifier-free-guidance branch to its configured conditioning source."""
+
         if branch is Branch.COND:
             return BranchSource.CONDITIONING
         if branch is Branch.TEXT_UNCOND:
@@ -197,6 +218,8 @@ class GenerationPipeline:
         negative_token_ids: tuple[int, ...],
         tokenizer: Any | None,
     ) -> tuple[tuple[int, ...], bool]:
+        """Resolve a branch prefix and flag an empty positive prompt as start-state conditioning."""
+
         if source is BranchSource.CONDITIONING and not image_prompt.strip():
             return (), True
         if source is BranchSource.NEGATIVE_OR_START and negative_token_ids:
@@ -217,9 +240,13 @@ class GenerationPipeline:
         return self.prompt.encode(tokenizer, text=text, conditioned=conditioned), False
 
     def image_tokens(self, height: int, width: int) -> int:
+        """Count latent-grid tokens for an output image at the model downsample ratio."""
+
         return (int(height) // self.latent_downsample) * (int(width) // self.latent_downsample)
 
     def physical_tokens(self, height: int, width: int) -> int:
+        """Include commit-marker rows in the scheduler-visible latent allocation."""
+
         count = self.image_tokens(height, width)
         return (
             count + self.commit_marker_tokens
@@ -228,12 +255,16 @@ class GenerationPipeline:
         )
 
     def latent_shape(self, height: int, width: int) -> tuple[int, ...]:
+        """Describe the stored latent tensor for the configured image or patch layout."""
+
         if self.latent_layout is LatentLayout.PATCH_TOKENS:
             width_per_token = self.latent_patch_size**2 * self.latent_channels
             return (self.image_tokens(height, width), width_per_token)
         return (1, self.latent_channels, int(height), int(width))
 
     def noise_scale(self, height: int, width: int) -> float:
+        """Scale initial noise by latent resolution and clamp it to the model limit."""
+
         value = self.noise_scale_value
         if self.noise_scale_mode in {
             NoiseScaleMode.RESOLUTION,
@@ -246,11 +277,15 @@ class GenerationPipeline:
         return min(value, self.noise_scale_maximum)
 
     def neural_latent(self, latent: torch.Tensor) -> torch.Tensor:
+        """Convert image-layout latent storage into patch rows consumed by the denoiser."""
+
         if self.latent_layout is LatentLayout.PATCH_TOKENS:
             return latent
         return patchify_batch(latent, self.latent_patch_size)
 
     def stored_latent(self, latent: torch.Tensor, height: int, width: int) -> torch.Tensor:
+        """Convert denoiser patch rows back to the configured persistent latent layout."""
+
         if self.latent_layout is LatentLayout.PATCH_TOKENS:
             return latent
         return unpatchify_batch(
@@ -285,6 +320,8 @@ class GenerationPipeline:
         *,
         patch_size: int | None,
     ) -> FlowPatches | None:
+        """Build image-conditioning patches and their grid/noise metadata when required."""
+
         if self.latent_layout is LatentLayout.PATCH_TOKENS:
             return None
         if patch_size is None:

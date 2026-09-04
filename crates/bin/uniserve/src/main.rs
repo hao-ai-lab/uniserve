@@ -1,4 +1,6 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+//! UniServe command-line entry point and process lifecycle orchestration.
+
 mod cli;
 mod logging;
 
@@ -17,10 +19,9 @@ const TOKIO_WORKER_THREADS_ENV: &str = "TOKIO_WORKER_THREADS";
 const DEFAULT_MAX_TOKIO_WORKER_THREADS: usize = 32;
 const TOKIO_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
 
-/// Cap the default number of Tokio worker threads if the user did not
-/// explicitly set `TOKIO_WORKER_THREADS` to avoid spawning too many threads on
-/// machines with a large number of CPUs, which may lead to excessive context
-/// switching and degraded performance.
+/// Caps the default number of Tokio worker threads when `TOKIO_WORKER_THREADS` is unset.
+///
+/// The cap bounds scheduling overhead on machines with many logical CPUs.
 fn tokio_worker_threads() -> Option<usize> {
     if env::var_os(TOKIO_WORKER_THREADS_ENV).is_some() {
         return None;
@@ -42,7 +43,7 @@ fn tokio_worker_threads() -> Option<usize> {
         .ok()
 }
 
-/// Cancellation token tripped by Ctrl-C or SIGTERM.
+/// Returns a cancellation token triggered by Ctrl-C or SIGTERM.
 fn shutdown_signal() -> CancellationToken {
     let token = CancellationToken::new();
     let shutdown = token.clone();
@@ -78,6 +79,7 @@ fn shutdown_signal() -> CancellationToken {
     token
 }
 
+/// Starts the UniServe command-line process.
 fn main() -> Result<()> {
     let cli = Cli::parse();
     logging::init_tracing(cli.log_level.as_deref(), cli.log_level_http.as_deref());
@@ -97,6 +99,7 @@ fn main() -> Result<()> {
         .block_on(async_main(cli))
 }
 
+/// Runs the UniServe command-line process.
 async fn async_main(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Serve(args) => {

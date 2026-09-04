@@ -1,20 +1,16 @@
-//! PyO3 bridge between the Rust IPC transport and the Python worker.
+//! Python bindings for the worker-side shared-memory IPC endpoint.
 //!
 //! # Boundary conversions
 //!
-//! Each IPC call crosses two boundaries:
+//! Each request crosses two boundaries:
 //!
-//! 1. The shared-memory IPC boundary (iceoryx2), which carries flatbuffer
-//!    bytes. `Frame::decode_request` / `ServerEndpoint::respond` handle this
-//!    via the zero-copy-friendly flatbuffer codec in `uniserve-worker-ipc::codec`.
+//! 1. iceoryx2 carries FlatBuffers frames through shared memory;
 //! 2. The Rust↔Python FFI boundary, crossed once on the inbound path
 //!    ([`PyServer::recv`] / [`PyServer::try_recv`]) and once on the outbound
 //!    path ([`PyServer::respond`]).
 //!
-//! The steady-state `submit` and `result` frames use typed converters with
-//! interned keys, preallocated lists, and direct scalar extraction. Worker-info,
-//! acknowledgment, and error frames use the schema-derived serde converter.
-//! Frame kind determines exactly one conversion path.
+//! Submit and result frames use typed conversion; administrative frames use the
+//! schema-derived serde representation.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -32,17 +28,24 @@ use uniserve_worker_ipc::{RequestKind, WorkerRequest, WorkerResponse};
 use uniserve_worker_ipc::{ServerEndpoint, WakeSender};
 
 #[pyclass(name = "Server")]
+/// Python-facing owner of one worker-side IPC endpoint.
 struct PyServer {
+    /// Endpoint held outside the mutex while a blocking operation releases the GIL.
     inner: Mutex<Option<ServerEndpoint>>,
+    /// Wake source used by CPU, transfer, and device completion callbacks.
     completion_wake: WakeSender,
 }
 
+/// Shared eventfd state retained until the last scheduled callback completes.
 struct StreamSignalState {
+    /// Selector-compatible descriptor owned by this state.
     fd: i32,
+    /// One-shot scheduling guard for the CUDA callback.
     scheduled: AtomicBool,
 }
 
 impl Drop for StreamSignalState {
+    /// Closes the owned eventfd when no Python object or callback retains it.
     fn drop(&mut self) {
         // SAFETY: this state exclusively owns the eventfd.
         unsafe {
@@ -57,23 +60,31 @@ struct PyStreamSignal {
     state: Arc<StreamSignalState>,
 }
 
+/// ABI of `cudaLaunchHostFunc` resolved from the CUDA runtime.
 type CudaLaunchHostFunc = unsafe extern "C" fn(
     stream: *mut c_void,
     callback: Option<unsafe extern "C" fn(*mut c_void)>,
     user_data: *mut c_void,
 ) -> i32;
 
+/// Loaded CUDA runtime and the host-callback entry point borrowed from it.
 struct CudaRuntime {
+    /// Library owner that keeps `launch_host_func` valid for the process lifetime.
     _library: libloading::Library,
+    /// CUDA host-callback launcher copied from the loaded runtime.
     launch_host_func: CudaLaunchHostFunc,
 }
 
+/// Process-wide result of resolving the CUDA host-callback API.
 static CUDA_RUNTIME: OnceLock<Result<CudaRuntime, String>> = OnceLock::new();
 
+/// Loads the CUDA runtime once and returns its host-callback entry point.
 fn cuda_runtime() -> Result<&'static CudaRuntime, String> {
     CUDA_RUNTIME
         .get_or_init(|| {
             let mut failure = String::new();
+            // Probe conventional sonames in preference order and retain the
+            // final loader diagnostic if none is available.
             for name in ["libcudart.so", "libcudart.so.13", "libcudart.so.12"] {
                 // SAFETY: the library handle remains owned by `CudaRuntime` for the
                 // process lifetime and the copied symbol has the CUDA runtime ABI.
@@ -104,6 +115,7 @@ fn cuda_runtime() -> Result<&'static CudaRuntime, String> {
         .map_err(Clone::clone)
 }
 
+/// Signals worker completion after preceding CUDA stream work finishes.
 unsafe extern "C" fn completion_callback(user_data: *mut c_void) {
     // SAFETY: `schedule_completion_wake` passes ownership of exactly one boxed
     // `WakeSender` to CUDA, which invokes this callback exactly once.
@@ -111,6 +123,7 @@ unsafe extern "C" fn completion_callback(user_data: *mut c_void) {
     wake.wake();
 }
 
+/// Writes one eventfd signal after preceding CUDA stream work finishes.
 unsafe extern "C" fn stream_signal_callback(user_data: *mut c_void) {
     // SAFETY: `PyStreamSignal::schedule` transfers one boxed Arc to CUDA and
     // CUDA invokes this callback exactly once after preceding stream work.
@@ -121,6 +134,7 @@ unsafe extern "C" fn stream_signal_callback(user_data: *mut c_void) {
     let _ = unsafe { libc::write(state.fd, value.as_ptr().cast(), value.len()) };
 }
 
+/// Transfers a completion wake to a one-shot CUDA stream callback.
 fn schedule_completion_wake(stream: usize, wake: WakeSender) -> Result<(), String> {
     let runtime = cuda_runtime()?;
     let user_data = Box::into_raw(Box::new(wake)).cast::<c_void>();
@@ -142,6 +156,7 @@ fn schedule_completion_wake(stream: usize, wake: WakeSender) -> Result<(), Strin
 #[pymethods]
 impl PyStreamSignal {
     #[new]
+    /// Creates a non-blocking one-shot eventfd signal.
     fn new() -> PyResult<Self> {
         // SAFETY: eventfd has no pointer arguments and returns an owned fd.
         let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
@@ -159,15 +174,18 @@ impl PyStreamSignal {
         })
     }
 
+    /// Returns the borrowed descriptor consumed by Python selector loops.
     fn fileno(&self) -> i32 {
         self.state.fd
     }
 
+    /// Schedules this signal after all prior work on a CUDA stream.
     fn schedule(&self, stream: usize) -> PyResult<()> {
         self.state
             .scheduled
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| py_runtime("CUDA stream signal was scheduled more than once"))?;
+        // Transfer an Arc to CUDA so the eventfd remains alive until callback.
         let runtime = cuda_runtime().map_err(py_runtime)?;
         let user_data = Box::into_raw(Box::new(Arc::clone(&self.state))).cast::<c_void>();
         // SAFETY: `stream` is a native CUDA stream address supplied by PyTorch;
@@ -190,6 +208,7 @@ impl PyStreamSignal {
         Ok(())
     }
 
+    /// Consumes the eventfd counter produced by the scheduled callback.
     fn consume(&self) -> PyResult<()> {
         let mut value = 0_u64;
         // SAFETY: the state owns a valid non-blocking eventfd and `value` is a
@@ -219,6 +238,7 @@ impl PyStreamSignal {
 impl PyServer {
     #[new]
     #[pyo3(signature = (service_name, max_payload = 1048576, max_inflight = 1))]
+    /// Binds a worker IPC service with bounded payload and inflight capacity.
     fn new(service_name: &str, max_payload: usize, max_inflight: usize) -> PyResult<Self> {
         let inner = ServerEndpoint::bind(service_name, max_payload, max_inflight)
             .map_err(|err| py_runtime(format!("failed to bind IPC service: {err:#}")))?;
@@ -229,8 +249,11 @@ impl PyServer {
         })
     }
 
+    /// Waits for one request and converts it into its Python representation.
     fn recv(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let mut endpoint = self.take_endpoint()?;
+
+        // Move exclusive endpoint ownership into the GIL-free blocking section.
         let (endpoint, result) = py.detach(move || {
             let result: anyhow::Result<WorkerRequest> = (|| {
                 let frame = endpoint.recv()?;
@@ -238,14 +261,20 @@ impl PyServer {
             })();
             (endpoint, result)
         });
+
+        // Restore endpoint ownership before surfacing transport or decode errors.
         self.replace_endpoint(endpoint)?;
         let req =
             result.map_err(|err| py_runtime(format!("failed to receive IPC request: {err:#}")))?;
         pythonize_request(py, &req)
     }
 
+    /// Attempts one request receive without blocking.
     fn try_recv(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         let mut endpoint = self.take_endpoint()?;
+
+        // Keep the endpoint unavailable to concurrent Python calls while the
+        // non-blocking transport attempt runs without the GIL.
         let (endpoint, result) = py.detach(move || {
             let result: anyhow::Result<Option<WorkerRequest>> = (|| {
                 let Some(frame) = endpoint.try_recv()? else {
@@ -264,6 +293,7 @@ impl PyServer {
         Ok(Some(pythonize_request(py, &req)?))
     }
 
+    /// Waits for request or completion readiness while releasing the GIL.
     fn wait_incoming(&self, py: Python<'_>, timeout_us: u64) -> PyResult<()> {
         let endpoint = self.take_endpoint()?;
         let (endpoint, result) = py.detach(move || {
@@ -275,15 +305,18 @@ impl PyServer {
         Ok(())
     }
 
+    /// Signals that asynchronous worker progress is ready to consume.
     fn wake(&self) {
         self.completion_wake.wake();
     }
 
+    /// Schedules the worker completion wake on a CUDA stream.
     fn wake_on_stream(&self, stream: usize) -> PyResult<()> {
         let wake = self.completion_wake.clone();
         schedule_completion_wake(stream, wake).map_err(py_runtime)
     }
 
+    /// Converts and publishes one response for the active request.
     fn respond(&self, py: Python<'_>, response: &Bound<'_, PyAny>) -> PyResult<()> {
         // Per-step result reports use the typed extractor. Every other response
         // kind is decoded by the schema-derived converter.
@@ -292,6 +325,7 @@ impl PyServer {
             None => depythonize(response)
                 .map_err(|err| PyErr::new::<PyValueError, _>(format!("invalid response: {err}")))?,
         };
+        // Publish without the GIL while retaining exclusive endpoint ownership.
         let mut endpoint = self.take_endpoint()?;
         let (endpoint, result) = py.detach(move || {
             let result = endpoint.respond(&resp);
@@ -303,6 +337,7 @@ impl PyServer {
     }
 }
 
+/// Converts a request through the typed submit path or schema-derived fallback.
 fn pythonize_request(py: Python<'_>, request: &WorkerRequest) -> PyResult<Py<PyAny>> {
     // Submitted runs use the typed converter, which constructs the worker's
     // Python operation objects directly after Rust validation.
@@ -316,6 +351,7 @@ fn pythonize_request(py: Python<'_>, request: &WorkerRequest) -> PyResult<Py<PyA
 }
 
 impl PyServer {
+    /// Takes exclusive endpoint ownership for an operation that releases the GIL.
     fn take_endpoint(&self) -> PyResult<ServerEndpoint> {
         let mut guard = self
             .inner
@@ -326,6 +362,7 @@ impl PyServer {
             .ok_or_else(|| py_runtime("IPC server endpoint is already in use"))
     }
 
+    /// Restores endpoint ownership after a GIL-free operation.
     fn replace_endpoint(&self, endpoint: ServerEndpoint) -> PyResult<()> {
         let mut guard = self
             .inner
@@ -337,12 +374,14 @@ impl PyServer {
 }
 
 #[pymodule]
+/// Registers the worker IPC Python extension module.
 fn _uniserve_ipc(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyServer>()?;
     m.add_class::<PyStreamSignal>()?;
     Ok(())
 }
 
+/// Converts contextual Rust failures into Python runtime errors.
 fn py_runtime(message: impl ToString) -> PyErr {
     PyErr::new::<PyRuntimeError, _>(message.to_string())
 }

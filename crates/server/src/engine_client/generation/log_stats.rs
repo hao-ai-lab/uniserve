@@ -1,3 +1,5 @@
+//! Periodic logging and metric publication for generation throughput.
+
 use std::fmt::Write;
 use std::time::{Duration, Instant};
 
@@ -34,7 +36,7 @@ struct CounterSnapshot {
     prefix_cache_hits: u64,
 }
 
-/// Periodic stats logger that mirrors the reference `LoggingStatLogger`.
+/// Periodic logger for throughput and scheduler state.
 ///
 /// Spawns a background task that logs throughput and scheduler state at a fixed
 /// interval. When idle (both current and previous throughputs are zero), logs
@@ -45,7 +47,7 @@ pub(crate) struct StatsLogger {
 }
 
 impl StatsLogger {
-    /// Start the background stats logging task.
+    /// Starts the background stats logging task.
     pub(crate) fn start(model_name: String, engine_count: usize) -> Self {
         let task = AbortOnDropHandle::new(tokio::spawn(async move {
             run_stats_logger(model_name, engine_count).await;
@@ -54,7 +56,7 @@ impl StatsLogger {
     }
 }
 
-/// Resolve and clone all metric handles once so the hot path is lock-free.
+/// Resolves and clone all metric handles once so the hot path is lock-free.
 fn resolve_engine_metrics(model_name: &str, engine_count: usize) -> Vec<EngineMetrics> {
     let m = &METRICS;
     (0..engine_count as u32)
@@ -69,9 +71,8 @@ fn resolve_engine_metrics(model_name: &str, engine_count: usize) -> Vec<EngineMe
                 source: "local_compute",
             };
             EngineMetrics {
-                // Use "local_compute" source for prompt throughput (excludes
-                // cached/transferred tokens), matching Python's
-                // `iteration_stats.prompt_token_stats.computed`.
+                // Prompt throughput counts local computation and excludes cached
+                // or transferred tokens.
                 prompt_tokens_computed: m.request.prompt_tokens_by_source.get_or_create_owned(&pt),
                 generation_tokens: m.request.generation_tokens.get_or_create_owned(&el),
                 prefix_cache_queries: m.scheduler.prefix_cache_queries.get_or_create_owned(&el),
@@ -84,6 +85,7 @@ fn resolve_engine_metrics(model_name: &str, engine_count: usize) -> Vec<EngineMe
         .collect()
 }
 
+/// Samples cumulative engine metrics and periodically logs interval throughput and occupancy.
 async fn run_stats_logger(model_name: String, engine_count: usize) {
     let engines = resolve_engine_metrics(&model_name, engine_count);
 
@@ -165,7 +167,7 @@ async fn run_stats_logger(model_name: String, engine_count: usize) {
     }
 }
 
-/// Read the current cumulative counter values for throughput computation.
+/// Reads the current cumulative counter values for throughput computation.
 fn read_counters(engines: &[EngineMetrics]) -> CounterSnapshot {
     let mut snap = CounterSnapshot {
         prompt_tokens: 0,
@@ -182,7 +184,7 @@ fn read_counters(engines: &[EngineMetrics]) -> CounterSnapshot {
     snap
 }
 
-/// Read the current scheduler gauge values, aggregated across engines.
+/// Reads the current scheduler gauge values, aggregated across engines.
 fn read_scheduler_gauges(engines: &[EngineMetrics]) -> (u64, u64, f64) {
     let mut num_running = 0u64;
     let mut num_waiting = 0u64;

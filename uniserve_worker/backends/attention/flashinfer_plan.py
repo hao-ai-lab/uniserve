@@ -1,4 +1,5 @@
 """FlashInfer plan caching, plan-key building, and fast-plan quarantine."""
+
 from __future__ import annotations
 
 import weakref
@@ -17,6 +18,8 @@ if TYPE_CHECKING:
 
 @dataclass
 class _DecodePlanWorkspace:
+    """Owns mutable device buffers used to assemble a FlashInfer decode plan."""
+
     indptr: torch.Tensor
     indices: torch.Tensor
     last_page_len: torch.Tensor
@@ -25,6 +28,8 @@ class _DecodePlanWorkspace:
 
 @dataclass
 class _DecodePlanTensors:
+    """Bounded tensor views consumed by one FlashInfer decode plan."""
+
     indptr: torch.Tensor
     indices: torch.Tensor
     last_page_len: torch.Tensor
@@ -33,6 +38,8 @@ class _DecodePlanTensors:
 
 @dataclass
 class _PrefillPlanWorkspace:
+    """Owns mutable device buffers used to assemble a FlashInfer prefill plan."""
+
     qo_indptr: torch.Tensor
     kv_indptr: torch.Tensor
     indices: torch.Tensor
@@ -42,6 +49,8 @@ class _PrefillPlanWorkspace:
 
 @dataclass
 class _PrefillPlanTensors:
+    """Bounded tensor views consumed by one FlashInfer prefill plan."""
+
     qo_indptr: torch.Tensor
     kv_indptr: torch.Tensor
     indices: torch.Tensor
@@ -51,6 +60,8 @@ class _PrefillPlanTensors:
 
 @dataclass(frozen=True)
 class _FastDecodePlanDefaults:
+    """Captures dtype and split-KV defaults required by FlashInfer fast decode planning."""
+
     q_data_type: torch.dtype | str
     kv_data_type: torch.dtype | str
     logits_soft_cap: float
@@ -59,12 +70,16 @@ class _FastDecodePlanDefaults:
 
 @dataclass(frozen=True)
 class _FastDecodePlanImports:
+    """Holds resolved FlashInfer helpers required to construct sequence metadata."""
+
     get_range_buf: Callable[..., torch.Tensor]
     get_seq_lens: Callable[..., torch.Tensor]
 
 
 @dataclass(frozen=True)
 class _FastDecodePlanHostTensors:
+    """Holds CPU planning tensors derived from device-resident decode metadata."""
+
     qo_indptr: torch.Tensor
     indptr: torch.Tensor
     kv_lens: torch.Tensor
@@ -80,6 +95,8 @@ class _PlanCache:
     """
 
     def __init__(self) -> None:
+        """Create a weakly keyed registry of wrapper plan identities and graph bindings."""
+
         self._plan_keys: dict[
             "WrapperKey",
             tuple[tuple[Any, ...], weakref.ReferenceType[Any] | None],
@@ -91,6 +108,8 @@ class _PlanCache:
         plan_key: tuple[Any, ...],
         binding: Any,
     ) -> bool:
+        """Return whether a wrapper’s cached plan key and graph binding match the requested plan."""
+
         cached = self._plan_keys.get(wrapper_key)
         if cached is None:
             return False
@@ -105,6 +124,8 @@ class _PlanCache:
         plan_key: tuple[Any, ...],
         binding: Any,
     ) -> None:
+        """Record the plan key and optional graph binding currently installed on a wrapper."""
+
         self._plan_keys[wrapper_key] = (plan_key, _weakref_or_none(binding))
 
     def forget(self, wrapper_key: "WrapperKey") -> None:
@@ -138,6 +159,8 @@ def _decode_plan_key(
     current_tokens: int,
     wrapper_key: "WrapperKey",
 ) -> tuple[Any, ...]:
+    """Build a decode-plan cache key from binding identity, tensor geometry, and scale."""
+
     return _decode_plan_key_from_shape(
         binding,
         block_table,
@@ -171,6 +194,8 @@ def _decode_plan_key_from_shape(
     current_tokens: int,
     wrapper_key: "WrapperKey",
 ) -> tuple[Any, ...]:
+    """Build a decode-plan cache key from explicit graph-capture geometry."""
+
     return (
         wrapper_key,
         id(binding) if binding is not None else None,
@@ -201,6 +226,8 @@ def _prefill_plan_key(
     scale: float | None,
     wrapper_key: "WrapperKey",
 ) -> tuple[Any, ...]:
+    """Build a prefill-plan cache key from packed boundaries, cache geometry, and causality."""
+
     return (
         wrapper_key,
         id(binding) if binding is not None else None,
@@ -230,6 +257,8 @@ def _decode_fast_plan_signature(
     q_data_type: torch.dtype,
     kv_data_type: torch.dtype,
 ) -> tuple[Any, ...]:
+    """Resolve the installed fast-plan callable and its geometry-specific module cache."""
+
     return (
         wrapper_key.backend,
         int(num_q_heads),
@@ -267,6 +296,8 @@ def _fast_decode_plan_with_cpu_metadata(
     global_override_indptr_cpu: torch.Tensor | None = None,
     global_override_last_page_len_cpu: torch.Tensor | None = None,
 ) -> bool:
+    """Plan decode with explicit CPU indptr and last-page metadata overrides."""
+
     imports = _fast_decode_plan_imports(wrapper, global_override_last_page_len_cpu)
     if imports is None or global_override_last_page_len_cpu is None:
         return False
@@ -314,6 +345,8 @@ def _fast_decode_plan_imports(
     wrapper: Any,
     global_override_last_page_len_cpu: torch.Tensor | None,
 ) -> _FastDecodePlanImports | None:
+    """Resolve planner internals required for CPU-metadata decode planning."""
+
     if not bool(getattr(wrapper, "use_tensor_cores", False)):
         return None
     if global_override_last_page_len_cpu is None:
@@ -333,6 +366,8 @@ def _fast_decode_plan_defaults(
     logits_soft_cap: float | None,
     fixed_split_size: int | None,
 ) -> _FastDecodePlanDefaults:
+    """Normalize optional dtype, soft-cap, and split-KV settings for fast planning."""
+
     if data_type is not None:
         q_data_type = data_type if q_data_type is None else q_data_type
         kv_data_type = data_type if kv_data_type is None else kv_data_type
@@ -348,18 +383,11 @@ def _fast_decode_plan_defaults(
     )
 
 
-# flashinfer-internals adapter (pinned to flashinfer 0.2.x). Quarantines the
-# fast-plan path's reliance on private flashinfer wrapper attributes: it writes
-# the wrapper's ``_paged_kv_*_buf`` / ``_qo_indptr_buf`` ring buffers, reads its
-# ``_float_workspace_buffer`` / ``_int_workspace_buffer`` /
-# ``_pin_memory_int_workspace_buffer`` / ``_backend`` fields, calls the cached
-# module's ``plan`` to populate ``_plan_info``, and stamps the planning scalars
-# (``_pos_encoding_mode`` / ``_window_left`` / ``_logits_soft_cap`` / ``_sm_scale``
-# / ``_rope_scale`` / ``_rope_theta``). These names are not part of flashinfer's
-# public API and can change across releases; ``_can_use_fast_decode_plan`` gates
-# entry and ``_fast_decode_plan_with_cpu_metadata`` is the upstream-equivalent
-# fallback when this path is unavailable. The values written here intentionally
-# mirror flashinfer's own ``fast_decode_plan`` and must not be altered.
+# This adapter writes FlashInfer's private planning buffers and stamps the
+# corresponding scalar fields as one coherent cached plan. Capability checks
+# guard every required attribute; the public planner handles incompatible
+# wrappers. Keep buffer contents and scalar metadata aligned with the installed
+# FlashInfer planning ABI.
 def _apply_fast_plan_overrides(
     wrapper: Any,
     indptr: torch.Tensor,
@@ -386,6 +414,8 @@ def _apply_fast_plan_overrides(
     global_override_indptr_cpu: torch.Tensor | None,
     global_override_last_page_len_cpu: torch.Tensor,
 ) -> None:
+    """Install temporary planner metadata overrides and restore wrapper state afterward."""
+
     is_graph = bool(getattr(wrapper, "is_cuda_graph_enabled", False))
     _prepare_fast_decode_plan_buffers(
         wrapper,
@@ -449,6 +479,8 @@ def _fast_decode_plan_host_tensors(
     non_blocking: bool,
     is_graph: bool,
 ) -> _FastDecodePlanHostTensors:
+    """Prepare pinned host indptr and KV-length tensors required by the fast planner."""
+
     qo_indptr_host = _prepare_fast_decode_qo_indptr(
         wrapper,
         indptr,
@@ -485,6 +517,8 @@ def _invoke_fast_decode_plan(
     disable_split_kv: bool,
     is_graph: bool,
 ) -> None:
+    """Invoke the cached decode planner with normalized host metadata and split settings."""
+
     with _wrapper_device_context(wrapper):
         wrapper._plan_info = cached_module.plan(
             *_fast_decode_plan_args(
@@ -514,6 +548,8 @@ def _prepare_fast_decode_plan_buffers(
     batch_size: int,
     is_graph: bool,
 ) -> None:
+    """Bind reusable page metadata tensors to the wrapper before fast planning."""
+
     if is_graph:
         fixed_batch_size = int(getattr(wrapper, "_fixed_batch_size", batch_size))
         if batch_size != fixed_batch_size:
@@ -540,6 +576,8 @@ def _prepare_fast_decode_qo_indptr(
     non_blocking: bool,
     is_graph: bool,
 ) -> torch.Tensor:
+    """Build the fixed one-query-per-row host indptr used by decode planning."""
+
     qo_indptr_host = get_range_buf(batch_size + 1, "cpu")
     if not is_graph:
         wrapper._qo_indptr_buf = qo_indptr_host.to(
@@ -550,6 +588,8 @@ def _prepare_fast_decode_qo_indptr(
 
 
 def _cpu_int32_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Copy plan metadata to contiguous CPU int32 storage."""
+
     if tensor.device.type == "cpu" and tensor.dtype == torch.int32:
         return tensor
     return tensor.to(device="cpu", dtype=torch.int32)
@@ -571,6 +611,8 @@ def _fast_decode_plan_args(
     disable_split_kv: bool,
     is_graph: bool,
 ) -> list[Any]:
+    """Assemble the ordered low-level argument tuple for the installed decode planner."""
+
     args = [
         wrapper._float_workspace_buffer,
         wrapper._int_workspace_buffer,
@@ -604,6 +646,8 @@ def _stamp_fast_decode_plan_scalars(
     rope_scale: float | None,
     rope_theta: float | None,
 ) -> None:
+    """Write normalized scalar attention settings onto the planner wrapper."""
+
     wrapper._pos_encoding_mode = pos_encoding_mode
     wrapper._window_left = window_left
     wrapper._logits_soft_cap = logits_soft_cap
@@ -613,6 +657,8 @@ def _stamp_fast_decode_plan_scalars(
 
 
 def _wrapper_device_context(wrapper: Any):
+    """Return the wrapper device context or a no-op context when none is declared."""
+
     raw_device = getattr(wrapper, "device", None)
     if raw_device is None:
         return nullcontext()
@@ -630,6 +676,8 @@ def _wrapper_device_context(wrapper: Any):
 
 
 def _cpu_paged_indptr(plan: Any, batch_size: int, page_size: int) -> torch.Tensor | None:
+    """Return pinned CPU page indptr metadata from a prepared plan."""
+
     if plan is None:
         return None
     kv_seqlens_cpu = tuple(int(x) for x in getattr(plan, "kv_lens_cpu", ()) or ())
@@ -646,6 +694,8 @@ def _cpu_paged_indptr(plan: Any, batch_size: int, page_size: int) -> torch.Tenso
 
 
 def _cpu_last_page_len(plan: Any, batch_size: int, page_size: int) -> torch.Tensor | None:
+    """Resolve CPU last-page lengths from a plan or its paged indptr."""
+
     if plan is None:
         return None
     kv_seqlens_cpu = tuple(int(x) for x in getattr(plan, "kv_lens_cpu", ()) or ())
@@ -657,12 +707,16 @@ def _cpu_last_page_len(plan: Any, batch_size: int, page_size: int) -> torch.Tens
 
 
 def _indptr_last(indptr: torch.Tensor | None) -> int | None:
+    """Return the terminal value of an optional indptr tensor."""
+
     if indptr is None or int(indptr.numel()) <= 0:
         return None
     return int(indptr[-1].item())
 
 
 def _weakref_or_none(obj: Any) -> weakref.ReferenceType[Any] | None:
+    """Create a weak reference when the object supports weak ownership."""
+
     if obj is None:
         return None
     try:

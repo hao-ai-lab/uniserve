@@ -1,3 +1,5 @@
+//! Hugging Face tokenizer loading and the unified tokenizer implementation.
+
 use std::path::Path;
 use std::sync::Arc;
 
@@ -10,7 +12,9 @@ use crate::profile::tokenizer::Result;
 use crate::profile::tokenizer::byte_level_decode::decode_byte_level as decode_tokens_byte_level;
 use crate::profile::tokenizer::incremental::IncrementalDecoder;
 
+/// Returns whether a tokenizer decoder is exclusively byte-level.
 fn is_byte_level_only(decoder: &FastokensDecoder) -> bool {
+    /// Returns the count byte level.
     fn count_byte_level(decoder: &FastokensDecoder) -> usize {
         match decoder {
             FastokensDecoder::ByteLevel(_) => 1,
@@ -19,6 +23,7 @@ fn is_byte_level_only(decoder: &FastokensDecoder) -> bool {
     }
     count_byte_level(decoder) == 1
 }
+/// Decodes tokens with the byte-level fast tokenizer path.
 fn decode_fastokens_byte_level(
     tokenizer: &FastokensTokenizer,
     token_ids: &[u32],
@@ -44,6 +49,7 @@ pub struct HuggingFaceTokenizer {
 }
 
 impl HuggingFaceTokenizer {
+    /// Loads tokenizer data and derives special-token lookup tables.
     pub fn new(path: &Path) -> Result<Self> {
         info!(path = %path.display(), "loading configured Hugging Face tokenizer");
         let tokenizer = FastokensTokenizer::from_file(path)
@@ -64,13 +70,14 @@ impl HuggingFaceTokenizer {
             special_token_ids: Arc::from(special_token_ids),
         })
     }
-    /// Encode one prompt string into token IDs.
+    /// Encodes one prompt string into token IDs.
     pub fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
         self.tokenizer
             .encode_with_special_tokens(text, add_special_tokens)
             .map_err(|error| tokenizer_error!("encoding failed: {}", error.as_report()))
     }
 
+    /// Decodes token identifiers with optional special-token filtering.
     pub fn decode(&self, token_ids: &[u32], skip_special_tokens: bool) -> Result<String> {
         if self.byte_level {
             decode_fastokens_byte_level(&self.tokenizer, token_ids, skip_special_tokens)
@@ -81,19 +88,22 @@ impl HuggingFaceTokenizer {
         }
     }
 
+    /// Resolves one vocabulary token to its identifier.
     pub fn token_to_id(&self, token: &str) -> Option<u32> {
         self.tokenizer.token_to_id(token)
     }
 
+    /// Resolves one vocabulary identifier to its token text.
     pub fn id_to_token(&self, id: u32) -> Option<String> {
         self.tokenizer.id_to_token(id).map(ToOwned::to_owned)
     }
 
+    /// Returns whether an identifier belongs to the special-token set.
     pub fn is_special_id(&self, token_id: u32) -> bool {
         self.special_token_ids.binary_search(&token_id).is_ok()
     }
 
-    /// Create a stateful incremental decoder primed with the given prompt tokens.
+    /// Creates a stateful incremental decoder primed with the given prompt tokens.
     pub fn create_decode_stream(
         &self,
         prompt_token_ids: &[u32],

@@ -1,4 +1,4 @@
-//! Tensor-parallel rank fan-out, completion merge, failure detection, and respawn.
+//! Tensor-parallel rank fan-out, completion agreement, and process recovery.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::TcpListener;
@@ -14,13 +14,11 @@ use uniserve_worker_ipc::{ModelOutput, Run as PhysicalRun, RunResult, WorkerInfo
 
 use crate::worker::WorkerProcessArgs;
 
-/// How long a single rank may go without producing output, while batches are in
-/// flight, before `next_result` treats it as dead and bails. Generous so a
-/// healthy-but-slow forward is never falsely failed; short enough that a hung
-/// rank does not wedge the scheduler loop forever.
+/// Maximum interval without rank progress before an in-flight run is treated as failed.
 const NEXT_RESULT_DEADLINE: Duration = Duration::from_secs(300);
 
 impl WorkerProcessArgs {
+    /// Launches and connects every rank in one tensor-parallel worker group.
     fn launch(
         &self,
     ) -> anyhow::Result<(Vec<Box<dyn PhysicalExecutor>>, Vec<CommandWaker>, Vec<i32>)> {
@@ -53,7 +51,7 @@ impl WorkerProcessArgs {
     }
 }
 
-/// W worker processes, one iceoryx2 request-response service each.
+/// Tensor-parallel worker processes with one iceoryx2 service per rank.
 pub struct MultiprocExecutor {
     workers: Vec<Box<dyn PhysicalExecutor>>,
     buffers: Vec<VecDeque<RunResult>>,
@@ -79,6 +77,7 @@ pub struct MultiprocExecutor {
 
 type OperationIdentity = (u64, u64, u64, u64);
 
+/// Returns the request and operation identifiers carried by a worker operation.
 fn operation_identity(
     request: uniserve_worker_ipc::RequestKey,
     op: uniserve_worker_ipc::OpId,
@@ -92,10 +91,12 @@ fn operation_identity(
 }
 
 impl MultiprocExecutor {
+    /// Constructs a tensor-parallel executor from connected physical ranks.
     pub fn new(workers: Vec<Box<dyn PhysicalExecutor>>) -> anyhow::Result<Self> {
         Self::from_workers(workers, Vec::new(), Vec::new(), None)
     }
 
+    /// Validates rank topology and constructs shared tensor-parallel executor state.
     fn from_workers(
         workers: Vec<Box<dyn PhysicalExecutor>>,
         command_wakers: Vec<CommandWaker>,
@@ -152,12 +153,14 @@ impl MultiprocExecutor {
         })
     }
 
+    /// Spawns every tensor-parallel rank and validates their shared capabilities.
     pub fn spawn(args: WorkerProcessArgs) -> anyhow::Result<Self> {
         anyhow::ensure!(args.world_size > 0, "worker world size must be positive");
         let (workers, wakers, progress_fds) = args.launch()?;
         Self::from_workers(workers, wakers, progress_fds, Some(args))
     }
 
+    /// Drains immediately available rank results into per-rank agreement buffers.
     fn pump_once(&mut self) -> anyhow::Result<()> {
         for rank in 0..self.workers.len() {
             loop {
@@ -206,6 +209,7 @@ impl MultiprocExecutor {
         Ok(())
     }
 
+    /// Records the rank error.
     fn record_rank_error(&mut self, rank: usize, error: &anyhow::Error) -> anyhow::Result<()> {
         let execution = error
             .downcast_ref::<WorkerExecError>()
@@ -226,6 +230,7 @@ impl MultiprocExecutor {
         Ok(())
     }
 
+    /// Replaces the complete rank group after worker loss and invalidates affected requests.
     fn recover_workers(&mut self, cause: &anyhow::Error) -> anyhow::Result<()> {
         let args = self.process_args.clone().ok_or_else(|| {
             anyhow::anyhow!("worker process failed without a restart specification: {cause}")
@@ -248,6 +253,7 @@ impl MultiprocExecutor {
         .into())
     }
 
+    /// Installs a capability-compatible replacement rank group and resets rank-local state.
     fn install_replacement(
         &mut self,
         workers: Vec<Box<dyn PhysicalExecutor>>,
@@ -273,6 +279,7 @@ impl MultiprocExecutor {
         Ok(())
     }
 
+    /// Discards the requests after loss.
     fn discard_requests_after_loss(&mut self) {
         self.pending_batches.clear();
         self.pending_operations.clear();
@@ -287,6 +294,7 @@ impl MultiprocExecutor {
         self.dirty_requests.clear();
     }
 
+    /// Discards the inflight.
     fn discard_inflight(&mut self) {
         self.pending_batches.clear();
         self.pending_operations.clear();
@@ -299,6 +307,7 @@ impl MultiprocExecutor {
         self.inflight = 0;
     }
 
+    /// Advances rank I/O until no immediate progress remains.
     fn pump(&mut self) -> anyhow::Result<()> {
         loop {
             match self.pump_once() {
@@ -314,6 +323,7 @@ impl MultiprocExecutor {
         }
     }
 
+    /// Joins mutually agreeing rank reports into one logical physical result.
     fn try_join(&mut self) -> anyhow::Result<Option<RunResult>> {
         self.join_rank_errors()?;
         if self.buffers.iter().any(|buffer| buffer.is_empty()) {
@@ -366,6 +376,7 @@ impl MultiprocExecutor {
         Ok(Some(out))
     }
 
+    /// Returns the command-channel waker.
     pub(crate) fn command_waker(&self) -> CommandWaker {
         let wakes = self.command_wakers.clone();
         CommandWaker::new(move || {
@@ -375,10 +386,12 @@ impl MultiprocExecutor {
         })
     }
 
+    /// Returns the file descriptors that signal worker progress.
     pub(crate) fn progress_fds(&self) -> &[i32] {
         &self.progress_fds
     }
 
+    /// Resolves a run once every rank reports either success or a compatible error.
     fn join_rank_errors(&mut self) -> anyhow::Result<()> {
         let steps = self
             .rank_errors
@@ -420,6 +433,7 @@ impl MultiprocExecutor {
         Ok(())
     }
 
+    /// Retires all rank-local tracking for one agreed terminal run.
     fn finish_step(&mut self, run_id: u64) {
         self.pending_batches.remove(&run_id);
         self.pending_operations.remove(&run_id);
@@ -438,6 +452,7 @@ impl MultiprocExecutor {
         self.inflight = self.inflight.saturating_sub(1);
     }
 
+    /// Returns the key used to join a rank report.
     fn joinable_report_key(&self) -> Option<(u64, Vec<OperationIdentity>)> {
         self.buffers[0]
             .iter()
@@ -457,6 +472,7 @@ impl MultiprocExecutor {
     }
 }
 
+/// Returns the operation identifiers carried by a rank report.
 fn report_operation_ids(report: &RunResult) -> Vec<OperationIdentity> {
     let mut ids = report
         .completions
@@ -467,7 +483,7 @@ fn report_operation_ids(report: &RunResult) -> Vec<OperationIdentity> {
     ids
 }
 
-/// Join one step's per-rank completion reports into rank 0's. Tensor-parallel
+/// Joins one step's per-rank completion reports into rank 0's. Tensor-parallel
 /// ranks run the identical operation set, so every rank must report the same
 /// semantic completion for each operation; only the per-rank product shards
 /// differ and are concatenated in rank order.
@@ -527,6 +543,7 @@ fn merge_rank_report(
     Ok(())
 }
 
+/// Validates a rank report and orders completions to match the submitted operation sequence.
 fn validate_and_order_rank_report(
     batch: &PhysicalRun,
     report: &mut RunResult,
@@ -578,7 +595,7 @@ fn validate_and_order_rank_report(
     Ok(())
 }
 
-/// Merge one rank's completion record into rank 0's. Every rank must agree on
+/// Merges one rank's completion record into rank 0's. Every rank must agree on
 /// the semantic result; only `product_generations` are per-rank shards, which
 /// concatenate in rank order.
 fn merge_completion_record(
@@ -610,6 +627,7 @@ fn merge_completion_record(
     Ok(())
 }
 
+/// Validates that a replacement rank preserves the established worker contract.
 fn validate_replacement_info(
     expected: &WorkerInfo,
     actual: &WorkerInfo,
@@ -627,12 +645,14 @@ fn validate_replacement_info(
     Ok(())
 }
 
+/// Allocates a tensor-parallel initialization endpoint.
 fn allocate_tp_init_method() -> anyhow::Result<String> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let addr = listener.local_addr()?;
     Ok(format!("tcp://127.0.0.1:{}", addr.port()))
 }
 
+/// Returns the device assigned to a tensor-parallel rank.
 fn device_for_rank(device: &str, rank: usize, world_size: usize) -> String {
     let trimmed = device.trim();
     if world_size > 1 && matches!(trimmed, "cuda" | "gpu") {
@@ -643,10 +663,12 @@ fn device_for_rank(device: &str, rank: usize, world_size: usize) -> String {
 }
 
 impl PhysicalExecutor for MultiprocExecutor {
+    /// Returns metadata for the physical worker.
     fn physical_info(&self) -> &ExecutorInfo {
         &self.executor_info
     }
 
+    /// Broadcasts one validated physical run to every rank as a single ownership transaction.
     fn submit_run(&mut self, batch: PhysicalRun) -> Result<(), PhysicalSubmitError> {
         if self.inflight >= self.depth {
             return Err(PhysicalSubmitError::WouldBlock(batch));
@@ -709,6 +731,7 @@ impl PhysicalExecutor for MultiprocExecutor {
         Ok(())
     }
 
+    /// Waits for rank progress and returns the next fully agreed physical result.
     fn poll_run(&mut self, timeout: Duration) -> anyhow::Result<Option<RunResult>> {
         if self.command_wake_pending {
             return Ok(None);
@@ -785,10 +808,12 @@ impl PhysicalExecutor for MultiprocExecutor {
         }
     }
 
+    /// Consumes the pending command-wake notification.
     fn take_command_wake(&mut self) -> bool {
         std::mem::take(&mut self.command_wake_pending)
     }
 
+    /// Closes every rank in the physical worker group.
     fn close_physical(&mut self) -> anyhow::Result<()> {
         let mut first_error = None;
         for worker in self.workers.iter_mut() {
@@ -807,10 +832,12 @@ impl PhysicalExecutor for MultiprocExecutor {
 }
 
 impl Executor for MultiprocExecutor {
+    /// Returns the worker metadata.
     fn info(&self) -> &ExecutorInfo {
         &self.executor_info
     }
 
+    /// Lowers and submits a logical batch while preserving backpressure and result tracking.
     fn submit(&mut self, batch: Batch) -> Result<(), ExecutorSubmitError> {
         if self.inflight >= self.depth {
             return Err(ExecutorSubmitError::WouldBlock(batch));
@@ -833,6 +860,7 @@ impl Executor for MultiprocExecutor {
         }
     }
 
+    /// Polls for the next completed worker operation.
     fn poll(&mut self, timeout: Duration) -> anyhow::Result<Option<BatchResult>> {
         if self.take_command_wake() {
             return Ok(None);
@@ -846,6 +874,7 @@ impl Executor for MultiprocExecutor {
             .transpose()
     }
 
+    /// Closes the component and releases its resources.
     fn close(&mut self) -> anyhow::Result<()> {
         self.close_physical()
     }

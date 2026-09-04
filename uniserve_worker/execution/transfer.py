@@ -36,6 +36,8 @@ from .rows import LaneState, OperationState, Outcome
 
 
 def run_action(runtime: ExecutionResources, state: OperationState) -> bool:
+    """Execute product transfer, KV publication, or KV installation without a model call."""
+
     if state.phase != "initial":
         return False
     work = state.operation.kind
@@ -49,10 +51,15 @@ def run_action(runtime: ExecutionResources, state: OperationState) -> bool:
 
 
 def _prepare_media(runtime: ExecutionResources, state: OperationState) -> None:
+    """Seed and publish the initial latent trajectory for one diffusion request."""
+
     operation = state.operation
     scope = state.lane
     runtime.generation()
     request_id = operation.request_key.request_id
+
+    # Media preparation joins one visible conditioning publication to one new
+    # latent product; accepting any other arity would make ownership ambiguous.
     conditioning = tuple(
         reference for reference in operation.inputs if reference.kind is ProductKind.KV
     )
@@ -88,6 +95,9 @@ def _prepare_media(runtime: ExecutionResources, state: OperationState) -> None:
     output = latent_outputs[0]
     if int(output.generation) < 1:
         raise invalid_descriptor("media preparation latent has no logical generation")
+
+    # Noise is generated directly into request-owned staging, then installed in
+    # the pool before its generation becomes visible to downstream operations.
     row = runtime.latent_row(operation, scope)
     pool = runtime.require_latent_pool()
     row.staging.value.zero_()
@@ -104,6 +114,9 @@ def _prepare_media(runtime: ExecutionResources, state: OperationState) -> None:
         row.staging,
         latent_units=int(row.placement.latent_units),
     )
+
+    # Publication is deferred with the lane commit so a failed lane cannot
+    # expose a partially initialized trajectory.
     scope.latent_publications.append(
         LatentPublication(
             request_pool_idx=row.request_pool_idx,
@@ -130,10 +143,14 @@ def _prepare_media(runtime: ExecutionResources, state: OperationState) -> None:
         product_generations=runtime.output_generations(operation),
         products=products,
     )
+    # The operation itself is complete once all state and product publications
+    # have been staged; lane commit establishes their external visibility.
     state.phase = "done"
 
 
 def _transfer(runtime: ExecutionResources, state: OperationState) -> None:
+    """Execute a tensor transfer or KV publication/install operation and stage its result."""
+
     from . import encode
 
     operation = state.operation
@@ -239,6 +256,8 @@ def publish_product(
     source_metadata: Mapping[str, object],
     scope: LaneState,
 ) -> ProductPayload:
+    """Publish a typed device, encoder, latent, or artifact product through the selected transport."""
+
     transport = runtime.transport
     if transport is None:
         raise unsupported_setup("product publication requires a configured transport")
@@ -317,6 +336,8 @@ def fetch_product(
     operation: Operation,
     scope: LaneState,
 ) -> tuple[torch.Tensor, Mapping[str, object]]:
+    """Fetch a transfer handle and stage its typed value for the consuming operation."""
+
     for reference in operation.inputs:
         if reference.kind is ProductKind.LATENT:
             request = runtime.request_row(scope, operation.request_key.request_id)
@@ -385,6 +406,8 @@ def fetch_product(
 
 
 def metadata_uint(metadata: Mapping[str, object], name: str, default: int) -> int:
+    """Read a nonnegative integer from transfer metadata with a validated default."""
+
     value = metadata.get(name, default)
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise invalid_descriptor(f"product metadata field {name!r} must be a non-negative integer")
@@ -392,6 +415,8 @@ def metadata_uint(metadata: Mapping[str, object], name: str, default: int) -> in
 
 
 def requires_device_product_binding(reference: ProductRef) -> bool:
+    """Return whether receiving this product requires a destination device slot."""
+
     return reference.storage_class in {
         StorageClass.DEVICE_TENSOR,
         StorageClass.REQUEST_RELAY,
@@ -402,6 +427,8 @@ def requires_device_product_binding(reference: ProductRef) -> bool:
 
 
 def transferable(reference: ProductRef) -> bool:
+    """Return whether a product storage class supports transport publication."""
+
     return (
         reference.kind is ProductKind.LATENT
         or reference.kind in {ProductKind.VISION_FEATURE, ProductKind.LATENT_FEATURE}
@@ -417,6 +444,8 @@ def transferable(reference: ProductRef) -> bool:
 
 
 def metadata_string(metadata: Mapping[str, object], name: str, default: str) -> str:
+    """Read a nonempty string from transfer metadata with a validated default."""
+
     value = metadata.get(name, default)
     if not isinstance(value, str):
         raise invalid_descriptor(f"product metadata field {name!r} must be a string")
@@ -424,6 +453,8 @@ def metadata_string(metadata: Mapping[str, object], name: str, default: str) -> 
 
 
 def locator_matches_product(locator: Locator, product: ProductRef) -> bool:
+    """Verify that a transfer locator’s byte size, dtype, and shape match a product contract."""
+
     shape = tuple(int(value) for value in locator.shape)
     elements = math.prod(shape)
     bounds = product.shape_bound.dims

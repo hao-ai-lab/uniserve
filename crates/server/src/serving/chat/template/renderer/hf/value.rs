@@ -1,3 +1,5 @@
+//! MiniJinja object wrappers that preserve JSON map order and value semantics.
+
 use std::sync::Arc;
 
 use indexmap::IndexMap;
@@ -12,6 +14,7 @@ use serde_json::Value as JsonValue;
 #[serde(transparent)]
 pub(super) struct TemplateValue(minijinja::Value);
 
+/// Wraps a JSON value while preserving ordered-object template semantics.
 pub(super) fn to_template_value(value: JsonValue) -> TemplateValue {
     TemplateValue(match value {
         JsonValue::Array(values) => values
@@ -42,18 +45,22 @@ pub(super) fn to_template_value(value: JsonValue) -> TemplateValue {
 struct TemplateMap(IndexMap<String, minijinja::Value>);
 
 impl Object for TemplateMap {
+    /// Returns the template representation of the value.
     fn repr(self: &Arc<Self>) -> ObjectRepr {
         ObjectRepr::Map
     }
 
+    /// Returns an indexed child value.
     fn get_value(self: &Arc<Self>, key: &minijinja::Value) -> Option<minijinja::Value> {
         self.0.get(key.as_str()?).cloned()
     }
 
+    /// Returns a named child value.
     fn get_value_by_str(self: &Arc<Self>, key: &str) -> Option<minijinja::Value> {
         self.0.get(key).cloned()
     }
 
+    /// Returns an iterator over the value.
     fn enumerate(self: &Arc<Self>) -> Enumerator {
         self.mapped_rev_enumerator(|this| {
             Box::new(
@@ -64,10 +71,12 @@ impl Object for TemplateMap {
         })
     }
 
+    /// Returns the number of enumerable elements.
     fn enumerator_len(self: &Arc<Self>) -> Option<usize> {
         Some(self.0.len())
     }
 
+    /// Returns the result of invoking a supported template method.
     fn call_method(
         self: &Arc<Self>,
         _state: &State<'_, '_>,

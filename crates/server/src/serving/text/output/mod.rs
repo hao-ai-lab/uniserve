@@ -1,4 +1,4 @@
-//! Output processing helpers shared by text and chat layers.
+//! Decoded events, finish reasons, and logprob conversion shared by output layers.
 
 pub use decoded::{DecodedTextEvent, Finished, TextDecodeOptions, decoded_text_event_stream};
 pub(crate) use decoded::{matches_stop_string, stop_string_holdback_bytes};
@@ -21,18 +21,26 @@ use crate::serving::text::{Error, Result};
 /// Final decoded text plus terminal stream metadata.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CollectedTextOutput {
+    /// Complete decoded response text.
     pub text: String,
+    /// Prompt token identifiers submitted to the engine.
     pub prompt_token_ids: Arc<[u32]>,
+    /// Per-position prompt log probabilities, when requested.
     pub prompt_logprobs: Option<DecodedPromptLogprobs>,
+    /// Per-position generated-token log probabilities, when requested.
     pub logprobs: Option<DecodedLogprobs>,
+    /// Generated token identifiers in stream order.
     pub token_ids: Vec<u32>,
+    /// Total number of generated tokens.
     pub output_token_count: usize,
+    /// Number of generated tokens consumed by internal protocol sections.
     pub internal_token_count: usize,
+    /// Terminal condition for the request.
     pub finish_reason: FinishReason,
 }
 
 impl CollectedTextOutput {
-    /// Collect the stream to completion and return the final decoded text plus
+    /// Collects the stream to completion and returns the final decoded text plus
     /// terminal metadata.
     pub async fn collect(
         stream: impl Stream<Item = Result<DecodedTextEvent>> + Send,
@@ -99,8 +107,6 @@ impl CollectedTextOutput {
             }
         }
 
-        // Note: this is actually unreachable, as the underlying stream always emit an
-        // error on unexpected close.
         Err(Error::StreamClosedBeforeTerminalOutput {
             request_id: "unknown".to_string(),
         })

@@ -1,9 +1,12 @@
+//! Video-generation request validation and serving-input construction.
+
 use crate::serving::{ServeRequestId, VideoGenerationInput};
 
 use crate::openai::error::ApiError;
 use crate::openai::types::VideoGenerationRequest;
 use crate::openai::utils::{ResolvedRequestContext, check_model_served};
 
+/// Validates a video request and constructs a serving input.
 pub fn lower_video_generation_request(
     request: VideoGenerationRequest,
     served_model_name: &str,

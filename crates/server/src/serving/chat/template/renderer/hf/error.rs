@@ -1,6 +1,9 @@
+//! Hugging Face chat-template loading and rendering errors.
+
 use thiserror::Error as ThisError;
 
 #[derive(Debug, ThisError)]
+/// Error returned while loading, detecting, or rendering a chat template.
 pub enum TemplateError {
     #[error("failed to render jinja template")]
     Jinja(#[from] minijinja::Error),

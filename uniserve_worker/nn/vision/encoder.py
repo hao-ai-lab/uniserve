@@ -25,6 +25,8 @@ __all__ = [
 
 @dataclass(frozen=True)
 class VisionEncoderConfig:
+    """Defines patch, width, head, layer, activation, normalization, and position settings for a vision tower."""
+
     hidden_size: int
     num_attention_heads: int
     intermediate_size: int
@@ -33,7 +35,11 @@ class VisionEncoderConfig:
 
 
 class VisionSelfAttention(nn.Module):
+    """Computes packed vision self-attention using cumulative sequence boundaries."""
+
     def __init__(self, hidden_size: int, num_heads: int, *, layer_config: LayerConfig) -> None:
+        """Build packed self-attention projections after validating per-head width."""
+
         super().__init__()
         if hidden_size % num_heads != 0:
             raise ValueError("vision hidden_size must be divisible by num_attention_heads")
@@ -55,6 +61,8 @@ class VisionSelfAttention(nn.Module):
         max_seqlen: int,
         seq_lens: Sequence[int],
     ) -> torch.Tensor:
+        """Apply variable-length self-attention to packed image-token sequences."""
+
         n_tokens = x.shape[0]
         q = self.q_proj(x).view(n_tokens, self.num_heads, self.head_dim)
         k = self.k_proj(x).view(n_tokens, self.num_heads, self.head_dim)
@@ -103,7 +111,11 @@ class VisionSelfAttention(nn.Module):
 
 
 class VisionEncoderLayer(nn.Module):
+    """Composes pre-normalized packed attention and MLP residual updates for vision tokens."""
+
     def __init__(self, cfg: VisionEncoderConfig, *, layer_config: LayerConfig) -> None:
+        """Assemble one pre-normalized packed-attention and MLP residual layer."""
+
         super().__init__()
         self.layer_norm1 = nn.LayerNorm(cfg.hidden_size, eps=cfg.layer_norm_eps)
         self.self_attn = VisionSelfAttention(
@@ -127,6 +139,8 @@ class VisionEncoderLayer(nn.Module):
         max_seqlen: int,
         seq_lens: Sequence[int],
     ) -> torch.Tensor:
+        """Apply pre-normalized vision attention and MLP residual updates."""
+
         x = x + self.self_attn(
             self.layer_norm1(x),
             cu_seqlens,
@@ -138,6 +152,8 @@ class VisionEncoderLayer(nn.Module):
 
 
 class VisionEncoder(nn.Module):
+    """Projects image patches through position embeddings and a packed transformer stack."""
+
     def __init__(
         self,
         cfg: VisionEncoderConfig,
@@ -145,6 +161,8 @@ class VisionEncoder(nn.Module):
         layer_config: LayerConfig,
         post_norm: bool = True,
     ) -> None:
+        """Build the configured vision transformer stack and optional terminal norm."""
+
         super().__init__()
         self.layers = nn.ModuleList(
             VisionEncoderLayer(cfg, layer_config=layer_config) for _ in range(cfg.num_hidden_layers)
@@ -161,6 +179,8 @@ class VisionEncoder(nn.Module):
         *,
         seq_lens: Sequence[int] | None = None,
     ) -> torch.Tensor:
+        """Encode packed image tokens using explicit or inferred sequence boundaries."""
+
         if cu_seqlens is None:
             cu_seqlens = torch.tensor([0, x.shape[0]], dtype=torch.int32, device=x.device)
             if seq_lens is None:

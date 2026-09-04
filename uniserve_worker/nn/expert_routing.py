@@ -20,6 +20,8 @@ class RoutedTensor:
     flow: torch.Tensor | None
 
     def __post_init__(self) -> None:
+        """Require at least one routed tensor and validate compatible text/flow widths."""
+
         if self.text is None and self.flow is None:
             raise ValueError("routed tensor must contain text or flow tokens")
 
@@ -29,6 +31,8 @@ class RoutedTensor:
         value: torch.Tensor,
         spans: tuple[RouteSpan, ...],
     ) -> RoutedTensor:
+        """Split a packed token axis into contiguous text and flow expert tensors."""
+
         if value.ndim < 1 or not spans or spans[-1].token_end != int(value.shape[0]):
             raise ValueError("packed tensor does not match its expert spans")
         text_parts = tuple(
@@ -44,6 +48,8 @@ class RoutedTensor:
         return cls(_join(text_parts), _join(flow_parts))
 
     def packed(self, spans: tuple[RouteSpan, ...]) -> torch.Tensor:
+        """Restore text and flow tensors to the scheduler-defined packed span order."""
+
         if not spans:
             raise ValueError("packed expert layout must contain a span")
         offsets = {ExpertRoute.TEXT: 0, ExpertRoute.FLOW: 0}
@@ -71,12 +77,16 @@ class RoutedTensor:
         text: Callable[[torch.Tensor], torch.Tensor],
         flow: Callable[[torch.Tensor], torch.Tensor],
     ) -> RoutedTensor:
+        """Apply independent transforms to the populated expert tensors."""
+
         return RoutedTensor(
             None if self.text is None else text(self.text),
             None if self.flow is None else flow(self.flow),
         )
 
     def add(self, other: RoutedTensor) -> RoutedTensor:
+        """Add residuals after verifying both operands contain the same expert routes."""
+
         if (self.text is None) != (other.text is None) or (self.flow is None) != (
             other.flow is None
         ):
@@ -93,6 +103,8 @@ class RoutedTensor:
 
 
 def _join(parts: tuple[torch.Tensor, ...]) -> torch.Tensor | None:
+    """Concatenate routed tensor fragments while preserving an existing single view."""
+
     if not parts:
         return None
     if len(parts) == 1:

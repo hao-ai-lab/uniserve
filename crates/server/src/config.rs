@@ -1,3 +1,5 @@
+//! Server, engine, worker, model, and listener configuration values.
+
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -16,12 +18,23 @@ use uniserve_engine::{
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum HttpListenerMode {
     /// Bind a fresh TCP listener on the given host/port.
-    BindTcp { host: String, port: u16 },
+    BindTcp {
+        /// Host name or address passed to the TCP binder.
+        host: String,
+        /// TCP port, with zero requesting an OS-assigned ephemeral port.
+        port: u16,
+    },
     /// Bind a fresh Unix domain listener on the given filesystem path.
-    BindUnix { path: String },
+    BindUnix {
+        /// Filesystem path for the Unix domain socket.
+        path: String,
+    },
     /// Adopt an already-open listening socket inherited from a supervisor
     /// process.
-    InheritedFd { fd: i32 },
+    InheritedFd {
+        /// Nonnegative descriptor for the inherited listening socket.
+        fd: i32,
+    },
 }
 
 /// Which forward-only worker the UniServe Rust engine drives.
@@ -42,11 +55,11 @@ pub struct EngineSettings {
     pub backend: EngineBackendKind,
     /// Maximum ops assembled into one forward batch.
     pub max_batch: usize,
-    /// Per-step scheduling token budget (vLLM's `max_num_batched_tokens`).
+    /// Maximum number of tokens scheduled in one engine step.
     pub max_num_batched_tokens: usize,
-    /// Maximum concurrently running requests (vLLM's `max_num_seqs`).
+    /// Maximum number of concurrently running requests.
     pub max_num_seqs: usize,
-    /// Per-request ceiling for one prefill chunk (SGLang's chunked prefill size).
+    /// Per-request token ceiling for one prefill chunk.
     pub long_prefill_threshold: usize,
     /// Per-step budget of text prefill tokens allowed to join a decode batch
     /// as one mixed extend+decode forward. `0` disables mixing.
@@ -74,6 +87,7 @@ pub struct EngineSettings {
 }
 
 impl Default for EngineSettings {
+    /// Returns the default value.
     fn default() -> Self {
         Self {
             backend: EngineBackendKind::Worker,
@@ -140,6 +154,7 @@ pub struct Config {
 }
 
 impl Default for Config {
+    /// Returns a local TCP server configuration with Qwen3 profile defaults.
     fn default() -> Self {
         Self {
             engine: EngineSettings::default(),
@@ -166,7 +181,7 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Validate frontend configuration that can be checked before engine
+    /// Validates frontend configuration that can be checked before engine
     /// startup.
     pub fn validate(&self) -> Result<()> {
         self.validate_listener()?;
@@ -174,7 +189,7 @@ impl Config {
         Ok(())
     }
 
-    /// Reject listener configurations that can never bind successfully. Port 0
+    /// Rejects listener configurations that cannot bind successfully. Port 0
     /// is intentionally allowed: it requests an OS-assigned ephemeral port.
     fn validate_listener(&self) -> Result<()> {
         match &self.listener_mode {
@@ -208,7 +223,7 @@ impl EngineSettings {
     /// encoded media remains in its shared-memory segment.
     pub const MEDIA_IPC_SLOT_CAP: usize = 256 << 10;
 
-    /// Reject numeric engine settings that are structurally required to be
+    /// Rejects numeric engine settings that are structurally required to be
     /// positive (they index, divide, or bound scheduling). This catches a `0`
     /// override before it reaches the scheduler or KV sizing math.
     pub fn validate(&self) -> Result<()> {

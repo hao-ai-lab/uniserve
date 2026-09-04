@@ -1,3 +1,6 @@
+//! Build-time generation of Rust bindings for the worker FlatBuffers schema.
+
+/// Compiles the schema with the owned-object API used by the IPC codec.
 fn main() {
     let flatc = flatc_fork::flatc();
     flatbuffers_build::BuilderOptions::new_with_files(["schema/worker.fbs"])

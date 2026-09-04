@@ -1,3 +1,5 @@
+//! Public OpenAI-compatible wire schemas.
+
 mod chat_completions;
 mod common;
 mod images;

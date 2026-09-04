@@ -1,4 +1,5 @@
-"""Visible-end CUTE mask used by UniServe mixed forward attention."""
+"""Defines the per-query visible-end mask for jagged forward attention."""
+
 from __future__ import annotations
 
 import cutlass
@@ -23,6 +24,8 @@ def hybrid_multimodal_mask(
     aux_tensors: list,
     aux_scalars: list,
 ) -> cute.TensorSSA:
+    """Keep key positions below the visible-end limit for each batch/query pair."""
+
     del head, seqlen_info, aux_scalars
     visible_end = aux_tensors[0]
     limit = scalar_to_ssa(visible_end[batch[0], q_idx[0]], cutlass.Int32)

@@ -16,6 +16,8 @@ from .rows import ForwardRow
 
 
 def columns(runtime, tasks: tuple[ForwardRow, ...]) -> dict[str, object]:
+    """Build packed attention mode, sequence, cache, position, and route tensors for forward rows."""
+
     if not tasks:
         raise invalid_descriptor("attention metadata requires forward rows")
     groups = {int(task.group_id) for task in tasks}
@@ -115,6 +117,8 @@ def columns(runtime, tasks: tuple[ForwardRow, ...]) -> dict[str, object]:
 
 
 def dense_columns(row_count: int, query_lens: Sequence[int]) -> dict[str, object]:
+    """Build cumulative query offsets and maximum lengths for dense packed rows."""
+
     lengths = tuple(int(value) for value in query_lens)
     return {
         "forward_mode": AttentionMode.DENSE,
@@ -136,6 +140,8 @@ def _packed_columns(
     width: int,
     runtime,
 ) -> dict[str, object]:
+    """Build packed attention boundaries, cache tables, write locations, and route spans."""
+
     max_query = bucketed_length(max(query_lens))
     visible = torch.zeros((len(tasks), max_query), dtype=torch.int32)
     indexes: list[torch.Tensor] = []
@@ -143,6 +149,8 @@ def _packed_columns(
     offset = 0
 
     def append_span(route: ExpertRoute, count: int) -> None:
+        """Append rows to the packed route, coalescing adjacent spans with the same expert."""
+
         nonlocal offset
         if count < 1:
             return
@@ -204,6 +212,8 @@ def _output_locations(
     write_rows: Sequence[bool],
     block_size: int,
 ) -> torch.Tensor:
+    """Map newly computed query rows to physical page and offset destinations."""
+
     values: list[int] = []
     for row_pages, prefix, query, write in zip(
         pages, seq_lens, query_lens, write_rows, strict=True
@@ -221,6 +231,8 @@ def _output_locations(
 
 
 def _three_axis_positions(positions: torch.Tensor | None, query: int) -> torch.Tensor:
+    """Validate and normalize optional positions to three axes by query row."""
+
     if positions is None:
         return torch.zeros((3, query), dtype=torch.long)
     if positions.ndim == 1 and int(positions.numel()) == query:
@@ -231,6 +243,8 @@ def _three_axis_positions(positions: torch.Tensor | None, query: int) -> torch.T
 
 
 def _cumulative(lengths: Sequence[int]) -> torch.Tensor:
+    """Build cumulative row offsets from host lengths."""
+
     values = [0]
     for length in lengths:
         values.append(values[-1] + int(length))
@@ -238,6 +252,8 @@ def _cumulative(lengths: Sequence[int]) -> torch.Tensor:
 
 
 def _binding_identity(tasks: Sequence[ForwardRow]) -> int:
+    """Return a shared attention binding when every forward row agrees."""
+
     hasher = hashlib.blake2b(digest_size=8)
     for task in tasks:
         hasher.update(int(task.operation.request_key.request_id).to_bytes(8, "little"))

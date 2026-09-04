@@ -1,4 +1,4 @@
-//! Shared value types and geometry used by the two configured omni descriptions.
+//! Shared contracts and model-specific profiles for multimodal generation.
 
 pub mod bagel;
 pub mod resolution;
@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::profile::assets::{self, Error as AssetError};
 use crate::profile::tokenizer::HuggingFaceTokenizer;
 
+/// Returns the storage width in bytes for a model dtype.
 pub(super) const fn model_dtype_bytes(dtype: uniserve_core::ModelDtype) -> u64 {
     match dtype {
         uniserve_core::ModelDtype::Float16 | uniserve_core::ModelDtype::BFloat16 => 2,
@@ -17,42 +18,68 @@ pub(super) const fn model_dtype_bytes(dtype: uniserve_core::ModelDtype) -> u64 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Model-token controls for switching between understanding and generation.
 pub struct GenerationControls {
+    /// Beginning-of-sequence token identifier.
     pub bos: u32,
+    /// End-of-sequence token identifier.
     pub eos: u32,
+    /// Token identifier that opens generated image content.
     pub start_of_image: u32,
+    /// Token identifier that closes generated image content.
     pub end_of_image: u32,
+    /// Tokenizer text corresponding to [`Self::start_of_image`].
     pub start_of_image_text: String,
+    /// Tokenizer text corresponding to [`Self::end_of_image`].
     pub end_of_image_text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Profile-provided defaults for output image generation.
 pub struct ImageGenerationDefaults {
+    /// Default named output resolution.
     pub resolution: resolution::ResolutionName,
+    /// Default diffusion step count.
     pub steps: u16,
+    /// Default classifier-free guidance scale for text conditioning.
     pub cfg_text_scale: f32,
+    /// Default classifier-free guidance scale for image conditioning.
     pub cfg_img_scale: f32,
+    /// Default guidance renormalization algorithm.
     pub cfg_renorm_type: uniserve_core::CfgRenorm,
+    /// Minimum scale at which guidance renormalization applies.
     pub cfg_renorm_min: f32,
+    /// Fractional diffusion interval over which guidance applies.
     pub cfg_interval: (f32, f32),
+    /// Default diffusion timestep shift.
     pub timestep_shift: f32,
+    /// Optional deterministic sampling seed.
     pub seed: Option<u64>,
+    /// Default maximum number of images generated for one request.
     pub max_images: u16,
+    /// Hard profile limit on generated images per request.
     pub max_images_limit: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Start and end delimiters for a filtered text section.
 pub struct DelimitedTextPolicy {
+    /// Text delimiter that opens the section.
     pub start: String,
+    /// Text delimiter that closes the section.
     pub end: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Model-selected filters applied to generated assistant text.
 pub struct OutputFilterPolicy {
+    /// Optional section whose contents are exposed as reasoning.
     pub reasoning: Option<DelimitedTextPolicy>,
+    /// Sections whose delimiters are removed while their contents remain visible.
     pub visible_wrappers: Vec<DelimitedTextPolicy>,
 }
 
+/// Resolves a required special-token string from tokenizer metadata.
 pub(super) fn required_token(
     tokenizer: &HuggingFaceTokenizer,
     token: &str,
@@ -68,6 +95,7 @@ pub(super) fn required_token(
         })
 }
 
+/// Resolves the unique token identifier for a required token string.
 pub(super) fn required_token_id(
     tokenizer: &HuggingFaceTokenizer,
     token: &str,
@@ -76,6 +104,7 @@ pub(super) fn required_token_id(
     required_token(tokenizer, token, role).map(|(id, _)| id)
 }
 
+/// Encodes prompt text without automatically adding special tokens.
 pub(super) fn encode(
     tokenizer: &HuggingFaceTokenizer,
     text: &str,
@@ -83,6 +112,7 @@ pub(super) fn encode(
     tokenizer.encode(text, false)
 }
 
+/// Renders a minimal ChatML prompt with an open assistant turn.
 pub(super) fn chatml(system: Option<&str>, user: &str, assistant_suffix: &str) -> String {
     let mut output = String::new();
     if let Some(system) = system {
@@ -97,6 +127,7 @@ pub(super) fn chatml(system: Option<&str>, user: &str, assistant_suffix: &str) -
     output
 }
 
+/// Computes visual token count after stride-aligned resizing.
 pub(super) fn stride_resize_tokens(
     width: u32,
     height: u32,
@@ -118,6 +149,7 @@ pub(super) fn stride_resize_tokens(
     dimensions_to_tokens(dimensions, token_stride, marker_tokens)
 }
 
+/// Computes visual token count under pixel-area and aspect-ratio bounds.
 pub(super) fn pixel_bound_tokens(
     width: u32,
     height: u32,
@@ -131,6 +163,7 @@ pub(super) fn pixel_bound_tokens(
     dimensions_to_tokens(dimensions, token_stride, marker_tokens)
 }
 
+/// Converts image dimensions into model token counts.
 fn dimensions_to_tokens(
     (width, height): (u32, u32),
     token_stride: u32,
@@ -151,6 +184,7 @@ fn dimensions_to_tokens(
         .map_err(|_| AssetError::invalid("image token count exceeds the engine range"))
 }
 
+/// Resizes dimensions within side and pixel limits while preserving stride alignment.
 fn stride_resize(
     width: u32,
     height: u32,
@@ -179,6 +213,7 @@ fn stride_resize(
     Ok(resized)
 }
 
+/// Scales both dimensions and rounds them to positive stride multiples.
 fn scale_to_stride(width: u32, height: u32, scale: f64, stride: u32) -> (u32, u32) {
     let scale_one = |value: u32| {
         let scaled = (f64::from(value) * scale).round_ties_even();
@@ -188,6 +223,7 @@ fn scale_to_stride(width: u32, height: u32, scale: f64, stride: u32) -> (u32, u3
     (scale_one(width), scale_one(height))
 }
 
+/// Resizes dimensions to factor-aligned values within configured pixel-area bounds.
 fn pixel_bound_resize(
     width: u32,
     height: u32,

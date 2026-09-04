@@ -52,10 +52,11 @@ class WorkerErrorCode(StrEnum):
 
 
 class ErrorPolicy(NamedTuple):
-    """Per-class behavior. ``fatal`` means the worker can no longer be trusted to
-    serve further requests and the host should tear it down; non-fatal errors
-    fail only the offending request/op. ``capture_trace`` marks the severe subset
-    whose log line should include a stack trace.
+    """Define the handling policy for an error class.
+
+    Fatal errors leave the worker unsafe for further requests and require host
+    teardown; non-fatal errors fail only the offending request or operation.
+    ``capture_trace`` marks errors whose log record includes a stack trace.
     """
 
     retryable: bool
@@ -83,7 +84,7 @@ _POLICY: dict[WorkerErrorCode, ErrorPolicy] = {
 
 
 def should_capture_trace(code: WorkerErrorCode) -> bool:
-    """Whether an error of this class warrants a stack trace in its log line.
+    """Return whether an error of this class warrants a stack trace in its log line.
 
     The single source for that decision so the request handler shares one policy table.
     """
@@ -107,9 +108,13 @@ class WorkerError(Exception):
     details: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        """Initialize the exception message from the classified worker error fields."""
+
         Exception.__init__(self, f"{self.code}: {self.message}")
 
     def to_mapping(self) -> dict[str, Any]:
+        """Serialize the stable error code, message, fatal flag, and optional operation context."""
+
         # Only the fields modeled on the Rust WorkerResponse cross the IPC boundary.
         # Richer context (req_id, op_id, op_kind, details) stays local
         # for logging and metrics.
@@ -139,6 +144,8 @@ class InputError(WorkerError):
     """A staged execution input is invalid for its declared route."""
 
     def __init__(self, message: str, **kw: Any) -> None:
+        """Create a request-scoped input failure with the configured retry policy."""
+
         policy = _POLICY[WorkerErrorCode.INPUT_ERROR]
         kw.setdefault("retryable", policy.retryable)
         kw.setdefault("fatal", policy.fatal)
@@ -149,6 +156,8 @@ class ComputeError(WorkerError):
     """Neural execution or raw-output validation failed."""
 
     def __init__(self, message: str, **kw: Any) -> None:
+        """Create a request-scoped execution failure with the configured retry policy."""
+
         policy = _POLICY[WorkerErrorCode.COMPUTE_ERROR]
         kw.setdefault("retryable", policy.retryable)
         kw.setdefault("fatal", policy.fatal)
@@ -159,6 +168,8 @@ class ResourceError(WorkerError):
     """Graph, device, allocation, communication, or residency failed."""
 
     def __init__(self, message: str, **kw: Any) -> None:
+        """Create a resource failure with the configured retry and fatality policy."""
+
         policy = _POLICY[WorkerErrorCode.RESOURCE_ERROR]
         kw.setdefault("retryable", policy.retryable)
         kw.setdefault("fatal", policy.fatal)
@@ -166,26 +177,23 @@ class ResourceError(WorkerError):
 
 
 def _make(code: WorkerErrorCode, message: str, **kw: Any) -> WorkerError:
+    """Construct a classified worker error with shared contextual fields."""
+
     policy = _POLICY.get(code, _DEFAULT_POLICY)
     kw.setdefault("retryable", policy.retryable)
     kw.setdefault("fatal", policy.fatal)
     return WorkerError(code=code, message=message, **kw)
 
 
-# OOM signals. We cannot import torch here (errors must classify without GPU
-# deps), so OOM is detected structurally first — by walking the exception's
-# class hierarchy names, which catches ``torch.cuda.OutOfMemoryError`` and any
-# subclass/alias regardless of the leaf name — and only then by message text as
-# a fallback for the common case where CUDA OOM surfaces as a plain
-# ``RuntimeError`` carrying "CUDA out of memory" / "out of memory".
+# Error classification cannot import the GPU runtime. Detect OOM structurally
+# through exception hierarchy names, then recognize plain runtime errors by
+# their stable allocation-failure messages.
 _OOM_TYPE_TOKENS = ("outofmemory",)
 _OOM_TEXT_TOKENS = ("out of memory", "cuda oom", "cublas_status_alloc_failed")
 
-# Context-corrupting CUDA failures: once the CUDA context hits one of these the
-# worker can no longer be trusted to serve any further request, so it is
-# classified FATAL (host tears the worker down) rather than failing only the
-# offending op. Matched by message text since the leaf exception is usually a
-# plain RuntimeError.
+# Context-corrupting CUDA failures leave the worker unsafe for further requests
+# and require host teardown. Match their messages because the leaf exception is
+# usually a plain RuntimeError.
 _FATAL_CUDA_TEXT_TOKENS = (
     "illegal memory access",
     "cudaerrorillegaladdress",
@@ -201,6 +209,8 @@ _FATAL_CUDA_TEXT_TOKENS = (
 
 
 def _looks_like_oom(exc: BaseException, lowered_msg: str) -> bool:
+    """Return whether an exception type or message denotes resource exhaustion."""
+
     for cls in type(exc).__mro__:
         lname = cls.__name__.lower()
         if any(tok in lname for tok in _OOM_TYPE_TOKENS):
@@ -209,10 +219,14 @@ def _looks_like_oom(exc: BaseException, lowered_msg: str) -> bool:
 
 
 def _looks_like_fatal_cuda(lowered_msg: str) -> bool:
+    """Return whether an error message denotes an unrecoverable CUDA context failure."""
+
     return any(tok in lowered_msg for tok in _FATAL_CUDA_TEXT_TOKENS)
 
 
 def unsupported_control(name: str) -> WorkerError:
+    """Create a classified error for an unrecognized control-plane request."""
+
     return _make(
         WorkerErrorCode.UNSUPPORTED_CONTROL,
         f"control {name!r} is not supported by this worker",
@@ -220,6 +234,8 @@ def unsupported_control(name: str) -> WorkerError:
 
 
 def unsupported_operation(kind: str, req_id: int | None = None) -> WorkerError:
+    """Create a classified error for an operation kind unavailable on this worker."""
+
     return _make(
         WorkerErrorCode.UNSUPPORTED_OPERATION,
         f"op kind {kind!r} is not supported by this worker",
@@ -229,28 +245,36 @@ def unsupported_operation(kind: str, req_id: int | None = None) -> WorkerError:
 
 
 def invalid_descriptor(message: str, **kw: Any) -> WorkerError:
+    """Create a classified error for malformed scheduler or transport input."""
+
     return _make(WorkerErrorCode.INVALID_DESCRIPTOR, message, **kw)
 
 
 def unsupported_setup(message: str, **kw: Any) -> WorkerError:
+    """Create a classified error for launch configuration the runtime cannot provide."""
+
     return _make(WorkerErrorCode.UNSUPPORTED_SETUP, message, **kw)
 
 
 def compute_error(message: str, **kw: Any) -> ComputeError:
+    """Create a nonfatal classified error for model execution failure."""
+
     return ComputeError(message, **kw)
 
 
 def resource_error(message: str, **kw: Any) -> ResourceError:
+    """Create a classified error for exhausted or unavailable runtime resources."""
+
     return ResourceError(message, **kw)
 
 
 def distributed_setup_error(message: str, **kw: Any) -> WorkerError:
-    """Tensor-parallel/distributed initialization failure.
+    """Classify unavailable or invalid distributed topology as unsupported setup.
 
-    Reported as an unsupported setup: the worker cannot
-    provide the requested multi-rank topology (missing torch.distributed, a
-    misconfigured world size, or no rendezvous address).
+    The nonfatal classification rejects worker construction without attributing
+    the failure to an individual request operation.
     """
+
     return _make(WorkerErrorCode.UNSUPPORTED_SETUP, message, **kw)
 
 

@@ -27,6 +27,8 @@ _FUSED_ABSMAX_BLOCK = 1 << 16
 
 @dataclass(frozen=True, slots=True)
 class NvFp4Activation:
+    """Holds packed FP4 activations, block scales, global scale, and original shape."""
+
     packed: torch.Tensor
     block_scale: torch.Tensor
     scale_2: torch.Tensor
@@ -34,6 +36,8 @@ class NvFp4Activation:
 
 
 def _flashinfer() -> Any:
+    """Import and return FlashInfer activation-quantization operators."""
+
     import flashinfer
 
     return flashinfer
@@ -46,6 +50,8 @@ def _absmax_partial_kernel(
     elements: tl.constexpr,
     block: tl.constexpr,
 ):
+    """Reduce one source block into a partial absolute maximum."""
+
     offsets = tl.program_id(0) * block + tl.arange(0, block)
     values = tl.load(source + offsets, mask=offsets < elements, other=0.0)
     tl.store(partials + tl.program_id(0), tl.max(tl.abs(values), axis=0))
@@ -58,6 +64,8 @@ def _absmax_finish_kernel(
     count: tl.constexpr,
     block: tl.constexpr,
 ):
+    """Reduce partial maxima into one global absolute maximum."""
+
     offsets = tl.arange(0, block)
     values = tl.load(partials + offsets, mask=offsets < count, other=-float("inf"))
     tl.store(output, tl.max(values, axis=0))
@@ -65,6 +73,8 @@ def _absmax_finish_kernel(
 
 @torch.library.custom_op("uniserve_worker::nvfp4_absmax", mutates_args=())
 def _nvfp4_absmax(value: torch.Tensor) -> torch.Tensor:
+    """Compute one finite absolute maximum per NVFP4 quantization group."""
+
     if value.device.type != "cuda" or value.dtype != torch.bfloat16:
         raise RuntimeError("fused NVFP4 abs-max requires a CUDA bfloat16 tensor")
     if not value.is_contiguous():
@@ -93,14 +103,20 @@ def _nvfp4_absmax(value: torch.Tensor) -> torch.Tensor:
 
 @_nvfp4_absmax.register_fake
 def _nvfp4_absmax_fake(value: torch.Tensor) -> torch.Tensor:
+    """Infer the scalar absolute-maximum output for custom-op tracing."""
+
     return value.new_empty(())
 
 
 def _scale_2_from_absmax(maximum: torch.Tensor) -> torch.Tensor:
+    """Convert an absolute maximum into the second-level NVFP4 scale."""
+
     return maximum.float().clamp_min(_SCALE_EPS) / _NVFP4_MAX
 
 
 def _global_scale_2(value: torch.Tensor) -> torch.Tensor:
+    """Derive a finite distributed activation scale shared across tensor-parallel ranks."""
+
     if (
         value.device.type == "cuda"
         and value.dtype == torch.bfloat16
@@ -118,6 +134,8 @@ def _nvfp4_quantize_128x4(
     value: torch.Tensor,
     inverse_global_scale: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize activations into packed 128x4 NVFP4 blocks and hierarchical scales."""
+
     flashinfer = _flashinfer()
     return flashinfer.nvfp4_quantize(
         value,
@@ -132,6 +150,8 @@ def _nvfp4_quantize_128x4_fake(
     value: torch.Tensor,
     inverse_global_scale: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Infer packed NVFP4 value and scale tensor shapes for custom-op tracing."""
+
     del inverse_global_scale
     rows, width = value.shape
     scale_rows = ((rows + 127) // 128) * 128
@@ -147,6 +167,8 @@ def _nvfp4_quantize_linear(
     value: torch.Tensor,
     inverse_global_scale: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a flattened activation matrix into NVFP4 values and block scales."""
+
     flashinfer = _flashinfer()
     return flashinfer.nvfp4_quantize(
         value,
@@ -162,6 +184,8 @@ def _nvfp4_quantize_linear_fake(
     value: torch.Tensor,
     inverse_global_scale: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Infer linear-layout NVFP4 value and scale tensors for custom-op tracing."""
+
     del inverse_global_scale
     rows, width = value.shape
     return (
@@ -172,11 +196,15 @@ def _nvfp4_quantize_linear_fake(
 
 @torch.library.custom_op("uniserve_worker::nvfp4_interleave_scale", mutates_args=())
 def _nvfp4_interleave_scale(linear_scale: torch.Tensor) -> torch.Tensor:
+    """Reorder linear block scales into the GEMM kernel's interleaved layout."""
+
     return _flashinfer().block_scale_interleave(linear_scale)
 
 
 @_nvfp4_interleave_scale.register_fake
 def _nvfp4_interleave_scale_fake(linear_scale: torch.Tensor) -> torch.Tensor:
+    """Infer the interleaved scale tensor shape for custom-op tracing."""
+
     rows, columns = linear_scale.shape
     padded_rows = ((rows + 127) // 128) * 128
     padded_columns = ((columns + 3) // 4) * 4
@@ -191,6 +219,8 @@ def _nvfp4_mm_bf16(
     right_scale: torch.Tensor,
     alpha: torch.Tensor,
 ) -> torch.Tensor:
+    """Run scaled NVFP4 matrix multiplication and return BF16 output."""
+
     return _flashinfer().mm_fp4(
         left,
         right,
@@ -210,6 +240,8 @@ def _nvfp4_mm_bf16_fake(
     right_scale: torch.Tensor,
     alpha: torch.Tensor,
 ) -> torch.Tensor:
+    """Infer BF16 matrix-product geometry for the NVFP4 custom op."""
+
     del left_scale, right_scale, alpha
     return left.new_empty((left.shape[0], right.shape[1]), dtype=torch.bfloat16)
 
@@ -222,6 +254,8 @@ def _nvfp4_mm_bf16_cute(
     right_scale: torch.Tensor,
     alpha: torch.Tensor,
 ) -> torch.Tensor:
+    """Dispatch scaled NVFP4 matrix multiplication through the CuTe implementation."""
+
     return _flashinfer().mm_fp4(
         left,
         right,
@@ -242,6 +276,8 @@ def _nvfp4_mm_bf16_cute_fake(
     right_scale: torch.Tensor,
     alpha: torch.Tensor,
 ) -> torch.Tensor:
+    """Infer BF16 matrix-product geometry for the CuTe NVFP4 custom op."""
+
     del left_scale, right_scale, alpha
     return left.new_empty((left.shape[0], right.shape[1]), dtype=torch.bfloat16)
 
@@ -260,6 +296,8 @@ class DynamicW4A4NvFp4LinearMethod(QuantizeMethodBase):
         bias: bool,
         **_: object,
     ) -> None:
+        """Register BF16 staging weights whose dimensions satisfy NVFP4 packing alignment."""
+
         if int(input_size) % 16 or int(output_size) % 16:
             raise ValueError("NVFP4 linear dimensions must be divisible by 16")
         module.register_parameter(
@@ -282,6 +320,8 @@ class DynamicW4A4NvFp4LinearMethod(QuantizeMethodBase):
 
     @torch.no_grad()
     def process_weights_after_loading(self, module: nn.Module) -> None:
+        """Quantize loaded BF16 weights into SM100 NVFP4 values and block scales."""
+
         from ..linear import LinearBase
 
         linear = cast(LinearBase, module)
@@ -307,6 +347,8 @@ class DynamicW4A4NvFp4LinearMethod(QuantizeMethodBase):
         *,
         absmax: torch.Tensor | None = None,
     ) -> NvFp4Activation:
+        """Pack BF16 activations and retain block/global scales plus leading shape."""
+
         if x.dtype != torch.bfloat16:
             raise RuntimeError("NVFP4 linear execution requires bfloat16 activations")
         original_shape = tuple(int(size) for size in x.shape[:-1])
@@ -330,6 +372,8 @@ class DynamicW4A4NvFp4LinearMethod(QuantizeMethodBase):
         *,
         include_bias: bool,
     ) -> torch.Tensor:
+        """Multiply a packed activation by finalized FP4 weights with optional bias."""
+
         from ..linear import LinearBase
 
         linear = cast(LinearBase, module)
@@ -355,6 +399,8 @@ class DynamicW4A4NvFp4LinearMethod(QuantizeMethodBase):
         *,
         include_bias: bool,
     ) -> torch.Tensor:
+        """Quantize activations, execute packed FP4 GEMM, and optionally add bias."""
+
         return self.apply_packed(
             module,
             self.quantize_activation(x),
@@ -362,9 +408,13 @@ class DynamicW4A4NvFp4LinearMethod(QuantizeMethodBase):
         )
 
     def apply(self, module: nn.Module, x: torch.Tensor) -> torch.Tensor:
+        """Dynamically quantize BF16 input and execute the finalized FP4 linear."""
+
         return self._apply(module, x, include_bias=True)
 
     def apply_unbiased(self, module: nn.Module, x: torch.Tensor) -> torch.Tensor:
+        """Execute the FP4 linear while deferring its bias to a fused consumer."""
+
         return self._apply(module, x, include_bias=False)
 
     def apply_sequence_parallel(
@@ -376,6 +426,8 @@ class DynamicW4A4NvFp4LinearMethod(QuantizeMethodBase):
         *,
         group: str,
     ) -> torch.Tensor:
+        """Quantize rank-local rows, gather packed rows/scales, and project the global sequence."""
+
         from ..linear import LinearBase
         from ..mesh import DeviceMesh
 
@@ -388,6 +440,8 @@ class DynamicW4A4NvFp4LinearMethod(QuantizeMethodBase):
         if x.dtype != torch.bfloat16:
             raise RuntimeError("sequence-parallel NVFP4 execution requires bfloat16 activations")
 
+        # A shared global scale keeps independently quantized rank shards in one
+        # numeric domain before their packed values and block scales are gathered.
         input_scale_2 = _global_scale_2(x)
         device_mesh.all_reduce_max(input_scale_2, group)
         local_packed, local_scale = _nvfp4_quantize_linear(
@@ -404,6 +458,7 @@ class DynamicW4A4NvFp4LinearMethod(QuantizeMethodBase):
                 f"NVFP4 sequence-parallel workspace requires {required_elements} bytes, "
                 f"got {workspace.numel()}"
             )
+        # The byte workspace stores packed nibbles followed by linear-layout scales.
         gathered_packed = workspace[:packed_elements].view(
             global_rows,
             int(x.shape[1]) // 2,
@@ -430,6 +485,8 @@ class NvFp4Linear(nn.Module):
     """A load-finalized NVFP4 replacement for an ordinary dense linear."""
 
     def __init__(self, source: nn.Linear) -> None:
+        """Copy a dense layer into BF16 staging parameters for load-time NVFP4 packing."""
+
         super().__init__()
         self.input_size = int(source.in_features)
         self.output_size = int(source.out_features)
@@ -448,9 +505,13 @@ class NvFp4Linear(nn.Module):
         self.quant_method.process_weights_after_loading(self)
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
+        """Project values through resident FP4 weights, including the source bias."""
+
         return self.quant_method.apply(self, value.to(torch.bfloat16))
 
     def forward_unbiased(self, value: torch.Tensor) -> torch.Tensor:
+        """Project values while returning bias application to the caller."""
+
         return self.quant_method.apply_unbiased(self, value.to(torch.bfloat16))
 
     def quantize_activation(
@@ -459,6 +520,8 @@ class NvFp4Linear(nn.Module):
         *,
         absmax: torch.Tensor | None = None,
     ) -> NvFp4Activation:
+        """Pack an activation once for reuse by multiple FP4 projections."""
+
         return self.quant_method.quantize_activation(
             value.to(torch.bfloat16),
             absmax=absmax,
@@ -470,6 +533,8 @@ class NvFp4Linear(nn.Module):
         *,
         include_bias: bool,
     ) -> torch.Tensor:
+        """Project a reusable packed activation with optional bias application."""
+
         return self.quant_method.apply_packed(
             self,
             activation,

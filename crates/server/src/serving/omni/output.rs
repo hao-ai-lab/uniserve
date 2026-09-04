@@ -1,19 +1,24 @@
+//! Multimodal output filters selected by model profiles.
+
 use crate::profile::omni::{DelimitedTextPolicy, OutputFilterPolicy};
 use crate::profile::reasoning::DelimitedReasoningParser;
 use crate::serving::text::tokenizer::DynTokenizer;
 
+/// Stateful SenseNova reasoning and visible-wrapper filter.
 pub(crate) struct SenseNovaOutputProcessor {
     reasoning: Option<DelimitedReasoningParser>,
     visible_wrappers: VisibleWrapperFilter,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
+/// Visible and reasoning text emitted by one filter update.
 pub(crate) struct SenseNovaTextDelta {
     pub(crate) visible: String,
     pub(crate) reasoning: String,
 }
 
 impl SenseNovaOutputProcessor {
+    /// Creates the output filter selected by a SenseNova profile.
     pub(crate) fn new(
         policy: OutputFilterPolicy,
         tokenizer: DynTokenizer,
@@ -33,6 +38,7 @@ impl SenseNovaOutputProcessor {
         })
     }
 
+    /// Applies one decoded text fragment and returns semantic deltas.
     pub(crate) fn push(&mut self, text: &str) -> SenseNovaTextDelta {
         let (content, reasoning) = if let Some(parser) = self.reasoning.as_mut() {
             let delta = parser.push(text);
@@ -56,6 +62,7 @@ struct VisibleWrapperFilter {
 }
 
 impl VisibleWrapperFilter {
+    /// Creates an output extractor for the configured marker set.
     fn new(wrappers: Vec<DelimitedTextPolicy>) -> Self {
         Self {
             wrappers,
@@ -63,6 +70,7 @@ impl VisibleWrapperFilter {
         }
     }
 
+    /// Removes configured wrapper delimiters while retaining incomplete marker prefixes.
     fn push(&mut self, text: &str) -> String {
         if self.wrappers.is_empty() {
             return text.to_string();
@@ -87,6 +95,7 @@ impl VisibleWrapperFilter {
         visible
     }
 
+    /// Returns all configured output markers.
     fn markers(&self) -> Vec<&str> {
         let mut markers = Vec::new();
         for wrapper in &self.wrappers {
@@ -96,6 +105,7 @@ impl VisibleWrapperFilter {
         markers
     }
 
+    /// Returns the earliest complete output marker.
     fn first_marker(&self) -> Option<(usize, usize)> {
         let mut matches = Vec::new();
         for wrapper in &self.wrappers {
@@ -109,6 +119,7 @@ impl VisibleWrapperFilter {
     }
 }
 
+/// Returns the longest suffix matching any marker prefix.
 fn trailing_marker_prefix_len_any(text: &str, markers: &[&str]) -> usize {
     markers
         .iter()
@@ -117,6 +128,7 @@ fn trailing_marker_prefix_len_any(text: &str, markers: &[&str]) -> usize {
         .unwrap_or(0)
 }
 
+/// Returns the suffix length matching a marker prefix.
 fn trailing_marker_prefix_len(text: &str, marker: &str) -> usize {
     let max = text.len().min(marker.len().saturating_sub(1));
     for len in (1..=max).rev() {

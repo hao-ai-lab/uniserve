@@ -67,6 +67,8 @@ _next_buffer_generation = 1
 
 
 def _invariant(message: str) -> WorkerError:
+    """Construct a classified invariant error for output-buffer misuse."""
+
     return WorkerError(
         code=WorkerErrorCode.INVARIANT_VIOLATION,
         message=message,
@@ -83,9 +85,13 @@ class TokenCapture:
     count: int
 
     def ready(self) -> bool:
+        """Indicate whether the token copy event has completed."""
+
         return self.buffer.ready()
 
     def values(self) -> tuple[int, ...]:
+        """Read this row's captured tokens after the owning buffer becomes ready."""
+
         return self.buffer.read_tokens(self)
 
 
@@ -100,12 +106,18 @@ class ByteCapture:
     external: torch.Tensor | None = None
 
     def ready(self) -> bool:
+        """Indicate whether the byte-range copy event has completed."""
+
         return self.buffer.ready()
 
     def tensor(self) -> torch.Tensor:
+        """Expose this capture's shaped CPU byte view after readiness."""
+
         return self.buffer.read_bytes(self)
 
     def numpy(self) -> Any:
+        """Return the captured byte range as a shaped NumPy view after readiness."""
+
         if self.external is not None:
             if int(self.external.numel()) != int(self.count):
                 raise _invariant("external completion byte storage has an invalid extent")
@@ -154,6 +166,8 @@ class OutputBuffer:
         event_pool: DeviceEventPool,
         release_to_pool: Callable[[OutputBuffer], None] | None = None,
     ) -> None:
+        """Reserve pinned completion rows and generation-tagged CUDA copy state."""
+
         global _next_buffer_generation
         count = int(rows)
         capacity = int(token_capacity)
@@ -261,13 +275,19 @@ class OutputBuffer:
 
     @property
     def generation(self) -> int:
+        """Identify the lease generation guarding all captures from this buffer use."""
+
         return self._generation
 
     @property
     def row_count(self) -> int:
+        """Count completion rows reserved by the active buffer lease."""
+
         return self._rows
 
     def register_device(self, device: torch.device | str) -> None:
+        """Verify that a CUDA producer belongs to the devices declared for this lease."""
+
         if self._sealed:
             raise _invariant("completion device was registered after its buffer was sealed")
         target = canonical_device(device)
@@ -275,6 +295,8 @@ class OutputBuffer:
             raise _invariant("completion work uses an undeclared CUDA device")
 
     def begin_device(self, device: torch.device | str) -> None:
+        """Mark device execution start and record its optional timing event."""
+
         if self._sealed:
             raise _invariant("completion device timing began after its buffer was sealed")
         target = canonical_device(device)
@@ -294,6 +316,8 @@ class OutputBuffer:
         self._start_events[name] = event
 
     def _mark_copy_started(self, device: torch.device) -> None:
+        """Record the stream event that protects one device-to-host completion copy."""
+
         if self._copy_started_ns == 0:
             self._copy_started_ns = time.perf_counter_ns()
         name = str(device)
@@ -309,6 +333,8 @@ class OutputBuffer:
         self._producer_events[name] = event
 
     def capture(self, tokens: torch.Tensor) -> TokenCapture:
+        """Copy a token tensor into the next bounded span of pinned host storage."""
+
         if self._sealed:
             raise _invariant("completion capture was registered after its buffer was sealed")
         flat = tokens.reshape(-1).to(dtype=torch.long)
@@ -331,6 +357,8 @@ class OutputBuffer:
         return TokenCapture(self, offset, count)
 
     def capture_bytes(self, value: torch.Tensor) -> ByteCapture:
+        """Copy a contiguous uint8 tensor into the byte region growing from the buffer tail."""
+
         if value.dtype is not torch.uint8:
             raise ValueError("completion byte capture requires uint8 storage")
         if self._sealed:
@@ -401,9 +429,13 @@ class OutputBuffer:
         )
 
     def _byte_floor(self) -> int:
+        """Return the first byte offset not reserved for fixed completion words."""
+
         return int(self._host.numel()) * int(self._host.element_size()) - self._byte_cursor
 
     def seal(self) -> None:
+        """Record completion events for every producer device and prohibit additional captures."""
+
         if self._sealed:
             return
         for device in self.devices:
@@ -422,6 +454,8 @@ class OutputBuffer:
         self._sealed_ns = time.perf_counter_ns()
 
     def ready(self) -> bool:
+        """Return whether all sealed device-copy events have completed."""
+
         if not self._sealed:
             return False
         if self._ready_ns:
@@ -440,6 +474,8 @@ class OutputBuffer:
         self._retained_until_ready.append(owner)
 
     def read_tokens(self, capture: TokenCapture) -> tuple[int, ...]:
+        """Read and cache a validated token capture after its copy completes."""
+
         if capture.buffer is not self:
             raise _invariant("completion capture belongs to a different pinned output buffer")
         key = (int(capture.offset), int(capture.count))
@@ -456,6 +492,8 @@ class OutputBuffer:
         return values
 
     def read_bytes(self, capture: ByteCapture) -> torch.Tensor:
+        """Return a validated shaped view of captured bytes after readiness."""
+
         if capture.buffer is not self:
             raise _invariant("completion byte capture belongs to a different pinned output buffer")
         if not self.ready():
@@ -471,6 +509,8 @@ class OutputBuffer:
         return self._host.view(torch.uint8)[capture.offset : end].view(capture.shape)
 
     def observe(self, row: int, generation: int) -> tuple[int, int]:
+        """Mark one result row observed and return copy and host-observation timing."""
+
         index = int(row)
         if int(generation) != self._generation:
             raise _invariant("completion record carries a stale buffer generation")
@@ -513,11 +553,15 @@ class OutputBuffer:
         return self._timing[2], self._timing[3]
 
     def timing(self) -> tuple[int, int, int, int]:
+        """Expose submit, seal, ready, and observation timestamps for the completed lease."""
+
         if self._timing is None:
             raise _invariant("completion timing was read before observation")
         return self._timing
 
     def discard(self, row: int, generation: int) -> None:
+        """Retire one unobserved result row while preserving unfinished device copies."""
+
         index = int(row)
         if int(generation) != self._generation or index < 0 or index >= self._rows:
             return
@@ -529,6 +573,8 @@ class OutputBuffer:
                 self._defer_release()
 
     def abandon(self) -> None:
+        """Seal and retire the entire output lease without exposing its rows."""
+
         if self._abandoned:
             return
         if not self._sealed:
@@ -540,6 +586,8 @@ class OutputBuffer:
             self._defer_release()
 
     def _all_events(self) -> tuple[torch.cuda.Event, ...]:
+        """Collect distinct device-copy events currently owned by the buffer."""
+
         return tuple(
             (
                 *self._start_events.values(),
@@ -549,6 +597,8 @@ class OutputBuffer:
         )
 
     def _release_events(self) -> None:
+        """Return all owned device-copy events to the shared event pool."""
+
         if self._events_released or self._release_pending:
             return
         for event in self._all_events():
@@ -557,6 +607,8 @@ class OutputBuffer:
         self._return_to_pool()
 
     def _defer_release(self) -> None:
+        """Defer buffer reuse until every outstanding device-copy event completes."""
+
         if self._events_released or self._release_pending:
             return
         events = self._all_events()
@@ -575,6 +627,8 @@ class OutputBuffer:
         self._return_to_pool()
 
     def _return_to_pool(self) -> None:
+        """Return the fully released completion buffer to its owning pool."""
+
         if self._released_to_pool or self._release_to_pool is None:
             return
         self._released_to_pool = True
@@ -591,6 +645,8 @@ class OutputPool:
         max_words: int,
         event_pool: DeviceEventPool,
     ) -> None:
+        """Allocate a bounded set of reusable pinned completion buffers."""
+
         self.capacity = int(capacity)
         self.max_words = int(max_words)
         if self.capacity < 1 or self.max_words < 1:
@@ -608,6 +664,8 @@ class OutputPool:
         token_capacity: int,
         devices: Sequence[torch.device | str] = (),
     ) -> OutputBuffer:
+        """Lease a reset or newly allocated output buffer within startup row and byte bounds."""
+
         words = int(token_capacity)
         if words > self.max_words:
             raise resource_error("lane output exceeds its startup storage bound")
@@ -631,6 +689,8 @@ class OutputPool:
             return buffer
 
     def _release(self, buffer: OutputBuffer) -> None:
+        """Accept a released completion buffer back into the bounded free list."""
+
         with self._lock:
             if self._closed:
                 return
@@ -639,6 +699,8 @@ class OutputPool:
             self._free.append(buffer)
 
     def close(self) -> None:
+        """Prevent new leases and release references to every pooled output buffer."""
+
         with self._lock:
             self._closed = True
             self._free.clear()
@@ -646,10 +708,14 @@ class OutputPool:
 
 
 class _InvalidSamplingDistribution(RuntimeError):
+    """Marks a sampling row whose filtered probability mass is unusable."""
+
     pass
 
 
 class _PredicatedOperation(RuntimeError):
+    """Marks an operation suppressed by its resolved device predicate."""
+
     pass
 
 
@@ -664,14 +730,20 @@ class SamplingCapture:
         count: int,
         values: tuple[int, ...] | None = None,
     ) -> None:
+        """Bind packed sampling metadata to row layouts or predecoded values."""
+
         self.capture = capture
         self.count = int(count)
         self._values = values
 
     def ready(self) -> bool:
+        """Indicate whether the packed sampling metadata can be decoded without blocking."""
+
         return self._values is not None or (self.capture is not None and self.capture.ready())
 
     def finalize(self) -> tuple[int, ...]:
+        """Decode and cache validity, activity, token, and acceptance vectors from pinned output."""
+
         if self._values is None:
             if self.capture is None:
                 raise RuntimeError("sampling completion metadata has no capture")
@@ -682,6 +754,8 @@ class SamplingCapture:
         return self._values
 
     def token(self, index: int) -> int:
+        """Return the selected token after enforcing predicate and distribution validity."""
+
         values = self.finalize()
         if not bool(values[self.count + index]):
             raise _PredicatedOperation("operation predicate selected no state")
@@ -690,6 +764,8 @@ class SamplingCapture:
         return values[self.count * 2 + index]
 
     def accepted(self, index: int) -> int:
+        """Return the accepted speculative-prefix length for one valid active row."""
+
         values = self.finalize()
         if not bool(values[self.count + index]):
             raise _PredicatedOperation("operation predicate selected no state")
@@ -710,9 +786,13 @@ class SamplingOutputRow:
     kv_base: int | None = None
 
     def ready(self) -> bool:
+        """Indicate whether this row's speculative sampling capture is host-visible."""
+
         return self.capture.ready()
 
     def materialize(self) -> tuple[tuple[int, ...], int, int]:
+        """Combine accepted draft tokens with the sampled continuation and return its committed extent."""
+
         token = self.capture.token(int(self.index))
         accepted = self.capture.accepted(int(self.index))
         if not self.draft_tokens:
@@ -749,6 +829,8 @@ class LogprobCapture:
         max_requested: int,
         values: tuple[int, ...] | None = None,
     ) -> None:
+        """Bind packed log-probability metadata to its requested row schemas."""
+
         self.capture = capture
         self.rows = rows
         self.counts = counts
@@ -760,13 +842,19 @@ class LogprobCapture:
             self._details = self._decode(values)
 
     def ready(self) -> bool:
+        """Indicate whether all selected and requested log-probability entries are host-visible."""
+
         return self._details is not None or (self.capture is not None and self.capture.ready())
 
     @staticmethod
     def _float(value: int) -> float:
+        """Decode a float32 value from its unsigned integer bit pattern."""
+
         return struct.unpack("<f", struct.pack("<I", value & 0xFFFFFFFF))[0]
 
     def finalize(self) -> dict[int, tuple[float, tuple[tuple[int, float, int], ...]]]:
+        """Decode and cache selected, top-k, and explicitly requested token log probabilities."""
+
         if self._details is not None:
             return self._details
         if self.capture is None:
@@ -778,10 +866,14 @@ class LogprobCapture:
         self,
         values: tuple[int, ...],
     ) -> dict[int, tuple[float, tuple[tuple[int, float, int], ...]]]:
+        """Decode flattened completion fields into token, chosen, and requested log probabilities."""
+
         row_count = len(self.rows)
         cursor = 0
 
         def vector(width: int) -> tuple[tuple[int, ...], ...]:
+            """Consume one row-major field of fixed width from the packed capture."""
+
             nonlocal cursor
             total = row_count * width
             part = values[cursor : cursor + total]
@@ -841,12 +933,18 @@ class LogprobOutputRow:
     index: int
 
     def ready(self) -> bool:
+        """Indicate whether this row's shared log-probability capture is host-visible."""
+
         return self.capture.ready()
 
     def finalize(self) -> tuple[float, tuple[tuple[int, float, int], ...]]:
+        """Select this row's decoded log-probability record from the shared capture."""
+
         return self.capture.finalize()[int(self.index)]
 
     def max_entries(self) -> int:
+        """Return the maximum unique log-probability entries this row can encode."""
+
         local = self.capture.rows.index(int(self.index))
         return (
             1
@@ -884,6 +982,8 @@ class CpuJob:
         release: Callable[[], None] | None = None,
         defer_release: Callable[[ByteCapture], None] | None = None,
     ) -> None:
+        """Retain a bounded CPU reservation and lazily submitted host operation."""
+
         self.capture = capture
         self.reservation = reservation
         self.dependencies = dependencies
@@ -898,12 +998,16 @@ class CpuJob:
         self._resource_released = False
 
     def _release_now(self) -> None:
+        """Release the CPU task reservation unless submission already transferred ownership."""
+
         if self._resource_released or self._release is None:
             return
         self._resource_released = True
         self._release()
 
     def _release_after_capture(self) -> None:
+        """Release the task reservation after captured output ownership is established."""
+
         if self._resource_released or self._release is None:
             return
         self._resource_released = True
@@ -913,6 +1017,8 @@ class CpuJob:
             self._release()
 
     def _run(self) -> object:
+        """Execute one host job and capture its value or exception exactly once."""
+
         try:
             if self.ready_event is not None:
                 self.ready_event.synchronize()
@@ -930,6 +1036,8 @@ class CpuJob:
         return value
 
     def start(self, ready_event: torch.cuda.Event | None = None) -> None:
+        """Submit the bounded host action, optionally gated by a CUDA readiness event."""
+
         if self._submission_error is not None:
             return
         if self._future is not None:
@@ -944,6 +1052,8 @@ class CpuJob:
                 self.promise.set_exception(error)
 
     def ready(self) -> bool:
+        """Start eligible work lazily and report whether the host action has completed."""
+
         if self._submission_error is not None:
             return True
         if self._future is None:
@@ -953,6 +1063,8 @@ class CpuJob:
         return self._future is None or bool(self._future.done())
 
     def finalize(self) -> object:
+        """Return the completed host result or raise its captured failure without blocking."""
+
         if not self.ready():
             raise RuntimeError("output CPU job was observed before it was ready")
         if self._submission_error is not None:
@@ -962,6 +1074,8 @@ class CpuJob:
         return self._future.result(timeout=0)
 
     def __del__(self) -> None:
+        """Release an unsubmitted CPU reservation during finalization."""
+
         self.reservation.abandon()
         if self.capture is None or self.capture.ready():
             self._release_now()
@@ -970,6 +1084,8 @@ class CpuJob:
 
 
 class LogprobPayload:
+    """Owns asynchronously copied log-probability entries until wire serialization."""
+
     __slots__ = ("selected", "prompt", "_value")
 
     def __init__(
@@ -977,11 +1093,15 @@ class LogprobPayload:
         selected: LogprobOutputRow | None,
         prompt: tuple[LogprobOutputRow, ...] = (),
     ) -> None:
+        """Collect selected and prompt log-probability rows for bounded serialization."""
+
         self.selected = selected
         self.prompt = prompt
         self._value: TransferHandle | None = None
 
     def ready(self) -> bool:
+        """Return whether every selected and prompt log-probability capture is query-ready."""
+
         if self._value is not None:
             return True
         return (self.selected is None or self.selected.ready()) and all(
@@ -989,6 +1109,8 @@ class LogprobPayload:
         )
 
     def max_encoded_bytes(self) -> int:
+        """Calculate the exact upper bound for the binary log-probability payload."""
+
         return (
             (5 if self.selected is not None else 1)
             + 4
@@ -998,6 +1120,8 @@ class LogprobPayload:
         )
 
     def finalize(self) -> bytes:
+        """Serialize selected and prompt log probabilities into the bounded binary wire format."""
+
         if self._value is not None:
             return self._value
         if not self.ready():
@@ -1019,10 +1143,14 @@ class LogprobPayload:
         return self._value
 
     def __bytes__(self) -> bytes:
+        """Serialize captured log-probability records to their binary payload."""
+
         return self.finalize()
 
 
 class TransferPayload:
+    """Owns an asynchronous transfer ticket until its encoded handle is ready."""
+
     __slots__ = (
         "kind",
         "descriptor_value",
@@ -1038,6 +1166,8 @@ class TransferPayload:
         locators: tuple[Locator, ...],
         transport: Transport,
     ) -> None:
+        """Retain transport locators until every producer becomes externally readable."""
+
         self.kind = kind
         self.descriptor_value = descriptor_value
         self.locators = locators
@@ -1045,14 +1175,20 @@ class TransferPayload:
         self._value: TransferHandle | None = None
 
     def ready(self) -> bool:
+        """Indicate whether every asynchronous transfer descriptor is available."""
+
         return self._value is not None or all(
             self.transport.ready(locator) for locator in self.locators
         )
 
     def max_encoded_bytes(self) -> int:
+        """Bound the encoded transport handle using its kind and descriptor schema."""
+
         return encode_transfer_handle(self.kind, self.descriptor_value).encoded_size_bound()
 
     def finalize(self) -> TransferHandle:
+        """Return the encoded transfer handle after its asynchronous ticket completes."""
+
         if self._value is None:
             if not self.ready():
                 raise RuntimeError("transport descriptor was observed before producer readiness")
@@ -1081,6 +1217,8 @@ class ImagePayload:
         reservation: CpuTaskReservation,
         max_bytes: int,
     ) -> None:
+        """Own a captured image tensor and deferred bounded host encoding job."""
+
         self.capture = capture
         self.reservation = reservation
         self.max_bytes = int(max_bytes)
@@ -1089,6 +1227,8 @@ class ImagePayload:
         self._submission_error: Exception | None = None
 
     def ready(self) -> bool:
+        """Return whether image bytes are encoded or all deferred encoding work is complete."""
+
         if self._value is not None or self._submission_error is not None:
             return True
         if self._future is None:
@@ -1105,9 +1245,13 @@ class ImagePayload:
         return bool(self._future.done())
 
     def max_encoded_bytes(self) -> int:
+        """Expose the byte capacity reserved for the encoded image payload."""
+
         return self.max_bytes
 
     def finalize(self) -> bytes:
+        """Return encoded image bytes, materializing the deferred host result when necessary."""
+
         if self._value is not None:
             return self._value
         if not self.ready():
@@ -1125,9 +1269,13 @@ class ImagePayload:
         return self._value
 
     def __bytes__(self) -> bytes:
+        """Return the encoded image artifact bytes."""
+
         return self.finalize()
 
     def __del__(self) -> None:
+        """Release an unconsumed encoded image payload during finalization."""
+
         self.reservation.abandon()
 
 
@@ -1188,6 +1336,8 @@ class PendingOutput:
         resolved_callback: Callable[[ModelOutput], None] | None = None,
         completion_tasks: tuple[CpuJob | ImagePayload | LogprobPayload, ...] = (),
     ) -> None:
+        """Bind deferred device, CPU, transport, and media work to one completion record."""
+
         self._record: OutputRecord | None = None
         self._parent = parent
         self._buffer: OutputBuffer | None = buffer
@@ -1225,23 +1375,31 @@ class PendingOutput:
 
     @property
     def request_key(self) -> object:
+        """Identify the request generation that owns the bound completion record."""
+
         if self._record is None:
             raise RuntimeError("completion has no bound record")
         return self._record.request_key
 
     @property
     def op_id(self) -> int:
+        """Identify the operation within the bound request generation."""
+
         if self._record is None:
             raise RuntimeError("completion has no bound record")
         return self._record.op_id
 
     @property
     def status(self) -> OpStatus:
+        """Expose the status staged by device execution before final host materialization."""
+
         if self._record is None:
             raise RuntimeError("completion has no bound record")
         return self._record.status
 
     def ready(self) -> bool:
+        """Return whether sampling, transfers, media, CPU work, and completion copies are all ready."""
+
         if self._record is None:
             raise RuntimeError("completion has no bound record")
         if self._done:
@@ -1256,6 +1414,8 @@ class PendingOutput:
         return True
 
     def finalize(self) -> ModelOutput:
+        """Materialize one operation result, publish payload handles, and attach measured timing."""
+
         if not self._done:
             if not self.ready():
                 raise RuntimeError("completion was resolved before query-ready")
@@ -1332,6 +1492,8 @@ class PendingOutput:
         return self._value
 
     def _resolve_predicated(self) -> None:
+        """Resolve inactive output rows without waiting for model or CPU work."""
+
         predicated_parent = self._predicated_parent
         if predicated_parent is None:
             raise RuntimeError("predicated completion lost its parent resolver")
@@ -1343,58 +1505,78 @@ class PendingOutput:
         self._selected_runtime = runtime
 
     def completion_timing(self) -> tuple[int, int, int, int]:
+        """Finalize the record and expose its output-buffer lifecycle timestamps."""
+
         self.finalize()
         return self._completion_timing or (0, 0, 0, 0)
 
     @property
     def media_output(self) -> MediaOutput | None:
+        """Finalize the record and expose its published media artifact, if any."""
+
         self.finalize()
         return self._media_output
 
     @property
     def invalid_sampling(self) -> bool:
+        """Indicate whether token selection produced no valid finite candidate."""
+
         self.finalize()
         return self._invalid_sampling
 
     @property
     def predicated(self) -> bool:
+        """Indicate whether device predicate resolution suppressed this operation."""
+
         self.finalize()
         return self._predicated
 
     @property
     def completion_error(self) -> bool:
+        """Indicate whether deferred CPU or media completion failed."""
+
         self.finalize()
         return self._completion_error
 
     @property
     def selected_point(self) -> int:
+        """Expose the checkpoint point selected after predicate and sampling resolution."""
+
         self.finalize()
         return int(self._selected_point)
 
     @property
     def selected_runtime(self) -> RequestRuntime:
+        """Expose the request state selected by a predicated operation."""
+
         self.finalize()
         if self._selected_runtime is None:
             raise RuntimeError("predicated operation lost its selected runtime state")
         return self._selected_runtime
 
     def __deepcopy__(self, memo: dict[int, object]) -> PendingOutput:
+        """Preserve identity because this object uniquely owns asynchronous completion state."""
+
         memo[id(self)] = self
         return self
 
     def __del__(self) -> None:
+        """Abandon unresolved completion ownership during finalization."""
+
         buffer = self._buffer
         if buffer is not None and not self._observed:
             buffer.discard(self._row, self._generation)
 
 
 def _record_ready(record: ModelOutput | PendingOutput) -> bool:
-    """Whether a completion's device and CPU output work has landed."""
+    """Return whether a completion's device and CPU output work has landed."""
 
     return record.ready() if isinstance(record, PendingOutput) else True
 
 
 def _finalized_record(record: ModelOutput | PendingOutput) -> ModelOutput:
+    """Require and return a concrete model-output record."""
+
     return record.finalize() if isinstance(record, PendingOutput) else record
 
 
@@ -1404,12 +1586,16 @@ def _concrete_record(
     timing: TimingCounters = TimingCounters(),
     media_output: MediaOutput | None = None,
 ) -> ModelOutput:
+    """Freeze a host-visible output record after resolving deferred sampling fields."""
+
     lengths = record.logical_lengths
     span = record.token_span
     selected_point = int(record.selected_point)
     tokens = record.committed_tokens
     sampling = record.sampling
     if sampling is not None:
+        # Sampling decides both the accepted prefix and the selected checkpoint;
+        # logical token/cache lengths advance only by that accepted prefix.
         tokens, selected_point, _accepted = sampling.materialize()
         if sampling.logical_base is not None:
             lengths = replace(
@@ -1430,6 +1616,8 @@ def _concrete_record(
             lengths.latent_len,
         )
     ):
+        # Wire records contain builtin integers even when counters originated as
+        # scalar tensors or NumPy-compatible integer values.
         lengths = LogicalLengths(
             token_len=int(lengths.token_len),
             kv_visible_len=int(lengths.kv_visible_len),
@@ -1452,6 +1640,9 @@ def _concrete_record(
         }
         else TransferResult
     )
+
+    # Select the closed result schema from the operation family. Diffusion is
+    # the only family with trajectory cursor and terminal-state fields.
     payload_args = (lengths, span, tokens, record.finish_flags, media_output)
     payload = (
         DiffusionResult(
@@ -1476,6 +1667,8 @@ def _concrete_record(
 
 
 def _invalid_sampling_record(record: ModelOutput) -> ModelOutput:
+    """Return an output record representing a sampling-policy rejection."""
+
     return replace(
         record,
         status=OpStatus.ERROR,
@@ -1492,6 +1685,8 @@ def _invalid_sampling_record(record: ModelOutput) -> ModelOutput:
 
 
 def _completion_error_record(record: ModelOutput) -> ModelOutput:
+    """Return an output record for a failed completion capture or host artifact."""
+
     return replace(
         record,
         status=OpStatus.ERROR,
@@ -1511,6 +1706,8 @@ def _predicated_record(
     selected_point: int,
     runtime: RequestRuntime,
 ) -> ModelOutput:
+    """Apply a resolved speculative point to one output record and request runtime."""
+
     return replace(
         record,
         status=OpStatus.PREDICATED,
@@ -1533,7 +1730,7 @@ def _predicated_record(
 
 
 def run_result_ready(report: RunResult) -> bool:
-    """True once every completion token and artifact can be read
+    """Return whether every completion token and artifact can be read
     without a stall."""
 
     for record in report.completions:
@@ -1546,6 +1743,8 @@ def run_result_ready(report: RunResult) -> bool:
 
 
 def lane_completion_ready(lane: LaneResult) -> bool:
+    """Return whether every pending output in a lane can be finalized without blocking."""
+
     for record in lane.completions:
         if not _record_ready(record):
             return False
@@ -1556,6 +1755,8 @@ def lane_completion_ready(lane: LaneResult) -> bool:
 
 
 def _completion_payload_ready(payload: object) -> bool:
+    """Return whether a completion payload's asynchronous work is readable."""
+
     return (
         not isinstance(
             payload,

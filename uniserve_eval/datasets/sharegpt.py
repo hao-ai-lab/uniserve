@@ -1,4 +1,4 @@
-"""ShareGPT row loader aligned with the SGLang ShareGPT sampler."""
+"""Loads deterministic two-turn ShareGPT text-generation examples."""
 
 from __future__ import annotations
 
@@ -15,10 +15,14 @@ SHAREGPT_FILENAME = "ShareGPT_V3_unfiltered_cleaned_split.json"
 
 
 class ShareGPTDataset(Dataset):
+    """Selects tokenized prompts and target lengths from ShareGPT conversations."""
+
     name: ClassVar[str] = "sharegpt"
     requires_tokenizer: ClassVar[bool] = True
 
     def load(self, tokenizer: Any | None = None) -> list[Example]:
+        """Return seeded, non-empty prompt and completion pairs."""
+
         if tokenizer is None:
             raise ValueError("dataset 'sharegpt' requires a tokenizer")
         point = self.point
@@ -72,6 +76,8 @@ class ShareGPTDataset(Dataset):
 
 
 def _is_file_valid_json(path: str) -> bool:
+    """Report whether a path names a readable JSON document."""
+
     if not path or not os.path.isfile(path):
         return False
     try:

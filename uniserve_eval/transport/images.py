@@ -1,4 +1,4 @@
-"""Decode and validate generated images returned by public APIs."""
+"""Decodes and validates generated images returned by public APIs."""
 
 from __future__ import annotations
 
@@ -14,7 +14,11 @@ from ..types import DecodedImage
 
 
 class ImageOutputError(ValueError):
+    """Carries a stable classifier for invalid generated image output."""
+
     def __init__(self, classifier: str) -> None:
+        """Initialize the error with its external classifier."""
+
         super().__init__(classifier)
         self.classifier = classifier
 
@@ -31,6 +35,8 @@ _MIME_ALIASES = {"image/jpg": "image/jpeg", "image/x-png": "image/png"}
 
 
 def decode_openai_image_part(part: dict[str, Any]) -> DecodedImage:
+    """Decode one embedded OpenAI-compatible image response part."""
+
     encoded: Any = part.get("b64_json")
     declared_mime: str | None = None
     if not isinstance(encoded, str) or not encoded:
@@ -50,10 +56,14 @@ def decode_openai_image_part(part: dict[str, Any]) -> DecodedImage:
 
 
 def decode_openai_image_parts(parts: Sequence[dict[str, Any]]) -> list[DecodedImage]:
+    """Decode an ordered collection of embedded image response parts."""
+
     return [decode_openai_image_part(part) for part in parts]
 
 
 def inspect_image_bytes(data: bytes, *, declared_mime: str | None = None) -> DecodedImage:
+    """Decode image bytes fully and return verified content metadata."""
+
     try:
         with Image.open(BytesIO(data)) as image:
             image_format = image.format
@@ -91,6 +101,8 @@ def inspect_image_bytes(data: bytes, *, declared_mime: str | None = None) -> Dec
 
 
 def _parse_image_data_url(value: str) -> tuple[str, str]:
+    """Split a base64 image data URL into MIME type and encoded payload."""
+
     if not value.startswith("data:") or "," not in value:
         raise ImageOutputError("response_image_payload_not_embedded")
     header, encoded = value[5:].split(",", maxsplit=1)
@@ -104,5 +116,7 @@ def _parse_image_data_url(value: str) -> tuple[str, str]:
 
 
 def _normalize_mime(value: str) -> str:
+    """Normalize supported image MIME aliases."""
+
     mime = value.strip().lower()
     return _MIME_ALIASES.get(mime, mime)

@@ -1,3 +1,5 @@
+//! Incremental reasoning-parser behavior across delimiter boundaries.
+
 use std::sync::Arc;
 
 use tempfile::tempdir;

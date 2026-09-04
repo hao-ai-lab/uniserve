@@ -1,4 +1,4 @@
-//! HTTP serving surface for UniServe's configured public APIs.
+//! HTTP router construction, listener binding, middleware, and shutdown.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 mod listener;
@@ -21,7 +21,7 @@ use crate::{Config, build_state};
 pub use crate::openai::ApiError;
 pub use routes::build_router;
 
-/// Run the configured HTTP server until the shutdown token is cancelled.
+/// Runs the configured HTTP server until the shutdown token is cancelled.
 pub async fn serve(config: Config, shutdown: CancellationToken) -> Result<()> {
     config
         .validate()

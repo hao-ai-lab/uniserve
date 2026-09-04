@@ -1,3 +1,5 @@
+//! Derive support for registering typed Prometheus metric families.
+
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::Data;
@@ -12,7 +14,7 @@ use syn::parse_macro_input;
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 
-/// Derive a `register` constructor that registers every field into a
+/// Derives a `register` constructor that registers every field into a
 /// `prometheus_client::registry::Registry`.
 ///
 /// Each field carries `#[metric(name = "...", help = "...")]`, where `name` is
@@ -44,10 +46,13 @@ struct MetricField {
     init: Option<Expr>,
 }
 
+/// Expands one named-field struct into a metric-family registration implementation.
 fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let struct_ident = &input.ident;
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
+    // Registration requires stable field identifiers, so only named-field
+    // structs form a valid derive target.
     let fields = match &input.data {
         Data::Struct(data) => match &data.fields {
             Fields::Named(named) => &named.named,
@@ -66,11 +71,15 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         }
     };
 
+    // Validate every field before emitting tokens so diagnostics point to the
+    // original declaration rather than generated code.
     let mut metric_fields = Vec::with_capacity(fields.len());
     for field in fields {
         metric_fields.push(parse_field(field)?);
     }
 
+    // Each handle is constructed once, cloned into the registry, and retained
+    // on the returned metrics family for updates.
     let registrations = metric_fields.iter().map(|field| {
         let ident = &field.ident;
         let name = &field.name;
@@ -85,10 +94,12 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         }
     });
 
+    // Reuse the parsed field order for deterministic construction and output.
     let field_idents = metric_fields.iter().map(|field| &field.ident);
 
     Ok(quote! {
         impl #impl_generics #struct_ident #ty_generics #where_clause {
+            /// Registers every metric family field and returns its initialized handles.
             pub fn register(registry: &mut ::prometheus_client::registry::Registry) -> Self {
                 #(#registrations)*
                 Self {
@@ -99,6 +110,7 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     })
 }
 
+/// Parses and validates the metric metadata attached to one struct field.
 fn parse_field(field: &syn::Field) -> syn::Result<MetricField> {
     let ident = field
         .ident
@@ -109,6 +121,8 @@ fn parse_field(field: &syn::Field) -> syn::Result<MetricField> {
     let mut help: Option<LitStr> = None;
     let mut init: Option<Expr> = None;
 
+    // Collect the single metric attribute while rejecting duplicate keys at
+    // their precise literal spans.
     let mut metric_attr_seen = false;
     for attr in &field.attrs {
         if !attr.path().is_ident("metric") {
@@ -140,6 +154,8 @@ fn parse_field(field: &syn::Field) -> syn::Result<MetricField> {
         }
     }
 
+    // Every derived field needs registration metadata; only initialization is
+    // optional because metric handles generally implement `Default`.
     if !metric_attr_seen {
         return Err(Error::new(
             field.span(),
@@ -165,9 +181,11 @@ enum MetricArg {
 }
 
 impl syn::parse::Parse for MetricArg {
+    /// Parses one `name`, `help`, or `init` assignment from a metric attribute.
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
         let key: Ident = input.parse()?;
         input.parse::<Token![=]>()?;
+
         if key == "name" {
             Ok(MetricArg::Name(input.parse()?))
         } else if key == "help" {

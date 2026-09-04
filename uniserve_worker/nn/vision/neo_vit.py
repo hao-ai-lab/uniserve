@@ -1,4 +1,5 @@
 """Shared NEO-ViT embedding tower."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -17,6 +18,8 @@ __all__ = [
 
 @dataclass(frozen=True)
 class NeoVitConfig:
+    """Defines NEO-ViT patch, width, head, layer, projection, and position settings."""
+
     hidden_size: int = 1024
     llm_hidden_size: int = 1024
     downsample_ratio: float = 0.5
@@ -29,6 +32,8 @@ class NeoVitEncoder(nn.Module):
     """Conv patch + dense downsample NEO vision encoder with 2D RoPE."""
 
     def __init__(self, cfg: NeoVitConfig) -> None:
+        """Build patch projection, positional encoding, downsampling, and language-width output."""
+
         super().__init__()
         hidden = int(cfg.hidden_size)
         llm_hidden = int(cfg.llm_hidden_size)
@@ -65,6 +70,8 @@ class NeoVitEncoder(nn.Module):
         *,
         grid_shapes: tuple[tuple[int, int], ...] | None = None,
     ) -> torch.Tensor:
+        """Encode flattened or image-shaped patches with grid-aware rotary positions."""
+
         if pixels.ndim == 2:
             pixels = pixels.view(-1, self.num_channels, self.patch_size, self.patch_size)
         if pixels.ndim != 4:
@@ -83,6 +90,8 @@ class NeoVitEncoder(nn.Module):
     def _apply_2d_rope(self, patch_embeds: torch.Tensor, grid_hw: torch.Tensor) -> torch.Tensor:
         # ``patch_embeds.shape[0]`` is the total patch count as a static tensor
         # shape, so passing it avoids a host sync and keeps this capturable.
+        """Apply independent height and width rotary coordinates to patch embeddings."""
+
         abs_x, abs_y = build_abs_positions_from_grid_hw(
             grid_hw, device=patch_embeds.device, total=int(patch_embeds.shape[0])
         )
@@ -112,6 +121,8 @@ class NeoVitEncoder(nn.Module):
         # Host-known per-image (h, w) grids drive the conv geometry, so the
         # downsample never reads the device ``grid_hw`` tensor back to the host;
         # ``grid_hw`` remains the device source of truth for 2D RoPE positions.
+        """Merge fixed patch neighborhoods and project them to language width."""
+
         if grid_shapes is None:
             raise ValueError("NeoVitEncoder requires host-known grid shapes for dense downsample")
         shapes = [(int(h), int(w)) for h, w in grid_shapes]

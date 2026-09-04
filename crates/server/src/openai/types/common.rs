@@ -1,31 +1,28 @@
+//! Schema values shared across OpenAI-compatible request families.
+
 use std::slice;
 
 use llm_multimodal::ImageDetail;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-// ============================================================================
-// Default value helpers
-// ============================================================================
-
-/// Helper function for serde default value (returns true).
+/// Returns `true` for fields whose wire default is enabled.
 pub(super) fn default_true() -> bool {
     true
 }
 
-// ============================================================================
-// String/Array Utilities
-// ============================================================================
-
-/// A type that can be either a single string or an array of strings.
+/// A wire value accepted as either one string or an array of strings.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum StringOrArray {
+    /// One string value.
     String(String),
+    /// Ordered array of string values.
     Array(Vec<String>),
 }
 
 impl StringOrArray {
+    /// Borrows the value uniformly as a string slice.
     pub fn as_slice(&self) -> &[String] {
         match self {
             StringOrArray::String(s) => slice::from_ref(s),
@@ -34,6 +31,7 @@ impl StringOrArray {
     }
 
     #[allow(unused)]
+    /// Converts the value into an owned string vector.
     pub fn into_vec(self) -> Vec<String> {
         match self {
             StringOrArray::String(s) => vec![s],
@@ -52,11 +50,7 @@ pub(super) fn validate_stop(stop: &StringOrArray) -> Result<(), validator::Valid
     Ok(())
 }
 
-// ============================================================================
-// Validation helpers
-// ============================================================================
-
-/// Validates top_p: 0.0 < top_p <= 1.0.
+/// Validates that `top_p` lies in `(0, 1]`.
 pub(super) fn validate_top_p_value(top_p: f32) -> Result<(), validator::ValidationError> {
     if !(top_p > 0.0 && top_p <= 1.0) {
         return Err(validator::ValidationError::new(
@@ -66,35 +60,42 @@ pub(super) fn validate_top_p_value(top_p: f32) -> Result<(), validator::Validati
     Ok(())
 }
 
-// ============================================================================
-// Reasoning controls
-// ============================================================================
-
 /// Effort level accepted by OpenAI-compatible reasoning requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
+    /// Disables explicit reasoning effort.
     None,
+    /// Requests the smallest available reasoning budget.
     Minimal,
+    /// Requests a low reasoning budget.
     Low,
+    /// Requests a medium reasoning budget.
     Medium,
+    /// Requests a high reasoning budget.
     High,
+    /// Requests an extra-high reasoning budget.
     XHigh,
+    /// Requests the largest available reasoning budget.
     Max,
 }
 
-// ============================================================================
-// Content Parts (for multimodal messages)
-// ============================================================================
-
+/// One typed part of multimodal message content.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "type", deny_unknown_fields)]
 pub enum ContentPart {
+    /// Plain text content.
     #[serde(rename = "text")]
-    Text { text: String },
+    Text {
+        /// Text carried by the content part.
+        text: String,
+    },
+    /// Image content referenced by URL or data URL.
     #[serde(rename = "image_url")]
     ImageUrl {
+        /// Image source and requested detail level.
         image_url: ImageUrl,
+        /// Optional caller-provided image identity.
         #[serde(skip_serializing_if = "Option::is_none")]
         uuid: Option<String>,
     },
@@ -103,72 +104,92 @@ pub enum ContentPart {
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
+/// Remote or data URL and requested image-detail level.
 pub struct ImageUrl {
+    /// Remote URL or data URL containing the image.
     pub url: String,
+    /// Requested image preprocessing detail.
     pub detail: Option<ImageDetail>,
 }
 
-// ============================================================================
-// Streaming
-// ============================================================================
-
-/// Mirrors the `StreamOptions` class.
+/// Options that alter streamed chat-completion responses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StreamOptions {
+    /// Whether the stream includes a terminal usage-only chunk.
     pub include_usage: Option<bool>,
 }
 
-// ============================================================================
-// Tools and Function Calling
-// ============================================================================
-
+/// A tool definition accepted by chat-completion requests.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Tool {
-    Function { function: Function },
+    /// Function tool callable by the assistant.
+    Function {
+        /// Function declaration exposed to the model.
+        function: Function,
+    },
 }
 
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+/// Function-tool name, description, and JSON parameter schema.
 pub struct Function {
+    /// Function name exposed to the model.
     pub name: String,
+    /// Optional human-readable function description.
     pub description: Option<String>,
+    /// JSON Schema describing accepted function arguments.
     pub parameters: Value,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+/// Completed assistant tool call.
 pub struct ToolCall {
+    /// Model-assigned tool call identifier.
     pub id: String,
+    /// Tool type, currently `function`.
     #[serde(rename = "type")]
     pub tool_type: String,
+    /// Function name and serialized arguments.
     pub function: FunctionCallResponse,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+/// Completed function name and serialized arguments.
 pub struct FunctionCallResponse {
+    /// Function name selected by the model.
     pub name: String,
+    /// Serialized JSON arguments, when supplied.
     #[serde(default)]
     pub arguments: Option<String>,
 }
 
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize)]
+/// Incremental fields for one indexed tool call.
 pub struct ToolCallDelta {
+    /// Position of the tool call within the assistant message.
     pub index: u32,
+    /// Tool call identifier when first announced.
     pub id: Option<String>,
+    /// Tool type when first announced.
     #[serde(rename = "type")]
     pub tool_type: Option<String>,
+    /// Incremental function fields.
     pub function: Option<FunctionCallDelta>,
 }
 
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize)]
+/// Incremental function name and argument fragments.
 pub struct FunctionCallDelta {
+    /// Function name when first announced.
     pub name: Option<String>,
+    /// Incremental serialized argument fragment.
     pub arguments: Option<String>,
 }
 
@@ -176,7 +197,9 @@ pub struct FunctionCallDelta {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolChoiceValue {
+    /// Lets the model decide whether to call a tool.
     Auto,
+    /// Prevents the model from calling tools.
     None,
 }
 
@@ -186,78 +209,100 @@ pub enum ToolChoiceValue {
 pub struct ToolChoice(pub ToolChoiceValue);
 
 impl Default for ToolChoice {
+    /// Returns the default value.
     fn default() -> Self {
         Self(ToolChoiceValue::Auto)
     }
 }
 
-// ============================================================================
-// Chat Messages
-// ============================================================================
-
+/// A role-tagged OpenAI-compatible chat message.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "role")]
 #[serde(deny_unknown_fields)]
 pub enum ChatMessage {
+    /// System instruction message.
     #[serde(rename = "system")]
     System {
+        /// Instruction content.
         content: MessageContent,
+        /// Optional participant name.
         name: Option<String>,
     },
+    /// User-authored message.
     #[serde(rename = "user")]
     User {
+        /// User content.
         content: MessageContent,
+        /// Optional participant name.
         name: Option<String>,
     },
+    /// Assistant-authored message.
     #[serde(rename = "assistant")]
     Assistant {
+        /// Optional visible assistant content.
         content: Option<MessageContent>,
+        /// Optional participant name.
         name: Option<String>,
+        /// Tool calls requested by the assistant.
         tool_calls: Option<Vec<ToolCall>>,
         /// Reasoning content for reasoning-capable models.
         reasoning: Option<String>,
     },
+    /// Tool result message.
     #[serde(rename = "tool")]
     Tool {
+        /// Tool result content.
         content: MessageContent,
+        /// Identifier of the assistant tool call being answered.
         tool_call_id: String,
     },
+    /// Developer instruction message with optional tool declarations.
     #[serde(rename = "developer")]
     Developer {
+        /// Developer instruction content.
         content: MessageContent,
+        /// Tools introduced by the developer message.
         tools: Option<Vec<Tool>>,
+        /// Optional participant name.
         name: Option<String>,
     },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(untagged)]
+/// Chat message content accepted as text or typed parts.
 pub enum MessageContent {
+    /// Plain text content.
     Text(String),
+    /// Ordered multimodal content parts.
     Parts(Vec<ContentPart>),
 }
-
-// ============================================================================
-// Usage and Logging
-// ============================================================================
 
 /// OpenAI usage fields plus optional generated-image lifecycle accounting.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize)]
 pub struct Usage {
+    /// Tokens consumed by the prompt.
     pub prompt_tokens: u32,
+    /// Sum of prompt and completion tokens.
     pub total_tokens: u32,
+    /// Tokens generated by the model, when applicable.
     pub completion_tokens: Option<u32>,
+    /// Prompt token breakdown, when available.
     pub prompt_tokens_details: Option<PromptTokenUsageInfo>,
+    /// Completion token breakdown, when available.
     pub completion_tokens_details: Option<CompletionTokenUsageInfo>,
+    /// Number of generated images, when applicable.
     pub image_count: Option<u32>,
+    /// Total denoising steps across generated images.
     pub image_steps: Option<u32>,
+    /// Denoising steps observed for each generated image.
     pub image_steps_per_image: Option<Vec<u32>>,
 }
 
 impl Usage {
-    /// Create a Usage from prompt and completion token counts.
+    /// Creates usage from prompt and completion token counts.
     pub fn from_counts(prompt_tokens: u32, completion_tokens: u32) -> Self {
         Self {
             prompt_tokens,
@@ -274,7 +319,7 @@ impl Usage {
         }
     }
 
-    /// Create usage for a response that includes generated images.
+    /// Creates usage for a response that includes generated images.
     pub fn from_generation_counts(
         prompt_tokens: u32,
         completion_tokens: u32,
@@ -288,7 +333,7 @@ impl Usage {
         }
     }
 
-    /// Attach the observed denoising-step count for each completed image.
+    /// Attaches the observed denoising-step count for each completed image.
     pub fn with_image_steps_per_image(mut self, image_steps_per_image: Vec<u32>) -> Self {
         self.image_steps_per_image =
             (!image_steps_per_image.is_empty()).then_some(image_steps_per_image);
@@ -296,95 +341,104 @@ impl Usage {
     }
 }
 
-/// Mirrors the `PromptTokenUsageInfo` class.
+/// Prompt-token usage breakdown.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize)]
 pub struct PromptTokenUsageInfo {
+    /// Prompt tokens reused from cache, when reported.
     pub cached_tokens: Option<u32>,
 }
 
-/// Mirrors the `CompletionTokenUsageInfo` class.
-/// Breakdown of completion-token usage required by the current OpenAI API,
-/// notably `reasoning_tokens` for reasoning-capable models.
+/// Completion-token usage breakdown.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize)]
 pub struct CompletionTokenUsageInfo {
+    /// Completion tokens retained as reasoning content.
     pub reasoning_tokens: Option<u32>,
 }
 
-/// Mirrors the `ChatCompletionLogProbs` class.
+/// Generated-token logprob response payload.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatLogProbs {
+    /// Per-token logprob entries, or `None` when unavailable.
     pub content: Option<Vec<ChatLogProbsContent>>,
 }
 
-/// Mirrors the `ChatCompletionLogProbsContent` class.
+/// Logprob details for one generated token.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatLogProbsContent {
+    /// Decoded token text.
     pub token: String,
+    /// Natural logarithm of the selected token probability.
     pub logprob: f32,
+    /// UTF-8 bytes of the token text, when representable.
     pub bytes: Option<Vec<u8>>,
+    /// Highest-probability alternatives requested by the caller.
     pub top_logprobs: Vec<TopLogProb>,
 }
 
-/// Mirrors the `ChatCompletionLogProb` class.
+/// One alternate token and its log probability.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize)]
 pub struct TopLogProb {
+    /// Decoded token text.
     pub token: String,
+    /// Natural logarithm of the token probability.
     pub logprob: f32,
+    /// UTF-8 bytes of the token text, when representable.
     pub bytes: Option<Vec<u8>>,
 }
 
-// ============================================================================
-// Error Types
-// ============================================================================
-
+/// Wire response containing one structured API error.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ErrorResponse {
+    /// Structured API error.
     pub error: ErrorDetail,
 }
 
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize)]
+/// Structured OpenAI-compatible error details.
 pub struct ErrorDetail {
+    /// Human-readable error description.
     pub message: String,
+    /// Stable OpenAI-compatible error category.
     #[serde(rename = "type")]
     pub error_type: String,
+    /// Request parameter associated with the error, when known.
     pub param: Option<String>,
+    /// Stable machine-readable error code, when available.
     pub code: Option<String>,
 }
-
-// ============================================================================
-// Model types
-// ============================================================================
 
 /// A single model entry in the `/v1/models` response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelObject {
+    /// Served model identifier.
     pub id: String,
+    /// Object type, always `model`.
     pub object: String,
+    /// Model creation timestamp in Unix seconds.
     pub created: i64,
+    /// Organization or deployment that owns the model.
     pub owned_by: String,
 }
 
 /// Response body for `GET /v1/models`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListModelsResponse {
+    /// Object type, always `list`.
     pub object: String,
+    /// Models served by this deployment.
     pub data: Vec<ModelObject>,
 }
 
-// ============================================================================
-// Normalizable trait
-// ============================================================================
-
 /// Trait for request types that need post-deserialization normalization.
 pub trait Normalizable {
-    /// Normalize the request by applying defaults and transformations.
+    /// Applies request defaults and canonical transformations after deserialization.
     fn normalize(&mut self) {
-        // Default: no-op
+        // Most request schemas require no post-deserialization transformation.
     }
 }

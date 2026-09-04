@@ -12,6 +12,8 @@ from .config import WorkerProcessArgs
 
 
 def _json_object(value: str) -> dict[str, object]:
+    """Parse a command-line JSON object and reject non-object values."""
+
     try:
         parsed = json.loads(value)
     except json.JSONDecodeError as error:
@@ -22,6 +24,8 @@ def _json_object(value: str) -> dict[str, object]:
 
 
 def create_worker_cli_parser() -> argparse.ArgumentParser:
+    """Build the worker CLI parser with launch, placement, resource, execution, and loading options."""
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--service-name", required=True)
     parser.add_argument("--pipeline-depth", type=int, default=2)
@@ -145,6 +149,8 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
 def parse_worker_args(
     arguments: Sequence[str] | None = None,
 ) -> WorkerProcessArgs:
+    """Parse CLI arguments and return their validated worker-process configuration."""
+
     parser = create_worker_cli_parser()
     namespace = parser.parse_args(arguments)
     try:

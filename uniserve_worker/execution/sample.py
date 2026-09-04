@@ -43,6 +43,8 @@ TOKEN_VALUE_MASK = TOKEN_CONTINUATION_BIT - 1
 
 
 def sample_result(value: object) -> SampleResult:
+    """Validate and return the single tensor produced by a sampling operator."""
+
     if not isinstance(value, SampleResult):
         raise RuntimeError("sampling task returned an invalid result")
     return value
@@ -54,6 +56,8 @@ def sampling_task_tensors(
     vocab: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pack row sampling controls, suppression masks, and penalty counts into device tensors."""
+
     # Penalties are applied densely from the device-resident count base in the
     # general sampling path; the fused top-k path never receives a penalty-
     # bearing operation. The sparse penalty tensors are therefore always empty
@@ -94,6 +98,8 @@ def sampling_task_tensors(
 
 
 def device_greedy_parameters(parameters: SamplingParams) -> bool:
+    """Return whether sampling parameters reduce exactly to unpenalized greedy selection."""
+
     return (
         float(parameters.temperature) <= 0.0
         and not parameters.return_logprobs
@@ -107,6 +113,8 @@ def device_greedy_parameters(parameters: SamplingParams) -> bool:
 
 
 def device_greedy_row(row: SampleRow) -> bool:
+    """Return whether one sampling row can use the captured device-greedy path."""
+
     return (
         device_greedy_parameters(row.parameters)
         and int(row.n_logprobs) == 0
@@ -119,6 +127,8 @@ def graph_greedy_compatible(
     forward_tasks: Sequence[ForwardRow],
     output: GraphGreedyOutput | None,
 ) -> bool:
+    """Validate that graph-produced greedy outputs match every sampling task and forward row."""
+
     if output is None or len(tasks) != len(forward_tasks):
         return False
     count = len(tasks)
@@ -281,6 +291,10 @@ def sample_device_greedy_group(
     selection_broadcast: Callable[[torch.Tensor], torch.Tensor] | None,
     preselected: GraphGreedyOutput | None = None,
 ) -> tuple[SampleResult, ...]:
+    """Resolve predicates, greedy tokens, finish state, publications, and completions for a task group."""
+
+    # Materialize one row-major logit matrix unless graph replay already
+    # supplied its device-resident token and predicate decisions.
     selection_logits: torch.Tensor | None = None
     if preselected is None:
         logits = packed_tensor_views(tuple(task.logits for task in tasks))
@@ -296,6 +310,8 @@ def sample_device_greedy_group(
                 for token_id in dict.fromkeys(int(value) for value in task.rows[0].suppress):
                     if 0 <= token_id < vocab:
                         selection_logits[row_index, token_id].fill_(float("-inf"))
+    # Scalar product arenas allow selection and later publication to share the
+    # same storage. A heterogeneous binding falls back to independent writes.
     products = tuple(task.token_product for task in tasks)
     bound_products = device_products is not None and all(
         product is not None for product in products
@@ -323,6 +339,8 @@ def sample_device_greedy_group(
         and product_batch is not None
         and (not transition_writes or transition_batch is not None)
     )
+    # Select directly into publication storage when all token products form one
+    # linked scalar batch; otherwise retain a transient result tensor.
     if preselected is not None:
         device_tokens = preselected.tokens
         max_values = None
@@ -357,6 +375,9 @@ def sample_device_greedy_group(
     )
     if selection_broadcast is not None:
         selection_broadcast(device_tokens)
+
+    # Finish, continuation, and transition predicates are derived from the same
+    # selected token vector so they cannot observe different sampling outcomes.
     empty_finish = grouped_publication and all(
         not task.rows[0].force_finish and not task.rows[0].finish_token_ids for task in tasks
     )
@@ -430,6 +451,8 @@ def sample_device_greedy_group(
             cast(DeviceProducts, device_products),
             device_reads,
         )
+    # Capture host-facing token metadata before publishing products. The output
+    # buffer owns the asynchronous device-to-host lifetime from this point.
     span = (
         capture_preselected_span(preselected, completion)
         if preselected is not None
@@ -452,6 +475,8 @@ def sample_device_greedy_group(
     )
     if preselected is not None and packed_output is not None:
         packed_output.copy_(tagged_tokens)
+    # Group publication records one dependency edge for every linked scalar
+    # output, preserving atomic visibility after all consumed reads complete.
     published = product_table is not None
     if product_table is not None:
         if grouped_publication:
@@ -508,6 +533,8 @@ def sample_device_greedy_group(
 
 
 def _fused_top_k(task: SampleWork, vocab: int) -> int:
+    """Return a fused top-k width when the task satisfies the kernel's sampling contract."""
+
     if task.logits.device.type != "cuda":
         return 0
     if task.draft_token_ids:
@@ -547,6 +574,10 @@ def _sample_fused_top_k_group(
     device_reads: tuple[DeviceProductRead, ...],
     selection_broadcast: Callable[[torch.Tensor], torch.Tensor] | None,
 ) -> tuple[SampleResult, ...]:
+    """Sample a homogeneous fused-top-k task group and publish its device-resident results."""
+
+    # The compiled kernel consumes one contiguous column for each sampling
+    # input, so compatible task rows are packed before a single launch.
     rows = tuple(task.rows[0] for task in tasks)
     logits = torch.cat(tuple(task.logits for task in tasks), dim=0)
     draws = torch.cat(tuple(cast(torch.Tensor, task.draws) for task in tasks), dim=0)
@@ -567,6 +598,9 @@ def _sample_fused_top_k_group(
         parameters,
         top_k,
     )
+
+    # Tensor-parallel peers share the selected tokens; finish and transition
+    # policy is then evaluated from the common selection on every rank.
     if selection_broadcast is not None:
         selection_broadcast(tokens)
     active = _sample_predicates(tasks, tokens.device)
@@ -585,6 +619,9 @@ def _sample_fused_top_k_group(
         device_products,
         device_reads,
     )
+
+    # Completion storage retains the host-visible sampling fields while token
+    # products remain device-resident for successor operations.
     published = _publish_sampled_device_values(
         tasks,
         "token_product",
@@ -616,6 +653,8 @@ def _run_fused_top_k_sampling(
     parameters: torch.Tensor,
     top_k: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the compiled fixed-top-k sampler after validating CUDA toolchain availability."""
+
     if not triton_available(logits.device):
         raise unsupported_setup(
             "fused top-k sampling requires a supported CUDA compile toolchain"
@@ -638,6 +677,10 @@ def _sample_task_group(
     device_reads: tuple[DeviceProductRead, ...],
     selection_broadcast: Callable[[torch.Tensor], torch.Tensor] | None,
 ) -> tuple[SampleResult, ...]:
+    """Sample arbitrary compatible tasks, resolve speculative acceptance, and capture outputs."""
+
+    # Flatten task-local candidate rows into one sampling matrix while retaining
+    # offsets needed to restore one selected result per operation.
     device = tasks[0].logits.device
     vocab = int(tasks[0].logits.shape[1])
     offsets: list[int] = []
@@ -650,6 +693,8 @@ def _sample_task_group(
     draws = torch.cat(tuple(cast(torch.Tensor, task.draws) for task in tasks), dim=0)
     work, valid = _shape_sampling_logits_batch(logits, rows)
 
+    # Temperature-zero rows use deterministic argmax; remaining rows invert the
+    # categorical CDF with their precomputed RNG draw.
     temperatures = torch.tensor(
         [float(row.parameters.temperature) for row in rows],
         dtype=work.dtype,
@@ -667,6 +712,9 @@ def _sample_task_group(
         sampled_tokens,
         torch.argmax(work, dim=-1),
     )
+
+    # Speculative tasks accept the longest matching draft prefix. A terminal
+    # prefix selects its final draft token without adding a continuation point.
     accepted_counts: list[torch.Tensor] = []
     selected_points: list[torch.Tensor] = []
     terminal_finishes: list[torch.Tensor] = []
@@ -700,6 +748,9 @@ def _sample_task_group(
     points = torch.stack(selected_points)
     terminal_finish = torch.stack(terminal_finishes)
     task_tokens = torch.where(terminal_finish, torch.stack(terminal_tokens), task_tokens)
+
+    # Broadcast the complete selection state so all tensor-parallel ranks
+    # advance request state from identical speculative decisions.
     if selection_broadcast is not None:
         selection = torch.stack(
             (
@@ -715,6 +766,8 @@ def _sample_task_group(
         points = selection[2].to(dtype=points.dtype)
         terminal_finish = selection[3].to(dtype=torch.bool)
 
+    # A task is valid only when every consumed speculative point retained a
+    # legal vocabulary candidate under its sampling constraints.
     task_valid = torch.stack(
         tuple(
             valid[offsets[index] : offsets[index] + len(task.rows)][
@@ -739,6 +792,9 @@ def _sample_task_group(
         device_products,
         device_reads,
     )
+
+    # Publish device-side dependencies before capturing the compact host
+    # completion and any requested log-probability details.
     published = _publish_sampled_device_values(
         tasks,
         "token_product",
@@ -778,6 +834,8 @@ def _capture_sample_span(
     accepted: torch.Tensor,
     completion: OutputBuffer | None,
 ) -> SamplingCapture:
+    """Pack validity, activity, token, and acceptance vectors into completion storage."""
+
     count = int(tokens.numel())
     if (
         int(valid.numel()) != count
@@ -813,6 +871,8 @@ def capture_preselected_span(
     output: GraphGreedyOutput,
     completion: OutputBuffer | None,
 ) -> SamplingCapture:
+    """Capture graph-selected token, validity, activity, and acceptance vectors into host output."""
+
     count = int(output.tokens.numel())
     if int(output.completion.numel()) != SAMPLING_COMPLETION_FIELDS * count:
         raise RuntimeError("graph sampling completion vectors do not align")
@@ -829,6 +889,8 @@ def _device_finish_values(
     device_tokens: torch.Tensor,
     valid: torch.Tensor,
 ) -> torch.Tensor:
+    """Evaluate per-row terminal token policies entirely on the sampling device."""
+
     count = len(tasks)
     tokens = device_tokens.reshape(-1)
     validity = valid.reshape(-1)
@@ -874,6 +936,8 @@ def _sample_predicates(
     tasks: tuple[SampleWork, ...],
     device: torch.device,
 ) -> torch.Tensor:
+    """Collect one active predicate per task, decoding tagged continuation values when needed."""
+
     if tasks and all(task.predicate is not None and task.tagged_predicate for task in tasks):
         predicates = tuple(cast(torch.Tensor, task.predicate).reshape(-1)[:1] for task in tasks)
         packed = packed_tensor_views(predicates)
@@ -901,6 +965,8 @@ def tagged_token_values(
     *,
     in_place: bool = False,
 ) -> torch.Tensor:
+    """Pack token identifiers with continuation flags into signed 64-bit relay values."""
+
     if int(tokens.numel()) != int(continuation.numel()):
         raise RuntimeError("token continuation vector does not align with selected tokens")
     tags = torch.where(continuation.reshape(-1), TOKEN_CONTINUATION_BIT, 0)
@@ -910,6 +976,8 @@ def tagged_token_values(
 
 
 def copy_runtime_scalar(target: torch.Tensor, value: int | torch.Tensor) -> None:
+    """Copy a scalar or one-element tensor into fixed device runtime storage."""
+
     if isinstance(value, torch.Tensor):
         target.copy_(value.reshape(-1)[:1].to(device=target.device, dtype=target.dtype))
     else:
@@ -917,6 +985,8 @@ def copy_runtime_scalar(target: torch.Tensor, value: int | torch.Tensor) -> None
 
 
 def request_pool_index(task: ForwardRow) -> torch.Tensor:
+    """Return the validated scalar request-pool index carried by a forward row."""
+
     index = task.request_pool_index
     if index is None:
         raise RuntimeError("forward task has no staged request slot")
@@ -927,6 +997,8 @@ def _packed_required_views(
     values: Sequence[torch.Tensor | None],
     message: str,
 ) -> torch.Tensor:
+    """Return one packed view of required aligned tensors, concatenating when necessary."""
+
     if not values or any(value is None for value in values):
         raise RuntimeError(message)
     tensors = tuple(cast(torch.Tensor, value).reshape(-1) for value in values)
@@ -935,6 +1007,8 @@ def _packed_required_views(
 
 
 def sample_request_pool_indices(tasks: Sequence[SampleWork]) -> torch.Tensor:
+    """Collect one validated request-pool index for each sampling task."""
+
     return _packed_required_views(
         tuple(task.request_pool_index for task in tasks),
         "sample batch lost its staged request slots",
@@ -945,6 +1019,8 @@ def sample_result_vector(
     samples: Sequence[SampleResult],
     field_name: str,
 ) -> torch.Tensor:
+    """Concatenate an optional device-result field across sampling rows."""
+
     return _packed_required_views(
         tuple(cast(torch.Tensor | None, getattr(sample, field_name)) for sample in samples),
         f"sample batch lost device field {field_name}",
@@ -955,6 +1031,8 @@ def runtime_selected_points(
     selected_values: Sequence[torch.Tensor | None],
     accepted_values: Sequence[torch.Tensor | None],
 ) -> torch.Tensor:
+    """Resolve selected speculative points from explicit indices or acceptance counts."""
+
     if len(selected_values) != len(accepted_values):
         raise RuntimeError("runtime selected-point columns are not aligned")
     points: list[torch.Tensor] = []
@@ -978,6 +1056,8 @@ def _publish_sampled_device_values(
     *,
     producer_event: torch.cuda.Event | None = None,
 ) -> bool:
+    """Publish one aligned sampled-value vector when every task declares the product."""
+
     products = tuple(getattr(task, product_field) for task in tasks)
     if device_products is None or not all(product is not None for product in products):
         return False
@@ -1000,6 +1080,8 @@ def _publish_sampled_transition_values(
     device_products: DeviceProducts | None,
     device_reads: tuple[DeviceProductRead, ...],
 ) -> None:
+    """Publish transition-token matches for tasks that declare transition products."""
+
     writes, transitions = _sampled_transition_values(
         tasks,
         device_tokens,
@@ -1028,6 +1110,10 @@ def _sampled_transition_values(
     *,
     destination: torch.Tensor | None = None,
 ) -> tuple[tuple[DeviceProductWrite, ...], torch.Tensor | None]:
+    """Match selected tokens against per-task transition sets and return aligned writes."""
+
+    # Only operations declaring a transition product participate; indexes keep
+    # their token and eligibility rows aligned after filtering.
     selected = tuple(
         (index, task, task.transition_product)
         for index, task in enumerate(tasks)
@@ -1043,6 +1129,9 @@ def _sampled_transition_values(
     writes = tuple(cast(DeviceProductWrite, write) for _index, _task, write in selected)
     selected_tokens = select_device_values(tokens, indexes)
     selected_eligibility = select_device_values(eligibility, indexes)
+
+    # Captured graphs may supply fixed destination storage. Its one-bit row
+    # contract must exactly match the selected product subset.
     target: torch.Tensor | None = None
     if destination is not None:
         target = destination.reshape(-1)
@@ -1052,6 +1141,9 @@ def _sampled_transition_values(
             or target.dtype is not torch.bool
         ):
             raise RuntimeError("sampling transition destination does not align")
+
+    # Shared transition sets avoid materializing a per-row token matrix; mixed
+    # policies use a padded matrix with -1 as the non-token sentinel.
     transition_sets = tuple(task.rows[0].transition_token_ids for _index, task, _write in selected)
     first = transition_sets[0]
     if all(values == first for values in transition_sets[1:]):
@@ -1091,6 +1183,8 @@ def _resolve_sampled_finish_values(
     active: torch.Tensor,
     terminal_finish: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Combine token, speculative-terminal, validity, and activity finish policies."""
+
     finish_values = _device_finish_values(tasks, device_tokens, valid & active) | (
         terminal_finish.reshape(-1).to(dtype=torch.bool) & valid & active
     )
@@ -1099,6 +1193,8 @@ def _resolve_sampled_finish_values(
 
 
 def select_device_values(values: torch.Tensor, indexes: tuple[int, ...]) -> torch.Tensor:
+    """Gather device values at a validated tuple of host-selected indices."""
+
     flat = values.reshape(-1)
     if len(indexes) == int(flat.numel()) and all(
         index == expected for expected, index in enumerate(indexes)
@@ -1119,6 +1215,8 @@ def publish_device_writes(
     *,
     producer_event: torch.cuda.Event | None = None,
 ) -> torch.cuda.Event | None:
+    """Publish a batch of device-resident scalar products with shared producer synchronization."""
+
     values = device_values.reshape(-1)
     product_batch = device_products.producer_scalar_batch(writes)
     if product_batch is not None and int(product_batch.tensor.numel()) == len(writes):
@@ -1142,6 +1240,8 @@ def semantic_sampling_draws(
     *,
     device: torch.device,
 ) -> torch.Tensor:
+    """Materialize deterministic uniform RNG draws for sampling rows on the target device."""
+
     # Each row's draw is the canonical Philox uniform for its semantic
     # coordinate, computed from host-known identity when the descriptor was
     # built. Greedy rows carry a zero draw. Uploading the host-resident vector
@@ -1387,6 +1487,8 @@ def logprob_details(
     rows: Sequence[SampleRow],
     completion: OutputBuffer | None,
 ) -> Mapping[int, LogprobOutputRow]:
+    """Compute selected-token, top-k, and requested-token log probabilities and ranks."""
+
     vocab = int(work.shape[1])
     requested_rows = tuple(
         index
@@ -1488,6 +1590,8 @@ def logprob_details(
         )
 
     def float_bits(values: torch.Tensor) -> torch.Tensor:
+        """Encode float32 values as unsigned-preserving integer bit patterns."""
+
         return values.to(dtype=torch.float32).contiguous().view(torch.int32).to(torch.long)
 
     packed = torch.cat(

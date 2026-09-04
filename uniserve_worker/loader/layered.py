@@ -1,4 +1,4 @@
-"""Layer-at-a-time checkpoint materialization loader."""
+"""Public import surface for layer-at-a-time checkpoint materialization."""
 
 from .loader import LayeredModelLoader
 

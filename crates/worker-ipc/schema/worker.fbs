@@ -140,7 +140,7 @@ table WorkerInfo {
   max_unresolved_ops:uint = 1;
 }
 
-// ---- Identities and the four operation records ----------------------------
+// Request identities and operation records.
 
 table RequestKey {
   authority_id:ulong;
@@ -489,7 +489,7 @@ union BatchCommand { StartCommand, CommitCommand, FinishCommand, FreeCommand }
 
 table BatchCommandEnvelope { command:BatchCommand; }
 
-// ---- NewRequest framing (request start) ------------------------------------
+// Static request admission and physical run placement.
 
 table ArRequestParams {
   sampling:SamplingParams;
@@ -536,7 +536,7 @@ table Run {
   input_products:[ProductPayload];
 }
 
-// ---- Worker response payloads ---------------------------------------------
+// Worker response payloads.
 
 table RegistrationAck { visible:bool; }
 

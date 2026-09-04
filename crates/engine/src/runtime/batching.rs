@@ -1,26 +1,33 @@
+//! Batch selection, operation planning, and physical placement assembly.
+//!
+//! Each pass selects a compatible execution lane, applies sequence and token
+//! budgets, and emits at most one planned operation per eligible request.
+
 use super::*;
 
+/// Computes the target decode capacity for a scheduling round.
 fn decode_capacity_target(pos: usize, spec_len: usize) -> usize {
     pos.saturating_add(1).saturating_add(spec_len)
 }
 
 impl EngineLoop {
-    /// Assemble the per-step batch: walk the priority order, ask each request for at most one op, clip prefill chunks to the remaining token budget, and pair first-dispatch requests with their typed admission record.
+    /// Assembles one scheduling-step batch in priority order.
+    ///
+    /// Each request contributes at most one operation, prefill chunks consume only
+    /// the remaining token budget, and first dispatch carries typed admission.
     pub(super) fn assemble(&mut self) -> (Vec<NewRequest>, Vec<NextOp>) {
         let ids = self.assembly_order();
         let lane = self.select_batch_kind(&ids);
         let (new_reqs, ops) = self.assemble_pass(&ids, lane);
         if ops.is_empty() && lane == Some(BatchKind::Prefill) {
-            // Prefill runs first *if possible* (SGLang's order). When no
-            // prefill op could actually be built (e.g. blocked on KV memory
-            // it cannot displace), fall through to the decode lane instead of
-            // idling — otherwise a starved waiting prompt would stall ready
-            // decodes forever.
+            // A blocked prefill lane must not prevent already-ready decode work
+            // from using the execution slot.
             return self.assemble_pass(&ids, Some(BatchKind::Decode));
         }
         (new_reqs, ops)
     }
 
+    /// Reserves persistent buffers, latent pages, and transfer capacity for one transition.
     fn reserve_transition_resources(&mut self, transition: &mut NextOp) -> bool {
         let id = transition.request_id;
         if transition.operation_variant == RunKind::DiffusionStep && !self.ensure_flow_prefix(id) {
@@ -111,6 +118,7 @@ impl EngineLoop {
         true
     }
 
+    /// Selects compatible request transitions within one lane's token and sequence budgets.
     pub(super) fn assemble_pass(
         &mut self,
         ids: &[RequestId],
@@ -119,8 +127,8 @@ impl EngineLoop {
         let mut admissions: Vec<NewRequest> = Vec::new();
         let mut ops: Vec<NextOp> = Vec::new();
         let mut selected: HashSet<RequestId> = HashSet::new();
-        // vLLM's per-step token budget with the clip rule: the budget, not the
-        // chunk threshold, is the binding constraint.
+        // The per-step token budget is the binding limit; individual prefill
+        // chunks are clipped to its remaining capacity.
         let mut budget: usize = self.scheduler.config.max_num_batched_tokens;
         // Text prefill tokens may ride along inside a decode batch (mixed
         // extend+decode forward): the prompt work then shares the decode
@@ -270,6 +278,7 @@ impl EngineLoop {
         (admissions, ops)
     }
 
+    /// Chooses the highest-priority execution lane that has schedulable work.
     pub(super) fn select_batch_kind(&self, ids: &[RequestId]) -> Option<BatchKind> {
         let mut projected_decode_ready = false;
         let mut committed_decode_ready = false;
@@ -315,6 +324,7 @@ impl EngineLoop {
         }
     }
 
+    /// Returns the stable order key for batch assembly.
     pub(super) fn assembly_order(&self) -> Vec<RequestId> {
         let mut ids: Vec<(usize, RequestId)> = self
             .scheduler
@@ -327,6 +337,7 @@ impl EngineLoop {
         ids.into_iter().map(|(_, id)| id).collect()
     }
 
+    /// Returns the scheduling priority used during batch assembly.
     pub(super) fn assembly_priority(&self, id: RequestId) -> u8 {
         match self.peek_next_operation_variant(id) {
             Some(RunKind::EncoderVision | RunKind::EncoderLatent | RunKind::ArExtend) => 0,
@@ -344,6 +355,7 @@ impl EngineLoop {
         }
     }
 
+    /// Determines the next operation kind without mutating request or resource state.
     pub(super) fn peek_next_operation_variant(&self, id: RequestId) -> Option<RunKind> {
         let st = self.running.get(&id)?;
         if st.cursor.image_gen.branch_pending {
@@ -395,6 +407,7 @@ impl EngineLoop {
         })
     }
 
+    /// Lowers planned transitions into one physical batch and transfers ownership to the executor.
     pub(super) fn submit_batch(
         &mut self,
         admissions: Vec<NewRequest>,
@@ -405,6 +418,9 @@ impl EngineLoop {
             tracing::trace_span!("scheduler.submit_batch", ops = transitions.len()).entered();
         let batch_id = self.inflight.next_batch_id();
         let submit_at = Instant::now();
+
+        // Placement maps are keyed by the registered operation identity and are
+        // joined with logical operations only after every transition is lowered.
         let mut operations = Vec::with_capacity(transitions.len());
         let mut input_products = Vec::new();
         let mut trace_ops = self
@@ -419,10 +435,14 @@ impl EngineLoop {
         let mut forward_rows = HashMap::with_capacity(transitions.len());
         let mut latent_placements = HashMap::with_capacity(transitions.len());
         let mut buffer_placements = HashMap::with_capacity(transitions.len());
+
         for mut transition in transitions {
             let oid = self.next_op_id;
             self.next_op_id += 1;
             let request_id = transition.request_id;
+
+            // Planning may queue successors speculatively, but registration still
+            // requires the request epoch and exact resident predecessor.
             let Some((epoch, latest_device_version)) =
                 self.running.get(&request_id).and_then(|state| {
                     state
@@ -449,6 +469,7 @@ impl EngineLoop {
                 self.fatal = true;
                 return false;
             }
+
             let request_key = RequestKey::new(self.authority_id, request_id, epoch);
             // A device successor roots on the exact selected-point product of
             // either its in-flight predecessor or the latest resolved operation.
@@ -506,11 +527,15 @@ impl EngineLoop {
                 };
                 (parent, None)
             };
+
             transition.predicate = predicate;
             transition.control_seq = self
                 .running
                 .get(&request_id)
                 .map_or(0, |state| state.control_seq);
+
+            // KV descriptors include complete tables only on admission or growth;
+            // fresh-page lists identify storage the worker must initialize now.
             let kv_lengths = transition_kv_lengths(&transition.intent);
             let new_page_count = transition.new_blocks.len();
             let mut operation_block_tables = Vec::new();
@@ -584,6 +609,7 @@ impl EngineLoop {
                     });
                 }
             }
+
             let output_event_bound = transition_output_bound(&transition);
             let planned_us = transition.planned_us;
             let reserved_buffers = std::mem::take(&mut transition.buffer_allocations);
@@ -610,6 +636,9 @@ impl EngineLoop {
                     return false;
                 }
             };
+
+            // Persistent product buffers transfer ownership from the transition
+            // reservation into request state using the minted product identities.
             let operation_identity = (operation.request_key, operation.op_id);
             let persistent_outputs = operation
                 .outputs()
@@ -653,6 +682,9 @@ impl EngineLoop {
             if !operation_buffers.is_empty() {
                 buffer_placements.insert(operation_identity, operation_buffers);
             }
+
+            // Diffusion rows include the positive branch and any negative CFG
+            // branch, each bound to its own request-state row.
             if operation.kind == RunKind::DiffusionStep {
                 let conditioning_tokens = match &apply.intent {
                     TransitionIntent::DenoiseGen {
@@ -727,6 +759,7 @@ impl EngineLoop {
                     });
                 }
             }
+
             if !operation_block_tables.is_empty() {
                 block_tables.insert(operation_identity, operation_block_tables);
             }
@@ -736,6 +769,9 @@ impl EngineLoop {
             if !operation_forward_rows.is_empty() {
                 forward_rows.insert(operation_identity, operation_forward_rows);
             }
+
+            // Latent placements describe the request-owned page table and the
+            // exact denoising interval executed by this operation.
             if matches!(
                 operation.kind,
                 RunKind::DiffusionPrepare | RunKind::DiffusionStep
@@ -790,6 +826,7 @@ impl EngineLoop {
                     },
                 );
             }
+
             let operation_variant = operation.kind.as_str();
             if let Some(trace_ops) = trace_ops.as_mut() {
                 let phase = self
@@ -813,6 +850,7 @@ impl EngineLoop {
                     },
                 }));
             }
+
             input_products.extend(payloads);
             let submitted_us = uniserve_core::now_monotonic_us();
             self.register_inflight(
@@ -826,6 +864,9 @@ impl EngineLoop {
                 st.latest_device_version = None;
             }
         }
+
+        // Snapshot scheduler gauges at the batch boundary before ownership moves
+        // into the executor.
         self.peak_ops_in_batch = self.peak_ops_in_batch.max(operations.len());
         self.stats
             .general
@@ -856,6 +897,7 @@ impl EngineLoop {
         {
             self.inflight.prefill_steps.insert(batch_id);
         }
+
         if let Some(trace_ops) = trace_ops {
             let operation_types: Vec<&'static str> = operations
                 .iter()
@@ -910,6 +952,9 @@ impl EngineLoop {
                 "submitting mixed forward batch"
             );
         }
+
+        // Join each registered operation with the placement records accumulated
+        // under its identity, then record the exact expected completion set.
         let logical_ops = operations
             .into_iter()
             .map(|operation| {
@@ -937,6 +982,7 @@ impl EngineLoop {
         self.inflight
             .batch_group_worker_exec_us
             .insert(batch_id, HashMap::new());
+
         let mut batch_commands = admissions
             .into_iter()
             .map(|request| BatchCommand::Start { request })
@@ -946,6 +992,9 @@ impl EngineLoop {
         if !commands.is_empty() {
             self.inflight.command_batches.insert(batch_id, commands);
         }
+
+        // Backpressure retains the fully lowered batch for a later retry; a
+        // terminal failure removes every in-flight index created above.
         match self.executor.submit(batch) {
             Ok(()) => true,
             Err(ExecutorSubmitError::WouldBlock(batch)) => {
@@ -976,6 +1025,7 @@ impl EngineLoop {
         }
     }
 
+    /// Returns whether generated output satisfies the trigger.
     pub(super) fn generated_trigger_matches(st: &ReqState) -> bool {
         st.req
             .policy
@@ -983,10 +1033,12 @@ impl EngineLoop {
             .matches_generated(&st.cursor.replay.generated_ids)
     }
 
+    /// Returns whether direct input satisfies the trigger.
     pub(super) fn direct_trigger_matches(st: &ReqState, token_id: u32) -> bool {
         st.req.policy.trigger.direct_token() == Some(token_id)
     }
 
+    /// Returns the next token fed back into generation.
     pub(super) fn feedback_next_token(&self, id: RequestId) -> Option<u32> {
         let next = self
             .running
@@ -1004,6 +1056,7 @@ impl EngineLoop {
         }
     }
 
+    /// Builds the generation trigger after prefill.
     pub(super) fn prefilled_gen_trigger(&self, id: RequestId) -> bool {
         let Some(st) = self.running.get(&id) else {
             return false;
@@ -1016,6 +1069,7 @@ impl EngineLoop {
                 .matches_generated(st.effective_prompt())
     }
 
+    /// Ensures the request capacity.
     pub(super) fn ensure_request_capacity(&mut self, id: RequestId, total_tokens: usize) -> bool {
         let (runtime, memory) = (&mut self.runtime, &mut self.memory);
         let Some(state) = runtime.state_mut().running.get_mut(&id) else {
@@ -1033,6 +1087,7 @@ impl EngineLoop {
             .is_ok()
     }
 
+    /// Activates the KV tables reserved for a request.
     pub(super) fn activate_request_tables(&self, id: RequestId) {
         let kv = self.memory.cache();
         if let Some(state) = self.running.get(&id) {
@@ -1042,8 +1097,9 @@ impl EngineLoop {
         }
     }
 
-    /// The block-id delta since the last op for this request (the stateful-diff
-    /// update): everything `blocks_for` holds beyond what already crossed.
+    /// Takes the block-ID delta accumulated since the request's previous operation.
+    ///
+    /// The delta contains every `blocks_for` entry beyond the last transmitted boundary.
     pub(super) fn take_new_blocks(&mut self, id: RequestId) -> Vec<BlockId> {
         let Some(st) = self.running.get_mut(&id) else {
             return Vec::new();
@@ -1055,6 +1111,7 @@ impl EngineLoop {
         new
     }
 
+    /// Returns unsent KV blocks to the free pool.
     pub(super) fn return_unsent_blocks(&mut self, id: RequestId, transition: &NextOp) {
         if let Some(state) = self.running.get_mut(&id) {
             state.cursor.resources.blocks_sent = state
@@ -1065,6 +1122,7 @@ impl EngineLoop {
         }
     }
 
+    /// Converts one state-machine intent into a bounded operation or fails the request.
     pub(super) fn plan_intent(
         &mut self,
         id: RequestId,
@@ -1096,6 +1154,7 @@ impl EngineLoop {
         }
     }
 
+    /// Plans the next schedulable transition from projected request state.
     pub(super) fn next_transition(&mut self, id: RequestId, budget: usize) -> Option<NextOp> {
         let projection = self.projected_cursor(id)?;
         let context_pending = self.running.get(&id).is_some_and(|st| {
@@ -1353,6 +1412,7 @@ impl EngineLoop {
         }
     }
 
+    /// Plans the next ordered text or image context-ingest transition within `budget`.
     pub(super) fn next_context_ingest_transition(
         &mut self,
         id: RequestId,
@@ -1360,6 +1420,9 @@ impl EngineLoop {
         projection: GenerationCursor,
     ) -> Option<NextOp> {
         let cursor = projection.ingest.prompt_cursor as usize;
+
+        // An image anchored at the current text cursor takes precedence over
+        // further text ingestion so logical multimodal order is preserved.
         let image = self
             .running
             .get(&id)?
@@ -1374,6 +1437,9 @@ impl EngineLoop {
             let step_index = state.cursor.ingest.pending_image_step;
             let step = image.ingest.steps.get(step_index).copied()?;
             let is_final_step = step_index + 1 == image.ingest.steps.len();
+
+            // Once an encoded feature exists, apply its declared KV effect at
+            // the projected cursor and reserve the required cache pages.
             if state.cursor.phase == Phase::IngestState {
                 let feature = state.cursor.ingest.encoded_product.clone()?;
                 let physical_kv_tokens = image.ingest.kv_effect(step_index)?;
@@ -1389,6 +1455,7 @@ impl EngineLoop {
                         }
                     },
                 };
+
                 if !self.ensure_request_capacity(
                     id,
                     projection
@@ -1398,6 +1465,7 @@ impl EngineLoop {
                 ) {
                     return None;
                 }
+
                 let new_blocks = self.take_new_blocks(id);
                 return self.plan_intent(
                     id,
@@ -1415,6 +1483,9 @@ impl EngineLoop {
                     },
                 );
             }
+
+            // Encoder-cache hits are pinned before entering ingest state. If
+            // request ownership disappears during acquisition, release the pin.
             let cache_read = state.req.cache.read;
             let cache_write = state.req.cache.write;
             let cache_key = encoder_cache_key(image.hash, step_index, step);
@@ -1444,6 +1515,9 @@ impl EngineLoop {
                 state.cursor.phase = Phase::IngestState;
                 return self.next_context_ingest_transition(id, budget, projection);
             }
+
+            // A cache miss schedules the encoder step; writable requests attach
+            // a persistent key so completion can populate the cache.
             let persistent_cache_key = cache_write.then_some(cache_key);
             return self.plan_intent(
                 id,
@@ -1459,6 +1533,8 @@ impl EngineLoop {
             );
         }
 
+        // Select a text chunk bounded by the request budget, scheduler chunk
+        // limit, semantic segment boundary, and next image position.
         let (prompt, segment_index, segment_end, next_image) = {
             let st = self.running.get(&id)?;
             let prompt = st.context.prompt_ids.clone();
@@ -1474,6 +1550,7 @@ impl EngineLoop {
         if cursor >= prompt.len() {
             return None;
         }
+
         let end = cursor
             .saturating_add(
                 budget
@@ -1483,10 +1560,12 @@ impl EngineLoop {
             .min(prompt.len())
             .min(segment_end)
             .min(next_image.max(cursor + 1));
+
         if !self.ensure_request_capacity(id, projection.und.physical_kv_len as usize + end - cursor)
         {
             return None;
         }
+
         let sampling_state = self.sampling_state(id, 0);
         let new_blocks = self.take_new_blocks(id);
         self.plan_intent(
@@ -1505,7 +1584,7 @@ impl EngineLoop {
         )
     }
 
-    /// Decide branch-vs-finish once a declared round-close token is committed.
+    /// Chooses whether a committed round-close token opens a branch or finishes the request.
     pub(super) fn close_context_round(&mut self, id: RequestId, close_token: u32) {
         let (triggered, can_open_gen_branch, n_gen, max_tokens, eos_finishes) = {
             let Some(st) = self.running.get(&id) else {
@@ -1543,7 +1622,7 @@ impl EngineLoop {
         )
     }
 
-    /// Compute the operation's allowed/suppress masks from the host-side
+    /// Computes the operation's allowed/suppress masks from the host-side
     /// logits-processor pipeline (minimum-token floor, bad-words, allowed
     /// tokens). `n_generated` is the count of generated tokens the sampled point
     /// follows: for a successor registered before its predecessors are observed
@@ -1586,7 +1665,7 @@ impl EngineLoop {
         (allowed, suppress)
     }
 
-    /// The branch-local static sampling state staged for one operation.
+    /// Builds the branch-local static sampling state for one operation.
     ///
     /// `projected` is the number of unresolved predecessors the operation is
     /// registered behind: zero for a host-paced operation, the in-flight window

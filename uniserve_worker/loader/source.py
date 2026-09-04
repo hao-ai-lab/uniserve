@@ -1,4 +1,4 @@
-"""Closed checkpoint file sets for local paths and Hugging Face repositories."""
+"""Checkpoint discovery and closed file-set resolution for local and remote models."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ _PT_INDEX = "pytorch_model.bin.index.json"
 
 @dataclass(frozen=True, slots=True)
 class WeightSourceSet:
-    """The exact files one logical checkpoint source is allowed to read."""
+    """Exact files and logical namespace belonging to one checkpoint source."""
 
     root: Path
     weight_files: tuple[Path, ...]
@@ -43,6 +43,8 @@ class WeightSourceSet:
     source_name: str = "primary"
 
     def __post_init__(self) -> None:
+        """Validate one-to-one file identities and require every local artifact to exist."""
+
         if len(self.weight_files) != len(self.relative_paths):
             raise ValueError("weight files and relative paths must align")
         if len(set(self.relative_paths)) != len(self.relative_paths):
@@ -52,8 +54,9 @@ class WeightSourceSet:
             raise FileNotFoundError(f"checkpoint source is missing {missing[0]}")
 
     def preview_shape(self, tensor_name: str) -> tuple[int, ...]:
-        """Read tensor metadata without materializing its payload."""
+        """Read one tensor's shape while avoiding safetensors payload materialization."""
 
+        # Safetensors exposes shape metadata independently from tensor storage.
         for path in self.weight_files:
             if path.suffix == ".safetensors":
                 with safe_open(path, framework="pt", device="cpu") as checkpoint:
@@ -62,6 +65,8 @@ class WeightSourceSet:
                             int(value) for value in checkpoint.get_slice(tensor_name).get_shape()
                         )
                 continue
+
+            # PT containers require deserialization before their tensor metadata is visible.
             import torch
 
             state = torch.load(path, map_location="cpu", weights_only=True)
@@ -76,14 +81,20 @@ class WeightSourceSet:
 
 
 def resolve_model_root(model_path: str, load: LoadConfig) -> tuple[Path, str | None]:
-    """Resolve enough of a model path to read its architecture configuration."""
+    """Resolve a local model root or fetch remote configuration into the hub cache.
 
+    Return the resolved directory together with the repository identifier needed for
+    subsequent remote file discovery.
+    """
+
+    # Existing paths are complete local identities, including direct weight files.
     candidate = Path(model_path)
     if candidate.exists():
         return (candidate.parent if candidate.is_file() else candidate), None
     from huggingface_hub import hf_hub_download
     from huggingface_hub.errors import EntryNotFoundError
 
+    # Either supported configuration file is sufficient to establish the cached root.
     config_path: Path | None = None
     for filename in ("config.json", "modular_model_index.json"):
         try:
@@ -106,6 +117,9 @@ def resolve_model_root(model_path: str, load: LoadConfig) -> tuple[Path, str | N
 
 
 def read_model_config(root: Path) -> dict[str, Any]:
+    """Read and normalize a checkpoint root's architecture configuration object."""
+
+    # Modular pipelines carry their architecture in a pipeline index rather than config.json.
     path = root / "config.json"
     if not path.is_file():
         path = root / "modular_model_index.json"
@@ -116,6 +130,8 @@ def read_model_config(root: Path) -> dict[str, Any]:
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
         raise TypeError(f"checkpoint {path.name} must contain an object")
+
+    # Normalize the supported modular pipeline onto the architecture dispatch contract.
     if path.name == "modular_model_index.json":
         if value.get("_class_name") != "MiniMaxH3ModularPipeline":
             raise ValueError(
@@ -133,12 +149,15 @@ def resolve_weight_sources(
     root: Path,
     repository_id: str | None,
 ) -> tuple[WeightSourceSet, ...]:
-    """Resolve primary and architecture-declared secondary weight sources."""
+    """Resolve the complete primary and architecture-owned secondary source set."""
 
+    # Synthetic loading carries a source identity without checkpoint files.
     if request.load.load_format is LoadFormat.DUMMY:
         return (
             WeightSourceSet(root=root, weight_files=(), relative_paths=()),
         )
+
+    # Freeze the visible repository inventory before selecting or fetching artifacts.
     available = _available_files(root, repository_id, request.load)
     _fetch_sidecars(
         sidecars,
@@ -146,6 +165,8 @@ def resolve_weight_sources(
         repository_id=repository_id,
         load=request.load,
     )
+
+    # BAGEL assigns its transformer and autoencoder files to separate load owners.
     if architecture == "BagelForConditionalGeneration":
         primary_name = next(
             (name for name in ("ema.safetensors", "model.safetensors") if name in available),
@@ -167,10 +188,14 @@ def resolve_weight_sources(
                 source_name="autoencoder",
             ),
         )
+
+    # Installed-name sharded state selects exactly the file for this tensor-parallel rank.
     if request.load.load_format is LoadFormat.SHARDED_STATE:
         name = _rank_file(available, request.parallel.rank, request.parallel.size)
         path = _fetch_file(name, root, repository_id, request.load)
         return (WeightSourceSet(root, (path,), (name,)),)
+
+    # Conventional checkpoints resolve one ordered primary shard set.
     selected = _select_primary(
         model_path=request.model_path,
         root=root,
@@ -183,6 +208,8 @@ def resolve_weight_sources(
 
 
 def _available_files(root: Path, repository_id: str | None, load: LoadConfig) -> tuple[str, ...]:
+    """List non-ignored checkpoint files using stable repository-relative names."""
+
     if repository_id is None:
         return tuple(
             sorted(
@@ -206,6 +233,9 @@ def _select_primary(
     load: LoadConfig,
     repository_id: str | None,
 ) -> tuple[str, ...]:
+    """Select an explicit file, indexed shards, or top-level files for the load format."""
+
+    # A direct local file bypasses repository-wide candidate selection.
     local_candidate = Path(model_path)
     if repository_id is None and local_candidate.is_file():
         relative = local_candidate.relative_to(root).as_posix()
@@ -214,6 +244,8 @@ def _select_primary(
                 f"load format {load.load_format.value!r} does not accept checkpoint file {relative!r}"
             )
         return (relative,)
+
+    # Prefer an index when present; otherwise collect one supported top-level format.
     for index_name, pattern in _format_candidates(load.load_format):
         if index_name is not None and index_name in available:
             return _index_weight_files(index_name, root, available, load, repository_id)
@@ -234,6 +266,8 @@ def _select_primary(
 
 
 def _format_candidates(load_format: LoadFormat) -> tuple[tuple[str | None, str | None], ...]:
+    """Return index and filename candidates in checkpoint format preference order."""
+
     if load_format in {LoadFormat.AUTO, LoadFormat.LAYERED}:
         return (
             (_SAFETENSORS_INDEX, None),
@@ -256,6 +290,8 @@ def _index_weight_files(
     load: LoadConfig,
     repository_id: str | None,
 ) -> tuple[str, ...]:
+    """Read a checkpoint index and validate its unique shard file set."""
+
     index_path = _fetch_file(index_name, root, repository_id, load)
     value = json.loads(index_path.read_text(encoding="utf-8"))
     mapping = value.get("weight_map") if isinstance(value, dict) else None
@@ -269,6 +305,8 @@ def _index_weight_files(
 
 
 def _rank_file(available: tuple[str, ...], rank: int, size: int) -> str:
+    """Select the recognized installed-state filename for one parallel rank."""
+
     candidates = (
         f"rank-{rank:05d}-of-{size:05d}.safetensors",
         f"rank-{rank}.safetensors",
@@ -289,6 +327,8 @@ def _fetch_sidecars(
     repository_id: str | None,
     load: LoadConfig,
 ) -> None:
+    """Fetch remote architecture sidecars that match the declared glob patterns."""
+
     if repository_id is None:
         return
     for name in available:
@@ -297,6 +337,8 @@ def _fetch_sidecars(
 
 
 def _fetch_file(name: str, root: Path, repository_id: str | None, load: LoadConfig) -> Path:
+    """Resolve one required local file or materialize it through the hub cache."""
+
     if repository_id is None:
         path = root / name
         if not path.is_file():
@@ -315,6 +357,8 @@ def _fetch_file(name: str, root: Path, repository_id: str | None, load: LoadConf
 
 
 def _ignored(name: str, patterns: tuple[str, ...]) -> bool:
+    """Return whether a repository-relative path matches an ignore pattern."""
+
     return any(
         fnmatch.fnmatchcase(name, pattern) or PurePosixPath(name).match(pattern)
         for pattern in patterns
@@ -322,6 +366,8 @@ def _ignored(name: str, patterns: tuple[str, ...]) -> bool:
 
 
 def _accepts_suffix(name: str, load_format: LoadFormat) -> bool:
+    """Return whether a direct checkpoint file is compatible with the load format."""
+
     suffix = Path(name).suffix
     if load_format in {LoadFormat.AUTO, LoadFormat.LAYERED}:
         return suffix in {".safetensors", ".bin", ".pt"}

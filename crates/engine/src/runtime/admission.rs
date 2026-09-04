@@ -1,6 +1,9 @@
+//! Request admission, resource reservation, and waiting-queue insertion.
+
 use super::*;
 
 impl EngineLoop {
+    /// Validates and queues one token-generation request or rejects it synchronously.
     pub(super) fn enqueue(&mut self, req: GenerationRequest, event_tx: EventTx) {
         if self.memory.cache.is_none() {
             self.trace_record(json!({
@@ -127,6 +130,7 @@ impl EngineLoop {
         self.waiting.insert(request_id, st);
     }
 
+    /// Validates and queues one terminal media-generation request.
     pub(super) fn enqueue_media(&mut self, submission: PendingMedia) {
         let request = &submission.request;
         if let Err(message) = request.validate() {
@@ -173,6 +177,7 @@ impl EngineLoop {
         self.scheduler.enqueue_media(request_id);
     }
 
+    /// Admits queued media requests while request-slot and latent capacity remain available.
     pub(super) fn admit_media(&mut self) {
         while self.running_request_count() < self.scheduler.config.max_num_seqs {
             let Some(id) = self.scheduler.pop_media() else {
@@ -242,11 +247,13 @@ impl EngineLoop {
         }
     }
 
+    /// Returns the number of configured VAE workers.
     pub(super) fn num_vae(&self, ip: &uniserve_core::ImageParams) -> u64 {
         let dl = u64::from(self.profile.generation_limits.latent_downsample).max(1);
         (ip.height as u64 / dl) * (ip.width as u64 / dl)
     }
 
+    /// Caps image grid tokens to the configured VAE limit.
     pub(super) fn cap_max_vae_grid_tokens(&self) -> usize {
         if self.profile.generation_limits.max_vae_grid_tokens > 0 {
             self.profile.generation_limits.max_vae_grid_tokens as usize
@@ -255,6 +262,7 @@ impl EngineLoop {
         }
     }
 
+    /// Returns a required runtime feature that the worker lacks.
     pub(super) fn missing_required_feature(
         &self,
         request: &GenerationRequest,
@@ -269,15 +277,18 @@ impl EngineLoop {
         self.profile.generation_limits.covers(needs).err()
     }
 
+    /// Returns whether the worker tracks image-latent capacity.
     pub(super) fn worker_tracks_image_latent(&self) -> bool {
         self.info.latent_page_units > 0 && self.info.latent_pages > 1
     }
 
+    /// Returns the worker used image-latent capacity.
     pub(super) fn worker_image_latent_used(&self) -> u64 {
         (self.memory.latent_pages.used_pages() as u64)
             .saturating_mul(u64::from(self.info.latent_page_units))
     }
 
+    /// Computes image-latent capacity required by a request.
     pub(super) fn worker_image_latent_units_for(&self, st: &ReqState) -> u64 {
         let downsample = (self.profile.generation_limits.latent_downsample as u64).max(1);
         let (height, width) = (st.req.image.height, st.req.image.width);
@@ -285,6 +296,7 @@ impl EngineLoop {
             * ceil_div_u64((width as u64).max(1), downsample)
     }
 
+    /// Materializes the negative-prompt KV prefix required by multi-branch guidance.
     pub(super) fn ensure_flow_prefix(&mut self, id: RequestId) -> bool {
         let (prefix_tokens, needs_alternative) = self
             .running
@@ -346,6 +358,7 @@ impl EngineLoop {
         true
     }
 
+    /// Releases the request's flow-prefix allocations.
     pub(super) fn free_flow_prefix(&mut self, id: RequestId) {
         let prefix = self
             .running
@@ -356,8 +369,7 @@ impl EngineLoop {
         }
     }
 
-    /// One loop iteration of the schedule-ahead loop. Returns true if any work
-    /// was submitted or any result resolved.
+    /// Reaps terminal requests after all submitted descendants resolve.
     pub(super) fn reap_cancellations(&mut self) {
         // A cancelled request closes only after every submitted descendant has
         // resolved. Host KV ownership then remains pinned through the close
@@ -406,10 +418,10 @@ impl EngineLoop {
         }
     }
 
-    /// Admit: consume the waiting-queue head while budgets allow (vLLM's
-    /// posture — head-of-line, `max_num_seqs`-capped). Reserving requests
-    /// allocate their full worst-case KV here, which is what makes them
-    /// resident for its complete lifetime.
+    /// Admits requests from the queue head while sequence and memory budgets allow.
+    ///
+    /// Requests configured for worst-case reservation acquire their full KV capacity here,
+    /// keeping that capacity resident for the request lifetime.
     pub(super) fn admit(&mut self) {
         let bs = self.info.kv_block_size() as usize;
         loop {
@@ -530,9 +542,13 @@ impl EngineLoop {
         }
     }
 
+    /// Reserves request resources and moves one validated request into the runnable set.
     pub(super) fn admit_running(&mut self, mut st: ReqState) {
         let id = st.req.request_id;
         let request_key = RequestKey::new(self.authority_id, id, st.epoch);
+
+        // Admission owns the request row and an initially empty table for every
+        // KV group before the request enters the runnable set.
         let request_slot = self
             .memory
             .alloc(request_key, MemoryLayout::RequestSlot)
@@ -553,6 +569,9 @@ impl EngineLoop {
             latent: None,
             buffers: HashMap::new(),
         });
+
+        // Queue latency is finalized at the same timestamp exposed through the
+        // public scheduling event.
         let q = st.queued_at;
         let scheduled_at = now();
         let queue_wait_us = ((scheduled_at - q).max(0.0) * 1_000_000.0) as u64;
@@ -568,6 +587,8 @@ impl EngineLoop {
             .timing
             .queue_wait_us_max
             .fetch_max(queue_wait_us, Ordering::Relaxed);
+
+        // Snapshot trace fields before moving the request into runtime storage.
         let generation = st.req.behavior.clone();
         let phase = st.cursor.phase;
         let prompt_tokens = st.context.prompt_ids.len();
@@ -582,12 +603,16 @@ impl EngineLoop {
         }) {
             st.terminal_intent = TerminalIntent::Cancel;
         }
+
+        // Running order, resource reservations, and runtime ownership advance
+        // together so the next scheduling pass observes one coherent admission.
         self.running.insert(id, st);
         self.scheduler.running_order.push(id);
         self.memory.reserved_encoder_entries = self
             .memory
             .reserved_encoder_entries
             .saturating_add(encoder_entries);
+
         self.trace_record(json!({
             "event": "request_admitted",
             "at_s": scheduled_at,
@@ -607,6 +632,9 @@ impl EngineLoop {
             "reserved_blocks": self.memory.reserved_blocks,
             "reserved_encoder_entries": self.memory.reserved_encoder_entries,
         }));
+
+        // Prefix-cache acquisition pins every reused block to this request's
+        // newly installed block tables.
         let (runtime, memory) = (&mut self.runtime, &self.memory);
         if let Some(st) = runtime.state_mut().running.get_mut(&id) {
             let kv = memory.cache();
@@ -615,6 +643,7 @@ impl EngineLoop {
     }
 }
 
+/// Returns the reusable prefix length for an admitted request.
 fn prefix_hit(
     coordinator: &KvCacheCoordinator,
     state: &ReqState,
@@ -629,6 +658,7 @@ fn prefix_hit(
     )
 }
 
+/// Acquires a complete cross-group prefix hit and records cache accounting on the request.
 fn acquire_cached_prefix(
     coordinator: &KvCacheCoordinator,
     state: &mut ReqState,

@@ -66,6 +66,8 @@ _merge_state = getattr(_flashinfer, "merge_state", None) if _flashinfer is not N
 
 
 class _PagedDecodeInputs(NamedTuple):
+    """Groups normalized queries, page tables, sequence lengths, and layout restoration for paged decode."""
+
     q_bhd: torch.Tensor
     block_table: torch.Tensor
     cache_seqlens: torch.Tensor
@@ -73,6 +75,8 @@ class _PagedDecodeInputs(NamedTuple):
 
 
 class _VarlenPrefillInputs(NamedTuple):
+    """Groups packed queries and cumulative sequence offsets for paged variable-length prefill."""
+
     q: torch.Tensor
     block_table: torch.Tensor
     cu_seqlens_q: torch.Tensor
@@ -81,6 +85,8 @@ class _VarlenPrefillInputs(NamedTuple):
 
 
 class _DecodeGraphPlanInputs(NamedTuple):
+    """Holds live decode metadata and wrapper identity used to refresh a captured graph plan."""
+
     block_table: torch.Tensor
     cache_seqlens: torch.Tensor
     effective_seqlens: torch.Tensor
@@ -103,6 +109,8 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
     dense_ranks = frozenset({3})
 
     def supports(self, mode: AttentionMode, *, cuda_graph: bool = False) -> bool:
+        """Accept FlashInfer dense, paged, packed, and variable-length paths supported by the active wrapper."""
+
         if mode is AttentionMode.PAGED_DECODE and _BatchDecodeWithPagedKVCacheWrapper is None:
             return False
         if mode is AttentionMode.PAGED_VARLEN and _BatchPrefillWithPagedKVCacheWrapper is None:
@@ -116,6 +124,8 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         return super().supports(mode, cuda_graph=cuda_graph)
 
     def __init__(self, *, tuning: FlashInferTuningConfig) -> None:
+        """Initialize decode and prefill plan caches under one tuning policy."""
+
         super().__init__(tuning=tuning)
         self._decode_plan_cache = _PlanCache()
         self._prefill_plan_cache = _PlanCache()
@@ -131,6 +141,8 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         attn_mask: torch.Tensor | None = None,
         context: ForwardBatch | None = None,
     ) -> torch.Tensor:
+        """Compute dense attention through FlashInfer’s single-request prefill operator."""
+
         del context
         if _flashinfer is None:
             raise RuntimeError("flashinfer backend is not available")
@@ -160,6 +172,8 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         scale: float,
         context: ForwardBatch | None = None,
     ) -> torch.Tensor:
+        """Plan and execute FlashInfer paged decode, including an optional current-token cache write."""
+
         del causal
         if _BatchDecodeWithPagedKVCacheWrapper is None:
             raise RuntimeError("flashinfer paged decode wrapper is not available")
@@ -198,6 +212,8 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         )
 
         def build() -> int:
+            """Populate decode plan tensors for the selected wrapper and return index capacity."""
+
             return self._build_decode_plan(
                 wrapper_key,
                 wrapper,
@@ -227,6 +243,8 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         block_table: torch.Tensor,
         cache_seqlens: torch.Tensor,
     ) -> _PagedDecodeInputs:
+        """Normalize decode query and cache tensors to FlashInfer's batch-head-dimension layout."""
+
         q_bhd, restore = normalize_to(q, QKVLayout.BHD)
         if q_bhd.shape[0] <= 0:
             raise ValueError("flashinfer paged decode requires a non-empty batch")
@@ -252,6 +270,8 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         v: torch.Tensor | None,
         plan: Any,
     ) -> int:
+        """Write an optional decode token into the cache and return the effective sequence lengths."""
+
         if k is None and v is None:
             return 0
         if k is None or v is None:
@@ -273,6 +293,8 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         k_cache: torch.Tensor,
         binding: Any,
     ) -> tuple[WrapperKey, Any]:
+        """Resolve an eager or graph-bound decode wrapper for the query and cache geometry."""
+
         graph_wrapper = self._decode_graph_wrapper_for_binding(binding)
         if graph_wrapper is not None:
             return graph_wrapper
@@ -294,6 +316,8 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         plan: Any,
         scale: float,
     ) -> int:
+        """Populate decode page metadata and plan the selected FlashInfer wrapper."""
+
         cpu_indptr = _cpu_paged_indptr(
             plan,
             int(q_bhd.shape[0]),
@@ -348,6 +372,8 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         block_table: torch.Tensor | None = None,
         context: ForwardBatch | None = None,
     ) -> torch.Tensor:
+        """Plan and execute FlashInfer paged prefill for packed variable-length queries."""
+
         del max_seqlen_q, max_seqlen_k
         if _BatchPrefillWithPagedKVCacheWrapper is None:
             raise RuntimeError("flashinfer paged prefill wrapper is not available")
@@ -379,6 +405,8 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         )
 
         def build() -> int:
+            """Populate the packed-prefill plan and return its page-index capacity."""
+
             return self._build_prefill_plan(
                 wrapper_key,
                 wrapper,
@@ -417,6 +445,8 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         fully_visible_current: bool,
         context: ForwardBatch | None = None,
     ) -> torch.Tensor:
+        """Evaluate live and cached KV segments with FlashInfer and merge their attention states."""
+
         if (
             _BatchPrefillWithPagedKVCacheWrapper is None
             or _single_prefill_return_lse is None
@@ -502,6 +532,8 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         cu_seqlens_k: torch.Tensor,
         block_table: torch.Tensor | None,
     ) -> _VarlenPrefillInputs:
+        """Validate packed prefill boundaries and normalize query, key, and value layouts."""
+
         if block_table is None:
             raise RuntimeError("flashinfer varlen path requires a paged KV block table")
         if q.ndim != 3:
@@ -525,6 +557,8 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         cu_seqlens_q: torch.Tensor,
         cu_seqlens_k: torch.Tensor,
     ) -> int:
+        """Validate packed query and KV boundaries against the paged block table."""
+
         if int(cu_seqlens_q.numel()) != int(cu_seqlens_k.numel()):
             raise ValueError("q and k cu_seqlens must describe the same batch")
         batch_size = int(cu_seqlens_q.numel()) - 1
@@ -547,6 +581,8 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         causal: bool,
         scale: float,
     ) -> int:
+        """Populate packed prefill page metadata and plan the selected wrapper."""
+
         kv_seqlens = getattr(plan, "kv_lens", None)
         if not isinstance(kv_seqlens, torch.Tensor) or tuple(kv_seqlens.shape) != (
             int(cu_seqlens_k.numel()) - 1,
@@ -605,6 +641,8 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         causal: bool,
         scale: float | None,
     ) -> None:
+        """Bind bounded plan tensors and attention geometry to a prefill wrapper."""
+
         scale_value = None if scale is None else float(scale)
         self.plan_prefill(
             (
@@ -729,6 +767,8 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         kv_dtype: torch.dtype,
         scale: float | None = None,
     ) -> None:
+        """Refresh graph-scoped decode plan tensors and plan the exclusive wrapper before replay."""
+
         if _BatchDecodeWithPagedKVCacheWrapper is None:
             raise RuntimeError("flashinfer paged decode wrapper is not available")
         if binding is None:
@@ -857,6 +897,8 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         page_size: int,
         kv_dtype: torch.dtype,
     ) -> _DecodeGraphPlanInputs:
+        """Allocate or reuse fixed-shape page metadata for decode graph preparation."""
+
         block_table = plan.block_table.to(dtype=torch.int32).contiguous()
         cache_seqlens = plan.kv_lens.to(dtype=torch.int32).contiguous()
         wrapper_key, wrapper = self._decode_cuda_graph_wrapper(
@@ -900,6 +942,8 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         batch_size: int,
         cpu_indptr: torch.Tensor,
     ) -> _DecodePlanTensors:
+        """Fill fixed graph plan buffers and derive CPU indptr metadata."""
+
         plan = self._decode_plan_tensors(
             wrapper_key,
             block_table,
@@ -925,6 +969,8 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         scale: float | None,
         wrapper_key: WrapperKey,
     ) -> tuple[Any, ...]:
+        """Build the identity that distinguishes one reusable decode graph plan."""
+
         return _decode_plan_key_from_shape(
             binding,
             block_table,
@@ -961,6 +1007,8 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         cpu_indptr: torch.Tensor,
         cpu_last_page_len: torch.Tensor,
     ) -> None:
+        """Plan a graph-bound decode wrapper from caller-owned page metadata buffers."""
+
         self._plan_decode(
             wrapper_key,
             wrapper,
@@ -991,6 +1039,8 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         *,
         index_count: int | None,
     ) -> _DecodePlanTensors:
+        """Materialize bounded decode indptr, page-index, and last-page-length tensors."""
+
         batch_size = int(seq_lens.shape[0])
         max_indices = max(1, int(block_table.numel()))
         graph_buffers = self._decode_graph_buffers.get(wrapper_key)
@@ -1032,6 +1082,8 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         *,
         index_count: int | None,
     ) -> _PrefillPlanTensors:
+        """Materialize bounded prefill query and KV indptr plus page-index tensors."""
+
         batch_size = int(kv_seqlens.shape[0])
         max_indices = max(1, int(block_table.numel()))
         workspace = self._prefill_plan_workspace(

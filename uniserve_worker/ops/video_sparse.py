@@ -1,4 +1,10 @@
-"""Packed-QKV, tile pooling, sparse selection, and gated composition ops."""
+"""Sparse-video QKV packing, tile selection, and output composition.
+
+The kernels transform row-major Q/K/V projections into head-major sparse
+attention inputs, pool fixed-size token tiles, select score-threshold candidates,
+and combine attended values with learned compression tokens. Composition can
+write one local result or route rank-local heads directly into exchange shards.
+"""
 
 from __future__ import annotations
 
@@ -40,6 +46,8 @@ if triton is not None:
         tile_rows: tl.constexpr,
         width: tl.constexpr,
     ):
+        """Average valid Q/K/V rows for one tile and attention head."""
+
         tile = tl.program_id(0)
         head = tl.program_id(1)
         row_offsets = tile * tile_rows + tl.arange(0, tile_rows)
@@ -48,6 +56,8 @@ if triton is not None:
         mask = tl.arange(0, tile_rows)[:, None] < valid_rows
         output_offsets = tile * output_stride_tile + head * output_stride_head + columns
 
+        # Q, K, and V share tiling but retain independent source strides and
+        # output buffers. Empty tiles use a denominator of one and sum to zero.
         query_values = tl.load(
             query
             + row_offsets[:, None] * query_stride_row
@@ -95,6 +105,8 @@ if triton is not None:
         block: tl.constexpr,
         iterations: tl.constexpr,
     ):
+        """Select up to ``selected`` score columns by iterative threshold search."""
+
         row = tl.program_id(0)
         head = row // rows_per_head
         query_row = row % rows_per_head
@@ -105,6 +117,10 @@ if triton is not None:
             mask=valid,
             other=-float("inf"),
         ).to(tl.float32)
+
+        # Maintain score bounds and the number of candidates at each bound.
+        # Interpolation converges toward a threshold with at least ``selected``
+        # values while avoiding a full per-row sort.
         lower = tl.min(tl.where(valid, values, float("inf")))
         upper = tl.max(tl.where(valid, values, -float("inf"))) + 1.0
         lower_count = tl.sum(valid.to(tl.int32), axis=0).to(tl.float32)
@@ -127,6 +143,9 @@ if triton is not None:
             lower_count = tl.where(enough, count, lower_count)
             upper = tl.where(enough, upper, threshold)
             upper_count = tl.where(enough, upper_count, count)
+
+        # Prefix ranks give threshold ties a deterministic column order and
+        # cap stores at the requested output width.
         chosen = (values >= lower) & valid
         positions = tl.cumsum(chosen.to(tl.int32), axis=0) - 1
         tl.store(
@@ -158,6 +177,8 @@ if triton is not None:
         width: tl.constexpr,
         block_rows: tl.constexpr,
     ):
+        """Pack row-major Q/K/V into contiguous ``[3, heads, rows, width]`` storage."""
+
         row_offsets = tl.program_id(0) * block_rows + tl.arange(0, block_rows)
         head = tl.program_id(1)
         columns = tl.arange(0, width)
@@ -165,6 +186,9 @@ if triton is not None:
         destination = (
             head * rows * width + row_offsets[:, None] * width + columns[None, :]
         )
+
+        # Each component uses its own source strides and a component-sized
+        # offset into the shared destination allocation.
         query_values = tl.load(
             query
             + row_offsets[:, None] * query_stride_0
@@ -214,6 +238,8 @@ if triton is not None:
         tile_rows: tl.constexpr,
         block_rows: tl.constexpr,
     ):
+        """Compose head-major attention output with per-tile compression values."""
+
         row_offsets = tl.program_id(0) * block_rows + tl.arange(0, block_rows)
         head = tl.program_id(1)
         columns = tl.arange(0, width)
@@ -242,6 +268,9 @@ if triton is not None:
             mask=mask,
             other=0.0,
         ).to(tl.float32)
+
+        # Compression is shared by all rows in a fixed 64-row tile and gated
+        # independently for every row, head, and feature.
         tl.store(
             output
             + row_offsets[:, None] * output_stride_row
@@ -275,6 +304,8 @@ if triton is not None:
         tile_rows: tl.constexpr,
         block_rows: tl.constexpr,
     ):
+        """Compose values and route them into four destination-rank head shards."""
+
         row_offsets = tl.program_id(0) * block_rows + tl.arange(0, block_rows)
         local_row_offsets = row_offsets % local_rows
         head = tl.program_id(1)
@@ -305,6 +336,10 @@ if triton is not None:
             other=0.0,
         ).to(tl.float32)
         values = attended_values + gate_values * compressed_values
+
+        # Consecutive ``local_rows`` source ranges target distinct destination
+        # ranks. ``source_rank`` selects this rank's global head interval inside
+        # every destination tensor.
         destination = (
             local_row_offsets[:, None] * global_heads * width
             + (source_rank * local_heads + head) * width
@@ -322,14 +357,20 @@ def _pack_qkv(
     key: torch.Tensor,
     value: torch.Tensor,
 ) -> torch.Tensor:
+    """Allocate and return packed ``[3, heads, rows, width]`` Q/K/V storage."""
+
     if triton is None or not triton_available(query.device):
         raise RuntimeError("FastH3 SM100a QKV packing requires Triton")
+
     rows, heads, width = (int(size) for size in query.shape)
     packed = torch.empty(
         (3, heads, rows, width),
         dtype=query.dtype,
         device=query.device,
     )
+
+    # The output orders components before heads and rows, matching the sparse
+    # attention kernel while avoiding an intermediate permuted tensor.
     block_rows = 8
     _pack_qkv_kernel[(triton.cdiv(rows, block_rows), heads)](
         query,
@@ -364,12 +405,18 @@ def _pool_qkv_means(
     pooled_key: torch.Tensor,
     pooled_value: torch.Tensor,
 ) -> None:
+    """Average each Q/K/V head across fixed 64-row tiles into output buffers."""
+
     if triton is None or not triton_available(query.device):
         raise RuntimeError("FastH3 VSA fused pooling requires Triton")
+
     rows, heads, width = (int(size) for size in query.shape)
     tiles = int(valid_sizes.numel())
     if rows != tiles * 64:
         raise ValueError("FastH3 VSA pooling metadata does not match the input rows")
+
+    # One program owns a tile/head pair and reduces only the live prefix given
+    # by ``valid_sizes``; the final tile may therefore be partially occupied.
     _pool_qkv_means_kernel[(tiles, heads)](
         query,
         key,
@@ -407,6 +454,8 @@ def _pool_qkv_means_custom(
     pooled_key: torch.Tensor,
     pooled_value: torch.Tensor,
 ) -> None:
+    """Expose in-place pooled outputs through the registered custom operator."""
+
     _pool_qkv_means(
         query,
         key,
@@ -428,14 +477,22 @@ def _pool_qkv_means_fake(
     pooled_key: torch.Tensor,
     pooled_value: torch.Tensor,
 ) -> None:
+    """Declare the pooled custom operator's fake-tensor mutation contract."""
+
     del query, key, value, valid_sizes, pooled_query, pooled_key, pooled_value
 
 
 def _threshold_topk_indices(scores: torch.Tensor, output: torch.Tensor) -> None:
+    """Fill ``output`` with threshold-selected indices for every score row."""
+
     if triton is None or not triton_available(scores.device):
         raise RuntimeError("FastH3 VSA fused top-k requires Triton")
+
     heads, rows, columns = (int(size) for size in scores.shape)
     selected = int(output.shape[-1])
+
+    # Each program searches one head/query row over a power-of-two score tile
+    # and writes at most the caller-provided selection width.
     _threshold_topk_kernel[(heads * rows,)](
         scores,
         output,
@@ -458,11 +515,15 @@ def _threshold_topk_indices(scores: torch.Tensor, output: torch.Tensor) -> None:
     mutates_args=("output",),
 )
 def _threshold_topk_indices_custom(scores: torch.Tensor, output: torch.Tensor) -> None:
+    """Expose threshold selection as an output-mutating custom operator."""
+
     _threshold_topk_indices(scores, output)
 
 
 @_threshold_topk_indices_custom.register_fake
 def _threshold_topk_indices_fake(scores: torch.Tensor, output: torch.Tensor) -> None:
+    """Declare the threshold custom operator's fake-tensor mutation contract."""
+
     del scores, output
 
 
@@ -472,9 +533,15 @@ def _unpack_add_compression(
     compressed: torch.Tensor,
     output: torch.Tensor,
 ) -> None:
+    """Write ``attended + gate * compressed_tile`` in row-major output layout."""
+
     if triton is None or not triton_available(attended.device):
         raise RuntimeError("FastH3 SM100a output fusion requires Triton")
+
     rows, heads, width = (int(size) for size in gate.shape)
+
+    # Attention and compression are head-major; gate and destination are
+    # row-major. The kernel composes values while converting between layouts.
     block_rows = 8
     _unpack_add_compression_kernel[(triton.cdiv(rows, block_rows), heads)](
         attended,
@@ -505,11 +572,17 @@ def _compose_to_head_shards(
     outputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     source_rank: int,
 ) -> None:
+    """Compose values and scatter this rank's heads into four exchange shards."""
+
     if triton is None or not triton_available(attended.device):
         raise RuntimeError("FastH3 SM100a output exchange requires Triton")
+
     rows, local_heads, width = (int(size) for size in gate.shape)
     local_rows = int(outputs[0].shape[0])
     global_heads = int(outputs[0].shape[1])
+
+    # The source row axis concatenates four destination-rank segments. Each
+    # output receives one segment in the global head range owned by source_rank.
     block_rows = 8
     _compose_to_head_shards_kernel[(triton.cdiv(rows, block_rows), local_heads)](
         attended,
@@ -540,6 +613,8 @@ def _compose_to_head_shards(
 
 @dataclass(frozen=True, slots=True)
 class PackQKVReq:
+    """Q/K/V projections to pack into newly allocated head-major storage."""
+
     query: torch.Tensor
     key: torch.Tensor
     value: torch.Tensor
@@ -547,6 +622,8 @@ class PackQKVReq:
 
 @dataclass(frozen=True, slots=True)
 class PoolQKVMeansReq:
+    """Q/K/V projections, tile occupancy, and caller-owned pooled outputs."""
+
     query: torch.Tensor
     key: torch.Tensor
     value: torch.Tensor
@@ -558,12 +635,16 @@ class PoolQKVMeansReq:
 
 @dataclass(frozen=True, slots=True)
 class ThresholdTopKReq:
+    """Tile scores and caller-owned selected-index storage."""
+
     scores: torch.Tensor
     output: torch.Tensor
 
 
 @dataclass(frozen=True, slots=True)
 class AddCompressionReq:
+    """Attention, gate, compression, and output tensors for gated composition."""
+
     attended: torch.Tensor
     gate: torch.Tensor
     compressed: torch.Tensor
@@ -572,6 +653,8 @@ class AddCompressionReq:
 
 @dataclass(frozen=True, slots=True)
 class ComposeHeadShardsReq:
+    """Rank-local attention values and destination shards for global-head composition."""
+
     attended: torch.Tensor
     gate: torch.Tensor
     compressed: torch.Tensor
@@ -580,24 +663,40 @@ class ComposeHeadShardsReq:
 
 
 class _TritonPackQKV(Operator):
+    """Packs query, key, and value tensors through the Triton sparse-video kernel."""
+
     def __init__(self) -> None:
+        """Register the Triton QKV-packing provider identity."""
+
         super().__init__("triton", "video_sparse_pack_qkv")
 
     def can_run(self, req: PackQKVReq) -> bool:
+        """Return whether Triton can pack tensors on the query device."""
+
         return triton is not None and triton_available(req.query.device)
 
     def run(self, req: PackQKVReq) -> torch.Tensor:
+        """Allocate and return head-major packed Q/K/V storage."""
+
         return _pack_qkv(req.query, req.key, req.value)
 
 
 class _TritonPoolQKVMeans(Operator):
+    """Computes per-tile Q/K/V means through the Triton sparse-video kernel."""
+
     def __init__(self) -> None:
+        """Register the Triton tile-pooling provider identity."""
+
         super().__init__("triton", "video_sparse_pool_qkv_means")
 
     def can_run(self, req: PoolQKVMeansReq) -> bool:
+        """Return whether Triton can pool tensors on the query device."""
+
         return triton is not None and triton_available(req.query.device)
 
     def run(self, req: PoolQKVMeansReq) -> None:
+        """Fill caller-owned pooled Q/K/V buffers through the custom operator."""
+
         _pool_qkv_means_custom(
             req.query,
             req.key,
@@ -610,32 +709,54 @@ class _TritonPoolQKVMeans(Operator):
 
 
 class _TritonThresholdTopK(Operator):
+    """Selects thresholded top-k video tiles through the Triton kernel."""
+
     def __init__(self) -> None:
+        """Register the Triton threshold-selection provider identity."""
+
         super().__init__("triton", "video_sparse_threshold_topk")
 
     def can_run(self, req: ThresholdTopKReq) -> bool:
+        """Return whether Triton can select scores on their current device."""
+
         return triton is not None and triton_available(req.scores.device)
 
     def run(self, req: ThresholdTopKReq) -> None:
+        """Fill the request's selected-index output buffer."""
+
         _threshold_topk_indices_custom(req.scores, req.output)
 
 
 class _TritonAddCompression(Operator):
+    """Adds trained compression tokens through the Triton sparse-video kernel."""
+
     def __init__(self) -> None:
+        """Register the Triton compression-composition provider identity."""
+
         super().__init__("triton", "video_sparse_add_compression")
 
     def can_run(self, req: AddCompressionReq) -> bool:
+        """Return whether Triton can compose on the attention output device."""
+
         return triton is not None and triton_available(req.attended.device)
 
     def run(self, req: AddCompressionReq) -> None:
+        """Fill row-major composed output storage."""
+
         _unpack_add_compression(req.attended, req.gate, req.compressed, req.output)
 
 
 class _TritonComposeHeadShards(Operator):
+    """Composes rank-local attention heads through the Triton sparse-video kernel."""
+
     def __init__(self) -> None:
+        """Register the Triton head-shard composition provider identity."""
+
         super().__init__("triton", "video_sparse_compose_head_shards")
 
     def can_run(self, req: ComposeHeadShardsReq) -> bool:
+        """Return whether Triton and the four-destination layout are available."""
+
         return (
             triton is not None
             and triton_available(req.attended.device)
@@ -643,6 +764,8 @@ class _TritonComposeHeadShards(Operator):
         )
 
     def run(self, req: ComposeHeadShardsReq) -> None:
+        """Compose local heads directly into destination-rank output shards."""
+
         _compose_to_head_shards(
             req.attended,
             req.gate,
@@ -654,32 +777,44 @@ class _TritonComposeHeadShards(Operator):
 
 @lru_cache(maxsize=1)
 def pack_qkv_dispatcher() -> Dispatcher[PackQKVReq, torch.Tensor]:
+    """Return the process-wide sparse QKV-packing dispatcher."""
+
     return Dispatcher("video_sparse_pack_qkv", [_TritonPackQKV()])
 
 
 @lru_cache(maxsize=1)
 def pool_qkv_means_dispatcher() -> Dispatcher[PoolQKVMeansReq, None]:
+    """Return the process-wide sparse tile-pooling dispatcher."""
+
     return Dispatcher("video_sparse_pool_qkv_means", [_TritonPoolQKVMeans()])
 
 
 @lru_cache(maxsize=1)
 def threshold_topk_dispatcher() -> Dispatcher[ThresholdTopKReq, None]:
+    """Return the process-wide sparse threshold-selection dispatcher."""
+
     return Dispatcher("video_sparse_threshold_topk", [_TritonThresholdTopK()])
 
 
 @lru_cache(maxsize=1)
 def add_compression_dispatcher() -> Dispatcher[AddCompressionReq, None]:
+    """Return the process-wide compression-composition dispatcher."""
+
     return Dispatcher("video_sparse_add_compression", [_TritonAddCompression()])
 
 
 @lru_cache(maxsize=1)
 def compose_head_shards_dispatcher() -> Dispatcher[ComposeHeadShardsReq, None]:
+    """Return the process-wide head-shard composition dispatcher."""
+
     return Dispatcher("video_sparse_compose_head_shards", [_TritonComposeHeadShards()])
 
 
 def pack_qkv(
     query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
 ) -> torch.Tensor:
+    """Return Q/K/V packed from ``[rows, heads, width]`` to component-head order."""
+
     return pack_qkv_dispatcher().run(PackQKVReq(query, key, value))
 
 
@@ -692,6 +827,8 @@ def pool_qkv_means(
     pooled_key: torch.Tensor,
     pooled_value: torch.Tensor,
 ) -> None:
+    """Fill per-tile Q/K/V means using ``valid_sizes`` for partial tiles."""
+
     pool_qkv_means_dispatcher().run(
         PoolQKVMeansReq(
             query,
@@ -706,6 +843,8 @@ def pool_qkv_means(
 
 
 def threshold_topk_indices(scores: torch.Tensor, output: torch.Tensor) -> None:
+    """Fill selected score-column indices, using ``output`` width as selection count."""
+
     threshold_topk_dispatcher().run(ThresholdTopKReq(scores, output))
 
 
@@ -715,6 +854,8 @@ def unpack_add_compression(
     compressed: torch.Tensor,
     output: torch.Tensor,
 ) -> None:
+    """Fill row-major output with gated per-tile compression added to attention."""
+
     add_compression_dispatcher().run(
         AddCompressionReq(attended, gate, compressed, output)
     )
@@ -727,6 +868,8 @@ def compose_to_head_shards(
     outputs: tuple[torch.Tensor, ...],
     source_rank: int,
 ) -> None:
+    """Compose local heads into four destination shards at ``source_rank``'s head range."""
+
     compose_head_shards_dispatcher().run(
         ComposeHeadShardsReq(attended, gate, compressed, outputs, int(source_rank))
     )

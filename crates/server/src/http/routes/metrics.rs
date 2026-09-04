@@ -1,3 +1,5 @@
+//! OpenMetrics exposition endpoint.
+
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -8,6 +10,7 @@ use crate::AppState;
 
 const OPENMETRICS_CONTENT_TYPE: &str = "application/openmetrics-text; version=1.0.0; charset=utf-8";
 
+/// Renders the current process registry in OpenMetrics text format.
 pub(super) async fn scrape(State(state): State<Arc<AppState>>) -> Response {
     let identity = state.runtime().model().served_identity();
     METRICS.serving.set_request_states(

@@ -31,6 +31,8 @@ class H3Schedule:
 
     @classmethod
     def build(cls, device: torch.device | str) -> "H3Schedule":
+        """Materialize the four-step video and audio sigma ladders on one device."""
+
         video = torch.tensor(shifted_sigmas(12.0), dtype=torch.float32, device=device)
         audio = torch.tensor(shifted_sigmas(3.0), dtype=torch.float32, device=device)
         return cls(
@@ -41,6 +43,8 @@ class H3Schedule:
         )
 
     def __post_init__(self) -> None:
+        """Validate host and device schedule lengths against the fixed H3 step count."""
+
         if self.video_sigmas.shape != (5,) or self.audio_sigmas.shape != (5,):
             raise ValueError("FastH3 requires five sigma points")
         if self.video_timesteps.shape != (4,) or self.audio_timesteps.shape != (4,):

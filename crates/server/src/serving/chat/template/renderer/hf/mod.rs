@@ -1,3 +1,8 @@
+//! Hugging Face Jinja chat-template renderer.
+//!
+//! The renderer loads tokenizer metadata, detects the expected message-content
+//! shape, and renders messages and tools into a tokenizable prompt.
+
 use std::collections::HashMap;
 
 use crate::profile::assets::{
@@ -28,7 +33,9 @@ pub use template::{load_chat_template, resolve_chat_template};
 pub use self::format::ChatTemplateContentFormatOption;
 
 #[derive(Debug, Clone)]
+/// Rendered image placements and hashes aligned with prompt content.
 pub struct MultimodalRenderInfo {
+    /// Template token inserted at each rendered image position.
     pub placeholder_token: String,
 }
 
@@ -42,7 +49,7 @@ pub struct HfChatRenderer {
 }
 
 impl HfChatRenderer {
-    /// Create a renderer from the given template string.
+    /// Creates a renderer from the given template string.
     pub fn new(
         template: Option<String>,
         default_template_kwargs: HashMap<String, JsonValue>,
@@ -61,17 +68,19 @@ impl HfChatRenderer {
         })
     }
 
+    /// Attaches tokenizer special tokens to the renderer.
     pub fn with_special_tokens(mut self, special_tokens: Option<HfSpecialTokens>) -> Self {
         self.special_tokens = special_tokens;
         self
     }
 
+    /// Attaches ordered multimodal placement metadata to the renderer.
     pub fn with_multimodal(mut self, multimodal: Option<MultimodalRenderInfo>) -> Self {
         self.multimodal = multimodal;
         self
     }
 
-    /// Create a renderer from the given model files and loading options.
+    /// Creates a renderer from the given model files and loading options.
     pub fn load(
         files: &ResolvedModelFiles,
         options: ChatTemplateLoadOptions,
@@ -120,7 +129,7 @@ impl HfChatRenderer {
         .with_multimodal(multimodal))
     }
 
-    /// Render one chat request into the text prompt submitted to the configured
+    /// Renders one chat request into the text prompt submitted to the configured
     /// model description.
     pub fn render(&self, request: &ChatRequest) -> Result<String> {
         let template = self
@@ -131,6 +140,7 @@ impl HfChatRenderer {
         self.apply_chat_template_inner(template, request)
     }
 
+    /// Builds template values and renders them with request-specific control flags.
     fn apply_chat_template_inner(
         &self,
         effective_template: &CompiledChatTemplate,
@@ -221,6 +231,7 @@ struct TemplateToolFunction {
 }
 
 #[derive(Debug, Serialize)]
+/// Template-facing function tool representation.
 pub(super) struct TemplateTool {
     #[serde(rename = "type")]
     tool_type: &'static str,
@@ -235,7 +246,7 @@ struct TemplateToolDefinition {
     strict: Option<bool>,
 }
 
-/// Convert chat messages into the JSON shape expected by Jinja chat templates.
+/// Converts chat messages into the value shape expected by Jinja chat templates.
 fn to_template_messages(
     messages: &[ChatMessage],
     content_format: ChatTemplateContentFormat,
@@ -247,6 +258,7 @@ fn to_template_messages(
         .collect()
 }
 
+/// Converts one structured message into the renderer's template value model.
 fn to_template_message(
     message: &ChatMessage,
     content_format: ChatTemplateContentFormat,
@@ -306,6 +318,7 @@ fn to_template_message(
     })
 }
 
+/// Parses assistant tool arguments and converts complete calls into template values.
 fn to_template_tool_calls(
     content: &crate::serving::chat::AssistantMessage,
 ) -> Result<Option<Vec<TemplateToolCall>>> {
@@ -334,6 +347,7 @@ fn to_template_tool_calls(
     Ok((!tool_calls.is_empty()).then_some(tool_calls))
 }
 
+/// Converts message content according to the template's detected representation.
 fn to_template_content(
     content: &ChatContent,
     content_format: ChatTemplateContentFormat,
@@ -355,6 +369,7 @@ fn to_template_content(
     })
 }
 
+/// Converts message content into an OpenAI-style list of typed parts.
 fn to_template_openai_content(
     content: &ChatContent,
     multimodal: Option<&MultimodalRenderInfo>,
@@ -377,6 +392,7 @@ fn to_template_openai_content(
     }
 }
 
+/// Flattens content into a string while substituting multimodal placeholder tokens.
 fn to_template_string_content(
     content: &ChatContent,
     multimodal: Option<&MultimodalRenderInfo>,
@@ -400,6 +416,7 @@ fn to_template_string_content(
     }
 }
 
+/// Converts request tools into template values.
 fn to_template_tools(tools: &[Tool]) -> Vec<TemplateTool> {
     tools
         .iter()

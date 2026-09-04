@@ -38,6 +38,12 @@ _FLOW_COORDINATE = 1
 
 @dataclass(frozen=True, slots=True)
 class MoTConfig:
+    """Defines a Mixture-of-Transformers decoder's tensor geometry.
+
+    The configuration fixes hidden width, attention heads, experts, rotary settings,
+    and mesh placement.
+    """
+
     hidden_size: int
     intermediate_size: int
     num_hidden_layers: int
@@ -51,6 +57,8 @@ class MoTConfig:
 
 @dataclass(frozen=True, slots=True)
 class _MlpConfig:
+    """Defines dense or expert feed-forward widths and routing parameters for one decoder layer."""
+
     hidden_size: int
     intermediate_size: int
     hidden_act: str = "silu"
@@ -58,6 +66,8 @@ class _MlpConfig:
 
 @dataclass(frozen=True, slots=True)
 class _Expert:
+    """Groups one Mixture-of-Transformers expert’s norms, projections, MLP, and mesh coordinate."""
+
     input_norm: nn.Module
     qkv: nn.Module
     output: nn.Module
@@ -77,6 +87,8 @@ def _apply(
     target: torch.device,
     call: Callable[[nn.Module, torch.Tensor, ForwardBatch], torch.Tensor],
 ) -> torch.Tensor:
+    """Dispatch one routed tensor to an expert coordinate and combine the module output."""
+
     staged = context.mesh.dispatch(value, "tower", coordinate)
     result = call(module, staged, context)
     if not isinstance(result, torch.Tensor):
@@ -92,7 +104,11 @@ def _route_modules(
     context: ForwardBatch,
     call: Callable[[nn.Module, torch.Tensor, ForwardBatch], torch.Tensor],
 ) -> RoutedTensor:
+    """Execute text and flow tensors through their route-specific module replicas."""
+
     def apply_text(item: torch.Tensor) -> torch.Tensor:
+        """Run the text module on its tower coordinate and restore the caller device."""
+
         return _apply(
             text_module,
             item,
@@ -103,6 +119,8 @@ def _route_modules(
         )
 
     def apply_flow(item: torch.Tensor) -> torch.Tensor:
+        """Run the flow module on its tower coordinate and restore the caller device."""
+
         return _apply(
             flow_module,
             item,
@@ -120,6 +138,8 @@ def _plain_call(
     value: torch.Tensor,
     context: ForwardBatch,
 ) -> torch.Tensor:
+    """Invoke a routed module without mesh-aware arguments."""
+
     del context
     return cast(torch.Tensor, module(value))
 
@@ -129,6 +149,8 @@ def _parallel_call(
     value: torch.Tensor,
     context: ForwardBatch,
 ) -> torch.Tensor:
+    """Invoke a routed module with the route-restricted mesh view."""
+
     return cast(torch.Tensor, module(value, context.mesh))
 
 
@@ -136,6 +158,8 @@ class MoTDecoderLayer(nn.Module):
     """One decoder layer with text and flow experts over shared attention."""
 
     def __init__(self, config: MoTConfig, *, layer_config: LayerConfig) -> None:
+        """Build text and flow projections around shared paged attention geometry."""
+
         super().__init__()
         hidden = int(config.hidden_size)
         head_dim = int(config.head_dim)
@@ -241,6 +265,8 @@ class MoTDecoderLayer(nn.Module):
         sin: torch.Tensor,
         context: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project one expert route into normalized rotary QKV heads."""
+
         target = hidden.device
         staged = context.mesh.dispatch(hidden, "tower", expert.coordinate)
         staged_cos = context.mesh.dispatch(cos, "tower", expert.coordinate)
@@ -350,6 +376,8 @@ class MoTModel(nn.Module):
     """Packed text/flow decoder with no request or runtime state."""
 
     def __init__(self, config: MoTConfig, *, layer_config: LayerConfig) -> None:
+        """Build the routed decoder and bind flow normalization to its tower coordinate."""
+
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,

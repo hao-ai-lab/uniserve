@@ -1,3 +1,5 @@
+//! Stateful incremental decoding with stable-prefix emission.
+
 use std::mem::take;
 
 use crate::profile::tokenizer::{HuggingFaceTokenizer, Result};
@@ -25,6 +27,7 @@ pub struct IncrementalDecoder<'a> {
 }
 
 impl<'a> IncrementalDecoder<'a> {
+    /// Creates an incremental decoder for one generation stream.
     pub(crate) fn new(
         tokenizer: &'a HuggingFaceTokenizer,
         prompt_token_ids: &[u32],
@@ -62,7 +65,7 @@ const SAFE_SUFFIX_MAX: usize = 6;
 const MAX_PENDING_TOKENS: usize = 32;
 
 impl IncrementalDecoder<'_> {
-    /// Seed `self.prefix` from the shortest trailing suffix whose decoded text
+    /// Seeds `self.prefix` from the shortest trailing suffix whose decoded text
     /// has no U+FFFD — a clean decode means the suffix starts and ends at
     /// valid UTF-8/token boundaries, so priming from it is equivalent to
     /// priming from the full prompt.
@@ -102,7 +105,7 @@ impl IncrementalDecoder<'_> {
 }
 
 impl IncrementalDecoder<'_> {
-    /// Push one generated token and return how many new string bytes were added.
+    /// Pushes one generated token and return how many new string bytes were added.
     pub fn push_token(&mut self, token_id: u32) -> Result<usize> {
         if !self.prompt_seeded {
             self.prompt_seeded = true;
@@ -134,6 +137,7 @@ impl IncrementalDecoder<'_> {
         Ok(new_chunk.len())
     }
 
+    /// Decodes and returns the next stable text prefix, if available.
     pub fn next_chunk(&mut self) -> Option<String> {
         let cutoff = self
             .cumulative_output
@@ -148,6 +152,7 @@ impl IncrementalDecoder<'_> {
         })
     }
 
+    /// Flushes buffered tokens and optionally truncates final output bytes.
     pub fn flush(&mut self, truncate_output_to: Option<usize>) -> Result<(Option<String>, String)> {
         if !self.ids.is_empty() {
             let string = self.tokenizer.decode(&self.ids, self.skip_special_tokens)?;
@@ -169,6 +174,7 @@ impl IncrementalDecoder<'_> {
         Ok((last_chunk, take(&mut self.cumulative_output)))
     }
 
+    /// Returns all stable text emitted so far.
     pub fn output(&self) -> &str {
         &self.cumulative_output
     }

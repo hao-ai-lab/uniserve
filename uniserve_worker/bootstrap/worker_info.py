@@ -12,6 +12,8 @@ from ..foundation.errors import invalid_descriptor
 
 
 class RequestKind(StrEnum):
+    """Defines IPC request verbs for discovery, submission, polling, and shutdown."""
+
     INFO = "info"
     SUBMIT = "submit"
     POLL = "poll"
@@ -19,6 +21,8 @@ class RequestKind(StrEnum):
 
 
 class ResponseKind(StrEnum):
+    """Defines IPC response categories for worker information, results, acknowledgements, and errors."""
+
     INFO = "info"
     RESULT = "result"
     OK = "ok"
@@ -26,12 +30,16 @@ class ResponseKind(StrEnum):
 
 
 class KvGroupKind(StrEnum):
+    """Distinguishes full-context and sliding-window KV cache groups."""
+
     FULL = "full"
     SLIDING_WINDOW = "sliding_window"
 
 
 @dataclass(frozen=True, slots=True)
 class KvGroup:
+    """Describes the page count and optional window geometry of one KV cache group."""
+
     num_blocks: int
     kind: KvGroupKind
     window: int
@@ -39,6 +47,8 @@ class KvGroup:
 
     @classmethod
     def from_mapping(cls, value: object, where: str) -> KvGroup:
+        """Decode and validate one KV group from its scheduler wire mapping."""
+
         data = _map(value, where)
         kind_data = _map(data.get("kind"), f"{where}.kind")
         return cls(
@@ -49,6 +59,8 @@ class KvGroup:
         )
 
     def to_mapping(self) -> dict[str, object]:
+        """Encode full-context or sliding-window geometry for the scheduler wire format."""
+
         kind: dict[str, object] = {"kind": self.kind.value}
         if self.kind is KvGroupKind.SLIDING_WINDOW:
             kind.update(window=self.window, sink=self.sink)
@@ -60,6 +72,8 @@ class KvGroup:
 
 @dataclass(frozen=True, slots=True)
 class KvCacheConfig:
+    """Publishes KV block size, dtype, token capacity, and group geometry to the scheduler."""
+
     block_size: int
     num_blocks: int
     num_layers: int
@@ -70,6 +84,8 @@ class KvCacheConfig:
     dtype: str
 
     def __post_init__(self) -> None:
+        """Validate published KV dimensions, dtype, token capacity, and group coverage."""
+
         if min(
             self.block_size,
             self.num_blocks,
@@ -86,6 +102,8 @@ class KvCacheConfig:
 
     @classmethod
     def from_mapping(cls, value: object, where: str) -> KvCacheConfig:
+        """Decode and validate complete physical KV geometry from the wire mapping."""
+
         data = _map(value, where)
         return cls(
             block_size=_uint(data.get("block_size"), f"{where}.block_size"),
@@ -102,6 +120,8 @@ class KvCacheConfig:
         )
 
     def to_mapping(self) -> dict[str, object]:
+        """Encode physical KV geometry and page groups for scheduler discovery."""
+
         return {
             "block_size": self.block_size,
             "num_blocks": self.num_blocks,
@@ -116,15 +136,21 @@ class KvCacheConfig:
 
 @dataclass(frozen=True, slots=True)
 class RankInfo:
+    """Describes one rank’s identity within the worker topology."""
+
     tp_rank: int = 0
     tp_size: int = 1
 
     def __post_init__(self) -> None:
+        """Validate rank coordinates against the declared topology size."""
+
         if self.tp_size < 1 or not 0 <= self.tp_rank < self.tp_size:
             raise invalid_descriptor("rank.tp must satisfy 0 <= rank < size")
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "rank") -> RankInfo:
+        """Decode and validate tensor-parallel rank identity from the wire mapping."""
+
         data = _map(value, where)
         return cls(
             tp_rank=_uint(data.get("tp_rank", 0), f"{where}.tp_rank"),
@@ -132,6 +158,8 @@ class RankInfo:
         )
 
     def to_mapping(self) -> dict[str, int]:
+        """Encode tensor-parallel rank identity for scheduler discovery."""
+
         return {
             "tp_rank": self.tp_rank,
             "tp_size": self.tp_size,
@@ -140,6 +168,8 @@ class RankInfo:
 
 @dataclass(frozen=True, slots=True)
 class WorkerInfo:
+    """Describes a worker’s public capabilities, topology, and resource bounds."""
+
     model_name: str
     weight_version: int
     rank: RankInfo
@@ -156,13 +186,19 @@ class WorkerInfo:
 
     @property
     def latent_capacity_units(self) -> int:
+        """Report allocatable latent units after reserving the sentinel page."""
+
         return max(0, self.latent_pages - 1) * self.latent_page_units
 
     @property
     def uses_kv(self) -> bool:
+        """Indicate whether this worker publishes a physical KV cache."""
+
         return self.kv_cache is not None
 
     def __post_init__(self) -> None:
+        """Validate advertised worker topology, capacities, variants, and cache-group geometry."""
+
         for name in (
             "queue_depth",
             "max_batch_ops",
@@ -210,6 +246,8 @@ class WorkerInfo:
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "info") -> WorkerInfo:
+        """Decode and validate a worker capability advertisement from IPC data."""
+
         data = _map(value, where)
         return cls(
             model_name=_str(data.get("model_name", ""), f"{where}.model_name"),
@@ -241,6 +279,8 @@ class WorkerInfo:
         )
 
     def to_mapping(self) -> dict[str, object]:
+        """Encode worker capabilities and resource bounds for IPC discovery."""
+
         return {
             "model_name": self.model_name,
             "weight_version": self.weight_version,
@@ -262,6 +302,8 @@ _E = TypeVar("_E", bound=StrEnum)
 
 
 def _enum(kind: type[_E], value: object, where: str) -> _E:
+    """Decode one string-backed enum field from scheduler metadata."""
+
     if not isinstance(value, str):
         raise invalid_descriptor(f"{where} must be a string")
     try:
@@ -271,34 +313,46 @@ def _enum(kind: type[_E], value: object, where: str) -> _E:
 
 
 def _map(value: object, where: str) -> Mapping[str, Any]:
+    """Require a metadata field to be a mapping."""
+
     if not isinstance(value, Mapping):
         raise invalid_descriptor(f"{where} must be a map")
     return cast(Mapping[str, Any], value)
 
 
 def _seq(value: object, where: str) -> Sequence[Any]:
+    """Require a metadata field to be a non-string sequence."""
+
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
         raise invalid_descriptor(f"{where} must be a list")
     return value
 
 
 def _uint(value: object, where: str) -> int:
+    """Decode a non-negative integer metadata field."""
+
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise invalid_descriptor(f"{where} must be a non-negative integer")
     return value
 
 
 def _optional_uint(value: object, where: str) -> int | None:
+    """Decode an optional non-negative integer metadata field."""
+
     return None if value is None else _uint(value, where)
 
 
 def _bool(value: object, where: str) -> bool:
+    """Require a metadata field to contain a boolean."""
+
     if not isinstance(value, bool):
         raise invalid_descriptor(f"{where} must be a boolean")
     return value
 
 
 def _str(value: object, where: str) -> str:
+    """Require a metadata field to contain text."""
+
     if not isinstance(value, str):
         raise invalid_descriptor(f"{where} must be a string")
     return value

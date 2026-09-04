@@ -1,9 +1,5 @@
-"""Jagged visible-end FlashAttention kernel.
+"""Exposes jagged visible-end FlashAttention with optional CuTe runtime loading."""
 
-This submodule owns the UniServe-facing jagged attention ABI and the visible-end
-helpers. The CUTE runtime is an optional extra of the installed pack; when it is
-absent this submodule stays importable and reports itself unavailable.
-"""
 from __future__ import annotations
 
 from .prefix_bounds import compute_prefix_bounds, compute_prefix_bounds_varlen
@@ -19,14 +15,20 @@ except Exception as exc:  # pragma: no cover
 
 
 def available() -> bool:
+    """Report whether the jagged FlashAttention runtime loaded successfully."""
+
     return flash_attn_fwd is not None
 
 
 def import_error() -> BaseException | None:
+    """Return the exception that prevented runtime loading, when present."""
+
     return _IMPORT_ERROR
 
 
 def require_available() -> None:
+    """Require the optional runtime and raise an actionable error when absent."""
+
     if available():
         return
     detail = f": {_IMPORT_ERROR}" if _IMPORT_ERROR is not None else ""

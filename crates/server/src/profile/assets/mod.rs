@@ -1,4 +1,4 @@
-//! Model file and metadata resolution for frontend backends.
+//! Model asset discovery and tokenizer metadata loading.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 pub mod config;

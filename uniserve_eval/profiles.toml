@@ -1,3 +1,5 @@
+# Declares serial benchmark servers, workload points, and named benchmark suites.
+# Model and tokenizer placeholders resolve from the launch environment.
 artifact_root = "artifacts/benchmark"
 
 [servers.qwen]

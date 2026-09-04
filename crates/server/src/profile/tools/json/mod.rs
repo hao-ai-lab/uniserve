@@ -1,4 +1,4 @@
-//! Shared parser core for JSON tool calls wrapped by text markers.
+//! Incremental parser for JSON tool calls enclosed by text markers.
 
 pub use qwen::Qwen3XmlToolParser;
 
@@ -68,7 +68,7 @@ struct JsonToolCallParser {
 }
 
 impl JsonToolCallParser {
-    /// Create a marker-wrapped JSON tool-call parser.
+    /// Creates a marker-wrapped JSON tool-call parser.
     fn new(config: JsonToolCallConfig) -> Self {
         Self {
             config,
@@ -79,6 +79,7 @@ impl JsonToolCallParser {
         }
     }
 
+    /// Advances incremental parsing and appends every complete event to `output`.
     fn parse_into(&mut self, chunk: &str, output: &mut ToolParserOutput) -> Result<()> {
         self.buffer.push_str(chunk);
         let config = self.config;
@@ -104,6 +105,7 @@ impl JsonToolCallParser {
         Ok(())
     }
 
+    /// Finalizes buffered input or rejects an incomplete tool call.
     fn finish(&mut self) -> Result<ToolParserOutput> {
         let mut output = ToolParserOutput::default();
         match &self.mode {
@@ -119,7 +121,7 @@ impl JsonToolCallParser {
         Ok(output)
     }
 
-    /// Apply one parsed JSON tool-call event to parser state and output.
+    /// Applies one parsed JSON tool-call event to parser state and output.
     fn apply_event(
         &mut self,
         event: JsonToolCallEvent,
@@ -164,6 +166,7 @@ impl JsonToolCallParser {
         Ok(())
     }
 
+    /// Resets the incremental parser state.
     fn reset(&mut self) -> String {
         self.mode = JsonToolCallMode::Text;
         self.active_tool_index = None;
@@ -172,7 +175,7 @@ impl JsonToolCallParser {
     }
 }
 
-/// Parse a JSON tool-call event for the current parser mode.
+/// Parses a JSON tool-call event for the current parser mode.
 fn parse_next_json_tool_call_event(
     input: &mut JsonToolInput<'_>,
     mode: &mut JsonToolCallMode,
@@ -187,7 +190,7 @@ fn parse_next_json_tool_call_event(
     }
 }
 
-/// Parse a text-mode JSON tool-call event.
+/// Parses a text-mode JSON tool-call event.
 fn parse_text_event(
     input: &mut JsonToolInput<'_>,
     config: JsonToolCallConfig,
@@ -199,7 +202,7 @@ fn parse_text_event(
     .parse_next(input)
 }
 
-/// Parse a marker-wrapped JSON tool-call start marker.
+/// Parses a marker-wrapped JSON tool-call start marker.
 fn tool_call_start_event(
     input: &mut JsonToolInput<'_>,
     config: JsonToolCallConfig,
@@ -212,7 +215,7 @@ fn tool_call_start_event(
     .parse_next(input)
 }
 
-/// Parse a marker-wrapped JSON tool-call header before the raw arguments
+/// Parses a marker-wrapped JSON tool-call header before the raw arguments
 /// payload.
 fn tool_call_header_event(
     input: &mut JsonToolInput<'_>,
@@ -241,7 +244,7 @@ fn tool_call_header_event(
     Ok(JsonToolCallEvent::ToolCallHeader { function_name })
 }
 
-/// Parse a configured JSON object key.
+/// Parses a configured JSON object key.
 fn json_key(input: &mut JsonToolInput<'_>, key: &'static str) -> ModalResult<()> {
     seq!(
         _: literal("\""),
@@ -252,7 +255,7 @@ fn json_key(input: &mut JsonToolInput<'_>, key: &'static str) -> ModalResult<()>
     .parse_next(input)
 }
 
-/// Parse a JSON object key accepting any of `candidates`.
+/// Parses a JSON object key accepting any of `candidates`.
 ///
 /// The full quoted key is consumed and compared against the candidate list,
 /// so this works correctly under partial input regardless of key lengths.
@@ -287,7 +290,7 @@ fn json_arguments_key(
         })
 }
 
-/// Parse one event inside a marker-wrapped JSON tool-call arguments payload.
+/// Parses one event inside a marker-wrapped JSON tool-call arguments payload.
 fn parse_arguments_event(
     input: &mut JsonToolInput<'_>,
     json_scan: &mut JsonObjectScanState,
@@ -300,7 +303,7 @@ fn parse_arguments_event(
     }
 }
 
-/// Parse a raw JSON arguments delta.
+/// Parses a raw JSON arguments delta.
 fn argument_delta_event(
     input: &mut JsonToolInput<'_>,
     json_scan: &mut JsonObjectScanState,
@@ -308,7 +311,7 @@ fn argument_delta_event(
     take_json_object(input, json_scan).map(|len| JsonToolCallEvent::Arguments { len })
 }
 
-/// Parse a marker-wrapped JSON tool-call close marker.
+/// Parses a marker-wrapped JSON tool-call close marker.
 fn tool_call_close_event(
     input: &mut JsonToolInput<'_>,
     config: JsonToolCallConfig,
@@ -318,7 +321,7 @@ fn tool_call_close_event(
     tool_call_end_event(input, config)
 }
 
-/// Parse a marker-wrapped JSON tool-call end marker.
+/// Parses a marker-wrapped JSON tool-call end marker.
 fn tool_call_end_event(
     input: &mut JsonToolInput<'_>,
     config: JsonToolCallConfig,
@@ -331,12 +334,12 @@ fn tool_call_end_event(
     .parse_next(input)
 }
 
-/// Parse configured whitespace around a marker-wrapped JSON tool call.
+/// Parses configured whitespace around a marker-wrapped JSON tool call.
 fn marker_whitespace(input: &mut JsonToolInput<'_>, config: JsonToolCallConfig) -> ModalResult<()> {
     literal(config.marker_whitespace).void().parse_next(input)
 }
 
-/// Parse a safe text run before the next marker-wrapped JSON tool call.
+/// Parses a safe text run before the next marker-wrapped JSON tool call.
 fn safe_text_event(
     input: &mut JsonToolInput<'_>,
     config: JsonToolCallConfig,

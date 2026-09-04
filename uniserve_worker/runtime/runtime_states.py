@@ -36,6 +36,8 @@ if triton is not None:
         vocab_size: tl.constexpr,
         block_size: tl.constexpr,
     ):
+        """Reset one device runtime row while preserving its declared logical coordinates."""
+
         offsets = tl.program_id(0) * block_size + tl.arange(0, block_size)
         tl.store(
             future_tokens_ptr + row * continuation_width + offsets,
@@ -71,6 +73,8 @@ if triton is not None:
         has_selected: tl.constexpr,
         block_size: tl.constexpr,
     ):
+        """Publish batched decode tokens and advance device-resident runtime coordinates."""
+
         offsets = tl.arange(0, block_size)
         mask = offsets < count
         indices = tl.load(indices_ptr + offsets, mask=mask, other=0)
@@ -98,6 +102,8 @@ if triton is not None:
 
 @dataclass(frozen=True, slots=True)
 class RuntimeStateSnapshot:
+    """Captures continuation tensors and cache length for rollback-safe request execution."""
+
     valid_cache_length: int
     logical_length: int
     sampling_position: int
@@ -125,6 +131,8 @@ class RuntimeStates:
         logits_dtype: torch.dtype = torch.float32,
         valid_cache_lengths: torch.Tensor | None = None,
     ) -> None:
+        """Allocate request-indexed continuation tensors and prewarm update kernels."""
+
         if request_pool_size < 1 or vocab_size < 1 or continuation_width < 1:
             raise ValueError("runtime-state geometry must be positive")
         self.request_pool_size = int(request_pool_size)
@@ -134,6 +142,9 @@ class RuntimeStates:
         if not logits_dtype.is_floating_point:
             raise ValueError("runtime prompt-logit dtype must be floating point")
         self.logits_dtype = logits_dtype
+
+        # Row zero is the immutable padding sentinel. Real request slots use the
+        # same one-based indexes assigned by the request pool.
         rows = self.request_pool_size + 1
         if valid_cache_lengths is None:
             self.valid_cache_lengths = torch.zeros(
@@ -170,6 +181,9 @@ class RuntimeStates:
             dtype=torch.int64,
             device=self.device,
         )
+
+        # Zero-count launches compile representative block sizes without
+        # modifying any request row.
         if triton is not None and self.device.type == "cuda" and triton_available(self.device):
             self._reset_device_row(0, 0, 0, 0)
             for block_size in (1, 2, 4, 8, 16, 32, 64, 128):
@@ -200,6 +214,8 @@ class RuntimeStates:
         logical_lengths: torch.Tensor | Sequence[int] | None = None,
         sampling_positions: torch.Tensor | Sequence[int] | None = None,
     ) -> None:
+        """Initialize selected request rows with validated cache length and sampling state."""
+
         if not isinstance(request_pool_indices, torch.Tensor) and self.device.type == "cuda":
             host = tuple(int(value) for value in request_pool_indices)
             self._validate_host_indices(host)
@@ -225,6 +241,8 @@ class RuntimeStates:
         self._copy_or_zero(self.sampling_positions, indices, sampling_positions)
 
     def release(self, request_pool_indices: torch.Tensor | Sequence[int]) -> None:
+        """Mark selected continuation-state rows inactive."""
+
         self.reset(request_pool_indices)
 
     def snapshot_rows(
@@ -233,6 +251,8 @@ class RuntimeStates:
         *,
         prompt_logits_ready: Sequence[bool],
     ) -> tuple[RuntimeStateSnapshot, ...]:
+        """Copy selected continuation rows and prompt-logit readiness into rollback snapshots."""
+
         rows = tuple(int(value) for value in request_pool_indices)
         flags = tuple(bool(value) for value in prompt_logits_ready)
         self._validate_host_indices(rows)
@@ -258,6 +278,8 @@ class RuntimeStates:
         self,
         rows: Sequence[tuple[int, RuntimeStateSnapshot]],
     ) -> None:
+        """Restore continuation tensors and metadata from rollback snapshots."""
+
         for raw_index, snapshot in rows:
             index = int(raw_index)
             self._validate_host_indices((index,))
@@ -294,6 +316,8 @@ class RuntimeStates:
         predicates: torch.Tensor,
         selected_points: torch.Tensor | None,
     ) -> None:
+        """Commit device-selected decode transitions into request-indexed continuation tensors."""
+
         host = tuple(int(value) for value in request_pool_indices)
         self._validate_host_indices(host)
         count = len(host)
@@ -356,9 +380,13 @@ class RuntimeStates:
         self.valid_cache_lengths.index_add_(0, indices, ones_i32)
 
     def penalty_rows(self, request_pool_indices: torch.Tensor) -> torch.Tensor:
+        """Gather vocabulary-wide occurrence counts for selected request slots."""
+
         return self.penalty_counts.index_select(0, self._indices(request_pool_indices))
 
     def _indices(self, values: torch.Tensor | Sequence[int]) -> torch.Tensor:
+        """Normalize host or device row indices onto the runtime-state device."""
+
         if isinstance(values, torch.Tensor):
             source = values.reshape(-1)
             count = int(source.numel())
@@ -385,6 +413,8 @@ class RuntimeStates:
         return torch.tensor(host, dtype=torch.long, device=self.device)
 
     def _validate_host_indices(self, values: tuple[int, ...]) -> None:
+        """Validate host reset indices are unique and within runtime row bounds."""
+
         if any(value < 1 or value > self.request_pool_size for value in values):
             raise ValueError("request-pool index is outside runtime-state capacity")
         if len(set(values)) != len(values):
@@ -395,6 +425,8 @@ class RuntimeStates:
         values: torch.Tensor | Sequence[int] | None,
         count: int,
     ) -> tuple[int, ...] | None:
+        """Normalize an optional host reset column to the requested row count."""
+
         if values is None:
             return (0,) * count
         if isinstance(values, torch.Tensor):
@@ -416,6 +448,8 @@ class RuntimeStates:
         logical_length: int,
         sampling_position: int,
     ) -> None:
+        """Reset one device row through the fused kernel or tensor fallback path."""
+
         if triton is not None and triton_available(self.device):
             block_size = 256
             span = max(self.continuation_width, self.vocab_size)
@@ -450,6 +484,8 @@ class RuntimeStates:
         indices: torch.Tensor,
         values: torch.Tensor | Sequence[int] | None,
     ) -> None:
+        """Scatter supplied values into indexed rows or clear those rows when absent."""
+
         if values is None:
             target.index_fill_(0, indices, 0)
             return

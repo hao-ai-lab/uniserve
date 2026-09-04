@@ -28,6 +28,8 @@ _SamplingKernel = Callable[
 
 @dataclass(frozen=True)
 class SamplingParameters:
+    """Holds device-ready temperature, filtering, and token-penalty vectors for batched sampling."""
+
     temperature: torch.Tensor
     top_p: torch.Tensor
     min_p: torch.Tensor
@@ -37,6 +39,8 @@ class SamplingParameters:
 
     @classmethod
     def from_columns(cls, values: torch.Tensor) -> SamplingParameters:
+        """View a ``[rows, 6]`` parameter matrix as named row-aligned vectors."""
+
         if values.ndim != 2 or int(values.shape[-1]) != 6:
             raise ValueError("sampling parameters must have six columns per row")
         return cls(
@@ -62,6 +66,10 @@ def _sample_top_k_tensor(
     presence_penalty: torch.Tensor,
     top_k: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample row-wise top-k candidates after penalties and probability filters."""
+
+    # Penalties are applied in flattened row-major space so repeated token IDs
+    # in different rows cannot alias each other.
     work = logits.float()
     if penalty_token_ids.numel():
         row_offsets = (
@@ -98,6 +106,8 @@ def _sample_top_k_tensor(
             ),
         )
         work = flat.view_as(work)
+    # Zero temperature preserves finite logits for filtering; it later selects
+    # the first sorted candidate deterministically.
     divisors = torch.where(
         temperature > 0.0,
         temperature,
@@ -110,6 +120,9 @@ def _sample_top_k_tensor(
         dim=-1,
         sorted=True,
     )
+
+    # Nucleus filtering retains the candidate that first crosses top-p, while
+    # min-p is measured relative to the maximum candidate probability in log space.
     cumulative = torch.softmax(candidates, dim=-1).cumsum(dim=-1)
     over = cumulative > top_p.unsqueeze(1)
     drop = torch.cat((torch.zeros_like(over[:, :1]), over[:, :-1]), dim=1)
@@ -121,6 +134,8 @@ def _sample_top_k_tensor(
         float("-inf"),
     )
     probabilities = torch.softmax(candidates, dim=-1)
+    # Sorting candidates by token ID makes inverse-CDF draws deterministic for
+    # a fixed random value independent of top-k kernel ordering.
     token_order = torch.argsort(token_indexes, dim=-1)
     ordered_probabilities = probabilities.gather(1, token_order)
     cumulative = ordered_probabilities.cumsum(dim=-1)
@@ -146,6 +161,8 @@ def _sample_top_k_tensor(
 
 @lru_cache(maxsize=256)
 def _compiled_sampling(top_k: int) -> _SamplingKernel:
+    """Compile and cache the fixed-top-k sampling specialization for one k value."""
+
     def kernel(
         logits: torch.Tensor,
         draws: torch.Tensor,
@@ -158,6 +175,8 @@ def _compiled_sampling(top_k: int) -> _SamplingKernel:
         frequency_penalty: torch.Tensor,
         presence_penalty: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Execute the fixed-top-k sampling graph used by the compiled specialization."""
+
         return _sample_top_k_tensor(
             logits,
             draws,

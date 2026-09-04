@@ -1,4 +1,4 @@
-"""Image encoding helpers for concrete model outputs."""
+"""Image layout normalization, quantization, and PNG encoding helpers."""
 
 from __future__ import annotations
 
@@ -20,17 +20,17 @@ __all__ = [
 def pil_image_to_png_bytes(image: Image.Image) -> bytes:
     """Encode a PIL image as PNG container bytes.
 
-    Centralizes the BytesIO -> save(PNG) tail so the PNG container format is
-    chosen in exactly one place.
+    Low compression preserves lossless pixels while keeping CPU encoding latency
+    practical for high-resolution generated images.
     """
     buffer = io.BytesIO()
-    # Lossless PNG: lower compression keeps pixels identical while avoiding
-    # spending hundreds of milliseconds per 2K generated image on CPU deflate.
     image.save(buffer, format="PNG", compress_level=1)
     return buffer.getvalue()
 
 
 def png_bytes_to_b64(png: bytes) -> str:
+    """Encode PNG container bytes as an ASCII base64 string."""
+
     return base64.b64encode(png).decode("ascii")
 
 
@@ -46,12 +46,11 @@ def quantize_image_hwc(
 ) -> torch.Tensor:
     """Quantize one CHW/NCHW image to contiguous HWC uint8 on its source device.
 
-    ``value_range`` is the ``(lo, hi)`` span the tensor's values occupy; it is
-    rescaled to ``[0, 1]``, clamped, and quantized to ``[0, 255]``. The single
-    place the value-range assumption is made explicit — the default ``(-1, 1)``
-    is the diffusion latent-decode convention; pass ``(0, 1)`` for tensors that
-    are already in normalized image space.
+    ``value_range`` declares the source interval mapped onto ``[0, 1]`` before
+    clamping and conversion to ``[0, 255]``. The default ``(-1, 1)`` matches
+    diffusion decoder output; callers with normalized pixels pass ``(0, 1)``.
     """
+    # Collapse the supported singleton batch form into the canonical CHW layout.
     image = tensor.detach()
     if image.ndim == 4:
         if int(image.shape[0]) != 1:
@@ -59,6 +58,8 @@ def quantize_image_hwc(
         image = image[0]
     if image.ndim != 3 or int(image.shape[0]) != 3:
         raise ValueError("image quantization requires RGB CHW pixels")
+
+    # Normalize on-device, then transpose into the packed HWC encoder layout.
     image = image.float()
     lo, hi = float(value_range[0]), float(value_range[1])
     span = hi - lo

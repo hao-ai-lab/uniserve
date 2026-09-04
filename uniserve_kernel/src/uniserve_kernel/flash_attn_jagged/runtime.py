@@ -1,4 +1,5 @@
-"""FlashAttention CUTE runtime for jagged visible-end attention."""
+"""Loads the optional CuTe runtime used by jagged visible-end attention."""
+
 from __future__ import annotations
 
 from importlib import metadata
@@ -6,12 +7,7 @@ from pathlib import Path
 
 
 def _ensure_upstream_cute() -> None:
-    """Make unforked ``flash_attn.cute`` modules importable from flash-attn-4.
-
-    Some images install FA2 as the top-level ``flash_attn`` package. Extend
-    that package's search path with the flash-attn-4 distribution so
-    ``flash_attn.cute.utils`` and the rest of the upstream CUTE tree resolve.
-    """
+    """Add the flash-attn-4 CuTe provider to the shared package search path."""
 
     try:
         from flash_attn.cute import utils as _utils  # noqa: F401

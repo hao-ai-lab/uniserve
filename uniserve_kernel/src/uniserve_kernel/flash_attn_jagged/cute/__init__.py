@@ -1,1 +1,1 @@
-"""Jagged FlashAttention CUTE kernels owned by UniServe."""
+"""Contains CuTe DSL kernels and launch interfaces for jagged FlashAttention."""

@@ -1,3 +1,5 @@
+//! Process-wide tracing configuration and compact terminal log formatting.
+
 use std::{env, fmt, process};
 
 use time::UtcOffset;
@@ -26,7 +28,7 @@ const LOCAL_TIME_FORMAT: &[time::format_description::FormatItem<'static>] =
 const PROCESS_LABEL: &str = "RustFrontend";
 const HTTP_LOG_TARGETS: &[&str] = &["axum", "hyper", "tower_http", "uniserve_server"];
 
-/// Install the process-wide tracing subscriber for the CLI binary.
+/// Installs the process-wide tracing subscriber for the CLI binary.
 pub(crate) fn init_tracing(log_level: Option<&str>, log_level_http: Option<&str>) {
     let filter = build_targets_filter(
         log_level,
@@ -50,13 +52,14 @@ pub(crate) fn init_tracing(log_level: Option<&str>, log_level_http: Option<&str>
     }
 }
 
-/// Build the CLI log filter by merging the default level with Rust-style
+/// Builds the CLI log filter by merging the default level with Rust-style
 /// target overrides.
 ///
 /// Precedence:
 /// - Start from `--log-level` as the default level for all targets.
-/// - If `RUST_LOG` contains a global default level such as `warn`, it overrides the CLI default.
-/// - Any explicit target directives in `RUST_LOG`, such as `hyper=info`, override whichever default level is active for those targets only.
+/// - A global `RUST_LOG` level such as `warn` overrides the CLI default.
+/// - Explicit `RUST_LOG` targets such as `hyper=info` override the active default
+///   for those targets only.
 /// - `--log-level-http` applies to the HTTP server targets.
 fn build_targets_filter(
     log_level: Option<&str>,
@@ -89,6 +92,7 @@ struct UniserveLocalTimer {
 }
 
 impl Default for UniserveLocalTimer {
+    /// Returns the default value.
     fn default() -> Self {
         let local_offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
         Self { local_offset }
@@ -96,6 +100,7 @@ impl Default for UniserveLocalTimer {
 }
 
 impl FormatTime for UniserveLocalTimer {
+    /// Formats a timestamp for structured log output.
     fn format_time(&self, w: &mut Writer<'_>) -> fmt::Result {
         let now = time::OffsetDateTime::now_utc().to_offset(self.local_offset);
         let formatted = now.format(LOCAL_TIME_FORMAT).map_err(|_| fmt::Error)?;
@@ -110,6 +115,7 @@ struct UniserveEventFormatter {
 }
 
 impl UniserveEventFormatter {
+    /// Creates a log formatter with the selected output options.
     fn new() -> Self {
         Self {
             prefix: format!("({} pid={})", PROCESS_LABEL, process::id()),
@@ -117,11 +123,13 @@ impl UniserveEventFormatter {
         }
     }
 
+    /// Writes the process prefix.
     fn write_process_prefix(&self, writer: &mut Writer<'_>, ansi: bool) -> fmt::Result {
         write_colored(writer, ansi, Some(CYAN), &self.prefix)?;
         writer.write_char(' ')
     }
 
+    /// Writes the log level using the configured color policy.
     fn write_level(&self, writer: &mut Writer<'_>, level: &Level, ansi: bool) -> fmt::Result {
         let (text, color) = match *level {
             Level::TRACE => ("TRACE", WHITE),
@@ -133,6 +141,7 @@ impl UniserveEventFormatter {
         write_colored(writer, ansi, Some(color), text)
     }
 
+    /// Writes the event timestamp when timestamps are enabled.
     fn write_timestamp(&self, writer: &mut Writer<'_>, ansi: bool) -> fmt::Result {
         if ansi {
             writer.write_str(GREY)?;
@@ -146,6 +155,7 @@ impl UniserveEventFormatter {
         Ok(())
     }
 
+    /// Writes a compact source location when event metadata provides one.
     fn write_location(
         &self,
         writer: &mut Writer<'_>,
@@ -175,6 +185,7 @@ impl UniserveEventFormatter {
         Ok(())
     }
 
+    /// Writes the active span hierarchy and each span's formatted fields.
     fn write_scope<S, N>(&self, ctx: &FmtContext<'_, S, N>, writer: &mut Writer<'_>) -> fmt::Result
     where
         S: Subscriber + for<'lookup> LookupSpan<'lookup>,
@@ -213,6 +224,7 @@ where
     S: Subscriber + for<'lookup> LookupSpan<'lookup>,
     N: for<'writer> FormatFields<'writer> + 'static,
 {
+    /// Formats one tracing event with process, level, time, scope, and source context.
     fn format_event(
         &self,
         ctx: &FmtContext<'_, S, N>,
@@ -239,7 +251,7 @@ where
     }
 }
 
-/// Shorten a source file path for log output while preserving enough context
+/// Shortens a source file path for log output while preserving enough context
 /// for common Rust entrypoint and module filenames.
 ///
 /// - For `mod.rs`, keep the parent directory as `parent/mod.rs`.
@@ -270,6 +282,7 @@ fn shorten_file_path(file: &str) -> &str {
     &file[file.len() - grandparent.len() - 1 - parent.len() - 1 - name.len()..]
 }
 
+/// Writes text with the requested ANSI style when color is enabled.
 fn write_colored(
     writer: &mut Writer<'_>,
     ansi: bool,
@@ -290,7 +303,7 @@ fn write_colored(
     writer.write_str(text)
 }
 
-/// Map a Python logging level name to the corresponding Rust tracing level.
+/// Maps a Python logging level name to the corresponding Rust tracing level.
 fn map_python_log_level(level: &str) -> LevelFilter {
     match level.to_ascii_uppercase().as_str() {
         "CRITICAL" | "FATAL" => LevelFilter::ERROR,

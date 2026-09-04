@@ -1,18 +1,11 @@
-"""Shared model layers for the worker stack.
+"""Lazily exported neural layers, parallel primitives, and model operators."""
 
-This barrel resolves its public names lazily (PEP 562 ``__getattr__``): importing
-``uniserve_worker.nn`` does not eagerly pull the entire layer zoo (attention,
-decoder, vae, vision, moe, quant, ...) and its torch/backends dependencies. A
-    name listed in ``__all__`` is imported from its owning submodule on first
-    access, so canonical package imports load only the layer they use.
-"""
 from __future__ import annotations
 
 import importlib
 from typing import TYPE_CHECKING
 
-# Public name -> owning submodule. The single source of truth for what the
-# package re-exports; ``__all__`` is derived from it so the two cannot drift.
+# Each public symbol names the submodule imported on its first package lookup.
 _EXPORTS: dict[str, str] = {
     # activation
     "GeluAndMul": "activation",
@@ -82,9 +75,7 @@ _EXPORTS: dict[str, str] = {
     "pad_vocab_size": "vocab_parallel_embedding",
 }
 
-# Literal list (kept in sync with ``_EXPORTS`` by the assert below) so static
-# tooling sees the package's public surface and the TYPE_CHECKING re-exports are
-# recognised as exported rather than unused.
+# The literal export list remains visible to static tooling without eager imports.
 __all__ = [
     "AutoEncoder",
     "AutoEncoderParams",
@@ -140,26 +131,29 @@ __all__ = [
     "shard_for",
 ]
 
-# Single-source-of-truth guard: the lazy resolver map and the advertised surface
-# must list exactly the same names.
+# Lazy resolution and the advertised public surface must describe the same names.
 assert set(__all__) == set(_EXPORTS), sorted(set(__all__) ^ set(_EXPORTS))
 
 
 def __getattr__(name: str):
+    """Resolve a lazily exported neural-network symbol from its owning module."""
+
     submodule = _EXPORTS.get(name)
     if submodule is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     module = importlib.import_module(f"{__name__}.{submodule}")
     value = getattr(module, name)
-    globals()[name] = value  # cache so subsequent lookups skip __getattr__
+    globals()[name] = value  # Cache resolved symbols for normal module lookup.
     return value
 
 
 def __dir__() -> list[str]:
+    """List eager globals and all supported lazy exports."""
+
     return sorted(set(globals()) | set(_EXPORTS))
 
 
-if TYPE_CHECKING:  # let type-checkers see the concrete exports without eager cost
+if TYPE_CHECKING:  # Expose concrete definitions to type checkers without importing at runtime.
     from .activation import GeluAndMul, SiluAndMul, get_act_fn
     from .attention import RadixAttention
     from .decoder import MoTDecoderLayer, MoTModel

@@ -1,4 +1,5 @@
-"""Immutable checkpoint quantization declarations."""
+"""Immutable checkpoint quantization declarations and configuration normalization."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -23,11 +24,7 @@ _QUANT_METHOD_FACTORIES: dict[str, Callable[[], QuantizeMethodBase]] = {
 
 @dataclass(frozen=True)
 class QuantizationConfig:
-    """Checkpoint-level quantization policy.
-
-    This is intentionally conservative: unsupported checkpoint quantization
-    fails during construction instead of silently running with the wrong layout.
-    """
+    """Defines checkpoint linear precision, excluded layer prefixes, and KV storage dtype."""
 
     method: str = "unquantized"
     ignored_layers: tuple[str, ...] = ()
@@ -36,6 +33,8 @@ class QuantizationConfig:
 
     @classmethod
     def from_model_config(cls, config: Any | None) -> "QuantizationConfig | None":
+        """Validate and normalize quantization metadata from a model configuration."""
+
         raw = _extract_quantization_config(config)
         if raw is None:
             return None
@@ -66,6 +65,8 @@ class QuantizationConfig:
         )
 
     def get_quant_method(self, prefix: str = "") -> QuantizeMethodBase:
+        """Construct the linear method selected for a parameter prefix."""
+
         if self._is_ignored(prefix):
             return UnquantizedLinearMethod()
         factory = _QUANT_METHOD_FACTORIES.get(self.method)
@@ -74,17 +75,18 @@ class QuantizationConfig:
         return factory()
 
     def _is_ignored(self, prefix: str) -> bool:
+        """Return whether a parameter prefix is excluded from checkpoint quantization."""
+
         if not prefix:
             return False
         return any(prefix == name or prefix.startswith(f"{name}.") for name in self.ignored_layers)
 
 
 def _read_quant_section(config: Any | None) -> Mapping[str, Any]:
-    """Normalize any config object into its top-level mapping.
+    """Normalize mapping, wrapper, and Hugging Face configuration surfaces.
 
-    This is the single boundary that turns a Hugging Face config object (or a
-    raw dict) into a ``Mapping`` so the rest of the module reads keys instead of
-    re-probing ``.raw``/``.to_dict()``/attribute shapes.
+    This boundary keeps quantization parsing independent of the model loader's
+    concrete config type while preserving serialized keys without reinterpretation.
     """
 
     if config is None:
@@ -105,6 +107,8 @@ def _read_quant_section(config: Any | None) -> Mapping[str, Any]:
 
 
 def _extract_quantization_config(config: Any | None) -> Any | None:
+    """Extract nested quantization metadata from a normalized model mapping."""
+
     if config is None:
         return None
     top = _read_quant_section(config)
@@ -114,15 +118,15 @@ def _extract_quantization_config(config: Any | None) -> Any | None:
 
 
 def _kv_cache_dtype(raw_map: Mapping[str, Any]) -> str | None:
+    """Validate and return the optional serialized KV storage dtype."""
+
     value = raw_map.get("kv_cache_dtype")
     if value is None:
         return None
     name = str(value)
     if not name:
         raise ValueError("quantization_config.kv_cache_dtype must not be empty")
-    # This single extraction point validates the name: ``resolve_kv_store_dtype``
-    # raises ValueError for store dtypes it cannot map, surfacing bad config at
-    # parse time.  ``compute_dtype`` is irrelevant here because only the string
-    # name is being validated, not resolved to a runtime dtype.
+    # Resolve only to validate the serialized storage name; runtime compute
+    # precision does not affect this configuration boundary.
     resolve_kv_store_dtype(torch.bfloat16, name)
     return name

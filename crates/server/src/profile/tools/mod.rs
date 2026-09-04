@@ -1,4 +1,4 @@
-//! Qwen3 XML tool-call parsing.
+//! Streaming tool-call parsers and normalized tool descriptors.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 #[macro_use]
@@ -18,9 +18,13 @@ use serde_json::Value;
 /// One function-style tool made available to the model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tool {
+    /// Function name presented to the model.
     pub name: String,
+    /// Optional natural-language function description.
     pub description: Option<String>,
+    /// JSON Schema describing accepted function arguments.
     pub parameters: Value,
+    /// Optional strict-schema enforcement preference.
     pub strict: Option<bool>,
 }
 
@@ -45,7 +49,7 @@ pub struct ToolParserOutput {
 }
 
 impl ToolParserOutput {
-    /// Append another parser output onto this one.
+    /// Appends another parser output onto this one.
     ///
     /// Note that this does not attempt to merge multiple deltas for the same
     /// tool call into one complete item. Call `coalesce_calls` after if
@@ -55,7 +59,7 @@ impl ToolParserOutput {
         self.calls.append(&mut other.calls);
     }
 
-    /// Merge multiple deltas for the same tool call into one complete item.
+    /// Merges multiple deltas for the same tool call into one complete item.
     ///
     /// This is primarily used by the default `parse_complete` implementation,
     /// which delegates through the incremental parser lifecycle and then

@@ -1,3 +1,5 @@
+//! Request latency, token, and completion metrics.
+
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::histogram::Histogram;
@@ -19,6 +21,10 @@ const REQUEST_LATENCY_BUCKETS: [f64; 21] = [
 ];
 const REQUEST_PARAMS_N_BUCKETS: [f64; 5] = [1.0, 2.0, 5.0, 10.0, 20.0];
 
+/// Builds logarithmic 1-2-5 histogram boundaries through an exact upper bound.
+///
+/// The explicit final boundary preserves the caller's requested maximum when it
+/// does not lie on the 1-2-5 progression.
 fn build_1_2_5_buckets(max_value: u32) -> Vec<f64> {
     let mut buckets = Vec::new();
     let mut exponent = 0;
@@ -38,168 +44,198 @@ fn build_1_2_5_buckets(max_value: u32) -> Vec<f64> {
     }
 }
 
+/// Builds the histogram used for request time to first token.
 fn time_to_first_token_histogram() -> Histogram {
     Histogram::new(TTFT_BUCKETS.iter().copied())
 }
 
+/// Builds the histogram used for latency between generated tokens.
 fn inter_token_latency_histogram() -> Histogram {
     Histogram::new(ITL_BUCKETS.iter().copied())
 }
 
+/// Builds the histogram used for request time per generated token.
 fn request_time_per_output_token_histogram() -> Histogram {
     Histogram::new(ITL_BUCKETS.iter().copied())
 }
 
+/// Builds the histogram used for end-to-end and lifecycle-phase latency.
 fn request_latency_histogram() -> Histogram {
     Histogram::new(REQUEST_LATENCY_BUCKETS.iter().copied())
 }
 
+/// Builds the histogram used for per-request token counts.
 fn request_token_count_histogram() -> Histogram {
     // Histogram upper bound is intentionally static; request-level context
     // limits are enforced before metrics are recorded.
     Histogram::new(build_1_2_5_buckets(131_072))
 }
 
+/// Builds the histogram used for requested candidate counts.
 fn request_params_n_histogram() -> Histogram {
     Histogram::new(REQUEST_PARAMS_N_BUCKETS.iter().copied())
 }
 
+/// Labels identifying a terminal request outcome.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct FinishedReasonLabels {
+    /// Served model identity.
     pub model_name: String,
+    /// Engine instance index.
     pub engine: u32,
+    /// Stable terminal reason name.
     pub finished_reason: &'static str,
 }
 
+/// Labels identifying the source of prompt tokens.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct PromptTokenSourceLabels {
+    /// Served model identity.
     pub model_name: String,
+    /// Engine instance index.
     pub engine: u32,
+    /// Prompt-token origin such as local compute or cache.
     pub source: &'static str,
 }
 
+/// Completion counter family keyed by terminal outcome.
 pub(crate) type FinishedReasonCounterFamily = Family<FinishedReasonLabels, U64Counter>;
+/// Prompt-token counter family keyed by token source.
 pub(crate) type PromptTokenSourceCounterFamily = Family<PromptTokenSourceLabels, U64Counter>;
 
 /// Request-lifecycle Prometheus families exported from the `llm` layer.
 #[derive(MetricFamily)]
 pub struct RequestMetrics {
     // Request-derived counters.
+    /// Cumulative request preemption count.
     #[metric(
         name = "uniserve:num_preemptions",
         help = "Cumulative number of preemption events."
     )]
     pub num_preemptions: Family<EngineLabels, U64Counter>,
+    /// Prompt tokens processed by each engine.
     #[metric(
         name = "uniserve:prompt_tokens",
         help = "Number of prefill tokens processed."
     )]
     pub prompt_tokens: Family<EngineLabels, U64Counter>,
+    /// Prompt tokens grouped by their compute or cache source.
     #[metric(
         name = "uniserve:prompt_tokens_by_source",
         help = "Number of prompt tokens by source."
     )]
     pub prompt_tokens_by_source: PromptTokenSourceCounterFamily,
+    /// Prompt tokens served from prefix cache.
     #[metric(
         name = "uniserve:prompt_tokens_cached",
         help = "Number of prompt tokens with prefix cache hits."
     )]
     pub prompt_tokens_cached: Family<EngineLabels, U64Counter>,
+    /// Generated tokens processed by each engine.
     #[metric(
         name = "uniserve:generation_tokens",
         help = "Number of generation tokens processed."
     )]
     pub generation_tokens: Family<EngineLabels, U64Counter>,
 
-    // We intentionally don't support iteration-level histograms for now, since it seems to make
-    // more sense if the engine maintains these metrics and frontend simply forwards.
-
-    // pub iteration_tokens_total: HistogramFamily,
-
-    // Request lifecycle counters and histograms.
+    /// Successfully completed requests grouped by terminal reason.
     #[metric(
         name = "uniserve:request_success",
         help = "Count of successfully processed requests."
     )]
     pub request_success: FinishedReasonCounterFamily,
+    /// Prompt-token count distribution per request.
     #[metric(
         name = "uniserve:request_prompt_tokens",
         help = "Number of prefill tokens processed.",
         init = Family::new_with_constructor(request_token_count_histogram as fn() -> Histogram)
     )]
     pub request_prompt_tokens: HistogramFamily,
+    /// Generated-token count distribution per request.
     #[metric(
         name = "uniserve:request_generation_tokens",
         help = "Number of generation tokens processed.",
         init = Family::new_with_constructor(request_token_count_histogram as fn() -> Histogram)
     )]
     pub request_generation_tokens: HistogramFamily,
+    /// Requested maximum generated-token distribution.
     #[metric(
         name = "uniserve:request_max_num_generation_tokens",
         help = "Histogram of maximum number of requested generation tokens.",
         init = Family::new_with_constructor(request_token_count_histogram as fn() -> Histogram)
     )]
     pub request_max_num_generation_tokens: HistogramFamily,
+    /// `max_tokens` request parameter distribution.
     #[metric(
         name = "uniserve:request_params_max_tokens",
         help = "Histogram of the max_tokens request parameter.",
         init = Family::new_with_constructor(request_token_count_histogram as fn() -> Histogram)
     )]
     pub request_params_max_tokens: HistogramFamily,
+    /// Requested candidate-count distribution.
     #[metric(
         name = "uniserve:request_params_n",
         help = "Histogram of the n request parameter.",
         init = Family::new_with_constructor(request_params_n_histogram as fn() -> Histogram)
     )]
     pub request_params_n: HistogramFamily,
+    /// Newly computed prefill KV token distribution.
     #[metric(
         name = "uniserve:request_prefill_kv_computed_tokens",
         help = "Histogram of new KV tokens computed during prefill (excluding cached tokens).",
         init = Family::new_with_constructor(request_token_count_histogram as fn() -> Histogram)
     )]
     pub request_prefill_kv_computed_tokens: HistogramFamily,
+    /// Time-to-first-token distribution in seconds.
     #[metric(
         name = "uniserve:time_to_first_token_seconds",
         help = "Histogram of time to first token in seconds.",
         init = Family::new_with_constructor(time_to_first_token_histogram as fn() -> Histogram)
     )]
     pub time_to_first_token_seconds: HistogramFamily,
+    /// Inter-token latency distribution in seconds.
     #[metric(
         name = "uniserve:inter_token_latency_seconds",
         help = "Histogram of inter-token latency in seconds.",
         init = Family::new_with_constructor(inter_token_latency_histogram as fn() -> Histogram)
     )]
     pub inter_token_latency_seconds: HistogramFamily,
+    /// End-to-end request latency distribution in seconds.
     #[metric(
         name = "uniserve:e2e_request_latency_seconds",
         help = "Histogram of e2e request latency in seconds.",
         init = Family::new_with_constructor(request_latency_histogram as fn() -> Histogram)
     )]
     pub e2e_request_latency_seconds: HistogramFamily,
+    /// Time spent waiting for scheduler admission.
     #[metric(
         name = "uniserve:request_queue_time_seconds",
         help = "Histogram of time spent in WAITING phase for request.",
         init = Family::new_with_constructor(request_latency_histogram as fn() -> Histogram)
     )]
     pub request_queue_time_seconds: HistogramFamily,
+    /// Time spent in request prefill.
     #[metric(
         name = "uniserve:request_prefill_time_seconds",
         help = "Histogram of time spent in PREFILL phase for request.",
         init = Family::new_with_constructor(request_latency_histogram as fn() -> Histogram)
     )]
     pub request_prefill_time_seconds: HistogramFamily,
+    /// Time spent in request decode.
     #[metric(
         name = "uniserve:request_decode_time_seconds",
         help = "Histogram of time spent in DECODE phase for request.",
         init = Family::new_with_constructor(request_latency_histogram as fn() -> Histogram)
     )]
     pub request_decode_time_seconds: HistogramFamily,
+    /// Total model inference time per request.
     #[metric(
         name = "uniserve:request_inference_time_seconds",
         help = "Histogram of time spent in RUNNING phase for request.",
         init = Family::new_with_constructor(request_latency_histogram as fn() -> Histogram)
     )]
     pub request_inference_time_seconds: HistogramFamily,
+    /// Request latency normalized by emitted output tokens.
     #[metric(
         name = "uniserve:request_time_per_output_token_seconds",
         help = "Histogram of time_per_output_token_seconds per request.",

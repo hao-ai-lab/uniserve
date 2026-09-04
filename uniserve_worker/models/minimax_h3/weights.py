@@ -24,11 +24,15 @@ CHECKPOINT_ID = "FastVideo/FastVideo-Minimax-FastH3-Preview-v0.2"
 
 @dataclass(frozen=True, slots=True)
 class H3Checkpoint:
+    """Canonical component paths rooted at one H3 checkpoint directory."""
+
     root: Path
 
 
 @dataclass(slots=True)
 class H3Components:
+    """Bundles the H3 transformer, text encoder, video VAE, audio VAE, and their checkpoint root."""
+
     checkpoint: H3Checkpoint
     transformer: MiniMaxH3Transformer
     encoder: MiniMaxH3TextEncoder
@@ -42,6 +46,8 @@ def resolve_h3_checkpoint(
     cache_dir: str | None = None,
     revision: str | None = None,
 ) -> H3Checkpoint:
+    """Resolve a local or Hugging Face checkpoint and verify its component manifest."""
+
     candidate = Path(model_path).expanduser()
     if candidate.is_dir():
         root = candidate.resolve()
@@ -68,6 +74,8 @@ def resolve_h3_checkpoint(
                 ),
             )
         ).resolve()
+
+    # Every execution component has an independent config and weight namespace.
     required = (
         "modular_model_index.json",
         "transformer/config.json",
@@ -86,6 +94,8 @@ def resolve_h3_checkpoint(
 
 
 def _require_checkpoint_geometry(checkpoint: H3Checkpoint) -> None:
+    """Validate checkpoint component files and tensor dimensions against the H3 architecture."""
+
     transformer = json.loads(
         (checkpoint.root / "transformer" / "config.json").read_text(encoding="utf-8")
     )
@@ -150,6 +160,8 @@ def _require_checkpoint_geometry(checkpoint: H3Checkpoint) -> None:
 
 
 def _weight_map(component: Path) -> dict[str, Any]:
+    """Read and validate the safetensors index that maps parameter names to shard files."""
+
     from ...loader.handles import SafetensorFileWeightHandle, safetensor_dtype
 
     indexes = sorted(component.glob("*.safetensors.index.json"))
@@ -196,6 +208,8 @@ def _weight_map(component: Path) -> dict[str, Any]:
 
 
 def _set_parameter(module: nn.Module, name: str, value: torch.Tensor) -> None:
+    """Replace a nested parameter by dotted checkpoint name without enabling gradients."""
+
     owner: nn.Module = module
     fields = name.split(".")
     for field in fields[:-1]:
@@ -211,6 +225,8 @@ def _set_parameter(module: nn.Module, name: str, value: torch.Tensor) -> None:
 
 
 def _transformer_dtype(name: str) -> torch.dtype:
+    """Map a transformer parameter name to its checkpoint storage dtype."""
+
     fp32_prefixes = (
         "proj_in.",
         "audio_proj_in.",
@@ -226,6 +242,8 @@ def _load_transformer(
     component: Path,
     device: torch.device,
 ) -> None:
+    """Stream transformer shards into resident parameters and finalize quantized projections."""
+
     from ...loader.handles import weight_handle_materialization
     from ...loader.weight_loaders import attach_parameter_loaders, load_parameter_weight
     from ...nn.quant import process_quantized_modules
@@ -281,6 +299,8 @@ def _load_encoder(
     component: Path,
     device: torch.device,
 ) -> None:
+    """Stream retained text-encoder layers and embeddings into resident parameters."""
+
     from ...loader.handles import weight_handle_materialization
     from ...loader.weight_loaders import attach_parameter_loaders, load_parameter_weight
     from ...nn.quant import process_quantized_modules
@@ -334,6 +354,8 @@ def load_h3_components(
     revision: str | None = None,
     precision_policy: H3LinearPrecisionPolicy,
 ) -> H3Components:
+    """Validate and materialize the rank-local H3 transformer, encoder, and VAE modules."""
+
     checkpoint = resolve_h3_checkpoint(
         checkpoint_path,
         cache_dir=cache_dir,
@@ -357,6 +379,8 @@ def load_h3_components(
     if precision_policy.text_encoder == "nvfp4":
         encoder.enable_nvfp4()
 
+    # Every sequence-parallel rank reconstructs video tiles locally. Audio
+    # reconstruction is centralized on rank zero because its result is not sharded.
     video_vae = MiniMaxH3VideoVAE.from_pretrained(
         str(checkpoint.root),
         device=mesh.local_device,

@@ -1,8 +1,7 @@
-//! Unified HTTP listener wrapper for the Rust frontend.
+//! Listener abstraction for TCP, Unix-domain, and inherited sockets.
 //!
-//! This module hides the difference between TCP and Unix-domain listeners so
-//! the rest of the server can bind or inherit one socket and pass it to
-//! `axum::serve(...)` through a single type.
+//! [`HttpListener`] presents a single accept interface to Axum while preserving
+//! the address and shutdown behavior of each transport.
 
 use std::io::Result;
 use std::net::TcpListener as StdTcpListener;
@@ -24,7 +23,7 @@ pub(crate) enum Listener {
 }
 
 impl Listener {
-    /// Bind or adopt the listener described by the frontend configuration.
+    /// Binds or adopts the listener described by the frontend configuration.
     ///
     /// For inherited sockets, the concrete listener kind is detected from the
     /// socket family of the supplied file descriptor.
@@ -38,7 +37,7 @@ impl Listener {
         }
     }
 
-    /// Return a log-friendly local address string for either TCP or Unix
+    /// Returns a log-friendly local address string for either TCP or Unix
     /// sockets.
     pub(crate) fn local_addr(&self) -> Result<String> {
         match self {
@@ -50,6 +49,7 @@ impl Listener {
         }
     }
 
+    /// Adopts a validated inherited stream socket and prepares it for asynchronous accepts.
     fn from_inherited_fd(fd: i32) -> Result<Self> {
         // Validate the raw integer before taking ownership of it. `OwnedFd` assumes
         // the fd is open and will `close(2)` it on drop, so handing it a negative or
@@ -89,6 +89,7 @@ impl axum::serve::Listener for Listener {
     type Addr = Either<std::net::SocketAddr, tokio::net::unix::SocketAddr>;
     type Io = Either<TcpStream, UnixStream>;
 
+    /// Accepts the next incoming connection.
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         match self {
             Self::Tcp(listener) => {
@@ -102,6 +103,7 @@ impl axum::serve::Listener for Listener {
         }
     }
 
+    /// Returns the listener socket address.
     fn local_addr(&self) -> Result<Self::Addr> {
         match self {
             Self::Tcp(listener) => listener.local_addr().map(Either::Left),

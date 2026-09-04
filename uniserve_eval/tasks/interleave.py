@@ -1,3 +1,5 @@
+"""Defines interleaved text-and-image benchmark behavior."""
+
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -8,6 +10,8 @@ from .base import BenchmarkTask, ImageCountRule
 
 
 class InterleaveTask(BenchmarkTask):
+    """Builds streamed multimodal requests and validates mixed output."""
+
     name: ClassVar[TaskName] = TaskName.INTERLEAVE
     default_stream: ClassVar[bool] = True
     accepts_image: ClassVar[bool] = True
@@ -15,6 +19,8 @@ class InterleaveTask(BenchmarkTask):
     minimum_average_images: ClassVar[float] = 1.1
 
     def build_request(self, example: Example) -> TaskRequest:
+        """Build a chat request that streams both text and images."""
+
         max_tokens = int(
             example.max_tokens
             if example.max_tokens is not None
@@ -33,6 +39,8 @@ class InterleaveTask(BenchmarkTask):
         return TaskRequest(self.point.endpoint, payload, stream=True)
 
     def validate_output(self, records: Sequence[RequestRecord]) -> ValidationResult:
+        """Check visible text, image integrity, usage, and image frequency."""
+
         checks = self.image_integrity_checks(records)
         checks["visible_text"] = bool(records) and all(record.generated_text for record in records)
         checks["server_usage"] = self.server_usage_ok(records)

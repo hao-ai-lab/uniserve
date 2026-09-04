@@ -37,6 +37,8 @@ class HostStagingRing:
         depth: int,
         device: torch.device | str,
     ) -> None:
+        """Allocate a generation-safe ring of pinned host copy sources."""
+
         count = int(depth)
         if count < 1:
             raise ValueError("host staging depth must be positive")
@@ -49,6 +51,8 @@ class HostStagingRing:
         self._cursor = 0
 
     def acquire(self) -> tuple[int, torch.Tensor]:
+        """Lease the next pinned host integer buffer and return its generation-tagged slot."""
+
         slot = self._cursor % len(self._buffers)
         self._cursor += 1
         event = self._events[slot]
@@ -57,6 +61,8 @@ class HostStagingRing:
         return slot, self._buffers[slot]
 
     def release(self, slot: int) -> None:
+        """Return a validated host-staging slot to the free ring."""
+
         if self.device.type != "cuda":
             return
         index = int(slot)

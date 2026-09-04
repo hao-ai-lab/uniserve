@@ -1,3 +1,5 @@
+//! Qwen3 reasoning and tool-call output behavior across stream boundaries.
+
 use std::sync::Arc;
 
 use futures::stream;

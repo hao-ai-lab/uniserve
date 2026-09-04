@@ -13,7 +13,7 @@ from ..runtime.cache_pool import CachePool
 
 
 class RadixAttention(nn.Module):
-    """Execute dense or paged attention using startup-owned resources."""
+    """Dense and paged attention facade over startup-owned backend resources."""
 
     def __init__(
         self,
@@ -23,6 +23,8 @@ class RadixAttention(nn.Module):
         *,
         layer_id: int = 0,
     ) -> None:
+        """Validate local head geometry and identify the layer's paged-cache slice."""
+
         super().__init__()
         if min(num_heads, num_kv_heads, head_dim) < 1:
             raise ValueError("attention geometry must be positive")
@@ -37,6 +39,8 @@ class RadixAttention(nn.Module):
         self._varlen_provider: AttentionBackend | None = None
 
     def bind(self, cache_pool: CachePool, selection: AttentionSelection) -> None:
+        """Bind physical KV storage and select one compatible backend per attention mode."""
+
         self._cache_pool = cache_pool
         self._selection = selection
         candidates = {
@@ -91,11 +95,15 @@ class RadixAttention(nn.Module):
 
     @property
     def selection(self) -> AttentionSelection:
+        """Expose the immutable startup backend selection after binding."""
+
         if self._selection is None:
             raise RuntimeError("attention module has not been bound to a startup backend")
         return self._selection
 
     def provider(self, mode: AttentionMode) -> AttentionBackend:
+        """Resolve the bound backend for a concrete attention execution mode."""
+
         try:
             return self._providers[mode]
         except KeyError:
@@ -105,6 +113,8 @@ class RadixAttention(nn.Module):
 
     @property
     def varlen_provider(self) -> AttentionBackend | None:
+        """Expose the optional provider used for variable-length cache prefix reads."""
+
         return self._varlen_provider
 
     def forward(
@@ -118,6 +128,8 @@ class RadixAttention(nn.Module):
         scale: float | None = None,
         attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Dispatch dense or paged attention and commit requested K/V rows to the bound cache."""
+
         effective_scale = self.scale if scale is None else float(scale)
         if self._selection is None:
             raise RuntimeError("attention module has not been bound to a startup backend")
@@ -157,6 +169,8 @@ class RadixAttention(nn.Module):
         scale: float,
         pool: CachePool,
     ) -> torch.Tensor:
+        """Execute one-token paged decode against the selected cache group."""
+
         if q.ndim != 3 or int(q.shape[0]) != int(context.block_table.shape[0]):
             raise ValueError("paged decode query rows do not match its page table")
         if context.kv_lens is None:
@@ -189,6 +203,8 @@ class RadixAttention(nn.Module):
         scale: float,
         pool: CachePool,
     ) -> torch.Tensor:
+        """Execute variable-length paged prefill with packed query boundaries."""
+
         raw_tokens = sum(context.query_lens_cpu)
         if (
             q.ndim != 3
@@ -233,6 +249,8 @@ class RadixAttention(nn.Module):
         scale: float,
         pool: CachePool,
     ) -> torch.Tensor:
+        """Execute cache-free packed attention across declared route spans."""
+
         if q.ndim != 3 or context.cu_seqlens_q is None or context.visible_end is None:
             raise ValueError("packed attention geometry is invalid")
         if context.has_cache_writes:
@@ -266,6 +284,8 @@ def _select_provider(
     device: torch.device,
     cuda_graph: bool = False,
 ) -> AttentionBackend | None:
+    """Select the first backend that supports the requested mode and concrete geometry."""
+
     for provider in selection.providers:
         if provider.can_bind(
             mode,
@@ -285,6 +305,8 @@ def _select_varlen_provider(
     block_size: int,
     device: torch.device,
 ) -> AttentionBackend | None:
+    """Select paged-varlen attention or raise when no backend supports the geometry."""
+
     for provider in selection.providers:
         if provider.can_bind_varlen(
             head_dim=head_dim,
@@ -300,6 +322,8 @@ def bind_attention_modules(
     cache_pool: CachePool,
     selection: AttentionSelection,
 ) -> None:
+    """Bind every radix-attention layer in a model to shared cache and backend resources."""
+
     for module in model.modules():
         if isinstance(module, RadixAttention):
             module.bind(cache_pool, selection)

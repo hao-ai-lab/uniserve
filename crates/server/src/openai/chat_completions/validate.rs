@@ -1,8 +1,10 @@
+//! Deployment-dependent validation for chat-completion requests.
+
 use crate::openai::error::{ApiError, bail_invalid_request};
 use crate::openai::types::ChatCompletionRequest;
 use crate::openai::utils::{check_model_served, check_prompt_logprobs_bound};
 
-/// Validate relationships that depend on the configured serving route.
+/// Validates relationships that depend on the configured serving route.
 pub fn validate_request_compat(
     request: &ChatCompletionRequest,
     served_model_name: &str,

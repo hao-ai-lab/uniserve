@@ -29,6 +29,8 @@ except ImportError:  # pragma: no cover
 
 
 class FlashAttentionBackend(AttentionBackend):
+    """Executes dense, paged, and variable-length attention through flash-attn kernels."""
+
     name = "flash_attn"
     available = any(
         value is not None
@@ -40,6 +42,8 @@ class FlashAttentionBackend(AttentionBackend):
     dense_ranks = frozenset({4})
 
     def supports(self, mode: AttentionMode, *, cuda_graph: bool = False) -> bool:
+        """Accept dense, paged, and variable-length modes outside CUDA graph capture."""
+
         if mode is AttentionMode.DENSE and _flash_attn_func is None:
             return False
         if mode is AttentionMode.PAGED_DECODE and _flash_attn_with_kvcache is None:
@@ -49,6 +53,8 @@ class FlashAttentionBackend(AttentionBackend):
         return super().supports(mode, cuda_graph=cuda_graph)
 
     def supports_varlen(self) -> bool:
+        """Report whether the installed flash-attn package exposes packed varlen attention."""
+
         return _flash_attn_varlen_func is not None and super().supports_varlen()
 
     def forward(
@@ -62,6 +68,8 @@ class FlashAttentionBackend(AttentionBackend):
         attn_mask: torch.Tensor | None = None,
         context: ForwardBatch | None = None,
     ) -> torch.Tensor:
+        """Compute dense attention with flash-attn after normalizing head layout."""
+
         del context
         if _flash_attn_func is None:
             raise RuntimeError("flash-attn backend is not available")
@@ -93,6 +101,8 @@ class FlashAttentionBackend(AttentionBackend):
         scale: float,
         context: ForwardBatch | None = None,
     ) -> torch.Tensor:
+        """Write current K/V and compute paged decode with flash-attn’s KV-cache kernel."""
+
         del context
         if _flash_attn_with_kvcache is None:
             raise RuntimeError("flash-attn paged KV kernel is not available")
@@ -133,6 +143,8 @@ class FlashAttentionBackend(AttentionBackend):
         block_table: torch.Tensor | None = None,
         context: ForwardBatch | None = None,
     ) -> torch.Tensor:
+        """Compute packed variable-length attention with flash-attn cumulative offsets."""
+
         del context
         if _flash_attn_varlen_func is None:
             raise RuntimeError("flash-attn varlen kernel is not available")

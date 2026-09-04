@@ -6,6 +6,7 @@ reshapes an incoming q/k/v tensor into that layout and returns a
 The reshape, transpose, and squeeze operations define the canonical tensor
 forms consumed by every paged attention backend.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -42,6 +43,8 @@ class LayoutRestore:
     source_ndim: int
 
     def apply(self, out: torch.Tensor) -> torch.Tensor:
+        """Restore normalized attention output to the caller’s original rank and head layout."""
+
         if self.layout is QKVLayout.BLHD:
             if self.source_ndim == 3:
                 return out.squeeze(0)

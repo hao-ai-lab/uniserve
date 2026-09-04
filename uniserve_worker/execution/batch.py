@@ -18,23 +18,40 @@ MAX_TRANSFER_HANDLE_BYTES = 64 * 1024
 class CompletionState(Protocol):
     """Structural interface for one pending output row."""
 
-    def ready(self) -> bool: ...
+    def ready(self) -> bool:
+        """Return whether the pending row can be finalized without blocking."""
 
-    def finalize(self) -> object: ...
+        ...
+
+    def finalize(self) -> object:
+        """Materialize the completed row into its wire-ready payload."""
+
+        ...
 
 
 class LanePublication(Protocol):
     """One-shot request-state publication owned by a lane result."""
 
-    def finish(self, completions: tuple[ModelOutput, ...]) -> None: ...
+    def finish(self, completions: tuple[ModelOutput, ...]) -> None:
+        """Atomically publish successor-visible request state from finalized lane completions."""
 
-    def cancel(self) -> None: ...
+        ...
+
+    def cancel(self) -> None:
+        """Discard the unpublished request-state transition."""
+
+        ...
 
     @property
-    def successors_ready(self) -> bool: ...
+    def successors_ready(self) -> bool:
+        """Return whether the request-state transition is visible to successor operations."""
+
+        ...
 
 
 class TransferKind(StrEnum):
+    """Identifies encoder, device-product, KV, and latent transfer payloads on the wire."""
+
     ENCODER = "encoder"
     DEVICE_PRODUCT = "device_product"
     KV = "kv"
@@ -43,21 +60,29 @@ class TransferKind(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class LocalTransfer:
+    """Identifies an in-process transfer by endpoint and registry key."""
+
     endpoint: str
     key: int
 
     def __post_init__(self) -> None:
+        """Validate the process-local endpoint and registry key."""
+
         if not self.endpoint or self.key < 0:
             raise invalid_descriptor("local transfer handle is invalid")
 
 
 @dataclass(frozen=True, slots=True)
 class PosixShmTransfer:
+    """Identifies shared-memory storage and its optional readiness semaphore."""
+
     name: str
     ready_header_bytes: int
     ready_semaphore: str | None
 
     def __post_init__(self) -> None:
+        """Validate shared-memory and optional readiness-semaphore names."""
+
         if not self.name or self.ready_header_bytes < 0:
             raise invalid_descriptor("shared-memory transfer handle is invalid")
         if self.ready_header_bytes and not self.ready_semaphore:
@@ -66,6 +91,8 @@ class PosixShmTransfer:
 
 @dataclass(frozen=True, slots=True)
 class CudaIpcTransfer:
+    """Carries CUDA IPC memory, reference-count, and event handles for one tensor view."""
+
     endpoint: str
     publication_id: str
     storage_handle: bytes
@@ -80,6 +107,8 @@ class CudaIpcTransfer:
     ready_event_handle: bytes
 
     def __post_init__(self) -> None:
+        """Validate CUDA IPC handles, device identity, allocation bounds, and view offsets."""
+
         if (
             not self.endpoint
             or not self.publication_id
@@ -111,6 +140,8 @@ TransferTransport: TypeAlias = LocalTransfer | PosixShmTransfer | CudaIpcTransfe
 
 @dataclass(frozen=True, slots=True)
 class TransferLocator:
+    """Describes a typed tensor view and the transport-specific handle that owns its storage."""
+
     transport: TransferTransport
     nbytes: int
     dtype: str
@@ -118,6 +149,8 @@ class TransferLocator:
     device: str
 
     def __post_init__(self) -> None:
+        """Validate tensor geometry and ensure the handle matches its transport kind."""
+
         if (
             self.nbytes < 1
             or not self.dtype
@@ -133,6 +166,8 @@ class TransferLocator:
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "transfer locator") -> TransferLocator:
+        """Parse a tensor locator and validate its transport handle, shape, dtype, and byte bounds."""
+
         data = _map(value, where)
         kind = _str(data.get("transport"), f"{where}.transport")
         if kind == "local":
@@ -196,6 +231,8 @@ class TransferLocator:
         )
 
     def to_mapping(self) -> dict[str, object]:
+        """Encode the tensor geometry and transport-specific handle as a wire mapping."""
+
         output: dict[str, object] = {
             "nbytes": self.nbytes,
             "dtype": self.dtype,
@@ -233,6 +270,8 @@ class TransferLocator:
 
 @dataclass(frozen=True, slots=True)
 class EncoderTransferValue:
+    """Describes the generation, media geometry, payload encoding, and location of transferred encoder features."""
+
     generation: int
     height: int
     width: int
@@ -242,6 +281,8 @@ class EncoderTransferValue:
 
 @dataclass(frozen=True, slots=True)
 class DeviceProductTransferValue:
+    """Describes the generation, media geometry, numeric range, and location of a transferred device product."""
+
     generation: int
     height: int
     width: int
@@ -251,6 +292,8 @@ class DeviceProductTransferValue:
 
 @dataclass(frozen=True, slots=True)
 class KvTransferValue:
+    """Describes a versioned KV extent, its page locators, and source-to-destination checkpoint relation."""
+
     generation: int
     locators: tuple[TransferLocator, ...]
     source: Checkpoint
@@ -264,6 +307,8 @@ class KvTransferValue:
 
 @dataclass(frozen=True, slots=True)
 class LatentTransferValue:
+    """Describes a generation step and media geometry for transferred latent storage."""
+
     generation: int
     height: int
     width: int
@@ -282,10 +327,14 @@ TransferValue: TypeAlias = (
 
 @dataclass(frozen=True, slots=True)
 class TransferHandle:
+    """Wraps one typed transfer descriptor for bounded wire encoding and decoding."""
+
     value: TransferValue
 
     @property
     def kind(self) -> TransferKind:
+        """Return the semantic transfer kind selected by the wrapped descriptor."""
+
         if isinstance(self.value, EncoderTransferValue):
             return TransferKind.ENCODER
         if isinstance(self.value, DeviceProductTransferValue):
@@ -295,6 +344,8 @@ class TransferHandle:
         return TransferKind.LATENT
 
     def encoded_size_bound(self) -> int:
+        """Calculate a conservative wire-size bound for the nested transport handles."""
+
         typed = self.value
         locators = typed.locators if isinstance(typed, KvTransferValue) else (typed.locator,)
         size = 512
@@ -322,6 +373,8 @@ class TransferHandle:
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "transfer handle") -> TransferHandle:
+        """Parse and validate the kind-specific encoder, product, KV, or latent transfer descriptor."""
+
         data = _map(value, where)
         kind = _enum(TransferKind, data.get("kind"), f"{where}.kind")
         payload = _map(data.get("value"), f"{where}.value")
@@ -397,6 +450,8 @@ class TransferHandle:
         return cls(value=typed)
 
     def to_mapping(self) -> dict[str, object]:
+        """Encode the wrapped kind-specific transfer descriptor for IPC."""
+
         typed = self.value
         if isinstance(typed, EncoderTransferValue):
             value: dict[str, object] = {
@@ -439,23 +494,31 @@ class TransferHandle:
 
 
 class TokenMode(StrEnum):
+    """Selects prompt extension, single-token decode, or speculative verification."""
+
     EXTEND = "extend"
     DECODE = "decode"
     VERIFY = "verify"
 
 
 class EncodeMode(StrEnum):
+    """Selects vision-feature or latent-feature encoding."""
+
     VISION = "vision"
     LATENT = "latent"
 
 
 class TransferMode(StrEnum):
+    """Selects product movement, KV publication, or KV installation."""
+
     PRODUCT = "product"
     KV_PUBLISH = "kv_publish"
     KV_INSTALL = "kv_install"
 
 
 class MediaMode(StrEnum):
+    """Selects diffusion preparation, denoising, or reconstruction."""
+
     PREPARE = "prepare"
     DENOISE = "denoise"
     RECONSTRUCT = "reconstruct"
@@ -474,6 +537,8 @@ class OpKind(StrEnum):
 
 
 class RunKind(StrEnum):
+    """Defines every executable scheduler operation and its canonical model or transfer route."""
+
     AR_EXTEND = "ar_extend"
     AR_DECODE = "ar_decode"
     AR_VERIFY = "ar_verify"
@@ -489,6 +554,8 @@ class RunKind(StrEnum):
 
     @property
     def op_kind(self) -> OpKind | None:
+        """Map an executable route to its control-plane capability family."""
+
         return {
             RunKind.AR_EXTEND: OpKind.AR_EXTEND,
             RunKind.AR_DECODE: OpKind.AR_DECODE,
@@ -506,14 +573,20 @@ class RunKind(StrEnum):
 
     @property
     def advances_state(self) -> bool:
+        """Indicate whether successful execution creates a new request checkpoint."""
+
         return self in _STATE_ADVANCING_WORK
 
     @property
     def requires_fixed_parent(self) -> bool:
+        """Indicate whether host-resolved parent state is required before execution."""
+
         return self is RunKind.TRANSFER_KV_PUBLISH
 
     @property
     def token_mode(self) -> TokenMode | None:
+        """Resolve the autoregressive token mode for token routes."""
+
         if self is RunKind.AR_EXTEND:
             return TokenMode.EXTEND
         if self is RunKind.AR_DECODE:
@@ -524,6 +597,8 @@ class RunKind(StrEnum):
 
     @property
     def encode_mode(self) -> EncodeMode | None:
+        """Resolve the encoder modality for encoder routes."""
+
         if self is RunKind.ENCODER_VISION:
             return EncodeMode.VISION
         if self is RunKind.ENCODER_LATENT:
@@ -532,6 +607,8 @@ class RunKind(StrEnum):
 
     @property
     def transfer_mode(self) -> TransferMode | None:
+        """Resolve the data-movement mode for transfer routes."""
+
         if self is RunKind.TRANSFER_PRODUCT:
             return TransferMode.PRODUCT
         if self is RunKind.TRANSFER_KV_PUBLISH:
@@ -542,6 +619,8 @@ class RunKind(StrEnum):
 
     @property
     def media_mode(self) -> MediaMode | None:
+        """Resolve the diffusion media phase for trajectory routes."""
+
         if self is RunKind.DIFFUSION_PREPARE:
             return MediaMode.PREPARE
         if self is RunKind.DIFFUSION_STEP:
@@ -552,6 +631,8 @@ class RunKind(StrEnum):
 
     @classmethod
     def token(cls, mode: TokenMode) -> RunKind:
+        """Select the executable autoregressive route for a token mode."""
+
         return {
             TokenMode.EXTEND: cls.AR_EXTEND,
             TokenMode.DECODE: cls.AR_DECODE,
@@ -560,6 +641,8 @@ class RunKind(StrEnum):
 
     @classmethod
     def encode(cls, mode: EncodeMode) -> RunKind:
+        """Select the executable encoder route for a modality."""
+
         return {
             EncodeMode.VISION: cls.ENCODER_VISION,
             EncodeMode.LATENT: cls.ENCODER_LATENT,
@@ -567,6 +650,8 @@ class RunKind(StrEnum):
 
     @classmethod
     def transfer(cls, mode: TransferMode) -> RunKind:
+        """Select the executable data-movement route for a transfer mode."""
+
         return {
             TransferMode.PRODUCT: cls.TRANSFER_PRODUCT,
             TransferMode.KV_PUBLISH: cls.TRANSFER_KV_PUBLISH,
@@ -575,6 +660,8 @@ class RunKind(StrEnum):
 
     @classmethod
     def media(cls, mode: MediaMode) -> RunKind:
+        """Select the executable diffusion route for a media phase."""
+
         return {
             MediaMode.PREPARE: cls.DIFFUSION_PREPARE,
             MediaMode.DENOISE: cls.DIFFUSION_STEP,
@@ -590,6 +677,8 @@ def logical_op_kinds(kinds: Sequence[RunKind]) -> tuple[OpKind, ...]:
 
 
 class Domain(StrEnum):
+    """Separates prefill, autoregressive decode, and diffusion-flow execution domains."""
+
     PREFILL = "prefill"
     DECODE = "decode"
     FLOW = "flow"
@@ -612,10 +701,14 @@ _DOMAIN_BY_WORK_VARIANT = {
 
 
 def execution_domain(kind: RunKind) -> Domain:
+    """Map an executable operation kind to its prefill, decode, or flow scheduling domain."""
+
     return _DOMAIN_BY_WORK_VARIANT[kind]
 
 
 class AttentionRegime(StrEnum):
+    """Specifies whether an operation uses no attention, causal attention, bidirectional attention, or a hybrid mask."""
+
     NONE = "none"
     CAUSAL = "causal"
     BIDIRECTIONAL = "bidirectional"
@@ -623,6 +716,8 @@ class AttentionRegime(StrEnum):
 
 
 class ProductKind(StrEnum):
+    """Identifies the semantic value carried by an operation input or output edge."""
+
     TOKEN = "token"
     LOGPROB = "logprob"
     VISION_FEATURE = "vision_feature"
@@ -636,6 +731,8 @@ class ProductKind(StrEnum):
 
 
 class StorageClass(StrEnum):
+    """Identifies the physical storage owner used for an execution product."""
+
     DEVICE_TENSOR = "device_tensor"
     REQUEST_RELAY = "request_relay"
     PAGED_KV = "paged_kv"
@@ -645,6 +742,8 @@ class StorageClass(StrEnum):
 
 
 class DType(StrEnum):
+    """Defines wire-stable scalar dtypes supported by scheduler descriptors."""
+
     U8 = "u8"
     U16 = "u16"
     U32 = "u32"
@@ -656,12 +755,16 @@ class DType(StrEnum):
 
 
 class OpStatus(StrEnum):
+    """Classifies an operation result as successful, predicated away, or failed."""
+
     OK = "ok"
     PREDICATED = "predicated"
     ERROR = "error"
 
 
 class ErrorCode(StrEnum):
+    """Classifies bounded execution failures returned to the scheduler."""
+
     INVALID_OPERATION = "invalid_operation"
     RESOURCE_EXHAUSTED = "resource_exhausted"
     COMPUTE_ERROR = "compute_error"
@@ -670,18 +773,24 @@ class ErrorCode(StrEnum):
 
 
 class DrawLayout(StrEnum):
+    """Assigns deterministic RNG coordinates to sampling, speculation, and flow noise."""
+
     TARGET_SAMPLING = "target_sampling"
     SPECULATIVE_PROPOSAL = "speculative_proposal"
     FLOW_NOISE = "flow_noise"
 
 
 class Disposition(StrEnum):
+    """Controls whether a committed product is published, retained privately, or discarded."""
+
     PUBLISH = "publish"
     RETAIN = "retain"
     DISCARD = "discard"
 
 
 class CloseReason(StrEnum):
+    """Records why a request reached its terminal lifecycle state."""
+
     COMPLETED = "completed"
     CANCELLED = "cancelled"
     ERROR = "error"
@@ -766,6 +875,8 @@ def native_run(
 
 @dataclass(frozen=True, slots=True)
 class SamplingParams:
+    """Defines sampling filters, token penalties, log-probability output, and terminal token rules."""
+
     temperature: float = 0.0
     top_k: int = 0
     top_p: float = 1.0
@@ -788,6 +899,8 @@ class SamplingParams:
     forced_token_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
+        """Validate probability filters, penalties, token rules, and log-probability bounds."""
+
         for name in (
             "temperature",
             "top_p",
@@ -821,6 +934,8 @@ class SamplingParams:
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "sampling") -> SamplingParams:
+        """Parse sampling controls while validating probabilities, penalties, token sets, and output bounds."""
+
         data = _map(value, where)
         return cls(
             temperature=_float(data.get("temperature", 0.0), f"{where}.temperature"),
@@ -873,6 +988,8 @@ class SamplingParams:
         )
 
     def to_mapping(self) -> dict[str, object]:
+        """Encode all sampling filters, penalties, token rules, and log-probability controls."""
+
         return {
             "temperature": self.temperature,
             "top_k": self.top_k,
@@ -901,6 +1018,8 @@ class SamplingParams:
 
 @dataclass(frozen=True, slots=True)
 class ImageParams:
+    """Defines source image bytes, format, dimensions, and preprocessing bounds for an encode request."""
+
     steps: int = 50
     cfg_text_scale: float = 4.0
     cfg_img_scale: float = 1.0
@@ -917,6 +1036,8 @@ class ImageParams:
     retain_images: bool = True
 
     def __post_init__(self) -> None:
+        """Validate encoded image payload, dimensions, format, and preprocessing bounds."""
+
         if not 1 <= self.steps <= 1000:
             raise invalid_descriptor("image.steps must be in 1..=1000")
         for name in ("height", "width"):
@@ -946,6 +1067,8 @@ class ImageParams:
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "image") -> ImageParams:
+        """Parse encoded image input and validate format, dimensions, and processing bounds."""
+
         data = _map(value, where)
         interval = _pair(data.get("cfg_interval", (0.0, 1.0)), f"{where}.cfg_interval")
         return cls(
@@ -974,6 +1097,8 @@ class ImageParams:
         )
 
     def to_mapping(self) -> dict[str, object]:
+        """Serialize image-generation controls into their wire mapping."""
+
         return {
             "steps": self.steps,
             "cfg_text_scale": self.cfg_text_scale,
@@ -994,17 +1119,23 @@ class ImageParams:
 
 @dataclass(frozen=True, slots=True)
 class RequestKey:
+    """Identifies one request epoch within a scheduler authority."""
+
     authority_id: int
     request_id: int
     epoch: int
 
     def __post_init__(self) -> None:
+        """Validate the non-negative request identifier and epoch."""
+
         _nonnegative(self.authority_id, "request_key.authority_id")
         _nonnegative(self.request_id, "request_key.request_id")
         _nonnegative(self.epoch, "request_key.epoch")
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "request_key") -> RequestKey:
+        """Parse and validate a scheduler authority, request id, and admission epoch."""
+
         key = _fast_request_key(value)
         if key is not None:
             return key
@@ -1016,6 +1147,8 @@ class RequestKey:
         )
 
     def to_mapping(self) -> dict[str, object]:
+        """Serialize the complete request-generation identity for IPC."""
+
         return {
             "authority_id": self.authority_id,
             "request_id": self.request_id,
@@ -1025,11 +1158,15 @@ class RequestKey:
 
 @dataclass(frozen=True, slots=True)
 class StaticDim:
+    """Fixes one tensor dimension to an exact extent."""
+
     extent: int
 
 
 @dataclass(frozen=True, slots=True)
 class DeviceDim:
+    """Bounds one tensor dimension whose live extent is selected on the device."""
+
     bound: int
 
 
@@ -1038,9 +1175,13 @@ DimBound: TypeAlias = StaticDim | DeviceDim
 
 @dataclass(frozen=True, slots=True)
 class ShapeBound:
+    """Defines the maximum physical tensor shape allowed for a product."""
+
     dims: tuple[DimBound, ...] = ()
 
     def __post_init__(self) -> None:
+        """Normalize dimensions and reject empty or non-positive shape bounds."""
+
         device_dims = sum(1 for dim in self.dims if isinstance(dim, DeviceDim))
         if device_dims > 1:
             raise invalid_descriptor("a shape bound carries more than one device-actual dimension")
@@ -1049,6 +1190,8 @@ class ShapeBound:
 
     @property
     def max_elements(self) -> int:
+        """Multiply static extents and the maximum device-selected extent."""
+
         elements = 1
         for dim in self.dims:
             elements *= dim.extent if isinstance(dim, StaticDim) else dim.bound
@@ -1056,6 +1199,8 @@ class ShapeBound:
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "shape_bound") -> ShapeBound:
+        """Parse static and device-selected dimension bounds from the wire schema."""
+
         data = _map(value, where)
         dims: list[DimBound] = []
         for index, item in enumerate(_seq(data.get("dims", ()), f"{where}.dims")):
@@ -1070,10 +1215,14 @@ class ShapeBound:
         return cls(tuple(dims))
 
     def to_mapping(self) -> dict[str, object]:
+        """Serialize ordered dimension bounds into tagged wire variants."""
+
         return {"dims": [_dim_to_mapping(dim) for dim in self.dims]}
 
 
 def _dim_to_mapping(dim: DimBound) -> dict[str, object]:
+    """Encode a static or symbolic dimension bound for the wire format."""
+
     if isinstance(dim, StaticDim):
         return {"kind": "static", "value": dim.extent}
     return {"kind": "device", "value": {"max": dim.bound}}
@@ -1081,11 +1230,15 @@ def _dim_to_mapping(dim: DimBound) -> dict[str, object]:
 
 @dataclass(frozen=True, slots=True)
 class PointRange:
+    """Defines a half-open range of speculative or diffusion checkpoint points."""
+
     base_point: int = 0
     max_points: int = 0
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "point_range") -> PointRange:
+        """Parse a half-open checkpoint-point capacity range."""
+
         point_range = _fast_point_range(value)
         if point_range is not None:
             return point_range
@@ -1096,11 +1249,15 @@ class PointRange:
         )
 
     def to_mapping(self) -> dict[str, object]:
+        """Serialize checkpoint base and maximum point count for IPC."""
+
         return {"base_point": self.base_point, "max_points": self.max_points}
 
 
 @dataclass(frozen=True, slots=True)
 class ProductRef:
+    """Identifies a typed, versioned operation output and its bounded physical storage contract."""
+
     request_key: RequestKey
     producer_op_id: int
     output_index: int
@@ -1112,12 +1269,16 @@ class ProductRef:
     point_range: PointRange
 
     def __post_init__(self) -> None:
+        """Validate product identity, version, kind, and bounded tensor contract."""
+
         if self.generation < 1:
             raise invalid_descriptor("product reference has no logical generation")
         self.shape_bound.__post_init__()
 
     @property
     def buffer_id(self) -> BufferId:
+        """Derive the persistent-buffer identity carried by this product generation."""
+
         return BufferId(
             owner=self.request_key,
             producer_op_id=self.producer_op_id,
@@ -1127,6 +1288,8 @@ class ProductRef:
 
     @property
     def max_bytes(self) -> int:
+        """Return the maximum physical bytes allowed by this product’s shape and dtype."""
+
         element_bytes = {
             DType.U8: 1,
             DType.U16: 2,
@@ -1140,6 +1303,8 @@ class ProductRef:
         return self.shape_bound.max_elements * element_bytes
 
     def uses_persistent_buffer(self) -> bool:
+        """Return whether the product is assigned to scheduler-managed persistent storage."""
+
         if self.kind in {ProductKind.VISION_FEATURE, ProductKind.LATENT_FEATURE}:
             return True
         return self.kind is ProductKind.ARTIFACT and self.storage_class in {
@@ -1149,6 +1314,8 @@ class ProductRef:
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "product_ref") -> ProductRef:
+        """Parse and validate a typed logical product and its storage bounds."""
+
         reference = _fast_product_ref(value)
         if reference is not None:
             return reference
@@ -1166,6 +1333,8 @@ class ProductRef:
         )
 
     def to_mapping(self) -> dict[str, object]:
+        """Serialize the complete logical product contract for IPC."""
+
         return {
             "request_key": self.request_key.to_mapping(),
             "producer_op_id": self.producer_op_id,
@@ -1181,17 +1350,23 @@ class ProductRef:
 
 @dataclass(frozen=True, slots=True)
 class BufferId:
+    """Identifies a versioned operation output buffer and its owning request."""
+
     owner: RequestKey
     producer_op_id: int
     output_index: int
     generation: int
 
     def __post_init__(self) -> None:
+        """Validate the owning request, operation identifier, and version."""
+
         if self.generation < 1:
             raise invalid_descriptor("buffer id has no logical generation")
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "buffer_id") -> BufferId:
+        """Parse a versioned persistent-buffer identity from the wire schema."""
+
         data = _map(value, where)
         return cls(
             owner=RequestKey.from_mapping(data.get("owner"), f"{where}.owner"),
@@ -1201,6 +1376,8 @@ class BufferId:
         )
 
     def to_mapping(self) -> dict[str, object]:
+        """Serialize persistent-buffer ownership and generation fields for IPC."""
+
         return {
             "owner": self.owner.to_mapping(),
             "producer_op_id": self.producer_op_id,
@@ -1211,15 +1388,21 @@ class BufferId:
 
 @dataclass(frozen=True, slots=True)
 class FixedCheckpoint:
+    """Selects a fixed speculative checkpoint by point index."""
+
     point: int
 
     @property
     def point_index(self) -> int:
+        """Expose the fixed checkpoint point selected by the scheduler."""
+
         return self.point
 
 
 @dataclass(frozen=True, slots=True)
 class DeviceSelected:
+    """Marks a checkpoint whose committed point is selected by device execution."""
+
     pass
 
 
@@ -1228,14 +1411,20 @@ CheckpointPoint: TypeAlias = FixedCheckpoint | DeviceSelected
 
 @dataclass(frozen=True, slots=True)
 class Checkpoint:
+    """Identifies an operation checkpoint using either a fixed or device-selected point."""
+
     op_id: int
     point: CheckpointPoint
 
     def is_fixed(self) -> bool:
+        """Indicate whether the checkpoint point is already host-resolved."""
+
         return isinstance(self.point, FixedCheckpoint)
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "checkpoint") -> Checkpoint:
+        """Parse an operation checkpoint with fixed or device-selected point semantics."""
+
         reference = _fast_version_ref(value)
         if reference is not None:
             return reference
@@ -1252,6 +1441,8 @@ class Checkpoint:
         return cls(op_id=_uint(data.get("op_id"), f"{where}.op_id"), point=point)
 
     def to_mapping(self) -> dict[str, object]:
+        """Serialize the checkpoint point as its tagged wire variant."""
+
         point = (
             {"kind": "fixed", "value": self.point.point}
             if isinstance(self.point, FixedCheckpoint)
@@ -1262,6 +1453,8 @@ class Checkpoint:
 
 @dataclass(frozen=True, slots=True)
 class Bounds:
+    """Caps tokens, pages, latent bytes, completion bytes, and transfer bytes for one operation."""
+
     max_points: int = 0
     max_tokens: int = 0
     max_kv_pages: int = 0
@@ -1271,6 +1464,8 @@ class Bounds:
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "bounds") -> Bounds:
+        """Parse scheduler-enforced resource ceilings for one operation."""
+
         bounds = _fast_bounds(value)
         if bounds is not None:
             return bounds
@@ -1287,6 +1482,8 @@ class Bounds:
         )
 
     def to_mapping(self) -> dict[str, object]:
+        """Serialize all operation resource ceilings for IPC."""
+
         return {
             "max_points": self.max_points,
             "max_tokens": self.max_tokens,
@@ -1299,12 +1496,16 @@ class Bounds:
 
 @dataclass(frozen=True, slots=True)
 class Rng:
+    """Defines the seed, semantic offset, and draw layout for deterministic random values."""
+
     seed: int
     semantic_index_base: int
     draw_layout: DrawLayout
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "rng") -> Rng:
+        """Parse deterministic random seed, semantic offset, and draw layout."""
+
         rng = _fast_rng(value)
         if rng is not None:
             return rng
@@ -1318,6 +1519,8 @@ class Rng:
         )
 
     def to_mapping(self) -> dict[str, object]:
+        """Serialize deterministic RNG coordinates for IPC."""
+
         return {
             "seed": self.seed,
             "semantic_index_base": self.semantic_index_base,
@@ -1327,6 +1530,8 @@ class Rng:
 
 @dataclass(frozen=True, slots=True)
 class _OpPayload:
+    """Holds the shared bounds, dataflow edges, predicate, RNG, and control sequence for an operation family."""
+
     family: ClassVar[str]
     bounds: Bounds
     inputs: tuple[ProductRef, ...]
@@ -1336,6 +1541,8 @@ class _OpPayload:
     control_seq: int
 
     def to_mapping(self) -> dict[str, object]:
+        """Serialize fields shared by every operation-family payload."""
+
         return {
             "family": self.family,
             "bounds": self.bounds.to_mapping(),
@@ -1348,18 +1555,26 @@ class _OpPayload:
 
 
 class ArOpPayload(_OpPayload):
+    """Carries the shared payload contract for autoregressive operations."""
+
     family = "ar"
 
 
 class EncoderOpPayload(_OpPayload):
+    """Carries the shared payload contract for encoder operations."""
+
     family = "encoder"
 
 
 class DiffusionOpPayload(_OpPayload):
+    """Carries the shared payload contract for diffusion operations."""
+
     family = "diffusion"
 
 
 class TransferOpPayload(_OpPayload):
+    """Carries the shared payload contract for transfer operations."""
+
     family = "transfer"
 
 
@@ -1367,6 +1582,8 @@ OpPayload: TypeAlias = ArOpPayload | EncoderOpPayload | DiffusionOpPayload | Tra
 
 
 def _payload_class(kind: RunKind) -> type[_OpPayload]:
+    """Return the family-specific payload class required by an operation kind."""
+
     if kind in {RunKind.AR_EXTEND, RunKind.AR_DECODE, RunKind.AR_VERIFY}:
         return ArOpPayload
     if kind in {RunKind.ENCODER_VISION, RunKind.ENCODER_LATENT}:
@@ -1383,6 +1600,8 @@ def _payload_class(kind: RunKind) -> type[_OpPayload]:
 
 @dataclass(frozen=True, slots=True)
 class Operation:
+    """Binds one typed operation payload to its request identity, parent checkpoint, and executable kind."""
+
     request_key: RequestKey
     op_id: int
     parent: Checkpoint
@@ -1404,6 +1623,8 @@ class Operation:
         rng: Rng | None = None,
         control_seq: int = 0,
     ) -> Operation:
+        """Construct an operation from already typed scheduler fields and the payload matching its family."""
+
         return cls(
             request_key=request_key,
             op_id=op_id,
@@ -1414,37 +1635,55 @@ class Operation:
 
     @property
     def domain(self) -> Domain:
+        """Select the execution lane domain implied by this operation's route."""
+
         return execution_domain(self.kind)
 
     @property
     def advances_state(self) -> bool:
+        """Indicate whether this operation publishes a new request checkpoint."""
+
         return self.kind.advances_state
 
     @property
     def bounds(self) -> Bounds:
+        """Expose scheduler-enforced resource ceilings from the typed payload."""
+
         return self.payload.bounds
 
     @property
     def inputs(self) -> tuple[ProductRef, ...]:
+        """Expose logical products consumed in descriptor order."""
+
         return self.payload.inputs
 
     @property
     def outputs(self) -> tuple[ProductRef, ...]:
+        """Expose logical products produced in descriptor order."""
+
         return self.payload.outputs
 
     @property
     def predicate(self) -> ProductRef | None:
+        """Expose the device decision that conditionally enables this operation."""
+
         return self.payload.predicate
 
     @property
     def rng(self) -> Rng | None:
+        """Expose deterministic draw coordinates required by this operation."""
+
         return self.payload.rng
 
     @property
     def control_seq(self) -> int:
+        """Expose the scheduler control sequence used for ordering checks."""
+
         return self.payload.control_seq
 
     def validate(self) -> None:
+        """Enforce operation-family, parent, bound, dataflow, predicate, RNG, and control-sequence invariants."""
+
         if self.op_id < 1:
             raise invalid_descriptor("operation id must be positive")
         if not isinstance(self.payload, _payload_class(self.kind)):
@@ -1517,6 +1756,8 @@ class Operation:
         value: object,
         where: str = "operation",
     ) -> Operation:
+        """Parse a typed operation and validate its identity, parent checkpoint, and family payload."""
+
         # Field decoding follows declaration order with a no-allocation fast
         # path per field. Irregular values use the validating field decoders so
         # diagnostics identify the first invalid declaration.
@@ -1583,6 +1824,8 @@ class Operation:
         return operation
 
     def to_mapping(self) -> dict[str, object]:
+        """Encode operation identity, parent checkpoint, kind, and family-specific payload."""
+
         return {
             "request_key": self.request_key.to_mapping(),
             "op_id": self.op_id,
@@ -1594,6 +1837,8 @@ class Operation:
 
 @dataclass(frozen=True, slots=True)
 class LogicalLengths:
+    """Tracks semantic token, visible-KV, computed-KV, and latent extents after an operation."""
+
     token_len: int = 0
     kv_visible_len: int = 0
     kv_computed_len: int = 0
@@ -1601,6 +1846,8 @@ class LogicalLengths:
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "logical_lengths") -> LogicalLengths:
+        """Parse semantic token, KV, and latent extents from a result payload."""
+
         data = _map(value, where)
         return cls(
             token_len=_uint(data.get("token_len"), f"{where}.token_len"),
@@ -1610,6 +1857,8 @@ class LogicalLengths:
         )
 
     def to_mapping(self) -> dict[str, object]:
+        """Serialize semantic token, KV, and latent extents for IPC."""
+
         return {
             "token_len": self.token_len,
             "kv_visible_len": self.kv_visible_len,
@@ -1620,11 +1869,15 @@ class LogicalLengths:
 
 @dataclass(frozen=True, slots=True)
 class TokenSpan:
+    """Identifies a contiguous token interval in a model result."""
+
     base: int = 0
     len: int = 0
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "token_span") -> TokenSpan:
+        """Parse a contiguous token base and length from a result payload."""
+
         data = _map(value, where)
         return cls(
             base=_uint(data.get("base"), f"{where}.base"),
@@ -1632,17 +1885,23 @@ class TokenSpan:
         )
 
     def to_mapping(self) -> dict[str, object]:
+        """Serialize the contiguous token interval for IPC."""
+
         return {"base": self.base, "len": self.len}
 
 
 @dataclass(frozen=True, slots=True)
 class FinishFlags:
+    """Records length, stop-token, EOS, and forced termination conditions for generated output."""
+
     eos: bool = False
     length: bool = False
     stop: bool = False
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "finish_flags") -> FinishFlags:
+        """Parse EOS, length-limit, and stop-sequence termination flags."""
+
         data = _map(value, where)
         return cls(
             eos=_bool(data.get("eos", False), f"{where}.eos"),
@@ -1651,11 +1910,15 @@ class FinishFlags:
         )
 
     def to_mapping(self) -> dict[str, object]:
+        """Serialize generation termination flags for IPC."""
+
         return {"eos": self.eos, "length": self.length, "stop": self.stop}
 
 
 @dataclass(frozen=True, slots=True)
 class TimingCounters:
+    """Accumulates queue, device, copy, and host execution time in microseconds."""
+
     queued_us: int = 0
     device_us: int = 0
     copy_us: int = 0
@@ -1663,6 +1926,8 @@ class TimingCounters:
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "timing_counters") -> TimingCounters:
+        """Parse nonnegative queue, device, copy, and host timings in microseconds."""
+
         data = _map(value, where)
         return cls(
             queued_us=_uint(data.get("queued_us", 0), f"{where}.queued_us"),
@@ -1672,6 +1937,8 @@ class TimingCounters:
         )
 
     def to_mapping(self) -> dict[str, object]:
+        """Serialize execution-stage timings in microseconds for IPC."""
+
         return {
             "queued_us": self.queued_us,
             "device_us": self.device_us,
@@ -1682,14 +1949,20 @@ class TimingCounters:
 
 @dataclass(frozen=True, slots=True)
 class PosixShmArtifact:
+    """Identifies a completed media artifact stored in POSIX shared memory."""
+
     name: str
 
     def __post_init__(self) -> None:
+        """Validate the shared-memory artifact name and byte length."""
+
         if not self.name or "/" in self.name:
             raise invalid_descriptor("POSIX shared-memory artifact name is invalid")
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "artifact handle") -> PosixShmArtifact:
+        """Parse and validate a POSIX shared-memory media handle."""
+
         data = _map(value, where)
         if data.get("transport") != "posix_shm":
             raise invalid_descriptor(f"{where}.transport is invalid")
@@ -1697,20 +1970,28 @@ class PosixShmArtifact:
         return cls(name=_str(payload.get("name"), f"{where}.value.name"))
 
     def to_mapping(self) -> dict[str, object]:
+        """Serialize the shared-memory handle as a tagged transport value."""
+
         return {"transport": "posix_shm", "value": {"name": self.name}}
 
 
 @dataclass(frozen=True, slots=True)
 class MediaOutput:
+    """Describes a produced media artifact by format, dimensions, duration, and storage reference."""
+
     handle: PosixShmArtifact
     bytes: int
 
     def __post_init__(self) -> None:
+        """Validate media format, dimensions, duration, and artifact consistency."""
+
         if self.bytes < 1:
             raise invalid_descriptor("media output locator is invalid")
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "media_output") -> MediaOutput:
+        """Parse a validated media artifact handle and byte extent."""
+
         data = _map(value, where)
         return cls(
             handle=PosixShmArtifact.from_mapping(data.get("handle"), f"{where}.handle"),
@@ -1718,11 +1999,15 @@ class MediaOutput:
         )
 
     def to_mapping(self) -> dict[str, object]:
+        """Serialize a completed media artifact for IPC."""
+
         return {"handle": self.handle.to_mapping(), "bytes": self.bytes}
 
 
 @dataclass(frozen=True, slots=True)
 class _ResultData:
+    """Holds fields shared by autoregressive, encoder, diffusion, and transfer results."""
+
     family: ClassVar[str]
     logical_lengths: LogicalLengths
     token_span: TokenSpan
@@ -1731,6 +2016,8 @@ class _ResultData:
     media_output: MediaOutput | None = None
 
     def to_mapping(self) -> dict[str, object]:
+        """Serialize fields shared by every result family and diffusion cursor extensions."""
+
         lengths = self.logical_lengths
         span = self.token_span
         flags = self.finish_flags
@@ -1753,21 +2040,29 @@ class _ResultData:
 
 
 class ArResult(_ResultData):
+    """Carries autoregressive lengths, committed tokens, finish state, and optional media output."""
+
     family = "ar"
 
 
 class EncoderResult(_ResultData):
+    """Carries encoder logical lengths and any produced feature payload metadata."""
+
     family = "encoder"
 
 
 @dataclass(frozen=True, slots=True)
 class DiffusionResult(_ResultData):
+    """Carries diffusion logical lengths, committed points, and optional media output."""
+
     family = "diffusion"
     next_cursor: int = 0
     done: bool = False
 
 
 class TransferResult(_ResultData):
+    """Carries logical lengths and publication metadata from a transfer operation."""
+
     family = "transfer"
 
 
@@ -1776,6 +2071,8 @@ ResultPayload: TypeAlias = ArResult | EncoderResult | DiffusionResult | Transfer
 
 @dataclass(frozen=True, slots=True)
 class ModelOutput:
+    """Associates a typed operation result with status, error metadata, timing, and output products."""
+
     request_key: RequestKey
     op_id: int
     completion_slot_generation: int
@@ -1788,37 +2085,55 @@ class ModelOutput:
 
     @property
     def logical_lengths(self) -> LogicalLengths:
+        """Expose semantic extents carried by the typed result payload."""
+
         return self.payload.logical_lengths
 
     @property
     def token_span(self) -> TokenSpan:
+        """Expose the contiguous token interval produced by the operation."""
+
         return self.payload.token_span
 
     @property
     def committed_tokens(self) -> tuple[int, ...]:
+        """Expose host-visible tokens accepted into request state."""
+
         return self.payload.committed_tokens
 
     @property
     def finish_flags(self) -> FinishFlags:
+        """Expose generation termination conditions from the typed payload."""
+
         return self.payload.finish_flags
 
     @property
     def media_output(self) -> MediaOutput | None:
+        """Expose the completed media artifact attached to this result, if any."""
+
         return self.payload.media_output
 
     @property
     def result_family(self) -> str:
+        """Expose the wire discriminator for the typed result payload."""
+
         return self.payload.family
 
     @property
     def next_cursor(self) -> int:
+        """Expose the next diffusion reconstruction cursor, or zero for other families."""
+
         return self.payload.next_cursor if isinstance(self.payload, DiffusionResult) else 0
 
     @property
     def done(self) -> bool:
+        """Indicate whether diffusion reconstruction is complete."""
+
         return self.payload.done if isinstance(self.payload, DiffusionResult) else False
 
     def validate(self) -> None:
+        """Verify that status, result family, products, errors, and timing form a coherent completion."""
+
         if self.op_id < 1:
             raise invalid_descriptor("completion op id must be positive")
         if self.logical_lengths.kv_visible_len > self.logical_lengths.kv_computed_len:
@@ -1846,6 +2161,8 @@ class ModelOutput:
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "completion") -> ModelOutput:
+        """Parse a completion and enforce its status-specific result and error contract."""
+
         data = _map(value, where)
         payload = _map(data.get("payload"), f"{where}.payload")
         result_family = _str(payload.get("family"), f"{where}.payload.family")
@@ -1905,6 +2222,8 @@ class ModelOutput:
         return record
 
     def to_mapping(self) -> dict[str, object]:
+        """Encode one operation completion with typed result, products, timing, and error metadata."""
+
         key = self.request_key
         timing = self.timing_counters
         error_code = self.error_code
@@ -1932,14 +2251,20 @@ class ModelOutput:
 
 @dataclass(frozen=True, slots=True)
 class Start:
+    """Registers a new request and its immutable execution parameters."""
+
     request: NewRequest
 
     @property
     def request_key(self) -> RequestKey:
+        """Expose the request generation registered by this start command."""
+
         return self.request.request_key
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "start command") -> Start:
+        """Parse a request admission from a start-command payload."""
+
         data = _map(value, where)
         return cls(
             request=NewRequest.from_mapping(data.get("request"), f"{where}.request")
@@ -1948,6 +2273,8 @@ class Start:
 
 @dataclass(frozen=True, slots=True)
 class Commit:
+    """Atomically selects a checkpoint, publishes bounded results, and advances request state."""
+
     request_key: RequestKey
     control_seq: int
     expected_parent: Checkpoint
@@ -1958,6 +2285,8 @@ class Commit:
 
 @dataclass(frozen=True, slots=True)
 class Finish:
+    """Closes a request at a validated cutoff and records its terminal reason."""
+
     request_key: RequestKey
     control_seq: int
     cutoff: Checkpoint
@@ -1966,10 +2295,14 @@ class Finish:
 
 @dataclass(frozen=True, slots=True)
 class Free:
+    """Releases one scheduler-owned persistent buffer."""
+
     buffer: BufferId
 
     @property
     def request_key(self) -> RequestKey:
+        """Expose the request generation that owns the freed persistent buffer."""
+
         return self.buffer.owner
 
 
@@ -1977,6 +2310,8 @@ BatchCommand: TypeAlias = Start | Commit | Finish | Free
 
 
 def _command_variant_index(command: BatchCommand) -> int:
+    """Return the stable wire-union variant index for a lifecycle command."""
+
     if isinstance(command, Start):
         return 0
     if isinstance(command, Commit):
@@ -1990,6 +2325,8 @@ def command_from_mapping(
     value: object,
     where: str = "batch command",
 ) -> BatchCommand:
+    """Parse a tagged start, commit, finish, or free lifecycle command."""
+
     kind, payload = _tagged(value, where)
     data = _map(payload, f"{where}.value")
     if kind == "start":
@@ -2041,6 +2378,8 @@ def command_from_mapping(
 
 
 def command_to_mapping(command: BatchCommand) -> dict[str, object]:
+    """Encode a lifecycle command with its stable variant tag."""
+
     if isinstance(command, Start):
         return {
             "kind": "start",
@@ -2073,12 +2412,19 @@ def command_to_mapping(command: BatchCommand) -> dict[str, object]:
 
 @dataclass(frozen=True, slots=True)
 class ArRequestParams:
+    """Defines prompt tokens and sampling policy for autoregressive execution.
+
+    The parameters also bound generated tokens and carry speculative draft input.
+    """
+
     sampling: SamplingParams = field(default_factory=SamplingParams)
     negative_token_ids: tuple[int, ...] = ()
     finish_token_ids: tuple[int, ...] = ()
     initial_position: int = 0
 
     def __post_init__(self) -> None:
+        """Validate prompt, generation limit, draft tokens, and sampling policy."""
+
         _nonnegative(self.initial_position, "autoregressive initial position")
         if any(
             left >= right
@@ -2092,6 +2438,8 @@ class ArRequestParams:
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "autoregressive parameters") -> ArRequestParams:
+        """Parse sampling policy, token controls, and initial position for autoregressive work."""
+
         data = _map(value, where)
         return cls(
             sampling=SamplingParams.from_mapping(data.get("sampling", {}), f"{where}.sampling"),
@@ -2103,6 +2451,8 @@ class ArRequestParams:
         )
 
     def to_mapping(self) -> dict[str, object]:
+        """Serialize autoregressive sampling and token controls for admission."""
+
         return {
             "sampling": self.sampling.to_mapping(),
             "negative_token_ids": list(self.negative_token_ids),
@@ -2113,25 +2463,35 @@ class ArRequestParams:
 
 @dataclass(frozen=True, slots=True)
 class UmmRequestParams:
+    """Defines multimodal request text, media inputs, and model-specific generation controls."""
+
     image: ImageParams = field(default_factory=ImageParams)
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "unified-multimodal parameters") -> UmmRequestParams:
+        """Parse unified multimodal image-generation parameters for admission."""
+
         data = _map(value, where)
         return cls(image=ImageParams.from_mapping(data.get("image", {}), f"{where}.image"))
 
     def to_mapping(self) -> dict[str, object]:
+        """Serialize unified multimodal controls for admission."""
+
         return {"image": self.image.to_mapping()}
 
 
 @dataclass(frozen=True, slots=True)
 class MediaGeometry:
+    """Fixes frame rate, frame count, and raster dimensions for bounded media generation."""
+
     frame_count: int
     decode_units: int
     prompt_tokens: int
     denoise_steps: int
 
     def __post_init__(self) -> None:
+        """Validate positive frame rate, frame count, and raster dimensions."""
+
         for name in (
             "frame_count",
             "decode_units",
@@ -2149,6 +2509,8 @@ class MediaGeometry:
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "media geometry") -> MediaGeometry:
+        """Parse exact frame, prompt, denoising, and reconstruction-unit geometry."""
+
         data = _map(value, where)
         return cls(
             frame_count=_uint(data.get("frame_count"), f"{where}.frame_count"),
@@ -2158,6 +2520,8 @@ class MediaGeometry:
         )
 
     def to_mapping(self) -> dict[str, object]:
+        """Serialize bounded media execution geometry for admission."""
+
         return {
             "frame_count": self.frame_count,
             "decode_units": self.decode_units,
@@ -2168,11 +2532,15 @@ class MediaGeometry:
 
 @dataclass(frozen=True, slots=True)
 class DiffusionRequestParams:
+    """Defines latent geometry, integration steps, guidance scales, and deterministic noise coordinates."""
+
     prompt_token_ids: tuple[int, ...]
     seed: int
     geometry: MediaGeometry
 
     def __post_init__(self) -> None:
+        """Validate latent geometry, integration steps, guidance, and noise coordinates."""
+
         if not self.prompt_token_ids:
             raise invalid_descriptor("diffusion prompt tokens must not be empty")
         _nonnegative(self.seed, "diffusion seed")
@@ -2181,6 +2549,8 @@ class DiffusionRequestParams:
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "diffusion parameters") -> DiffusionRequestParams:
+        """Parse prompt tokens, deterministic seed, and media geometry for diffusion work."""
+
         data = _map(value, where)
         return cls(
             prompt_token_ids=_uints(data.get("prompt_token_ids", ()), f"{where}.prompt_token_ids"),
@@ -2189,6 +2559,8 @@ class DiffusionRequestParams:
         )
 
     def to_mapping(self) -> dict[str, object]:
+        """Serialize diffusion admission parameters for IPC."""
+
         return {
             "prompt_token_ids": list(self.prompt_token_ids),
             "seed": self.seed,
@@ -2198,6 +2570,8 @@ class DiffusionRequestParams:
 
 @dataclass(frozen=True, slots=True)
 class NewRequest:
+    """Binds one request key to its autoregressive, multimodal, or diffusion parameters."""
+
     request_key: RequestKey
     request_pool_idx: int
     ar: ArRequestParams | None
@@ -2205,6 +2579,8 @@ class NewRequest:
     diffusion: DiffusionRequestParams | None = None
 
     def __post_init__(self) -> None:
+        """Require exactly one parameter family compatible with the request kind."""
+
         if self.request_pool_idx < 1:
             raise invalid_descriptor("request-pool index must be positive")
         if self.ar is None and self.umm is None and self.diffusion is None:
@@ -2220,10 +2596,14 @@ class NewRequest:
         umm: UmmRequestParams | None = None,
         diffusion: DiffusionRequestParams | None = None,
     ) -> NewRequest:
+        """Construct a new request while requiring exactly one parameter family."""
+
         return cls(request_key, request_pool_idx, ar, umm, diffusion)
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "admission") -> NewRequest:
+        """Parse a request slot and its optional execution-family parameter sets."""
+
         data = _map(value, where)
         admission = cls(
             request_key=RequestKey.from_mapping(data.get("request_key"), f"{where}.request_key"),
@@ -2247,6 +2627,8 @@ class NewRequest:
         return admission
 
     def to_mapping(self) -> dict[str, object]:
+        """Serialize request identity, slot, and family parameters for admission."""
+
         return {
             "request_key": self.request_key.to_mapping(),
             "request_pool_idx": self.request_pool_idx,
@@ -2258,12 +2640,16 @@ class NewRequest:
 
 @dataclass(frozen=True, slots=True)
 class BlockTable:
+    """Maps a request and KV group to its ordered physical pages and allocated token extent."""
+
     request_pool_idx: int
     group_id: int
     page_ids: tuple[int, ...]
     allocated_tokens: int
 
     def __post_init__(self) -> None:
+        """Validate request/group identity, ordered pages, and allocated token extent."""
+
         if (
             self.request_pool_idx < 1
             or self.group_id < 0
@@ -2280,9 +2666,13 @@ class BlockTable:
         value: object,
         where: str = "block table",
     ) -> BlockTable:
+        """Parse an installed KV page table and its allocated token extent."""
+
         data = _map(value, where)
 
         def uint_field(name: str) -> int:
+            """Decode a nonnegative integer field through the fast scalar path."""
+
             raw = data.get(name)
             return raw if type(raw) is int and raw >= 0 else _uint(raw, f"{where}.{name}")
 
@@ -2298,6 +2688,8 @@ class BlockTable:
         return cls(*fields)
 
     def to_mapping(self) -> dict[str, object]:
+        """Serialize an installed request-and-group KV page table."""
+
         return {
             "request_pool_idx": self.request_pool_idx,
             "group_id": self.group_id,
@@ -2308,11 +2700,15 @@ class BlockTable:
 
 @dataclass(frozen=True, slots=True)
 class CachePageAllocation:
+    """Declares newly assigned physical pages for a request KV group."""
+
     request_pool_idx: int
     group_id: int
     page_ids: tuple[int, ...]
 
     def __post_init__(self) -> None:
+        """Validate newly assigned page identifiers and request/group ownership."""
+
         if (
             self.request_pool_idx < 1
             or self.group_id < 0
@@ -2328,9 +2724,13 @@ class CachePageAllocation:
         value: object,
         where: str = "cache-page allocation",
     ) -> CachePageAllocation:
+        """Parse newly assigned physical KV pages for one request and cache group."""
+
         data = _map(value, where)
 
         def uint_field(name: str) -> int:
+            """Decode a nonnegative integer field through the fast scalar path."""
+
             raw = data.get(name)
             return raw if type(raw) is int and raw >= 0 else _uint(raw, f"{where}.{name}")
 
@@ -2345,6 +2745,8 @@ class CachePageAllocation:
         return cls(*fields)
 
     def to_mapping(self) -> dict[str, object]:
+        """Serialize newly assigned KV pages for lane registration."""
+
         return {
             "request_pool_idx": self.request_pool_idx,
             "group_id": self.group_id,
@@ -2354,12 +2756,16 @@ class CachePageAllocation:
 
 @dataclass(frozen=True, slots=True)
 class RowGeometry:
+    """Describes logical and physical row counts for one packed execution layout."""
+
     operation_index: int
     request_pool_index: int
     seq_len: int
     query_len: int
 
     def __post_init__(self) -> None:
+        """Validate logical rows fit their positive physical row capacity."""
+
         if (
             self.operation_index < 0
             or self.request_pool_index < 1
@@ -2374,6 +2780,8 @@ class RowGeometry:
         value: object,
         where: str = "forward row",
     ) -> RowGeometry:
+        """Parse one packed forward row's operation, slot, and sequence geometry."""
+
         data = _map(value, where)
         return cls(
             operation_index=_uint(data.get("operation_index"), f"{where}.operation_index"),
@@ -2383,6 +2791,8 @@ class RowGeometry:
         )
 
     def to_mapping(self) -> dict[str, object]:
+        """Serialize row-to-operation placement and token lengths."""
+
         return {
             "operation_index": self.operation_index,
             "request_pool_index": self.request_pool_index,
@@ -2393,6 +2803,8 @@ class RowGeometry:
 
 @dataclass(frozen=True, slots=True)
 class LatentPlacement:
+    """Assigns a request trajectory to fixed latent pages with bounded units and width."""
+
     request_key: RequestKey
     op_id: int
     page_table: tuple[int, ...]
@@ -2403,6 +2815,8 @@ class LatentPlacement:
     step_count: int
 
     def __post_init__(self) -> None:
+        """Validate latent page ownership, bank, units, width, and raster geometry."""
+
         if self.op_id < 1:
             raise invalid_descriptor("latent placement operation id must be positive")
         if min(self.latent_units, self.height, self.width) < 1:
@@ -2418,6 +2832,8 @@ class LatentPlacement:
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "latent placement") -> LatentPlacement:
+        """Parse request-owned latent pages, raster geometry, and solver-step range."""
+
         data = _map(value, where)
         return cls(
             request_key=RequestKey.from_mapping(data.get("request_key"), f"{where}.request_key"),
@@ -2431,6 +2847,8 @@ class LatentPlacement:
         )
 
     def to_mapping(self) -> dict[str, object]:
+        """Serialize a physical latent trajectory placement for lane execution."""
+
         return {
             "request_key": self.request_key.to_mapping(),
             "op_id": self.op_id,
@@ -2445,12 +2863,16 @@ class LatentPlacement:
 
 @dataclass(frozen=True, slots=True)
 class DecodePlacement:
+    """Assigns a reconstruction operation to one latent slice and output ring slot."""
+
     request_key: RequestKey
     op_id: int
     cursor: int
     max_units: int
 
     def __post_init__(self) -> None:
+        """Validate latent slice bounds and destination output-ring slot."""
+
         if self.op_id < 1 or self.max_units < 1:
             raise invalid_descriptor(
                 "decode placement identity and unit bound must be positive"
@@ -2461,6 +2883,8 @@ class DecodePlacement:
     def from_mapping(
         cls, value: object, where: str = "decode placement"
     ) -> DecodePlacement:
+        """Parse the reconstruction cursor and bounded unit count for one operation."""
+
         data = _map(value, where)
         return cls(
             request_key=RequestKey.from_mapping(data.get("request_key"), f"{where}.request_key"),
@@ -2470,6 +2894,8 @@ class DecodePlacement:
         )
 
     def to_mapping(self) -> dict[str, object]:
+        """Serialize a media reconstruction placement for lane execution."""
+
         return {
             "request_key": self.request_key.to_mapping(),
             "op_id": self.op_id,
@@ -2480,11 +2906,15 @@ class DecodePlacement:
 
 @dataclass(frozen=True, slots=True)
 class BufferPlacement:
+    """Assigns a product to a bounded slice of scheduler-managed persistent storage."""
+
     buffer: BufferId
     offset: int
     bytes: int
 
     def __post_init__(self) -> None:
+        """Validate the persistent-buffer identifier, offset, and bounded shape."""
+
         if self.offset < 0 or self.bytes < 1:
             raise invalid_descriptor("buffer placement span is invalid")
         if self.offset + self.bytes > (1 << 64) - 1:
@@ -2494,6 +2924,8 @@ class BufferPlacement:
     def from_mapping(
         cls, value: object, where: str = "buffer placement"
     ) -> BufferPlacement:
+        """Parse a bounded byte slice in scheduler-managed persistent storage."""
+
         data = _map(value, where)
         return cls(
             buffer=BufferId.from_mapping(data.get("buffer"), f"{where}.buffer"),
@@ -2502,6 +2934,8 @@ class BufferPlacement:
         )
 
     def to_mapping(self) -> dict[str, object]:
+        """Serialize persistent-buffer identity, offset, and byte extent."""
+
         return {
             "buffer": self.buffer.to_mapping(),
             "offset": self.offset,
@@ -2514,6 +2948,8 @@ def _validate_buffer_placements(
     placements: Sequence[BufferPlacement],
     where: str,
 ) -> None:
+    """Validate persistent-buffer placements against producing operations and shape bounds."""
+
     by_id: dict[BufferId, BufferPlacement] = {}
     spans: list[tuple[int, int]] = []
     for placement in placements:
@@ -2541,6 +2977,8 @@ def _validate_buffer_placements(
 
 @dataclass(frozen=True, slots=True)
 class RunLane:
+    """Carries one lane’s ordered operations, row tables, placements, and collective identity."""
+
     lane_id: int
     launch_id: int
     collective_seq: int
@@ -2557,6 +2995,8 @@ class RunLane:
     buffer_placements: tuple[BufferPlacement, ...] = ()
 
     def __post_init__(self) -> None:
+        """Validate aligned lane columns, operation ownership, placements, and collective identity."""
+
         if (
             min(
                 self.lane_id,
@@ -2594,6 +3034,8 @@ class RunLane:
         latent_pages: set[int] = set()
 
         def addresses_trajectory(operation: Operation) -> bool:
+            """Identify operations that require an explicit physical latent placement."""
+
             return operation.kind in {
                 RunKind.DIFFUSION_PREPARE,
                 RunKind.DIFFUSION_STEP,
@@ -2654,6 +3096,8 @@ class RunLane:
         value: object,
         where: str = "batch lane",
     ) -> RunLane:
+        """Parse one physical lane and validate its operations, rows, cache tables, and placements."""
+
         data = _map(value, where)
         fields = dict(
             lane_id=_uint(data.get("lane_id"), f"{where}.lane_id"),
@@ -2728,6 +3172,8 @@ class RunLane:
         return cls(**cast(Any, fields))
 
     def to_mapping(self) -> dict[str, object]:
+        """Encode one physical lane with its routing, row, cache, and placement tables."""
+
         return {
             "lane_id": self.lane_id,
             "launch_id": self.launch_id,
@@ -2752,6 +3198,8 @@ class RunLane:
 
 @dataclass(frozen=True, slots=True)
 class Run:
+    """Describes one scheduler-submitted collection of lane operations."""
+
     batch_id: int
     run_id: int
     collective_seq: int = 1
@@ -2767,6 +3215,8 @@ class Run:
     lanes: tuple[RunLane, ...] = field(default=(), repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        """Validate run identity, lane uniqueness, and lifecycle-operation consistency."""
+
         if self.lanes and not self.operations:
             set_field = object.__setattr__
             set_field(self, "collective_seq", self.lanes[0].collective_seq)
@@ -2785,11 +3235,15 @@ class Run:
 
     @property
     def admissions(self) -> tuple[NewRequest, ...]:
+        """Extract new-request payloads from lifecycle commands in submission order."""
+
         return tuple(
             command.request for command in self.commands if isinstance(command, Start)
         )
 
     def validate(self) -> None:
+        """Enforce run identity, command ordering, lane uniqueness, operation counts, and token bounds."""
+
         if not self.operations and not self.commands:
             raise invalid_descriptor(
                 "a submission batch must carry at least one operation or command"
@@ -2880,6 +3334,8 @@ class Run:
 
     @classmethod
     def from_mapping(cls, value: object) -> Run:
+        """Parse a scheduler run and validate all lifecycle commands and physical lanes."""
+
         data = _map(value, "execute run")
         batch_id = _uint(data.get("batch_id"), "execute run.batch_id")
         run_id = _uint(data.get("run_id"), "execute run.run_id")
@@ -2938,6 +3394,8 @@ class Run:
         )
 
     def to_mapping(self) -> dict[str, object]:
+        """Encode run identity, lifecycle commands, and physical lane descriptors."""
+
         return {
             "batch_id": self.batch_id,
             "run_id": self.run_id,
@@ -2956,24 +3414,34 @@ class Run:
 
 @dataclass(frozen=True, slots=True)
 class RegistrationAck:
+    """Returns the request versions made visible by a registration batch."""
+
     visible: bool = False
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "registration") -> RegistrationAck:
+        """Parse whether registration effects became visible to successor runs."""
+
         data = _map(value, where)
         return cls(visible=_bool(data.get("visible", False), f"{where}.visible"))
 
     def to_mapping(self) -> dict[str, object]:
+        """Serialize registration visibility for IPC."""
+
         return {"visible": self.visible}
 
 
 @dataclass(frozen=True, slots=True)
 class ProductPayload:
+    """Associates one semantic product reference with its encoded payload."""
+
     product: ProductRef
     payload: bytes | TransferHandle
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "product payload") -> ProductPayload:
+        """Parse inline bytes or a transfer handle for one declared product reference."""
+
         data = _map(value, where)
         raw_value = _map(data.get("value"), f"{where}.value")
         value_kind = _str(raw_value.get("kind"), f"{where}.value.kind")
@@ -2996,6 +3464,8 @@ class ProductPayload:
         )
 
     def to_mapping(self) -> dict[str, object]:
+        """Serialize a product reference with its tagged inline or transfer payload."""
+
         if isinstance(self.payload, TransferHandle):
             value = {"kind": "transfer", "value": self.payload.to_mapping()}
         else:
@@ -3049,6 +3519,8 @@ class SamplingState:
 
 
 def encode_sampling_state_bytes(state: SamplingState) -> bytes:
+    """Encode generated-token counts as a bounded little-endian sampling-state payload."""
+
     allowed = (
         None
         if state.allowed_token_ids is None
@@ -3078,9 +3550,13 @@ def encode_sampling_state_bytes(state: SamplingState) -> bytes:
 
 
 def decode_sampling_state_bytes(data: bytes) -> SamplingState:
+    """Decode and validate a little-endian sampling-state payload."""
+
     offset = 0
 
     def take_u32() -> int:
+        """Consume one little-endian unsigned integer from the sampling payload."""
+
         nonlocal offset
         if offset + 4 > len(data):
             raise invalid_descriptor("sampling-state bytes are truncated")
@@ -3089,6 +3565,8 @@ def decode_sampling_state_bytes(data: bytes) -> SamplingState:
         return value
 
     def take_ids(count: int) -> tuple[int, ...]:
+        """Consume a canonical strictly increasing token-id vector."""
+
         values = tuple(take_u32() for _ in range(count))
         if any(left >= right for left, right in zip(values, values[1:], strict=False)):
             raise invalid_descriptor("sampling-state token ids are not canonical")
@@ -3120,6 +3598,8 @@ def decode_sampling_state_bytes(data: bytes) -> SamplingState:
 
 @dataclass(frozen=True, slots=True)
 class WorkerForwardStats:
+    """Aggregates model-path, attention, graph, relay, and speculative-decoding measurements for a run."""
+
     mode_counts: Mapping[str, int] = field(default_factory=dict)
     mode_tokens: Mapping[str, int] = field(default_factory=dict)
     mode_us: Mapping[str, int] = field(default_factory=dict)
@@ -3153,9 +3633,13 @@ class WorkerForwardStats:
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "worker forward stats") -> WorkerForwardStats:
+        """Parse aggregate execution counters and reject malformed mode, backend, or speculative statistics."""
+
         data = _map(value, where)
 
         def counter_map(name: str) -> dict[str, int]:
+            """Parse one string-keyed map of nonnegative execution counters."""
+
             values = _map(data.get(name, {}), f"{where}.{name}")
             return {
                 _str(key, f"{where}.{name}.key"): _uint(raw, f"{where}.{name}.{key}")
@@ -3238,6 +3722,8 @@ class WorkerForwardStats:
         )
 
     def to_mapping(self) -> dict[str, object]:
+        """Serialize scalar and keyed execution counters using plain wire values."""
+
         return {
             name: dict(value) if isinstance(value, Mapping) else value
             for name, value in ((name, getattr(self, name)) for name in self.__dataclass_fields__)
@@ -3246,6 +3732,8 @@ class WorkerForwardStats:
 
 @dataclass(frozen=True, slots=True)
 class LaneResult:
+    """Carries the ordered operation results produced by one execution lane."""
+
     lane_id: int
     completions: tuple[ModelOutput | CompletionState, ...]
     products: tuple[ProductPayload, ...] = ()
@@ -3264,6 +3752,8 @@ class LaneResult:
         value: object,
         where: str = "lane completion",
     ) -> LaneResult:
+        """Parse one lane completion with ordered operation outputs and optional publication state."""
+
         data = _map(value, where)
         return cls(
             lane_id=_uint(data.get("lane_id"), f"{where}.lane_id"),
@@ -3291,6 +3781,8 @@ class LaneResult:
         )
 
     def to_mapping(self) -> dict[str, object]:
+        """Encode one lane’s operation completions in execution order."""
+
         return {
             "lane_id": self.lane_id,
             "completions": [cast(ModelOutput, value).to_mapping() for value in self.completions],
@@ -3305,6 +3797,8 @@ class LaneResult:
 
 @dataclass(frozen=True, slots=True)
 class RunResult:
+    """Carries the completed lane results and aggregate forward statistics for one run."""
+
     batch_id: int
     run_id: int
     lanes: tuple[LaneResult, ...]
@@ -3312,16 +3806,22 @@ class RunResult:
 
     @property
     def completions(self) -> tuple[ModelOutput | CompletionState, ...]:
+        """Flatten lane completions in physical lane and operation order."""
+
         return tuple(
             completion for lane in self.lanes for completion in lane.completions
         )
 
     @property
     def products(self) -> tuple[ProductPayload, ...]:
+        """Flatten lane product payloads in physical lane order."""
+
         return tuple(product for lane in self.lanes for product in lane.products)
 
     @property
     def registration(self) -> RegistrationAck:
+        """Report visibility only after every physical lane acknowledges registration."""
+
         return RegistrationAck(
             visible=bool(self.lanes)
             and all(lane.registration.visible for lane in self.lanes)
@@ -3329,6 +3829,8 @@ class RunResult:
 
     @property
     def worker_exec_us(self) -> int | None:
+        """Use the slowest lane duration as the run's wall-clock execution time."""
+
         values = tuple(
             lane.worker_exec_us
             for lane in self.lanes
@@ -3338,6 +3840,8 @@ class RunResult:
 
     @property
     def forward_stats(self) -> WorkerForwardStats | None:
+        """Merge lane counters by summing scalars and keyed counter maps."""
+
         values = tuple(lane.forward_stats for lane in self.lanes if lane.forward_stats is not None)
         if not values:
             return None
@@ -3358,6 +3862,8 @@ class RunResult:
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "completion report") -> RunResult:
+        """Parse a run completion and its lane reports, registration acknowledgement, and forward statistics."""
+
         data = _map(value, where)
         completions = tuple(
             ModelOutput.from_mapping(item, f"{where}.completions[{index}]")
@@ -3391,6 +3897,8 @@ class RunResult:
         )
 
     def to_mapping(self) -> dict[str, object]:
+        """Encode the completed run, lane outputs, registration state, and aggregate statistics."""
+
         return {
             "batch_id": self.batch_id,
             "run_id": self.run_id,
@@ -3403,13 +3911,9 @@ class RunResult:
         }
 
 
-# ---------------------------------------------------------------------------
-# Decode helpers
-#
 # Each `_fast_*` helper recognizes the exact built-in IPC shape without
 # allocating error-location strings. A non-matching value returns ``None`` so
 # the caller applies the canonical validated constructor and its precise error.
-# ---------------------------------------------------------------------------
 
 _E = TypeVar("_E", bound=StrEnum)
 
@@ -3421,6 +3925,8 @@ _DRAW_LAYOUT_BY_VALUE: Mapping[str, DrawLayout] = DrawLayout._value2member_map_ 
 
 
 def _enum(kind: type[_E], value: object, where: str) -> _E:
+    """Decode and validate one string-backed enum value for a wire field."""
+
     if type(value) is str:
         member = kind._value2member_map_.get(value)
         if member is not None:
@@ -3435,6 +3941,8 @@ def _enum(kind: type[_E], value: object, where: str) -> _E:
 
 
 def _map(value: object, where: str) -> Mapping[str, Any]:
+    """Require a decoded wire field to be a mapping."""
+
     if type(value) is dict:
         return value
     if not isinstance(value, Mapping):
@@ -3443,6 +3951,8 @@ def _map(value: object, where: str) -> Mapping[str, Any]:
 
 
 def _seq(value: object, where: str) -> Sequence[Any]:
+    """Require a decoded wire field to be a non-string sequence."""
+
     kind = type(value)
     if kind is list or kind is tuple:
         return cast(Sequence[Any], value)
@@ -3452,6 +3962,8 @@ def _seq(value: object, where: str) -> Sequence[Any]:
 
 
 def _pair(value: object, where: str) -> Sequence[Any]:
+    """Require a decoded wire field to contain exactly two values."""
+
     items = _seq(value, where)
     if len(items) != 2:
         raise invalid_descriptor(f"{where} must contain two values")
@@ -3459,23 +3971,31 @@ def _pair(value: object, where: str) -> Sequence[Any]:
 
 
 def _tagged(value: object, where: str) -> tuple[str, object]:
+    """Extract a non-empty variant tag and its mapping payload."""
+
     data = _map(value, where)
     return _str(data.get("kind"), f"{where}.kind"), data.get("value")
 
 
 def _str(value: object, where: str) -> str:
+    """Require a decoded wire field to contain text."""
+
     if not isinstance(value, str):
         raise invalid_descriptor(f"{where} must be a string")
     return value
 
 
 def _bool(value: object, where: str) -> bool:
+    """Require a decoded wire field to contain a boolean."""
+
     if value is True or value is False:
         return value
     raise invalid_descriptor(f"{where} must be a bool")
 
 
 def _uint(value: object, where: str) -> int:
+    """Decode a non-negative integer wire field."""
+
     if type(value) is int and value >= 0:
         return value
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
@@ -3484,10 +4004,14 @@ def _uint(value: object, where: str) -> int:
 
 
 def _optional_uint(value: object, where: str) -> int | None:
+    """Decode an optional non-negative integer wire field."""
+
     return None if value is None else _uint(value, where)
 
 
 def _float(value: object, where: str) -> float:
+    """Decode a finite floating-point wire field while rejecting booleans."""
+
     kind = type(value)
     if kind is not float and kind is not int:
         if not isinstance(value, (int, float)) or isinstance(value, bool):
@@ -3499,6 +4023,8 @@ def _float(value: object, where: str) -> float:
 
 
 def _uints(value: object, where: str) -> tuple[int, ...]:
+    """Decode a sequence of non-negative integer wire values."""
+
     items = _seq(value, where)
     for item in items:
         if not (type(item) is int and item >= 0):
@@ -3507,6 +4033,8 @@ def _uints(value: object, where: str) -> tuple[int, ...]:
 
 
 def _ints(value: object, where: str) -> tuple[int, ...]:
+    """Decode a sequence of integer wire values."""
+
     items = _seq(value, where)
     if not all(isinstance(item, int) and not isinstance(item, bool) for item in items):
         raise invalid_descriptor(f"{where} must contain integers")
@@ -3514,6 +4042,8 @@ def _ints(value: object, where: str) -> tuple[int, ...]:
 
 
 def _bytes(value: object, where: str) -> bytes:
+    """Decode a bytes-like wire payload to immutable bytes."""
+
     if type(value) is bytes:
         return cast(bytes, value)
     if isinstance(value, (bytearray, memoryview)):
@@ -3522,22 +4052,22 @@ def _bytes(value: object, where: str) -> bytes:
 
 
 def _nonnegative(value: int, where: str) -> None:
+    """Validate a decoded integer is non-negative."""
+
     _uint(value, where)
 
 
-# ---------------------------------------------------------------------------
-# Allocation-light record decoders for the per-batch hot path
-#
 # Each returns the decoded record for a well-formed IPC value and ``None``
 # otherwise; the caller uses validating decoders in declaration order so the
 # first invalid field receives a precise diagnostic.
 # Construction bypasses ``__init__``/``__post_init__`` only where the fast
 # path itself enforces everything those validators check.
-# ---------------------------------------------------------------------------
 
 
 @lru_cache(maxsize=8192)
 def _interned_request_key(authority_id: int, request_id: int, epoch: int) -> RequestKey:
+    """Reuse an immutable request key for identical authority, request, and epoch values."""
+
     key = object.__new__(RequestKey)
     object.__setattr__(key, "authority_id", authority_id)
     object.__setattr__(key, "request_id", request_id)
@@ -3546,6 +4076,8 @@ def _interned_request_key(authority_id: int, request_id: int, epoch: int) -> Req
 
 
 def _fast_request_key(value: object) -> RequestKey | None:
+    """Decode a trusted compact request-key mapping."""
+
     if type(value) is not dict:
         return None
     authority_id = value.get("authority_id")
@@ -3565,6 +4097,8 @@ def _fast_request_key(value: object) -> RequestKey | None:
 
 @lru_cache(maxsize=1024)
 def _interned_point_range(base_point: int, max_points: int) -> PointRange:
+    """Reuse an immutable point range for identical base and extent values."""
+
     point_range = object.__new__(PointRange)
     object.__setattr__(point_range, "base_point", base_point)
     object.__setattr__(point_range, "max_points", max_points)
@@ -3572,6 +4106,8 @@ def _interned_point_range(base_point: int, max_points: int) -> PointRange:
 
 
 def _fast_point_range(value: object) -> PointRange | None:
+    """Decode a trusted compact point-range mapping."""
+
     if type(value) is not dict:
         return None
     base_point = value.get("base_point")
@@ -3585,6 +4121,8 @@ def _fast_point_range(value: object) -> PointRange | None:
 def _interned_shape_bound(
     encoded_dims: tuple[tuple[bool, int], ...],
 ) -> ShapeBound:
+    """Reuse an immutable shape bound for an already encoded dimension tuple."""
+
     shape = object.__new__(ShapeBound)
     object.__setattr__(
         shape,
@@ -3598,6 +4136,8 @@ def _interned_shape_bound(
 
 
 def _fast_shape_bound(value: object) -> ShapeBound | None:
+    """Decode a trusted compact shape-bound mapping without generic schema dispatch."""
+
     if type(value) is not dict:
         return None
     raw_dims = value.get("dims", ())
@@ -3632,6 +4172,8 @@ def _fast_shape_bound(value: object) -> ShapeBound | None:
 
 
 def _fast_product_ref(value: object) -> ProductRef | None:
+    """Decode a trusted compact product reference and its optional tensor bound."""
+
     if type(value) is not dict:
         return None
     request_key = _fast_request_key(value.get("request_key"))
@@ -3680,6 +4222,8 @@ def _fast_product_ref(value: object) -> ProductRef | None:
 
 
 def _fast_product_refs(value: object) -> tuple[ProductRef, ...] | None:
+    """Decode a trusted sequence of compact product references."""
+
     kind = type(value)
     if kind is not list and kind is not tuple:
         return None
@@ -3694,6 +4238,8 @@ def _fast_product_refs(value: object) -> tuple[ProductRef, ...] | None:
 
 
 def _fast_version_ref(value: object) -> Checkpoint | None:
+    """Decode a trusted compact version reference from its wire mapping."""
+
     if type(value) is not dict:
         return None
     op_id = value.get("op_id")
@@ -3722,6 +4268,8 @@ def _fast_version_ref(value: object) -> Checkpoint | None:
 
 
 def _fast_work(value: object) -> RunKind | None:
+    """Decode a trusted compact work descriptor and its kind-specific payload."""
+
     if type(value) is RunKind:
         return value
     if type(value) is str:
@@ -3738,6 +4286,8 @@ def _interned_bounds(
     max_completion_bytes: int,
     max_transfer_bytes: int,
 ) -> Bounds:
+    """Reuse immutable execution bounds for an identical capacity tuple."""
+
     bounds = object.__new__(Bounds)
     set_field = object.__setattr__
     set_field(bounds, "max_points", max_points)
@@ -3750,6 +4300,8 @@ def _interned_bounds(
 
 
 def _fast_bounds(value: object) -> Bounds | None:
+    """Decode trusted optional execution bounds from their compact wire representation."""
+
     if type(value) is not dict:
         return None
     max_points = value.get("max_points")
@@ -3784,6 +4336,8 @@ def _fast_bounds(value: object) -> Bounds | None:
 
 
 def _fast_rng(value: object) -> Rng | None:
+    """Decode trusted optional RNG coordinates from their compact wire representation."""
+
     if type(value) is not dict:
         return None
     seed = value.get("seed")
@@ -3808,6 +4362,8 @@ def _fast_rng(value: object) -> Rng | None:
 
 
 def _fast_uints(value: object) -> tuple[int, ...] | None:
+    """Decode a trusted integer sequence while enforcing non-negative values."""
+
     kind = type(value)
     if kind is not list and kind is not tuple:
         return None

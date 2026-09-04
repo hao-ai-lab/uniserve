@@ -1,11 +1,14 @@
-//! In-process engine runtime: scheduler ownership, executor construction,
-//! stats, control surface, and shutdown.
+//! In-process scheduling, memory management, worker execution, and request control.
+//!
+//! The crate owns the engine thread and exports request handles, configuration,
+//! execution backends, statistics, and a GPU-free simulator.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 mod core;
 mod executor;
 mod handle;
 mod kv;
+/// Scheduler-owned allocation and worker-placement primitives.
 pub mod memory;
 mod runtime;
 mod scheduler;

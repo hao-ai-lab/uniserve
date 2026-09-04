@@ -1,4 +1,4 @@
-//! Adapts Qwen3 assistant text deltas into tool-call-aware assistant updates.
+//! Converts Qwen3 assistant text into tool-call-aware updates.
 
 use asynk_strim_attr::{TryYielder, try_stream};
 use futures::{StreamExt as _, pin_mut};
@@ -19,6 +19,7 @@ struct ToolState {
 }
 
 impl ToolState {
+    /// Creates a Qwen tool-call stream parser.
     fn new(parser: Qwen3XmlToolParser) -> Self {
         Self {
             parser,
@@ -27,6 +28,7 @@ impl ToolState {
         }
     }
 
+    /// Feeds visible text through incremental tool parsing with lossless text fallback.
     fn process_text_delta(
         &mut self,
         kind: AssistantBlockKind,
@@ -53,6 +55,7 @@ impl ToolState {
         Ok(events)
     }
 
+    /// Processes the parser output.
     fn process_parser_output(
         &mut self,
         kind: AssistantBlockKind,
@@ -72,6 +75,7 @@ impl ToolState {
         Ok(())
     }
 
+    /// Converts parser deltas into ordered tool-call start and argument events.
     fn process_tool_items(
         &mut self,
         items: Vec<ToolCallDelta>,
@@ -114,6 +118,7 @@ impl ToolState {
         Ok(())
     }
 
+    /// Finishes incremental output processing.
     fn finish(&mut self) -> Result<Vec<AssistantEvent>> {
         if self.parser_failed {
             return Ok(Vec::new());
@@ -132,6 +137,7 @@ impl ToolState {
     }
 }
 
+/// Appends a nonempty semantic text delta.
 fn push_text_delta(events: &mut Vec<AssistantEvent>, kind: AssistantBlockKind, delta: String) {
     if !delta.is_empty() {
         events.push(AssistantEvent::TextDelta { kind, delta });
@@ -139,6 +145,7 @@ fn push_text_delta(events: &mut Vec<AssistantEvent>, kind: AssistantBlockKind, d
 }
 
 #[try_stream]
+/// Converts assistant text events into tool-call-aware events.
 pub async fn tool_event_stream(
     stream: impl futures::Stream<Item = Result<ReasoningEvent>> + Send,
     parser: Option<Qwen3XmlToolParser>,

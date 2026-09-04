@@ -24,7 +24,7 @@ __all__ = [
 
 
 def approx(a: float, b: float) -> bool:
-    """Float-equality test for CFG-scale control flow.
+    """Compare CFG scales with the tolerance used by plan control flow.
 
     The plan builder branches on scales being exactly 1 (CFG disabled for that
     axis) or equal to each other; ``math.isclose`` tolerates the float noise that
@@ -42,6 +42,8 @@ _RESCALE_BLEND_COMPLEMENT = 0.3
 
 
 class RenormKind(str, Enum):
+    """Selects the norm-matching rule applied after classifier-free guidance."""
+
     NONE = "none"
     GLOBAL = "global"
     CHANNEL = "channel"
@@ -87,6 +89,8 @@ class CfgRecipe(Enum):
 
     @classmethod
     def coerce(cls, value: "CfgRecipe | str") -> "CfgRecipe":
+        """Normalize serialized recipe values while preserving enum instances."""
+
         if isinstance(value, cls):
             return value
         return cls(str(value))
@@ -94,12 +98,16 @@ class CfgRecipe(Enum):
 
 @dataclass(frozen=True)
 class CfgParams:
+    """Defines text and image guidance scales, renormalization policy, and blend strength."""
+
     branch_count: int = 1
     scales: tuple[float, ...] = ()
     renorm: RenormKind = RenormKind.NONE
     renorm_min: float = 0.0
 
     def __post_init__(self) -> None:
+        """Validate guidance scales, blend strength, and renormalization bounds."""
+
         if self.branch_count < 1:
             raise ValueError("branch_count must be >= 1")
         if self.scales and len(self.scales) not in {self.branch_count - 1, self.branch_count}:
@@ -107,6 +115,8 @@ class CfgParams:
 
     @staticmethod
     def from_mapping(raw: Mapping[str, Any] | None) -> "CfgParams":
+        """Normalize serialized guidance scales and renormalization settings."""
+
         if raw is None:
             return CfgParams()
         renorm = raw.get("renorm_type", RenormKind.NONE)
@@ -195,6 +205,8 @@ class CfgPlan:
     ops: tuple[_CfgCombineOp, ...] = ()
 
     def combine(self, outputs: Mapping[Branch, torch.Tensor]) -> torch.Tensor:
+        """Execute the ordered guidance operations over named branch predictions."""
+
         if not self.ops:
             return outputs[Branch.COND]
         result: torch.Tensor | None = None
@@ -292,6 +304,8 @@ def _two_branch_text_plan(
     renorm_kind: RenormKind,
     renorm_min: float,
 ) -> CfgPlan:
+    """Build unconditional-to-text classifier-free guidance operations."""
+
     return CfgPlan(
         branches=(Branch.COND, Branch.TEXT_UNCOND),
         ops=(
@@ -311,6 +325,8 @@ def _two_branch_image_plan(
     renorm_kind: RenormKind,
     renorm_min: float,
 ) -> CfgPlan:
+    """Build unconditional-to-image classifier-free guidance operations."""
+
     return CfgPlan(
         branches=(Branch.COND, Branch.IMG_UNCOND),
         ops=(
@@ -330,6 +346,8 @@ def _image_over_text_channel_plan(
     cfg_img_scale: float,
     renorm_min: float,
 ) -> CfgPlan:
+    """Build channel guidance that applies image conditioning over the text baseline."""
+
     ops = [
         _CfgCombineOp(
             inputs=(Branch.TEXT_UNCOND, Branch.COND),
@@ -357,6 +375,8 @@ def _three_branch_plan(
     renorm_kind: RenormKind,
     renorm_min: float,
 ) -> CfgPlan:
+    """Build ordered unconditional, text, and image guidance operations."""
+
     if applies_to_text:
         scales = (
             1.0 - float(cfg_img_scale),
@@ -417,6 +437,8 @@ def combine_text_image_cfg(
 def _renorm_global(
     guided: torch.Tensor, ref: torch.Tensor, params: CfgParams, eps: float
 ) -> torch.Tensor:
+    """Match guided global magnitude to the reference under the configured floor."""
+
     dims = tuple(range(1, guided.ndim)) if guided.ndim >= 3 else tuple(range(guided.ndim))
     return _match_norm(guided, ref, dims=dims, minimum=params.renorm_min, eps=eps)
 
@@ -424,6 +446,8 @@ def _renorm_global(
 def _renorm_channel(
     guided: torch.Tensor, ref: torch.Tensor, params: CfgParams, eps: float
 ) -> torch.Tensor:
+    """Match guided per-channel magnitude to the reference under the configured floor."""
+
     dims = (guided.ndim - 1,)
     return _match_norm(guided, ref, dims=dims, minimum=params.renorm_min, eps=eps)
 
@@ -431,6 +455,8 @@ def _renorm_channel(
 def _renorm_rescale(
     guided: torch.Tensor, ref: torch.Tensor, params: CfgParams, eps: float
 ) -> torch.Tensor:
+    """Blend guided output toward reference-matched magnitude."""
+
     dims = (guided.ndim - 1,)
     matched = _match_norm(guided, ref, dims=dims, minimum=params.renorm_min, eps=eps)
     return _RESCALE_BLEND_PHI * matched + _RESCALE_BLEND_COMPLEMENT * guided
@@ -439,6 +465,8 @@ def _renorm_rescale(
 def _renorm_cfg_zero_star(
     guided: torch.Tensor, ref: torch.Tensor, params: CfgParams, eps: float
 ) -> torch.Tensor:
+    """Apply CFG-Zero-Star magnitude correction against the reference branch."""
+
     del ref, params, eps
     return guided - guided.mean(dim=tuple(range(1, guided.ndim)), keepdim=True)
 
@@ -457,6 +485,8 @@ _RENORM_HANDLERS: dict[
 
 
 def _renorm(guided: torch.Tensor, branches: torch.Tensor, params: CfgParams) -> torch.Tensor:
+    """Dispatch the configured guidance renormalization policy."""
+
     if params.renorm == RenormKind.NONE:
         return guided
     handler = _RENORM_HANDLERS.get(params.renorm)
@@ -475,6 +505,8 @@ def _match_norm(
     minimum: float,
     eps: float,
 ) -> torch.Tensor:
+    """Limit guided magnitude relative to a reference over selected dimensions."""
+
     guided_norm = guided.float().norm(dim=dims, keepdim=True).clamp_min(eps)
     ref_norm = ref.float().norm(dim=dims, keepdim=True).clamp_min(minimum)
     scale = (ref_norm / guided_norm).clamp(max=1.0)

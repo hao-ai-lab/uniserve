@@ -1,3 +1,5 @@
+//! Chat request validation, lowering, and response construction.
+
 mod convert;
 mod response;
 mod validate;

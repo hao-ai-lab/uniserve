@@ -1,3 +1,5 @@
+//! HTTP request identification, load tracking, and metrics middleware.
+
 mod load;
 mod metrics;
 mod request_id;

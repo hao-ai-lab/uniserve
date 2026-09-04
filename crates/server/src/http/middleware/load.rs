@@ -1,3 +1,5 @@
+//! Middleware that tracks active requests and streaming response bodies.
+
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
@@ -20,7 +22,7 @@ const TRACKED_HANDLERS: &[&str] = &["/v1/chat/completions", "/v1/images/generati
 /// `Retry-After` hint (in seconds) advertised when shedding load.
 const RETRY_AFTER_SECONDS: &str = "1";
 
-/// Build the 503 load-shedding response returned when the in-flight limit is
+/// Builds the 503 load-shedding response returned when the in-flight limit is
 /// reached.
 fn overloaded_response(limit: u64) -> Response {
     let body = json!({
@@ -41,7 +43,7 @@ fn overloaded_response(limit: u64) -> Response {
         .into_response()
 }
 
-/// Track frontend-local in-flight inference requests. When an admission limit
+/// Tracks frontend-local in-flight inference requests. When an admission limit
 /// is configured, tracked requests are shed with `503
 /// Service Unavailable` (plus a `Retry-After` hint) once that many requests are
 /// already in flight, so a fixed-capacity engine browns out gracefully instead
@@ -93,6 +95,7 @@ struct ServerLoadGuard {
 }
 
 impl Drop for ServerLoadGuard {
+    /// Releases resources owned by this value.
     fn drop(&mut self) {
         if let Some(state) = self.state.upgrade() {
             state.decrement_server_load();
@@ -108,11 +111,11 @@ struct LoadTrackedBody {
     _guard: ServerLoadGuard,
 }
 
-// Simply delegate all `HttpBody` methods to the inner body.
 impl HttpBody for LoadTrackedBody {
     type Data = Bytes;
     type Error = axum::Error;
 
+    /// Polls the wrapped response body for its next frame.
     fn poll_frame(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -120,10 +123,12 @@ impl HttpBody for LoadTrackedBody {
         Pin::new(&mut self.inner).poll_frame(cx)
     }
 
+    /// Returns whether the wrapped response body has ended.
     fn is_end_stream(&self) -> bool {
         self.inner.is_end_stream()
     }
 
+    /// Returns the wrapped response body size estimate.
     fn size_hint(&self) -> SizeHint {
         self.inner.size_hint()
     }

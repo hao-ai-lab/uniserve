@@ -1,3 +1,9 @@
+//! Generation lifecycle state and worker-operation planning.
+//!
+//! A request advances through context ingestion, understanding decode, image
+//! generation, optional feedback, and terminal publication. Every planned
+//! output is named by request epoch, producer operation, point, and generation.
+
 use std::collections::HashSet;
 
 use uniserve_core::product_blob::LogprobBlob;
@@ -15,7 +21,7 @@ use uniserve_worker_ipc::{
 use crate::memory::Allocation;
 use crate::runtime::image_artifact::png_artifact_dims_b64;
 
-/// A product reference minted by the planner for an operation output. The
+/// Builds an unstamped product reference for a planned operation output. The
 /// owning `request_key` and `producer_op_id` are placeholder until
 /// [`NextOp::register`] stamps the real identity. The shape
 /// bound is empty (it carries identity, not a device geometry).
@@ -38,6 +44,7 @@ fn output_product(
     }
 }
 
+/// Builds a product with an explicit byte bound.
 fn bounded_product(
     output_index: u16,
     kind: ProductKind,
@@ -50,6 +57,7 @@ fn bounded_product(
     product
 }
 
+/// Returns the byte width of a tensor element type.
 fn dtype_bytes(dtype: DType) -> u64 {
     match dtype {
         DType::U8 => 1,
@@ -59,6 +67,7 @@ fn dtype_bytes(dtype: DType) -> u64 {
     }
 }
 
+/// Returns the declared byte bound for a product.
 fn product_bound_bytes(product: &ProductRef) -> u64 {
     product
         .shape_bound
@@ -73,6 +82,7 @@ fn product_bound_bytes(product: &ProductRef) -> u64 {
         .saturating_mul(dtype_bytes(product.dtype))
 }
 
+/// Computes a bounded element count for a dynamic dimension.
 fn dynamic_element_bound(bytes: u64, dtype: DType) -> Result<ShapeBound, PlanningError> {
     let elements = bytes.div_ceil(dtype_bytes(dtype));
     let max = u32::try_from(elements).map_err(|_| PlanningError::ProductBoundTooLarge { bytes })?;
@@ -84,6 +94,7 @@ fn dynamic_element_bound(bytes: u64, dtype: DType) -> Result<ShapeBound, Plannin
     })
 }
 
+/// Computes the encoded size bound for a PNG artifact.
 fn png_base64_bound(width: u32, height: u32) -> Result<u64, PlanningError> {
     let raw = u64::from(height)
         .checked_mul(u64::from(width).saturating_mul(3).saturating_add(1))
@@ -95,7 +106,7 @@ fn png_base64_bound(width: u32, height: u32) -> Result<u64, PlanningError> {
     Ok(png.div_ceil(3).saturating_mul(4))
 }
 
-/// A host-supplied input product reference for an operation's forward, owned by
+/// Builds a host-supplied input product reference owned by
 /// the consuming operation's identity at a reserved input index so it never
 /// collides with the operation's declared outputs. Its value is carried in the
 /// batch's `input_products` under this same identity.
@@ -130,6 +141,7 @@ fn host_input_product(
 
 const RANKED_LOGPROB_BYTES: u64 = 12;
 
+/// Computes the maximum serialized log-probability payload required by a request.
 fn logprob_blob_bound(
     sampling: &SamplingParams,
     prompt_positions: u32,
@@ -182,7 +194,7 @@ fn logprob_blob_bound(
     Ok(Some(bytes))
 }
 
-/// The declared outputs of a token operation. The selected-token product also
+/// Builds the declared outputs of a token operation. The selected-token product also
 /// carries the device continuation bit consumed by a registered descendant;
 /// the worker masks that bit before the token reaches model input.
 fn token_outputs(
@@ -232,7 +244,7 @@ fn token_outputs(
     Ok(outputs)
 }
 
-/// Products emitted by the state-advancing feedback extend. The completion
+/// Builds products emitted by the state-advancing feedback extension. The completion
 /// predicate identifies the final feedback state transition independently of
 /// whether the model policy also requests a sampled continuation token.
 fn feedback_state_outputs(
@@ -274,6 +286,7 @@ fn feedback_state_outputs(
     Ok(outputs)
 }
 
+/// Returns the sampling parameters changed by an operation.
 fn operation_sampling_delta(
     sampling: &SamplingParams,
     state: &SamplingState,
@@ -304,6 +317,7 @@ struct RuntimeTokenSegment {
 }
 
 #[derive(Debug, Clone)]
+/// Materialized input or generated image tracked by a request runtime.
 pub(crate) struct RuntimeImage {
     pub(crate) segment_index: usize,
     pub(crate) hash: u64,
@@ -313,6 +327,7 @@ pub(crate) struct RuntimeImage {
 }
 
 impl RuntimeContext {
+    /// Validates and flattens public context segments into scheduler-owned text and image state.
     pub(crate) fn lower(request: &GenerationRequest) -> Result<Self, ContextLoweringError> {
         request
             .validate()
@@ -369,6 +384,7 @@ impl RuntimeContext {
         })
     }
 
+    /// Returns the token segment beginning at an offset.
     pub(crate) fn token_segment_at(&self, offset: usize) -> Option<(usize, usize)> {
         self.token_segments
             .iter()
@@ -378,6 +394,7 @@ impl RuntimeContext {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+/// Failure while converting ordered context segments into runtime state.
 pub(crate) enum ContextLoweringError {
     #[error("invalid generation request: {0}")]
     InvalidRequest(String),
@@ -419,6 +436,7 @@ pub(crate) struct GenerationCursor {
 }
 
 impl GenerationCursor {
+    /// Creates a generation cursor at the given phase with its KV reservation policy.
     pub(crate) fn new(
         phase: GenerationPhase,
         worstcase_blocks: usize,
@@ -477,7 +495,7 @@ impl GenerationCursor {
         }
     }
 
-    /// Apply one transition to either the committed cursor (with a worker
+    /// Applies one transition to either the committed cursor (with a worker
     /// result) or a lookahead clone (without one).
     pub(crate) fn apply(
         &mut self,
@@ -485,6 +503,8 @@ impl GenerationCursor {
         apply: &RuntimeApply,
         outcome: Option<(&ModelOutput, &[ProductPayload])>,
     ) -> Result<(), CursorApplyError> {
+        // Only committed worker outcomes participate in duplicate suppression;
+        // lookahead projections may apply the same operation to cloned cursors.
         if let Some((record, _)) = outcome {
             let op_id = operation.op_id.0;
             if op_id == 0 {
@@ -497,6 +517,7 @@ impl GenerationCursor {
                 return Ok(());
             }
         }
+
         match &apply.intent {
             TransitionIntent::IngestText {
                 start,
@@ -507,6 +528,9 @@ impl GenerationCursor {
             } => {
                 let count = end.saturating_sub(*start);
                 self.ingest.prompt_cursor = self.ingest.prompt_cursor.max(*end);
+
+                // Logical positions track model semantics while physical positions
+                // track the worker's KV address space.
                 self.und.logical_pos = self
                     .und
                     .logical_pos
@@ -530,6 +554,7 @@ impl GenerationCursor {
                     || projected_kv_len(*physical_start, *physical_kv_tokens),
                     |(record, _)| Ok(record.logical_lengths().kv_visible_len),
                 )?;
+
                 if *is_final_step {
                     self.und.logical_pos = self
                         .und
@@ -557,6 +582,7 @@ impl GenerationCursor {
                         .max(1)
                         .min(u32::MAX as usize) as u32
                 });
+
                 self.und.logical_pos = self
                     .und
                     .logical_pos
@@ -576,6 +602,7 @@ impl GenerationCursor {
                     || Ok(physical_position.saturating_add(1)),
                     |(record, _)| Ok(record.logical_lengths().kv_visible_len),
                 )?;
+
                 self.image_gen.image_id = *image_id;
                 self.image_gen.cond_pos = *logical_position;
                 self.phase = GenerationPhase::PublishKv;
@@ -598,6 +625,7 @@ impl GenerationCursor {
                             .find(|product| product.kind == ProductKind::Kv)
                             .cloned()
                     });
+
                 if self.image_gen.conditioning.is_none() {
                     return Err(CursorApplyError::MissingKvProduct);
                 }
@@ -609,6 +637,7 @@ impl GenerationCursor {
                     .iter()
                     .find(|product| product.kind == ProductKind::Latent)
                     .cloned();
+
                 if self.image_gen.latent.is_none() {
                     return Err(CursorApplyError::MissingLatentProduct);
                 }
@@ -624,6 +653,9 @@ impl GenerationCursor {
                     outcome.map_or(start_step.saturating_add(*step_count), |(record, _)| {
                         record.logical_lengths().latent_len.min(u32::from(u16::MAX)) as u16
                     });
+
+                // Progress is monotonic even when a completion reports fewer steps
+                // than the transition reserved.
                 self.image_gen.steps_done = self
                     .image_gen
                     .steps_done
@@ -633,6 +665,7 @@ impl GenerationCursor {
                     .iter()
                     .find(|product| product.kind == ProductKind::Latent)
                     .cloned();
+
                 if self.image_gen.latent.is_none() {
                     return Err(CursorApplyError::MissingLatentProduct);
                 }
@@ -683,6 +716,7 @@ impl GenerationCursor {
                     || projected_kv_len(*physical_start, *physical_kv_tokens),
                     |(record, _)| Ok(record.logical_lengths().kv_visible_len),
                 )?;
+
                 if *is_final_step {
                     self.und.logical_pos = self
                         .und
@@ -700,6 +734,8 @@ impl GenerationCursor {
                 }
             }
         }
+
+        // Replayability may close but never reopen during a request lifetime.
         self.replay.replayability =
             match (self.replay.replayability, apply.replayability_after_apply) {
                 (Replayability::NotReplayable, _) | (_, Replayability::NotReplayable) => {
@@ -710,6 +746,7 @@ impl GenerationCursor {
         Ok(())
     }
 
+    /// Projects generation state through one operation.
     pub(crate) fn project<'a>(
         &self,
         inflight: impl IntoIterator<Item = (&'a Operation, &'a RuntimeApply)>,
@@ -722,6 +759,7 @@ impl GenerationCursor {
     }
 }
 
+/// Projects a declared image KV effect onto the current physical length.
 fn projected_kv_len(base: u32, effect: ImageKvEffect) -> Result<u32, CursorApplyError> {
     match effect {
         ImageKvEffect::Exact { tokens } => Ok(base.saturating_add(tokens)),
@@ -731,6 +769,7 @@ fn projected_kv_len(base: u32, effect: ImageKvEffect) -> Result<u32, CursorApply
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+/// Failure while applying an operation completion to a generation cursor.
 pub(crate) enum CursorApplyError {
     #[error("operation has no registered identity")]
     MissingOperationId,
@@ -744,7 +783,7 @@ pub(crate) enum CursorApplyError {
     DuplicateOperation { op_id: u64 },
 }
 
-/// Locate the completion product a given operation produced for `kind`.
+/// Finds the completion product that an operation produced for `kind`.
 fn find_product(
     products: &[ProductPayload],
     op_id: OpId,
@@ -756,6 +795,7 @@ fn find_product(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Progress through ordered text and image context segments.
 pub(crate) struct ContextCursor {
     pub(crate) prompt_cursor: u32,
     pub(crate) prompt_logprobs_processed: usize,
@@ -769,12 +809,14 @@ pub(crate) struct ContextCursor {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Request-held reference to a reusable encoder-cache entry.
 pub(crate) struct EncoderCachePin {
     pub(crate) key: u64,
     pub(crate) product: ProductRef,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Progress and products for the understanding branch.
 pub(crate) struct UndCursor {
     pub(crate) logical_pos: u32,
     pub(crate) physical_kv_len: u32,
@@ -785,6 +827,7 @@ pub(crate) struct UndCursor {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Progress and products for one image-generation branch.
 pub(crate) struct GenCursor {
     pub(crate) image_id: u32,
     pub(crate) images_done: usize,
@@ -800,6 +843,7 @@ pub(crate) struct GenCursor {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Progress through generated-image feedback ingestion.
 pub(crate) struct FeedbackCursor {
     pub(crate) image_b64: Option<String>,
     pub(crate) ingest_step: usize,
@@ -808,6 +852,7 @@ pub(crate) struct FeedbackCursor {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Request-local allocation and placement identities.
 pub(crate) struct ResourceCursor {
     pub(crate) worker_registered: bool,
     pub(crate) blocks_sent: usize,
@@ -816,6 +861,7 @@ pub(crate) struct ResourceCursor {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Replay boundary and checkpoint state for one request.
 pub(crate) struct ReplayCursor {
     pub(crate) block_hashes: Vec<Vec<u64>>,
     pub(crate) prefix_cached_blocks: usize,
@@ -934,7 +980,7 @@ pub(crate) enum TransitionIntent {
 const HOST_INPUT_OUTPUT_INDEX: u16 = u16::MAX;
 const SAMPLING_INPUT_OUTPUT_INDEX: u16 = u16::MAX - 1;
 
-/// The immutable auxiliary feature product an encode operation produces.
+/// Builds the immutable auxiliary feature product produced by an encode operation.
 fn encode_outputs(
     step: ImageIngestStep,
     handle: u32,
@@ -961,7 +1007,7 @@ fn encode_outputs(
     Ok(vec![feature])
 }
 
-/// One immutable image-latent generation. The output remains addressed by its
+/// Builds one immutable image-latent generation. The output remains addressed by its
 /// exact operation identity and logical generation until the scheduler releases
 /// it after all registered readers have fenced.
 fn latent_output(
@@ -978,7 +1024,7 @@ fn latent_output(
     ))
 }
 
-/// Side-effect-free lowering from one scheduler decision to its next operation.
+/// Lowers one scheduler decision into its next operation without mutating runtime state.
 pub(crate) fn plan(
     latent_dtype: Option<DType>,
     kv_bytes_per_token: u64,
@@ -1031,11 +1077,14 @@ pub(crate) fn plan(
     }
 }
 
+/// Lowers one autoregressive extend intent into an exact worker product contract.
 fn plan_ar_extend(
     request: &GenerationRequest,
     cursor: &GenerationCursor,
     intent: TransitionIntent,
 ) -> Result<NextOp, PlanningError> {
+    // Each extend intent validates its host cursor before declaring the exact
+    // input and output product contract for worker execution.
     match &intent {
         TransitionIntent::IngestText {
             start,
@@ -1057,6 +1106,9 @@ fn plan_ar_extend(
                     actual: *end,
                 });
             }
+
+            // Prompt logprobs omit the first token when there is no predecessor
+            // position from which to score it.
             let prompt_positions = request
                 .sampling
                 .prompt_logprobs_requested()
@@ -1068,6 +1120,7 @@ fn plan_ar_extend(
                 !sampling_state.transition_token_ids.is_empty(),
                 1,
             )?;
+
             finish_plan(
                 request,
                 cursor,
@@ -1086,6 +1139,7 @@ fn plan_ar_extend(
                     actual: *position,
                 });
             }
+
             let inputs = vec![feature.clone()];
             finish_plan(
                 request,
@@ -1125,6 +1179,9 @@ fn plan_ar_extend(
                     actual: *position,
                 });
             }
+
+            // Feedback produces token-side outputs only when the policy asks
+            // the autoregressive stage to sample a continuation.
             let outputs = feedback_state_outputs(
                 sample_continuation
                     .then(|| logprob_blob_bound(&request.sampling, 0))
@@ -1134,12 +1191,14 @@ fn plan_ar_extend(
                 *sample_continuation && !sampling_state.transition_token_ids.is_empty(),
             )?;
             let inputs = vec![feature.clone()];
+
             finish_plan(request, cursor, intent, RunKind::ArExtend, inputs, outputs)
         }
         _ => unreachable!("token-extend planner received another forward mode"),
     }
 }
 
+/// Lowers one autoregressive decode intent into a token-sampling worker operation.
 fn plan_ar_decode(
     request: &GenerationRequest,
     cursor: &GenerationCursor,
@@ -1175,6 +1234,7 @@ fn plan_ar_decode(
     finish_plan(request, cursor, intent, work, Vec::new(), outputs)
 }
 
+/// Lowers one image encoder step and declares its intermediate or completion products.
 fn plan_encode(
     request: &GenerationRequest,
     cursor: &GenerationCursor,
@@ -1216,6 +1276,7 @@ fn plan_encode(
     finish_plan(request, cursor, intent, work, inputs, outputs)
 }
 
+/// Lowers a KV-publication intent into a transferable checkpoint product.
 fn plan_kv_publish(
     kv_bytes_per_token: u64,
     request: &GenerationRequest,
@@ -1269,6 +1330,7 @@ fn plan_kv_publish(
     )
 }
 
+/// Lowers image conditioning into the initial latent-generation operation.
 fn plan_diffusion_prepare(
     latent_dtype: Option<DType>,
     request: &GenerationRequest,
@@ -1304,6 +1366,7 @@ fn plan_diffusion_prepare(
     )
 }
 
+/// Lowers one denoising transition with exact conditioning and latent products.
 fn plan_diffusion_step(
     latent_dtype: Option<DType>,
     request: &GenerationRequest,
@@ -1344,6 +1407,7 @@ fn plan_diffusion_step(
     )
 }
 
+/// Lowers final latent decoding and optional feedback products for one generated image.
 fn plan_diffusion_finalize(
     request: &GenerationRequest,
     cursor: &GenerationCursor,
@@ -1378,6 +1442,10 @@ fn plan_diffusion_finalize(
     )
 }
 
+/// Derives the complete worker contract for a phase transition.
+///
+/// Resource bounds and completion validation are computed from the same intent so
+/// admission and result application agree on the operation's observable effects.
 fn finish_plan(
     request: &GenerationRequest,
     cursor: &GenerationCursor,
@@ -1386,6 +1454,7 @@ fn finish_plan(
     inputs: Vec<ProductRef>,
     outputs: Vec<ProductRef>,
 ) -> Result<NextOp, PlanningError> {
+    // Classify the operation before deriving intent-specific inputs and costs.
     let operation_variant = kind;
     let produces_latent = matches!(
         operation_variant,
@@ -1395,6 +1464,7 @@ fn finish_plan(
     let produces_token = outputs
         .iter()
         .any(|output| output.kind == ProductKind::Token);
+
     let new_blocks = match &intent {
         TransitionIntent::IngestText { new_blocks, .. }
         | TransitionIntent::IngestImageState { new_blocks, .. }
@@ -1403,6 +1473,7 @@ fn finish_plan(
         | TransitionIntent::FeedbackState { new_blocks, .. } => new_blocks.clone(),
         _ => Vec::new(),
     };
+
     let draft_token_ids = match &intent {
         TransitionIntent::DecodeUnd { spec_token_ids, .. } => {
             spec_token_ids.clone().unwrap_or_default()
@@ -1411,6 +1482,7 @@ fn finish_plan(
     };
     let draft_count =
         (!draft_token_ids.is_empty()).then(|| draft_token_ids.len().min(u32::MAX as usize) as u32);
+
     let token_cost = match &intent {
         TransitionIntent::IngestText { token_ids, .. } => token_ids.len(),
         TransitionIntent::IngestImageState {
@@ -1432,10 +1504,13 @@ fn finish_plan(
         | TransitionIntent::CommitGen { .. }
         | TransitionIntent::EncodeFeedbackStep { .. } => 1,
     };
+
     let cfg_branches = match &intent {
         TransitionIntent::DenoiseGen { cfg, .. } => usize::from(cfg.branch_count.max(1)),
         _ => 1,
     };
+
+    // Materialize only payloads that cross the host-worker boundary directly.
     let input_tokens = match &intent {
         TransitionIntent::IngestText { token_ids, .. } => token_ids.clone(),
         TransitionIntent::DecodeUnd {
@@ -1453,6 +1528,7 @@ fn finish_plan(
         } if !relay_input => vec![*token],
         _ => Vec::new(),
     };
+
     let input_image_bytes = match &intent {
         TransitionIntent::EncodeImageStep {
             source_product,
@@ -1466,6 +1542,8 @@ fn finish_plan(
         } if source.is_none() && !image_b64.is_empty() => Some(image_b64.clone().into_bytes()),
         _ => None,
     };
+
+    // Sampling metadata is emitted only for transitions that can consume it.
     let source_sampling = match &intent {
         TransitionIntent::IngestText { sampling_state, .. }
         | TransitionIntent::DecodeUnd { sampling_state, .. } => Some(sampling_state),
@@ -1479,6 +1557,7 @@ fn finish_plan(
     let sampling_state =
         source_sampling.and_then(|state| operation_sampling_delta(&request.sampling, state));
     let allowed_text_tokens = source_sampling.and_then(|state| state.allowed_token_ids.clone());
+
     let expected_prompt_token_ids = match &intent {
         TransitionIntent::IngestText {
             start, token_ids, ..
@@ -1491,12 +1570,15 @@ fn finish_plan(
         }
         _ => None,
     };
+
     let encoder_pins = match &intent {
         TransitionIntent::EncodeImageStep {
             encoder_cache_key, ..
         } => encoder_cache_key.iter().copied().collect(),
         _ => Vec::new(),
     };
+
+    // Irreversible transitions close the replay window at commit time.
     let replayability_after_apply = match &intent {
         TransitionIntent::CloseKv { .. }
         | TransitionIntent::DenoiseGen { .. }
@@ -1505,15 +1587,19 @@ fn finish_plan(
         | TransitionIntent::FeedbackState { .. } => Replayability::NotReplayable,
         _ => cursor.replay.replayability,
     };
+
     let latent_units = match &intent {
         TransitionIntent::PrepareGen { latent_units, .. }
         | TransitionIntent::DenoiseGen { latent_units, .. } => *latent_units,
         _ => 0,
     };
+
     let kv_target_tokens = transition_kv_target(&intent).or_else(|| {
         transition_may_write_worker_defined_kv(&intent).then_some(request.resources.max_kv_tokens)
     });
     let new_blocks_len = new_blocks.len();
+
+    // Output product declarations determine the maximum arena and relay footprint.
     let max_latent_bytes = if produces_latent {
         request.resources.max_image_latent_bytes
     } else {
@@ -1524,6 +1610,7 @@ fn finish_plan(
             .max()
             .unwrap_or(0)
     };
+
     let max_completion_bytes = outputs
         .iter()
         .filter(|output| {
@@ -1534,11 +1621,13 @@ fn finish_plan(
         })
         .map(product_bound_bytes)
         .fold(0_u64, u64::saturating_add);
+
     let max_transfer_bytes = outputs
         .iter()
         .filter(|output| output.storage_class == StorageClass::PagedKv)
         .map(product_bound_bytes)
         .fold(0_u64, u64::saturating_add);
+
     let resources = TransitionResources {
         new_blocks: new_blocks_len,
         kv_target_tokens,
@@ -1548,6 +1637,8 @@ fn finish_plan(
         replayability_after_apply,
         free_latent_on_apply: is_diffusion_finalize,
     };
+
+    // Validation describes exactly which worker claims may mutate request state.
     let validation = TransitionValidation {
         expected_denoise_step: match &intent {
             TransitionIntent::DenoiseGen {
@@ -1610,6 +1701,7 @@ fn finish_plan(
             ),
         expected_prompt_token_ids,
     };
+
     let bounds = Bounds {
         max_points: if operation_variant == RunKind::ArVerify {
             token_cost.min(u32::MAX as usize) as u32
@@ -1622,6 +1714,8 @@ fn finish_plan(
         max_completion_bytes,
         max_transfer_bytes,
     };
+
+    // Random draws are indexed by semantic progress rather than batch placement.
     let rng = match &intent {
         TransitionIntent::PrepareGen { image_id, .. } => Some(Rng {
             seed: request.image.seed.unwrap_or(0),
@@ -1635,6 +1729,7 @@ fn finish_plan(
         }),
         _ => None,
     };
+
     Ok(NextOp {
         kind,
         bounds,
@@ -1663,7 +1758,7 @@ fn finish_plan(
     })
 }
 
-/// The immutable products of image materialization.
+/// Builds the immutable products of image materialization.
 ///
 /// Public PNG bytes and a device-resident feedback source are independent
 /// products. The latter is present only for the device-product feedback route;
@@ -1700,6 +1795,7 @@ fn diffusion_finalize_outputs(
     Ok(outputs)
 }
 
+/// Returns the physical KV length produced by a state-advancing transition.
 fn transition_kv_target(intent: &TransitionIntent) -> Option<usize> {
     let target = match intent {
         TransitionIntent::IngestText {
@@ -1742,6 +1838,7 @@ fn transition_kv_target(intent: &TransitionIntent) -> Option<usize> {
     Some(target as usize)
 }
 
+/// Returns whether the transition may determine its KV contribution only at execution time.
 fn transition_may_write_worker_defined_kv(intent: &TransitionIntent) -> bool {
     matches!(
         intent,
@@ -1749,6 +1846,7 @@ fn transition_may_write_worker_defined_kv(intent: &TransitionIntent) -> bool {
     )
 }
 
+/// Builds a bounded worker-KV product.
 fn bounded_worker_kv(
     effect: ImageKvEffect,
     max_kv_tokens: usize,
@@ -1764,6 +1862,7 @@ fn bounded_worker_kv(
     }
 }
 
+/// Computes the token bound for image KV state.
 fn image_kv_token_bound(
     effect: ImageKvEffect,
     max_kv_tokens: usize,
@@ -1776,6 +1875,7 @@ fn image_kv_token_bound(
     }
 }
 
+/// Returns the deterministic sampling position associated with a token-producing transition.
 fn transition_sampling_index(intent: &TransitionIntent) -> Option<u64> {
     match intent {
         TransitionIntent::IngestText { end, .. } => Some(u64::from(*end)),
@@ -1795,6 +1895,7 @@ fn transition_sampling_index(intent: &TransitionIntent) -> Option<u64> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+/// Failure while constructing the next worker operation.
 pub(crate) enum PlanningError {
     #[error("prompt cursor mismatch: expected {expected}, got {actual}")]
     PromptCursorMismatch { expected: u32, actual: u32 },
@@ -1864,7 +1965,7 @@ pub(crate) struct RuntimeApply {
 }
 
 impl NextOp {
-    /// Consume this builder into the immutable operation, its scheduler apply
+    /// Consumes this builder into the immutable operation, its scheduler apply
     /// record, and the exact host input payloads carried by the submission.
     pub(crate) fn register(
         self,
@@ -1874,6 +1975,8 @@ impl NextOp {
         next_product_generation: &mut u64,
         output_event_bound: usize,
     ) -> Result<(Operation, RuntimeApply, Vec<ProductPayload>), PlanningError> {
+        // Reserve a contiguous generation range before mutating the shared
+        // counter so exhaustion cannot leave a partially registered operation.
         let required_generations = self
             .outputs
             .iter()
@@ -1890,6 +1993,9 @@ impl NextOp {
                 return Err(PlanningError::ProductGenerationExhausted);
             }
         }
+
+        // Host data becomes ordinary declared input products, keeping tokens,
+        // images, and sampler state inside the same validated operation schema.
         let host_input = if !self.input_tokens.is_empty() {
             Some(host_input_product(
                 request_key,
@@ -1928,12 +2034,17 @@ impl NextOp {
                 )
             })
             .transpose()?;
+
+        // The preflight above guarantees every conversion in this allocator.
         let mut acquire_generation = || {
             let generation =
                 u32::try_from((*next_product_generation).max(1)).expect("generation preflight");
             *next_product_generation = u64::from(generation) + 1;
             generation
         };
+
+        // Bind placeholder product references to the immutable request and
+        // operation identities assigned at registration.
         let outputs = self
             .outputs
             .into_iter()
@@ -1947,6 +2058,7 @@ impl NextOp {
             })
             .collect();
         let mut inputs = self.inputs;
+
         let host_input = host_input.map(|mut product| {
             product.generation = acquire_generation();
             product
@@ -1957,6 +2069,9 @@ impl NextOp {
         });
         inputs.extend(host_input.iter().cloned());
         inputs.extend(sampling_input.iter().cloned());
+
+        // Seal the wire operation only after every input and output identity is
+        // final, so scheduler state and worker declarations cannot diverge.
         let operation = Operation {
             request_key,
             op_id,
@@ -1973,6 +2088,9 @@ impl NextOp {
             ),
         }
         .sealed();
+
+        // Carry only host-resident values inline; cross-stage products remain
+        // represented by their separately resolved transfer handles.
         let mut input_products = Vec::with_capacity(2);
         if let Some(product) = host_input {
             let bytes = if !self.input_tokens.is_empty() {
@@ -1985,12 +2103,16 @@ impl NextOp {
                 value: InlineValue::Bytes(bytes),
             });
         }
+
         if let (Some(product), Some(bytes)) = (sampling_input, sampling_bytes) {
             input_products.push(ProductPayload {
                 product,
                 value: InlineValue::Bytes(bytes),
             });
         }
+
+        // Preserve the runtime-only transition contract alongside the sealed
+        // wire operation for completion validation and state application.
         let apply = RuntimeApply {
             intent: self.intent,
             validation: self.validation,
@@ -2000,11 +2122,13 @@ impl NextOp {
             free_latent_on_apply: self.resources.free_latent_on_apply,
             output_event_bound,
         };
+
         Ok((operation, apply, input_products))
     }
 }
 
 impl RuntimeApply {
+    /// Validates a worker result against the operation identity and planned transition contract.
     pub(crate) fn validate_result(
         &self,
         operation: &Operation,
@@ -2058,12 +2182,14 @@ impl RuntimeApply {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Visibility and termination effects of one completed output point.
 pub(crate) struct OutputVisibilityPlan {
     pub(crate) und_tokens: UndTokenAction,
     pub(crate) generated_image: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Resources created, consumed, or retained by one state transition.
 pub(crate) struct TransitionResources {
     pub(crate) new_blocks: usize,
     pub(crate) kv_target_tokens: Option<usize>,
@@ -2078,18 +2204,21 @@ pub(crate) struct TransitionResources {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
+/// Whether a transition can be reconstructed after worker recovery.
 pub(crate) enum Replayability {
     Replayable,
     NotReplayable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Declared KV effect expected from one image encoder operation.
 pub(crate) struct ImageKvExpectation {
     pub(crate) base: u32,
     pub(crate) effect: ImageKvEffect,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Expected outputs and state movement for a planned transition.
 pub(crate) struct TransitionValidation {
     pub(crate) expected_denoise_step: Option<u16>,
     pub(crate) expects_encoder_handle: bool,
@@ -2110,12 +2239,14 @@ pub(crate) struct TransitionValidation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Inclusive lower and upper bounds for committed text-token counts.
 pub(crate) struct TextTokenCountRange {
     pub(crate) min: u32,
     pub(crate) max: u32,
 }
 
 impl TransitionValidation {
+    /// Validates status, products, lengths, and sampling metadata for one transition result.
     fn validate(
         &self,
         operation_variant: RunKind,
@@ -2371,6 +2502,7 @@ impl TransitionValidation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+/// Mismatch between a completion and its planned state transition.
 pub(crate) enum TransitionValidationError {
     #[error("worker status invalid: {detail}")]
     Status { detail: &'static str },
@@ -2387,6 +2519,7 @@ pub(crate) enum TransitionValidationError {
 }
 
 impl TransitionValidationError {
+    /// Returns structured generation-error details.
     pub(crate) fn detail(&self) -> &'static str {
         match self {
             Self::Status { detail }

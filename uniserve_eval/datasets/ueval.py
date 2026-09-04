@@ -1,4 +1,4 @@
-"""UEval prompt loader for interleaved generation."""
+"""Loads deterministic UEval prompts for interleaved generation."""
 
 from __future__ import annotations
 
@@ -16,9 +16,13 @@ _PROMPT_FIELDS = ("prompt", "question", "instruction", "input", "query", "text")
 
 
 class UEvalDataset(Dataset):
+    """Adapts local or hosted UEval rows to normalized prompts."""
+
     name: ClassVar[str] = "ueval"
 
     def load(self, tokenizer: Any | None = None) -> list[Example]:
+        """Extract, shuffle, and select the declared number of prompts."""
+
         point = self.point
         raw = _load_local(point.dataset_path) if point.dataset_path else _load_hf(point)
         prompts = [prompt for entry in raw if (prompt := _extract_prompt(entry))]
@@ -31,6 +35,8 @@ class UEvalDataset(Dataset):
 
 
 def _load_local(dataset_path: str) -> list[dict[str, Any]]:
+    """Load object rows from a local JSON array or JSON Lines file."""
+
     path = Path(dataset_path)
     text = path.read_text(encoding="utf-8")
     stripped = text.lstrip()
@@ -47,6 +53,8 @@ def _load_local(dataset_path: str) -> list[dict[str, Any]]:
 
 
 def _load_hf(point: BenchmarkPoint) -> list[dict[str, Any]]:
+    """Flatten all splits from the configured UEval hub revision."""
+
     try:
         load_dataset = getattr(importlib.import_module("datasets"), "load_dataset")
     except ImportError as error:
@@ -64,6 +72,8 @@ def _load_hf(point: BenchmarkPoint) -> list[dict[str, Any]]:
 
 
 def _extract_prompt(entry: dict[str, Any]) -> str:
+    """Return the first non-empty supported prompt field."""
+
     for field in _PROMPT_FIELDS:
         value = entry.get(field)
         if isinstance(value, str) and value.strip():

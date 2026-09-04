@@ -1,9 +1,11 @@
+//! Shared fixtures and stream collectors for tool-parser tests and benchmarks.
+
 use serde_json::json;
 
 use super::{Qwen3XmlToolParser, ToolParserOutput};
 use crate::profile::tools::Tool;
 
-/// Build a reusable set of function tools for parser unit tests.
+/// Builds a reusable set of function tools for parser unit tests.
 pub fn test_tools() -> Vec<Tool> {
     vec![
         Tool {
@@ -88,6 +90,7 @@ pub fn test_tools() -> Vec<Tool> {
     clippy::unwrap_used,
     reason = "this assertion helper intentionally panics on parser failures"
 )]
+/// Feeds all chunks into a parser and combines their incremental outputs.
 pub fn collect_stream(parser: &mut Qwen3XmlToolParser, chunks: &[&str]) -> ToolParserOutput {
     let mut output = ToolParserOutput::default();
     for chunk in chunks {
@@ -97,7 +100,7 @@ pub fn collect_stream(parser: &mut Qwen3XmlToolParser, chunks: &[&str]) -> ToolP
     output.coalesce_calls()
 }
 
-/// Split text into chunks containing at most `chunk_chars` Unicode scalar
+/// Splits text into chunks containing at most `chunk_chars` Unicode scalar
 /// values.
 pub fn split_by_chars(text: &str, chunk_chars: usize) -> Vec<&str> {
     let mut chunks = Vec::new();

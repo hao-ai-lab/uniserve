@@ -60,6 +60,8 @@ from .rows import (
 
 
 def pack_forward(runtime: ExecutionResources, state: OperationState) -> tuple[object, ...]:
+    """Pack autoregressive extension, decode, or verification work into model-forward rows."""
+
     if state.phase != "initial":
         return ()
 
@@ -152,6 +154,8 @@ def consume_forward(
     state: OperationState,
     outputs: tuple[torch.Tensor, ...],
 ) -> None:
+    """Convert token-model outputs into sampling work, prompt log probabilities, or direct outcomes."""
+
 
     if state.phase != "forward_pending" or len(outputs) != 1:
         raise RuntimeError("token forward result is not aligned")
@@ -217,6 +221,8 @@ def consume_forward(
 
 
 def pack_sample(state: OperationState) -> object | None:
+    """Return the sampling task previously prepared for an autoregressive operation."""
+
     if state.phase != "sample":
         return None
     state.phase = "sample_pending"
@@ -224,6 +230,8 @@ def pack_sample(state: OperationState) -> object | None:
 
 
 def consume_sample(runtime: ExecutionResources, state: OperationState, value: object) -> None:
+    """Publish sampled tokens, speculative selections, and request runtime transitions."""
+
 
     if state.phase != "sample_pending":
         raise RuntimeError("token sample result has no pending selection")
@@ -373,6 +381,8 @@ def _pack_visual(
     runtime: ExecutionResources, state: OperationState, request: object
 ) -> tuple[object, ...]:
 
+    """Resolve image features and interleave them with prompt tokens for model execution."""
+
     operation = state.operation
     scope = state.lane
     references = tuple(
@@ -437,6 +447,8 @@ def _pack_visual(
 def _consume_visual(
     runtime: ExecutionResources, state: OperationState, output: torch.Tensor
 ) -> None:
+    """Publish encoded visual features and update the request feature reference."""
+
     from . import flow
 
     task = state.data["task"]
@@ -470,6 +482,8 @@ def _consume_visual(
 
 def _finish_visual(runtime: ExecutionResources, state: OperationState) -> None:
 
+    """Finalize visual feature publication and advance the encode operation state."""
+
     request = state.data["request"]
     position = state.data["start"]
     if state.data["close_image"]:
@@ -492,6 +506,8 @@ def decode_batch(
     operations: tuple[Operation, ...],
     scope: LaneState,
 ) -> tuple[Outcome, ...]:
+    """Build a request-indexed decode forward and sampling group for compatible operations."""
+
     build_started = time.perf_counter_ns()
     starts: list[int] = []
     layout = scope.layout
@@ -650,6 +666,8 @@ def _decode_forward_tasks(
     starts: list[int],
     scope: LaneState,
 ) -> tuple[ForwardRow, ...]:
+    """Build paged-decode forward rows and stage their runtime-owned scalar columns."""
+
     states = runtime.runtime_states
     predicates = tuple(
         scope.predicate_values.get(runtime.operation_identity(operation))
@@ -866,6 +884,8 @@ def prompt_logprob_details(
     logits: torch.Tensor,
     scope: LaneState,
 ) -> tuple[LogprobOutputRow, ...]:
+    """Create per-position log-probability rows for a prompt logits tensor."""
+
     tokens = tokens.reshape(-1).to(device=logits.device, dtype=torch.long)
     if logits.ndim != 2 or int(logits.shape[0]) != int(tokens.numel()):
         raise invalid_descriptor("prompt scoring logits do not align with input tokens")
@@ -945,6 +965,8 @@ def token_outcome(
     sample: SampleResult | None = None,
     selection: SpeculativeSelection | None = None,
 ) -> Outcome:
+    """Record logical lengths and pending payloads for one autoregressive completion."""
+
     if request is None:
         request = runtime.request_row(scope, operation.request_key.request_id)
     cache = runtime.cache_coordinates(operation, scope)
@@ -1008,6 +1030,8 @@ def token_task(
     seq_len: int | None = None,
     weights: WeightSet | None = None,
 ) -> ForwardRow:
+    """Build one staged autoregressive forward row from request runtime and token coordinates."""
+
     if len(token_ids) != len(positions) or not token_ids:
         raise invalid_descriptor("token task ids and positions must align")
     if len(token_ids) == 1 and isinstance(token_ids[0], torch.Tensor):
@@ -1056,6 +1080,8 @@ def commit_kv(
     *,
     publish_runtime: bool = True,
 ) -> None:
+    """Advance computed KV length and optionally publish the updated request runtime."""
+
     count = int(tokens)
     if count < 0 or count > task.query_tokens:
         raise RuntimeError("KV commit count is outside the task query span")
@@ -1095,6 +1121,8 @@ def resolve_decode_token(
     request: Request,
     scope: LaneState,
 ) -> int | torch.Tensor:
+    """Resolve one decode input token from an explicit value or device relay product."""
+
     point = operation.parent.point
     if isinstance(point, DeviceSelected):
         predicate = scope.predicate_values.get(runtime.operation_identity(operation))
@@ -1119,6 +1147,8 @@ def resolve_decode_tokens(
     operations: tuple[Operation, ...],
     scope: LaneState,
 ) -> tuple[int | torch.Tensor, ...]:
+    """Resolve and validate decode tokens for a batch of operations."""
+
     resolved: list[int | torch.Tensor | None] = [None] * len(operations)
     for index, operation in enumerate(operations):
         point = operation.parent.point
@@ -1152,6 +1182,8 @@ def _pending_runtime_token(
     slot: int,
     scope: LaneState,
 ) -> torch.Tensor | None:
+    """Read the staged future token for a request while tracking its device lease."""
+
     for publication in reversed(scope.runtime_publications):
         if isinstance(publication, RuntimePublication):
             if publication.slot == slot:
@@ -1171,6 +1203,8 @@ def publish_token_product(
     sample: SampleResult,
     scope: LaneState,
 ) -> None:
+    """Publish a sampled token as a device product when declared by the operation."""
+
     if sample.device_product_published:
         return
     write = scope.token_writes.get(runtime.operation_identity(operation))
@@ -1204,6 +1238,8 @@ def publish_runtime_samples(
     sampling_positions: Sequence[int | torch.Tensor],
     decode_increment: bool = False,
 ) -> None:
+    """Commit device-selected token transitions into request runtime storage and semantic history."""
+
     states = runtime.runtime_states
     if states is None:
         return
@@ -1317,6 +1353,8 @@ def publish_token_products(
     samples: tuple[SampleResult, ...],
     scope: LaneState,
 ) -> None:
+    """Publish sampled token and selected-checkpoint products for all operations in a group."""
+
     if all(sample.device_product_published for sample in samples):
         return
     writes: list[DeviceProductWrite] = []
@@ -1363,6 +1401,8 @@ def _publish_selection_products(
     sample: SampleResult,
     scope: LaneState,
 ) -> None:
+    """Publish sampled token and speculative selection products from one result."""
+
     device_token = sample.device_token
     if device_token is None:
         raise RuntimeError("device selection products require a device token")
@@ -1390,6 +1430,8 @@ def build_sample_work(
     request_pool_index: torch.Tensor,
     draft_token_ids: tuple[int, ...] = (),
 ) -> SampleWork:
+    """Build sampling rows, penalties, RNG coordinates, predicates, and device-product bindings."""
+
     parameters = require_sampling(request)
     state = scope.sampling_states.get(runtime.operation_identity(operation), SamplingState())
     allowed_token_ids = (
@@ -1552,6 +1594,8 @@ def _candidate_penalty_counts(
     committed: torch.Tensor,
     scope: LaneState,
 ) -> torch.Tensor:
+    """Build penalty counts that combine committed history with speculative candidates."""
+
     slot = int(request.request_pool_idx)
     counts = committed.clone()
     found = False
@@ -1578,6 +1622,8 @@ def _candidate_penalty_counts(
 
 
 def _logprob_product_ref(operation: Operation) -> ProductRef | None:
+    """Return the declared log-probability product for an autoregressive operation."""
+
     matches = tuple(output for output in operation.outputs if output.kind is ProductKind.LOGPROB)
     if len(matches) > 1:
         raise invalid_descriptor("operation declares multiple logprob products")
@@ -1588,6 +1634,8 @@ def sample_product_payloads(
     operation: Operation,
     sample: SampleResult | None,
 ) -> tuple[ProductPayload, ...]:
+    """Return wire payloads for declared token and selected-point products."""
+
     if sample is None or (sample.logprobs is None and not sample.prompt_logprobs):
         return ()
     reference = _logprob_product_ref(operation)
@@ -1601,18 +1649,24 @@ def sample_product_payloads(
 
 
 def token_logits(output: torch.Tensor) -> torch.Tensor:
+    """Normalize model output to a two-dimensional token-by-vocabulary logits tensor."""
+
     if not isinstance(output, torch.Tensor) or output.ndim < 2:
         raise invalid_descriptor("token route did not return logits")
     return output
 
 
 def require_sampling(request: Request) -> SamplingParams:
+    """Return the sampling parameters required by an autoregressive request."""
+
     if request.sampling is None:
         raise invalid_descriptor("sequence execution requires admitted sampling parameters")
     return request.sampling
 
 
 def token_logits_or_hidden(output: torch.Tensor) -> torch.Tensor:
+    """Normalize model output to a two-dimensional token-by-feature tensor."""
+
     if not isinstance(output, torch.Tensor) or output.ndim < 2:
         raise invalid_descriptor("token route did not return a token tensor")
     return output

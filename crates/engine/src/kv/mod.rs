@@ -1,10 +1,8 @@
-//! Scheduler-side ownership for paged key/value cache memory.
+//! Scheduler-owned paged key/value cache allocation and prefix reuse.
 //!
 //! [`BlockPool`] owns physical page availability and prefix-cache metadata.
-//! [`BlockTable`] owns one cached sequence's logical-to-physical mapping. A
-//! table contains reference-counted [`CacheBlockRef`] handles, so sharing a
-//! prefix is ordinary Rust ownership and a page returns to the pool when its
-//! last table owner is dropped.
+//! [`BlockTable`] maps one sequence's logical blocks to reference-counted
+//! physical pages. Dropping the final page reference returns it to the pool.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -20,7 +18,7 @@ mod freeq;
 pub(crate) use encoder_cache::EncoderCacheManager;
 use freeq::BlockMeta;
 
-/// Incremental per-page prefix hash.
+/// Computes an incremental per-page prefix hash.
 pub(crate) fn block_hash(
     parent: u64,
     group_id: u32,
@@ -69,6 +67,7 @@ pub(crate) fn block_hash(
     }
 }
 
+/// Returns the stable byte tag included in modality-specific prefix hashes.
 pub(crate) fn modality_tag(modality: Modality) -> u8 {
     match modality {
         Modality::Und => 0,
@@ -76,6 +75,7 @@ pub(crate) fn modality_tag(modality: Modality) -> u8 {
     }
 }
 
+/// Ownership state of one physical cache page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BlockState {
     Free,
@@ -84,12 +84,14 @@ pub(crate) enum BlockState {
     Cached,
 }
 
+/// Cache observation emitted by a block-pool operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CacheEvent {
     BlockStored { hash: u64, block: BlockId },
     BlockRemoved { hash: u64, block: BlockId },
 }
 
+/// Aggregate cache counters retained by the block pool.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BlockPoolStats {
     pub(crate) total: usize,
@@ -120,6 +122,7 @@ struct PoolInner {
 }
 
 impl PoolInner {
+    /// Appends a block to its group free queue.
     fn fq_push_back(&mut self, group: usize, id: BlockId) {
         let index = id.0;
         let tail = self.groups[group].fq_tail;
@@ -135,6 +138,7 @@ impl PoolInner {
         self.groups[group].free_count += 1;
     }
 
+    /// Unlinks a block index from its group free queue.
     fn fq_unlink_index(&mut self, group: usize, index: u32) {
         let previous = self.meta[index as usize].fq_prev;
         let next = self.meta[index as usize].fq_next;
@@ -155,12 +159,14 @@ impl PoolInner {
         self.groups[group].free_count = self.groups[group].free_count.saturating_sub(1);
     }
 
+    /// Returns and removes the first free block.
     fn fq_pop_front(&mut self, group: usize) -> Option<BlockId> {
         let index = self.groups[group].fq_head?;
         self.fq_unlink_index(group, index);
         Some(BlockId(index))
     }
 
+    /// Unlinks a block from its group free queue.
     fn fq_unlink(&mut self, id: BlockId) {
         if self.meta[id.0 as usize].in_fq {
             let group = self.block_group[id.0 as usize] as usize;
@@ -168,10 +174,12 @@ impl PoolInner {
         }
     }
 
+    /// Returns the total number of free blocks.
     fn total_free(&self) -> usize {
         self.groups.iter().map(|group| group.free_count).sum()
     }
 
+    /// Appends a cache event while respecting the bounded event history.
     fn push_event(&mut self, event: CacheEvent) {
         if self.events.len() == self.events_cap {
             self.events.pop_front();
@@ -179,6 +187,7 @@ impl PoolInner {
         self.events.push_back(event);
     }
 
+    /// Releases one reference to a KV block.
     fn release_ref(&mut self, id: BlockId) {
         let meta = &mut self.meta[id.0 as usize];
         debug_assert!(meta.ref_cnt > 0, "cache page reference count underflow");
@@ -204,12 +213,14 @@ pub(crate) struct CacheBlockRef {
 }
 
 impl CacheBlockRef {
+    /// Returns the block identifier.
     pub(crate) fn id(&self) -> BlockId {
         self.id
     }
 }
 
 impl Clone for CacheBlockRef {
+    /// Creates another handle to the same value.
     fn clone(&self) -> Self {
         if let Some(pool) = self.pool.upgrade() {
             let mut inner = lock(&pool);
@@ -227,6 +238,7 @@ impl Clone for CacheBlockRef {
 }
 
 impl Drop for CacheBlockRef {
+    /// Releases resources owned by this value.
     fn drop(&mut self) {
         if let Some(pool) = self.pool.upgrade() {
             lock(&pool).release_ref(self.id);
@@ -235,6 +247,7 @@ impl Drop for CacheBlockRef {
 }
 
 impl fmt::Debug for CacheBlockRef {
+    /// Formats the value for diagnostic output.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_tuple("CacheBlockRef")
@@ -244,6 +257,7 @@ impl fmt::Debug for CacheBlockRef {
 }
 
 impl PartialEq for CacheBlockRef {
+    /// Returns whether both handles identify the same allocation.
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id && Weak::ptr_eq(&self.pool, &other.pool)
     }
@@ -251,6 +265,7 @@ impl PartialEq for CacheBlockRef {
 
 impl Eq for CacheBlockRef {}
 
+/// Invalid block-pool geometry or group configuration.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum BlockPoolConfigError {
     #[error("physical KV capacity and every cache group must be positive")]
@@ -277,6 +292,7 @@ pub(crate) struct BlockPool {
 }
 
 impl BlockPool {
+    /// Creates a block pool with one full-attention cache group.
     pub(crate) fn new(num_blocks: usize, block_size: usize) -> Self {
         Self::with_groups(
             num_blocks,
@@ -289,6 +305,7 @@ impl BlockPool {
         )
     }
 
+    /// Validates that cache groups partition the complete physical page range exactly once.
     pub(crate) fn validate_group_specs(
         num_blocks: usize,
         group_specs: &[(KvGroupKind, u32, u32)],
@@ -327,6 +344,11 @@ impl BlockPool {
         Ok(())
     }
 
+    /// Creates a block pool from a validated physical cache-group partition.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the block size is zero or group specifications do not partition the pool.
     pub(crate) fn with_groups(
         num_blocks: usize,
         block_size: usize,
@@ -383,22 +405,27 @@ impl BlockPool {
         }
     }
 
+    /// Returns the KV block size in tokens.
     pub(crate) fn block_size(&self) -> usize {
         lock(&self.inner).block_size
     }
 
+    /// Returns the total number of KV blocks.
     pub(crate) fn num_blocks(&self) -> usize {
         lock(&self.inner).num_blocks
     }
 
+    /// Returns the number of KV groups.
     pub(crate) fn num_groups(&self) -> usize {
         lock(&self.inner).groups.len()
     }
 
+    /// Returns the kind of a KV group.
     pub(crate) fn group_kind(&self, group: usize) -> Option<KvGroupKind> {
         lock(&self.inner).groups.get(group).map(|value| value.kind)
     }
 
+    /// Returns the block capacity of a KV group.
     pub(crate) fn group_capacity(&self, group: usize) -> usize {
         lock(&self.inner)
             .groups
@@ -406,15 +433,18 @@ impl BlockPool {
             .map_or(0, |value| value.total)
     }
 
+    /// Returns the total request-page capacity.
     pub(crate) fn request_page_capacity(&self) -> usize {
         let inner = lock(&self.inner);
         inner.groups.iter().map(|group| group.total).sum()
     }
 
+    /// Returns the number of free KV blocks.
     pub(crate) fn free_blocks(&self) -> usize {
         lock(&self.inner).total_free()
     }
 
+    /// Returns the number of free blocks in a KV group.
     pub(crate) fn free_blocks_in_group(&self, group: usize) -> usize {
         lock(&self.inner)
             .groups
@@ -422,6 +452,7 @@ impl BlockPool {
             .map_or(0, |value| value.free_count)
     }
 
+    /// Returns the number of free request pages.
     pub(crate) fn free_request_pages(&self) -> usize {
         let inner = lock(&self.inner);
         inner
@@ -432,14 +463,17 @@ impl BlockPool {
             .unwrap_or(0)
     }
 
+    /// Returns the number of additional blocks required.
     pub(crate) fn blocks_needed(&self, tokens: usize) -> usize {
         tokens.div_ceil(self.block_size())
     }
 
+    /// Returns a snapshot of the current statistics.
     pub(crate) fn stats(&self) -> BlockPoolStats {
         lock(&self.inner).stats
     }
 
+    /// Reserves free pages from one cache group, evicting cached contents as necessary.
     pub(crate) fn allocate(&self, group: usize, count: usize) -> Option<Vec<CacheBlockRef>> {
         let mut inner = lock(&self.inner);
         if group >= inner.groups.len() || count > inner.groups[group].free_count {
@@ -469,6 +503,7 @@ impl BlockPool {
         Some(refs)
     }
 
+    /// Activates the requested KV allocation.
     pub(crate) fn activate(&self, blocks: &[CacheBlockRef]) {
         let mut inner = lock(&self.inner);
         for block in blocks {
@@ -482,14 +517,17 @@ impl BlockPool {
         }
     }
 
+    /// Returns the block reference count.
     pub(crate) fn ref_count(&self, block: BlockId) -> u32 {
         lock(&self.inner).meta[block.0 as usize].ref_cnt
     }
 
+    /// Returns the block lifecycle state.
     pub(crate) fn block_state(&self, block: BlockId) -> BlockState {
         lock(&self.inner).meta[block.0 as usize].state
     }
 
+    /// Returns the block KV group.
     pub(crate) fn block_group(&self, block: BlockId) -> Option<usize> {
         lock(&self.inner)
             .block_group
@@ -497,6 +535,7 @@ impl BlockPool {
             .map(|group| *group as usize)
     }
 
+    /// Caches the block.
     pub(crate) fn cache_block(&self, block: &CacheBlockRef, hash: u64, tokens: &[u32]) {
         let mut inner = lock(&self.inner);
         if inner.hash_to_block.contains_key(&hash) {
@@ -514,12 +553,14 @@ impl BlockPool {
         });
     }
 
+    /// Looks up the cached.
     pub(crate) fn lookup_cached(&self, hash: u64, tokens: &[u32]) -> Option<BlockId> {
         let inner = lock(&self.inner);
         let block = *inner.hash_to_block.get(&hash)?;
         (inner.meta[block.0 as usize].tokens == tokens).then_some(block)
     }
 
+    /// Acquires an active reference when a cached page still matches its hash and token payload.
     pub(crate) fn acquire_cached(
         &self,
         block: BlockId,
@@ -542,16 +583,19 @@ impl BlockPool {
         })
     }
 
+    /// Returns the cached prefix blocks.
     pub(crate) fn cached_blocks(&self) -> usize {
         lock(&self.inner).hash_to_block.len()
     }
 
+    /// Drains pending cache events in publication order.
     pub(crate) fn drain_events(&self) -> Vec<CacheEvent> {
         lock(&self.inner).events.drain(..).collect()
     }
 }
 
 impl fmt::Debug for BlockPool {
+    /// Formats the value for diagnostic output.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("BlockPool")
@@ -572,6 +616,7 @@ pub(crate) struct BlockTable {
 }
 
 impl BlockTable {
+    /// Creates an empty block table for one KV group.
     pub(crate) fn new(group_id: usize, block_size: usize) -> Self {
         assert!(block_size > 0, "KV block size must be positive");
         Self {
@@ -582,34 +627,42 @@ impl BlockTable {
         }
     }
 
+    /// Returns the KV group identifier.
     pub(crate) fn group_id(&self) -> usize {
         self.group_id
     }
 
+    /// Returns the number of entries.
     pub(crate) fn len(&self) -> usize {
         self.blocks.len()
     }
 
+    /// Returns whether the collection contains no entries.
     pub(crate) fn is_empty(&self) -> bool {
         self.blocks.is_empty()
     }
 
+    /// Returns the table capacity in tokens.
     pub(crate) fn capacity_tokens(&self) -> usize {
         self.blocks.len() * self.block_size
     }
 
+    /// Returns the table page identifiers.
     pub(crate) fn page_ids(&self) -> Vec<BlockId> {
         self.blocks.iter().map(CacheBlockRef::id).collect()
     }
 
+    /// Returns the block at the requested logical position.
     pub(crate) fn block(&self, index: usize) -> Option<&CacheBlockRef> {
         self.blocks.get(index)
     }
 
+    /// Returns whether the collection contains the requested item.
     pub(crate) fn contains(&self, block: BlockId) -> bool {
         self.blocks.iter().any(|candidate| candidate.id() == block)
     }
 
+    /// Appends cached blocks to the table and returns the appended count.
     pub(crate) fn append_cached(&mut self, block: CacheBlockRef) -> bool {
         if self.contains(block.id()) {
             return false;
@@ -619,6 +672,7 @@ impl BlockTable {
         true
     }
 
+    /// Ensures the capacity.
     pub(crate) fn ensure_capacity(
         &mut self,
         pool: &BlockPool,
@@ -633,10 +687,12 @@ impl BlockTable {
         Some(page_ids)
     }
 
+    /// Activates the requested KV allocation.
     pub(crate) fn activate(&self, pool: &BlockPool) {
         pool.activate(&self.blocks);
     }
 
+    /// Releases sliding-window pages that lie outside both the sink and active window.
     pub(crate) fn trim(&mut self, pool: &BlockPool, position_tokens: usize) {
         let Some(KvGroupKind::SlidingWindow { window, sink }) = pool.group_kind(self.group_id)
         else {
@@ -660,6 +716,7 @@ impl BlockTable {
         self.token_starts = Some(kept_starts);
     }
 
+    /// Clears all retained entries.
     pub(crate) fn clear(&mut self) {
         self.blocks.clear();
         self.token_starts = None;
@@ -689,6 +746,7 @@ pub(crate) struct KvCacheCoordinator {
 }
 
 impl Default for KvCacheCoordinator {
+    /// Returns the default value.
     fn default() -> Self {
         Self {
             prefix_enabled: true,
@@ -699,15 +757,17 @@ impl Default for KvCacheCoordinator {
 }
 
 impl KvCacheCoordinator {
+    /// Sets the prefix enabled.
     pub(crate) fn set_prefix_enabled(&mut self, enabled: bool) {
         self.prefix_enabled = enabled;
     }
 
+    /// Sets the prefix-cache hashing algorithm.
     pub(crate) fn set_hash_algo(&mut self, algorithm: HashAlgo) {
         self.hash_algo = algorithm;
     }
 
-    /// Atomically grows every group table to the common token boundary and
+    /// Grows every group table atomically to the common token boundary and
     /// returns only the pages acquired by this allocation event.
     pub(crate) fn ensure_capacity(
         &self,
@@ -743,6 +803,7 @@ impl KvCacheCoordinator {
         Some(updates)
     }
 
+    /// Measures the longest complete cached prefix without acquiring page references.
     pub(crate) fn probe_prefix(
         &self,
         pool: &BlockPool,
@@ -787,6 +848,7 @@ impl KvCacheCoordinator {
         hit
     }
 
+    /// Acquires the longest cache prefix present across every KV group atomically per block.
     pub(crate) fn acquire_prefix(
         &self,
         pool: &BlockPool,
@@ -847,6 +909,7 @@ impl KvCacheCoordinator {
         Some(result)
     }
 
+    /// Publishes full prompt blocks from every KV group into the prefix cache.
     pub(crate) fn cache_prefix(
         &self,
         pool: &BlockPool,
@@ -880,6 +943,7 @@ impl KvCacheCoordinator {
         true
     }
 
+    /// Computes group-specific chained hashes for each complete prompt block.
     fn prefix_hashes(
         &self,
         prompt: &[u32],
@@ -908,6 +972,7 @@ impl KvCacheCoordinator {
     }
 }
 
+/// Returns the maximum prefix length eligible for lookup.
 fn prefix_lookup_limit(prompt_tokens: usize, block_size: usize) -> usize {
     let full_blocks = prompt_tokens / block_size;
     if prompt_tokens.is_multiple_of(block_size) {
@@ -917,10 +982,12 @@ fn prefix_lookup_limit(prompt_tokens: usize, block_size: usize) -> usize {
     }
 }
 
+/// Returns whether the configured block size is invalid.
 fn block_size_invalid(group_specs: &[(KvGroupKind, u32, u32)]) -> bool {
     group_specs.is_empty() || group_specs.iter().any(|(_, _, count)| *count == 0)
 }
 
+/// Locks the shared state and recovers it after poisoning.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()

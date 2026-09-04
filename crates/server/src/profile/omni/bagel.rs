@@ -1,3 +1,5 @@
+//! Bagel model profile, prompt layout, and generation policy.
+
 use serde::{Deserialize, Serialize};
 use uniserve_core::{
     FeedbackNextToken, FeedbackSource, GenOnlyStartPolicyDescriptor, GeneratedImageFeedbackRecipe,
@@ -15,23 +17,35 @@ use crate::profile::assets;
 use crate::profile::tokenizer::HuggingFaceTokenizer;
 
 const DEFAULT_SYSTEM_PROMPT: &str = "You should first think about the planning process in the mind and then generate the image. \n     The planning process is enclosed within <think> </think> tags, i.e. <think> planning process here </think> image here";
+/// System instruction that establishes Bagel reasoning and answer delimiters.
 pub const CONTEXT_SYSTEM_PROMPT: &str = "\nLet's think step by step to answer the question. For text-based thinking, enclose the process within <think> </think>, e.g. <think> thinking process here </think>. For visual thinking, enclose the content within <image_start> </image_end>, e.g. <image_start> thinking image here </image_end>. Finally conclude with the final answer wrapped in <answer></answer> tags, i.e.<answer> answer here </answer>.\n";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Loaded Bagel profile and tokenizer assets.
 pub struct BagelProfile {
+    /// Special tokens that delimit multimodal generation.
     pub controls: GenerationControls,
+    /// Default image-generation parameters.
     pub image_defaults: ImageGenerationDefaults,
+    /// Supported image dimensions and default resolution.
     pub resolution_policy: ResolutionPolicy,
+    /// Filters applied to decoded assistant output.
     pub output_filter: OutputFilterPolicy,
+    /// Runtime recipe for encoding input images.
     pub image_ingest: ImageIngestRecipe,
+    /// Runtime state-machine policy for generated image segments.
     pub generation_policy: GenerationPolicyDescriptor,
 }
 
 impl BagelProfile {
+    /// Stable profile identifier.
     pub const ID: &'static str = "bagel";
+    /// Pixel-to-latent downsampling factor.
     pub const LATENT_DOWNSAMPLE: u32 = 16;
+    /// Maximum reusable encoder products tracked by the profile.
     pub const ENCODER_CACHE_ENTRIES: usize = 256;
 
+    /// Returns bounded runtime capabilities for the selected dtype.
     pub fn runtime_limits(model_dtype: ModelDtype) -> GenerationLimits {
         let dtype_bytes = model_dtype_bytes(model_dtype);
         GenerationLimits {
@@ -51,6 +65,7 @@ impl BagelProfile {
         }
     }
 
+    /// Resolves required control tokens from the loaded tokenizer.
     pub fn resolve(tokenizer: &HuggingFaceTokenizer) -> assets::Result<Self> {
         let (start_of_image, start_of_image_text) =
             required_token(tokenizer, "<|vision_start|>", "Bagel start-of-image")?;
@@ -124,10 +139,12 @@ impl BagelProfile {
         })
     }
 
+    /// Returns the default system instruction for a generation constraint.
     pub fn default_system_prompt(constraint: GenerationConstraint) -> Option<&'static str> {
         matches!(constraint, GenerationConstraint::Default).then_some(DEFAULT_SYSTEM_PROMPT)
     }
 
+    /// Renders and encodes the positive prompt for one request.
     pub fn render_prompt_ids(
         &self,
         tokenizer: &HuggingFaceTokenizer,
@@ -160,6 +177,7 @@ impl BagelProfile {
         }
     }
 
+    /// Renders and encodes classifier-free guidance context.
     pub fn render_negative_prompt_ids(
         &self,
         tokenizer: &HuggingFaceTokenizer,
@@ -171,6 +189,7 @@ impl BagelProfile {
         self.wrap_context_text(tokenizer, prompt)
     }
 
+    /// Wraps plain context text in the profile's required delimiters.
     pub fn wrap_context_text(
         &self,
         tokenizer: &HuggingFaceTokenizer,
@@ -182,6 +201,7 @@ impl BagelProfile {
         Ok(ids)
     }
 
+    /// Builds the encoder recipe for an input image of the given dimensions.
     pub fn image_ingest_for_dimensions(
         &self,
         width: u32,
@@ -204,6 +224,7 @@ impl BagelProfile {
         Ok(ingest)
     }
 
+    /// Builds generation and feedback policy for the requested canvas.
     pub fn generation_policy_for_dimensions(
         &self,
         width: u32,

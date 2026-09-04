@@ -1,35 +1,51 @@
+//! Named output resolutions and aspect-ratio bucket selection.
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Named output canvas accepted by multimodal profiles.
 pub enum ResolutionName {
+    /// Square 1:1 canvas.
     #[default]
     #[serde(rename = "1:1")]
     Square,
+    /// Landscape 16:9 canvas.
     #[serde(rename = "16:9")]
     Landscape16x9,
+    /// Model-specific 1.5K canvas preset.
     #[serde(rename = "1.5K")]
     OnePointFiveK,
+    /// Portrait 9:16 canvas.
     #[serde(rename = "9:16")]
     Portrait9x16,
+    /// Landscape 3:2 canvas.
     #[serde(rename = "3:2")]
     Landscape3x2,
+    /// Portrait 2:3 canvas.
     #[serde(rename = "2:3")]
     Portrait2x3,
+    /// Landscape 4:3 canvas.
     #[serde(rename = "4:3")]
     Landscape4x3,
+    /// Portrait 3:4 canvas.
     #[serde(rename = "3:4")]
     Portrait3x4,
+    /// Portrait 1:2 canvas.
     #[serde(rename = "1:2")]
     Portrait1x2,
+    /// Landscape 2:1 canvas.
     #[serde(rename = "2:1")]
     Landscape2x1,
+    /// Portrait 1:3 canvas.
     #[serde(rename = "1:3")]
     Portrait1x3,
+    /// Landscape 3:1 canvas.
     #[serde(rename = "3:1")]
     Landscape3x1,
 }
 
 impl ResolutionName {
+    /// Returns the stable wire name for this resolution.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Square => "1:1",
@@ -51,6 +67,7 @@ impl ResolutionName {
 impl std::str::FromStr for ResolutionName {
     type Err = ResolutionError;
 
+    /// Parses the value from its string representation.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "1:1" => Ok(Self::Square),
@@ -71,25 +88,37 @@ impl std::str::FromStr for ResolutionName {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One aspect-ratio bucket and its output dimensions.
 pub struct ResolutionBucket {
+    /// Stable name of the resolution preset.
     pub name: ResolutionName,
+    /// Output width in pixels.
     pub width: u32,
+    /// Output height in pixels.
     pub height: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Bucket set and default canvas used for resolution selection.
 pub struct ResolutionPolicy {
+    /// Resolution selected when the request provides no dimensions or name.
     pub default: ResolutionBucket,
+    /// Named resolutions accepted by the profile.
     pub buckets: Vec<ResolutionBucket>,
+    /// Whether arbitrary positive pixel dimensions are accepted.
     pub allow_custom: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Selected output dimensions and their stable bucket name.
 pub struct ResolvedResolution {
+    /// Selected output width in pixels.
     pub width: u32,
+    /// Selected output height in pixels.
     pub height: u32,
 }
 
+/// Resolves explicit dimensions or a named bucket under `policy`.
 pub fn resolve_resolution(
     policy: &ResolutionPolicy,
     requested: Option<ResolutionName>,
@@ -126,15 +155,26 @@ pub fn resolve_resolution(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+/// Invalid or unsupported output-resolution selection.
 pub enum ResolutionError {
+    /// An explicit height was provided without a width.
     #[error("custom image dimensions require width")]
     MissingWidth,
+    /// An explicit width was provided without a height.
     #[error("custom image dimensions require height")]
     MissingHeight,
+    /// At least one explicit dimension is zero.
     #[error("image dimensions must be positive")]
     NonPositiveDimensions,
+    /// Explicit dimensions do not match an allowed bucket.
     #[error("unsupported image dimensions {width}x{height}")]
-    UnsupportedDimensions { width: u32, height: u32 },
+    UnsupportedDimensions {
+        /// Requested width in pixels.
+        width: u32,
+        /// Requested height in pixels.
+        height: u32,
+    },
+    /// A named resolution is not present in the profile policy.
     #[error("unsupported image resolution {0:?}")]
     UnsupportedName(String),
 }

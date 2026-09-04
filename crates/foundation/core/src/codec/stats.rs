@@ -1,9 +1,10 @@
+//! Serializable scheduler, cache, and worker performance snapshots.
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-/// Stores cache hit statistics.
-///
+/// Cache query and hit counters for one reporting interval.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct BaseCacheStats {
     /// The number of requests in this update.
@@ -14,7 +15,7 @@ pub struct BaseCacheStats {
     pub hits: u64,
 }
 
-/// Stores prefix cache hit statistics. `queries` counts queried tokens.
+/// Prefix-cache counters, where query fields count tokens.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PrefixCacheStats {
     /// Embedded base cache counters.
@@ -28,8 +29,7 @@ pub struct PrefixCacheStats {
     pub preempted_hits: u64,
 }
 
-/// Single KV cache block eviction sample.
-///
+/// Timing sample captured when one KV-cache block is evicted.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct KvCacheEvictionEvent {
     /// Lifetime from allocation to eviction.
@@ -40,11 +40,9 @@ pub struct KvCacheEvictionEvent {
     pub reuse_gaps_seconds: Vec<f64>,
 }
 
-/// Breakdown of a scheduled prefill computation.
+/// Token-source breakdown for scheduled prefill work.
 ///
-/// Python models this as a plain `@dataclass`, so it is serialized by msgspec
-/// as a map with named fields.
-///
+/// The value serializes as a map with stable field names.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrefillStats {
     /// Total number of tokens to be prefilled.
@@ -64,8 +62,7 @@ pub struct PrefillStats {
     pub num_external_cached_tokens: u32,
 }
 
-/// Stats for debugging the metrics calculation.
-///
+/// Inputs and timing used to inspect performance-estimate calculation.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DebugPerfStats {
     /// Time spent calculating these stats.
@@ -84,6 +81,7 @@ pub struct DebugPerfStats {
     pub num_write_bytes_per_gpu_breakdown: Option<BTreeMap<String, u64>>,
 }
 
+/// Estimated compute and memory traffic for one worker update.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PerfStats {
     /// Estimated floating point operations per GPU.
@@ -96,6 +94,7 @@ pub struct PerfStats {
     pub debug_stats: Option<DebugPerfStats>,
 }
 
+/// Shape and runtime-mode metadata for one CUDA graph execution.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CudagraphStat {
     /// Number of real tokens in the captured batch before padding.
@@ -110,74 +109,106 @@ pub struct CudagraphStat {
 
 /// Worker-local forward/kernel counters folded into scheduler stats.
 ///
-/// These are per-update deltas when carried in `SchedulerStats`, not lifetime
-/// totals. Field names intentionally mirror the Python worker metrics service.
+/// Values are per-update deltas when carried in [`SchedulerStats`].
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WorkerForwardStats {
+    /// Forward executions grouped by runtime mode.
     #[serde(default)]
     pub mode_counts: BTreeMap<String, u64>,
+    /// Tokens processed by runtime mode.
     #[serde(default)]
     pub mode_tokens: BTreeMap<String, u64>,
+    /// Forward time in microseconds by runtime mode.
     #[serde(default)]
     pub mode_us: BTreeMap<String, u64>,
+    /// Component execution time in microseconds.
     #[serde(default)]
     pub component_us: BTreeMap<String, u64>,
+    /// Attention kernel launch count.
     #[serde(default)]
     pub attention_launches: u64,
+    /// Cumulative attention kernel time in microseconds.
     #[serde(default)]
     pub attention_us: u64,
+    /// Attention launches grouped by backend.
     #[serde(default)]
     pub attention_backend_counts: BTreeMap<String, u64>,
+    /// CUDA graph capture count.
     #[serde(default)]
     pub cuda_graph_captures: u64,
+    /// CUDA graph replay count.
     #[serde(default)]
     pub cuda_graph_replays: u64,
+    /// CUDA graph lookup misses.
     #[serde(default)]
     pub cuda_graph_misses: u64,
+    /// Executions that fell back from graph replay.
     #[serde(default)]
     pub cuda_graph_fallbacks: u64,
+    /// Real tokens represented by CUDA graph executions.
     #[serde(default)]
     pub cuda_graph_unpadded_tokens: u64,
+    /// Padded token slots represented by CUDA graph executions.
     #[serde(default)]
     pub cuda_graph_padded_tokens: u64,
+    /// CUDA graph dispatches grouped by runtime mode.
     #[serde(default)]
     pub cuda_graph_runtime_mode_counts: BTreeMap<String, u64>,
+    /// Decode tokens served from the token relay.
     #[serde(default)]
     pub text_decode_token_relay_hits: u64,
+    /// Decode token relay misses.
     #[serde(default)]
     pub text_decode_token_relay_misses: u64,
+    /// Decode positions served from the position relay.
     #[serde(default)]
     pub text_decode_position_relay_hits: u64,
+    /// Decode position relay misses.
     #[serde(default)]
     pub text_decode_position_relay_misses: u64,
+    /// FlashInfer decode plan construction count.
     #[serde(default)]
     pub flashinfer_decode_plan_calls: u64,
+    /// FlashInfer decode plan reuse count.
     #[serde(default)]
     pub flashinfer_decode_plan_reuses: u64,
+    /// Rows represented by FlashInfer decode plans.
     #[serde(default)]
     pub flashinfer_decode_plan_rows: u64,
+    /// Indices represented by FlashInfer decode plans.
     #[serde(default)]
     pub flashinfer_decode_plan_indices: u64,
+    /// FlashInfer graph-decode plan construction count.
     #[serde(default)]
     pub flashinfer_decode_graph_plan_calls: u64,
+    /// FlashInfer graph-decode plan reuse count.
     #[serde(default)]
     pub flashinfer_decode_graph_plan_reuses: u64,
+    /// Rows processed by speculative verification.
     #[serde(default)]
     pub spec_verify_rows: u64,
+    /// Draft tokens presented for speculative verification.
     #[serde(default)]
     pub spec_verify_draft_tokens: u64,
+    /// Draft tokens accepted by speculative verification.
     #[serde(default)]
     pub spec_verify_accepted_tokens: u64,
+    /// Draft tokens rejected by speculative verification.
     #[serde(default)]
     pub spec_verify_rejected_tokens: u64,
+    /// Tokens committed after speculative verification.
     #[serde(default)]
     pub spec_verify_committed_tokens: u64,
+    /// Speculative verification rows grouped by resolution path.
     #[serde(default)]
     pub spec_verify_path_counts: BTreeMap<String, u64>,
 }
 
 impl WorkerForwardStats {
+    /// Returns whether every worker counter and breakdown is empty or zero.
     pub fn is_empty(&self) -> bool {
+        // Map-backed breakdowns and scalar counters form one aggregate delta;
+        // any populated component makes the snapshot observable.
         self.mode_counts.is_empty()
             && self.mode_tokens.is_empty()
             && self.mode_us.is_empty()
@@ -219,41 +250,56 @@ impl WorkerForwardStats {
 /// therefore must not be summed to estimate aggregate GPU busy time.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DomainSchedulerStats {
+    /// Stable execution-domain name.
     pub domain: String,
+    /// Credits currently occupied by in-flight work.
     #[serde(default)]
     pub active_credits: u64,
+    /// Highest active-credit count in the interval.
     #[serde(default)]
     pub peak_credits: u64,
+    /// Operations launched in the interval.
     #[serde(default)]
     pub launched_operations: u64,
+    /// Operations completed in the interval.
     #[serde(default)]
     pub completed_operations: u64,
+    /// Operations skipped by a false predicate.
     #[serde(default)]
     pub predicated_operations: u64,
+    /// Operations completed with an error.
     #[serde(default)]
     pub error_operations: u64,
+    /// Submission attempts rejected by executor backpressure.
     #[serde(default)]
     pub backpressure_events: u64,
+    /// Scheduling credits returned after completion.
     #[serde(default)]
     pub reclaimed_credits: u64,
+    /// Physical runs completed in the interval.
     #[serde(default)]
     pub completed_runs: u64,
+    /// Runs overlapping another execution domain.
     #[serde(default)]
     pub co_resident_runs: u64,
+    /// Time spent queued before launch, in microseconds.
     #[serde(default)]
     pub queue_us: u64,
+    /// Host launch overhead in microseconds.
     #[serde(default)]
     pub launch_us: u64,
+    /// Device execution time in microseconds.
     #[serde(default)]
     pub device_us: u64,
+    /// Host completion processing time in microseconds.
     #[serde(default)]
     pub completion_us: u64,
+    /// Device time overlapping another execution domain, in microseconds.
     #[serde(default)]
     pub co_resident_us: u64,
 }
 
-/// Stats associated with the scheduler.
-///
+/// Serializable scheduler snapshot for one reporting interval.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SchedulerStats {
     /// Number of requests in model execution batches.
@@ -289,16 +335,13 @@ pub struct SchedulerStats {
     /// Worker-local forward/kernel counters since the previous stats snapshot.
     #[serde(default)]
     pub worker_forward_stats: Option<WorkerForwardStats>,
-    /// directly-measured batch latency since the previous snapshot, in
-    /// microseconds. `worker_exec_us` is the worker compute time the worker
-    /// reports; `batch_roundtrip_us` is the host-observed submit->result
-    /// round-trip; `batch_count` is the number of resolved batches over the
-    /// interval so the two sums can be normalized to per-batch averages. These
-    /// also reaches Prometheus.
+    /// Worker-reported execution time accumulated in the interval, in microseconds.
     #[serde(default)]
     pub worker_exec_us: u64,
+    /// Host-observed submit-to-result time accumulated in the interval, in microseconds.
     #[serde(default)]
     pub batch_roundtrip_us: u64,
+    /// Resolved batch count used to normalize interval latency totals.
     #[serde(default)]
     pub batch_count: u64,
     /// Exact prefill, decode, and flow accounting for this update.

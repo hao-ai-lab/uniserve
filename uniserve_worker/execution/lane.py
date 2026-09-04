@@ -18,6 +18,8 @@ class ExecutionLaneError(RuntimeError):
 
 @dataclass(slots=True)
 class _GreenContext:
+    """Owns one CUDA Green Context, its stream, resource partition, and component identity."""
+
     lane: LaneConfig
     device: torch.device
     sm_count: int
@@ -43,6 +45,8 @@ class ExecutionLaneRuntime:
         green: _GreenContext | None = None,
         event_slots: int = 2,
     ) -> None:
+        """Own one lane's stream, context, staging buffers, graph catalog, and output events."""
+
         if int(event_slots) < 1:
             raise ValueError("execution lane requires a positive event bound")
         self.lane = lane
@@ -67,13 +71,19 @@ class ExecutionLaneRuntime:
 
     @property
     def lane_id(self) -> str | None:
+        """Expose the scheduler lane identifier, or ``None`` for the default stream."""
+
         return None if self.lane is None else self.lane.lane_id
 
     @property
     def domains(self) -> tuple[Domain, ...]:
+        """List domains admitted by the bound lane, or all domains on the default stream."""
+
         return tuple(Domain) if self.lane is None else self.lane.domains
 
     def verify_stream(self) -> None:
+        """Verify that the active CUDA stream and context still match the lane binding."""
+
         if self._green is None:
             return
         cu = _driver()
@@ -93,6 +103,8 @@ class ExecutionLaneRuntime:
             raise ExecutionLaneError("lane Green Context SM resource changed after startup")
 
     def order_after(self, producer: torch.cuda.Stream) -> None:
+        """Make the lane stream wait for work enqueued on a producer stream."""
+
         if self.stream is None or int(producer.cuda_stream) == int(self.stream.cuda_stream):
             return
         event = self._ingress_events[self._event_cursor % len(self._ingress_events)]
@@ -100,6 +112,8 @@ class ExecutionLaneRuntime:
         self.stream.wait_event(event)
 
     def record_output(self) -> torch.cuda.Event | None:
+        """Record an event after all currently enqueued lane output work."""
+
         if self.stream is None:
             return None
         event = self._output_events[self._event_cursor % len(self._output_events)]
@@ -108,6 +122,8 @@ class ExecutionLaneRuntime:
         return event
 
     def close(self) -> None:
+        """Release the lane stream and CUDA Green Context resources."""
+
         if self._closed:
             return
         self._closed = True
@@ -258,6 +274,8 @@ def verify_graph_context(graph: torch.cuda.CUDAGraph, expected_context: int | No
 
 
 def _split_one(cu: Any, resource: Any, count: int) -> tuple[Any, Any]:
+    """Split one resource between green and default execution lanes."""
+
     result = cu.cuDevSmResourceSplitByCount(1, resource, 0, int(count))
     _cuda_status(result, "split SM resource")
     groups, group_count, remainder = result[1], int(result[2]), result[3]
@@ -272,6 +290,8 @@ def _split_one(cu: Any, resource: Any, count: int) -> tuple[Any, Any]:
 
 
 def _green_from_resources(cu: Any, device: Any, resources: tuple[Any, ...]) -> Any:
+    """Construct a green context from split device resources when supported."""
+
     descriptor = _cuda_value(
         cu.cuDevResourceGenerateDesc(list(resources), len(resources)),
         "generate Green Context resource descriptor",
@@ -287,6 +307,8 @@ def _green_from_resources(cu: Any, device: Any, resources: tuple[Any, ...]) -> A
 
 
 def _green_resource(cu: Any, green: Any) -> Any:
+    """Extract the green-partition handle returned by a CUDA split operation."""
+
     return _cuda_value(
         cu.cuGreenCtxGetDevResource(green, cu.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM),
         "query Green Context SM resource",
@@ -294,6 +316,8 @@ def _green_resource(cu: Any, green: Any) -> Any:
 
 
 def _driver() -> Any:
+    """Import and return the CUDA driver bindings required for green contexts."""
+
     try:
         from cuda.bindings import driver  # pyright: ignore[reportAttributeAccessIssue]
     except ImportError as error:  # pragma: no cover - CUDA deployments install cuda-python.
@@ -302,6 +326,8 @@ def _driver() -> Any:
 
 
 def _cuda_status(result: tuple[Any, ...], operation: str) -> None:
+    """Validate a CUDA driver result and return its remaining values."""
+
     cu = _driver()
     if result[0] == cu.CUresult.CUDA_SUCCESS:
         return
@@ -311,6 +337,8 @@ def _cuda_status(result: tuple[Any, ...], operation: str) -> None:
 
 
 def _cuda_value(result: tuple[Any, ...], operation: str) -> Any:
+    """Extract the sole value from a successful CUDA driver result."""
+
     _cuda_status(result, operation)
     return result[1]
 

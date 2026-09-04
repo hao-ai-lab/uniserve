@@ -60,6 +60,8 @@ OperationIdentity: TypeAlias = tuple[RequestKey, int]
 
 @dataclass(slots=True)
 class ForwardRow:
+    """Carries one operation’s staged tokens, positions, media tensors, routing, and cache coordinates."""
+
     operation: Operation
     request: RequestDraft
     weights: WeightSet
@@ -93,6 +95,8 @@ class ForwardRow:
 
     @property
     def query_tokens(self) -> int:
+        """Return the live token or image-patch count represented by this row."""
+
         if self.token_ids is not None:
             return int(self.token_ids.numel())
         if self.latent is not None and self.image_tokens > 0:
@@ -101,6 +105,8 @@ class ForwardRow:
 
     @property
     def kind(self) -> str:
+        """Classify the row as token, flow, encode, or latent-decode work."""
+
         if self.token_ids is not None:
             return "token"
         if self.latent is not None and self.image_tokens > 0:
@@ -112,6 +118,8 @@ class ForwardRow:
 
 @dataclass(frozen=True, slots=True)
 class SampleRow:
+    """Defines filters, penalties, RNG draw, and finish rules for one sampled token."""
+
     parameters: SamplingParams
     # Dense per-vocabulary count of generated tokens preceding this point, read
     # from the request's device-resident committed penalty base plus any draft
@@ -128,6 +136,8 @@ class SampleRow:
 
 @dataclass(frozen=True, slots=True)
 class SampleWork:
+    """Carries logits, RNG draws, penalties, predicates, and publication targets for one sampling task."""
+
     operation: Operation
     logits: torch.Tensor
     rows: tuple[SampleRow, ...]
@@ -150,6 +160,8 @@ class SampleWork:
 
 @dataclass(frozen=True, slots=True)
 class SampleBatchVectors:
+    """Holds device vectors produced by a batched sampling transition."""
+
     request_pool_indices: torch.Tensor
     tokens: torch.Tensor
     valid: torch.Tensor
@@ -161,6 +173,8 @@ class SampleBatchVectors:
 
 @dataclass(frozen=True, slots=True)
 class SampleResult:
+    """Owns a pending sampling completion and its device-resident token, acceptance, and validity outputs."""
+
     completion: SamplingOutputRow
     device_token: torch.Tensor | None
     logprobs: LogprobOutputRow | None
@@ -178,6 +192,8 @@ class SampleResult:
 
 @dataclass(frozen=True, slots=True)
 class RuntimePublication:
+    """Publishes a request runtime transition after its lane results become final."""
+
     slot: int
     token: torch.Tensor
     predicate: torch.Tensor
@@ -191,6 +207,8 @@ class RuntimePublication:
 
 @dataclass(frozen=True, slots=True)
 class DecodeRuntimePublication:
+    """Publishes batched device-selected decode transitions for a group of requests."""
+
     slots: tuple[int, ...]
     device_slots: torch.Tensor
     tokens: torch.Tensor
@@ -203,12 +221,16 @@ class DecodeRuntimePublication:
 
 @dataclass(frozen=True, slots=True)
 class PromptLogitsPublication:
+    """Publishes prompt-logit completion without advancing persistent request state."""
+
     slot: int
     logits: torch.Tensor
 
 
 @dataclass(frozen=True, slots=True)
 class PreparedTransferInput:
+    """Owns fetched transfer tickets, tensor locators, metadata, and any retained source snapshot."""
+
     product: ProductRef
     kind: str
     locators: tuple[Locator, ...]
@@ -223,9 +245,13 @@ class PreparedTransferInput:
     snapshot: CachePublication | None
 
     def ready(self) -> bool:
+        """Indicate whether every remote product tensor is available to consume."""
+
         return all(ticket.ready() for ticket in self.tickets)
 
     def tensors(self) -> tuple[torch.Tensor, ...]:
+        """Return fetched tensors only after every transfer ticket is ready."""
+
         if not self.ready():
             raise RuntimeError("prepared transfer input was observed before readiness")
         tensors = tuple(ticket.result() for ticket in self.tickets)
@@ -241,6 +267,8 @@ class PreparedTransferInput:
 
 @dataclass(slots=True)
 class PreparedPredicateBatch:
+    """Holds staged predicate tensors and their request-local lookup table."""
+
     buffer: OutputBuffer
     entries: list[tuple[OperationIdentity, TokenCapture, int]]
     transferred: tuple[tuple[OperationIdentity, PreparedTransferInput, int], ...]
@@ -248,6 +276,8 @@ class PreparedPredicateBatch:
     _values: dict[OperationIdentity, bool] | None = None
 
     def ready(self) -> bool:
+        """Return whether all predicate reads and their producer events are query-ready."""
+
         if self._values is not None:
             return True
         if not self.sealed:
@@ -269,6 +299,8 @@ class PreparedPredicateBatch:
         return self.buffer.ready()
 
     def resolve(self) -> dict[OperationIdentity, bool]:
+        """Read validated predicate scalars and index them by semantic product reference."""
+
         if self._values is not None:
             return self._values
         if not self.buffer.ready():
@@ -289,10 +321,14 @@ class PreparedPredicateBatch:
         return values
 
     def abandon(self) -> None:
+        """Release the predicate capture when its values will not be observed."""
+
         if self._values is None:
             self.buffer.abandon()
 
     def __del__(self) -> None:
+        """Abandon predicate completion storage that was never closed explicitly."""
+
         try:
             self.abandon()
         except Exception:
@@ -301,6 +337,8 @@ class PreparedPredicateBatch:
 
 @dataclass(slots=True)
 class PreparedExecution:
+    """Owns staged transfers and predicates until a batch executes, fails, or is abandoned."""
+
     batch: Run
     transfers: tuple[PreparedTransferInput, ...]
     predicates: PreparedPredicateBatch | None = None
@@ -312,14 +350,20 @@ class PreparedExecution:
     _finished: bool = field(default=False, init=False, repr=False)
 
     def ready(self) -> bool:
+        """Indicate whether transfers and device predicates can be consumed without blocking."""
+
         return all(transfer.ready() for transfer in self.transfers) and (
             self.predicates is None or self.predicates.ready()
         )
 
     def predicate_values(self) -> dict[OperationIdentity, bool]:
+        """Resolve staged device predicates by request generation and operation id."""
+
         return {} if self.predicates is None else self.predicates.resolve()
 
     def on_transfer_completion(self, callback: Callable[[], None]) -> None:
+        """Invoke a callback immediately or after all staged transfer tickets complete."""
+
         tickets = tuple(ticket for transfer in self.transfers for ticket in transfer.tickets)
         if not tickets:
             callback()
@@ -328,6 +372,8 @@ class PreparedExecution:
         fired = False
 
         def notify_if_ready() -> None:
+            """Invoke the callback once after every transfer ticket reports readiness."""
+
             nonlocal fired
             if not all(ticket.ready() for ticket in tickets):
                 return
@@ -346,6 +392,8 @@ class PreparedExecution:
         execute: Callable[[PreparedExecution], RunResult],
         release: Callable[[], None],
     ) -> PreparedExecution:
+        """Install the single-use execution and release callbacks for this prepared batch."""
+
         if self._execute is not None or self._release is not None:
             raise RuntimeError("prepared execution is already bound")
         self._execute = execute
@@ -353,6 +401,8 @@ class PreparedExecution:
         return self
 
     def resolve(self) -> RunResult:
+        """Execute the bound batch once and guarantee release of its preparation resources."""
+
         if not self.ready():
             raise RuntimeError("prepared execution was observed before transfer readiness")
         execute = self._execute
@@ -364,15 +414,21 @@ class PreparedExecution:
             self._finish()
 
     def record_failure(self, error: BaseException) -> WorkerError:
+        """Abandon prepared resources and classify the execution failure for the wire response."""
+
         self.abandon()
         return classify(error, context="execute")
 
     def abandon(self) -> None:
+        """Release predicate captures, transfer reads, and bound output candidates."""
+
         if self.predicates is not None:
             self.predicates.abandon()
         self._finish()
 
     def _finish(self) -> None:
+        """Close predicate and transfer preparation resources exactly once."""
+
         if self._finished:
             return
         self._finished = True
@@ -381,6 +437,8 @@ class PreparedExecution:
             release()
 
     def __del__(self) -> None:
+        """Release unfinished preparation resources during finalization."""
+
         try:
             self.abandon()
         except Exception:
@@ -389,6 +447,8 @@ class PreparedExecution:
 
 @dataclass(frozen=True, slots=True)
 class LaneLayout:
+    """Aligned operation, request, sequence, weight, and identity columns for one lane."""
+
     operations: tuple[Operation, ...]
     requests: tuple[RequestDraft, ...]
     seq_lens: tuple[int, ...]
@@ -396,6 +456,8 @@ class LaneLayout:
     identities: tuple[OperationIdentity, ...]
 
     def __post_init__(self) -> None:
+        """Validate equal-length lane columns and unique operation identities."""
+
         width = len(self.operations)
         if not all(
             len(values) == width
@@ -411,6 +473,8 @@ class LaneLayout:
 
 @dataclass(frozen=True, slots=True)
 class LatentExecution:
+    """Binds a latent placement and request slot to its staged trajectory view."""
+
     placement: LatentPlacement
     request_pool_idx: int
     staging: LatentStaging
@@ -418,6 +482,8 @@ class LatentExecution:
 
 @dataclass(slots=True)
 class LaneState:
+    """Tracks staged rows, sample tasks, publications, outputs, and stats for one executing lane."""
+
     lane: RunLane
     started_ns: int
     graph_eligible: bool
@@ -475,6 +541,8 @@ class LaneState:
 
 @dataclass(frozen=True, slots=True)
 class SpeculativeSelection:
+    """Captures draft tokens, selected checkpoint metadata, and the completion that resolves acceptance."""
+
     completion: SamplingOutputRow
     draft_tokens: tuple[int, ...]
     terminal_prefix: int | None
@@ -520,11 +588,15 @@ class StateOutcome:
 
     @property
     def sampled_tokens(self) -> int:
+        """Count committed prefix tokens plus one deferred sampling position."""
+
         return len(self.committed_tokens) + int(self.sampling is not None)
 
 
 @dataclass(slots=True)
 class OperationState:
+    """Tracks one operation from candidate preparation through result publication."""
+
     operation: Operation
     lane: Any
     phase: str = "initial"
@@ -538,6 +610,8 @@ def dependencies_ready(
     state: OperationState,
     producers: dict[ProductRef, OperationState],
 ) -> bool:
+    """Return whether every declared product input has a completed local producer."""
+
     return all(
         producer.outcome is not None
         for reference in state.operation.inputs

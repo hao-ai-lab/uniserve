@@ -1,4 +1,4 @@
-"""MJHQ-30K prompt loader."""
+"""Loads deterministic text-to-image prompts from MJHQ-30K metadata."""
 
 from __future__ import annotations
 
@@ -15,9 +15,13 @@ MJHQ_META_FILENAME = "meta_data.json"
 
 
 class MJHQDataset(Dataset):
+    """Adapts MJHQ metadata entries to text-only generation examples."""
+
     name: ClassVar[str] = "mjhq"
 
     def load(self, tokenizer: Any | None = None) -> list[Example]:
+        """Select seeded prompt entries from local or downloaded metadata."""
+
         point = self.point
         path = point.dataset_path or ""
         if not (path and os.path.isfile(path)):

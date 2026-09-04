@@ -9,7 +9,11 @@ __all__ = ["MiniMaxH3AudioVAE"]
 
 
 class MiniMaxH3AudioVAE(nn.Module):
+    """Decodes H3 audio latents into bounded stereo PCM waveforms."""
+
     def __init__(self, vae: nn.Module) -> None:
+        """Bind a pretrained decoder and materialize its latent normalization statistics."""
+
         super().__init__()
         self.vae = vae.float()
         if not hasattr(vae, "decode"):
@@ -37,6 +41,8 @@ class MiniMaxH3AudioVAE(nn.Module):
         device: torch.device,
         local_files_only: bool = False,
     ) -> "MiniMaxH3AudioVAE":
+        """Load the checkpoint audio decoder in FP32 on the target device."""
+
         try:
             from diffusers import AutoencoderKLMiniMaxH3Audio
         except ImportError as error:
@@ -51,9 +57,13 @@ class MiniMaxH3AudioVAE(nn.Module):
 
     @property
     def device(self) -> torch.device:
+        """Identify the execution device from the resident decoder parameters."""
+
         return next(self.vae.parameters()).device
 
     def _decode(self, normalized_latents: torch.Tensor) -> torch.Tensor:
+        """Denormalize audio latents and convert decoder output to interleaved signed-16 stereo."""
+
         latents = normalized_latents.to(device=self.device, dtype=torch.float32)
         latents = latents * self.latents_std + self.latents_mean
         decoded = self.vae.decode(latents).sample.float()
@@ -72,12 +82,16 @@ class MiniMaxH3AudioVAE(nn.Module):
 
     @torch.inference_mode()
     def decode(self, normalized_latents: torch.Tensor) -> torch.Tensor:
+        """Decode `[2, 32, time]` normalized latents into interleaved stereo PCM16 samples."""
+
         if normalized_latents.ndim != 3 or normalized_latents.shape[:2] != (2, 32):
             raise ValueError("the H3 audio latent must have shape [2, 32, time]")
         return self._decode(normalized_latents)
 
     @torch.inference_mode()
     def warmup_decoder(self, normalized_latents: torch.Tensor) -> torch.Tensor:
+        """Exercise the same bounded decode path used for request audio reconstruction."""
+
         if normalized_latents.ndim != 3 or normalized_latents.shape[:2] != (2, 32):
             raise ValueError("the H3 audio latent must have shape [2, 32, time]")
         return self._decode(normalized_latents)

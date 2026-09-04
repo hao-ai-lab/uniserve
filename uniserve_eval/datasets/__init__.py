@@ -1,3 +1,5 @@
+"""Registers dataset adapters and resolves configured example sources."""
+
 from __future__ import annotations
 
 from typing import Any
@@ -24,6 +26,8 @@ DATASETS: dict[str, type[Dataset]] = {
 
 
 def get_dataset(name: str) -> type[Dataset]:
+    """Return the dataset adapter registered under a configuration name."""
+
     if name not in DATASETS:
         known = ", ".join(sorted(DATASETS)) or "(none)"
         raise KeyError(f"unknown dataset {name!r}; known: {known}")
@@ -31,10 +35,14 @@ def get_dataset(name: str) -> type[Dataset]:
 
 
 def list_datasets() -> tuple[type[Dataset], ...]:
+    """Return registered dataset adapters in name order."""
+
     return tuple(DATASETS[name] for name in sorted(DATASETS))
 
 
 def load_examples(point: BenchmarkPoint) -> tuple[list[Example], Any | None]:
+    """Load the exact row count and optional tokenizer for a benchmark point."""
+
     dataset_cls = get_dataset(point.dataset)
     if dataset_cls.requires_path and not point.dataset_path:
         raise ValueError(f"dataset {point.dataset!r} requires dataset_path")

@@ -1,4 +1,5 @@
 """Sinusoidal timestep embeddings for flow-matching modules."""
+
 from __future__ import annotations
 
 import math
@@ -14,7 +15,7 @@ __all__ = [
 
 
 def timestep_embedding(t: torch.Tensor, dim: int, max_period: float = 10000.0) -> torch.Tensor:
-    """GLIDE/DiT sinusoidal timestep embedding with cosine-then-sine layout."""
+    """Build GLIDE/DiT sinusoidal timestep embeddings in cosine-then-sine order."""
 
     half = dim // 2
     freqs = torch.exp(
@@ -33,6 +34,8 @@ class TimestepEmbedder(nn.Module):
     timestep_embedding = staticmethod(timestep_embedding)
 
     def __init__(self, hidden_size: int, frequency_embedding_size: int = 256):
+        """Build the two-layer projection over fixed-width sinusoidal features."""
+
         super().__init__()
         self.mlp = nn.Sequential(
             nn.Linear(frequency_embedding_size, hidden_size, bias=True),
@@ -42,6 +45,8 @@ class TimestepEmbedder(nn.Module):
         self.frequency_embedding_size = frequency_embedding_size
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
+        """Project sinusoidal scalar-timestep features into the model conditioning width."""
+
         t_freq = timestep_embedding(t, self.frequency_embedding_size)
         input_layer = cast(nn.Linear, self.mlp[0])
         return self.mlp(t_freq.to(input_layer.weight.dtype))

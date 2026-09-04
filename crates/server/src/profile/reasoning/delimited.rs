@@ -1,3 +1,5 @@
+//! Incremental parser for reasoning enclosed by configured text delimiters.
+
 use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
 
 use super::{ReasoningDelta, ReasoningError, Result};
@@ -15,7 +17,7 @@ pub struct DelimitedReasoningParser {
 }
 
 impl DelimitedReasoningParser {
-    /// Create one delimited parser state machine.
+    /// Creates one delimited parser state machine.
     ///
     /// `default_in_reasoning` is only used when prompt initialization sees no
     /// reasoning boundary token at all. If the prompt contains either the
@@ -59,7 +61,7 @@ impl DelimitedReasoningParser {
         })
     }
 
-    /// Initialize the starting state from prompt token IDs.
+    /// Initializes parser state from the prompt token IDs.
     pub fn initialize(&mut self, prompt_token_ids: &[u32]) {
         self.current_in_reasoning = last_reasoning_boundary(
             prompt_token_ids,
@@ -70,7 +72,7 @@ impl DelimitedReasoningParser {
         .unwrap_or(self.default_in_reasoning);
     }
 
-    /// Parse one decoded text delta and return its reasoning/content split.
+    /// Parses one decoded text delta and return its reasoning/content split.
     pub fn push(&mut self, delta: &str) -> ReasoningDelta {
         self.buffer.push_str(delta);
 
@@ -82,13 +84,13 @@ impl DelimitedReasoningParser {
         self.parse_stable_text(&stable_text)
     }
 
-    /// Flush any buffered partial delimiter suffix at end of stream.
+    /// Flushes any buffered partial delimiter suffix at end of stream.
     pub fn finish(&mut self) -> ReasoningDelta {
         let stable_text = std::mem::take(&mut self.buffer);
         self.parse_stable_text(&stable_text)
     }
 
-    /// Parse text that is known not to end with a partial delimiter suffix.
+    /// Parses text that is known not to end with a partial delimiter suffix.
     fn parse_stable_text(&mut self, mut stable: &str) -> ReasoningDelta {
         let mut delta = ReasoningDelta::default();
 
@@ -115,7 +117,7 @@ impl DelimitedReasoningParser {
         delta
     }
 
-    /// Return the longest trailing suffix that could still complete a
+    /// Returns the longest trailing suffix that could still complete a
     /// delimiter.
     ///
     /// A trailing suffix can only be a *strict* prefix of a delimiter when it
@@ -150,7 +152,7 @@ impl DelimitedReasoningParser {
     }
 }
 
-/// Determine the reasoning state implied by the last prompt boundary, if any.
+/// Determines the reasoning state implied by the last prompt boundary, if any.
 fn last_reasoning_boundary(
     prompt_token_ids: &[u32],
     start_token_id: u32,

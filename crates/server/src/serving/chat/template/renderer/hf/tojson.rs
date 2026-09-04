@@ -1,3 +1,5 @@
+//! Hugging Face-compatible JSON serialization filter for chat templates.
+
 use minijinja::value::{Kwargs, ViaDeserialize};
 use minijinja::{Error as MinijinjaError, ErrorKind, Value};
 use serde::Deserialize;
@@ -5,9 +7,9 @@ use serde_json::Value as JsonValue;
 use serde_json_fmt::{JsonFormat, JsonSyntaxError};
 use thiserror_ext::AsReport;
 
-/// Hugging Face-compatible `tojson` filter for chat templates.
+/// Serializes a template value using Hugging Face `tojson` semantics.
 ///
-/// We cannot use MiniJinja's built-in filter directly because HF relies on
+/// Hugging Face templates rely on
 /// Python `json.dumps` semantics:
 /// - no HTML escaping
 /// - extra kwargs such as `ensure_ascii`, `separators`, and `sort_keys`
@@ -61,6 +63,7 @@ enum IndentArg {
     String(String),
 }
 
+/// Parses the indent.
 fn parse_indent(value: Option<IndentArg>) -> Option<String> {
     match value? {
         IndentArg::Bool(indent) => Some(if indent {
@@ -80,6 +83,7 @@ fn parse_indent(value: Option<IndentArg>) -> Option<String> {
 #[derive(Deserialize)]
 struct SeparatorsArg((String, String));
 
+/// Parses the separators.
 fn parse_separators(value: Option<SeparatorsArg>, pretty: bool) -> (String, String) {
     let Some(SeparatorsArg((item_separator, key_separator))) = value else {
         let default_item_separator = if pretty { "," } else { ", " };
@@ -94,6 +98,7 @@ fn parse_separators(value: Option<SeparatorsArg>, pretty: bool) -> (String, Stri
     (item_separator, key_separator)
 }
 
+/// Builds the JSON format.
 fn build_json_format(
     indent: Option<String>,
     item_separator: String,
@@ -110,6 +115,7 @@ fn build_json_format(
         .map(|format| format.ascii(ensure_ascii))
 }
 
+/// Maps the JSON syntax error.
 fn map_json_syntax_error(
     field: &'static str,
 ) -> impl FnOnce(JsonSyntaxError) -> MinijinjaError + Copy {
@@ -121,7 +127,7 @@ fn map_json_syntax_error(
     }
 }
 
-/// Recursively sort all object keys in a JSON value.
+/// Sorts every object key in a JSON value recursively.
 fn sort_json_keys(value: &JsonValue) -> JsonValue {
     match value {
         JsonValue::Object(map) => {
@@ -216,10 +222,8 @@ mod tests {
         let payload = serde_json::from_str(r#"{"x":2,"y":1.00}"#).unwrap();
         let rendered = render("{{ payload|tojson }}", payload);
 
-        // We cannot preserve the original number precision by enabling `serde_json`'s
-        // `arbitrary_precision` feature, otherwise the following test
-        // `serialized_json_numbers_do_not_leak_serde_private_representation` will fail.
-        // See issue: https://github.com/mitsuhiko/minijinja/issues/641
+        // Template JSON uses serde_json's standard numeric spelling because the
+        // arbitrary-precision representation is not a MiniJinja scalar.
         assert_eq!(rendered, "{\"x\": 2, \"y\": 1.0}");
     }
 
@@ -228,9 +232,7 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_str(r#"{"x":2,"y":1.00}"#).unwrap();
         let rendered = render("{{ payload }}", payload);
 
-        // We cannot preserve the original number precision by enabling `serde_json`'s
-        // `arbitrary_precision` feature, otherwise this will fail.
-        // See issue: https://github.com/mitsuhiko/minijinja/issues/641
+        // Serialized values expose JSON numbers rather than serde's private tagged form.
         assert!(!rendered.contains("$serde_json::private::Number"));
         assert_eq!(rendered, r#"{"x": 2, "y": 1.0}"#);
     }

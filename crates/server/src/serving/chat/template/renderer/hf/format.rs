@@ -1,3 +1,5 @@
+//! Chat-template content-shape detection and formatting options.
+
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::str::FromStr;
@@ -32,14 +34,18 @@ pub enum ChatTemplateContentFormatOption {
 }
 
 impl ChatTemplateContentFormatOption {
+    /// Configuration literal for automatic content-shape detection.
     pub const AUTO_LITERAL: &str = "auto";
+    /// Configuration literal for structured OpenAI content parts.
     pub const OPENAI_LITERAL: &str = "openai";
+    /// Configuration literal for flattened string content.
     pub const STRING_LITERAL: &str = "string";
 }
 
 impl FromStr for ChatTemplateContentFormatOption {
     type Err = String;
 
+    /// Parses the value from its string representation.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         if value.eq_ignore_ascii_case(Self::AUTO_LITERAL) {
             Ok(Self::Auto)
@@ -59,6 +65,7 @@ impl FromStr for ChatTemplateContentFormatOption {
 }
 
 impl fmt::Display for ChatTemplateContentFormatOption {
+    /// Formats the value for diagnostic output.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Auto => f.write_str(Self::AUTO_LITERAL),
@@ -68,14 +75,17 @@ impl fmt::Display for ChatTemplateContentFormatOption {
     }
 }
 
+/// Returns whether an expression references the named variable.
 fn is_var_access(expr: &Expr, varname: &str) -> bool {
     matches!(expr, Expr::Var(v) if v.id == varname)
 }
 
+/// Returns whether an expression is the requested string constant.
 fn is_const_str(expr: &Expr, value: &str) -> bool {
     matches!(expr, Expr::Const(c) if c.value.as_str() == Some(value))
 }
 
+/// Returns whether an expression accesses the requested variable attribute.
 fn is_attr_access(expr: &Expr, varname: &str, key: &str) -> bool {
     match expr {
         Expr::GetItem(g) => is_var_access(&g.expr, varname) && is_const_str(&g.subscript_expr, key),
@@ -84,6 +94,7 @@ fn is_attr_access(expr: &Expr, varname: &str, key: &str) -> bool {
     }
 }
 
+/// Returns whether an expression references a variable or one of its elements.
 fn is_var_or_elems_access(expr: &Expr, varname: &str, key: Option<&str>) -> bool {
     match expr {
         Expr::Filter(f) => f
@@ -99,6 +110,7 @@ fn is_var_or_elems_access(expr: &Expr, varname: &str, key: Option<&str>) -> bool
     }
 }
 
+/// Traverses a template AST and collects assignments and loops in encounter order.
 fn visit_stmt<'a>(
     stmt: &'a Stmt<'a>,
     assignments: &mut Vec<&'a Set<'a>>,
@@ -167,6 +179,7 @@ fn visit_stmt<'a>(
     }
 }
 
+/// Collects the assignments and loops.
 fn collect_assignments_and_loops<'a>(
     root: &'a Stmt<'a>,
 ) -> (Vec<&'a Set<'a>>, Vec<&'a ForLoop<'a>>) {
@@ -176,6 +189,7 @@ fn collect_assignments_and_loops<'a>(
     (assignments, loops)
 }
 
+/// Finds variables transitively assigned from a source variable or its elements.
 fn iter_nodes_assign_var_or_elems(root: &Stmt<'_>, varname: &str) -> Vec<String> {
     let (assignments, _) = collect_assignments_and_loops(root);
 
@@ -204,6 +218,7 @@ fn iter_nodes_assign_var_or_elems(root: &Stmt<'_>, varname: &str) -> Vec<String>
     discovered
 }
 
+/// Finds loop variables that iterate over the template's message collection.
 fn iter_nodes_assign_messages_item(root: &Stmt<'_>) -> Vec<String> {
     let message_varnames = iter_nodes_assign_var_or_elems(root, "messages");
     let (_, loops) = collect_assignments_and_loops(root);
@@ -230,6 +245,7 @@ fn iter_nodes_assign_messages_item(root: &Stmt<'_>) -> Vec<String> {
     discovered
 }
 
+/// Returns whether the value has content item loop.
 fn has_content_item_loop(root: &Stmt<'_>) -> bool {
     let message_varnames = iter_nodes_assign_messages_item(root);
     let (_, loops) = collect_assignments_and_loops(root);
@@ -242,6 +258,7 @@ fn has_content_item_loop(root: &Stmt<'_>) -> bool {
     })
 }
 
+/// Returns whether an expression tests message content for string representation.
 fn expression_tests_content_string(expr: &Expr<'_>, message_varnames: &[String]) -> bool {
     match expr {
         Expr::Test(test) => {
@@ -275,6 +292,7 @@ fn expression_tests_content_string(expr: &Expr<'_>, message_varnames: &[String])
     }
 }
 
+/// Returns whether a statement subtree tests message content for string representation.
 fn statement_tests_content_string(stmt: &Stmt<'_>, message_varnames: &[String]) -> bool {
     let children_test = |children: &[Stmt<'_>]| {
         children
@@ -302,12 +320,13 @@ fn statement_tests_content_string(stmt: &Stmt<'_>, message_varnames: &[String]) 
     }
 }
 
+/// Returns whether the value has content string test.
 fn has_content_string_test(root: &Stmt<'_>) -> bool {
     let message_varnames = iter_nodes_assign_messages_item(root);
     statement_tests_content_string(root, &message_varnames)
 }
 
-/// Detect the content format expected by a Jinja2 chat template based on AST
+/// Detects the content format expected by a Jinja2 chat template from AST
 /// analysis.
 pub(super) fn detect_chat_template_content_format(template: &str) -> ChatTemplateContentFormat {
     let ast = match parse(

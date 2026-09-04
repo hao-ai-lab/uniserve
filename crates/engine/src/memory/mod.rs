@@ -1,4 +1,8 @@
-//! Scheduler-side authority for logical GPU allocations and immutable worker placements.
+//! Scheduler-owned logical device allocations and worker placement descriptors.
+//!
+//! The manager reserves request slots, paged KV blocks, latent regions, and
+//! aligned buffers. Allocation identities remain host-side; workers receive
+//! immutable placements derived from them.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -7,23 +11,63 @@ use uniserve_worker_ipc::{BufferId, RequestKey, WorkerInfo};
 
 use crate::kv::{BlockPool, BlockTable, EncoderCacheManager, KvCacheCoordinator};
 
+/// Opaque identity of one scheduler-owned allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AllocationId(u64);
 
+/// Logical resource shape requested from the memory manager.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MemoryLayout {
+    /// One stable request-state row.
     RequestSlot,
-    Kv { tokens: u32, groups: u32 },
-    Latent { units: u64 },
-    Buffer { bytes: u64, alignment: u32 },
+    /// Paged KV capacity replicated across cache groups.
+    Kv {
+        /// Token capacity requested for each group.
+        tokens: u32,
+        /// Number of cache groups requiring block tables.
+        groups: u32,
+    },
+    /// Paged latent trajectory capacity.
+    Latent {
+        /// Number of logical latent units requested.
+        units: u64,
+    },
+    /// Byte-addressed persistent tensor storage.
+    Buffer {
+        /// Number of bytes requested.
+        bytes: u64,
+        /// Required byte alignment of the allocation start.
+        alignment: u32,
+    },
 }
 
+/// Immutable worker-visible placement of a logical allocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Placement {
-    RequestSlot { index: u32 },
-    Kv { tables: Vec<Vec<BlockId>> },
-    Latent { pages: Vec<u32>, units: u64 },
-    Buffer { offset: u64, bytes: u64 },
+    /// Stable request-state row assigned to the allocation.
+    RequestSlot {
+        /// Positive row index; zero remains reserved for inactive graph input.
+        index: u32,
+    },
+    /// Physical page tables for each requested KV cache group.
+    Kv {
+        /// Per-group block identifiers in logical order.
+        tables: Vec<Vec<BlockId>>,
+    },
+    /// Physical pages backing a latent trajectory.
+    Latent {
+        /// Latent page identifiers in logical order.
+        pages: Vec<u32>,
+        /// Logical latent units covered by the placement.
+        units: u64,
+    },
+    /// Address span in the persistent-buffer arena.
+    Buffer {
+        /// Byte offset from the start of the arena.
+        offset: u64,
+        /// Reserved span length in bytes.
+        bytes: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -46,22 +90,27 @@ pub struct Allocation {
 }
 
 impl Allocation {
+    /// Returns the manager-assigned allocation identity.
     pub const fn id(&self) -> AllocationId {
         self.id
     }
 
+    /// Returns the request lineage that owns this allocation.
     pub const fn owner(&self) -> RequestKey {
         self.owner
     }
 
+    /// Returns the requested logical resource shape.
     pub fn layout(&self) -> &MemoryLayout {
         &self.layout
     }
 
+    /// Returns the worker-visible physical placement.
     pub fn placement(&self) -> &Placement {
         &self.placement
     }
 
+    /// Returns the request-slot identifier.
     pub(crate) fn request_slot(&self) -> Option<u32> {
         match self.backing {
             AllocationBacking::RequestSlot(index) => Some(index),
@@ -69,6 +118,7 @@ impl Allocation {
         }
     }
 
+    /// Returns shared access to the KV tables.
     pub(crate) fn kv_tables(&self) -> Option<&[BlockTable]> {
         match &self.backing {
             AllocationBacking::Kv(tables) => Some(tables),
@@ -76,6 +126,7 @@ impl Allocation {
         }
     }
 
+    /// Returns mutable access to the KV tables.
     pub(crate) fn kv_tables_mut(&mut self) -> Option<&mut Vec<BlockTable>> {
         match &mut self.backing {
             AllocationBacking::Kv(tables) => Some(tables),
@@ -84,35 +135,49 @@ impl Allocation {
     }
 }
 
+/// Allocation failure identifying the exhausted resource class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum OutOfMemory {
     #[error("request slot capacity is exhausted")]
+    /// No request-state row remains available.
     RequestSlots,
     #[error("KV page capacity is exhausted")]
+    /// The paged KV pool cannot satisfy the requested token capacity.
     Kv,
     #[error("latent page capacity is exhausted")]
+    /// The latent page pool cannot satisfy the requested trajectory capacity.
     Latent,
     #[error("persistent buffer capacity is exhausted")]
+    /// The persistent-buffer arena has no suitable free span.
     Buffer,
     #[error("the requested allocation layout is invalid")]
+    /// The requested shape, count, or alignment is invalid.
     InvalidLayout,
 }
 
+/// Current allocation counts and available capacity by memory class.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MemoryStats {
+    /// Number of allocation handles currently owned by the manager.
     pub live_allocations: usize,
+    /// Request-state rows available for admission.
     pub free_request_slots: usize,
+    /// Physical KV pages available across all cache groups.
     pub free_kv_pages: usize,
+    /// Physical latent pages currently assigned to requests.
     pub used_latent_pages: usize,
+    /// Total bytes available in persistent-buffer free spans.
     pub free_buffer_bytes: u64,
 }
 
+/// Dense pool of stable request-state row identifiers.
 pub(crate) struct RequestSlotPool {
     free: Vec<u32>,
     live: Vec<bool>,
 }
 
 impl RequestSlotPool {
+    /// Creates an allocator for the supplied capacity.
     fn new(capacity: usize) -> Self {
         let capacity = capacity.clamp(1, u32::MAX as usize);
         Self {
@@ -121,20 +186,24 @@ impl RequestSlotPool {
         }
     }
 
+    /// Returns the allocator capacity.
     pub(crate) fn capacity(&self) -> usize {
         self.live.len().saturating_sub(1)
     }
 
+    /// Returns whether the collection contains no entries.
     pub(crate) fn is_empty(&self) -> bool {
         self.free.is_empty()
     }
 
+    /// Acquires an available slot.
     pub(crate) fn acquire(&mut self) -> Option<u32> {
         let index = self.free.pop()?;
         self.live[index as usize] = true;
         Some(index)
     }
 
+    /// Releases the supplied allocation.
     pub(crate) fn release(&mut self, index: u32) -> Result<(), &'static str> {
         let Some(live) = self.live.get_mut(index as usize) else {
             return Err("request-pool index is outside scheduler capacity");
@@ -148,6 +217,7 @@ impl RequestSlotPool {
     }
 }
 
+/// Fixed-size page allocator for request-owned latent storage.
 pub(crate) struct LatentPagePool {
     page_units: u32,
     free: Vec<u32>,
@@ -156,6 +226,7 @@ pub(crate) struct LatentPagePool {
 }
 
 impl LatentPagePool {
+    /// Creates an allocator for the supplied capacity.
     fn new(num_pages: u32, page_units: u32) -> Self {
         Self {
             page_units,
@@ -165,6 +236,7 @@ impl LatentPagePool {
         }
     }
 
+    /// Computes the number of pages required for a byte count.
     fn pages_needed(&self, units: u64) -> Option<usize> {
         if units == 0 {
             return Some(0);
@@ -176,6 +248,7 @@ impl LatentPagePool {
         usize::try_from(units.div_ceil(page_units)).ok()
     }
 
+    /// Returns whether the requested page count can be reserved.
     pub(crate) fn can_reserve(&self, request_id: RequestId, units: u64) -> bool {
         let Some(needed) = self.pages_needed(units) else {
             return false;
@@ -184,6 +257,7 @@ impl LatentPagePool {
         needed.saturating_sub(held) <= self.free.len()
     }
 
+    /// Reserves the requested capacity.
     pub(crate) fn reserve(&mut self, request_id: RequestId, units: u64) -> bool {
         if !self.can_reserve(request_id, units) {
             return false;
@@ -203,6 +277,7 @@ impl LatentPagePool {
         true
     }
 
+    /// Returns the pages owned by an allocation.
     pub(crate) fn pages_for(&self, request_id: RequestId) -> &[u32] {
         self.allocations
             .get(&request_id)
@@ -210,6 +285,7 @@ impl LatentPagePool {
             .unwrap_or(&[])
     }
 
+    /// Releases the supplied allocation.
     pub(crate) fn release(&mut self, request_id: RequestId) {
         if let Some(pages) = self.allocations.remove(&request_id) {
             for page in pages.into_iter().rev() {
@@ -219,6 +295,7 @@ impl LatentPagePool {
         }
     }
 
+    /// Returns the number of allocated pages.
     pub(crate) fn used_pages(&self) -> usize {
         self.owners
             .iter()
@@ -228,12 +305,14 @@ impl LatentPagePool {
     }
 }
 
+/// KV-cache geometry and coordination derived from worker capabilities.
 pub(crate) struct KvMemoryState {
     pub(crate) block_pool: BlockPool,
     pub(crate) coordinator: KvCacheCoordinator,
     pub(crate) usable_blocks: usize,
 }
 
+/// Builds scheduler KV state when a worker advertises paged cache capacity.
 pub(crate) fn worker_kv_state(info: &WorkerInfo) -> Option<KvMemoryState> {
     info.kv_cache.as_ref().map(|kv_cache| {
         let block_pool = if kv_cache.groups.is_empty() {
@@ -270,6 +349,7 @@ struct BufferPool {
 }
 
 impl BufferPool {
+    /// Creates an address-space allocator with one initial free extent.
     fn new(capacity: u64) -> Self {
         let free = (capacity > 0)
             .then_some((0, capacity))
@@ -278,6 +358,7 @@ impl BufferPool {
         Self { capacity, free }
     }
 
+    /// Allocates the first aligned extent large enough for `bytes`.
     fn alloc(&mut self, bytes: u64, alignment: u32) -> Option<u64> {
         if bytes == 0 || alignment == 0 || !alignment.is_power_of_two() {
             return None;
@@ -300,6 +381,7 @@ impl BufferPool {
         Some(aligned)
     }
 
+    /// Returns an extent and coalesces it with immediately adjacent free ranges.
     fn free(&mut self, offset: u64, bytes: u64) {
         let mut start = offset;
         let mut end = offset.saturating_add(bytes).min(self.capacity);
@@ -318,6 +400,7 @@ impl BufferPool {
         self.free.insert(start, end.saturating_sub(start));
     }
 
+    /// Extends an allocation into its adjacent free extent without relocating it.
     fn grow_in_place(&mut self, offset: u64, current: u64, requested: u64) -> bool {
         if requested <= current {
             return true;
@@ -341,11 +424,13 @@ impl BufferPool {
         true
     }
 
+    /// Returns the number of unallocated bytes.
     fn free_bytes(&self) -> u64 {
         self.free.values().copied().sum()
     }
 }
 
+/// Scheduler authority for request-scoped logical allocations.
 pub struct Memory {
     pub(crate) cache: Option<KvMemoryState>,
     pub(crate) encoder_cache: EncoderCacheManager,
@@ -360,6 +445,7 @@ pub struct Memory {
 }
 
 impl Memory {
+    /// Creates scheduler memory state from explicit logical pool capacities.
     pub(crate) fn new(
         cache: Option<KvMemoryState>,
         encoder_cache_budget: usize,
@@ -381,10 +467,12 @@ impl Memory {
         }
     }
 
+    /// Constructs memory pools from worker-advertised capacities.
     pub fn from_worker_info(info: &WorkerInfo) -> Self {
         Self::with_buffer_capacity(info, info.buffer_pool_bytes, info.request_slots as usize)
     }
 
+    /// Constructs memory pools with explicit persistent-buffer and encoder-cache limits.
     pub fn with_buffer_capacity(
         info: &WorkerInfo,
         buffer_pool_bytes: u64,
@@ -401,6 +489,7 @@ impl Memory {
         memory
     }
 
+    /// Returns the allocation identifier.
     fn allocation_id(&mut self) -> AllocationId {
         let id = AllocationId(self.next_allocation_id);
         self.next_allocation_id = self.next_allocation_id.saturating_add(1);
@@ -409,12 +498,21 @@ impl Memory {
         id
     }
 
+    /// Reserves one request-owned resource and returns its immutable placement.
+    ///
+    /// # Errors
+    ///
+    /// Returns the exhausted resource class or [`OutOfMemory::InvalidLayout`] for
+    /// a shape that does not match the configured worker pools.
     pub fn alloc(
         &mut self,
         owner: RequestKey,
         layout: MemoryLayout,
     ) -> Result<Allocation, OutOfMemory> {
         let recorded_layout = layout.clone();
+
+        // Each resource class records enough backing state to release or grow
+        // the placement without consulting the caller's requested layout.
         let (placement, backing) = match layout {
             MemoryLayout::RequestSlot => {
                 let index = self
@@ -467,6 +565,7 @@ impl Memory {
                 )
             }
         };
+
         let id = self.allocation_id();
         Ok(Allocation {
             id,
@@ -477,6 +576,12 @@ impl Memory {
         })
     }
 
+    /// Expands or narrows a live allocation within its existing resource class.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutOfMemory::InvalidLayout`] for stale handles or class changes,
+    /// and the relevant capacity error when expansion cannot be reserved.
     pub fn grow(
         &mut self,
         allocation: &mut Allocation,
@@ -485,6 +590,7 @@ impl Memory {
         if !self.live.contains(&allocation.id) {
             return Err(OutOfMemory::InvalidLayout);
         }
+
         let placement = match (&mut allocation.backing, &layout) {
             (AllocationBacking::RequestSlot(index), MemoryLayout::RequestSlot) => {
                 Placement::RequestSlot { index: *index }
@@ -527,6 +633,9 @@ impl Memory {
                     if *alignment == 0 || !alignment.is_power_of_two() {
                         return Err(OutOfMemory::InvalidLayout);
                     }
+
+                    // Preserve the current buffer unless replacement allocation
+                    // succeeds; an in-place extension keeps its stable offset.
                     let new_offset = if self.buffers.grow_in_place(*offset, *bytes, *requested) {
                         *offset
                     } else {
@@ -547,17 +656,20 @@ impl Memory {
             }
             _ => return Err(OutOfMemory::InvalidLayout),
         };
+
         allocation.layout = layout;
         allocation.placement = placement.clone();
         Ok(placement)
     }
 
+    /// Releases an allocation and returns its backing capacity to the owning pool.
     pub fn free(&mut self, allocation: Allocation) {
         let live = self.live.remove(&allocation.id);
         debug_assert!(live, "stale or duplicate allocation free");
         if !live {
             return;
         }
+
         match allocation.backing {
             AllocationBacking::RequestSlot(index) => {
                 let result = self.request_slots.release(index);
@@ -569,6 +681,7 @@ impl Memory {
         }
     }
 
+    /// Returns an instantaneous capacity snapshot.
     pub fn stats(&self) -> MemoryStats {
         MemoryStats {
             live_allocations: self.live.len(),
@@ -579,6 +692,7 @@ impl Memory {
         }
     }
 
+    /// Retains the encoder buffer.
     pub(crate) fn retain_encoder_buffer(
         &mut self,
         buffer: BufferId,
@@ -594,38 +708,45 @@ impl Memory {
         Ok(())
     }
 
+    /// Takes the encoder buffer.
     pub(crate) fn take_encoder_buffer(&mut self, buffer: BufferId) -> Option<Allocation> {
         self.encoder_buffers.remove(&buffer)
     }
 
+    /// Returns shared access to the KV cache.
     pub(crate) fn cache(&self) -> &KvMemoryState {
         self.cache
             .as_ref()
             .expect("generation scheduling requires worker KV resources")
     }
 
+    /// Returns the number of free KV blocks.
     pub(crate) fn free_blocks(&self) -> usize {
         self.cache
             .as_ref()
             .map_or(0, |state| state.block_pool.free_request_pages())
     }
 
+    /// Returns the number of KV blocks available for allocation.
     pub(crate) fn usable_blocks(&self) -> usize {
         self.cache.as_ref().map_or(0, |state| state.usable_blocks)
     }
 
+    /// Enables or disables prefix caching.
     pub(crate) fn set_prefix_cache(&mut self, enabled: bool) {
         if let Some(cache) = self.cache.as_mut() {
             cache.coordinator.set_prefix_enabled(enabled);
         }
     }
 
+    /// Sets the prefix-cache hashing algorithm.
     pub(crate) fn set_hash_algo(&mut self, algo: HashAlgo) {
         if let Some(cache) = self.cache.as_mut() {
             cache.coordinator.set_hash_algo(algo);
         }
     }
 
+    /// Resets allocator and cache state after worker loss.
     pub(crate) fn reset_after_worker_loss(&mut self, info: &WorkerInfo) {
         let coordinator = self.cache.take().map(|state| state.coordinator);
         let mut cache = worker_kv_state(info);

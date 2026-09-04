@@ -33,6 +33,8 @@ class InputBuffers:
         device: torch.device | str,
         max_inflight: int = 1,
     ) -> None:
+        """Allocate fixed-address row, token, attention, and host-staging buffers."""
+
         if min(max_rows, max_tokens, max_blocks_per_row) < 1:
             raise ValueError("input-buffer row, token, and block bounds must be positive")
         if hidden_size < 0:
@@ -142,6 +144,8 @@ class InputBuffers:
         attention: dict[str, object],
         mesh: MeshView = EmptyMeshView(),
     ) -> ForwardBatch:
+        """Copy row metadata and model inputs into fixed-address lane buffers and return bounded views."""
+
         if row_count < 1 or row_count > self.max_rows:
             raise ValueError("forward row count exceeds input-buffer capacity")
         if len(request_pool_indices) != row_count:
@@ -384,6 +388,11 @@ class InputBuffers:
         attention: dict[str, object],
         mesh: MeshView,
     ) -> ForwardBatch:
+        """Gather one-token decode rows from request-indexed state into fixed buffers."""
+
+        # This fast path derives tokens, positions, lengths, and block tables
+        # from stable request slots; caller-provided per-token payloads are not
+        # permitted because they could disagree with resident state.
         if (
             token_row_indices != tuple(range(row_count))
             or len(token_ids) != row_count
@@ -398,6 +407,9 @@ class InputBuffers:
             or attention["query_lens_cpu"] != (1,) * row_count
         ):
             raise ValueError("request-indexed decode requires one plain token per row")
+
+        # Request indices cross through pinned host storage so the copy can be
+        # enqueued without synchronizing a CUDA execution stream.
         request_slot, request_host = self._request_pool_indices_host.acquire()
         fill_cpu_ints(request_host, request_pool_indices)
         self.request_pool_indices[:row_count].copy_(
@@ -419,6 +431,9 @@ class InputBuffers:
         width = int(attention["table_width"])
         if width < 1 or width > int(self.block_tables.shape[1]):
             raise ValueError("request-indexed decode table width exceeds staging capacity")
+
+        # One device gather snapshots all mutable request-indexed columns into
+        # graph-stable staging addresses for this decode launch.
         gather_request_decode_inputs(
             request_pool_indices=self.request_pool_indices,
             request_page_tables=attention["request_page_tables"],
@@ -441,6 +456,9 @@ class InputBuffers:
         output_locations.copy_(self.decode_page_ids[:row_count])
         output_locations.mul_(int(attention["page_size"]))
         output_locations.add_(self.decode_page_offsets[:row_count])
+
+        # Cache write locations are flattened page-and-offset coordinates; the
+        # returned batch retains the two-dimensional table for attention reads.
         return ForwardBatch(
             phase=phase,
             row_count=row_count,
@@ -469,6 +487,8 @@ class InputBuffers:
         )
 
     def stage_attention(self, attention: dict[str, object]) -> dict[str, object]:
+        """Copy validated attention side tables into their fixed-address staging buffers."""
+
         mode = attention["forward_mode"]
         if mode is AttentionMode.REQUEST_INDEXED_DECODE:
             raise ValueError("request-indexed decode must use fused input staging")
@@ -499,6 +519,8 @@ class InputBuffers:
         return staged
 
     def _scrub(self, mode: object, *, embeddings: bool) -> None:
+        """Zero reusable fields whose stale values could affect the next staged mode."""
+
         if mode is AttentionMode.REQUEST_INDEXED_DECODE:
             raise ValueError("request-indexed decode must use fused input staging")
         self.input_ids.fill_(1)
@@ -524,6 +546,8 @@ class InputBuffers:
         self.flow_timesteps.zero_()
 
     def _stage_positions(self, source: torch.Tensor, offset: int, count: int) -> None:
+        """Copy a bounded slice of position rows into fixed device storage."""
+
         if source.ndim == 1:
             if int(source.numel()) != count:
                 raise ValueError("token positions do not match the token count")
@@ -535,6 +559,8 @@ class InputBuffers:
         self.positions[:axes, offset : offset + count].copy_(source, non_blocking=True)
 
     def _copy_vector(self, target: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
+        """Copy a vector into the leading extent of fixed staging storage."""
+
         values = source.reshape(-1)
         count = int(values.numel())
         if count > int(target.numel()):
@@ -544,6 +570,8 @@ class InputBuffers:
         return view
 
     def _copy_matrix(self, target: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
+        """Copy a source matrix into the leading rows and columns of bounded storage."""
+
         if source.ndim != 2:
             raise ValueError("attention table must be a matrix")
         rows, columns = (int(value) for value in source.shape)
@@ -557,6 +585,8 @@ class InputBuffers:
         return view
 
     def _stage_flow_conditioning(self, value: FlowPatches | None) -> FlowPatches | None:
+        """Stage optional flow patches or clear their active view."""
+
         if value is None:
             return None
         return FlowPatches(
@@ -566,6 +596,8 @@ class InputBuffers:
         )
 
     def _device_view(self, value: torch.Tensor) -> torch.Tensor:
+        """Return a tensor on the input-buffer device without unnecessary copying."""
+
         if value.device != self.device:
             raise ValueError(
                 f"model input is on {value.device}, expected execution device {self.device}"

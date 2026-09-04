@@ -1,7 +1,11 @@
-//! Client-visible event production and per-request output accounting.
+//! Client-visible event publication and per-request output accounting.
+//!
+//! Events accumulate in request-local journals when the bounded consumer channel
+//! is full, preserving order without blocking the engine owner thread.
 
 use super::*;
 
+/// Flushes journaled public events into the output channel.
 fn flush_public_journal(event_tx: &EventTx, journal: &mut VecDeque<Event>) -> bool {
     while let Some(event) = journal.pop_front() {
         match event_tx.send(event) {
@@ -19,6 +23,7 @@ fn flush_public_journal(event_tx: &EventTx, journal: &mut VecDeque<Event>) -> bo
     false
 }
 
+/// Event journal and usage counters for one request.
 pub(super) struct RequestOutput {
     pub(super) event_tx: EventTx,
     pub(super) event_seq: u64,
@@ -28,6 +33,7 @@ pub(super) struct RequestOutput {
 }
 
 impl RequestOutput {
+    /// Creates an output journal with the requested capacity.
     pub(super) fn new(event_tx: EventTx) -> Self {
         Self {
             event_tx,
@@ -38,20 +44,24 @@ impl RequestOutput {
         }
     }
 
+    /// Returns whether the journal is closed.
     pub(super) fn is_closed(&self) -> bool {
         self.event_tx.is_closed()
     }
 
+    /// Returns the number of events the journal can accept.
     pub(super) fn available_capacity(&self) -> usize {
         self.event_tx
             .capacity()
             .saturating_add(OUTPUT_JOURNAL_CAPACITY.saturating_sub(self.journal.len()))
     }
 
+    /// Flushes pending journal entries.
     fn flush(&mut self) -> bool {
         flush_public_journal(&self.event_tx, &mut self.journal)
     }
 
+    /// Delivers an event or journals it in order when the public channel is full.
     pub(super) fn enqueue(&mut self, event: Event) -> bool {
         if self.flush() {
             return true;
@@ -83,15 +93,18 @@ struct RetiredOutput {
 }
 
 #[derive(Default)]
+/// Non-blocking event publisher with request-local ordered buffering.
 pub(crate) struct OutputSender {
     retired: HashMap<RequestId, RetiredOutput>,
 }
 
 impl OutputSender {
+    /// Returns the number of retained events.
     pub(super) fn retained_len(&self) -> usize {
         self.retired.len()
     }
 
+    /// Marks journal entries as retired through the supplied sequence.
     pub(super) fn retire(&mut self, id: RequestId, output: RequestOutput) {
         if !output.journal.is_empty() {
             self.retired.insert(
@@ -104,6 +117,7 @@ impl OutputSender {
         }
     }
 
+    /// Flushes journal entries that are safe to retire.
     pub(super) fn flush_retired(&mut self) -> bool {
         let mut progressed = false;
         self.retired.retain(|_, output| {
@@ -117,6 +131,7 @@ impl OutputSender {
 }
 
 impl EngineLoop {
+    /// Publishes committed autoregressive tokens and advances text-generation state.
     pub(super) fn resolve_decode_text(
         &mut self,
         id: RequestId,
@@ -221,6 +236,10 @@ impl EngineLoop {
         }
     }
 
+    /// Applies one completed operation to its request and emits observable output.
+    ///
+    /// Each phase owns its cursor transition so a worker completion cannot advance
+    /// a request through an unrelated generation stage.
     pub(super) fn resolve(
         &mut self,
         id: RequestId,
@@ -230,16 +249,23 @@ impl EngineLoop {
         prefix_versions: Vec<Checkpoint>,
     ) {
         let operation_variant = operation.kind;
+
+        // Prompt scores share the completion but precede its phase transition.
         if !view.prompt_logprobs.is_empty() {
             let positions = std::mem::take(&mut view.prompt_logprobs);
             self.resolve_prompt_logprobs(id, positions);
         }
+
         if operation_variant == RunKind::ArDecode {
             return self.resolve_decode_text(id, view, &prefix_versions);
         }
+
         match operation_variant {
             RunKind::ArExtend => {
                 self.activate_request_tables(id);
+
+                // State-ingest and feedback operations use autoregressive extension
+                // transport while retaining their own completion transitions.
                 match &apply.intent {
                     crate::runtime::generation::TransitionIntent::CloseKv { .. } => return,
                     crate::runtime::generation::TransitionIntent::IngestImageState {
@@ -249,6 +275,7 @@ impl EngineLoop {
                         if *is_final_step {
                             self.free_transient_products(id);
                         }
+
                         if *is_final_step
                             && self.running.get(&id).is_some_and(|st| {
                                 st.cursor.ingest.mm_cursor >= st.context.images.len()
@@ -272,17 +299,20 @@ impl EngineLoop {
                         if !is_final_step {
                             return;
                         }
+
                         self.free_transient_products(id);
                         let sample_continuation = self
                             .running
                             .get(&id)
                             .and_then(|st| st.req.policy.feedback.as_ref())
                             .is_some_and(|feedback| feedback.sample_continuation);
+
                         if let Some(st) = self.running.get_mut(&id) {
                             st.cursor.image_gen.images_done += 1;
                             st.cursor.und.text_since_image = 0;
                             st.cursor.und.round_tokens.clear();
                         }
+
                         if !sample_continuation {
                             let Some(next_token) = self.feedback_next_token(id) else {
                                 return self.finish(id, FinishReason::Error);
@@ -293,9 +323,11 @@ impl EngineLoop {
                             }
                             return;
                         }
+
                         let Some(tok) = view.committed_tokens.last().copied() else {
                             return self.finish(id, FinishReason::Error);
                         };
+
                         let (can_open_gen_branch, images_done, max_images) = {
                             let st = self.running.get_mut(&id).unwrap();
                             st.cursor.und.tokens_emitted += 1;
@@ -305,6 +337,7 @@ impl EngineLoop {
                                 st.req.image.max_images as usize,
                             )
                         };
+
                         let direct_trigger = self
                             .running
                             .get(&id)
@@ -313,11 +346,14 @@ impl EngineLoop {
                             self.begin_image(id);
                             return;
                         }
+
+                        // A trigger that cannot open a branch becomes ordinary text.
                         let tok = if direct_trigger {
                             tok.wrapping_add(1)
                         } else {
                             tok
                         };
+
                         if self.emit_or_finish_und_token(
                             id,
                             tok,
@@ -328,11 +364,13 @@ impl EngineLoop {
                         ) {
                             return;
                         }
+
                         if let Some(st) = self.running.get_mut(&id) {
                             st.cursor.und.next_token = tok;
                             st.cursor.phase = Phase::DecodeUnd;
                             st.cursor.und.round_tokens.push(tok);
                         }
+
                         if can_open_gen_branch
                             && images_done < max_images
                             && self
@@ -346,8 +384,9 @@ impl EngineLoop {
                     }
                     _ => {}
                 }
-                // chunked prefill: a prefill op may only have consumed part of
-                // the prompt; if so, advance the cursor and stay in Prefill.
+
+                // Partial prefill remains in ingest until every text and multimodal
+                // position has been consumed.
                 let (cursor, prompt_len) = {
                     let st = self.running.get(&id).unwrap();
                     (
@@ -358,17 +397,20 @@ impl EngineLoop {
                 if cursor < prompt_len {
                     return;
                 }
+
                 if self.running.get(&id).is_some_and(|st| {
                     st.cursor.ingest.mm_cursor < st.context.images.len()
                         || st.cursor.ingest.prompt_cursor < st.context.prompt_ids.len() as u32
                 }) {
                     return;
                 }
+
                 let (starts_gen_after_context, can_open_gen_branch) = {
                     let st = self.running.get_mut(&id).unwrap();
                     st.cursor.und.tokens_emitted += 1;
                     (st.starts_gen_after_context(), st.can_open_gen_branch())
                 };
+
                 if self.running.get(&id).is_some_and(|state| {
                     state.req.sampling.prompt_logprobs_requested()
                         && state.cursor.ingest.prompt_logprobs_emitted
@@ -380,30 +422,33 @@ impl EngineLoop {
                     );
                     return self.finish(id, FinishReason::Error);
                 }
-                // the prompt is fully prefilled now — publish its full
-                // blocks to the prefix cache for later requests to reuse.
+
+                // Only a complete prompt publishes reusable KV blocks.
                 let (runtime, memory) = (&mut self.runtime, &self.memory);
                 if let Some(st) = runtime.state_mut().running.get_mut(&id) {
                     let kv = memory.cache();
                     cache_prompt_blocks(&kv.coordinator, st, &kv.block_pool);
                 }
+
                 // A description-lowered prefix may already end at a branch trigger.
-                // Treat that boundary exactly like a sampled trigger.
                 if self.prefilled_gen_trigger(id) {
                     self.begin_image(id);
                     return;
                 }
+
                 // Immediate Gen-only profiles skip Und decode after context prep.
                 if starts_gen_after_context {
                     self.begin_image(id);
                     return;
                 }
+
                 let tok = view
                     .committed_tokens
                     .last()
                     .copied()
                     .unwrap_or(self.ctrl.eos[0]);
                 let logprob = view.sampled_logprob;
+
                 let (images_done, max_images) = {
                     let st = self.running.get(&id).unwrap();
                     (
@@ -411,8 +456,8 @@ impl EngineLoop {
                         st.req.image.max_images as usize,
                     )
                 };
-                // the model requested an image inline; honor it while the
-                // request is still under its image budget.
+
+                // An inline image trigger consumes the remaining branch budget.
                 let direct_trigger = self
                     .running
                     .get(&id)
@@ -421,6 +466,7 @@ impl EngineLoop {
                     self.begin_image(id);
                     return;
                 }
+
                 if self.emit_or_finish_und_token(
                     id,
                     tok,
@@ -431,10 +477,12 @@ impl EngineLoop {
                 ) {
                     return;
                 }
+
                 if let Some(st) = self.running.get_mut(&id) {
                     st.cursor.und.next_token = tok;
                     st.cursor.phase = Phase::DecodeUnd;
                 }
+
                 if can_open_gen_branch
                     && images_done < max_images
                     && self
@@ -446,6 +494,8 @@ impl EngineLoop {
                 }
             }
             RunKind::DiffusionStep => {
+                // Publish every newly committed step exactly once, including steps
+                // coalesced into a single worker completion.
                 let (image_id, h, w, steps, prev_sd) = {
                     let st = self.running.get_mut(&id).unwrap();
                     let prev = match apply.intent {
@@ -463,11 +513,13 @@ impl EngineLoop {
                         prev,
                     )
                 };
+
                 let sd = self
                     .running
                     .get(&id)
                     .map(|s| s.cursor.image_gen.steps_done)
                     .unwrap_or(0);
+
                 if prev_sd == 0 && sd >= 1 {
                     self.emit(
                         id,
@@ -479,20 +531,23 @@ impl EngineLoop {
                         },
                     );
                 }
+
                 for step in prev_sd.saturating_add(1)..=sd {
                     self.emit(id, Event::ImageStep { image_id, step });
                 }
-                // The commit phase is entered host-side once the committed step
-                // count reaches `image.steps` (see the `Phase::DenoiseGen`
-                // planner); a worker completion flag does not drive termination.
+
+                // The host planner enters commit after the configured step count;
+                // worker completion flags do not determine diffusion termination.
             }
             RunKind::DiffusionDecode => {}
             RunKind::DiffusionFinalize => {
+                // Commit becomes visible before optional feedback state is prepared.
                 let image_id = self
                     .running
                     .get(&id)
                     .map_or(0, |st| st.cursor.image_gen.image_id);
                 self.emit(id, Event::ImageCommit { image_id });
+
                 let image = view.image_png.clone();
                 if let Some(image_b64) = image.clone() {
                     let Some(event) = image_done_event(image_id, image_b64) else {
@@ -501,6 +556,7 @@ impl EngineLoop {
                     let root = self.fixed_version(id);
                     self.emit_visible(id, event, root.as_ref());
                 }
+
                 self.activate_request_tables(id);
                 let (continues_after_gen_commit, feedback_source) = {
                     let st = self.running.get(&id).unwrap();
@@ -513,10 +569,12 @@ impl EngineLoop {
                             .map(|feedback| feedback.source.clone()),
                     )
                 };
+
                 if continues_after_gen_commit {
                     let Some(feedback_source) = feedback_source else {
                         return self.finish(id, FinishReason::Error);
                     };
+
                     let source_product = operation
                         .outputs()
                         .iter()
@@ -525,16 +583,21 @@ impl EngineLoop {
                                 && product.kind == uniserve_worker_ipc::ProductKind::Artifact
                         })
                         .cloned();
+
                     if feedback_source == uniserve_core::FeedbackSource::DeviceProduct
                         && source_product.is_none()
                     {
                         return self.finish(id, FinishReason::Error);
                     }
+
                     if feedback_source == uniserve_core::FeedbackSource::ArtifactProduct
                         && image.is_none()
                     {
                         return self.finish(id, FinishReason::Error);
                     }
+
+                    // Feedback retains the configured source representation until
+                    // the encode and state-ingest stages consume it.
                     if let Some(st) = self.running.get_mut(&id) {
                         st.cursor.feedback.image_b64 = image;
                         st.cursor.feedback.ingest_step = 0;
@@ -572,13 +635,18 @@ impl EngineLoop {
                     else {
                         return self.finish(id, FinishReason::Error);
                     };
+
                     let result_handle = u64::from(feature.generation);
                     if result_handle == 0
                         || view.encode_generation.map(u64::from) != Some(result_handle)
                     {
                         return self.finish(id, FinishReason::Error);
                     }
+
                     let mut free_products = Vec::new();
+
+                    // Cache ownership transfers the backing allocation out of the
+                    // request; uncached products remain request-local transients.
                     let selected_product = if let Some(cache_key) = encoder_cache_key {
                         if let Some(freed) = self
                             .memory
@@ -587,8 +655,10 @@ impl EngineLoop {
                         {
                             free_products.push(freed);
                         }
+
                         let stored = self.memory.encoder_cache.peek_product(*cache_key)
                             == Some(feature.clone());
+
                         if stored {
                             let allocation = self.running.get_mut(&id).and_then(|state| {
                                 state.allocations_mut().take_buffer(feature.buffer_id())
@@ -608,6 +678,7 @@ impl EngineLoop {
                                 return self.finish(id, FinishReason::Error);
                             }
                         }
+
                         let Some(product) = self.memory.encoder_cache.acquire(*cache_key) else {
                             return self.finish(id, FinishReason::Error);
                         };
@@ -630,10 +701,12 @@ impl EngineLoop {
                     } else {
                         feature.clone()
                     };
+
                     if let Some(st) = self.running.get_mut(&id) {
                         st.cursor.ingest.encoded_product = Some(selected_product);
                         st.cursor.phase = Phase::IngestState;
                     }
+
                     if !free_products.is_empty() {
                         self.free_products(free_products);
                     }
@@ -653,10 +726,12 @@ impl EngineLoop {
                     else {
                         return self.finish(id, FinishReason::Error);
                     };
+
                     let handle = u64::from(feature.generation);
                     if handle == 0 || view.encode_generation.map(u64::from) != Some(handle) {
                         return self.finish(id, FinishReason::Error);
                     }
+
                     if let Some(st) = self.running.get_mut(&id) {
                         st.cursor
                             .ingest
@@ -677,6 +752,7 @@ impl EngineLoop {
         }
     }
 
+    /// Deduplicates overlapping prompt scores and emits only newly resolved positions.
     pub(super) fn resolve_prompt_logprobs(
         &mut self,
         id: RequestId,
@@ -710,6 +786,7 @@ impl EngineLoop {
         );
     }
 
+    /// Releases the transient products.
     pub(super) fn free_transient_products(&mut self, id: RequestId) {
         let products = self
             .running
@@ -719,6 +796,7 @@ impl EngineLoop {
         self.free_products(products);
     }
 
+    /// Records the gen trigger for replay.
     pub(super) fn record_gen_trigger_for_replay(&mut self, id: RequestId) {
         let Some(start) = self
             .running
@@ -736,6 +814,7 @@ impl EngineLoop {
         }
     }
 
+    /// Converts a worst-case KV reservation into concrete generation-branch capacity.
     pub(super) fn promote_gen_branch_reservation(&mut self, id: RequestId) -> bool {
         let Some((required_blocks, reserves_envelope)) = self.running.get(&id).map(|st| {
             (
@@ -776,6 +855,7 @@ impl EngineLoop {
         true
     }
 
+    /// Begins the image.
     pub(super) fn begin_image(&mut self, id: RequestId) {
         self.record_gen_trigger_for_replay(id);
         let has_unresolved_descendants = self.inflight.contains(id);
@@ -791,6 +871,7 @@ impl EngineLoop {
         self.promote_gen_branch_reservation(id);
     }
 
+    /// Flushes the output journals.
     pub(super) fn flush_output_journals(&mut self) -> bool {
         let mut progressed = false;
         for state in self.running.values_mut() {
@@ -808,6 +889,7 @@ impl EngineLoop {
         progressed
     }
 
+    /// Emits a public event through the request output journal.
     pub(super) fn emit(&mut self, id: RequestId, ev: Event) {
         if let Some(st) = self.running.get_mut(&id) {
             if st.output.enqueue(ev) {
@@ -816,6 +898,7 @@ impl EngineLoop {
         }
     }
 
+    /// Emits a public event only when it can be anchored to a fixed semantic checkpoint.
     pub(super) fn emit_visible(
         &mut self,
         id: RequestId,
@@ -843,7 +926,7 @@ impl EngineLoop {
         published
     }
 
-    /// Emit a text token and retain its semantic history.
+    /// Emits a text token and retain its semantic history.
     pub(super) fn emit_text(
         &mut self,
         id: RequestId,
@@ -886,6 +969,7 @@ impl EngineLoop {
         }
     }
 
+    /// Emits one visible token and its requested candidate log probabilities.
     pub(super) fn emit_sampled_text(
         &mut self,
         id: RequestId,
@@ -907,6 +991,7 @@ impl EngineLoop {
         }
     }
 
+    /// Emits the terminal stop token.
     pub(super) fn emit_terminal_stop_token(
         &mut self,
         id: RequestId,
@@ -924,6 +1009,7 @@ impl EngineLoop {
         }
     }
 
+    /// Resolves stop conditions for one understanding token and emits it when appropriate.
     pub(super) fn emit_or_finish_und_token(
         &mut self,
         id: RequestId,
@@ -985,10 +1071,12 @@ impl EngineLoop {
         !self.running.contains_key(&id)
     }
 
+    /// Finishes one request without a concrete stop-token or stop-string cause.
     pub(super) fn finish(&mut self, id: RequestId, reason: FinishReason) {
         self.finish_with(id, reason, None);
     }
 
+    /// Defers terminal cleanup until in-flight work and semantic commits are drained.
     pub(super) fn finish_after_inflight(
         &mut self,
         id: RequestId,
@@ -1015,6 +1103,7 @@ impl EngineLoop {
         }
     }
 
+    /// Applies a deferred finish once no in-flight work or semantic commit remains.
     pub(super) fn finish_pending_if_idle(&mut self, id: RequestId) {
         if self.inflight.contains(id)
             || self
@@ -1029,6 +1118,7 @@ impl EngineLoop {
         }
     }
 
+    /// Publishes terminal accounting and releases every resource owned by one request.
     pub(super) fn finish_with(
         &mut self,
         id: RequestId,
@@ -1036,6 +1126,8 @@ impl EngineLoop {
         stop_reason: Option<uniserve_core::StopReason>,
     ) {
         self.inflight.finishes.remove(&id);
+
+        // Emit the last coherent runtime cursor before error teardown removes it.
         if reason == FinishReason::Error
             && let Some(state) = self.running.get(&id)
         {
@@ -1051,6 +1143,9 @@ impl EngineLoop {
                 "scheduler request terminated with an internal error"
             );
         }
+
+        // Registered requests retain their allocations until every worker pool
+        // acknowledges the ordered close command.
         let mut awaits_close = false;
         let mut allocations = None;
         let mut flow_prefix = None;
@@ -1081,6 +1176,9 @@ impl EngineLoop {
                 allocations = st.allocations.take();
                 flow_prefix = st.flow_prefix.take();
             }
+
+            // Remove admission reservations before exposing terminal output so
+            // the next scheduler step observes the released capacity.
             self.scheduler
                 .running_order
                 .retain(|request| *request != id);
@@ -1094,6 +1192,9 @@ impl EngineLoop {
                     .reserved_blocks
                     .saturating_sub(st.cursor.resources.worstcase_blocks);
             }
+
+            // Releasing the request's encoder pins may make cache products
+            // physically reclaimable by their owning worker.
             let mut free_encoder_products =
                 std::mem::take(&mut st.cursor.ingest.transient_encoder_products);
             for pin in &st.cursor.ingest.acquired_encoder_pins {
@@ -1102,6 +1203,7 @@ impl EngineLoop {
                 }
             }
             self.free_products(free_encoder_products);
+
             self.trace_request_finished(super::control::FinishedTrace {
                 id,
                 reason: &reason,
@@ -1111,6 +1213,9 @@ impl EngineLoop {
                 images: st.cursor.image_gen.images_done,
                 queue: "running",
             });
+
+            // A full event channel transfers ownership to the retired-output
+            // queue, which drains the terminal event under normal backpressure.
             let terminal = Event::Finished {
                 reason,
                 stop_reason,
@@ -1123,6 +1228,9 @@ impl EngineLoop {
                 self.scheduler.output.retire(id, st.output);
             }
         }
+
+        // Unregistered requests have no outstanding worker reference, so their
+        // allocations can return to the scheduler immediately.
         if !awaits_close {
             if let Some(prefix) = flow_prefix {
                 prefix.allocations.free(&mut self.memory);
@@ -1134,6 +1242,7 @@ impl EngineLoop {
     }
 }
 
+/// Caches the prompt blocks.
 fn cache_prompt_blocks(coordinator: &KvCacheCoordinator, state: &mut ReqState, pool: &BlockPool) {
     if state.cursor.replay.blocks_cached {
         return;

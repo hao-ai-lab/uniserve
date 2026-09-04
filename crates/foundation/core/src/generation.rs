@@ -1,8 +1,8 @@
-//! Canonical generation request descriptors.
+//! Generation policies, resource bounds, and scheduler-facing request values.
 //!
-//! These types describe the lowered generation paradigm before the scheduler
-//! turns it into worker ops. They are data-only: no channels, worker handles,
-//! scheduler state, or model-local logic belongs here.
+//! These data-only descriptors define generation behavior before the scheduler
+//! plans worker operations. Runtime ownership and model execution remain outside
+//! this boundary.
 
 use std::str::FromStr;
 
@@ -26,6 +26,7 @@ pub enum GenerationConstraint {
 }
 
 impl GenerationConstraint {
+    /// Returns the stable snake-case wire name.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Default => "default",
@@ -38,6 +39,7 @@ impl GenerationConstraint {
 impl FromStr for GenerationConstraint {
     type Err = GenerationConstraintParseError;
 
+    /// Parses a stable generation-constraint wire name.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "default" => Ok(Self::Default),
@@ -54,6 +56,7 @@ impl FromStr for GenerationConstraint {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("unsupported generation constraint: {value}")]
 pub struct GenerationConstraintParseError {
+    /// Unsupported wire value.
     pub value: String,
 }
 
@@ -61,8 +64,10 @@ pub struct GenerationConstraintParseError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UndVisibility {
+    /// Publishes tokens to the caller.
     #[default]
     Visible,
+    /// Retains tokens as model-control context.
     Internal,
 }
 
@@ -70,13 +75,19 @@ pub enum UndVisibility {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum ContextSegment {
+    /// Ordered understanding tokens.
     UndTokens {
+        /// Vocabulary token identities.
         token_ids: Vec<u32>,
+        /// Caller visibility of the segment.
         #[serde(default)]
         visibility: UndVisibility,
     },
+    /// Input image and its model-specific ingest recipe.
     Image {
+        /// Encoded image payload and logical placement.
         image: ImageSegment,
+        /// Encoder operations used to ingest the image.
         ingest: ImageIngestRecipe,
     },
 }
@@ -84,8 +95,11 @@ pub enum ContextSegment {
 /// Input image bytes plus placement in the rendered context stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageSegment {
+    /// Stable content hash used for encoder-cache identity.
     pub hash: u64,
+    /// Base64-encoded input image.
     pub b64: String,
+    /// Logical position in the rendered context.
     pub placement: SegmentPlacement,
 }
 
@@ -94,7 +108,10 @@ pub struct ImageSegment {
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum SegmentPlacement {
     /// The image encoder output fills the gap ending at this token index.
-    AtToken { position: u32 },
+    AtToken {
+        /// Exclusive token position at the end of the image gap.
+        position: u32,
+    },
     /// The image is appended after all Und tokens emitted by the context.
     Append,
 }
@@ -102,13 +119,18 @@ pub enum SegmentPlacement {
 /// Model-description recipe for turning an image segment into context.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImageIngestRecipe {
+    /// Ordered encoder stages.
     pub steps: Vec<ImageIngestStep>,
+    /// Logical model positions contributed by the image.
     pub logical_positions: u32,
+    /// Physical KV effect corresponding to each encoder stage.
     pub step_kv_tokens: Vec<ImageKvEffect>,
+    /// Model branch that consumes the encoded image.
     pub modality: Modality,
 }
 
 impl ImageIngestRecipe {
+    /// Builds a single-step vision-encoder recipe.
     pub fn vit_only(logical_positions: u32, kv_tokens: ImageKvEffect) -> Self {
         Self {
             steps: vec![ImageIngestStep::VitEncode],
@@ -118,6 +140,7 @@ impl ImageIngestRecipe {
         }
     }
 
+    /// Builds a latent-encoder followed by vision-encoder recipe.
     pub fn vae_then_vit(
         logical_positions: u32,
         vae_kv_tokens: ImageKvEffect,
@@ -131,11 +154,12 @@ impl ImageIngestRecipe {
         }
     }
 
+    /// Returns the declared KV effect for one ingest step.
     pub fn kv_effect(&self, step_index: usize) -> Option<ImageKvEffect> {
         self.step_kv_tokens.get(step_index).copied()
     }
 
-    /// Stable per-step keys for reusable worker-side encoder outputs.
+    /// Returns stable per-step keys for reusable worker-side encoder outputs.
     pub fn encoder_cache_keys(&self, image_hash: u64) -> Vec<u64> {
         self.steps
             .iter()
@@ -150,12 +174,16 @@ impl ImageIngestRecipe {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImageIngestStep {
+    /// Encodes image pixels into a latent representation.
     VaeEncode,
+    /// Encodes image content into vision features.
     VitEncode,
 }
 
-/// Derive the cache identity of one step in an image-ingest recipe.
+/// Derives the cache identity of one step in an image-ingest recipe.
 pub fn encoder_cache_key(image_hash: u64, step_index: usize, step: ImageIngestStep) -> u64 {
+    // Apply FNV-1a to the complete domain tuple in a fixed byte order. Including
+    // the stage index distinguishes repeated encoder kinds within one recipe.
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in image_hash
         .to_le_bytes()
@@ -176,17 +204,30 @@ pub fn encoder_cache_key(image_hash: u64, step_index: usize, step: ImageIngestSt
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum ImageKvEffect {
+    /// Uses the runtime-advertised bound for this encoder stage.
     WorkerDefined,
-    Exact { tokens: u32 },
-    Bounded { max_tokens: u32 },
+    /// Produces an exact number of physical KV tokens.
+    Exact {
+        /// Exact physical KV token count.
+        tokens: u32,
+    },
+    /// Produces a worker-selected count up to a fixed maximum.
+    Bounded {
+        /// Maximum physical KV token count.
+        max_tokens: u32,
+    },
 }
 
 /// Generated-image feedback recipe supplied by the model description.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GeneratedImageFeedbackRecipe {
+    /// Product representation fed into the encoder.
     pub source: FeedbackSource,
+    /// Understanding token used after feedback ingestion.
     pub next_und_token: FeedbackNextToken,
+    /// Encoder stages used to ingest the generated image.
     pub ingest: ImageIngestRecipe,
+    /// Whether feedback state samples its continuation token.
     pub sample_continuation: bool,
 }
 
@@ -194,7 +235,9 @@ pub struct GeneratedImageFeedbackRecipe {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum FeedbackSource {
+    /// Uses the device-resident image product directly.
     DeviceProduct,
+    /// Uses the materialized image artifact.
     ArtifactProduct,
 }
 
@@ -202,31 +245,46 @@ pub enum FeedbackSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum FeedbackNextToken {
+    /// Declares no automatic continuation token.
     None,
+    /// Continues with the model's beginning-of-sequence token.
     Bos,
+    /// Continues with the model's end-of-image token.
     EndOfImage,
-    Token { token_id: u32 },
+    /// Continues with an explicit vocabulary token.
+    Token {
+        /// Vocabulary token identity.
+        token_id: u32,
+    },
 }
 
 /// Model-description token-trigger matching lowered to scheduler-readable data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum TriggerPolicyDescriptor {
+    /// Disables image-branch triggering.
     Disabled,
+    /// Opens the branch after one exact token.
     Token {
+        /// Triggering vocabulary token.
         token_id: u32,
     },
+    /// Opens the branch after an exact generated suffix.
     Suffix {
+        /// Triggering token sequence.
         token_ids: Vec<u32>,
     },
+    /// Opens the branch when a closing round ends in a trigger suffix.
     RoundCloseThenSuffix {
+        /// Tokens that close an understanding round.
         close_token_ids: Vec<u32>,
+        /// Required suffix immediately before round closure.
         trigger_token_ids: Vec<u32>,
     },
 }
 
 impl TriggerPolicyDescriptor {
-    /// Match a branch-opening trigger during ordinary Und generation.
+    /// Matches a branch-opening trigger during ordinary Und generation.
     pub fn matches_generated(&self, generated: &[u32]) -> bool {
         match self {
             Self::Token { token_id } => generated.last() == Some(token_id),
@@ -235,7 +293,7 @@ impl TriggerPolicyDescriptor {
         }
     }
 
-    /// Match a branch-opening suffix when the current Und round closes.
+    /// Matches a branch-opening suffix when the current Und round closes.
     pub fn matches_round_close(&self, round: &[u32], close_token_id: u32) -> bool {
         match self {
             Self::RoundCloseThenSuffix {
@@ -250,7 +308,7 @@ impl TriggerPolicyDescriptor {
         }
     }
 
-    /// Single token that directly opens a branch, when the policy has one.
+    /// Returns the single token that directly opens a branch, when present.
     pub fn direct_token(&self) -> Option<u32> {
         match self {
             Self::Token { token_id } => Some(*token_id),
@@ -258,7 +316,7 @@ impl TriggerPolicyDescriptor {
         }
     }
 
-    /// Token sequence whose completion opens a branch during ordinary decode.
+    /// Returns the token sequence that opens a branch during ordinary decode.
     pub fn generated_suffix(&self) -> Option<&[u32]> {
         match self {
             Self::Token { token_id } => Some(std::slice::from_ref(token_id)),
@@ -267,10 +325,12 @@ impl TriggerPolicyDescriptor {
         }
     }
 
+    /// Returns whether the trigger is evaluated when an understanding round closes.
     pub fn requires_round_close(&self) -> bool {
         matches!(self, Self::RoundCloseThenSuffix { .. })
     }
 
+    /// Returns token identifiers that close a trigger-evaluated round.
     pub fn round_close_token_ids(&self) -> &[u32] {
         match self {
             Self::RoundCloseThenSuffix {
@@ -285,20 +345,27 @@ impl TriggerPolicyDescriptor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UndTokenAction {
+    /// Publishes understanding tokens.
     Emit,
+    /// Retains understanding tokens as internal context.
     KeepInternal,
+    /// Rejects constraints that require understanding output.
     Reject,
 }
 
 /// Visibility rules per output constraint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VisibilityPolicyDescriptor {
+    /// Action for unconstrained generation.
     pub default: UndTokenAction,
+    /// Action for understanding-only generation.
     pub und_only: UndTokenAction,
+    /// Action for image-only generation.
     pub gen_only: UndTokenAction,
 }
 
 impl Default for VisibilityPolicyDescriptor {
+    /// Returns visibility rules that emit understanding output for eligible requests.
     fn default() -> Self {
         Self {
             default: UndTokenAction::Emit,
@@ -311,16 +378,23 @@ impl Default for VisibilityPolicyDescriptor {
 /// Termination rules express whether branch completion finishes or continues.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminationPolicyDescriptor {
+    /// Whether EOS ends the request.
     pub eos_finishes: bool,
+    /// Whether configured stop conditions end the request.
     pub stop_finishes: bool,
+    /// Whether the matched stop token is published.
     #[serde(default)]
     pub emit_stop_token: bool,
+    /// Whether the generated-token bound ends the request.
     pub max_tokens_finishes: bool,
+    /// Whether image commit completes an image-only request.
     pub gen_commit_finishes_gen_only: bool,
+    /// Whether unconstrained generation resumes after image commit.
     pub gen_commit_continues_default: bool,
 }
 
 impl Default for TerminationPolicyDescriptor {
+    /// Returns terminal defaults for text bounds and image-only completion.
     fn default() -> Self {
         Self {
             eos_finishes: true,
@@ -337,7 +411,7 @@ impl Default for TerminationPolicyDescriptor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GenOnlyStartPolicyDescriptor {
-    /// Decode internal Und tokens until the model trigger opens Gen.
+    /// Internal Und decoding until the model trigger opens Gen.
     #[default]
     DiscoverTrigger,
     /// Enter Gen immediately after all context segments are prepared.
@@ -347,32 +421,46 @@ pub enum GenOnlyStartPolicyDescriptor {
 /// Model-description generation policy consumed by the scheduler planner.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GenerationPolicyDescriptor {
+    /// Model tokens that open an image-generation branch.
     pub trigger: TriggerPolicyDescriptor,
+    /// Entry behavior for image-only requests.
     #[serde(default)]
     pub gen_only_start: GenOnlyStartPolicyDescriptor,
+    /// Constraint-specific understanding-token visibility.
     pub visibility: VisibilityPolicyDescriptor,
+    /// Request termination rules.
     pub termination: TerminationPolicyDescriptor,
+    /// Generated-image feedback pipeline, when supported.
     pub feedback: Option<GeneratedImageFeedbackRecipe>,
 }
 
 /// Constraint-resolved behavior consumed by scheduler lifecycle planning.
 ///
-/// Keeping these decisions explicit prevents scheduler code from interpreting
-/// public constraint names. The profile/compiler resolves this descriptor from
-/// the constraint and model policy before admission.
+/// The explicit decisions give admission and scheduling one shared
+/// interpretation of the request constraint and model policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenerationBehaviorDescriptor {
+    /// Whether the runtime executes understanding decode.
     pub und_decode: bool,
+    /// Resolved handling for understanding tokens.
     pub und_tokens: UndTokenAction,
+    /// Whether the request may produce images.
     pub gen_output: bool,
+    /// Whether image generation starts immediately after context preparation.
     pub start_gen_after_context: bool,
+    /// Whether committed images feed back into model context.
     pub generated_image_feedback: bool,
+    /// Whether understanding decode resumes after image commit.
     pub continue_after_gen_commit: bool,
+    /// Whether image commit completes the request.
     pub finish_after_gen_commit: bool,
 }
 
 impl GenerationBehaviorDescriptor {
+    /// Resolves scheduler actions for a request constraint and model policy.
     pub fn resolve(constraint: GenerationConstraint, policy: &GenerationPolicyDescriptor) -> Self {
+        // Resolve caller visibility independently from the mechanism that opens
+        // the image-generation branch.
         let und_tokens = match constraint {
             GenerationConstraint::Default => policy.visibility.default,
             GenerationConstraint::UndOnly => policy.visibility.und_only,
@@ -383,12 +471,16 @@ impl GenerationBehaviorDescriptor {
         let gen_output = !matches!(constraint, GenerationConstraint::UndOnly)
             && (!matches!(policy.trigger, TriggerPolicyDescriptor::Disabled)
                 || start_gen_after_context);
+
+        // Image commit is terminal for image-only requests and may return to
+        // understanding decode for unconstrained requests.
         let finish_after_gen_commit = gen_output
             && matches!(constraint, GenerationConstraint::GenOnly)
             && policy.termination.gen_commit_finishes_gen_only;
         let continue_after_gen_commit = gen_output
             && matches!(constraint, GenerationConstraint::Default)
             && policy.termination.gen_commit_continues_default;
+
         Self {
             und_decode: !start_gen_after_context
                 && (und_tokens != UndTokenAction::Reject || gen_output),
@@ -403,18 +495,21 @@ impl GenerationBehaviorDescriptor {
         }
     }
 
+    /// Returns whether understanding tokens are visible to the caller.
     pub fn emits_und(&self) -> bool {
         self.und_tokens == UndTokenAction::Emit
     }
 
-    /// The generation branches this resolved behavior requires a runtime to
-    /// execute, for admission-time feature gating.
+    /// Returns the runtime features required by the reachable generation graph.
     pub fn required_features(
         &self,
         policy: &GenerationPolicyDescriptor,
         context_image_steps: impl IntoIterator<Item = ImageIngestStep>,
     ) -> GenerationFeatures {
+        // Understanding execution is the common control path for every request.
         let mut needs = GenerationFeatures::UNDERSTANDING;
+
+        // Context images require the encoder stages declared by their recipes.
         for step in context_image_steps {
             needs.insert(match step {
                 ImageIngestStep::VaeEncode => GenerationFeatures::LATENT_ENCODE,
@@ -424,6 +519,9 @@ impl GenerationBehaviorDescriptor {
         if self.gen_output {
             needs.insert(GenerationFeatures::IMAGE_GENERATION);
         }
+
+        // Feedback can make additional encoder stages reachable after image
+        // materialization.
         if self.generated_image_feedback
             && let Some(feedback) = &policy.feedback
         {
@@ -442,14 +540,19 @@ bitflags::bitflags! {
     /// Generation branches present in a runtime or required by one request.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
     pub struct GenerationFeatures: u8 {
+        /// Autoregressive understanding execution.
         const UNDERSTANDING = 1 << 0;
+        /// Vision feature encoding.
         const VISION_ENCODE = 1 << 1;
+        /// Variational-autoencoder latent encoding.
         const LATENT_ENCODE = 1 << 2;
+        /// Diffusion denoising and image materialization.
         const IMAGE_GENERATION = 1 << 3;
     }
 }
 
 impl GenerationFeatures {
+    /// Returns the admission diagnostic name for the first represented feature.
     pub fn name(self) -> &'static str {
         if self.contains(Self::UNDERSTANDING) {
             "runtime_und_execution"
@@ -466,6 +569,7 @@ impl GenerationFeatures {
 }
 
 impl std::fmt::Display for GenerationFeatures {
+    /// Writes the diagnostic name of the first represented feature.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.name())
     }
@@ -474,46 +578,73 @@ impl std::fmt::Display for GenerationFeatures {
 /// Conservative request-level resource declaration produced by compilation.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct GenerationResourceBounds {
+    /// Understanding tokens present in the positive context.
     pub context_tokens: usize,
+    /// Maximum physical KV tokens retained by the request.
     pub max_kv_tokens: usize,
+    /// Maximum latent allocation units for one generated image.
     pub max_image_latent_units: u64,
+    /// Maximum latent allocation bytes for one generated image.
     pub max_image_latent_bytes: u64,
+    /// Maximum VAE feature product bytes.
     pub max_latent_feature_bytes: u64,
+    /// Maximum vision feature product bytes.
     pub max_vision_feature_bytes: u64,
+    /// Encoder cache entries the context may pin concurrently.
     pub encoder_cache_keys: Vec<u64>,
+    /// Whether generated-image feedback makes the request non-replayable.
     pub generated_feedback_makes_non_replayable: bool,
 }
 
 /// Inputs used to derive conservative resources for one generation graph.
 pub struct GenerationResources<'a> {
+    /// Positive generation context.
     pub context: &'a [ContextSegment],
+    /// Negative image-generation conditioning context.
     pub negative_context: &'a [ContextSegment],
+    /// Constraint-resolved branch behavior.
     pub behavior: &'a GenerationBehaviorDescriptor,
+    /// Model-specific generation policy.
     pub policy: &'a GenerationPolicyDescriptor,
+    /// Image-generation parameters.
     pub image: &'a ImageParams,
+    /// Maximum understanding tokens generated by the request.
     pub max_und_tokens: usize,
+    /// Prefix and encoder-cache policy.
     pub cache: &'a GenerationCachePolicyDescriptor,
+    /// Runtime-advertised capability limits.
     pub limits: &'a GenerationLimits,
 }
 
 /// Worker and scheduler limits needed to compile a bounded generation graph.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct GenerationLimits {
+    /// Generation features implemented by the runtime.
     pub features: GenerationFeatures,
+    /// Maximum latent allocation units for one request.
     pub max_latent_units: u64,
+    /// Pixel-to-latent spatial downsample factor.
     pub latent_downsample: u32,
+    /// Maximum VAE grid tokens for a worker-defined effect.
     pub max_vae_grid_tokens: u32,
+    /// Maximum vision grid tokens for a worker-defined effect.
     pub max_vit_grid_tokens: u32,
+    /// Maximum VAE feature product size in bytes.
     pub max_latent_feature_bytes: u64,
+    /// Maximum vision feature product size in bytes.
     pub max_vision_feature_bytes: u64,
+    /// KV tokens reserved for image commit markers.
     pub commit_marker_tokens: u32,
+    /// Maximum classifier-free-guidance branches.
     pub max_cfg_branches: u32,
+    /// Maximum concurrently pinned encoder-cache entries.
     pub encoder_cache_entries: u32,
 }
 
 impl GenerationLimits {
-    /// Whether this runtime covers every branch the request needs. On a gap,
-    /// returns the admission-feature name of the first missing branch.
+    /// Checks whether the runtime covers every feature required by a request.
+    ///
+    /// A failure carries the missing feature set for admission diagnostics.
     pub fn covers(&self, needs: GenerationFeatures) -> Result<(), GenerationFeatures> {
         let missing = needs.difference(self.features);
         if !missing.is_empty() {
@@ -524,6 +655,7 @@ impl GenerationLimits {
 }
 
 impl GenerationResourceBounds {
+    /// Derives conservative resource maxima for a bounded generation graph.
     pub fn conservative(inputs: GenerationResources<'_>) -> Result<Self, GenerationResourceError> {
         let GenerationResources {
             context,
@@ -535,6 +667,9 @@ impl GenerationResourceBounds {
             cache,
             limits,
         } = inputs;
+
+        // Text and image KV contributions are accounted independently because
+        // each image ingest step may declare a different physical token effect.
         let context_tokens = context
             .iter()
             .map(|segment| match segment {
@@ -555,6 +690,9 @@ impl GenerationResourceBounds {
             };
             Ok(total.saturating_add(ingest_kv_bound(ingest, limits)?))
         })?;
+
+        // Generated-image feedback repeats its ingest contract once per maximum
+        // output image and therefore contributes to worst-case KV capacity.
         let feedback_kv_per_image = if behavior.generated_image_feedback {
             match policy.feedback.as_ref() {
                 Some(feedback) => ingest_kv_bound(&feedback.ingest, limits)?,
@@ -565,6 +703,9 @@ impl GenerationResourceBounds {
         };
         let generated_feedback_kv_tokens =
             feedback_kv_per_image.saturating_mul(image.max_images as usize);
+
+        // Determine feature storage requirements from the exact ingest steps
+        // reachable through context images or generated feedback.
         let feedback_ingest = behavior
             .generated_image_feedback
             .then(|| policy.feedback.as_ref().map(|feedback| &feedback.ingest))
@@ -589,6 +730,9 @@ impl GenerationResourceBounds {
                 resource: "max_vision_feature_bytes",
             });
         }
+
+        // Cache capacity covers every distinct encoder step that this request
+        // may pin concurrently.
         let encoder_cache_keys = if cache.read || cache.write {
             context
                 .iter()
@@ -615,6 +759,9 @@ impl GenerationResourceBounds {
                 });
             }
         }
+
+        // Media generation validates grid alignment and runtime capacities
+        // before deriving latent storage from the requested image dimensions.
         if behavior.gen_output && limits.latent_downsample == 0 {
             return Err(GenerationResourceError::MissingRuntimeBound {
                 resource: "latent_downsample",
@@ -640,6 +787,7 @@ impl GenerationResourceBounds {
                 resource: "max_cfg_branches",
             });
         }
+
         let latent_downsample = limits.latent_downsample.max(1);
         let requested_latent_units = u64::from(image.width / latent_downsample)
             .saturating_mul(u64::from(image.height / latent_downsample));
@@ -649,6 +797,9 @@ impl GenerationResourceBounds {
                 available: limits.max_latent_units,
             });
         }
+
+        // The worker's feature-byte maximum establishes a conservative byte
+        // density for the requested latent grid.
         let image_latent_bytes = if behavior.gen_output {
             if limits.max_vae_grid_tokens == 0 || limits.max_latent_feature_bytes == 0 {
                 return Err(GenerationResourceError::MissingRuntimeBound {
@@ -670,6 +821,8 @@ impl GenerationResourceBounds {
             });
         }
 
+        // Saturating sums keep the declaration conservative even when an input
+        // approaches the host representation limit.
         Ok(Self {
             context_tokens,
             max_kv_tokens: context_tokens
@@ -698,7 +851,10 @@ impl GenerationResourceBounds {
         })
     }
 
+    /// Checks that this declaration covers every required resource maximum.
     pub fn validate_covers(&self, required: &Self) -> Result<(), GenerationResourceError> {
+        // Compare scalar capacities through one table so every undersized field
+        // produces the same structured diagnostic.
         for (resource, declared, required) in [
             (
                 "max_kv_tokens",
@@ -734,6 +890,9 @@ impl GenerationResourceBounds {
                 });
             }
         }
+
+        // Replayability is a capability declaration rather than a numeric
+        // capacity and therefore requires a separate implication check.
         if required.generated_feedback_makes_non_replayable
             && !self.generated_feedback_makes_non_replayable
         {
@@ -743,10 +902,13 @@ impl GenerationResourceBounds {
     }
 }
 
+/// Computes the worst-case KV contribution of every configured image-ingest step.
 fn ingest_kv_bound(
     ingest: &ImageIngestRecipe,
     limits: &GenerationLimits,
 ) -> Result<usize, GenerationResourceError> {
+    // Stage/effect alignment is required before the two vectors can be folded
+    // into one conservative bound.
     if ingest.steps.len() != ingest.step_kv_tokens.len() {
         return Err(GenerationResourceError::ImageIngestKvArity {
             steps: ingest.steps.len(),
@@ -768,6 +930,7 @@ fn ingest_kv_bound(
         })
 }
 
+/// Resolves an exact, bounded, or runtime-defined KV contribution.
 fn kv_effect_bound(
     effect: ImageKvEffect,
     fallback: u32,
@@ -784,6 +947,7 @@ fn kv_effect_bound(
 }
 
 impl ImageIngestStep {
+    /// Returns the stable operation name used by resource diagnostics.
     fn as_str(self) -> &'static str {
         match self {
             Self::VaeEncode => "vae_encode",
@@ -792,38 +956,85 @@ impl ImageIngestStep {
     }
 }
 
+/// Failures while deriving bounded generation resources.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum GenerationResourceError {
+    /// Image ingest stages and KV effects have different lengths.
     #[error("image ingest declares {steps} steps but {effects} KV effects")]
-    ImageIngestKvArity { steps: usize, effects: usize },
+    ImageIngestKvArity {
+        /// Number of encoder stages.
+        steps: usize,
+        /// Number of declared KV effects.
+        effects: usize,
+    },
+    /// A worker-defined image KV effect has no runtime maximum.
     #[error("{operation} has a worker-defined KV effect but the runtime declares no bound")]
-    UnboundedImageKv { operation: &'static str },
+    UnboundedImageKv {
+        /// Encoder operation missing a bound.
+        operation: &'static str,
+    },
+    /// Continuation requires an image-feedback recipe.
     #[error("generated image continuation requires a feedback resource recipe")]
     MissingFeedback,
+    /// Image generation requires a runtime resource maximum that is zero.
     #[error("image generation requires the runtime to declare {resource}")]
-    MissingRuntimeBound { resource: &'static str },
+    MissingRuntimeBound {
+        /// Name of the missing resource maximum.
+        resource: &'static str,
+    },
+    /// Image dimensions do not align to the latent grid.
     #[error(
         "image dimensions {width}x{height} must be divisible by the runtime latent downsample factor {latent_downsample}"
     )]
     ImageDimensionAlignment {
+        /// Requested image width.
         width: u32,
+        /// Requested image height.
         height: u32,
+        /// Required latent downsample factor.
         latent_downsample: u32,
     },
+    /// Resource-bound arithmetic overflowed.
     #[error("{resource} overflowed while computing the request resource bound")]
-    ResourceOverflow { resource: &'static str },
+    ResourceOverflow {
+        /// Resource whose bound overflowed.
+        resource: &'static str,
+    },
+    /// Requested latent grid exceeds runtime capacity.
     #[error("requested image latent units ({requested}) exceed runtime capacity ({available})")]
-    LatentCapacity { requested: u64, available: u64 },
+    LatentCapacity {
+        /// Requested latent allocation units.
+        requested: u64,
+        /// Available latent allocation units.
+        available: u64,
+    },
+    /// Requested guidance branches exceed runtime capacity.
     #[error("requested CFG branches ({requested}) exceed runtime capacity ({available})")]
-    CfgBranchCapacity { requested: u64, available: u32 },
+    CfgBranchCapacity {
+        /// Requested branch count.
+        requested: u64,
+        /// Available branch count.
+        available: u32,
+    },
+    /// Context encoder-cache demand exceeds runtime capacity.
     #[error("requested encoder-cache entries ({requested}) exceed runtime capacity ({available})")]
-    EncoderCacheCapacity { requested: usize, available: u32 },
+    EncoderCacheCapacity {
+        /// Requested cache entry count.
+        requested: usize,
+        /// Available cache entry count.
+        available: u32,
+    },
+    /// A caller-declared resource maximum is below the computed requirement.
     #[error("declared {resource} bound ({declared}) is below the required bound ({required})")]
     DeclaredBoundTooSmall {
+        /// Name of the undersized resource.
         resource: &'static str,
+        /// Caller-declared maximum.
         declared: u64,
+        /// Computed required maximum.
         required: u64,
     },
+    /// Image feedback omits its non-replayable declaration.
     #[error("generated image feedback must be declared non-replayable")]
     MissingNonReplayableDeclaration,
 }
@@ -831,12 +1042,16 @@ pub enum GenerationResourceError {
 /// Scheduler-relevant prefix-cache behavior resolved during compilation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenerationCachePolicyDescriptor {
+    /// Whether admission may reuse cached prefixes or encoder outputs.
     pub read: bool,
+    /// Whether completed context may populate caches.
     pub write: bool,
+    /// Optional tenant or request-group cache namespace.
     pub isolation_key: Option<u64>,
 }
 
 impl Default for GenerationCachePolicyDescriptor {
+    /// Returns a shared-cache policy with reads and writes enabled.
     fn default() -> Self {
         Self {
             read: true,
@@ -846,29 +1061,44 @@ impl Default for GenerationCachePolicyDescriptor {
     }
 }
 
-/// Canonical scheduler-facing generation request.
+/// Validated scheduler-facing generation request.
 ///
-/// This is pure data. Event channels, streams, engine handles, worker state,
-/// and scheduler cursors belong to submission and runtime layers.
+/// The value contains immutable request data and conservative resource bounds;
+/// submission channels and mutable runtime state live in the engine.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GenerationRequest {
+    /// Engine request identity.
     pub request_id: RequestId,
+    /// Ordered positive model context.
     pub context: Vec<ContextSegment>,
+    /// Negative conditioning context used by image generation.
     pub negative_context: Vec<ContextSegment>,
+    /// Requested understanding/image output constraint.
     pub constraint: GenerationConstraint,
+    /// Constraint-resolved scheduler behavior.
     pub behavior: GenerationBehaviorDescriptor,
+    /// Text sampling parameters.
     pub sampling: SamplingParams,
+    /// Image-generation parameters.
     pub image: ImageParams,
+    /// Maximum understanding tokens generated by the request.
     pub max_und_tokens: usize,
+    /// Text sequences that terminate generation.
     pub stop_strings: Vec<String>,
+    /// Token identities that terminate generation.
     pub stop_token_ids: Vec<u32>,
+    /// Scheduler priority.
     pub priority: i32,
+    /// Prefix and encoder-cache policy.
     pub cache: GenerationCachePolicyDescriptor,
+    /// Model-specific trigger, visibility, feedback, and termination policy.
     pub policy: GenerationPolicyDescriptor,
+    /// Conservative resource declaration checked during admission.
     pub resources: GenerationResourceBounds,
 }
 
 impl GenerationRequest {
+    /// Collects understanding-token context in logical order.
     pub fn prompt_token_ids(&self) -> Vec<u32> {
         self.context
             .iter()
@@ -880,6 +1110,7 @@ impl GenerationRequest {
             .collect()
     }
 
+    /// Counts understanding tokens in the positive context.
     pub fn prompt_token_count(&self) -> usize {
         self.context
             .iter()
@@ -890,6 +1121,7 @@ impl GenerationRequest {
             .sum()
     }
 
+    /// Counts image segments in the positive context.
     pub fn context_image_count(&self) -> usize {
         self.context
             .iter()
@@ -897,7 +1129,10 @@ impl GenerationRequest {
             .count()
     }
 
+    /// Validates policy consistency, context layout, and declared bounds.
     pub fn validate(&self) -> Result<(), GenerationRequestError> {
+        // Validate request-wide policy and parameter invariants before walking
+        // the ordered context.
         if self.context.is_empty() {
             return Err(GenerationRequestError::EmptyContext);
         }
@@ -907,6 +1142,7 @@ impl GenerationRequest {
         if self.behavior != GenerationBehaviorDescriptor::resolve(self.constraint, &self.policy) {
             return Err(GenerationRequestError::BehaviorPolicyMismatch);
         }
+
         self.sampling
             .validate()
             .map_err(GenerationRequestError::InvalidSampling)?;
@@ -922,6 +1158,8 @@ impl GenerationRequest {
         if matches!(self.constraint, GenerationConstraint::GenOnly) && !self.behavior.gen_output {
             return Err(GenerationRequestError::GenOnlyCannotProduceImage);
         }
+
+        // Trigger and continuation policies must form a finite scheduler graph.
         if !self.policy.termination.max_tokens_finishes {
             return Err(GenerationRequestError::NonTerminalMaxTokensPolicy);
         }
@@ -956,6 +1194,9 @@ impl GenerationRequest {
         if let Some(feedback) = &self.policy.feedback {
             validate_ingest_recipe(&feedback.ingest)?;
         }
+
+        // Validate segment placement while deriving the context-dependent cache
+        // identities and token count used by the resource declaration.
         let context_tokens = self.prompt_token_count();
         let mut seen_tokens = 0usize;
         let mut expected_encoder_cache_keys = Vec::new();
@@ -985,6 +1226,9 @@ impl GenerationRequest {
                 }
             }
         }
+
+        // Negative conditioning is text-only because image ingest belongs to
+        // the positive model context.
         if self
             .negative_context
             .iter()
@@ -992,6 +1236,9 @@ impl GenerationRequest {
         {
             return Err(GenerationRequestError::ImageInNegativeContext);
         }
+
+        // Resource fields are supplied independently and must agree exactly
+        // with the validated positive context.
         if self.resources.context_tokens != context_tokens {
             return Err(GenerationRequestError::ContextTokenBoundMismatch {
                 expected: context_tokens,
@@ -1010,12 +1257,16 @@ impl GenerationRequest {
                 actual: self.resources.encoder_cache_keys.clone(),
             });
         }
+
+        // Empty stop strings would match every output position and do not form
+        // a meaningful termination boundary.
         if self.stop_strings.iter().any(String::is_empty) {
             return Err(GenerationRequestError::EmptyStopString);
         }
         Ok(())
     }
 
+    /// Recomputes required resources under `limits` and checks the declaration.
     pub fn validate_resources(
         &self,
         limits: &GenerationLimits,
@@ -1034,6 +1285,7 @@ impl GenerationRequest {
     }
 }
 
+/// Validates an image-ingest recipe's stage alignment and positive bounds.
 fn validate_ingest_recipe(recipe: &ImageIngestRecipe) -> Result<(), GenerationRequestError> {
     if recipe.steps.is_empty() {
         return Err(GenerationRequestError::EmptyImageIngestRecipe);
@@ -1054,6 +1306,7 @@ fn validate_ingest_recipe(recipe: &ImageIngestRecipe) -> Result<(), GenerationRe
         .try_for_each(validate_kv_effect)
 }
 
+/// Validates that an explicit image KV effect contributes a positive bound.
 fn validate_kv_effect(effect: ImageKvEffect) -> Result<(), GenerationRequestError> {
     if matches!(
         effect,
@@ -1064,70 +1317,116 @@ fn validate_kv_effect(effect: ImageKvEffect) -> Result<(), GenerationRequestErro
     Ok(())
 }
 
+/// Validation failures for a scheduler-facing generation request.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum GenerationRequestError {
+    /// The positive context contains no segments.
     #[error("generation context must contain at least one segment")]
     EmptyContext,
+    /// Image ingest stages and KV effects have different lengths.
     #[error("image ingest declares {steps} steps but {effects} KV effects")]
-    ImageIngestKvArity { steps: usize, effects: usize },
+    ImageIngestKvArity {
+        /// Number of encoder stages.
+        steps: usize,
+        /// Number of declared KV effects.
+        effects: usize,
+    },
+    /// Understanding decode has a zero token budget.
     #[error("max_und_tokens must be positive")]
     ZeroMaxUndTokens,
+    /// Resolved behavior disagrees with the request constraint and policy.
     #[error("resolved generation behavior does not match constraint and policy")]
     BehaviorPolicyMismatch,
+    /// An image context segment declares no encoder stages.
     #[error("image context segment has an empty ingest recipe")]
     EmptyImageIngestRecipe,
+    /// Negative conditioning contains an image segment.
     #[error("negative context may contain only Und token segments")]
     ImageInNegativeContext,
+    /// An image context segment carries no encoded payload.
     #[error("image segment payload must not be empty")]
     EmptyImagePayload,
+    /// An image segment does not follow the preceding understanding tokens.
     #[error(
         "image segment placement does not match ordered context: expected {expected}, got {actual}"
     )]
-    ImagePlacementMismatch { expected: usize, actual: usize },
+    ImagePlacementMismatch {
+        /// Position implied by preceding context segments.
+        expected: usize,
+        /// Position declared by the image segment.
+        actual: usize,
+    },
+    /// An image ingest recipe contributes no logical model positions.
     #[error("image ingest and feedback recipes must consume at least one logical position")]
     ZeroImageLogicalPositions,
+    /// A bounded image KV effect has a zero maximum.
     #[error("bounded image KV effects must be positive")]
     ZeroImageKvBound,
+    /// A suffix or round-close trigger contains no tokens.
     #[error("generation trigger patterns must not be empty")]
     EmptyTriggerPattern,
+    /// Image-only generation cannot open an image branch.
     #[error("gen_only request cannot produce an image under the resolved policy")]
     GenOnlyCannotProduceImage,
+    /// Image continuation has no feedback recipe.
     #[error("default generation continuation requires a feedback recipe")]
     MissingFeedbackRecipe,
+    /// Image feedback has no understanding continuation token.
     #[error("default generation feedback requires a continuation token")]
     IncompleteFeedbackRecipe,
+    /// The maximum-token policy does not terminate at the request bound.
     #[error("max-token policy must terminate at the declared request bound")]
     NonTerminalMaxTokensPolicy,
+    /// A round-close trigger is paired with non-terminal round closure.
     #[error("round-close trigger policy requires terminal round closure")]
     NonTerminalRoundClosePolicy,
+    /// Declared context-token count disagrees with the context.
     #[error("resource context-token bound mismatch: expected {expected}, got {actual}")]
-    ContextTokenBoundMismatch { expected: usize, actual: usize },
+    ContextTokenBoundMismatch {
+        /// Token count derived from the context.
+        expected: usize,
+        /// Declared context-token count.
+        actual: usize,
+    },
+    /// Declared KV bound cannot contain the positive context.
     #[error("max_kv_tokens ({max_kv_tokens}) is below context tokens ({context_tokens})")]
     MaxKvBelowContext {
+        /// Tokens present in the positive context.
         context_tokens: usize,
+        /// Declared maximum KV tokens.
         max_kv_tokens: usize,
     },
+    /// Declared encoder-cache keys disagree with image ingest recipes.
     #[error(
         "encoder-cache key declaration does not match context: expected {expected:?}, got {actual:?}"
     )]
     EncoderCacheKeysMismatch {
+        /// Keys derived from image context segments.
         expected: Vec<u64>,
+        /// Keys declared in request resources.
         actual: Vec<u64>,
     },
+    /// A configured stop string is empty.
     #[error("stop strings must not be empty")]
     EmptyStopString,
+    /// Text sampling parameters are invalid.
     #[error("invalid sampling parameters: {0}")]
     InvalidSampling(#[source] SamplingParamsError),
+    /// Image-generation parameters are invalid.
     #[error("invalid image parameters: {0}")]
     InvalidImage(#[source] ImageParamsError),
+    /// Minimum-token floor exceeds the generation budget.
     #[error("min_tokens ({min_tokens}) exceeds max_und_tokens ({max_und_tokens})")]
     MinTokensExceedsMaximum {
+        /// Required minimum generated tokens.
         min_tokens: usize,
+        /// Maximum generated understanding tokens.
         max_und_tokens: usize,
     },
 }
 
 impl Default for GenerationPolicyDescriptor {
+    /// Returns a text-only policy with visible understanding output.
     fn default() -> Self {
         Self {
             trigger: TriggerPolicyDescriptor::Disabled,

@@ -1,3 +1,5 @@
+//! Composition of reasoning and tool parsing into assistant updates.
+
 use std::sync::Arc;
 
 use uuid::Uuid;
@@ -7,6 +9,7 @@ use crate::serving::chat::output::FinishReason;
 use crate::serving::text::output::{DecodedLogprobs, DecodedPromptLogprobs};
 
 #[derive(Debug, Clone, PartialEq)]
+/// Incremental reasoning-parser event consumed by chat assembly.
 pub(crate) enum ReasoningEvent {
     Start {
         prompt_token_ids: Arc<[u32]>,
@@ -31,6 +34,7 @@ pub(crate) enum ReasoningEvent {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Incremental assistant event after reasoning and tool parsing.
 pub(crate) enum AssistantEvent {
     Start {
         prompt_token_ids: Arc<[u32]>,
@@ -62,6 +66,7 @@ pub(crate) enum AssistantEvent {
 }
 
 impl From<ReasoningEvent> for AssistantEvent {
+    /// Converts a reasoning-parser event without changing ordering or terminal accounting.
     fn from(event: ReasoningEvent) -> Self {
         match event {
             ReasoningEvent::Start {
@@ -98,6 +103,7 @@ impl From<ReasoningEvent> for AssistantEvent {
     }
 }
 
+/// Generates an OpenAI-compatible tool-call identifier.
 pub(crate) fn generate_tool_call_id() -> String {
     format!("call_{}", &Uuid::new_v4().simple().to_string()[..24])
 }

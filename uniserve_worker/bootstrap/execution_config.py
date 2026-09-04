@@ -154,6 +154,8 @@ DEFAULT_PREFILL_GRAPH_ROW_BUCKETS = (8, 16, 32)
 
 
 def graph_padding_block_count(block_size: int) -> int:
+    """Return the maximum additional KV pages required to pad a decode graph batch."""
+
     block_size = max(1, int(block_size))
     decode_tokens = max(DEFAULT_DECODE_GRAPH_BATCH_SIZES) - 1
     prefill_tokens = max(
@@ -175,13 +177,15 @@ DEFAULT_GRAPH_MEMORY_FRACTION = 0.10
 
 
 def graph_memory_budget_bytes(total_device_bytes: int) -> int:
-    """Device memory the retained graph executables may hold at once."""
+    """Return the device-memory budget for retained graph executables."""
 
     return max(0, int(float(max(0, int(total_device_bytes))) * DEFAULT_GRAPH_MEMORY_FRACTION))
 
 
 @dataclass(frozen=True, slots=True)
 class LaneConfig:
+    """Assigns domains, SM budget, and optional capacity overrides to one execution lane."""
+
     lane_id: str
     sm_budget: int
     domains: tuple[Domain, ...]
@@ -192,6 +196,8 @@ class LaneConfig:
     max_inflight: int | None = None
 
     def __post_init__(self) -> None:
+        """Normalize lane domains and validate SM and capacity overrides."""
+
         if not self.lane_id or any(character.isspace() for character in self.lane_id):
             raise ValueError("lane id must be a non-empty token")
         if int(self.sm_budget) < 1:
@@ -212,6 +218,8 @@ class LaneConfig:
 
 @dataclass(frozen=True)
 class ExecutionConfig:
+    """Defines dtype, cache, lane, CUDA graph, shape-bucket, and FlashInfer execution policy."""
+
     model_dtype: str = "bfloat16"
     kv_cache_dtype: str | None = None
     kv_memory_fraction: float = 0.70
@@ -226,6 +234,8 @@ class ExecutionConfig:
 
 
 def execution_config_from_namespace(namespace: Any) -> ExecutionConfig:
+    """Validate graph buckets, lanes, dtypes, and FlashInfer controls from parsed CLI arguments."""
+
     return ExecutionConfig(
         model_dtype=str(namespace.model_dtype),
         kv_cache_dtype=_none_if_empty(namespace.kv_cache_dtype),
@@ -270,6 +280,8 @@ def execution_config_from_namespace(namespace: Any) -> ExecutionConfig:
 
 
 def _none_if_empty(value: object | None) -> str | None:
+    """Normalize empty optional configuration values to ``None``."""
+
     if value is None:
         return None
     text = str(value).strip()
@@ -279,6 +291,8 @@ def _none_if_empty(value: object | None) -> str | None:
 
 
 def _positive_optional_int(value: object | None) -> int | None:
+    """Parse an optional positive integer capacity."""
+
     if value is None:
         return None
     parsed = int(cast(Any, value))
@@ -288,12 +302,16 @@ def _positive_optional_int(value: object | None) -> int | None:
 
 
 def _bounded_fraction(value: float, name: str) -> float:
+    """Validate a floating-point fraction lies within the closed unit interval."""
+
     if value <= 0.0 or value >= 1.0:
         raise ValueError(f"{name} must be greater than 0 and less than 1")
     return value
 
 
 def _parse_positive_int_csv(raw: object | None, *, default: tuple[int, ...]) -> tuple[int, ...]:
+    """Parse a comma-separated sequence of positive integer bucket sizes."""
+
     if raw is None:
         return default
     parts = tuple(part.strip() for part in str(raw).split(","))
@@ -308,6 +326,8 @@ def _parse_positive_int_csv(raw: object | None, *, default: tuple[int, ...]) -> 
 
 
 def _parse_image_shapes(raw: object | None) -> tuple[tuple[int, int], ...]:
+    """Parse and validate unique positive image-height and image-width buckets."""
+
     if raw is None:
         return ((1152, 2048), (2048, 1152))
     values: list[tuple[int, int]] = []
@@ -325,6 +345,8 @@ def _parse_image_shapes(raw: object | None) -> tuple[tuple[int, int], ...]:
 
 
 def _parse_lanes(raw: object | None) -> tuple[LaneConfig, ...]:
+    """Normalize lane declarations into unique identifiers and positive capacities."""
+
     result: list[LaneConfig] = []
     values = () if raw is None else raw
     if not isinstance(values, (list, tuple)):
@@ -373,6 +395,8 @@ def _parse_lanes(raw: object | None) -> tuple[LaneConfig, ...]:
 
 
 def _json_optional_int(data: dict[str, object], name: str) -> int | None:
+    """Read an optional integer field from a JSON lane descriptor."""
+
     value = data.get(name)
     if value is None:
         return None
@@ -382,6 +406,8 @@ def _json_optional_int(data: dict[str, object], name: str) -> int | None:
 
 
 def _parse_optional_bool(value: object | None) -> bool | None:
+    """Parse an optional boolean from native or textual configuration."""
+
     if value is None:
         return None
     if isinstance(value, bool):

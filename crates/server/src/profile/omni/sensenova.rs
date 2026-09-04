@@ -1,3 +1,5 @@
+//! SenseNova model profile, prompt layout, and generation policy.
+
 use serde::{Deserialize, Serialize};
 use uniserve_core::{
     FeedbackNextToken, FeedbackSource, GenOnlyStartPolicyDescriptor, GeneratedImageFeedbackRecipe,
@@ -20,20 +22,31 @@ const IMAGE_ASSISTANT_PREFIX: &str = "<think>\n\n</think>\n\n<img>";
 const NEGATIVE_ASSISTANT_PREFIX: &str = "<img>";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Loaded SenseNova profile and tokenizer assets.
 pub struct SenseNovaProfile {
+    /// Special tokens that delimit multimodal generation.
     pub controls: GenerationControls,
+    /// Default image-generation parameters.
     pub image_defaults: ImageGenerationDefaults,
+    /// Supported image dimensions and default resolution.
     pub resolution_policy: ResolutionPolicy,
+    /// Filters applied to decoded assistant output.
     pub output_filter: OutputFilterPolicy,
+    /// Runtime recipe for encoding input images.
     pub image_ingest: ImageIngestRecipe,
+    /// Runtime state-machine policy for generated image segments.
     pub generation_policy: GenerationPolicyDescriptor,
 }
 
 impl SenseNovaProfile {
+    /// Stable profile identifier.
     pub const ID: &'static str = "sensenova";
+    /// Pixel-to-latent downsampling factor.
     pub const LATENT_DOWNSAMPLE: u32 = 32;
+    /// Maximum reusable encoder products tracked by the profile.
     pub const ENCODER_CACHE_ENTRIES: usize = 256;
 
+    /// Returns bounded runtime capabilities for the selected dtype.
     pub fn runtime_limits(model_dtype: ModelDtype) -> GenerationLimits {
         let dtype_bytes = model_dtype_bytes(model_dtype);
         GenerationLimits {
@@ -52,6 +65,7 @@ impl SenseNovaProfile {
         }
     }
 
+    /// Resolves required control tokens from the loaded tokenizer.
     pub fn resolve(tokenizer: &HuggingFaceTokenizer) -> assets::Result<Self> {
         let (start_of_image, start_of_image_text) =
             required_token(tokenizer, "<img>", "SenseNova start-of-image")?;
@@ -123,6 +137,7 @@ impl SenseNovaProfile {
         })
     }
 
+    /// Returns the default system instruction for a generation constraint.
     pub fn default_system_prompt(constraint: GenerationConstraint) -> Option<&'static str> {
         match constraint {
             GenerationConstraint::Default => Some(DEFAULT_SYSTEM_PROMPT),
@@ -131,6 +146,7 @@ impl SenseNovaProfile {
         }
     }
 
+    /// Returns the assistant prefix required by a generation constraint.
     pub fn assistant_prefix(constraint: GenerationConstraint) -> &'static str {
         match constraint {
             GenerationConstraint::GenOnly => IMAGE_ASSISTANT_PREFIX,
@@ -138,6 +154,7 @@ impl SenseNovaProfile {
         }
     }
 
+    /// Renders and encodes the positive prompt for one request.
     pub fn render_prompt_ids(
         &self,
         tokenizer: &HuggingFaceTokenizer,
@@ -152,6 +169,7 @@ impl SenseNovaProfile {
         )
     }
 
+    /// Renders positive prompt text before tokenization.
     pub fn render_prompt_text(
         &self,
         constraint: GenerationConstraint,
@@ -164,6 +182,7 @@ impl SenseNovaProfile {
         chatml(system, prompt, assistant)
     }
 
+    /// Renders and encodes classifier-free guidance context.
     pub fn render_negative_prompt_ids(
         &self,
         tokenizer: &HuggingFaceTokenizer,
@@ -175,6 +194,7 @@ impl SenseNovaProfile {
         )
     }
 
+    /// Builds the encoder recipe for an input image of the given dimensions.
     pub fn image_ingest_for_dimensions(
         &self,
         width: u32,
@@ -187,6 +207,7 @@ impl SenseNovaProfile {
         Ok(ingest)
     }
 
+    /// Builds generation and feedback policy for the requested canvas.
     pub fn generation_policy_for_dimensions(
         &self,
         width: u32,
@@ -210,6 +231,7 @@ impl SenseNovaProfile {
     }
 }
 
+/// Returns the fixed SenseNova image-resolution bucket policy.
 fn resolution_policy() -> ResolutionPolicy {
     let buckets = [
         (ResolutionName::Square, 1536, 1536),

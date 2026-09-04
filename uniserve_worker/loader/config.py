@@ -14,6 +14,8 @@ __all__ = ["LoadConfig", "LoadFormat", "LoadRequest"]
 
 
 class LoadFormat(StrEnum):
+    """Checkpoint source and materialization strategies accepted by the loader."""
+
     AUTO = "auto"
     SAFETENSORS = "safetensors"
     PT = "pt"
@@ -26,6 +28,8 @@ _DEFAULT_THREADS = object()
 
 
 def _optional_text(value: object | None) -> str | None:
+    """Normalize an optional string-like setting and discard blank values."""
+
     if value is None:
         return None
     text = str(value).strip()
@@ -34,6 +38,8 @@ def _optional_text(value: object | None) -> str | None:
 
 @dataclass(frozen=True, slots=True, init=False)
 class LoadConfig:
+    """Immutable checkpoint discovery, I/O, caching, and integrity settings."""
+
     load_format: LoadFormat
     download_dir: str | None
     ignore_patterns: tuple[str, ...]
@@ -57,6 +63,9 @@ class LoadConfig:
         checksum_manifest: str | None = None,
         revision: str | None = None,
     ) -> None:
+        """Normalize checkpoint format, reader concurrency, cache, and revision options."""
+
+        # Resolve and validate caller-facing values before publishing the frozen state.
         try:
             resolved_format = LoadFormat(str(load_format))
         except ValueError as error:
@@ -75,6 +84,8 @@ class LoadConfig:
         patterns = tuple(str(value) for value in ignore_patterns)
         if any(not value for value in patterns):
             raise ValueError("load ignore patterns must not be empty")
+
+        # Prefetch follows mmap by default because page advice only benefits mapped reads.
         use_mmap = bool(mmap)
         object.__setattr__(self, "load_format", resolved_format)
         object.__setattr__(self, "download_dir", _optional_text(download_dir))
@@ -89,6 +100,8 @@ class LoadConfig:
 
     @property
     def reader_count(self) -> int:
+        """Limit implicit mmap-prefetch loading to one reader to avoid competing page walks."""
+
         if self.prefetch and not self._num_threads_explicit:
             return 1
         return self.num_threads
@@ -96,6 +109,8 @@ class LoadConfig:
 
 @dataclass(frozen=True, slots=True)
 class LoadRequest:
+    """Model construction scope, device placement, and checkpoint policy for one load."""
+
     model_path: str
     device: str
     execution: ExecutionConfig
@@ -105,6 +120,8 @@ class LoadRequest:
     attention_backend: str | None = None
 
     def __post_init__(self) -> None:
+        """Reject requests that cannot identify a checkpoint or destination device."""
+
         if not self.model_path:
             raise ValueError("model_path must not be empty")
         if not self.device:

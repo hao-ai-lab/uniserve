@@ -14,6 +14,8 @@ from .plan import ModelLoadScope, resolve_worker_plan
 
 @dataclass(frozen=True)
 class WorkerIpcConfig:
+    """Configures the IPC service name, payload bound, inflight limit, and pipeline depth."""
+
     service_name: str
     max_payload_bytes: int
     max_inflight: int
@@ -22,6 +24,8 @@ class WorkerIpcConfig:
 
 @dataclass(frozen=True)
 class WorkerPlacement:
+    """Assigns a worker rank to its primary device, tensor-parallel group, and optional tower devices."""
+
     device: str
     tp_rank: int
     tp_size: int
@@ -31,6 +35,8 @@ class WorkerPlacement:
 
     @property
     def generation_device(self) -> str | None:
+        """Expose the flow-tower device when modality towers are split."""
+
         if self.tower_devices is None:
             return None
         return self.tower_devices[1]
@@ -38,6 +44,8 @@ class WorkerPlacement:
 
 @dataclass(frozen=True)
 class WorkerResourceConfig:
+    """Caps batch work, model length, video duration, and physical KV allocation."""
+
     block_size: int
     max_batch_operations: int
     max_batch_tokens: int
@@ -48,6 +56,8 @@ class WorkerResourceConfig:
 
 @dataclass(frozen=True)
 class ModelLaunchConfig:
+    """Selects a checkpoint, attention backend, and quantization settings for model construction."""
+
     path: str
     attention_backend: str
     quantization_config: dict[str, object]
@@ -55,11 +65,15 @@ class ModelLaunchConfig:
 
 @dataclass(frozen=True)
 class DataPlaneConfig:
+    """Selects the transport backend used for cross-operation tensor movement."""
+
     backend: str
 
 
 @dataclass(frozen=True)
 class WorkerProcessArgs:
+    """Aggregates the validated launch configuration for one worker rank."""
+
     supported_ops: frozenset[RunKind]
     ipc: WorkerIpcConfig
     placement: WorkerPlacement
@@ -72,6 +86,8 @@ class WorkerProcessArgs:
 
     @classmethod
     def from_namespace(cls, namespace: argparse.Namespace) -> "WorkerProcessArgs":
+        """Validate parsed CLI values and resolve them into immutable worker launch configuration."""
+
         supported_ops = _parse_supported_ops(namespace.supported_ops)
         plan = resolve_worker_plan(supported_ops)
         device = _normalize_device(namespace.device)
@@ -139,6 +155,8 @@ class WorkerProcessArgs:
 
 
 def _validate_scalars(namespace: argparse.Namespace) -> None:
+    """Validate positive capacities and normalize optional scalar process settings."""
+
     positive_fields = {
         "--block-size": namespace.block_size,
         "--max-batch-operations": namespace.max_batch_operations,
@@ -165,6 +183,8 @@ def _validate_scalars(namespace: argparse.Namespace) -> None:
 
 
 def _load_config(namespace: argparse.Namespace) -> LoadConfig:
+    """Build and validate process configuration from parsed command-line values."""
+
     threads = getattr(namespace, "load_threads", None)
     load_format = str(getattr(namespace, "load_format", "auto"))
     download_dir = _optional_text(getattr(namespace, "download_dir", None))
@@ -184,11 +204,15 @@ def _load_config(namespace: argparse.Namespace) -> LoadConfig:
 
 
 def _validate_data_plane(*, backend: str) -> None:
+    """Validate that the selected transfer backend implements the data plane."""
+
     if backend not in {"local", "shm", "cuda_ipc"}:
         raise ValueError(f"unknown --transfer-backend {backend!r}")
 
 
 def _parse_supported_ops(value: object) -> frozenset[RunKind]:
+    """Parse unique supported operation kinds from text or an iterable."""
+
     names = tuple(part.strip() for part in str(value).split(",") if part.strip())
     if not names:
         raise ValueError("--supported-ops must list at least one operation")
@@ -206,6 +230,8 @@ def _parse_mesh(
     *,
     device: str,
 ) -> tuple[str, str] | None:
+    """Parse and validate a named device-mesh declaration."""
+
     text = value.strip()
     if not text:
         return None
@@ -229,6 +255,8 @@ def _parse_mesh(
 
 
 def _parse_tower_placement(value: str, *, device: str) -> tuple[str, str]:
+    """Parse tower coordinates and validate their mesh-axis assignments."""
+
     import torch
 
     placements: dict[str, str] = {}
@@ -275,11 +303,15 @@ def _normalize_device(value: object) -> str:
 
 
 def _normalize_transfer_backend(value: object) -> str:
+    """Canonicalize the configured transfer backend name."""
+
     backend = str(value or "local").strip().lower()
     return "local" if backend == "inproc" else backend
 
 
 def _optional_text(value: object | None) -> str | None:
+    """Normalize an optional value to stripped text or ``None``."""
+
     if value is None:
         return None
     text = str(value).strip()

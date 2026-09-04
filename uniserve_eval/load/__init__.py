@@ -1,3 +1,5 @@
+"""Exposes request-arrival execution and GPU telemetry sampling."""
+
 from .arrival import LoadResult, WarmupFailure, run_load
 from .gpu import GpuMemorySampler
 

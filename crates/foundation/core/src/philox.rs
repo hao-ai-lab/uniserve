@@ -1,21 +1,15 @@
-//! The canonical counter-based sampling RNG shared by the GPU-free `SimEngine`
-//! and the Python/CUDA production worker.
+//! Counter-based random draws shared by scheduler simulations and model workers.
 //!
-//! One mapping owns the Philox4x32-10 key and counter words, the
-//! integer-to-uniform conversion, and the draw-space separation. A draw is
-//! addressed only by its request lineage and semantic coordinates, so the same
-//! coordinate yields the same uniform in every language and is independent of
-//! batch order, execution depth, accepted proposal length, completion order,
-//! and replay.
+//! Philox4x32-10 maps request lineage and semantic draw coordinates to stable
+//! uniforms. This addressing makes a draw independent of batching, execution
+//! depth, completion order, and replay.
 //!
 //! Layout:
 //!
-//! - key    = `splitmix` fold of `(session_seed, authority_id, request_id,
-//!   epoch, draw_layout)` split into two 32-bit words. The draw layout enters
-//!   the key so target sampling, speculative proposal, and flow noise occupy
-//!   disjoint draw spaces.
+//! - key = a `splitmix` fold of `(session_seed, authority_id, request_id,
+//!   epoch, draw_layout)`, split into two 32-bit words;
 //! - counter = `[semantic_token_index low, semantic_token_index high,
-//!   processor_stage, draw_index]`.
+//!   processor_stage, draw_index]`;
 //! - uniform = `(word0 >> 8) * 2^-24`, a 24-bit dyadic value in `[0, 1)`.
 
 const PHILOX_M0: u32 = 0xD251_1F53;
@@ -24,13 +18,17 @@ const PHILOX_KEY_BUMP_0: u32 = 0x9E37_79B9;
 const PHILOX_KEY_BUMP_1: u32 = 0xBB67_AE85;
 const SPLITMIX_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
 
-/// Draw layout identifiers. They match the IPC `DrawLayout` discriminants and
-/// separate the proposal and target draw spaces so rejected proposals cannot
-/// shift target coordinates.
+/// Target-model sampling draw space.
+///
+/// Draw-space values match the IPC `DrawLayout` discriminants and isolate
+/// semantic streams so activity in one stream cannot shift another.
 pub const DRAW_LAYOUT_TARGET: u64 = 0;
+/// Draw-space identifier for speculative proposal sampling.
 pub const DRAW_LAYOUT_PROPOSAL: u64 = 1;
+/// Draw-space identifier for diffusion flow noise.
 pub const DRAW_LAYOUT_FLOW_NOISE: u64 = 2;
 
+/// Folds one semantic coordinate into an evolving key with SplitMix64 avalanche.
 fn splitmix_coordinate(seed: u64, coordinate: u64) -> u64 {
     let mut value = seed.wrapping_add(coordinate.wrapping_add(1).wrapping_mul(SPLITMIX_GAMMA));
     value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -38,11 +36,13 @@ fn splitmix_coordinate(seed: u64, coordinate: u64) -> u64 {
     value ^ (value >> 31)
 }
 
+/// Returns the high and low halves of one wrapping 32-bit multiplication.
 fn mulhilo(a: u32, b: u32) -> (u32, u32) {
     let product = (a as u64).wrapping_mul(b as u64);
     ((product >> 32) as u32, product as u32)
 }
 
+/// Applies one Philox round to both counter lanes under the supplied key.
 fn single_round(counter: [u32; 4], key: [u32; 2]) -> [u32; 4] {
     let (hi0, lo0) = mulhilo(PHILOX_M0, counter[0]);
     let (hi1, lo1) = mulhilo(PHILOX_M1, counter[2]);
@@ -54,9 +54,11 @@ fn single_round(counter: [u32; 4], key: [u32; 2]) -> [u32; 4] {
     ]
 }
 
-/// The ten-round Philox4x32 bijection over a 128-bit counter and 64-bit key.
+/// Applies the ten-round Philox4x32 bijection to a counter and key.
 pub fn philox4x32_10(mut counter: [u32; 4], mut key: [u32; 2]) -> [u32; 4] {
     for round in 0..10 {
+        // Round zero consumes the caller's key; every later round advances both
+        // lanes by the Philox Weyl constants before permuting the counter.
         if round > 0 {
             key = [
                 key[0].wrapping_add(PHILOX_KEY_BUMP_0),
@@ -68,7 +70,7 @@ pub fn philox4x32_10(mut counter: [u32; 4], mut key: [u32; 2]) -> [u32; 4] {
     counter
 }
 
-/// The 64-bit Philox key for one request lineage and draw space.
+/// Derives the 64-bit Philox key for one request lineage and draw space.
 pub fn sampling_key(
     session_seed: u64,
     authority_id: u64,
@@ -76,22 +78,27 @@ pub fn sampling_key(
     epoch: u64,
     draw_layout: u64,
 ) -> u64 {
+    // Fold coordinates in protocol order so the same tuple addresses the same
+    // random stream in every runtime.
     [authority_id, request_id, epoch, draw_layout]
         .into_iter()
         .fold(session_seed, splitmix_coordinate)
 }
 
+/// Maps one Philox word to an exactly representable 24-bit uniform value.
 fn uniform_from_word(word: u32) -> f32 {
     ((word >> 8) as f32) * (1.0f32 / 16_777_216.0f32)
 }
 
-/// One uniform draw in `[0, 1)` for a semantic coordinate under one request key.
+/// Returns one uniform draw in `[0, 1)` for a semantic coordinate and request key.
 pub fn sampling_uniform(
     key: u64,
     semantic_token_index: u64,
     processor_stage: u64,
     draw_index: u64,
 ) -> f32 {
+    // The counter layout gives each token, processor stage, and draw index an
+    // independent address without relying on mutable generator state.
     let counter = [
         semantic_token_index as u32,
         (semantic_token_index >> 32) as u32,
@@ -108,12 +115,8 @@ mod tests {
 
     #[test]
     fn philox_matches_the_reference_known_answer_vectors() {
-        // Random123 philox4x32x10 known-answer vectors. The leading words agree
-        // with the published reference (`6627e8d5 e169c58d` for the zero input,
-        // `408f276d 41c83b0e a20bc7c6` for the all-ones input); because the two
-        // multiply lanes cross-feed every round, agreement on the leading words
-        // fixes the entire state, so these are the standard bijection rather
-        // than a private variant.
+        // Random123 Philox4x32-10 known-answer vectors establish the exact
+        // round count, lane ordering, and key schedule.
         assert_eq!(
             philox4x32_10([0, 0, 0, 0], [0, 0]),
             [0x6627_e8d5, 0xe169_c58d, 0xbc57_ac4c, 0x9b00_dbd8]

@@ -1,3 +1,5 @@
+//! Deserialized tokenizer and processor metadata used during profile resolution.
+
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -9,8 +11,10 @@ use crate::profile::assets::error::{Error, Result};
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct HfTokenizerConfig {
+    /// Named tokenizer special tokens.
     #[serde(flatten)]
     pub special_tokens: HfSpecialTokens,
+    /// Embedded default chat template, when configured.
     pub chat_template: Option<String>,
 }
 
@@ -18,11 +22,17 @@ pub struct HfTokenizerConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum NamedSpecialToken {
+    /// Token represented directly as text.
     Text(String),
-    WithContent { content: String },
+    /// Token represented by an object containing its text.
+    WithContent {
+        /// Token text.
+        content: String,
+    },
 }
 
 impl Serialize for NamedSpecialToken {
+    /// Serializes the value with the provided serializer.
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -32,6 +42,7 @@ impl Serialize for NamedSpecialToken {
 }
 
 impl From<NamedSpecialToken> for String {
+    /// Converts the source value into this type.
     fn from(value: NamedSpecialToken) -> Self {
         match value {
             NamedSpecialToken::Text(string) => string,
@@ -41,6 +52,7 @@ impl From<NamedSpecialToken> for String {
 }
 
 impl NamedSpecialToken {
+    /// Returns the configured template text or path.
     pub fn as_str(&self) -> &str {
         match self {
             Self::Text(value) | Self::WithContent { content: value } => value,
@@ -51,14 +63,20 @@ impl NamedSpecialToken {
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
+/// Special-token strings resolved from tokenizer metadata.
 pub struct HfSpecialTokens {
+    /// Beginning-of-sequence token.
     pub bos_token: Option<NamedSpecialToken>,
+    /// End-of-sequence token.
     pub eos_token: Option<NamedSpecialToken>,
+    /// Unknown-token marker.
     pub unk_token: Option<NamedSpecialToken>,
+    /// Padding token.
     pub pad_token: Option<NamedSpecialToken>,
 }
 
 impl HfSpecialTokens {
+    /// Returns whether no special-token value is configured.
     pub fn is_empty(&self) -> bool {
         self.bos_token.is_none()
             && self.eos_token.is_none()
@@ -80,23 +98,34 @@ pub struct ModelConfig {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct GenerationConfig {
+    /// One or more token identifiers that terminate generation.
     pub eos_token_id: Option<OneOrManyTokenIds>,
+    /// Default sampling temperature.
     pub temperature: Option<f32>,
+    /// Default nucleus-sampling probability mass.
     pub top_p: Option<f32>,
+    /// Default candidate-token limit.
     pub top_k: Option<u32>,
+    /// Default minimum relative token probability.
     pub min_p: Option<f32>,
+    /// Default repetition penalty.
     pub repetition_penalty: Option<f32>,
+    /// Default maximum number of generated tokens.
     pub max_new_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
+/// Tokenizer field accepted as one token identifier or a list.
 pub enum OneOrManyTokenIds {
+    /// One token identifier.
     One(u32),
+    /// Ordered token identifier list.
     Many(Vec<u32>),
 }
 
 impl OneOrManyTokenIds {
+    /// Converts one-or-many identifiers into a deduplicated ordered set.
     pub fn into_set(self) -> BTreeSet<u32> {
         match self {
             Self::One(id) => BTreeSet::from([id]),
@@ -106,31 +135,38 @@ impl OneOrManyTokenIds {
 }
 
 impl ModelConfig {
+    /// Returns the language-model section of the configuration.
     fn language_model(&self) -> &Self {
         self.llm_config.as_deref().unwrap_or(self)
     }
 
+    /// Returns the configured model-type discriminator.
     pub fn model_type(&self) -> Option<&str> {
         self.model_type.as_deref()
     }
 
+    /// Returns the declared maximum position count.
     pub fn max_position_embeddings(&self) -> Option<u32> {
         self.language_model().max_position_embeddings
     }
 }
 
+/// Loads tokenizer metadata, returning defaults when no file is configured.
 pub fn load_tokenizer_config(path: Option<&Path>) -> Result<HfTokenizerConfig> {
     read_json_file(path)
 }
 
+/// Loads generation defaults, returning defaults when no file is configured.
 pub fn load_generation_config(path: Option<&Path>) -> Result<GenerationConfig> {
     read_json_file(path)
 }
 
+/// Loads model metadata, returning defaults when no file is configured.
 pub fn load_model_config(path: Option<&Path>) -> Result<ModelConfig> {
     read_json_file(path)
 }
 
+/// Reads the JSON file.
 fn read_json_file<T>(path: Option<&Path>) -> Result<T>
 where
     T: for<'de> Deserialize<'de> + Default,

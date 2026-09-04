@@ -28,6 +28,8 @@ _IMAGENET_STD = (0.229, 0.224, 0.225)
 
 @dataclass(frozen=True, slots=True)
 class PreparedImage:
+    """Holds normalized image pixels, patch-grid coordinates, and original media dimensions."""
+
     pixels: torch.Tensor
     grid: torch.Tensor | None
     grid_shape: tuple[int, int] | None
@@ -42,6 +44,8 @@ def prepare_image(
     *,
     device: torch.device,
 ) -> PreparedImage:
+    """Decode, resize, normalize, and stage one encoded image for the selected model tower."""
+
     image = _decode_rgb(encoded)
     transform = processor.vit if kind is EncodeMode.VISION else processor.vae
     if transform is None:
@@ -166,6 +170,8 @@ def prepare_tensor_image(
 
 
 def _decode_rgb(encoded: str) -> Image.Image:
+    """Decode a base64 image payload and normalize it to RGB."""
+
     if not isinstance(encoded, str) or not encoded:
         raise invalid_descriptor("inline image payload must be non-empty base64")
     try:
@@ -183,6 +189,8 @@ def _decode_rgb(encoded: str) -> Image.Image:
 
 
 def _resize_patch_image(image: Image.Image, processor: PatchTransform) -> Image.Image:
+    """Resize an image to the processor's bounded aspect-preserving patch grid."""
+
     height, width = _patch_image_shape(processor, image.height, image.width)
     return vision.resize(
         image,
@@ -209,6 +217,8 @@ def _patch_image_shape(
     source_height: int,
     source_width: int,
 ) -> tuple[int, int]:
+    """Resolve patch-grid dimensions after applying processor pixel bounds."""
+
     factor = int(round(int(processor.patch_size) / float(processor.downsample_ratio)))
     return _bounded_grid_shape(
         source_height,
@@ -227,6 +237,8 @@ def _bounded_grid_shape(
     minimum: int,
     maximum: int,
 ) -> tuple[int, int]:
+    """Fit an aspect-preserving patch grid within minimum and maximum token bounds."""
+
     if min(height, width, factor) < 1:
         raise invalid_descriptor("image geometry must be positive")
     if max(height, width) / min(height, width) > 200:
@@ -245,6 +257,8 @@ def _bounded_grid_shape(
 
 
 def _resize_stride(image: Image.Image, processor: StrideResize) -> Image.Image:
+    """Resize an image so both dimensions align with the configured spatial stride."""
+
     width, height = image.size
     scale = min(int(processor.max_size) / max(width, height), 1.0)
     scale = max(scale, int(processor.min_size) / min(width, height))
@@ -264,18 +278,26 @@ def _resize_stride(image: Image.Image, processor: StrideResize) -> Image.Image:
 
 
 def _stride_shape(width: int, height: int, scale: float, stride: int) -> tuple[int, int]:
+    """Round scaled dimensions to positive multiples of the required stride."""
+
     def align(value: float) -> int:
+        """Round a scaled edge to the nearest positive model stride."""
+
         return max(stride, round(value / stride) * stride)
 
     return align(width * scale), align(height * scale)
 
 
 def _normalize(image: Image.Image, name: str) -> torch.Tensor:
+    """Apply channel-wise normalization to a PIL image converted to a tensor."""
+
     tensor = vision.to_tensor(image).to(torch.float32)
     return _normalize_tensor(tensor, name)
 
 
 def _normalize_tensor(tensor: torch.Tensor, name: str) -> torch.Tensor:
+    """Apply the named channel normalization policy to an image tensor."""
+
     if name == "signed_unit":
         return (tensor - 0.5) / 0.5
     if name == "imagenet":
@@ -286,6 +308,8 @@ def _normalize_tensor(tensor: torch.Tensor, name: str) -> torch.Tensor:
 
 
 def _resize_tensor(value: torch.Tensor, height: int, width: int) -> torch.Tensor:
+    """Resize a batched tensor image with bicubic interpolation."""
+
     return F.interpolate(
         value.unsqueeze(0),
         size=(int(height), int(width)),
@@ -296,6 +320,8 @@ def _resize_tensor(value: torch.Tensor, height: int, width: int) -> torch.Tensor
 
 
 def _stage(value: torch.Tensor, processor: ImageProcessor, device: torch.device) -> torch.Tensor:
+    """Convert preprocessing output to the processor staging dtype and device."""
+
     dtype = None if processor.staging_dtype is None else getattr(torch, processor.staging_dtype, None)
     if processor.staging_dtype is not None and not isinstance(dtype, torch.dtype):
         raise invalid_descriptor(f"unknown image staging dtype {processor.staging_dtype!r}")

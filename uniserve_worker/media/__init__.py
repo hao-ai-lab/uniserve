@@ -1,1 +1,1 @@
-"""Media encoding and muxing boundaries."""
+"""Image encoding and synchronized audio/video container boundaries."""

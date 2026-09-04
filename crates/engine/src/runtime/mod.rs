@@ -1,21 +1,15 @@
-//! Family request runtimes and the single-owner engine control loop.
+//! Request-family runtimes and the single-owner engine control loop.
 //!
-//! Runtime owns request progress and operation construction. EngineLoop combines
-//! that state with Scheduler policy, Memory placements, and asynchronous Executor
-//! completions without locking engine state or synchronizing CUDA work.
+//! The loop combines request progress, scheduler policy, memory placement, and
+//! asynchronous executor completions. All mutable engine state stays on its
+//! owner thread.
 //!
-//! Scheduling uses budgeted, chunked-prefill admission with exact resident state:
-//! - waiting requests live in a [`RequestQueue`] (FCFS deque or priority
-//!   ordering) and admission consumes the queue head;
-//! - scheduling is bounded by the `max_num_batched_tokens` / `max_num_seqs`
-//!   pair with vLLM's clip rule (`min(num_new_tokens, token_budget)`);
-//! - worst-case reservation is a per-request admission attribute; requests whose
-//!   exact physical state cannot be relocated remain resident and apply queue
-//!   backpressure when capacity is exhausted.
+//! Scheduling admits from a [`RequestQueue`], chunks prefill against sequence and
+//! token budgets, and reserves each request's maximum declared resources. A
+//! resident request remains in place when capacity prevents relocation.
 //!
-//! Worker updates are stateful: a request's static state crosses once
-//! as [`NewRequest`]; per-step ops carry only deltas (new block ids, new
-//! tokens, and per-step masks).
+//! Static worker state crosses the boundary once in [`NewRequest`]; subsequent
+//! operations carry only step-specific deltas.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -81,6 +75,7 @@ use inflight::{
 use output::RequestOutput;
 use serde_json::json;
 
+/// Number of denoising steps planned for one scheduling burst by default.
 pub(crate) const DEFAULT_DENOISE_STEP_BURST: u16 = 1;
 const MAX_INFLIGHT_TRANSFERS: usize = 256;
 
@@ -96,6 +91,7 @@ const PREFILL_WINDOW_CREDITS: usize = 2;
 const DENOISE_STEP_BURST_ENV: &str = "UNISERVE_DENOISE_STEP_BURST";
 const FLOW_EXCLUSIVE_BATCH_ENV: &str = "UNISERVE_FLOW_EXCLUSIVE_BATCH";
 
+/// Builds a validated image-completion event from a PNG payload.
 fn image_done_event(image_id: u32, pixels_png_b64: String) -> Option<Event> {
     let metadata = validate_png_artifact(&pixels_png_b64, None)?;
     Some(Event::ImageDone {
@@ -108,6 +104,7 @@ fn image_done_event(image_id: u32, pixels_png_b64: String) -> Option<Event> {
     })
 }
 
+/// Returns the product with the requested producer and kind.
 fn find_product(
     products: &[ProductPayload],
     op_id: OpId,
@@ -130,6 +127,7 @@ struct SequenceView {
 }
 
 impl SequenceView {
+    /// Decodes typed products and completion fields into a transition-neutral result view.
     fn from_report(record: &ModelOutput, products: &[ProductPayload]) -> Self {
         let logprobs = find_product(products, record.op_id, ProductKind::Logprob)
             .and_then(|payload| payload.value.bytes())
@@ -153,6 +151,7 @@ impl SequenceView {
     }
 }
 
+/// Returns cache-version metadata for the committed token prefix.
 fn token_prefix_versions(
     operation: Option<&Operation>,
     record: &ModelOutput,
@@ -174,13 +173,18 @@ fn token_prefix_versions(
 }
 
 #[derive(Clone)]
+/// Cooperative cancellation and shutdown tokens shared with engine clients.
 pub struct ControlTokens {
+    /// Beginning-of-sequence token identifier.
     pub bos: u32,
+    /// Token identifiers that terminate generation.
     pub eos: Vec<u32>,
+    /// Token identifier that terminates encoded image content.
     pub end_of_image: u32,
 }
 
 impl Default for ControlTokens {
+    /// Returns the default value.
     fn default() -> Self {
         Self {
             bos: 151644,
@@ -190,6 +194,7 @@ impl Default for ControlTokens {
     }
 }
 
+/// Engine-owned state for one admitted request.
 pub(crate) struct ReqState {
     pub req: GenerationRequest,
     pub(crate) finish_token_ids: Vec<u32>,
@@ -239,6 +244,7 @@ pub(crate) struct ReqState {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Terminal action deferred until outstanding work is reconciled.
 pub(crate) enum TerminalIntent {
     #[default]
     None,
@@ -248,6 +254,7 @@ pub(crate) enum TerminalIntent {
 }
 
 impl TerminalIntent {
+    /// Returns whether the state is terminal.
     pub(crate) const fn is_terminal(self) -> bool {
         !matches!(self, Self::None)
     }
@@ -260,10 +267,12 @@ struct FlowPrefixState {
 }
 
 impl FlowPrefixState {
+    /// Returns the request-pool index.
     fn request_pool_idx(&self) -> u32 {
         self.allocations.request_slot()
     }
 
+    /// Returns shared access to the request block tables.
     fn block_tables(&self) -> &[BlockTable] {
         self.allocations.block_tables()
     }
@@ -283,24 +292,29 @@ struct RequestAllocations {
 }
 
 impl RequestAllocations {
+    /// Returns the request-slot identifier.
     fn request_slot(&self) -> u32 {
         self.request_slot
             .request_slot()
             .expect("request slot allocation")
     }
 
+    /// Returns shared access to the request block tables.
     fn block_tables(&self) -> &[BlockTable] {
         self.kv.kv_tables().expect("KV allocation")
     }
 
+    /// Returns mutable access to the request block tables.
     fn block_tables_mut(&mut self) -> &mut Vec<BlockTable> {
         self.kv.kv_tables_mut().expect("KV allocation")
     }
 
+    /// Takes ownership of the request buffer allocation.
     fn take_buffer(&mut self, id: BufferId) -> Option<Allocation> {
         self.buffers.remove(&id)
     }
 
+    /// Releases the owned request allocation.
     fn free(self, memory: &mut Memory) {
         for allocation in self.buffers.into_values() {
             memory.free(allocation);
@@ -314,6 +328,7 @@ impl RequestAllocations {
 }
 
 #[derive(Clone)]
+/// Semantic commit waiting for all required worker products.
 pub(crate) struct PendingSemanticCommit {
     token_count: Option<usize>,
     expected_parent: Checkpoint,
@@ -322,57 +337,70 @@ pub(crate) struct PendingSemanticCommit {
 }
 
 #[derive(Clone)]
+/// Latest worker-resident checkpoint available for further planning.
 pub(crate) struct ResidentDeviceVersion {
     version: Checkpoint,
     token: ProductRef,
 }
 
 impl ReqState {
+    /// Returns the request allocations.
     fn allocations(&self) -> &RequestAllocations {
         self.allocations.as_ref().expect("request is admitted")
     }
 
+    /// Returns mutable access to the request allocations.
     fn allocations_mut(&mut self) -> &mut RequestAllocations {
         self.allocations.as_mut().expect("request is admitted")
     }
 
+    /// Returns the request-pool index.
     fn request_pool_idx(&self) -> u32 {
         self.allocations().request_slot()
     }
 
+    /// Returns shared access to the request block tables.
     fn block_tables(&self) -> &[BlockTable] {
         self.allocations().block_tables()
     }
 
+    /// Returns mutable access to the request block tables.
     fn block_tables_mut(&mut self) -> &mut Vec<BlockTable> {
         self.allocations_mut().block_tables_mut()
     }
 
+    /// Returns whether the request includes context images.
     fn has_context_images(&self) -> bool {
         !self.context.images.is_empty()
     }
 
+    /// Returns whether execution continues after committing generation output.
     fn continues_after_gen_commit(&self) -> bool {
         self.req.behavior.continue_after_gen_commit
     }
 
+    /// Returns whether the request can open a generation branch.
     fn can_open_gen_branch(&self) -> bool {
         self.req.behavior.gen_output
             && self.cursor.image_gen.images_done < self.req.image.max_images as usize
     }
 
+    /// Returns whether generation starts after context ingestion.
     fn starts_gen_after_context(&self) -> bool {
         self.req.behavior.start_gen_after_context && self.can_open_gen_branch()
     }
 
+    /// Returns whether the text request can be replayed.
     pub(crate) fn is_replayable_text(&self) -> bool {
         self.cursor.replay.replayability == crate::runtime::generation::Replayability::Replayable
     }
 
+    /// Returns the prompt used for execution.
     pub(crate) fn effective_prompt(&self) -> &[u32] {
         &self.context.prompt_ids
     }
 
+    /// Returns the pending image step, if one exists.
     fn pending_image_step(&self) -> Option<ImageIngestStep> {
         self.context
             .images
@@ -404,6 +432,7 @@ enum MediaQuantum {
     },
 }
 
+/// Returns the next schedulable media quantum.
 fn next_media_quantum(cursor: MediaCursor, geometry: MediaGeometry) -> Option<MediaQuantum> {
     if !cursor.prepared {
         Some(MediaQuantum::Prepare)
@@ -422,6 +451,7 @@ fn next_media_quantum(cursor: MediaCursor, geometry: MediaGeometry) -> Option<Me
     }
 }
 
+/// Advances the request media cursor.
 fn advance_media_cursor(mut cursor: MediaCursor, quantum: MediaQuantum) -> MediaCursor {
     match quantum {
         MediaQuantum::Prepare => cursor.prepared = true,
@@ -435,6 +465,7 @@ fn advance_media_cursor(mut cursor: MediaCursor, quantum: MediaQuantum) -> Media
     cursor
 }
 
+/// Returns the request remaining media work.
 fn media_work(quantum: MediaQuantum) -> RunKind {
     match quantum {
         MediaQuantum::Prepare => RunKind::DiffusionPrepare,
@@ -466,12 +497,14 @@ struct MediaAllocations {
 }
 
 impl MediaAllocations {
+    /// Returns the request-slot identifier.
     fn request_slot(&self) -> u32 {
         self.request_slot
             .request_slot()
             .expect("media request slot allocation")
     }
 
+    /// Returns the latent-page allocations.
     fn latent_pages(&self) -> &[u32] {
         match self.latent.placement() {
             Placement::Latent { pages, .. } => pages,
@@ -479,6 +512,7 @@ impl MediaAllocations {
         }
     }
 
+    /// Releases the owned request allocation.
     fn free(self, memory: &mut Memory) {
         memory.free(self.latent);
         memory.free(self.request_slot);
@@ -506,10 +540,12 @@ enum DiffusionTerminal {
 }
 
 impl MediaTerminalIntent {
+    /// Returns whether the state is terminal.
     const fn is_terminal(&self) -> bool {
         !matches!(self, Self::None)
     }
 
+    /// Records the first terminal reason while preserving an earlier terminal intent.
     fn finish(&mut self, reason: FinishReason) {
         if matches!(self, Self::None) {
             *self = Self::Finish(reason);
@@ -528,6 +564,7 @@ struct PendingMedia {
 }
 
 #[doc(hidden)]
+/// Family-independent generation state shared by runtime wrappers.
 pub struct RuntimeState {
     ctrl: ControlTokens,
     logits_pipeline: Vec<crate::runtime::logits::BuiltinLogitsProcessor>,
@@ -548,8 +585,11 @@ pub struct RuntimeState {
     next_epoch: u64,
 }
 
+/// Autoregressive request runtime.
 pub struct ArRuntime(RuntimeState);
+/// Terminal diffusion request runtime.
 pub struct DiffusionRuntime(RuntimeState);
+/// Unified multimodal request runtime.
 pub struct UmmRuntime(RuntimeState);
 
 /// Serving-profile facts consumed by a family runtime. Physical capacities are
@@ -557,12 +597,17 @@ pub struct UmmRuntime(RuntimeState);
 /// captured execution shapes remain worker-local.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeProfile {
+    /// Numeric data type used by model activations.
     pub model_dtype: uniserve_core::ModelDtype,
+    /// Model-family generation features and shape limits.
     pub generation_limits: uniserve_core::GenerationLimits,
+    /// Data type used by diffusion latent products, when applicable.
     pub latent_dtype: Option<DType>,
+    /// Maximum number of encoder products retained for reuse.
     pub encoder_cache_entries: usize,
 }
 
+/// Returns simulator capabilities for unified multimodal generation.
 pub(crate) fn sim_umm_generation_limits() -> uniserve_core::GenerationLimits {
     uniserve_core::GenerationLimits {
         features: uniserve_core::GenerationFeatures::UNDERSTANDING
@@ -582,6 +627,7 @@ pub(crate) fn sim_umm_generation_limits() -> uniserve_core::GenerationLimits {
 }
 
 impl RuntimeProfile {
+    /// Builds an autoregressive text profile for the model data type.
     pub fn ar(model_dtype: uniserve_core::ModelDtype) -> Self {
         Self {
             latent_dtype: worker_float_dtype(Some(model_dtype)),
@@ -596,6 +642,7 @@ impl RuntimeProfile {
         }
     }
 
+    /// Builds a diffusion-only profile for the model data type.
     pub fn diffusion(model_dtype: uniserve_core::ModelDtype) -> Self {
         Self {
             latent_dtype: worker_float_dtype(Some(model_dtype)),
@@ -609,6 +656,7 @@ impl RuntimeProfile {
         }
     }
 
+    /// Builds a unified multimodal profile with explicit generation limits.
     pub fn umm(
         model_dtype: uniserve_core::ModelDtype,
         generation_limits: uniserve_core::GenerationLimits,
@@ -622,6 +670,7 @@ impl RuntimeProfile {
         }
     }
 
+    /// Intersects configured profile limits with capabilities advertised by the worker.
     fn resolved(mut self, info: &WorkerInfo) -> Self {
         let supports = |kind| info.supported_ops.contains(&kind);
         let mut available = uniserve_core::GenerationFeatures::empty();
@@ -673,13 +722,18 @@ impl RuntimeProfile {
     }
 }
 
+/// Runtime state selected by the admitted request family.
 pub enum Runtime {
+    /// Autoregressive text runtime.
     Ar(ArRuntime),
+    /// Diffusion-only media runtime.
     Diffusion(DiffusionRuntime),
+    /// Unified multimodal runtime.
     Umm(UmmRuntime),
 }
 
 impl Runtime {
+    /// Creates an initialized instance.
     fn new(family: RuntimeFamily, state: RuntimeState) -> Self {
         match family {
             RuntimeFamily::Ar => Self::Ar(ArRuntime(state)),
@@ -688,6 +742,7 @@ impl Runtime {
         }
     }
 
+    /// Returns the operation family.
     const fn family(&self) -> RuntimeFamily {
         match self {
             Self::Ar(_) => RuntimeFamily::Ar,
@@ -696,6 +751,7 @@ impl Runtime {
         }
     }
 
+    /// Returns whether the pool accepts the operation.
     const fn accepts(&self, family: RuntimeFamily) -> bool {
         matches!(
             (self.family(), family),
@@ -705,10 +761,12 @@ impl Runtime {
         )
     }
 
+    /// Returns shared access to the execution state.
     fn state(&self) -> &RuntimeState {
         self
     }
 
+    /// Returns mutable access to the execution state.
     fn state_mut(&mut self) -> &mut RuntimeState {
         self
     }
@@ -717,6 +775,7 @@ impl Runtime {
 impl std::ops::Deref for Runtime {
     type Target = RuntimeState;
 
+    /// Returns shared access to the wrapped value.
     fn deref(&self) -> &Self::Target {
         match self {
             Self::Ar(runtime) => &runtime.0,
@@ -727,6 +786,7 @@ impl std::ops::Deref for Runtime {
 }
 
 impl std::ops::DerefMut for Runtime {
+    /// Returns mutable access to the wrapped value.
     fn deref_mut(&mut self) -> &mut Self::Target {
         match self {
             Self::Ar(runtime) => &mut runtime.0,
@@ -736,6 +796,7 @@ impl std::ops::DerefMut for Runtime {
     }
 }
 
+/// Single-threaded owner of scheduling, memory, execution, and request state.
 pub struct EngineLoop {
     executor: Box<dyn Executor>,
     pending_submission: Option<Batch>,
@@ -752,24 +813,29 @@ pub struct EngineLoop {
     /// the control loop exits and the host converts this into engine-dead.
     fatal: bool,
     trace_sink: Option<crate::runtime::bench_trace::RuntimeTraceSink>,
+    /// Largest number of operations observed in one submitted batch.
     pub peak_ops_in_batch: usize,
+    /// Shared scheduler counters and latency accumulators.
     pub stats: Arc<SchedStats>,
 }
 
 impl std::ops::Deref for EngineLoop {
     type Target = Runtime;
 
+    /// Returns shared access to the wrapped value.
     fn deref(&self) -> &Self::Target {
         &self.runtime
     }
 }
 
 impl std::ops::DerefMut for EngineLoop {
+    /// Returns mutable access to the wrapped value.
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.runtime
     }
 }
 
+/// Returns the current scheduler time.
 fn now() -> f64 {
     // route through the single shared epoch helper so every
     // component's wall-clock timestamps match. It never panics on the hot loop:
@@ -778,6 +844,7 @@ fn now() -> f64 {
     uniserve_core::now_unix_secs()
 }
 
+/// Returns the worker floating-point data type.
 fn worker_float_dtype(
     value: Option<uniserve_core::ModelDtype>,
 ) -> Option<uniserve_worker_ipc::DType> {
@@ -789,6 +856,7 @@ fn worker_float_dtype(
     }
 }
 
+/// Adds the worker forward map.
 fn add_worker_forward_map(target: &Mutex<BTreeMap<String, u64>>, delta: &BTreeMap<String, u64>) {
     if delta.is_empty() {
         return;
@@ -801,6 +869,7 @@ fn add_worker_forward_map(target: &Mutex<BTreeMap<String, u64>>, delta: &BTreeMa
     }
 }
 
+/// Returns the terminal reason for a closed request.
 fn close_reason(reason: &FinishReason) -> CloseReason {
     match reason {
         FinishReason::Cancelled | FinishReason::Aborted => CloseReason::Cancelled,
@@ -809,7 +878,7 @@ fn close_reason(reason: &FinishReason) -> CloseReason {
     }
 }
 
-/// Tokens that stop a device-relay successor before host semantic resolution.
+/// Returns tokens that stop a device-relay successor before host semantic resolution.
 ///
 /// Terminal stop/EOS tokens end the request. A direct Gen trigger instead ends
 /// the current Und continuation window: the sampled trigger remains
@@ -830,6 +899,7 @@ fn finish_token_ids(request: &GenerationRequest, eos: &[u32]) -> Vec<u32> {
     finish_token_ids
 }
 
+/// Builds ranked log-probability entries.
 fn ranked_logprobs(entries: Vec<RankedToken>) -> Vec<TokenLogprob> {
     entries
         .into_iter()
@@ -841,6 +911,7 @@ fn ranked_logprobs(entries: Vec<RankedToken>) -> Vec<TokenLogprob> {
         .collect()
 }
 
+/// Returns the operation batch classification.
 fn batch_kind(operation_variant: RunKind) -> BatchKind {
     match operation_variant {
         RunKind::ArExtend | RunKind::EncoderVision | RunKind::EncoderLatent => BatchKind::Prefill,
@@ -855,6 +926,7 @@ fn batch_kind(operation_variant: RunKind) -> BatchKind {
     }
 }
 
+/// Returns the scheduling priority for a completion.
 fn completion_priority(operation_variant: RunKind) -> u8 {
     match operation_variant {
         RunKind::DiffusionStep | RunKind::DiffusionFinalize | RunKind::TransferKvInstall => 0,
@@ -871,6 +943,7 @@ struct KvLengths {
     visible: u32,
 }
 
+/// Computes physical input and visible-prefix lengths for KV-affecting transitions.
 fn transition_kv_lengths(delta: &TransitionIntent) -> Option<KvLengths> {
     let (prefix, input) = match delta {
         TransitionIntent::IngestText {
@@ -921,6 +994,7 @@ fn transition_kv_lengths(delta: &TransitionIntent) -> Option<KvLengths> {
     })
 }
 
+/// Serializes worker forward-pass counters into the scheduler trace schema.
 fn worker_forward_stats_trace(stats: &WorkerForwardStats) -> serde_json::Value {
     json!({
         "mode_counts": stats.mode_counts,
@@ -956,13 +1030,15 @@ fn worker_forward_stats_trace(stats: &WorkerForwardStats) -> serde_json::Value {
     })
 }
 
+/// Computes ceiling division for unsigned values.
 fn ceil_div_u64(value: u64, divisor: u64) -> u64 {
     let divisor = divisor.max(1);
     value.div_ceil(divisor)
 }
 
-/// Physical transformer-token work a planned op contributes to one scheduler
-/// step. Denoise executes every latent token once per CFG branch at every
+/// Computes the physical transformer-token work charged to one scheduler step.
+///
+/// Denoising executes every latent token once per CFG branch at every
 /// timestep, so its cost multiplies the compiled latent geometry rather than the
 /// scalar per-step token cost.
 fn planned_op_token_cost(transition: &NextOp) -> usize {
@@ -979,6 +1055,7 @@ fn planned_op_token_cost(transition: &NextOp) -> usize {
         .saturating_mul(timesteps)
 }
 
+/// Computes the event capacity required before scheduling one transition.
 fn transition_output_bound(transition: &NextOp) -> usize {
     match transition.operation_variant {
         RunKind::ArVerify => transition
@@ -998,6 +1075,7 @@ fn transition_output_bound(transition: &NextOp) -> usize {
     }
 }
 
+/// Records the operation in the optional benchmark trace.
 fn operation_trace(operation: &Operation, apply: &RuntimeApply) -> serde_json::Value {
     let parent_kind = match operation.parent.point {
         CheckpointPoint::Fixed(_) => "fixed",
@@ -1016,6 +1094,7 @@ fn operation_trace(operation: &Operation, apply: &RuntimeApply) -> serde_json::V
     })
 }
 
+/// Reads the denoising burst size from the environment.
 fn denoise_step_burst_from_env() -> u16 {
     env::var(DENOISE_STEP_BURST_ENV)
         .ok()
@@ -1024,7 +1103,7 @@ fn denoise_step_burst_from_env() -> u16 {
         .unwrap_or(DEFAULT_DENOISE_STEP_BURST)
 }
 
-/// Build the IPC [`CfgParams`] for a denoise op.
+/// Builds the IPC [`CfgParams`] for a denoise op.
 ///
 /// The exact text/image CFG branch set is derived by the worker-side CFG plan.
 /// The scheduler only carries the per-path branch bound needed by generic
@@ -1040,6 +1119,7 @@ fn cfg_params(image: &uniserve_core::ImageParams, branch_count: u8) -> CfgParams
     }
 }
 
+/// Returns the number of classifier-free-guidance branches.
 fn cfg_branch_count(image: &uniserve_core::ImageParams) -> u8 {
     image.cfg_branch_count()
 }

@@ -1,4 +1,4 @@
-"""Run explicit serving benchmarks against public HTTP endpoints."""
+"""Defines commands for planning and running HTTP serving benchmarks."""
 
 from __future__ import annotations
 
@@ -15,6 +15,8 @@ from .server import ManagedServer
 
 
 def list_items(args: argparse.Namespace) -> None:
+    """Print configured servers, benchmark points, and suites."""
+
     config = load_config(args.config)
     if args.section in {"all", "servers"}:
         print("[servers]")
@@ -31,6 +33,8 @@ def list_items(args: argparse.Namespace) -> None:
 
 
 def plan(args: argparse.Namespace) -> None:
+    """Print the resolved execution plan for a benchmark selection."""
+
     config = load_config(args.config)
     points = config.selected_points(args.selection)
     rendered = []
@@ -57,6 +61,8 @@ def plan(args: argparse.Namespace) -> None:
 
 
 def run(args: argparse.Namespace) -> None:
+    """Run selected points serially and stop after the first invalid result."""
+
     config = load_config(args.config)
     output_root = args.output_root or config.artifact_root
     points = config.selected_points(args.selection)
@@ -105,6 +111,8 @@ def run(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build the evaluator command-line parser."""
+
     parser = argparse.ArgumentParser(prog="uniserve-eval", description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -139,6 +147,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    """Parse command-line arguments and dispatch the selected command."""
+
     args = build_parser().parse_args()
     args.function(args)
 

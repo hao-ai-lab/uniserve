@@ -1,4 +1,5 @@
 """Load-time parameter sharding and modality-tower device placement."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -32,6 +33,8 @@ class WeightMode(Enum):
 
     @property
     def shard_keys(self) -> tuple[str, ...]:
+        """List symbolic checkpoint shard ids in their packed parameter order."""
+
         if self is WeightMode.FUSED_QKV_LINEAR:
             return ("q", "k", "v")
         if self is WeightMode.FUSED_GATE_UP_LINEAR:
@@ -40,6 +43,8 @@ class WeightMode(Enum):
 
     @property
     def shard_key_to_index(self) -> dict[str, int]:
+        """Map symbolic checkpoint shard ids to packed slot indices."""
+
         return {key: idx for idx, key in enumerate(self.shard_keys)}
 
 
@@ -78,6 +83,8 @@ class ShardPlan:
     slots: dict[int | str, ShardSlot] = field(default_factory=dict)
 
     def slot_for(self, shard_id: int | str) -> ShardSlot | None:
+        """Resolve an integer or symbolic shard id to its destination parameter slice."""
+
         key: int | str = shard_id
         if isinstance(shard_id, str):
             key = self.mode.shard_key_to_index.get(shard_id, shard_id)
@@ -98,10 +105,14 @@ _SHARD_PLAN_ATTR = "_uniserve_shard"
 
 
 def get_shard_plan(param: nn.Parameter) -> ShardPlan | None:
+    """Read the load-time sharding plan attached to a parameter, if present."""
+
     return getattr(param, _SHARD_PLAN_ATTR, None)
 
 
 def set_shard_plan(param: nn.Parameter, plan: ShardPlan) -> None:
+    """Attach the load-time sharding plan consumed by checkpoint weight loaders."""
+
     setattr(param, _SHARD_PLAN_ATTR, plan)
 
 

@@ -1,33 +1,44 @@
-//! Engine interface for streamed generation and terminal media requests.
+//! Cloneable submission and control handles for an engine owner thread.
+//!
+//! Each accepted request receives a bounded event channel. Commands are queued
+//! independently and wake the engine after enqueueing.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 use tokio::sync::mpsc;
 use uniserve_core::{Event, Request, RequestId};
 
-/// Maximum number of canonical generation events buffered between one
-/// scheduler request and its immediate consumer.
+/// Maximum number of generation events buffered for one request consumer.
 pub const EVENT_BUFFER_CAPACITY: usize = 64;
 
+/// Failure to publish an event into a request's bounded channel.
 #[derive(Debug, thiserror::Error)]
 pub enum EventSendError {
     #[error("generation event channel is full")]
+    /// Returns the event rejected by a full bounded channel.
     Full(Box<Event>),
     #[error("generation event channel is closed")]
+    /// Returns the event rejected after the receiver closed.
     Closed(Box<Event>),
 }
 
+/// Cause recorded when an event receiver closes before terminal completion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StreamCancelCause {
     #[default]
+    /// The consumer dropped or explicitly closed the event stream.
     DroppedStream,
+    /// Incremental decoding matched a configured stop string.
     StopStringMatched,
 }
 
+/// Request-submission failures visible to engine clients.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum SubmitError {
     #[error("engine command channel is closed")]
+    /// The scheduler command channel is closed to submissions.
     Closed,
     #[error("engine is unavailable after a worker failure")]
+    /// A terminal worker failure made the engine unavailable.
     Dead,
 }
 
@@ -38,6 +49,7 @@ pub struct EventTx {
 }
 
 impl EventTx {
+    /// Attempts to publish an event without waiting for channel capacity.
     pub fn send(&self, event: Event) -> Result<(), EventSendError> {
         self.inner.try_send(event).map_err(|error| match error {
             mpsc::error::TrySendError::Full(event) => EventSendError::Full(Box::new(event)),
@@ -45,10 +57,12 @@ impl EventTx {
         })
     }
 
+    /// Returns the channel's currently available event slots.
     pub fn capacity(&self) -> usize {
         self.inner.capacity()
     }
 
+    /// Returns whether the receiving side has closed.
     pub fn is_closed(&self) -> bool {
         self.inner.is_closed()
     }
@@ -73,6 +87,7 @@ struct EventCancellation {
 }
 
 impl EventRx {
+    /// Wraps a Tokio receiver without engine cancellation or wake integration.
     pub fn from_receiver(inner: mpsc::Receiver<Event>) -> Self {
         Self {
             inner,
@@ -84,10 +99,12 @@ impl EventRx {
         }
     }
 
+    /// Registers a callback to run once on terminal completion or channel close.
     pub fn set_on_finish(&mut self, on_finish: impl FnOnce() + Send + 'static) {
         self.on_finish = Some(Box::new(on_finish));
     }
 
+    /// Receives the next event and advances output acknowledgement state.
     pub async fn recv(&mut self) -> Option<Event> {
         let event = self.inner.recv().await;
         match event.as_ref() {
@@ -100,10 +117,12 @@ impl EventRx {
         event
     }
 
+    /// Receives the next event.
     pub async fn next(&mut self) -> Option<Event> {
         self.recv().await
     }
 
+    /// Attempts to receive an event without waiting.
     pub fn try_recv(&mut self) -> Result<Event, mpsc::error::TryRecvError> {
         let event = self.inner.try_recv();
         if let Ok(event) = event.as_ref() {
@@ -113,6 +132,7 @@ impl EventRx {
         event
     }
 
+    /// Updates acknowledgement and completion state for a received event.
     fn observe(&mut self, event: &Event) {
         match event {
             Event::TextToken { .. } => {
@@ -133,6 +153,7 @@ impl EventRx {
         }
     }
 
+    /// Acknowledges every text token observed through this receiver.
     pub fn acknowledge_consumed_prefix(&mut self) {
         if self.text_tokens_received <= self.acknowledged_token_count {
             return;
@@ -146,11 +167,12 @@ impl EventRx {
         }
     }
 
-    /// Cancel the request at its last acknowledged public token prefix.
+    /// Cancels the request at its last acknowledged public token prefix.
     pub fn cancel(&mut self) {
         self.cancel_at_consumed_prefix(StreamCancelCause::DroppedStream);
     }
 
+    /// Closes generation at the receiver's safe public-token boundary.
     pub fn cancel_at_consumed_prefix(&mut self, cause: StreamCancelCause) {
         let Some(cancellation) = self.cancellation.take() else {
             return;
@@ -168,6 +190,7 @@ impl EventRx {
         let _ = cancellation.tx.send(command);
     }
 
+    /// Disarms cancellation and invokes the completion callback exactly once.
     fn finish(&mut self) {
         self.cancellation = None;
         if let Some(on_finish) = self.on_finish.take() {
@@ -177,6 +200,7 @@ impl EventRx {
 }
 
 impl Drop for EventRx {
+    /// Releases resources owned by this value.
     fn drop(&mut self) {
         if let Some(cancellation) = self.cancellation.take() {
             let _ = cancellation.tx.send(Command::Cancel {
@@ -191,10 +215,12 @@ impl Drop for EventRx {
     }
 }
 
+/// Creates a bounded request event channel with cancellation tracking.
 pub(crate) fn event_channel() -> (EventTx, EventRx) {
     event_channel_with_waker(uniserve_core::CommandWaker::noop(), None)
 }
 
+/// Creates an event channel connected to a wake descriptor.
 fn event_channel_with_waker(
     waker: uniserve_core::CommandWaker,
     cancellation: Option<EventCancellation>,
@@ -215,27 +241,37 @@ fn event_channel_with_waker(
 
 /// Command sent from a frontend handler to the scheduler thread.
 pub enum Command {
+    /// Admits a request and binds its event channel.
     Submit {
+        /// Request admitted by the scheduler.
         request: Request,
+        /// Destination for public request events.
         event_tx: EventTx,
     },
-    /// Client-side cancel → `FinishReason::Cancelled`.
+    /// Cancels a request at its acknowledged public-token boundary.
     Cancel {
+        /// Request to cancel.
         request_id: RequestId,
+        /// Safe public-token prefix, when known.
         output_token_count: Option<usize>,
     },
     /// Frontend decoder matched a stop string at this exact token prefix.
     StopAt {
+        /// Request whose decoder matched the stop string.
         request_id: RequestId,
+        /// Exact public-token prefix at which generation stops.
         output_token_count: usize,
     },
     /// Frontend decoder accepted this exact public token prefix.
     Acknowledge {
+        /// Request whose public output was consumed.
         request_id: RequestId,
+        /// Number of public tokens consumed by the frontend.
         output_token_count: usize,
     },
-    /// Server-side abort → `FinishReason::Aborted`.
+    /// Aborts a request immediately at the server boundary.
     Abort(RequestId),
+    /// Requests orderly engine shutdown.
     Shutdown,
 }
 
@@ -253,13 +289,13 @@ pub struct EngineHandle {
 }
 
 impl EngineHandle {
-    /// Construct a handle with the no-op waker (the polling / sim path, which
+    /// Constructs a handle with the no-op waker (the polling / sim path, which
     /// observes commands through its own timed wait).
     pub fn new(tx: crossbeam_channel::Sender<Command>) -> Self {
         Self::with_waker(tx, uniserve_core::CommandWaker::noop())
     }
 
-    /// Construct a handle that fires `waker` after every enqueue, used when the
+    /// Constructs a handle that fires `waker` after every enqueue, used when the
     /// engine drives an event-driven executor that parks between steps.
     pub fn with_waker(
         tx: crossbeam_channel::Sender<Command>,
@@ -268,8 +304,7 @@ impl EngineHandle {
         Self { tx, waker }
     }
 
-    /// Enqueue a command and wake any parked scheduler. Centralizes the
-    /// send-then-wake order so no caller can forget the wake.
+    /// Enqueues a command, then wakes the scheduler after a successful send.
     fn send(&self, cmd: Command) -> Result<(), crossbeam_channel::SendError<Command>> {
         let r = self.tx.send(cmd);
         // Wake only on a successful enqueue: if the channel is closed there is
@@ -280,6 +315,7 @@ impl EngineHandle {
         r
     }
 
+    /// Submits a request and returns its bounded event stream.
     pub fn submit(&self, request: impl Into<Request>) -> Result<EventRx, SubmitError> {
         let request = request.into();
         let request_id = request.request_id();
@@ -300,34 +336,39 @@ impl EngineHandle {
         Ok(event_rx)
     }
 
+    /// Cancels a request without constraining its public output prefix.
     pub fn cancel(&self, id: RequestId) {
         let _ = self.send(Command::Cancel {
             request_id: id,
             output_token_count: None,
         });
     }
+    /// Cancels a request after the specified public token count.
     pub fn cancel_at(&self, id: RequestId, output_token_count: usize) {
         let _ = self.send(Command::Cancel {
             request_id: id,
             output_token_count: Some(output_token_count),
         });
     }
+    /// Finishes a request successfully at the specified public token count.
     pub fn stop_at(&self, id: RequestId, output_token_count: usize) {
         let _ = self.send(Command::StopAt {
             request_id: id,
             output_token_count,
         });
     }
+    /// Acknowledges consumption through the specified public token count.
     pub fn acknowledge_at(&self, id: RequestId, output_token_count: usize) {
         let _ = self.send(Command::Acknowledge {
             request_id: id,
             output_token_count,
         });
     }
-    /// Server-side abort, distinct from a client cancel.
+    /// Aborts a request immediately without applying client cancellation semantics.
     pub fn abort(&self, id: RequestId) {
         let _ = self.send(Command::Abort(id));
     }
+    /// Requests orderly engine shutdown.
     pub fn shutdown(&self) {
         let _ = self.send(Command::Shutdown);
     }
@@ -569,7 +610,7 @@ mod tests {
         assert!(matches!(rx.recv().unwrap(), Command::Shutdown));
     }
 
-    /// Finish reasons are distinct values, so a client-side cancel never
+    /// Finishes reasons are distinct values, so a client-side cancel never
     /// compares equal to a server-side abort.
     #[test]
     fn finish_reason_variants_are_distinct() {

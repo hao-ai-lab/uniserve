@@ -1,4 +1,5 @@
 """Shared vision layers."""
+
 from .encoder import VisionEncoder, VisionEncoderConfig
 from .modules import MLPConnector, PatchEmbed
 from .neo_vit import NeoVitConfig, NeoVitEncoder

@@ -1,3 +1,5 @@
+"""Registers task adapters for request construction and output validation."""
+
 from __future__ import annotations
 
 from ..types import TaskName
@@ -20,6 +22,8 @@ TASKS: dict[str, type[BenchmarkTask]] = {
 
 
 def get_task(name: str | TaskName) -> type[BenchmarkTask]:
+    """Return the task adapter registered under a task identifier."""
+
     key = name.value if isinstance(name, TaskName) else name
     if key not in TASKS:
         known = ", ".join(sorted(TASKS)) or "(none)"
@@ -28,6 +32,8 @@ def get_task(name: str | TaskName) -> type[BenchmarkTask]:
 
 
 def list_tasks() -> tuple[type[BenchmarkTask], ...]:
+    """Return registered task adapters in identifier order."""
+
     return tuple(TASKS[name] for name in sorted(TASKS))
 
 

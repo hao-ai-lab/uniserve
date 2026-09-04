@@ -1,12 +1,14 @@
-//! EngineLoop-owned execution window and request-local completion ordering.
+//! Engine-loop-owned execution window and request-local completion ordering.
 
 use super::*;
 
+/// Runtime-family state updated by a physical completion.
 pub(super) enum InflightApply {
     Generation(RuntimeApply),
     Media(MediaCursor),
 }
 
+/// Submitted operation and timing state awaiting completion.
 pub(super) struct InflightOp {
     pub(super) operation: Operation,
     pub(super) apply: InflightApply,
@@ -14,6 +16,7 @@ pub(super) struct InflightOp {
 }
 
 impl InflightOp {
+    /// Applies a generation result to its in-flight request.
     pub(super) fn generation_apply(&self) -> &RuntimeApply {
         match &self.apply {
             InflightApply::Generation(apply) => apply,
@@ -23,6 +26,7 @@ impl InflightOp {
 }
 
 #[derive(Clone, Copy)]
+/// Scheduler counters captured when one run is submitted.
 pub(super) struct SubmittedRunAccounting {
     pub(super) domain: uniserve_worker_ipc::Domain,
     pub(super) mixed: bool,
@@ -30,17 +34,20 @@ pub(super) struct SubmittedRunAccounting {
     pub(super) operation_count: usize,
 }
 
+/// Completion held until earlier request operations are applied.
 pub(super) struct PendingCompletion {
     pub(super) record: ModelOutput,
     pub(super) products: Arc<[ProductPayload]>,
     pub(super) arrival_seq: u64,
 }
 
+/// Terminal event held until outstanding operations are reconciled.
 pub(super) struct PendingFinish {
     pub(super) reason: FinishReason,
     pub(super) stop_reason: Option<uniserve_core::StopReason>,
 }
 
+/// Batches, operations, and deferred completions owned by the engine loop.
 pub(super) struct InflightWindow {
     pub(super) transfer_capacity: usize,
     pub(super) inflight_transfers: usize,
@@ -57,6 +64,7 @@ pub(super) struct InflightWindow {
 }
 
 impl InflightWindow {
+    /// Creates an empty in-flight batch registry.
     pub(super) fn new(transfer_capacity: usize) -> Self {
         Self {
             transfer_capacity,
@@ -74,27 +82,32 @@ impl InflightWindow {
         }
     }
 
+    /// Returns and advances the next batch identifier.
     pub(super) fn next_batch_id(&mut self) -> u64 {
         self.batch_id = self.batch_id.saturating_add(1);
         self.batch_id
     }
 
+    /// Returns and advances the next arrival sequence.
     pub(super) fn next_arrival(&mut self) -> u64 {
         let arrival = self.next_arrival_seq;
         self.next_arrival_seq = self.next_arrival_seq.saturating_add(1);
         arrival
     }
 
+    /// Returns whether the collection contains the requested item.
     pub(super) fn contains(&self, id: RequestId) -> bool {
         self.operations
             .get(&id)
             .is_some_and(|queue| !queue.is_empty())
     }
 
+    /// Returns the number of entries.
     pub(super) fn len(&self, id: RequestId) -> usize {
         self.operations.get(&id).map_or(0, VecDeque::len)
     }
 
+    /// Returns whether any in-flight operation performs denoising.
     pub(super) fn any_denoise(&self) -> bool {
         self.operations
             .values()
@@ -102,6 +115,7 @@ impl InflightWindow {
             .any(|op| op.operation.kind == RunKind::DiffusionStep)
     }
 
+    /// Removes head-of-line completions in domain-priority and arrival order.
     pub(super) fn take_ready(&mut self) -> Vec<PendingCompletion> {
         let mut ready = self
             .completions
@@ -134,6 +148,7 @@ impl InflightWindow {
         completions
     }
 
+    /// Removes the exact head operation and releases its transfer reservation.
     pub(super) fn pop(&mut self, request_key: RequestKey, op_id: u64) -> Option<InflightOp> {
         let id = request_key.request_id;
         let queue = self.operations.get_mut(&id)?;
@@ -158,6 +173,7 @@ impl InflightWindow {
         Some(inflight)
     }
 
+    /// Removes failed operations from the in-flight registry.
     pub(super) fn clear_failed(&mut self) -> (Vec<RequestId>, Vec<BatchCommand>) {
         let ids = self.operations.keys().copied().collect();
         let commands = self

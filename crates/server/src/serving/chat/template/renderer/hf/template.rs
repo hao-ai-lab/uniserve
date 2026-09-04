@@ -1,6 +1,6 @@
-//! Chat template environment and content-shape detection for tokenizers using
-//! Jinja2 templates. Special tokens come from
-//! `crate::profile::assets::HfSpecialTokens`.
+//! Jinja environment construction and chat-template content-shape detection.
+//!
+//! Tokenizer metadata supplies special tokens and the configured template text.
 
 use std::collections::HashMap;
 use std::fs;
@@ -21,7 +21,7 @@ use crate::serving::chat::template::renderer::hf::{TemplateMessage, TemplateTool
 
 type Result<T> = std::result::Result<T, TemplateError>;
 
-/// Build a pre-configured environment with the given template string.
+/// Builds a pre-configured environment with the given template string.
 fn build_environment(template: String) -> Result<Environment<'static>> {
     let mut env = Environment::new();
 
@@ -38,6 +38,7 @@ fn build_environment(template: String) -> Result<Environment<'static>> {
 
 #[serde_with::skip_serializing_none]
 #[derive(Default, Serialize)]
+/// Values installed into the Jinja environment for one render.
 pub(super) struct TemplateContext<'a> {
     pub(super) messages: &'a [TemplateMessage],
     pub(super) add_generation_prompt: bool,
@@ -53,7 +54,7 @@ pub(super) struct TemplateContext<'a> {
     pub(super) reasoning_effort: Option<ReasoningEffort>,
 }
 
-/// Load chat template from a file (`.jinja` or `.json` containing Jinja).
+/// Loads chat template from a file (`.jinja` or `.json` containing Jinja).
 pub fn load_chat_template(template_path: &Path) -> Result<Option<String>> {
     let content = fs::read_to_string(template_path).map_err(TemplateError::ReadTemplateFile)?;
 
@@ -80,7 +81,7 @@ pub fn load_chat_template(template_path: &Path) -> Result<Option<String>> {
     Ok(Some(template))
 }
 
-/// Resolve a configured chat template value into a template string.
+/// Resolves a configured chat template value into a template string.
 pub fn resolve_chat_template(chat_template: &str) -> Result<String> {
     let path = Path::new(chat_template);
     if path.exists() {
@@ -104,7 +105,7 @@ pub(super) struct CompiledChatTemplate {
 }
 
 impl CompiledChatTemplate {
-    /// Compile the given chat template string into a [`CompiledChatTemplate`].
+    /// Compiles the given chat template string into a [`CompiledChatTemplate`].
     pub(super) fn new(
         template: String,
         content_format: ChatTemplateContentFormatOption,
@@ -121,13 +122,14 @@ impl CompiledChatTemplate {
         })
     }
 
-    /// Apply the compiled template to the given context and return the rendered
+    /// Applies the compiled template to the given context and return the rendered
     /// prompt.
     pub(super) fn apply(&self, ctx: TemplateContext<'_>) -> Result<String> {
         let tmpl = self.env.get_template("chat")?;
         tmpl.render(ctx).map_err(TemplateError::from)
     }
 
+    /// Returns the resolved message-content shape expected by the template.
     pub(super) fn content_format(&self) -> ChatTemplateContentFormat {
         self.content_format
     }

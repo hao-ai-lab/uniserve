@@ -1,4 +1,4 @@
-//! Prometheus recording for engine-reported scheduler statistics.
+//! Prometheus publication of engine-reported scheduler statistics.
 
 use uniserve_observability::{
     EngineBackendLabels, EngineComponentLabels, EngineDomainKindLabels, EngineDomainLabels,
@@ -9,7 +9,7 @@ use uniserve_core::codec::stats::SchedulerStats;
 
 const WAITING_REASON_CAPACITY: &str = "capacity";
 
-/// Record the scheduler-stats-backed metrics for one engine at one point in
+/// Records the scheduler-stats-backed metrics for one engine at one point in
 /// time.
 pub fn record_scheduler_stats(
     metrics: &SchedulerMetrics,
@@ -299,16 +299,9 @@ pub fn record_scheduler_stats(
         }
     }
 
-    // directly-measured batch latency (worker compute + host
-    // round-trip), now surfaced to Prometheus instead of the JSON trace only.
-
-    // the worker/scheduler latency counters use cumulative *microseconds*
-    // (the `_us` suffix records the unit in IPC), deliberately
-    // distinct from the per-request second-valued histograms in
-    // `uniserve_observability::request`. They are not a competing unit system:
-    // a dashboard reconciles them as `seconds = <_us counter> / 1e6`. The
-    // microsecond integer counter is kept (rather than a lossy us->s cast at
-    // ingest) so sub-microsecond cumulative precision is preserved.
+    // Worker and round-trip latency remain cumulative integer microseconds to
+    // preserve precision. Dashboards convert these counters to seconds when
+    // combining them with per-request second-valued histograms.
     metrics
         .worker_exec_us
         .get_or_create(&labels)

@@ -1,5 +1,12 @@
 # Copyright (c) 2025, Tri Dao.
 
+"""Builds and applies attention masks in accumulator-layout coordinates.
+
+The helpers cover SM90 register fragments and SM100 TMEM fragments. They translate
+logical query/key bounds into the lane ordering expected by R2P instructions and
+partition tiled work into fully visible, partially masked, and residual regions.
+"""
+
 from typing import Optional, Callable, TypeAlias, Tuple
 from dataclasses import dataclass
 import enum
@@ -29,6 +36,7 @@ def call_mask_mod(
     seqlen_info,
     aux_data: AuxData,
 ):
+    """Call a compiled mask predicate with its tensor and scalar auxiliaries."""
     return mask_mod(
         batch_idx,
         head_idx,
@@ -42,10 +50,10 @@ def call_mask_mod(
 
 @cute.jit
 def r2p_bitmask_below(limit: Int32, s: int) -> Uint32:
-    """32-bit R2P bitmask keeping positions < limit (exclusive upper bound).
+    """Return the R2P keep bits below an exclusive element index.
 
-    Positions 0..limit-1 in chunk `s` get bit=1 (keep), the rest bit=0 (mask).
-    Uses inline PTX to avoid shift-by-type-width UB.
+    ``s`` selects a 32-element chunk. The PTX-backed shift helper defines the
+    boundary case where the chunk lies wholly above or below ``limit``.
     """
     m = max((s + 1) * MASK_R2P_CHUNK_SIZE - limit, 0)
     return utils.shr_u32(Uint32(0xFFFFFFFF), Uint32(m))
@@ -53,10 +61,10 @@ def r2p_bitmask_below(limit: Int32, s: int) -> Uint32:
 
 @cute.jit
 def r2p_bitmask_above(limit: Int32, s: int) -> Uint32:
-    """32-bit R2P bitmask keeping positions >= limit (inclusive lower bound).
+    """Return the R2P keep bits at or above an inclusive element index.
 
-    Positions limit..31 in chunk `s` get bit=1 (keep), the rest bit=0 (mask).
-    Uses inline PTX to avoid shift-by-type-width UB.
+    ``s`` selects a 32-element chunk. The PTX-backed shift helper preserves the
+    all-zero and all-one masks at word-sized shift boundaries.
     """
     n = max(limit - s * MASK_R2P_CHUNK_SIZE, 0)
     return utils.shl_u32(Uint32(0xFFFFFFFF), Uint32(n))
@@ -68,18 +76,16 @@ def mask_r2p_lambda(
     mask_gen_fn: cutlass.Constexpr[MaskGenFn],
     rank1: bool = False,
 ) -> None:
-    """Apply R2P masking with a custom bitmask generator.
+    """Mask a register fragment from generated 32-element R2P keep masks.
 
-    mask_gen_fn(chunk_idx: constexpr int) -> Uint32:
-        Returns a 32-bit bitmask for the chunk. Bit i set means column
-        chunk_idx * chunk_size + i is KEPT; bit i clear means masked to -inf.
+    ``mask_gen_fn`` returns one word per chunk; set bits preserve values and
+    clear bits replace values with negative infinity.
     """
     ncol = const_expr(cute.size(X.shape[cute.rank(X) - 1]) if not rank1 else cute.size(X.shape))
-    # 32-column chunks. The mask_gen_fn returns a Uint32 bitmask (1=keep).
     CHUNK_SIZE = MASK_R2P_CHUNK_SIZE
     for s in cutlass.range_constexpr(cute.ceil_div(ncol, CHUNK_SIZE)):
         mask = mask_gen_fn(s)
-        # This needs to be range_constexpr, o/w the compiler can't generate the R2P instruction
+        # Compile-time lane expansion allows the stores to lower to R2P.
         for i in cutlass.range_constexpr(min(CHUNK_SIZE, ncol - s * CHUNK_SIZE)):
             in_bound = cutlass.Boolean(mask & (Uint32(1) << i))
             c = s * CHUNK_SIZE + i
@@ -92,34 +98,19 @@ def mask_r2p_lambda(
 
 @cute.jit
 def sm90_col_to_r2p_idx(col_limit: Int32) -> Int32:
-    """Transform SM90 MMA column coordinate to R2P element index.
+    """Map an SM90 MMA column threshold to contiguous R2P lane order.
 
-    SM90 MMA accumulator column indices are non-contiguous: 0, 1, 8, 9, 16, 17, ...
-    Element indices are contiguous: 0, 1, 2, 3, 4, 5, ...
-    This converts a column-space threshold to element-space for r2p_bitmask_below/above.
+    MMA columns follow ``0, 1, 8, 9, ...`` while R2P lanes are contiguous.
     """
     return col_limit // 8 * 2 + min(col_limit % 8, 2)
 
 
 @cute.jit
 def row_to_r2p_idx(x: Int32, num_rep: int, num_wg: int) -> Int32:
-    """Convert a row coordinate to an R2P element index in the warp-group interleaved layout.
+    """Map a logical row threshold to a warp-group-interleaved R2P index.
 
-    In the SM100 backward pass, 2 warp groups share TMEM. The TMEM load atom
-    distributes rows in an interleaved pattern: elements 0..num_rep-1 map to
-    rows 0..num_rep-1 (warp group 0), elements num_rep..2*num_rep-1 map to
-    rows num_rep*num_wg..num_rep*num_wg+num_rep-1 (warp group 1), and so on.
-    Row-coordinate thresholds (causal limits, window bounds, uih_len) must be
-    converted to element indices before use with r2p_bitmask_above/below.
-
-    Rows not owned by this thread (in the gap between warp groups) are clamped
-    to the boundary element index, which is safe because R2P thresholds are
-    monotonic.
-
-    Example with num_rep=16, num_wg=2:
-        row  0 -> elem  0,  row 15 -> elem 15,
-        row 16 -> elem 16 (clamped), row 31 -> elem 16 (clamped),
-        row 32 -> elem 16, row 33 -> elem 17, row 47 -> elem 31.
+    SM100 backward TMEM loads interleave ``num_rep`` rows from each sharing warp
+    group. Gaps not owned by the current thread clamp to the monotonic boundary.
     """
     return x // (num_rep * num_wg) * num_rep + min(x % (num_rep * num_wg), num_rep)
 
@@ -130,9 +121,10 @@ def apply_packed_mask_chunk(
     chunk_idx: cutlass.Constexpr[int],
     mask: Uint32,
 ) -> None:
-    """Apply one 32-bit keep mask to one 32-column chunk.
+    """Apply one packed keep mask to a 32-element register chunk.
 
-    The one-iteration chunk loop keeps the same lowering pattern as mask_r2p_lambda.
+    The constexpr single-trip loop exposes lane operations in the form expected
+    by R2P lowering while still accepting a caller-selected chunk.
     """
     ncol = const_expr(cute.size(X.shape))
     col_base = chunk_idx * MASK_R2P_CHUNK_SIZE
@@ -147,20 +139,30 @@ def apply_packed_mask_chunk(
 
 @dataclass(frozen=True)
 class AttentionMask:
+    """Maps logical attention constraints onto an MMA accumulator tile.
+
+    ``tile_m`` and ``tile_n`` describe query and key tile extents. ``swap_AB``
+    records whether the accumulator's row and column modes exchange those roles.
+    Pack-GQA folds query heads into the row coordinate and restores them before a
+    user mask predicate is evaluated.
+    """
+
     tile_m: cutlass.Constexpr[int]
     tile_n: cutlass.Constexpr[int]
     seqlen_info: SeqlenInfoQK
     window_size_left: Optional[Int32] = None
     window_size_right: Optional[Int32] = None
-    qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1  # only pass in if we're doing PackGQA
+    qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
     swap_AB: cutlass.Constexpr[bool] = False
 
     @property
     def seqlen_q(self) -> Int32:
+        """Return the logical query sequence length."""
         return self.seqlen_info.seqlen_q
 
     @property
     def seqlen_k(self) -> Int32:
+        """Return the logical key sequence length."""
         return self.seqlen_info.seqlen_k
 
     @cute.jit
@@ -179,22 +181,25 @@ class AttentionMask:
         aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
     ) -> None:
+        """Mask an SM90 MMA accumulator for bounds, windows, or a predicate.
+
+        The accumulator remains in register-fragment order. Compile-time identity
+        coordinates convert each lane to its logical query and key position.
+        """
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
         acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S, transpose=self.swap_AB)
         acc_shape = (self.tile_m, self.tile_n)
         cS = cute.make_identity_tensor(acc_shape if not self.swap_AB else acc_shape[::-1])
         tScS_mn = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(cS), transpose=self.swap_AB)
-        # We use t0ScS as these indices are known at compile time. We then must subtract the
-        # column limit by the thread column offset.
+        # Slice-zero coordinates stay compile-time constants; runtime limits account
+        # for the current thread's column offset separately.
         t0ScS_mn = layout_utils.reshape_acc_to_mn(
             thr_mma.get_slice(0).partition_C(cS), transpose=self.swap_AB
         )
         ROW = 0 if const_expr(not self.swap_AB) else 1
         COL = 1 if const_expr(not self.swap_AB) else 0
         thr_col_offset = tScS_mn[0][COL]
-        # To handle edge cases of completely masked out rows where n_block_max = 0,
-        # we treat negative n_blocks as 0th n_block
-        # TODO: find more transparent solution
+        # A negative sentinel denotes a fully masked row and shares tile-zero bounds.
         if n_block < 0:
             n_block = 0
         seqlenk_col_limit = self.seqlen_k - n_block * self.tile_n - thr_col_offset
@@ -202,7 +207,6 @@ class AttentionMask:
             if const_expr(mask_seqlen):
                 r2p = const_expr(not self.swap_AB)
                 if const_expr(not r2p):
-                    # traverse column index.
                     for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
                         oob = t0ScS_mn[0, c][COL] >= seqlenk_col_limit
                         for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
@@ -226,7 +230,6 @@ class AttentionMask:
             )
 
             for r in cutlass.range_constexpr(nrow):
-                # Respect swap_AB: ROW/COL determine which coordinate component corresponds to Q/KV.
                 local_row = tScS_mn[r, 0][ROW]
                 global_row_idx = local_row + m_block * self.tile_m
                 row_for_mod = global_row_idx
@@ -241,7 +244,6 @@ class AttentionMask:
 
                 for col in cutlass.range_constexpr(ncol):
                     col_idx_local = t0ScS_mn[0, col][COL]
-                    # Convert to absolute column index
                     global_col_idx = thr_col_offset + col_idx_local + n_block * self.tile_n
                     col_for_mod = global_col_idx
                     if const_expr(wrap_aux_indices):
@@ -272,9 +274,9 @@ class AttentionMask:
                     else:
                         acc_S_mn[r, col] = acc_S_mn[r, col] if cond else -cutlass.Float32.inf
 
-        else:  # Causal or local
+        else:
             if const_expr(not self.swap_AB):
-                # If PackGQA, we split the work of compute divmod among threads in the same row
+                # Threads sharing an accumulator row also share Pack-GQA index conversion.
                 threads_per_row = thr_mma.tv_layout_C.shape[0][0]
                 mma_m_idx = None
                 if const_expr(self.qhead_per_kvhead_packgqa != 1):
@@ -291,9 +293,8 @@ class AttentionMask:
                     1 + self.seqlen_k - n_block * self.tile_n - self.seqlen_q - thr_col_offset
                 )
                 if const_expr(mask_causal):
-                    r2p = const_expr(not self.swap_AB)  # R2P trick, see apply_mask_sm100
+                    r2p = const_expr(not self.swap_AB)
                     for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
-                        # get the column index limit based on current row. Only consider the row index, so the column index sets to 0.
                         if const_expr(self.qhead_per_kvhead_packgqa == 1):
                             row_idx = tScS_mn[r, 0][0] + m_block * self.tile_m
                         else:
@@ -304,7 +305,6 @@ class AttentionMask:
                         if const_expr(mask_seqlen):
                             col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
                         if const_expr(not r2p):
-                            # traverse column index.
                             for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
                                 acc_S_mn[r, c] = (
                                     -Float32.inf
@@ -318,7 +318,7 @@ class AttentionMask:
                                 lambda s: r2p_bitmask_below(col_limit_r2p, s),
                                 rank1=True,
                             )
-                else:  # Local
+                else:
                     local_row_offset_right = (
                         causal_row_offset + self.window_size_right
                         if const_expr(self.window_size_right is not None)
@@ -349,7 +349,6 @@ class AttentionMask:
                             else 0
                         )
                         if const_expr(not r2p_local):
-                            # traverse column index.
                             for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
                                 col_idx = t0ScS_mn[0, c][1]
                                 if col_idx >= col_limit_right or col_idx < col_limit_left:
@@ -359,12 +358,13 @@ class AttentionMask:
                             col_limit_left_r2p = sm90_col_to_r2p_idx(col_limit_left)
 
                             def mask_gen_fn(s: int) -> Uint32:
+                                """Return keep bits inside the local window."""
                                 return r2p_bitmask_below(
                                     col_limit_right_r2p, s
                                 ) & r2p_bitmask_above(col_limit_left_r2p, s)
 
                             mask_r2p_lambda(acc_S_mn[r, None], mask_gen_fn, rank1=True)
-            else:  # swap_AB
+            else:
                 assert self.qhead_per_kvhead_packgqa == 1
                 thr_row_offset = tScS_mn[0][ROW]
                 causal_row_offset = (
@@ -373,8 +373,7 @@ class AttentionMask:
                 if const_expr(mask_causal):
                     for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
                         col0 = t0ScS_mn[0, c][COL]
-                        # If col0 is beyond the column limit, we want to mask out the entire
-                        # column, by setting row limit to be self.tile_m.
+                        # An out-of-range key raises the threshold past every query row.
                         row_limit_top = (
                             self.tile_m
                             if col0 >= seqlenk_col_limit and mask_seqlen
@@ -389,8 +388,7 @@ class AttentionMask:
                 else:
                     for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
                         col0 = t0ScS_mn[0, c][COL]
-                        # If col0 is beyond the column limit, we want to mask out the entire
-                        # column, by setting row limit to be self.tile_m.
+                        # An out-of-range key raises the threshold past every query row.
                         row_limit_top = (
                             self.tile_m
                             if col0 >= seqlenk_col_limit and mask_seqlen
@@ -429,12 +427,11 @@ class AttentionMask:
         head_divmod=None,
         check_q_boundary: bool = False,
     ) -> None:
-        """Apply a scalar FlexAttention mask_mod to an SM100 accumulator fragment.
+        """Apply a scalar mask predicate to an SM100 TMEM load fragment.
 
-        Each accumulator lane calls mask_mod once with logical (batch, head, q, kv)
-        indices. Pack-GQA rows are converted back to logical q/head indices before
-        the call. When aux tensors are present, indices are wrapped with fastdiv so
-        mask_mod never reads outside the per-example auxiliary storage.
+        Each lane evaluates logical ``(batch, head, query, key)`` coordinates.
+        Pack-GQA rows restore the query-head coordinate, and auxiliary indices wrap
+        to their declared per-example extent before the predicate reads them.
         """
         has_fastdiv = const_expr(
             fastdiv_mods is not None and fastdiv_mods[0] is not None and fastdiv_mods[1] is not None
@@ -443,11 +440,15 @@ class AttentionMask:
         ncol = const_expr(cute.size(tScS_t2r.shape))
 
         for i in cutlass.range_constexpr(ncol):
+            # Recover logical score coordinates from the TMEM load atom's lane
+            # order before applying block origins.
             row_coord = tScS_t2r[i][0] if not self.swap_AB else tScS_t2r[i][1]
             col_coord = tScS_t2r[i][1] if not self.swap_AB else tScS_t2r[i][0]
             global_row = row_coord + m_block * self.tile_m
             global_col = col_coord + n_block * self.tile_n
 
+            # Packed GQA folds query heads into the row coordinate, so restore
+            # the public query row and head seen by the predicate.
             if const_expr(self.qhead_per_kvhead_packgqa != 1):
                 assert head_divmod is not None
                 mask_row, head_offset = divmod(global_row, head_divmod)
@@ -456,6 +457,8 @@ class AttentionMask:
                 head_idx_for_mod = head_idx
                 mask_row = global_row
 
+            # Auxiliary tensors can use shorter per-example extents than the
+            # padded score tile; fast division wraps only those predicate inputs.
             mask_row_for_mod = mask_row
             if const_expr(has_fastdiv and aux_data.tensors is not None):
                 if check_q_boundary:
@@ -464,6 +467,8 @@ class AttentionMask:
             if const_expr(has_fastdiv and mask_seqlen and aux_data.tensors is not None):
                 _, global_col_for_mod = divmod(global_col, fastdiv_mods[1])
 
+            # Invoke the user predicate in scalar SSA form, then compose its
+            # result with the physical query and key sequence boundaries.
             head_idx_ssa = utils.scalar_to_ssa(head_idx_for_mod, cutlass.Int32)
             mask_row_ssa = utils.scalar_to_ssa(mask_row_for_mod, cutlass.Int32)
             kv_idx_ssa = utils.scalar_to_ssa(global_col_for_mod, cutlass.Int32)
@@ -500,12 +505,11 @@ class AttentionMask:
         head_divmod=None,
         check_q_boundary: bool = False,
     ) -> None:
-        """Apply a vectorized FlexAttention mask_mod to an SM100 fragment.
+        """Apply a vectorized mask predicate to an SM100 TMEM load fragment.
 
-        mask_mod receives vec_size adjacent KV indices for one logical q row and
-        returns bit-packed Uint32 keep masks. Low bits correspond to lower KV
-        indices. The packed masks are combined with sequence-boundary checks, then
-        applied in 32-column chunks so the final masking lowers to R2P.
+        The predicate receives ``vec_size`` adjacent key indices for one logical
+        query and returns packed keep bits in ascending key order. Sequence bounds
+        join those bits before 32-element chunks lower to R2P.
         """
         has_fastdiv = const_expr(
             fastdiv_mods is not None and fastdiv_mods[0] is not None and fastdiv_mods[1] is not None
@@ -517,8 +521,7 @@ class AttentionMask:
         n_calls = const_expr(cute.ceil_div(ncol, vec_size))
         mask_vals = cute.make_rmem_tensor(mask_vals_per_apply, dtype=cutlass.Uint32)
 
-        # Accumulate enough vector mask_mod calls to produce 32-bit chunks that
-        # apply_packed_mask_chunk can lower to R2P.
+        # Sub-word predicate results accumulate until they fill an R2P word.
         for s in cutlass.range_constexpr(n_calls):
             if const_expr(s % calls_per_apply == 0):
                 for c in cutlass.range_constexpr(mask_vals_per_apply):
@@ -549,7 +552,6 @@ class AttentionMask:
             batch_idx_ssa_call = batch_idx_ssa.broadcast_to((vec_size,))
             kv_idx_vec = cute.make_rmem_tensor(vec_size, cutlass.Int32)
 
-            # Build the per-lane KV indices for this vectorized mask_mod call.
             for j in cutlass.range_constexpr(min(vec_size, ncol - i)):
                 col_j_coord = tScS_t2r[i + j][1] if not self.swap_AB else tScS_t2r[i + j][0]
                 col_j_global = col_j_coord + n_block * self.tile_n
@@ -559,7 +561,6 @@ class AttentionMask:
                 kv_idx_vec[j] = col_j_for_mod
             kv_idx_ssa = kv_idx_vec.load()
 
-            # mask_value is already bit-packed by the vectorized mask_mod.
             mask_value = call_mask_mod(
                 mask_mod,
                 batch_idx_ssa_call,
@@ -570,7 +571,6 @@ class AttentionMask:
                 aux_data,
             )
 
-            # For vec_size < 32, multiple mask_mod calls fill one R2P chunk.
             bit_offset = const_expr((s % calls_per_apply) * vec_size)
             seqlen_thresh_call = (
                 self.seqlen_k - global_col if const_expr(mask_seqlen) else cutlass.Int32(0)
@@ -590,14 +590,13 @@ class AttentionMask:
                     mask_val = mask_val if q_in_bounds else cutlass.Uint32(0)
                 mask_vals[c] = mask_vals[c] | (mask_val << bit_offset)
 
-            # Apply only when the 32-bit chunk is complete, or at the tile tail.
+            # A partial final word is valid because the fragment extent bounds stores.
             is_last_in_apply = const_expr(s % calls_per_apply == calls_per_apply - 1)
             is_last_overall = const_expr(s == n_calls - 1)
             if const_expr(is_last_in_apply or is_last_overall):
                 apply_idx = s // calls_per_apply
                 for c in cutlass.range_constexpr(mask_vals_per_apply):
                     chunk_idx = apply_idx * mask_vals_per_apply + c
-                    # Skip packed chunks that start past the accumulator fragment.
                     if const_expr(chunk_idx * 32 < ncol):
                         apply_packed_mask_chunk(acc_S, chunk_idx, mask_vals[c])
 
@@ -624,15 +623,21 @@ class AttentionMask:
         rBitmask: Optional[cute.Tensor] = None,
         prefix_visible_end: Optional[cute.Tensor] = None,
     ) -> None:
+        """Mask an SM100 attention-score fragment loaded from TMEM.
+
+        The score fragment stays in the TMEM load atom's lane order. This routine
+        derives logical coordinates from that layout and applies exactly one of a
+        packed bitmask, residual bounds, prefix visibility, a user predicate, or a
+        causal/local window. Set bits preserve scores; all excluded scores become
+        negative infinity before the online-softmax update.
+        """
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
         acc_shape = (self.tile_m, self.tile_n)
         cS = cute.make_identity_tensor(acc_shape if not self.swap_AB else acc_shape[::-1])
         tScS = thr_mma.partition_C(cS)
         tScS = tScS[(None, None), 0, 0]
         tScS_t2r = thr_tmem_load.partition_D(tScS)
-        # To handle edge cases of completely masked out rows where n_block_max = 0,
-        # we treat negative n_blocks as 0th n_block
-        # TODO: find more transparent solution
+        # A negative sentinel denotes a fully masked row and shares tile-zero bounds.
         if n_block < 0:
             n_block = 0
         seqlenk_col_limit = self.seqlen_k - n_block * self.tile_n
@@ -640,7 +645,7 @@ class AttentionMask:
         if const_expr(rBitmask is not None):
             ncol_packed = const_expr(cute.size(rBitmask.shape[0]))
             for i in cutlass.range_constexpr(ncol_packed):
-                col_start = 32 * i  # mask is bit-packed into uint32
+                col_start = 32 * i
                 curr_mask_val = rBitmask[i]
                 for j in cutlass.range_constexpr(32):
                     curr_col = col_start + j
@@ -651,9 +656,6 @@ class AttentionMask:
             if const_expr(mask_seqlen):
                 if const_expr(not r2p):
                     for i in cutlass.range(cute.size(tScS_t2r.shape), unroll_full=True):
-                        # if tScS_t2r[i][1] >= seqlenk_col_limit:
-                        #     acc_S[i] = -Float32.inf
-                        # For some reason the 2 lines above generate really bad SASS
                         acc_S[i] = -Float32.inf if tScS_t2r[i][1] >= seqlenk_col_limit else acc_S[i]
                 else:
                     mask_r2p_lambda(
@@ -667,9 +669,7 @@ class AttentionMask:
             and not mask_local
             and (mask_mod is not None or prefix_visible_end is not None)
         ):
-            # FlexAttention mask_mod vectorization is gated on `mask_mod.__vec_size__`.
-            # vec_size == 1 returns a scalar Boolean. vec_size > 1 returns packed
-            # Uint32 mask fragments: one word per 32 evaluated columns.
+            # Prefix limits and user predicates share logical coordinate recovery.
             if const_expr(prefix_visible_end is not None):
                 has_fastdiv = const_expr(
                     fastdiv_mods is not None and fastdiv_mods[0] is not None and fastdiv_mods[1] is not None
@@ -737,7 +737,7 @@ class AttentionMask:
                         check_q_boundary,
                     )
 
-        else:  # Causal or local
+        else:
             causal_row_offset = self.seqlen_k - n_block * self.tile_n - self.seqlen_q
             row_idx = tScS_t2r[0][0] + m_block * self.tile_m
             if const_expr(self.qhead_per_kvhead_packgqa != 1):
@@ -746,8 +746,6 @@ class AttentionMask:
                 col_limit_right = row_idx + causal_row_offset + 1
                 if const_expr(mask_seqlen):
                     col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
-                # if cute.arch.thread_idx()[0] % 32 == 0:
-                #     cute.printf("tidx = %d, tidx tmem = %d, row_idx = %d, col_limit_right = %d, causal_row_offset = %d\n", cute.arch.thread_idx()[0], thr_tmem_load.thr_idx, row_idx, col_limit_right, causal_row_offset)
                 ncol = const_expr(cute.size(tScS_t2r.shape))
                 if const_expr(not r2p):
                     for i in cutlass.range(ncol, unroll_full=True):
@@ -781,7 +779,6 @@ class AttentionMask:
                     else 0
                 )
                 if const_expr(not r2p):
-                    # if cute.arch.thread_idx()[0] == 0 or cute.arch.thread_idx()[0] == 128: cute.printf("m_block = {}, n_block = {}, row_idx = {}, causal_row_offset = {}, col_limit_right = {}, col_limit_left = {}", m_block, n_block, row_idx, causal_row_offset, col_limit_right, col_limit_left)
                     for i in cutlass.range(cute.size(tScS_t2r.shape), unroll_full=True):
                         col_idx = tScS_t2r[i][1]
                         acc_S[i] = (
@@ -790,10 +787,8 @@ class AttentionMask:
                             else acc_S[i]
                         )
                 else:
-                    # Dual-bound R2P masking for SM100.
-                    # Masks elements where: NOT (col_limit_left <= col < col_limit_right)
-
                     def mask_gen_fn(s: int) -> Uint32:
+                        """Return keep bits inside the half-open local window."""
                         return r2p_bitmask_below(col_limit_right, s) & r2p_bitmask_above(
                             col_limit_left, s
                         )
@@ -819,41 +814,27 @@ class AttentionMask:
         is_full_block: bool = False,
         check_m_boundary: bool = True,
     ) -> None:
-        """
-        Backward pass: mask S = K @ Q.T where n_block tiles seqlen_k and m_block tiles seqlen_q.
+        """Mask a transposed ``K @ Q.T`` fragment used by the backward pass.
 
-        Coordinate convention:
-        - ROW corresponds to Q (m_block)
-        - COL corresponds to KV (n_block)
-
-        is_full_block: If True, skip mask_mod (all elements valid). Only apply seqlen masking.
-        check_m_boundary: If False, skip seqlen_q boundary check (optimization for non-boundary m_blocks).
-                          When iterating m_blocks in forward order, only the last m_block may be partial.
+        ``m_block`` indexes query rows and ``n_block`` indexes key columns,
+        independent of physical accumulator orientation. A full predicate block
+        skips predicate evaluation but retains residual sequence checks. Interior
+        query tiles may omit query-boundary checks because their rows are valid.
         """
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
         ROW = 0 if const_expr(not self.swap_AB) else 1
         COL = 1 if const_expr(not self.swap_AB) else 0
-        # assert t0ScS_t2r[0][COL] == 0, "col0 == 0" # tmp comment for 2-cta bwd
         thr_col_offset = tScS_t2r[0][COL]
         seqlenk_col_limit = self.seqlen_k - n_block * self.tile_n - thr_col_offset
 
         if const_expr(not mask_causal and not mask_local and mask_mod is not None):
-            # Block sparse case with mask_mod (backward)
-            #
-            # Coordinate convention: ROW → Q (m_block), COL → KV (n_block).
-            # These already account for swap_AB.
-            #
-            # FULL blocks: mask_mod returns True for all elements, so skip it.
-            #   Still need seqlen bounds check (elements may be OOB on last m_block).
-            # PARTIAL blocks: apply mask_mod element-wise, then seqlen bounds.
+            # Full sparse blocks elide the predicate; partial blocks evaluate it per lane.
             if is_full_block:
                 if const_expr(mask_seqlen):
                     if seqlenk_col_limit <= 0:
-                        # Entire tile is OOB for K
                         for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
                             acc_S[i] = -cutlass.Float32.inf
                     elif check_m_boundary:
-                        # Last m_block: check Q and K boundaries
                         ncol = const_expr(cute.size(tScS_t2r.shape))
                         for i in cutlass.range_constexpr(ncol):
                             row_coord = tScS_t2r[i][ROW]
@@ -865,7 +846,6 @@ class AttentionMask:
                             out_of_bounds = q_out_of_bounds or kv_out_of_bounds
                             acc_S[i] = -cutlass.Float32.inf if out_of_bounds else acc_S[i]
             else:
-                # Partial block
                 has_fastdiv = const_expr(
                     fastdiv_mods is not None
                     and fastdiv_mods[0] is not None
@@ -906,7 +886,6 @@ class AttentionMask:
                     acc_S[i] = acc_S[i] if cond else -cutlass.Float32.inf
 
                     if const_expr(mask_seqlen):
-                        # check_m_boundary=False skips q check for non-boundary m_blocks
                         q_out_of_bounds = check_m_boundary and (global_q >= self.seqlen_q)
                         kv_out_of_bounds = global_kv >= self.seqlen_k
                         out_of_bounds = q_out_of_bounds or kv_out_of_bounds
@@ -917,18 +896,14 @@ class AttentionMask:
                 if seqlenk_col_limit <= 0:
                     for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
                         acc_S[i] = -cutlass.Float32.inf
-        else:  # Causal or local
+        else:
             thr_row_offset = tScS_t2r[0][ROW]
             seqlenq_row_limit = self.seqlen_q - m_block * self.tile_m - thr_row_offset
             causal_offset = seqlenq_row_limit - seqlenk_col_limit
             if const_expr(mask_causal):
-                # tidx = cute.arch.thread_idx()[0] % 256
-                # if tidx < 32:
-                #     cute.printf("tidx = {}, {} {}, {} {}", tidx, tScS_t2r[0][0], tScS_t2r[0][1], tScS_t2r[1][0], tScS_t2r[1][1])
                 row_limit_top = causal_offset
                 if const_expr(mask_seqlen):
-                    # If col is beyond the column limit, we want to mask out the entire
-                    # column, by setting row limit to be self.tile_m.
+                    # An out-of-range key raises the threshold past every query row.
                     if seqlenk_col_limit <= 0:
                         row_limit_top = self.tile_m
                 r2p = True
@@ -938,7 +913,7 @@ class AttentionMask:
                             -cutlass.Float32.inf if t0ScS_t2r[i][ROW] < row_limit_top else acc_S[i]
                         )
                 else:
-                    num_rep = cute.size(tScS_t2r, mode=[0])  # 16 or 32
+                    num_rep = cute.size(tScS_t2r, mode=[0])
                     num_wg = 2
                     row_limit = row_to_r2p_idx(row_limit_top, num_rep, num_wg)
                     mask_r2p_lambda(
@@ -967,6 +942,7 @@ class AttentionMask:
                 else:
 
                     def mask_gen_fn(s: int) -> Uint32:
+                        """Return keep bits inside the transposed local window."""
                         num_rep = cute.size(tScS_t2r, mode=[0])
                         num_wg = 2
 
@@ -985,44 +961,25 @@ class AttentionMask:
                         rank1=True,
                     )
 
-
-# -----------------------------------------------------------------------------
-# SM100 FMHA fused-mask policy layer (separate from generic mask primitives).
-# -----------------------------------------------------------------------------
-
-
 class Sm100MaskEnum(enum.Enum):
-    """Enumeration of mask types for FMHA operations.
-
-    - RESIDUAL_MASK: Residual mask for handling variable sequence lengths
-    - WINDOW_MASK: Window mask for attention which also includes causal and no mask
-    - WINDOW_MASK_INFERENCE: Same as the window mask, but has the limitation that the end of q is aligned with the end of k
-    - WINDOW_MASK_BACKWARD: Window mask for backward pass
-    - WINDOW_MASK_BACKWARD_INFERENCE: Same as the window mask for backward pass, but has the limitation that the end of q is aligned with the end of k
-    """
+    """Identifies the residual and window policy used to schedule mask work."""
 
     NO_MASK = enum.auto()
     RESIDUAL_MASK = enum.auto()
     CAUSAL_MASK = enum.auto()
     WINDOW_MASK = enum.auto()
     WINDOW_MASK_INFERENCE = enum.auto()
-    # Backward-pass mask types
     WINDOW_MASK_BACKWARD = enum.auto()
     WINDOW_MASK_BACKWARD_INFERENCE = enum.auto()
     RESIDUAL_MASK_BACKWARD = enum.auto()
 
 
 class Sm100FusedMask:
-    """A fused mask implementation for FMHA operations.
+    """Schedules mask regions and applies them to SM100 attention tiles.
 
-    This class handles different types of attention masks including no mask,
-    residual mask for variable sequence lengths, and causal mask for
-    autoregressive attention patterns.
-
-    The class provides methods to:
-    - Calculate trip counts for different mask types
-    - Apply masks to attention scores
-    - Handle masked and unmasked trip calculations
+    Trip helpers express the key-tile interval owned by a query tile and divide it
+    into leading masked, fully visible, and trailing masked regions. Backward modes
+    exchange the iterated query and key axes while preserving logical coordinates.
     """
 
     def get_trip_count(
@@ -1034,36 +991,20 @@ class Sm100FusedMask:
         window_size_left: Optional[Int32] = None,
         window_size_right: Optional[Int32] = None,
     ) -> Int32:
-        """
-        Calculate the number of trips needed for the current block.
+        """Return the number of sequence tiles visited from the trip start."""
 
-        The trip count depends on the mask type and the block coordinates.
-        For causal masks, it considers the autoregressive constraint.
-
-        :param mask_type: Type of mask to use
-        :type mask_type: utils.Sm100MaskEnum
-        :param blk_coord: Block coordinates.
-        :type blk_coord: cute.Coord
-        :param tile_shape: Shape of the tile.
-        :type tile_shape: cute.Shape
-        :param seqlen_q: Query sequence length for attention computation.
-        :type seqlen_q: Int32
-        :param seqlen_k: Key sequence length for attention computation.
-        :type seqlen_k: Int32
-        :param window_size_left: Left-side sliding window size for attention masking.
-        :type window_size_left: Optional[Int32]
-        :param window_size_right: Right-side sliding window size for attention masking.
-        :type window_size_right: Optional[Int32]
-
-        :return: Number of trips needed.
-        :rtype: Int32
-        """
         result = 0
         offset = 0
+
+        # Inference windows align sequence ends before converting logical
+        # query/key bounds into tile counts.
         if cutlass.const_expr(mask_type is Sm100MaskEnum.WINDOW_MASK_INFERENCE):
             offset = seqlen_k - seqlen_q
         if cutlass.const_expr(mask_type is Sm100MaskEnum.WINDOW_MASK_BACKWARD_INFERENCE):
             offset = seqlen_q - seqlen_k
+
+        # Residual policies visit the complete tiled sequence on the iterated
+        # axis; window policies clamp that extent to their right boundary.
         if cutlass.const_expr(mask_type == Sm100MaskEnum.RESIDUAL_MASK):
             result = cute.ceil_div(seqlen_k, tile_shape[1])
         if cutlass.const_expr(mask_type is Sm100MaskEnum.RESIDUAL_MASK_BACKWARD):
@@ -1092,6 +1033,9 @@ class Sm100FusedMask:
                 tmp_blocks_q = cute.ceil_div(idx_k, tile_shape[0])
                 max_blocks_q = cute.ceil_div(seqlen_q, tile_shape[0])
                 result = dsl_min(max_blocks_q, tmp_blocks_q)
+
+        # Trip counts are relative to the first tile admitted by the left
+        # boundary, not to tile zero.
         start_block = Sm100FusedMask.get_trip_start(
             mask_type,
             blk_coord,
@@ -1101,6 +1045,7 @@ class Sm100FusedMask:
             window_size_left,
             window_size_right,
         )
+
         result = result - start_block
         return result
 
@@ -1115,6 +1060,7 @@ class Sm100FusedMask:
         window_size_left: Optional[Int32] = None,
         window_size_right: Optional[Int32] = None,
     ) -> Tuple[Int32, Int32]:
+        """Return the first key tile and dense trip count from ``BlockInfo``."""
         block_info = BlockInfo(
             tile_m=tile_shape[0],
             tile_n=tile_shape[1],
@@ -1153,11 +1099,11 @@ class Sm100FusedMask:
         window_size_left: Optional[Int32] = None,
         window_size_right: Optional[Int32] = None,
     ) -> Tuple[Int32, Int32]:
-        """Return SM100-style mask boundaries for dense iteration.
+        """Return the right-mask and fully-visible boundaries from ``BlockInfo``.
 
         Returns:
-          - n_block_min_causal_local_mask: right-side masked region start
-          - n_block_min_before_local_mask: start of fully unmasked middle region
+            The first tile requiring the causal/right-window mask and the first
+            tile preceding the left-window mask.
         """
         block_info = BlockInfo(
             tile_m=tile_shape[0],
@@ -1167,6 +1113,9 @@ class Sm100FusedMask:
             window_size_left=window_size_left,
             window_size_right=window_size_right,
         )
+
+        # Synthetic zero-based sequence metadata lets BlockInfo reuse the same
+        # boundary algebra as the runtime kernel path.
         seqlen_info = SeqlenInfoQK(
             offset_q=Int32(0),
             offset_k=Int32(0),
@@ -1182,6 +1131,9 @@ class Sm100FusedMask:
             has_seqused_q=False,
             has_seqused_k=False,
         )
+
+        # The two lower bounds partition right-masked, fully visible, and
+        # left-masked trips without inspecting accumulator values.
         n_block_min, _ = block_info.get_n_block_min_max(seqlen_info, blk_coord[0])
         n_block_min_causal_local_mask = block_info.get_n_block_min_causal_local_mask(
             seqlen_info, blk_coord[0], n_block_min
@@ -1201,24 +1153,7 @@ class Sm100FusedMask:
         window_size_left: Optional[Int32] = None,
         window_size_right: Optional[Int32] = None,
     ) -> Int32:
-        """
-        Get the start of the trip for the current block.
-
-        :param mask_type: Type of mask to use
-        :type mask_type: utils.Sm100MaskEnum
-        :param blk_coord: Block coordinates.
-        :type blk_coord: cute.Coord
-        :param tile_shape: Shape of the tile.
-        :type tile_shape: cute.Shape
-        :param seqlen_q: Query sequence length for attention computation.
-        :type seqlen_q: Int32
-        :param seqlen_k: Key sequence length for attention computation.
-        :type seqlen_k: Int32
-        :param window_size_left: Left-side sliding window size for attention masking.
-        :type window_size_left: Optional[Int32]
-        :param window_size_right: Right-side sliding window size for attention masking.
-        :type window_size_right: Optional[Int32]
-        """
+        """Return the first sequence tile intersecting the attention window."""
         result = 0
         offset = 0
         if cutlass.const_expr(mask_type is Sm100MaskEnum.WINDOW_MASK_INFERENCE):
@@ -1255,27 +1190,7 @@ class Sm100FusedMask:
         window_size_left: Optional[Int32] = None,
         window_size_right: Optional[Int32] = None,
     ) -> Tuple[Int32, Int32]:
-        """
-        Get the begin and end tile idx for the leading mask.
-
-        :param mask_type: Type of mask to use
-        :type mask_type: utils.Sm100MaskEnum
-        :param blk_coord: Block coordinates.
-        :type blk_coord: cute.Coord
-        :param tile_shape: Shape of the tile.
-        :type tile_shape: cute.Shape
-        :param seqlen_q: Query sequence length for attention computation.
-        :type seqlen_q: Int32
-        :param seqlen_k: Key sequence length for attention computation.
-        :type seqlen_k: Int32
-        :param window_size_left: Left-side sliding window size for attention masking.
-        :type window_size_left: Optional[Int32]
-        :param window_size_right: Right-side sliding window size for attention masking.
-        :type window_size_right: Optional[Int32]
-
-        :return: Tuple of (begin, end) tile idx for the leading mask.
-        :rtype: Tuple[Int32, Int32]
-        """
+        """Return the inclusive tile interval cut by the leading window edge."""
         offset = 0
         if cutlass.const_expr(mask_type is Sm100MaskEnum.WINDOW_MASK_INFERENCE):
             offset = seqlen_k - seqlen_q
@@ -1334,27 +1249,7 @@ class Sm100FusedMask:
         window_size_left: Optional[Int32] = None,
         window_size_right: Optional[Int32] = None,
     ) -> Tuple[Optional[Int32], Optional[Int32]]:
-        """
-        Get the begin and end tile idx for the trailing mask.
-
-        :param mask_type: Type of mask to use
-        :type mask_type: utils.Sm100MaskEnum
-        :param blk_coord: Block coordinates.
-        :type blk_coord: cute.Coord
-        :param tile_shape: Shape of the tile.
-        :type tile_shape: cute.Shape
-        :param seqlen_q: Query sequence length for attention computation.
-        :type seqlen_q: Int32
-        :param seqlen_k: Key sequence length for attention computation.
-        :type seqlen_k: Int32
-        :param window_size_left: Left-side sliding window size for attention masking.
-        :type window_size_left: Optional[Int32]
-        :param window_size_right: Right-side sliding window size for attention masking.
-        :type window_size_right: Optional[Int32]
-
-        :return: Tuple of (begin, end) tile idx for the trailing mask.
-        :rtype: Tuple[Int32, Int32]
-        """
+        """Return the inclusive tile interval cut by the trailing window edge."""
         offset = 0
         if cutlass.const_expr(mask_type is Sm100MaskEnum.WINDOW_MASK_INFERENCE):
             offset = seqlen_k - seqlen_q
@@ -1391,7 +1286,7 @@ class Sm100FusedMask:
                 )
                 trailing_mask_end = trip_count + trip_start - 1
             else:
-                # last tile, we always apply mask on it regardless whether it's a residual tile
+                # The terminal tile always enforces the residual sequence boundary.
                 trailing_mask_begin = trip_count + trip_start - 1
                 trailing_mask_end = trip_count + trip_start - 1
         else:
@@ -1407,7 +1302,7 @@ class Sm100FusedMask:
                     trip_count + trip_start - 1,
                 )
             else:
-                # last tile, we always apply mask on it regardless whether it's a residual tile
+                # The terminal tile always enforces the residual sequence boundary.
                 trailing_mask_begin = trip_count + trip_start - 1
                 trailing_mask_end = trip_count + trip_start - 1
 
@@ -1423,29 +1318,7 @@ class Sm100FusedMask:
         window_size_left: Optional[Int32] = None,
         window_size_right: Optional[Int32] = None,
     ) -> Int32:
-        """
-        Calculate the number of masked trips for the leading mask.
-
-        This is used for blocks that need special handling due to masking.
-
-        :param mask_type: Type of mask to use
-        :type mask_type: utils.Sm100MaskEnum
-        :param blk_coord: Block coordinates.
-        :type blk_coord: cute.Coord
-        :param tile_shape: Shape of the tile.
-        :type tile_shape: cute.Shape
-        :param seqlen_q: Query sequence length for attention computation.
-        :type seqlen_q: Int32
-        :param seqlen_k: Key sequence length for attention computation.
-        :type seqlen_k: Int32
-        :param window_size_left: Left-side sliding window size for attention masking.
-        :type window_size_left: Optional[Int32]
-        :param window_size_right: Right-side sliding window size for attention masking.
-        :type window_size_right: Optional[Int32]
-
-        :return: Number of masked trips.
-        :rtype: Int32
-        """
+        """Return the number of trips requiring the leading-edge mask."""
         result = 0
         if cutlass.const_expr(
             mask_type is not Sm100MaskEnum.RESIDUAL_MASK
@@ -1476,31 +1349,7 @@ class Sm100FusedMask:
         window_size_right: Optional[Int32] = None,
         rem_count: Optional[Int32] = 0,
     ) -> Int32:
-        """
-        Calculate the number of masked trips for the trailing mask.
-
-        This is used for blocks that need special handling due to masking.
-
-        :param mask_type: Type of mask to use
-        :type mask_type: utils.Sm100MaskEnum
-        :param blk_coord: Block coordinates.
-        :type blk_coord: cute.Coord
-        :param tile_shape: Shape of the tile.
-        :type tile_shape: cute.Shape
-        :param seqlen_q: Query sequence length for attention computation.
-        :type seqlen_q: Int32
-        :param seqlen_k: Key sequence length for attention computation.
-        :type seqlen_k: Int32
-        :param window_size_left: Left-side sliding window size for attention masking.
-        :type window_size_left: Optional[Int32]
-        :param window_size_right: Right-side sliding window size for attention masking.
-        :type window_size_right: Optional[Int32]
-        :param rem_count: Remaining count from previous calculations.
-        :type rem_count: Int32
-
-        :return: Number of masked trips.
-        :rtype: Int32
-        """
+        """Return trailing-edge mask trips plus an existing remainder count."""
         result = 0
 
         if cutlass.const_expr(
@@ -1551,30 +1400,7 @@ class Sm100FusedMask:
         window_size_left: Optional[Int32] = None,
         window_size_right: Optional[Int32] = None,
     ) -> Int32:
-        """
-        Calculate the number of unmasked trips for the current block.
-
-        This represents the number of trips that don't require special
-        masking treatment.
-
-        :param mask_type: Type of mask to use
-        :type mask_type: utils.Sm100MaskEnum
-        :param blk_coord: Block coordinates.
-        :type blk_coord: cute.Coord
-        :param tile_shape: Shape of the tile.
-        :type tile_shape: cute.Shape
-        :param seqlen_q: Query sequence length for attention computation.
-        :type seqlen_q: Int32
-        :param seqlen_k: Key sequence length for attention computation.
-        :type seqlen_k: Int32
-        :param window_size_left: Left-side sliding window size for attention masking.
-        :type window_size_left: Optional[Int32]
-        :param window_size_right: Right-side sliding window size for attention masking.
-        :type window_size_right: Optional[Int32]
-
-        :return: Number of unmasked trips.
-        :rtype: Int32
-        """
+        """Return trips wholly inside the visible attention region."""
         result = (
             Sm100FusedMask.get_trip_count(
                 mask_type,
@@ -1621,32 +1447,14 @@ class Sm100FusedMask:
             index_k,
         ),
     ):
-        """
-        Apply the appropriate mask to the attention scores.
+        """Apply a fused mask policy to score values and logical coordinates.
 
-        This method modifies the attention scores (acc_qk) based on the mask type
-        and the positions in the index tensor.
-
-        :param mask_type: Type of mask to use
-        :type mask_type: utils.Sm100MaskEnum
-        :param acc_qk: Accumulated QK attention scores tensor.
-        :type acc_qk: cute.Tensor
-        :param index_qk: Index tensor containing position information.
-        :type index_qk: cute.Tensor
-        :param seqlen_k: Key sequence length for attention computation.
-        :type seqlen_k: Int32
-        :param seqlen_q: Query sequence length for attention computation.
-        :type seqlen_q: Optional[int]
-        :param window_size_left: Left-side sliding window size for attention masking.
-        :type window_size_left: Optional[int]
-        :param window_size_right: Right-side sliding window size for attention masking.
-        :type window_size_right: Optional[int]
+        Inference window modes align the ends of unequal query and key sequences.
+        ``index_transform`` maps physical accumulator coordinates to logical query
+        and key indices before window and residual checks.
         """
         offset = 0
-        # NOTE: causal masking in this repo aligns the *end* of Q with the *end* of K
-        # when seqlen_k != seqlen_q (same as the test/reference implementation):
-        #   k_index <= q_index + (seqlen_k - seqlen_q) + window_right
-        # In our kernels, causal is represented by (window_left is None, window_right is not None).
+        # A right-only window represents causal masking with end-aligned sequences.
         if cutlass.const_expr(window_size_left is None and window_size_right is not None):
             offset = seqlen_k - seqlen_q
         elif cutlass.const_expr(
@@ -1660,19 +1468,19 @@ class Sm100FusedMask:
                 if cutlass.const_expr(window_size_left is None):
                     if index_q + offset + window_size_right < index_k:
                         acc_qk[i] = -Float32.inf
-                    if index_k >= seqlen_k or index_q >= seqlen_q:  # residual mask
+                    if index_k >= seqlen_k or index_q >= seqlen_q:
                         acc_qk[i] = -Float32.inf
                 elif cutlass.const_expr(window_size_right is None):
                     if index_q + offset - window_size_left > index_k:
                         acc_qk[i] = -Float32.inf
-                    if index_k >= seqlen_k or index_q >= seqlen_q:  # residual mask
+                    if index_k >= seqlen_k or index_q >= seqlen_q:
                         acc_qk[i] = -Float32.inf
                 else:
                     max_K_index = dsl_min(index_q + offset + window_size_right, seqlen_k)
                     min_K_index = max(0, index_q + offset - window_size_left)
                     if index_k > max_K_index or index_k < min_K_index:
                         acc_qk[i] = -Float32.inf
-                    if index_k >= seqlen_k or index_q >= seqlen_q:  # residual mask
+                    if index_k >= seqlen_k or index_q >= seqlen_q:
                         acc_qk[i] = -Float32.inf
 
             if cutlass.const_expr(
@@ -1698,22 +1506,19 @@ class Sm100FusedMask:
             index_k,
         ),
     ):
-        """Apply forward mask without mask_type.
+        """Apply causal or local bounds plus unconditional residual bounds.
 
-        - If apply_semantic_window=True, apply causal/local window constraints.
-        - Always apply residual OOB masking (index_k>=seqlen_k or index_q>=seqlen_q).
+        Semantic windows end-align unequal query and key sequences. Disabling the
+        semantic window retains only the sequence-boundary protection.
         """
         offset = 0
         if cutlass.const_expr(apply_semantic_window):
-            # Match WINDOW_MASK_INFERENCE semantics: end-align Q/K when lengths differ.
             offset = seqlen_k - seqlen_q
         for i in cutlass.range_constexpr(cute.size(acc_qk), unroll_full=True):
             index_q, index_k = index_transform(*index_qk[i])
             if cutlass.const_expr(apply_semantic_window):
                 if cutlass.const_expr(is_causal and not is_local):
-                    # Pure causal; tolerate both external forms:
-                    # - (None, None) from interface
-                    # - (None, 0) from fused-mask-style callers
+                    # Causal callers may encode the zero-width right edge as None or zero.
                     right = 0 if const_expr(window_size_right is None) else window_size_right
                     if index_q + offset + right < index_k:
                         acc_qk[i] = -Float32.inf
@@ -1731,6 +1536,6 @@ class Sm100FusedMask:
                         min_K_index = max(0, index_q + offset - window_size_left)
                         if index_k > max_K_index or index_k < min_K_index:
                             acc_qk[i] = -Float32.inf
-            # Residual mask is always needed for boundary protection.
+            # Residual bounds protect partial sequence tiles in every policy.
             if index_k >= seqlen_k or index_q >= seqlen_q:
                 acc_qk[i] = -Float32.inf

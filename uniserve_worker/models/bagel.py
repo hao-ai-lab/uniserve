@@ -1,4 +1,10 @@
-"""BAGEL neural model definition."""
+"""Defines BAGEL language, vision, latent, and flow-matching execution routes.
+
+The model shares one Mixture-of-Transformers graph across autoregressive token
+rows and image-generation rows. Vision features and VAE latents are projected
+into that graph's hidden space, while route-specific projection restores logits,
+latent velocity, image features, or decoded pixels for the scheduler.
+"""
 
 from __future__ import annotations
 
@@ -96,6 +102,8 @@ class LLMConfig:
 
     @property
     def head_dim(self) -> int:
+        """Return the per-head query/key/value width."""
+
         return self.hidden_size // self.num_attention_heads
 
 
@@ -123,22 +131,32 @@ class BagelConfig:
 
     @property
     def latent_downsample(self) -> int:
+        """Return the pixel-to-latent-token downsampling factor."""
+
         return self.vae_downsample * self.latent_patch_size
 
     @property
     def latent_token_capacity(self) -> int:
+        """Return the maximum flattened latent patch count."""
+
         return self.max_latent_size * self.max_latent_size
 
     @property
     def vit_token_capacity(self) -> int:
+        """Return the maximum square ViT patch count."""
+
         return (self.vit_image_size // self.vit_patch_size) ** 2
 
     @property
     def latent_channel(self) -> int:
+        """Return the VAE channel count exposed to latent patch packing."""
+
         return self.vae_z_channels
 
     @property
     def patch_latent_dim(self) -> int:
+        """Return the flattened feature width of one latent patch."""
+
         return self.latent_patch_size**2 * self.latent_channel
 
     @classmethod
@@ -181,12 +199,16 @@ class BagelConfig:
 
 
 class _BagelGraph(nn.Module):
-    """BAGEL neural graph: MoT language model, VAE, ViT, and flow-matching connectors."""
+    """Owns the MoT, VAE, ViT, and flow-matching projections as one neural graph."""
 
     def __init__(self, cfg: BagelConfig, *, layer_config: LayerConfig) -> None:
+        """Construct all route components against one placement and quantization policy."""
+
         super().__init__()
         self.cfg = cfg
         hidden = cfg.llm.hidden_size
+
+        # Text and flow rows meet in the common MoT hidden space.
         self.lm = MoTModel(
             MoTConfig(
                 hidden_size=cfg.llm.hidden_size,
@@ -212,6 +234,8 @@ class _BagelGraph(nn.Module):
         self.time_embedder = TimestepEmbedder(hidden)
         self.latent_pos_embed = PositionEmbedding(cfg.max_latent_size, hidden, init_sincos=False)
         self.vae = AutoEncoder(default_ae_params())
+
+        # Vision patches retain their own encoder before projection into MoT width.
         self.vit_model = SiglipNavitEncoder(
             SiglipNavitConfig(
                 patch_size=cfg.vit_patch_size,
@@ -231,13 +255,19 @@ class _BagelGraph(nn.Module):
 
     @property
     def num_layers(self) -> int:
+        """Return the transformer layer count used by KV-cache allocation."""
+
         return self.cfg.llm.num_hidden_layers
 
     @property
     def device(self) -> torch.device:
+        """Return the device that owns route inputs and model outputs."""
+
         return self.lm_head.weight.device
 
     def embed_tokens(self, ids: torch.Tensor, context: ForwardBatch) -> torch.Tensor:
+        """Embed token identifiers with the batch's tensor-parallel mesh."""
+
         return self.lm.embed_tokens(ids, context.mesh)
 
     def gen_segment_embeds(
@@ -248,13 +278,15 @@ class _BagelGraph(nn.Module):
         timestep,
         context: ForwardBatch,
     ) -> torch.Tensor:
-        """Marker/VAE-latent/timestep embeddings for one gen segment, ``[num_vae+2, hidden]``.
+        """Build a ``[num_vae + 2, hidden]`` embedding sequence for one generation segment.
 
-        Shared by graph denoise and image-commit paths so marker and latent
-        embeddings follow one model layout.
+        Start/end image markers frame VAE latents augmented with timestep and
+        position embeddings. Graph denoise and image commit share this layout.
         """
         hidden = self.cfg.llm.hidden_size
         total = int(num_vae) + 2
+
+        # Image markers frame the latent span in the language-model sequence.
         marker_ids = torch.tensor(
             [self.cfg.start_of_image_id, self.cfg.end_of_image_id],
             dtype=torch.long,
@@ -264,6 +296,8 @@ class _BagelGraph(nn.Module):
         x_t = x_t.to(device=self.device, dtype=torch.bfloat16).reshape(int(num_vae), -1)
         timestep_value = torch.as_tensor(timestep, device=self.device).reshape(1)
         timesteps = timestep_value.expand(int(num_vae))
+
+        # Content, diffusion time, and two-dimensional location share the same width.
         vae_emb = (
             self.vae2llm(x_t)
             + self.time_embedder(timesteps)
@@ -281,13 +315,19 @@ class _BagelGraph(nn.Module):
         hidden_last_row: torch.Tensor,
         context: ForwardBatch,
     ) -> torch.Tensor:
+        """Project selected hidden rows into tensor-parallel vocabulary logits."""
+
         return self.lm_head(hidden_last_row, context.mesh)
 
     @torch.no_grad()
     def velocity_from_hidden(self, hidden, num_vae) -> torch.Tensor:
+        """Project the latent span, excluding its two marker rows, into velocity."""
+
         return self.llm2vae(hidden[1 : 1 + int(num_vae)].to(torch.bfloat16))
 
     def latent_hw(self, height: int, width: int) -> tuple[int, int]:
+        """Convert output pixel geometry to latent patch-grid geometry."""
+
         return height // self.cfg.latent_downsample, width // self.cfg.latent_downsample
 
     @torch.no_grad()
@@ -296,11 +336,16 @@ class _BagelGraph(nn.Module):
         image_tensors: torch.Tensor,
         context: ForwardBatch,
     ) -> torch.Tensor:
+        """Encode a uniform NCHW image batch into MoT-width patch features."""
+
         if image_tensors.ndim != 4:
             raise ValueError("BAGEL batched ViT encode expects NCHW pixels")
+
         image_tensors = image_tensors.to(self.device)
         batch, _channels, height, width = image_tensors.shape
         patch = self.cfg.vit_patch_size
+
+        # Every image shares one extrapolated grid and one packed sequence length.
         pos_ids = get_flattened_position_ids_extrapolate(
             height,
             width,
@@ -324,6 +369,8 @@ class _BagelGraph(nn.Module):
             device=self.device,
         )
         packed_pos_ids = pos_ids.repeat(batch)
+
+        # Packed attention isolates images through cumulative sequence boundaries.
         vit_out = self.vit_model(
             patches,
             {
@@ -341,8 +388,11 @@ class _BagelGraph(nn.Module):
         self,
         image_tensors: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, tuple[int, int]]:
+        """Encode NCHW pixels and pack the clean latent grid into patch tokens."""
+
         if image_tensors.ndim != 4:
             raise ValueError("BAGEL batched VAE encode expects NCHW pixels")
+
         image_tensors = image_tensors.to(self.device)
         _batch, _channels, height, width = image_tensors.shape
         vae_dtype = next(self.vae.parameters()).dtype
@@ -351,6 +401,8 @@ class _BagelGraph(nn.Module):
         channels = self.cfg.latent_channel
         h = height // self.cfg.latent_downsample
         w = width // self.cfg.latent_downsample
+
+        # Patch pixels become the feature axis while the spatial grid becomes sequence.
         latents = latent_images[:, :, : h * patch, : w * patch].reshape(
             int(latent_images.shape[0]),
             channels,
@@ -379,6 +431,8 @@ class _BagelGraph(nn.Module):
         height: int,
         width: int,
     ) -> torch.Tensor:
+        """Unpack latent patch tokens and decode them into unit-range NCHW pixels."""
+
         h, w = self.latent_hw(height, width)
         patch = self.cfg.latent_patch_size
         channels = self.cfg.latent_channel
@@ -402,6 +456,8 @@ _BAGEL_STACKED_WEIGHTS: WeightNameMap = (
 
 
 def _bagel_checkpoint_name(name: str) -> str | None:
+    """Map an external BAGEL checkpoint name into the owned graph namespace."""
+
     exact = {
         "language_model.model.embed_tokens.weight": "lm.embed_tokens.weight",
         "language_model.model.norm.weight": "lm.norm.weight",
@@ -441,13 +497,15 @@ def _bagel_checkpoint_name(name: str) -> str | None:
 
 
 class BagelForConditionalGeneration(ExecutionModel):
-    """Stateless BAGEL neural graph for the declared MoT, ViT, and VAE routes."""
+    """Exposes the stateless BAGEL graph through scheduler-owned execution routes."""
 
     def load_weights(self, weights: Iterable[WeightHandle]) -> LoadReport:
         """Load BAGEL's root checkpoint into its language, vision, and connector graph."""
 
         parameter_names = set(dict(self.model.named_parameters()))
         report = LoadReport()
+
+        # External names are normalized before stacked QKV and MLP shards are resolved.
         for handle in weights:
             source_name = handle.name
             renamed = _bagel_checkpoint_name(source_name)
@@ -464,6 +522,8 @@ class BagelForConditionalGeneration(ExecutionModel):
         return report
 
     def load_autoencoder_weights(self, weights: Iterable[WeightHandle]) -> LoadReport:
+        """Load a VAE-only checkpoint directly into the autoencoder namespace."""
+
         parameter_names = set(dict(self.model.vae.named_parameters()))
         report = LoadReport()
         for handle in weights:
@@ -476,6 +536,8 @@ class BagelForConditionalGeneration(ExecutionModel):
         return report
 
     def checkpoint_parameter_names(self) -> set[str]:
+        """Return root-checkpoint parameters, excluding the separately loaded VAE."""
+
         return {name for name, _ in self.model.named_parameters() if not name.startswith("vae.")}
 
     def __init__(
@@ -485,6 +547,8 @@ class BagelForConditionalGeneration(ExecutionModel):
         layer_config: LayerConfig,
         graph: _BagelGraph | None = None,
     ) -> None:
+        """Bind graph geometry and route capabilities to the worker execution model."""
+
         super().__init__()
         if graph is not None and graph.cfg != config:
             raise ValueError("BAGEL graph and root must use the same immutable configuration")
@@ -493,6 +557,8 @@ class BagelForConditionalGeneration(ExecutionModel):
         self.model = graph if graph is not None else _BagelGraph(config, layer_config=layer_config)
         llm = self.cfg.llm
         self.architecture = "BagelForConditionalGeneration"
+
+        # Generation metadata defines how scheduler coordinates map to model rows.
         self.generation = GenerationPipeline(
             latent_downsample=int(self.cfg.latent_downsample),
             prediction="velocity",
@@ -514,6 +580,8 @@ class BagelForConditionalGeneration(ExecutionModel):
             cfg_recipe=CfgRecipe.IMAGE_OVER_TEXT,
             timestep_shift=float(self.cfg.timestep_shift),
         )
+
+        # Vision and VAE routes use independent raster bounds but one feature contract.
         self.image_processor = ImageProcessor(
             vit=TowerTransform(
                 resize=StrideResize(
@@ -538,6 +606,8 @@ class BagelForConditionalGeneration(ExecutionModel):
                 end_token_id=int(self.cfg.end_of_image_id),
             ),
         )
+
+        # Runtime pools are sized from rank-local attention and latent geometry.
         self.cache_geometry = CacheGeometry(
             num_layers=int(llm.num_hidden_layers),
             num_attention_heads=local_attention_head_count(
@@ -584,12 +654,18 @@ class BagelForConditionalGeneration(ExecutionModel):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        """Build mixed token/flow rows and execute their shared transformer forward."""
+
         batch = forward_batch
         decode_positions: torch.Tensor | None = None
+
+        # Paged decode has a compact positional contract and cannot carry flow rows.
         if batch.forward_mode is AttentionMode.PAGED_DECODE:
             if batch.flow_row_indices:
                 raise TypeError("BAGEL paged decode accepts token rows only")
             decode_positions = positions
+
+        # External image features replace only positions selected by the embedding mask.
         token_embeds = self.model.embed_tokens(input_ids.reshape(-1), batch)
         if batch.input_embeddings is not None:
             if batch.embedding_mask is None:
@@ -599,6 +675,8 @@ class BagelForConditionalGeneration(ExecutionModel):
                 batch.input_embeddings.to(dtype=token_embeds.dtype),
                 token_embeds,
             )
+
+        # Restore packed token embeddings to scheduler row order.
         chunks: list[torch.Tensor | None] = [None] * batch.row_count
         token_offset = 0
         for row_index, count in zip(
@@ -608,6 +686,8 @@ class BagelForConditionalGeneration(ExecutionModel):
         ):
             chunks[row_index] = token_embeds[token_offset : token_offset + count]
             token_offset += count
+
+        # Flow rows contribute framed latent segments in the same hidden space.
         for flow_index, row_index in enumerate(batch.flow_row_indices):
             if batch.flow_conditioning[flow_index] is not None:
                 raise TypeError("BAGEL denoise does not accept external feature conditioning")
@@ -623,8 +703,11 @@ class BagelForConditionalGeneration(ExecutionModel):
                 batch.flow_timesteps[flow_index],
                 batch,
             )
+
         if any(value is None for value in chunks):
             raise RuntimeError("BAGEL forward batch contains an unbound row")
+
+        # The transformer consumes one contiguous BF16 sequence with batch metadata.
         typed_chunks = tuple(value for value in chunks if value is not None)
         normalized: list[torch.Tensor] = []
         for chunk in typed_chunks:
@@ -637,6 +720,9 @@ class BagelForConditionalGeneration(ExecutionModel):
         )
 
     def project(self, hidden: torch.Tensor, batch: ForwardBatch) -> ForwardOutput:
+        """Project packed hidden rows into logits, hidden states, or latent velocities."""
+
+        # Reconstruct row extents from the token and flow descriptors.
         row_lengths = [0] * batch.row_count
         for row_index, count in zip(
             batch.token_row_indices,
@@ -651,6 +737,8 @@ class BagelForConditionalGeneration(ExecutionModel):
         for count in row_lengths:
             row_hidden.append(hidden[offset : offset + count])
             offset += count
+
+        # Token rows share one vocabulary projection whenever their selection permits it.
         selection_by_row = dict(zip(batch.token_row_indices, batch.token_selections, strict=True))
         row_hidden_values = tuple(row_hidden)
         projected_rows = tuple(
@@ -681,6 +769,7 @@ class BagelForConditionalGeneration(ExecutionModel):
                 )
             projected = self.model.logits(selected, batch)
 
+        # Restore heterogeneous results to scheduler row order.
         outputs: list[torch.Tensor] = []
         projected_offset = 0
         flow_by_row = {row_index: index for index, row_index in enumerate(batch.flow_row_indices)}
@@ -709,10 +798,14 @@ class BagelForConditionalGeneration(ExecutionModel):
         return ForwardOutput(tuple(outputs))
 
     def encode(self, pixels: tuple[torch.Tensor, ...], batch: ForwardBatch) -> ForwardOutput:
+        """Encode a uniform image batch into language-width vision features."""
+
         features = self.model.vit_encode_batch(torch.stack(pixels, dim=0), batch)
         return ForwardOutput(tuple(features[index] for index in range(len(pixels))))
 
     def encoder_latent(self, pixels: tuple[torch.Tensor, ...], batch: ForwardBatch) -> ForwardOutput:
+        """Encode a uniform image batch into clean VAE latent patch tokens."""
+
         del batch
         latents, _positions, _shape = self.model.vae_encode_clean_batch(torch.stack(pixels, dim=0))
         return ForwardOutput(tuple(latents[index] for index in range(len(pixels))))
@@ -720,6 +813,8 @@ class BagelForConditionalGeneration(ExecutionModel):
     def decode_latent(
         self, latents: tuple[torch.Tensor, ...], batch: ForwardBatch
     ) -> ForwardOutput:
+        """Decode a uniform latent batch into unit-range image tensors."""
+
         geometry = set(zip(batch.decode_heights, batch.decode_widths, strict=True))
         if len(geometry) != 1:
             raise ValueError("BAGEL latent decode requires one image geometry")

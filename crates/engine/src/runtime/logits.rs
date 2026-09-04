@@ -1,16 +1,14 @@
-//! Host-side logits-processor pipeline. The math processors (min-p, penalties,
-//! logit bias, top-k/p, temperature) are parameters the device sampler consumes;
-//! the control-flow processors here compute the minimum-token floor, bad-word,
-//! and allowed-token masks and express them to the worker as small id masks
-//! (`allowed_tokens`/`suppress_tokens`).
+//! Host-side construction of position-dependent token masks.
 //!
-//! The built-in masks are cheap host- or position-derived computations and run
-//! inline in the scheduler's per-step masking path.
+//! Numeric sampling transforms remain worker parameters. This module lowers
+//! minimum-token, bad-word, and allowed-token rules into compact allow and
+//! suppress lists for each step.
 
 use uniserve_core::SamplingParams;
 
 type TokenMask = Option<Vec<u32>>;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Allow and suppress masks computed for one sampling position.
 pub(super) struct ProcessorMasks {
     pub(super) allowed: TokenMask,
     pub(super) suppress: TokenMask,
@@ -34,6 +32,7 @@ struct MaskContribution {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Host-evaluated logits rule that produces token masks.
 pub(super) enum BuiltinLogitsProcessor {
     MinTokens,
     BadWords,
@@ -47,6 +46,7 @@ const DEFAULT_PIPELINE: [BuiltinLogitsProcessor; 3] = [
 ];
 
 impl BuiltinLogitsProcessor {
+    /// Produces the allowlist and suppression masks contributed by one logits rule.
     fn contribute(self, ctx: &ProcCtx<'_>) -> MaskContribution {
         match self {
             Self::MinTokens => {
@@ -80,12 +80,12 @@ impl BuiltinLogitsProcessor {
     }
 }
 
-/// The default control-flow pipeline (order matches the reference non-argmax-invariant set).
+/// Returns mask processors in their canonical composition order.
 pub(super) fn default_pipeline() -> Vec<BuiltinLogitsProcessor> {
     DEFAULT_PIPELINE.to_vec()
 }
 
-/// Merge all processors' contributions into a single `(allowed, suppress)` pair.
+/// Merges all processors' contributions into a single `(allowed, suppress)` pair.
 pub(super) fn run_pipeline(
     pipeline: &[BuiltinLogitsProcessor],
     ctx: &ProcCtx<'_>,

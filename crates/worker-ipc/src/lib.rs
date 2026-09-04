@@ -1,9 +1,9 @@
-//! Versioned scheduler-to-worker IPC and FlatBuffers transport types.
+//! Versioned scheduler-to-worker protocol and shared-memory transport.
 //!
-//! A [`NewRequest`] carries static request state once, [`Run`] carries planned
-//! operations, and [`RunResult`] returns resolved outputs. [`WorkerInfo`]
-//! is the post-load handshake. Runtime identity is numeric and stable across
-//! serialization: request epoch, operation id, point index, and generation.
+//! [`NewRequest`] admits static state, [`Run`] submits planned operations, and
+//! [`RunResult`] returns completions and products. [`WorkerInfo`] describes a
+//! loaded worker before execution begins. Numeric request, operation, point,
+//! and generation identities remain stable across serialization.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -15,25 +15,30 @@ use uniserve_core::{
 };
 pub use uniserve_core::{OpId, WorkerForwardStats};
 
+/// Result type for semantic worker-message validation.
 pub type ValidationResult<T> = std::result::Result<T, ValidationError>;
 
+/// Describes a worker message that violates the protocol contract.
 #[derive(Debug, thiserror::Error)]
 #[error("invalid worker message: {0}")]
 pub struct ValidationError(String);
 
 impl ValidationError {
+    /// Constructs a validation error from contextual text.
     pub(crate) fn message(message: impl Into<String>) -> Self {
         Self(message.into())
     }
 }
 
 impl From<uniserve_core::SamplingParamsError> for ValidationError {
+    /// Converts sampling validation failures into worker-protocol failures.
     fn from(error: uniserve_core::SamplingParamsError) -> Self {
         Self::message(error.to_string())
     }
 }
 
 impl From<uniserve_core::ImageParamsError> for ValidationError {
+    /// Converts image validation failures into worker-protocol failures.
     fn from(error: uniserve_core::ImageParamsError) -> Self {
         Self::message(error.to_string())
     }
@@ -59,9 +64,12 @@ macro_rules! ensure_valid {
     };
 }
 
+/// FlatBuffers encoding and decoding for protocol messages.
 pub mod codec;
+/// Shared-memory request-response endpoints and wake events.
 pub mod iceoryx;
-#[allow(warnings)]
+#[allow(missing_docs, warnings)]
+/// FlatBuffers bindings generated from the worker protocol schema.
 pub mod schema {
     include!(concat!(env!("OUT_DIR"), "/flatbuffers/mod.rs"));
 }

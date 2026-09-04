@@ -39,6 +39,8 @@ from .rows import ForwardRow, LaneState, LatentExecution, OperationState, Outcom
 
 
 def pack_forward(runtime: ExecutionResources, state: OperationState) -> tuple[object, ...]:
+    """Pack diffusion prefix or denoise state into the matching model-forward row."""
+
     if state.operation.kind is not RunKind.DIFFUSION_STEP:
         return ()
     if state.phase == "initial":
@@ -60,6 +62,8 @@ def consume_forward(
     state: OperationState,
     outputs: tuple[torch.Tensor, ...],
 ) -> None:
+    """Publish prefix conditioning or integrate denoise predictions into latent state."""
+
 
     if state.phase == "prefix_pending":
         if len(outputs) != len(state.rows):
@@ -95,6 +99,8 @@ def consume_forward(
 
 
 def integrate(runtime: ExecutionResources, state: OperationState) -> bool:
+    """Advance one latent trajectory step and publish its checkpointed state transition."""
+
     if state.phase != "integrate":
         return False
 
@@ -118,6 +124,8 @@ def integrate(runtime: ExecutionResources, state: OperationState) -> bool:
 
 
 def _initialize(runtime: ExecutionResources, state: OperationState) -> None:
+
+    """Create a diffusion trajectory from deterministic noise and publish its initial state."""
 
     operation = state.operation
     scope = state.lane
@@ -196,6 +204,8 @@ def _initialize(runtime: ExecutionResources, state: OperationState) -> None:
 
 def _prepare_step(runtime: ExecutionResources, state: OperationState) -> None:
 
+    """Gather current latent pages and construct one guided diffusion-step batch."""
+
     operation = state.operation
     scope = state.lane
     data = state.data
@@ -266,6 +276,8 @@ def _prepare_step(runtime: ExecutionResources, state: OperationState) -> None:
 
 def _pack_denoise(runtime: ExecutionResources, state: OperationState) -> None:
 
+    """Assemble denoising rows, branch weights, positions, and timestep conditioning."""
+
     data = state.data
     row = data["row"]
     state.rows = tuple(
@@ -286,6 +298,8 @@ def _pack_denoise(runtime: ExecutionResources, state: OperationState) -> None:
 
 
 def _finish(runtime: ExecutionResources, state: OperationState) -> None:
+
+    """Integrate predicted velocity, write the next latent bank, and prepare publication."""
 
     operation = state.operation
     scope = state.lane
@@ -401,6 +415,8 @@ def initial_latent(
     width: int,
     target: torch.Tensor,
 ) -> None:
+    """Create deterministic bounded latent noise or reuse the request’s staged image latent."""
+
     flow = runtime.generation()
     rng = operation.rng
     assert rng is not None and rng.draw_layout is DrawLayout.FLOW_NOISE
@@ -420,6 +436,8 @@ def initial_latent(
 
 
 def branch_source(runtime: ExecutionResources, branch: Branch) -> BranchSource:
+    """Resolve a guidance branch to conditioning, negative/start, or start-state input."""
+
     return runtime.generation().branch_source(branch)
 
 
@@ -429,6 +447,8 @@ def flow_prefix(
     image_prompt: str,
     request: Request,
 ) -> tuple[tuple[int, ...], bool]:
+    """Tokenize and embed the prompt source used to construct diffusion conditioning."""
+
     return runtime.generation().prefix(
         source,
         image_prompt=image_prompt,
@@ -446,6 +466,8 @@ def prefix_row(
     branch: Branch,
     scope: LaneState,
 ) -> ForwardRow:
+    """Build the model-forward row that materializes one diffusion conditioning prefix."""
+
     request = runtime.request_row(scope, operation.request_key.request_id)
     positions = torch.arange(entry[2], entry[2] + len(tokens), dtype=torch.long)
     return ForwardRow(
@@ -479,6 +501,8 @@ def denoise_row(
     width: int,
     scope: LaneState,
 ) -> ForwardRow:
+    """Build one guided denoise row with latent, timestep, conditioning, and spatial positions."""
+
     request = runtime.request_row(scope, operation.request_key.request_id)
     flow = runtime.generation()
     image_tokens = image_token_count(runtime, latent, height, width)
@@ -541,6 +565,8 @@ def _temporal_position(
     conditioning_position: int,
     entry: tuple[int, int, int, int],
 ) -> int:
+    """Resolve a branch temporal coordinate from conditioning and latent placement."""
+
     if branch is Branch.COND:
         return int(conditioning_position)
     return int(entry[2])
@@ -549,23 +575,31 @@ def _temporal_position(
 def image_token_count(
     runtime: ExecutionResources, latent: torch.Tensor, height: int, width: int
 ) -> int:
+    """Validate latent geometry and return its model-visible patch-token count."""
+
     del latent
     return runtime.generation().image_tokens(height, width)
 
 
 def require_image(request: Request) -> ImageParams:
+    """Return the request image input required by image-conditioned diffusion."""
+
     if request.image is None:
         raise invalid_descriptor("flow execution requires admitted image parameters")
     return request.image
 
 
 def prediction(output: torch.Tensor) -> torch.Tensor:
+    """Extract a denoise prediction tensor from the supported model output wrapper."""
+
     if not isinstance(output, torch.Tensor) or not output.is_floating_point():
         raise invalid_descriptor("flow route did not return a flow prediction")
     return output
 
 
 def physical_tokens(runtime: ExecutionResources, height: int, width: int) -> int:
+    """Return the padded image-token capacity for the requested raster geometry."""
+
     return runtime.generation().physical_tokens(height, width)
 
 
@@ -575,6 +609,8 @@ def _conditioning(
     height: int,
     width: int,
 ) -> FlowPatches | None:
+    """Build request-aligned conditioning rows for one latent image geometry."""
+
     transform = runtime.image_processor().vit
     generation = runtime.generation()
     return generation.conditioning(
@@ -592,6 +628,8 @@ def _spatial_positions(
     patch: int,
     temporal: int,
 ) -> torch.Tensor:
+    """Build flattened temporal-height-width coordinates for latent patches."""
+
     grid_height = height // patch
     grid_width = width // patch
     y = torch.arange(grid_height, dtype=torch.long).repeat_interleave(grid_width)

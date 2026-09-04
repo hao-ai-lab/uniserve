@@ -47,6 +47,8 @@ logger = logging.getLogger(__name__)
 
 
 class RunPath(StrEnum):
+    """Identifies eager, graph-capture, graph-replay, and graph-fallback execution paths."""
+
     EAGER = "eager"
     GRAPH_CAPTURE = "graph_capture"
     GRAPH_REPLAY = "graph_replay"
@@ -55,6 +57,8 @@ class RunPath(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class RunObservation:
+    """Records route, row composition, graph padding, path, and duration for one model invocation."""
+
     route: str
     row_count: int
     row_kind_counts: tuple[tuple[str, int], ...]
@@ -66,6 +70,8 @@ class RunObservation:
 
 @dataclass(frozen=True, slots=True)
 class ForwardResult:
+    """Pairs a model output with the route and execution-path observation that produced it."""
+
     values: tuple[torch.Tensor, ...]
     request_pool_indices: torch.Tensor
     path: RunPath
@@ -80,6 +86,8 @@ def _invoke(
     positions: torch.Tensor,
     batch: ForwardBatch,
 ) -> ForwardOutput:
+    """Call the model with staged identifiers, positions, and execution context."""
+
     if batch.phase in {ModelPhase.TEXT, ModelPhase.DENOISE}:
         hidden = model.forward(ids, positions, batch)
         if not isinstance(hidden, torch.Tensor):
@@ -120,6 +128,8 @@ class ModelRunner:
         lanes: tuple[LaneConfig, ...] = (),
         max_inflight: int = 1,
     ) -> None:
+        """Construct device-and-lane runtimes around one pure execution model."""
+
         canonical = tuple(dict.fromkeys(str(torch.device(device)) for device in devices))
         if not canonical:
             raise ValueError("model runner requires an execution device")
@@ -136,6 +146,8 @@ class ModelRunner:
         self._owned_lanes: list[ExecutionLaneRuntime] = []
 
         def make_buffer(device: str) -> InputBuffers:
+            """Allocate fixed-capacity staging storage for one execution device."""
+
             return InputBuffers(
                 max_rows=max_rows,
                 max_tokens=max_tokens,
@@ -201,9 +213,13 @@ class ModelRunner:
 
     @property
     def execution_lanes(self) -> tuple[ExecutionLaneRuntime, ...]:
+        """Expose lane runtimes in deterministic ownership order."""
+
         return tuple(self._owned_lanes)
 
     def complete_startup(self) -> None:
+        """Freeze attention bindings and model state after warmup completes."""
+
         for lane_runtime in self._owned_lanes:
             lane_id = lane_runtime.lane_id or "default"
             logger.info("verifying CUDA graph catalog lane=%s", lane_id)
@@ -233,16 +249,22 @@ class ModelRunner:
             logger.info("verified tensor-parallel execution lane agreement")
 
     def invalidate_graphs(self, weight_version: int) -> None:
+        """Drop captures whose embedded parameters predate the supplied weight version."""
+
         for lane_runtime in self._owned_lanes:
             lane_runtime.graphs.invalidate(weight_version)
 
     def close(self) -> None:
+        """Release lane streams, graph bindings, and runner-owned staging state."""
+
         for lane_runtime in reversed(self._owned_lanes):
             lane_runtime.close()
         self._execution_lanes.clear()
         self._owned_lanes.clear()
 
     def synchronize(self) -> None:
+        """Wait for every non-default lane stream owned by this runner."""
+
         for lane_runtime in self._owned_lanes:
             if lane_runtime.stream is not None:
                 lane_runtime.stream.synchronize()
@@ -258,6 +280,8 @@ class ModelRunner:
         graph_eligible: bool,
         domain: Domain,
     ) -> ForwardResult:
+        """Stage forward rows, choose eager or CUDA graph execution, invoke the model, and validate outputs."""
+
         tasks = rows
         if not tasks:
             raise ValueError("model runner received an empty call")
@@ -413,6 +437,8 @@ class ModelRunner:
             raise ValueError("one model call cannot mix immutable weight sets")
 
         def invoke(value: ForwardBatch) -> ForwardOutput:
+            """Invoke the model while counting eager or captured forward executions."""
+
             nonlocal calls
             calls += 1
             ids = buffers.input_ids[:0] if value.input_ids is None else value.input_ids
@@ -503,6 +529,8 @@ class ModelRunner:
 
 
 def _kind_counts(tasks: tuple[ForwardRow, ...]) -> dict[str, int]:
+    """Count forward rows by stable operation-kind label."""
+
     result: dict[str, int] = {}
     for task in tasks:
         result[task.kind] = result.get(task.kind, 0) + 1
@@ -510,6 +538,8 @@ def _kind_counts(tasks: tuple[ForwardRow, ...]) -> dict[str, int]:
 
 
 def _base_version(operation: Operation) -> int:
+    """Return an operation's base weight generation or the default generation."""
+
     point = operation.parent.point
     value = getattr(point, "point_index", 0)
     return int(value)
@@ -520,6 +550,8 @@ def _validate_outputs(
     tasks: tuple[ForwardRow, ...],
     device: torch.device,
 ) -> None:
+    """Validate one model output tensor per task on the expected device."""
+
     for value, task in zip(values, tasks, strict=True):
         if value.device != device:
             raise ValueError(f"model output is on {value.device}, expected {device}")
@@ -544,6 +576,8 @@ def _input_failure(
     phase: ModelPhase,
     operations: tuple[OperationTrace, ...],
 ) -> InputError:
+    """Classify invalid model inputs with phase and operation trace context."""
+
     if isinstance(error, InputError):
         return error
     return InputError(
@@ -561,6 +595,8 @@ def _execution_failure(
     phase: ModelPhase,
     operations: tuple[OperationTrace, ...],
 ) -> WorkerError:
+    """Classify a model failure and attach the active phase and operation traces."""
+
     if isinstance(error, WorkerError):
         return error
     classified = classify(error)

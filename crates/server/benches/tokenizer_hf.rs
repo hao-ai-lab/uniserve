@@ -1,4 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+//! Encoding and decoding throughput benchmarks for Hugging Face tokenizers.
 
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use hf_hub::api::sync::ApiBuilder;

@@ -9,6 +9,8 @@ from ..foundation.errors import invalid_descriptor
 
 @dataclass(frozen=True, slots=True)
 class GraphBucket:
+    """Defines a capturable decode or flow shape using row counts and media geometry."""
+
     decode_rows: int
     flow_rows: int
     height: int
@@ -16,6 +18,8 @@ class GraphBucket:
     cfg_branches: int
 
     def __post_init__(self) -> None:
+        """Validate row counts and mode-specific media geometry for graph capture."""
+
         if min(
             self.decode_rows,
             self.flow_rows,

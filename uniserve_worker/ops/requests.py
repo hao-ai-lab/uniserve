@@ -12,6 +12,8 @@ from ..execution.forward_batch import ForwardBatch
 
 @dataclass(frozen=True)
 class RmsNormReq:
+    """Carries an input tensor, normalization weight, and epsilon for RMS normalization."""
+
     hidden_states: torch.Tensor
     weight: torch.Tensor
     eps: float
@@ -19,6 +21,8 @@ class RmsNormReq:
 
 @dataclass(frozen=True)
 class AddRmsNormReq:
+    """Carries mutable input and residual tensors for fused residual addition and RMS normalization."""
+
     hidden_states: torch.Tensor
     residual: torch.Tensor
     weight: torch.Tensor
@@ -28,11 +32,15 @@ class AddRmsNormReq:
 
 @dataclass(frozen=True)
 class SiluAndMulReq:
+    """Carries a packed gate/value tensor for gated SiLU activation."""
+
     x: torch.Tensor
 
 
 @dataclass(frozen=True)
 class QKNormReq:
+    """Carries query/key tensors, independent RMS weights, and epsilon for QK normalization."""
+
     q: torch.Tensor
     k: torch.Tensor
     q_weight: torch.Tensor
@@ -42,6 +50,8 @@ class QKNormReq:
 
 @dataclass(frozen=True)
 class MultiAxisQKNormReq:
+    """Carries Q/K tensors and per-axis dimensions and weights for grouped normalization."""
+
     q: torch.Tensor
     k: torch.Tensor
     axis_dims: tuple[int, ...]
@@ -55,6 +65,8 @@ QKNormRequest = QKNormReq | MultiAxisQKNormReq
 
 @dataclass(frozen=True)
 class QKNormRopeReq:
+    """Carries Q/K tensors, normalization weights, rotary tables, and interleaving policy for fused execution."""
+
     q: torch.Tensor
     k: torch.Tensor
     q_weight: torch.Tensor
@@ -69,6 +81,8 @@ class QKNormRopeReq:
 
 @dataclass(frozen=True)
 class MultiAxisQKNormRopeReq:
+    """Carries per-axis QK normalization and rotary metadata for fused multimodal execution."""
+
     q: torch.Tensor
     k: torch.Tensor
     axis_dims: tuple[int, ...]
@@ -87,6 +101,8 @@ QKNormRopeRequest = QKNormRopeReq | MultiAxisQKNormRopeReq
 
 @dataclass(frozen=True)
 class PackedRopeReq:
+    """Carries packed Q/K tensors, rotary tables, positions, and rotary-dimension policy."""
+
     x: torch.Tensor
     cos: torch.Tensor
     sin: torch.Tensor
@@ -94,6 +110,8 @@ class PackedRopeReq:
 
 @dataclass(frozen=True)
 class DenseAttention:
+    """Carries dense Q/K/V tensors, scaling, causality, and optional attention mask."""
+
     q: torch.Tensor
     k: torch.Tensor
     v: torch.Tensor
@@ -105,6 +123,8 @@ class DenseAttention:
 
 @dataclass(frozen=True)
 class PagedDecodeAttention:
+    """Carries decode queries, paged KV storage, page tables, lengths, and optional current K/V writes."""
+
     q: torch.Tensor
     k: torch.Tensor
     v: torch.Tensor
@@ -120,6 +140,8 @@ class PagedDecodeAttention:
 
 @dataclass(frozen=True)
 class VarlenAttention:
+    """Carries packed variable-length Q/K/V tensors and cumulative sequence offsets."""
+
     q: torch.Tensor
     k: torch.Tensor
     v: torch.Tensor
@@ -136,6 +158,8 @@ class VarlenAttention:
 
 @dataclass(frozen=True)
 class VisibleEndAttention:
+    """Carries dense Q/K/V tensors with a per-row visible KV boundary."""
+
     q: torch.Tensor
     k: torch.Tensor
     v: torch.Tensor

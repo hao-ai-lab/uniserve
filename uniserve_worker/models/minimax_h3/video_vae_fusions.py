@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fixed-width fused operations for the MiniMax H3 video decoder."""
+"""Implements fixed-width fused operations for the MiniMax H3 video decoder.
+
+Triton kernels preserve the decoder's BF16 rounding, partial rotary, residual,
+normalization, activation, and patch-unpacking contracts on CUDA. Tensor paths
+provide the same operations for non-CUDA execution, and magnitude-returning
+variants feed activation quantization without an additional full-tensor pass.
+"""
 
 from __future__ import annotations
 
@@ -38,6 +44,8 @@ def _video_rmsnorm_kernel(
     eps,
     BLOCK: tl.constexpr,
 ):
+    """Normalize one fixed-width decoder row and apply its learned scale."""
+
     row = tl.program_id(0)
     columns = tl.arange(0, BLOCK)
     hidden = tl.load(hidden_ptr + row * _WIDTH_TL + columns).to(tl.float32)
@@ -55,6 +63,8 @@ def _video_rmsnorm_absmax_kernel(
     eps,
     BLOCK: tl.constexpr,
 ):
+    """Normalize one row while publishing its output magnitude for reduction."""
+
     row = tl.program_id(0)
     columns = tl.arange(0, BLOCK)
     hidden = tl.load(hidden_ptr + row * _WIDTH_TL + columns).to(tl.float32)
@@ -77,6 +87,8 @@ def _scaled_residual_rmsnorm_kernel(
     HAS_UPDATE_BIAS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
+    """Update a residual row in place and emit its RMS-normalized value."""
+
     row = tl.program_id(0)
     columns = tl.arange(0, BLOCK)
     offsets = row * _WIDTH_TL + columns
@@ -106,6 +118,8 @@ def _scaled_residual_rmsnorm_absmax_kernel(
     HAS_UPDATE_BIAS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
+    """Fuse residual update, RMS normalization, and rowwise magnitude capture."""
+
     row = tl.program_id(0)
     columns = tl.arange(0, BLOCK)
     offsets = row * _WIDTH_TL + columns
@@ -134,6 +148,8 @@ def _scaled_residual_kernel(
     HAS_UPDATE_BIAS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
+    """Apply a channel-scaled update to the fixed-width residual stream."""
+
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < elements
     columns = offsets % _WIDTH_TL
@@ -159,6 +175,8 @@ def _scaled_residual_layernorm_kernel(
     HAS_UPDATE_BIAS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
+    """Fuse a scaled residual update with fixed-width layer normalization."""
+
     row = tl.program_id(0)
     columns = tl.arange(0, BLOCK)
     offsets = row * _WIDTH_TL + columns
@@ -191,6 +209,8 @@ def _scaled_residual_layernorm_absmax_kernel(
     HAS_UPDATE_BIAS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
+    """Compute fused residual layer normalization and rowwise output magnitude."""
+
     row = tl.program_id(0)
     columns = tl.arange(0, BLOCK)
     offsets = row * _WIDTH_TL + columns
@@ -230,6 +250,8 @@ def _qk_rmsnorm_partial_rope_kernel(
     HAS_VALUE_BIAS: tl.constexpr,
     ROW_BLOCK: tl.constexpr,
 ):
+    """Normalize Q/K heads, rotate their leading coordinates, and apply biases."""
+
     row = tl.program_id(0) * ROW_BLOCK + tl.arange(0, ROW_BLOCK)
     head = tl.program_id(1)
     columns = tl.arange(0, _HEAD_DIM_TL)
@@ -252,6 +274,7 @@ def _qk_rmsnorm_partial_rope_kernel(
     query = (query * query_rstd[:, None]).to(query_ptr.dtype.element_ty).to(tl.float32)
     key = (key * key_rstd[:, None]).to(key_ptr.dtype.element_ty).to(tl.float32)
 
+    # Partner coordinates come from the opposite half of the rotary subspace.
     half_rotary: tl.constexpr = _ROTARY_DIM_TL // 2
     partner_columns = tl.where(
         columns < half_rotary,
@@ -294,6 +317,8 @@ def _value_first_swiglu_kernel(
     HAS_BIAS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
+    """Evaluate value-first SwiGLU over a packed ``[value, gate]`` projection."""
+
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < elements
     row = offsets // width
@@ -325,6 +350,8 @@ def _value_first_swiglu_absmax_kernel(
     HAS_BIAS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
+    """Evaluate packed SwiGLU and record one magnitude partial per program."""
+
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < elements
     row = offsets // width
@@ -357,6 +384,8 @@ def _finish_absmax_kernel(
     count: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
+    """Reduce per-program magnitude partials to one scalar."""
+
     offsets = tl.arange(0, BLOCK)
     values = tl.load(partials_ptr + offsets, mask=offsets < count, other=-float("inf"))
     tl.store(output_ptr, tl.max(values, axis=0))
@@ -375,6 +404,8 @@ def _video_patch_output_kernel(
     HAS_BIAS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
+    """Unpack decoder patch channels into planar RGB video coordinates."""
+
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < elements
     output_width: tl.constexpr = width * 16
@@ -383,6 +414,8 @@ def _video_patch_output_kernel(
     output_spatial: tl.constexpr = output_height * output_width
     output_volume: tl.constexpr = output_frames * output_spatial
     output_channels: tl.constexpr = 3 * output_volume
+
+    # Decompose a planar output offset, then invert the decoder's patch packing.
     batch = offsets // output_channels
     remainder = offsets - batch * output_channels
     channel = remainder // output_volume
@@ -408,6 +441,8 @@ def _video_patch_output_kernel(
 
 
 def _finish_absmax(partials: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Reduce Triton magnitude partials into a scalar of the requested dtype."""
+
     maximum = torch.empty((), dtype=dtype, device=partials.device)
     finish_block = triton.next_power_of_2(int(partials.numel()))
     _finish_absmax_kernel[(1,)](
@@ -421,13 +456,17 @@ def _finish_absmax(partials: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
 
 
 def video_rmsnorm(hidden: torch.Tensor, weight: torch.Tensor, *, eps: float) -> torch.Tensor:
+    """Apply width-2048 RMS normalization with CPU and Triton execution paths."""
+
     if not hidden.is_cuda:
         normalized = hidden.float() * torch.rsqrt(
             hidden.float().pow(2).mean(-1, keepdim=True) + eps
         )
         return (normalized * weight.float()).to(hidden.dtype)
+
     if hidden.shape[-1] != _WIDTH:
         raise ValueError("H3 video RMSNorm requires width 2048")
+
     output_dtype = (
         torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else hidden.dtype
     )
@@ -450,11 +489,15 @@ def video_rmsnorm_absmax(
     *,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return normalized width-2048 rows and their global absolute maximum."""
+
     if not hidden.is_cuda:
         output = video_rmsnorm(hidden, weight, eps=eps)
         return output, output.abs().amax()
+
     if hidden.shape[-1] != _WIDTH:
         raise ValueError("H3 video RMSNorm requires width 2048")
+
     output_dtype = (
         torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else hidden.dtype
     )
@@ -482,11 +525,14 @@ def scaled_residual_rmsnorm_(
     *,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Update the residual stream in place and return its RMS-normalized view."""
+
     if not hidden.is_cuda:
         if update_bias is not None:
             update = update + update_bias
         hidden.add_(update.float() * scale.float())
         return hidden, video_rmsnorm(hidden, weight, eps=eps)
+
     output_dtype = (
         torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else update.dtype
     )
@@ -516,6 +562,8 @@ def scaled_residual_rmsnorm_absmax_(
     *,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Update a residual in place and return normalized values with their magnitude."""
+
     if not hidden.is_cuda:
         hidden, output = scaled_residual_rmsnorm_(
             hidden,
@@ -526,6 +574,7 @@ def scaled_residual_rmsnorm_absmax_(
             eps=eps,
         )
         return hidden, output, output.abs().amax()
+
     output_dtype = (
         torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else update.dtype
     )
@@ -554,11 +603,14 @@ def scaled_residual_(
     scale: torch.Tensor,
     update_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    """Add a channel-scaled, optionally biased update to ``hidden`` in place."""
+
     if not hidden.is_cuda:
         if update_bias is not None:
             update = update + update_bias
         hidden.add_(update.float() * scale.float())
         return hidden
+
     elements = hidden.numel()
     _scaled_residual_kernel[(triton.cdiv(elements, 1024),)](
         hidden,
@@ -583,11 +635,14 @@ def scaled_residual_layernorm(
     *,
     eps: float,
 ) -> torch.Tensor:
+    """Apply a scaled residual update followed by width-2048 layer normalization."""
+
     if not hidden.is_cuda:
         if update_bias is not None:
             update = update + update_bias
         residual = hidden + update.float() * scale.float()
         return F.layer_norm(residual, (_WIDTH,), weight, bias, eps)
+
     output_dtype = (
         torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else update.dtype
     )
@@ -619,6 +674,8 @@ def scaled_residual_layernorm_absmax(
     *,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return fused residual layer normalization and its global absolute maximum."""
+
     if not hidden.is_cuda:
         output = scaled_residual_layernorm(
             hidden,
@@ -630,6 +687,7 @@ def scaled_residual_layernorm_absmax(
             eps=eps,
         )
         return output, output.abs().amax()
+
     output_dtype = (
         torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else update.dtype
     )
@@ -663,10 +721,18 @@ def qk_rmsnorm_partial_rope_(
     value: torch.Tensor | None = None,
     value_bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Normalize Q/K heads and rotate their leading 48 of 64 coordinates in place.
+
+    Optional projection biases are rounded through the operand dtype before
+    normalization. When supplied, the value bias is also applied in place so the
+    three attention projections share one launch.
+    """
+
     if (query_bias is None) != (key_bias is None):
         raise ValueError("H3 video Q/K fusion requires both biases or neither")
     if (value is None) != (value_bias is None):
         raise ValueError("H3 video Q/K fusion requires both value and value bias or neither")
+
     if not query.is_cuda:
         if query_bias is not None and key_bias is not None:
             query = query + query_bias.view(query.shape[-2], query.shape[-1])
@@ -676,6 +742,8 @@ def qk_rmsnorm_partial_rope_(
         key = key.float() * torch.rsqrt(key.float().pow(2).mean(-1, keepdim=True) + 1e-5)
         query = query.to(dtype)
         key = key.to(dtype)
+
+        # The checkpoint uses split-half rotary pairs in only the leading coordinates.
         first, second = query[..., :_ROTARY_DIM].chunk(2, dim=-1)
         query_rotary = torch.cat((-second, first), dim=-1)
         first, second = key[..., :_ROTARY_DIM].chunk(2, dim=-1)
@@ -685,10 +753,12 @@ def qk_rmsnorm_partial_rope_(
         if value is not None and value_bias is not None:
             value.add_(value_bias.view(value.shape[-2], value.shape[-1]))
         return query, key
+
     if query.shape != key.shape or query.shape[-1] != _HEAD_DIM:
         raise ValueError("H3 video Q/K fusion requires matching head dimension 64")
     if value is not None and value.shape != query.shape:
         raise ValueError("H3 video Q/K fusion requires matching value geometry")
+
     rows = query.numel() // (int(query.shape[-2]) * _HEAD_DIM)
     heads = int(query.shape[-2])
     row_block = 8
@@ -718,6 +788,8 @@ def value_first_swiglu(
     value_gate: torch.Tensor,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    """Apply SwiGLU to a projection packed in value-then-gate order."""
+
     value, gate = value_gate.chunk(2, dim=-1)
     if not value_gate.is_cuda:
         if bias is not None:
@@ -725,6 +797,7 @@ def value_first_swiglu(
             value = value + value_bias
             gate = gate + gate_bias
         return value * F.silu(gate)
+
     width = int(value.shape[-1])
     output = torch.empty_like(value)
     elements = output.numel()
@@ -745,11 +818,16 @@ def value_first_swiglu_absmax(
     value_gate: torch.Tensor,
     bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply value-first SwiGLU and return its global absolute maximum."""
+
     if not value_gate.is_cuda:
         output = value_first_swiglu(value_gate, bias)
         return output, output.abs().amax()
+
     width = int(value_gate.shape[-1]) // 2
     elements = value_gate.numel() // 2
+
+    # Each program publishes one partial so the final reduction stays launch-bounded.
     block = 32768
     partial_count = triton.cdiv(elements, block)
     output = torch.empty(
@@ -778,12 +856,19 @@ def video_patch_output(
     height: int,
     width: int,
 ) -> torch.Tensor:
+    """Unpack H3 decoder tokens into ``[batch, RGB, frames, height, width]`` video.
+
+    Every source token represents a 4×16×16 spatiotemporal patch with three color
+    channels. Tokens beyond the requested patch volume are padding and are ignored.
+    """
+
     batch, sequence, channels = source.shape
     if channels != 3072:
         raise ValueError("H3 video patch output requires width 3072")
     patch_count = frames * height * width
     if sequence < patch_count:
         raise ValueError("H3 video patch output has fewer tokens than patches")
+
     if not source.is_cuda:
         if bias is not None:
             source = source + bias
@@ -802,6 +887,9 @@ def video_patch_output(
             .contiguous()
             .reshape(batch, 3, frames * 4, height * 16, width * 16)
         )
+
+    # The CUDA path maps output elements directly back to token-local patch
+    # coordinates, avoiding an intermediate permuted tensor.
     output = torch.empty(
         (batch, 3, frames * 4, height * 16, width * 16),
         dtype=source.dtype,

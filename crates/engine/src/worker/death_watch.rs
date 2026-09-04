@@ -1,14 +1,10 @@
-//! Edge-triggered worker-death detection for the event-driven boundary.
+//! Edge-triggered worker-exit notification for event-driven executors.
 //!
-//! The scheduler park waits on a single event listener over {result, command,
-//! death}. Result and command wakes are fired by the transport and the command
-//! ingress; this module supplies the third source: a watcher that fires a
-//! [`WakeSender`] when the worker child exits.
+//! A watcher signals [`WakeSender`] when a child exits, allowing the scheduler to
+//! share one wait boundary for results, commands, and worker death.
 //!
-//! On Linux this uses a `pidfd` (Linux 5.3+) parked on with `poll()`, which
-//! goes readable on child exit without reaping it (the executor still reaps via
-//! `try_wait`). On other platforms — or if `pidfd_open` is unavailable — the
-//! watcher is absent and death is detected by the bounded liveness probe instead.
+//! Linux uses `pidfd` readiness without reaping the child. Unsupported platforms
+//! rely on the executor's bounded liveness check.
 
 #[cfg(target_os = "linux")]
 mod imp {
@@ -29,10 +25,10 @@ mod imp {
     }
 
     impl DeathWatcher {
+        /// Starts a pidfd watcher that wakes the engine when the child exits.
         pub(crate) fn spawn(pid: u32, wake: WakeSender) -> Option<Self> {
-            // SAFETY: pidfd_open is a thin syscall wrapper; pid is the child we
-            // just spawned. A negative return means the kernel lacks the
-            // syscall (pre-5.3) — we fall back to the liveness probe.
+            // SAFETY: `pidfd_open` receives the PID of the child just spawned. A
+            // negative return leaves liveness monitoring to the caller's probe.
             let pidfd = unsafe {
                 libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0 as libc::c_uint)
             };
@@ -53,6 +49,7 @@ mod imp {
         }
     }
 
+    /// Polls the process descriptor until exit or an explicit watcher stop.
     fn run(pidfd: libc::c_int, stop: &AtomicBool, wake: &WakeSender) {
         loop {
             if stop.load(Ordering::Relaxed) {
@@ -77,13 +74,14 @@ mod imp {
             }
             // n == 0: poll timeout; loop to re-check the stop flag.
         }
-        // SAFETY: we own this fd and no longer use it.
+        // SAFETY: the watcher exclusively owns this valid descriptor and closes it once.
         unsafe {
             libc::close(pidfd);
         }
     }
 
     impl Drop for DeathWatcher {
+        /// Releases resources owned by this value.
         fn drop(&mut self) {
             self.stop.store(true, Ordering::Relaxed);
             if let Some(handle) = self.handle.take() {
@@ -100,6 +98,7 @@ mod imp {
     pub(crate) struct DeathWatcher;
 
     impl DeathWatcher {
+        /// Spawns a watcher that reports unexpected worker termination.
         pub(crate) fn spawn(_pid: u32, _wake: WakeSender) -> Option<Self> {
             // No pidfd equivalent off Linux; death is caught by the bounded
             // liveness probe instead.

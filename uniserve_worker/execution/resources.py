@@ -50,6 +50,8 @@ from uniserve_worker.transfer.tickets import Locator, Transport
 
 @dataclass(slots=True)
 class ExecutionResources:
+    """Owns the model, runtime stores, lanes, and transfer services used for execution."""
+
     runner: ModelRunner | None
     model: ExecutionModel
     deployment: WorkerDeployment
@@ -87,9 +89,13 @@ class ExecutionResources:
 
     @staticmethod
     def operation_identity(operation: Operation) -> OperationIdentity:
+        """Form the lane-local identity from request generation and operation id."""
+
         return operation.request_key, int(operation.op_id)
 
     def request_row(self, scope: LaneState, request_id: int) -> RequestDraft:
+        """Return the unique staged request draft for an identifier within the current lane."""
+
         try:
             return scope.request_rows[int(request_id)]
         except KeyError:
@@ -98,23 +104,31 @@ class ExecutionResources:
             ) from None
 
     def generation(self) -> GenerationPipeline:
+        """Require the model's diffusion generation contract for the active operation."""
+
         value = self.model.generation
         if not isinstance(value, GenerationPipeline):
             raise invalid_descriptor("operation requires model generation behavior")
         return value
 
     def image_processor(self) -> ImageProcessor:
+        """Require the model's image preprocessing contract for the active operation."""
+
         value = self.model.image_processor
         if not isinstance(value, ImageProcessor):
             raise invalid_descriptor("operation requires model image processing")
         return value
 
     def media_mux(self) -> Any:
+        """Require the rank-local coordinator that finalizes encoded media artifacts."""
+
         if self._media_mux is None:
             raise unsupported_setup("operation requires media mux resources")
         return self._media_mux
 
     def media_output_ring(self) -> Any:
+        """Require rank-zero bounded storage for asynchronous encoded media output."""
+
         if self._media_output_ring is None:
             raise unsupported_setup("operation requires a rank-zero media output ring")
         return self._media_output_ring
@@ -126,6 +140,8 @@ class ExecutionResources:
         *,
         group_id: int = 0,
     ) -> tuple[int, int, int, int]:
+        """Resolve visible, computed, and physical KV coordinates for an operation and cache group."""
+
         request = self.request_row(scope, operation.request_key.request_id)
         slot = int(request.request_pool_idx)
         rows = scope.forward_rows.get(self.operation_identity(operation), ())
@@ -145,12 +161,16 @@ class ExecutionResources:
         return slot, int(group_id), visible, capacity
 
     def latent_row(self, operation: Operation, scope: LaneState) -> LatentExecution:
+        """Resolve the staged physical latent placement for an operation in this lane."""
+
         row = scope.latent_rows.get(self.operation_identity(operation))
         if row is None:
             raise invalid_descriptor("trajectory operation has no staged latent placement")
         return row
 
     def require_latent_pool(self) -> LatentPool:
+        """Require the worker-owned resident latent page pool."""
+
         if self.latent_pool is None:
             raise unsupported_setup("operation requires a physical latent pool")
         return self.latent_pool
@@ -164,6 +184,8 @@ class ExecutionResources:
         latent_len: int | None = None,
         computed_len: int | None = None,
     ) -> LogicalLengths:
+        """Construct post-operation semantic lengths from request state and optional cache coordinates."""
+
         parent = self.parent_runtime(operation, request)
         if cache is None:
             visible = parent.kv_visible_len
@@ -180,9 +202,13 @@ class ExecutionResources:
 
     @staticmethod
     def output_generations(operation: Operation) -> tuple[int, ...]:
+        """List logical generations in descriptor output order."""
+
         return tuple(int(reference.generation) for reference in operation.outputs)
 
     def operation_device(self, operation: Operation) -> torch.device:
+        """Return the model or generation device assigned to an operation kind."""
+
         if operation.kind in {
             RunKind.DIFFUSION_PREPARE,
             RunKind.DIFFUSION_STEP,
@@ -193,6 +219,8 @@ class ExecutionResources:
         return self._device
 
     def phase_device(self, phase: ModelPhase) -> torch.device:
+        """Select the generation device for latent codecs and the model device otherwise."""
+
         if phase in {ModelPhase.ENCODE_LATENT, ModelPhase.DECODE_LATENT}:
             return torch.device(self.deployment.generation_device or self.deployment.device)
         return torch.device(self.deployment.device)
@@ -205,6 +233,8 @@ class ExecutionResources:
         consumer_op_id: int,
         device: torch.device | str | None = None,
     ) -> DeviceProductRead:
+        """Acquire a device product for one consumer and retain its read lease in the lane."""
+
         candidate = scope.transferred_device_products.get(reference)
         if candidate is not None:
             return self.device_products.consume_candidate(
@@ -226,6 +256,8 @@ class ExecutionResources:
         consumer_op_id: int,
         device: torch.device | str | None = None,
     ) -> EncoderRead:
+        """Acquire an encoder feature for one consumer and retain its read lease in the lane."""
+
         candidate = scope.transferred_encoder_features.get(reference)
         if candidate is not None:
             return self.encoder_cache.consume_candidate(
@@ -240,6 +272,8 @@ class ExecutionResources:
         )
 
     def broadcast_tp_selection(self, value: torch.Tensor) -> torch.Tensor:
+        """Broadcast device-selected scalar values from tensor-parallel rank zero."""
+
         if self.mesh.tp_size <= 1:
             return value
         transport = self.mesh.transport("tp")
@@ -250,6 +284,8 @@ class ExecutionResources:
         tasks: tuple[ForwardRow, ...],
         scope: LaneState,
     ) -> ForwardResult:
+        """Run a forward group and accumulate its path, token, timing, and attention observations."""
+
         from .step import _run_forward_group
 
         result = _run_forward_group(self, tasks, scope)
@@ -258,10 +294,14 @@ class ExecutionResources:
 
     @staticmethod
     def record_component(scope: LaneState, name: str, started_ns: int) -> None:
+        """Accumulate elapsed microseconds under a lane-scoped execution component."""
+
         elapsed_us = max(0, (time.perf_counter_ns() - int(started_ns)) // 1000)
         scope.component_us[name] = scope.component_us.get(name, 0) + elapsed_us
 
     def parent_runtime(self, operation: Operation, request: RequestDraft) -> RequestRuntime:
+        """Resolve the operation’s parent checkpoint to its request runtime state."""
+
         parent = operation.parent
         point = parent.point
         runtime = (
@@ -278,6 +318,8 @@ class ExecutionResources:
 
     @staticmethod
     def fixed_parent(operation: Operation) -> FixedCheckpoint:
+        """Require a host-resolved parent checkpoint for a depth-one state transition."""
+
         point = operation.parent.point
         if not isinstance(point, FixedCheckpoint):
             raise invalid_descriptor("operation names a device parent; depth one commits fixed")

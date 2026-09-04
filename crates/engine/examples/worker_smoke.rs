@@ -1,5 +1,4 @@
-//! Two-process IPC smoke test: spawn the (stub) Python worker, handshake info,
-//! and drive a few requests through the scheduler over the shared-memory ring.
+//! Demonstrates worker startup, capability negotiation, and shared-memory execution.
 use std::collections::HashMap;
 
 use uniserve_core::Event;

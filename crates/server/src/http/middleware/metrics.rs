@@ -1,3 +1,5 @@
+//! Middleware that records HTTP status, latency, and body-size metrics.
+
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Instant;
@@ -13,7 +15,7 @@ use uniserve_observability::{HttpHandlerLabels, HttpRequestLabels, METRICS};
 ///
 const EXCLUDED_HANDLERS: &[&str] = &["/metrics", "/health", "/version"];
 
-/// Record API-server HTTP metrics with Python-compatible
+/// Records API-server HTTP metrics with Python-compatible
 /// (`PrometheusFastApiInstrumentator` style) family names and labels.
 pub(crate) async fn track_http_metrics(req: Request, next: Next) -> Response {
     // Resolve the handler from a borrowed `&str` first so excluded requests
@@ -71,6 +73,7 @@ struct MetricsGuard {
 }
 
 impl Drop for MetricsGuard {
+    /// Records request count and end-to-end body delivery latency.
     fn drop(&mut self) {
         let elapsed = self.started_at.elapsed().as_secs_f64();
         let metrics = &METRICS.api_server;
@@ -104,11 +107,11 @@ struct MetricsTrackedBody {
     _guard: MetricsGuard,
 }
 
-// Simply delegate all `HttpBody` methods to the inner body.
 impl HttpBody for MetricsTrackedBody {
     type Data = Bytes;
     type Error = axum::Error;
 
+    /// Polls the wrapped response body for its next frame.
     fn poll_frame(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -116,15 +119,18 @@ impl HttpBody for MetricsTrackedBody {
         Pin::new(&mut self.inner).poll_frame(cx)
     }
 
+    /// Returns whether the wrapped response body has ended.
     fn is_end_stream(&self) -> bool {
         self.inner.is_end_stream()
     }
 
+    /// Returns the wrapped response body size estimate.
     fn size_hint(&self) -> SizeHint {
         self.inner.size_hint()
     }
 }
 
+/// Returns the metrics class for an HTTP status.
 fn status_group(status: u16) -> &'static str {
     match status / 100 {
         1 => "1xx",

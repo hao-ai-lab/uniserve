@@ -9,6 +9,8 @@ from ..execution.batch import RunKind
 
 
 class ModelLoadScope(StrEnum):
+    """Enumerates the checkpoint scope materialized by a worker role."""
+
     WHOLE = "whole"
     UNDERSTANDING = "understanding"
     GENERATION = "generation"
@@ -16,11 +18,15 @@ class ModelLoadScope(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class WorkerPlan:
+    """Defines the model scope and operation variants assigned to one worker."""
+
     model_scope: ModelLoadScope
     allowed_work_variants: frozenset[RunKind]
 
 
 def resolve_worker_plan(supported_ops: frozenset[RunKind]) -> WorkerPlan:
+    """Map supported operation kinds to the model scope and executable variants for one worker."""
+
     if not supported_ops:
         raise ValueError("worker pool must support at least one operation")
     return WorkerPlan(

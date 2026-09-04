@@ -48,6 +48,8 @@ _CUDA_PROFILER_ENV = "UNISERVE_CUDA_PROFILER"
 
 @dataclass(frozen=True)
 class WorkerProfileConfig:
+    """Configures torch-profiler activities, NVTX ranges, CUDA-profiler control, schedules, and trace output."""
+
     output_dir: Path
     prefix: str
     activities: tuple[str, ...]
@@ -62,6 +64,8 @@ class WorkerProfiler:
     """Small execution-step profiler for worker processes."""
 
     def __init__(self, config: WorkerProfileConfig | None) -> None:
+        """Initialize capture-window counters for an optional profiler configuration."""
+
         self.config = config
         self._seen_steps = 0
         self._profiled_steps = 0
@@ -72,6 +76,8 @@ class WorkerProfiler:
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "WorkerProfiler":
+        """Build a bounded step profiler from the worker profiling environment."""
+
         env = os.environ if env is None else env
         output_dir = env.get(_TORCH_PROFILE_DIR_ENV) or env.get(_PROFILE_DIR_ENV)
         if not output_dir:
@@ -95,10 +101,14 @@ class WorkerProfiler:
 
     @property
     def enabled(self) -> bool:
+        """Indicate whether this worker has an active profiling configuration."""
+
         return self.config is not None
 
     @contextmanager
     def step(self, debug_name: str) -> Iterator[None]:
+        """Profile one execution step when it falls inside the configured capture window."""
+
         if self.config is None:
             with profile_range(debug_name):
                 yield
@@ -122,10 +132,14 @@ class WorkerProfiler:
                 self._stop()
 
     def close(self) -> None:
+        """Finalize an active capture and write its trace artifacts."""
+
         if self._active:
             self._stop()
 
     def _start(self, step_id: int) -> bool:
+        """Begin a bounded profiler window on the configured execution step."""
+
         assert self.config is not None
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
         self._start_step = int(step_id)
@@ -161,6 +175,8 @@ class WorkerProfiler:
         return True
 
     def _stop(self) -> None:
+        """Stop the active profiler, export its trace, and release profiler state."""
+
         assert self.config is not None
         end_step = self._start_step + max(0, self._profiled_steps - 1)
         trace_base = _trace_base(self.config, self._start_step, end_step)
@@ -216,6 +232,8 @@ def synchronize_profile_range(device: Any) -> None:
 
 @contextmanager
 def _profile_range_impl(debug_name: str, *, record: bool, nvtx: bool) -> Iterator[None]:
+    """Enter configured record-function and NVTX ranges around one code region."""
+
     with ExitStack() as stack:
         if record and torch is not None:
             stack.enter_context(torch.profiler.record_function(debug_name))
@@ -226,6 +244,8 @@ def _profile_range_impl(debug_name: str, *, record: bool, nvtx: bool) -> Iterato
 
 
 def _torch_profiler_enabled() -> bool:
+    """Return whether PyTorch autograd profiling is currently active."""
+
     if torch is None:
         return False
     enabled = getattr(torch.autograd, "_profiler_enabled", None)
@@ -233,6 +253,8 @@ def _torch_profiler_enabled() -> bool:
 
 
 def _nvtx_ranges_enabled() -> bool:
+    """Return whether environment policy enables NVTX range emission."""
+
     if torch is None:
         return False
     if not torch.cuda.is_available():
@@ -245,6 +267,8 @@ def _nvtx_ranges_enabled() -> bool:
 
 
 def _parse_activities(raw: str | None) -> tuple[str, ...]:
+    """Normalize profiler activity names into unique canonical values."""
+
     values = []
     for piece in (raw or "").replace(",", " ").split():
         value = piece.strip().upper()
@@ -256,6 +280,8 @@ def _parse_activities(raw: str | None) -> tuple[str, ...]:
 
 
 def _trace_base(config: WorkerProfileConfig, start_step: int, end_step: int) -> str:
+    """Build a process-, rank-, step-, and time-qualified trace basename."""
+
     stamp = time.strftime("%Y%m%d-%H%M%S")
     rank = os.environ.get("RANK") or os.environ.get("LOCAL_RANK")
     rank_part = f"-rank{rank}" if rank is not None else ""
@@ -263,6 +289,8 @@ def _trace_base(config: WorkerProfileConfig, start_step: int, end_step: int) -> 
 
 
 def _torch_profiler_activities(activities: tuple[str, ...]):
+    """Resolve configured activity names to supported PyTorch profiler activities."""
+
     if torch is None:
         return []
     out = []
@@ -277,6 +305,8 @@ def _torch_profiler_activities(activities: tuple[str, ...]):
 
 
 def _accepts_torch_profiler_arg(name: str) -> bool:
+    """Return whether the installed profiler accepts a named option."""
+
     if torch is None:
         return False
     try:
@@ -286,6 +316,8 @@ def _accepts_torch_profiler_arg(name: str) -> bool:
 
 
 def _cuda_profiler_start() -> None:
+    """Start CUDA profiler collection when CUDA is available."""
+
     if torch is None or not torch.cuda.is_available():
         logger.warning("CUDA profiler requested but CUDA is unavailable")
         return
@@ -293,12 +325,16 @@ def _cuda_profiler_start() -> None:
 
 
 def _cuda_profiler_stop() -> None:
+    """Stop CUDA profiler collection when CUDA is available."""
+
     if torch is None or not torch.cuda.is_available():
         return
     torch.cuda.cudart().cudaProfilerStop()
 
 
 def _profiler_table(profiler, *, prefer_cuda: bool) -> str:
+    """Render a profiler summary sorted by CUDA or CPU self time."""
+
     sort_keys = (
         ("cuda_time_total", "self_cuda_time_total", "cpu_time_total", "self_cpu_time_total")
         if prefer_cuda

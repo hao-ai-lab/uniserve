@@ -1,4 +1,4 @@
-//! Description-owned preprocessing for the configured SenseNova and Bagel routes.
+//! Multimodal prompt preprocessing for SenseNova and Bagel profiles.
 
 mod output;
 
@@ -35,6 +35,7 @@ pub(crate) use output::{SenseNovaOutputProcessor, SenseNovaTextDelta};
 type OmniResult<T> = std::result::Result<T, OmniError>;
 
 #[derive(Debug, Error)]
+/// Failure while preprocessing a multimodal generation request.
 pub enum OmniError {
     #[error(transparent)]
     Tokenizer(#[from] crate::profile::tokenizer::TokenizerError),
@@ -53,6 +54,7 @@ pub enum OmniError {
 }
 
 impl From<String> for OmniError {
+    /// Converts the source value into this type.
     fn from(message: String) -> Self {
         Self::Invalid(message)
     }
@@ -64,13 +66,19 @@ const DEFAULT_TOP_P: f32 = 1.0;
 const DEFAULT_TOP_K: u32 = 0;
 
 mod context_image_defaults {
+    /// Default text classifier-free guidance scale.
     pub(super) const CFG_TEXT_SCALE: f32 = 4.0;
+    /// Default image classifier-free guidance scale.
     pub(super) const CFG_IMG_SCALE: f32 = 2.0;
+    /// Default lower bound for guidance renormalization.
     pub(super) const CFG_RENORM_MIN: f32 = 0.0;
+    /// Default denoising interval for classifier-free guidance.
     pub(super) const CFG_INTERVAL: (f32, f32) = (0.0, 1.0);
+    /// Default square output dimension in pixels.
     pub(super) const RESOLUTION: u32 = 512;
 }
 
+/// Profile and request values shared by multimodal tokenizers.
 pub(super) struct RuntimeBinding<'a> {
     pub(super) tokenizer: DynTokenizer,
     pub(super) renderer: &'a HfChatRenderer,
@@ -103,6 +111,7 @@ struct RenderedImage {
     b64: String,
 }
 
+/// Tokenizes and lowers a request using the SenseNova profile.
 pub(super) fn tokenize_sensenova(
     profile: &SenseNovaProfile,
     binding: RuntimeBinding<'_>,
@@ -130,6 +139,7 @@ pub(super) fn tokenize_sensenova(
     })
 }
 
+/// Tokenizes and lowers a request using the Bagel profile.
 pub(super) fn tokenize_bagel(
     profile: &BagelProfile,
     binding: RuntimeBinding<'_>,
@@ -157,6 +167,7 @@ pub(super) fn tokenize_bagel(
     })
 }
 
+/// Lowers a SenseNova request into token, image, sampling, and termination inputs.
 fn lower_sensenova(
     profile: &SenseNovaProfile,
     tokenizer: &DynTokenizer,
@@ -185,6 +196,7 @@ fn lower_sensenova(
     })
 }
 
+/// Lowers a Bagel request into token, image, sampling, and termination inputs.
 fn lower_bagel(
     profile: &BagelProfile,
     tokenizer: &DynTokenizer,
@@ -223,6 +235,7 @@ fn lower_bagel(
     })
 }
 
+/// Renders a SenseNova text or chat prompt and resolves positioned input images.
 fn sensenova_prompt(
     profile: &SenseNovaProfile,
     tokenizer: &DynTokenizer,
@@ -251,6 +264,7 @@ fn sensenova_prompt(
     }
 }
 
+/// Renders a Bagel prompt and selects its context-image conditioning mode.
 fn bagel_prompt(
     profile: &BagelProfile,
     tokenizer: &DynTokenizer,
@@ -303,6 +317,7 @@ fn bagel_prompt(
     }
 }
 
+/// Renders structured SenseNova chat while preserving one placeholder per input image.
 fn render_sensenova_chat(
     profile: &SenseNovaProfile,
     tokenizer: &DynTokenizer,
@@ -349,6 +364,7 @@ fn render_sensenova_chat(
     tokenize_sensenova_with_slots(tokenizer, &rendered, &placeholders, images, profile)
 }
 
+/// Replaces SenseNova image slots and computes their positions in token space.
 fn tokenize_sensenova_with_slots(
     tokenizer: &DynTokenizer,
     rendered: &str,
@@ -391,6 +407,7 @@ fn tokenize_sensenova_with_slots(
     Ok((prompt_ids, images))
 }
 
+/// Renders structured Bagel chat while preserving one placeholder per input image.
 fn render_bagel_chat(
     tokenizer: &DynTokenizer,
     renderer: &HfChatRenderer,
@@ -430,6 +447,7 @@ fn render_bagel_chat(
     tokenize_bagel_with_slots(tokenizer, &rendered, &placeholders, images)
 }
 
+/// Removes Bagel image slots and computes their positions in token space.
 fn tokenize_bagel_with_slots(
     tokenizer: &DynTokenizer,
     rendered: &str,
@@ -456,6 +474,7 @@ fn tokenize_bagel_with_slots(
     Ok((prompt_ids, images))
 }
 
+/// Validates resolved multimodal state and assembles the canonical engine request.
 fn finish_tokenized(
     binding: &RuntimeBinding<'_>,
     policy: &GenerationPolicyDescriptor,
@@ -464,6 +483,8 @@ fn finish_tokenized(
     mut context: Vec<CoreContextSegment>,
     output_processor: OutputProcessorPolicy,
 ) -> OmniResult<TokenizedGenerateReqInput> {
+    // Resolve the autoregressive budget only for requests whose behavior can
+    // enter text decoding.
     let prompt_tokens = u32::try_from(lowered.prompt_ids.len())
         .map_err(|_| "generation prompt exceeds the supported token count".to_string())?;
     let behavior = GenerationBehaviorDescriptor::resolve(lowered.constraint, policy);
@@ -479,6 +500,8 @@ fn finish_tokenized(
         0
     };
 
+    // Sampling choices determine logprob delivery and whether prefix-cache
+    // reads remain semantically valid for this request.
     apply_request_sampling(&binding.tokenizer, &request, &mut lowered.sampling)?;
     let prompt_logprobs_requested = lowered.sampling.prompt_logprobs_requested();
     let generated_logprobs_requested = lowered.sampling.generated_logprobs_requested();
@@ -495,6 +518,9 @@ fn finish_tokenized(
             image.hash = isolated_cache_key(image.hash, cache.isolation_key);
         }
     }
+
+    // Negative conditioning is internal context and contributes to resource
+    // bounds only when the selected generation behavior consumes it.
     let negative_context = (!lowered.negative_prompt_ids.is_empty())
         .then(|| CoreContextSegment::UndTokens {
             token_ids: lowered.negative_prompt_ids.clone(),
@@ -502,6 +528,9 @@ fn finish_tokenized(
         })
         .into_iter()
         .collect::<Vec<_>>();
+
+    // Compile conservative capacity before admission. Text output may shrink to
+    // fit the model context, but non-text resource requirements remain fixed.
     let mut resources =
         GenerationResourceBounds::conservative(uniserve_core::GenerationResources {
             context: &context,
@@ -538,6 +567,7 @@ fn finish_tokenized(
         })
         .map_err(|error| error.to_string())?;
     }
+
     if resources.max_kv_tokens > binding.max_model_tokens as usize {
         return Err(format!(
             "generation requires {} KV tokens, exceeding the {}-token runtime limit",
@@ -546,6 +576,8 @@ fn finish_tokenized(
         .into());
     }
 
+    // Public accounting captures the admitted cache and resource contract before
+    // ownership moves into the core generation request.
     let cache_accounting = CacheAccounting {
         read_enabled: cache.read,
         write_enabled: cache.write,
@@ -557,6 +589,7 @@ fn finish_tokenized(
         encoder_cache_pins: resources.encoder_cache_keys.len(),
         replayable: !resources.generated_feedback_makes_non_replayable,
     };
+
     let generation = GenerationRequest {
         request_id: RequestId(fnv1a(request.request_id.as_bytes())),
         context,
@@ -574,6 +607,8 @@ fn finish_tokenized(
         resources,
     };
     generation.validate().map_err(|error| error.to_string())?;
+
+    // Derive the flattened prompt only from the validated canonical context.
     let prompt_token_ids = generation.prompt_token_ids();
     Ok(TokenizedGenerateReqInput {
         request_id: request.request_id,
@@ -602,6 +637,7 @@ fn finish_tokenized(
     })
 }
 
+/// Applies request-specific penalties, masks, and bad-word tokens to profile sampling.
 fn apply_request_sampling(
     tokenizer: &DynTokenizer,
     request: &GenerateReqInput,
@@ -645,6 +681,7 @@ fn apply_request_sampling(
     Ok(())
 }
 
+/// Resolves and validates baseline multimodal sampling parameters.
 fn resolve_sampling(request: &GenerateReqInput) -> OmniResult<SamplingParams> {
     let temperature = finite(
         request.sampling.temperature.unwrap_or(DEFAULT_TEMPERATURE),
@@ -677,6 +714,7 @@ fn resolve_sampling(request: &GenerateReqInput) -> OmniResult<SamplingParams> {
     })
 }
 
+/// Merges profile defaults with request image controls and validates generation geometry.
 fn resolve_image_params(
     defaults: &crate::profile::omni::ImageGenerationDefaults,
     resolution_policy: &ResolutionPolicy,
@@ -746,6 +784,7 @@ fn resolve_image_params(
     })
 }
 
+/// Resolves Bagel image parameters for understanding requests with context images.
 fn bagel_context_image_params(
     profile: &BagelProfile,
     request: &GenerateReqInput,
@@ -787,6 +826,7 @@ fn bagel_context_image_params(
     })
 }
 
+/// Builds the sensenova context.
 fn build_sensenova_context(
     profile: &SenseNovaProfile,
     lowered: &LoweredInput,
@@ -805,6 +845,7 @@ fn build_sensenova_context(
     assemble_context(&lowered.prompt_ids, &lowered.images, ingests)
 }
 
+/// Builds the bagel context.
 fn build_bagel_context(
     profile: &BagelProfile,
     lowered: &LoweredInput,
@@ -823,6 +864,7 @@ fn build_bagel_context(
     assemble_context(&lowered.prompt_ids, &lowered.images, ingests)
 }
 
+/// Interleaves token spans and positioned image segments into canonical context order.
 fn assemble_context(
     prompt_ids: &[u32],
     images: &[RenderedImage],
@@ -872,6 +914,7 @@ fn assemble_context(
     Ok(segments)
 }
 
+/// Resolves the generation constraint implied by requested modalities.
 pub(crate) fn generation_constraint(request: &GenerateReqInput) -> GenerationConstraint {
     match request.modalities {
         ModalitySelection::Text => GenerationConstraint::UndOnly,
@@ -880,6 +923,7 @@ pub(crate) fn generation_constraint(request: &GenerateReqInput) -> GenerationCon
     }
 }
 
+/// Returns the images attached at the top request level.
 fn top_level_images(request: &GenerateReqInput) -> Vec<PositionedImageInput> {
     request
         .images
@@ -890,6 +934,7 @@ fn top_level_images(request: &GenerateReqInput) -> Vec<PositionedImageInput> {
         .collect()
 }
 
+/// Replaces chat image parts with unique template placeholders and retains their payloads.
 fn replace_chat_images(
     request_id: &str,
     messages: &mut [ChatMessage],
@@ -922,16 +967,19 @@ fn replace_chat_images(
     Ok((images, placeholders))
 }
 
+/// Returns the placeholder for one image slot.
 fn image_placeholder(request_id: &str, index: usize) -> String {
     format!("[IMAGE_SLOT_{:016x}_{index}]", fnv1a(request_id.as_bytes()))
 }
 
+/// Builds placeholders for the requested image slots.
 fn image_placeholders(request_id: &str, count: usize) -> Vec<String> {
     (0..count)
         .map(|index| image_placeholder(request_id, index))
         .collect()
 }
 
+/// Replaces each rendered image placeholder exactly once and returns its byte offset.
 fn replace_rendered_slots(
     rendered: &str,
     placeholders: &[String],
@@ -959,6 +1007,7 @@ fn replace_rendered_slots(
     Ok((clean, byte_offsets))
 }
 
+/// Decodes an inline image data URL.
 fn data_image_payload(url: &str) -> OmniResult<String> {
     let (metadata, payload) = url
         .split_once(',')
@@ -975,6 +1024,7 @@ fn data_image_payload(url: &str) -> OmniResult<String> {
     Ok(payload.to_string())
 }
 
+/// Renders an image input for the model prompt.
 fn rendered_image(image: &PositionedImageInput, position: u32) -> RenderedImage {
     RenderedImage {
         hash: fnv1a(image.b64.as_bytes()),
@@ -983,6 +1033,7 @@ fn rendered_image(image: &PositionedImageInput, position: u32) -> RenderedImage 
     }
 }
 
+/// Builds a prompt containing the required image slots.
 fn prompt_with_image_slots(prompt: &str, placeholders: &[String]) -> String {
     let mut output = String::new();
     if placeholders.len() == 1 {
@@ -997,6 +1048,7 @@ fn prompt_with_image_slots(prompt: &str, placeholders: &[String]) -> String {
     output
 }
 
+/// Returns the decoded image dimensions.
 fn image_dimensions(b64: &str) -> OmniResult<(u32, u32)> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64)
@@ -1008,6 +1060,7 @@ fn image_dimensions(b64: &str) -> OmniResult<(u32, u32)> {
         .map_err(|error| format!("invalid input image data: {error}"))?)
 }
 
+/// Validates the prompt.
 fn validate_prompt(prompt_ids: &[u32]) -> OmniResult<()> {
     if prompt_ids.is_empty() {
         Err(OmniError::Invalid(
@@ -1018,6 +1071,7 @@ fn validate_prompt(prompt_ids: &[u32]) -> OmniResult<()> {
     }
 }
 
+/// Validates the max images.
 fn validate_max_images(value: u16, limit: u16) -> OmniResult<()> {
     if value == 0 {
         return Err(OmniError::Invalid(
@@ -1030,6 +1084,7 @@ fn validate_max_images(value: u16, limit: u16) -> OmniResult<()> {
     Ok(())
 }
 
+/// Validates the CFG interval.
 fn validate_cfg_interval(value: (f32, f32)) -> OmniResult<()> {
     let (lo, hi) = value;
     if !lo.is_finite() || !hi.is_finite() || lo > hi {
@@ -1040,6 +1095,7 @@ fn validate_cfg_interval(value: (f32, f32)) -> OmniResult<()> {
     Ok(())
 }
 
+/// Returns the value when it is finite.
 fn finite(value: f32, name: &str) -> OmniResult<f32> {
     if value.is_finite() {
         Ok(value)
@@ -1048,6 +1104,7 @@ fn finite(value: f32, name: &str) -> OmniResult<f32> {
     }
 }
 
+/// Builds a cache key isolated by request namespace and salt.
 fn isolated_cache_key(content_key: u64, isolation_key: Option<u64>) -> u64 {
     let Some(isolation_key) = isolation_key else {
         return content_key;
@@ -1058,6 +1115,7 @@ fn isolated_cache_key(content_key: u64, isolation_key: Option<u64>) -> u64 {
     fnv1a(&bytes)
 }
 
+/// Computes a stable FNV-1a hash.
 fn fnv1a(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in bytes {

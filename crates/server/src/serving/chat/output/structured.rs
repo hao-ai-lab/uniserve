@@ -1,7 +1,7 @@
-//! Adapts parsed assistant updates into structured chat events.
+//! Converts semantic assistant updates into structured chat events.
 //!
-//! This module is the final chat assembly stage. It consumes semantic parser
-//! deltas and assembles public assistant content blocks.
+//! The processor preserves block order while assembling incremental reasoning,
+//! text, and tool-call content.
 
 use crate::serving::text::DecodedLogprobs;
 use asynk_strim_attr::{TryYielder, try_stream};
@@ -54,7 +54,7 @@ struct StructuredEventState {
 }
 
 impl StructuredEventState {
-    /// Create one fresh assembly state for a new streamed response.
+    /// Creates one fresh assembly state for a new streamed response.
     fn new() -> Self {
         Self {
             message: AssistantMessage::default(),
@@ -64,7 +64,7 @@ impl StructuredEventState {
         }
     }
 
-    /// Convert one parsed text delta into zero or more structured chat events.
+    /// Converts one parsed text delta into zero or more structured chat events.
     fn process_text_delta(
         &mut self,
         kind: AssistantBlockKind,
@@ -76,7 +76,7 @@ impl StructuredEventState {
         Ok(events)
     }
 
-    /// Forward per-update sample metadata without attaching it to text blocks.
+    /// Forwards per-update sample metadata without attaching it to text blocks.
     fn process_logprobs_delta(
         &mut self,
         logprobs: Option<DecodedLogprobs>,
@@ -88,7 +88,7 @@ impl StructuredEventState {
         }])
     }
 
-    /// Start one new tool call, closing any incompatible open block first.
+    /// Starts one new tool call, closing any incompatible open block first.
     fn start_tool_call(&mut self, id: String, name: String) -> Result<Vec<ChatEvent>> {
         let mut events = Vec::new();
         self.close_open_text_block(&mut events);
@@ -106,7 +106,7 @@ impl StructuredEventState {
         Ok(events)
     }
 
-    /// Append one incremental tool-call arguments delta.
+    /// Appends one incremental tool-call arguments delta.
     fn push_tool_call_arguments(&mut self, delta: String) -> Result<Vec<ChatEvent>> {
         let mut events = Vec::new();
         let Some(open_tool_call) = self.open_tool_call.as_mut() else {
@@ -122,7 +122,7 @@ impl StructuredEventState {
         Ok(events)
     }
 
-    /// Close any open block and emit the terminal `Done` event.
+    /// Closes any open block and emit the terminal `Done` event.
     fn finish(
         &mut self,
         prompt_token_count: usize,
@@ -144,7 +144,7 @@ impl StructuredEventState {
         Ok(events)
     }
 
-    /// Append one semantic text delta to the current block, or open a new block
+    /// Appends one semantic text delta to the current block, or open a new block
     /// when the semantic kind changes.
     fn push_text_delta(
         &mut self,
@@ -182,7 +182,7 @@ impl StructuredEventState {
         }
     }
 
-    /// Finalize the currently open text block, if present.
+    /// Finalizes the currently open text block, if present.
     fn close_open_text_block(&mut self, events: &mut Vec<ChatEvent>) {
         let Some(open_block) = self.open_text_block.take() else {
             return;
@@ -206,7 +206,7 @@ impl StructuredEventState {
         });
     }
 
-    /// Finalize the currently open tool call, if present.
+    /// Finalizes the currently open tool call, if present.
     fn close_open_tool_call(&mut self, events: &mut Vec<ChatEvent>) {
         let Some(open_tool_call) = self.open_tool_call.take() else {
             return;
@@ -226,7 +226,7 @@ impl StructuredEventState {
     }
 }
 
-/// Wrap one parsed assistant stream into the public structured chat event
+/// Wraps one parsed assistant stream in the public structured chat event
 /// stream.
 #[try_stream]
 pub async fn structured_chat_event_stream(

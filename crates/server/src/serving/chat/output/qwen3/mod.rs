@@ -1,4 +1,4 @@
-//! Qwen3 reasoning and tool-call output processing pipeline.
+//! Qwen3 reasoning and tool-call output processor composition.
 
 mod reasoning;
 mod tool;
@@ -19,6 +19,7 @@ pub struct Qwen3ChatOutputProcessor {
 }
 
 impl Qwen3ChatOutputProcessor {
+    /// Creates a request-scoped Qwen3 reasoning and tool output processor.
     pub fn new(
         request: &mut ChatRequest,
         tokenizer: DynTokenizer,

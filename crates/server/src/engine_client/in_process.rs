@@ -1,3 +1,5 @@
+//! In-process engine construction, submission, and lifecycle management.
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -20,6 +22,7 @@ pub struct EngineClient {
 type ActiveRequests = HashMap<String, RequestId>;
 type SharedActiveRequests = Arc<Mutex<ActiveRequests>>;
 
+/// Locks the active-request registry.
 fn lock_active(active: &Mutex<ActiveRequests>) -> std::sync::MutexGuard<'_, ActiveRequests> {
     match active.lock() {
         Ok(guard) => guard,
@@ -30,6 +33,7 @@ fn lock_active(active: &Mutex<ActiveRequests>) -> std::sync::MutexGuard<'_, Acti
     }
 }
 
+/// Removes the active request.
 fn remove_active_request(active: &Mutex<ActiveRequests>, request_id: &str, rid: RequestId) {
     let mut active = lock_active(active);
     if active.get(request_id) == Some(&rid) {
@@ -38,10 +42,12 @@ fn remove_active_request(active: &Mutex<ActiveRequests>, request_id: &str, rid: 
 }
 
 impl EngineClient {
+    /// Returns the shared engine handle.
     fn handle(&self) -> EngineHandle {
         self.core.handle()
     }
 
+    /// Starts an engine from its worker-backed core configuration.
     pub fn connect(config: uniserve_engine::EngineCoreConfig) -> Result<Self> {
         let core = EngineCore::new(config).map_err(|e| Error::ClientClosed {
             message: format!("failed to start the UniServe engine: {e:?}"),
@@ -49,6 +55,7 @@ impl EngineClient {
         Self::from_core(core)
     }
 
+    /// Starts an engine over an explicitly supplied executor.
     pub fn connect_with_executor(
         config: uniserve_engine::EngineCoreConfig,
         executor: Box<dyn Executor>,
@@ -60,6 +67,7 @@ impl EngineClient {
         Self::from_core(core)
     }
 
+    /// Starts an engine over an executor and explicit command waker.
     pub fn connect_with_executor_and_waker(
         config: uniserve_engine::EngineCoreConfig,
         executor: Box<dyn Executor>,
@@ -74,6 +82,7 @@ impl EngineClient {
         Self::from_core(core)
     }
 
+    /// Wraps an initialized engine core with request tracking and periodic statistics export.
     fn from_core(core: EngineCore) -> Result<Self> {
         let core = Arc::new(core);
 
@@ -113,51 +122,63 @@ impl EngineClient {
 }
 
 impl EngineClient {
+    /// Returns the configured model name.
     pub fn model_name(&self) -> &str {
         self.core.model_name()
     }
 
+    /// Returns the number of logical engine instances.
     pub fn engine_count(&self) -> usize {
         1
     }
 
+    /// Returns the maximum supported model context length.
     pub fn max_model_len(&self) -> u32 {
         self.core.max_model_len()
     }
 
+    /// Returns worker-advertised generation limits.
     pub fn generation_limits(&self) -> GenerationLimits {
         self.core.generation_limits()
     }
 
+    /// Returns whether the worker supports token sampling operations.
     pub fn supports_token_sampling(&self) -> bool {
         self.core.supports_token_sampling()
     }
 
+    /// Returns the worker's effective model dtype.
     pub fn model_dtype(&self) -> ModelDtype {
         self.core.model_dtype()
     }
 
+    /// Returns the worker's UniServe protocol version string.
     pub fn uniserve_version(&self) -> &str {
         "uniserve"
     }
 
+    /// Returns aggregate paged-KV capacity across worker pools.
     pub fn total_num_gpu_blocks(&self) -> u64 {
         self.core.info().kv_num_blocks() as u64
     }
 
+    /// Returns whether the engine can accept requests.
     pub fn is_healthy(&self) -> bool {
         !self.core.is_dead()
     }
 
+    /// Returns the terminal health error, if the engine failed.
     pub fn health_error(&self) -> Option<Arc<Error>> {
         None
     }
 
+    /// Submits one tokenized generation request and returns its event receiver.
     pub async fn submit_generation(&self, input: &TokenizedGenerateReqInput) -> Result<EventRx> {
         self.submit_generation_request(input.request_id.to_string(), input.request.clone())
             .await
     }
 
+    /// Maps an external request identity to an engine identity and submits the canonical request.
     async fn submit_generation_request(
         &self,
         external_request_id: String,
@@ -196,6 +217,7 @@ impl EngineClient {
         Ok(scheduler_rx)
     }
 
+    /// Submits one terminal media request and returns its event receiver.
     pub async fn submit_media(&self, submission: MediaSubmission) -> Result<EventRx> {
         let MediaSubmission {
             external_request_id,
@@ -243,6 +265,7 @@ impl EngineClient {
         Ok(scheduler_rx)
     }
 
+    /// Aborts each supplied external request identifier.
     pub async fn abort<I, S>(&self, ids: I) -> Result<()>
     where
         I: IntoIterator<Item = S>,
@@ -258,6 +281,7 @@ impl EngineClient {
         Ok(())
     }
 
+    /// Cancels each supplied request at its consumed output prefix.
     pub async fn cancel<I, S>(&self, ids: I) -> Result<()>
     where
         I: IntoIterator<Item = S>,
@@ -273,6 +297,7 @@ impl EngineClient {
         Ok(())
     }
 
+    /// Requests graceful shutdown and joins the engine owner thread.
     pub async fn shutdown(&self) -> Result<()> {
         self.core.shutdown();
         Ok(())

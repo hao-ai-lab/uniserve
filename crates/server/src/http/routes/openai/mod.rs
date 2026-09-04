@@ -1,3 +1,5 @@
+//! OpenAI-compatible HTTP route handlers.
+
 pub(crate) mod chat_completions;
 mod images;
 mod models;

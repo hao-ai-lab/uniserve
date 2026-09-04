@@ -31,6 +31,8 @@ ATTENTION_BACKENDS = (
 def _constructors(
     tuning: FlashInferTuningConfig,
 ) -> tuple[tuple[str, Callable[[], AttentionBackend]], ...]:
+    """Build the ordered attention-backend constructor table from startup tuning."""
+
     from .fa4_cute import Fa4CuteAttentionBackend
     from .flash_attn import FlashAttentionBackend
     from .flashinfer import FlashInferAttentionBackend

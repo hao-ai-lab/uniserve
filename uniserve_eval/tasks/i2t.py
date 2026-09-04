@@ -1,3 +1,5 @@
+"""Defines image-to-text benchmark request and validation behavior."""
+
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -8,6 +10,8 @@ from .base import BenchmarkTask, ImageCountRule
 
 
 class I2TTask(BenchmarkTask):
+    """Builds multimodal prompts and validates their text completions."""
+
     name: ClassVar[TaskName] = TaskName.I2T
     default_stream: ClassVar[bool] = True
     accepts_image: ClassVar[bool] = False
@@ -15,6 +19,8 @@ class I2TTask(BenchmarkTask):
     image_count: ClassVar[ImageCountRule] = ImageCountRule.FORBIDDEN
 
     def build_request(self, example: Example) -> TaskRequest:
+        """Build a chat request containing text and an embedded input image."""
+
         sampling = self.point.sampling
         max_tokens = int(
             example.max_tokens
@@ -42,6 +48,8 @@ class I2TTask(BenchmarkTask):
         return TaskRequest(self.point.endpoint, payload, stream=sampling.stream)
 
     def validate_output(self, records: Sequence[RequestRecord]) -> ValidationResult:
+        """Require authoritative usage and configured fixed-length output."""
+
         checks = {"server_usage": self.server_usage_ok(records)}
         if self.point.sampling.ignore_eos:
             checks["fixed_output_length"] = self.fixed_output_length_ok(records)

@@ -14,7 +14,11 @@ __all__ = [
 
 
 class TopK(nn.Module):
+    """Selects and renormalizes the highest-scoring experts for each token."""
+
     def __init__(self, k: int, *, renormalize: bool = True) -> None:
+        """Validate the expert count and configure optional probability renormalization."""
+
         super().__init__()
         if k <= 0:
             raise ValueError("k must be positive")
@@ -22,6 +26,8 @@ class TopK(nn.Module):
         self.renormalize = renormalize
 
     def forward(self, scores: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Select the highest-probability experts per row and optionally renormalize weights."""
+
         probs = torch.softmax(scores, dim=-1, dtype=torch.float32)
         weights, ids = torch.topk(probs, self.k, dim=-1)
         if self.renormalize:
@@ -32,13 +38,11 @@ class TopK(nn.Module):
 
 
 class FusedMoE(nn.Module):
-    """Reference per-expert dense-masked MoE dispatch.
+    """Evaluate every expert densely and accumulate top-k per-token contributions.
 
-    Despite the name, this performs no kernel fusion or token grouping: it loops
-    over experts, evaluates each expert on every token, and accumulates the
-    outputs scaled by a per-token routing gate that is zero wherever the router
-    did not select that expert. It is the deterministic correctness floor that
-    model code builds on.
+    The implementation preserves exact top-k routing semantics without token
+    dispatch: every expert processes every row, so compute scales with the full
+    expert count even though unselected outputs receive a zero gate.
     """
 
     def __init__(
@@ -48,6 +52,8 @@ class FusedMoE(nn.Module):
         *,
         norm_topk_prob: bool = True,
     ) -> None:
+        """Register every expert and configure the per-token top-k gate."""
+
         super().__init__()
         self.experts = nn.ModuleList(experts)
         self.topk = TopK(top_k, renormalize=norm_topk_prob)
@@ -58,6 +64,8 @@ class FusedMoE(nn.Module):
         router_logits: torch.Tensor,
         mesh: MeshView,
     ) -> torch.Tensor:
+        """Route flattened rows to top-k experts and reduce tensor-parallel partial outputs."""
+
         original_shape = hidden_states.shape
         flat = hidden_states.reshape(-1, original_shape[-1])
         flat_logits = router_logits.reshape(-1, router_logits.shape[-1])
@@ -65,9 +73,8 @@ class FusedMoE(nn.Module):
         weights = weights.to(flat.dtype)
         out = torch.zeros_like(flat)
         for expert_idx, expert in enumerate(self.experts):
-            # Per-token gate for this expert: the routed weight where the router
-            # selected it, zero everywhere else. Selection is one-hot across the
-            # top-k axis, so the masked sum recovers exactly that weight.
+            # Summing the one-hot top-k matches yields this expert's scalar gate
+            # for every token and zero for tokens routed elsewhere.
             gate = (weights * (expert_ids == expert_idx)).sum(dim=-1)
             expert_out = expert(flat, mesh)
             out += expert_out * gate.unsqueeze(-1).to(expert_out.dtype)

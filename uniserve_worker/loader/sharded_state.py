@@ -1,4 +1,4 @@
-"""Rank-local installed-name checkpoint loader."""
+"""Public import surface for rank-local installed-name checkpoint loading."""
 
 from .loader import ShardedStateLoader
 

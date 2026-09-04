@@ -1,19 +1,11 @@
-//! iceoryx2 event-service companions for the request-response boundary.
+//! Directional wake services for the iceoryx2 request-response boundary.
 //!
-//! The request-response ports (`Client`/`Server`) carry no file descriptor, so
-//! they cannot be parked on directly — only an event `Listener` implements
-//! `SynchronousMultiplexing`. Each request-response service therefore gets a
-//! companion `<svc>/evt_host_wake` event service: the worker notifies after
-//! sending a response, and the host's command ingress / worker-death watcher
-//! notify here too; the host (client) parks here for {result, command, death}
-//! (the scheduler park). A separate `<svc>/evt_worker_wake` service carries
-//! request-ring notifications to the worker. Keeping the two directions separate is
-//! essential: an event notifier broadcasts to every listener on its service, so
-//! a shared service would enqueue every result on the worker's own listener
-//! while it is busy on the GPU and eventually overflow that listener.
+//! Request-response ports do not expose a file descriptor suitable for parking.
+//! A host wake service reports results, commands, and worker death, while a
+//! worker wake service reports submitted requests. Separate directions prevent
+//! broadcast notifications from accumulating on the sender's listener.
 //!
-//! Wait deadlines are supplied by the caller's operation or liveness deadline.
-//! They are not transport polling intervals: progress is signalled by an event.
+//! Callers supply operation or liveness deadlines to all waits.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,14 +35,17 @@ pub const EVT_REQUEST: usize = 5;
 /// `evt_worker_wake`: asynchronous worker progress became observable.
 pub const EVT_COMPLETION: usize = 6;
 
+/// Builds the event-service name listened to by the host.
 fn host_wake_event_name(svc: &str) -> String {
     format!("{svc}/evt_host_wake")
 }
 
+/// Builds the event-service name listened to by the worker.
 fn worker_wake_event_name(svc: &str) -> String {
     format!("{svc}/evt_worker_wake")
 }
 
+/// Opens or creates one named iceoryx2 event service.
 fn open_event_service(node: &Node<IxService>, name: &str) -> IpcResult<EventFactory<IxService>> {
     let service_name =
         ServiceName::new(name).map_err(|e| ipc_error!("event service name {name:?}: {e:?}"))?;
@@ -60,6 +55,7 @@ fn open_event_service(node: &Node<IxService>, name: &str) -> IpcResult<EventFact
         .map_err(|e| ipc_error!("opening iceoryx2 event service {name:?}: {e:?}"))
 }
 
+/// Creates a notifier whose ordinary wake uses `default_id`.
 fn make_notifier(
     factory: &EventFactory<IxService>,
     default_id: usize,
@@ -71,6 +67,7 @@ fn make_notifier(
         .map_err(|e| ipc_error!("creating iceoryx2 notifier: {e:?}"))
 }
 
+/// Creates the listener paired with an event service.
 fn make_listener(factory: &EventFactory<IxService>) -> IpcResult<Listener<IxService>> {
     factory
         .listener_builder()
@@ -82,13 +79,16 @@ fn make_listener(factory: &EventFactory<IxService>) -> IpcResult<Listener<IxServ
 /// Commands and worker death can fire from arbitrary frontend / watcher threads.
 #[derive(Clone)]
 pub struct WakeSender {
+    /// Shared event notifier safe to call from callback and watcher threads.
     notifier: Arc<Notifier<IxService>>,
+    /// Event identity stamped onto each notification.
     event_id: usize,
+    /// Coalescing bit cleared when the corresponding listener drains.
     pending: Arc<AtomicBool>,
 }
 
 impl WakeSender {
-    /// Fire one coalesced wake. A notifier failure clears the pending bit so a
+    /// Fires one coalesced wake. A notifier failure clears the pending bit so a
     /// later producer can retry; endpoint teardown remains intentionally
     /// non-panicking for callback and watcher threads.
     pub fn wake(&self) {
@@ -108,14 +108,18 @@ impl WakeSender {
 /// Which wake sources fired during a [`ClientEvents::wait`].
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WakeEvents {
+    /// A worker response became available.
     pub result: bool,
+    /// A host command entered the engine queue.
     pub command: bool,
+    /// A monitored worker process exited.
     pub death: bool,
-    /// A notification with an unrecognized id (forward-compat / spurious wake).
+    /// A notification carried an unrecognized event identity.
     pub other: bool,
 }
 
 impl WakeEvents {
+    /// Returns whether at least one wake category was observed.
     pub fn any(&self) -> bool {
         self.result || self.command || self.death || self.other
     }
@@ -124,14 +128,20 @@ impl WakeEvents {
 /// Host-side event ports: a listener for {result, command, death}, a host-local
 /// notifier, and a distinct notifier for the worker's request listener.
 pub(crate) struct ClientEvents {
+    /// Host-facing listener for results, commands, and process death.
     wake_listener: Listener<IxService>,
+    /// Host-local notifier shared by command and death wake senders.
     wake_notifier: Arc<Notifier<IxService>>,
+    /// Notifier targeting the worker's request listener.
     request_notifier: Notifier<IxService>,
+    /// Coalescing state for command wakes.
     command_pending: Arc<AtomicBool>,
+    /// Coalescing state for process-death wakes.
     death_pending: Arc<AtomicBool>,
 }
 
 impl ClientEvents {
+    /// Opens host-facing result, command, and death wake ports.
     pub(crate) fn open(node: &Node<IxService>, service: &str) -> IpcResult<Self> {
         let wake = open_event_service(node, &host_wake_event_name(service))?;
         let request_wake = open_event_service(node, &worker_wake_event_name(service))?;
@@ -149,9 +159,11 @@ impl ClientEvents {
         })
     }
 
-    /// Park until a wake fires or `timeout` elapses, draining every pending
+    /// Parks until a wake fires or `timeout` elapses, draining every pending
     /// event id so a backlog cannot cause an immediate re-wake spin.
     pub(crate) fn wait(&self, timeout: Duration) -> IpcResult<WakeEvents> {
+        // Clearing producer coalescing bits transfers responsibility for all
+        // currently visible wakes to this drain.
         let mut ev = WakeEvents::default();
         self.command_pending.store(false, Ordering::Release);
         self.death_pending.store(false, Ordering::Release);
@@ -169,7 +181,9 @@ impl ClientEvents {
         Ok(ev)
     }
 
+    /// Drains pending host wakes and classifies their event identifiers.
     pub(crate) fn drain(&self) -> IpcResult<WakeEvents> {
+        // Re-arm coalesced local producers before draining event identities.
         let mut ev = WakeEvents::default();
         self.command_pending.store(false, Ordering::Release);
         self.death_pending.store(false, Ordering::Release);
@@ -184,14 +198,14 @@ impl ClientEvents {
         Ok(ev)
     }
 
+    /// Returns the listener descriptor used by external poll loops.
     pub(crate) fn file_descriptor(&self) -> i32 {
         // SAFETY: the listener owns this descriptor for at least as long as the
         // endpoint exposing it. Callers borrow it only while the endpoint lives.
         unsafe { self.wake_listener.file_descriptor().native_handle() }
     }
 
-    /// A cloneable wake source the command ingress fires after enqueuing a
-    /// command.
+    /// Returns a cloneable wake source for queued host commands.
     pub(crate) fn command_wake(&self) -> WakeSender {
         WakeSender {
             notifier: Arc::clone(&self.wake_notifier),
@@ -200,8 +214,7 @@ impl ClientEvents {
         }
     }
 
-    /// A cloneable wake source the worker-death watcher fires on child exit, so
-    /// an idle host detects death immediately.
+    /// Returns a cloneable wake source for worker-process exit.
     pub(crate) fn death_wake(&self) -> WakeSender {
         WakeSender {
             notifier: Arc::clone(&self.wake_notifier),
@@ -210,7 +223,7 @@ impl ClientEvents {
         }
     }
 
-    /// Tell the worker that one or more requests are available in the ring.
+    /// Tells the worker that one or more requests are available in the ring.
     pub(crate) fn notify_request(&self) {
         let _ = self
             .request_notifier
@@ -221,13 +234,18 @@ impl ClientEvents {
 /// Worker-side event ports: a notifier fired after each response on the host
 /// service and a listener on the separate request service.
 pub(crate) struct ServerEvents {
+    /// Notifier targeting the host's result listener.
     wake_notifier: Notifier<IxService>,
+    /// Worker-facing listener for requests and asynchronous completions.
     wake_listener: Listener<IxService>,
+    /// Shared notifier for completion callbacks.
     completion_notifier: Arc<Notifier<IxService>>,
+    /// Coalescing state for asynchronous completion wakes.
     completion_pending: Arc<AtomicBool>,
 }
 
 impl ServerEvents {
+    /// Opens worker-facing request and completion wake ports.
     pub(crate) fn open(node: &Node<IxService>, service: &str) -> IpcResult<Self> {
         let wake = open_event_service(node, &host_wake_event_name(service))?;
         let request_wake = open_event_service(node, &worker_wake_event_name(service))?;
@@ -242,14 +260,14 @@ impl ServerEvents {
         })
     }
 
-    /// Tell the host a response is available in the request-response ring.
+    /// Tells the host a response is available in the request-response ring.
     pub(crate) fn notify_response(&self) {
         let _ = self
             .wake_notifier
             .notify_with_custom_event_id(EventId::new(EVT_RESULT));
     }
 
-    /// Park until an inbound request wake fires or `timeout` elapses, draining
+    /// Parks until an inbound request wake fires or `timeout` elapses, draining
     /// every pending event id. The IPC client fires `EVT_REQUEST` after send, so
     /// an idle server wakes immediately. The timeout belongs to the caller's
     /// liveness or shutdown deadline.
@@ -267,7 +285,7 @@ impl ServerEvents {
         Ok(())
     }
 
-    /// Drain wake hints after consuming directly from the request ring. A busy
+    /// Drains wake hints after consuming directly from the request ring. A busy
     /// worker may never need to park, so keeping the listener aligned with ring
     /// consumption prevents bounded event capacity from becoming backpressure.
     pub(crate) fn drain_worker_wakes(&self) -> IpcResult<()> {
@@ -281,6 +299,7 @@ impl ServerEvents {
         Ok(())
     }
 
+    /// Returns a sender for notifying asynchronous completion readiness.
     pub(crate) fn completion_wake(&self) -> WakeSender {
         WakeSender {
             notifier: Arc::clone(&self.completion_notifier),

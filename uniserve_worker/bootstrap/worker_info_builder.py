@@ -233,6 +233,8 @@ def _dedicated_state_worker_layout(
     queue_depth: int,
     completion_payload_bytes: int,
 ) -> WorkerLayout:
+    """Describe a dedicated-state model's lanes, products, and persistent capacity."""
+
     if int(completion_payload_bytes) < 1:
         raise ValueError("completion payload capacity must be positive")
     geometry = model.dedicated_state_geometry
@@ -280,6 +282,8 @@ def _dedicated_state_worker_layout(
 
 
 def _kv_dtype(model: ExecutionModel, deployment: WorkerDeployment) -> str:
+    """Resolve the advertised KV storage dtype from model and deployment policy."""
+
     override = deployment.kv_cache_dtype
     if override is None:
         cache = model.cache_geometry
@@ -288,6 +292,8 @@ def _kv_dtype(model: ExecutionModel, deployment: WorkerDeployment) -> str:
 
 
 def _model_dtype_bytes(dtype: str) -> int:
+    """Return the byte width of a supported model activation dtype."""
+
     width = {
         "float16": 2,
         "bfloat16": 2,
@@ -299,6 +305,8 @@ def _model_dtype_bytes(dtype: str) -> int:
 
 
 def _kv_bytes_per_token(model: ExecutionModel, deployment: WorkerDeployment) -> int:
+    """Compute rank-local key-and-value bytes retained for one cached token."""
+
     width = {
         "float8_e4m3fn": 1,
         "float16": 2,

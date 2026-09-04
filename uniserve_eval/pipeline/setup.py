@@ -1,4 +1,4 @@
-"""Resolve a selection and prepare one point for measurement."""
+"""Prepares an exclusive, resolved server launch for measurement."""
 
 from __future__ import annotations
 
@@ -20,6 +20,8 @@ from ..types import BenchmarkPoint
 
 @contextmanager
 def host_lock() -> Iterator[None]:
+    """Acquire the process-wide lock that serializes benchmark servers."""
+
     path = Path("/tmp/uniserve-eval.lock")
     with path.open("a+", encoding="utf-8") as handle:
         try:
@@ -31,6 +33,8 @@ def host_lock() -> Iterator[None]:
 
 @contextmanager
 def applied_environment(values: dict[str, str]) -> Iterator[None]:
+    """Apply launch environment values and restore the prior process state."""
+
     previous: dict[str, str | None] = {name: os.environ.get(name) for name in values}
     os.environ.update(values)
     try:
@@ -48,6 +52,8 @@ def prepare_launch(
     point: BenchmarkPoint,
     executable: Path | None,
 ) -> ServerLaunch:
+    """Resolve a point's server launch and require all environment references."""
+
     server = config.servers[point.server]
     launch = server_launch(server, executable)
     require_resolved(launch.command, context=f"server {server.name}")
@@ -56,6 +62,8 @@ def prepare_launch(
 
 
 def describe_launch(launch: ServerLaunch) -> dict[str, Any]:
+    """Capture command, environment, revision, worktree, and GPU provenance."""
+
     record: dict[str, Any] = {
         "command": list(launch.command),
         "working_directory": str(launch.working_directory),
@@ -72,6 +80,8 @@ def describe_launch(launch: ServerLaunch) -> dict[str, Any]:
 
 
 def _gpu(selector: str | None) -> dict[str, str] | None:
+    """Return the selected GPU name and driver version when available."""
+
     command = ["nvidia-smi"]
     if selector and "," not in selector:
         command.append(f"--id={selector}")
@@ -84,6 +94,8 @@ def _gpu(selector: str | None) -> dict[str, str] | None:
 
 
 def _capture(command: list[str], *, cwd: Path | None = None) -> str:
+    """Return stdout from a successful read-only provenance command."""
+
     try:
         result = subprocess.run(
             command,

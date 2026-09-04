@@ -41,6 +41,8 @@ from .rows import LaneState, OperationState, Outcome
 
 
 def require_video_codecs() -> None:
+    """Verify that the model’s configured video and audio codec dependencies are installed."""
+
     require_media_codecs("libx264", "aac")
 
 
@@ -55,6 +57,8 @@ class VideoOutputRing:
         max_video_frames_per_round: int,
         max_geometry: VideoOutputGeometry,
     ) -> None:
+        """Allocate bounded video and audio tensors with independent free-slot queues."""
+
         self.video_capacity = int(state_slots) * int(unresolved_window)
         self.audio_capacity = int(state_slots)
         if min(self.video_capacity, self.audio_capacity) < 1:
@@ -89,6 +93,8 @@ class VideoOutputRing:
         self._lock = RLock()
 
     def reserve(self, kind: str) -> "VideoOutputRingLease":
+        """Lease an unused video or audio output slot from the fixed ring."""
+
         if kind not in {"video", "audio"}:
             raise ValueError(f"unknown video output-ring kind {kind!r}")
         with self._lock:
@@ -99,10 +105,14 @@ class VideoOutputRing:
         return VideoOutputRingLease(self, kind, index)
 
     def _storage(self, kind: str, index: int) -> torch.Tensor:
+        """Return backing storage for one typed output-ring slot."""
+
         values = self._video_storage if kind == "video" else self._audio_storage
         return values[int(index)]
 
     def _release(self, kind: str, index: int) -> None:
+        """Return a typed output-ring slot to its free queue."""
+
         with self._lock:
             free = self._video_free if kind == "video" else self._audio_free
             capacity = self.video_capacity if kind == "video" else self.audio_capacity
@@ -112,6 +122,8 @@ class VideoOutputRing:
 
     @property
     def used(self) -> tuple[int, int]:
+        """Return the number of output-ring slots currently leased."""
+
         with self._lock:
             return (
                 self.video_capacity - len(self._video_free),
@@ -120,9 +132,13 @@ class VideoOutputRing:
 
 
 class VideoOutputRingLease:
+    """Grants exclusive access to one video output slot until immediate or deferred release."""
+
     __slots__ = ("_ring", "kind", "index", "_released")
 
     def __init__(self, ring: VideoOutputRing, kind: str, index: int) -> None:
+        """Take exclusive ownership of one typed output-ring slot."""
+
         self._ring = ring
         self.kind = kind
         self.index = int(index)
@@ -130,17 +146,23 @@ class VideoOutputRingLease:
 
     @property
     def storage(self) -> torch.Tensor:
+        """Expose the leased output tensor while this ring slot remains owned."""
+
         if self._released:
             raise RuntimeError("video output-ring storage was accessed after release")
         return self._ring._storage(self.kind, self.index)
 
     def release(self) -> None:
+        """Return this output slot to the ring exactly once."""
+
         if self._released:
             return
         self._released = True
         self._ring._release(self.kind, self.index)
 
     def defer_until_capture_ready(self, capture: ByteCapture) -> None:
+        """Keep this output slot leased until its asynchronous byte capture completes."""
+
         if self._released:
             return
         if capture.ready():
@@ -152,18 +174,26 @@ class VideoOutputRingLease:
         )
 
     def __del__(self) -> None:
+        """Release an unclosed output-ring lease during finalization."""
+
         self.release()
 
 
 class _DeferredRingRelease:
+    """Retains a video-ring lease until capture completion permits safe reclamation."""
+
     __slots__ = ("_ring", "_kind", "_index")
 
     def __init__(self, ring: VideoOutputRing, kind: str, index: int) -> None:
+        """Retain a ring slot until an asynchronous consumer releases it."""
+
         self._ring = ring
         self._kind = kind
         self._index = int(index)
 
     def __del__(self) -> None:
+        """Complete a deferred ring release during finalization."""
+
         self._ring._release(self._kind, self._index)
 
 
@@ -171,6 +201,8 @@ class VideoMuxCoordinator:
     """Request-indexed mux sessions with independent video and audio tails."""
 
     def __init__(self) -> None:
+        """Initialize per-request mux sessions and temporal overlap tails."""
+
         self._sessions: dict[RequestKey, AvMuxSession] = {}
         self._video_tails: dict[
             RequestKey, concurrent.futures.Future[object] | None
@@ -180,6 +212,8 @@ class VideoMuxCoordinator:
         ] = {}
 
     def open(self, request_key: RequestKey, *, geometry) -> None:
+        """Create the request-owned mux session for a validated output geometry."""
+
         if request_key in self._sessions:
             raise RuntimeError("video mux session is already active")
         self._sessions[request_key] = AvMuxSession(
@@ -206,6 +240,8 @@ class VideoMuxCoordinator:
         *,
         profile_name: str,
     ) -> CpuJob:
+        """Submit one ordered mux action and release its reservation and ring lease on completion."""
+
         session = self._sessions.get(request_key)
         if session is None:
             raise RuntimeError("video mux session is not active")
@@ -231,6 +267,8 @@ class VideoMuxCoordinator:
         ring_lease: VideoOutputRingLease,
         operation_id: int,
     ) -> CpuJob:
+        """Schedule ordered RGB frame encoding from a captured output-ring slot."""
+
         dependency = self._video_tails[request_key]
         task = self._task(
             request_key,
@@ -258,6 +296,8 @@ class VideoMuxCoordinator:
         ring_lease: VideoOutputRingLease,
         operation_id: int,
     ) -> CpuJob:
+        """Schedule PCM encoding from a captured output-ring slot."""
+
         dependency = self._audio_tails[request_key]
         task = self._task(
             request_key,
@@ -282,6 +322,8 @@ class VideoMuxCoordinator:
         reservation: CpuTaskReservation,
         operation_id: int,
     ) -> CpuJob:
+        """Schedule mux finalization and shared-memory publication after all segment jobs."""
+
         dependencies = tuple(
             tail
             for tail in (self._video_tails[request_key], self._audio_tails[request_key])
@@ -289,6 +331,8 @@ class VideoMuxCoordinator:
         )
 
         def publish(session: AvMuxSession) -> MediaOutput:
+            """Close the mux session, publish its bytes, and release request-local tails."""
+
             payload = session.close()
             locator = ShmTransport.publish_bytes(payload)
             self._sessions.pop(request_key, None)
@@ -312,6 +356,8 @@ class VideoMuxCoordinator:
         )
 
     def drop(self, request_id: int) -> None:
+        """Abort and remove every mux session owned by a request identifier."""
+
         selected = [key for key in self._sessions if key.request_id == int(request_id)]
         for key in selected:
             session = self._sessions.pop(key)
@@ -320,6 +366,8 @@ class VideoMuxCoordinator:
             session.abort()
 
     def close(self) -> None:
+        """Abort all active mux sessions and reject new media work."""
+
         for session in self._sessions.values():
             session.abort()
         self._sessions.clear()
@@ -328,10 +376,14 @@ class VideoMuxCoordinator:
 
 
 def _key_label(request_key: RequestKey) -> str:
+    """Format a stable request key for media task profiling."""
+
     return f"{request_key.authority_id}:{request_key.request_id}:{request_key.epoch}"
 
 
 def trajectory_placement(lane: RunLane, operation: Operation):
+    """Return the unique latent trajectory placement assigned to an operation."""
+
     selected = tuple(
         placement
         for placement in lane.latent_placements
@@ -346,6 +398,8 @@ def trajectory_placement(lane: RunLane, operation: Operation):
 def decode_placement(
     lane: RunLane, operation: Operation
 ) -> DecodePlacement:
+    """Return the unique reconstruction placement assigned to an operation."""
+
     selected = tuple(
         placement
         for placement in lane.decode_placements
@@ -557,6 +611,8 @@ def run_action(runtime: ExecutionResources, state: OperationState) -> bool:
 
 
 def _request_label(operation: Operation) -> str:
+    """Format a stable request and operation label for media work."""
+
     key = operation.request_key
     return f"{key.authority_id}:{key.request_id}:{key.epoch}"
 

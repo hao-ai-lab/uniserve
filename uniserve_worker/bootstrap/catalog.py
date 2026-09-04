@@ -26,6 +26,8 @@ class CatalogEntry:
     sidecars: tuple[str, ...] = ("config.json",)
 
     def __post_init__(self) -> None:
+        """Validate the architecture name, model class, scopes, and default scope."""
+
         if not self.architecture:
             raise invalid_descriptor("catalog entries require a stable architecture name")
         if not issubclass(self.model_class, nn.Module):

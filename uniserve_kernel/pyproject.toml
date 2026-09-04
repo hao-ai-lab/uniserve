@@ -1,3 +1,4 @@
+# Packages accelerator-specific kernels independently from the core runtime.
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"

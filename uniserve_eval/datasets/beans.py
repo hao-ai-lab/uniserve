@@ -1,4 +1,4 @@
-"""Beans image-to-text loader."""
+"""Loads Beans photographs as deterministic image-to-text examples."""
 
 from __future__ import annotations
 
@@ -15,9 +15,13 @@ BEANS_REPOSITORY = "AI-Lab-Makerere/beans"
 
 
 class BeansDataset(Dataset):
+    """Adapts the Beans training split to embedded JPEG prompts."""
+
     name: ClassVar[str] = "beans"
 
     def load(self, tokenizer: Any | None = None) -> list[Example]:
+        """Select seeded rows and encode their RGB images as JPEG data."""
+
         point = self.point
         load_dataset = getattr(importlib.import_module("datasets"), "load_dataset")
         dataset = load_dataset(

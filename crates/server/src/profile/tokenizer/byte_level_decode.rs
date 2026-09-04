@@ -1,14 +1,17 @@
-//! Fast GPT-2 byte-level detokenization that writes into a single `Vec<u8>`,
-//! avoiding the `Vec<String>` / `String::join` assembly in fastokens' generic
-//! `Decoder::decode` pipeline.
+//! GPT-2 byte-level detokenization into a contiguous byte buffer.
+//!
+//! Token pieces are unescaped directly into one allocation before UTF-8
+//! validation.
 
 /// Reverse GPT-2 byte-to-unicode mapping: codepoint → original byte. The GPT-2
 /// table only emits codepoints in U+0000..U+0143, so a flat array suffices.
 const CHAR_TO_BYTE: [u8; 324] = build_char_to_byte();
 
+/// Returns whether a byte offset is safe for direct decoding.
 const fn is_nice(b: u8) -> bool {
     (b >= b'!' && b <= b'~') || (b >= 0xA1 && b <= 0xAC) || b >= 0xAE
 }
+/// Builds the char to byte.
 const fn build_char_to_byte() -> [u8; 324] {
     let mut table = [0u8; 324];
     let mut b: u16 = 0;
@@ -24,6 +27,7 @@ const fn build_char_to_byte() -> [u8; 324] {
     table
 }
 
+/// Returns the nearest safe byte offset at or before the requested position.
 const fn nice_offset(b: u8) -> u32 {
     let mut i: u16 = 0;
     let mut n: u32 = 0;
@@ -36,7 +40,7 @@ const fn nice_offset(b: u8) -> u32 {
     n
 }
 
-/// Decode byte-level encoded token strings into a single UTF-8 string,
+/// Decodes byte-level encoded token strings into a single UTF-8 string,
 /// matching `fastokens::decoders::ByteLevelDecoder`.
 pub(crate) fn decode_byte_level<'a, I: IntoIterator<Item = &'a str>>(tokens: I) -> String {
     let iter = tokens.into_iter();

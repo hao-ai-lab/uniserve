@@ -1,4 +1,4 @@
-"""Parameter-owned checkpoint placement functions."""
+"""Parameter-owned checkpoint placement, sharding, and materialization policies."""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ from ..nn.quant.load_state import (
 )
 from .handles import WeightHandle
 
+# A parameter owns the policy that maps one checkpoint handle and logical shard into storage.
 WeightLoader = Callable[[nn.Parameter, WeightHandle, str | int | None], None]
 
 __all__ = [
@@ -62,6 +63,8 @@ class DeferredWeightPlacement:
     shard_id: str | int | None
 
     def apply(self) -> None:
+        """Materialize and assign this checkpoint slice to its destination parameter."""
+
         load_parameter_weight(_current_parameter(self.parameter), self.handle, self.shard_id)
 
 
@@ -72,6 +75,8 @@ _DEFERRED_PLACEMENTS: ContextVar[list[DeferredWeightPlacement] | None] = Context
 
 
 def attach_weight_loader(parameter: nn.Parameter, loader: WeightLoader) -> None:
+    """Attach a parameter-specific checkpoint assignment policy."""
+
     setattr(parameter, _LOADER_ATTR, loader)
 
 
@@ -81,9 +86,15 @@ def attach_parameter_loaders(
     device: str | torch.device,
     dtype: torch.dtype,
 ) -> None:
-    """Bind ownership/materialization context and fill ordinary default loaders."""
+    """Bind parameter ownership, serving placement, and default assignment policies.
+
+    Every alias of a tied parameter is retained so meta-device materialization can
+    replace all owning module slots with one shared parameter object.
+    """
 
     target = str(torch.device(device))
+
+    # Record each direct owner; tied parameters may accumulate multiple bindings.
     for owner in module.modules():
         for name, parameter in owner.named_parameters(recurse=False):
             bindings = list(getattr(parameter, _BINDINGS_ATTR, ()))
@@ -98,6 +109,8 @@ def attach_parameter_loaders(
             setattr(parameter, _DEVICE_ATTR, target)
             setattr(parameter, _DTYPE_ATTR, dtype)
             setattr(parameter, _LOADED_ATTR, False)
+
+            # Architecture-specific loaders remain authoritative when already attached.
             if not callable(getattr(parameter, _LOADER_ATTR, None)):
                 attach_weight_loader(parameter, default_weight_loader)
 
@@ -109,6 +122,8 @@ def set_vocab_layout(
     start: int,
     end: int,
 ) -> None:
+    """Record the real and rank-local vocabulary interval on a padded parameter."""
+
     setattr(parameter, _VOCAB_ATTR, (int(real_size), int(start), int(end)))
     attach_weight_loader(parameter, vocab_weight_loader)
 
@@ -118,10 +133,15 @@ def load_parameter_weight(
     handle: WeightHandle,
     shard_id: str | int | None = None,
 ) -> None:
+    """Dispatch checkpoint assignment through the parameter's attached loader."""
+
+    # Layered construction records logical placements before allocating their owners.
     deferred = _DEFERRED_PLACEMENTS.get()
     if deferred is not None:
         deferred.append(DeferredWeightPlacement(parameter, handle, shard_id))
         return
+
+    # Resolve a replacement created through another tied binding before assignment.
     parameter = _current_parameter(parameter)
     loader = getattr(parameter, _LOADER_ATTR, None)
     if not callable(loader):
@@ -165,6 +185,8 @@ def default_weight_loader(
     handle: WeightHandle,
     shard_id: str | int | None = None,
 ) -> None:
+    """Copy a shape-compatible checkpoint tensor into an unsharded parameter."""
+
     if shard_id is not None:
         raise ValueError("ordinary parameters cannot receive packed checkpoint shards")
     parameter = _materialize(parameter, dtype=_target_dtype(parameter, handle))
@@ -181,6 +203,8 @@ def sharded_weight_loader(
     handle: WeightHandle,
     shard_id: str | int | None = None,
 ) -> None:
+    """Copy the rank-local slice selected by a parameter shard plan."""
+
     if shard_id is not None:
         raise ValueError("sharded parameters cannot receive packed checkpoint shards")
     plan = _required_plan(parameter)
@@ -195,6 +219,8 @@ def packed_weight_loader(
     handle: WeightHandle,
     shard_id: str | int | None = None,
 ) -> None:
+    """Copy one logical packed shard into its assigned interval of a merged parameter."""
+
     if shard_id is None:
         raise ValueError("packed parameters require a checkpoint shard id")
     plan = _required_plan(parameter)
@@ -222,8 +248,9 @@ def interleaved_packed_weight_loader(
     branches: int,
     group_width: int,
 ) -> None:
-    """Load one branch into a head/group-interleaved merged projection."""
+    """Load one branch into a rank-sharded, group-interleaved merged projection."""
 
+    # Validate source divisibility and the exact merged destination geometry.
     if not isinstance(shard_id, int) or not 0 <= shard_id < int(branches):
         raise ValueError("interleaved packed parameters require an integer branch id")
     if len(handle.shape) != 2 or int(handle.shape[0]) % int(size):
@@ -236,6 +263,8 @@ def interleaved_packed_weight_loader(
         raise ValueError(
             f"interleaved projection target shape {tuple(parameter.shape)} != {expected}"
         )
+
+    # Extract this rank's rows and project the branch onto the interleaved target view.
     parameter = _materialize(parameter, dtype=_target_dtype(parameter, handle))
     payload = handle.narrow(0, int(rank) * local_rows, local_rows)
     target = parameter.data.view(
@@ -245,6 +274,8 @@ def interleaved_packed_weight_loader(
         int(handle.shape[1]),
     )[:, shard_id]
     _copy(target, payload.reshape_as(target), parameter)
+
+    # The merged parameter becomes complete only after every logical branch arrives.
     loaded = set(getattr(parameter, _SHARDS_ATTR, set()))
     loaded.add(shard_id)
     setattr(parameter, _SHARDS_ATTR, loaded)
@@ -257,6 +288,9 @@ def vocab_weight_loader(
     handle: WeightHandle,
     shard_id: str | int | None = None,
 ) -> None:
+    """Copy the rank-local real vocabulary interval and zero padded rows."""
+
+    # Resolve the rank interval recorded when the vocabulary parameter was constructed.
     if shard_id is not None:
         raise ValueError("vocabulary parameters cannot receive packed checkpoint shards")
     layout = getattr(parameter, _VOCAB_ATTR, None)
@@ -265,6 +299,9 @@ def vocab_weight_loader(
     real_size, start, end = (int(value) for value in layout)
     parameter = _materialize(parameter, dtype=_target_dtype(parameter, handle))
     target = parameter.data
+
+    # A rank-local checkpoint can be copied directly; a global checkpoint contributes
+    # only the overlap between the rank interval and the real vocabulary.
     if handle.shape == tuple(target.shape):
         _copy(target, handle.full(), parameter)
     else:
@@ -284,6 +321,8 @@ def vocab_weight_loader(
         if copy_end > copy_start:
             payload = handle.narrow(0, copy_start, copy_end - copy_start)
             _copy(target[copy_start - start : copy_end - start], payload, parameter)
+
+    # Padding must be deterministic because logits may include the padded local rows.
     padding_start = max(0, real_size - start)
     if padding_start < int(target.shape[0]):
         target[padding_start:].zero_()
@@ -297,6 +336,9 @@ def fp8_weight_loader(
     *,
     module: nn.Module,
 ) -> None:
+    """Load an FP8 weight shard and record whether checkpoint quantization is authoritative."""
+
+    # Native E4M3 values retain their dtype and bypass the serving-dtype cast policy.
     offline = handle.dtype == torch.float8_e4m3fn
     serving_dtype = getattr(parameter, _DTYPE_ATTR, parameter.dtype)
     target_dtype = (
@@ -306,6 +348,8 @@ def fp8_weight_loader(
     )
     parameter = _materialize(parameter, dtype=target_dtype)
     set_skip_serving_cast(parameter, offline)
+
+    # Ordinary shard plans and packed logical shards share the same materialization path.
     plan = get_shard_plan(parameter)
     if shard_id is None:
         payload = (
@@ -328,6 +372,8 @@ def fp8_scale_loader(
     *,
     module: nn.Module,
 ) -> None:
+    """Load the float32 scale associated with an FP8 weight or packed shard."""
+
     parameter = _materialize(parameter, dtype=torch.float32)
     if shard_id is None:
         plan = get_shard_plan(parameter)
@@ -350,6 +396,8 @@ def _copy_packed(
     preserve_dtype: bool,
     reshape_scale: bool = False,
 ) -> None:
+    """Copy one packed logical shard into its placement slot."""
+
     plan = _required_plan(parameter)
     if plan.shard_axis is None:
         raise ValueError("packed parameter plan has no shard axis")
@@ -370,10 +418,14 @@ def _payload_for_plan(
     plan: ShardPlan,
     target_shape: tuple[int, ...],
 ) -> torch.Tensor:
+    """Select the rank-local payload described by a parameter's shard plan."""
+
     return _payload_for_shard(handle, plan.shard, target_shape)
 
 
 def _payload_for_shard(handle: WeightHandle, shard: Any, target_shape: tuple[int, ...]) -> torch.Tensor:
+    """Materialize a replicated value or the rank-local interval along one shard axis."""
+
     axis = int(shard.axis)
     if shard.replicated or int(shard.size) <= 1 or handle.shape[axis] == target_shape[axis]:
         return handle.full()
@@ -388,6 +440,8 @@ def _payload_for_shard(handle: WeightHandle, shard: Any, target_shape: tuple[int
 
 
 def _required_plan(parameter: nn.Parameter) -> ShardPlan:
+    """Return a parameter's placement plan or reject missing sharding metadata."""
+
     plan = get_shard_plan(parameter)
     if plan is None:
         raise ValueError("partitioned parameter has no ShardPlan")
@@ -395,6 +449,8 @@ def _required_plan(parameter: nn.Parameter) -> ShardPlan:
 
 
 def _target_dtype(parameter: nn.Parameter, handle: WeightHandle) -> torch.dtype:
+    """Resolve the materialized dtype from tensor kind and serving cast policy."""
+
     if not _is_float_dtype(handle.dtype) or skip_serving_cast(parameter):
         return handle.dtype if skip_serving_cast(parameter) else parameter.dtype
     value = getattr(parameter, _DTYPE_ATTR, parameter.dtype)
@@ -402,8 +458,13 @@ def _target_dtype(parameter: nn.Parameter, handle: WeightHandle) -> torch.dtype:
 
 
 def _materialize(parameter: nn.Parameter, *, dtype: torch.dtype) -> nn.Parameter:
+    """Allocate or retype a parameter and rebind every recorded owner alias."""
+
+    # A resident parameter with the requested dtype already satisfies the contract.
     if not parameter.is_meta and parameter.dtype == dtype:
         return parameter
+
+    # Retype resident storage without replacing the Parameter identity.
     if not parameter.is_meta and parameter.dtype != dtype:
         parameter.data = torch.empty_like(parameter.data, dtype=dtype)
         return parameter
@@ -411,6 +472,8 @@ def _materialize(parameter: nn.Parameter, *, dtype: torch.dtype) -> nn.Parameter
     device = getattr(parameter, _DEVICE_ATTR, None)
     if not bindings or not isinstance(device, str):
         raise RuntimeError("meta parameter has no materialization owner")
+
+    # Meta parameters need a concrete shared replacement installed into every owner.
     replacement = nn.Parameter(
         torch.empty(tuple(parameter.shape), device=device, dtype=dtype),
         requires_grad=parameter.requires_grad,
@@ -425,6 +488,8 @@ def _materialize(parameter: nn.Parameter, *, dtype: torch.dtype) -> nn.Parameter
 
 
 def _current_parameter(parameter: nn.Parameter) -> nn.Parameter:
+    """Resolve the concrete replacement currently held by any recorded owner."""
+
     bindings = getattr(parameter, _BINDINGS_ATTR, ())
     for owner_ref, name in bindings:
         owner = owner_ref() if callable(owner_ref) else None
@@ -442,6 +507,8 @@ def _copy(
     *,
     preserve_dtype: bool = False,
 ) -> None:
+    """Validate shape, apply serving dtype policy, and copy a checkpoint payload."""
+
     value = payload
     if value.is_floating_point() and not preserve_dtype and not skip_serving_cast(parameter):
         value = value.to(dtype=target.dtype)
@@ -453,6 +520,8 @@ def _copy(
 
 
 def _mark_loaded(parameter: nn.Parameter) -> None:
+    """Mark a parameter as having received checkpoint data."""
+
     setattr(parameter, _LOADED_ATTR, True)
 
 
@@ -461,6 +530,8 @@ def _mark_shard_loaded(
     plan: ShardPlan,
     shard_id: str | int,
 ) -> None:
+    """Record one packed shard and mark the destination parameter loaded."""
+
     key: str | int = shard_id
     if isinstance(shard_id, str):
         key = plan.mode.shard_key_to_index.get(shard_id, shard_id)
@@ -471,6 +542,8 @@ def _mark_shard_loaded(
 
 
 def _is_float_dtype(dtype: torch.dtype) -> bool:
+    """Return whether a dtype participates in floating-point serving casts."""
+
     return dtype in {
         torch.bfloat16,
         torch.float16,

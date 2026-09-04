@@ -24,6 +24,8 @@ DEFAULT_BLOCK_SIZE = 64
 
 @dataclass(frozen=True)
 class CudaKVCapacity:
+    """Records the device memory budget and resulting CUDA KV page capacity."""
+
     device: str
     free_bytes: int
     total_bytes: int
@@ -36,6 +38,8 @@ class CudaKVCapacity:
 
 @dataclass(frozen=True)
 class RuntimeKVCapacity:
+    """Records resolved KV token and page capacity with optional CUDA memory evidence."""
+
     block_size: int
     bytes_per_token: int
     token_capacity: int
@@ -48,6 +52,8 @@ def latent_trajectory_bytes(
     latent_width: int,
     dtype_bytes: int,
 ) -> int:
+    """Calculate storage for one latent trajectory from unit count, width, and element size."""
+
     units = int(latent_units)
     width = int(latent_width)
     element_bytes = int(dtype_bytes)
@@ -64,6 +70,8 @@ def latent_pool_capacity_bytes(
     latent_width: int,
     dtype_bytes: int,
 ) -> int:
+    """Calculate double-buffered latent pages, step storage, page tables, and timestep metadata."""
+
     slots = int(request_pool_size)
     pages = int(num_pages)
     units = int(page_units)
@@ -81,6 +89,8 @@ def latent_pool_capacity_bytes(
 
 @dataclass(frozen=True, slots=True)
 class ArenaCapacity:
+    """Budgets latent storage, device products, transfers, and CPU tasks for one worker arena."""
+
     latent_pool_bytes: int
     device_products: int
     device_product_bytes: int
@@ -90,6 +100,8 @@ class ArenaCapacity:
 
 
 def operation_window(pipeline_depth: int, max_operations: int) -> int:
+    """Bound simultaneously live operations by pipeline depth and per-batch capacity."""
+
     depth = int(pipeline_depth)
     operations = int(max_operations)
     if depth < 1 or operations < 1:
@@ -112,6 +124,8 @@ def model_arena_capacity(
     max_vision_feature_bytes: int,
     bytes_per_token: int,
 ) -> ArenaCapacity:
+    """Derive device-product, transfer, latent, and CPU arena bounds from deployment geometry."""
+
     depth = int(pipeline_depth)
     payload_bytes = int(completion_payload_bytes)
     max_operations = int(deployment.max_batch_operations)
@@ -246,7 +260,7 @@ def derive_num_blocks(
 
 
 def device_total_bytes(device: Any) -> int:
-    """Total memory of one device, or zero when it exposes no CUDA memory."""
+    """Return one device's total CUDA memory, or zero for a non-CUDA device."""
 
     try:
         import torch

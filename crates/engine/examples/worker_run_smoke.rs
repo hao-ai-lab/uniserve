@@ -1,13 +1,10 @@
-//! Event-driven `run` smoke test against the stub Python worker.
+//! Exercises the event-driven engine loop against a Python worker process.
 //!
-//! Unlike `worker_smoke` (which drives `step` directly), this exercises the
-//! production owner-thread reactor `EngineLoop::run` over the iceoryx2
-//! event-driven boundary: the worker parks on its request listener, the
-//! scheduler parks on {result, command, death}, and the command ingress wakes
-//! the park via the executor's command waker. It also exercises the idle path
-//! (submit after the engine has gone idle and parked) and graceful shutdown.
+//! The engine parks on result, command, and worker-death events while the worker
+//! parks on request notifications. The flow includes idle wakeup and graceful
+//! shutdown.
 //!
-//! Run with PYTHONPATH set to the repo root.
+//! Set `PYTHONPATH` to the repository root before running the example.
 use std::collections::HashMap;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -55,7 +52,7 @@ fn submit_text(handle: &EngineHandle, rxs: &mut Rxs, id: u64) -> anyhow::Result<
     Ok(())
 }
 
-/// Drain events until every request in `ids` has emitted `Finished`, or until
+/// Drains events until every request in `ids` has emitted `Finished`, or until
 /// `deadline`. Returns the set that finished.
 fn await_finished(rxs: &mut Rxs, ids: &[RequestId], deadline: Instant) -> Vec<RequestId> {
     let mut finished = Vec::new();

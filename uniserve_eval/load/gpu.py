@@ -1,4 +1,4 @@
-"""Client-side GPU memory and utilization sampling."""
+"""Samples host-visible NVIDIA GPU memory and utilization telemetry."""
 
 from __future__ import annotations
 
@@ -11,6 +11,8 @@ from typing import Any
 
 
 def _read_gpu_rows() -> list[dict[str, int]]:
+    """Read one numeric telemetry row per GPU from nvidia-smi."""
+
     out = subprocess.run(
         [
             "nvidia-smi",
@@ -43,6 +45,8 @@ def _read_gpu_rows() -> list[dict[str, int]]:
 
 @dataclass
 class GpuMemorySampler:
+    """Collects periodic GPU telemetry and aggregate peaks on a background thread."""
+
     interval_s: float = 0.5
     peak_per_gpu_mib: list[int] = field(default_factory=list)
     peak_utilization_gpu_pct: list[int] = field(default_factory=list)
@@ -55,21 +59,29 @@ class GpuMemorySampler:
 
     @property
     def available(self) -> bool:
+        """Report whether the nvidia-smi executable is available."""
+
         return shutil.which("nvidia-smi") is not None
 
     def start(self) -> None:
+        """Start background sampling when NVIDIA telemetry is available."""
+
         if not self.available:
             return
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
+        """Stop sampling and join the background thread."""
+
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=15)
             self._thread = None
 
     def _sample_once(self) -> None:
+        """Record one telemetry snapshot and update aggregate peaks."""
+
         try:
             rows = _read_gpu_rows()
         except Exception:
@@ -97,11 +109,15 @@ class GpuMemorySampler:
         self.sample_records.append({"time": time.time(), "gpus": rows})
 
     def _loop(self) -> None:
+        """Sample immediately and then at the configured interval."""
+
         self._sample_once()
         while not self._stop.wait(self.interval_s):
             self._sample_once()
 
     def summary(self) -> dict[str, Any] | None:
+        """Return aggregate telemetry, or ``None`` when no sample succeeded."""
+
         if self.samples == 0:
             return None
         return {

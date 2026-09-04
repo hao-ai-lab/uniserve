@@ -1,4 +1,4 @@
-"""Build and render a point summary."""
+"""Builds validated benchmark summaries and renders concise reports."""
 
 from __future__ import annotations
 
@@ -29,6 +29,8 @@ def build_summary(
     server_version: dict[str, Any] | None = None,
     launch: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """Combine workload identity, metrics, validation, and provenance."""
+
     metrics = summarize(records, dur_s, tokenizer=tokenizer)
     validation = task.validate(records).merged(_metric_validation(point.metrics, metrics))
     warnings = _warnings(records, server_version, launch or {})
@@ -60,6 +62,8 @@ def build_summary(
 
 
 def metric_value(metrics: dict[str, Any], definition: MetricDefinition) -> float | None:
+    """Resolve a finite numeric value from a dotted metric definition."""
+
     value: Any = metrics
     for part in definition.path:
         if not isinstance(value, dict):
@@ -72,6 +76,8 @@ def metric_value(metrics: dict[str, Any], definition: MetricDefinition) -> float
 
 
 def render_markdown(summary: dict[str, Any]) -> str:
+    """Render protected metrics and validation status as Markdown."""
+
     lines = [
         f"# {summary['benchmark']}",
         "",
@@ -99,6 +105,8 @@ def render_markdown(summary: dict[str, Any]) -> str:
 def _metric_validation(
     definitions: tuple[MetricDefinition, ...], metrics: dict[str, Any]
 ) -> ValidationResult:
+    """Check that every protected metric is finite and positive."""
+
     checks = {}
     for definition in definitions:
         value = metric_value(metrics, definition)
@@ -111,6 +119,8 @@ def _warnings(
     server_version: dict[str, Any] | None,
     launch: dict[str, Any],
 ) -> list[str]:
+    """Collect stable request and launch provenance warnings."""
+
     values = sorted({warning for record in records for warning in record.warnings})
     if server_version is None:
         values.append("server_version_unavailable")

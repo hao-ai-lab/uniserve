@@ -22,6 +22,8 @@ else:  # pragma: no cover
 
 
 def available() -> bool:
+    """Return whether the SM100 sparse-attention extension is registered."""
+
     if _provider is None or not torch.cuda.is_available():
         return False
     major, _minor = torch.cuda.get_device_capability()
@@ -33,6 +35,8 @@ def available() -> bool:
 
 
 def import_error() -> BaseException | None:
+    """Return the exception that prevented SM100 extension registration, if any."""
+
     return _IMPORT_ERROR or video_sparse_cute.import_error()
 
 
@@ -54,10 +58,14 @@ def _block_sparse_custom(
     source_rank: int,
     prefix_tiles: int,
 ) -> None:
+    """Dispatch sparse attention and write dense-compressed rank-local output shards."""
+
     if not available() or _provider is None:
         raise RuntimeError(
             "SM100a sparse video attention is unavailable"
         ) from import_error()
+    # The CuTe route consumes unpacked Q/K/V and may tile a single output's head
+    # axis to satisfy its fixed 14-head kernel geometry.
     if video_sparse_cute.should_use(
         rows=int(query.shape[0]),
         prefix_tiles=prefix_tiles,
@@ -72,6 +80,8 @@ def _block_sparse_custom(
             valid_sizes,
         )
     else:
+        # The extension route expects Q/K/V packed as head-major tensors with an
+        # explicit singleton batch axis.
         packed = pack_qkv(query, key, value)
         attended, _ = _provider.block_sparse_attn_sm100a(
             packed[0].unsqueeze(0),
@@ -100,6 +110,8 @@ def _block_sparse_custom_fake(
     source_rank: int,
     prefix_tiles: int,
 ) -> None:
+    """Infer custom-op output aliases and geometry without executing the SM100 kernel."""
+
     del (
         query,
         key,
@@ -134,6 +146,8 @@ def block_sparse_attention(
     exchange_sync_input: torch.Tensor,
     exchange_sync_output: torch.Tensor,
 ) -> torch.Tensor:
+    """Execute SM100 block-sparse attention using per-query block counts and indices."""
+
     if not available():
         raise RuntimeError(
             "SM100a sparse video attention is unavailable"

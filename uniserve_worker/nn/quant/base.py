@@ -16,6 +16,8 @@ __all__ = [
 ]
 
 class QuantizeMethodBase(abc.ABC):
+    """Defines parameter creation, loading finalization, and execution for a linear quantization method."""
+
     # Cross-cutting flag read by consumers to decide quantized-only handling.
     is_quantized: ClassVar[bool] = False
 
@@ -29,13 +31,19 @@ class QuantizeMethodBase(abc.ABC):
         bias: bool,
         **_: object,
     ) -> None:
+        """Register weight, scale, and optional bias storage on a linear module."""
+
         raise NotImplementedError
 
     @abc.abstractmethod
     def apply(self, module: nn.Module, x: torch.Tensor) -> torch.Tensor:
+        """Project activations through a materialized linear module."""
+
         raise NotImplementedError
 
     def process_weights_after_loading(self, module: nn.Module) -> None:
+        """Finalize loaded tensors into the representation consumed by execution."""
+
         return None
 
     def apply_prequantized(
@@ -46,11 +54,15 @@ class QuantizeMethodBase(abc.ABC):
         *,
         output_dtype: torch.dtype,
     ) -> torch.Tensor:
+        """Project caller-quantized activations when the method supports that boundary."""
+
         del module, x, scale, output_dtype
         raise RuntimeError("linear quantization method cannot consume prequantized activations")
 
 
 class UnquantizedLinearMethod(QuantizeMethodBase):
+    """Implements dense linear execution with loader-managed unquantized weights."""
+
     def create_weights(
         self,
         module: nn.Module,
@@ -60,6 +72,8 @@ class UnquantizedLinearMethod(QuantizeMethodBase):
         bias: bool,
         **_: object,
     ) -> None:
+        """Register dense weight and optional bias parameters with checkpoint loaders."""
+
         module.register_parameter(
             "weight",
             nn.Parameter(torch.empty(int(output_size), int(input_size))),
@@ -77,6 +91,8 @@ class UnquantizedLinearMethod(QuantizeMethodBase):
             attach_weight_loader(bias_parameter, default_weight_loader)
 
     def apply(self, module: nn.Module, x: torch.Tensor) -> torch.Tensor:
+        """Project activations with the module's dense weight and optional bias."""
+
         from ..linear import LinearBase
 
         linear = cast(LinearBase, module)
@@ -91,6 +107,8 @@ class UnquantizedLinearMethod(QuantizeMethodBase):
         *,
         group: str,
     ) -> torch.Tensor:
+        """Gather row shards into caller-owned scratch and project the global sequence."""
+
         from ..linear import LinearBase
         from ..mesh import DeviceMesh
 
@@ -106,6 +124,8 @@ class UnquantizedLinearMethod(QuantizeMethodBase):
 
 
 def process_quantized_modules(modules: Iterable[nn.Module]) -> None:
+    """Finalize the loaded weight representation of every quantized module."""
+
     for module in modules:
         method = getattr(module, "quant_method", None)
         if isinstance(method, QuantizeMethodBase):

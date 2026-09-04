@@ -1,4 +1,9 @@
-"""Deterministic execution model used by worker-process simulation."""
+"""Defines a deterministic CPU model for exercising every worker execution route.
+
+The model implements the same cache, forward, projection, vision, latent, and
+diffusion boundaries as a neural deployment while deriving outputs entirely from
+request coordinates. Its fixed token cycle makes scheduler outcomes reproducible.
+"""
 
 from __future__ import annotations
 
@@ -59,6 +64,8 @@ def stub_deployment(
     max_batch_operations: int = DEFAULT_MAX_BATCH_OPS,
     max_batch_tokens: int,
 ) -> WorkerDeployment:
+    """Build the single-device deployment geometry required by ``StubModel``."""
+
     return WorkerDeployment(
         device="cpu",
         model_scope="whole",
@@ -78,13 +85,17 @@ def stub_deployment(
 
 
 class StubModel(ExecutionModel):
-    """Stateless neural test double for the concrete imperative model boundary."""
+    """Implements every execution route with deterministic coordinate-derived output."""
 
     architectures = ("UniServeStubForUnifiedGeneration",)
 
     def __init__(self) -> None:
+        """Declare fixed feature, cache, diffusion, and scheduling capabilities."""
+
         super().__init__()
         self.architecture = "UniServeStubForUnifiedGeneration"
+
+        # Feature transforms match the shape contracts of vision and VAE routes.
         image_resize = StrideResize(
             max_size=512,
             min_size=16,
@@ -107,6 +118,8 @@ class StubModel(ExecutionModel):
                 end_token_id=1007,
             ),
         )
+
+        # A single scalar KV head is sufficient to exercise physical cache writes.
         self.cache_geometry = CacheGeometry(
             num_layers=STUB_NUM_LAYERS,
             num_attention_heads=1,
@@ -115,6 +128,8 @@ class StubModel(ExecutionModel):
             dtype="bfloat16",
             store_dtype="bfloat16",
         )
+
+        # Deterministic zero velocity keeps the diffusion route stable at every point.
         self.generation = GenerationPipeline(
             latent_downsample=STUB_LATENT_DOWNSAMPLE,
             prediction="velocity",
@@ -153,6 +168,8 @@ class StubModel(ExecutionModel):
         cache_pool: CachePool,
         selection: AttentionSelection,
     ) -> None:
+        """Bind the physical cache that receives deterministic forward writes."""
+
         del selection
         self._cache_pool = cache_pool
 
@@ -163,6 +180,8 @@ class StubModel(ExecutionModel):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        """Build deterministic hidden rows and record one zero KV value per query."""
+
         query_tokens = sum(forward_batch.query_lens_cpu)
         device = positions.device
         if query_tokens < 1:
@@ -172,6 +191,7 @@ class StubModel(ExecutionModel):
             raise RuntimeError("stub model has no bound physical cache")
         self._cache_pool.write_locations(0, forward_batch.out_cache_loc, kv, kv)
 
+        # Token rows encode temporal position into four predictable hidden channels.
         chunks: list[torch.Tensor | None] = [None] * forward_batch.row_count
         token_offset = 0
         for row_index, count in zip(
@@ -192,6 +212,8 @@ class StubModel(ExecutionModel):
                 dim=-1,
             )
             token_offset += count
+
+        # Flow rows share the packed forward boundary but deliberately carry zero state.
         for flow_index, row_index in enumerate(forward_batch.flow_row_indices):
             count = int(forward_batch.flow_image_tokens[flow_index])
             chunks[row_index] = torch.zeros(
@@ -204,6 +226,9 @@ class StubModel(ExecutionModel):
         return torch.cat(tuple(chunk for chunk in chunks if chunk is not None), dim=0)
 
     def project(self, hidden: torch.Tensor, forward_batch: ForwardBatch) -> ForwardOutput:
+        """Project rows into deterministic logits, hidden states, or zero velocity."""
+
+        # Split the packed hidden matrix back into scheduler row order.
         row_lengths = [0] * forward_batch.row_count
         for row_index, count in zip(
             forward_batch.token_row_indices,
@@ -223,6 +248,7 @@ class StubModel(ExecutionModel):
             rows.append(hidden[offset : offset + count])
             offset += count
 
+        # Input token slices determine the single high-logit successor in each row.
         token_ids: dict[int, torch.Tensor] = {}
         token_offset = 0
         if forward_batch.input_ids is not None:
@@ -243,6 +269,8 @@ class StubModel(ExecutionModel):
             )
         )
         flow_rows = set(forward_batch.flow_row_indices)
+
+        # Preserve heterogeneous output order across token and diffusion rows.
         outputs: list[torch.Tensor] = []
         for row_index, row_hidden in enumerate(rows):
             selection = selections.get(row_index)
@@ -275,6 +303,8 @@ class StubModel(ExecutionModel):
         pixels: tuple[torch.Tensor, ...],
         batch: ForwardBatch,
     ) -> ForwardOutput:
+        """Reduce staged pixels into fixed-width deterministic feature rows."""
+
         outputs: list[torch.Tensor] = []
         for value, grid in zip(pixels, batch.encode_grids, strict=True):
             typed = value.to(torch.bfloat16)
@@ -290,6 +320,8 @@ class StubModel(ExecutionModel):
         pixels: tuple[torch.Tensor, ...],
         batch: ForwardBatch,
     ) -> ForwardOutput:
+        """Cast image values into the latent route's batched BF16 contract."""
+
         del batch
         return ForwardOutput(
             tuple(
@@ -305,6 +337,8 @@ class StubModel(ExecutionModel):
         latents: tuple[torch.Tensor, ...],
         batch: ForwardBatch,
     ) -> ForwardOutput:
+        """Materialize zero RGB images at each row's requested output geometry."""
+
         outputs = tuple(
             torch.zeros(
                 (3, height, width),
@@ -322,6 +356,8 @@ class StubModel(ExecutionModel):
 
 
 def _next_token(token: int) -> int:
+    """Return the scalar successor in the deterministic multimodal token cycle."""
+
     if token == 1000:
         return 1001
     if token == 1001:
@@ -336,6 +372,8 @@ def _next_token(token: int) -> int:
 
 
 def _next_tokens(tokens: torch.Tensor) -> torch.Tensor:
+    """Vectorize the deterministic multimodal token cycle over a tensor."""
+
     targets = torch.full_like(tokens, 1000)
     targets = torch.where(tokens == 1000, 1001, targets)
     targets = torch.where(tokens == 1001, STUB_IMG_START_TOKEN_ID, targets)

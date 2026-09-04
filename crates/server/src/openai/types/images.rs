@@ -1,3 +1,5 @@
+//! OpenAI-compatible image-generation request and response schemas.
+
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
@@ -7,51 +9,74 @@ use super::common::Normalizable;
 #[derive(Debug, Clone, Deserialize, PartialEq, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct ImageGenerationRequest {
+    /// Text prompt describing the requested image.
     pub prompt: String,
+    /// Served model name, or the deployment default when omitted.
     #[serde(default)]
     pub model: Option<String>,
+    /// Number of images to generate.
     #[serde(default = "default_image_count")]
     pub n: u16,
+    /// Named output resolution.
     #[serde(default)]
     pub size: Option<String>,
+    /// Number of denoising steps per image.
     #[serde(default)]
     pub steps: Option<u16>,
+    /// Image-generation random seed.
     #[serde(default)]
     pub seed: Option<u64>,
+    /// Text prompt describing content to suppress.
     #[serde(default)]
     pub negative_prompt: Option<String>,
+    /// Text classifier-free-guidance scale.
     #[serde(default)]
     pub guidance_scale: Option<f32>,
+    /// Image classifier-free-guidance scale.
     #[serde(default)]
     pub image_guidance_scale: Option<f32>,
+    /// Classifier-free-guidance renormalization policy.
     #[serde(default)]
     pub cfg_norm: Option<uniserve_core::CfgRenorm>,
+    /// Fractional denoising interval in which guidance is active.
     #[serde(default)]
     pub cfg_interval: Option<[f32; 2]>,
+    /// Diffusion scheduler timestep shift.
     #[serde(default)]
     pub timestep_shift: Option<f32>,
 }
 
 impl Normalizable for ImageGenerationRequest {}
 
+/// Returns the default number of requested images.
 const fn default_image_count() -> u16 {
     1
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+/// Completed OpenAI-compatible image-generation response.
 pub struct ImageGenerationResponse {
+    /// Response creation timestamp in Unix seconds.
     pub created: u64,
+    /// Generated images in request order.
     pub data: Vec<GeneratedImageData>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+/// Base64-encoded generated image and optional revised prompt.
 pub struct GeneratedImageData {
+    /// Base64-encoded PNG image bytes.
     pub b64_json: String,
+    /// Model-revised prompt, when produced.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revised_prompt: Option<String>,
+    /// Image height in pixels.
     pub height: u32,
+    /// Image width in pixels.
     pub width: u32,
+    /// Encoded image length in bytes.
     pub bytes: u64,
+    /// Lowercase hexadecimal SHA-256 digest of the encoded image.
     pub sha256: String,
 }
 

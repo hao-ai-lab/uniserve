@@ -1,8 +1,7 @@
-//! Single-worker executor over the iceoryx2 request-response service.
+//! Single-worker executor over an iceoryx2 request-response service.
 //!
-//! The host sends FlatBuffers descriptors and receives small scalar/image
-//! results. Worker-resident tensors, KV pages, and latents never cross this
-//! boundary.
+//! The host exchanges FlatBuffers descriptors and bounded result values while
+//! tensors, KV pages, and latent storage remain worker-resident.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::process::{Child, Command};
@@ -24,6 +23,7 @@ use uniserve_worker_ipc::{
 use crate::worker::WorkerProcessArgs;
 use crate::worker::death_watch::DeathWatcher;
 
+/// Enqueues a completed worker result for delivery.
 fn enqueue_ready(ready: &mut VecDeque<RunResult>, report: RunResult) {
     ready.push_back(report);
 }
@@ -46,19 +46,28 @@ const WORKER_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 /// One configured model-execution lane passed in [`WorkerProcessArgs`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaneConfig {
+    /// Stable lane identity within the worker process.
     pub lane_id: String,
+    /// Streaming-multiprocessor budget assigned to the lane.
     pub sm_budget: u32,
+    /// Execution domains routed to the lane.
     pub domains: Vec<Domain>,
+    /// Optional lane-local KV capacity in tokens.
     pub kv_capacity_tokens: Option<u64>,
+    /// Optional lane-local latent capacity in allocation units.
     pub latent_capacity_units: Option<u64>,
+    /// Optional operation-count limit per batch.
     pub max_batch_operations: Option<u32>,
+    /// Optional token-count limit per batch.
     pub max_batch_tokens: Option<u32>,
+    /// Optional unresolved-run limit.
     pub max_inflight: Option<u32>,
 }
 
 impl std::str::FromStr for LaneConfig {
     type Err = String;
 
+    /// Parses the value from its string representation.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let lane: Self = serde_json::from_str(value)
             .map_err(|error| format!("invalid execution lane JSON: {error}"))?;
@@ -74,6 +83,7 @@ impl std::str::FromStr for LaneConfig {
 }
 
 impl LaneConfig {
+    /// Serializes the lane as the worker command-line JSON value.
     pub fn worker_arg(&self) -> String {
         serde_json::json!({
             "lane_id": self.lane_id,
@@ -93,13 +103,17 @@ impl LaneConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FlashInferBackend {
+    /// Lets the worker select a compatible backend.
     #[default]
     Auto,
+    /// Uses FlashAttention 2 kernels.
     Fa2,
+    /// Uses FlashAttention 3 kernels.
     Fa3,
 }
 
 impl FlashInferBackend {
+    /// Returns the stable command-line spelling.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Auto => "auto",
@@ -112,6 +126,7 @@ impl FlashInferBackend {
 impl std::str::FromStr for FlashInferBackend {
     type Err = FlashInferBackendParseError;
 
+    /// Parses the value from its string representation.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "auto" => Ok(Self::Auto),
@@ -124,9 +139,11 @@ impl std::str::FromStr for FlashInferBackend {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("unsupported FlashInfer backend {0:?}")]
+/// Error returned for an unsupported FlashInfer backend name.
 pub struct FlashInferBackendParseError(String);
 
 impl Default for WorkerProcessArgs {
+    /// Returns worker launch settings suitable for a single local rank.
     fn default() -> Self {
         Self {
             python: "python3".into(),
@@ -176,6 +193,7 @@ impl Default for WorkerProcessArgs {
 }
 
 impl WorkerProcessArgs {
+    /// Appends model-loading, memory, graph, and sampler options to a worker command.
     fn append_worker_args(&self, cmd: &mut Command) {
         if self.stub {
             cmd.arg("--no-model").arg("--allow-stub");
@@ -284,6 +302,7 @@ struct PendingRecord {
     pending: Pending,
 }
 
+/// Releases the consumed request.
 fn release_consumed_request(record: PendingRecord) -> OutstandingKind {
     let PendingRecord { kind, pending } = record;
     drop(pending);
@@ -298,6 +317,12 @@ enum OutstandingKind {
 }
 
 impl UniprocExecutor {
+    /// Spawns one worker process and completes its capability handshake.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid world size, process or IPC setup failure,
+    /// or an invalid worker capability response.
     pub fn spawn(args: WorkerProcessArgs) -> anyhow::Result<Self> {
         anyhow::ensure!(
             args.world_size == 1,
@@ -308,6 +333,7 @@ impl UniprocExecutor {
         Ok(me)
     }
 
+    /// Spawns one rank and connects its IPC client without waiting for model readiness.
     pub(crate) fn spawn_rank_deferred(
         args: &WorkerProcessArgs,
         device: &str,
@@ -357,9 +383,7 @@ impl UniprocExecutor {
                     .join(","),
             );
         }
-        // Data-plane Tier-2 backend for this stage's tensor handoffs. The
-        // default (in-process) is omitted so the full-pool worker command
-        // line stays byte-identical.
+        // In-process transfer is the worker default and needs no command-line override.
         if args.transfer_backend != crate::executor::TransferBackend::Inproc {
             cmd.arg("--transfer-backend")
                 .arg(args.transfer_backend.as_str());
@@ -416,6 +440,7 @@ impl UniprocExecutor {
         })
     }
 
+    /// Completes the worker information handshake and validates rank capabilities.
     pub(crate) fn finish_startup(&mut self) -> anyhow::Result<()> {
         tracing::info!(
             tp_rank = self.rank,
@@ -460,12 +485,14 @@ impl UniprocExecutor {
         Ok(())
     }
 
+    /// Allocates the next worker call identifier.
     fn alloc_call_id(&mut self) -> u64 {
         let id = self.next_call_id;
         self.next_call_id += 1;
         id
     }
 
+    /// Checks the worker.
     fn check_worker(&mut self, context: &str) -> anyhow::Result<()> {
         if let Some(status) = self.child.try_wait()? {
             bail!("worker process exited during {context}: {status}");
@@ -473,6 +500,7 @@ impl UniprocExecutor {
         Ok(())
     }
 
+    /// Sends the request checked.
     fn send_request_checked(
         &mut self,
         req: &WorkerRequest,
@@ -481,6 +509,7 @@ impl UniprocExecutor {
         self.send_request_with_timeout(req, context, WORKER_SEND_TIMEOUT)
     }
 
+    /// Waits for an IPC server connection and submits a request before the deadline.
     fn send_request_with_timeout(
         &mut self,
         req: &WorkerRequest,
@@ -502,6 +531,7 @@ impl UniprocExecutor {
         }
     }
 
+    /// Waits for one startup response while checking child liveness and reporting progress.
     fn wait_pending_response(&mut self, pending: &Pending, context: &str) -> anyhow::Result<Frame> {
         let started = Instant::now();
         let mut last_log = started;
@@ -527,6 +557,7 @@ impl UniprocExecutor {
         }
     }
 
+    /// Drains ready IPC responses and routes them to physical-run completion state.
     fn drain_ready(&mut self) -> anyhow::Result<(usize, uniserve_worker_ipc::WakeEvents)> {
         let wakes = self.client.drain_wakes()?;
         let ids = self.pending.keys().copied().collect::<Vec<_>>();
@@ -551,6 +582,7 @@ impl UniprocExecutor {
         Ok((drained, wakes))
     }
 
+    /// Validates response correlation and routes one decoded worker response.
     fn route(&mut self, call_id: u64, kind: OutstandingKind, frame: Frame) -> anyhow::Result<()> {
         if frame.header.call_id != 0 && frame.header.call_id != call_id {
             bail!(
@@ -572,6 +604,7 @@ impl UniprocExecutor {
         }
     }
 
+    /// Accumulates a partial run response or schedules polling for remaining operations.
     fn route_batch(
         &mut self,
         run_id: u64,
@@ -621,6 +654,7 @@ impl UniprocExecutor {
         }
     }
 
+    /// Submits a continuation poll for the unresolved operations of one run.
     fn submit_completion_poll(
         &mut self,
         run_id: u64,
@@ -643,21 +677,25 @@ impl UniprocExecutor {
         Ok(())
     }
 
+    /// Returns a waker for interrupting the worker IPC wait after command enqueue.
     pub fn command_waker(&self) -> CommandWaker {
         let sender = self.client.command_wake();
         CommandWaker::new(move || sender.wake())
     }
 
+    /// Returns the file descriptor that signals worker progress.
     pub(crate) fn progress_fd(&self) -> i32 {
         self.client.wake_file_descriptor()
     }
 }
 
 impl PhysicalExecutor for UniprocExecutor {
+    /// Returns metadata for the physical worker.
     fn physical_info(&self) -> &ExecutorInfo {
         &self.executor_info
     }
 
+    /// Submits one physical run and records its outstanding operation identities.
     fn submit_run(&mut self, batch: PhysicalRun) -> Result<(), PhysicalSubmitError> {
         self.drain_ready().map_err(PhysicalSubmitError::Failed)?;
         if self.pending.len() >= self.depth {
@@ -688,6 +726,7 @@ impl PhysicalExecutor for UniprocExecutor {
         Ok(())
     }
 
+    /// Drives IPC progress until a result, command wake, worker death, or timeout.
     fn poll_run(&mut self, timeout: Duration) -> anyhow::Result<Option<RunResult>> {
         if self.command_wake_pending {
             return Ok(None);
@@ -727,10 +766,12 @@ impl PhysicalExecutor for UniprocExecutor {
         }
     }
 
+    /// Consumes the pending command-wake notification.
     fn take_command_wake(&mut self) -> bool {
         std::mem::take(&mut self.command_wake_pending)
     }
 
+    /// Drains outstanding calls, requests graceful shutdown, and bounds forced termination.
     fn close_physical(&mut self) -> anyhow::Result<()> {
         if self.shutdown_sent {
             return Ok(());
@@ -741,9 +782,8 @@ impl PhysicalExecutor for UniprocExecutor {
         let _ = self.death_watcher.take();
         let exited = matches!(self.child.try_wait(), Ok(Some(_)));
         if !exited {
-            // Drain in-flight responses, but do NOT block indefinitely on a worker that is
-            // alive yet hung: bound the drain with a deadline so we always fall through to
-            // the graceful shutdown request and, ultimately, the kill fallback below.
+            // Bound response draining so shutdown can advance to graceful termination
+            // and, if necessary, forced process cleanup.
             let drain_deadline = Instant::now() + WORKER_DRAIN_TIMEOUT;
             while !self.pending.is_empty() {
                 if Instant::now() >= drain_deadline {
@@ -795,10 +835,12 @@ impl PhysicalExecutor for UniprocExecutor {
 }
 
 impl Executor for UniprocExecutor {
+    /// Returns the worker metadata.
     fn info(&self) -> &ExecutorInfo {
         &self.executor_info
     }
 
+    /// Lowers and submits a logical batch while preserving result-tracker ownership.
     fn submit(&mut self, batch: Batch) -> Result<(), ExecutorSubmitError> {
         if self.pending.len() >= self.depth {
             return Err(ExecutorSubmitError::WouldBlock(batch));
@@ -821,6 +863,7 @@ impl Executor for UniprocExecutor {
         }
     }
 
+    /// Polls for the next completed worker operation.
     fn poll(&mut self, timeout: Duration) -> anyhow::Result<Option<BatchResult>> {
         if self.take_command_wake() {
             return Ok(None);
@@ -834,17 +877,20 @@ impl Executor for UniprocExecutor {
             .transpose()
     }
 
+    /// Closes the component and releases its resources.
     fn close(&mut self) -> anyhow::Result<()> {
         self.close_physical()
     }
 }
 
 impl Drop for UniprocExecutor {
+    /// Releases resources owned by this value.
     fn drop(&mut self) {
         let _ = self.close_physical();
     }
 }
 
+/// Returns a process-local identifier suitable for worker IPC service names.
 pub(crate) fn nano_id() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};

@@ -1,3 +1,5 @@
+//! HTTP handler for OpenAI-compatible image generation.
+
 use std::sync::Arc;
 
 use crate::openai::ImageGenerationRequest;
@@ -12,6 +14,7 @@ use crate::http::routes::openai::utils::validated_json::ValidatedJson;
 use crate::http::utils::{resolve_request_context, unix_timestamp};
 use crate::openai::ApiError;
 
+/// Validates, submits, and collects one image-generation request.
 pub(crate) async fn images_generations(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,

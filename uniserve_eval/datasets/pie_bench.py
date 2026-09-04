@@ -1,4 +1,4 @@
-"""PIE-Bench source-image and edit-prompt loader."""
+"""Loads PIE-Bench source images and image-editing instructions."""
 
 from __future__ import annotations
 
@@ -19,9 +19,13 @@ _BRACKETS = re.compile(r"[\[\]]")
 
 
 class PieBenchDataset(Dataset):
+    """Adapts resolvable PIE-Bench pairs to embedded PNG examples."""
+
     name: ClassVar[str] = "pie-bench"
 
     def load(self, tokenizer: Any | None = None) -> list[Example]:
+        """Select seeded entries that contain both an image and instruction."""
+
         point = self.point
         mapping_path, images_root = _resolve_sources(point.dataset_path)
         with open(mapping_path, encoding="utf-8") as handle:
@@ -54,6 +58,8 @@ class PieBenchDataset(Dataset):
 
 
 def _resolve_sources(dataset_path: str | None) -> tuple[Path, Path]:
+    """Resolve the mapping file and image root from local or hub storage."""
+
     if dataset_path:
         base = Path(dataset_path)
         if base.is_file():
@@ -72,6 +78,8 @@ def _resolve_sources(dataset_path: str | None) -> tuple[Path, Path]:
 
 
 def _find_mapping(root: Path) -> Path | None:
+    """Find the preferred PIE-Bench mapping file beneath a root."""
+
     for name in _MAPPING_CANDIDATES:
         direct = root / name
         if direct.is_file():
@@ -81,6 +89,8 @@ def _find_mapping(root: Path) -> Path | None:
 
 
 def _resolve_image_file(images_root: Path, rel_path: str) -> Path | None:
+    """Resolve an image path across the supported snapshot layouts."""
+
     candidates = [
         images_root / rel_path,
         images_root / "annotation_images" / rel_path,
@@ -95,6 +105,8 @@ def _resolve_image_file(images_root: Path, rel_path: str) -> Path | None:
 
 
 def _edit_instruction(entry: dict[str, Any]) -> str:
+    """Extract and normalize the usable edit instruction for an entry."""
+
     instruction = entry.get("editing_instruction")
     if instruction:
         return str(instruction).strip()
@@ -105,6 +117,8 @@ def _edit_instruction(entry: dict[str, Any]) -> str:
 
 
 def _png_b64(path: Path) -> str:
+    """Normalize an input image to RGB PNG and return base64 text."""
+
     from PIL import Image
 
     with Image.open(path) as image:

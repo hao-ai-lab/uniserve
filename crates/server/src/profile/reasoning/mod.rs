@@ -1,4 +1,4 @@
-//! Qwen3 streaming reasoning parsing.
+//! Streaming reasoning parsers and semantic deltas.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 mod delimited;
@@ -15,17 +15,19 @@ pub type Result<T> = std::result::Result<T, ReasoningError>;
 /// One parsed streaming delta split into reasoning and visible content.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ReasoningDelta {
+    /// Incremental hidden reasoning text.
     pub reasoning: Option<String>,
+    /// Incremental user-visible assistant text.
     pub content: Option<String>,
 }
 
 impl ReasoningDelta {
-    /// Return true when this delta carries neither reasoning nor content text.
+    /// Returns `true` when this delta carries neither reasoning nor content text.
     pub fn is_empty(&self) -> bool {
         self.reasoning.is_none() && self.content.is_none()
     }
 
-    /// Append text to the reasoning portion, creating it on first use.
+    /// Appends text to the reasoning portion, creating it on first use.
     pub(crate) fn push_reasoning(&mut self, text: &str) {
         if text.is_empty() {
             return;
@@ -36,7 +38,7 @@ impl ReasoningDelta {
         }
     }
 
-    /// Append text to the visible content portion, creating it on first use.
+    /// Appends text to the visible content portion, creating it on first use.
     pub(crate) fn push_content(&mut self, text: &str) {
         if text.is_empty() {
             return;
@@ -51,10 +53,18 @@ impl ReasoningDelta {
 /// Errors produced while creating or running reasoning parsers.
 #[derive(Debug, Error)]
 pub enum ReasoningError {
+    /// A required delimiter token is absent from the tokenizer vocabulary.
     #[error("tokenizer is missing reasoning delimiter token `{token}`")]
-    MissingToken { token: String },
+    MissingToken {
+        /// Missing delimiter token text.
+        token: String,
+    },
+    /// A configured delimiter has no text.
     #[error("reasoning delimiter {field} must not be empty")]
-    EmptyDelimiter { field: &'static str },
+    EmptyDelimiter {
+        /// Configuration field that contains the empty delimiter.
+        field: &'static str,
+    },
 }
 
 #[cfg(test)]

@@ -35,6 +35,10 @@ class CachePool:
         store_dtype: torch.dtype | str | None = None,
         group_ranges: Sequence[tuple[int, int]] | None = None,
     ) -> None:
+        """Allocate layer-major KV pages and optional per-page FP8 scales."""
+
+        # Normalize scheduler-visible geometry before device allocation so
+        # every tensor shares one validated page interpretation.
         self.num_layers = int(num_layers)
         self.num_pages = int(num_pages)
         self.num_blocks = self.num_pages
@@ -55,6 +59,9 @@ class CachePool:
             or self.head_dim < 1
         ):
             raise invalid_descriptor("CachePool geometry is invalid")
+
+        # Keys and values use identical layer/page/token/head geometry. FP8
+        # storage adds one scale and initialization flag per layer-page pair.
         shape = (
             self.num_layers,
             self.num_pages,
@@ -83,6 +90,9 @@ class CachePool:
         self.v_scale_set = (
             torch.zeros(scale_flags, device=device, dtype=torch.bool) if self.is_quantized else None
         )
+
+        # Reuse normalized page tuples after their bounds and group ownership
+        # have been established by the validation path.
         self._validated_page_tuples: dict[
             tuple[tuple[int, ...], bool, int | None], tuple[int, ...]
         ] = {}
@@ -91,6 +101,8 @@ class CachePool:
         self,
         declared: Sequence[tuple[int, int]] | None,
     ) -> tuple[tuple[int, int], ...]:
+        """Normalize physical cache-group ranges and require exact non-overlapping page coverage."""
+
         ranges = (
             ((0, self.num_pages),)
             if declared is None
@@ -112,6 +124,8 @@ class CachePool:
         return ranges
 
     def validate_group(self, group: int) -> int:
+        """Validate a cache-group index and return its normalized integer value."""
+
         value = int(group)
         if value < 0 or value >= self.group_count:
             raise invalid_descriptor(
@@ -120,6 +134,8 @@ class CachePool:
         return value
 
     def page_ids(self, group: int) -> range:
+        """Expose allocatable non-sentinel page ids assigned to one cache group."""
+
         group_id = self.validate_group(group)
         offset, count = self.group_ranges[group_id]
         return range(max(1, offset), offset + count)
@@ -131,6 +147,8 @@ class CachePool:
         allow_sentinel: bool = False,
         group: int | None = None,
     ) -> tuple[int, ...]:
+        """Validate physical page identifiers against one group, optionally accepting the sentinel page."""
+
         pages = tuple(int(page) for page in page_ids)
         key = (pages, bool(allow_sentinel), group)
         cached = self._validated_page_tuples.get(key)
@@ -148,6 +166,8 @@ class CachePool:
         allow_sentinel: bool,
         group: int | None,
     ) -> tuple[int, ...]:
+        """Validate page identifiers, sentinel policy, and optional group ownership once per tuple."""
+
         real_pages = tuple(page for page in pages if page != 0)
         if len(set(real_pages)) != len(real_pages):
             raise invalid_descriptor("KV placement repeats a physical page")
@@ -164,6 +184,8 @@ class CachePool:
         return pages
 
     def zero_pages(self, group: int, page_ids: Iterable[int]) -> None:
+        """Zero every layer and field for the selected physical KV pages."""
+
         pages = self.validate_pages(page_ids, group=group)
         if not pages:
             return
@@ -183,6 +205,8 @@ class CachePool:
         source_pages: Sequence[int],
         target_pages: Sequence[int],
     ) -> None:
+        """Copy complete KV pages between equal-length source and destination page lists."""
+
         if len(source_pages) != len(target_pages):
             raise invalid_descriptor("KV page copy requires aligned source and destination pages")
         source_ids = self.validate_pages(source_pages, group=group)
@@ -203,6 +227,8 @@ class CachePool:
                 store.index_copy_(1, target, store.index_select(1, source))
 
     def field(self, group: int, layer: int, name: str) -> torch.Tensor:
+        """Return one layer’s key, value, or scale tensor for a validated cache group."""
+
         self.validate_group(group)
         layer_id = self._validate_layer(layer)
         fields = {
@@ -223,6 +249,8 @@ class CachePool:
         group: int,
         page_ids: Iterable[int],
     ) -> tuple[torch.Tensor, ...]:
+        """Return flattened key/value page views for the selected physical page identifiers."""
+
         pages = self.validate_pages(page_ids, group=group)
         index = self._device_page_indices(pages)
         values: list[torch.Tensor] = [
@@ -240,6 +268,8 @@ class CachePool:
         page_ids: Sequence[int],
         tensors: Sequence[torch.Tensor],
     ) -> None:
+        """Restore flattened page tensors into validated physical KV pages."""
+
         pages = self.validate_pages(page_ids, group=group)
         stores = tuple(
             store
@@ -267,6 +297,8 @@ class CachePool:
             )
 
     def _device_page_indices(self, pages: tuple[int, ...]) -> torch.Tensor:
+        """Cache and return validated page identifiers on the KV storage device."""
+
         if not pages:
             return self._page_ids[:0]
         first = pages[0]
@@ -275,6 +307,8 @@ class CachePool:
         return torch.stack(tuple(self._page_ids[page] for page in pages))
 
     def layer_cache(self, layer: int, group: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return key and value storage for one layer and cache group."""
+
         self.validate_group(group)
         layer_id = self._validate_layer(layer)
         if self.is_quantized:
@@ -292,6 +326,8 @@ class CachePool:
         start: int,
         length: int,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Gather a bounded token interval from selected pages into contiguous K/V tensors."""
+
         layer_id = self._validate_layer(layer)
         pages = self.validate_pages(page_ids, allow_sentinel=True, group=group)
         if length <= 0:
@@ -319,6 +355,8 @@ class CachePool:
         k: torch.Tensor,
         v: torch.Tensor,
     ) -> None:
+        """Scatter contiguous K/V tensors into a bounded token interval of selected pages."""
+
         layer_id = self._validate_layer(layer)
         pages = self.validate_pages(page_ids, group=group)
         if k.shape != v.shape:
@@ -409,6 +447,8 @@ class CachePool:
             )
 
     def _validate_layer(self, layer: int) -> int:
+        """Validate and normalize a cache layer index."""
+
         value = int(layer)
         if value < 0 or value >= self.num_layers:
             raise invalid_descriptor(f"layer {value} outside KV pool layers {self.num_layers}")
@@ -420,6 +460,8 @@ class CachePool:
         start: int,
         length: int,
     ) -> tuple[tuple[int, int, int], ...]:
+        """Partition a logical token interval into contiguous physical page spans."""
+
         if start < 0 or length < 0 or start + length > len(page_ids) * self.block_size:
             raise invalid_descriptor("KV token range exceeds its scheduler block table")
         spans: list[tuple[int, int, int]] = []
@@ -443,6 +485,8 @@ class CachePool:
         offset: int,
         count: int,
     ) -> torch.Tensor:
+        """Read and dequantize one contiguous physical cache span."""
+
         span = store[layer, page, offset : offset + count]
         if not self.is_quantized:
             return span
@@ -460,6 +504,8 @@ class CachePool:
         offset: int,
         values: torch.Tensor,
     ) -> None:
+        """Write a contiguous logical span across pages with scale-aware FP8 storage."""
+
         count = int(values.shape[0])
         if not self.is_quantized:
             store[layer, page, offset : offset + count] = values.to(

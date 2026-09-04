@@ -1,16 +1,15 @@
+//! Transport-level request metadata and timestamp helpers.
+
 pub(crate) use crate::openai::ResolvedRequestContext;
 use axum::http::HeaderMap;
 use uuid::Uuid;
 
-/// Return the current Unix timestamp in seconds for OpenAI response objects.
-///
-/// delegates to the single shared epoch helper (the integer-seconds
-/// companion) so this matches the fractional-second timestamps used elsewhere.
+/// Returns the current Unix timestamp in whole seconds for API response objects.
 pub(crate) fn unix_timestamp() -> u64 {
     uniserve_core::now_unix_secs_u64()
 }
 
-/// Extract the external request ID and tracing metadata from HTTP headers.
+/// Extracts the external request ID and tracing metadata from HTTP headers.
 pub(crate) fn resolve_request_context(headers: &HeaderMap) -> ResolvedRequestContext {
     // Extract request id from header.
     let request_id_header = headers
@@ -39,7 +38,7 @@ pub(crate) fn resolve_request_context(headers: &HeaderMap) -> ResolvedRequestCon
 /// vector.
 const MAX_REQUEST_ID_LEN: usize = 128;
 
-/// Resolve the base external request ID before API-specific prefixes such as
+/// Resolves the base external request ID before API-specific prefixes such as
 /// `chatcmpl-`.
 ///
 /// A client-supplied ID (from the `X-Request-Id` header or the request body) is
@@ -54,7 +53,7 @@ pub(crate) fn resolve_base_request_id(request_id_header: Option<&str>) -> String
         .unwrap_or_else(generate_request_id)
 }
 
-/// Whether a client-supplied request ID is safe to use verbatim as an engine
+/// Returns whether a client-supplied request ID is safe to use as an engine
 /// correlation key. Rejects empty, over-long, and non-printable values (control
 /// characters, including newlines, would otherwise enable log injection).
 fn is_acceptable_request_id(id: &str) -> bool {
@@ -63,7 +62,7 @@ fn is_acceptable_request_id(id: &str) -> bool {
         && id.chars().all(|c| !c.is_control() && !c.is_whitespace())
 }
 
-/// Generate a fresh server-side request ID. Uses a full (untruncated) UUIDv4 so
+/// Generates a fresh server-side request ID. Uses a full (untruncated) UUIDv4 so
 /// the IDs stay collision-resistant under high request volume.
 fn generate_request_id() -> String {
     Uuid::new_v4().simple().to_string()

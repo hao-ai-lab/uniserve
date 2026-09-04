@@ -1,21 +1,23 @@
-//! The worker-side sampling math, shared by the GPU-free `SimEngine` and
-//! mirrored by the Python worker. It applies the canonical fixed processor
-//! order:
+//! Deterministic token sampling shared by simulated and model-worker execution.
+//!
+//! The pipeline applies processors in this fixed order:
 //!
 //! allowed/forced-token mask → bad-word suppress → min-token suppress →
 //! penalties (repetition / frequency / presence over the recent window) →
 //! logit bias → temperature → top-k → top-p → min-p → typical →
 //! distribution validation → inverse-CDF draw → gather logprobs.
 //!
-//! It operates on a logits slice and the per-request `SamplingParams` plus the
-//! small descriptor lists the host computed (recent tokens, allowed/suppress
-//! masks). No logits tensor crosses the IPC — this runs inside the worker.
+//! Sampling consumes logits, request parameters, recent-token counts, and token
+//! masks. It returns the selected token together with requested ranked scores.
 
 use crate::SamplingParams;
 
+/// Selected token and ranked logprob candidates from one sampling step.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SampleOutput {
+    /// Selected vocabulary token.
     pub token: u32,
+    /// Natural-log probability of the selected token.
     pub logprob: f32,
     /// Ranked sampled, top, and explicitly requested vocabulary candidates.
     pub top: Vec<(u32, f32, u32)>,
@@ -23,7 +25,7 @@ pub struct SampleOutput {
 
 const NEG_INF: f32 = f32::NEG_INFINITY;
 
-/// Apply the full sampling pipeline from canonical branch-local token counts.
+/// Applies the full sampling pipeline from canonical branch-local token counts.
 ///
 /// `draw` is the canonical uniform in `[0, 1)` produced by
 /// [`crate::philox::sampling_uniform`] for one semantic sampling coordinate.
@@ -43,7 +45,8 @@ pub fn try_apply_sampling_counts(
         return None;
     }
 
-    // 1. allowed-token whitelist: mask everything else.
+    // Apply vocabulary eligibility constraints before any probability-derived
+    // processor observes the logits.
     if let Some(allow) = allowed {
         let mut keep = vec![false; v];
         for &t in allow {
@@ -57,7 +60,7 @@ pub fn try_apply_sampling_counts(
             }
         }
     }
-    // 2. suppress (bad-words completion / min-tokens EOS floor).
+
     if let Some(sup) = suppress {
         for &t in sup {
             if (t as usize) < v {
@@ -65,7 +68,9 @@ pub fn try_apply_sampling_counts(
             }
         }
     }
-    // 5. penalties over the recent output window.
+
+    // Penalize tokens from the canonical branch-local history. Repetition is
+    // sign-aware, while frequency and presence are additive adjustments.
     if p.repetition_penalty != 1.0 || p.frequency_penalty != 0.0 || p.presence_penalty != 0.0 {
         for &(t, count) in recent_counts {
             let i = t as usize;
@@ -73,7 +78,7 @@ pub fn try_apply_sampling_counts(
                 continue;
             }
             let c = count as f32;
-            // repetition penalty (multiplicative, sign-aware — reference semantics)
+
             if p.repetition_penalty != 1.0 {
                 logits[i] = if logits[i] > 0.0 {
                     logits[i] / p.repetition_penalty
@@ -81,12 +86,13 @@ pub fn try_apply_sampling_counts(
                     logits[i] * p.repetition_penalty
                 };
             }
-            // frequency (scaled by count) + presence (flat, once-appeared)
+
             logits[i] -= p.frequency_penalty * c;
             logits[i] -= p.presence_penalty;
         }
     }
-    // 6. logit bias.
+
+    // Apply explicit biases only to candidates that remain eligible.
     for &(t, b) in &p.logit_bias {
         if (t as usize) < v && logits[t as usize] != NEG_INF {
             logits[t as usize] += b;
@@ -95,7 +101,9 @@ pub fn try_apply_sampling_counts(
     if !valid_distribution(logits) {
         return None;
     }
-    // 7. temperature (0 == greedy; applied at sample time).
+
+    // Zero temperature selects deterministic argmax; positive temperatures
+    // rescale the finite candidate logits.
     let greedy = p.temperature <= 0.0;
     if !greedy {
         for l in logits.iter_mut() {
@@ -104,7 +112,8 @@ pub fn try_apply_sampling_counts(
             }
         }
     }
-    // 8a. top-k.
+
+    // Retain the highest-scoring `top_k` candidates.
     if p.top_k > 0 && (p.top_k as usize) < v {
         let mut idx: Vec<usize> = (0..v).filter(|&i| logits[i] != NEG_INF).collect();
         idx.sort_by(|&a, &b| {
@@ -116,7 +125,8 @@ pub fn try_apply_sampling_counts(
             logits[i] = NEG_INF;
         }
     }
-    // 8b. top-p (nucleus).
+
+    // Retain the smallest descending-probability prefix that reaches `top_p`.
     if p.top_p < 1.0 && p.top_p > 0.0 {
         let probs = softmax(logits);
         let mut order: Vec<usize> = (0..v).filter(|&i| logits[i] != NEG_INF).collect();
@@ -138,7 +148,8 @@ pub fn try_apply_sampling_counts(
             logits[i] = NEG_INF;
         }
     }
-    // 8c. min-p: drop tokens below `min_p * max_prob`.
+
+    // Remove candidates below the configured fraction of the largest mass.
     if p.min_p > 0.0 {
         let probs = softmax(logits);
         let maxp = probs.iter().cloned().fold(0.0f32, f32::max);
@@ -149,7 +160,8 @@ pub fn try_apply_sampling_counts(
             }
         }
     }
-    // 8d. typical: keep the locally-typical set whose surprisal deviates least
+
+    // Keep the locally typical set whose surprisal deviates least
     // from the distribution entropy, until its cumulative mass reaches
     // `typical_p`.
     if p.typical_p < 1.0 && p.typical_p > 0.0 {
@@ -178,11 +190,13 @@ pub fn try_apply_sampling_counts(
             logits[i] = NEG_INF;
         }
     }
+
     if !valid_distribution(logits) {
         return None;
     }
 
-    // 9. sample.
+    // Select from the final candidate distribution in ascending vocabulary
+    // order so equal inputs have identical cross-runtime outcomes.
     let token = if greedy {
         argmax(logits)
     } else {
@@ -190,7 +204,8 @@ pub fn try_apply_sampling_counts(
         sample_categorical(&probs, draw)
     };
 
-    // 10. gather logprobs (softmax of the final, masked logits).
+    // Score the sampled token and any requested alternatives against the final,
+    // masked distribution.
     let logprobs = log_softmax(logits);
     let sampled_lp = logprobs.get(token as usize).copied().unwrap_or(NEG_INF);
     let top = if p.generated_logprobs_requested() || n_logprobs > 0 {
@@ -198,6 +213,7 @@ pub fn try_apply_sampling_counts(
     } else {
         Vec::new()
     };
+
     Some(SampleOutput {
         token,
         logprob: sampled_lp,
@@ -205,7 +221,11 @@ pub fn try_apply_sampling_counts(
     })
 }
 
-/// Score one known token against a vocabulary-logits row and return ranked candidates.
+/// Scores one known token against a logits row and returns ranked candidates.
+///
+/// The sampled token is first, followed by the highest-probability and explicit
+/// token requests without duplicates. Ranks use competition ranking, so tied
+/// log probabilities receive the same rank.
 pub fn score_token_logprobs(
     logits: &[f32],
     token: u32,
@@ -213,6 +233,8 @@ pub fn score_token_logprobs(
     requested_token_ids: &[u32],
 ) -> Vec<(u32, f32, u32)> {
     let logprobs = log_softmax(logits);
+
+    // Rank only candidates that survived the sampling masks.
     let mut order: Vec<usize> = (0..logits.len())
         .filter(|&index| logits[index] != NEG_INF)
         .collect();
@@ -221,12 +243,17 @@ pub fn score_token_logprobs(
             .partial_cmp(&logprobs[a])
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+
     let token_index = token as usize;
     if token_index >= logits.len() {
         return Vec::new();
     }
+
+    // Keep the sampled token first even when it falls outside the requested
+    // top-N set.
     let sampled_rank = competition_rank(&logprobs, logprobs[token_index]);
     let mut entries = vec![(token, logprobs[token_index], sampled_rank)];
+
     for &index in order.iter().take(n_logprobs) {
         let token_id = index as u32;
         if !entries.iter().any(|(existing, _, _)| *existing == token_id) {
@@ -237,6 +264,9 @@ pub fn score_token_logprobs(
             ));
         }
     }
+
+    // Append explicit vocabulary requests while preserving the unique-token
+    // contract established by the sampled and top-N entries.
     for &token_id in requested_token_ids {
         let index = token_id as usize;
         if index < logits.len() && !entries.iter().any(|(existing, _, _)| *existing == token_id) {
@@ -250,6 +280,7 @@ pub fn score_token_logprobs(
     entries
 }
 
+/// Returns the one-based competition rank of a log probability, preserving ties.
 fn competition_rank(logprobs: &[f32], value: f32) -> u32 {
     let strictly_greater = logprobs
         .iter()
@@ -260,6 +291,7 @@ fn competition_rank(logprobs: &[f32], value: f32) -> u32 {
         .saturating_add(1)
 }
 
+/// Returns the first vocabulary index with the greatest finite logit.
 fn argmax(logits: &[f32]) -> u32 {
     let mut best = 0usize;
     let mut bestv = NEG_INF;
@@ -272,6 +304,7 @@ fn argmax(logits: &[f32]) -> u32 {
     best as u32
 }
 
+/// Returns whether logits contain at least one finite candidate and no NaNs.
 fn valid_distribution(logits: &[f32]) -> bool {
     !logits.is_empty()
         && logits
@@ -280,6 +313,7 @@ fn valid_distribution(logits: &[f32]) -> bool {
         && logits.iter().any(|value| value.is_finite())
 }
 
+/// Computes a numerically stable probability vector while preserving masks.
 fn softmax(logits: &[f32]) -> Vec<f32> {
     let m = logits.iter().cloned().fold(NEG_INF, f32::max);
     if m == NEG_INF {
@@ -298,6 +332,7 @@ fn softmax(logits: &[f32]) -> Vec<f32> {
     exps
 }
 
+/// Computes numerically stable log probabilities while preserving masks.
 fn log_softmax(logits: &[f32]) -> Vec<f32> {
     let m = logits.iter().cloned().fold(NEG_INF, f32::max);
     if m == NEG_INF {
@@ -314,10 +349,8 @@ fn log_softmax(logits: &[f32]) -> Vec<f32> {
         .collect()
 }
 
+/// Selects the first vocabulary entry whose inclusive cumulative mass reaches `draw`.
 fn sample_categorical(probs: &[f32], draw: f32) -> u32 {
-    // Inverse-CDF selection over the ascending vocabulary: the first entry whose
-    // inclusive cumulative probability reaches the canonical uniform draw. The
-    // boundary matches the production worker's `(cumulative < draw).sum()`.
     let mut cum = 0.0f32;
     for (i, &p) in probs.iter().enumerate() {
         cum += p;
@@ -360,7 +393,7 @@ mod tests {
 
     fn base_logits() -> Vec<f32> {
         vec![0.0, 1.0, 2.0, 3.0, 0.5]
-    } // argmax = 3
+    }
 
     #[test]
     fn greedy_argmax_default() {
@@ -437,7 +470,8 @@ mod tests {
 
     #[test]
     fn repetition_penalty_demotes_recent() {
-        // token 3 is argmax; penalize it heavily via repetition over recent.
+        // Token 3 begins as the argmax and is then heavily penalized by its
+        // repeated appearances in the recent window.
         let mut l = base_logits();
         let p = SamplingParams {
             repetition_penalty: 100.0,
@@ -478,22 +512,12 @@ mod tests {
 
     #[test]
     fn defaults_are_noop_argmax() {
-        // Every transform unset => plain argmax, deterministic.
+        // With every optional transform disabled, sampling reduces to a
+        // deterministic argmax.
         let mut l = base_logits();
         let out = sample_valid_fixture(&mut l, &SamplingParams::default(), &[1, 2], None, None, 0);
         assert_eq!(out.token, 3);
     }
-
-    // ----------------------------------------------------------------------
-    // Masking transforms (min-p / top-k / top-p) prune low-probability tokens.
-    //
-    // With greedy defaults (temperature 0.0 => no temperature scaling, top_p 1.0,
-    // top_k 0, min_p 0.0 all no-op) the ONLY transform that touches the in-place
-    // `logits` slice is the one we enable, so reading the slice back after the
-    // call observes exactly which positions were pruned to NEG_INF. The base
-    // logits [3,2,1,0] have softmax probs ~[0.644, 0.237, 0.087, 0.032]
-    // (descending), which pins the cutoffs below.
-    // ----------------------------------------------------------------------
 
     fn ramp_logits() -> Vec<f32> {
         vec![3.0, 2.0, 1.0, 0.0]
@@ -501,9 +525,8 @@ mod tests {
 
     #[test]
     fn min_p_prunes_below_relative_threshold() {
-        // min_p 0.3 => threshold = 0.3 * maxprob(0.644) = 0.193.
-        // token0 (0.644) and token1 (0.237) survive; token2 (0.087) and
-        // token3 (0.032) fall below threshold and are masked to NEG_INF.
+        // With `min_p = 0.3`, the threshold is approximately 0.193. Tokens 0
+        // and 1 exceed it, while tokens 2 and 3 are masked.
         let mut l = ramp_logits();
         let p = SamplingParams {
             min_p: 0.3,
@@ -518,8 +541,8 @@ mod tests {
 
     #[test]
     fn top_k_keeps_only_k_highest_logits() {
-        // top_k = 2 keeps the two highest logits (tokens 0 and 1); the rest
-        // are masked to NEG_INF regardless of how close their probs are.
+        // `top_k = 2` retains tokens 0 and 1 regardless of how closely the
+        // remaining candidates follow them.
         let mut l = ramp_logits();
         let p = SamplingParams {
             top_k: 2,
@@ -534,9 +557,8 @@ mod tests {
 
     #[test]
     fn top_p_nucleus_keeps_smallest_set_reaching_mass() {
-        // top_p 0.7: descending cumulative prob is 0.644 (rank0), 0.881 (rank1),
-        // 0.968 (rank2). The cumulative first reaches >=0.7 at rank1, so the
-        // nucleus is {token0, token1}; tokens 2 and 3 are pruned to NEG_INF.
+        // Descending cumulative mass first reaches `top_p = 0.7` after tokens 0
+        // and 1, so the remaining candidates fall outside the nucleus.
         let mut l = ramp_logits();
         let p = SamplingParams {
             top_p: 0.7,
@@ -551,9 +573,8 @@ mod tests {
 
     #[test]
     fn masking_excludes_pruned_tokens_from_logprobs() {
-        // The returned top-logprobs list only contains surviving (non-NEG_INF)
-        // tokens: top_k=2 leaves 2 candidates, so requesting 5 logprobs returns
-        // exactly the 2 survivors and never a pruned id.
+        // Ranked output includes only finite candidates. A top-k cutoff of two
+        // therefore limits even a five-entry request to two results.
         let mut l = ramp_logits();
         let p = SamplingParams {
             top_k: 2,
@@ -572,19 +593,10 @@ mod tests {
         );
     }
 
-    // ----------------------------------------------------------------------
-    // Penalty semantics: frequency (count-scaled additive), presence (flat
-    // additive), repetition (multiplicative, sign-aware) are three distinct
-    // transforms. With greedy defaults the penalty is the only transform applied
-    // to the in-place logits, so reading the slice back reveals the exact math.
-    // ----------------------------------------------------------------------
-
     #[test]
     fn frequency_penalty_scales_with_recent_count() {
-        // Equal base logits; token1 appears twice in `recent`, token2 once.
-        // frequency penalty subtracts penalty*count, so the more-repeated token1
-        // is demoted strictly more than token2, and a non-recent token is
-        // untouched. This count scaling is what distinguishes it from presence.
+        // Frequency penalties scale by occurrence count: token 1 appears twice,
+        // token 2 once, and the other tokens do not appear.
         let mut l = vec![3.0f32, 3.0, 3.0, 3.0];
         let p = SamplingParams {
             frequency_penalty: 1.0,
@@ -600,9 +612,8 @@ mod tests {
 
     #[test]
     fn presence_penalty_is_flat_regardless_of_count() {
-        // Same recent window as the frequency test, but presence subtracts a
-        // flat penalty once for any appearance: token1 (count 2) and token2
-        // (count 1) are demoted by the SAME amount, leaving them tied.
+        // Presence penalties apply once to every observed token, leaving tokens
+        // 1 and 2 tied despite their different occurrence counts.
         let mut l = vec![3.0f32, 3.0, 3.0, 3.0];
         let p = SamplingParams {
             presence_penalty: 1.0,
@@ -618,10 +629,8 @@ mod tests {
 
     #[test]
     fn repetition_penalty_is_multiplicative_and_sign_aware() {
-        // token0 has a positive logit, token1 a negative one, both in `recent`.
         // Repetition penalty divides positive logits and multiplies negative
-        // logits by the penalty (sign-aware), unlike the additive penalties
-        // which would shift both by the same constant.
+        // logits, moving both values away from selection without a sign change.
         let mut l = vec![4.0f32, -4.0, 0.0];
         let p = SamplingParams {
             repetition_penalty: 2.0,
@@ -631,9 +640,7 @@ mod tests {
         assert_eq!(l[0], 2.0, "positive logit DIVIDED by penalty (4/2)");
         assert_eq!(l[1], -8.0, "negative logit MULTIPLIED by penalty (-4*2)");
         assert_eq!(l[2], 0.0, "non-recent token untouched");
-        // Distinct from additive: the two recent tokens moved by different
-        // deltas (-2 and -4), whereas frequency/presence with count 1 each would
-        // shift both by an identical constant.
+        // Different deltas distinguish this transform from an additive penalty.
         let delta0 = 4.0 - l[0];
         let delta1 = -4.0 - l[1];
         assert_ne!(delta0, delta1, "sign-aware deltas differ, not a flat shift");
@@ -641,10 +648,8 @@ mod tests {
 
     #[test]
     fn frequency_and_presence_diverge_on_repeated_token() {
-        // Direct contrast: with the SAME recent window, frequency demotes the
-        // twice-seen token below the once-seen token, while presence leaves them
-        // tied. Asserting both orderings in one place proves the semantics are
-        // genuinely different transforms, not aliases.
+        // The same history demonstrates the defining distinction: frequency
+        // uses occurrence counts, while presence uses membership alone.
         let recent = [1u32, 1, 2];
 
         let mut lf = vec![3.0f32, 3.0, 3.0];
@@ -681,8 +686,8 @@ mod tests {
 
     #[test]
     fn typical_keeps_the_locally_typical_set() {
-        // A sharply-peaked distribution: the single most-typical token (the one
-        // whose surprisal is closest to the entropy) survives a small typical_p.
+        // A small cutoff on a sharply peaked distribution retains only the
+        // candidates whose surprisal lies closest to the entropy.
         let mut l = vec![0.0, 5.0, 0.1, 0.2, 0.05];
         let p = SamplingParams {
             typical_p: 0.1,
@@ -698,8 +703,7 @@ mod tests {
 
     #[test]
     fn inverse_cdf_selects_the_first_entry_reaching_the_draw() {
-        // Ascending inclusive cumulative probability [0.2, 0.5, 1.0]. The draw
-        // boundary is `draw <= cumulative[i]`, matching the production worker.
+        // Equality remains in the lower bucket of the inclusive cumulative sum.
         let probs = [0.2f32, 0.3, 0.5];
         assert_eq!(sample_categorical(&probs, 0.0), 0);
         assert_eq!(sample_categorical(&probs, 0.2), 0);

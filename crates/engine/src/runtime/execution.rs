@@ -1,6 +1,13 @@
+//! Batch submission, completion application, and allocation reclamation.
+//!
+//! The loop keeps executor progress non-blocking until work is outstanding, then
+//! parks with a bounded liveness deadline. Completion application validates
+//! request and operation identities before mutating runtime state.
+
 use super::*;
 
 impl EngineLoop {
+    /// Releases the request latent.
     fn free_request_latent(&mut self, id: RequestId) {
         let allocation = self
             .running
@@ -10,6 +17,9 @@ impl EngineLoop {
             self.memory.free(allocation);
         }
     }
+    /// Advances scheduler and executor work, blocking only for an outstanding result.
+    ///
+    /// Returns whether the loop made progress or handled an executor outcome.
     pub fn step(&mut self) -> bool {
         let progressed = self.step_nonblocking();
         if progressed || self.inflight.batch_started.is_empty() {
@@ -30,7 +40,7 @@ impl EngineLoop {
         true
     }
 
-    /// Nonblocking schedule-ahead tick used by the owner-thread reactor. It
+    /// Advances one nonblocking schedule-ahead tick for the owner-thread reactor. It
     /// drains ready results, reaps cancellations, and fills available executor
     /// slots, but leaves any blocking result wait to `run`.
     pub(super) fn step_nonblocking(&mut self) -> bool {
@@ -53,6 +63,7 @@ impl EngineLoop {
         progressed
     }
 
+    /// Drains ready work, admits requests, and fills every available executor slot.
     pub(super) fn refill_executor(&mut self) -> bool {
         let mut progressed = false;
 
@@ -151,6 +162,7 @@ impl EngineLoop {
         progressed
     }
 
+    /// Allocates a request-scoped product reference for a terminal media result.
     pub(super) fn media_completion_product(
         &mut self,
         request_key: RequestKey,
@@ -175,6 +187,7 @@ impl EngineLoop {
         }
     }
 
+    /// Selects eligible media requests and submits one bounded diffusion batch.
     pub(super) fn submit_media_batch(&mut self) -> bool {
         let max_unresolved =
             usize::try_from(self.info.max_unresolved_ops.max(1)).unwrap_or(usize::MAX);
@@ -398,7 +411,7 @@ impl EngineLoop {
         }
     }
 
-    /// Surface cache observability (events drained into counters).
+    /// Publishes cache state and drained cache events to scheduler counters.
     pub(super) fn publish_cache_stats(&mut self) {
         self.stats
             .general
@@ -447,7 +460,7 @@ impl EngineLoop {
             .store(self.memory.encoder_cache.len(), Ordering::Relaxed);
     }
 
-    /// Resolve at most one ready result so assembly can refill the freed slot
+    /// Resolves at most one ready result so assembly can refill the freed slot
     /// before another completion is consumed.
     pub(super) fn poll_one_result(&mut self) -> bool {
         let _span = tracing::trace_span!("scheduler.poll_one_result").entered();
@@ -464,6 +477,7 @@ impl EngineLoop {
         }
     }
 
+    /// Returns whether a flow prefix can be scheduled now.
     pub(super) fn flow_prefix_is_schedulable(&self, id: RequestId) -> bool {
         let prefix_is_pending = self
             .running
@@ -480,6 +494,7 @@ impl EngineLoop {
                 .any(|op| op.operation.kind == RunKind::DiffusionStep)
     }
 
+    /// Projects committed request state through every queued state-advancing operation.
     pub(super) fn projected_cursor(&self, id: RequestId) -> Option<GenerationCursor> {
         let st = self.running.get(&id)?;
         let inflight = self
@@ -504,6 +519,7 @@ impl EngineLoop {
         Some(projected)
     }
 
+    /// Returns a fixed cache-version provider.
     pub(super) fn fixed_version(&self, id: RequestId) -> Option<Checkpoint> {
         let state = self.running.get(&id)?;
         state.cursor.resources.worker_registered.then_some(())?;
@@ -513,6 +529,7 @@ impl EngineLoop {
         })
     }
 
+    /// Returns the checkpoint that the next state-advancing operation must consume.
     pub(super) fn projected_parent(&self, id: RequestId) -> Option<Checkpoint> {
         let operation = self
             .inflight
@@ -543,6 +560,7 @@ impl EngineLoop {
         })
     }
 
+    /// Returns the public output limit for an operation.
     pub(super) fn public_limit_for(&self, id: RequestId, apply: &RuntimeApply) -> u64 {
         self.running.get(&id).map_or(0, |state| {
             state.public_event_limit.max(
@@ -554,6 +572,7 @@ impl EngineLoop {
         })
     }
 
+    /// Queues a semantic checkpoint commit behind the frontend's visible-output acknowledgement.
     pub(super) fn queue_commit(
         &mut self,
         id: RequestId,
@@ -585,9 +604,12 @@ impl EngineLoop {
         });
     }
 
+    /// Applies completed worker commands to scheduler-owned allocation state.
     pub(super) fn acknowledge_commands(&mut self, commands: &[BatchCommand]) {
         for command in commands {
             if let BatchCommand::Free { buffer } = command {
+                // Buffer ownership may sit with an already queued free, a live
+                // request, or a request awaiting its close acknowledgement.
                 let id = buffer.owner.request_id;
                 let allocation = self
                     .pending_buffer_frees
@@ -608,6 +630,8 @@ impl EngineLoop {
                     self.memory.free(allocation);
                 }
             } else if let BatchCommand::Finish { request_key, .. } = command {
+                // Media and text requests retain different allocation bundles,
+                // but both require an exact epoch match before reclamation.
                 let id = request_key.request_id;
                 if let Some(retiring) = self.retiring_media.get(&id) {
                     if retiring.request_key != *request_key {
@@ -625,6 +649,7 @@ impl EngineLoop {
                     retiring.allocations.free(&mut self.memory);
                     continue;
                 }
+
                 let Some(retiring) = self.retiring_requests.get(&id) else {
                     tracing::error!(
                         request_id = id.0,
@@ -643,6 +668,7 @@ impl EngineLoop {
                     self.fatal = true;
                     continue;
                 }
+
                 let retiring = self
                     .retiring_requests
                     .remove(&id)
@@ -655,11 +681,13 @@ impl EngineLoop {
         }
     }
 
-    /// Whether a request may keep an additional operation in flight at the
+    /// Returns whether a request may keep an additional operation in flight at the
     /// predecessor's not-yet-observed selected point. Eligibility requires an
     /// exact projected cursor and a reachable predicate product for the target
     /// work leaf.
     pub(super) fn can_queue_successor(&self, id: RequestId, target: RunKind) -> bool {
+        // Successor projection requires both live runtime state and an unresolved
+        // predecessor from which to derive the device-selected checkpoint.
         let Some(state) = self.running.get(&id) else {
             return false;
         };
@@ -671,6 +699,9 @@ impl EngineLoop {
         else {
             return false;
         };
+
+        // Bound speculation by worker capacity and exclude lineages whose
+        // terminal or relay state makes the projection unsafe.
         if queue.len() >= self.info.max_unresolved_ops as usize
             || state.terminal_intent.is_terminal()
             || self.inflight.finishes.contains_key(&id)
@@ -681,6 +712,7 @@ impl EngineLoop {
         let Some(predecessor) = queue.back() else {
             return false;
         };
+
         if target.requires_fixed_parent() {
             return false;
         }
@@ -690,6 +722,9 @@ impl EngineLoop {
         ) {
             return false;
         }
+
+        // Decode successors support both feedback continuation and ordinary
+        // prompt/decode pipelining, with different cursor evidence for each.
         if target == RunKind::ArDecode {
             let feedback_continuation = matches!(
                 predecessor.generation_apply().intent,
@@ -715,6 +750,7 @@ impl EngineLoop {
                     && state.cursor.und.tokens_emitted.saturating_add(1)
                         < state.req.max_und_tokens;
             }
+
             if !matches!(state.cursor.phase, Phase::Prefill | Phase::DecodeUnd)
                 || (state.cursor.phase == Phase::Prefill && state.starts_gen_after_context())
                 || queue
@@ -726,11 +762,15 @@ impl EngineLoop {
             let Some(projected) = self.projected_cursor(id) else {
                 return false;
             };
+
             return projected.ingest.prompt_cursor as usize >= state.effective_prompt().len()
                 && state.cursor.ingest.mm_cursor >= state.context.images.len()
                 && state.cursor.und.tokens_emitted.saturating_add(queue.len())
                     < state.req.max_und_tokens;
         }
+
+        // Other successor kinds require a completion predicate and an exact
+        // projected physical variant match.
         predecessor
             .operation
             .outputs()
@@ -741,6 +781,7 @@ impl EngineLoop {
                 .is_some_and(|variant| variant == target)
     }
 
+    /// Infers the next pipelined operation kind from projected in-flight request state.
     pub(super) fn projected_inflight_variant(&self, id: RequestId) -> Option<RunKind> {
         if !self.inflight.contains(id) {
             return None;
@@ -797,6 +838,7 @@ impl EngineLoop {
         })
     }
 
+    /// Returns whether a successor can consume device-selected tokens before host observation.
     pub(super) fn device_token_relay_eligible(state: &ReqState) -> bool {
         // A successor may consume the parent's device-selected point before host
         // observation whenever its own sampling state is device-representable
@@ -818,7 +860,7 @@ impl EngineLoop {
             && sampling.bad_words_ids.iter().all(|word| word.len() == 1)
     }
 
-    /// Whether the latest host-resolved token may remain the exact device input
+    /// Returns whether the latest host-resolved token may remain the exact device input
     /// to the next decode. CPU stop and EOS decisions are complete before this
     /// check; a continuing request therefore names the same sampled token.
     pub(super) fn can_reuse_resolved_token_product(&self, id: RequestId) -> bool {
@@ -834,6 +876,7 @@ impl EngineLoop {
         })
     }
 
+    /// Returns whether the next operation can be scheduled.
     pub(super) fn can_schedule_next(&self, id: RequestId) -> bool {
         !self.inflight.finishes.contains_key(&id)
             && self.output_window_ready(id)
@@ -846,7 +889,7 @@ impl EngineLoop {
                     .is_some_and(|target| self.can_queue_successor(id, target)))
     }
 
-    /// Whether the request may register another operation without exceeding its
+    /// Returns whether the request may register another operation without exceeding its
     /// bounded provisional horizon. A request with no held commits is always
     /// open; a stop-string request that has decoded prefixes awaiting the
     /// frontend decision may run ahead by at most the unresolved-window depth,
@@ -856,6 +899,7 @@ impl EngineLoop {
         state.pending_commits.len() < horizon
     }
 
+    /// Returns whether output capacity can cover every unresolved token-producing operation.
     pub(super) fn output_window_ready(&self, id: RequestId) -> bool {
         let Some(state) = self.running.get(&id) else {
             return false;
@@ -878,6 +922,7 @@ impl EngineLoop {
             >= self.next_output_bound(id)
     }
 
+    /// Returns the output-size bound for the next operation.
     pub(super) fn next_output_bound(&self, id: RequestId) -> usize {
         match self.peek_next_operation_variant(id) {
             Some(RunKind::ArExtend | RunKind::ArDecode) => 4,
@@ -887,6 +932,7 @@ impl EngineLoop {
         }
     }
 
+    /// Registers a submitted generation operation and its cursor transition.
     pub(super) fn register_inflight(
         &mut self,
         operation: Operation,
@@ -902,6 +948,7 @@ impl EngineLoop {
         );
     }
 
+    /// Registers a submitted media operation and its projected media cursor.
     pub(super) fn register_media_inflight(
         &mut self,
         operation: Operation,
@@ -911,6 +958,7 @@ impl EngineLoop {
         self.register_inflight_apply(operation, InflightApply::Media(cursor_after), started, 0);
     }
 
+    /// Registers a submitted operation and charges its domain and transfer credits.
     pub(super) fn register_inflight_apply(
         &mut self,
         operation: Operation,
@@ -935,6 +983,7 @@ impl EngineLoop {
             });
     }
 
+    /// Records the domain backpressure.
     pub(super) fn record_domain_backpressure(&self, domain: uniserve_worker_ipc::Domain) {
         self.stats
             .domains
@@ -943,6 +992,7 @@ impl EngineLoop {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Accumulates timing and completion counters for one returned domain operation.
     pub(super) fn record_domain_run(
         &self,
         accounting: SubmittedRunAccounting,
@@ -968,6 +1018,7 @@ impl EngineLoop {
         }
     }
 
+    /// Records the domain completion.
     pub(super) fn record_domain_completion(
         &self,
         domain: uniserve_worker_ipc::Domain,
@@ -986,6 +1037,7 @@ impl EngineLoop {
         }
     }
 
+    /// Reclaims the domain credit.
     pub(super) fn reclaim_domain_credit(&self, domain: uniserve_worker_ipc::Domain, failed: bool) {
         let stats = self.stats.domains.get(domain);
         let active = stats.active_credits.load(Ordering::Relaxed);
@@ -1000,12 +1052,14 @@ impl EngineLoop {
         }
     }
 
+    /// Fails the inflight domain credits.
     pub(super) fn fail_inflight_domain_credits(&self) {
         for inflight in self.inflight.operations.values().flatten() {
             self.reclaim_domain_credit(inflight.operation.domain(), true);
         }
     }
 
+    /// Stages one validated completion until earlier operations for the request are applied.
     pub(super) fn stage_completion(
         &mut self,
         record: ModelOutput,
@@ -1051,6 +1105,7 @@ impl EngineLoop {
         );
     }
 
+    /// Validates and applies one ordered media completion to the request cursor.
     pub(super) fn apply_media_completion(
         &mut self,
         operation: Operation,
@@ -1144,6 +1199,7 @@ impl EngineLoop {
         }
     }
 
+    /// Emits terminal media output and releases all request-owned resources.
     pub(super) fn finish_media(
         &mut self,
         id: RequestId,
@@ -1222,7 +1278,7 @@ impl EngineLoop {
         );
     }
 
-    /// Resolve the front in-flight op for `id` by the worker's echoed `op_id`.
+    /// Resolves the front in-flight op for `id` by the worker's echoed `op_id`.
     pub(super) fn pop_inflight(
         &mut self,
         request_key: RequestKey,
@@ -1233,6 +1289,7 @@ impl EngineLoop {
         Some((inflight.operation, inflight.apply, inflight.started))
     }
 
+    /// Releases product allocations owned by completed operations.
     pub(super) fn free_products(&mut self, products: Vec<ProductRef>) {
         let mut products = products;
         products.sort_unstable_by_key(|product| product.generation);
@@ -1251,7 +1308,7 @@ impl EngineLoop {
         }
     }
 
-    /// Failure policy after an executor/worker error.
+    /// Applies the failure policy for an executor or worker error.
     /// A typed non-fatal [`WorkerExecError`] fails the in-flight requests but
     /// keeps the engine alive to serve subsequent requests; anything else (a
     /// fatal worker error, ring/transport death) latches the engine fatal.
@@ -1260,7 +1317,7 @@ impl EngineLoop {
     /// real policy rather than being log-only. The worker's `fatal` bit is the
     /// baseline, but the host *escalates* host-bug classes to fatal even when
     /// the worker marked them non-fatal (a `SCHEDULER_BUG`/`INVARIANT_VIOLATION`
-    /// means the control plane can no longer be trusted), and it picks the log
+    /// leaves the control-plane state untrustworthy), and it picks the log
     /// severity by class so a benign `InputError` does not spam warnings.
     pub(super) fn on_executor_error(&mut self, e: anyhow::Error) {
         if e.downcast_ref::<WorkerLossError>().is_some() {
@@ -1301,11 +1358,15 @@ impl EngineLoop {
         self.fail_all_inflight(&format!("{e}"));
     }
 
+    /// Reconciles one physical batch result with logical operations, state, and ownership.
     pub(super) fn apply_result(&mut self, report: BatchResult) {
         let result_batch_id = report.batch_id;
         let mut returned_domains: HashMap<uniserve_worker_ipc::Domain, (usize, TimingCounters)> =
             HashMap::new();
         let mut invalid_result = false;
+
+        // A completion can mutate state only while its logical batch remains owned
+        // by the in-flight window.
         if !self
             .inflight
             .batch_operations
@@ -1319,6 +1380,9 @@ impl EngineLoop {
             self.fail_all_running("executor returned a result for an unknown logical batch");
             return;
         }
+
+        // Consume each expected operation identity exactly once while folding the
+        // rank-local timing records into their scheduler domains.
         for result in &report.results {
             let record = &result.output;
             let identity = (record.request_key, record.op_id);
@@ -1360,6 +1424,7 @@ impl EngineLoop {
             entry.1.copy_us = entry.1.copy_us.max(record.timing_counters.copy_us);
             entry.1.host_us = entry.1.host_us.max(record.timing_counters.host_us);
         }
+
         let operations_complete = self
             .inflight
             .batch_operations
@@ -1374,6 +1439,9 @@ impl EngineLoop {
             self.fail_all_running("executor returned an invalid operation result");
             return;
         }
+
+        // Publish domain and batch accounting before individual request state is
+        // advanced, so every accepted completion contributes exactly once.
         let forward_stats = report.forward_stats;
         let completion_count = report.results.len();
         let trace_enabled = self.trace_enabled();
@@ -1416,6 +1484,7 @@ impl EngineLoop {
                 }));
             }
         }
+
         if !report.worker_exec_us.is_empty() {
             let groups = self
                 .inflight
@@ -1427,18 +1496,21 @@ impl EngineLoop {
                 groups.insert(group, worker_exec_us);
             }
         }
+
         if batch_complete {
             self.inflight.batch_operations.remove(&result_batch_id);
             if let Some(commands) = self.inflight.command_batches.remove(&result_batch_id) {
                 self.acknowledge_commands(&commands);
             }
         }
+
         let batch_roundtrip_us = self
             .inflight
             .batch_started
             .get(&result_batch_id)
             .map(|start| start.elapsed().as_micros() as u64)
             .unwrap_or(0);
+
         if batch_complete {
             self.inflight.batch_started.remove(&result_batch_id);
             self.inflight.prefill_steps.remove(&result_batch_id);
@@ -1453,6 +1525,7 @@ impl EngineLoop {
         } else {
             0
         };
+
         if batch_complete {
             self.stats
                 .timing
@@ -1473,6 +1546,7 @@ impl EngineLoop {
                 .batch_timing_count
                 .fetch_add(1, Ordering::Relaxed);
         }
+
         let forward_stats_trace = trace_enabled.then(|| {
             forward_stats
                 .iter()
@@ -1482,16 +1556,22 @@ impl EngineLoop {
         for stats in &forward_stats {
             self.record_worker_forward_stats(Some(stats));
         }
+
+        // Staging decouples executor arrival order from request-local dependency
+        // order. Only a ready prefix is removed by `take_ready` below.
         for result in report.results {
             self.stage_completion(result.output, Arc::from(result.products));
         }
+
         let mut resolved_ops = trace_enabled.then(|| Vec::with_capacity(completion_count));
         let mut progress_ops = trace_enabled.then(|| Vec::with_capacity(completion_count));
+
         loop {
             let completions = self.inflight.take_ready();
             if completions.is_empty() {
                 break;
             }
+
             let mut to_resolve = Vec::with_capacity(completions.len());
             for completion in completions {
                 let PendingCompletion {
@@ -1519,8 +1599,12 @@ impl EngineLoop {
                     }
                     continue;
                 };
+
                 let operation_variant = operation.kind;
                 let roundtrip_us = started.elapsed().as_micros() as u64;
+
+                // Media operations update their independent cursor immediately;
+                // generation operations continue through semantic validation.
                 let apply = match apply {
                     InflightApply::Media(cursor_after) => {
                         self.apply_media_completion(operation, cursor_after, record);
@@ -1528,6 +1612,7 @@ impl EngineLoop {
                     }
                     InflightApply::Generation(apply) => apply,
                 };
+
                 let discard_invalidated_descendant = self
                     .running
                     .get(&id)
@@ -1546,6 +1631,7 @@ impl EngineLoop {
                     self.finish_pending_if_idle(id);
                     continue;
                 }
+
                 let view = SequenceView::from_report(&record, products.as_ref());
                 let sampled_token_ids_len = view.committed_tokens.len();
                 let sampled_token_ids_last = view.committed_tokens.last().copied();
@@ -1578,6 +1664,7 @@ impl EngineLoop {
                         "product_handle": view.encode_generation,
                     }));
                 }
+
                 let predicated_parent_point = (record.status == OpStatus::Predicated).then(|| {
                     self.running
                         .get(&id)
@@ -1602,6 +1689,9 @@ impl EngineLoop {
                     }
                     continue;
                 }
+
+                // Completion products used only as device predicates can be released
+                // once no in-flight descendant refers to them.
                 if record.status == OpStatus::Ok && !operation.advances_state() {
                     let completion_has_device_consumer =
                         self.inflight.operations.get(&id).is_some_and(|queue| {
@@ -1625,6 +1715,7 @@ impl EngineLoop {
                         self.free_products(completed_predicates);
                     }
                 }
+
                 let semantic_blocked = self
                     .running
                     .get(&id)
@@ -1637,6 +1728,7 @@ impl EngineLoop {
                     self.finish_pending_if_idle(id);
                     continue;
                 }
+
                 let expected_parent = self.fixed_version(id);
                 let prefix_versions =
                     token_prefix_versions(Some(&operation), &record, expected_parent.as_ref());
@@ -1663,6 +1755,7 @@ impl EngineLoop {
                     }
                     continue;
                 }
+
                 // A state-advancing completion resolves a new point. Ordered commit
                 // control emission below decides when that point becomes semantic.
                 let advanced = record.status == OpStatus::Ok
@@ -1700,6 +1793,7 @@ impl EngineLoop {
                         None
                     };
                 }
+
                 let selected_fixed = self.fixed_version(id);
                 // A stop-string token op defers its semantic commit until the
                 // frontend decoder rules on its exact prefix; every other
@@ -1726,6 +1820,9 @@ impl EngineLoop {
                         self.queue_commit(id, expected_parent, selected, public_event_limit);
                     }
                 }
+
+                // Reclaim resources whose lifetime ends at this transition before
+                // making its public output eligible for resolution.
                 let free_flow_prefix = operation_variant == RunKind::DiffusionStep
                     && record.status == OpStatus::Ok
                     && match &apply.intent {
@@ -1767,6 +1864,7 @@ impl EngineLoop {
                         self.free_products(consumed_latents);
                     }
                 }
+
                 let priority = completion_priority(operation_variant);
                 let public_tokens_before = self
                     .running
@@ -1800,6 +1898,9 @@ impl EngineLoop {
                     ));
                 }
             }
+
+            // Resolve semantic effects in lifecycle priority and stable arrival
+            // order, independent of the executor's physical completion order.
             to_resolve.sort_by_key(|(priority, seq_index, ..)| (*priority, *seq_index));
             for (
                 _priority,
@@ -1904,6 +2005,7 @@ impl EngineLoop {
                 }
             }
         }
+
         if let (Some(resolved_ops), Some(progress_ops)) = (resolved_ops, progress_ops) {
             self.trace_record(json!({
                 "event": "batch_resolved",
@@ -1924,6 +2026,7 @@ impl EngineLoop {
         }
     }
 
+    /// Merges optional worker forward-pass counters into scheduler statistics.
     pub(super) fn record_worker_forward_stats(&self, stats: Option<&WorkerForwardStats>) {
         let Some(stats) = stats else {
             return;
@@ -2046,12 +2149,12 @@ impl EngineLoop {
         }
     }
 
+    /// Fails every submitted operation while preserving requests that can be rescheduled.
     pub(super) fn fail_all_inflight(&mut self, msg: &str) {
         self.pending_submission = None;
         self.fail_inflight_domain_credits();
-        // the submitted batches whose results will now never return are
-        // failed here, so drop their pending submit-timestamps too — otherwise
-        // `batch_started` accumulates orphaned entries for every failed batch.
+        // Submitted batches cannot return after this boundary, so their timing
+        // and command ownership must be retired together.
         let (ids, commands) = self.inflight.clear_failed();
         self.acknowledge_commands(&commands);
         for id in ids {
@@ -2074,6 +2177,7 @@ impl EngineLoop {
         }
     }
 
+    /// Reconciles all in-flight and resident state after the worker loses device allocations.
     fn fail_all_after_worker_loss(&mut self, message: &str) {
         self.pending_submission = None;
         self.fail_inflight_domain_credits();
@@ -2124,6 +2228,7 @@ impl EngineLoop {
         self.memory.reset_after_worker_loss(&self.info);
     }
 
+    /// Fails every queued and running request and releases scheduler-owned resources.
     pub(super) fn fail_all_running(&mut self, message: &str) {
         self.pending_submission = None;
         self.fail_inflight_domain_credits();

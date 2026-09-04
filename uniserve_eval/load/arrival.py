@@ -1,4 +1,4 @@
-"""Warmup, settle, and Poisson or immediate arrival."""
+"""Executes warmup and measured loads with immediate or Poisson arrivals."""
 
 from __future__ import annotations
 
@@ -21,13 +21,19 @@ Submit = Callable[[Example, float | None], Coroutine[Any, Any, T]]
 
 @dataclass(frozen=True)
 class LoadResult:
+    """Contains warmup outputs, measured outputs, and measured duration."""
+
     warmup_outputs: tuple[Any, ...]
     outputs: tuple[Any, ...]
     duration_s: float
 
 
 class WarmupFailure(RuntimeError):
+    """Reports outputs from a warmup batch containing a failed request."""
+
     def __init__(self, outputs: list[Any]) -> None:
+        """Capture warmup outputs and summarize the first failure."""
+
         self.outputs = tuple(outputs)
         first = outputs[0] if outputs else None
         super().__init__(
@@ -42,6 +48,8 @@ async def get_request(
     rows: list[Example],
     request_rate: float,
 ) -> AsyncGenerator[Example, None]:
+    """Yield rows with exponential inter-arrival delays at a finite rate."""
+
     for row in rows:
         yield row
         if request_rate == float("inf"):
@@ -59,9 +67,13 @@ async def run_load(
     warmup_requests: int = 1,
     measurement: NsysCapture | None = None,
 ) -> LoadResult:
+    """Run warmup, settle, and measured requests under a concurrency limit."""
+
     if not rows:
         return LoadResult((), (), 0.0)
 
+    # Warmup exercises the same request path but remains outside both the profiler
+    # window and the reported duration.
     warmup_outputs: list[T] = []
     if warmup_requests > 0:
         warmup_outputs = await asyncio.gather(
@@ -72,9 +84,13 @@ async def run_load(
 
     await asyncio.sleep(1.0)
 
+    # The semaphore bounds in-flight requests without changing the configured
+    # arrival schedule; queueing behind it remains part of request latency.
     semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else None
 
     async def limited(row: Example, scheduled: float | None) -> T:
+        """Submit one row within the optional concurrency semaphore."""
+
         if semaphore is None:
             return await submit(row, scheduled)
         async with semaphore:
@@ -83,6 +99,7 @@ async def run_load(
     if measurement is not None:
         measurement.start()
     benchmark_start_time = time.perf_counter()
+
     try:
         tasks: list[asyncio.Task[T]] = []
         async for row in get_request(rows, request_rate):
@@ -91,6 +108,9 @@ async def run_load(
     finally:
         if measurement is not None:
             measurement.stop()
+
+    # Duration covers scheduled arrival generation through completion of the final
+    # measured request, matching the throughput denominator.
     return LoadResult(
         tuple(warmup_outputs),
         tuple(outputs),

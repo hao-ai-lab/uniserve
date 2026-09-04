@@ -1,3 +1,5 @@
+//! Buffered and streaming OpenAI chat-completion response assembly.
+
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::result::Result;
@@ -21,6 +23,7 @@ use crate::openai::ApiError;
 use crate::openai::logprobs::{decoded_logprobs_to_openai_chat, decoded_prompt_logprobs_to_maps};
 use crate::openai::utils::completion_token_count;
 
+/// Converts a terminal serving event into its OpenAI representation.
 fn openai_terminal_event(event: ServeEvent) -> ServeEvent {
     match event {
         ServeEvent::Cancelled { .. } | ServeEvent::Aborted { .. } => ServeEvent::Finished {
@@ -44,6 +47,7 @@ macro_rules! bail_server_error {
     };
 }
 
+/// Collects a chat event stream into one non-streaming response.
 pub async fn collect_chat_completion(
     stream: impl Stream<Item = crate::serving::Result<ServeEvent>> + Send,
     request_id: String,
@@ -161,6 +165,7 @@ struct CollectedChatOutput {
     finish_status: FinishStatus,
 }
 
+/// Collects semantic serving events into one non-streaming chat response payload.
 async fn collect_chat_events(
     stream: impl Stream<Item = crate::serving::Result<ServeEvent>> + Send,
 ) -> Result<CollectedChatOutput, ApiError> {
@@ -178,10 +183,9 @@ async fn collect_chat_events(
     let mut image_step_counts = HashMap::<String, u32>::new();
     let mut completed_image_ids = Vec::<String>::new();
     let mut finish_status = None;
-    // Structured chat processors finalize text through OutputBlockEnd. The
-    // The description-owned processor emits semantic deltas directly, so keep
-    // a fallback copy for non-streaming collection without duplicating blocks
-    // from the structured path.
+    // Structured processors finalize text through `OutputBlockEnd`. Direct
+    // semantic deltas are retained separately so collection can assemble models
+    // that do not emit structured blocks without duplicating structured output.
     let mut loose_text = String::new();
     let mut loose_reasoning = String::new();
     let mut saw_text_block = false;
@@ -329,7 +333,7 @@ async fn collect_chat_events(
     })
 }
 
-/// Convert one serving event stream into OpenAI chat-completion chunks.
+/// Converts one serving event stream into OpenAI chat-completion chunks.
 #[try_stream]
 pub async fn chat_completion_chunk_stream(
     stream: impl Stream<Item = crate::serving::Result<ServeEvent>> + Send,
@@ -623,6 +627,7 @@ pub async fn chat_completion_chunk_stream(
     Ok(())
 }
 
+/// Builds a streaming usage chunk.
 fn usage_chunk(
     request_id: &str,
     response_model: &str,
@@ -634,6 +639,7 @@ fn usage_chunk(
     chunk
 }
 
+/// Builds a streaming image-delta chunk.
 fn image_delta_chunk(
     request_id: &str,
     response_model: &str,
@@ -651,6 +657,7 @@ fn image_delta_chunk(
     chunk
 }
 
+/// Builds an image content part for a chat response.
 fn image_content_part(png_b64: String) -> ContentPart {
     ContentPart::ImageUrl {
         image_url: ImageUrl {
@@ -684,7 +691,7 @@ struct PendingChatChunk {
 }
 
 impl PendingChatChunk {
-    /// Append one assistant text/reasoning block delta to the buffered OpenAI
+    /// Appends one assistant text/reasoning block delta to the buffered OpenAI
     /// delta payload.
     fn push_block_delta(&mut self, kind: AssistantBlockKind, delta: String) {
         match kind {
@@ -699,7 +706,7 @@ impl PendingChatChunk {
         }
     }
 
-    /// Append the OpenAI tool-call-start representation to the buffered delta.
+    /// Appends the OpenAI tool-call-start representation to the buffered delta.
     fn push_tool_call_start(&mut self, index: u32, id: String, name: String) {
         self.delta
             .tool_calls
@@ -715,7 +722,7 @@ impl PendingChatChunk {
             });
     }
 
-    /// Append one incremental tool-call arguments update to the buffered delta.
+    /// Appends one incremental tool-call arguments update to the buffered delta.
     fn push_tool_call_arguments(&mut self, index: u32, delta: String) {
         self.delta
             .tool_calls
@@ -731,7 +738,7 @@ impl PendingChatChunk {
             });
     }
 
-    /// Finalize the currently buffered SSE chunk, if it contains either a
+    /// Finalizes the currently buffered SSE chunk when it contains either a
     /// semantic delta or a logprobs payload.
     ///
     /// This may produce:
@@ -767,7 +774,7 @@ impl PendingChatChunk {
         Some(chunk)
     }
 
-    /// Take the currently buffered OpenAI delta payload and leave this pending
+    /// Takes the currently buffered OpenAI delta payload and leaves this pending
     /// chunk empty for the next decoded update.
     fn take_delta(&mut self) -> ChatMessageDelta {
         ChatMessageDelta {
@@ -780,7 +787,7 @@ impl PendingChatChunk {
     }
 }
 
-/// Append one text fragment to an optional OpenAI delta string field.
+/// Appends one text fragment to an optional OpenAI delta string field.
 fn append_delta_text(slot: &mut Option<String>, delta: String) {
     match slot {
         Some(existing) => existing.push_str(&delta),
@@ -788,7 +795,7 @@ fn append_delta_text(slot: &mut Option<String>, delta: String) {
     }
 }
 
-/// Convert one chunk stream into OpenAI-style SSE events.
+/// Converts one chunk stream into OpenAI-style SSE events.
 ///
 /// OpenAI-style streaming errors are encoded as ordinary `data: {"error":...}`
 /// events followed by `data: [DONE]`, so the transport stream itself stays
@@ -814,7 +821,7 @@ pub async fn chat_completion_sse_stream(
     Ok(())
 }
 
-/// Serialize one OpenAI chunk payload into one SSE `data:` event.
+/// Serializes one OpenAI chunk payload into one SSE `data:` event.
 fn to_sse_event(chunk: &ChatCompletionStreamResponse) -> Event {
     let payload = serde_json::to_string(chunk).unwrap_or_else(|_| {
         r#"{"error":{"message":"failed to serialize chat completion chunk","type":"server_error"}}"#
@@ -824,7 +831,7 @@ fn to_sse_event(chunk: &ChatCompletionStreamResponse) -> Event {
     json_sse_event(payload)
 }
 
-/// Serialize one OpenAI error payload into one SSE `data:` event.
+/// Serializes one OpenAI error payload into one SSE `data:` event.
 fn to_error_sse_event(error: &ApiError) -> Event {
     let payload = serde_json::to_string(&error.to_error_response()).unwrap_or_else(|_| {
         r#"{"error":{"message":"failed to serialize error response","type":"server_error"}}"#
@@ -834,17 +841,18 @@ fn to_error_sse_event(error: &ApiError) -> Event {
     json_sse_event(payload)
 }
 
+/// Serializes a value as a JSON server-sent event.
 fn json_sse_event(payload: String) -> Event {
     Event::default().data(payload.replace('\r', "\\r").replace('\n', "\\n"))
 }
 
-/// Build the terminal OpenAI SSE sentinel event.
+/// Builds the terminal OpenAI SSE sentinel event.
 fn done_sse_event() -> Event {
     trace!("chat completion emitting done");
     Event::default().data("[DONE]")
 }
 
-/// Build the initial assistant-role SSE chunk required by OpenAI streaming.
+/// Builds the initial assistant-role SSE chunk required by OpenAI streaming.
 fn start_chunk(
     request_id: &str,
     response_model: &str,
@@ -861,7 +869,7 @@ fn start_chunk(
     chunk
 }
 
-/// Build one content-delta SSE chunk from one internal assistant block delta.
+/// Builds one content-delta SSE chunk from one internal assistant block delta.
 fn block_delta_chunk(
     request_id: &str,
     response_model: &str,
@@ -895,6 +903,7 @@ fn block_delta_chunk(
     chunk
 }
 
+/// Builds the streaming chunk that opens one assistant function call.
 fn tool_call_start_chunk(
     request_id: &str,
     response_model: &str,
@@ -922,6 +931,7 @@ fn tool_call_start_chunk(
     chunk
 }
 
+/// Builds a streaming chunk containing incremental function arguments.
 fn tool_call_arguments_chunk(
     request_id: &str,
     response_model: &str,
@@ -948,6 +958,7 @@ fn tool_call_arguments_chunk(
     chunk
 }
 
+/// Builds a chunk containing only log-probability updates.
 fn logprobs_only_chunk(
     request_id: &str,
     response_model: &str,
@@ -962,7 +973,7 @@ fn logprobs_only_chunk(
     chunk
 }
 
-/// Build the terminal SSE chunk carrying the OpenAI finish reason.
+/// Builds the terminal SSE chunk carrying the OpenAI finish reason.
 fn final_chunk(
     request_id: &str,
     response_model: &str,
@@ -988,6 +999,7 @@ fn final_chunk(
     Ok(chunk)
 }
 
+/// Converts a chat finish status into OpenAI fields.
 fn chat_finish_status_to_openai(
     finish_status: &FinishStatus,
     saw_tool_calls: bool,
@@ -1004,6 +1016,7 @@ fn chat_finish_status_to_openai(
     }
 }
 
+/// Finishes the status as str.
 fn finish_status_as_str(status: &FinishStatus) -> &'static str {
     match status {
         FinishStatus::Stop { .. } => "stop",
@@ -1014,6 +1027,7 @@ fn finish_status_as_str(status: &FinishStatus) -> &'static str {
     }
 }
 
+/// Finishes the status stop reason.
 fn finish_status_stop_reason(status: &FinishStatus) -> Option<Value> {
     match status {
         FinishStatus::Stop { cause } => cause.as_ref().and_then(|cause| match cause {

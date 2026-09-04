@@ -16,6 +16,8 @@ __all__ = [
 
 
 class TorchSDPAAttentionBackend(AttentionBackend):
+    """Executes dense, paged, segmented, and variable-length attention with PyTorch SDPA."""
+
     name = "torch_sdpa"
     paged_varlen = True
     dense_ranks = frozenset({3, 4})
@@ -32,6 +34,8 @@ class TorchSDPAAttentionBackend(AttentionBackend):
         attn_mask: torch.Tensor | None = None,
         context: ForwardBatch | None = None,
     ) -> torch.Tensor:
+        """Compute dense attention with PyTorch SDPA after canonicalizing layout and mask shape."""
+
         del context
         if q.ndim == 3:
             return self._forward_lhd(q, k, v, causal=causal, scale=scale, attn_mask=attn_mask)
@@ -53,6 +57,8 @@ class TorchSDPAAttentionBackend(AttentionBackend):
         scale: float,
         context: ForwardBatch | None = None,
     ) -> torch.Tensor:
+        """Gather each visible paged KV row, append current K/V, and apply PyTorch SDPA."""
+
         plan = context
         base_lens = getattr(plan, "seq_lens_cpu", None)
         if base_lens is None:
@@ -115,6 +121,8 @@ class TorchSDPAAttentionBackend(AttentionBackend):
         fully_visible_current: bool,
         context: ForwardBatch | None = None,
     ) -> torch.Tensor:
+        """Concatenate current and cached segments per row before applying PyTorch SDPA."""
+
         if q.ndim != 3 or current_k.shape != current_v.shape or current_k.ndim != 3:
             raise ValueError("segmented attention expects packed current Q/K/V tensors")
         plan = context
@@ -190,6 +198,8 @@ class TorchSDPAAttentionBackend(AttentionBackend):
         block_table: torch.Tensor | None = None,
         context: ForwardBatch | None = None,
     ) -> torch.Tensor:
+        """Slice packed variable-length rows and apply PyTorch SDPA independently."""
+
         del max_seqlen_q, max_seqlen_k
         if q.ndim != 3:
             raise ValueError(
@@ -256,6 +266,8 @@ class TorchSDPAAttentionBackend(AttentionBackend):
         fully_visible: bool = False,
         context: ForwardBatch | None = None,
     ) -> torch.Tensor:
+        """Apply PyTorch SDPA to each query row’s bounded visible KV prefix."""
+
         del max_seqlen_q, max_seqlen_k, use_prefix_bounds
         plan = context
         query_lens = getattr(plan, "query_lens_cpu", None)
@@ -342,6 +354,8 @@ class TorchSDPAAttentionBackend(AttentionBackend):
         scale: float | None,
         attn_mask: torch.Tensor | None,
     ) -> torch.Tensor:
+        """Run SDPA for token-head-dimension tensors and restore the original head layout."""
+
         lq, n_heads, _ = q.shape
         lk, _, _ = k.shape
         k, v = _expand_gqa(k, v, n_heads, head_axis=1)
@@ -381,6 +395,8 @@ class TorchSDPAAttentionBackend(AttentionBackend):
         scale: float | None,
         attn_mask: torch.Tensor | None,
     ) -> torch.Tensor:
+        """Run SDPA for batch-head-length-dimension tensors with optional masking."""
+
         k, v = _expand_gqa(k, v, q.shape[1], head_axis=1)
         mask = _normalize_mask(attn_mask, q)
         out = F.scaled_dot_product_attention(
@@ -424,6 +440,8 @@ def _attention_state(
     scale: float,
     allowed: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return attention output and log-sum-exp state for one allowed key segment."""
+
     key, value = _expand_gqa(key, value, int(query.shape[1]), head_axis=1)
     if int(key.shape[0]) == 0:
         return query.new_zeros(query.shape), query.new_full(query.shape[:2], float("-inf"))
@@ -439,6 +457,8 @@ def _attention_state(
 
 
 def _normalize_mask(mask: torch.Tensor | None, q: torch.Tensor) -> torch.Tensor | None:
+    """Move an optional attention mask to the query device and boolean dtype."""
+
     if mask is None:
         return None
     if mask.device != q.device:
@@ -449,13 +469,15 @@ def _normalize_mask(mask: torch.Tensor | None, q: torch.Tensor) -> torch.Tensor 
 
 
 def _integer_values(value: torch.Tensor, name: str) -> tuple[int, ...]:
+    """Read a tensor as a validated tuple of integer values."""
+
     if value.ndim != 1 or value.dtype not in (torch.int32, torch.int64):
         raise ValueError(f"{name} must be a one-dimensional integer tensor")
     return tuple(int(item) for item in value.detach().to(device="cpu").tolist())
 
 
 def _offsets_from_lengths(lengths: Sequence[int]) -> tuple[int, ...]:
-    """Cumulative packed offsets ``[0, l0, l0+l1, ...]`` from host segment lengths."""
+    """Build cumulative packed offsets ``[0, l0, l0+l1, ...]`` from host lengths."""
 
     offsets = [0]
     for length in lengths:
@@ -468,6 +490,8 @@ def _validated_offsets(
     terminal: int | None,
     name: str,
 ) -> tuple[int, ...]:
+    """Validate monotonic packed offsets and their optional terminal extent."""
+
     offsets = _integer_values(value, f"{name} offsets")
     if (
         len(offsets) < 2
@@ -484,6 +508,8 @@ def _paged_query_rows(
     q: torch.Tensor,
     row_count: int,
 ) -> tuple[list[torch.Tensor], Callable[[list[torch.Tensor]], torch.Tensor]]:
+    """Normalize paged queries to one row-major token sequence."""
+
     if q.ndim == 4:
         if int(q.shape[0]) != row_count:
             raise ValueError("paged query batch does not match its page table")
@@ -501,18 +527,26 @@ def _paged_query_rows(
 
 
 def _concatenate_rows(rows: list[torch.Tensor]) -> torch.Tensor:
+    """Concatenate non-empty variable-length attention rows along the token axis."""
+
     return torch.cat(rows, dim=0)
 
 
 def _stack_attention_rows(rows: list[torch.Tensor]) -> torch.Tensor:
+    """Stack equal-length attention rows along a new batch axis."""
+
     return torch.stack(rows, dim=0).transpose(1, 2).contiguous()
 
 
 def _first_row(rows: list[torch.Tensor]) -> torch.Tensor:
+    """Return the sole attention row when batching introduced no row axis."""
+
     return rows[0]
 
 
 def _paged_current_rows(value: torch.Tensor, query_lens: tuple[int, ...]) -> list[torch.Tensor]:
+    """Split optional current KV rows according to packed query lengths."""
+
     row_count = len(query_lens)
     if value.ndim == 4:
         if int(value.shape[0]) != row_count:
@@ -532,6 +566,8 @@ def _paged_current_rows(value: torch.Tensor, query_lens: tuple[int, ...]) -> lis
 
 
 def _read_paged_row(cache: torch.Tensor, pages: torch.Tensor, length: int) -> torch.Tensor:
+    """Gather one logical KV sequence from its ordered physical pages."""
+
     if cache.ndim != 4 or length < 0:
         raise ValueError("paged cache must be [pages, page, heads, dim]")
     if length == 0:
@@ -554,6 +590,8 @@ def _write_paged_row(
     start: int,
     values: torch.Tensor,
 ) -> None:
+    """Scatter contiguous token rows across their physical cache pages."""
+
     if values.ndim != 3 or values.shape[1:] != cache.shape[2:]:
         raise ValueError("paged cache write geometry does not match cache storage")
     count = int(values.shape[0])

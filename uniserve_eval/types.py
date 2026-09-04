@@ -1,4 +1,4 @@
-"""Data shared by configuration, tasks, requests, and reports."""
+"""Defines evaluator configuration, request, media, and result value types."""
 
 from __future__ import annotations
 
@@ -20,6 +20,8 @@ MetricDirection = Literal["higher", "lower"]
 
 
 class TaskName(StrEnum):
+    """Identifies the request and validation contract for a benchmark point."""
+
     TEXT = "text"
     T2I = "t2i"
     I2I = "i2i"
@@ -30,19 +32,27 @@ class TaskName(StrEnum):
 
 @dataclass(frozen=True)
 class MetricDefinition:
+    """Selects a numeric summary metric and its preferred direction."""
+
     path: tuple[str, ...]
     direction: MetricDirection
 
     @property
     def name(self) -> str:
+        """Return the dotted metric path."""
+
         return ".".join(self.path)
 
     def as_dict(self) -> dict[str, str]:
+        """Return a JSON-compatible metric declaration."""
+
         return {"path": self.name, "direction": self.direction}
 
 
 @dataclass(frozen=True)
 class LoadConfig:
+    """Configures warmup, arrivals, concurrency, and deterministic sampling."""
+
     num_prompts: int = 1000
     request_rate: float = float("inf")
     max_concurrency: int | None = None
@@ -50,6 +60,8 @@ class LoadConfig:
     seed: int = 42
 
     def __post_init__(self) -> None:
+        """Validate load parameters that govern request scheduling."""
+
         if self.num_prompts < 1:
             raise ValueError("num_prompts must be positive")
         if self.request_rate <= 0 or math.isnan(self.request_rate):
@@ -62,6 +74,8 @@ class LoadConfig:
 
 @dataclass(frozen=True)
 class SamplingConfig:
+    """Configures model sampling and endpoint-specific request extensions."""
+
     temperature: float = 0.0
     top_p: float = 1.0
     top_k: int | None = None
@@ -78,6 +92,8 @@ class SamplingConfig:
 
 @dataclass(frozen=True)
 class ImageConfig:
+    """Configures image geometry, denoising, guidance, and output count."""
+
     width: int | None = None
     height: int | None = None
     steps: int | None = None
@@ -89,6 +105,8 @@ class ImageConfig:
     timestep_shift: float | None = None
 
     def __post_init__(self) -> None:
+        """Validate image settings with structural or positivity constraints."""
+
         if self.cfg_interval is not None and len(self.cfg_interval) != 2:
             raise ValueError("cfg_interval must contain exactly two values")
         if self.steps is not None and self.steps < 1:
@@ -99,10 +117,14 @@ class ImageConfig:
 
 @dataclass(frozen=True)
 class VideoConfig:
+    """Configures generated duration and synthesized prompt length."""
+
     seconds: float = 5.0
     prompt_tokens: int = 1000
 
     def __post_init__(self) -> None:
+        """Validate finite duration and positive prompt length."""
+
         if not math.isfinite(self.seconds) or self.seconds <= 0.0:
             raise ValueError("video seconds must be finite and positive")
         if self.prompt_tokens < 1:
@@ -111,6 +133,8 @@ class VideoConfig:
 
 @dataclass(frozen=True)
 class Example:
+    """A dataset row with optional task-specific modality overrides."""
+
     id: str
     prompt: str
     messages: list[dict[str, Any]] | None = None
@@ -127,11 +151,15 @@ class Example:
     seconds: float | None = None
 
     def as_dict(self) -> dict[str, Any]:
+        """Return populated fields as a JSON-compatible mapping."""
+
         return {key: value for key, value in asdict(self).items() if value is not None}
 
 
 @dataclass(frozen=True)
 class TaskRequest:
+    """Contains an endpoint payload and its streaming mode."""
+
     endpoint: str
     payload: dict[str, Any]
     stream: bool
@@ -139,6 +167,8 @@ class TaskRequest:
 
 @dataclass(frozen=True)
 class DecodedImage:
+    """Contains validated image bytes and content-derived metadata."""
+
     data: bytes
     sha256: str
     byte_size: int
@@ -148,6 +178,8 @@ class DecodedImage:
     sample_filename: str
 
     def metadata_dict(self) -> dict[str, int | str]:
+        """Return persistent image metadata without the encoded bytes."""
+
         return {
             "sha256": self.sha256,
             "byte_size": self.byte_size,
@@ -160,6 +192,8 @@ class DecodedImage:
 
 @dataclass(frozen=True)
 class DecodedVideo:
+    """Contains validated MP4 bytes and decoded stream metadata."""
+
     data: bytes
     sha256: str
     byte_size: int
@@ -178,17 +212,25 @@ class DecodedVideo:
 
     @property
     def fps(self) -> float:
+        """Return the exact rational frame rate as a float."""
+
         return self.fps_numerator / self.fps_denominator
 
     @property
     def video_duration_s(self) -> float:
+        """Return duration derived from decoded frames and frame rate."""
+
         return self.frame_count / self.fps
 
     @property
     def audio_duration_s(self) -> float:
+        """Return duration derived from decoded samples and sample rate."""
+
         return self.audio_samples / self.audio_sample_rate
 
     def metadata_dict(self) -> dict[str, float | int | str]:
+        """Return persistent media metadata without the encoded bytes."""
+
         return {
             "sha256": self.sha256,
             "byte_size": self.byte_size,
@@ -211,6 +253,8 @@ class DecodedVideo:
 
 @dataclass
 class RequestRecord:
+    """Accumulates transport, timing, usage, and decoded-output observations."""
+
     request_id: str
     task: str
     success: bool = False
@@ -253,39 +297,55 @@ class RequestRecord:
         scheduled_time: float | None,
         requested_output_len: int,
     ) -> None:
+        """Initialize endpoint metadata and the monotonic request clock."""
+
         self.endpoint = endpoint
         self.scheduled_time = scheduled_time
         self.requested_output_len = requested_output_len
         self.start_time = time.perf_counter()
 
     def note_http(self, status_code: int) -> None:
+        """Record when the HTTP response headers become available."""
+
         self.http_response_time = time.perf_counter()
         self.status_code = status_code
 
     def close_now(self) -> None:
+        """Close the request at the current monotonic time."""
+
         now = time.perf_counter()
         self.latency = now - self.start_time
         self.final_event_time = now
 
     def close_at(self, timestamp: float) -> None:
+        """Close the request at a supplied monotonic event timestamp."""
+
         self.final_event_time = timestamp
         self.latency = timestamp - self.start_time
 
     def mark_failure(self, classifier: str, error: str | None = None) -> None:
+        """Mark the request unsuccessful with a stable classifier."""
+
         self.success = False
         self.classifier = classifier
         if error is not None:
             self.error = error
 
     def mark_success(self) -> None:
+        """Mark the request successful."""
+
         self.success = True
         self.classifier = "ok"
 
     def mark_transport_exception(self, error: BaseException) -> None:
+        """Close and classify an exception raised by the transport path."""
+
         self.close_now()
         self.mark_failure("transport_failure", f"{type(error).__name__}: {error}")
 
     def apply_choice_metadata(self, choice: dict[str, Any]) -> None:
+        """Record finish and stop reasons from a completion choice."""
+
         finish_reason = choice.get("finish_reason")
         if isinstance(finish_reason, str):
             self.finish_reason = finish_reason
@@ -294,6 +354,8 @@ class RequestRecord:
             self.stop_reason = stop_reason
 
     def apply_usage(self, usage: dict[str, Any]) -> None:
+        """Apply authoritative token and image-step usage fields."""
+
         if isinstance(usage.get("completion_tokens"), int):
             self.output_len = int(usage["completion_tokens"])
             self.output_len_source = "server_usage"
@@ -305,6 +367,8 @@ class RequestRecord:
             self.image_steps = [int(step) for step in steps]
 
     def apply_cached_prompt_tokens(self, payload: dict[str, Any]) -> None:
+        """Extract cached-token usage from an OpenAI-compatible payload."""
+
         usage = payload.get("usage")
         if not isinstance(usage, dict):
             return
@@ -317,6 +381,8 @@ class RequestRecord:
             self.cached_prompt_tokens_source = "openai_usage_prompt_tokens_details"
 
     def apply_token_fallbacks(self, *, prompt_len: int, output_len_fallback: int) -> None:
+        """Fill token counts that the server did not report."""
+
         if self.output_len_source != "server_usage":
             self.output_len = output_len_fallback
         if self.prompt_len_source != "server_usage":
@@ -330,6 +396,8 @@ class RequestRecord:
         last_text_time: float | None,
         count_itl: bool,
     ) -> None:
+        """Append streamed text and update first-token or inter-token timing."""
+
         self.token_timing_available = True
         self.generated_text += content
         if timestamp is None:
@@ -341,6 +409,8 @@ class RequestRecord:
             self.itl.append(timestamp - last_text_time)
 
     def add_image_arrival(self, count: int, timestamp: float | None) -> None:
+        """Record completion latency for newly observed image parts."""
+
         if timestamp is None:
             return
         latency = timestamp - self.start_time
@@ -350,12 +420,16 @@ class RequestRecord:
         self.image_latencies.extend([latency] * count)
 
     def attach_images(self, decoded: list[DecodedImage], *, assign_json_latency: bool = False) -> None:
+        """Attach validated images and optionally assign response latency to each."""
+
         self.decoded_images = decoded
         self.images = len(decoded)
         if assign_json_latency and decoded:
             self.image_latencies = [self.latency] * self.images
 
     def record_dict(self) -> dict[str, Any]:
+        """Return the durable request record without raw media or generated text."""
+
         generated_text_bytes = self.generated_text.encode("utf-8")
         http_response = (
             self.http_response_time - self.start_time
@@ -365,7 +439,9 @@ class RequestRecord:
         dispatch_wait = (
             self.start_time - self.scheduled_time if self.scheduled_time is not None else None
         )
+
         return {
+            # Stable identity and terminal classification.
             "request_id": self.request_id,
             "task": self.task,
             "success": self.success,
@@ -373,12 +449,16 @@ class RequestRecord:
             "error": self.error,
             "warnings": list(self.warnings),
             "endpoint": self.endpoint,
+
+            # Absolute event timestamps support cross-process timeline joins.
             "scheduled_time": self.scheduled_time,
             "client_send_time": self.start_time,
             "http_response_time": self.http_response_time,
             "first_text_time": self.first_text_time,
             "first_image_done_time": self.first_image_done_time,
             "final_event_time": self.final_event_time,
+
+            # Derived durations use milliseconds in durable artifacts.
             "client_dispatch_wait_ms": (
                 dispatch_wait * 1000.0 if dispatch_wait is not None else None
             ),
@@ -396,6 +476,9 @@ class RequestRecord:
                 else None
             ),
             "itl_count": len(self.itl),
+
+            # Token provenance distinguishes authoritative server counts from
+            # client-side fallbacks without retaining generated text.
             "prompt_len": self.prompt_len,
             "output_len": self.output_len,
             "requested_output_len": self.requested_output_len,
@@ -407,6 +490,9 @@ class RequestRecord:
             "generated_text_sha256": (
                 hashlib.sha256(generated_text_bytes).hexdigest() if generated_text_bytes else None
             ),
+
+            # Media entries retain verified metadata while sample bytes live in
+            # their own content-addressed artifacts.
             "images": self.images,
             "image_outputs": [image.metadata_dict() for image in self.decoded_images],
             "first_image_latency_ms": (
@@ -417,6 +503,8 @@ class RequestRecord:
             "video_output": (
                 self.decoded_video.metadata_dict() if self.decoded_video is not None else None
             ),
+
+            # Transport terminal state remains available for validation reports.
             "status_code": self.status_code,
             "finish_reason": self.finish_reason,
             "stop_reason": self.stop_reason,
@@ -425,6 +513,8 @@ class RequestRecord:
 
 @dataclass(frozen=True)
 class BenchmarkPoint:
+    """Defines one fully resolved workload, task, server, and metric contract."""
+
     name: str
     server: str
     task: TaskName
@@ -442,11 +532,15 @@ class BenchmarkPoint:
     question: str | None = None
 
     def __post_init__(self) -> None:
+        """Normalize the task identifier and require protected metrics."""
+
         object.__setattr__(self, "task", TaskName(self.task))
         if not self.metrics:
             raise ValueError("a benchmark point must protect at least one metric")
 
     def workload_dict(self) -> dict[str, Any]:
+        """Return the benchmark workload as a JSON-compatible mapping."""
+
         load = asdict(self.load)
         load["request_rate"] = "inf" if math.isinf(self.load.request_rate) else self.load.request_rate
         return {
@@ -470,15 +564,21 @@ class BenchmarkPoint:
 
 @dataclass(frozen=True)
 class ValidationResult:
+    """Collects named observable checks, statistics, and warnings."""
+
     checks: dict[str, bool]
     statistics: dict[str, Any] = field(default_factory=dict)
     warnings: tuple[str, ...] = ()
 
     @property
     def valid(self) -> bool:
+        """Report whether at least one check exists and every check passes."""
+
         return bool(self.checks) and all(self.checks.values())
 
     def as_dict(self) -> dict[str, Any]:
+        """Return a JSON-compatible validation report."""
+
         return {
             "valid": self.valid,
             "checks": dict(self.checks),
@@ -487,6 +587,8 @@ class ValidationResult:
         }
 
     def merged(self, other: ValidationResult) -> ValidationResult:
+        """Combine validation reports whose check names do not overlap."""
+
         overlap = set(self.checks) & set(other.checks)
         if overlap:
             raise ValueError(f"duplicate validation checks: {', '.join(sorted(overlap))}")
@@ -499,15 +601,21 @@ class ValidationResult:
 
 @dataclass
 class RunResult:
+    """Pairs the completed summary with its artifact directory."""
+
     summary: dict[str, Any]
     output_dir: Path
 
 
 def _is_token_count(value: Any) -> TypeGuard[int]:
+    """Recognize non-negative integer token counts while excluding booleans."""
+
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 def selected_rows_identity(rows: list[Example]) -> dict[str, Any]:
+    """Return a deterministic count and digest for selected dataset rows."""
+
     encoded = json.dumps(
         [row.as_dict() for row in rows],
         sort_keys=True,

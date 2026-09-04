@@ -1,10 +1,13 @@
-"""Prefix-bound helpers for visible-end attention."""
+"""Reduces per-query visible-end limits into query-tile bounds."""
+
 from __future__ import annotations
 
 import torch
 
 
 def _validate_visible_end(visible_end: torch.Tensor) -> tuple[int, int]:
+    """Validate the visible-end matrix and return its batch and query extents."""
+
     if visible_end.dtype != torch.int32:
         raise TypeError(f"visible_end must be int32, got {visible_end.dtype}")
     if visible_end.ndim != 2:
@@ -19,7 +22,7 @@ def compute_prefix_bounds(
     *,
     q_tile_size: int,
 ) -> torch.Tensor:
-    """Reduce ``visible_end[batch, seqlen_q]`` to per-Q-tile min/max bounds."""
+    """Return per-query-tile minimum and maximum visible-end values."""
 
     batch, seqlen_q = _validate_visible_end(visible_end)
     seqlens_q = torch.full(
@@ -42,7 +45,7 @@ def compute_prefix_bounds_varlen(
     q_tile_size: int,
     num_q_tiles: int | None = None,
 ) -> torch.Tensor:
-    """Reduce padded ``visible_end`` rows using per-batch query lengths."""
+    """Return tile bounds while excluding padding beyond each query length."""
 
     batch, max_q = _validate_visible_end(visible_end)
     if seqlens_q.ndim != 1 or int(seqlens_q.shape[0]) != batch:
@@ -54,9 +57,7 @@ def compute_prefix_bounds_varlen(
     if num_q_tiles is not None:
         max_tiles = int(num_q_tiles)
     else:
-        # Sizing the output by the longest query row (not the padded width)
-        # matches the per-row semantics below; this branch runs outside CUDA
-        # graph capture, so the single host read is acceptable.
+        # The longest logical row defines output shape; padded query width does not.
         max_len = int(seqlens_q.max().item()) if batch else 0
         max_tiles = (max_len + q_tile_size - 1) // q_tile_size
     if max_tiles < 0:
@@ -67,10 +68,8 @@ def compute_prefix_bounds_varlen(
             dtype=torch.int32,
             device=visible_end.device,
         )
-    # Validate lengths without forcing a host sync during graph capture: on the
-    # host this is exact; on device the same bound is enforced by the mask below
-    # (positions >= seqlen contribute nothing), so an out-of-range length can
-    # never widen a tile's visible window.
+    # CPU lengths can be rejected eagerly. Device lengths remain bounded by the
+    # validity mask so positions outside the padded matrix never affect a tile.
     if seqlens_q.device.type == "cpu":
         lengths = tuple(int(value) for value in seqlens_q.tolist())
         if any(length < 0 or length > max_q for length in lengths):

@@ -39,6 +39,8 @@ _SOFTMAX_SCALE = 1.0 / math.sqrt(128)
 
 
 def available(device: torch.device | None = None) -> bool:
+    """Return whether the CuTe kernel can compile for the requested SM100 device."""
+
     if (
         _cute is None
         or _from_dlpack is None
@@ -52,6 +54,8 @@ def available(device: torch.device | None = None) -> bool:
 
 
 def import_error() -> BaseException | None:
+    """Return the exception that prevented CuTe kernel registration, if any."""
+
     return _IMPORT_ERROR
 
 
@@ -62,6 +66,8 @@ def should_use(*, rows: int, prefix_tiles: int) -> bool:
 
 
 def _dynamic_tensor(tensor: torch.Tensor, assumed_align: int = 16) -> Any:
+    """Wrap a tensor as a CuTe dynamic-layout argument with declared alignment."""
+
     if _from_dlpack is None:
         raise RuntimeError("CuTe tensor ingress is unavailable") from _IMPORT_ERROR
     return _from_dlpack(
@@ -72,6 +78,8 @@ def _dynamic_tensor(tensor: torch.Tensor, assumed_align: int = 16) -> Any:
 
 
 def _tensor_abi_key(tensor: torch.Tensor) -> tuple[object, ...]:
+    """Describe a tensor's device, dtype, shape, and stride for kernel specialization."""
+
     leading_dim = tensor.ndim - 1
     return (
         tensor.dtype,
@@ -92,6 +100,8 @@ def _compile_key(
     valid_sizes: torch.Tensor,
     use_int64_kv_strides: bool,
 ) -> tuple[object, ...]:
+    """Build the CuTe kernel specialization key from tensor layouts and stride mode."""
+
     device_index = query.device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
@@ -136,6 +146,8 @@ def _compile(
     valid_sizes: torch.Tensor,
     use_int64_kv_strides: bool,
 ) -> Callable[..., None]:
+    """Compile and cache the block-sparse CuTe kernel for one concrete tensor geometry."""
+
     if _cute is None or _kernel_type is None:
         raise RuntimeError("CuTe sparse video attention is unavailable") from _IMPORT_ERROR
     kernel = _kernel_type(
@@ -180,6 +192,8 @@ def _validate(
     block_counts: torch.Tensor,
     valid_sizes: torch.Tensor,
 ) -> None:
+    """Validate tensor ranks, dtypes, shapes, devices, and block-index bounds."""
+
     if query.shape != key.shape or query.shape != value.shape:
         raise ValueError("CuTe sparse attention requires matching Q/K/V shapes")
     if query.ndim != 3 or query.shape[1:] != (14, 128):

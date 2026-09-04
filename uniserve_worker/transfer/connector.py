@@ -32,6 +32,8 @@ class TransferConnector:
         ticket_capacity: int,
         cross_process: bool = False,
     ) -> None:
+        """Select a transport and enforce its global byte and ticket capacities."""
+
         selected = str(backend)
         if bool(cross_process) and selected in {"", "local"}:
             raise unsupported_setup(
@@ -48,14 +50,20 @@ class TransferConnector:
         )
 
     def close(self) -> None:
+        """Close the selected transport and release every active KV publication."""
+
         self.transport.close()
 
     def set_completion_wake(self, wake: Callable[[], None]) -> None:
+        """Register the callback invoked when asynchronous transport work completes."""
+
         self.transport.set_completion_wake(wake)
 
 
 @dataclass(frozen=True, slots=True)
 class CachePublication:
+    """Owns prepared KV transfer publications until installation commits or discards them."""
+
     locators: tuple[Locator, ...]
     source_version: Checkpoint
     destination: str
@@ -66,6 +74,8 @@ class CachePublication:
     scale_identity: str
 
     def __post_init__(self) -> None:
+        """Validate publication ranges, layer bounds, request identity, and source locator."""
+
         if not isinstance(self.source_version.point, FixedCheckpoint):
             raise invalid_descriptor("KV publication source identity is not exact")
         if not self.destination or self.base_extent < 0 or self.published_extent < self.base_extent:
@@ -76,6 +86,8 @@ class CachePublication:
             raise invalid_descriptor("KV publication storage identity is invalid")
 
     def to_mapping(self) -> dict[str, object]:
+        """Encode KV publication products, destination bases, installed bases, and transfer locators."""
+
         return {
             "locators": [locator.to_mapping() for locator in self.locators],
             "source_version": self.source_version.to_mapping(),
@@ -89,6 +101,8 @@ class CachePublication:
 
     @classmethod
     def from_mapping(cls, value: object) -> CachePublication:
+        """Parse and validate the product and locator vectors of one KV publication."""
+
         if not isinstance(value, Mapping):
             raise invalid_descriptor("KV publication descriptor is not a mapping")
         raw_locators = value.get("locators", ())
@@ -117,6 +131,8 @@ class CachePublication:
 
 @dataclass(frozen=True, slots=True)
 class CachePublicationState:
+    """Records source, destination, extent, and locator metadata for one installed KV publication."""
+
     request_id: int
     products: tuple[tuple[ProductRef, CachePublication], ...]
     destination_bases: tuple[tuple[str, Checkpoint, int], ...]
@@ -125,6 +141,8 @@ class CachePublicationState:
 
 @dataclass(frozen=True, slots=True)
 class _CachePublicationCommit:
+    """Holds KV products, base checkpoints, and locators prepared for atomic installation."""
+
     products: dict[ProductRef, CachePublication]
     destination_bases: dict[tuple[int, str], tuple[Checkpoint, int]]
     installed_bases: dict[tuple[int, str], tuple[Checkpoint, int]]
@@ -135,6 +153,8 @@ class CachePublications:
     """Semantic publication progress over request-indexed cache tables."""
 
     def __init__(self, pool: CachePool, request_tables: ReqToTokenPool) -> None:
+        """Bind publication records to physical KV storage and request page tables."""
+
         self.pool = pool
         self.request_tables = request_tables
         self._products: dict[ProductRef, CachePublication] = {}
@@ -143,10 +163,14 @@ class CachePublications:
         self._locators: dict[tuple[int, int], tuple[tuple[Locator, ...], Transport]] = {}
 
     def destination_base(self, request_id: int, destination: str) -> Checkpoint | None:
+        """Resolve the newest checkpoint published to one destination for a request."""
+
         value = self._destination_bases.get((int(request_id), str(destination)))
         return None if value is None else value[0]
 
     def published_extent(self, request_id: int) -> int:
+        """Return the largest source KV extent currently published for a request."""
+
         selected = (
             extent
             for (candidate, _destination), (_version, extent) in self._destination_bases.items()
@@ -166,6 +190,8 @@ class CachePublications:
         product: ProductRef,
         transport: Transport,
     ) -> CachePublication:
+        """Export a visible KV extent as page-granular products and transport locators."""
+
         if product.kind is not ProductKind.KV:
             raise invalid_descriptor("KV publication product identity is invalid")
         point = source_version.point
@@ -226,12 +252,16 @@ class CachePublications:
         return publication
 
     def publication(self, product: ProductRef) -> CachePublication:
+        """Require the resident KV publication identified by a logical product reference."""
+
         try:
             return self._products[product]
         except KeyError:
             raise invalid_descriptor("KV publication product is not resident") from None
 
     def resident(self, product: ProductRef) -> CachePublication | None:
+        """Look up a resident KV publication without treating absence as an error."""
+
         return self._products.get(product)
 
     def validate_conditioning(
@@ -244,6 +274,8 @@ class CachePublications:
         visible_length: int,
         publication: CachePublication | None = None,
     ) -> CachePublication:
+        """Verify that an installation product extends the request’s current compatible KV base."""
+
         publication = self.publication(product) if publication is None else publication
         if int(product.request_key.request_id) != int(request_id):
             raise invalid_descriptor("KV conditioning product belongs to another request")
@@ -268,6 +300,8 @@ class CachePublications:
         transferred_tensors: tuple[torch.Tensor, ...] | None,
         publication: CachePublication | None = None,
     ) -> CachePublication:
+        """Fetch and stage published KV pages for installation into destination cache storage."""
+
         publication = self.publication(source) if publication is None else publication
         if (
             installed_product.kind is not ProductKind.KV
@@ -327,6 +361,8 @@ class CachePublications:
         installations: Sequence[tuple[ProductRef, ProductRef, CachePublication]],
         transport: Transport | None,
     ) -> _CachePublicationCommit:
+        """Validate staged publications and build an atomic cache-installation commit."""
+
         products = dict(self._products)
         destination_bases = dict(self._destination_bases)
         installed_bases = dict(self._installed_bases)
@@ -396,12 +432,16 @@ class CachePublications:
         )
 
     def apply_commit(self, commit: _CachePublicationCommit) -> None:
+        """Atomically replace publication indexes with a validated staged commit."""
+
         self._products = commit.products
         self._destination_bases = commit.destination_bases
         self._installed_bases = commit.installed_bases
         self._locators = commit.locators
 
     def release_operations(self, releases: Sequence[tuple[RequestKey, int]]) -> None:
+        """Release KV publications owned by completed operation identities."""
+
         identities = {(key, int(op_id)) for key, op_id in releases}
         products = tuple(
             product
@@ -420,9 +460,13 @@ class CachePublications:
                     transport.release(locator)
 
     def drop(self, request_id: int) -> None:
+        """Discard a request's publications and release their transport locators."""
+
         self.discard(request_id, release_locators=True)
 
     def discard(self, request_id: int, *, release_locators: bool) -> None:
+        """Remove a request publication and optionally release its transport locators."""
+
         selected = tuple(
             product
             for product in self._products
@@ -444,6 +488,8 @@ class CachePublications:
                 table.pop(key, None)
 
     def snapshot(self, request_id: int) -> CachePublicationState:
+        """Capture one request’s installed publication state for rollback."""
+
         selected = int(request_id)
         return CachePublicationState(
             request_id=selected,
@@ -470,6 +516,8 @@ class CachePublications:
         request_pool_idx: int,
         transport: Transport,
     ) -> None:
+        """Restore a captured publication and reacquire its transport ownership."""
+
         self.drop(state.request_id)
         for product, publication in state.products:
             if (

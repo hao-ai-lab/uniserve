@@ -1,4 +1,4 @@
-"""Local JSONL loader."""
+"""Loads evaluator examples from a local JSON Lines file."""
 
 from __future__ import annotations
 
@@ -25,10 +25,14 @@ _OPTIONAL = (
 
 
 class JsonlDataset(Dataset):
+    """Adapts schema-checked JSON objects to benchmark examples."""
+
     name: ClassVar[str] = "jsonl"
     requires_path: ClassVar[bool] = True
 
     def load(self, tokenizer: Any | None = None) -> list[Example]:
+        """Read normalized rows up to the benchmark's declared count."""
+
         point = self.point
         if not point.dataset_path:
             raise ValueError("dataset 'jsonl' requires dataset_path")

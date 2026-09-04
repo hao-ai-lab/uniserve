@@ -1,4 +1,10 @@
-"""Device mesh and transport boundaries for model parallelism."""
+"""Defines device-mesh coordinates and transport boundaries for model parallelism.
+
+Named axes select either process-group collectives or in-process device copies.
+The mesh supplies size-one behavior for absent axes, caller-buffered collective
+operations, and cached symmetric-memory peer views without exposing transport
+selection to neural layers.
+"""
 
 from __future__ import annotations
 
@@ -18,6 +24,8 @@ def _symmetric_memory_fence_custom(
     input: torch.Tensor,
     output: torch.Tensor,
 ) -> None:
+    """Issue a stream-ordered all-gather used as a symmetric-memory fence."""
+
     work = torch.distributed.all_gather_into_tensor(output, input, async_op=True)
     work.block_current_stream()
 
@@ -27,6 +35,8 @@ def _symmetric_memory_fence_custom_fake(
     input: torch.Tensor,
     output: torch.Tensor,
 ) -> None:
+    """Define the mutation contract for graph tracing."""
+
     del input, output
 
 
@@ -40,6 +50,8 @@ def _all_to_all_single_into_custom(
     output_splits: list[int],
     input_splits: list[int],
 ) -> None:
+    """Execute caller-buffered all-to-all on the default process group."""
+
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     with profile_range(f"uniserve.h3.collective kind=all_to_all rank={rank}"):
         work = torch.distributed.all_to_all_single(
@@ -59,6 +71,8 @@ def _all_to_all_single_into_custom_fake(
     output_splits: list[int],
     input_splits: list[int],
 ) -> None:
+    """Define caller-buffer mutation for traced all-to-all execution."""
+
     del output, input, output_splits, input_splits
 
 
@@ -70,6 +84,8 @@ def _all_gather_into_tensor_custom(
     output: torch.Tensor,
     input: torch.Tensor,
 ) -> None:
+    """Execute caller-buffered all-gather on the default process group."""
+
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     with profile_range(f"uniserve.h3.collective kind=all_gather rank={rank}"):
         work = torch.distributed.all_gather_into_tensor(
@@ -85,6 +101,8 @@ def _all_gather_into_tensor_custom_fake(
     output: torch.Tensor,
     input: torch.Tensor,
 ) -> None:
+    """Define caller-buffer mutation for traced all-gather execution."""
+
     del output, input
 
 
@@ -93,6 +111,8 @@ def _all_gather_into_tensor_custom_fake(
     mutates_args=("value",),
 )
 def _all_reduce_max_custom(value: torch.Tensor) -> None:
+    """Reduce a tensor in place with MAX on the default process group."""
+
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     with profile_range(f"uniserve.h3.collective kind=all_reduce_max rank={rank}"):
         work = torch.distributed.all_reduce(
@@ -105,6 +125,8 @@ def _all_reduce_max_custom(value: torch.Tensor) -> None:
 
 @_all_reduce_max_custom.register_fake
 def _all_reduce_max_custom_fake(value: torch.Tensor) -> None:
+    """Define in-place mutation for traced MAX reduction."""
+
     del value
 
 
@@ -121,7 +143,8 @@ __all__ = [
 
 
 def divide(numerator: int, denominator: int) -> int:
-    """Exact integer division, raising on a non-divisible or non-positive denom."""
+    """Return an exact integer quotient after validating divisibility and sign."""
+
     numerator = int(numerator)
     denominator = int(denominator)
     if denominator <= 0:
@@ -146,13 +169,19 @@ class CollectiveTransport:
 
     @property
     def size(self) -> int:
+        """Return the number of ranks on this axis."""
+
         return int(self._size)
 
     @property
     def coord(self) -> int:
+        """Return this process's rank within the axis."""
+
         return int(self._coord)
 
     def _require(self) -> Any:
+        """Validate distributed readiness and return the owned process group."""
+
         if not torch.distributed.is_available() or not torch.distributed.is_initialized():
             raise RuntimeError(
                 f"mesh axis {self.axis!r} size>1 requires an initialized "
@@ -168,11 +197,15 @@ class CollectiveTransport:
         return self.group
 
     def all_reduce(self, t: torch.Tensor) -> torch.Tensor:
+        """Sum a tensor in place across the axis."""
+
         group = self._require()
         torch.distributed.all_reduce(t, group=group)
         return t
 
     def all_reduce_max(self, value: torch.Tensor) -> torch.Tensor:
+        """Reduce a tensor in place to the elementwise maximum across the axis."""
+
         group = self._require()
         if group is None:
             _all_reduce_max_custom(value)
@@ -187,6 +220,8 @@ class CollectiveTransport:
         return value
 
     def all_gather(self, t: torch.Tensor, dim: int) -> torch.Tensor:
+        """Gather equal tensors from every rank and concatenate them along ``dim``."""
+
         group = self._require()
         chunks = [torch.empty_like(t) for _ in range(self.size)]
         torch.distributed.all_gather(chunks, t.contiguous(), group=group)
@@ -199,6 +234,8 @@ class CollectiveTransport:
         output_splits: tuple[int, ...] | list[int],
         input_splits: tuple[int, ...] | list[int],
     ) -> Any:
+        """Exchange variable row splits into caller-owned output storage."""
+
         group = self._require()
         if group is None:
             _all_to_all_single_into_custom(
@@ -220,6 +257,8 @@ class CollectiveTransport:
         return work
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor) -> Any:
+        """Gather equal inputs into contiguous caller-owned output storage."""
+
         group = self._require()
         if group is None:
             _all_gather_into_tensor_custom(output, input)
@@ -240,9 +279,13 @@ class CollectiveTransport:
         *,
         dst: int,
     ) -> Any:
+        """Gather equal inputs into a leading rank axis owned by ``dst``."""
+
         group = self._require()
         if not 0 <= int(dst) < self.size:
             raise ValueError(f"gather destination {dst} is outside axis {self.axis!r}")
+
+        # Only the destination materializes the leading-rank output dimension.
         if self.coord == int(dst):
             expected = (self.size, *input.shape)
             if output is None or tuple(output.shape) != expected:
@@ -254,6 +297,8 @@ class CollectiveTransport:
             if output is not None:
                 raise ValueError("only the gather destination may provide output storage")
             gather_list = None
+
+        # ``torch.distributed.gather`` addresses the world rank even for subgroups.
         global_dst = (
             int(dst) if group is None else int(torch.distributed.get_global_rank(group, int(dst)))
         )
@@ -268,6 +313,8 @@ class CollectiveTransport:
         return work
 
     def broadcast(self, t: torch.Tensor, *, src: int) -> torch.Tensor:
+        """Broadcast a caller-owned tensor in place from one axis rank."""
+
         group = self._require()
         torch.distributed.broadcast(t, src=src, group=group)
         return t
@@ -286,6 +333,8 @@ class SymmetricMemoryWorkspace:
     group: Any = None
 
     def fence(self, input: torch.Tensor, output: torch.Tensor) -> None:
+        """Make every rank's arrival visible in rank-ordered output storage."""
+
         if tuple(input.shape) != (1,) or tuple(output.shape) != (self.size,):
             raise ValueError("symmetric-memory fence buffers do not match the mesh axis")
         if self.size == 1:
@@ -319,20 +368,29 @@ class LocalP2PTransport:
 
     @property
     def size(self) -> int:
+        """Return the number of in-process devices on the route axis."""
+
         return len(self.devices)
 
     @property
     def coord(self) -> int:
+        """Return the local device coordinate represented by this view."""
+
         return int(self._coord)
 
     def device(self, coord: int) -> torch.device:
-        """The CUDA device backing ``coord`` (in-process tower routing seam)."""
+        """Return the CUDA device backing one in-process route coordinate."""
+
         return self.devices[int(coord)]
 
     def copy_to(self, t: torch.Tensor, *, coord: int, non_blocking: bool = True) -> torch.Tensor:
+        """Copy a tensor to one route coordinate's device."""
+
         return t.to(self.devices[int(coord)], non_blocking=non_blocking)
 
     def broadcast(self, t: torch.Tensor, *, src: int) -> torch.Tensor:
+        """Copy a source-owned tensor onto this view's local route device."""
+
         if int(src) < 0 or int(src) >= self.size:
             raise ValueError(f"broadcast source {src} is outside axis {self.axis!r}")
         return t.to(self.devices[self.coord]) if t.device != self.devices[self.coord] else t
@@ -345,9 +403,9 @@ AxisTransport: TypeAlias = CollectiveTransport | LocalP2PTransport
 class MeshAxis:
     """One parallelism dimension of the mesh.
 
-    ``parent`` marks a *sub-factorization* axis (e.g. ``attn_tp`` carved out of
-    ``tp``) rather than an independent product dimension; this models the real
-    topology of production systems where finer axes divide a coarser one.
+    ``parent`` marks a sub-factorization axis, such as ``attn_tp`` within ``tp``,
+    rather than an independent product dimension. A transport may be omitted when
+    only load-time sharding coordinates are required.
     """
 
     name: str
@@ -357,6 +415,8 @@ class MeshAxis:
     parent: str | None = None
 
     def __post_init__(self) -> None:
+        """Validate the coordinate against the positive axis extent."""
+
         if self.size <= 0:
             raise ValueError(f"mesh axis {self.name!r} size must be positive")
         if self.coord < 0 or self.coord >= self.size:
@@ -364,15 +424,14 @@ class MeshAxis:
                 f"mesh axis {self.name!r} coord must satisfy 0 <= coord < size "
                 f"(coord={self.coord}, size={self.size})"
             )
-        # Load-time sharding can use axis coordinates without a live transport.
 
 
 @dataclass(frozen=True)
 class DeviceMesh:
-    """The process-wide parallelism topology: named axes + this rank's local device.
+    """Owns the process-wide parallel topology and this rank's local device.
 
-    The degenerate mesh (no non-trivial axis) reproduces a single-rank,
-    single-device worker exactly.
+    Missing axes are treated as size-one dimensions so callers can use the same
+    operations for distributed and single-device execution.
     """
 
     axes: Mapping[str, MeshAxis] = field(default_factory=dict)
@@ -384,20 +443,30 @@ class DeviceMesh:
     )
 
     def axis(self, name: str) -> MeshAxis | None:
+        """Return a named axis when it belongs to this mesh."""
+
         return self.axes.get(name)
 
     def size(self, name: str) -> int:
+        """Return a named axis extent, defaulting to one for an absent axis."""
+
         ax = self.axes.get(name)
         return int(ax.size) if ax is not None else 1
 
     def coord(self, name: str) -> int:
+        """Return this rank's axis coordinate, defaulting to zero when absent."""
+
         ax = self.axes.get(name)
         return int(ax.coord) if ax is not None else 0
 
     def is_trivial(self, name: str) -> bool:
+        """Return whether an axis needs no cross-rank communication."""
+
         return self.size(name) <= 1
 
     def transport(self, name: str) -> AxisTransport:
+        """Return the live transport for a named nontrivial axis."""
+
         ax = self.axes.get(name)
         if ax is None or ax.transport is None:
             raise RuntimeError(f"mesh axis {name!r} has no transport")
@@ -423,6 +492,7 @@ class DeviceMesh:
     ) -> SymmetricMemoryWorkspace:
         """Allocate or retrieve one symmetric-memory workspace on a collective axis."""
 
+        # Trivial axes retain the same cache and peer-view contract without rendezvous.
         if self.is_trivial(group):
             key = (group, name, tuple(int(value) for value in shape), dtype, self.local_device)
             cached = self._symmetric_workspaces.get(key)
@@ -440,6 +510,7 @@ class DeviceMesh:
             )
             self._symmetric_workspaces[key] = workspace
             return workspace
+
         transport = self.transport(group)
         if not isinstance(transport, CollectiveTransport):
             raise RuntimeError(f"mesh axis {group!r} does not support symmetric memory")
@@ -448,6 +519,8 @@ class DeviceMesh:
         cached = self._symmetric_workspaces.get(key)
         if cached is not None:
             return cached
+
+        # All ranks rendezvous the allocation once, then cache stable peer mappings.
         import torch.distributed._symmetric_memory as symm_mem
 
         backend = symm_mem.get_backend(self.local_device)
@@ -558,18 +631,26 @@ class DeviceMesh:
 
     @property
     def tp_size(self) -> int:
+        """Return the tensor-parallel world size."""
+
         return self.size("tp")
 
     @property
     def tp_rank(self) -> int:
+        """Return this worker's tensor-parallel rank."""
+
         return self.coord("tp")
 
     @classmethod
     def trivial(cls, device: torch.device | str = "cpu") -> "DeviceMesh":
+        """Construct a single-device mesh with no communication axes."""
+
         return cls(axes={}, local_device=torch.device(device))
 
     @classmethod
     def of(cls, *axes: MeshAxis, device: torch.device | str = "cpu") -> "DeviceMesh":
+        """Construct a mesh from nontrivial named axes and one local device."""
+
         return cls(
             axes={ax.name: ax for ax in axes if ax.size > 1},
             local_device=torch.device(device),
@@ -584,6 +665,8 @@ class TensorParallel:
     size: int
 
     def __post_init__(self) -> None:
+        """Validate the rank against the positive tensor-parallel extent."""
+
         if self.size <= 0:
             raise ValueError("tensor-parallel size must be positive")
         if self.rank < 0 or self.rank >= self.size:
@@ -591,4 +674,6 @@ class TensorParallel:
 
     @classmethod
     def from_mesh(cls, mesh: DeviceMesh) -> "TensorParallel":
+        """Extract construction-time tensor-parallel coordinates from a device mesh."""
+
         return cls(rank=mesh.tp_rank, size=mesh.tp_size)

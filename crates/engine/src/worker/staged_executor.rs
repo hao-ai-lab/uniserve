@@ -1,12 +1,9 @@
-//! Typed control-plane routing across heterogeneous worker pools.
+//! Typed operation routing across heterogeneous worker pools.
 //!
-//! A staged topology routes each logical batch by exact [`OpKind`],
-//! sends each request's `NewRequest` before that pool's first operation
-//! for the request, and publishes each independently ready lane by identity.
-//! A worker-local device product remains resident within its producing pool.
-//! The executor retains a cross-pool consumer by exact product identity until the
-//! producer publishes the bounded transfer descriptor, then submits the
-//! consumer before exposing the producer completion to the scheduler.
+//! A topology routes operations by [`OpKind`] and admits a request to each pool
+//! before its first operation there. Device products remain resident in their
+//! producing pool. Cross-pool consumers wait for a bounded transfer descriptor,
+//! then launch before the producer completion becomes scheduler-visible.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::Duration;
@@ -72,11 +69,12 @@ pub struct StagedExecutor {
 }
 
 impl StagedExecutor {
-    /// Build a staged router after validating exact, non-overlapping pool claims.
+    /// Builds a staged router after validating exact, non-overlapping pool claims.
     pub fn try_new(pools: Vec<(PoolConfig, Box<dyn PhysicalExecutor>)>) -> anyhow::Result<Self> {
         Self::try_new_with_signals(pools, Vec::new(), Vec::new())
     }
 
+    /// Builds a staged router with explicit command wakes and progress descriptors.
     pub(crate) fn try_new_with_signals(
         pools: Vec<(PoolConfig, Box<dyn PhysicalExecutor>)>,
         command_wakers: Vec<CommandWaker>,
@@ -172,10 +170,12 @@ impl StagedExecutor {
         })
     }
 
+    /// Returns the mask bit assigned to a command pool.
     fn pool_bit(index: usize) -> u64 {
         1u64 << index
     }
 
+    /// Returns the command pools eligible for cache admission.
     fn cache_admissions(&mut self, admissions: &[NewRequest]) -> anyhow::Result<()> {
         for admission in admissions {
             if let Some(existing) = self.admissions.get(&admission.request_key) {
@@ -192,6 +192,7 @@ impl StagedExecutor {
         Ok(())
     }
 
+    /// Partitions new-request admissions by the pools used by their first operations.
     fn admissions_for(
         &self,
         pool_index: usize,
@@ -216,7 +217,7 @@ impl StagedExecutor {
         Ok(admissions)
     }
 
-    /// The pools a control command must reach. A commit or close rides with
+    /// Returns the pools that must receive a control command. A commit or close rides with
     /// the operation that produced the version it names, so it targets the pool
     /// running this request's operation in this batch; a control for a request
     /// with no operation this batch is broadcast to every pool that has admitted
@@ -259,6 +260,7 @@ impl StagedExecutor {
             .collect()
     }
 
+    /// Submits or queues one pool-local run while preserving collective order.
     fn submit_pool(
         &mut self,
         pool_index: usize,
@@ -291,6 +293,7 @@ impl StagedExecutor {
         Ok(true)
     }
 
+    /// Dispatches queued pool runs whose collective and capacity constraints are satisfied.
     fn dispatch_ready(&mut self) -> anyhow::Result<()> {
         loop {
             let mut progressed = false;
@@ -347,6 +350,7 @@ impl StagedExecutor {
         }
     }
 
+    /// Advances staged command execution until no immediate progress remains.
     fn pump(&mut self) -> anyhow::Result<()> {
         self.dispatch_ready()?;
         for pool_index in 0..self.pools.len() {
@@ -364,6 +368,7 @@ impl StagedExecutor {
         self.dispatch_ready()
     }
 
+    /// Routes a pool result into its staged aggregate and publishes transferable products.
     fn route_result(&mut self, pool_index: usize, report: RunResult) -> anyhow::Result<()> {
         report.validate()?;
         let mut report = report;
@@ -452,6 +457,7 @@ impl StagedExecutor {
         Ok(())
     }
 
+    /// Finalizes a staged run once every required pool has returned its contribution.
     fn try_complete(&mut self, run_id: u64) -> anyhow::Result<bool> {
         let complete = self
             .pending
@@ -474,6 +480,7 @@ impl StagedExecutor {
         Ok(true)
     }
 
+    /// Forgets the request.
     fn forget_request(&mut self, request_id: RequestId) {
         self.admissions
             .retain(|request_key, _| request_key.request_id != request_id);
@@ -489,6 +496,7 @@ impl StagedExecutor {
         });
     }
 
+    /// Returns the command-channel waker.
     pub(crate) fn command_waker(&self) -> CommandWaker {
         let wakes = self.command_wakers.clone();
         CommandWaker::new(move || {
@@ -500,10 +508,12 @@ impl StagedExecutor {
 }
 
 impl Executor for StagedExecutor {
+    /// Returns the worker metadata.
     fn info(&self) -> &ExecutorInfo {
         &self.executor_info
     }
 
+    /// Partitions a logical batch across owning pools and registers aggregate completion state.
     fn submit(&mut self, batch: Batch) -> Result<(), ExecutorSubmitError> {
         self.pump().map_err(ExecutorSubmitError::Failed)?;
         if self.pending.len() >= self.depth {
@@ -788,6 +798,7 @@ impl Executor for StagedExecutor {
         submit_result.map_err(ExecutorSubmitError::Failed)
     }
 
+    /// Drives pool progress and returns the next completed logical batch.
     fn poll(&mut self, timeout: Duration) -> anyhow::Result<Option<BatchResult>> {
         if std::mem::take(&mut self.command_wake_pending) {
             return Ok(None);
@@ -830,6 +841,7 @@ impl Executor for StagedExecutor {
             .transpose()
     }
 
+    /// Closes the component and releases its resources.
     fn close(&mut self) -> anyhow::Result<()> {
         let mut first_error = None;
         for pool in &mut self.pools {

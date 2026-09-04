@@ -1,16 +1,21 @@
-//! OpenAI-compatible request validation and conversion.
+//! OpenAI-compatible schemas, validation, lowering, and response helpers.
 //!
-//! This crate owns schema-only validation, OpenAI-to-UniServe lowering, and
-//! OpenAI response helper conversion. HTTP routes supply state and map
-//! [`ApiError`] into transport responses.
+//! HTTP routes provide deployment state and convert [`ApiError`] values into
+//! transport responses; this module remains independent of routing.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+/// Chat-completion request lowering and response assembly.
 pub mod chat_completions;
+/// OpenAI-compatible API errors.
 pub mod error;
+/// Image-generation request and response schemas.
 pub mod images;
+/// Token log-probability response values.
 pub mod logprobs;
 mod types;
+/// Shared request conversion helpers.
 pub mod utils;
+/// Video-generation request and response schemas.
 pub mod videos;
 
 pub use error::{ApiError, Result, serve_error_to_api};

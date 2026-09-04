@@ -11,6 +11,7 @@ One worker may bind two devices through a :class:`LocalP2PTransport` over its
 The degenerate case (tp_size==1, no tower) returns a trivial single-device mesh
 that is byte-identical to a single-rank worker.
 """
+
 from __future__ import annotations
 
 import logging
@@ -90,6 +91,8 @@ def build_device_mesh(
 
 
 def _resolve_local_device(device: str, tp_rank: int, tp_size: int) -> torch.device:
+    """Resolve a process-local device, assigning CUDA ranks when the index is omitted."""
+
     dev = torch.device(device)
     if dev.type == "cuda" and tp_size > 1:
         _set_cuda_device(dev, tp_rank)
@@ -108,6 +111,8 @@ def _build_tp_axis(
     backend_override: str | None = None,
     init_method_override: str | None = None,
 ) -> MeshAxis:
+    """Initialize the tensor-parallel process group and bind its local device mesh."""
+
     if not torch.distributed.is_available():
         raise distributed_setup_error("torch.distributed is required for tp_size > 1")
     backend = _distributed_backend(device, backend_override=backend_override)
@@ -157,6 +162,8 @@ def _build_tp_axis(
 
 
 def _build_tower_axis(tower_devices: Sequence[str] | None, tower_primary: int) -> MeshAxis | None:
+    """Build the optional tower-placement axis and validate its primary coordinate."""
+
     if tower_devices is None:
         return None
     devices = tuple(torch.device(d) for d in tower_devices)
@@ -174,6 +181,8 @@ def _build_tower_axis(tower_devices: Sequence[str] | None, tower_primary: int) -
 
 
 def _set_cuda_device(device: torch.device, tp_rank: int) -> None:
+    """Select the process CUDA device and report setup failures with rank context."""
+
     if not torch.cuda.is_available():
         raise distributed_setup_error("tp_size > 1 on cuda requires torch.cuda.is_available()")
     index = device.index if device.index is not None else int(tp_rank)
@@ -182,6 +191,8 @@ def _set_cuda_device(device: torch.device, tp_rank: int) -> None:
 
 
 def _validate_cuda_device_index(device: torch.device) -> None:
+    """Validate an explicit CUDA index against visible device capacity."""
+
     if device.type != "cuda" or device.index is None:
         return
     if not torch.cuda.is_available():
@@ -192,6 +203,8 @@ def _validate_cuda_device_index(device: torch.device) -> None:
 
 
 def _distributed_backend(device: torch.device, *, backend_override: str | None = None) -> str:
+    """Select the process-group backend compatible with the local device."""
+
     override = (backend_override or "").strip()
     if override:
         return override
@@ -199,6 +212,8 @@ def _distributed_backend(device: torch.device, *, backend_override: str | None =
 
 
 def _init_method(init_method_override: str | None = None) -> str:
+    """Resolve an explicit or environment-derived distributed rendezvous method."""
+
     value = (init_method_override or "").strip()
     if value:
         return value

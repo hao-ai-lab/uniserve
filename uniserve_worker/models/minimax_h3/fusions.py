@@ -1,4 +1,10 @@
-"""H3 inference operations with checkpoint-defined BF16 boundaries."""
+"""Implements H3 transformer fusions with checkpoint-defined BF16 boundaries.
+
+The operations combine row-indexed modulation, residual gates, normalization,
+partial rotary embedding, and value-first SwiGLU. Fixed-width Triton paths make
+the rounding order explicit; FP8 variants publish the scale required to recover
+each quantized output row.
+"""
 
 from __future__ import annotations
 
@@ -28,6 +34,8 @@ _SCALE_EPS_TL = tl.constexpr(1.0e-12)
 
 @triton.jit
 def _round_to_bf16(value):
+    """Round FP32 values through BF16 with explicit nearest-even PTX semantics."""
+
     return tl.inline_asm_elementwise(
         asm="""{
         .reg .b16 rounded;
@@ -44,6 +52,8 @@ def _round_to_bf16(value):
 
 @triton.jit
 def _divide_rn(dividend, divisor):
+    """Divide FP32 operands with explicit nearest-even PTX semantics."""
+
     return tl.inline_asm_elementwise(
         asm="div.rn.f32 $0, $1, $2;",
         constraints="=f,f,f",
@@ -56,6 +66,8 @@ def _divide_rn(dividend, divisor):
 
 @triton.jit
 def _multiply_rn(left, right):
+    """Multiply FP32 operands with explicit nearest-even PTX semantics."""
+
     return tl.inline_asm_elementwise(
         asm="mul.rn.f32 $0, $1, $2;",
         constraints="=f,f,f",
@@ -80,11 +92,15 @@ def _row_normalized_modulation_kernel(
     elements,
     BLOCK: tl.constexpr,
 ):
+    """Fuse RMS scaling with row-selected affine modulation at BF16 boundaries."""
+
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < elements
     row = offsets // _HIDDEN_SIZE_TL
     column = offsets - row * _HIDDEN_SIZE_TL
     modulation_row = tl.load(row_indices_ptr + row, mask=mask, other=0)
+
+    # Rounding after weight and scale multiplication matches checkpoint inference.
     value = tl.load(
         value_ptr + offsets,
         mask=mask,
@@ -121,6 +137,8 @@ def _gated_residual_kernel(
     elements,
     BLOCK: tl.constexpr,
 ):
+    """Add a row-selected gated update using checkpoint BF16 rounding points."""
+
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < elements
     row = offsets // _HIDDEN_SIZE_TL
@@ -152,6 +170,8 @@ def _row_normalized_modulation_fp8_kernel(
     scale_row_stride,
     BLOCK: tl.constexpr,
 ):
+    """Modulate one hidden row and emit tensorwise-scaled E4M3 values."""
+
     row = tl.program_id(0)
     columns = tl.arange(0, BLOCK)
     mask = columns < _HIDDEN_SIZE_TL
@@ -178,6 +198,8 @@ def _row_normalized_modulation_fp8_kernel(
     scale = _round_to_bf16(1.0 + scale)
     modulated = _round_to_bf16(normalized * scale)
     output = (modulated + shift).to(tl.bfloat16)
+
+    # Each row carries the reciprocal dequantization scale consumed by FP8 GEMM.
     output_fp32 = tl.where(mask, output.to(tl.float32), 0.0)
     output_scale = tl.maximum(tl.max(tl.abs(output_fp32), axis=0), _SCALE_EPS_TL)
     output_scale /= _FP8_MAX_TL
@@ -191,6 +213,8 @@ def _row_normalized_modulation_fp8_kernel(
 
 @triton.jit
 def _value_first_swiglu_kernel(value_gate_ptr, output_ptr, elements, BLOCK: tl.constexpr):
+    """Evaluate fixed-width SwiGLU from a packed value-then-gate projection."""
+
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < elements
     row = offsets // _FFN_SIZE_TL
@@ -217,6 +241,8 @@ def _value_first_swiglu_fp8_kernel(
     output_scale_ptr,
     BLOCK: tl.constexpr,
 ):
+    """Evaluate one packed SwiGLU row and quantize it with a rowwise scale."""
+
     row = tl.program_id(0)
     columns = tl.arange(0, BLOCK)
     mask = columns < _FFN_SIZE_TL
@@ -244,6 +270,8 @@ def _value_first_swiglu_fp8_kernel(
 
 
 def _rmsnorm(value: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """Apply RMS normalization in FP32 and restore the operand dtype."""
+
     normalized = value.float() * torch.rsqrt(value.float().pow(2).mean(-1, keepdim=True) + eps)
     return (normalized * weight.float()).to(value.dtype)
 
@@ -257,6 +285,8 @@ def row_modulated_rmsnorm(
     *,
     eps: float,
 ) -> torch.Tensor:
+    """RMS-normalize hidden rows and apply row-indexed shift and scale vectors."""
+
     if value.is_cuda and value.dtype == torch.bfloat16 and value.shape[-1] == _HIDDEN_SIZE:
         inverse_rms = torch.rsqrt(value.float().pow(2).mean(-1, keepdim=True) + eps)
         output = torch.empty_like(value)
@@ -276,6 +306,7 @@ def row_modulated_rmsnorm(
             num_warps=4,
         )
         return output
+
     normalized = _rmsnorm(value, weight, eps)
     return normalized * (1.0 + scale.index_select(0, row_indices)) + shift.index_select(
         0, row_indices
@@ -288,6 +319,12 @@ def gated_residual(
     gate: torch.Tensor,
     row_indices: torch.Tensor,
 ) -> torch.Tensor:
+    """Add row-indexed gated updates to the residual stream.
+
+    The fixed-width CUDA path reuses ``update`` as its output buffer; callers must
+    treat that input as consumed after the call.
+    """
+
     if hidden.is_cuda and hidden.dtype == torch.bfloat16 and hidden.shape[-1] == _HIDDEN_SIZE:
         elements = hidden.numel()
         _gated_residual_kernel[(triton.cdiv(elements, 1024),)](
@@ -302,6 +339,7 @@ def gated_residual(
             num_warps=4,
         )
         return update
+
     return hidden + gate.index_select(0, row_indices) * update
 
 
@@ -316,6 +354,8 @@ def attention_residual_modulated_rmsnorm(
     *,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the gated attention residual and its row-modulated normalization."""
+
     residual = gated_residual(hidden, attention, attention_gate, row_indices)
     normalized = row_modulated_rmsnorm(
         residual,
@@ -339,6 +379,8 @@ def attention_residual_modulated_rmsnorm_fp8(
     *,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Produce a gated residual plus row-scaled FP8 modulated normalization."""
+
     residual = gated_residual(hidden, attention, attention_gate, row_indices)
     inverse_rms = torch.rsqrt(residual.float().pow(2).mean(-1, keepdim=True) + eps)
     rows = residual.numel() // _HIDDEN_SIZE
@@ -366,6 +408,8 @@ def apply_partial_rope(
     cosine: torch.Tensor,
     sine: torch.Tensor,
 ) -> torch.Tensor:
+    """Apply split-half rotary embedding to the leading coordinates of each head."""
+
     rotary = cosine.shape[-1]
     head = value[..., :rotary]
     tail = value[..., rotary:]
@@ -384,12 +428,16 @@ def qk_rmsnorm_rope(
     *,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """RMS-normalize query and key heads before applying partial rotary embedding."""
+
     query = _rmsnorm(query, query_weight, eps)
     key = _rmsnorm(key, key_weight, eps)
     return apply_partial_rope(query, cosine, sine), apply_partial_rope(key, cosine, sine)
 
 
 def value_first_swiglu(value_gate: torch.Tensor) -> torch.Tensor:
+    """Apply SwiGLU to a projection packed in value-then-gate order."""
+
     if (
         value_gate.is_cuda
         and value_gate.dtype == torch.bfloat16
@@ -409,15 +457,19 @@ def value_first_swiglu(value_gate: torch.Tensor) -> torch.Tensor:
             num_warps=4,
         )
         return output
+
     value, gate = value_gate.chunk(2, dim=-1)
     return value * F.silu(gate.float()).to(gate.dtype)
 
 
 def value_first_swiglu_fp8(value_gate: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return fixed-width SwiGLU output in E4M3 form with one scale per row."""
+
     if not value_gate.is_cuda or value_gate.dtype != torch.bfloat16:
         raise RuntimeError("fused SwiGLU FP8 execution requires bfloat16 CUDA input")
     if value_gate.shape[-1] != 2 * _FFN_SIZE:
         raise ValueError(f"fused SwiGLU FP8 width must be {2 * _FFN_SIZE}")
+
     rows = value_gate.numel() // (2 * _FFN_SIZE)
     output = torch.empty(
         (*value_gate.shape[:-1], _FFN_SIZE),

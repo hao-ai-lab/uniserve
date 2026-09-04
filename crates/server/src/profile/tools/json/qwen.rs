@@ -1,3 +1,5 @@
+//! Qwen XML marker configuration for the JSON tool-call parser.
+
 use super::{JsonToolCallConfig, JsonToolCallParser};
 use crate::profile::tools::{Result, Tool, ToolParserOutput};
 
@@ -30,30 +32,35 @@ pub struct Qwen3XmlToolParser {
 }
 
 impl Qwen3XmlToolParser {
-    /// Create a Qwen XML tool parser.
+    /// Creates a Qwen XML tool parser.
     pub fn new(_tools: &[Tool]) -> Self {
         Self {
             inner: JsonToolCallParser::new(QWEN_XML_CONFIG),
         }
     }
 
+    /// Returns whether decoding must preserve tool-call markers.
     pub const fn preserve_special_tokens(&self) -> bool {
         false
     }
 
+    /// Parses one text chunk into an existing output accumulator.
     pub fn parse_into(&mut self, chunk: &str, output: &mut ToolParserOutput) -> Result<()> {
         self.inner.parse_into(chunk, output)
     }
 
+    /// Flushes buffered parser state at end of generation.
     pub fn finish(&mut self) -> Result<ToolParserOutput> {
         self.inner.finish()
     }
 
+    /// Resets parser state and returns any buffered normal text.
     pub fn reset(&mut self) -> String {
         self.inner.reset()
     }
 
     #[cfg(any(test, feature = "test-util"))]
+    /// Parses one incremental text chunk.
     pub fn parse_chunk(&mut self, chunk: &str) -> Result<ToolParserOutput> {
         let mut output = ToolParserOutput::default();
         self.parse_into(chunk, &mut output)?;
@@ -61,6 +68,7 @@ impl Qwen3XmlToolParser {
     }
 
     #[cfg(any(test, feature = "test-util"))]
+    /// Parses a complete assistant response and flushes all state.
     pub fn parse_complete(&mut self, text: &str) -> Result<ToolParserOutput> {
         let mut output = self.parse_chunk(text)?;
         output.append(self.finish()?);

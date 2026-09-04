@@ -1,16 +1,7 @@
-//! Hugging Face chat-template rendering behavior.
+//! Public Hugging Face chat-template rendering behavior.
 //!
-//! These integration tests drive the public [`HfChatRenderer`] API against the
-//! committed offline chat-template fixtures under `tests/templates`.
-//! They cover three observable renderer behaviors:
-//!
-//! 1. The String-vs-OpenAI content-format detector (used by `HfChatRenderer`
-//!    with `Auto`) classifies real committed templates correctly, observed
-//!    through the rendered output rather than the private AST detector.
-//! 2. Re-rendering identical multi-turn chat is deterministic and preserves
-//!    assistant completion text byte-for-byte.
-//! 3. Tool-call argument key order and JSON number precision survive each
-//!    configured argument formatting.
+//! The integration cases cover content-shape detection, deterministic
+//! continuation rendering, and lossless tool-argument formatting.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -44,20 +35,7 @@ fn base_request(messages: Vec<ChatMessage>) -> ChatRequest {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Behavior 1: content-format detector over real committed templates.
-//
-// The private AST detector is exercised through `Auto` + the observable
-// rendering difference: a String-format template flattens multi-part content
-// into one concatenated string, while an OpenAI-format template iterates the
-// content list (so a probe template seeing the list emits one marker per part).
-// ---------------------------------------------------------------------------
-
-/// Minimal probe whose output distinguishes how the detector treated content:
-/// it both flattens (`{{ content }}`) and, when content is a list, iterates it.
-/// Under `String` the content is a plain string so the for-loop iterates the
-/// characters' container as a string and the `is string` test is true; we use a
-/// dedicated probe that branches on `is string` to read the detected format.
+/// Probe template that renders a marker for the detected content shape.
 const DETECT_PROBE: &str = "{%- for message in messages -%}\
 {%- if message.content is string -%}STR:{{ message.content }}\
 {%- else -%}LIST{%- for part in message.content -%}:{{ part.text }}{%- endfor -%}\
@@ -134,11 +112,6 @@ fn detector_probe_reports_list_for_openai_format() {
     assert_eq!(rendered, "LIST:a:b");
 }
 
-// ---------------------------------------------------------------------------
-// Behavior 2: re-rendering identical history is deterministic and reproduces
-// the prior assistant completion text byte-for-byte.
-// ---------------------------------------------------------------------------
-
 fn qwen_history() -> ChatRequest {
     base_request(vec![
         ChatMessage::text(ChatRole::User, "What is the capital of France?"),
@@ -182,15 +155,6 @@ fn qwen3_preserves_prior_assistant_completion_text_byte_identically() {
         "assistant completion text should round-trip byte-for-byte, got:\n{rendered}"
     );
 }
-
-// ---------------------------------------------------------------------------
-// Behavior 3: tool-call argument key order and number precision survive each
-// configured JSON formatting.
-//
-// `serde_json` is built with `preserve_order`, so object key insertion order is
-// preserved end-to-end; floats with a trailing fractional zero normalize to a
-// single `.0` and integers stay integers.
-// ---------------------------------------------------------------------------
 
 /// Deliberately non-alphabetical key order plus mixed numeric spellings.
 const MIXED_ARGS: &str = r#"{"zulu":2,"alpha":1.00,"mike":"hi","delta":[3,4]}"#;

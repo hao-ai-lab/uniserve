@@ -1,8 +1,9 @@
-use super::*;
+//! Assembly of engine events into public serving events.
+//!
+//! The assembler applies model-selected output processing, tracks usage, and
+//! emits exactly one terminal result for each accepted request.
 
-// ==========================================================================
-// Single engine -> ServeEvent stream assembler.
-// ==========================================================================
+use super::*;
 
 /// Runtime output sink built from the model-supplied [`OutputProcessorPolicy`].
 enum OutputSink {
@@ -12,6 +13,7 @@ enum OutputSink {
     SenseNova(SenseNovaOutputProcessor),
 }
 
+/// Constructs the model-selected semantic output processor for one request.
 fn build_output_sink(
     request_id: &ServeRequestId,
     policy: OutputProcessorPolicy,
@@ -63,9 +65,12 @@ struct TerminalAccounting {
     image_steps: u32,
 }
 
+/// Maps one structured chat event into the transport-neutral serving event model.
 fn map_chat_event(event: ChatEvent) -> MappedChatEvent {
     match event {
+        // Start metadata is consumed by the assembly loop before mapping.
         ChatEvent::Start { .. } => MappedChatEvent::Ignore,
+        // Assistant content blocks preserve their processor-assigned indices.
         ChatEvent::BlockStart { index, kind } => {
             MappedChatEvent::Event(ServeEvent::OutputBlockStart {
                 candidate_id: CandidateId::PRIMARY,
@@ -86,6 +91,8 @@ fn map_chat_event(event: ChatEvent) -> MappedChatEvent {
             }),
             AssistantBlockKind::ToolCall => MappedChatEvent::Ignore,
         },
+        // Logprobs travel independently from decoded text so either surface can
+        // be suppressed without altering token accounting.
         ChatEvent::LogprobsDelta {
             token_ids,
             logprobs,
@@ -102,6 +109,8 @@ fn map_chat_event(event: ChatEvent) -> MappedChatEvent {
                 block,
             })
         }
+        // Tool calls use explicit start, argument, and terminal events so
+        // streaming consumers can assemble structured calls incrementally.
         ChatEvent::ToolCallStart { index, id, name } => {
             MappedChatEvent::Event(ServeEvent::ToolCallStart {
                 candidate_id: CandidateId::PRIMARY,
@@ -124,6 +133,7 @@ fn map_chat_event(event: ChatEvent) -> MappedChatEvent {
             name: call.name,
             arguments: call.arguments,
         }),
+        // Terminal processor accounting becomes the common serving terminal.
         ChatEvent::Done {
             prompt_token_count,
             output_token_count,
@@ -141,6 +151,7 @@ fn map_chat_event(event: ChatEvent) -> MappedChatEvent {
     }
 }
 
+/// Applies text filtering and emits visible, reasoning, and terminal updates in order.
 async fn emit_text_update(
     context: &EmitContext<'_>,
     sink: &mut OutputSink,
@@ -194,6 +205,7 @@ async fn emit_text_update(
     }))
 }
 
+/// Emits final usage followed by exactly one terminal serving event.
 async fn emit_terminal(
     context: &EmitContext<'_>,
     accounting: TerminalAccounting,
@@ -254,6 +266,7 @@ async fn emit_terminal(
 }
 
 #[try_stream]
+/// Applies chat output processing and assembles public serving events.
 pub(super) async fn assemble_chat_event_stream(
     assembly: StreamInput,
     processor: Qwen3ChatOutputProcessor,
@@ -270,6 +283,9 @@ pub(super) async fn assemble_chat_event_stream(
         decode_options,
         stream,
     } = assembly;
+
+    // Decode raw engine events first, then apply the model-selected structured
+    // chat processor before exposing any public event.
     let started = Instant::now();
     let emit_context = EmitContext {
         request_id: &request_id,
@@ -294,6 +310,8 @@ pub(super) async fn assemble_chat_event_stream(
         })?;
     futures::pin_mut!(output);
 
+    // A start event establishes prompt metadata and must precede every output
+    // block, token delta, tool call, and terminal result.
     let mut accepted = false;
     let mut queue_us = None;
     let mut first_visible_output_us = None;
@@ -347,6 +365,7 @@ pub(super) async fn assemble_chat_event_stream(
             }
             event => event,
         };
+
         if !accepted {
             return Err(ServeError::OutputProcessing {
                 request_id: request_id.clone(),
@@ -355,11 +374,15 @@ pub(super) async fn assemble_chat_event_stream(
                 ),
             });
         }
+
+        // Token identifiers are removed at the final public boundary while the
+        // processor retains their internal accounting.
         if let ChatEvent::LogprobsDelta { token_ids, .. } = &mut event
             && !emit_token_ids
         {
             token_ids.clear();
         }
+
         match map_chat_event(event) {
             MappedChatEvent::Ignore => {}
             MappedChatEvent::Event(event) => {
@@ -373,6 +396,8 @@ pub(super) async fn assemble_chat_event_stream(
                 y.yield_ok(event).await;
             }
             MappedChatEvent::Done(done) => {
+                // The first processor terminal owns final metrics and is the
+                // only successful exit from the assembled stream.
                 let finish_detail =
                     generation_finish_detail(done.finish_reason.reason()).to_string();
                 emit_terminal(
@@ -426,6 +451,7 @@ struct RawTokenEmitContext<'a, 'tokenizer> {
 }
 
 impl RawAssemblerState {
+    /// Emits acceptance metadata and any scheduling event that arrived before it.
     async fn emit_accepted(
         &mut self,
         request_id: &ServeRequestId,
@@ -457,12 +483,14 @@ impl RawAssemblerState {
         }
     }
 
+    /// Flushes the pending images.
     async fn flush_pending_images(&mut self, y: &mut TryYielder<ServeEvent, ServeError>) {
         for event in self.pending_image_events.drain(..) {
             y.yield_ok(event).await;
         }
     }
 
+    /// Ensures the output ready.
     fn ensure_output_ready(
         &self,
         request_id: &ServeRequestId,
@@ -478,14 +506,18 @@ impl RawAssemblerState {
         }
     }
 
+    /// Decodes one committed token while enforcing stop strings and output ordering.
     async fn consume_token(
         &mut self,
         id: u32,
         logprobs: Option<DecodedLogprobs>,
         context: &mut RawTokenEmitContext<'_, '_>,
     ) -> Result<bool> {
+        // Image events generated before this text token remain ordered ahead of
+        // the token at the public serving boundary.
         self.flush_pending_images(context.y).await;
         self.emitted_output_tokens = self.emitted_output_tokens.saturating_add(1);
+
         let new_bytes =
             context
                 .decoder
@@ -494,6 +526,9 @@ impl RawAssemblerState {
                     request_id: context.emit.request_id.clone(),
                     source: OutputProcessingError::Tokenizer(error),
                 })?;
+
+        // Stop matching begins only after the minimum output length and checks
+        // the newly decoded suffix, including cross-token boundaries.
         let matched_stop = if self.emitted_output_tokens > context.decode_options.min_tokens {
             context
                 .decode_options
@@ -509,6 +544,9 @@ impl RawAssemblerState {
         } else {
             None
         };
+
+        // A matched stop flushes held-back decoder bytes at the exact requested
+        // inclusion boundary; ordinary tokens emit only the next safe chunk.
         let (text, stop_string) = if let Some((index, offset)) = matched_stop {
             let stop_string = context
                 .decode_options
@@ -536,6 +574,7 @@ impl RawAssemblerState {
         } else {
             (context.decoder.next_chunk().unwrap_or_default(), None)
         };
+
         let finished = stop_string
             .as_ref()
             .map(|stop_string| crate::serving::text::Finished {
@@ -547,6 +586,9 @@ impl RawAssemblerState {
                     Some(StopReason::Text(stop_string.clone())),
                 ),
             });
+
+        // Acknowledgement advances the engine's safe public prefix. A matched
+        // stop instead closes generation at the consumed token boundary.
         if stop_string.is_none() {
             context.stream.acknowledge_consumed_prefix();
         } else {
@@ -554,11 +596,13 @@ impl RawAssemblerState {
                 .stream
                 .cancel_at_consumed_prefix(StreamCancelCause::StopStringMatched);
         }
+
         let emitted_ids = if context.emit_token_ids {
             vec![id]
         } else {
             Vec::new()
         };
+
         let done = emit_text_update(
             context.emit,
             &mut self.sink,
@@ -570,9 +614,12 @@ impl RawAssemblerState {
             context.y,
         )
         .await?;
+
         if stop_string.is_none() {
             return Ok(false);
         }
+
+        // Stop matching must synchronously produce the terminal accounting event.
         let done = done.ok_or_else(|| {
             malformed_output(
                 context.emit.request_id.clone(),
@@ -597,6 +644,10 @@ impl RawAssemblerState {
 }
 
 #[try_stream]
+/// Assembles model output according to the request's output policy.
+///
+/// Engine protocol events are validated and correlated before becoming public;
+/// malformed ordering terminates the stream with an output-processing error.
 pub(super) async fn assemble_event_stream(
     assembly: StreamInput,
     output_processor: OutputProcessorPolicy,
@@ -613,14 +664,17 @@ pub(super) async fn assemble_event_stream(
         mut decode_options,
         mut stream,
     } = assembly;
+
     let started = Instant::now();
     let emit_context = EmitContext {
         request_id: &request_id,
         event: &event_context,
         started: &started,
     };
+
     let expected_prompt_positions = prompt_token_ids.len().saturating_sub(1);
     let sink = build_output_sink(&request_id, output_processor, &tokenizer, &prompt_token_ids)?;
+
     let mut state = RawAssemblerState {
         first_visible_output_us: None,
         queue_us: None,
@@ -634,11 +688,14 @@ pub(super) async fn assemble_event_stream(
         pending_image_events: Vec::new(),
         sink,
     };
+
     let mut decoder = tokenizer.create_decode_stream(
         &prompt_token_ids,
         decode_options.skip_special_tokens,
         stop_string_holdback_bytes(&decode_options),
     );
+
+    // Acceptance waits for prompt scores when the public response promises them.
     if !prompt_logprobs_requested || expected_prompt_positions == 0 {
         let prompt_logprobs = if prompt_logprobs_requested {
             let first_token_id = prompt_token_ids.first().copied().ok_or_else(|| {
@@ -671,6 +728,7 @@ pub(super) async fn assemble_event_stream(
             )
             .await;
     }
+
     while let Some(event) = stream.next().await {
         match event {
             Event::Scheduled {
@@ -690,6 +748,7 @@ pub(super) async fn assemble_event_stream(
                 } else {
                     state.pending_scheduled = Some((queued_at, scheduled_at));
                 }
+
                 event_context
                     .metrics
                     .scheduled
@@ -703,6 +762,7 @@ pub(super) async fn assemble_event_stream(
                         "engine returned more prompt logprob positions than requested",
                     ));
                 }
+
                 if !state.accepted && state.prompt_positions.len() == expected_prompt_positions {
                     let positions = std::mem::take(&mut state.prompt_positions);
                     let decoded = crate::serving::text::output::decode_prompt_logprobs(
@@ -740,6 +800,9 @@ pub(super) async fn assemble_event_stream(
                         "engine emitted a new token before resolving prior logprobs",
                     ));
                 }
+
+                // Generated token scores arrive as a separate event and must be
+                // paired before the token enters incremental decoding.
                 if generated_logprobs_requested {
                     state.pending_token = Some(id);
                 } else {
@@ -781,6 +844,7 @@ pub(super) async fn assemble_event_stream(
                     request_id: request_id.clone(),
                     source: OutputProcessingError::Text(error),
                 })?;
+
                 let mut context = RawTokenEmitContext {
                     emit: &emit_context,
                     prompt_token_ids: &prompt_token_ids,
@@ -830,6 +894,9 @@ pub(super) async fn assemble_event_stream(
             }
             Event::ImageCommit { image_id } => {
                 state.ensure_output_ready(&request_id, "image-commit event")?;
+
+                // Commit and payload publication remain adjacent even when text
+                // decoding interleaves with the engine's image lifecycle.
                 state.pending_image_events.push(ServeEvent::ImageCommit {
                     candidate_id: CandidateId::PRIMARY,
                     image_id: image_id.to_string(),
@@ -846,6 +913,7 @@ pub(super) async fn assemble_event_stream(
             } => {
                 state.ensure_output_ready(&request_id, "image-done event")?;
                 state.image_count = state.image_count.saturating_add(1);
+
                 state.pending_image_events.push(ServeEvent::ImageDone {
                     candidate_id: CandidateId::PRIMARY,
                     image_id: image_id.to_string(),
@@ -866,6 +934,8 @@ pub(super) async fn assemble_event_stream(
             } => {
                 state.ensure_output_ready(&request_id, "terminal event")?;
                 state.flush_pending_images(&mut y).await;
+
+                // Flush decoder holdback before constructing terminal usage.
                 let (last_chunk, _) =
                     decoder
                         .flush(None)
@@ -881,6 +951,7 @@ pub(super) async fn assemble_event_stream(
                         .saturating_sub(state.emitted_output_tokens as usize),
                     finish_reason: generation_text_finish_reason(reason, stop_reason),
                 };
+
                 let done = emit_text_update(
                     &emit_context,
                     &mut state.sink,
@@ -898,6 +969,7 @@ pub(super) async fn assemble_event_stream(
                         "output processor omitted the engine terminal event",
                     )
                 })?;
+
                 state.image_count = state.image_count.max(images.min(u32::MAX as usize) as u32);
                 emit_terminal(
                     &emit_context,
@@ -941,6 +1013,7 @@ pub(super) async fn assemble_event_stream(
         }
     }
 
+    // A clean transport close without a protocol terminal is still malformed.
     state.flush_pending_images(&mut y).await;
     Err(malformed_output(
         request_id,
@@ -948,6 +1021,7 @@ pub(super) async fn assemble_event_stream(
     ))
 }
 
+/// Returns the text finish reason from a generation event.
 fn generation_text_finish_reason(
     reason: uniserve_core::FinishReason,
     stop_reason: Option<uniserve_core::StopReason>,
@@ -964,6 +1038,7 @@ fn generation_text_finish_reason(
     FinishReason::new(reason)
 }
 
+/// Returns structured finish details from a generation event.
 fn generation_finish_detail(reason: &uniserve_core::FinishReason) -> &'static str {
     match reason {
         uniserve_core::FinishReason::Completed => "completed",

@@ -1,4 +1,10 @@
-"""Fused request-indexed decode input staging."""
+"""Request-pool staging for fixed-capacity decode execution buffers.
+
+The Triton kernel gathers live request rows, expands their paged-cache tables,
+derives each token's cache write location, and initializes inactive capacity in
+one launch. This keeps graph-replayed decode inputs internally consistent while
+the scheduler changes the set of live request slots.
+"""
 
 from __future__ import annotations
 
@@ -43,7 +49,15 @@ if triton is not None:
         page_size: tl.constexpr,
         block: tl.constexpr,
     ):
+        """Gather block-table cells and per-row decode scalars by request slot."""
+
+        # The flattened launch covers both the two-dimensional block table and
+        # the one-dimensional scalar buffers. Each program handles whichever
+        # domains contain its offsets.
         offsets = tl.program_id(0) * block + tl.arange(0, block)
+
+        # Map active output rows through the request pool into the selected KV
+        # group. Stores span the full graph capacity, zeroing inactive rows.
         table_elements = max_rows * table_width
         table_mask = offsets < table_elements
         table_rows = offsets // table_width
@@ -68,6 +82,9 @@ if triton is not None:
             mask=table_mask,
         )
 
+        # Gather the next token and its sequence state for every live row. The
+        # masked load defaults also initialize unused scalar capacity to stable
+        # graph inputs during the same launch.
         scalar_mask = offsets < max_rows
         live_rows = scalar_mask & (offsets < rows)
         slots = tl.load(request_pool_indices + offsets, mask=live_rows, other=0)
@@ -86,6 +103,9 @@ if triton is not None:
             mask=live_rows,
             other=0,
         )
+
+        # The current cache length is the append position: its quotient selects
+        # a physical page and its remainder selects the offset within that page.
         page_slots = cache // page_size
         write_pages = tl.load(
             request_page_tables
@@ -103,6 +123,7 @@ if triton is not None:
         tl.store(query_lengths + offsets, 1, mask=scalar_mask)
         tl.store(decode_page_ids + offsets, write_pages, mask=scalar_mask)
         tl.store(decode_page_offsets + offsets, cache % page_size, mask=scalar_mask)
+
 
 def gather_request_decode_inputs(
     *,
@@ -123,6 +144,17 @@ def gather_request_decode_inputs(
     group_id: int,
     page_size: int,
 ) -> None:
+    """Gather live request state into fixed-capacity decode buffers in place.
+
+    ``request_pool_indices[:rows]`` identifies scheduler-owned request slots.
+    The function materializes their selected KV-group page tables, next-token
+    ids and positions, cache/query lengths, and physical append locations.
+    Output rows beyond ``rows`` are initialized for safe fixed-shape graph
+    replay. Every tensor must reside on the same CUDA device.
+    """
+
+    # A single-device contract lets the fused kernel dereference every input
+    # directly and prevents partially staged graph inputs.
     tensors = (
         request_pool_indices,
         request_page_tables,
@@ -143,12 +175,18 @@ def gather_request_decode_inputs(
         raise ValueError("request-indexed decode staging requires one CUDA device")
     if triton is None or not triton_available(device):
         raise RuntimeError("request-indexed decode staging requires Triton")
+
+    # ``request_pool_indices`` defines scalar output capacity; ``rows`` selects
+    # the live prefix populated from request-owned state.
     row_count = int(rows)
     max_rows = int(request_pool_indices.numel())
     if row_count < 1 or row_count > max_rows:
         raise ValueError("request-indexed decode row count exceeds staging capacity")
     if request_page_tables.ndim != 3 or block_tables.ndim != 2:
         raise ValueError("request-indexed decode page tables must be rank three and two")
+
+    # The graph's dense table may expose a narrower page horizon than the
+    # request pool, but it must hold every output row and the chosen KV group.
     width = int(block_tables.shape[1])
     if (
         int(block_tables.shape[0]) != max_rows
@@ -169,6 +207,9 @@ def gather_request_decode_inputs(
     )
     if any(int(value.numel()) < max_rows for value in scalar_outputs):
         raise ValueError("request-indexed decode scalar buffers are undersized")
+
+    # Size the grid for the larger flattened output domain so the one launch
+    # always covers both block-table cells and per-row scalars.
     block = 256
     _gather_request_decode_inputs_kernel[
         (triton.cdiv(max(max_rows, int(block_tables.numel())), block),)
@@ -188,4 +229,6 @@ def gather_request_decode_inputs(
         block=block,
         num_warps=4,
     )
+
+
 __all__ = ["gather_request_decode_inputs"]

@@ -1,4 +1,4 @@
-"""TOML configuration for explicit evaluator points."""
+"""Loads and validates evaluator servers, benchmark points, and suites."""
 
 from __future__ import annotations
 
@@ -51,6 +51,8 @@ _VIDEO_FIELDS = set(VideoConfig.__dataclass_fields__)
 
 @dataclass(frozen=True)
 class ServerProfile:
+    """Describes one benchmark server and its launch environment."""
+
     name: str
     command: tuple[str, ...]
     host: str
@@ -59,11 +61,15 @@ class ServerProfile:
 
     @property
     def base_url(self) -> str:
+        """Return the server's HTTP origin."""
+
         return f"http://{self.host}:{self.port}"
 
 
 @dataclass(frozen=True)
 class ServerLaunch:
+    """Contains a resolved server command and its process context."""
+
     command: tuple[str, ...]
     working_directory: Path
     environment: dict[str, str]
@@ -71,18 +77,24 @@ class ServerLaunch:
 
 @dataclass(frozen=True)
 class SuiteProfile:
+    """Names an ordered collection of benchmark points."""
+
     name: str
     points: tuple[str, ...]
 
 
 @dataclass(frozen=True)
 class EvaluationConfig:
+    """Contains the complete validated evaluator configuration."""
+
     artifact_root: Path
     servers: dict[str, ServerProfile]
     benchmarks: dict[str, BenchmarkPoint]
     suites: dict[str, SuiteProfile]
 
     def selected_points(self, selection: str) -> tuple[BenchmarkPoint, ...]:
+        """Resolve a benchmark or suite name to its ordered points."""
+
         if selection in self.benchmarks:
             return (self.benchmarks[selection],)
         suite = self.suites.get(selection)
@@ -93,6 +105,8 @@ class EvaluationConfig:
 
 
 def load_config(path: Path = DEFAULT_CONFIG) -> EvaluationConfig:
+    """Load and validate an evaluator TOML file."""
+
     with Path(path).open("rb") as handle:
         raw = tomllib.load(handle)
 
@@ -117,6 +131,8 @@ def load_config(path: Path = DEFAULT_CONFIG) -> EvaluationConfig:
 
 
 def expand_environment(value: Any) -> Any:
+    """Expand declared environment references recursively when values exist."""
+
     if isinstance(value, str):
         return _ENV_REF.sub(lambda match: os.environ.get(match.group(1), match.group(0)), value)
     if isinstance(value, list):
@@ -127,6 +143,8 @@ def expand_environment(value: Any) -> Any:
 
 
 def unresolved_environment(value: Any) -> tuple[str, ...]:
+    """Return sorted environment names that remain referenced in a value."""
+
     names: set[str] = set()
     if isinstance(value, str):
         names.update(_ENV_REF.findall(value))
@@ -140,12 +158,16 @@ def unresolved_environment(value: Any) -> tuple[str, ...]:
 
 
 def require_resolved(value: Any, *, context: str) -> None:
+    """Reject a value that still contains environment references."""
+
     names = unresolved_environment(value)
     if names:
         raise ValueError(f"{context} has unresolved environment variables: {', '.join(names)}")
 
 
 def server_launch(server: ServerProfile, executable: Path | None = None) -> ServerLaunch:
+    """Resolve a server profile into an executable launch description."""
+
     command = list(server.command)
     selected_executable = executable if executable is not None else Path(command[0])
     if not selected_executable.is_absolute():
@@ -167,6 +189,8 @@ def server_launch(server: ServerProfile, executable: Path | None = None) -> Serv
 
 
 def _resolve_command_path(command: list[str], option: str, base: Path) -> None:
+    """Make the path argument for a command option absolute in place."""
+
     try:
         value_index = command.index(option) + 1
     except ValueError:
@@ -179,6 +203,8 @@ def _resolve_command_path(command: list[str], option: str, base: Path) -> None:
 
 
 def _server_profile(name: str, raw: Any) -> ServerProfile:
+    """Validate and construct one server profile table."""
+
     value = expand_environment(_mapping(raw, f"servers.{name}"))
     _reject_unknown(value, {"command", "host", "port", "environment"}, f"servers.{name}")
     command = value.get("command")
@@ -207,6 +233,10 @@ def _benchmark_point(
     raw: Any,
     servers: dict[str, ServerProfile],
 ) -> BenchmarkPoint:
+    """Validate and construct one task-aware benchmark point."""
+
+    # Resolve the benchmark's named server, task, dataset adapter, and model
+    # before interpreting task-specific configuration tables.
     value = expand_environment(_mapping(raw, f"benchmarks.{name}"))
     _reject_unknown(value, _ROOT_FIELDS, f"benchmarks.{name}")
     server = value.get("server")
@@ -224,6 +254,8 @@ def _benchmark_point(
     if not isinstance(model, str) or not model:
         raise ValueError(f"benchmarks.{name}.model must be a non-empty string")
 
+    # Each nested parser owns its schema, while the task and dataset adapters
+    # enforce modality and source requirements that cross table boundaries.
     metrics = _metrics(value.get("metrics"), f"benchmarks.{name}")
     load = _load_config(value.get("load"), f"benchmarks.{name}.load")
     sampling = _sampling_config(value.get("sampling"), task, f"benchmarks.{name}.sampling")
@@ -242,6 +274,7 @@ def _benchmark_point(
     if revision is not None and not isinstance(revision, str):
         raise ValueError(f"benchmarks.{name}.dataset_revision must be a string")
 
+    # Construct only after every referenced component has accepted the point.
     task.check_image(image, f"benchmarks.{name}")
     return BenchmarkPoint(
         name=name,
@@ -263,6 +296,8 @@ def _benchmark_point(
 
 
 def _metrics(raw: Any, context: str) -> tuple[MetricDefinition, ...]:
+    """Parse protected metric paths and optimization directions."""
+
     table = _mapping(raw, f"{context}.metrics")
     metrics: list[MetricDefinition] = []
     for path, direction in table.items():
@@ -276,6 +311,8 @@ def _metrics(raw: Any, context: str) -> tuple[MetricDefinition, ...]:
 
 
 def _load_config(raw: Any, context: str) -> LoadConfig:
+    """Parse request arrival and concurrency settings."""
+
     if raw is None:
         return LoadConfig()
     value = _mapping(raw, context)
@@ -286,6 +323,8 @@ def _load_config(raw: Any, context: str) -> LoadConfig:
 
 
 def _sampling_config(raw: Any, task: type[BenchmarkTask], context: str) -> SamplingConfig:
+    """Parse sampling settings with task-specific streaming defaults."""
+
     value = dict(_mapping(raw, context)) if raw is not None else {}
     _reject_unknown(value, _SAMPLING_FIELDS, context)
     if "stream" not in value:
@@ -297,6 +336,8 @@ def _sampling_config(raw: Any, task: type[BenchmarkTask], context: str) -> Sampl
 
 
 def _image_config(raw: Any, task: type[BenchmarkTask], context: str) -> ImageConfig:
+    """Parse image-generation settings accepted by the selected task."""
+
     if raw is None:
         return ImageConfig()
     if not task.accepts_image:
@@ -312,6 +353,8 @@ def _image_config(raw: Any, task: type[BenchmarkTask], context: str) -> ImageCon
 
 
 def _video_config(raw: Any, context: str) -> VideoConfig:
+    """Parse synchronous video-generation settings."""
+
     if raw is None:
         return VideoConfig()
     value = _mapping(raw, context)
@@ -324,6 +367,8 @@ def _suite_profile(
     raw: Any,
     benchmarks: dict[str, BenchmarkPoint],
 ) -> SuiteProfile:
+    """Validate an ordered suite against the declared benchmark points."""
+
     value = _mapping(raw, f"suites.{name}")
     _reject_unknown(value, {"points"}, f"suites.{name}")
     points = value.get("points")
@@ -342,16 +387,22 @@ def _suite_profile(
 
 
 def _table(raw: dict[str, Any], key: str) -> dict[str, Any]:
+    """Return a named root table or an empty table when absent."""
+
     return _mapping(raw.get(key, {}), key)
 
 
 def _mapping(value: Any, context: str) -> dict[str, Any]:
+    """Return a defensive copy of a required TOML mapping."""
+
     if not isinstance(value, dict):
         raise ValueError(f"{context} must be a TOML table")
     return dict(value)
 
 
 def _reject_unknown(value: dict[str, Any], allowed: set[str], context: str) -> None:
+    """Reject keys outside a table's public configuration schema."""
+
     unknown = sorted(set(value) - allowed)
     if unknown:
         raise ValueError(f"{context} has unknown fields: {', '.join(unknown)}")

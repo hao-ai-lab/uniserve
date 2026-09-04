@@ -3,6 +3,7 @@
 Boolean flags use allowlist semantics: only ``{"1", "true", "yes", "on"}`` enable
 a flag; unrecognized values fall back to the caller-supplied ``default``.
 """
+
 from __future__ import annotations
 
 import os

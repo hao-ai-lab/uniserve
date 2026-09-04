@@ -101,6 +101,8 @@ class Worker:
 
     @classmethod
     def from_config(cls, config: WorkerProcessArgs) -> Worker:
+        """Build model, mesh, runtime stores, lanes, transport, and capacity from validated launch configuration."""
+
         from ..backends.attention import resolve_attention_selection
         from ..backends.triton import configure_triton_toolchain
         from ..bootstrap.model_loader import materialize_worker_model
@@ -163,6 +165,10 @@ class Worker:
         pipeline_depth: int,
         completion_payload_bytes: int,
     ) -> None:
+        """Assemble all bounded runtime stores and execution lanes for one model replica."""
+
+        # Freeze model identity, weight generation, and advertised capacity from
+        # the same deployment geometry before allocating runtime state.
         if not isinstance(model, ExecutionModel):
             raise unsupported_setup("worker model has no supported execution surface")
         if not isinstance(deployment, WorkerDeployment):
@@ -204,6 +210,9 @@ class Worker:
         )
         if int(pipeline_depth) <= 0:
             raise unsupported_setup("worker pipeline depth must be positive")
+
+        # The scheduler sees only routes supported by both its resolved plan and
+        # the concrete model, further capped by physical lane geometry.
         implemented_work = model.supported_work
         self._effective_work_variants = allowed_work_variants & implemented_work
         if not self._effective_work_variants:
@@ -245,6 +254,9 @@ class Worker:
         self.cache_pool = None
         self.req_to_token_pool = None
         max_blocks_per_row = 0
+
+        # KV pages and request-to-token tables share group geometry; bind them to
+        # the model only after attention compatibility has been established.
         if cache is not None:
             kv_cache = self._info.kv_cache
             if kv_cache is None:
@@ -294,6 +306,9 @@ class Worker:
                 staging_depth=int(pipeline_depth),
             )
             packed_model.bind_cache_pool(self.cache_pool, attention)
+
+        # Generic request rows own admission and lineage. Model-specific state,
+        # continuation vectors, and latent pages retain the same one-based slots.
         self.requests = RequestPool(int(self._info.request_slots))
         self.requests.attach_model_state(model.create_request_state())
         torch_dtype = getattr(
@@ -335,6 +350,9 @@ class Worker:
             and self.latent_pool.persistent_bytes != arena.latent_pool_bytes
         ):
             raise RuntimeError("latent pool allocation disagrees with its exact capacity plan")
+
+        # These bounded stores own all asynchronous products, copies, CPU tasks,
+        # and transfer lifetimes exposed by an in-flight pipeline.
         owner_devices = tuple(
             dict.fromkeys(
                 (
@@ -387,6 +405,9 @@ class Worker:
             int(self._info.max_batch_ops),
             int(self._info.request_slots),
         )
+
+        # Derive fixed staging and graph catalogs from the intersection of model,
+        # lane, cache, latent, and scheduler capacities.
         max_staged_rows = max_rows * (1 if flow is None else int(flow.max_cfg_branches))
         max_text_staged_tokens = int(self._info.max_batch_tokens)
         max_flow_staged_tokens = (
@@ -622,6 +643,8 @@ class Worker:
             stream: torch.cuda.Stream | None,
             expected_context: int | None,
         ) -> CudaGraphRunner:
+            """Construct a lane-scoped graph catalog within its row, token, and memory bounds."""
+
             if (
                 packed_model is None
                 or attention is None
@@ -631,6 +654,8 @@ class Worker:
                 raise RuntimeError("packed graph construction lost model-owned KV resources")
             domains = tuple(Domain) if lane is None else lane.domains
             owns_model_compute = str(device) == str(torch.device(deployment.device))
+
+            # Intersect global graph buckets with this physical lane's advertised capacity.
             lane_max_operations = (
                 max_rows if lane is None else int(lane.max_batch_operations or max_rows)
             )
@@ -682,6 +707,8 @@ class Worker:
                 if owns_model_compute and Domain.FLOW in domains
                 else ()
             )
+            # The expected count reserves catalog metadata and provides a precise
+            # post-warmup completeness bound for this lane.
             expected_resident_executables = 0
             if execution.cuda_graph:
                 if RunKind.AR_DECODE in self._effective_work_variants:
@@ -769,6 +796,9 @@ class Worker:
             else None
         )
         self.runner = runner
+
+        # ExecutionResources is the sole façade passed to operation handlers;
+        # every referenced store above remains worker-owned until close.
         self.media_mux, self.media_output_ring = model.create_media_runtime(
             self._info.max_unresolved_ops
         )
@@ -815,9 +845,13 @@ class Worker:
 
     @property
     def info(self) -> WorkerInfo:
+        """Expose immutable placement, capacity, and model metadata advertised to the scheduler."""
+
         return self._info
 
     def _decode_context_blocks(self) -> int:
+        """Return the maximum paged-decode context blocks supported by this worker."""
+
         model = self.model
         if not model.resource_geometry.kv:
             return 0
@@ -832,6 +866,8 @@ class Worker:
         return min(blocks, max(0, int(pool.num_pages) - 1))
 
     def execute(self, batch: Run) -> RunResult:
+        """Plan and synchronously resolve one physical run under model-call exclusion."""
+
         with self._model_call():
             batch = self.plan_run(batch)
             report = execute_batch(self.execution, batch)
@@ -848,6 +884,8 @@ class Worker:
         return kind in self._effective_work_variants
 
     def prepare_execute(self, batch: Run) -> PreparedExecution | None:
+        """Validate and stage a scheduler run while retaining all asynchronous input ownership."""
+
         self._begin_model_call()
         try:
             batch = self.plan_run(batch)
@@ -874,6 +912,8 @@ class Worker:
         batch: Run,
         report: RunResult,
     ) -> RunResult:
+        """Release model-owned state after terminal request completions become visible."""
+
         closed = {
             int(command.request_key.request_id)
             for command in batch.commands
@@ -884,12 +924,16 @@ class Worker:
         return report
 
     def execute_prepared(self, prepared: PreparedExecution) -> RunResult:
+        """Resolve an already staged execution after validating its ownership type."""
+
         if not isinstance(prepared, PreparedExecution):
             raise invalid_descriptor("prepared execution has an invalid type")
         return prepared.resolve()
 
     @contextmanager
     def _model_call(self) -> Generator[None, None, None]:
+        """Return the model-call context that enforces weight-update exclusion."""
+
         self._begin_model_call()
         try:
             yield
@@ -897,6 +941,8 @@ class Worker:
             self._end_model_call()
 
     def _begin_model_call(self) -> None:
+        """Register an active model call unless an exclusive update is pending."""
+
         with self._weight_condition:
             updater = getattr(self, "weight_updater", None)
             if updater is not None and updater.unhealthy:
@@ -906,6 +952,8 @@ class Worker:
             self._active_model_calls += 1
 
     def _end_model_call(self) -> None:
+        """Release an active model-call registration and wake update waiters."""
+
         with self._weight_condition:
             if self._active_model_calls < 1:
                 raise RuntimeError("worker model-call accounting underflow")
@@ -914,6 +962,8 @@ class Worker:
 
     @contextmanager
     def _exclusive_weight_update(self) -> Generator[None, None, None]:
+        """Enter the model's optional exclusive weight-update context."""
+
         with self._weight_condition:
             if self._weight_update_active:
                 raise RuntimeError("worker already has an active weight update")
@@ -928,12 +978,16 @@ class Worker:
                 self._weight_condition.notify_all()
 
     def _publish_weight_set(self, weights: WeightSet) -> None:
+        """Atomically publish a loaded weight generation to the live registry."""
+
         install_weights(self.execution, weights)
         self.weights = weights
         self.weight_version = weights.version
         self._info = replace(self._info, weight_version=weights.version)
 
     def warmup(self) -> None:
+        """Materialize startup workloads and capture configured CUDA graph shapes."""
+
         context = packed_warmup.WarmupContext(self)
         packed_warmup.warmup(context)
         self.model.warmup(context)
@@ -943,6 +997,8 @@ class Worker:
         )
 
     def drop_request(self, request_id: int) -> None:
+        """Release all runtime, cache, latent, product, and transfer state for one request."""
+
         request_id = int(request_id)
         request = self.requests.peek(request_id)
         drop_execution_request(self.execution, request_id)
@@ -967,6 +1023,8 @@ class Worker:
             )
 
     def retire_request(self, request_id: int) -> None:
+        """Retire a completed request after releasing its model and data-plane state."""
+
         request_id = int(request_id)
         request = self.requests.peek(request_id)
         if request is None or request.retired:
@@ -992,11 +1050,15 @@ class Worker:
         )
 
     def free_products(self, handles: tuple[int, ...]) -> None:
+        """Release scheduler generations from device-product and encoder-cache ownership."""
+
         generations = tuple(int(handle) for handle in handles)
         self.device_products.release_generations(generations)
         self.encoder_cache.release_generations(generations)
 
     def close(self) -> None:
+        """Release execution, transport, model-state, and distributed resources owned by the worker."""
+
         runner = self.runner
         if runner is not None:
             runner.synchronize()
@@ -1021,6 +1083,8 @@ class Worker:
         wake: Callable[[], None],
         wake_on_stream: Callable[[int], None],
     ) -> None:
+        """Register host and CUDA-stream callbacks used to wake result polling."""
+
         self.device_events.set_completion_wake(wake_on_stream)
         self.cpu_tasks.set_completion_wake(wake)
         self.transfers.set_completion_wake(wake)
@@ -1032,6 +1096,8 @@ def _supports_flow_attention(
     pool: CachePool,
     device: torch.device,
 ) -> bool:
+    """Return whether the selected backend can execute the model's flow-attention geometry."""
+
     if not pool.supports_paged_attention_storage:
         return False
     head_dim = int(getattr(geometry, "head_dim"))

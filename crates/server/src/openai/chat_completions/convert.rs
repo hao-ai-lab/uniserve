@@ -1,3 +1,5 @@
+//! Conversion from chat-completion schemas into serving admission values.
+
 use crate::profile::tools;
 use crate::serving::chat::{
     AssistantContentBlock, AssistantToolCall, ChatContent, ChatContentPart,
@@ -21,17 +23,25 @@ use super::validate;
 /// Public response metadata retained after request lowering.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatResponseContext {
+    /// OpenAI-compatible response identifier.
     pub request_id: String,
+    /// Model name reported in response objects.
     pub response_model: String,
+    /// Whether streaming responses include a terminal usage chunk.
     pub include_usage: bool,
+    /// Whether generated-token logprobs were requested.
     pub requested_logprobs: bool,
+    /// Whether prompt-token logprobs were requested.
     pub include_prompt_logprobs: bool,
+    /// Whether parsed reasoning is exposed in responses.
     pub include_reasoning: bool,
+    /// Whether token identifiers are exposed in responses.
     pub return_token_ids: bool,
+    /// Whether textual tokens use token-identifier placeholders.
     pub return_tokens_as_token_ids: bool,
 }
 
-/// Lower one validated chat request into the sole generate admission value and
+/// Lowers one validated chat request into the sole generate admission value and
 /// response-only metadata.
 pub fn lower_chat_request(
     request: ChatCompletionRequest,
@@ -39,6 +49,9 @@ pub fn lower_chat_request(
     context: ResolvedRequestContext,
 ) -> Result<(GenerateReqInput, ChatResponseContext), ApiError> {
     validate::validate_request_compat(&request, served_model_name)?;
+
+    // Preserve response-only choices before moving request fields into the
+    // engine-facing admission value.
     let response_model = served_model_name.to_owned();
     let request_id = format!("chatcmpl-{}", context.request_id);
     let include_usage = request
@@ -57,6 +70,9 @@ pub fn lower_chat_request(
     } else {
         OutputDetail::VisibleText
     };
+
+    // Normalize public chat content and tool declarations into the serving
+    // layer's closed prompt representation.
     let modalities = convert_modalities(&request.modalities);
     let image_gen = request.image_config.as_ref().map(convert_image_config);
     let messages = request
@@ -70,6 +86,9 @@ pub fn lower_chat_request(
         tool_choice: convert_tool_choice(request.tool_choice),
         reasoning_effort: request.reasoning_effort.map(convert_reasoning_effort),
     };
+
+    // Sampling, stopping, cache, and scheduling controls are lowered without
+    // retaining transport-specific OpenAI schema wrappers.
     let input = GenerateReqInput {
         request_id: ServeRequestId::from(request_id.clone()),
         stream: request.stream,
@@ -117,6 +136,8 @@ pub fn lower_chat_request(
             include_stop_string_in_output: request.include_stop_str_in_output,
         },
     };
+
+    // Response context contains only metadata needed after engine submission.
     let response = ChatResponseContext {
         request_id,
         response_model,
@@ -127,9 +148,11 @@ pub fn lower_chat_request(
         return_token_ids,
         return_tokens_as_token_ids: request.return_tokens_as_token_ids.unwrap_or(false),
     };
+
     Ok((input, response))
 }
 
+/// Converts requested response modalities into the serving selection.
 fn convert_modalities(modalities: &[ChatModality]) -> ModalitySelection {
     match (
         modalities.contains(&ChatModality::Text),
@@ -141,6 +164,7 @@ fn convert_modalities(modalities: &[ChatModality]) -> ModalitySelection {
     }
 }
 
+/// Converts the image config.
 fn convert_image_config(config: &ChatImageConfig) -> ImageGenControls {
     ImageGenControls {
         resolution: config.resolution.clone(),
@@ -160,6 +184,7 @@ fn convert_image_config(config: &ChatImageConfig) -> ImageGenControls {
     }
 }
 
+/// Converts the reasoning effort.
 fn convert_reasoning_effort(value: ReasoningEffort) -> ServingReasoningEffort {
     match value {
         ReasoningEffort::None => ServingReasoningEffort::None,
@@ -172,6 +197,7 @@ fn convert_reasoning_effort(value: ReasoningEffort) -> ServingReasoningEffort {
     }
 }
 
+/// Converts one wire chat message into the serving layer's structured message model.
 fn convert_message(message: ChatMessage) -> Result<ServingChatMessage, ApiError> {
     match message {
         ChatMessage::System { content, .. } => {
@@ -215,6 +241,7 @@ fn convert_message(message: ChatMessage) -> Result<ServingChatMessage, ApiError>
     }
 }
 
+/// Converts OpenAI message content into serving chat content.
 fn convert_content(content: MessageContent) -> Result<ChatContent, ApiError> {
     match content {
         MessageContent::Text(text) => Ok(ChatContent::Text(text)),
@@ -233,6 +260,7 @@ fn convert_content(content: MessageContent) -> Result<ChatContent, ApiError> {
     }
 }
 
+/// Converts the assistant content.
 fn convert_assistant_content(
     content: MessageContent,
 ) -> Result<Vec<AssistantContentBlock>, ApiError> {
@@ -250,6 +278,7 @@ fn convert_assistant_content(
     }
 }
 
+/// Validates and converts assistant function calls into structured content blocks.
 fn convert_assistant_tool_calls(
     tool_calls: Vec<ToolCall>,
 ) -> Result<Vec<AssistantContentBlock>, ApiError> {
@@ -271,6 +300,7 @@ fn convert_assistant_tool_calls(
         .collect()
 }
 
+/// Converts OpenAI function tools into serving tool definitions.
 fn convert_tools(tools: Option<Vec<Tool>>) -> Result<Vec<tools::Tool>, ApiError> {
     tools
         .unwrap_or_default()
@@ -287,11 +317,13 @@ fn convert_tools(tools: Option<Vec<Tool>>) -> Result<Vec<tools::Tool>, ApiError>
         .collect()
 }
 
+/// Converts the message tools.
 fn convert_message_tools(tools: Option<Vec<Tool>>) -> Result<Option<Vec<tools::Tool>>, ApiError> {
     let tools = convert_tools(tools)?;
     Ok((!tools.is_empty()).then_some(tools))
 }
 
+/// Converts the tool choice.
 fn convert_tool_choice(tool_choice: Option<ToolChoice>) -> ChatToolChoice {
     match tool_choice.map(|choice| choice.0) {
         None | Some(ToolChoiceValue::Auto) => ChatToolChoice::Auto,

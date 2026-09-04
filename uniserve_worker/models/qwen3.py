@@ -1,11 +1,7 @@
-"""Qwen3 causal-LM model — a thin ``nn.Module`` over the system-managed forward.
+"""Pure Qwen3 forward computation over worker-owned attention and request state.
 
-The model is a pure function of ``(input_ids, positions, forward_batch)``: it
-embeds tokens, runs the decoder stack (single-axis RoPE via
-``RotaryEmbedding.cos_sin_1d``, full ``head_dim`` QK-norm, the fused
-QK-norm+RoPE kernel), and calls :class:`RadixAttention` per layer. It owns **no**
-KV pool, builds **no** attention metadata, captures **no** CUDA graphs, and never
-advances KV length. The model runner and stores own those behaviors.
+The model consumes prepared tensor views and delegates KV allocation, cache lifetime,
+sampling, batching, and request transitions to the worker runtime.
 """
 
 from __future__ import annotations
@@ -71,6 +67,8 @@ _QWEN_STACKED_WEIGHTS: WeightNameMap = (
 
 
 def _qwen_declared_skip(source_name: str, target_name: str) -> bool:
+    """Return whether a checkpoint tensor is an allowed non-parameter artifact."""
+
     return (
         source_name.endswith(
             (
@@ -85,6 +83,8 @@ def _qwen_declared_skip(source_name: str, target_name: str) -> bool:
 
 
 def _required_int(config: Mapping[str, object], name: str) -> int:
+    """Read a required non-boolean integer from model configuration."""
+
     raw = config.get(name)
     if not isinstance(raw, int) or isinstance(raw, bool):
         raise ValueError(f"Qwen3 config requires integer field {name!r}")
@@ -100,6 +100,8 @@ def _optional_int(
     *,
     minimum: int,
 ) -> int:
+    """Read and lower-bound an optional integer model setting."""
+
     raw = config.get(name, default)
     if not isinstance(raw, int) or isinstance(raw, bool) or raw < minimum:
         raise ValueError(f"Qwen3 config field {name!r} must be an integer >= {minimum}")
@@ -107,6 +109,8 @@ def _optional_int(
 
 
 def _number(config: Mapping[str, object], name: str, default: float) -> float:
+    """Read a numeric model setting while rejecting boolean values."""
+
     raw = config.get(name, default)
     if not isinstance(raw, (int, float)) or isinstance(raw, bool):
         raise ValueError(f"Qwen3 config field {name!r} must be numeric")
@@ -117,6 +121,8 @@ def _number(config: Mapping[str, object], name: str, default: float) -> float:
 
 
 def _boolean(config: Mapping[str, object], name: str, default: bool) -> bool:
+    """Read a boolean model setting with a default."""
+
     raw = config.get(name, default)
     if not isinstance(raw, bool):
         raise ValueError(f"Qwen3 config field {name!r} must be boolean")
@@ -124,6 +130,8 @@ def _boolean(config: Mapping[str, object], name: str, default: bool) -> bool:
 
 
 def _string(config: Mapping[str, object], name: str, default: str) -> str:
+    """Read a textual model setting with a default."""
+
     raw = config.get(name, default)
     if not isinstance(raw, str) or not raw:
         raise ValueError(f"Qwen3 config field {name!r} must be a non-empty string")
@@ -132,6 +140,8 @@ def _string(config: Mapping[str, object], name: str, default: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class _QwenConfig:
+    """Normalizes the Qwen3 checkpoint fields required by the worker decoder."""
+
     vocab_size: int
     hidden_size: int
     intermediate_size: int
@@ -151,6 +161,8 @@ class _QwenConfig:
 
     @classmethod
     def from_mapping(cls, config: Mapping[str, object]) -> "_QwenConfig":
+        """Validate checkpoint fields and derive local Qwen attention and expert geometry."""
+
         hidden_size = _required_int(config, "hidden_size")
         num_attention_heads = _required_int(config, "num_attention_heads")
         if hidden_size % num_attention_heads:
@@ -202,11 +214,15 @@ class _QwenConfig:
 
 @dataclass(frozen=True, slots=True)
 class _MlpConfig:
+    """Defines dense or expert MLP widths and routing parameters for a Qwen3 layer."""
+
     hidden_size: int
     intermediate_size: int
 
 
 def _expert_cfg(cfg: _QwenConfig, intermediate_size: int | None = None) -> _MlpConfig:
+    """Derive expert MLP widths from the Qwen model configuration."""
+
     return _MlpConfig(
         hidden_size=cfg.hidden_size,
         intermediate_size=int(intermediate_size or cfg.moe_intermediate_size),
@@ -217,6 +233,8 @@ class Qwen3Attention(nn.Module):
     """Multi-head self-attention with QK-norm, RoPE, and paged KV via ``RadixAttention``."""
 
     def __init__(self, cfg: _QwenConfig, layer_id: int, *, layer_config: LayerConfig) -> None:
+        """Build rank-local QKV projections, rotary normalization, and paged attention."""
+
         super().__init__()
         self.total_num_heads = cfg.num_attention_heads
         self.total_num_kv_heads = cfg.num_key_value_heads
@@ -259,6 +277,8 @@ class Qwen3Attention(nn.Module):
         sin: torch.Tensor,
         positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Run QK-normalized rotary attention over packed prefill or batched decode rows."""
+
         state_shape = hidden_states.shape[:-1]
         qkv = self.qkv_proj(hidden_states)
         batched = len(state_shape) == 2
@@ -290,6 +310,8 @@ class Qwen3Attention(nn.Module):
         sin: torch.Tensor,
         positions: torch.Tensor | None,
     ) -> torch.Tensor | None:
+        """Run the flattened fused-prefill path when positions and tensor layout permit it."""
+
         if batched or positions is None:
             return None
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -319,6 +341,8 @@ class Qwen3Attention(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reshape, normalize, and rotate query and key heads for attention."""
+
         q_heads = q.reshape(-1, self.num_heads, self.head_dim)
         k_heads = k.reshape(-1, self.num_kv_heads, self.head_dim)
         q, k = qk_norm_rope(
@@ -342,6 +366,8 @@ class Qwen3Attention(nn.Module):
         batched_decode: bool,
         batched: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Convert flattened QKV heads to the layout required by the active attention mode."""
+
         v = v.reshape(-1, self.num_kv_heads, self.head_dim)
         if batched_decode:
             batch = int(state_shape[0])
@@ -370,6 +396,8 @@ class Qwen3Attention(nn.Module):
         batched_decode: bool,
         batched: bool,
     ) -> torch.Tensor:
+        """Restore backend attention output to the caller's batched or flattened state shape."""
+
         if batched_decode:
             return out.reshape(int(state_shape[0]), 1, self.q_size)
         if batched:
@@ -381,6 +409,8 @@ class Qwen3MoE(nn.Module):
     """Mixture-of-experts feed-forward routed by a learned gate."""
 
     def __init__(self, cfg: _QwenConfig, *, layer_config: LayerConfig) -> None:
+        """Build the token router and dense collection of rank-sharded experts."""
+
         super().__init__()
         num_experts = cfg.num_experts
         top_k = cfg.num_experts_per_tok
@@ -396,6 +426,8 @@ class Qwen3MoE(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor, context: ForwardBatch) -> torch.Tensor:
+        """Route packed hidden rows through the selected experts and combine their outputs."""
+
         return self.experts(hidden_states, self.gate(hidden_states), context.mesh)
 
 
@@ -403,6 +435,8 @@ class Qwen3DecoderLayer(nn.Module):
     """One transformer decoder layer (attention + MLP or MoE)."""
 
     def __init__(self, cfg: _QwenConfig, layer_id: int, *, layer_config: LayerConfig) -> None:
+        """Assemble one normalized attention layer with dense or expert feed-forward work."""
+
         super().__init__()
         self.self_attn = Qwen3Attention(cfg, layer_id, layer_config=layer_config)
         self.mlp = Qwen3MoE(cfg, layer_config=layer_config) if cfg.num_experts > 0 else Qwen3MLP(cfg, layer_config=layer_config)
@@ -419,6 +453,8 @@ class Qwen3DecoderLayer(nn.Module):
         sin: torch.Tensor,
         positions: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Advance the fused residual stream through attention and dense or expert MLP work."""
+
         if residual is None:
             residual = hidden_states
             attn_in = self.input_layernorm(hidden_states)
@@ -443,6 +479,8 @@ class Qwen3Model(nn.Module):
     """Stack of Qwen3 decoder layers with token embeddings and final RMSNorm."""
 
     def __init__(self, cfg: _QwenConfig, *, layer_config: LayerConfig) -> None:
+        """Build sharded token embeddings, decoder layers, rotary tables, and final norm."""
+
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(
             cfg.vocab_size,
@@ -467,6 +505,8 @@ class Qwen3Model(nn.Module):
         *,
         input_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Decode token or supplied embedding rows and return final normalized hidden states."""
+
         hidden_states = (
             input_embeds if input_embeds is not None else self.embed_tokens(input_ids, context.mesh)
         )
@@ -521,6 +561,8 @@ class Qwen3ForCausalLM(ExecutionModel):
         return report
 
     def __init__(self, config: Mapping[str, object], *, layer_config: LayerConfig) -> None:
+        """Construct the tensor-parallel decoder and publish its serving geometry."""
+
         super().__init__()
         if not isinstance(config, Mapping):
             raise TypeError("Qwen3 config must be a mapping")
@@ -574,6 +616,8 @@ class Qwen3ForCausalLM(ExecutionModel):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        """Merge optional multimodal embeddings and execute the packed Qwen decoder."""
+
         input_embeds: torch.Tensor | None = None
         if forward_batch.input_embeddings is not None:
             embedded = self.model.embed_tokens(input_ids.reshape(-1), forward_batch.mesh)
@@ -593,6 +637,8 @@ class Qwen3ForCausalLM(ExecutionModel):
         )
 
     def project(self, hidden: torch.Tensor, forward_batch: ForwardBatch) -> ForwardOutput:
+        """Select per-request hidden states or vocabulary logits from packed decoder rows."""
+
         selections = forward_batch.token_selections
         query_lens = forward_batch.query_lens_cpu
         dynamic_last = (
@@ -607,11 +653,13 @@ class Qwen3ForCausalLM(ExecutionModel):
             return ForwardOutput(
                 tuple(dynamic_projected[index : index + 1] for index in range(len(selections)))
             )
+        # Recover request-local row views before applying each request's output selection.
         row_hidden: list[torch.Tensor] = []
         begin = 0
         for count in query_lens:
             row_hidden.append(hidden[begin : begin + count])
             begin += count
+        # Project all rows that require logits in one vocabulary-parallel operation.
         projected_rows = tuple(
             index
             for index, selection in enumerate(selections)
@@ -637,6 +685,7 @@ class Qwen3ForCausalLM(ExecutionModel):
                 )
             projected = self.logits(self.lm_head(selected, forward_batch.mesh))
 
+        # Slice the shared projection back into request order while preserving hidden outputs.
         outputs: list[torch.Tensor] = []
         projected_offset = 0
         for index, selection in enumerate(selections):

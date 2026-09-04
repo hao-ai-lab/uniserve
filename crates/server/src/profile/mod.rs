@@ -1,4 +1,4 @@
-//! Closed model profile resolution for the configured serving set.
+//! Model-profile selection and load-time serving capabilities.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -23,15 +23,20 @@ pub mod tools;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelDescription {
+    /// Qwen3 text-generation profile.
     #[default]
     Qwen3,
+    /// SenseNova multimodal-generation profile.
     #[serde(rename = "sensenova")]
     SenseNova,
+    /// Bagel multimodal-generation profile.
     Bagel,
+    /// MiniMax H3 video-generation profile.
     MiniMaxH3,
 }
 
 impl ModelDescription {
+    /// Returns the stable profile identifier.
     pub const fn id(self) -> &'static str {
         match self {
             Self::Qwen3 => "qwen3",
@@ -41,6 +46,7 @@ impl ModelDescription {
         }
     }
 
+    /// Returns the model-family identifier.
     const fn model_type(self) -> &'static str {
         match self {
             Self::Qwen3 => "qwen3",
@@ -54,6 +60,7 @@ impl ModelDescription {
 impl std::str::FromStr for ModelDescription {
     type Err = ModelDescriptionParseError;
 
+    /// Parses the value from its string representation.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "qwen3" => Ok(Self::Qwen3),
@@ -67,59 +74,86 @@ impl std::str::FromStr for ModelDescription {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("unsupported model description {0:?}")]
+/// Error returned for an unsupported model-description name.
 pub struct ModelDescriptionParseError(String);
 
 /// Deployment-owned profile inputs applied after repository metadata.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileDeploymentConfig {
+    /// Optional template text that replaces the repository-provided chat template.
     pub chat_template_override: Option<String>,
+    /// Optional deployment ceiling on the complete model context.
     pub max_model_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Model name, revision, and numeric precision resolved at load time.
 pub struct ModelIdentity {
+    /// Model name exposed through serving APIs.
     pub served_name: String,
+    /// Profile family that defines this model's serving behavior.
     pub description: ModelDescription,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+/// Model-provided defaults for sampling and generation limits.
 pub struct GenerationDefaultsDescriptor {
+    /// Default sampling temperature.
     pub temperature: Option<f32>,
+    /// Default nucleus-sampling probability mass.
     pub top_p: Option<f32>,
+    /// Default top-k candidate limit.
     pub top_k: Option<u32>,
+    /// Default minimum relative token probability.
     pub min_p: Option<f32>,
+    /// Default repetition penalty.
     pub repetition_penalty: Option<f32>,
+    /// Default maximum number of generated tokens.
     pub max_output_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Maximum context and generated-token lengths supported by a profile.
 pub struct ContextLimits {
+    /// Maximum combined input and output token count.
     pub max_model_tokens: Option<u32>,
+    /// Maximum generated-token count.
     pub max_output_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// End-of-sequence and stop-token handling supplied by a profile.
 pub struct StopTokenPolicy {
+    /// Canonical end-of-sequence token identifier.
     pub primary_eos_token_id: Option<u32>,
+    /// Token identifiers that terminate generation.
     pub eos_token_ids: BTreeSet<u32>,
+    /// Tokenizer strings recognized as end-of-sequence aliases.
     pub eos_aliases: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Model capabilities and policies shared across serving families.
 pub struct CommonModelProfile {
+    /// Stable identity exposed to clients and runtime components.
     pub identity: ModelIdentity,
+    /// Model-provided generation defaults.
     pub generation_defaults: GenerationDefaultsDescriptor,
+    /// Context and output length limits.
     pub context_limits: ContextLimits,
+    /// End-of-sequence recognition policy.
     pub stop_tokens: StopTokenPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Fully resolved SenseNova model profile.
 pub(crate) struct SenseNovaModelProfile {
     pub common: CommonModelProfile,
     pub preprocessing: SenseNovaProfile,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Fully resolved Bagel model profile.
 pub(crate) struct BagelModelProfile {
     pub common: CommonModelProfile,
     pub preprocessing: BagelProfile,
@@ -135,6 +169,7 @@ pub(crate) enum ModelProfile {
 }
 
 impl ModelProfile {
+    /// Constructs a MiniMax H3 description with model defaults.
     pub(crate) fn minimax_h3(model_id: &str) -> Self {
         Self::MiniMaxH3(CommonModelProfile {
             identity: ModelIdentity {
@@ -147,6 +182,7 @@ impl ModelProfile {
         })
     }
 
+    /// Resolves model assets and profile-specific serving contracts.
     pub(crate) fn resolve(
         description: ModelDescription,
         model_id: &str,
@@ -196,6 +232,7 @@ impl ModelProfile {
         }
     }
 
+    /// Returns the common capabilities of this resolved profile.
     pub(crate) fn common(&self) -> &CommonModelProfile {
         match self {
             Self::Qwen3(profile) => profile,
@@ -205,6 +242,7 @@ impl ModelProfile {
         }
     }
 
+    /// Returns mutable access to common profile capabilities.
     pub(crate) fn common_mut(&mut self) -> &mut CommonModelProfile {
         match self {
             Self::Qwen3(profile) => profile,
@@ -215,6 +253,7 @@ impl ModelProfile {
     }
 }
 
+/// Extracts serving generation defaults from repository configuration.
 fn generation_defaults(config: &GenerationConfig) -> GenerationDefaultsDescriptor {
     GenerationDefaultsDescriptor {
         temperature: config.temperature,
@@ -226,6 +265,7 @@ fn generation_defaults(config: &GenerationConfig) -> GenerationDefaultsDescripto
     }
 }
 
+/// Combines tokenizer and generation metadata into one canonical termination policy.
 fn stop_token_policy(
     tokenizer_config: &HfTokenizerConfig,
     generation_config: &GenerationConfig,

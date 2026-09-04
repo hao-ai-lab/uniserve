@@ -1,3 +1,5 @@
+//! HTTP handler for OpenAI-compatible chat completions.
+
 use std::sync::Arc;
 
 use crate::openai::ChatCompletionRequest;
@@ -19,7 +21,7 @@ use crate::http::routes::openai::utils::validated_json::ValidatedJson;
 use crate::http::utils::{resolve_request_context, unix_timestamp};
 use crate::openai::ApiError;
 
-/// Validate one chat completion request and run it through the serving runtime.
+/// Validates one chat completion request and run it through the serving runtime.
 pub(crate) async fn chat_completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,

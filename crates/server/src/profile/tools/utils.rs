@@ -1,11 +1,11 @@
-//! Shared helpers for tool parsers.
+//! JSON repair and identifier helpers shared by tool parsers.
 
 use winnow::error::{ContextError, ErrMode, ModalResult, Needed, StrContext, StrContextValue};
 use winnow::stream::{Offset, Partial, Stream};
 
 use super::Result;
 
-/// Return the byte length of the longest proper prefix of `token` that is also
+/// Returns the byte length of the longest proper prefix of `token` that is also
 /// a suffix of `buffer`.
 ///
 /// Streaming parsers use this to keep only the trailing fragment that might
@@ -41,7 +41,7 @@ pub(super) fn partial_prefix_len(buffer: &str, token: &str) -> usize {
     0
 }
 
-/// Parse a safe text run before the next marker.
+/// Parses a safe text run before the next marker.
 ///
 /// Returns the text length in bytes, and advances the input.
 pub(super) fn safe_text_len(input: &mut Partial<&str>, marker: &str) -> ModalResult<usize> {
@@ -90,7 +90,7 @@ impl JsonObjectScanState {
     }
 }
 
-/// Parse a raw top-level JSON object argument prefix.
+/// Parses a raw top-level JSON object argument prefix.
 ///
 /// The returned length is safe to emit as raw argument text. This scans only
 /// lexical boundaries from `{` through the matching `}`, preserving
@@ -181,7 +181,7 @@ pub(super) fn take_json_object(
     Ok(text.len())
 }
 
-/// Parse a JSON string literal.
+/// Parses a JSON string literal.
 pub(super) fn json_str(input: &mut Partial<&str>) -> ModalResult<String> {
     let text = **input;
     if text.is_empty() {
@@ -227,6 +227,7 @@ pub(super) fn json_str(input: &mut Partial<&str>) -> ModalResult<String> {
     incomplete()
 }
 
+/// Builds a parser error at the current JSON scan position.
 fn json_scan_error(label: &'static str, expected: StrContextValue) -> ErrMode<ContextError> {
     let mut error = ContextError::new();
     error.push(StrContext::Label(label));
@@ -234,7 +235,7 @@ fn json_scan_error(label: &'static str, expected: StrContextValue) -> ErrMode<Co
     ErrMode::Cut(error)
 }
 
-/// Parse one event from a buffered streaming input.
+/// Parses one event from a buffered streaming input.
 ///
 /// Returns:
 /// - `Ok(Some((event, consumed_len)))` if an event was successfully parsed, along with the number

@@ -1,4 +1,4 @@
-//! Request round trips and descriptor validation.
+//! Protocol round trips and validation behavior for every message family.
 
 use std::collections::BTreeMap;
 
@@ -515,7 +515,7 @@ fn token_product_bytes_round_trip() {
         let bytes = encode_token_product_bytes(&tokens);
         assert_eq!(decode_token_product_bytes(&bytes).unwrap(), tokens);
     }
-    // A truncated count is rejected rather than silently misread.
+    // The count prefix must occupy a complete little-endian word.
     assert!(decode_token_product_bytes(&[0, 0]).is_err());
     // A length that disagrees with the declared count is a fault.
     assert!(decode_token_product_bytes(&[2, 0, 0, 0, 9, 0, 0, 0]).is_err());
@@ -659,12 +659,6 @@ fn worker_info_requires_group_totals_to_match_the_cache() {
     info.kv_cache.as_mut().unwrap().groups[1].num_blocks = 2047;
     assert!(encode_response(&WorkerResponse::info(info)).is_err());
 }
-
-// ---------------------------------------------------------------------------
-// Canonical IPC fixtures cover every request and response kind, every `RunKind`
-// and `BatchCommand` variant, fixed and device parents, full admissions, and non-empty
-// product payloads. Distinct scalar values expose transposed field mappings.
-// ---------------------------------------------------------------------------
 
 fn key_for_request(request: u64) -> RequestKey {
     RequestKey::new(4, RequestId(request), 2)

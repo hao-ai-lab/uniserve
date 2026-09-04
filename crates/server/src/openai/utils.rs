@@ -1,16 +1,16 @@
+//! Validation and accounting helpers shared by OpenAI request families.
+
 use std::collections::HashMap;
 
 use crate::openai::error::ApiError;
 
-/// OpenAI completion usage includes every generated token, including tokens
+/// Counts every generated token included in OpenAI completion usage, including tokens
 /// retained internally for reasoning or model control.
 pub(crate) fn completion_token_count(visible: u32, internal: u32) -> u32 {
     visible.saturating_add(internal)
 }
 
-// ---- Transport-agnostic compatibility predicates ----
-
-/// Reject a request whose model name is not among the served model names.
+/// Rejects a request whose model name is not the served model name.
 ///
 /// `model` is the resolved model name the caller extracted from its own
 /// request shape.
@@ -21,7 +21,7 @@ pub fn check_model_served(model: &str, served_model_name: &str) -> Result<(), Ap
     Ok(())
 }
 
-/// Reject `stream_options` supplied without `stream=true`.
+/// Rejects `stream_options` supplied without `stream=true`.
 pub fn check_stream_options_requires_stream(
     stream_options_present: bool,
     stream: bool,
@@ -35,7 +35,7 @@ pub fn check_stream_options_requires_stream(
     Ok(())
 }
 
-/// Reject a `prompt_logprobs` value outside the supported range.
+/// Rejects a `prompt_logprobs` value outside the supported range.
 ///
 /// Valid values are any non-negative integer or the sentinel `-1` (full
 /// vocabulary). `param` lets each surface attribute the error to its own field
@@ -54,12 +54,15 @@ pub fn check_prompt_logprobs_bound(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// Request metadata resolved from HTTP headers before schema lowering.
 pub struct ResolvedRequestContext {
+    /// Canonical request identifier selected from HTTP metadata.
     pub request_id: String,
+    /// Distributed trace headers accepted from the request.
     pub trace_context: HashMap<String, String>,
 }
 
-/// Convert OpenAI-style `logit_bias` with string token-ID keys into the
+/// Converts OpenAI-style `logit_bias` with string token-ID keys into the
 /// internal token-ID map.
 pub fn convert_logit_bias(
     logit_bias: Option<HashMap<String, f32>>,

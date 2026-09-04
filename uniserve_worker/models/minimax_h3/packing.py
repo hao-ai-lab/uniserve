@@ -34,17 +34,23 @@ _ROPE_SPATIAL_SCALE = 32.0
 
 
 def video_latent_frames(num_frames: int) -> int:
+    """Convert a valid H3 output-frame count into temporal video-VAE latents."""
+
     if num_frames % 17 != 5:
         raise ValueError("H3 frame count must have the form 17 * n + 5")
     return (num_frames - 5) // 17 * 5 + 2
 
 
 def audio_latent_frames(num_frames: int) -> int:
+    """Size the 40 Hz audio latent timeline for a 24 Hz video frame count."""
+
     return math.ceil(num_frames / FPS * AUDIO_LATENTS_PER_SECOND)
 
 
 @dataclass(frozen=True, slots=True)
 class H3PackedLayout:
+    """Defines the padded multimodal row order, indices, positions, and media geometry for one H3 request."""
+
     semantic_rows: int
     padded_rows: int
     position_ids: torch.Tensor
@@ -64,6 +70,8 @@ class H3PackedLayout:
 
 
 def _spatial_grid(dim: int, patch: int, sqrt_area: float) -> torch.Tensor:
+    """Choose a patch-aligned spatial extent near the target square-root area."""
+
     ratio = dim / sqrt_area
     left = (1.0 - ratio) / 2.0
     values = np.linspace(left, left + ratio, dim // patch, endpoint=False)
@@ -71,6 +79,8 @@ def _spatial_grid(dim: int, patch: int, sqrt_area: float) -> torch.Tensor:
 
 
 def _temporal_grid(count: int, origin: float) -> torch.Tensor:
+    """Generate evenly spaced temporal coordinates from an origin."""
+
     spans = torch.tensor(
         [
             ROPE_FRAME_RESCALE * ROPE_FRAMES_PER_LATENT[index % len(ROPE_FRAMES_PER_LATENT)]
@@ -91,7 +101,7 @@ def build_packed_layout(
     row_multiple: int = 256,
     audio_frames: int | None = None,
 ) -> H3PackedLayout:
-    """Build the immutable T2VA `[text|audio|video|padding]` document."""
+    """Build the fixed-profile `[text | audio | tiled video | padding]` row layout."""
 
     if text_rows < 1 or height != 768 or width != 1344:
         raise ValueError("the FastH3 profile requires 1344x768 output and nonempty text")
@@ -105,6 +115,8 @@ def build_packed_layout(
         raise ValueError("H3 audio latent frame count must be positive")
     if video_frames % patch_t or latent_height % patch_h or latent_width % patch_w:
         raise ValueError("fixed latent geometry is not divisible by the transformer patch")
+
+    # Text and audio occupy dense 64-row tiles before the sparse video region.
     rows_per_frame = latent_height // patch_h * (latent_width // patch_w)
     audio_rows = AUDIO_CHANNELS * audio_frames
     video_rows = video_frames // patch_t * rows_per_frame
@@ -113,10 +125,8 @@ def build_packed_layout(
     audio_block_rows = math.ceil(audio_rows / 64) * 64
     video_start = text_rows + audio_block_rows
 
-    # The sparse kernel consumes actual (4, 4, 4) spatiotemporal tiles, not
-    # arbitrary runs of 64 raster-order rows. Boundary tiles reserve all 64
-    # transport rows and place their valid rows first, matching the checkpoint
-    # VSA variable-block-size layout.
+    # Sparse attention consumes 4x4x4 spatiotemporal tiles. Boundary tiles reserve
+    # 64 transport rows and pack their valid raster rows at the front.
     tile_t, tile_h, tile_w = (4, 4, 4)
     grid_t = video_frames // patch_t
     grid_h = latent_height // patch_h
@@ -134,17 +144,18 @@ def build_packed_layout(
                 ].reshape(-1)
                 tiled_raster.append(block)
                 video_valid_sizes.append(int(block.numel()))
+
     video_tiles = len(tiled_raster)
     video_transport_rows = video_tiles * 64
     transport_rows = video_start + video_transport_rows
-    # The SM100a block-sparse path requires an even transport tile count. The
-    # fixed H3 geometry has 683 logical tiles, so its last tile is an internal
-    # all-zero partner rather than a model row.
+    # The block-sparse kernel consumes tile pairs, so an odd logical tile count
+    # receives one all-zero transport partner that is not a semantic model row.
     padded_rows = math.ceil(transport_rows / max(row_multiple, 128)) * max(row_multiple, 128)
     if padded_rows // 64 % 2:
         padded_rows += 64
     semantic_rows = text_rows + audio_rows + video_rows
 
+    # Map semantic video raster rows to their tile-major transport positions.
     text_indices = torch.arange(text_rows, dtype=torch.long)
     audio_indices = torch.arange(text_rows, text_rows + audio_rows, dtype=torch.long)
     video_indices_parts: list[torch.Tensor] = []
@@ -161,6 +172,8 @@ def build_packed_layout(
     tags[text_indices] = TEXT_TAG
     tags[text_rows:video_start] = AUDIO_TAG
 
+    # Rotary coordinates share a temporal origin at the end of the text prefix;
+    # video rows additionally carry normalized height and width coordinates.
     positions = torch.zeros((padded_rows, 3), dtype=torch.float64)
     positions[text_indices, 0] = torch.arange(text_rows, dtype=torch.float64)
     sqrt_area = math.sqrt(latent_height * latent_width)
@@ -183,6 +196,9 @@ def build_packed_layout(
     video_positions[:, :, 0] = temporal[:, None]
     video_positions[:, :, 1:] = spatial[None]
     positions[video_indices] = video_positions.reshape(-1, 3).index_select(0, video_raster_indices)
+
+    # Per-tile valid counts let sparse attention ignore audio, video-boundary,
+    # and pair-alignment padding without changing the fixed row allocation.
     tile_valid_sizes = torch.zeros((padded_rows // 64,), dtype=torch.int32)
     tile_valid_sizes[: text_rows // 64] = 64
     audio_tile_start = text_rows // 64
@@ -213,6 +229,8 @@ def build_packed_layout(
 
 
 def patchify_video(latents: torch.Tensor, patch_size: tuple[int, int, int] = (1, 2, 2)) -> torch.Tensor:
+    """Flatten `[B, C, T, H, W]` latents into raster-ordered spatiotemporal patch rows."""
+
     patch_t, patch_h, patch_w = patch_size
     batch, channels, frames, height, width = latents.shape
     rows = latents.reshape(
@@ -239,6 +257,8 @@ def unpatchify_video(
     channels: int = 24,
     patch_size: tuple[int, int, int] = (1, 2, 2),
 ) -> torch.Tensor:
+    """Restore raster patch rows to contiguous `[B, C, T, H, W]` video latents."""
+
     patch_t, patch_h, patch_w = patch_size
     value = rows.reshape(
         -1,

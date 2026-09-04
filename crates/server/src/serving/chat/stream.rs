@@ -1,3 +1,5 @@
+//! Collection and compatibility adapters for structured chat event streams.
+
 use std::sync::Arc;
 
 use crate::serving::text::{DecodedLogprobs, DecodedPositionLogprobs, DecodedPromptLogprobs};
@@ -10,19 +12,30 @@ use crate::serving::chat::{AssistantContentBlock, AssistantMessage, ChatEvent};
 /// Final structured assistant message plus terminal stream metadata.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CollectedAssistantMessage {
+    /// Final structured assistant response.
     pub message: AssistantMessage,
+    /// Number of prompt tokens submitted to the engine.
     pub prompt_token_count: usize,
+    /// Prompt token identifiers submitted to the engine.
     pub prompt_token_ids: Arc<[u32]>,
+    /// Per-position prompt log probabilities, when requested.
     pub prompt_logprobs: Option<DecodedPromptLogprobs>,
+    /// Per-position generated-token log probabilities, when requested.
     pub logprobs: Option<DecodedLogprobs>,
+    /// Generated token identifiers in stream order.
     pub token_ids: Vec<u32>,
+    /// Total number of generated tokens.
     pub output_token_count: usize,
+    /// Number of generated tokens included in user-visible output.
     pub visible_output_token_count: usize,
+    /// Number of generated tokens consumed by internal protocol sections.
     pub internal_token_count: usize,
+    /// Terminal condition for the request.
     pub finish_reason: FinishReason,
 }
 
 impl CollectedAssistantMessage {
+    /// Collects a chat event stream into one assistant message and usage summary.
     pub async fn collect(
         request_id: impl Into<String>,
         stream: impl Stream<Item = Result<ChatEvent>> + Send,

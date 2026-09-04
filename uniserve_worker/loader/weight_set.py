@@ -14,12 +14,14 @@ __all__ = ["WeightSet"]
 
 @dataclass(frozen=True, slots=True)
 class WeightSet:
-    """A read-only view of one installed generation of live module tensors."""
+    """Read-only tensor identities for one installed live-weight generation."""
 
     version: int
     tensors: Mapping[str, torch.Tensor]
 
     def __post_init__(self) -> None:
+        """Validate the generation and freeze a detached mapping of materialized tensors."""
+
         if self.version < 0:
             raise ValueError("weight version cannot be negative")
         if any(
@@ -39,6 +41,8 @@ class WeightSet:
         *,
         version: int = 0,
     ) -> "WeightSet":
+        """Capture the live parameter and buffer identities for one installed model generation."""
+
         return cls(
             version=int(version),
             tensors=_live_tensors(module),
@@ -46,6 +50,8 @@ class WeightSet:
 
 
 def _live_tensors(module: nn.Module) -> dict[str, torch.Tensor]:
+    """Collect detached references to every materialized parameter and buffer."""
+
     return {
         **{
             name: parameter.detach()

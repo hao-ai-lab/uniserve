@@ -20,7 +20,7 @@ __all__ = [
 
 @lru_cache(maxsize=1)
 def configure_triton_toolchain() -> bool:
-    """Install a CUDA 13+ ptxas for Blackwell devices when one is present."""
+    """Select a CUDA 13+ assembler or honor the unsupported-toolchain opt-in."""
 
     existing = os.environ.get("TRITON_PTXAS_PATH")
     if existing and _ptxas_supports_blackwell(Path(existing)):
@@ -38,7 +38,7 @@ def configure_triton_toolchain() -> bool:
 
 @torch.compiler.assume_constant_result
 def triton_available(device: torch.device | str) -> bool:
-    """Whether fused Triton kernels may run on ``device``."""
+    """Return whether fused Triton kernels may run on ``device``."""
 
     try:
         major, _minor = torch.cuda.get_device_capability(torch.device(device))
@@ -50,6 +50,8 @@ def triton_available(device: torch.device | str) -> bool:
 
 
 def _ptxas_supports_blackwell(path: Path) -> bool:
+    """Return whether the installed assembler advertises Blackwell target support."""
+
     if not path.is_file():
         return False
     try:

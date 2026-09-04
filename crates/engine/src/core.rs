@@ -1,5 +1,7 @@
-//! In-process engine composition: worker lifecycle, scheduler ownership, and the
-//! transport-free [`EngineHandle`] surface used by the server.
+//! In-process composition of worker executors, scheduler ownership, and handles.
+//!
+//! [`EngineCore`] owns the scheduler thread and worker lifecycle while exposing
+//! a transport-independent [`EngineHandle`] to request producers.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -29,11 +31,11 @@ pub struct EngineCoreConfig {
     pub runtime_profile: RuntimeProfile,
     /// Maximum number of ops assembled into a single forward batch.
     pub max_batch: usize,
-    /// Per-step scheduling token budget (vLLM's `max_num_batched_tokens`).
+    /// Maximum number of tokens scheduled in one engine step.
     pub max_num_batched_tokens: usize,
-    /// Maximum concurrently running requests (vLLM's `max_num_seqs`).
+    /// Maximum number of concurrently running requests.
     pub max_num_seqs: usize,
-    /// Per-request ceiling for one prefill chunk (SGLang's chunked prefill size).
+    /// Per-request token ceiling for one prefill chunk.
     pub long_prefill_threshold: usize,
     /// Per-step budget of text prefill tokens allowed to join a decode batch
     /// as one mixed extend+decode forward. `0` disables mixing.
@@ -51,14 +53,16 @@ pub struct EngineCoreConfig {
     pub transfer: TransportMap,
     /// Complete process arguments; staged pools override placement and role.
     pub worker_process: WorkerProcessArgs,
-    /// Control-token ids resolved from the tokenizer for EOS and feedback continuation.
+    /// Beginning-of-sequence token identifier.
     pub bos: u32,
+    /// Token identifiers that terminate generation.
     pub eos: Vec<u32>,
+    /// Token identifier that terminates encoded image content.
     pub end_of_image: u32,
 }
 
 impl EngineCoreConfig {
-    /// A minimal config for the GPU-free sim backend (used by tests).
+    /// Builds a minimal configuration for the CPU simulation backend.
     ///
     /// Pair this with [`EngineCore::with_executor`]: [`EngineCore::new`] cannot
     /// build a `Sim` backend because it has no spawnable worker process.
@@ -96,6 +100,7 @@ impl EngineCoreConfig {
         }
     }
 
+    /// Returns the control tokens for a scheduler request.
     fn control_tokens(&self) -> ControlTokens {
         ControlTokens {
             bos: self.bos,
@@ -124,12 +129,11 @@ pub struct EngineCore {
 }
 
 impl EngineCore {
-    /// Build the scheduler, spawn the forward-only worker, and start the
+    /// Builds the scheduler, spawn the forward-only worker, and start the
     /// scheduler owner thread.
     ///
     /// Blocks until the worker has loaded the model and answered the
-    /// worker-info handshake — for the real worker this can take minutes.
-    ///
+    /// worker-info handshake, including model initialization.
     pub fn new(config: EngineCoreConfig) -> anyhow::Result<Self> {
         let workers = config.workers.clone().with_process_defaults(
             &config.worker_process.device,
@@ -143,7 +147,7 @@ impl EngineCore {
         Self::assemble(config, executor, command_waker)
     }
 
-    /// Spawn the single Full pool. `tp == 1` uses a `UniprocExecutor`; `tp > 1`
+    /// Spawns the single Full pool. `tp == 1` uses a `UniprocExecutor`; `tp > 1`
     /// uses a `MultiprocExecutor`.
     fn spawn_full_pool(
         config: &EngineCoreConfig,
@@ -170,7 +174,7 @@ impl EngineCore {
         }
     }
 
-    /// Compose a staged executor over explicitly configured physical pools.
+    /// Composes a staged executor over explicitly configured physical pools.
     fn spawn_staged(
         config: &EngineCoreConfig,
         workers: &WorkerTopology,
@@ -230,7 +234,7 @@ impl EngineCore {
         Ok((Box::new(executor), waker))
     }
 
-    /// Build the engine core from an executor supplied by a higher composition layer.
+    /// Builds the engine core from an executor supplied by a higher composition layer.
     pub fn with_executor(
         config: EngineCoreConfig,
         executor: Box<dyn Executor>,
@@ -238,6 +242,7 @@ impl EngineCore {
         Self::assemble(config, executor, CommandWaker::noop())
     }
 
+    /// Builds the engine core from an executor with an event-driven command waker.
     pub fn with_executor_and_waker(
         config: EngineCoreConfig,
         executor: Box<dyn Executor>,
@@ -246,6 +251,7 @@ impl EngineCore {
         Self::assemble(config, executor, command_waker)
     }
 
+    /// Assembles scheduler state and transport channels around an initialized executor.
     fn assemble(
         config: EngineCoreConfig,
         executor: Box<dyn Executor>,
@@ -303,21 +309,22 @@ impl EngineCore {
         })
     }
 
-    /// Cloneable command-channel front door over the scheduler.
+    /// Returns a cloneable command-channel front door over the scheduler.
     pub fn handle(&self) -> EngineHandle {
         self.handle.clone()
     }
 
-    /// Worker-reported worker info (the post-load truth).
+    /// Returns the worker-reported runtime capabilities.
     pub fn info(&self) -> &WorkerInfo {
         &self.info
     }
 
-    /// Serving-facing projection of post-load worker limits.
+    /// Returns the generation limits resolved against worker capabilities.
     pub fn generation_limits(&self) -> GenerationLimits {
         self.generation_limits.clone()
     }
 
+    /// Returns whether the worker can sample autoregressive tokens.
     pub fn supports_token_sampling(&self) -> bool {
         self.info.supported_ops.iter().any(|mode| {
             matches!(
@@ -327,38 +334,42 @@ impl EngineCore {
         })
     }
 
-    /// Live scheduler stats, shared with the scheduler thread.
+    /// Returns live scheduler statistics shared with the scheduler thread.
     pub fn stats(&self) -> &Arc<SchedStats> {
         &self.stats
     }
 
+    /// Returns the served model identifier.
     pub fn model_name(&self) -> &str {
         &self.model_name
     }
 
+    /// Returns the model parameter data type.
     pub fn model_dtype(&self) -> ModelDtype {
         self.model_dtype
     }
 
+    /// Returns the configured maximum model context length.
     pub fn max_model_len(&self) -> u32 {
         self.max_model_len
     }
 
+    /// Returns the request runtime family.
     pub const fn runtime_family(&self) -> RuntimeFamily {
         self.runtime_family
     }
 
-    /// Allocate the next internal scheduler request id.
+    /// Allocates the next internal scheduler request id.
     pub fn next_request_id(&self) -> RequestId {
         RequestId(self.next_id.fetch_add(1, Ordering::Relaxed))
     }
 
-    /// Whether the engine died (worker/executor failure). Sticky.
+    /// Returns whether the engine has encountered a terminal worker or executor failure.
     pub fn is_dead(&self) -> bool {
         self.dead.load(Ordering::SeqCst)
     }
 
-    /// Submit one translated request to the scheduler.
+    /// Submits one translated request to the scheduler.
     pub fn submit(&self, request: Request) -> Result<EventRx, SubmitError> {
         if self.is_dead() {
             return Err(SubmitError::Dead);
@@ -366,7 +377,7 @@ impl EngineCore {
         self.handle.submit(request)
     }
 
-    /// Shut down the scheduler (which tears down the executor/worker) and join
+    /// Shuts down the scheduler, tears down its executor, and joins
     /// its thread. Idempotent.
     pub fn shutdown(&self) {
         self.handle.shutdown();
@@ -386,6 +397,7 @@ impl EngineCore {
 }
 
 impl Drop for EngineCore {
+    /// Releases resources owned by this value.
     fn drop(&mut self) {
         self.shutdown();
     }

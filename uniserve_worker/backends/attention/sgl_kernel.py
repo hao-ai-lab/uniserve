@@ -27,6 +27,8 @@ except Exception:  # pragma: no cover
 
 
 class SglKernelAttentionBackend(AttentionBackend):
+    """Executes dense, paged, and variable-length attention through SGL kernels."""
+
     name = "sgl_kernel"
     available = any(
         value is not None for value in (_flash_attn_varlen_func, _flash_attn_with_kvcache)
@@ -36,6 +38,8 @@ class SglKernelAttentionBackend(AttentionBackend):
     dense_ranks = frozenset({3, 4})
 
     def supports(self, mode: AttentionMode, *, cuda_graph: bool = False) -> bool:
+        """Accept dense, paged, and variable-length attention outside CUDA graph capture."""
+
         if mode is AttentionMode.DENSE and _flash_attn_varlen_func is None:
             return False
         if mode is AttentionMode.PAGED_DECODE and _flash_attn_with_kvcache is None:
@@ -43,6 +47,8 @@ class SglKernelAttentionBackend(AttentionBackend):
         return super().supports(mode, cuda_graph=cuda_graph)
 
     def supports_varlen(self) -> bool:
+        """Report whether the installed SGL kernel package exposes varlen attention."""
+
         return _flash_attn_varlen_func is not None and super().supports_varlen()
 
     def forward(
@@ -56,6 +62,8 @@ class SglKernelAttentionBackend(AttentionBackend):
         attn_mask: torch.Tensor | None = None,
         context: ForwardBatch | None = None,
     ) -> torch.Tensor:
+        """Compute dense attention through the SGL FlashAttention extension."""
+
         if _flash_attn_varlen_func is None:
             raise RuntimeError("sgl_kernel flash attention backend is not available")
         if attn_mask is not None:
@@ -123,6 +131,8 @@ class SglKernelAttentionBackend(AttentionBackend):
         scale: float,
         context: ForwardBatch | None = None,
     ) -> torch.Tensor:
+        """Write current K/V and compute paged decode through the SGL extension."""
+
         del context
         if _flash_attn_with_kvcache is None:
             raise RuntimeError("sgl_kernel paged KV attention backend is not available")
@@ -187,6 +197,8 @@ class SglKernelAttentionBackend(AttentionBackend):
         block_table: torch.Tensor | None = None,
         context: ForwardBatch | None = None,
     ) -> torch.Tensor:
+        """Compute packed variable-length attention through the SGL extension."""
+
         del context
         if _flash_attn_varlen_func is None:
             raise RuntimeError("sgl_kernel flash attention backend is not available")
@@ -211,6 +223,8 @@ class SglKernelAttentionBackend(AttentionBackend):
 
 
 def _q_to_blh(q: torch.Tensor, block_table: torch.Tensor) -> tuple[torch.Tensor, str]:
+    """Normalize decode queries to batch-length-head layout using table row count."""
+
     if q.ndim == 4:
         return q.transpose(1, 2).contiguous(), "bhld"
     if q.ndim != 3:
@@ -224,6 +238,8 @@ def _q_to_blh(q: torch.Tensor, block_table: torch.Tensor) -> tuple[torch.Tensor,
 
 
 def _kv_to_blh(x: torch.Tensor | None, *, rows: int) -> torch.Tensor | None:
+    """Normalize optional KV rows into batch-length-head layout."""
+
     if x is None:
         return None
     if x.ndim == 4:

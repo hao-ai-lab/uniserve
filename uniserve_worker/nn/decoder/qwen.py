@@ -21,12 +21,16 @@ __all__ = [
 
 
 def _silu_and_mul(x: torch.Tensor) -> torch.Tensor:
+    """Apply SiLU to one packed half and gate it with the other half."""
+
     from uniserve_worker import ops
 
     return ops.silu_and_mul(x)
 
 
 def qwen3_gate_up_activation(hidden_act: str | None) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Resolve a checkpoint activation name to its fused gate/up operation."""
+
     key = str(hidden_act or "silu").lower()
     if key in {"silu", "swish", "silu_and_mul", "swiglu"}:
         return _silu_and_mul
@@ -47,6 +51,8 @@ class Qwen3MLP(nn.Module):
         layer_config: LayerConfig,
         weight_mode: WeightMode = WeightMode.VANILLA,
     ) -> None:
+        """Build the fused gate/up expansion and tensor-parallel reduction projection."""
+
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             int(config.hidden_size),
@@ -64,4 +70,6 @@ class Qwen3MLP(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor, mesh: MeshView) -> torch.Tensor:
+        """Apply gated expansion and reduce the output projection across the mesh."""
+
         return self.down_proj(self.act(self.gate_up_proj(hidden_states)), mesh)

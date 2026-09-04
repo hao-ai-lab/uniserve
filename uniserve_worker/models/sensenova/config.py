@@ -1,4 +1,5 @@
 """Loader-owned config objects for checkpoints with custom HF config classes."""
+
 from __future__ import annotations
 
 from typing import Any
@@ -22,20 +23,14 @@ def _vision_stage_scalar(value: Any, field_name: str) -> Any:
     return value
 
 
-# Architecture names used to default an absent sub-config section (the standard
-# HF ``is_composition`` behavior). Named once so the magic strings are not
-# repeated inline in the ``NeoChatConfig`` default-resolution branches.
+# Hugging Face composition resolves omitted tower configs from these architecture names.
 _DEFAULT_VISION_ARCHITECTURE = "NEOVisionModel"
 _DEFAULT_LLM_ARCHITECTURE = "Qwen3ForCausalLM"
 _TOKEN_ID_FIELDS = ("bos_token_id", "eos_token_id", "pad_token_id")
 
 
 def _ensure_layer_types(config: PretrainedConfig) -> None:
-    """Populate ``config.layer_types`` if absent or stale.
-
-    Shared by SenseNova LLM configs so the sliding-window layer derivation lives
-    in exactly one place.
-    """
+    """Derive each decoder layer's attention type from the sliding-window boundary."""
     existing = getattr(config, "layer_types", None)
     if existing and len(existing) == config.num_hidden_layers:
         return
@@ -50,6 +45,8 @@ def _ensure_layer_types(config: PretrainedConfig) -> None:
 
 
 class NeoVisionConfig(PretrainedConfig):
+    """Normalizes vision-tower patch, width, head, layer, and position settings from checkpoint metadata."""
+
     model_type = "neo_vision"
 
     def __init__(
@@ -65,6 +62,8 @@ class NeoVisionConfig(PretrainedConfig):
         max_pixels: int = 4194304,
         **kwargs: Any,
     ) -> None:
+        """Normalize serialized vision geometry into scalar tower configuration."""
+
         super().__init__(**kwargs)
         self.hidden_size = hidden_size
         # Checkpoints may express ``llm_hidden_size``/``downsample_ratio`` as a
@@ -81,12 +80,16 @@ class NeoVisionConfig(PretrainedConfig):
         self.max_pixels = max_pixels
 
 class NeoLlmConfig(Qwen3Config):
+    """Normalizes decoder width, head, layer, expert, rotary, and vocabulary settings for SenseNova."""
+
     def __init__(
         self,
         rope_theta_hw: float = 10000.0,
         max_position_embeddings_hw: int = 10000,
         **kwargs: Any,
     ) -> None:
+        """Normalize rotary metadata and derive per-layer attention modes."""
+
         super().__init__(**kwargs)
         if not hasattr(self, "rope_theta"):
             rope = getattr(self, "rope_parameters", None) or getattr(self, "rope_scaling", None) or {}
@@ -96,16 +99,22 @@ class NeoLlmConfig(Qwen3Config):
         self._ensure_layer_types()
 
     def _ensure_layer_types(self) -> None:
+        """Populate decoder attention modes from sliding-window configuration."""
+
         _ensure_layer_types(self)
 
 
 def build_neo_llm_config(llm_config: Any) -> Any:
+    """Materialize mapping-based decoder metadata while preserving config instances."""
+
     if isinstance(llm_config, dict):
         return NeoLlmConfig(**llm_config)
     return llm_config
 
 
 class NeoChatConfig(PretrainedConfig):
+    """Combines SenseNova language and vision configuration with multimodal token identities."""
+
     model_type = "neo_chat"
     is_composition = True
 
@@ -117,6 +126,8 @@ class NeoChatConfig(PretrainedConfig):
         template: str | None = None,
         **kwargs: Any,
     ) -> None:
+        """Materialize nested language and vision configs with shared token identities."""
+
         super().__init__(**kwargs)
         if vision_config is None:
             vision_config = {"architectures": [_DEFAULT_VISION_ARCHITECTURE]}
@@ -138,6 +149,8 @@ class NeoChatConfig(PretrainedConfig):
         self.tie_word_embeddings = self.llm_config.tie_word_embeddings
 
     def to_dict(self) -> dict[str, Any]:
+        """Serialize nested vision and language configuration with multimodal fields intact."""
+
         output = super().to_dict()
         output["vision_config"] = self.vision_config.to_dict()
         output["llm_config"] = self.llm_config.to_dict()

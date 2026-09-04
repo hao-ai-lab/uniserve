@@ -9,7 +9,7 @@ __all__ = [
 
 
 def ceil_div(value: int, divisor: int) -> int:
-    """Ceiling division of two integers.
+    """Return the ceiling of ``value`` divided by ``divisor``.
 
     The divisor is clamped to ``>= 1`` so a zero or negative ``block_size``
     cannot raise ``ZeroDivisionError``.

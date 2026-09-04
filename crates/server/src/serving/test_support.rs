@@ -1,3 +1,5 @@
+//! Deterministic tokenizer fixtures shared by serving tests.
+
 use std::sync::Arc;
 
 use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
@@ -5,6 +7,7 @@ use tempfile::tempdir;
 use tokenizers::models::bpe::{BPE, Vocab};
 use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 
+/// Builds a deterministic byte-oriented tokenizer for serving tests.
 pub(crate) fn configured_tokenizer() -> DynTokenizer {
     let mut vocab = (0_u32..=127)
         .map(|id| {

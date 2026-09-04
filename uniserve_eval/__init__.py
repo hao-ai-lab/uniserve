@@ -1,4 +1,4 @@
-"""Serving evaluation through public HTTP endpoints."""
+"""Public types and single-point execution for HTTP serving evaluations."""
 
 from .pipeline.run import run_point
 from .types import BenchmarkPoint, MetricDefinition, RunResult, TaskName

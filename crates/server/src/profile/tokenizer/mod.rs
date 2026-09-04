@@ -1,4 +1,6 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+//! Tokenizer abstraction, Hugging Face implementation, and incremental decoding.
+
 use std::sync::Arc;
 
 mod byte_level_decode;

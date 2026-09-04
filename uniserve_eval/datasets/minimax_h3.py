@@ -1,4 +1,4 @@
-"""Fixed MiniMax H3 T2VA qualification prompts."""
+"""Builds fixed-length MiniMax H3 text-to-video-with-audio prompts."""
 
 from __future__ import annotations
 
@@ -30,11 +30,15 @@ _SEED = 1000
 
 
 class MiniMaxH3Dataset(Dataset):
+    """Synthesizes deterministic prompts at an exact tokenizer length."""
+
     name: ClassVar[str] = "minimax-h3"
     requires_path = False
     requires_tokenizer = True
 
     def load(self, tokenizer: Any | None) -> list[Example]:
+        """Construct repeated examples whose decoded prompt has the target length."""
+
         if tokenizer is None:
             raise ValueError("MiniMax H3 benchmark prompt synthesis requires its tokenizer")
         target = int(self.point.video.prompt_tokens)

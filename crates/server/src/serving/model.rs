@@ -1,11 +1,8 @@
-//! Closed, load-bound model resolution and the sole model-owned `tokenize`
-//! arrow.
+//! Load-time model resolution and model-owned request tokenization.
 //!
-//! [`ResolvedModel`] is the closed value the server resolves at load time. It
-//! owns the only transition from [`GenerateReqInput`] to
-//! [`TokenizedGenerateReqInput`] via the inherent [`ResolvedModel::tokenize`]
-//! method. There is no name registry, family router, plugin factory, or
-//! trait-object tower in front of it.
+//! [`ResolvedModel`] binds tokenizer assets, generation policy, geometry, and
+//! output processing. Its [`ResolvedModel::tokenize`] method lowers
+//! [`GenerateReqInput`] into [`TokenizedGenerateReqInput`].
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -39,69 +36,98 @@ use crate::serving::{
     CacheAccounting, ResourceAccounting, Result, ServeError, cache_isolation_key,
 };
 
-/// Public endpoint admitted by one resolved model description.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
 #[serde(rename_all = "snake_case")]
+/// Public API endpoint supported by a resolved model.
 pub enum ServedEndpoint {
+    /// OpenAI-compatible chat-completions endpoint.
     ChatCompletions,
+    /// OpenAI-compatible image-generations endpoint.
     ImageGenerations,
+    /// OpenAI-compatible video-generations endpoint.
     VideoGenerations,
 }
 
-/// Public input or output modality admitted by one resolved description.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
 #[serde(rename_all = "snake_case")]
+/// Input or output modality supported by a resolved model.
 pub enum ServedModality {
+    /// Tokenized or decoded text.
     Text,
+    /// Encoded or generated images.
     Image,
+    /// Encoded or generated video.
     Video,
+    /// Encoded or generated audio.
     Audio,
 }
 
-/// Public behavior whose semantics are owned by the resolved description and
-/// the shared response path.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
 #[serde(rename_all = "snake_case")]
+/// Optional serving feature supported by a resolved model.
 pub enum ServedFeature {
+    /// Incremental response streaming.
     Streaming,
+    /// Token and resource usage reporting.
     Usage,
+    /// Prompt and generated-token log probabilities.
     Logprobs,
+    /// Structured reasoning output.
     Reasoning,
+    /// Structured function-tool calls.
     ToolCalling,
+    /// Repeated transitions between generated modalities.
     RepeatedInterleave,
 }
 
-/// Sampling control admitted by every configured sampler route.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
 #[serde(rename_all = "snake_case")]
+/// Sampling control accepted by a resolved model.
 pub enum ServedSamplingControl {
+    /// Deterministic highest-probability sampling.
     Greedy,
+    /// Temperature scaling.
     Temperature,
+    /// Top-k candidate truncation.
     TopK,
+    /// Nucleus candidate truncation.
     TopP,
+    /// Minimum relative-probability truncation.
     MinP,
+    /// Multiplicative repetition penalty.
     RepetitionPenalty,
+    /// Frequency-based repetition penalty.
     FrequencyPenalty,
+    /// Presence-based repetition penalty.
     PresencePenalty,
+    /// Per-token additive logit adjustment.
     LogitBias,
+    /// Explicit token allowlist.
     AllowedTokenIds,
+    /// Text-sequence denylist.
     BadWords,
+    /// Minimum generated-token count.
     MinTokens,
+    /// Candidate log-probability reporting.
     Logprobs,
+    /// Additional stop-token identifiers.
     StopTokenIds,
+    /// End-of-sequence stopping policy.
     Eos,
+    /// Decoded stop strings.
     StopStrings,
 }
 
 impl ServedSamplingControl {
+    /// Sampling controls supported by token-generating model profiles.
     pub const ALL: [Self; 16] = [
         Self::Greedy,
         Self::Temperature,
@@ -125,72 +151,110 @@ impl ServedSamplingControl {
 /// Exact public route declaration for one load-bound model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelSupport {
+    /// Public endpoints served by the model.
     pub endpoints: Vec<ServedEndpoint>,
+    /// Input modalities accepted by the model.
     pub input_modalities: Vec<ServedModality>,
+    /// Output modalities produced by the model.
     pub output_modalities: Vec<ServedModality>,
+    /// Optional serving behaviors implemented by the model path.
     pub features: Vec<ServedFeature>,
+    /// Sampling controls accepted by the model path.
     pub sampling_controls: Vec<ServedSamplingControl>,
 }
 
 /// The closed load-bound model owner.
 pub enum ResolvedModel {
+    /// Text-generation model with chat support.
     Text(Qwen3Desc),
+    /// Multimodal understanding and image-generation model.
     Omni(OmniDesc),
+    /// Media-generation model.
     Media(MiniMaxH3Desc),
 }
 
+/// Resolved multimodal model description.
 pub enum OmniDesc {
+    /// SenseNova multimodal model.
     SenseNova(SenseNovaDesc),
+    /// Bagel multimodal model.
     Bagel(BagelDesc),
 }
 
 /// Typed assets awaiting validation against the running worker limits.
 pub enum ResolvedAssets {
+    /// Text-model assets.
     Text {
+        /// Resolved common model profile.
         profile: CommonModelProfile,
+        /// Tokenizer bound to the model vocabulary.
         tokenizer: DynTokenizer,
+        /// Renderer bound to the model chat template.
         renderer: HfChatRenderer,
     },
+    /// Multimodal-model assets.
     Omni {
+        /// Resolved common model profile.
         profile: CommonModelProfile,
+        /// Tokenizer bound to the model vocabulary.
         tokenizer: DynTokenizer,
+        /// Renderer bound to the model chat template.
         renderer: HfChatRenderer,
+        /// Profile-specific image preprocessing and generation policy.
         preprocessing: OmniPreprocessing,
     },
+    /// Media-generation model assets.
     Media {
+        /// Resolved common model profile.
         profile: CommonModelProfile,
+        /// Tokenizer bound to the model vocabulary.
         tokenizer: DynTokenizer,
+        /// Maximum generated video duration in seconds.
         max_video_seconds: f64,
     },
 }
 
+/// Profile-specific multimodal preprocessing implementation.
 pub enum OmniPreprocessing {
+    /// SenseNova image preprocessing and generation policy.
     SenseNova(SenseNovaProfile),
+    /// Bagel image preprocessing and generation policy.
     Bagel(BagelProfile),
 }
 
 #[derive(Debug, Error)]
+/// Failure while resolving a configured model and its assets.
 pub enum ModelResolutionError {
+    /// Model files or profile metadata cannot be resolved.
     #[error(transparent)]
     Assets(#[from] crate::profile::assets::Error),
+    /// The model tokenizer cannot be loaded.
     #[error(transparent)]
     Tokenizer(#[from] TokenizerError),
+    /// The model chat renderer cannot be initialized.
     #[error(transparent)]
     Chat(#[from] crate::serving::chat::Error),
+    /// A resolved asset path cannot be prepared for worker access.
     #[error("model asset path `{path}` could not be prepared")]
     Io {
+        /// Asset path that could not be prepared.
         path: PathBuf,
+        /// Underlying filesystem error.
         #[source]
         source: std::io::Error,
     },
+    /// The running worker lacks a feature required by the selected profile.
     #[error("configured model description `{description}` requires worker feature `{feature}`")]
     MissingFeature {
+        /// Stable model-profile identifier.
         description: &'static str,
+        /// Required runtime feature.
         feature: GenerationFeatures,
     },
 }
 
 impl ResolvedAssets {
+    /// Resolves assets and validates the selected model against engine capabilities.
     pub(crate) async fn load(
         config: &crate::Config,
     ) -> std::result::Result<Self, ModelResolutionError> {
@@ -268,6 +332,7 @@ impl ResolvedAssets {
         })
     }
 
+    /// Builds a resolved model from local assets and an engine snapshot.
     pub fn from_files(
         description: ModelDescription,
         served_name: &str,
@@ -309,6 +374,7 @@ impl ResolvedAssets {
         })
     }
 
+    /// Returns the model's common capability profile.
     pub(crate) fn profile(&self) -> &CommonModelProfile {
         match self {
             Self::Text { profile, .. }
@@ -317,6 +383,7 @@ impl ResolvedAssets {
         }
     }
 
+    /// Returns the maximum combined context and generated token count.
     pub(crate) fn max_model_tokens(&self) -> u32 {
         self.profile()
             .context_limits
@@ -324,6 +391,7 @@ impl ResolvedAssets {
             .unwrap_or(EngineSettings::DEFAULT_MAX_MODEL_LEN)
     }
 
+    /// Returns the request-state capacity advertised by the engine.
     pub(crate) fn request_slot_capacity(&self) -> usize {
         if matches!(self, Self::Media { .. }) {
             EngineSettings::MEDIA_IPC_SLOT_CAP
@@ -332,6 +400,7 @@ impl ResolvedAssets {
         }
     }
 
+    /// Returns multimodal generation control tokens, when supported.
     pub(crate) fn generation_controls(&self) -> Option<&crate::profile::omni::GenerationControls> {
         match self {
             Self::Omni {
@@ -346,6 +415,7 @@ impl ResolvedAssets {
         }
     }
 
+    /// Builds the engine runtime profile required by this model.
     pub(crate) fn runtime_profile(
         &self,
         model_dtype: uniserve_core::ModelDtype,
@@ -409,6 +479,7 @@ pub struct BagelDesc {
     max_model_tokens: u32,
 }
 
+/// Resolved MiniMax H3 video-generation description.
 pub struct MiniMaxH3Desc {
     identity: ModelIdentity,
     tokenizer: DynTokenizer,
@@ -417,7 +488,7 @@ pub struct MiniMaxH3Desc {
 }
 
 impl ResolvedModel {
-    /// Fallible, exhaustive resolution over the closed configured set.
+    /// Resolves the configured assets into a validated model description.
     ///
     /// The typed description selects the variant; required description-owned
     /// assets are checked before construction.
@@ -428,6 +499,8 @@ impl ResolvedModel {
         max_model_tokens: u32,
         parse_reasoning: bool,
     ) -> Result<Self> {
+        // Resolution validates each asset family against the runtime features
+        // required by its public serving contract.
         match assets {
             ResolvedAssets::Text {
                 profile,
@@ -476,6 +549,8 @@ impl ResolvedModel {
                     .context_limits
                     .max_output_tokens
                     .or(profile.generation_defaults.max_output_tokens);
+                // The preprocessing profile selects the concrete multimodal
+                // descriptor while sharing the validated identity and limits.
                 Ok(Self::Omni(match preprocessing {
                     OmniPreprocessing::SenseNova(preprocessing) => {
                         OmniDesc::SenseNova(SenseNovaDesc {
@@ -501,6 +576,7 @@ impl ResolvedModel {
                     }),
                 }))
             }
+            // Media assets carry all geometry limits needed by request lowering.
             ResolvedAssets::Media {
                 profile,
                 tokenizer,
@@ -514,7 +590,7 @@ impl ResolvedModel {
         }
     }
 
-    /// Served-model description used by `/v1/models` and public events.
+    /// Returns the model identity used by `/v1/models` and public events.
     pub fn served_identity(&self) -> &ModelIdentity {
         match self {
             Self::Text(d) => &d.identity,
@@ -524,11 +600,12 @@ impl ResolvedModel {
         }
     }
 
-    /// Friendly served-model name.
+    /// Returns the public served-model name.
     pub fn served_model_name(&self) -> &str {
         &self.served_identity().served_name
     }
 
+    /// Resolves and validates requested video dimensions and frame count.
     pub fn resolve_video_request_geometry(
         &self,
         request_id: &crate::serving::ServeRequestId,
@@ -541,6 +618,7 @@ impl ResolvedModel {
                 feature: "video_generation",
             });
         };
+        // Tokenize and bound the prompt before deriving any media allocation.
         let prompt_token_ids = description
             .tokenizer
             .encode(prompt, false)
@@ -563,6 +641,8 @@ impl ResolvedModel {
                 max_tokens: description.max_prompt_tokens,
             });
         }
+        // Duration is a public floating-point input and must be finite before
+        // conversion to the fixed-width frame protocol.
         if !seconds.is_finite() || seconds <= 0.0 || seconds > description.max_video_seconds {
             return Err(ServeError::Tokenize {
                 request_id: request_id.clone(),
@@ -581,6 +661,7 @@ impl ResolvedModel {
                 ),
             });
         }
+        // H3 media geometry uses frame counts congruent to five modulo seventeen.
         let raw_frames = raw_frames as u32;
         let frame_count = raw_frames + (5 + 17 - raw_frames % 17) % 17;
         if frame_count < 22 {
@@ -598,6 +679,8 @@ impl ResolvedModel {
                     "video prompt token count exceeds the protocol width".to_string(),
                 ),
             })?;
+        // Sequence-parallel decode work rounds video units up across ranks and
+        // reserves two terminal units for the media pipeline.
         let video_units = (frame_count - 5) / 17;
         let decode_units = video_units.div_ceil(4).saturating_add(2);
         Ok((
@@ -611,7 +694,7 @@ impl ResolvedModel {
         ))
     }
 
-    /// Event identity stamped onto `Accepted`.
+    /// Builds the model identity stamped onto accepted events.
     pub fn event_identity(&self) -> ModelEventIdentity {
         let identity = self.served_identity();
         ModelEventIdentity {
@@ -620,17 +703,17 @@ impl ResolvedModel {
         }
     }
 
-    /// True when the description supports image output.
+    /// Returns whether the model supports image output.
     pub fn supports_image_output(&self) -> bool {
         matches!(self, Self::Omni(_))
     }
 
-    /// True when the description supports image input.
+    /// Returns whether the model supports image input.
     pub fn supports_image_input(&self) -> bool {
         matches!(self, Self::Omni(_))
     }
 
-    /// Exact route limits exposed by model discovery and enforced by
+    /// Returns the route limits exposed by model discovery and enforced by
     /// request admission.
     pub fn support(&self) -> ModelSupport {
         if matches!(self, Self::Media(_)) {
@@ -683,7 +766,7 @@ impl ResolvedModel {
         }
     }
 
-    /// Deterministic feature admission or rejection from the resolved route.
+    /// Validates request features against the resolved route.
     pub fn validate_request(&self, request: &GenerateReqInput) -> Result<()> {
         let reject = |feature: &'static str| ServeError::UnsupportedFeature {
             request_id: request.request_id.clone(),
@@ -732,8 +815,7 @@ impl ResolvedModel {
         Ok(())
     }
 
-    /// The sole model-owned arrow from [`GenerateReqInput`] to
-    /// [`TokenizedGenerateReqInput`]. Inherent (not `From`/`TryFrom`/`Into`).
+    /// Tokenizes a generation request with the resolved model pipeline.
     pub fn tokenize(&self, request: GenerateReqInput) -> Result<TokenizedGenerateReqInput> {
         match self {
             Self::Text(d) => d.tokenize(request),
@@ -747,6 +829,7 @@ impl ResolvedModel {
     }
 }
 
+/// Returns the multimodal resources required by the active profile.
 fn configured_omni_needs(
     policy: &GenerationPolicyDescriptor,
     image_ingest: &uniserve_core::ImageIngestRecipe,
@@ -755,6 +838,7 @@ fn configured_omni_needs(
         .required_features(policy, image_ingest.steps.iter().copied())
 }
 
+/// Validates the runtime features.
 fn validate_runtime_features(
     identity: &ModelIdentity,
     limits: &GenerationLimits,
@@ -768,6 +852,7 @@ fn validate_runtime_features(
     })
 }
 
+/// Returns the runtime features required for multimodal serving.
 fn omni_required_features(
     policy: &GenerationPolicyDescriptor,
     image_ingest: &uniserve_core::ImageIngestRecipe,
@@ -784,6 +869,7 @@ fn omni_required_features(
     behavior.required_features(policy, context_steps)
 }
 
+/// Returns the model-specific sampling hints.
 fn sampling_hints(profile: &CommonModelProfile, max_model_tokens: u32) -> SamplingHints {
     let primary = profile.stop_tokens.primary_eos_token_id;
     let mut extra: BTreeSet<u32> = profile.stop_tokens.eos_token_ids.clone();
@@ -804,12 +890,14 @@ fn sampling_hints(profile: &CommonModelProfile, max_model_tokens: u32) -> Sampli
 }
 
 impl Qwen3Desc {
+    /// Tokenizes a Qwen3 request and attaches its request identity to any failure.
     fn tokenize(&self, request: GenerateReqInput) -> Result<TokenizedGenerateReqInput> {
         let request_id = request.request_id.clone();
         self.tokenize_inner(request)
             .map_err(|source| ServeError::Tokenize { request_id, source })
     }
 
+    /// Renders input, resolves sampling and cache policy, and builds the canonical engine request.
     fn tokenize_inner(
         &self,
         request: GenerateReqInput,
@@ -948,6 +1036,7 @@ impl Qwen3Desc {
         })
     }
 
+    /// Resolves model defaults and request controls into validated engine sampling parameters.
     fn lower_sampling(
         &self,
         request: &GenerateReqInput,
@@ -1059,6 +1148,7 @@ impl Qwen3Desc {
 }
 
 impl SenseNovaDesc {
+    /// Tokenizes a request with the SenseNova multimodal preprocessing pipeline.
     fn tokenize(&self, request: GenerateReqInput) -> Result<TokenizedGenerateReqInput> {
         crate::serving::omni::tokenize_sensenova(
             &self.preprocessing,
@@ -1079,6 +1169,7 @@ impl SenseNovaDesc {
 }
 
 impl BagelDesc {
+    /// Tokenizes a request with the Bagel multimodal preprocessing pipeline.
     fn tokenize(&self, request: GenerateReqInput) -> Result<TokenizedGenerateReqInput> {
         crate::serving::omni::tokenize_bagel(
             &self.preprocessing,
@@ -1104,7 +1195,7 @@ struct LoweredSampling {
     stop_token_ids: Vec<u32>,
 }
 
-/// Convert bad-word strings into token-ID sequences, encoding each word both
+/// Converts bad-word strings into token-ID sequences, encoding each word both
 /// with and without a leading space (prefix-space convention) and deduping.
 fn tokenize_bad_words(
     bad_words: &[String],
@@ -1130,6 +1221,7 @@ fn tokenize_bad_words(
     Ok((!all_token_ids.is_empty()).then_some(all_token_ids))
 }
 
+/// Computes a stable hash for cache isolation.
 fn stable_hash(value: &str) -> u64 {
     value
         .as_bytes()

@@ -1,8 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-//! Full-stack GPU-free control-plane integration tests: drive the
-//! real `EngineLoop` over a `LocalExecutor`+`SimEngine` and assert the lifecycle/event
-//! behavior. This is the regression harness every workstream relies on.
+//! End-to-end engine-loop lifecycle behavior over the GPU-free simulator.
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -148,7 +146,7 @@ struct Collected {
     reason: Option<FinishReason>,
 }
 
-/// Run the given (constraint, count) requests through a fresh scheduler at `depth`,
+/// Runs the given (constraint, count) requests through a fresh scheduler at `depth`,
 /// returning per-request collected counts.
 fn run_requests(
     depth: u32,
@@ -1057,7 +1055,7 @@ fn chunked_prefill_progresses_with_decode() {
     assert!(t1 > 0 && t2 > 0, "both must produce text (t1={t1} t2={t2})");
 }
 
-/// Run one text request with the given sampling params and a sim `text_len`,
+/// Runs one text request with the given sampling params and a sim `text_len`,
 /// returning (emitted token ids, whether any logprob was populated, finished).
 fn run_sampling(
     sampling: SamplingParams,

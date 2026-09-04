@@ -1,3 +1,5 @@
+//! Token decoding and ranking for generated and prompt logprobs.
+
 use crate::profile::tokenizer::HuggingFaceTokenizer;
 use itertools::Itertools as _;
 use serde::{Deserialize, Serialize};
@@ -49,7 +51,7 @@ pub struct DecodedPromptLogprobs {
     pub scored_positions: Vec<DecodedPositionLogprobs>,
 }
 
-/// Decode generated-token logprobs from the raw `llm` token-ID shape into the
+/// Decodes generated-token logprobs from the raw `llm` token-ID shape into the
 /// text-layer decoded-token representation.
 ///
 /// Each returned position corresponds to one generated token position from the
@@ -67,12 +69,11 @@ pub(crate) fn decode_logprobs(
     })
 }
 
-/// Decode prompt logprobs from the raw `llm` token-ID shape into the text-layer
+/// Decodes prompt logprobs from the raw `llm` token-ID shape into the text-layer
 /// decoded-token representation.
 ///
-/// The returned payload stores the first prompt token separately and decodes
-/// the remaining scored prompt positions into `scored_positions`, matching
-/// the reference prompt-logprobs semantics.
+/// The first prompt token is stored separately because scored positions begin
+/// with the token predicted after it.
 pub(crate) fn decode_prompt_logprobs(
     request_id: &str,
     tokenizer: &HuggingFaceTokenizer,
@@ -98,7 +99,7 @@ pub(crate) fn decode_prompt_logprobs(
     })
 }
 
-/// Decode one token position's raw candidate set into decoded token strings
+/// Decodes one token position's raw candidate set into decoded token strings
 /// plus logprob metadata.
 ///
 /// This decodes every candidate token ID independently through the active text

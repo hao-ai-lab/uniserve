@@ -52,6 +52,8 @@ from .rows import (
 
 
 def pack_forward(runtime: ExecutionResources, state: OperationState) -> tuple[object, ...]:
+    """Pack an encoder or latent-decoder operation into a single-row model forward."""
+
     if state.phase != "initial":
         return ()
     if state.operation.kind.encode_mode is not None:
@@ -66,6 +68,8 @@ def consume_forward(
     state: OperationState,
     outputs: tuple[torch.Tensor, ...],
 ) -> None:
+    """Publish encoder features or begin deferred latent reconstruction from model output."""
+
     if state.phase != "forward_pending" or len(outputs) != 1:
         raise RuntimeError("encode forward result is not aligned")
     if state.data["mode"] == "encode":
@@ -77,6 +81,8 @@ def consume_forward(
 
 
 def run_action(runtime: ExecutionResources, state: OperationState) -> bool:
+    """Execute encoder finalization work that does not require a model forward."""
+
     if state.phase != "action":
         return False
     if state.data["mode"] == "frames":
@@ -88,6 +94,8 @@ def run_action(runtime: ExecutionResources, state: OperationState) -> bool:
 
 
 def _pack_encode(runtime: ExecutionResources, state: OperationState) -> tuple[object, ...]:
+
+    """Stage image tensors and build the model batch for one encoder operation."""
 
     operation = state.operation
     scope = state.lane
@@ -134,6 +142,8 @@ def _pack_encode(runtime: ExecutionResources, state: OperationState) -> tuple[ob
 def _consume_encode(
     runtime: ExecutionResources, state: OperationState, output: torch.Tensor
 ) -> None:
+
+    """Split encoded features by request and prepare cache or product publication."""
 
     operation = state.operation
     scope = state.lane
@@ -183,6 +193,8 @@ def _consume_encode(
 
 
 def _pack_diffusion_finalize(runtime: ExecutionResources, state: OperationState) -> tuple[object, ...]:
+
+    """Gather the final latent trajectory and build its decoder batch."""
 
     operation = state.operation
     scope = state.lane
@@ -247,6 +259,8 @@ def _pack_diffusion_finalize(runtime: ExecutionResources, state: OperationState)
 
 
 def _finish_diffusion_finalize(runtime: ExecutionResources, state: OperationState) -> None:
+
+    """Decode final latents and schedule bounded image-output publication."""
 
     operation = state.operation
     scope = state.lane
@@ -319,6 +333,8 @@ def state_outcome(
     base: int | None = None,
     products: tuple[ProductPayload, ...] = (),
 ) -> Outcome:
+    """Record logical lengths and defer successor publication until stateful products are ready."""
+
     request = runtime.request_row(scope, operation.request_key.request_id)
     cache = runtime.cache_coordinates(operation, scope)
     selected = scope.runtime_cache_lengths.get(cache[0], cache[2])
@@ -347,6 +363,8 @@ def non_state_outcome(
     products: tuple[ProductPayload, ...] = (),
     completion_tasks: tuple[ImagePayload, ...] = (),
 ) -> Outcome:
+    """Record a stateless completion and its already materialized output products."""
+
     request = runtime.request_row(scope, operation.request_key.request_id)
     base = request.logical_position
     return Outcome(
@@ -366,6 +384,8 @@ def encode_source(
     operation: Operation,
     scope: LaneState,
 ) -> str | tuple[torch.Tensor, DeviceProductMetadata]:
+    """Resolve encoded request media and stage it according to the model’s image policy."""
+
     for reference in operation.inputs:
         inline = scope.input_images.get(reference)
         if inline is not None:
@@ -398,6 +418,8 @@ def encode_row(
     prepared: PreparedImage,
     scope: LaneState,
 ) -> ForwardRow:
+    """Build a vision- or latent-encoder row from prepared image tensors."""
+
     request = runtime.request_row(scope, operation.request_key.request_id)
     return ForwardRow(
         operation=operation,
@@ -422,6 +444,8 @@ def vision_state_row(
     close_image: bool,
     logits: bool,
 ) -> ForwardRow:
+    """Publish vision features and construct the request runtime that references their token span."""
+
     request = runtime.request_row(scope, operation.request_key.request_id)
     cache = runtime.cache_coordinates(operation, scope)
     injection = runtime.image_processor().feature_injection
@@ -476,6 +500,8 @@ def vision_state_row(
 
 
 def _feature_token_id(runtime: ExecutionResources, injection: Any, *, start: bool) -> int:
+    """Resolve the configured opening or closing token for image-feature injection."""
+
     value = injection.start_token_id if start else injection.end_token_id
     text = injection.start_token if start else injection.end_token
     if value is not None:
@@ -500,6 +526,8 @@ def _vision_positions(
     trailing: bool,
     close_image: bool,
 ) -> torch.Tensor:
+    """Build temporal-height-width positions and boundary markers for vision tokens."""
+
     query = int(leading) + feature_tokens + int(trailing)
     if layout is PositionLayout.TEMPORAL:
         return torch.full((query,), int(conditioning_position), dtype=torch.long)
@@ -542,6 +570,8 @@ def latent_state_row(
     conditioning_position: int,
     scope: LaneState,
 ) -> ForwardRow:
+    """Publish encoded image latents and construct the request runtime for diffusion conditioning."""
+
     request = runtime.request_row(scope, operation.request_key.request_id)
     flow = runtime.generation()
     if flow.latent_layout is not LatentLayout.PATCH_TOKENS:
@@ -587,6 +617,8 @@ def diffusion_finalize_frames(
     operation: Operation,
     scope: LaneState,
 ) -> Outcome:
+    """Validate finalized diffusion output and return RGB frames with their numeric range."""
+
     image, metadata = transfer.fetch_product(runtime, operation, scope)
     if transfer.metadata_string(metadata, "payload_kind", "") != "image_nchw":
         raise invalid_descriptor("frame materialization source is not an image tensor")
@@ -613,6 +645,8 @@ def defer_image_encoding(
     *,
     max_bytes: int,
 ) -> ImagePayload:
+    """Reserve output storage and schedule image encoding after the device copy completes."""
+
     if max_bytes < 1:
         raise invalid_descriptor("image materialization requires a positive completion bound")
     quantized = quantize_image_hwc(
@@ -634,6 +668,8 @@ def defer_image_encoding(
 
 
 def artifact_product(operation: Operation) -> ProductRef:
+    """Return the operation output declared to carry a completed media artifact."""
+
     for output in operation.outputs:
         if (
             output.kind is ProductKind.ARTIFACT
@@ -644,6 +680,8 @@ def artifact_product(operation: Operation) -> ProductRef:
 
 
 def bound_device_write(scope: LaneState, reference: ProductRef) -> DeviceProductWrite:
+    """Return the staged device-product write matching a declared output reference."""
+
     matches = tuple(write for write in scope.device_writes if write.reference == reference)
     if len(matches) != 1:
         raise invalid_descriptor(
@@ -653,6 +691,8 @@ def bound_device_write(scope: LaneState, reference: ProductRef) -> DeviceProduct
 
 
 def bound_encoder_write(scope: LaneState, reference: ProductRef) -> EncoderWrite:
+    """Return the staged encoder-cache write matching a declared output reference."""
+
     matches = tuple(write for write in scope.encoder_writes if write.reference == reference)
     if len(matches) != 1:
         raise invalid_descriptor(
@@ -662,18 +702,24 @@ def bound_encoder_write(scope: LaneState, reference: ProductRef) -> EncoderWrite
 
 
 def encode_features(output: torch.Tensor) -> torch.Tensor:
+    """Normalize model encoder output to a two-dimensional token-by-width tensor."""
+
     if not isinstance(output, torch.Tensor) or not output.is_floating_point():
         raise invalid_descriptor("encode route did not return encoder features")
     return output
 
 
 def decoded_tensor(output: torch.Tensor) -> torch.Tensor:
+    """Extract the reconstructed image tensor from a supported model output wrapper."""
+
     if not isinstance(output, torch.Tensor) or not output.is_floating_point():
         raise invalid_descriptor("decode route did not return an image tensor")
     return output
 
 
 def positions_as_three_axis(positions: torch.Tensor, query: int) -> torch.Tensor:
+    """Expand temporal positions into the three-axis layout required by multimodal decoders."""
+
     if positions.ndim == 1 and int(positions.numel()) == query:
         return torch.stack((positions, torch.zeros_like(positions), torch.zeros_like(positions)))
     if positions.ndim == 2 and tuple(positions.shape) == (3, query):

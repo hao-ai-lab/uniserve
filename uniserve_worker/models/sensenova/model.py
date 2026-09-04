@@ -99,6 +99,8 @@ _STACKED_WEIGHTS: WeightNameMap = (
 
 
 def _scope_includes(name: str, scope: str) -> bool:
+    """Return whether a parameter name belongs to the selected checkpoint tower scope."""
+
     if scope == "whole":
         return True
     generation = name.startswith("fm_modules.") or "_mot_gen." in name
@@ -110,6 +112,8 @@ def _scope_includes(name: str, scope: str) -> bool:
 
 
 def _check_checkpoint_code_version(config: Any) -> None:
+    """Validate the checkpoint-declared custom-code version when present."""
+
     from packaging.version import Version
 
     raw = config.to_dict() if hasattr(config, "to_dict") else config
@@ -129,6 +133,8 @@ def _module_tensor(
     target: torch.device,
     call: Callable[[nn.Module, torch.Tensor, ForwardBatch], torch.Tensor],
 ) -> torch.Tensor:
+    """Dispatch one tensor to a tower coordinate, execute its module, and restore its device."""
+
     staged = context.mesh.dispatch(value, "tower", coordinate)
     result = call(module, staged, context)
     if not isinstance(result, torch.Tensor):
@@ -144,7 +150,11 @@ def _route_modules(
     context: ForwardBatch,
     call: Callable[[nn.Module, torch.Tensor, ForwardBatch], torch.Tensor],
 ) -> RoutedTensor:
+    """Execute text and flow tensors on their tower coordinates and combine outputs."""
+
     def apply_text(item: torch.Tensor) -> torch.Tensor:
+        """Run the text branch on its tower coordinate and restore the caller device."""
+
         return _module_tensor(
             text_module,
             item,
@@ -155,6 +165,8 @@ def _route_modules(
         )
 
     def apply_flow(item: torch.Tensor) -> torch.Tensor:
+        """Run the flow branch on its tower coordinate and restore the caller device."""
+
         return _module_tensor(
             flow_module,
             item,
@@ -172,6 +184,8 @@ def _plain_call(
     value: torch.Tensor,
     context: ForwardBatch,
 ) -> torch.Tensor:
+    """Invoke a module without mesh-aware arguments."""
+
     del context
     return cast(torch.Tensor, module(value))
 
@@ -181,22 +195,30 @@ def _parallel_call(
     value: torch.Tensor,
     context: ForwardBatch,
 ) -> torch.Tensor:
+    """Invoke a module with the route-restricted mesh view."""
+
     return cast(torch.Tensor, module(value, context.mesh))
 
 
 @dataclass(frozen=True, slots=True)
 class _PackedRope:
+    """Holds cosine and sine tables aligned to one packed token stream."""
+
     cos: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     sin: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
 
 @dataclass(frozen=True, slots=True)
 class _RoutedRope:
+    """Independent rotary tables for text and diffusion-flow routes."""
+
     text: _PackedRope | None
     flow: _PackedRope | None
 
 
 def _route_rope(rope: _PackedRope, spans: tuple[RouteSpan, ...]) -> _RoutedRope:
+    """Split packed rotary tables into independent text and flow route tables."""
+
     cosine = tuple(RoutedTensor.from_packed(value, spans) for value in rope.cos)
     sine = tuple(RoutedTensor.from_packed(value, spans) for value in rope.sin)
     text = (
@@ -238,6 +260,8 @@ class _VisionModel(nn.Module):
     """NEO vision tower returning its raw language-width features."""
 
     def __init__(self, config: NeoVisionConfig) -> None:
+        """Build the vision encoder that projects patches directly to language width."""
+
         super().__init__()
         self.embeddings = NeoVitEncoder(
             NeoVitConfig(
@@ -257,6 +281,8 @@ class _VisionModel(nn.Module):
         *,
         grid_shapes: tuple[tuple[int, int], ...] | None = None,
     ) -> torch.Tensor:
+        """Embed flattened vision patches and add their grid-derived positions."""
+
         return self.embeddings(pixels, grid, grid_shapes=grid_shapes)
 
 
@@ -264,6 +290,8 @@ class _SenseAttention(nn.Module):
     """SenseNova dual-expert QKV projection over one explicit attention plan."""
 
     def __init__(self, config: NeoLlmConfig, layer: int, *, layer_config: LayerConfig) -> None:
+        """Build text and flow projection towers around one shared attention backend."""
+
         super().__init__()
         hidden_size = int(getattr(config, "hidden_size"))
         total_heads = int(getattr(config, "num_attention_heads"))
@@ -343,6 +371,8 @@ class _SenseAttention(nn.Module):
             set_tower_coord(module, _FLOW_COORDINATE)
 
     def rope(self, indexes: torch.Tensor) -> _PackedRope:
+        """Build temporal, height, and width rotary tables for ``[3, tokens]`` indexes."""
+
         if indexes.ndim != 2 or tuple(indexes.shape[:1]) != (3,):
             raise ValueError("SenseNova positions must have shape [3, tokens]")
         target = indexes.device
@@ -351,6 +381,8 @@ class _SenseAttention(nn.Module):
             module: RotaryEmbedding | HFRotaryEmbedding,
             positions: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
+            """Evaluate one rotary axis on its module device and restore the target device."""
+
             frequency = cast(torch.Tensor, getattr(module, "inv_freq"))
             local_positions = positions.to(frequency.device)
             cosine, sine = module.cos_sin_1d(local_positions)
@@ -369,6 +401,8 @@ class _SenseAttention(nn.Module):
         generation: bool,
         context: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project and rotate one route's QKV rows on its assigned tower coordinate."""
+
         coordinate = _FLOW_COORDINATE if generation else _TEXT_COORDINATE
         target = hidden.device
         staged = context.mesh.dispatch(hidden, "tower", coordinate)
@@ -427,6 +461,8 @@ class _SenseAttention(nn.Module):
         rope: _RoutedRope,
         causal: bool,
     ) -> RoutedTensor:
+        """Project routed Q/K/V, attend across declared spans, and restore branch shards."""
+
         text_projection = (
             None
             if hidden.text is None or rope.text is None
@@ -467,7 +503,11 @@ class _SenseAttention(nn.Module):
 
 
 class _SenseLayer(nn.Module):
+    """Routes packed text and flow tokens through shared attention and modality-specific feed-forward experts."""
+
     def __init__(self, config: NeoLlmConfig, layer: int, *, layer_config: LayerConfig) -> None:
+        """Assemble shared attention with route-specific norms and feed-forward towers."""
+
         super().__init__()
         hidden = int(getattr(config, "hidden_size"))
         epsilon = float(getattr(config, "rms_norm_eps"))
@@ -502,6 +542,8 @@ class _SenseLayer(nn.Module):
         rope: _RoutedRope,
         causal: bool,
     ) -> RoutedTensor:
+        """Advance text and flow branches through one normalized attention-plus-MLP layer."""
+
         normalized = _route_modules(
             hidden,
             text_module=self.input_layernorm,
@@ -539,6 +581,8 @@ class _SenseDecoder(nn.Module):
     """One packed text/flow decoder with no serving state."""
 
     def __init__(self, config: NeoLlmConfig, *, layer_config: LayerConfig) -> None:
+        """Build the packed decoder and bind flow-specific modules to their mesh coordinate."""
+
         super().__init__()
         hidden = int(getattr(config, "hidden_size"))
         self.embed_tokens = VocabParallelEmbedding(
@@ -564,6 +608,8 @@ class _SenseDecoder(nn.Module):
         *,
         positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Decode packed routed rows and return final-normalized states in input order."""
+
         if inputs.ndim != 2:
             raise ValueError("SenseNova decoder inputs must have shape [tokens, hidden]")
         token_count = int(inputs.shape[0])
@@ -618,7 +664,11 @@ class _SenseDecoder(nn.Module):
 
 
 class _LanguageModel(nn.Module):
+    """Owns the SenseNova token embedding, decoder, normalization, and vocabulary projection stack."""
+
     def __init__(self, config: NeoLlmConfig, *, layer_config: LayerConfig) -> None:
+        """Build the decoder and tensor-parallel vocabulary projection."""
+
         super().__init__()
         self.model = _SenseDecoder(config, layer_config=layer_config)
         self.lm_head = ParallelLMHead(
@@ -658,6 +708,8 @@ class NEOChatModel(ExecutionModel):
         return report
 
     def checkpoint_parameter_names(self) -> set[str]:
+        """List parameters belonging to the configured checkpoint tower scope."""
+
         return {
             name for name, _ in self.named_parameters() if _scope_includes(name, self._load_scope)
         }
@@ -669,6 +721,8 @@ class NEOChatModel(ExecutionModel):
         layer_config: LayerConfig,
         scope: str = "whole",
     ) -> None:
+        """Construct selected SenseNova towers and publish their serving geometry."""
+
         super().__init__()
         if scope not in {"whole", "understanding", "generation"}:
             raise ValueError(f"unknown SenseNova model scope {scope!r}")
@@ -704,6 +758,8 @@ class NEOChatModel(ExecutionModel):
         hidden: int,
         layer_config: LayerConfig,
     ) -> nn.Module:
+        """Build the configured shallow or deep patch-space flow prediction head."""
+
         merge = int(1 / float(config.downsample_ratio))
         output_dim = 3 * (int(config.vision_config.patch_size) * merge) ** 2
         if int(getattr(config, "fm_head_layers", 2)) > 2:
@@ -722,11 +778,16 @@ class NEOChatModel(ExecutionModel):
         )
 
     def _configure_runtime(self, config: NeoChatConfig) -> None:
+        """Derive serving geometry and multimodal protocol capabilities from checkpoint config."""
+
         llm = config.llm_config
         vision = config.vision_config
         max_text = int(getattr(llm, "max_position_embeddings", 32768))
         max_image = max(1, int(getattr(config, "max_image_seq_len", 4096)))
         latent_downsample = int(int(vision.patch_size) * round(1 / float(config.downsample_ratio)))
+
+        # Flow-head patch expansion determines latent placement, positional
+        # coordinates, and scheduler-visible capacity units.
         self.architecture = "NEOChatModel"
         self.generation = GenerationPipeline(
             latent_downsample=latent_downsample,
@@ -785,6 +846,9 @@ class NEOChatModel(ExecutionModel):
                 end_token="</img>",
             ),
         )
+
+        # Attention pages store rank-local heads while token and latent bounds
+        # remain global scheduler-visible quantities.
         self.cache_geometry = CacheGeometry(
             num_layers=int(llm.num_hidden_layers),
             num_attention_heads=local_attention_head_count(
@@ -799,6 +863,9 @@ class NEOChatModel(ExecutionModel):
             encoder_cache_entries=256,
             latent_downsample=latent_downsample,
         )
+
+        # The advertised operation set exactly matches the state and transfer
+        # transitions implemented by this runner.
         self.supported_work = frozenset(
             {
                 RunKind.AR_EXTEND,
@@ -824,6 +891,8 @@ class NEOChatModel(ExecutionModel):
         self,
         batch: ForwardBatch,
     ) -> dict[int, torch.Tensor]:
+        """Assemble noisy image, text-conditioning, timestep, and route embeddings for flow."""
+
         patches = batch.flow_conditioning
         if any(value is None for value in patches):
             raise TypeError("SenseNova flow rows require patch conditioning")
@@ -857,6 +926,8 @@ class NEOChatModel(ExecutionModel):
         if int(features.shape[0]) != expected:
             raise ValueError("SenseNova flow vision features do not match row geometry")
 
+        # Expand each request timestep across its image-token span before adding
+        # diffusion and optional noise-scale conditioning.
         timesteps = torch.cat(
             tuple(
                 timestep.reshape(1).expand(image_tokens)
@@ -893,6 +964,7 @@ class NEOChatModel(ExecutionModel):
                 call=_plain_call,
             )
 
+        # Restore the packed tower output to scheduler row identities.
         result: dict[int, torch.Tensor] = {}
         offset = 0
         for row_index, image_tokens in zip(
@@ -909,6 +981,8 @@ class NEOChatModel(ExecutionModel):
         positions: torch.Tensor,
         batch: ForwardBatch,
     ) -> torch.Tensor:
+        """Interleave text and flow embeddings in row order and run the routed decoder."""
+
         decode_positions: torch.Tensor | None = None
         if batch.forward_mode is AttentionMode.PAGED_DECODE:
             if batch.flow_row_indices:
@@ -924,6 +998,9 @@ class NEOChatModel(ExecutionModel):
                 token_embeds,
             )
         flow_embeddings = self._flow_embeddings(batch) if batch.flow_row_indices else {}
+
+        # The decoder consumes a single packed stream; scheduler row indices retain
+        # enough information to restore each modality during routing and projection.
         chunks: list[torch.Tensor | None] = [None] * batch.row_count
         token_offset = 0
         for row_index, count in zip(
@@ -947,6 +1024,9 @@ class NEOChatModel(ExecutionModel):
         )
 
     def project(self, hidden: torch.Tensor, batch: ForwardBatch) -> ForwardOutput:
+        """Project packed text rows to requested logits and flow rows to latent velocity."""
+
+        # Reconstruct scheduler row boundaries from modality-specific length metadata.
         row_lengths = [0] * batch.row_count
         for row_index, count in zip(
             batch.token_row_indices,
@@ -963,6 +1043,7 @@ class NEOChatModel(ExecutionModel):
             offset += count
         row_hidden = tuple(rows)
         selection_by_row = dict(zip(batch.token_row_indices, batch.token_selections, strict=True))
+        # Text rows share one vocabulary projection; flow rows bypass it entirely.
         projected_rows = tuple(
             index
             for index, selection in selection_by_row.items()
@@ -991,6 +1072,7 @@ class NEOChatModel(ExecutionModel):
                 )
             projected = self.language_model.lm_head(selected, batch.mesh)
 
+        # Reassemble heterogeneous outputs in the scheduler's original row order.
         outputs: list[torch.Tensor] = []
         projected_offset = 0
         flow_by_row = {row_index: index for index, row_index in enumerate(batch.flow_row_indices)}
@@ -1020,6 +1102,8 @@ class NEOChatModel(ExecutionModel):
         flow_index: int,
         context: ForwardBatch,
     ) -> torch.Tensor:
+        """Select flow rows, predict patch velocity, and restore the requested image geometry."""
+
         target = context.flow_latents[flow_index].device
         latent = context.flow_latents[flow_index]
         image_tokens = context.flow_image_tokens[flow_index]
@@ -1045,6 +1129,7 @@ class NEOChatModel(ExecutionModel):
             _FLOW_COORDINATE,
         )
         batch, latent_tokens = int(local_latent.shape[0]), int(local_latent.shape[1])
+        # Checkpoint metadata selects one of three equivalent prediction heads.
         if self._use_pixel_head:
             merge = int(1 / self._downsample_ratio)
             token_height = image_height // (self._patch_size * merge)
@@ -1080,6 +1165,8 @@ class NEOChatModel(ExecutionModel):
             predicted = self.fm_modules["fm_head"](
                 local_hidden[:, -image_tokens:].view(batch, latent_tokens, -1)
             ).view(batch, latent_tokens, -1)
+        # Convert the predicted clean sample to the flow-matching velocity used
+        # by the scheduler, with a bounded denominator at the terminal endpoint.
         velocity = (predicted - local_latent) / (1 - local_timestep).clamp_min(_GENERATION_EPSILON)
         velocity = context.mesh.combine(
             velocity,
@@ -1090,6 +1177,8 @@ class NEOChatModel(ExecutionModel):
         return velocity[0] if was_flat else velocity
 
     def encode(self, pixels: tuple[torch.Tensor, ...], batch: ForwardBatch) -> ForwardOutput:
+        """Encode packed image patches and split language-width features by request."""
+
         if any(grid is None for grid in batch.encode_grids) or any(
             shape is None for shape in batch.encode_grid_shapes
         ):

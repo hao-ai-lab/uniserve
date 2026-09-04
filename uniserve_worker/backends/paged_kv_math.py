@@ -1,4 +1,5 @@
 """Small tensor helpers for paged KV addressing."""
+
 from __future__ import annotations
 
 import torch
@@ -39,6 +40,8 @@ if triton is not None:
         v_row_stride: tl.constexpr,
         block_size: tl.constexpr,
     ):
+        """Scatter contiguous key and value rows into physical page-offset locations."""
+
         row = tl.program_id(0)
         columns = tl.program_id(1) * block_size + tl.arange(0, block_size)
         page_id = tl.load(page_ids_ptr + row)
@@ -99,6 +102,8 @@ def _triton_paged_kv_write_eligible(
     k_src: torch.Tensor,
     v_src: torch.Tensor,
 ) -> bool:
+    """Return whether paged KV inputs satisfy the fused Triton scatter contract."""
+
     tensors = (k_cache, v_cache, page_ids, offsets, k_src, v_src)
     if (
         triton is None
@@ -149,6 +154,8 @@ def _triton_paged_kv_write(
     k_src: torch.Tensor,
     v_src: torch.Tensor,
 ) -> None:
+    """Launch the fused paged KV scatter over flattened token rows."""
+
     num_pages, page_size, heads, head_dim = (int(dim) for dim in k_cache.shape)
     row_width = heads * head_dim
     grid = (int(page_ids.numel()), triton.cdiv(row_width, _TRITON_KV_WRITE_BLOCK))

@@ -23,17 +23,23 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True, slots=True)
 class EmptyMeshView:
-    """Single-rank mesh implementation."""
+    """Implements mesh collectives as identity operations for a single-device route."""
 
     def all_reduce(self, value: torch.Tensor, axis: str) -> torch.Tensor:
+        """Preserve the local value because the requested axis has one participant."""
+
         del axis
         return value
 
     def all_gather(self, value: torch.Tensor, axis: str, dimension: int) -> torch.Tensor:
+        """Preserve rank and storage because there are no remote shards to concatenate."""
+
         del axis, dimension
         return value
 
     def dispatch(self, value: torch.Tensor, axis: str, coordinate: int) -> torch.Tensor:
+        """Preserve the local value for the sole valid route coordinate."""
+
         del axis, coordinate
         return value
 
@@ -44,20 +50,26 @@ class EmptyMeshView:
         coordinate: int,
         target: torch.device,
     ) -> torch.Tensor:
+        """Return the local tensor unchanged because no distributed mesh is active."""
+
         del axis, coordinate
         return value.to(target) if value.device != target else value
 
 
 class RouteMeshView:
-    """Expose only the mesh axes declared by one physical model route."""
+    """Restricted view of the mesh axes declared by one physical model route."""
 
     def __init__(self, mesh: DeviceMesh, axes: tuple[str, ...]) -> None:
+        """Restrict a physical device mesh to axes declared by one model route."""
+
         self._mesh = mesh
         self._axes = frozenset(axes)
         if any(not axis for axis in self._axes):
             raise ValueError("mesh axis names must not be empty")
 
     def all_reduce(self, value: torch.Tensor, axis: str) -> torch.Tensor:
+        """Reduce a tensor across the requested mesh axis for the active model route."""
+
         transport = self._transport(axis)
         if transport is None:
             return value
@@ -66,6 +78,8 @@ class RouteMeshView:
         return transport.all_reduce(value)
 
     def all_gather(self, value: torch.Tensor, axis: str, dimension: int) -> torch.Tensor:
+        """Gather tensor shards along a dimension across the requested route mesh axis."""
+
         transport = self._transport(axis)
         if transport is None:
             return value
@@ -74,6 +88,8 @@ class RouteMeshView:
         return transport.all_gather(value, dimension)
 
     def dispatch(self, value: torch.Tensor, axis: str, coordinate: int) -> torch.Tensor:
+        """Select the requested mesh coordinate and exchange route-local tensor shards."""
+
         transport = self._transport(axis)
         if transport is None:
             return value
@@ -88,17 +104,23 @@ class RouteMeshView:
         coordinate: int,
         target: torch.device,
     ) -> torch.Tensor:
+        """Collect route-local shards on the target device and compose the requested mesh axis."""
+
         self._require_axis(axis)
         del coordinate
         return value if value.device == target else value.to(target, non_blocking=True)
 
     def _transport(self, axis: str):
+        """Return the transport for a declared route axis after validating access."""
+
         self._require_axis(axis)
         if self._mesh.is_trivial(axis):
             return None
         return self._mesh.transport(axis)
 
     def _require_axis(self, axis: str) -> None:
+        """Reject collective access to an axis outside the physical route."""
+
         if axis not in self._axes:
             raise RuntimeError(f"mesh axis {axis!r} is outside this forward route")
 
@@ -114,6 +136,8 @@ class AttentionSelection:
     providers: tuple[AttentionBackend, ...]
 
     def __post_init__(self) -> None:
+        """Require a non-empty ordered set of distinct attention backends."""
+
         if not self.identity or not self.providers:
             raise ValueError("attention selection requires an identity and providers")
         names = tuple(str(provider.name) for provider in self.providers)
@@ -122,6 +146,8 @@ class AttentionSelection:
 
 
 class AttentionMode(StrEnum):
+    """Selects dense, paged-decode, paged-prefill, packed, or request-indexed attention execution."""
+
     DENSE = "dense"
     PAGED_DECODE = "paged_decode"
     PAGED_VARLEN = "paged_varlen"
@@ -130,6 +156,8 @@ class AttentionMode(StrEnum):
 
 
 class ExpertRoute(StrEnum):
+    """Selects text or diffusion-flow experts for routed transformer tokens."""
+
     TEXT = "text"
     FLOW = "flow"
 
@@ -143,15 +171,21 @@ class RouteSpan:
     token_count: int
 
     def __post_init__(self) -> None:
+        """Validate a non-empty half-open span for one expert route."""
+
         if self.token_start < 0 or self.token_count < 1:
             raise ValueError("packed expert span geometry is invalid")
 
     @property
     def token_end(self) -> int:
+        """Give the exclusive packed-token boundary of this expert route."""
+
         return self.token_start + self.token_count
 
 
 class TokenSelection(StrEnum):
+    """Selects final-token logits, all-token logits, or hidden states from a model forward."""
+
     LAST_LOGITS = "last_logits"
     ALL_LOGITS = "all_logits"
     HIDDEN = "hidden"
@@ -189,6 +223,8 @@ class FlowPatches:
     noise_scale: torch.Tensor
 
     def __post_init__(self) -> None:
+        """Validate flow patch tensor rank, grid geometry, and token count."""
+
         if self.pixels.ndim not in (2, 4):
             raise ValueError("flow patches must be flattened rows or NCHW patches")
         if self.grid.ndim != 2 or int(self.grid.shape[1]) != 2:
@@ -198,6 +234,8 @@ class FlowPatches:
 
 
 class ModelPhase(StrEnum):
+    """Identifies the text, denoise, encoder, or latent-decoder phase executed by the model."""
+
     TEXT = "text"
     DENOISE = "denoise"
     ENCODE_VISION = "encoder_vision"
@@ -260,6 +298,8 @@ class ForwardBatch:
     mesh: MeshView = EmptyMeshView()
 
     def __post_init__(self) -> None:
+        """Validate borrowed batch columns against attention mode and row geometry."""
+
         if self.row_count < 1:
             raise ValueError("forward batch must contain at least one row")
         if int(self.req_pool_indices.numel()) != self.row_count:
@@ -310,6 +350,8 @@ class ForwardBatch:
 
     @property
     def request_pool_indices(self) -> torch.Tensor:
+        """Expose the one-based request slots aligned with forward rows."""
+
         return self.req_pool_indices
 
 
@@ -320,6 +362,8 @@ class ForwardOutput:
     values: tuple[torch.Tensor, ...]
 
     def validate_for(self, batch: ForwardBatch) -> None:
+        """Require one tensor result for every row in the originating batch."""
+
         if len(self.values) != batch.row_count:
             raise ValueError("model output count does not match forward rows")
         if any(not isinstance(value, torch.Tensor) for value in self.values):

@@ -9,6 +9,8 @@ __all__ = ["FlashInferTuningConfig"]
 
 @dataclass(frozen=True)
 class FlashInferTuningConfig:
+    """Controls FlashInfer workspace size, kernel families, split-KV policy, and fast planning."""
+
     workspace_size: int = 512 * 1024 * 1024
     use_tensor_core: bool | None = None
     decode_backend: str = "fa2"

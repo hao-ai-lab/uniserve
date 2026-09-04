@@ -1,4 +1,4 @@
-//! Validated JSON extractor for automatic request validation.
+//! JSON extractor that combines deserialization with `validator` checks.
 
 use crate::openai::Normalizable;
 use axum::Json;
@@ -28,6 +28,7 @@ where
 {
     type Rejection = ApiError;
 
+    /// Extracts and validates the value from an HTTP request.
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
         let Json(mut data) = Json::<T>::from_request(req, state)
             .await
@@ -46,12 +47,14 @@ where
 impl<T> std::ops::Deref for ValidatedJson<T> {
     type Target = T;
 
+    /// Returns shared access to the wrapped value.
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
 impl<T> std::ops::DerefMut for ValidatedJson<T> {
+    /// Returns mutable access to the wrapped value.
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }

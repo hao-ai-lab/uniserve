@@ -1,5 +1,7 @@
-//! GPU-free control-plane test in Rust: drive the EngineLoop with
-//! SimEngine over concurrent text + image requests; check lifecycle events.
+//! Demonstrates concurrent text and image requests through the simulated engine.
+//!
+//! The example exercises scheduling and lifecycle events without requiring a
+//! model worker or GPU.
 use std::collections::HashMap;
 use std::thread;
 use std::time::Duration;

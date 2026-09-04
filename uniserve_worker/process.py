@@ -35,6 +35,8 @@ logger = logging.getLogger(__name__)
 
 
 def _response(kind: ResponseKind, **payload: Any) -> dict[str, Any]:
+    """Build a protocol response with the canonical kind tag and payload fields."""
+
     response: dict[str, Any] = {
         "kind": kind.value,
         "call_id": None,
@@ -56,6 +58,8 @@ def _response(kind: ResponseKind, **payload: Any) -> dict[str, Any]:
 
 
 def _required(request: Mapping[str, Any], field: str, kind: RequestKind) -> Any:
+    """Return a required request field or raise a classified descriptor error."""
+
     value = request.get(field)
     if value is None:
         raise invalid_descriptor(
@@ -66,6 +70,8 @@ def _required(request: Mapping[str, Any], field: str, kind: RequestKind) -> Any:
 
 
 def _integer(request: Mapping[str, Any], field: str, kind: RequestKind) -> int:
+    """Decode a required request field as a non-negative integer."""
+
     value = _required(request, field, kind)
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise invalid_descriptor(
@@ -76,6 +82,8 @@ def _integer(request: Mapping[str, Any], field: str, kind: RequestKind) -> int:
 
 
 def _request_kind(request: Mapping[str, Any]) -> RequestKind:
+    """Decode and validate the request kind discriminator."""
+
     raw = request.get("kind")
     if not isinstance(raw, str):
         raise invalid_descriptor("worker request kind must be a string")
@@ -86,6 +94,8 @@ def _request_kind(request: Mapping[str, Any]) -> RequestKind:
 
 
 def _run_requests(run: Run) -> frozenset[int]:
+    """Collect request identifiers referenced by a run's admissions, operations, and commands."""
+
     keys = (
         *(admission.request_key for admission in run.admissions),
         *(operation.request_key for operation in run.operations),
@@ -95,6 +105,8 @@ def _run_requests(run: Run) -> frozenset[int]:
 
 
 def _raw_request_ids(request: Mapping[str, Any]) -> frozenset[int]:
+    """Extract the request identifiers touched by a submit or lifecycle command."""
+
     requests: set[int] = set()
     run = request.get("run")
     if isinstance(run, Run):
@@ -122,6 +134,8 @@ def _raw_request_ids(request: Mapping[str, Any]) -> frozenset[int]:
 
 
 def _finalize_response(response: Mapping[str, Any]) -> dict[str, Any]:
+    """Convert an in-memory run result into its transport mapping."""
+
     finalized = dict(response)
     report = finalized.get("result")
     if isinstance(report, RunResult):
@@ -144,6 +158,8 @@ def dispatch(worker: Worker, request: Mapping[str, Any]) -> dict[str, Any]:
 
 @dataclass(slots=True)
 class _Request:
+    """Tracks one decoded IPC request, its dependencies, successors, run, and release state."""
+
     sequence: int
     request: dict[str, Any]
     requests: frozenset[int]
@@ -157,6 +173,8 @@ class _Request:
 
 @dataclass(slots=True)
 class _PendingResponse:
+    """Pairs an ordered IPC response with the run reader that determines readiness."""
+
     sequence: int
     requests: frozenset[int]
     response: dict[str, Any]
@@ -173,6 +191,8 @@ class WorkerProcess:
         *,
         replay_capacity: int | None = None,
     ) -> None:
+        """Bind one worker to bounded IPC admission, dependency, replay, and response queues."""
+
         self.worker = worker
         self.ipc_endpoint = ipc_endpoint
         self.profiler = WorkerProfiler.from_env()
@@ -233,6 +253,8 @@ class WorkerProcess:
                 worker.set_completion_wake(wake, wake_on_stream)
 
     def _profile_tick(self) -> None:
+        """Advance profiler state at an execution boundary and apply the configured window."""
+
         if self._profile_state is None:
             return
         profiler, deadline, directory = self._profile_state
@@ -253,11 +275,15 @@ class WorkerProcess:
 
     @staticmethod
     def _call_id(request: Mapping[str, Any]) -> object:
+        """Return the optional caller correlation identifier."""
+
         return request.get("call_id")
 
     def _with_call_id(
         self, response: dict[str, Any], request: Mapping[str, Any]
     ) -> dict[str, Any]:
+        """Copy the caller correlation identifier onto a response when present."""
+
         call_id = self._call_id(request)
         if call_id is not None:
             response["call_id"] = call_id
@@ -266,6 +292,8 @@ class WorkerProcess:
     def _error_response(
         self, error: WorkerError, request: Mapping[str, Any]
     ) -> dict[str, Any]:
+        """Encode a classified error and preserve the request correlation identifier."""
+
         fields = error.to_mapping()
         fields.pop("kind", None)
         return self._with_call_id(_response(ResponseKind.ERROR, **fields), request)
@@ -273,6 +301,8 @@ class WorkerProcess:
     def _record_failure(
         self, raw_kind: object, error: WorkerError, *, unexpected: bool = False
     ) -> None:
+        """Log a classified request failure at the severity required by its error code."""
+
         log = logger.exception if unexpected or should_capture_trace(error.code) else logger.warning
         log(
             "worker request %r failed: %s [code=%s request_id=%s op_id=%s operation=%s]",
@@ -287,6 +317,8 @@ class WorkerProcess:
     def _boxed_error(
         self, request: Mapping[str, Any], error: BaseException
     ) -> dict[str, Any]:
+        """Classify an exception, record it, and encode the protocol error response."""
+
         classified = (
             error
             if isinstance(error, WorkerError)
@@ -300,12 +332,19 @@ class WorkerProcess:
         return self._error_response(classified, request)
 
     def _accept(self, request: dict[str, Any]) -> int:
+        """Assign transport order, decode the request, and link per-request dependencies."""
+
+        # Sequence and occupancy are assigned before parsing so even malformed
+        # requests produce an ordered response and release one transport slot.
         sequence = self._next_sequence
         self._next_sequence += 1
         self._transport_occupancy += 1
         requests = _raw_request_ids(request)
         try:
             kind = _request_kind(request)
+
+            # Close commands stop admission immediately but retain their
+            # sequence position until all earlier responses have drained.
             if kind is RequestKind.CLOSE:
                 self._accepting_closed = True
                 self._shutdown_response = self._with_call_id(dispatch(self.worker, request), request)
@@ -339,6 +378,9 @@ class WorkerProcess:
                     or operation.kind is RunKind.AR_EXTEND
                     for operation in run.operations
                 )
+
+            # Each request identifier forms a FIFO dependency chain. Multi-key
+            # work waits once per distinct predecessor to avoid double counts.
             pending = _Request(
                 sequence=sequence,
                 request=request,
@@ -361,12 +403,16 @@ class WorkerProcess:
             if pending.dependencies == 0:
                 self._enqueue(pending)
         except BaseException as error:
+            # Parse and admission failures enter the same ordered response queue
+            # as successfully launched requests.
             self.pending_responses.append(
                 _PendingResponse(sequence, requests, self._boxed_error(request, error))
             )
         return sequence
 
     def _enqueue(self, pending: _Request) -> None:
+        """Place a dependency-ready request into its priority execution queue."""
+
         if pending.kind is not RequestKind.SUBMIT:
             self._runnable_admin.append(pending)
         elif pending.early:
@@ -375,6 +421,8 @@ class WorkerProcess:
             self._runnable.append(pending)
 
     def _release(self, pending: _Request) -> None:
+        """Release one completed request and wake successors whose dependencies reach zero."""
+
         if pending.released:
             return
         pending.released = True
@@ -389,9 +437,13 @@ class WorkerProcess:
         pending.successors.clear()
 
     def _transport_window_open(self) -> bool:
+        """Return whether the IPC pipeline can admit another request."""
+
         return self._transport_occupancy < self.pipeline_depth
 
     def _launch_one_ready_request(self) -> bool:
+        """Select and launch one dependency-ready administrative or execution request."""
+
         if self._runnable_admin:
             pending = self._runnable_admin.popleft()
         else:
@@ -425,6 +477,8 @@ class WorkerProcess:
         return True
 
     def _launch_admin(self, pending: _Request) -> None:
+        """Dispatch an administrative request and queue its ordered response."""
+
         response = dispatch(self.worker, pending.request)
         self.pending_responses.append(
             _PendingResponse(
@@ -435,6 +489,8 @@ class WorkerProcess:
         )
 
     def _launch_execute(self, pending: _Request) -> None:
+        """Start one submitted run and attach ordered response completion handling."""
+
         submitted = pending.run
         if submitted is None:
             raise RuntimeError("accepted execute request lost its run")
@@ -475,6 +531,8 @@ class WorkerProcess:
         )
 
     def _start_execution(self, run: WorkerRun) -> None:
+        """Prepare transfers and predicates, then execute now or return a readiness-gated future."""
+
         try:
             unsupported = tuple(
                 operation.kind
@@ -504,6 +562,8 @@ class WorkerProcess:
             run.fail(error)
 
     def _launch_poll(self, pending: _Request) -> None:
+        """Execute one administrative poll command and queue its ordered response."""
+
         run_id = _integer(pending.request, "run_id", RequestKind.POLL)
         reader = self.poll_readers.pop(run_id, None)
         if reader is None:
@@ -523,12 +583,16 @@ class WorkerProcess:
         )
 
     def _new_reader(self, run: WorkerRun) -> RunReader:
+        """Acquire one reader lease over a run's completion stream."""
+
         if run.complete:
             self.replay.take(run.run_id)
         run.active_readers += 1
         return RunReader(run, self._reader_closed)
 
     def _reader_closed(self, reader: RunReader) -> None:
+        """Release a run reader and retain terminal replay state after the final reader."""
+
         run = reader.run
         if run.active_readers < 1:
             raise RuntimeError("run reader ownership underflow")
@@ -537,6 +601,8 @@ class WorkerProcess:
             self._retain_terminal(run)
 
     def _queue_response(self, pending: _PendingResponse) -> None:
+        """Queue a response immediately or hold it until its run reader is ready."""
+
         reader = pending.reader
         if reader is None or self._pending_ready(pending):
             self.pending_responses.append(pending)
@@ -545,6 +611,8 @@ class WorkerProcess:
         self._waiting_response_count += 1
 
     def _run_ready(self, run: WorkerRun) -> None:
+        """Move newly readable responses for a run into the transport-ready queue."""
+
         waiting = self._waiting_responses.pop(run.run_id, ())
         self._waiting_response_count -= len(waiting)
         for pending in waiting:
@@ -555,10 +623,14 @@ class WorkerProcess:
                 self._waiting_response_count += 1
 
     def _run_successors_ready(self, run: WorkerRun) -> None:
+        """Release requests waiting for a run's successor-visible products."""
+
         for pending in self._run_waiters.pop(run.run_id, ()):
             self._release(pending)
 
     def _run_terminal(self, run: WorkerRun) -> None:
+        """Retire a terminal run, release its waiters, and retain replay state."""
+
         self._active_runs.discard(run.run_id)
         self._ended_epochs.update(
             (int(command.request_key.request_id), int(command.request_key.epoch))
@@ -572,6 +644,8 @@ class WorkerProcess:
             self._retain_terminal(run)
 
     def _retain_terminal(self, run: WorkerRun) -> None:
+        """Retain request identities whose terminal releases must wait for response delivery."""
+
         retains_finish = any(
             isinstance(command, Finish) for command in run.run.commands
         )
@@ -591,12 +665,16 @@ class WorkerProcess:
         self._prune_ended_epochs()
 
     def _prune_ended_epochs(self) -> None:
+        """Retain terminal epochs still referenced by completed resident runs."""
+
         referenced = {
             epoch for run in self.runs.values() if run.complete for epoch in run.epochs
         }
         self._ended_epochs.intersection_update(referenced)
 
     def _advance_device_fifo(self) -> bool:
+        """Retire device work in submission order once its completion events become ready."""
+
         advanced = False
         if not self._preparation_ready.empty():
             run = self._preparation_ready.get_nowait()
@@ -622,6 +700,8 @@ class WorkerProcess:
         return advanced
 
     def _pending_ready(self, pending: _PendingResponse) -> bool:
+        """Return whether device completion and all CPU artifacts for a response are ready."""
+
         reader = pending.reader
         if reader is None:
             return True
@@ -635,12 +715,16 @@ class WorkerProcess:
             return True
 
     def _send_one_ready_response(self) -> bool:
+        """Send the oldest transport-ready response if one exists."""
+
         if not self.pending_responses:
             return False
         self._send_pending(self.pending_responses.popleft())
         return True
 
     def _send_pending(self, pending: _PendingResponse) -> None:
+        """Serialize and send one ready response while preserving transport sequence order."""
+
         response = dict(pending.response)
         reader = pending.reader
         run_id = reader.run_id if reader is not None else None
@@ -670,16 +754,22 @@ class WorkerProcess:
             self._fatal_shutdown = True
 
     def _transport_respond(self, response: dict[str, Any]) -> None:
+        """Send one finalized response through the bound IPC endpoint."""
+
         if self.ipc_endpoint is None:
             raise RuntimeError("worker process has no IPC endpoint")
         with profile_range("uniserve.worker.respond"):
             self.ipc_endpoint.respond(response)
 
     def _profile_name(self, boundary: str, *, run_id: int | None = None) -> str:
+        """Build a rank- and run-qualified profiler range name."""
+
         name = f"uniserve.worker.{boundary} rank={int(self.worker.info.rank.tp_rank)}"
         return f"{name} run={run_id}" if run_id is not None and run_id >= 0 else name
 
     def _drain_continuations(self) -> None:
+        """Close completed continuation readers retained for polling."""
+
         for run_id, reader in tuple(self.poll_readers.items()):
             try:
                 reader.ready()
@@ -690,6 +780,8 @@ class WorkerProcess:
                 reader.close()
 
     def _drained(self) -> bool:
+        """Return whether all tasks, responses, runs, and readers have drained."""
+
         return (
             not self._tasks
             and not self.pending_responses
@@ -699,7 +791,7 @@ class WorkerProcess:
         )
 
     def handle(self, request: Mapping[str, Any]) -> dict[str, Any]:
-        """Accept and launch one request without transport I/O."""
+        """Accept one request and synchronously resolve its query-ready response."""
 
         sequence = self._accept(dict(request))
         while self._launch_one_ready_request():
@@ -725,6 +817,8 @@ class WorkerProcess:
         raise RuntimeError("worker request did not become launchable")
 
     def respond(self, response: dict[str, Any]) -> None:
+        """Send a response after resolving any device-backed run reader it contains."""
+
         reader = response.get("result")
         pending = _PendingResponse(
             0,
@@ -738,6 +832,8 @@ class WorkerProcess:
         self._send_pending(pending)
 
     def serve(self) -> None:
+        """Drive request admission, device completion, and ordered IPC responses until shutdown."""
+
         if self.ipc_endpoint is None:
             raise RuntimeError("worker process has no IPC endpoint")
         gc_was_enabled = gc.isenabled()

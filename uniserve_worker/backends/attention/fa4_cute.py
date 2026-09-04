@@ -92,6 +92,8 @@ class Fa4CuteAttentionBackend(AttentionBackend):
         attn_mask: torch.Tensor | None = None,
         context: ForwardBatch | None = None,
     ) -> torch.Tensor:
+        """Compute dense causal or noncausal attention through FlashAttention-4 CuTe kernels."""
+
         del context
         if attn_mask is not None:
             raise RuntimeError("fa4_cute backend does not accept explicit dense masks")
@@ -126,6 +128,8 @@ class Fa4CuteAttentionBackend(AttentionBackend):
         scale: float,
         context: ForwardBatch | None = None,
     ) -> torch.Tensor:
+        """Write current K/V into paged storage and run FlashAttention-4 decode over the visible prefix."""
+
         q_blh, restore = normalize_to(q, QKVLayout.BLHD)
         _validate_unified_trunk_geometry(
             q_blh.shape[-1],
@@ -246,6 +250,8 @@ class Fa4CuteAttentionBackend(AttentionBackend):
         fully_visible_current: bool,
         context: ForwardBatch | None = None,
     ) -> torch.Tensor:
+        """Merge FlashAttention-4 states from the live segment and each cached KV segment."""
+
         del context
         _require_fa4()
         if q.ndim != 3 or current_k.shape != current_v.shape or current_k.ndim != 3:
@@ -302,6 +308,8 @@ class Fa4CuteAttentionBackend(AttentionBackend):
 
 
 def _require_fa4() -> None:
+    """Return the loaded FlashAttention-4 module or raise its import failure."""
+
     if _fa4_flash_attn_fwd is None:
         detail = f": {_IMPORT_ERROR}" if _IMPORT_ERROR is not None else ""
         raise RuntimeError(
@@ -312,12 +320,16 @@ def _require_fa4() -> None:
 
 
 def _fa4_output(result: Any) -> torch.Tensor:
+    """Extract the attention output tensor from a FlashAttention-4 result."""
+
     if isinstance(result, tuple):
         return result[0]
     return result
 
 
 def _fa4_state(result: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    """Extract output and log-sum-exp tensors from a FlashAttention-4 state result."""
+
     if not isinstance(result, tuple) or len(result) < 2 or result[1] is None:
         raise RuntimeError("FA4 segmented attention did not return log-sum-exp state")
     output, lse = result[0], result[1]
@@ -336,6 +348,8 @@ def _cached_prefix_bounds(
     qhead_per_kvhead: int,
     q_tile_size: int,
 ) -> torch.Tensor:
+    """Derive each query tile's visible cached-prefix interval from packed sequence metadata."""
+
     compute_prefix_bounds = _compute_prefix_bounds
     compute_prefix_bounds_varlen = _compute_prefix_bounds_varlen
     if compute_prefix_bounds is None or compute_prefix_bounds_varlen is None:
@@ -397,6 +411,8 @@ def _validate_unified_trunk_geometry(
     *,
     scale: float | None = None,
 ) -> None:
+    """Validate head dimensions and scale against the unified FlashAttention trunk contract."""
+
     geometry = (int(q_head_dim), int(k_head_dim), int(v_head_dim))
     if geometry not in _SUPPORTED_TRUNK_GEOMETRIES:
         raise RuntimeError(
@@ -421,6 +437,8 @@ def _write_paged_kv_cache(
     k_current: torch.Tensor,
     v_current: torch.Tensor,
 ) -> None:
+    """Append current key and value rows to their logical locations in the paged cache."""
+
     if k_cache.shape != v_cache.shape:
         raise ValueError("paged K/V cache tensors must have identical shapes")
     if k_current.shape != v_current.shape:
@@ -454,6 +472,8 @@ def _write_paged_kv_cache(
 
 
 def _metadata_context_len(plan: object | None) -> int:
+    """Read the maximum cached context length carried by an optional plan."""
+
     value = getattr(plan, "max_seqlen_k", 0)
     try:
         return max(0, int(value))

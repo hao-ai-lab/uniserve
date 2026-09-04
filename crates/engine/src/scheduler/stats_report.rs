@@ -1,5 +1,7 @@
-//! EngineLoop-stats reporter: the mapping from live [`SchedStats`] counters onto
-//! the [`SchedulerStats`] snapshot consumed by the HTTP process.
+//! Converts live engine counters into serializable scheduler snapshots.
+//!
+//! [`SchedStatsReporter`] retains cumulative baselines and reports interval
+//! deltas without resetting counters observed by other readers.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
@@ -45,7 +47,7 @@ pub struct SchedStatsReporter {
 }
 
 impl SchedStatsReporter {
-    /// Snapshot the live counters into one snapshot `SchedulerStats` update.
+    /// Captures the live counters in one `SchedulerStats` update.
     ///
     /// `block_size` converts block-granular prefix-cache query counts into the
     /// token-granular counts the snapshot shape documents.
@@ -120,6 +122,7 @@ impl SchedStatsReporter {
         }
     }
 
+    /// Converts cumulative per-domain counters into interval deltas.
     fn domain_stats(&mut self, stats: &SchedStats) -> Vec<DomainSchedulerStats> {
         let domains = [
             ("prefill", &stats.domains.prefill),
@@ -173,6 +176,7 @@ impl SchedStatsReporter {
             .collect()
     }
 
+    /// Returns cumulative worker-forward statistics.
     fn worker_forward_stats(&mut self, stats: &SchedStats) -> Option<WorkerForwardStats> {
         let current = worker_forward_stats_snapshot(stats);
         let delta = delta_worker_forward_stats(&current, &self.last_worker_forward_stats);
@@ -181,6 +185,7 @@ impl SchedStatsReporter {
     }
 }
 
+/// Returns cumulative statistics for a scheduling domain.
 fn domain_cumulative(stats: &crate::scheduler::DomainStats) -> DomainCumulative {
     DomainCumulative {
         active_credits: stats.active_credits.load(Ordering::Relaxed) as u64,
@@ -201,6 +206,7 @@ fn domain_cumulative(stats: &crate::scheduler::DomainStats) -> DomainCumulative 
     }
 }
 
+/// Captures a coherent value snapshot of worker forward-pass counters.
 fn worker_forward_stats_snapshot(stats: &SchedStats) -> WorkerForwardStats {
     let path_counts = stats
         .worker
@@ -328,6 +334,7 @@ fn worker_forward_stats_snapshot(stats: &SchedStats) -> WorkerForwardStats {
     }
 }
 
+/// Computes saturating interval deltas between two worker counter snapshots.
 fn delta_worker_forward_stats(
     current: &WorkerForwardStats,
     previous: &WorkerForwardStats,
@@ -341,7 +348,7 @@ fn delta_worker_forward_stats(
             .attention_launches
             .saturating_sub(previous.attention_launches),
         attention_us: current.attention_us.saturating_sub(previous.attention_us),
-        // per-update deltas for the two newly-surfaced maps.
+        // Map counters are exported as interval deltas alongside scalar counters.
         attention_backend_counts: delta_map(
             &current.attention_backend_counts,
             &previous.attention_backend_counts,
@@ -420,6 +427,7 @@ fn delta_worker_forward_stats(
     }
 }
 
+/// Computes per-key deltas between cumulative snapshots.
 fn delta_map(
     current: &BTreeMap<String, u64>,
     previous: &BTreeMap<String, u64>,

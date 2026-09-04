@@ -1,4 +1,7 @@
-//! Shared IPC primitives for the iceoryx2 worker request-response boundary.
+//! Request-response endpoints built on iceoryx2 shared memory.
+//!
+//! Frames carry a fixed header and a FlatBuffers payload. Companion event
+//! services provide blocking wakeups without polling the request rings.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 use std::collections::VecDeque;
@@ -19,26 +22,36 @@ pub use events::{
     EVT_COMMAND, EVT_COMPLETION, EVT_DEATH, EVT_REQUEST, EVT_RESULT, WakeEvents, WakeSender,
 };
 
+/// Default namespace prefix for per-worker iceoryx2 services.
 pub const DEFAULT_SERVICE_PREFIX: &str = "uniserve/worker";
 
+/// Result type returned by worker transport operations.
 pub type IpcResult<T> = std::result::Result<T, IpcError>;
 
+/// Codec, transport, timeout, and protocol failures at the IPC boundary.
 #[derive(Debug, thiserror::Error)]
 pub enum IpcError {
+    /// Payload encoding, decoding, or semantic validation failed.
     #[error(transparent)]
     Codec(#[from] CodecError),
+    /// Shared-memory transport setup or operation failed.
     #[error("worker IPC error: {0}")]
     Transport(String),
 }
 
 impl IpcError {
+    /// Constructs a transport error with contextual text.
     pub(crate) fn transport(message: impl Into<String>) -> Self {
         Self::Transport(message.into())
     }
 }
 
+/// Extension methods for attaching transport context to fallible operations.
 trait IpcContext<T> {
+    /// Replaces a missing value or source error with fixed transport context.
     fn context(self, message: &str) -> IpcResult<T>;
+
+    /// Adds lazily constructed transport context to a missing value or error.
     fn with_context<F, D>(self, message: F) -> IpcResult<T>
     where
         F: FnOnce() -> D,
@@ -49,10 +62,12 @@ impl<T, E> IpcContext<T> for std::result::Result<T, E>
 where
     E: std::fmt::Debug,
 {
+    /// Wraps a source error with fixed transport context.
     fn context(self, message: &str) -> IpcResult<T> {
         self.map_err(|error| IpcError::transport(format!("{message}: {error:?}")))
     }
 
+    /// Wraps a source error with lazily constructed transport context.
     fn with_context<F, D>(self, message: F) -> IpcResult<T>
     where
         F: FnOnce() -> D,
@@ -63,10 +78,12 @@ where
 }
 
 impl<T> IpcContext<T> for Option<T> {
+    /// Converts absence into a transport error with fixed context.
     fn context(self, message: &str) -> IpcResult<T> {
         self.ok_or_else(|| IpcError::transport(message))
     }
 
+    /// Converts absence into a transport error with lazily constructed context.
     fn with_context<F, D>(self, message: F) -> IpcResult<T>
     where
         F: FnOnce() -> D,
@@ -91,7 +108,7 @@ macro_rules! ipc_error {
 /// IPC version this build emits on every [`Header`].
 pub const IPC_VERSION: u16 = 13;
 
-/// Whether a peer-advertised IPC `version` is one this build can decode.
+/// Returns whether this build can decode a peer-advertised IPC `version`.
 pub fn is_supported_ipc_version(version: u16) -> bool {
     version == IPC_VERSION
 }
@@ -100,27 +117,36 @@ pub fn is_supported_ipc_version(version: u16) -> bool {
 /// boundary.
 ///
 /// Fields are ordered largest-alignment-first so the `#[repr(C)]` layout is
-/// completely free of implicit padding. This matters because the header is
-/// shipped via [`ZeroCopySend`]: any padding bytes the compiler inserted would
-/// be copied verbatim across the process boundary while uninitialized, leaking
-/// stale stack/heap contents and making byte-for-byte comparison of two
-/// logically-equal headers unreliable. The current layout is exactly
+/// completely free of implicit padding. The header is shipped via
+/// [`ZeroCopySend`], so padding would copy uninitialized bytes across the
+/// process boundary and make logically equal headers bytewise unstable. The
+/// layout is exactly
 /// `3*u64 + 3*u32 + u16 + 2*u8 = 40` bytes with no holes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
+    /// Physical run identity, or zero for non-run requests.
     pub run_id: u64,
+    /// Operation identity, or zero for run-level frames.
     pub op_id: u64,
+    /// Request-response correlation identity.
     pub call_id: u64,
+    /// Encoded payload length in bytes.
     pub len: u32,
+    /// Reserved protocol word, emitted as zero.
     pub reserved0: u32,
+    /// Reserved protocol word, emitted as zero.
     pub reserved1: u32,
+    /// Worker IPC protocol version.
     pub version: u16,
+    /// Request or response kind discriminator.
     pub kind: u8,
+    /// Kind-specific protocol flags.
     pub flags: u8,
 }
 
 impl Default for Header {
+    /// Returns an empty header stamped with the emitted IPC version.
     fn default() -> Self {
         Self {
             run_id: 0,
@@ -138,39 +164,47 @@ impl Default for Header {
 
 unsafe impl ZeroCopySend for Header {}
 
-// Guard the padding-free invariant: if a future field change reintroduces
-// implicit padding, `size_of::<Header>` will no longer equal the sum of the
-// field sizes and this assertion fails the build, signalling that
-// uninitialized padding bytes would otherwise be sent zero-copy.
+// This assertion binds the C representation to the sum of its field sizes so
+// zero-copy transmission cannot include implicit padding.
 const _: () = assert!(
     std::mem::size_of::<Header>() == 3 * 8 + 3 * 4 + 2 + 2,
     "Header must be padding-free for zero-copy transmission"
 );
 
+/// Received frame header and owned FlatBuffers payload.
 pub struct Frame {
+    /// Zero-copy transport header.
     pub header: Header,
+    /// Owned encoded message payload.
     pub payload: Vec<u8>,
 }
 
 impl Frame {
+    /// Decodes this frame as a worker request.
     pub fn decode_request(&self) -> IpcResult<WorkerRequest> {
         decode_request(&self.payload).map_err(Into::into)
     }
 
+    /// Decodes this frame as a worker response.
     pub fn decode_response(&self) -> IpcResult<WorkerResponse> {
         decode_response(&self.payload).map_err(Into::into)
     }
 }
 
+/// Thread-safe iceoryx2 IPC service type used by endpoint aliases.
 pub(crate) type IxService = iceoryx2::service::ipc_threadsafe::Service;
+/// Concrete iceoryx2 client port used by the host endpoint.
 type IxClient = Client<IxService, [u8], Header, [u8], Header>;
+/// Concrete iceoryx2 server port used by the worker endpoint.
 type IxServer = Server<IxService, [u8], Header, [u8], Header>;
+/// Active request handle retained until the worker publishes its response.
 type IxActive = ActiveRequest<IxService, [u8], Header, [u8], Header>;
+/// Pending response handle returned after a request is sent.
 pub type Pending = PendingResponse<IxService, [u8], Header, [u8], Header>;
 
-/// Convert an encoded payload length to the `u32` carried in [`Header::len`],
-/// rejecting payloads that do not fit instead of silently truncating with an
-/// `as u32` cast (which would corrupt the length on the receiving side).
+/// Converts an encoded payload length to the checked `u32` in [`Header::len`].
+///
+/// Truncation would make the receiver interpret a different frame boundary.
 fn payload_len_u32(len: usize) -> IpcResult<u32> {
     u32::try_from(len).map_err(|_| {
         ipc_error!(
@@ -180,6 +214,7 @@ fn payload_len_u32(len: usize) -> IpcResult<u32> {
     })
 }
 
+/// Builds the iceoryx2 service name for one worker identifier.
 pub fn service_name(id: &str) -> String {
     if id.contains('/') {
         id.to_string()
@@ -188,19 +223,27 @@ pub fn service_name(id: &str) -> String {
     }
 }
 
+/// Host-side endpoint for sending requests and receiving worker responses.
 pub struct ClientEndpoint {
+    /// Node owner that keeps all client ports alive.
     _node: Node<IxService>,
+    /// Request-response port used to loan and send request frames.
     client: IxClient,
+    /// Deadline for establishing or awaiting worker connectivity.
     connect_timeout: Duration,
+    /// Directional wake ports paired with the request-response service.
     events: ClientEvents,
 }
 
 impl ClientEndpoint {
+    /// Connects a host endpoint to an existing worker service.
     pub fn connect(
         service: &str,
         initial_max_slice_len: usize,
         max_inflight: usize,
     ) -> IpcResult<Self> {
+        // Create the request-response service with bounded, non-overflowing
+        // capacity so every pending handle names one retained request.
         let service_name = ServiceName::new(service).context("invalid iceoryx2 service name")?;
         let node = NodeBuilder::new()
             .create::<IxService>()
@@ -220,12 +263,14 @@ impl ClientEndpoint {
             .enable_safe_overflow_for_responses(false)
             .open_or_create()
             .context("opening iceoryx2 request-response service")?;
+        // Power-of-two growth accommodates variable FlatBuffers frame sizes.
         let client = factory
             .client_builder()
             .initial_max_slice_len(initial_max_slice_len.max(1))
             .allocation_strategy(AllocationStrategy::PowerOfTwo)
             .create()
             .context("creating iceoryx2 client port")?;
+        // Companion event ports provide file-descriptor-based wakeups.
         let events =
             ClientEvents::open(&node, service).context("opening client event companions")?;
         Ok(Self {
@@ -236,34 +281,34 @@ impl ClientEndpoint {
         })
     }
 
-    /// Park for {result, command, death} until a wake fires or `timeout`
+    /// Parks for {result, command, death} until a wake fires or `timeout`
     /// elapses. Returns which sources fired.
     pub fn wait_wake(&self, timeout: Duration) -> IpcResult<WakeEvents> {
         self.events.wait(timeout)
     }
 
-    /// Drain queued wake ids after a composite executor parked on this
+    /// Drains queued wake ids after a composite executor parked on this
     /// listener's descriptor.
     pub fn drain_wakes(&self) -> IpcResult<WakeEvents> {
         self.events.drain()
     }
 
-    /// Native descriptor used by a composite executor's single multi-worker
-    /// park. It remains owned by this endpoint.
+    /// Returns the borrowed descriptor used by an external poll loop.
     pub fn wake_file_descriptor(&self) -> i32 {
         self.events.file_descriptor()
     }
 
-    /// A cloneable wake source the command ingress fires after enqueuing a command.
+    /// Returns a cloneable wake source for queued host commands.
     pub fn command_wake(&self) -> WakeSender {
         self.events.command_wake()
     }
 
-    /// A cloneable wake source the worker-death watcher fires on child exit.
+    /// Returns a cloneable wake source for worker-process exit.
     pub fn death_wake(&self) -> WakeSender {
         self.events.death_wake()
     }
 
+    /// Encodes and sends a request, waiting for ring capacity until the deadline.
     pub fn send_request(&self, req: &WorkerRequest) -> IpcResult<Pending> {
         let payload = encode_request(req)?;
         let mut header = header_for_request(req);
@@ -271,6 +316,7 @@ impl ClientEndpoint {
         self.send_raw(header, &payload)
     }
 
+    /// Attempts one non-blocking request submission.
     pub fn send_request_attempt(&self, req: &WorkerRequest) -> IpcResult<Pending> {
         let payload = encode_request(req)?;
         let mut header = header_for_request(req);
@@ -278,6 +324,7 @@ impl ClientEndpoint {
         self.send_raw_attempt(header, &payload)
     }
 
+    /// Sends a pre-encoded frame, waiting for ring capacity until the deadline.
     pub fn send_raw(&self, header: Header, payload: &[u8]) -> IpcResult<Pending> {
         let deadline = Instant::now() + self.connect_timeout;
         loop {
@@ -293,7 +340,10 @@ impl ClientEndpoint {
         }
     }
 
+    /// Attempts one non-blocking pre-encoded frame submission.
     pub fn send_raw_attempt(&self, header: Header, payload: &[u8]) -> IpcResult<Pending> {
+        // Loan exact shared-memory capacity, initialize the header and payload,
+        // then transfer ownership to the request-response service.
         let mut request = self
             .client
             .loan_slice_uninit(payload.len())
@@ -305,6 +355,7 @@ impl ClientEndpoint {
         Ok(pending)
     }
 
+    /// Attempts to receive the response associated with `pending`.
     pub fn try_recv_response(&self, pending: &Pending) -> IpcResult<Option<Frame>> {
         let Some(response) = pending.receive().context("receiving iceoryx2 response")? else {
             return Ok(None);
@@ -315,6 +366,7 @@ impl ClientEndpoint {
         Ok(Some(Frame { header, payload }))
     }
 
+    /// Waits up to `timeout` for the response associated with `pending`.
     pub fn recv_response_timeout(
         &self,
         pending: &Pending,
@@ -334,19 +386,27 @@ impl ClientEndpoint {
     }
 }
 
+/// Worker-side endpoint for receiving requests and publishing responses.
 pub struct ServerEndpoint {
+    /// Node owner that keeps all server ports alive.
     _node: Node<IxService>,
+    /// Request-response port used to receive and answer request frames.
     server: IxServer,
+    /// Active requests retained until their matching `call_id` is answered.
     active: VecDeque<(u64, IxActive)>,
+    /// Directional wake ports paired with the request-response service.
     events: ServerEvents,
 }
 
 impl ServerEndpoint {
+    /// Creates the worker endpoint and its directional wake services.
     pub fn bind(
         service: &str,
         initial_max_slice_len: usize,
         max_inflight: usize,
     ) -> IpcResult<Self> {
+        // Mirror client capacity on a single-server, single-client service and
+        // disable overflow so request ownership remains explicit.
         let service_name = ServiceName::new(service).context("invalid iceoryx2 service name")?;
         let node = NodeBuilder::new()
             .create::<IxService>()
@@ -366,6 +426,7 @@ impl ServerEndpoint {
             .enable_safe_overflow_for_responses(false)
             .open_or_create()
             .context("opening iceoryx2 request-response service")?;
+        // Allocate response buffers with the same variable-size strategy.
         let server = factory
             .server_builder()
             .initial_max_slice_len(initial_max_slice_len.max(1))
@@ -373,6 +434,7 @@ impl ServerEndpoint {
             .max_loaned_responses_per_request(1)
             .create()
             .context("creating iceoryx2 server port")?;
+        // Companion event ports wake request and asynchronous-completion paths.
         let events =
             ServerEvents::open(&node, service).context("opening server event companions")?;
         Ok(Self {
@@ -383,6 +445,7 @@ impl ServerEndpoint {
         })
     }
 
+    /// Attempts to receive one request without blocking.
     pub fn try_recv(&mut self) -> IpcResult<Option<Frame>> {
         let Some(active) = self
             .server
@@ -391,14 +454,17 @@ impl ServerEndpoint {
         else {
             return Ok(None);
         };
+        // Receiving from the ring consumes the work represented by wake hints.
         self.events.drain_worker_wakes()?;
         let header = *active.user_header();
         let payload = active.payload().to_vec();
         verify_header_len(header, payload.len())?;
+        // Retain transport ownership until a response with this call id arrives.
         self.active.push_back((header.call_id, active));
         Ok(Some(Frame { header, payload }))
     }
 
+    /// Waits for and receives one request before the operation deadline.
     pub fn recv(&mut self) -> IpcResult<Frame> {
         loop {
             if let Some(frame) = self.try_recv()? {
@@ -408,17 +474,18 @@ impl ServerEndpoint {
         }
     }
 
-    /// Park until an inbound request or asynchronous completion wake fires, or
+    /// Parks until an inbound request or asynchronous completion wake fires, or
     /// `timeout` elapses. The caller re-checks all progress sources after return.
     pub fn wait_incoming(&self, timeout: Duration) -> IpcResult<()> {
         self.events.wait_request(timeout)
     }
 
-    /// A thread-safe signal for device, transfer, and CPU completion callbacks.
+    /// Returns a thread-safe signal for asynchronous worker completion.
     pub fn completion_wake(&self) -> WakeSender {
         self.events.completion_wake()
     }
 
+    /// Encodes and publishes a response for the active request.
     pub fn respond(&mut self, resp: &WorkerResponse) -> IpcResult<()> {
         let payload = encode_response(resp)?;
         let mut header = header_for_response(resp);
@@ -426,7 +493,10 @@ impl ServerEndpoint {
         self.respond_raw(header, &payload)
     }
 
+    /// Publishes a pre-encoded response for the active request.
     pub fn respond_raw(&mut self, header: Header, payload: &[u8]) -> IpcResult<()> {
+        // Resolve and remove the exact active transport request before loaning
+        // its response buffer.
         let pos = self
             .active
             .iter()
@@ -442,30 +512,30 @@ impl ServerEndpoint {
             .remove(pos)
             .map(|(_, active)| active)
             .context("active request position disappeared")?;
+        // Initialize the loaned response completely before publishing it.
         let mut response = active
             .loan_slice_uninit(payload.len())
             .context("loaning iceoryx2 response slice")?;
         *response.user_header_mut() = header;
         let response = response.write_from_slice(payload);
         response.send().context("sending iceoryx2 response")?;
-        // Wake the host the instant the response is queued.
+        // Notify only after the ring owns the fully initialized response.
         self.events.notify_response();
         Ok(())
     }
 
+    /// Returns the worker-side deadline used by blocking receive operations.
     fn connect_timeout(&self) -> Duration {
         Duration::from_secs(300)
     }
 }
 
-/// Build the IPC header that accompanies `req`.
+/// Builds the IPC header that accompanies `req`.
 ///
 /// `call_id` is the authoritative request/response correlation key. The
-/// `run_id`/`op_id` fields are populated from the run's `run_id` and the
-/// *first* op only, as a cheap at-a-glance diagnostic hint (e.g. for tracing);
-/// they are **not** a per-op index. A run may carry many ops with distinct
-/// `op_id`s, so consumers must read the full decoded payload rather than
-/// treating `header.op_id` as identifying every op in the frame.
+/// `run_id` and `op_id` fields are diagnostic hints populated from the run and
+/// its first operation. The decoded payload is authoritative for runs that
+/// carry multiple operation identities.
 pub fn header_for_request(req: &WorkerRequest) -> Header {
     let mut h = Header {
         kind: request_kind_code(req.kind()),
@@ -474,7 +544,7 @@ pub fn header_for_request(req: &WorkerRequest) -> Header {
     };
     if let Some(run) = req.run() {
         h.run_id = run.run_id;
-        // Hint only: first op's id. See the doc comment above.
+        // Only the first operation contributes the diagnostic header hint.
         if let Some(operation) = run.operations().next() {
             h.op_id = operation.op_id.0;
         }
@@ -482,13 +552,12 @@ pub fn header_for_request(req: &WorkerRequest) -> Header {
     h
 }
 
-/// Build the IPC header that accompanies `resp`.
+/// Builds the IPC header that accompanies `resp`.
 ///
-/// As in [`header_for_request`], `call_id` is the authoritative correlation
-/// key. `run_id`/`op_id` are populated from the result's `run_id` and the
-/// *first* per-seq entry only, as a diagnostic hint; a result may aggregate
-/// many sequences with distinct `op_id`s, so consumers must use the decoded
-/// payload to correlate individual sequences.
+/// `call_id` is the authoritative request/response correlation key. The
+/// `run_id` and `op_id` fields are diagnostic hints populated from the result
+/// and its first completion. The decoded payload is authoritative when a result
+/// aggregates multiple operation identities.
 pub fn header_for_response(resp: &WorkerResponse) -> Header {
     let mut h = Header {
         kind: response_kind_code(resp.kind()),
@@ -497,7 +566,7 @@ pub fn header_for_response(resp: &WorkerResponse) -> Header {
     };
     if let Some(report) = resp.report() {
         h.run_id = report.run_id;
-        // Hint only: first completion's op id. See the doc comment above.
+        // Only the first completion contributes the diagnostic header hint.
         if let Some(completion) = report.completions().next() {
             h.op_id = completion.op_id.0;
         }
@@ -505,6 +574,7 @@ pub fn header_for_response(resp: &WorkerResponse) -> Header {
     h
 }
 
+/// Verifies protocol version and payload length before frame decoding.
 fn verify_header_len(header: Header, actual: usize) -> IpcResult<()> {
     if !is_supported_ipc_version(header.version) {
         ipc_bail!(
@@ -522,7 +592,9 @@ fn verify_header_len(header: Header, actual: usize) -> IpcResult<()> {
     Ok(())
 }
 
-// Diagnostic-only header byte; the authoritative kind travels in the payload.
+/// Maps a request kind to its diagnostic header byte.
+///
+/// The FlatBuffers payload remains authoritative for request dispatch.
 fn request_kind_code(kind: RequestKind) -> u8 {
     match kind {
         RequestKind::Info => 1,
@@ -532,6 +604,9 @@ fn request_kind_code(kind: RequestKind) -> u8 {
     }
 }
 
+/// Maps a response kind to its diagnostic header byte.
+///
+/// The FlatBuffers payload remains authoritative for response dispatch.
 fn response_kind_code(kind: ResponseKind) -> u8 {
     match kind {
         ResponseKind::Info => 1,
@@ -575,8 +650,7 @@ mod tests {
     fn payload_len_u32_rejects_oversized() {
         assert_eq!(payload_len_u32(0).unwrap(), 0);
         assert_eq!(payload_len_u32(u32::MAX as usize).unwrap(), u32::MAX);
-        // Lengths that do not fit in u32 must error instead of silently
-        // truncating via `as u32`.
+        // Header lengths are exact `u32` values; oversized payloads are invalid.
         if (u32::MAX as usize) < usize::MAX {
             assert!(payload_len_u32(u32::MAX as usize + 1).is_err());
         }

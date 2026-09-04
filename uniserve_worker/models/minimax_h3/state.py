@@ -32,6 +32,8 @@ MIN_H3_FRAMES = 22
 
 
 def _reconstruction_unit_frames(frames: int) -> tuple[int, ...]:
+    """Convert generated frame count into overlapping decoder reconstruction units."""
+
     if frames < MIN_H3_FRAMES or frames % 17 != 5:
         raise ValueError("H3 frame count must have the form 17 * n + 5")
     units = (frames - 5) // 17
@@ -40,6 +42,8 @@ def _reconstruction_unit_frames(frames: int) -> tuple[int, ...]:
 
 @dataclass(frozen=True, slots=True)
 class H3Layout:
+    """Combines packed multimodal geometry with schedule and sequence-parallel rank ownership."""
+
     packed: H3PackedLayout
     schedule: H3Schedule
     sp_rank: int
@@ -59,6 +63,8 @@ class H3Layout:
         audio_frames: int,
         schedule: H3Schedule | None = None,
     ) -> "H3Layout":
+        """Partition one packed request evenly across the mesh sequence ranks."""
+
         size = mesh.size("sp")
         rank = mesh.coord("sp")
         packed = build_packed_layout(
@@ -81,6 +87,8 @@ class H3Layout:
 
     @property
     def shape_key(self) -> tuple[int, int, int]:
+        """Identify layouts by video frames, padded text rows, and audio frames."""
+
         return (
             self.frame_count,
             int(self.packed.text_indices.numel()),
@@ -89,6 +97,8 @@ class H3Layout:
 
     @property
     def video_round_frames(self) -> int:
+        """Bound the RGB frames produced by the largest reconstruction round."""
+
         return max(
             sum(self.reconstruction_unit_frames[start : start + VIDEO_ROUND_UNITS])
             for start in range(0, self.video_reconstruction_units, VIDEO_ROUND_UNITS)
@@ -96,39 +106,54 @@ class H3Layout:
 
     @property
     def max_video_round_frames(self) -> int:
+        """Bound one full sequence-parallel round at deployment capacity."""
+
         units = min(self.video_reconstruction_units, VIDEO_ROUND_UNITS)
         return (units - 1) * 17 + MIN_H3_FRAMES
 
     @property
     def local_rows(self) -> int:
+        """Count packed transport rows owned by this sequence rank."""
+
         return self.local_end - self.local_start
 
     @property
     def video_reconstruction_units(self) -> int:
+        """Count overlapping temporal segments needed to reconstruct the video."""
+
         return len(self.reconstruction_unit_frames)
 
     @property
     def persistent_units(self) -> int:
-        # Scheduler capacity token: fixed bytes rounded to one MiB.
+        """Express per-request conditioning and media storage in rounded MiB units."""
+
         video = self.packed.video_indices.numel() * 96 * 4
         audio = self.packed.audio_indices.numel() * 32 * 4
         text = self.packed.text_indices.numel() * 5120 * 2
         return (video + audio + text + (1 << 20) - 1) // (1 << 20)
 
     def local_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        """Filter global packed indices to this rank and convert them to local offsets."""
+
         selected = indices[(indices >= self.local_start) & (indices < self.local_end)]
         return selected - self.local_start
 
     @property
     def local_video_rows(self) -> int:
+        """Count semantic video rows owned by this sequence rank."""
+
         return int(self.local_indices(self.packed.video_indices).numel())
 
     @property
     def local_audio_rows(self) -> int:
+        """Count semantic audio rows owned by this sequence rank."""
+
         return int(self.local_indices(self.packed.audio_indices).numel())
 
     @property
     def local_video_raster_indices(self) -> torch.Tensor:
+        """Map this rank's tile-major video rows back to global raster order."""
+
         selected = (self.packed.video_indices >= self.local_start) & (
             self.packed.video_indices < self.local_end
         )
@@ -136,6 +161,8 @@ class H3Layout:
 
     @property
     def local_audio_raster_indices(self) -> torch.Tensor:
+        """Map this rank's packed audio rows to the unsharded channel-major timeline."""
+
         selected = (self.packed.audio_indices >= self.local_start) & (
             self.packed.audio_indices < self.local_end
         )
@@ -144,6 +171,8 @@ class H3Layout:
 
 @dataclass(frozen=True, slots=True)
 class _H3StateBuffers:
+    """Owns persistent conditioning, media rows, rotary tables, modulation plans, and overlap storage."""
+
     text_condition: torch.Tensor
     video_rows: torch.Tensor
     audio_rows: torch.Tensor
@@ -160,6 +189,8 @@ class _H3StateBuffers:
 
 @dataclass(slots=True)
 class H3StateSlot:
+    """Tracks one admitted request’s persistent H3 state and generation progress."""
+
     index: int
     text_condition: torch.Tensor
     video_rows: torch.Tensor
@@ -182,9 +213,13 @@ class H3StateSlot:
 
     @property
     def active(self) -> bool:
+        """Indicate whether an admitted request currently owns this slot."""
+
         return self.request_key is not None
 
     def bind(self, layout: H3Layout) -> None:
+        """Rebind capacity tensors to shape-bounded views for a compatible request layout."""
+
         text_rows = int(layout.packed.text_indices.numel())
         if self.active and self.shape_key != layout.shape_key:
             raise RuntimeError("an active H3 state slot cannot change its execution layout")
@@ -206,6 +241,8 @@ class H3StateSlot:
                 "video_overlap": tuple(capacity["video_overlap"].shape),
             },
         )
+        # Replace every exposed tensor with the shape-bounded view returned by the
+        # common storage owner; no allocation changes ownership during rebinding.
         buffers = _H3StateBuffers(**views)
         self.text_condition = buffers.text_condition
         self.video_rows = buffers.video_rows
@@ -222,6 +259,8 @@ class H3StateSlot:
         self.shape_key = layout.shape_key
 
     def clear(self) -> None:
+        """Release request ownership and reset progress while retaining resident buffers."""
+
         self.request_key = None
         self.shape_key = None
         self.denoise_step = 0
@@ -232,6 +271,8 @@ class H3StateSlot:
 
 
 class H3StatePool:
+    """Owns bounded persistent H3 request slots and admits shape-compatible generation state atomically."""
+
     def __init__(
         self,
         layout: H3Layout,
@@ -241,6 +282,8 @@ class H3StatePool:
         block_plan_shape: tuple[int, ...],
         final_plan_shape: tuple[int, ...],
     ) -> None:
+        """Allocate a fixed set of reusable device-resident request-state slots."""
+
         if slot_count < 2:
             raise ValueError("the FastH3 serving topology requires at least two state slots")
         self.layout = layout
@@ -264,6 +307,10 @@ class H3StatePool:
         block_plan_shape: tuple[int, ...],
         final_plan_shape: tuple[int, ...],
     ) -> H3StateSlot:
+        """Allocate all bounded device buffers owned by one reusable H3 request slot."""
+
+        # Derive capacities from the largest packed layout; active request
+        # shapes bind narrower views without reallocating slot storage.
         text_capacity = int(layout.packed.text_indices.numel())
         video_capacity = min(int(layout.packed.video_indices.numel()), layout.local_rows)
         audio_capacity = min(int(layout.packed.audio_indices.numel()), layout.local_rows)
@@ -271,6 +318,9 @@ class H3StatePool:
         prefix_capacity = int(layout.packed.prefix_tiles)
         dense_capacity = int(layout.packed.prefix_tiles + layout.packed.video_tiles)
         row_capacity = int(layout.packed.padded_rows)
+
+        # Conditioning, modality rows, sparse metadata, rotary tables, and
+        # modulation plans remain resident for the entire slot lifetime.
         text_condition = torch.empty((1, text_capacity, 5376), dtype=torch.bfloat16, device=device)
         video_rows = torch.empty((video_capacity, 96), dtype=torch.float32, device=device)
         audio_rows = torch.empty((audio_capacity, 32), dtype=torch.float32, device=device)
@@ -295,6 +345,9 @@ class H3StatePool:
             dtype=torch.float16,
             device=device,
         )
+
+        # The bounded inventory lets smaller layout bindings expose typed views
+        # while keeping the overlap buffer under the same ownership boundary.
         tensors = locals()
         bounded = BoundedTensorStorage(
             {
@@ -320,6 +373,9 @@ class H3StatePool:
             video_overlap=video_overlap,
             bounded=bounded,
         )
+
+        # Initial binding establishes maximum views; clear shape ownership so
+        # admission can claim the slot for its concrete request geometry.
         slot.bind(layout)
         slot.shape_key = None
         return slot
@@ -358,19 +414,27 @@ class H3StatePool:
 
     @property
     def slot_count(self) -> int:
+        """Expose the number of concurrently resident request states."""
+
         return len(self.slots)
 
     def get(self, index: int) -> H3StateSlot:
+        """Resolve the one-based request-pool index to its resident H3 slot."""
+
         if index < 1 or index > len(self.slots):
             raise ValueError(f"H3 request-pool index {index} is outside resident capacity")
         return self.slots[index - 1]
 
     def drop_request(self, request_id: int) -> None:
+        """Release every slot owned by a request id after completion or cancellation."""
+
         for slot in self.slots:
             if slot.request_key is not None and slot.request_key.request_id == int(request_id):
                 slot.clear()
 
     def abort_admissions(self, admissions) -> None:
+        """Atomically validate and release state slots for discarded admissions."""
+
         slots = tuple((admission, self.get(int(admission.request_pool_idx))) for admission in admissions)
         for admission, slot in slots:
             if slot.request_key not in (None, admission.request_key):
@@ -381,6 +445,8 @@ class H3StatePool:
 
 @dataclass(slots=True)
 class H3Scratch:
+    """Owns fixed intermediate tensors for H3 projection, attention, exchange, reconstruction, and modulation."""
+
     packed_hidden: torch.Tensor
     local_text_hidden: torch.Tensor
     projected_input: torch.Tensor
@@ -422,6 +488,8 @@ class H3Scratch:
     bounded: BoundedTensorStorage | None
 
     def view(self, layout: H3Layout) -> "H3Scratch":
+        """Create layout-bounded tensor views over the shared maximum-capacity scratch arena."""
+
         local_rows = int(layout.local_rows)
         global_rows = int(layout.packed.padded_rows)
         local_heads = 56 // layout.sp_size
@@ -434,6 +502,8 @@ class H3Scratch:
         workspace_elements = global_rows * 5376
         if self.bounded is None:
             raise RuntimeError("H3 scratch storage has no bounded-view owner")
+        # Fixed reconstruction buffers retain capacity shape; packed execution
+        # buffers contract to the active page geometry.
         shapes = {name: tuple(tensor.shape) for name, tensor in self.bounded.capacity.items()}
         shapes.update(
             {
@@ -498,6 +568,8 @@ class H3Scratch:
         final_params_shape: tuple[int, ...],
         attention_workspace_dtype: torch.dtype,
     ) -> "H3Scratch":
+        """Allocate the maximum rank-local execution arena and symmetric attention exchange."""
+
         device = mesh.local_device
         local_rows = layout.local_rows
         local_heads = 56 // layout.sp_size
@@ -508,6 +580,8 @@ class H3Scratch:
         local_video = min(int(layout.packed.video_indices.numel()), local_rows)
         local_audio = min(int(layout.packed.audio_indices.numel()), local_rows)
         max_projected_rows = max(local_video, local_audio)
+        # Q/K/V projection exchange is symmetric so every rank can address peer
+        # slices directly during sequence-parallel sparse attention.
         projection_exchange = mesh.symmetric_memory(
             (local_rows, 56, 128),
             dtype=torch.bfloat16,
@@ -636,6 +710,8 @@ class H3Scratch:
             ),
             bounded=None,
         )
+        # Only tensors whose active shapes depend on request geometry participate
+        # in bounded rebinding; decoder and collective buffers remain fixed.
         variable_fields = (
             "packed_hidden",
             "local_text_hidden",

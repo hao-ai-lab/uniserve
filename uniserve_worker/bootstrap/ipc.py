@@ -15,12 +15,7 @@ except ImportError as exc:  # pragma: no cover
 
 
 class EndpointBusyError(Exception):
-    """The IPC server endpoint is already bound (a startup race).
-
-    Raised at this IPC seam instead of leaving callers to sniff the message
-    text; the serve loop catches this type to back off and retry rather than
-    treating it as a fatal transport failure.
-    """
+    """Typed startup error for an IPC server endpoint that is already bound."""
 
 
 __all__ = ["EndpointBusyError", "WorkerIpcEndpoint"]

@@ -1,3 +1,5 @@
+"""Defines synchronous text-to-video-with-audio benchmark behavior."""
+
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -16,12 +18,16 @@ from .base import BenchmarkTask
 
 
 class VideoTask(BenchmarkTask):
+    """Builds synchronous video requests and validates the media contract."""
+
     name: ClassVar[TaskName] = TaskName.VIDEO
     allowed_endpoints: ClassVar[tuple[str, ...]] = (VIDEOS_SYNC,)
     default_endpoint: ClassVar[str] = VIDEOS_SYNC
     default_stream: ClassVar[bool] = False
 
     def build_request(self, example: Example) -> TaskRequest:
+        """Build a deterministic duration- and seed-qualified video request."""
+
         return TaskRequest(
             self.point.endpoint,
             {
@@ -40,6 +46,8 @@ class VideoTask(BenchmarkTask):
         )
 
     def validate_output(self, records: Sequence[RequestRecord]) -> ValidationResult:
+        """Validate fixed video geometry, codecs, audio, and duration alignment."""
+
         raw_frames = math.floor(float(self.point.video.seconds) * 24.0 + 0.5)
         expected_frames = int(raw_frames + (5 - raw_frames) % 17)
         outputs = [record.decoded_video for record in records]

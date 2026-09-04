@@ -35,6 +35,8 @@ if triton is not None:
         block_rows: tl.constexpr,
         block_dim: tl.constexpr,
     ):
+        """Merge two independently normalized attention states with online-softmax rescaling."""
+
         rows = tl.program_id(0) * block_rows + tl.arange(0, block_rows)
         columns = tl.arange(0, block_dim)
         row_mask = rows < state_count
@@ -67,7 +69,7 @@ def merge_attention_states(
     second_output: torch.Tensor,
     second_lse: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Stable online-softmax merge for independently evaluated KV segments."""
+    """Merge independently evaluated KV segments with stable online softmax."""
 
     if first_output.shape != second_output.shape or first_lse.shape != second_lse.shape:
         raise ValueError("attention states must have matching shapes")
@@ -108,6 +110,8 @@ def _triton_merge_eligible(
     second_output: torch.Tensor,
     second_lse: torch.Tensor,
 ) -> bool:
+    """Return whether two attention states satisfy the fused merge kernel contract."""
+
     tensors = (first_output, first_lse, second_output, second_lse)
     return bool(
         triton is not None
@@ -147,11 +151,15 @@ class AttentionBackend:
     def supports_head_geometry(
         self, q_head_dim: int, k_head_dim: int, v_head_dim: int
     ) -> bool:
+        """Return whether the backend implements the supplied query, key, and value head widths."""
+
         if not self.head_geometries:
             return True
         return (int(q_head_dim), int(k_head_dim), int(v_head_dim)) in self.head_geometries
 
     def supports(self, mode: AttentionMode, *, cuda_graph: bool = False) -> bool:
+        """Return whether this backend implements the mode, including its CUDA graph contract when requested."""
+
         if not self.available:
             return False
         implementation = type(self)
@@ -177,6 +185,8 @@ class AttentionBackend:
         return True
 
     def supports_varlen(self) -> bool:
+        """Return whether this backend exposes a non-paged variable-length path."""
+
         return (
             self.available
             and not self.paged_varlen_only
@@ -192,6 +202,8 @@ class AttentionBackend:
         device: torch.device,
         cuda_graph: bool = False,
     ) -> bool:
+        """Check static head, page, device, and graph constraints before binding the backend."""
+
         if not self.supports(mode, cuda_graph=cuda_graph):
             return False
         return self._bind_geometry_supported(head_dim, block_size, device)
@@ -203,6 +215,8 @@ class AttentionBackend:
         block_size: int,
         device: torch.device,
     ) -> bool:
+        """Check static head, page, and device constraints for variable-length attention."""
+
         if not self.supports_varlen():
             return False
         return self._bind_geometry_supported(head_dim, block_size, device)
@@ -210,6 +224,8 @@ class AttentionBackend:
     def _bind_geometry_supported(
         self, head_dim: int, block_size: int, device: torch.device
     ) -> bool:
+        """Return whether graph binding supports the requested head, page, and device geometry."""
+
         if int(head_dim) < int(self.min_head_dim):
             return False
         if not self.supports_head_geometry(head_dim, head_dim, head_dim):
@@ -226,6 +242,8 @@ class AttentionBackend:
         return True
 
     def can_run(self, req: object) -> bool:
+        """Validate a typed attention request against backend capabilities and tensor geometry."""
+
         from ...ops.requests import (
             DenseAttention,
             PagedDecodeAttention,
@@ -274,6 +292,8 @@ class AttentionBackend:
         return int(req.q.ndim) in self.dense_ranks
 
     def run(self, req: object) -> torch.Tensor:
+        """Dispatch a validated typed request to the matching dense, paged, variable-length, or segmented path."""
+
         from ...ops.requests import (
             DenseAttention,
             PagedDecodeAttention,
@@ -362,6 +382,8 @@ class AttentionBackend:
         )
 
     def _device_supported(self, tensor: torch.Tensor) -> bool:
+        """Return whether this backend may execute tensors on the given device."""
+
         if self.cuda_only and tensor.device.type != "cuda":
             return False
         if self.min_compute_version is None:
@@ -371,6 +393,8 @@ class AttentionBackend:
         )
 
     def _paged_storage_supported(self, req: object) -> bool:
+        """Return whether the request cache uses storage this backend can consume directly."""
+
         from ...ops.requests import VisibleEndAttention
 
         kv_cache = getattr(req, "kv_cache", None)
@@ -395,6 +419,8 @@ class AttentionBackend:
 
     @staticmethod
     def _kv_dims(req: object) -> tuple[int, int]:
+        """Extract KV head count and head width from a typed attention request."""
+
         from ...ops.requests import PagedDecodeAttention, VisibleEndAttention
 
         if isinstance(req, VisibleEndAttention) and req.prefix_k is not None and req.prefix_v is not None:
@@ -407,6 +433,8 @@ class AttentionBackend:
 
     @staticmethod
     def _is_one_ar_decode(req: object) -> bool:
+        """Return whether a request describes exactly one autoregressive decode row."""
+
         from ...ops.requests import PagedDecodeAttention
 
         if not isinstance(req, PagedDecodeAttention):
@@ -430,6 +458,8 @@ class AttentionBackend:
         attn_mask: torch.Tensor | None = None,
         context: ForwardBatch | None = None,
     ) -> torch.Tensor:
+        """Compute dense attention over rank-three or rank-four Q/K/V tensors."""
+
         raise NotImplementedError
 
     def forward_paged(
@@ -446,6 +476,8 @@ class AttentionBackend:
         scale: float,
         context: ForwardBatch | None = None,
     ) -> torch.Tensor:
+        """Compute decode attention against scheduler-indexed paged KV storage."""
+
         raise NotImplementedError
 
     def forward_varlen(
@@ -463,6 +495,8 @@ class AttentionBackend:
         block_table: torch.Tensor | None = None,
         context: ForwardBatch | None = None,
     ) -> torch.Tensor:
+        """Compute attention over packed sequences delimited by cumulative query and KV offsets."""
+
         raise NotImplementedError
 
     def forward_visible_end(
@@ -483,6 +517,8 @@ class AttentionBackend:
         fully_visible: bool = False,
         context: ForwardBatch | None = None,
     ) -> torch.Tensor:
+        """Compute dense attention with an independent visible KV boundary for each query row."""
+
         raise NotImplementedError
 
     def forward_segmented(
@@ -501,4 +537,6 @@ class AttentionBackend:
         fully_visible_current: bool,
         context: ForwardBatch | None = None,
     ) -> torch.Tensor:
+        """Compute attention over current and cached KV segments and merge their online-softmax states."""
+
         raise NotImplementedError

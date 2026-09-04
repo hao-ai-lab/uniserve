@@ -1,3 +1,5 @@
+//! HTTP handler for the served-model listing.
+
 use std::sync::Arc;
 
 use crate::openai::{ListModelsResponse, ModelObject};
@@ -8,7 +10,7 @@ use crate::AppState;
 
 use crate::http::utils::unix_timestamp;
 
-/// Return all configured served model names in OpenAI `list models` format.
+/// Returns all configured served model names in OpenAI `list models` format.
 pub(crate) async fn list_models(State(state): State<Arc<AppState>>) -> Json<ListModelsResponse> {
     // OpenAI clients expect `created` to be a real Unix timestamp; report when
     // this listing was produced rather than the epoch.

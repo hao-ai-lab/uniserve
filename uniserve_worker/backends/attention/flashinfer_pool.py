@@ -35,6 +35,8 @@ def _empty_mutable(
     # FlashInfer plan/workspace buffers are rewritten across forward passes.
     # Keep them out of inference tensor mode even when first allocated during
     # model inference.
+    """Allocate mutable uninitialized plan storage with the requested shape and dtype."""
+
     with torch.inference_mode(False):
         return torch.empty(size, dtype=dtype, device=device)
 
@@ -58,10 +60,14 @@ class WrapperKey(NamedTuple):
 
     @property
     def is_graph(self) -> bool:
+        """Indicate whether this key identifies a graph-exclusive decode wrapper."""
+
         return self.kind == "decode_graph"
 
 
 class _DecodePlanOptions(NamedTuple):
+    """Captures split-KV controls and the cache signature for one decode plan."""
+
     fixed_split_size: int | None
     disable_split_kv: bool
     signature: tuple[Any, ...]
@@ -77,6 +83,8 @@ class _WrapperPool(PagedAttentionPlanPool):
     """
 
     def __init__(self, *, tuning: FlashInferTuningConfig) -> None:
+        """Initialize reusable eager and graph wrapper catalogs with device workspaces."""
+
         super().__init__()
         self._tuning = tuning
         self._decode_wrappers: dict[WrapperKey, Any] = {}
@@ -101,6 +109,8 @@ class _WrapperPool(PagedAttentionPlanPool):
         num_kv_heads: int,
         kv_dtype: torch.dtype,
     ) -> tuple[WrapperKey, Any]:
+        """Create and cache a decode wrapper for one device and attention geometry."""
+
         from . import flashinfer as _fi
 
         device_key = _device_key(device)
@@ -138,6 +148,8 @@ class _WrapperPool(PagedAttentionPlanPool):
         num_kv_heads: int,
         kv_dtype: torch.dtype,
     ) -> tuple[WrapperKey, Any]:
+        """Create a fixed-capacity decode wrapper and buffers for CUDA graph replay."""
+
         from . import flashinfer as _fi
 
         device_key = _device_key(device)
@@ -182,6 +194,8 @@ class _WrapperPool(PagedAttentionPlanPool):
         return key, wrapper
 
     def _prefill_wrapper(self, device: torch.device) -> tuple[WrapperKey, Any]:
+        """Create and cache a variable-length paged prefill wrapper for one device."""
+
         from . import flashinfer as _fi
 
         device_key = _device_key(device)
@@ -259,6 +273,8 @@ class _WrapperPool(PagedAttentionPlanPool):
         return key, wrapper
 
     def _prefill_graph_wrapper_for_binding(self, binding: Any) -> tuple[WrapperKey, Any] | None:
+        """Resolve the prefill graph wrapper registered for one binding identity."""
+
         if binding is None:
             return None
         entry = self._binding_prefill_graph_wrappers.get(id(binding))
@@ -296,6 +312,8 @@ class _WrapperPool(PagedAttentionPlanPool):
         global_override_last_page_len_cpu: torch.Tensor | None = None,
         allow_fast: bool = True,
     ) -> None:
+        """Select a planning path and bind one decode wrapper to page metadata."""
+
         options = self._decode_plan_options(
             wrapper_key=wrapper_key,
             num_q_heads=num_q_heads,
@@ -365,6 +383,8 @@ class _WrapperPool(PagedAttentionPlanPool):
         wrapper_key: WrapperKey,
         signature: tuple[Any, ...],
     ) -> None:
+        """Record a wrapper specialization that accepts fast decode planning."""
+
         from . import flashinfer as _fi
 
         if _fi._fast_decode_plan is not None:
@@ -392,6 +412,8 @@ class _WrapperPool(PagedAttentionPlanPool):
         global_override_last_page_len_cpu: torch.Tensor | None,
         allow_fast: bool,
     ) -> bool:
+        """Attempt fast decode planning when wrapper geometry and metadata support it."""
+
         if not allow_fast or not self._can_use_fast_decode_plan(
             wrapper_key, wrapper, options.signature
         ):
@@ -427,6 +449,8 @@ class _WrapperPool(PagedAttentionPlanPool):
         q_data_type: torch.dtype,
         kv_data_type: torch.dtype,
     ) -> _DecodePlanOptions:
+        """Derive split-KV and tensor-core planning options for one decode geometry."""
+
         signature = _decode_fast_plan_signature(
             wrapper_key=wrapper_key,
             num_q_heads=num_q_heads,
@@ -463,6 +487,8 @@ class _WrapperPool(PagedAttentionPlanPool):
         global_override_indptr_cpu: torch.Tensor | None,
         global_override_last_page_len_cpu: torch.Tensor | None,
     ) -> bool:
+        """Run the optional fast planner and report whether it accepted the decode plan."""
+
         from . import flashinfer as _fi
 
         assert _fi._fast_decode_plan is not None
@@ -528,6 +554,8 @@ class _WrapperPool(PagedAttentionPlanPool):
         seq_lens: torch.Tensor | None,
         options: _DecodePlanOptions,
     ) -> None:
+        """Plan decode through the public wrapper interface with normalized metadata."""
+
         wrapper.plan(
             indptr,
             indices,
@@ -554,6 +582,8 @@ class _WrapperPool(PagedAttentionPlanPool):
         wrapper: Any,
         signature: tuple[Any, ...],
     ) -> bool:
+        """Return whether a wrapper and specialization are eligible for fast planning."""
+
         from . import flashinfer as _fi
 
         if _fi._fast_decode_plan is None or not self._tuning.fast_decode_plan:
@@ -565,6 +595,8 @@ class _WrapperPool(PagedAttentionPlanPool):
         return getattr(wrapper, "_cached_module", None) is not None
 
     def _decode_graph_wrapper_for_binding(self, binding: Any) -> tuple[WrapperKey, Any] | None:
+        """Resolve the decode graph wrapper registered for one binding identity."""
+
         if binding is None:
             return None
         entry = self._binding_graph_wrappers.get(id(binding))
@@ -580,6 +612,8 @@ class _WrapperPool(PagedAttentionPlanPool):
         return wrapper_key, wrapper
 
     def _workspace(self, device: torch.device) -> torch.Tensor:
+        """Return the persistent FlashInfer workspace for one device."""
+
         return self.workspace(device, max(1, int(self._tuning.workspace_size)), dtype=torch.uint8)
 
     def _decode_plan_workspace(
@@ -591,6 +625,8 @@ class _WrapperPool(PagedAttentionPlanPool):
         max_indices: int,
         graph_buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
     ) -> _DecodePlanWorkspace:
+        """Reserve bounded decode plan tensors for eager or graph-bound execution."""
+
         batch_size = max(1, int(batch_size))
         max_indices = max(1, int(max_indices))
         if graph_buffers is not None:
@@ -638,6 +674,8 @@ class _WrapperPool(PagedAttentionPlanPool):
         batch_size: int,
         max_indices: int,
     ) -> _PrefillPlanWorkspace:
+        """Reserve bounded packed-query and paged-KV metadata for prefill planning."""
+
         batch_size = max(1, int(batch_size))
         max_indices = max(1, int(max_indices))
         workspace = self._prefill_plan_workspaces.get(wrapper_key)
@@ -662,6 +700,8 @@ class _WrapperPool(PagedAttentionPlanPool):
 
 
 def _device_key(device: torch.device | str) -> str:
+    """Return the canonical device string used by workspace and wrapper caches."""
+
     dev = torch.device(device)
     if dev.type == "cuda":
         index = dev.index
@@ -678,6 +718,8 @@ def _should_use_tensor_cores(
     num_q_heads: int,
     num_kv_heads: int,
 ) -> bool:
+    """Resolve the tensor-core decode policy from override, dtype, and grouped-query ratio."""
+
     if override is not None:
         return override
     try:

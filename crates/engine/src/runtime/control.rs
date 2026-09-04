@@ -1,5 +1,8 @@
+//! Cancellation, terminal cleanup, and lifecycle trace handling.
+
 use super::*;
 
+/// Terminal request facts recorded in a scheduler trace event.
 pub(super) struct FinishedTrace<'a> {
     pub id: RequestId,
     pub reason: &'a FinishReason,
@@ -11,7 +14,7 @@ pub(super) struct FinishedTrace<'a> {
 }
 
 impl EngineLoop {
-    /// Abort every queued/gated/running request with a terminal event.
+    /// Aborts every queued/gated/running request with a terminal event.
     pub(super) fn abort_all_requests(&mut self) {
         self.pending_submission = None;
         while let Some(id) = self.scheduler.pop_media() {
@@ -61,7 +64,7 @@ impl EngineLoop {
         }
     }
 
-    /// Apply one command; returns true on shutdown.
+    /// Applies one command; returns true on shutdown.
     pub(super) fn handle_command(&mut self, cmd: Command) -> bool {
         match cmd {
             Command::Submit { request, event_tx } => {
@@ -102,7 +105,7 @@ impl EngineLoop {
         false
     }
 
-    /// Test harness direct enqueue (the production path is `run` over the channel).
+    /// Enqueues a request directly for deterministic engine-loop tests.
     #[doc(hidden)]
     pub fn submit_for_test(&mut self, request: GenerationRequest) -> EventRx {
         let (event_tx, event_rx) = event_channel();
@@ -110,6 +113,7 @@ impl EngineLoop {
         event_rx
     }
 
+    /// Records cancellation or abortion across queued, media, and running request states.
     pub(super) fn mark_cancelled(
         &mut self,
         id: RequestId,
@@ -199,6 +203,7 @@ impl EngineLoop {
         }
     }
 
+    /// Releases semantic commits whose visible token prefixes the frontend has accepted.
     pub(super) fn acknowledge_semantic(&mut self, id: RequestId, output_token_count: usize) {
         let Some(current) = self.running.get(&id).map(|state| state.output.tokens_acked) else {
             return;
@@ -247,6 +252,7 @@ impl EngineLoop {
         self.finish_pending_if_idle(id);
     }
 
+    /// Marks the lifecycle tracker as stopped.
     pub(super) fn mark_stopped(&mut self, id: RequestId, output_token_count: usize) {
         let Some(state) = self.running.get_mut(&id) else {
             return;
@@ -263,16 +269,19 @@ impl EngineLoop {
         state.terminal_intent = TerminalIntent::StopMatched;
     }
 
+    /// Returns mutable access to the active trace record.
     pub(super) fn trace_record(&mut self, record: serde_json::Value) {
         if let Some(sink) = self.trace_sink.as_mut() {
             sink.record(&record);
         }
     }
 
+    /// Returns whether operation tracing is enabled.
     pub(super) fn trace_enabled(&self) -> bool {
         self.trace_sink.is_some()
     }
 
+    /// Records a complete scheduler-trace snapshot when a request enters a queue.
     pub(super) fn trace_request_queued(&mut self, st: &ReqState, queue: &'static str) {
         self.trace_record(json!({
             "event": "request_queued",
@@ -299,6 +308,7 @@ impl EngineLoop {
         }));
     }
 
+    /// Records terminal request accounting in the scheduler trace.
     pub(super) fn trace_request_finished(&mut self, trace: FinishedTrace<'_>) {
         let FinishedTrace {
             id,

@@ -24,6 +24,8 @@ __all__ = [
 
 @dataclass(frozen=True)
 class SiglipNavitConfig:
+    """Defines SigLIP-NaViT patch, width, head, layer, projection, and position settings."""
+
     patch_size: int = 14
     hidden_size: int = 1152
     image_size: int = 980
@@ -40,9 +42,11 @@ SIGLIP_SO400M = SiglipNavitConfig()
 
 
 class SiglipNavitEncoder(nn.Module):
-    """Linear-patch, learned-absolute-position NaViT encoder."""
+    """SigLIP transformer encoder for flattened image patches with learned 2D positions."""
 
     def __init__(self, cfg: SiglipNavitConfig, *, layer_config: LayerConfig) -> None:
+        """Build patch, position, transformer, and terminal normalization layers."""
+
         super().__init__()
         self.patch_size = int(cfg.patch_size)
         hidden = int(cfg.hidden_size)
@@ -77,6 +81,8 @@ class SiglipNavitEncoder(nn.Module):
         grid: Any,
         context: ForwardBatch,
     ) -> torch.Tensor:
+        """Pack variable image grids, add learned positions, and encode the patch sequences."""
+
         packed, pos_ids, cu_seqlens, seq_lens = self._pack_inputs(pixels, grid)
         x = self.patch_embedding(packed) + self.position_embedding(pos_ids)
         return self.encoder(x, context, cu_seqlens, seq_lens=seq_lens)
@@ -84,6 +90,8 @@ class SiglipNavitEncoder(nn.Module):
     def _pack_inputs(
         self, pixels: torch.Tensor, grid: Any | None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[int, ...]]:
+        """Normalize image or flattened patch inputs into packed patches and grid shapes."""
+
         if isinstance(grid, dict):
             pos = grid.get("position_ids")
             if pos is None:

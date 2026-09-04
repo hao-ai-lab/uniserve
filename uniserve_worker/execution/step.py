@@ -200,6 +200,8 @@ def create_execution_resources(
     media_mux: Any | None = None,
     media_output_ring: Any | None = None,
 ) -> ExecutionResources:
+    """Compose validated model, runtime-store, lane, transport, tracing, and media ownership into one execution root."""
+
     if not allowed_work_variants:
         raise ValueError("execution step must accept at least one work variant")
     if not model_name:
@@ -271,6 +273,8 @@ def create_execution_resources(
 
 
 def close_execution(runtime: ExecutionResources) -> None:
+    """Release all resources owned by an execution root in dependency-safe order."""
+
     runtime._collective_history.clear()
     runtime._transport_publications.clear()
     runtime._flow_prefix_slots.clear()
@@ -278,6 +282,8 @@ def close_execution(runtime: ExecutionResources) -> None:
 
 
 def install_weights(runtime: ExecutionResources, weights: WeightSet) -> None:
+    """Replace the live weight identity and invalidate captured graphs tied to its tensors."""
+
     if weights.version <= runtime.weights.version:
         raise ValueError("installed weight version must increase")
     if runtime.runner is not None:
@@ -287,14 +293,20 @@ def install_weights(runtime: ExecutionResources, weights: WeightSet) -> None:
 
 
 def _operation_identity(operation: Operation) -> OperationIdentity:
+    """Return the request key and operation identifier for one operation."""
+
     return operation.request_key, int(operation.op_id)
 
 
 def _reference_operation_identity(reference: ProductRef) -> OperationIdentity:
+    """Return the producer request key and operation identifier for a product reference."""
+
     return reference.request_key, int(reference.producer_op_id)
 
 
 def _unique_scopes(scopes: Sequence[LaneState]) -> tuple[LaneState, ...]:
+    """Deduplicate lane scopes by object identity while preserving order."""
+
     unique: list[LaneState] = []
     seen: set[int] = set()
     for scope in scopes:
@@ -306,6 +318,8 @@ def _unique_scopes(scopes: Sequence[LaneState]) -> tuple[LaneState, ...]:
 
 
 def _completion_error_code(code: WorkerErrorCode) -> ErrorCode:
+    """Map internal failure classes to their completion-wire error codes."""
+
     if code == WorkerErrorCode.RESOURCE_ERROR:
         return ErrorCode.RESOURCE_EXHAUSTED
     if code == WorkerErrorCode.COMPUTE_ERROR:
@@ -588,6 +602,10 @@ def _prepare_predicates(
     *,
     transfers: tuple[PreparedTransferInput, ...],
 ) -> PreparedPredicateBatch | None:
+    """Capture completion-valued predicates from local products or prepared transfers."""
+
+    # Predicate rows occupy one compact completion buffer regardless of whether
+    # their source is already local or will arrive through a prepared transfer.
     operations = tuple(
         operation
         for operation in batch.operations
@@ -605,6 +623,8 @@ def _prepare_predicates(
     pending: list[tuple[OperationIdentity, PreparedTransferInput, int]] = []
     recorded: list[DeviceProductRead] = []
     try:
+        # Local sources are consumed in device batches and captured directly;
+        # transferred sources retain their target row for later completion.
         grouped: dict[torch.device, list[Operation]] = defaultdict(list)
         rows = {_operation_identity(operation): row for row, operation in enumerate(operations)}
         for operation in operations:
@@ -636,10 +656,14 @@ def _prepare_predicates(
                 identity = _operation_identity(operation)
                 captures.append((identity, buffer.capture(read.tensor), rows[identity]))
             runtime.device_products.record_readers(reads, device=device)
+
+        # No pending transfer can mutate the buffer once it is sealed.
         sealed = not pending
         if sealed:
             buffer.seal()
     except BaseException:
+        # Every acquired read must receive a reader event even when preparation
+        # fails before all device groups are captured.
         unrecorded = tuple(read for read in recorded if not read._recorded)
         if unrecorded:
             runtime.device_products.record_readers(unrecorded)
@@ -654,6 +678,8 @@ def _prepare_predicates(
 
 
 def execute_prepared(runtime, prepared: PreparedExecution) -> RunResult:
+    """Execute a fully staged batch through the bound single-use preparation callback."""
+
     if not prepared.ready():
         raise RuntimeError("prepared execution was observed before transfer readiness")
     return _execute(
@@ -722,7 +748,7 @@ def _execute(
     propagate_errors: bool,
     graph_eligible: bool,
 ) -> RunResult:
-    """Shared execution for startup and admitted traffic."""
+    """Execute a prepared lane batch for startup or admitted traffic."""
 
     started = time.perf_counter_ns()
     operations = _trace_envelopes(batch.operations)
@@ -915,6 +941,8 @@ def _classify_lane_failure(
     *,
     phase: str,
 ) -> WorkerError:
+    """Classify a pre-publication lane failure with complete operation and route context."""
+
     operations = tuple(
         (
             int(operation.request_key.authority_id),
@@ -944,6 +972,8 @@ def _published_lane_failure(
     lane: RunLane,
     error: BaseException,
 ) -> WorkerError:
+    """Classify a post-visibility publication failure as a fatal invariant violation."""
+
     operations = tuple(
         (
             int(operation.request_key.authority_id),
@@ -972,6 +1002,8 @@ def _log_lane_failure(
     *,
     cause: BaseException | None = None,
 ) -> None:
+    """Log a classified lane failure with traceback only for diagnostic error classes."""
+
     capture_trace = should_capture_trace(error.code)
     log = logger.error if capture_trace else logger.warning
     log(
@@ -995,7 +1027,12 @@ def _open_lane(
     predicate_values: Mapping[OperationIdentity, bool],
     graph_eligible: bool,
 ) -> LaneState:
+    """Stage one lane's speculative state, resources, inputs, and completion storage."""
+
     operations = lane.operations
+
+    # Predicated rows remain in aligned output/state tables but do not reserve
+    # execution-only inputs, CPU tasks, or model resources.
     predicated = frozenset(
         identity
         for operation in operations
@@ -1011,6 +1048,7 @@ def _open_lane(
             if _operation_identity(operation) not in predicated
         )
     )
+    # Restrict admissions and input payloads to identities declared by this lane.
     traced = _trace_envelopes(operations)
     started = time.perf_counter_ns()
     request_keys = {operation.request_key for operation in operations}
@@ -1026,6 +1064,8 @@ def _open_lane(
     )
     completion: OutputBuffer | None = None
     try:
+        # Candidate drafts and completion slots form a speculative ownership unit:
+        # either all later lane resources bind successfully or both are discarded.
         admission_slots = {
             admission.request_key: int(admission.request_pool_idx) for admission in admissions
         }
@@ -1087,6 +1127,7 @@ def _open_lane(
         duration_us=(time.perf_counter_ns() - started) // 1000,
     )
     try:
+        # Bind physical state in dependency order before decoding transferred inputs.
         if runtime.runtime_states is not None:
             runtime.runtime_states.reset(
                 tuple(
@@ -1109,6 +1150,7 @@ def _open_lane(
                     )
             else:
                 _bind_cache_tables(runtime, active_lane, scope)
+        # Preserve operation/request row alignment for forward packing and commit.
         scope.layout = LaneLayout(
             operations=operations,
             requests=candidates,
@@ -1127,6 +1169,9 @@ def _open_lane(
         if active_lane is not None:
             _bind_latent_rows(runtime, active_lane, scope)
         _reserve_outputs(runtime, operations, scope)
+
+        # Only live operations consume inputs; predicated outputs are published
+        # directly into their aligned completion rows.
         active_inputs = {
             reference for operation in active_operations for reference in operation.inputs
         }
@@ -1155,6 +1200,8 @@ def _active_lane(
     lane: RunLane,
     operations: tuple[Operation, ...],
 ) -> RunLane | None:
+    """Rebuild lane-indexed rows and placements after predicated operations are removed."""
+
     if not operations:
         return None
     if operations is lane.operations:
@@ -1187,6 +1234,8 @@ def _active_lane(
 
 
 def _lane_completion_words(runtime, operations: tuple[Operation, ...]) -> int:
+    """Compute fixed completion-word capacity for all operations in a lane."""
+
     return max(
         1,
         SAMPLING_COMPLETION_FIELDS * len(operations)
@@ -1200,6 +1249,8 @@ def _execute_lane_group(
     *,
     qualify_mixed: bool,
 ) -> tuple[dict[int, tuple[Outcome, ...]], dict[int, BaseException]]:
+    """Execute active operations across lanes and align outcomes with original lane order."""
+
     from . import token
 
     for scope in scopes:
@@ -1278,15 +1329,23 @@ def _run_ready_set(
     *,
     qualify_mixed: bool,
 ) -> dict[int, BaseException]:
+    """Advance dependency-ready operations through forward, sampling, integration, and actions."""
+
     from . import encode, flow, token, transfer
 
+    # Products define the in-lane dependency graph; failures suppress only the
+    # affected lane while independent lanes continue through the ready set.
     producers = {output: state for state in states for output in state.operation.outputs}
     errors: dict[int, BaseException] = {}
 
     def live(state: OperationState) -> bool:
+        """Select unresolved operations whose lane has not recorded a failure."""
+
         return state.outcome is None and state.lane.lane.lane_id not in errors
 
     while any(live(state) for state in states):
+        # Pack all ready neural work first. Flow prefix preparation forms an
+        # exclusive wave because it may change the rows available to peers.
         forward: list[tuple[OperationState, object]] = []
         ready = tuple(
             state for state in states if live(state) and dependencies_ready(state, producers)
@@ -1336,6 +1395,8 @@ def _run_ready_set(
                     errors[state.lane.lane.lane_id] = error
             continue
 
+        # Sampling runs after its logits dependencies land and publishes token
+        # products that can unlock later operations in the same lane.
         samples: dict[int, list[tuple[OperationState, SampleWork]]] = defaultdict(list)
         for state in states:
             if not live(state) or not dependencies_ready(state, producers):
@@ -1362,6 +1423,8 @@ def _run_ready_set(
                     errors[lane_id] = error
             continue
 
+        # Integration consumes velocity outputs without another model call.
+        # Other host/device actions run only when no forward or sample is ready.
         progressed = False
         for state in states:
             if not live(state) or not dependencies_ready(state, producers):
@@ -1383,6 +1446,9 @@ def _run_ready_set(
                 errors[state.lane.lane.lane_id] = error
         if progressed:
             continue
+
+        # Reaching a live fixed point indicates a dependency or state-machine
+        # invariant violation rather than ordinary asynchronous waiting.
         if not any(live(state) for state in states):
             break
         blocked = tuple(_operation_identity(state.operation) for state in states if live(state))
@@ -1394,6 +1460,8 @@ def _pack_state_forward(
     runtime: ExecutionResources,
     state: OperationState,
 ) -> tuple[object, ...]:
+    """Dispatch an operation state to its token, flow, or encoder forward packer."""
+
     from . import encode, flow, token
 
     operation = state.operation
@@ -1413,6 +1481,8 @@ def _consume_state_forward(
     state: OperationState,
     outputs: tuple[torch.Tensor, ...],
 ) -> None:
+    """Dispatch aligned model outputs to the operation family's consumer."""
+
     from . import encode, flow, token
 
     operation = state.operation
@@ -1435,9 +1505,14 @@ def _commit_lane(
     outcomes: tuple[Outcome, ...],
     started: int,
 ) -> LaneResult:
+    """Atomically publish validated lane resources, request versions, and output records."""
+
     commit_started = time.perf_counter_ns()
     lane = scope.lane
     operations = lane.operations
+
+    # All device reads must finish and every staged resource must validate before
+    # completion storage becomes immutable or any publication becomes visible.
     _finish_device_reads(runtime, scope)
     _publish_predicates(runtime, scope)
     runtime.device_products.validate_writes(tuple(scope.device_writes))
@@ -1451,6 +1526,7 @@ def _commit_lane(
             scope.latent_releases,
         )
     scope.completion.seal()
+    # Build the complete next-version description without mutating resident state.
     records: list[PendingOutput] = []
     selected_versions: dict[int, Checkpoint] = {}
     pending_completions: dict[int, CompletionState] = {}
@@ -1547,6 +1623,9 @@ def _commit_lane(
                 initialized_kv=selection.initialized_kv,
             )
     _record_component(scope, "commit_lane", commit_started)
+
+    # Prepare cross-resource commit records first so no publication is visible
+    # until every participating owner has accepted its state transition.
     lane_report = LaneResult(
         lane_id=lane.lane_id,
         completions=tuple(records),
@@ -1580,6 +1659,8 @@ def _commit_lane(
         existing = runtime._transport_publications.get(identity)
         if existing is not None and existing != locators:
             raise RuntimeError("committed transport publication identity was reused")
+    # From this point the lane cannot be discarded: apply resource commits, then
+    # reserve the request publication that gates successor readiness.
     scope.publication_started = True
     runtime.device_products.commit_writes(tuple(scope.device_writes))
     runtime.encoder_cache.commit_writes(tuple(scope.encoder_writes))
@@ -1598,6 +1679,8 @@ def _commit_lane(
 
 
 def _commit_runtime_states(runtime, scope: LaneState) -> None:
+    """Publish committed token, predicate, position, cache-length, and penalty state to device rows."""
+
     states = runtime.runtime_states
     if states is None:
         if (
@@ -1607,10 +1690,15 @@ def _commit_runtime_states(runtime, scope: LaneState) -> None:
         ):
             raise RuntimeError("runtime state publication has no backing storage")
         return
+
+    # Cache lengths may advance without token publication, so apply their
+    # scalar updates before the row-level decode state transitions.
     for slot, length in scope.runtime_cache_lengths.items():
         _copy_runtime_scalar(states.valid_cache_lengths[slot : slot + 1], length)
     for publication in scope.runtime_publications:
         if isinstance(publication, DecodeRuntimePublication):
+            # Batched decode uses the fused device-state kernel, then updates
+            # request-owned penalty counts only for valid active selections.
             states.publish_decode(
                 publication.slots,
                 device_indices=publication.device_slots,
@@ -1630,6 +1718,9 @@ def _commit_runtime_states(runtime, scope: LaneState) -> None:
                     weight,
                 )
             continue
+
+        # Non-batched publications update the same fields explicitly while
+        # stripping the continuation tag from future input tokens.
         slot = publication.slot
         future_token = states.future_input_tokens[slot, :1]
         future_token.copy_(publication.token.reshape(-1)[:1])
@@ -1658,6 +1749,9 @@ def _commit_runtime_states(runtime, scope: LaneState) -> None:
                 future_token.to(dtype=torch.int64),
                 weight,
             )
+
+    # Prompt logits have request-row lifetime and become visible only after all
+    # scalar transition fields for the lane are committed.
     for prompt_publication in scope.prompt_logits_publications:
         states.prompt_logits[prompt_publication.slot].copy_(
             prompt_publication.logits.to(dtype=states.prompt_logits.dtype)
@@ -1669,6 +1763,8 @@ def _discard_lane(
     scope: LaneState,
     error: BaseException | None = None,
 ) -> None:
+    """Release all provisional lane resources that have not crossed publication visibility."""
+
     _finish_device_reads(runtime, scope)
     for reservation in scope.cpu_tasks.values():
         reservation.abandon()
@@ -1700,6 +1796,8 @@ def _reserve_cpu_tasks(
     operations: tuple[Operation, ...],
     scope: LaneState,
 ) -> None:
+    """Reserve bounded CPU slots for active operations that schedule host-side work."""
+
     video_model = isinstance(runtime.model, VideoRunner)
     rank_zero = runtime.mesh.coord("sp") == 0 if video_model else True
     for operation in operations:
@@ -1751,6 +1849,8 @@ def _registration_error_lane(
     error: WorkerError,
     started: int,
 ) -> LaneResult:
+    """Build aligned error outputs without committing candidate request state."""
+
     generation = 1
     report = _build_error_lane(
         runtime,
@@ -1771,6 +1871,8 @@ def _error_lane(
     error: WorkerError,
     started: int,
 ) -> LaneResult:
+    """Build a failed lane report and release its unpublished resources."""
+
     report = _build_error_lane(
         runtime,
         scope.lane,
@@ -1792,9 +1894,13 @@ def _build_error_lane(
     started: int,
     forward_stats: WorkerForwardStats,
 ) -> LaneResult:
+    """Materialize one error completion per lane operation without mutating request state."""
+
     completion_code = _completion_error_code(error.code)
     records: list[ModelOutput] = []
     for operation in lane.operations:
+        # Resolve only enough parent state to preserve the scheduler-visible
+        # checkpoint and logical lengths in the failed completion.
         request = runtime.requests.peek(operation.request_key.request_id)
         selected_parent = (
             operation.parent
@@ -1824,6 +1930,9 @@ def _build_error_lane(
             }
             else TransferResult
         )
+
+        # All result families share an empty token span. Diffusion additionally
+        # carries its cursor fields so the wire payload remains schema-complete.
         payload_args = (
             lengths,
             TokenSpan(base=lengths.token_len, len=0),
@@ -1861,6 +1970,8 @@ def _finalize_predicated_runtime(
     runtime,
     operation: Operation,
 ) -> tuple[Checkpoint, RequestRuntime]:
+    """Resolve request runtime state for an operation skipped by its predicate."""
+
     selected, runtime = runtime.requests.resolve_predicated(
         operation.request_key.request_id,
         operation.op_id,
@@ -1870,6 +1981,8 @@ def _finalize_predicated_runtime(
 
 
 def _validate_batch(runtime, batch: Run) -> None:
+    """Validate run identity, lane resources, routing, and operation support before staging."""
+
     if len(batch.operations) > runtime.deployment.max_batch_operations:
         raise invalid_descriptor("execution batch exceeds the deployment operation limit")
     for operation in batch.operations:
@@ -1932,6 +2045,8 @@ def validate_collective_sequence(
 
 
 def _completion_devices(runtime, operations: tuple[Operation, ...]) -> tuple[str, ...]:
+    """List distinct devices that may contribute asynchronous completion fields."""
+
     deployment = runtime.deployment
     generation_device = deployment.generation_device
     device = deployment.device
@@ -1951,6 +2066,8 @@ def _mixed_bucket(
     runtime,
     lanes: tuple[RunLane, ...],
 ) -> GraphBucket:
+    """Resolve a shared captured-graph bucket for a compatible mixed lane group."""
+
     decode_rows = sum(
         operation.kind is RunKind.AR_DECODE
         for lane in lanes
@@ -2112,6 +2229,8 @@ def _reserve_outputs(
 
 
 def _operation_device(runtime, operation: Operation) -> torch.device:
+    """Resolve the execution device for an operation's model phase."""
+
     return (
         runtime._generation_device
         if operation.kind
@@ -2129,6 +2248,8 @@ def _validate_completion_products(
     operation: Operation,
     products: tuple[ProductPayload, ...],
 ) -> None:
+    """Validate completion payloads against every product declared by the operation."""
+
     declared = {output: output for output in operation.outputs}
     for product in products:
         reference = declared.get(product.product)
@@ -2166,6 +2287,8 @@ def _consume_predicates(
     operations: tuple[Operation, ...],
     scope: LaneState,
 ) -> None:
+    """Resolve operation predicates from local device products and register their readers."""
+
     grouped: dict[
         torch.device,
         list[
@@ -2226,6 +2349,8 @@ def _publish_predicates(
     runtime,
     scope: LaneState,
 ) -> None:
+    """Publish predicate outputs after their producing operations have resolved."""
+
     producers = {_operation_identity(operation) for operation in scope.lane.operations}
     transitions = {id(write) for write in scope.transition_writes.values()}
     propagated = {
@@ -2263,6 +2388,8 @@ def _publish_predicated_outputs(
     operations: tuple[Operation, ...],
     scope: LaneState,
 ) -> None:
+    """Publish inactive sentinel values for products of predicated operations."""
+
     declared = {_operation_identity(operation) for operation in operations}
     for identity, writes in scope.propagated_predicate_writes.items():
         if identity not in declared:
@@ -2275,6 +2402,8 @@ def _finish_device_reads(
     runtime,
     scope: LaneState,
 ) -> None:
+    """Record or cancel every device-product read acquired by the lane."""
+
     reads = tuple(read for read in scope.device_reads if not read._recorded)
     if reads:
         after_writes: list[DeviceProductWrite] = []
@@ -2298,6 +2427,8 @@ def _finish_device_reads(
 
 
 def _apply_release_controls(runtime, batch: Run, *, before_execution: bool) -> None:
+    """Apply lifecycle releases in the phase required by their ownership contract."""
+
     consumed = {
         (reference.request_key, int(reference.producer_op_id))
         for operation in batch.operations
@@ -2380,10 +2511,14 @@ def _bind_latent_rows(
     lane: RunLane,
     scope: LaneState,
 ) -> None:
+    """Validate trajectory placements and bind rank-local latent staging views."""
+
     if not lane.latent_placements:
         return
     pool = runtime.latent_pool
     if pool is None:
+        # Dedicated-state models use their request-pool slot as a capacity token;
+        # scheduler placements still have to match resident solver progress.
         operations = {
             _operation_identity(operation): (
                 operation,
@@ -2421,6 +2556,7 @@ def _bind_latent_rows(
                     "pool-free latent placement disagrees with resident generation state"
                 )
         return
+    # Pooled models bind each operation to validated image geometry and page ownership.
     operations = {
         _operation_identity(operation): (
             operation,
@@ -2478,6 +2614,8 @@ def _bind_latent_rows(
         elif int(placement.start_step) != committed_step or int(placement.step_count) != 0:
             raise invalid_descriptor("latent reader placement disagrees with committed step state")
         rows.append((identity, placement, slot))
+    # Stage every page table together so overlapping physical ownership is
+    # rejected before any operation receives a writable tensor view.
     staged = pool.stage(
         tuple(placement.page_table for _identity, placement, _slot in rows),
         tuple(int(placement.latent_units) for _identity, placement, _slot in rows),
@@ -2493,6 +2631,8 @@ def _bind_latent_rows(
 
 
 def _latent_row(runtime, operation: Operation, scope: LaneState) -> LatentExecution:
+    """Resolve a latent placement into the request pool's staged row."""
+
     row = scope.latent_rows.get(_operation_identity(operation))
     if row is None:
         raise invalid_descriptor("trajectory operation has no staged latent placement")
@@ -2564,6 +2704,8 @@ def _bind_cache_tables(
 
 
 def _request_row(runtime, scope: LaneState, request_id: int) -> RequestDraft:
+    """Return the staged request draft for a request identifier in this lane."""
+
     try:
         return scope.request_rows[int(request_id)]
     except KeyError:
@@ -2578,6 +2720,8 @@ def _consume_device_product(
     consumer_op_id: int,
     device: torch.device | str | None = None,
 ) -> DeviceProductRead:
+    """Acquire a generation-checked device product and attach its read lease to the lane."""
+
     candidate = scope.transferred_device_products.get(reference)
     if candidate is not None:
         return runtime.device_products.consume_candidate(
@@ -2600,6 +2744,8 @@ def _consume_encoder_feature(
     consumer_op_id: int,
     device: torch.device | str | None = None,
 ) -> EncoderRead:
+    """Acquire an immutable encoder feature and attach its read lease to the lane."""
+
     candidate = scope.transferred_encoder_features.get(reference)
     if candidate is not None:
         return runtime.encoder_cache.consume_candidate(
@@ -2619,6 +2765,8 @@ def _parent_runtime(
     operation: Operation,
     request: RequestDraft,
 ) -> RequestRuntime:
+    """Resolve the request runtime checkpoint consumed by an operation."""
+
     parent = operation.parent
     point = parent.point
     runtime = (
@@ -2635,6 +2783,8 @@ def _parent_runtime(
 
 
 def parent_runtime(runtime, operation: Operation, request: RequestDraft) -> RequestRuntime:
+    """Resolve an operation’s semantic parent checkpoint against its request draft."""
+
     return _parent_runtime(runtime, operation, request)
 
 
@@ -2645,6 +2795,8 @@ def _cache_coordinates(
     *,
     group_id: int = 0,
 ) -> tuple[int, int, int, int]:
+    """Resolve request slot and verified, allocated, and logical cache lengths."""
+
     request = _request_row(runtime, scope, operation.request_key.request_id)
     slot = int(request.request_pool_idx)
     rows = scope.forward_rows.get(_operation_identity(operation), ())
@@ -2670,6 +2822,8 @@ def _logical_lengths(
     latent_len: int | None = None,
     computed_len: int | None = None,
 ) -> LogicalLengths:
+    """Derive logical input, cache, computed, and latent lengths for one forward row."""
+
     parent = _parent_runtime(runtime, operation, request)
     if cache is None:
         visible = parent.kv_visible_len
@@ -2695,6 +2849,8 @@ def _stage_input_products(
     for entry in input_products:
         product = entry.product
         if isinstance(entry.payload, TransferHandle):
+            # Transfer metadata determines which runtime owns the imported value;
+            # each branch validates identity and geometry before publication.
             transfer = scope.prepared_transfers.get(product)
             if transfer is None or not transfer.ready():
                 raise invalid_descriptor("cross-stage input has no query-ready prepared transfer")
@@ -2838,6 +2994,7 @@ def _stage_input_products(
                 EncoderMetadata(height=height, width=width),
             )
             continue
+        # Inline payloads remain host-owned until their consuming operation stages them.
         if product.kind is ProductKind.SAMPLING_STATE:
             scope.sampling_states[_reference_operation_identity(product)] = (
                 decode_sampling_state_bytes(entry.payload)
@@ -2858,6 +3015,8 @@ def _predicated_outcome(
     operation: Operation,
     scope: LaneState,
 ) -> Outcome:
+    """Construct an inactive outcome while preserving declared product generations."""
+
     request = _request_row(runtime, scope, operation.request_key.request_id)
     lengths = _logical_lengths(runtime, operation, request, None)
     selected = request.resolve_version(operation.parent)
@@ -2880,6 +3039,10 @@ def _run_laneed_wave(
     *,
     qualify_mixed: bool,
 ) -> tuple[torch.Tensor, ...]:
+    """Group compatible forward rows, execute each group, and restore task order."""
+
+    # Launch identity, physical lane, and shape key jointly define rows that may
+    # share one model invocation without changing scheduler ordering.
     grouped: dict[
         tuple[object, ...],
         list[tuple[int, ForwardRow, LaneState]],
@@ -2913,6 +3076,8 @@ def _run_laneed_wave(
         for scope in _unique_scopes(group_scopes):
             scope.completion.register_device(target)
         if qualify_mixed and len(kinds) > 1:
+            # Startup qualification compares tensorized mixed output with
+            # independently executed homogeneous groups for the same rows.
             output, observation, mixed_us = _run_startup_forward(
                 runtime,
                 group_tasks,
@@ -2979,6 +3144,7 @@ def _run_laneed_wave(
         group_scopes[0].observations.append(observation)
         if output_event is not None:
             output_events.append((target, output_event))
+        # Scatter each grouped result back to the caller's task ordering.
         for index, value in zip(indexes, output, strict=True):
             result[index] = value
     for device, event in output_events:
@@ -2994,6 +3160,8 @@ def _run_startup_forward(
     *,
     force_eager: bool = False,
 ) -> tuple[tuple[torch.Tensor, ...], RunObservation, int]:
+    """Execute startup forward rows eagerly or through graph qualification without publication."""
+
     with profile_range("uniserve.startup.mixed_oracle_forward"):
         if target.type != "cuda":
             started = time.perf_counter_ns()
@@ -3019,6 +3187,8 @@ def _assert_mixed_equivalence(
     homogeneous: tuple[torch.Tensor, ...],
     tasks: tuple[ForwardRow, ...],
 ) -> None:
+    """Compare mixed-lane outputs with homogeneous execution across corresponding row slices."""
+
     from . import flow as flow_ops
 
     if len(mixed) != len(homogeneous) or len(mixed) != len(tasks):
@@ -3091,6 +3261,8 @@ def _assert_mixed_equivalence(
             raise RuntimeError("mixed flow qualification changed its CFG branch geometry")
 
         def committed(values: tuple[torch.Tensor, ...]) -> torch.Tensor:
+            """Combine CFG branches and integrate the candidate latent for comparison."""
+
             predictions = {
                 branch: flow_ops.prediction(values[row])
                 for branch, row in zip(guide.branches, rows, strict=True)
@@ -3130,12 +3302,16 @@ def _run_observed_forward_group(
     tasks: tuple[ForwardRow, ...],
     scope: LaneState,
 ) -> ForwardResult:
+    """Run a forward group while recording timing and operation trace metadata."""
+
     result = _run_forward_group(runtime, tasks, scope)
     scope.observations.append(result.observation)
     return result
 
 
 def _broadcast_tp_selection(runtime, value: torch.Tensor) -> torch.Tensor:
+    """Broadcast sampled selection state from tensor-parallel rank zero."""
+
     if runtime.mesh.tp_size <= 1:
         return value
     transport = runtime.mesh.transport("tp")
@@ -3143,6 +3319,8 @@ def _broadcast_tp_selection(runtime, value: torch.Tensor) -> torch.Tensor:
 
 
 def _group_key(runtime, task: ForwardRow) -> tuple[object, ...]:
+    """Build the route, mode, geometry, and weight identity used to batch forward rows."""
+
     phase = (
         "textual"
         if task.phase in {ModelPhase.TEXT, ModelPhase.DENOISE}
@@ -3167,6 +3345,8 @@ def _group_key(runtime, task: ForwardRow) -> tuple[object, ...]:
 
 
 def _lane_identity(runner: ModelRunner, device: torch.device, domain: Domain) -> int:
+    """Return the physical runner, device, and domain identity used for lane grouping."""
+
     for lane in runner.execution_lanes:
         if lane.device == device and domain in lane.domains:
             return id(lane)
@@ -3180,6 +3360,8 @@ def _run_forward_group(
     *,
     force_eager: bool = False,
 ) -> ForwardResult:
+    """Execute one compatible forward-row group and register model output products."""
+
     target = _phase_device(runtime, tasks[0].phase)
     scope.completion.register_device(target)
     attention = (
@@ -3209,14 +3391,20 @@ def _run_forward_group(
 
 
 def _weights(runtime) -> WeightSet:
+    """Return the runtime's installed live-weight registry."""
+
     return runtime.weights
 
 
 def _model(runtime) -> ExecutionModel:
+    """Return the execution model currently bound to the runtime."""
+
     return runtime.model
 
 
 def _generation(runtime) -> GenerationPipeline:
+    """Require and return the model's diffusion-generation pipeline."""
+
     value = _model(
         runtime,
     ).generation
@@ -3226,12 +3414,16 @@ def _generation(runtime) -> GenerationPipeline:
 
 
 def _latent_pool(runtime) -> LatentPool:
+    """Require and return runtime-owned latent trajectory storage."""
+
     if runtime.latent_pool is None:
         raise unsupported_setup("operation requires a physical latent pool")
     return runtime.latent_pool
 
 
 def _image_processor(runtime) -> ImageProcessor:
+    """Require and return the model's image preprocessing contract."""
+
     value = _model(
         runtime,
     ).image_processor
@@ -3241,6 +3433,8 @@ def _image_processor(runtime) -> ImageProcessor:
 
 
 def _phase_device(runtime, phase: ModelPhase) -> torch.device:
+    """Resolve the model device responsible for an execution phase."""
+
     deployment = runtime.deployment
     if phase in {ModelPhase.ENCODE_LATENT, ModelPhase.DECODE_LATENT}:
         return torch.device(deployment.generation_device or deployment.device)
@@ -3248,6 +3442,8 @@ def _phase_device(runtime, phase: ModelPhase) -> torch.device:
 
 
 def _phase_topology(runtime, phase: ModelPhase) -> tuple[str, ...]:
+    """Resolve the distributed mesh axes used by an execution phase."""
+
     if phase in {ModelPhase.TEXT, ModelPhase.DENOISE}:
         return _model(
             runtime,
@@ -3256,6 +3452,8 @@ def _phase_topology(runtime, phase: ModelPhase) -> tuple[str, ...]:
 
 
 def _task_shape(runtime, task: ForwardRow) -> tuple[int, ...]:
+    """Build the graph-relevant shape signature for one forward row."""
+
     if task.encode_pixels is not None:
         return tuple(int(value) for value in task.encode_pixels.shape)
     if task.latent is not None:
@@ -3264,6 +3462,8 @@ def _task_shape(runtime, task: ForwardRow) -> tuple[int, ...]:
 
 
 def _group_graph_shape(runtime, tasks: tuple[ForwardRow, ...]) -> tuple[object, ...]:
+    """Require one shared graph-shape signature across grouped forward rows."""
+
     return (
         len(tasks),
         sum(task.query_tokens for task in tasks),
@@ -3273,6 +3473,8 @@ def _group_graph_shape(runtime, tasks: tuple[ForwardRow, ...]) -> tuple[object, 
 
 
 def _release_locators(runtime, locators: Iterable[Locator]) -> None:
+    """Release transfer locators through the runtime transport owner."""
+
     if runtime.transport is None:
         return
     for locator in locators:
@@ -3282,6 +3484,8 @@ def _release_locators(runtime, locators: Iterable[Locator]) -> None:
 def _trace_envelopes(
     operations: Sequence[Operation],
 ) -> tuple[OperationTrace, ...]:
+    """Encode operation identities and kinds for execution-trace records."""
+
     return tuple(
         OperationTrace(
             authority_id=int(operation.request_key.authority_id),
@@ -3305,10 +3509,14 @@ def _fixed_parent(operation: Operation) -> FixedCheckpoint:
 
 
 def _output_generations(operation: Operation) -> tuple[int, ...]:
+    """Return output product generations in declaration order."""
+
     return tuple(int(reference.generation) for reference in operation.outputs)
 
 
 def _record_component(scope: LaneState, name: str, started_ns: int) -> None:
+    """Accumulate elapsed microseconds for one lane execution component."""
+
     elapsed_us = max(0, (time.perf_counter_ns() - int(started_ns)) // 1000)
     scope.component_us[name] = scope.component_us.get(name, 0) + elapsed_us
 
@@ -3317,6 +3525,8 @@ def _forward_stats(
     observations: Sequence[RunObservation],
     component_us: Mapping[str, int] | None = None,
 ) -> WorkerForwardStats:
+    """Aggregate forward observations into stable per-component and total timing statistics."""
+
     route_counts: dict[str, int] = {}
     route_rows: dict[str, int] = {}
     route_us: dict[str, int] = {}

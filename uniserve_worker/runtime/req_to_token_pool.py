@@ -30,6 +30,10 @@ class ReqToTokenPool:
         device: torch.device | str,
         staging_depth: int = 1,
     ) -> None:
+        """Allocate device block tables and bounded host staging for atomic table updates."""
+
+        # Slot zero is included in every device row allocation but remains
+        # reserved for padding and graph replay rather than scheduler requests.
         self.group_count = int(group_count)
         self.request_pool_size = int(request_pool_size)
         self.max_blocks_per_request = int(max_blocks_per_request)
@@ -44,6 +48,7 @@ class ReqToTokenPool:
             < 1
         ):
             raise invalid_descriptor("request-to-token pool geometry is invalid")
+
         rows = self.request_pool_size + 1
         self.page_tables = torch.zeros(
             (self.group_count, rows, self.max_blocks_per_request),
@@ -54,6 +59,9 @@ class ReqToTokenPool:
         self.alloced_lens = torch.zeros(rows, dtype=torch.int32, device=device)
         self._host_tables: dict[tuple[int, int], tuple[int, ...]] = {}
         self._host_alloced_lens: dict[int, int] = {}
+
+        # A single install may replace every request/group table, so staging is
+        # sized for the full Cartesian capacity rather than the live batch.
         self._table_capacity = self.request_pool_size * self.group_count
         self._page_staging = torch.empty(
             (self._table_capacity, self.max_blocks_per_request),
@@ -65,6 +73,9 @@ class ReqToTokenPool:
         self._allocated_staging = torch.empty(
             self._table_capacity, dtype=torch.int32, device=device
         )
+
+        # Generation-safe pinned rings retain CPU sources until asynchronous
+        # copies into all four device staging tensors have completed.
         self._page_host = HostStagingRing(
             (self._table_capacity, self.max_blocks_per_request),
             dtype=torch.int32,
@@ -94,6 +105,8 @@ class ReqToTokenPool:
         self,
         tables: Sequence[tuple[int, int, Sequence[int], int]],
     ) -> None:
+        """Atomically install validated request block tables and allocated lengths on the device."""
+
         count = len(tables)
         if count == 0:
             return
@@ -197,15 +210,21 @@ class ReqToTokenPool:
             self._host_alloced_lens[slot] = allocated_tokens
 
     def pages(self, request_pool_idx: int, group_id: int) -> tuple[int, ...]:
+        """Resolve the installed cache-page table for one request slot and cache group."""
+
         try:
             return self._host_tables[(int(request_pool_idx), int(group_id))]
         except KeyError:
             raise invalid_descriptor("request slot has no installed block table") from None
 
     def allocated_length(self, request_pool_idx: int) -> int:
+        """Expose the token capacity currently installed for a request slot."""
+
         return self._host_alloced_lens.get(int(request_pool_idx), 0)
 
     def set_verified(self, slots: torch.Tensor, lengths: torch.Tensor) -> None:
+        """Update verified cache lengths for selected request slots without changing page tables."""
+
         slots = slots.to(device=self.page_tables.device, dtype=torch.int64)
         lengths = lengths.to(device=self.page_tables.device, dtype=torch.int32)
         if slots.ndim != 1 or lengths.shape != slots.shape:
@@ -219,6 +238,8 @@ class ReqToTokenPool:
         self.verified_lens.index_copy_(0, slots, lengths)
 
     def release(self, slots: Sequence[int]) -> None:
+        """Clear selected request slots and return them to the scheduler-owned free state."""
+
         values = tuple(dict.fromkeys(int(slot) for slot in slots))
         if not values:
             return

@@ -1,12 +1,20 @@
-//! Deployment state composition for the configured UniServe serving surface.
+//! UniServe HTTP frontend, model profiles, request lowering, and output assembly.
+//!
+//! The crate resolves one deployment configuration into shared application
+//! state and exposes OpenAI-compatible routes backed by the in-process engine.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 mod config;
+/// Server-facing engine submission and health client.
 pub mod engine_client;
+/// HTTP listener, middleware, and route construction.
 pub mod http;
+/// OpenAI-compatible schemas and conversion helpers.
 pub mod openai;
+/// Model assets and behavior profiles.
 pub mod profile;
 mod scheduler_stats;
+/// Model-aware request admission and output streaming.
 pub mod serving;
 mod state;
 
@@ -33,6 +41,7 @@ struct RuntimeControlTokens {
     end_of_image: u32,
 }
 
+/// Resolves canonical model control tokens for the selected engine backend.
 fn runtime_control_tokens(
     assets: &ResolvedAssets,
     backend: EngineBackendKind,
@@ -67,7 +76,7 @@ fn runtime_control_tokens(
     }
 }
 
-/// Build the shared application state for one resolved model and one engine client.
+/// Builds the shared application state for one resolved model and one engine client.
 pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     let assets = ResolvedAssets::load(config)
         .await

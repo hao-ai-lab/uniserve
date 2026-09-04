@@ -16,6 +16,8 @@ _GRAPH_POOLS: dict[tuple[str, int | None], Any] = {}
 
 
 def _graph_pool(device: torch.device) -> Any:
+    """Return the process-wide static graph pool associated with one CUDA device."""
+
     key = (device.type, device.index)
     with _POOL_LOCK:
         pool = _GRAPH_POOLS.get(key)
@@ -29,6 +31,8 @@ class StaticCudaGraph(Generic[_T]):
     """Capture during model warmup and replay from stable input addresses."""
 
     def __init__(self, device: torch.device | str) -> None:
+        """Create an uncaptured graph owner with a private stream on one CUDA device."""
+
         self.device = torch.device(device)
         if self.device.type != "cuda":
             raise ValueError("CUDA graph execution requires a CUDA device")
@@ -38,6 +42,8 @@ class StaticCudaGraph(Generic[_T]):
 
     @property
     def captured(self) -> bool:
+        """Indicate whether this wrapper owns a replayable CUDA graph."""
+
         return self._graph is not None
 
     def capture(
@@ -46,6 +52,8 @@ class StaticCudaGraph(Generic[_T]):
         *,
         warmup: Callable[[], Any] | None = None,
     ) -> _T:
+        """Warm the operation, capture it on the bound stream, and retain its graph memory pool."""
+
         if self._graph is not None:
             raise RuntimeError("the static CUDA graph has already been captured")
         if warmup is not None:
@@ -64,6 +72,8 @@ class StaticCudaGraph(Generic[_T]):
         return output
 
     def replay(self) -> _T:
+        """Replay the captured operation and return its persistent output object."""
+
         graph = self._graph
         if graph is None:
             raise RuntimeError("the static CUDA graph has not been captured during warmup")

@@ -65,6 +65,8 @@ __all__ = [
 
 
 class TransportKind(StrEnum):
+    """Selects in-process, POSIX shared-memory, or CUDA IPC byte transport."""
+
     LOCAL = "local"
     SHM = "shm"
     CUDA_IPC = "cuda_ipc"
@@ -92,6 +94,8 @@ class Locator:
     meta: dict[str, Any] = field(default_factory=dict)
 
     def to_mapping(self) -> dict[str, Any]:
+        """Encode a local, shared-memory, or CUDA IPC locator into the canonical transfer schema."""
+
         if self.transport == "local":
             transport = LocalTransfer(endpoint=self.endpoint, key=int(self.handle.decode()))
         elif self.transport == "shm":
@@ -128,6 +132,8 @@ class Locator:
 
     @staticmethod
     def from_mapping(raw: dict[str, Any]) -> "Locator":
+        """Parse the canonical transfer schema into the transport-neutral locator view."""
+
         locator = TransferLocator.from_mapping(raw)
         transport = locator.transport
         if isinstance(transport, LocalTransfer):
@@ -175,6 +181,8 @@ def encode_transfer_handle(
     kind: str,
     value: dict[str, object],
 ) -> TransferHandle:
+    """Build a typed transfer handle from transport metadata and validate its byte bound."""
+
     try:
         transfer_kind = TransferKind(kind)
     except ValueError:
@@ -230,6 +238,8 @@ def encode_transfer_handle(
 
 
 def decode_transfer_handle(handle: TransferHandle) -> tuple[str, dict[str, object]]:
+    """Convert a typed transfer handle into the transport-neutral locator view."""
+
     typed = handle.value
     if isinstance(typed, EncoderTransferValue):
         value: dict[str, object] = {
@@ -280,21 +290,27 @@ def fetch_locator(transport: "Transport", locator: Locator) -> "torch.Tensor":
 
 
 def _dtype_to_str(dtype: "torch.dtype") -> str:
+    """Encode a torch dtype as its unqualified transport name."""
+
     return str(dtype).removeprefix("torch.")
 
 
 def _dtype_from_str(name: str) -> "torch.dtype":
+    """Resolve a transport dtype name to a torch dtype."""
+
     import torch
 
     return getattr(torch, name)
 
 
 def _nbytes(tensor: "torch.Tensor") -> int:
+    """Return the physical byte size of a tensor view."""
+
     return int(tensor.numel() * tensor.element_size())
 
 
 class Transport(ABC):
-    """Register-once one-sided transport. One instance per worker."""
+    """Register-once, one-sided transport owned by a single worker."""
 
     name: str = "transport"
     supports_async_publication: bool = False
@@ -304,7 +320,7 @@ class Transport(ABC):
     blocking_fetch: bool = False
 
     def endpoint(self) -> str:
-        """This worker's stable transport endpoint identity."""
+        """Return this worker's stable transport endpoint identity."""
         return self.name
 
     @abstractmethod
@@ -361,37 +377,61 @@ class TransferTicket(ABC):
 
 
 class _ImmediateTransferTicket(TransferTicket):
+    """Exposes an already available tensor through the asynchronous transfer-ticket interface."""
+
     def __init__(self, value: "torch.Tensor") -> None:
+        """Store a tensor that is immediately available to ticket consumers."""
+
         self._value = value
 
     def ready(self) -> bool:
+        """Report immediate readiness for the already materialized tensor."""
+
         return True
 
     def result(self) -> "torch.Tensor":
+        """Expose the already materialized tensor without copying it."""
+
         return self._value
 
     def add_done_callback(self, callback: Any) -> None:
+        """Invoke the completion callback synchronously because the result is ready."""
+
         callback()
 
 
 class _FutureTransferTicket(TransferTicket):
+    """Wraps a future whose completion materializes a transferred tensor."""
+
     def __init__(self, future: "concurrent.futures.Future[torch.Tensor]") -> None:
+        """Take ownership of a future that materializes the transferred tensor."""
+
         self._future = future
 
     def ready(self) -> bool:
+        """Query whether the backing transfer future has completed."""
+
         return self._future.done()
 
     def result(self) -> "torch.Tensor":
+        """Expose the completed tensor while rejecting premature observation."""
+
         if not self.ready():
             raise RuntimeError("transfer ticket was observed before readiness")
         return self._future.result()
 
     def add_done_callback(self, callback: Any) -> None:
+        """Invoke the owner callback when the backing future reaches completion."""
+
         self._future.add_done_callback(lambda _future: callback())
 
 
 class _ByteCapacity:
+    """Reserves and releases bounded transport bytes under a condition variable."""
+
     def __init__(self, capacity: int) -> None:
+        """Initialize blocking byte reservations against a fixed positive capacity."""
+
         self.capacity = int(capacity)
         if self.capacity < 1:
             raise ValueError("transfer byte capacity must be positive")
@@ -399,6 +439,8 @@ class _ByteCapacity:
         self._lock = threading.Lock()
 
     def acquire(self, amount: int) -> None:
+        """Block until the requested byte capacity is available, then reserve it."""
+
         value = int(amount)
         if value < 0:
             raise ValueError("transfer byte reservation must not be negative")
@@ -411,6 +453,8 @@ class _ByteCapacity:
             self.used = projected
 
     def release(self, amount: int) -> None:
+        """Return reserved bytes and wake blocked transport publishers."""
+
         value = int(amount)
         with self._lock:
             if value < 0 or value > self.used:
@@ -426,12 +470,16 @@ class _NamedSemaphore:
     _failed = ctypes.c_void_p(-1).value
 
     def __init__(self, name: str, handle: int) -> None:
+        """Wrap an open POSIX semaphore handle with idempotent close ownership."""
+
         self.name = name
         self._handle = ctypes.c_void_p(handle)
         self._closed = False
 
     @classmethod
     def create(cls) -> "_NamedSemaphore":
+        """Create and own a uniquely named process-shared readiness semaphore."""
+
         name = f"/uniserve-{uuid.uuid4().hex}"
         handle = cls._libc.sem_open(
             name.encode(),
@@ -446,6 +494,8 @@ class _NamedSemaphore:
 
     @classmethod
     def open(cls, name: str) -> "_NamedSemaphore":
+        """Open an existing named readiness semaphore without taking unlink ownership."""
+
         handle = cls._libc.sem_open(name.encode(), 0, 0, 0)
         if handle == cls._failed:
             error = ctypes.get_errno()
@@ -453,17 +503,23 @@ class _NamedSemaphore:
         return cls(name, int(handle))
 
     def wait(self) -> None:
+        """Acquire the named POSIX semaphore, retrying interrupted system calls."""
+
         while self._libc.sem_wait(self._handle) != 0:
             error = ctypes.get_errno()
             if error != errno.EINTR:
                 raise OSError(error, os.strerror(error), self.name)
 
     def post(self) -> None:
+        """Release one waiter through the named POSIX semaphore."""
+
         if self._libc.sem_post(self._handle) != 0:
             error = ctypes.get_errno()
             raise OSError(error, os.strerror(error), self.name)
 
     def close(self, *, unlink: bool = False) -> None:
+        """Close the semaphore and optionally unlink its owned name."""
+
         if not self._closed:
             if self._libc.sem_close(self._handle) != 0:
                 error = ctypes.get_errno()
@@ -480,6 +536,8 @@ _SHM_LIBC.shm_open.restype = ctypes.c_int
 
 
 def _open_shared_memory(name: str, size: int) -> mmap.mmap:
+    """Open an existing shared-memory segment and validate its declared size."""
+
     canonical_name = name if name.startswith("/") else f"/{name}"
     descriptor = _SHM_LIBC.shm_open(canonical_name.encode(), os.O_RDONLY)
     if descriptor < 0:
@@ -497,6 +555,8 @@ def _open_shared_memory(name: str, size: int) -> mmap.mmap:
 
 
 class _BoundedTransferPool:
+    """Bounds asynchronous transfer count and aggregate bytes for one transport backend."""
+
     def __init__(
         self,
         *,
@@ -505,6 +565,8 @@ class _BoundedTransferPool:
         byte_capacity: int | _ByteCapacity,
         name: str,
     ) -> None:
+        """Create a worker pool governed by shared byte and entry reservations."""
+
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=workers,
             thread_name_prefix=name,
@@ -518,9 +580,13 @@ class _BoundedTransferPool:
         self._completion_wake: Any = None
 
     def set_completion_wake(self, wake: Any) -> None:
+        """Install the controller callback invoked after an asynchronous transfer finishes."""
+
         self._completion_wake = wake
 
     def submit(self, operation: Any, *args: Any, nbytes: int) -> TransferTicket:
+        """Reserve transfer bytes and a worker slot before scheduling one asynchronous operation."""
+
         if not self._entries.acquire(blocking=False):
             raise resource_error("asynchronous transfer ticket capacity is exhausted")
         bytes_acquired = False
@@ -535,6 +601,8 @@ class _BoundedTransferPool:
             raise
 
         def release(_future: object) -> None:
+            """Return byte and ticket capacity, then wake the completion controller."""
+
             self._bytes.release(nbytes)
             self._entries.release()
             wake = self._completion_wake
@@ -545,6 +613,8 @@ class _BoundedTransferPool:
         return _FutureTransferTicket(future)
 
     def close(self) -> None:
+        """Reject new work and shut down the transfer executor."""
+
         self._executor.shutdown(wait=True, cancel_futures=False)
 
 
@@ -555,6 +625,8 @@ class LocalTransport(Transport):
     supports_async_publication = True
 
     def __init__(self, *, byte_capacity: int) -> None:
+        """Create a process-local tensor table with bounded retained bytes."""
+
         self._table: dict[int, "torch.Tensor"] = {}
         self._next = 0
         self._lock = threading.Lock()
@@ -562,9 +634,13 @@ class LocalTransport(Transport):
         self._bytes = _ByteCapacity(byte_capacity)
 
     def endpoint(self) -> str:
+        """Expose the process-unique registry endpoint encoded into local locators."""
+
         return self._endpoint
 
     def publish(self, tensor: "torch.Tensor") -> Locator:
+        """Register a detached tensor in the in-process endpoint table and return its locator."""
+
         t = tensor.detach()
         nbytes = _nbytes(t)
         self._bytes.acquire(nbytes)
@@ -583,6 +659,8 @@ class LocalTransport(Transport):
         )
 
     def fetch(self, locator: Locator) -> "torch.Tensor":
+        """Resolve a local locator and return the registered tensor without copying."""
+
         if locator.endpoint != self._endpoint:
             raise invalid_descriptor("local locator belongs to another transport endpoint")
         key = int(locator.handle.decode())
@@ -593,9 +671,13 @@ class LocalTransport(Transport):
         return t
 
     def fetch_async(self, locator: Locator) -> TransferTicket:
+        """Wrap an in-process tensor lookup in an immediately ready ticket."""
+
         return _ImmediateTransferTicket(self.fetch(locator))
 
     def release(self, locator: Locator) -> None:
+        """Drop one local locator’s registry reference."""
+
         if locator.endpoint != self._endpoint:
             return
         with self._lock:
@@ -604,6 +686,8 @@ class LocalTransport(Transport):
             self._bytes.release(locator.nbytes)
 
     def close(self) -> None:
+        """Release every tensor registered under this local endpoint."""
+
         with self._lock:
             values = tuple(self._table.values())
             self._table.clear()
@@ -615,6 +699,8 @@ class _ShmReadTicket(TransferTicket):
     """A shared-memory read owned by the bounded transfer executor."""
 
     def __init__(self, transport: "ShmTransport", locator: Locator) -> None:
+        """Submit one bounded shared-memory fetch to the transport's read executor."""
+
         self._inner = transport._reads.submit(
             transport.fetch,
             locator,
@@ -622,14 +708,20 @@ class _ShmReadTicket(TransferTicket):
         )
 
     def ready(self) -> bool:
+        """Query whether the shared-memory read has materialized its tensor."""
+
         return self._inner.ready()
 
     def result(self) -> "torch.Tensor":
+        """Expose the shared-memory tensor while rejecting premature observation."""
+
         if not self._inner.ready():
             raise RuntimeError("transfer ticket was observed before readiness")
         return self._inner.result()
 
     def add_done_callback(self, callback: Any) -> None:
+        """Forward completion notification to the underlying shared-memory read."""
+
         self._inner.add_done_callback(callback)
 
 
@@ -647,6 +739,8 @@ class ShmTransport(Transport):
     _MAX_LIVE_SEGMENTS = 256
 
     def __init__(self, *, byte_capacity: int, ticket_capacity: int) -> None:
+        """Create bounded shared-memory publication and asynchronous read resources."""
+
         from collections import OrderedDict
 
         self._segments: "OrderedDict[str, Any]" = OrderedDict()  # name -> SharedMemory (LRU)
@@ -680,10 +774,14 @@ class ShmTransport(Transport):
         )
 
     def set_completion_wake(self, wake: Any) -> None:
+        """Install one callback for publication and read-ticket completion."""
+
         self._completion_wake = wake
         self._reads.set_completion_wake(wake)
 
     def _complete_publications(self) -> None:
+        """Drain readiness notifications and finalize asynchronous shared-memory publications."""
+
         import torch
 
         selector = selectors.DefaultSelector()
@@ -758,6 +856,8 @@ class ShmTransport(Transport):
         self,
         item: tuple[str, Any, int, Any, Any, threading.Event] | None,
     ) -> None:
+        """Send one publication descriptor to the readiness worker thread."""
+
         self._publication_queue.put(item)
         try:
             self._publication_control_tx.send(b"\x01")
@@ -765,6 +865,8 @@ class ShmTransport(Transport):
             pass
 
     def publish(self, tensor: "torch.Tensor") -> Locator:
+        """Copy a CPU tensor into owned POSIX shared memory and publish its readiness semaphore."""
+
         from multiprocessing import shared_memory
 
         import torch
@@ -830,6 +932,8 @@ class ShmTransport(Transport):
         )
 
     def publish_async(self, tensor: "torch.Tensor") -> Locator:
+        """Schedule shared-memory publication under transfer count and byte bounds."""
+
         if not tensor.is_cuda:
             return self.publish(tensor)
         from multiprocessing import shared_memory
@@ -903,6 +1007,8 @@ class ShmTransport(Transport):
         )
 
     def fetch(self, locator: Locator) -> "torch.Tensor":
+        """Map a shared-memory locator and copy its ready bytes into a typed CPU tensor."""
+
         import torch
 
         name = locator.handle.decode()
@@ -927,6 +1033,8 @@ class ShmTransport(Transport):
         return out
 
     def ready(self, locator: Locator) -> bool:
+        """Return whether the locator’s named semaphore reports published bytes."""
+
         header = int(locator.meta.get("ready_header_bytes", 0))
         if header == 0:
             return True
@@ -940,6 +1048,8 @@ class ShmTransport(Transport):
             shm.close()
 
     def _await_publication(self, locator: Locator) -> None:
+        """Wait for an asynchronous shared-memory publication readiness signal."""
+
         name = locator.handle.decode()
         with self._lock:
             pending = self._pending.get(name)
@@ -957,9 +1067,13 @@ class ShmTransport(Transport):
             semaphore.close()
 
     def fetch_async(self, locator: Locator) -> TransferTicket:
+        """Submit a bounded shared-memory read without blocking the request thread."""
+
         return _ShmReadTicket(self, locator)
 
     def release(self, locator: Locator) -> None:
+        """Close mapped shared memory and unlink producer-owned storage and semaphores."""
+
         name = locator.handle.decode()
         with self._lock:
             pending = name in self._pending
@@ -981,6 +1095,8 @@ class ShmTransport(Transport):
                 pass
 
     def close(self) -> None:
+        """Release every mapped and published shared-memory region owned by this transport."""
+
         self._queue_publication(None)
         self._publication_worker.join()
         self._publication_control_rx.close()
@@ -1016,11 +1132,15 @@ class CudaIpcTransport(Transport):
     _MAX_LIVE_PUBLICATIONS = 256
 
     def __init__(self, *, byte_capacity: int) -> None:
+        """Initialize bounded producer-owned CUDA allocations addressable by IPC locators."""
+
         self._alive: dict[str, tuple["torch.Tensor", "torch.cuda.Event"]] = {}
         self._lock = threading.Lock()
         self._bytes = _ByteCapacity(byte_capacity)
 
     def publish(self, tensor: "torch.Tensor") -> Locator:
+        """Export CUDA storage, reference counter, and readiness events as an IPC locator."""
+
         if not tensor.is_cuda:
             raise invalid_descriptor("cuda_ipc transport requires a CUDA tensor")
         import torch
@@ -1084,6 +1204,8 @@ class CudaIpcTransport(Transport):
         )
 
     def _open(self, locator: Locator) -> "torch.Tensor":
+        """Reconstruct a CUDA tensor view from an IPC allocation and event locator."""
+
         import torch
         from torch.multiprocessing.reductions import rebuild_cuda_tensor
 
@@ -1106,6 +1228,8 @@ class CudaIpcTransport(Transport):
         )
 
     def fetch(self, locator: Locator) -> "torch.Tensor":
+        """Open a CUDA IPC locator and return its tensor while retaining remote storage ownership."""
+
         import torch
 
         event_handle = locator.meta.get("ready_event_handle")
@@ -1119,9 +1243,13 @@ class CudaIpcTransport(Transport):
         return self._open(locator).clone()
 
     def fetch_async(self, locator: Locator) -> TransferTicket:
+        """Import a CUDA IPC tensor and expose it through an immediately ready ticket."""
+
         return _ImmediateTransferTicket(self.fetch(locator))
 
     def release(self, locator: Locator) -> None:
+        """Release one imported or published CUDA IPC locator."""
+
         publication_id = locator.meta.get("publication_id")
         if not isinstance(publication_id, str):
             return
@@ -1131,6 +1259,8 @@ class CudaIpcTransport(Transport):
             self._bytes.release(locator.nbytes)
 
     def close(self) -> None:
+        """Release every CUDA IPC publication and imported storage reference."""
+
         with self._lock:
             alive = tuple(self._alive.values())
             self._alive.clear()

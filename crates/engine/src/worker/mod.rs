@@ -1,4 +1,4 @@
-//! Worker process construction, IPC execution, rank aggregation, and respawn.
+//! Worker process configuration, IPC execution, rank aggregation, and recovery.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 mod death_watch;
@@ -13,50 +13,93 @@ pub use uniproc::{FlashInferBackend, FlashInferBackendParseError, LaneConfig, Un
 /// Everything required to create or recreate one worker rank process.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct WorkerProcessArgs {
+    /// Python interpreter used to launch the worker entry point.
     pub python: std::path::PathBuf,
+    /// Model identifier or local model path.
     pub model: String,
+    /// Device specification supplied to the worker.
     pub device: String,
+    /// Number of tensor-parallel worker ranks.
     pub world_size: usize,
+    /// Maximum number of physical runs concurrently in flight per rank.
     pub pipeline_depth: usize,
+    /// Request IPC slot capacity in bytes.
     pub req_slot_cap: usize,
+    /// Response IPC slot capacity in bytes.
     pub resp_slot_cap: usize,
+    /// Optional KV cache capacity expressed in tokens.
     pub kv_token_capacity: Option<u64>,
+    /// Tokens represented by one physical KV cache block.
     pub block_size: u32,
+    /// Maximum operations accepted in one worker run.
     pub max_batch_operations: u32,
+    /// Maximum tokens accepted in one worker run.
     pub max_batch_tokens: u32,
+    /// Attention implementation selected for model execution.
     pub attention_backend: uniserve_worker_ipc::AttentionBackend,
+    /// Logical operation kinds exposed by the worker pool.
     pub supported_ops: Vec<uniserve_worker_ipc::OpKind>,
+    /// Product transport exposed by the worker pool.
     pub transfer_backend: crate::executor::TransferBackend,
+    /// Whether to launch the deterministic worker stub without model weights.
     pub stub: bool,
+    /// Checkpoint loader format.
     pub load_format: String,
+    /// Optional cache directory for downloaded model artifacts.
     pub download_dir: Option<std::path::PathBuf>,
+    /// Optional number of concurrent checkpoint reader threads.
     pub load_threads: Option<u32>,
+    /// Optional manifest of checkpoint file checksums.
     pub checksum_manifest: Option<std::path::PathBuf>,
+    /// Numeric data type used by model parameters and activations.
     pub model_dtype: uniserve_core::ModelDtype,
+    /// Worker-specific quantization policy.
     pub quantization_config: serde_json::Value,
+    /// Numeric data type used by the KV cache, when explicitly selected.
     pub kv_cache_dtype: Option<uniserve_core::KvCacheDtype>,
+    /// Fraction of available device memory reserved for the KV cache.
     pub kv_memory_fraction: f64,
+    /// Optional device mesh specification for staged model components.
     pub mesh: Option<String>,
+    /// Optional tensor-parallel communication backend.
     pub tp_backend: Option<String>,
+    /// Deployment-static execution lane descriptors.
     pub lanes: Vec<LaneConfig>,
+    /// Whether decode execution may use captured CUDA graphs.
     pub cuda_graph: bool,
+    /// Optional decode batch sizes selected for CUDA graph capture.
     pub decode_graph_batch_sizes: Option<String>,
+    /// Whether prefill execution may use captured CUDA graphs.
     pub prefill_cuda_graph: bool,
+    /// Optional prefill token counts selected for CUDA graph capture.
     pub prefill_graph_token_sizes: Option<String>,
+    /// Optional diffusion batch sizes selected for CUDA graph capture.
     pub flow_graph_batch_sizes: Option<String>,
+    /// Optional diffusion tensor shapes selected for CUDA graph capture.
     pub flow_graph_shapes: Option<String>,
+    /// FlashInfer workspace capacity in bytes.
     pub flashinfer_workspace_size: u64,
+    /// Optional FlashInfer tensor-core selection forwarded to the worker.
     pub flashinfer_use_tensor_core: Option<String>,
+    /// FlashInfer backend used for decode attention.
     pub flashinfer_decode_backend: FlashInferBackend,
+    /// FlashInfer backend used for prefill attention.
     pub flashinfer_prefill_backend: FlashInferBackend,
+    /// Optional split-KV tile size used for FlashInfer decode attention.
     pub flashinfer_decode_split_tile_size: Option<u32>,
+    /// Optional split-KV tile size used for FlashInfer prefill attention.
     pub flashinfer_prefill_split_tile_size: Option<u32>,
+    /// Whether FlashInfer split-KV execution is disabled.
     pub flashinfer_disable_split_kv: bool,
+    /// Whether FlashInfer may reuse its optimized decode planning path.
     pub flashinfer_fast_decode_plan: bool,
+    /// Maximum model context length in tokens.
     pub max_model_len: u32,
+    /// Maximum accepted video duration in seconds.
     pub max_video_seconds: f64,
 }
 
+/// Parks until one descriptor becomes readable or `timeout` expires.
 pub(crate) fn park_descriptors(fds: &[i32], timeout: std::time::Duration) -> anyhow::Result<()> {
     if fds.is_empty() {
         std::thread::park_timeout(timeout);

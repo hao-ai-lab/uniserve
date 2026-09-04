@@ -1,3 +1,5 @@
+//! Incremental conversion from engine events to decoded text events.
+
 use std::sync::Arc;
 
 use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer, IncrementalDecoder};
@@ -16,13 +18,18 @@ use crate::serving::text::error::Error;
 /// Request-neutral options for incremental text decoding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextDecodeOptions {
+    /// Whether tokenizer special tokens are omitted from decoded text.
     pub skip_special_tokens: bool,
+    /// Whether the matched stop string remains in emitted output.
     pub include_stop_str_in_output: bool,
+    /// Decoded strings that terminate generation.
     pub stop_strings: Option<Vec<String>>,
+    /// Minimum number of generated tokens before stop strings can terminate output.
     pub min_tokens: u32,
 }
 
 impl Default for TextDecodeOptions {
+    /// Returns the default value.
     fn default() -> Self {
         Self {
             skip_special_tokens: true,
@@ -36,25 +43,39 @@ impl Default for TextDecodeOptions {
 /// Terminal metadata carried on the final [`DecodedTextEvent`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Finished {
+    /// Number of prompt tokens submitted to the engine.
     pub prompt_token_count: usize,
+    /// Total number of generated tokens.
     pub output_token_count: usize,
+    /// Number of generated tokens consumed by internal protocol sections.
     pub internal_token_count: usize,
+    /// Terminal condition and optional concrete stop cause.
     pub finish_reason: FinishReason,
 }
 
 /// Internal decoded-text event emitted before higher-level assistant adaptation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DecodedTextEvent {
+    /// The request has been scheduled and prompt metadata is available.
     Start {
+        /// Prompt token identifiers submitted to the engine.
         prompt_token_ids: Arc<[u32]>,
+        /// Per-position prompt log probabilities, when requested.
         prompt_logprobs: Option<DecodedPromptLogprobs>,
+        /// Monotonic timestamp at which the request entered the serving queue.
         queued_at: Option<f64>,
+        /// Monotonic timestamp at which engine execution began.
         scheduled_at: Option<f64>,
     },
+    /// Newly decoded text and token metadata.
     TextDelta {
+        /// Newly visible decoded text.
         delta: String,
+        /// Token identifiers represented by this update.
         token_ids: Vec<u32>,
+        /// Per-position candidate log probabilities, when requested.
         logprobs: Option<DecodedLogprobs>,
+        /// Terminal metadata when this is the final update.
         finished: Option<Finished>,
     },
 }
@@ -78,6 +99,7 @@ struct DecodeState<'a> {
 }
 
 impl DecodeState<'_> {
+    /// Emits start metadata once scheduling and any requested prompt scores are complete.
     async fn emit_start_if_ready(
         &mut self,
         request_id: &str,
@@ -114,6 +136,7 @@ impl DecodeState<'_> {
         Ok(())
     }
 
+    /// Decodes one committed token, applies stop-string holdback, and emits terminal metadata.
     async fn consume_token(
         &mut self,
         tokenizer: &HuggingFaceTokenizer,
@@ -200,6 +223,7 @@ impl DecodeState<'_> {
     }
 }
 
+/// Advances incremental decoding and returns only bytes newly made visible by this token.
 fn decode_one_token(
     decoder: &mut IncrementalDecoder<'_>,
     token_id: u32,
@@ -227,7 +251,7 @@ fn decode_one_token(
     Ok(ArDecode { delta, stop })
 }
 
-/// Decode one canonical generation event stream into text-runtime events.
+/// Decodes one canonical generation event stream into text-runtime events.
 #[try_stream]
 pub async fn decoded_text_event_stream(
     request_id: String,
@@ -240,6 +264,8 @@ pub async fn decoded_text_event_stream(
     intermediate: bool,
     mut y: TryYielder<DecodedTextEvent, Error>,
 ) -> crate::serving::text::Result<()> {
+    // The prompt seeds incremental decoding and supplies the expected prompt-
+    // logprob cardinality before any generated token can be accepted.
     if prompt_token_ids.is_empty() {
         return Err(Error::EmptyPromptTokenIds {
             request_id: request_id.clone(),
@@ -265,8 +291,12 @@ pub async fn decoded_text_event_stream(
         accumulated_logprobs: None,
     };
 
+    // Engine events form an ordered protocol: scheduling and optional prompt
+    // metadata establish Start, then each token is paired with optional logprobs.
     while let Some(event) = raw_stream.next().await {
         match event {
+            // Scheduling metadata may arrive before prompt logprobs; start is
+            // emitted only after both prerequisites are complete.
             Event::Scheduled {
                 queued_at: queued,
                 scheduled_at: scheduled,
@@ -309,6 +339,8 @@ pub async fn decoded_text_event_stream(
                     )
                     .await?;
             }
+            // Generated logprobs, when requested, defer decoding until the
+            // matching TokenLogprobs event validates the token identity.
             Event::TextToken { id, .. } => {
                 state
                     .emit_start_if_ready(
@@ -382,6 +414,8 @@ pub async fn decoded_text_event_stream(
                     return Ok(());
                 }
             }
+            // A terminal event flushes decoder holdback only after every pending
+            // token/logprob pair and all prompt metadata have resolved.
             Event::Finished {
                 reason,
                 stop_reason,
@@ -406,6 +440,7 @@ pub async fn decoded_text_event_stream(
                     });
                 }
                 let finish_reason = text_finish_reason(reason, stop_reason);
+
                 let (last_chunk, text) = state.decoder.flush(None)?;
                 let full_text = tracing::enabled!(Level::TRACE).then(|| text.clone());
                 let (delta, token_ids, logprobs) = if intermediate {
@@ -417,6 +452,7 @@ pub async fn decoded_text_event_stream(
                         state.accumulated_logprobs.take(),
                     )
                 };
+
                 debug!(
                     ?finish_reason,
                     output_token_count = state.output_token_count,
@@ -425,6 +461,7 @@ pub async fn decoded_text_event_stream(
                 if let Some(full_text) = full_text {
                     trace!(full_text, "terminal decoded text");
                 }
+
                 y.yield_ok(DecodedTextEvent::TextDelta {
                     delta,
                     token_ids,
@@ -440,12 +477,15 @@ pub async fn decoded_text_event_stream(
                 .await;
                 return Ok(());
             }
+            // Rejection and engine errors are terminal protocol failures for the
+            // text decoder and preserve the engine-supplied message.
             Event::Rejected { message } | Event::Error { message } => {
                 return Err(Error::MalformedOutput {
                     request_id: request_id.clone(),
                     message,
                 });
             }
+            // Media lifecycle events cannot be represented by a text-only stream.
             Event::ImageBegin { .. }
             | Event::ImageStep { .. }
             | Event::ImageCommit { .. }
@@ -462,6 +502,7 @@ pub async fn decoded_text_event_stream(
     Err(Error::StreamClosedBeforeTerminalOutput { request_id })
 }
 
+/// Returns the text finish reason represented by a generation event.
 fn text_finish_reason(
     reason: uniserve_core::FinishReason,
     stop_reason: Option<uniserve_core::StopReason>,
@@ -478,6 +519,7 @@ fn text_finish_reason(
     FinishReason::new(reason)
 }
 
+/// Returns the suffix byte count retained to detect cross-chunk stop strings.
 pub(crate) fn stop_string_holdback_bytes(options: &TextDecodeOptions) -> usize {
     if options.include_stop_str_in_output {
         return 0;
@@ -490,6 +532,7 @@ pub(crate) fn stop_string_holdback_bytes(options: &TextDecodeOptions) -> usize {
         .saturating_sub(1)
 }
 
+/// Returns the earliest configured stop string ending at the current suffix.
 pub(crate) fn matches_stop_string(
     stops: &[String],
     output: &str,

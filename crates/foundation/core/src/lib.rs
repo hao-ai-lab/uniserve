@@ -1,4 +1,7 @@
-//! Shared IDs, value parameters, and pure helpers.
+//! Foundational request values, identifiers, clocks, and sampling primitives.
+//!
+//! The crate contains transport-independent contracts shared by the server,
+//! scheduler, worker protocol, and simulation runtime.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 use std::sync::{Arc, OnceLock};
@@ -6,11 +9,16 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+/// Serializable statistics and observer-facing wire values.
 pub mod codec;
 mod events;
+/// Multimodal generation descriptors, resource bounds, and validation.
 pub mod generation;
+/// Counter-based Philox random-number generation.
 pub mod philox;
+/// Compact binary payloads carried by product values.
 pub mod product_blob;
+/// Deterministic token sampling and log-probability scoring.
 pub mod sampling;
 pub use codec::stats::WorkerForwardStats;
 pub use events::{
@@ -29,15 +37,9 @@ pub use generation::{
 };
 pub use sampling::{SampleOutput, score_token_logprobs, try_apply_sampling_counts};
 
-/// A cloneable, thread-safe wake the command ingress fires after enqueuing a
-/// command, so a parked executor wakes immediately.
-///
-/// Defined in the foundation crate so the executor seam (which mints the real
-/// waker over an iceoryx2 notifier) and the engine API (which holds it on the
-/// command front door and fires it on every send) can share the type without a
-/// cross-crate dependency. The no-op value is reserved for executor fixtures
-/// that do not run the threaded scheduler loop.
+/// Thread-safe notification used to wake an engine after command enqueue.
 pub trait Wake: Send + Sync {
+    /// Signals the waiting engine owner.
     fn wake(&self);
 }
 
@@ -45,43 +47,48 @@ impl<F> Wake for F
 where
     F: Fn() + Send + Sync,
 {
+    /// Invokes the closure as a wake notification.
     fn wake(&self) {
         self()
     }
 }
 
+/// Cloneable command wake backed by a live notifier or a no-op value.
 #[derive(Clone, Default)]
 pub enum CommandWaker {
+    /// Performs no notification.
     #[default]
     Noop,
+    /// Delegates notification to a shared [`Wake`] implementation.
     Live(Arc<dyn Wake>),
 }
 
 impl CommandWaker {
-    /// A waker that does nothing.
+    /// Returns a waker that performs no notification.
     pub fn noop() -> Self {
         Self::Noop
     }
 
-    /// Wrap a wake closure (e.g. fire an iceoryx2 notifier).
+    /// Wraps a thread-safe wake closure.
     pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
         Self::Live(Arc::new(wake))
     }
 
-    /// Fire the wake. A no-op for the polling variant.
+    /// Signals the live notifier, or returns immediately for [`Self::Noop`].
     pub fn wake(&self) {
         if let Self::Live(waker) = self {
             waker.wake();
         }
     }
 
-    /// Whether this is the no-op waker.
+    /// Returns whether this waker performs no notification.
     pub fn is_noop(&self) -> bool {
         matches!(self, Self::Noop)
     }
 }
 
 impl std::fmt::Debug for CommandWaker {
+    /// Formats the waker by variant without exposing the live closure.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("CommandWaker")
             .field(&if self.is_noop() { "Noop" } else { "Live" })
@@ -89,12 +96,9 @@ impl std::fmt::Debug for CommandWaker {
     }
 }
 
-/// Current wall-clock time in fractional seconds since the Unix epoch.
+/// Returns wall-clock time in fractional seconds since the Unix epoch.
 ///
-/// Shared by the frontend, engine client, scheduler, and engine process for
-/// latency metrics and IPC timestamps. Never panics: a clock set before the
-/// epoch (or stepped backward) clamps to `0.0` rather than unwrapping the
-/// `Result`.
+/// Times before the epoch clamp to zero.
 pub fn now_unix_secs() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -102,10 +106,9 @@ pub fn now_unix_secs() -> f64 {
         .as_secs_f64()
 }
 
-/// Current wall-clock time in whole seconds since the Unix epoch.
+/// Returns wall-clock time in whole seconds since the Unix epoch.
 ///
-/// Integer-seconds companion to [`now_unix_secs`] for callers that want a `u64`.
-/// Shares the same panic-free epoch source so the two cannot diverge.
+/// Times before the epoch clamp to zero.
 pub fn now_unix_secs_u64() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -113,13 +116,14 @@ pub fn now_unix_secs_u64() -> u64 {
         .as_secs()
 }
 
-/// Process-local monotonic time in fractional seconds from a stable epoch.
+/// Returns process-local monotonic time in fractional seconds from a stable epoch.
+///
 /// Differences between values remain valid across wall-clock adjustments.
 pub fn now_monotonic_secs() -> f64 {
     EPOCH.get_or_init(Instant::now).elapsed().as_secs_f64()
 }
 
-/// Process-local monotonic time in whole microseconds from the same epoch as
+/// Returns process-local monotonic time in whole microseconds from the epoch of
 /// [`now_monotonic_secs`]. Used for lifecycle phase stamps, whose differences
 /// stay valid across wall-clock adjustments.
 pub fn now_monotonic_us() -> u64 {
@@ -132,42 +136,46 @@ static EPOCH: OnceLock<Instant> = OnceLock::new();
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct BlockId(pub u32);
 
-/// Request id.
+/// Request identity within one engine authority.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Serialize, Deserialize,
 )]
 pub struct RequestId(pub u64);
 
-/// Trace id for end-to-end lifecycle reconstruction. One
-/// per request unless the frontend correlates several; defaults to the request id.
+/// Correlation identity for end-to-end lifecycle reconstruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct TraceId(pub u64);
 
-/// Op id: a single op within a program/request. `(request, seq)`
-/// flattened to a u64 on the IPC so the host correlates op result ↔ submitted op.
+/// Operation identity within a request program.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct OpId(pub u64);
 
-/// The two modality branches of the MoT model.
+/// Understanding and generation branches of a multimodal model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Modality {
-    Und, // understanding / text
-    Gen, // generation / image latents
+    /// Understanding or text branch.
+    Und,
+    /// Image-generation or latent branch.
+    Gen,
 }
 
 /// Effective model dtype reported after runtime configuration resolves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ModelDtype {
+    /// IEEE 754 half precision.
     #[serde(rename = "float16")]
     Float16,
+    /// Brain floating-point half precision.
     #[serde(rename = "bfloat16")]
     BFloat16,
+    /// IEEE 754 single precision.
     #[serde(rename = "float32")]
     Float32,
 }
 
 impl ModelDtype {
+    /// Returns the stable wire name for this dtype.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Float16 => "float16",
@@ -176,6 +184,7 @@ impl ModelDtype {
         }
     }
 
+    /// Parses a supported wire name without allocating an error.
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "float16" => Some(Self::Float16),
@@ -189,34 +198,43 @@ impl ModelDtype {
 impl std::str::FromStr for ModelDtype {
     type Err = ModelDtypeParseError;
 
+    /// Parses a stable model-dtype wire name.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         Self::parse(value).ok_or_else(|| ModelDtypeParseError(value.to_owned()))
     }
 }
 
 impl std::fmt::Display for ModelDtype {
+    /// Writes the stable model-dtype wire name.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.as_str())
     }
 }
 
+/// Error returned for an unsupported model dtype string.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("unsupported model dtype {0:?}")]
 pub struct ModelDtypeParseError(String);
 
+/// Storage dtype used by paged key/value cache tensors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KvCacheDtype {
+    /// IEEE 754 half precision.
     #[serde(rename = "float16")]
     Float16,
+    /// Brain floating-point half precision.
     #[serde(rename = "bfloat16")]
     BFloat16,
+    /// IEEE 754 single precision.
     #[serde(rename = "float32")]
     Float32,
+    /// Finite-only E4M3 8-bit floating point.
     #[serde(rename = "float8_e4m3fn")]
     Float8E4m3Fn,
 }
 
 impl KvCacheDtype {
+    /// Returns the stable wire name for this dtype.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Float16 => "float16",
@@ -230,6 +248,7 @@ impl KvCacheDtype {
 impl std::str::FromStr for KvCacheDtype {
     type Err = KvCacheDtypeParseError;
 
+    /// Parses a stable KV-cache dtype wire name.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "float16" => Ok(Self::Float16),
@@ -242,11 +261,13 @@ impl std::str::FromStr for KvCacheDtype {
 }
 
 impl std::fmt::Display for KvCacheDtype {
+    /// Writes the stable KV-cache dtype wire name.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.as_str())
     }
 }
 
+/// Error returned for an unsupported KV-cache dtype string.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("unsupported KV-cache dtype {0:?}")]
 pub struct KvCacheDtypeParseError(String);
@@ -260,10 +281,15 @@ pub struct KvCacheDtypeParseError(String);
 /// without carrying device state.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SamplingParams {
+    /// Softmax temperature; zero selects greedy decoding.
     pub temperature: f32,
+    /// Maximum number of highest-logit candidates; zero disables the cutoff.
     pub top_k: u32,
+    /// Cumulative probability mass retained by nucleus sampling.
     pub top_p: f32,
+    /// Whether EOS tokens remain eligible after the minimum-token floor.
     pub ignore_eos: bool,
+    /// Optional deterministic random seed.
     pub seed: Option<u64>,
     /// Minimum-probability cutoff relative to the top token.
     #[serde(default)]
@@ -313,43 +339,78 @@ pub struct SamplingParams {
     #[serde(default)]
     pub forced_token_ids: Vec<u32>,
 }
+
+/// Returns the neutral multiplicative repetition penalty.
 fn default_repetition_penalty() -> f32 {
     1.0
 }
+
+/// Returns the typical-sampling cutoff that retains the full distribution.
 fn default_typical_p() -> f32 {
     1.0
 }
 
-/// Why [`SamplingParams`] were rejected before worker execution.
+/// Validation failure returned by [`SamplingParams::validate`].
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum SamplingParamsError {
+    /// A floating-point parameter is NaN or infinite.
     #[error("{field} must be finite, got {got}")]
-    NonFinite { field: &'static str, got: f32 },
+    NonFinite {
+        /// Name of the invalid parameter.
+        field: &'static str,
+        /// Supplied non-finite value.
+        got: f32,
+    },
+    /// Temperature is below zero.
     #[error("temperature must be non-negative, got {got}")]
-    NegativeTemperature { got: f32 },
+    NegativeTemperature {
+        /// Supplied temperature.
+        got: f32,
+    },
+    /// Nucleus probability lies outside `(0, 1]`.
     #[error("top_p must be in (0, 1], got {got}")]
-    TopP { got: f32 },
+    TopP {
+        /// Supplied probability.
+        got: f32,
+    },
+    /// Minimum relative probability lies outside `[0, 1]`.
     #[error("min_p must be in [0, 1], got {got}")]
-    MinP { got: f32 },
+    MinP {
+        /// Supplied probability.
+        got: f32,
+    },
+    /// Repetition penalty is not positive.
     #[error("repetition_penalty must be positive, got {got}")]
-    RepetitionPenalty { got: f32 },
+    RepetitionPenalty {
+        /// Supplied penalty.
+        got: f32,
+    },
+    /// An explicit allowed-token set is empty.
     #[error("allowed_token_ids must contain at least one token when present")]
     EmptyAllowedTokenIds,
+    /// A bad-word sequence is empty.
     #[error("bad_words_ids[{index}] must contain at least one token")]
-    EmptyBadWord { index: usize },
+    EmptyBadWord {
+        /// Index of the empty sequence.
+        index: usize,
+    },
 }
 
 impl SamplingParams {
+    /// Returns whether generated-token logprobs are enabled.
     pub fn generated_logprobs_requested(&self) -> bool {
         self.return_logprobs || self.n_logprobs > 0 || !self.logprob_token_ids.is_empty()
     }
 
+    /// Returns whether prompt-token logprobs are enabled.
     pub fn prompt_logprobs_requested(&self) -> bool {
         self.return_prompt_logprobs || self.n_prompt_logprobs > 0
     }
 
-    /// Validate sampling math inputs before they reach a worker or simulator.
+    /// Validates sampling math inputs before they reach a worker or simulator.
     pub fn validate(&self) -> Result<(), SamplingParamsError> {
+        // Reject non-finite scalar math inputs before applying their individual
+        // range constraints.
         for (field, value) in [
             ("temperature", self.temperature),
             ("top_p", self.top_p),
@@ -362,6 +423,9 @@ impl SamplingParams {
                 return Err(SamplingParamsError::NonFinite { field, got: value });
             }
         }
+
+        // Bias values participate directly in logit arithmetic and follow the
+        // same finite-value contract as scalar processors.
         for &(_, bias) in &self.logit_bias {
             if !bias.is_finite() {
                 return Err(SamplingParamsError::NonFinite {
@@ -370,6 +434,8 @@ impl SamplingParams {
                 });
             }
         }
+
+        // Enforce the mathematical domains of each sampling transform.
         if self.temperature < 0.0 {
             return Err(SamplingParamsError::NegativeTemperature {
                 got: self.temperature,
@@ -386,6 +452,8 @@ impl SamplingParams {
                 got: self.repetition_penalty,
             });
         }
+
+        // Empty vocabulary constraints cannot express a valid sampling set.
         if self.allowed_token_ids.as_ref().is_some_and(Vec::is_empty) {
             return Err(SamplingParamsError::EmptyAllowedTokenIds);
         }
@@ -397,11 +465,10 @@ impl SamplingParams {
 }
 
 impl Default for SamplingParams {
-    /// Default `temperature` is `0.0`, which `sampling::apply_sampling` treats
-    /// as greedy (argmax). The production frontend resolves an unset user
-    /// temperature to `1.0` during lowering; a `SamplingParams` reaching the
-    /// worker has always passed through that path. This default is for direct
-    /// constructors (tests, sim, IPC fallbacks) only.
+    /// Defaults direct construction to greedy sampling.
+    ///
+    /// Request lowering assigns `1.0` when an API caller omits temperature, so
+    /// the zero value applies only when code constructs these parameters directly.
     fn default() -> Self {
         Self {
             temperature: 0.0,
@@ -428,31 +495,47 @@ impl Default for SamplingParams {
     }
 }
 
-/// Image (diffusion) parameters. `max_images` makes the admission budget finite for requests that can produce images.
+/// Image-generation parameters bounded for scheduler admission.
+///
+/// `max_images` limits the total media work and feedback resources reachable by
+/// one request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImageParams {
+    /// Number of denoising steps.
     pub steps: u16,
+    /// Classifier-free guidance scale for text conditioning.
     pub cfg_text_scale: f32,
+    /// Classifier-free guidance scale for image conditioning.
     pub cfg_img_scale: f32,
+    /// Guidance renormalization strategy.
     pub cfg_renorm_type: CfgRenorm,
+    /// Lower bound applied by guidance renormalization.
     pub cfg_renorm_min: f32,
+    /// Inclusive normalized step interval where guidance is active.
     pub cfg_interval: (f32, f32),
+    /// Shift applied to the diffusion timestep schedule.
     #[serde(default = "default_timestep_shift")]
     pub timestep_shift: f32,
+    /// Output height in pixels.
     pub height: u32,
+    /// Output width in pixels.
     pub width: u32,
+    /// Optional deterministic diffusion seed.
     pub seed: Option<u64>,
+    /// Negative text conditioning prompt.
     pub negative_prompt: String,
+    /// Maximum images this request may generate.
     pub max_images: u16,
+    /// Optional per-image prompt overrides.
     #[serde(default)]
     pub image_prompts: Vec<String>,
+    /// Whether completed image bytes remain available to the caller.
     #[serde(default = "default_retain_images")]
     pub retain_images: bool,
 }
 
 impl ImageParams {
-    /// Number of active classifier-free-guidance branches implied by the two
-    /// guidance axes.
+    /// Returns the classifier-free-guidance branch count implied by both axes.
     pub fn cfg_branch_count(&self) -> u8 {
         let text_off = scale_approx(self.cfg_text_scale, 1.0);
         let image_off = scale_approx(self.cfg_img_scale, 1.0);
@@ -466,61 +549,109 @@ impl ImageParams {
     }
 }
 
+/// Returns whether two guidance scales are equal within relative tolerance.
 fn scale_approx(left: f32, right: f32) -> bool {
     (left - right).abs() <= 1.0e-6_f32 * left.abs().max(right.abs()).max(1.0)
 }
+
+/// Returns the neutral diffusion timestep shift.
 fn default_timestep_shift() -> f32 {
     1.0
 }
+
+/// Returns the default policy that retains materialized image bytes.
 fn default_retain_images() -> bool {
     true
 }
-/// Why an [`ImageParams`] was rejected by [`ImageParams::validate`].
+
+/// Validation failure returned by [`ImageParams::validate`].
 /// Each variant names the offending field and the bound it violated so the
-/// frontend can surface a precise 4xx instead of letting unbounded diffusion
-/// work reach the worker.
+/// caller can report a precise input error before scheduling diffusion work.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum ImageParamsError {
+    /// Denoising step count lies outside its supported range.
     #[error("steps must be in 1..={max}, got {got}")]
-    Steps { got: u16, max: u16 },
+    Steps {
+        /// Supplied step count.
+        got: u16,
+        /// Maximum supported step count.
+        max: u16,
+    },
+    /// Image height violates range or alignment requirements.
     #[error("height must be a non-zero multiple of {multiple} in {min}..={max}, got {got}")]
     Height {
+        /// Supplied height.
         got: u32,
+        /// Minimum supported height.
         min: u32,
+        /// Maximum supported height.
         max: u32,
+        /// Required height alignment.
         multiple: u32,
     },
+    /// Image width violates range or alignment requirements.
     #[error("width must be a non-zero multiple of {multiple} in {min}..={max}, got {got}")]
     Width {
+        /// Supplied width.
         got: u32,
+        /// Minimum supported width.
         min: u32,
+        /// Maximum supported width.
         max: u32,
+        /// Required width alignment.
         multiple: u32,
     },
+    /// A guidance scale is non-finite or exceeds its supported range.
     #[error("{field} must be finite and in 0.0..={max}, got {got}")]
     CfgScale {
+        /// Name of the invalid scale.
         field: &'static str,
+        /// Supplied scale.
         got: f32,
+        /// Maximum supported scale.
         max: f32,
     },
+    /// Per-request image count lies outside its supported range.
     #[error("max_images must be in 1..={max}, got {got}")]
-    MaxImages { got: u16, max: u16 },
+    MaxImages {
+        /// Supplied image count.
+        got: u16,
+        /// Maximum supported image count.
+        max: u16,
+    },
+    /// A floating-point parameter is NaN or infinite.
     #[error("{field} must be finite, got {got}")]
-    NonFinite { field: &'static str, got: f32 },
+    NonFinite {
+        /// Name of the invalid parameter.
+        field: &'static str,
+        /// Supplied non-finite value.
+        got: f32,
+    },
+    /// Guidance interval endpoints are descending.
     #[error("cfg_interval must be an ordered pair, got ({lo}, {hi})")]
-    CfgIntervalOrder { lo: f32, hi: f32 },
+    CfgIntervalOrder {
+        /// Supplied lower endpoint.
+        lo: f32,
+        /// Supplied upper endpoint.
+        hi: f32,
+    },
 }
 
+/// Classifier-free guidance renormalization strategy.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CfgRenorm {
+    /// Leaves classifier-free guidance unnormalized.
     None,
+    /// Renormalizes the combined guidance prediction globally.
     #[default]
     Global,
+    /// Renormalizes against the text-conditioned prediction.
     TextChannel,
 }
 
 impl CfgRenorm {
+    /// Returns the stable wire name for this strategy.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::None => "none",
@@ -533,6 +664,7 @@ impl CfgRenorm {
 impl std::str::FromStr for CfgRenorm {
     type Err = CfgRenormParseError;
 
+    /// Parses a stable guidance-renormalization wire name.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "none" => Ok(Self::None),
@@ -544,11 +676,13 @@ impl std::str::FromStr for CfgRenorm {
 }
 
 impl std::fmt::Display for CfgRenorm {
+    /// Writes the stable guidance-renormalization wire name.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.as_str())
     }
 }
 
+/// Error returned for an unsupported guidance renormalization string.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("unsupported CFG renormalization mode {0:?}")]
 pub struct CfgRenormParseError(String);
@@ -559,21 +693,28 @@ impl ImageParams {
     /// Pixel-dimension bounds. `height`/`width` must be non-zero, within
     /// `[MIN_DIM, MAX_DIM]`, and a multiple of `DIM_MULTIPLE`.
     pub const MIN_DIM: u32 = 16;
+    /// Maximum supported image dimension in pixels.
     pub const MAX_DIM: u32 = 4096;
+    /// Required divisibility for each image dimension.
     pub const DIM_MULTIPLE: u32 = 16;
     /// Upper bound on any single CFG scale.
     pub const MAX_CFG_SCALE: f32 = 100.0;
     /// Upper bound on `max_images` per request.
     pub const MAX_IMAGES: u16 = 256;
 
-    /// Validate diffusion parameters before they reach the worker.
+    /// Validates diffusion parameters before they reach the worker.
     pub fn validate(&self) -> Result<(), ImageParamsError> {
+        // Bound discrete work before validating shape- and guidance-dependent
+        // values.
         if self.steps == 0 || self.steps > Self::MAX_STEPS {
             return Err(ImageParamsError::Steps {
                 got: self.steps,
                 max: Self::MAX_STEPS,
             });
         }
+
+        // Both dimensions obey the same positive, bounded, aligned grid
+        // contract.
         let check_dim = |got: u32| -> bool {
             got != 0
                 && (Self::MIN_DIM..=Self::MAX_DIM).contains(&got)
@@ -595,6 +736,9 @@ impl ImageParams {
                 multiple: Self::DIM_MULTIPLE,
             });
         }
+
+        // Each guidance axis accepts finite non-negative scaling up to the
+        // runtime-independent request bound.
         for (field, scale) in [
             ("cfg_text_scale", self.cfg_text_scale),
             ("cfg_img_scale", self.cfg_img_scale),
@@ -607,6 +751,9 @@ impl ImageParams {
                 });
             }
         }
+
+        // Remaining continuous parameters must be finite before interval order
+        // is evaluated.
         for (field, value) in [
             ("cfg_renorm_min", self.cfg_renorm_min),
             ("cfg_interval.0", self.cfg_interval.0),
@@ -617,12 +764,14 @@ impl ImageParams {
                 return Err(ImageParamsError::NonFinite { field, got: value });
             }
         }
+
         if self.cfg_interval.0 > self.cfg_interval.1 {
             return Err(ImageParamsError::CfgIntervalOrder {
                 lo: self.cfg_interval.0,
                 hi: self.cfg_interval.1,
             });
         }
+
         if self.max_images == 0 || self.max_images > Self::MAX_IMAGES {
             return Err(ImageParamsError::MaxImages {
                 got: self.max_images,
@@ -634,6 +783,7 @@ impl ImageParams {
 }
 
 impl Default for ImageParams {
+    /// Returns a bounded single-image diffusion configuration.
     fn default() -> Self {
         Self {
             steps: 50,
@@ -654,38 +804,56 @@ impl Default for ImageParams {
     }
 }
 
-/// CFG parameters carried on gen ops.
+/// Classifier-free-guidance configuration attached to image-generation operations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CfgParams {
-    pub branch_count: u8, // 1..=3
+    /// Number of active guidance branches in `1..=3`.
+    pub branch_count: u8,
+    /// Text-conditioning guidance scale.
     pub text_scale: f32,
+    /// Image-conditioning guidance scale.
     pub img_scale: f32,
+    /// Stable renormalization strategy name.
     pub renorm_type: String,
+    /// Minimum renormalization factor.
     pub renorm_min: f32,
+    /// Inclusive normalized denoising interval where guidance is active.
     #[serde(default)]
     pub interval: (f32, f32),
 }
 
-/// Physical KV layout descriptor:
-/// one page-first buffer addressed by `base + block_id*page_stride + layer*layer_stride`.
-/// Computed on the host for admission/sizing; the worker owns the actual buffer.
+/// Physical layout of a page-first key/value cache buffer.
+///
+/// Elements are addressed by `base + block_id * page_stride + layer * layer_stride`.
+/// The descriptor supports admission and sizing without transferring ownership
+/// of the backing buffer.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct KvLayout {
+    /// Number of physical KV pages.
     pub num_blocks: u32,
-    pub block_size: u32, // tokens per block (page)
+    /// Tokens stored in each physical page.
+    pub block_size: u32,
+    /// Transformer layers represented in the cache.
     pub num_layers: u32,
+    /// KV heads stored per layer.
     pub num_kv_heads: u32,
+    /// Elements stored per head.
     pub head_dim: u32,
+    /// Storage bytes for each KV element.
     pub dtype_bytes: u32,
 }
+
 impl KvLayout {
+    /// Returns storage consumed by one token across all layers and heads.
     pub fn bytes_per_token(&self) -> u64 {
-        // k + v, all layers
+        // Account for both key and value tensors at every layer.
         2 * self.num_kv_heads as u64
             * self.head_dim as u64
             * self.num_layers as u64
             * self.dtype_bytes as u64
     }
+
+    /// Returns storage consumed by the complete KV layout.
     pub fn total_bytes(&self) -> u64 {
         self.num_blocks as u64 * self.block_size as u64 * self.bytes_per_token()
     }
@@ -702,7 +870,12 @@ pub enum KvGroupKind {
     Full,
     /// Sliding-window attention with `sink` always-kept prefix tokens;
     /// blocks outside the window are eviction candidates once they fall out of range.
-    SlidingWindow { window: u32, sink: u32 },
+    SlidingWindow {
+        /// Number of recent tokens retained for attention.
+        window: u32,
+        /// Number of prefix tokens retained outside the window.
+        sink: u32,
+    },
 }
 
 /// One positional KV-cache group reported by the worker at handshake.
@@ -710,6 +883,7 @@ pub enum KvGroupKind {
 pub struct KvCacheGroup {
     /// Number of physical pages in this group's subspace.
     pub num_blocks: u32,
+    /// Attention retention policy for the group.
     #[serde(default)]
     pub kind: KvGroupKind,
 }
@@ -719,10 +893,14 @@ pub struct KvCacheGroup {
 /// inside the worker tier, not on the control-plane IPC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RankInfo {
+    /// Zero-based tensor-parallel rank.
     pub tp_rank: u32,
+    /// Total number of tensor-parallel ranks.
     pub tp_size: u32,
 }
+
 impl Default for RankInfo {
+    /// Returns the single-rank tensor-parallel topology.
     fn default() -> Self {
         Self {
             tp_rank: 0,
@@ -731,15 +909,17 @@ impl Default for RankInfo {
     }
 }
 
-/// Prefix-cache block-hash algorithm. Pluggable, seeded from config; the
-/// default is the fast non-cryptographic FNV-1a-with-seed mixer. Sha256 is an
-/// option for environments that want a cryptographic hash. Both produce a
-/// `u64` slot for `BlockHashToBlock`.
+/// Algorithm used to derive prefix-cache block keys.
+///
+/// FNV-1a provides a seeded non-cryptographic mixer, while SHA-256 provides a
+/// cryptographic digest truncated to the cache's 64-bit key space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum HashAlgo {
+    /// Seeded 64-bit FNV-1a hashing.
     #[default]
     Fnv1a,
+    /// SHA-256 truncated to the cache's 64-bit key space.
     Sha256,
 }
 
@@ -765,18 +945,9 @@ mod tests {
         assert!(ImageParams::default().validate().is_ok());
     }
 
-    // ----------------------------------------------------------------------
-    // now_unix_secs / now_unix_secs_u64 share one panic-free epoch source. The
-    // production functions read the wall clock, which is not injectable, so the
-    // exact conversion invariants are tested as a pure `SystemTime -> (f64, u64)`
-    // mapping with an injectable instant that mirrors the production expression
-    // (`duration_since(UNIX_EPOCH).unwrap_or_default()` then `.as_secs_f64()` /
-    // `.as_secs()`). The real functions get a lighter panic-free smoke check.
-    // ----------------------------------------------------------------------
-
-    /// Pure mirror of the two helpers with the clock injected as a `SystemTime`.
-    /// Returns `(fractional_secs, whole_secs)`; pre-epoch instants clamp to zero
-    /// exactly as `unwrap_or_default()` does in production.
+    /// Converts an injected clock to fractional and whole Unix seconds.
+    ///
+    /// Instants before the epoch clamp to zero.
     fn epoch_conversion(clock: SystemTime) -> (f64, u64) {
         let d = clock.duration_since(UNIX_EPOCH).unwrap_or_default();
         (d.as_secs_f64(), d.as_secs())
@@ -784,9 +955,9 @@ mod tests {
 
     #[test]
     fn epoch_conversion_u64_is_floor_of_f64() {
-        // A fractional post-epoch instant: whole seconds equal floor of the
-        // fractional seconds.
-        let clock = UNIX_EPOCH + std::time::Duration::from_millis(1_234_750); // 1234.75s
+        // Whole seconds are the floor of the fractional representation for an
+        // instant 1,234.75 seconds after the epoch.
+        let clock = UNIX_EPOCH + std::time::Duration::from_millis(1_234_750);
         let (frac, whole) = epoch_conversion(clock);
         assert!((frac - 1234.75).abs() < 1e-6, "fractional secs preserved");
         assert_eq!(whole, 1234, "whole secs == floor(fractional)");
@@ -806,8 +977,8 @@ mod tests {
 
     #[test]
     fn epoch_conversion_clamps_pre_epoch_to_zero() {
-        // A clock set before the epoch makes `duration_since` error; the
-        // panic-free source clamps to a zero duration => 0.0 / 0, never panics.
+        // `duration_since` rejects pre-epoch values, and the public clock
+        // helpers map that error to a zero duration.
         let clock = UNIX_EPOCH - std::time::Duration::from_secs(5);
         let (frac, whole) = epoch_conversion(clock);
         assert_eq!(frac, 0.0, "pre-epoch clamps fractional to 0.0");
@@ -816,13 +987,11 @@ mod tests {
 
     #[test]
     fn real_clock_helpers_are_panic_free_and_non_negative() {
-        // Smoke check that both production helpers run without panicking on the
-        // live clock and return non-negative values from the shared source.
+        // Both clock views use the same non-negative epoch conversion.
         let f = now_unix_secs();
         let u = now_unix_secs_u64();
         assert!(f.is_finite() && f >= 0.0, "fractional secs sane: {f}");
-        // u is u64 so inherently >= 0; assert it is in the same era as the float
-        // (within one second, allowing for the two separate clock reads).
+        // Separate clock reads may cross one whole-second boundary.
         let diff = (f.floor() as i128 - u as i128).abs();
         assert!(diff <= 1, "integer and fractional helpers agree within 1s");
     }

@@ -27,6 +27,11 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class WorkerModelLoadRequest:
+    """Carries checkpoint identity and deployment metadata into model construction.
+
+    The request also fixes load policy, architecture configuration, and rank geometry.
+    """
+
     model_path: str
     device: str
     block_size: int
@@ -46,6 +51,8 @@ class WorkerModelLoadRequest:
 
 @dataclass(frozen=True)
 class LoadedWorkerModel:
+    """Bundles a materialized model with its tokenizer, deployment geometry, weights, and sidecar metadata."""
+
     model: ExecutionModel
     tokenizer: Any | None
     deployment: WorkerDeployment
@@ -60,6 +67,8 @@ def load_worker_model(
     mesh: DeviceMesh | None = None,
     pipeline_depth: int | None = None,
 ) -> LoadedWorkerModel:
+    """Resolve architecture, sources, deployment geometry, and checkpoint weights for one model."""
+
     model_root, repository_id = resolve_model_root(request.model_path, request.load)
     config = read_model_config(model_root)
     entry = resolve_catalog_entry(tuple(str(value) for value in config.get("architectures") or ()))
@@ -123,6 +132,8 @@ def materialize_worker_model(
     plan: WorkerPlan,
     mesh: DeviceMesh,
 ) -> LoadedWorkerModel:
+    """Construct the configured model scope or the explicitly enabled deterministic stub."""
+
     if config.use_stub_model:
         return _stub_worker_model(config, plan)
     return load_worker_model(
@@ -139,6 +150,10 @@ def _load_h3_worker_model(
     mesh: DeviceMesh | None,
     pipeline_depth: int | None,
 ) -> LoadedWorkerModel:
+    """Load an SM100 H3 replica and derive capacities from its resident state pool."""
+
+    # H3 couples tensor and sequence parallelism because every rank owns one
+    # contiguous slice of the packed video sequence.
     if mesh is None or pipeline_depth is None:
         raise unsupported_setup("MiniMax H3 loading requires the worker device mesh")
     if request.parallel.size != 4 or mesh.size("tp") != 4 or mesh.size("sp") != 4:
@@ -148,6 +163,8 @@ def _load_h3_worker_model(
         0,
     ):
         raise unsupported_setup("MiniMax H3 requires an SM100-class CUDA device")
+    # Each state slot can have two unresolved outputs. Keep one additional
+    # pipeline position available so slot reuse cannot overtake publication.
     unresolved_window = 2
     max_state_slots = min(
         int(request.max_batch_operations),
@@ -175,6 +192,9 @@ def _load_h3_worker_model(
         revision=request.load.revision,
         precision_policy=precision_policy,
     )
+
+    # The allocation performed by the runner is authoritative: free device
+    # memory may reduce the usable slots below the requested operation bound.
     state_slots = int(model.dedicated_state_geometry.slot_count)
     max_operations = min(state_slots, int(request.max_batch_operations))
     deployment = replace(
@@ -205,6 +225,8 @@ def _checkpoint_request(
     plan: WorkerPlan,
     mesh: DeviceMesh,
 ) -> WorkerModelLoadRequest:
+    """Build the rank-local checkpoint load request from process and mesh configuration."""
+
     model = config.model
     if model is None:
         raise RuntimeError("validated model worker is missing model configuration")
@@ -228,6 +250,8 @@ def _checkpoint_request(
 
 
 def _stub_worker_model(config: WorkerProcessArgs, plan: WorkerPlan) -> LoadedWorkerModel:
+    """Construct the configured stub model and its rank-local layer configuration."""
+
     from ..models.stub import StubModel, stub_deployment
 
     stub = StubModel()
@@ -258,6 +282,8 @@ def _stub_worker_model(config: WorkerProcessArgs, plan: WorkerPlan) -> LoadedWor
 
 
 def _resolve_input_tokens(model: ExecutionModel, tokenizer: Any | None) -> None:
+    """Resolve model-specific input token identities from tokenizer metadata."""
+
     processor = model.image_processor
     injection = getattr(processor, "feature_injection", None)
     if processor is None or injection is None:
@@ -287,6 +313,8 @@ def _resolve_input_tokens(model: ExecutionModel, tokenizer: Any | None) -> None:
 
 
 def _deployment(request: WorkerModelLoadRequest) -> WorkerDeployment:
+    """Construct validated rank-local deployment metadata for model loading."""
+
     execution = request.execution
     return WorkerDeployment(
         device=request.device,
@@ -307,6 +335,8 @@ def _deployment(request: WorkerModelLoadRequest) -> WorkerDeployment:
 
 
 def _require_supported_scope(entry: CatalogEntry, scope: ModelLoadScope) -> None:
+    """Require the requested model scope to be advertised by the catalog entry."""
+
     if scope not in entry.scopes:
         raise unsupported_setup(
             f"{entry.architecture} does not support {scope.value!r} model materialization"
@@ -314,6 +344,8 @@ def _require_supported_scope(entry: CatalogEntry, scope: ModelLoadScope) -> None
 
 
 def _check_model_interface(model: nn.Module) -> ExecutionModel:
+    """Require a constructed module to implement the execution-model contract."""
+
     if not isinstance(model, ExecutionModel):
         raise unsupported_setup(f"{type(model).__name__} must implement ExecutionModel")
     return model

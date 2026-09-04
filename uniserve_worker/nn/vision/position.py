@@ -1,4 +1,5 @@
 """2D position embedding helpers shared by image-capable models."""
+
 from __future__ import annotations
 
 import numpy as np
@@ -15,6 +16,8 @@ __all__ = [
 
 
 def get_1d_sincos_pos_embed_from_grid(embed_dim: int, pos: np.ndarray) -> np.ndarray:
+    """Create sine-then-cosine features for arbitrary one-dimensional positions."""
+
     if embed_dim % 2 != 0:
         raise ValueError("embed_dim must be even")
     omega = np.arange(embed_dim // 2, dtype=np.float64)
@@ -26,6 +29,8 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim: int, pos: np.ndarray) -> np.nda
 
 
 def get_2d_sincos_pos_embed_from_grid(embed_dim: int, grid: np.ndarray) -> np.ndarray:
+    """Concatenate independent height and width sinusoidal grid embeddings."""
+
     if embed_dim % 2 != 0:
         raise ValueError("embed_dim must be even")
     emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])
@@ -41,6 +46,8 @@ def get_2d_sincos_pos_embed(
     extra_tokens: int = 0,
     pe_interpolation: float = 1.0,
 ) -> np.ndarray:
+    """Create a square 2D sinusoidal table with optional leading special-token rows."""
+
     grid_h = np.arange(grid_size, dtype=np.float32) / pe_interpolation
     grid_w = np.arange(grid_size, dtype=np.float32) / pe_interpolation
     grid_axes = np.meshgrid(grid_w, grid_h)
@@ -59,6 +66,8 @@ def get_flattened_position_ids_extrapolate(
     *,
     device: torch.device | str | None = None,
 ) -> torch.Tensor:
+    """Flatten patch coordinates into ids on a fixed maximum-width position grid."""
+
     nph, npw = int(img_h) // int(patch_size), int(img_w) // int(patch_size)
     coords_h = torch.arange(0, nph, device=device)
     coords_w = torch.arange(0, npw, device=device)
@@ -66,7 +75,11 @@ def get_flattened_position_ids_extrapolate(
 
 
 class PositionEmbedding(nn.Module):
+    """Adds learned or sinusoidal two-dimensional positions to packed image patches."""
+
     def __init__(self, max_num_patch_per_side: int, hidden_size: int, *, init_sincos: bool = True):
+        """Allocate a square position table and optionally initialize deterministic sinusoids."""
+
         super().__init__()
         self.max_num_patch_per_side = int(max_num_patch_per_side)
         self.hidden_size = int(hidden_size)
@@ -79,4 +92,6 @@ class PositionEmbedding(nn.Module):
             self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float())
 
     def forward(self, position_ids: torch.Tensor) -> torch.Tensor:
+        """Gather learned vision position rows for the supplied integer indexes."""
+
         return self.pos_embed[position_ids]

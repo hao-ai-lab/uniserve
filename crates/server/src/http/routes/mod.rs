@@ -1,3 +1,5 @@
+//! Route assembly, authentication, and request-size enforcement.
+
 mod health;
 mod metrics;
 pub(crate) mod openai;
@@ -18,6 +20,7 @@ use tower_http::trace::TraceLayer;
 use crate::AppState;
 use crate::http::middleware;
 
+/// Authorizes an HTTP request against the configured API key.
 fn authorize(headers: &HeaderMap, expected: &str) -> bool {
     let Some(value) = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -34,6 +37,7 @@ fn authorize(headers: &HeaderMap, expected: &str) -> bool {
     constant_time_eq(token.trim().as_bytes(), expected.as_bytes())
 }
 
+/// Compares byte strings without data-dependent early exit.
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {
         return false;
@@ -45,6 +49,7 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     difference == 0
 }
 
+/// Builds an unauthorized HTTP response.
 fn unauthorized_response() -> Response {
     let body = json!({
         "error": {
@@ -56,6 +61,7 @@ fn unauthorized_response() -> Response {
     (StatusCode::UNAUTHORIZED, Json(body)).into_response()
 }
 
+/// Builds a request-timeout HTTP response.
 fn timeout_response(timeout: Duration) -> Response {
     let body = json!({
         "error": {
@@ -69,6 +75,7 @@ fn timeout_response(timeout: Duration) -> Response {
 
 const AUTH_EXEMPT_PATHS: &[&str] = &["/health", "/metrics"];
 
+/// Validates the configured API key for an HTTP request.
 async fn require_api_key(api_key: Option<Arc<String>>, request: Request, next: Next) -> Response {
     if AUTH_EXEMPT_PATHS.contains(&request.uri().path())
         || api_key
@@ -81,6 +88,7 @@ async fn require_api_key(api_key: Option<Arc<String>>, request: Request, next: N
     }
 }
 
+/// Enforces the timeout.
 async fn enforce_timeout(timeout: Duration, request: Request, next: Next) -> Response {
     match tokio::time::timeout(timeout, next.run(request)).await {
         Ok(response) => response,
@@ -88,7 +96,7 @@ async fn enforce_timeout(timeout: Duration, request: Request, next: Next) -> Res
     }
 }
 
-/// Build the complete configured public router.
+/// Builds the complete configured public router.
 pub fn build_router(state: Arc<AppState>) -> Router {
     let enable_request_id_headers = state.enable_request_id_headers();
     let request_timeout = state.request_timeout();

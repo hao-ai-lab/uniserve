@@ -14,6 +14,8 @@ class BoundedTensorStorage:
     """Own fixed-capacity tensors and cache prefix views for legal shape keys."""
 
     def __init__(self, tensors: Mapping[str, torch.Tensor]) -> None:
+        """Take ownership of named capacity tensors and initialize an empty view cache."""
+
         if not tensors:
             raise ValueError("bounded tensor storage requires at least one field")
         self._tensors = dict(tensors)
@@ -25,6 +27,8 @@ class BoundedTensorStorage:
 
     @property
     def capacity(self) -> Mapping[str, torch.Tensor]:
+        """Expose read-only names for the fixed-capacity backing tensors."""
+
         return MappingProxyType(self._tensors)
 
     def bind(
@@ -32,6 +36,8 @@ class BoundedTensorStorage:
         shape_key: Hashable,
         shapes: Mapping[str, tuple[int, ...]],
     ) -> Mapping[str, torch.Tensor]:
+        """Bind a shape key to validated views that share the storage’s fixed backing tensors."""
+
         cached = self._views.get(shape_key)
         if cached is not None:
             requested = {

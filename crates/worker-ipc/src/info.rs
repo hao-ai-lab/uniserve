@@ -1,22 +1,32 @@
-//! Worker startup capacities, identity, and supported operations.
+//! Worker identity, supported operations, and startup capacity handshake.
 
 use super::*;
 
 /// Fixed physical KV-cache geometry exposed by a worker that executes AR work.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KvCacheConfig {
+    /// Tokens stored in each physical KV page.
     pub block_size: u32,
+    /// Total physical pages in the request KV pool.
     pub num_blocks: u32,
+    /// Transformer layers represented in the cache.
     pub num_layers: u32,
+    /// KV heads stored per layer.
     pub num_kv_heads: u32,
+    /// Elements stored per KV head.
     pub head_dim: u32,
+    /// Storage consumed by one token across all layers.
     pub bytes_per_token: u64,
+    /// Positional attention groups partitioning the physical pages.
     pub groups: Vec<KvCacheGroup>,
+    /// Element data type of KV tensors.
     pub dtype: KvCacheDtype,
 }
 
 impl KvCacheConfig {
+    /// Validates positive geometry and a complete non-overlapping group partition.
     pub fn validate(&self) -> ValidationResult<()> {
+        // Establish the physical dimensions before summing the group partition.
         ensure_valid!(
             self.block_size > 0
                 && self.num_blocks > 0
@@ -47,40 +57,59 @@ impl KvCacheConfig {
 /// Post-load worker geometry, limits, supported work, and model identity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkerInfo {
+    /// Loaded model identity.
     pub model_name: String,
+    /// Model-weight revision used to reject cross-version products.
     pub weight_version: u64,
+    /// Tensor-parallel rank topology.
     pub rank: RankInfo,
+    /// Operation families accepted by the worker.
     pub supported_ops: Vec<OpKind>,
+    /// Maximum unresolved physical runs.
     pub queue_depth: u32,
+    /// Maximum operations in one run.
     pub max_batch_ops: u32,
+    /// Maximum text tokens represented in one run.
     pub max_batch_tokens: u32,
+    /// Number of resident request slots.
     pub request_slots: u32,
+    /// Paged KV geometry when autoregressive work is supported.
     pub kv_cache: Option<KvCacheConfig>,
+    /// Model-defined units stored in one latent page.
     pub latent_page_units: u32,
+    /// Physical latent pages including the reserved sentinel page.
     pub latent_pages: u32,
+    /// Persistent buffer-pool capacity in bytes.
     pub buffer_pool_bytes: u64,
+    /// Maximum unresolved operations per request lineage.
     pub max_unresolved_ops: u32,
 }
 
 impl WorkerInfo {
+    /// Returns the advertised KV page size, or zero when KV is unsupported.
     pub fn kv_block_size(&self) -> u32 {
         self.kv_cache.as_ref().map_or(0, |config| config.block_size)
     }
 
+    /// Returns the advertised KV page count, or zero when KV is unsupported.
     pub fn kv_num_blocks(&self) -> u32 {
         self.kv_cache.as_ref().map_or(0, |config| config.num_blocks)
     }
 
+    /// Returns total latent capacity in model-defined units.
     pub fn latent_capacity_units(&self) -> u64 {
         u64::from(self.latent_pages.saturating_sub(1))
             .saturating_mul(u64::from(self.latent_page_units))
     }
 
+    /// Returns whether the worker advertises paged KV capacity.
     pub fn uses_kv(&self) -> bool {
         self.kv_cache.is_some()
     }
 
+    /// Validates worker identity, capacity, operation, and rank invariants.
     pub fn validate(&self) -> ValidationResult<()> {
+        // Capability and scheduling limits must describe a usable worker.
         ensure_valid!(
             !self.supported_ops.is_empty(),
             "worker info declare no work variants"
@@ -102,6 +131,7 @@ impl WorkerInfo {
             "worker info declare a zero scheduling bound"
         );
         ensure_valid!(self.queue_depth > 0, "worker queue depth must be positive");
+        // Advertised operation families require their corresponding pools.
         let requires_kv = self.supported_ops.iter().any(|variant| {
             matches!(
                 variant,
@@ -130,12 +160,14 @@ impl WorkerInfo {
             !addresses_latent || has_latent_capacity,
             "worker info advertise latent work without a latent page pool"
         );
+        // Model identity remains mandatory independently of enabled resources.
         ensure_valid!(!self.model_name.is_empty(), "worker model name is empty");
         Ok(())
     }
 }
 
 impl Default for WorkerInfo {
+    /// Returns a valid single-rank autoregressive worker description.
     fn default() -> Self {
         Self {
             model_name: "model".to_owned(),

@@ -1,3 +1,5 @@
+//! Local and Hugging Face Hub model-file resolution.
+
 use std::path::{Path, PathBuf};
 
 use hf_hub::Cache;
@@ -11,16 +13,22 @@ const HF_TOKEN_ENV: &str = "HF_TOKEN";
 /// Concrete files resolved for one configured Hugging Face model.
 #[derive(Debug, Clone)]
 pub struct ResolvedModelFiles {
+    /// Required tokenizer definition.
     pub tokenizer_path: PathBuf,
+    /// Optional tokenizer metadata.
     pub tokenizer_config_path: Option<PathBuf>,
+    /// Optional generation defaults.
     pub generation_config_path: Option<PathBuf>,
+    /// Optional media preprocessor metadata.
     pub preprocessor_config_path: Option<PathBuf>,
+    /// Optional standalone chat template.
     pub chat_template_path: Option<PathBuf>,
+    /// Optional model architecture metadata.
     pub config_path: Option<PathBuf>,
 }
 
 impl ResolvedModelFiles {
-    /// Resolve configured model files from a local directory, the local Hub cache, or the Hub.
+    /// Resolves configured model files from a local directory, the local Hub cache, or the Hub.
     pub async fn new(model_id: &str) -> Result<Self> {
         if Path::new(model_id).is_dir() {
             return resolve_local_model_files(Path::new(model_id));
@@ -32,7 +40,7 @@ impl ResolvedModelFiles {
     }
 }
 
-/// Resolve one required file from a local model directory, the local Hub cache, or the Hub.
+/// Resolves one required file from a local model directory, the local Hub cache, or the Hub.
 pub async fn resolve_model_file(model_id: &str, filename: &'static str) -> Result<PathBuf> {
     let local = Path::new(model_id);
     if local.is_dir() {
@@ -49,6 +57,7 @@ pub async fn resolve_model_file(model_id: &str, filename: &'static str) -> Resul
     download_known_file(&api.model(model_id.to_string()), model_id, filename).await
 }
 
+/// Resolves the local model files.
 fn resolve_local_model_files(model_dir: &Path) -> Result<ResolvedModelFiles> {
     let tokenizer_path =
         local_file_if_exists(model_dir, "tokenizer.json").ok_or_else(|| Error::MissingFile {
@@ -65,6 +74,7 @@ fn resolve_local_model_files(model_dir: &Path) -> Result<ResolvedModelFiles> {
     })
 }
 
+/// Resolves and downloads the required and optional files advertised by a remote model repository.
 async fn resolve_remote_model_files(model_id: &str) -> Result<ResolvedModelFiles> {
     let api = build_api(model_id)?;
     let repo = api.model(model_id.to_string());
@@ -110,6 +120,7 @@ async fn resolve_remote_model_files(model_id: &str) -> Result<ResolvedModelFiles
     })
 }
 
+/// Resolves a complete model-file set from the local repository cache when available.
 fn resolve_cached_model_files(model_id: &str) -> Result<Option<ResolvedModelFiles>> {
     let cache_repo = Cache::from_env().model(model_id.to_string());
     let Some(tokenizer_path) = cache_repo.get("tokenizer.json") else {
@@ -135,6 +146,7 @@ fn resolve_cached_model_files(model_id: &str) -> Result<Option<ResolvedModelFile
     }))
 }
 
+/// Downloads an optional model file when the repository provides it.
 async fn download_if_present(
     repo: &ApiRepo,
     model_id: &str,
@@ -149,6 +161,7 @@ async fn download_if_present(
     }
 }
 
+/// Downloads the known file.
 async fn download_known_file(repo: &ApiRepo, model_id: &str, filename: &str) -> Result<PathBuf> {
     repo.get(filename).await.map_err(|error| Error::Remote {
         model: model_id.to_owned(),
@@ -156,6 +169,7 @@ async fn download_known_file(repo: &ApiRepo, model_id: &str, filename: &str) -> 
     })
 }
 
+/// Builds an authenticated model-hub API client.
 fn build_api(model_id: &str) -> Result<Api> {
     let mut builder = ApiBuilder::from_env().with_progress(true);
     if let Ok(token) = std::env::var(HF_TOKEN_ENV)
@@ -169,11 +183,13 @@ fn build_api(model_id: &str) -> Result<Api> {
     })
 }
 
+/// Returns a local model file when it exists.
 fn local_file_if_exists(dir: &Path, filename: &str) -> Option<PathBuf> {
     let path = dir.join(filename);
     path.is_file().then_some(path)
 }
 
+/// Returns whether a local model configuration is readable.
 fn config_json_is_usable(path: &Path) -> bool {
     let Ok(content) = std::fs::read_to_string(path) else {
         return false;
@@ -184,6 +200,7 @@ fn config_json_is_usable(path: &Path) -> bool {
     }
 }
 
+/// Resolves the local config path.
 fn resolve_local_config_path(dir: &Path) -> Option<PathBuf> {
     if let Some(path) = local_file_if_exists(dir, "config.json")
         && config_json_is_usable(&path)
@@ -194,6 +211,7 @@ fn resolve_local_config_path(dir: &Path) -> Option<PathBuf> {
         .or_else(|| local_file_if_exists(dir, "config.json"))
 }
 
+/// Selects the chat template sibling.
 fn select_chat_template_sibling<'a>(
     siblings: &std::collections::BTreeSet<&'a str>,
 ) -> Option<&'a str> {
@@ -209,6 +227,7 @@ fn select_chat_template_sibling<'a>(
         .find(|name| name.ends_with(".jinja") && !name.contains('/'))
 }
 
+/// Discovers the chat template in dir.
 fn discover_chat_template_in_dir(dir: &Path) -> Option<PathBuf> {
     for filename in ["chat_template.json", "chat_template.jinja"] {
         let path = dir.join(filename);

@@ -1,4 +1,4 @@
-"""Lifecycle for the single server owned by one benchmark point."""
+"""Owns a benchmark server process from launch through termination."""
 
 from __future__ import annotations
 
@@ -15,6 +15,8 @@ from .config import ServerLaunch, ServerProfile
 
 
 class ManagedServer:
+    """Runs one server process group and waits for its TCP listener."""
+
     def __init__(
         self,
         profile: ServerProfile,
@@ -23,6 +25,8 @@ class ManagedServer:
         *,
         timeout_s: float,
     ) -> None:
+        """Configure the managed launch, log, and readiness deadline."""
+
         self.profile = profile
         self.launch = launch
         self.log_path = log_path
@@ -31,6 +35,8 @@ class ManagedServer:
         self.log: IO[str] | None = None
 
     def __enter__(self) -> Self:
+        """Start the server and return after its listener accepts connections."""
+
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self.log = self.log_path.open("w", encoding="utf-8")
         environment = dict(os.environ)
@@ -57,9 +63,13 @@ class ManagedServer:
         _exc: BaseException | None,
         _traceback: TracebackType | None,
     ) -> None:
+        """Terminate the server process group and close its log."""
+
         self.stop()
 
     def stop(self) -> None:
+        """Terminate the server process group and release process resources."""
+
         process = self.process
         self.process = None
         if process is not None and process.poll() is None:
@@ -74,6 +84,8 @@ class ManagedServer:
             self.log = None
 
     def _wait_until_ready(self) -> None:
+        """Wait for the configured TCP listener or reports early process exit."""
+
         deadline = time.monotonic() + self.timeout_s
         while time.monotonic() < deadline:
             if self.process is not None and self.process.poll() is not None:

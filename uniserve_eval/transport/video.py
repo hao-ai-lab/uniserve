@@ -1,4 +1,4 @@
-"""Inspection of synchronous raw-MP4 responses."""
+"""Decodes and validates synchronous raw-MP4 responses."""
 
 from __future__ import annotations
 
@@ -10,12 +10,19 @@ from ..types import DecodedVideo
 
 
 class VideoOutputError(ValueError):
+    """Carries a stable classifier and detail for invalid video output."""
+
     def __init__(self, classifier: str, message: str) -> None:
+        """Initialize the error with its classifier and diagnostic detail."""
+
         self.classifier = classifier
         super().__init__(message)
 
 
 def inspect_video_bytes(data: bytes, *, declared_mime: str) -> DecodedVideo:
+    """Decode one video and audio stream and return verified media metadata."""
+
+    # Validate the HTTP-level envelope before invoking the media decoder.
     if not data:
         raise VideoOutputError("response_empty_video", "video response body is empty")
     mime = declared_mime.partition(";")[0].strip().lower()
@@ -28,6 +35,8 @@ def inspect_video_bytes(data: bytes, *, declared_mime: str) -> DecodedVideo:
         import av
 
         with av.open(io.BytesIO(data), mode="r", format="mp4") as container:
+            # The public response contract requires exactly one stream of each
+            # modality so aggregate metadata is unambiguous.
             video_streams = list(container.streams.video)
             audio_streams = list(container.streams.audio)
             if len(video_streams) != 1 or len(audio_streams) != 1:
@@ -41,6 +50,9 @@ def inspect_video_bytes(data: bytes, *, declared_mime: str) -> DecodedVideo:
             audio_samples = 0
             audio_channels: int | None = None
             audio_sample_rate: int | None = None
+
+            # Fully decode both streams; container metadata alone cannot prove
+            # that frames and PCM samples are readable.
             for frame in container.decode(video=0, audio=0):
                 if isinstance(frame, av.VideoFrame):
                     frame_count += 1
@@ -64,6 +76,8 @@ def inspect_video_bytes(data: bytes, *, declared_mime: str) -> DecodedVideo:
                             "audio sample rate changes within the response",
                         )
 
+            # Derive content metadata only after all frames satisfy the stream
+            # invariants, then name the sample by its encoded bytes.
             rate_value = video_stream.average_rate
             if rate_value is None:
                 raise VideoOutputError(
@@ -101,6 +115,7 @@ def inspect_video_bytes(data: bytes, *, declared_mime: str) -> DecodedVideo:
     except VideoOutputError:
         raise
     except Exception as error:
+        # Normalize decoder-specific failures into the evaluator classifier set.
         raise VideoOutputError(
             "response_undecodable_video", f"MP4 decode failed: {type(error).__name__}: {error}"
         ) from error

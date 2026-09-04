@@ -122,6 +122,8 @@ def normal_noise(
 
 
 def _splitmix_coordinate(seed: int, coordinate: int) -> int:
+    """Mix a seed and logical coordinate into one deterministic unsigned 64-bit value."""
+
     if int(coordinate) < 0:
         raise ValueError("random coordinate must not be negative")
     value = (int(seed) + (int(coordinate) + 1) * _SPLITMIX64_GAMMA) & _U64

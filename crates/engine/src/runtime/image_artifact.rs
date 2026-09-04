@@ -1,3 +1,5 @@
+//! Validation and metadata extraction for PNG artifacts returned by workers.
+
 use std::fmt::Write as _;
 use std::io::Cursor;
 
@@ -5,6 +7,7 @@ use base64::Engine as _;
 use sha2::{Digest as _, Sha256};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Verified dimensions, size, and digest of a PNG artifact.
 pub(crate) struct ImageArtifactMetadata {
     pub(crate) height: u32,
     pub(crate) width: u32,
@@ -12,7 +15,7 @@ pub(crate) struct ImageArtifactMetadata {
     pub(crate) sha256: String,
 }
 
-/// Height/width parsed from a base64 PNG's IHDR header, decoding only the
+/// Parses image dimensions from a base64 PNG's IHDR header, decoding only the
 /// base64 prefix. The response path validates artifact dimensions per
 /// final image operation; decoding the entire multi-megabyte frame there costs hundreds
 /// of milliseconds per image, while the header carries the dimensions in the
@@ -30,6 +33,7 @@ pub(crate) fn png_artifact_dims_b64(pixels_png_b64: &str) -> Option<(u32, u32)> 
     (width != 0 && height != 0).then_some((height, width))
 }
 
+/// Verifies PNG framing and declared metadata, then returns response metadata.
 pub(crate) fn validate_png_artifact(
     pixels_png_b64: &str,
     expected_hw: Option<(u32, u32)>,

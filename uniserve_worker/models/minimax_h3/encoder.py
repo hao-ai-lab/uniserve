@@ -22,6 +22,12 @@ __all__ = ["H3TextEncoderConfig", "MiniMaxH3TextEncoder"]
 
 @dataclass(frozen=True, slots=True)
 class H3TextEncoderConfig:
+    """Defines the H3 text encoder's vocabulary and tensor geometry.
+
+    The configuration fixes hidden width, attention heads, layer count, and rotary
+    settings.
+    """
+
     vocab_size: int = 151_936
     hidden_size: int = 5_120
     intermediate_size: int = 25_600
@@ -36,6 +42,8 @@ class H3TextEncoderConfig:
 
 
 def _enable_nvfp4(module: nn.Module) -> None:
+    """Finalize eligible text projections for dynamic NVFP4 execution."""
+
     if not isinstance(module, (MergedColumnParallelLinear, QKVParallelLinear, RowParallelLinear)):
         return
     if not hasattr(module, "weight_scale"):
@@ -51,6 +59,8 @@ class _TextRotaryEmbedding(nn.Module):
     """Qwen3-VL mRoPE reduced to the text-only position path."""
 
     def __init__(self, config: H3TextEncoderConfig, *, device: torch.device | str) -> None:
+        """Precompute text rotary frequencies on the execution device."""
+
         super().__init__()
         inv_freq = 1.0 / (
             config.rope_theta
@@ -66,13 +76,19 @@ class _TextRotaryEmbedding(nn.Module):
         hidden: torch.Tensor,
         positions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build dtype-matched rotary tables for the supplied text positions."""
+
         frequencies = positions.float().unsqueeze(-1) * self.inv_freq.view(1, 1, -1)
         embedding = torch.cat((frequencies, frequencies), dim=-1)
         return embedding.cos().to(hidden.dtype), embedding.sin().to(hidden.dtype)
 
 
 class _Attention(nn.Module):
+    """Applies grouped-query self-attention with rotary query and key coordinates."""
+
     def __init__(self, config: H3TextEncoderConfig, layer_config: LayerConfig) -> None:
+        """Build rank-sharded grouped-query projections and per-head normalization."""
+
         super().__init__()
         parallel = layer_config.parallel
         self.heads = config.heads // parallel.size
@@ -103,6 +119,8 @@ class _Attention(nn.Module):
         rotary: tuple[torch.Tensor, torch.Tensor],
         mesh: DeviceMesh,
     ) -> torch.Tensor:
+        """Run grouped-query causal attention over one encoded prompt sequence."""
+
         batch, rows, _ = hidden.shape
         qkv = self.qkv_proj(hidden)
         query, key, value = qkv.split((self.q_size, self.kv_size, self.kv_size), dim=-1)
@@ -132,7 +150,11 @@ class _Attention(nn.Module):
 
 
 class _MLP(nn.Module):
+    """Applies the gated feed-forward projection used by each H3 text layer."""
+
     def __init__(self, config: H3TextEncoderConfig, layer_config: LayerConfig) -> None:
+        """Build the tensor-parallel gated expansion and reduction projections."""
+
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             config.hidden_size,
@@ -149,11 +171,17 @@ class _MLP(nn.Module):
         )
 
     def forward(self, hidden: torch.Tensor, mesh: DeviceMesh) -> torch.Tensor:
+        """Apply the sharded gated expansion and tensor-parallel output projection."""
+
         return self.down_proj(ops.silu_and_mul(self.gate_up_proj(hidden)), mesh)
 
 
 class _DecoderLayer(nn.Module):
+    """Composes pre-normalized attention and gated MLP residual updates for the H3 text encoder."""
+
     def __init__(self, config: H3TextEncoderConfig, layer_config: LayerConfig) -> None:
+        """Assemble one pre-normalized attention and feed-forward residual layer."""
+
         super().__init__()
         self.self_attn = _Attention(config, layer_config)
         self.mlp = _MLP(config, layer_config)
@@ -167,6 +195,8 @@ class _DecoderLayer(nn.Module):
         rotary: tuple[torch.Tensor, torch.Tensor],
         mesh: DeviceMesh,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Advance the fused residual stream through attention and gated MLP updates."""
+
         if residual is None:
             residual = hidden
             attention_input = self.input_layernorm(hidden)
@@ -186,6 +216,8 @@ class _DecoderLayer(nn.Module):
 
 
 class _LanguageModel(nn.Module):
+    """Owns token embeddings, decoder layers, and final normalization for H3 text conditioning."""
+
     def __init__(
         self,
         config: H3TextEncoderConfig,
@@ -193,6 +225,8 @@ class _LanguageModel(nn.Module):
         *,
         parameter_device: torch.device | str,
     ) -> None:
+        """Allocate retained text layers and bind them to the encoder device mesh."""
+
         super().__init__()
         layer_config = LayerConfig(
             parallel=TensorParallel.from_mesh(mesh),
@@ -212,6 +246,8 @@ class _LanguageModel(nn.Module):
         self.mesh = mesh
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """Encode one bounded token sequence into checkpoint-layer-50 conditioning states."""
+
         hidden = self.embed_tokens(token_ids, self.mesh)
         positions = torch.arange(
             token_ids.shape[1], dtype=torch.long, device=token_ids.device
@@ -238,6 +274,8 @@ class MiniMaxH3TextEncoder(nn.Module):
         parameter_device: torch.device | str = "meta",
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
+        """Configure a bounded BF16 text-conditioning path on the supplied mesh."""
+
         super().__init__()
         if dtype != torch.bfloat16:
             raise ValueError("the H3 text encoder uses bfloat16 activations")
@@ -252,6 +290,8 @@ class MiniMaxH3TextEncoder(nn.Module):
         )
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """Validate a single bounded prompt and produce its text-conditioning states."""
+
         if token_ids.ndim != 2 or token_ids.shape[0] != 1:
             raise ValueError("H3 text conditioning requires one token sequence")
         if token_ids.shape[1] < 1 or token_ids.shape[1] > self.config.max_text_rows:
@@ -261,4 +301,6 @@ class MiniMaxH3TextEncoder(nn.Module):
         return self.language_model(token_ids)
 
     def enable_nvfp4(self) -> None:
+        """Quantize eligible resident text projections to dynamic NVFP4 execution."""
+
         self.apply(_enable_nvfp4)

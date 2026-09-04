@@ -1,4 +1,4 @@
-//! Adapts Qwen3 decoded text updates into reasoning-aware assistant deltas.
+//! Converts decoded Qwen3 text into reasoning-aware assistant deltas.
 
 use crate::serving::text::output::DecodedTextEvent;
 use asynk_strim_attr::{TryYielder, try_stream};
@@ -18,6 +18,7 @@ struct ReasoningState {
 }
 
 impl ReasoningState {
+    /// Creates a Qwen reasoning-stream parser.
     fn new(parser: Option<Qwen3ReasoningParser>) -> Self {
         Self {
             parser,
@@ -25,6 +26,7 @@ impl ReasoningState {
         }
     }
 
+    /// Processes one text delta through the reasoning parser.
     fn process_delta(&mut self, delta: String) -> Vec<ReasoningEvent> {
         let Some(parser) = self.parser.as_mut().filter(|_| !self.parser_failed) else {
             return vec![ReasoningEvent::TextDelta {
@@ -45,6 +47,7 @@ impl ReasoningState {
         events
     }
 
+    /// Initializes reasoning state from the prompt token sequence.
     fn initialize(&mut self, prompt_token_ids: &[u32]) {
         let Some(parser) = self.parser.as_mut().filter(|_| !self.parser_failed) else {
             return;
@@ -55,6 +58,7 @@ impl ReasoningState {
         }
     }
 
+    /// Finishes incremental output processing.
     fn finish(&mut self) -> Vec<ReasoningEvent> {
         let Some(parser) = self.parser.as_mut().filter(|_| !self.parser_failed) else {
             return Vec::new();
@@ -73,12 +77,14 @@ impl ReasoningState {
     }
 }
 
+/// Appends a nonempty semantic text delta.
 fn push_text_delta(events: &mut Vec<ReasoningEvent>, kind: AssistantBlockKind, delta: String) {
     if !delta.is_empty() {
         events.push(ReasoningEvent::TextDelta { kind, delta });
     }
 }
 
+/// Pushes the reasoning delta.
 fn push_reasoning_delta(events: &mut Vec<ReasoningEvent>, delta: ReasoningDelta) {
     if let Some(reasoning) = delta.reasoning {
         push_text_delta(events, AssistantBlockKind::Reasoning, reasoning);
@@ -89,6 +95,7 @@ fn push_reasoning_delta(events: &mut Vec<ReasoningEvent>, delta: ReasoningDelta)
 }
 
 #[try_stream]
+/// Converts decoded text events into a reasoning-aware event stream.
 pub async fn reasoning_event_stream(
     decoded_stream: impl futures::Stream<Item = crate::serving::text::Result<DecodedTextEvent>> + Send,
     parser: Option<Qwen3ReasoningParser>,
