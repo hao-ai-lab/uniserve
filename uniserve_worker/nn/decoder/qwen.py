@@ -8,7 +8,6 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from ...execution.forward_batch import MeshView
 from ..activation import GeluAndMul
 from ..layer import LayerConfig
 from ..linear import MergedColumnParallelLinear, RowParallelLinear
@@ -69,7 +68,7 @@ class Qwen3MLP(nn.Module):
             bias=False,
         )
 
-    def forward(self, hidden_states: torch.Tensor, mesh: MeshView) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Apply gated expansion and reduce the output projection across the mesh."""
 
-        return self.down_proj(self.act(self.gate_up_proj(hidden_states)), mesh)
+        return self.down_proj(self.act(self.gate_up_proj(hidden_states)))

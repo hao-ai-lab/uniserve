@@ -4,7 +4,7 @@
 //! output processing. Its [`ResolvedModel::tokenize`] method lowers
 //! [`GenerateReqInput`] into [`TokenizedGenerateReqInput`].
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -225,6 +225,12 @@ pub enum OmniPreprocessing {
 #[derive(Debug, Error)]
 /// Failure while resolving a configured model and its assets.
 pub enum ModelResolutionError {
+    /// A required component has no finalized executing geometry.
+    #[error("running workers did not publish valid `{component}` component geometry")]
+    ComponentGeometry {
+        /// Required component identity.
+        component: &'static str,
+    },
     /// Model files or profile metadata cannot be resolved.
     #[error(transparent)]
     Assets(#[from] crate::profile::assets::Error),
@@ -485,6 +491,7 @@ pub struct MiniMaxH3Desc {
     tokenizer: DynTokenizer,
     max_prompt_tokens: u32,
     max_video_seconds: f64,
+    decoder_width: u32,
 }
 
 impl ResolvedModel {
@@ -498,6 +505,7 @@ impl ResolvedModel {
         sampling_controls: Vec<ServedSamplingControl>,
         max_model_tokens: u32,
         parse_reasoning: bool,
+        components: &BTreeMap<String, uniserve_core::ComponentDeployConfig>,
     ) -> Result<Self> {
         // Resolution validates each asset family against the runtime features
         // required by its public serving contract.
@@ -581,12 +589,33 @@ impl ResolvedModel {
                 profile,
                 tokenizer,
                 max_video_seconds,
-            } => Ok(Self::Media(MiniMaxH3Desc {
-                identity: profile.identity,
-                tokenizer,
-                max_prompt_tokens: max_model_tokens,
-                max_video_seconds,
-            })),
+            } => {
+                let decoder = components
+                    .get("video_decoder")
+                    .filter(|component| {
+                        component.distribution
+                            == Some(uniserve_core::ComponentDistribution::TemporalUnits)
+                            && component.units_per_rank == 1
+                            && !component.ranks.is_empty()
+                    })
+                    .ok_or_else(|| {
+                        ServeError::ModelResolution(ModelResolutionError::ComponentGeometry {
+                            component: "video_decoder",
+                        })
+                    })?;
+                let decoder_width = u32::try_from(decoder.ranks.len()).map_err(|_| {
+                    ServeError::ModelResolution(ModelResolutionError::ComponentGeometry {
+                        component: "video_decoder",
+                    })
+                })?;
+                Ok(Self::Media(MiniMaxH3Desc {
+                    identity: profile.identity,
+                    tokenizer,
+                    max_prompt_tokens: max_model_tokens,
+                    max_video_seconds,
+                    decoder_width,
+                }))
+            }
         }
     }
 
@@ -679,10 +708,12 @@ impl ResolvedModel {
                     "video prompt token count exceeds the protocol width".to_string(),
                 ),
             })?;
-        // Sequence-parallel decode work rounds video units up across ranks and
+        // Temporal decoder placement rounds video units up across its owners and
         // reserves two terminal units for the media pipeline.
         let video_units = (frame_count - 5) / 17;
-        let decode_units = video_units.div_ceil(4).saturating_add(2);
+        let decode_units = video_units
+            .div_ceil(description.decoder_width)
+            .saturating_add(2);
         Ok((
             uniserve_core::MediaGeometry {
                 frame_count,

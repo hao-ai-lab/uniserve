@@ -69,8 +69,8 @@ def stub_deployment(
     return WorkerDeployment(
         device="cpu",
         model_scope="whole",
-        tp_rank=0,
-        tp_size=1,
+        rank=0,
+        world_size=1,
         block_size=int(block_size),
         kv_token_capacity=int(block_size) * STUB_NUM_BLOCKS,
         attention_backend="torch_sdpa",

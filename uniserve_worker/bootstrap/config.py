@@ -9,7 +9,12 @@ from dataclasses import dataclass
 from ..execution.batch import RunKind
 from ..loader.config import LoadConfig
 from .execution_config import ExecutionConfig, execution_config_from_namespace
-from .plan import ModelLoadScope, resolve_worker_plan
+from .plan import (
+    ComponentDeployConfig,
+    ModelLoadScope,
+    parse_component_deployment,
+    resolve_worker_plan,
+)
 
 
 @dataclass(frozen=True)
@@ -24,13 +29,14 @@ class WorkerIpcConfig:
 
 @dataclass(frozen=True)
 class WorkerPlacement:
-    """Assigns a worker rank to its primary device, tensor-parallel group, and optional tower devices."""
+    """Assigns a worker rank to its primary device, process world, and optional tower devices."""
 
     device: str
-    tp_rank: int
-    tp_size: int
-    tp_backend: str | None
-    tp_init_method: str | None
+    rank: int
+    local_rank: int
+    world_size: int
+    distributed_backend: str | None
+    distributed_init_method: str | None
     tower_devices: tuple[str, str] | None
 
     @property
@@ -83,6 +89,7 @@ class WorkerProcessArgs:
     execution: ExecutionConfig
     load: LoadConfig
     use_stub_model: bool
+    components: tuple[tuple[str, ComponentDeployConfig], ...] = ()
 
     @classmethod
     def from_namespace(cls, namespace: argparse.Namespace) -> "WorkerProcessArgs":
@@ -118,10 +125,11 @@ class WorkerProcessArgs:
             ),
             placement=WorkerPlacement(
                 device=device,
-                tp_rank=int(namespace.tp_rank),
-                tp_size=int(namespace.tp_size),
-                tp_backend=_optional_text(namespace.tp_backend),
-                tp_init_method=_optional_text(namespace.tp_init_method),
+                rank=int(namespace.rank),
+                local_rank=int(namespace.local_rank),
+                world_size=int(namespace.world_size),
+                distributed_backend=_optional_text(namespace.distributed_backend),
+                distributed_init_method=_optional_text(namespace.distributed_init_method),
                 tower_devices=tower_devices,
             ),
             resources=WorkerResourceConfig(
@@ -151,6 +159,9 @@ class WorkerProcessArgs:
             execution=execution_config_from_namespace(namespace),
             load=_load_config(namespace),
             use_stub_model=use_stub_model,
+            components=parse_component_deployment(
+                namespace.component_deployment, int(namespace.world_size)
+            ),
         )
 
 
@@ -164,7 +175,7 @@ def _validate_scalars(namespace: argparse.Namespace) -> None:
         "--pipeline-depth": namespace.pipeline_depth,
         "--ipc-payload-cap": namespace.ipc_payload_cap,
         "--ipc-max-inflight": namespace.ipc_max_inflight,
-        "--tp-size": namespace.tp_size,
+        "--world-size": namespace.world_size,
         "--max-model-len": namespace.max_model_len,
     }
     for option, value in positive_fields.items():
@@ -178,8 +189,8 @@ def _validate_scalars(namespace: argparse.Namespace) -> None:
     max_video_frames = math.floor(max_video_seconds * 24.0 + 0.5)
     if max_video_frames < 6 or max_video_frames > 2**32 - 17:
         raise ValueError("--max-video-seconds must resolve to supported media geometry")
-    if int(namespace.tp_rank) < 0 or int(namespace.tp_rank) >= int(namespace.tp_size):
-        raise ValueError("--tp-rank must satisfy 0 <= rank < tp-size")
+    if int(namespace.rank) < 0 or int(namespace.rank) >= int(namespace.world_size):
+        raise ValueError("--rank must satisfy 0 <= rank < world-size")
 
 
 def _load_config(namespace: argparse.Namespace) -> LoadConfig:

@@ -1928,13 +1928,13 @@ fn multiworker_executor_drives_scheduler_unchanged() {
     let mk = |rank| {
         let mut sim = SimEngine::new();
         sim.set_pipeline_depth(2);
-        sim.mut_info_for_test().rank.tp_rank = rank;
-        sim.mut_info_for_test().rank.tp_size = 2;
+        sim.mut_info_for_test().rank.rank = rank;
+        sim.mut_info_for_test().rank.world_size = 2;
         Box::new(SimExecutor::new(sim)) as Box<dyn PhysicalExecutor>
     };
     let executor = Box::new(MultiprocExecutor::new(vec![mk(0), mk(1)]).unwrap());
     // rank-aware info reflect the topology at the handshake.
-    assert_eq!(executor.info().single_pool().rank.tp_size, 2);
+    assert_eq!(executor.info().single_pool().rank.world_size, 2);
     let sched = EngineLoop::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);

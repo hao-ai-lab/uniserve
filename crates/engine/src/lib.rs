@@ -17,8 +17,9 @@ mod worker;
 
 pub use crate::core::{EngineCore, EngineCoreConfig};
 pub use crate::executor::{
-    Batch, BatchResult, Executor, ExecutorError, ExecutorInfo, ExecutorSubmitError, Op,
-    OpPlacement, PhysicalExecutor, PhysicalSubmitError, PoolConfig, PoolId, TransferBackend,
+    Batch, BatchResult, ComponentDeployConfig, ComponentDistribution, Executor, ExecutorError,
+    ExecutorInfo, ExecutorSubmitError, Op, OpPlacement, ParallelConfig, PhysicalExecutor,
+    PhysicalSubmitError, PoolConfig, PoolId, SequenceParallel, StageDeployConfig, TransferBackend,
     TransferEdge, TransportMap, TransportMapError, WorkerExecError, WorkerLossError,
     WorkerTopology, WorkerTopologyError,
 };

@@ -297,7 +297,6 @@ class Qwen3Attention(nn.Module):
         out = self.attn(q_attn, k_attn, v_attn, context, causal=True, scale=self.scale)
         return self.o_proj(
             self._restore_attention_output(out, state_shape, batched_decode, batched),
-            context.mesh,
         )
 
     def _try_fused_prefill(
@@ -330,7 +329,7 @@ class Qwen3Attention(nn.Module):
         q_attn = q_attn.to(dtype=v_attn.dtype)
         k_attn = k_attn.to(dtype=v_attn.dtype)
         out = self.attn(q_attn, k_attn, v_attn, context, causal=True, scale=self.scale)
-        return self.o_proj(out.reshape(*state_shape, self.q_size), context.mesh)
+        return self.o_proj(out.reshape(*state_shape, self.q_size))
 
     def _prepare_qk(
         self,
@@ -428,7 +427,7 @@ class Qwen3MoE(nn.Module):
     def forward(self, hidden_states: torch.Tensor, context: ForwardBatch) -> torch.Tensor:
         """Route packed hidden rows through the selected experts and combine their outputs."""
 
-        return self.experts(hidden_states, self.gate(hidden_states), context.mesh)
+        return self.experts(hidden_states, self.gate(hidden_states))
 
 
 class Qwen3DecoderLayer(nn.Module):
@@ -439,7 +438,11 @@ class Qwen3DecoderLayer(nn.Module):
 
         super().__init__()
         self.self_attn = Qwen3Attention(cfg, layer_id, layer_config=layer_config)
-        self.mlp = Qwen3MoE(cfg, layer_config=layer_config) if cfg.num_experts > 0 else Qwen3MLP(cfg, layer_config=layer_config)
+        self.mlp = (
+            Qwen3MoE(cfg, layer_config=layer_config)
+            if cfg.num_experts > 0
+            else Qwen3MLP(cfg, layer_config=layer_config)
+        )
         self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
 
@@ -472,7 +475,7 @@ class Qwen3DecoderLayer(nn.Module):
         )
         if isinstance(self.mlp, Qwen3MoE):
             return self.mlp(mlp_in, context), residual
-        return self.mlp(mlp_in, context.mesh), residual
+        return self.mlp(mlp_in), residual
 
 
 class Qwen3Model(nn.Module):
@@ -489,7 +492,8 @@ class Qwen3Model(nn.Module):
             init_weights=False,
         )
         self.layers = nn.ModuleList(
-            Qwen3DecoderLayer(cfg, idx, layer_config=layer_config) for idx in range(cfg.num_hidden_layers)
+            Qwen3DecoderLayer(cfg, idx, layer_config=layer_config)
+            for idx in range(cfg.num_hidden_layers)
         )
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.rotary = get_rope(
@@ -507,9 +511,7 @@ class Qwen3Model(nn.Module):
     ) -> torch.Tensor:
         """Decode token or supplied embedding rows and return final normalized hidden states."""
 
-        hidden_states = (
-            input_embeds if input_embeds is not None else self.embed_tokens(input_ids, context.mesh)
-        )
+        hidden_states = input_embeds if input_embeds is not None else self.embed_tokens(input_ids)
         cos, sin = self.rotary.cos_sin_1d(positions.reshape(-1))
         residual = None
         for layer_module in self.layers:
@@ -530,6 +532,8 @@ class Qwen3Model(nn.Module):
 
 class Qwen3ForCausalLM(ExecutionModel):
     """Qwen3 serving model with a thin tensor-level text core."""
+
+    ordered_collective_execution = True
 
     def load_weights(
         self,
@@ -620,7 +624,7 @@ class Qwen3ForCausalLM(ExecutionModel):
 
         input_embeds: torch.Tensor | None = None
         if forward_batch.input_embeddings is not None:
-            embedded = self.model.embed_tokens(input_ids.reshape(-1), forward_batch.mesh)
+            embedded = self.model.embed_tokens(input_ids.reshape(-1))
             mask = forward_batch.embedding_mask
             if mask is None:
                 raise RuntimeError("Qwen3 embedding input lost its selection mask")
@@ -649,7 +653,7 @@ class Qwen3ForCausalLM(ExecutionModel):
         )
         if dynamic_last is not None:
             selected = hidden.index_select(0, dynamic_last.to(dtype=torch.long))
-            dynamic_projected = self.logits(self.lm_head(selected, forward_batch.mesh))
+            dynamic_projected = self.logits(self.lm_head(selected))
             return ForwardOutput(
                 tuple(dynamic_projected[index : index + 1] for index in range(len(selections)))
             )
@@ -683,7 +687,7 @@ class Qwen3ForCausalLM(ExecutionModel):
                 selected = (
                     selected_rows[0] if len(selected_rows) == 1 else torch.cat(selected_rows, dim=0)
                 )
-            projected = self.logits(self.lm_head(selected, forward_batch.mesh))
+            projected = self.logits(self.lm_head(selected))
 
         # Slice the shared projection back into request order while preserving hidden outputs.
         outputs: list[torch.Tensor] = []

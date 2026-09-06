@@ -9,6 +9,7 @@ from typing import cast
 import torch
 import torch.nn as nn
 
+from ...execution.device_transfer import DeviceTransfer
 from ...execution.forward_batch import (
     AttentionMode,
     ExpertRoute,
@@ -83,17 +84,18 @@ def _apply(
     value: torch.Tensor,
     *,
     context: ForwardBatch,
+    transfers: DeviceTransfer,
     coordinate: int,
     target: torch.device,
     call: Callable[[nn.Module, torch.Tensor, ForwardBatch], torch.Tensor],
 ) -> torch.Tensor:
     """Dispatch one routed tensor to an expert coordinate and combine the module output."""
 
-    staged = context.mesh.dispatch(value, "tower", coordinate)
+    staged = transfers.dispatch(value, coordinate)
     result = call(module, staged, context)
     if not isinstance(result, torch.Tensor):
         raise TypeError("MoT sublayer must return a tensor")
-    return context.mesh.combine(result, "tower", coordinate, target)
+    return transfers.combine(result, target)
 
 
 def _route_modules(
@@ -102,6 +104,7 @@ def _route_modules(
     text_module: nn.Module,
     flow_module: nn.Module,
     context: ForwardBatch,
+    transfers: DeviceTransfer,
     call: Callable[[nn.Module, torch.Tensor, ForwardBatch], torch.Tensor],
 ) -> RoutedTensor:
     """Execute text and flow tensors through their route-specific module replicas."""
@@ -116,6 +119,7 @@ def _route_modules(
             coordinate=_TEXT_COORDINATE,
             target=item.device,
             call=call,
+            transfers=transfers,
         )
 
     def apply_flow(item: torch.Tensor) -> torch.Tensor:
@@ -128,6 +132,7 @@ def _route_modules(
             coordinate=_FLOW_COORDINATE,
             target=item.device,
             call=call,
+            transfers=transfers,
         )
 
     return value.map(apply_text, apply_flow)
@@ -144,23 +149,20 @@ def _plain_call(
     return cast(torch.Tensor, module(value))
 
 
-def _parallel_call(
-    module: nn.Module,
-    value: torch.Tensor,
-    context: ForwardBatch,
-) -> torch.Tensor:
-    """Invoke a routed module with the route-restricted mesh view."""
-
-    return cast(torch.Tensor, module(value, context.mesh))
-
-
 class MoTDecoderLayer(nn.Module):
     """One decoder layer with text and flow experts over shared attention."""
 
-    def __init__(self, config: MoTConfig, *, layer_config: LayerConfig) -> None:
+    def __init__(
+        self,
+        config: MoTConfig,
+        *,
+        layer_config: LayerConfig,
+        transfers: DeviceTransfer = DeviceTransfer(),
+    ) -> None:
         """Build text and flow projections around shared paged attention geometry."""
 
         super().__init__()
+        self.transfers = transfers
         hidden = int(config.hidden_size)
         head_dim = int(config.head_dim)
         total_heads = int(config.num_attention_heads)
@@ -268,9 +270,9 @@ class MoTDecoderLayer(nn.Module):
         """Project one expert route into normalized rotary QKV heads."""
 
         target = hidden.device
-        staged = context.mesh.dispatch(hidden, "tower", expert.coordinate)
-        staged_cos = context.mesh.dispatch(cos, "tower", expert.coordinate)
-        staged_sin = context.mesh.dispatch(sin, "tower", expert.coordinate)
+        staged = self.transfers.dispatch(hidden, expert.coordinate)
+        staged_cos = self.transfers.dispatch(cos, expert.coordinate)
+        staged_sin = self.transfers.dispatch(sin, expert.coordinate)
         qkv = expert.qkv(staged)
         if not isinstance(qkv, torch.Tensor):
             raise TypeError("MoT QKV projection must return a tensor")
@@ -287,9 +289,9 @@ class MoTDecoderLayer(nn.Module):
         query = apply_rotary_emb(query, staged_cos, staged_sin).to(torch.bfloat16)
         key = apply_rotary_emb(key, staged_cos, staged_sin).to(torch.bfloat16)
         return (
-            context.mesh.combine(query, "tower", expert.coordinate, target),
-            context.mesh.combine(key, "tower", expert.coordinate, target),
-            context.mesh.combine(value.to(torch.bfloat16), "tower", expert.coordinate, target),
+            self.transfers.combine(query, target),
+            self.transfers.combine(key, target),
+            self.transfers.combine(value.to(torch.bfloat16), target),
         )
 
     def forward(
@@ -311,6 +313,7 @@ class MoTDecoderLayer(nn.Module):
             flow_module=self._flow.input_norm,
             context=context,
             call=_plain_call,
+            transfers=self.transfers,
         )
         text_projection = (
             None
@@ -349,7 +352,8 @@ class MoTDecoderLayer(nn.Module):
             text_module=self._text.output,
             flow_module=self._flow.output,
             context=context,
-            call=_parallel_call,
+            call=_plain_call,
+            transfers=self.transfers,
         )
         residual = hidden.add(projected)
         normalized = _route_modules(
@@ -358,6 +362,7 @@ class MoTDecoderLayer(nn.Module):
             flow_module=self._flow.post_norm,
             context=context,
             call=_plain_call,
+            transfers=self.transfers,
         ).map(
             lambda item: item.to(torch.bfloat16),
             lambda item: item.to(torch.bfloat16),
@@ -367,7 +372,8 @@ class MoTDecoderLayer(nn.Module):
             text_module=self._text.mlp,
             flow_module=self._flow.mlp,
             context=context,
-            call=_parallel_call,
+            call=_plain_call,
+            transfers=self.transfers,
         )
         return residual.add(feed_forward)
 
@@ -375,17 +381,25 @@ class MoTDecoderLayer(nn.Module):
 class MoTModel(nn.Module):
     """Packed text/flow decoder with no request or runtime state."""
 
-    def __init__(self, config: MoTConfig, *, layer_config: LayerConfig) -> None:
+    def __init__(
+        self,
+        config: MoTConfig,
+        *,
+        layer_config: LayerConfig,
+        transfers: DeviceTransfer = DeviceTransfer(),
+    ) -> None:
         """Build the routed decoder and bind flow normalization to its tower coordinate."""
 
         super().__init__()
+        self.transfers = transfers
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
             layer_config=layer_config,
         )
         self.layers = nn.ModuleList(
-            MoTDecoderLayer(config, layer_config=layer_config) for _ in range(config.num_hidden_layers)
+            MoTDecoderLayer(config, layer_config=layer_config, transfers=transfers)
+            for _ in range(config.num_hidden_layers)
         )
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.norm_moe_gen = RMSNorm(config.hidden_size, config.rms_norm_eps)
@@ -444,4 +458,5 @@ class MoTModel(nn.Module):
             flow_module=self.norm_moe_gen,
             context=context,
             call=_plain_call,
+            transfers=self.transfers,
         ).packed(spans)

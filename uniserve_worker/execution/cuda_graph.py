@@ -927,7 +927,6 @@ def _decode_signature(batch: ForwardBatch, geometry: _DecodeGeometry) -> tuple[o
         _batch_tensor_signature(batch),
         bool(batch.causal),
         bool(batch.has_cache_writes),
-        _owner_signature(batch),
     )
 
 
@@ -946,7 +945,6 @@ def _prefill_signature(batch: ForwardBatch, geometry: _PrefillGeometry) -> tuple
         _batch_tensor_signature(batch),
         bool(batch.causal),
         bool(batch.has_cache_writes),
-        _owner_signature(batch),
     )
 
 
@@ -963,12 +961,6 @@ def _batch_tensor_signature(batch: ForwardBatch) -> tuple[object, ...]:
         batch.input_embeddings is not None,
         None if batch.input_embeddings is None else str(batch.input_embeddings.dtype),
     )
-
-
-def _owner_signature(batch: ForwardBatch) -> tuple[object, ...]:
-    """Return the owner identity that prevents graph reuse across buffer arenas."""
-
-    return (type(batch.mesh).__qualname__,)
 
 
 def _direct_key(key: Hashable) -> tuple[object, ...]:
@@ -1000,7 +992,6 @@ def _exact_signature(batch: ForwardBatch) -> tuple[object, ...]:
         bool(batch.has_cache_writes),
         batch.max_seqlen_q,
         batch.max_seqlen_k,
-        _owner_signature(batch),
     )
 
 

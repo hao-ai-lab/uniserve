@@ -1257,6 +1257,33 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
             .rank()
             .map(rank_from_table)
             .context("info have no rank")?,
+        configuration_id: info.configuration_id().unwrap_or_default().to_owned(),
+        components: info
+            .components()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| {
+                        Ok(crate::ComponentInfo {
+                            name: required_str(item.name(), "component.name")?,
+                            deployment: uniserve_core::ComponentDeployConfig {
+                                ranks: item
+                                    .ranks()
+                                    .map(|ranks| ranks.iter().map(|rank| rank as usize).collect())
+                                    .unwrap_or_default(),
+                                parallel_config: parallel_from_fb(
+                                    item.parallel_config()
+                                        .context("component requires parallel_config")?,
+                                )?,
+                                distribution: distribution_from_fb(item.distribution())?,
+                                units_per_rank: item.units_per_rank() as usize,
+                            },
+                        })
+                    })
+                    .collect::<CodecResult<Vec<_>>>()
+            })
+            .transpose()?
+            .unwrap_or_default(),
         supported_ops: info
             .supported_ops()
             .map(|items| {
@@ -1456,11 +1483,11 @@ fn kv_group_from_table(group: fbs::KvGroup<'_>) -> CodecResult<KvCacheGroup> {
     })
 }
 
-/// Decodes tensor-parallel rank coordinates.
+/// Decodes physical process coordinates.
 fn rank_from_table(rank: fbs::RankInfo<'_>) -> RankInfo {
     RankInfo {
-        tp_rank: rank.tp_rank(),
-        tp_size: rank.tp_size(),
+        rank: rank.rank(),
+        world_size: rank.world_size(),
     }
 }
 
@@ -2313,6 +2340,119 @@ fn kv_cache_to_fb(config: &KvCacheConfig) -> fbs::KvCacheConfigT {
     }
 }
 
+fn distribution_from_fb(
+    value: fbs::ComponentDistribution,
+) -> CodecResult<Option<uniserve_core::ComponentDistribution>> {
+    match value {
+        fbs::ComponentDistribution::Local => Ok(None),
+        fbs::ComponentDistribution::TemporalUnits => {
+            Ok(Some(uniserve_core::ComponentDistribution::TemporalUnits))
+        }
+        _ => codec_bail!("unknown component distribution"),
+    }
+}
+
+fn parallel_to_fb(config: &uniserve_core::ParallelConfig) -> fbs::ParallelConfigT {
+    use uniserve_core::SequenceParallel;
+    let sequence_parallel = match config.sequence_parallel {
+        SequenceParallel::Local => {
+            fbs::SequenceParallelT::LocalSequence(Box::new(fbs::LocalSequenceT {}))
+        }
+        SequenceParallel::Ulysses { ulysses_degree } => {
+            fbs::SequenceParallelT::UlyssesSequence(Box::new(fbs::UlyssesSequenceT {
+                ulysses_degree: ulysses_degree as u32,
+            }))
+        }
+        SequenceParallel::Ring { ring_degree } => {
+            fbs::SequenceParallelT::RingSequence(Box::new(fbs::RingSequenceT {
+                ring_degree: ring_degree as u32,
+            }))
+        }
+        SequenceParallel::Hybrid {
+            ulysses_degree,
+            ring_degree,
+        } => fbs::SequenceParallelT::HybridSequence(Box::new(fbs::HybridSequenceT {
+            ulysses_degree: ulysses_degree as u32,
+            ring_degree: ring_degree as u32,
+        })),
+        SequenceParallel::Allgather { allgather_degree } => {
+            fbs::SequenceParallelT::GatherSequence(Box::new(fbs::GatherSequenceT {
+                allgather_degree: allgather_degree as u32,
+            }))
+        }
+        SequenceParallel::Attention2d {
+            attn2d_row_size,
+            attn2d_col_size,
+            ulysses_degree,
+        } => fbs::SequenceParallelT::Attention2dSequence(Box::new(fbs::Attention2dSequenceT {
+            attn2d_row_size: attn2d_row_size as u32,
+            attn2d_col_size: attn2d_col_size as u32,
+            ulysses_degree: ulysses_degree as u32,
+        })),
+    };
+    fbs::ParallelConfigT {
+        tensor_parallel_size: config.tensor_parallel_size as u32,
+        pipeline_parallel_size: config.pipeline_parallel_size as u32,
+        sequence_parallel,
+    }
+}
+
+fn parallel_from_fb(config: fbs::ParallelConfig<'_>) -> CodecResult<uniserve_core::ParallelConfig> {
+    use uniserve_core::SequenceParallel;
+    let sequence_parallel = match config.sequence_parallel_type() {
+        fbs::SequenceParallel::LocalSequence => SequenceParallel::Local,
+        fbs::SequenceParallel::UlyssesSequence => {
+            let value = config
+                .sequence_parallel_as_ulysses_sequence()
+                .context("missing UlyssesSequence configuration")?;
+            SequenceParallel::Ulysses {
+                ulysses_degree: value.ulysses_degree() as usize,
+            }
+        }
+        fbs::SequenceParallel::RingSequence => {
+            let value = config
+                .sequence_parallel_as_ring_sequence()
+                .context("missing RingSequence configuration")?;
+            SequenceParallel::Ring {
+                ring_degree: value.ring_degree() as usize,
+            }
+        }
+        fbs::SequenceParallel::HybridSequence => {
+            let value = config
+                .sequence_parallel_as_hybrid_sequence()
+                .context("missing HybridSequence configuration")?;
+            SequenceParallel::Hybrid {
+                ulysses_degree: value.ulysses_degree() as usize,
+                ring_degree: value.ring_degree() as usize,
+            }
+        }
+        fbs::SequenceParallel::GatherSequence => {
+            let value = config
+                .sequence_parallel_as_gather_sequence()
+                .context("missing GatherSequence configuration")?;
+            SequenceParallel::Allgather {
+                allgather_degree: value.allgather_degree() as usize,
+            }
+        }
+        fbs::SequenceParallel::Attention2dSequence => {
+            let value = config
+                .sequence_parallel_as_attention_2d_sequence()
+                .context("missing Attention2dSequence configuration")?;
+            SequenceParallel::Attention2d {
+                attn2d_row_size: value.attn2d_row_size() as usize,
+                attn2d_col_size: value.attn2d_col_size() as usize,
+                ulysses_degree: value.ulysses_degree() as usize,
+            }
+        }
+        _ => codec_bail!("unknown sequence parallel strategy"),
+    };
+    Ok(uniserve_core::ParallelConfig {
+        tensor_parallel_size: config.tensor_parallel_size() as usize,
+        pipeline_parallel_size: config.pipeline_parallel_size() as usize,
+        sequence_parallel,
+    })
+}
+
 /// Converts validated worker capabilities into their wire table.
 fn info_to_fb(info: &WorkerInfo) -> CodecResult<fbs::WorkerInfoT> {
     info.validate()?;
@@ -2320,6 +2460,35 @@ fn info_to_fb(info: &WorkerInfo) -> CodecResult<fbs::WorkerInfoT> {
         model_name: Some(info.model_name.clone()),
         weight_version: info.weight_version,
         rank: Some(Box::new(rank_to_fb(info.rank))),
+        configuration_id: Some(info.configuration_id.clone()),
+        components: Some(
+            info.components
+                .iter()
+                .map(|component| {
+                    Ok(fbs::ComponentInfoT {
+                        name: Some(component.name.clone()),
+                        ranks: Some(
+                            component
+                                .deployment
+                                .ranks
+                                .iter()
+                                .map(|&rank| rank as u64)
+                                .collect(),
+                        ),
+                        parallel_config: Some(Box::new(parallel_to_fb(
+                            &component.deployment.parallel_config,
+                        ))),
+                        distribution: match component.deployment.distribution {
+                            None => fbs::ComponentDistribution::Local,
+                            Some(uniserve_core::ComponentDistribution::TemporalUnits) => {
+                                fbs::ComponentDistribution::TemporalUnits
+                            }
+                        },
+                        units_per_rank: component.deployment.units_per_rank as u32,
+                    })
+                })
+                .collect::<CodecResult<Vec<_>>>()?,
+        ),
         supported_ops: Some(
             info.supported_ops
                 .iter()
@@ -2507,11 +2676,11 @@ fn kv_group_to_fb(group: &KvCacheGroup) -> fbs::KvGroupT {
     }
 }
 
-/// Converts tensor-parallel rank coordinates into their wire table.
+/// Converts physical process coordinates into their wire table.
 fn rank_to_fb(rank: RankInfo) -> fbs::RankInfoT {
     fbs::RankInfoT {
-        tp_rank: rank.tp_rank,
-        tp_size: rank.tp_size,
+        rank: rank.rank,
+        world_size: rank.world_size,
     }
 }
 

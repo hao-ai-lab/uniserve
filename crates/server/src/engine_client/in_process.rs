@@ -42,6 +42,18 @@ fn remove_active_request(active: &Mutex<ActiveRequests>, request_id: &str, rid: 
 }
 
 impl EngineClient {
+    /// Return the deployment accepted by the finalized worker descriptions.
+    pub(super) fn component_deployment(
+        &self,
+    ) -> std::collections::BTreeMap<String, uniserve_core::ComponentDeployConfig> {
+        self.core
+            .info()
+            .components
+            .iter()
+            .map(|component| (component.name.clone(), component.deployment.clone()))
+            .collect()
+    }
+
     /// Returns the shared engine handle.
     fn handle(&self) -> EngineHandle {
         self.core.handle()

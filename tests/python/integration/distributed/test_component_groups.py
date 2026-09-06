@@ -1,0 +1,280 @@
+"""Real collective and checkpoint-to-Linear behavior on overlapping component groups."""
+
+from pathlib import Path
+
+import pytest
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+import torch.nn.functional as F
+
+from uniserve_worker.loader.handles import TensorWeightHandle
+from uniserve_worker.loader.weight_loaders import attach_parameter_loaders, load_parameter_weight
+from uniserve_worker.nn.layer import LayerConfig
+from uniserve_worker.nn.linear import (
+    ColumnParallelLinear,
+    LinearBase,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
+from uniserve_worker.nn.mesh import TensorParallel
+from uniserve_worker.nn.parallel import ParallelConfig, UlyssesSequence
+from uniserve_worker.nn.vocab_parallel_embedding import VocabParallelEmbedding
+from uniserve_worker.runtime.distributed import (
+    init_distributed_environment,
+    initialize_model_parallel,
+)
+
+pytestmark = pytest.mark.integration
+
+
+def _run_groups(rank: int, rendezvous: str, backend: str):
+    device = f"cuda:{rank}" if backend == "nccl" else "cpu"
+    environment = init_distributed_environment(
+        rank=rank,
+        local_rank=rank,
+        world_size=4,
+        device=device,
+        backend=backend,
+        init_method=rendezvous,
+    )
+    meshes = initialize_model_parallel(
+        environment,
+        {
+            "denoiser": ((0, 1, 2, 3), ParallelConfig(2, sequence_parallel=UlyssesSequence(2))),
+            "encoder": ((3, 1), ParallelConfig(2)),
+            "output": ((2,), ParallelConfig()),
+        },
+    )
+    for mesh in meshes.values():
+        for dimension in ("tp", "ulysses", "sp", "pp"):
+            group = mesh.get_group(dimension)
+            value = torch.tensor([[rank + 1.0]], device=device)
+            expected = torch.tensor([[sum(member + 1.0 for member in group.ranks)]], device=device)
+            torch.testing.assert_close(group.all_reduce(value.clone()), expected, rtol=0, atol=0)
+            gathered = torch.empty((group.world_size, 1), device=device)
+            group.all_gather_into_tensor(gathered, value)
+            reference = torch.tensor([[member + 1.0] for member in group.ranks], device=device)
+            torch.testing.assert_close(gathered, reference, rtol=0, atol=0)
+            torch.testing.assert_close(group.all_gather(value), reference, rtol=0, atol=0)
+            root = group.world_size - 1
+            broadcast = group.broadcast(value.clone(), src=root)
+            torch.testing.assert_close(broadcast, reference[root : root + 1], rtol=0, atol=0)
+            gathered_root = (
+                torch.empty((group.world_size, 1, 1), device=device)
+                if group.rank_in_group == root
+                else None
+            )
+            group.gather_into_tensor(gathered_root, value, dst=root)
+            if gathered_root is not None:
+                torch.testing.assert_close(gathered_root.reshape(-1, 1), reference, rtol=0, atol=0)
+            send = torch.tensor([[rank * 10 + member] for member in group.ranks], device=device)
+            received = torch.empty_like(send)
+            group.all_to_all_single_into(
+                received, send, [1] * group.world_size, [1] * group.world_size
+            )
+            torch.testing.assert_close(
+                received,
+                torch.tensor([[member * 10 + rank] for member in group.ranks], device=device),
+                rtol=0,
+                atol=0,
+            )
+            reduced = group.reduce_scatter(
+                torch.ones(group.world_size, 2, device=device) * (rank + 1)
+            )
+            torch.testing.assert_close(
+                reduced,
+                torch.full((1, 2), sum(member + 1.0 for member in group.ranks), device=device),
+                rtol=0,
+                atol=0,
+            )
+
+    from uniserve_worker.execution.device_transfer import ComponentTensorTransfer
+
+    products = ComponentTensorTransfer(environment.process_group, (3, 1), (2, 0))
+    send = (
+        torch.stack(
+            [
+                torch.full((2, 3), rank * 10 + destination, device=device)
+                for destination in products.consumers
+            ]
+        )
+        if rank in products.producers
+        else torch.empty((0, 2, 3), device=device, dtype=torch.int64)
+    )
+    receive = torch.empty(
+        (len(products.producers) if rank in products.consumers else 0, 2, 3),
+        dtype=torch.int64,
+        device=device,
+    )
+    products.exchange(send, receive)
+    if rank in products.consumers:
+        expected = torch.stack(
+            [torch.full((2, 3), source * 10 + rank, device=device) for source in products.producers]
+        )
+        torch.testing.assert_close(receive, expected, rtol=0, atol=0)
+    conditioning = ComponentTensorTransfer(environment.process_group, (3,), (2, 0))
+    source = torch.full((2, 3), 17.0, device=device) if rank == 3 else None
+    target = torch.empty((2, 3), device=device) if rank in conditioning.consumers else None
+    conditioning.broadcast(source, target)
+    # PCM is a signed 16-bit stage product; transport preserves its bytes even
+    # when the collective backend has no numerical primitive for that dtype.
+    pcm = (
+        torch.tensor([-32768, -1, 0, 32767, 42, -42, 256, -256], device=device, dtype=torch.int16)
+        .reshape(2, 4)
+        .T
+    )
+    pcm_target = torch.empty((2, 4), device=device, dtype=torch.int16).T if rank in (2, 0) else None
+    conditioning.broadcast(pcm if rank == 3 else None, pcm_target)
+    if pcm_target is not None:
+        torch.testing.assert_close(pcm_target, pcm, rtol=0, atol=0)
+    if target is not None:
+        torch.testing.assert_close(target, torch.full_like(target, 17.0), rtol=0, atol=0)
+
+    if backend == "nccl":
+        from uniserve_worker.backends.attention.video_sparse import (
+            VideoSparseAttentionBackend,
+            build_video_sparse_metadata,
+        )
+        from uniserve_worker.nn.parallel_attention import UlyssesAttention
+        from uniserve_worker.ops.video_sparse import compose_to_head_shards
+
+        for component, dimension in (("denoiser", "ulysses"), ("encoder", "tp"), ("output", "tp")):
+            if component not in meshes:
+                continue
+            group = meshes[component].get_group(dimension)
+            rows, local_heads, width = 64, 7, 128
+            count = group.world_size
+            # Projection transport does not invoke the backend. The public
+            # exchange contract can be checked with exact rank/row/head values.
+            metadata = build_video_sparse_metadata(
+                padded_rows=128,
+                prefix_tiles=0,
+                video_tiles=2,
+                valid_sizes=torch.full((2,), 64, dtype=torch.int32),
+                device=torch.device(device),
+            )
+            parallel_attention = UlyssesAttention(
+                VideoSparseAttentionBackend(metadata), ulysses_group=group
+            )
+            projected = torch.arange(
+                rows * count * local_heads * 4 * width, device=device, dtype=torch.float32
+            )
+            projected = projected.view(rows, count * local_heads, 4, width) + rank * 1_000_000
+            exchanged = parallel_attention.exchange_projection(projected)
+            reference = torch.cat(
+                [
+                    (projected - rank * 1_000_000 + member * 1_000_000).chunk(count, dim=1)[
+                        group.rank_in_group
+                    ]
+                    for member in group.ranks
+                ]
+            )
+            torch.testing.assert_close(exchanged, reference, rtol=0, atol=0)
+            workspace = group.symmetric_memory(
+                (rows, count * local_heads, width), dtype=torch.bfloat16, name="attention_output"
+            )
+            global_rows = rows * count
+            attended = torch.full(
+                (1, local_heads, global_rows, width),
+                float(rank),
+                device=device,
+                dtype=torch.bfloat16,
+            )
+            gate = torch.ones(global_rows, local_heads, width, device=device, dtype=torch.bfloat16)
+            compressed = (
+                torch.arange(count, device=device, dtype=torch.float32)
+                .view(1, count, 1)
+                .expand(local_heads, count, width)
+                .contiguous()
+            )
+            sync_input = torch.ones(1, device=device, dtype=torch.int32)
+            sync_output = torch.empty(count, device=device, dtype=torch.int32)
+
+            def compose():
+                compose_to_head_shards(
+                    attended, gate, compressed, workspace.peers, group.rank_in_group
+                )
+                group.all_gather_into_tensor(sync_output, sync_input)
+
+            compose()
+            expected = torch.cat(
+                [
+                    torch.full(
+                        (rows, local_heads, width),
+                        float(member + group.rank_in_group),
+                        device=device,
+                        dtype=torch.bfloat16,
+                    )
+                    for member in group.ranks
+                ],
+                dim=1,
+            )
+            torch.testing.assert_close(workspace.local, expected, rtol=0, atol=0)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                compose()
+            attended.add_(1)
+            graph.replay()
+            torch.testing.assert_close(workspace.local, expected + 1, rtol=0, atol=0)
+            # Captured NCCL operations retain their communicator until graph
+            # retirement. Release graphs before destroying runtime groups.
+            graph.reset()
+
+    tp = meshes["denoiser"].get_group("tp")
+    config = LayerConfig(TensorParallel(tp.rank_in_group, tp.world_size), None, tp)
+    weight = torch.arange(32, dtype=torch.float32, device=device).reshape(8, 4) / 32
+    down_weight = torch.arange(24, dtype=torch.float32, device=device).reshape(3, 8) / 16
+    bias = torch.tensor([2.0, -1.0, 0.5], device=device)
+    x = torch.arange(12, dtype=torch.float32, device=device).reshape(3, 4) / 8
+    with torch.device(device):
+        column = ColumnParallelLinear(4, 8, layer_config=config, bias=False)
+        row = RowParallelLinear(8, 3, layer_config=config, bias=True)
+    load_parameter_weight(column.weight, TensorWeightHandle("weight", weight))
+    load_parameter_weight(row.weight, TensorWeightHandle("weight", down_weight))
+    load_parameter_weight(row.bias, TensorWeightHandle("bias", bias))
+    actual = row(column(x))
+    torch.testing.assert_close(
+        actual, F.linear(F.linear(x, weight), down_weight, bias), rtol=1e-6, atol=1e-6
+    )
+
+    with torch.device(device):
+        vocab = VocabParallelEmbedding(65, 4, layer_config=config, init_weights=False)
+        qkv = QKVParallelLinear(4, 2, 2, 2, layer_config=config, bias=False)
+    attach_parameter_loaders(vocab, device=device, dtype=torch.float32)
+    vocab_weight = torch.arange(260, dtype=torch.float32, device=device).reshape(65, 4) / 32
+    load_parameter_weight(vocab.weight, TensorWeightHandle("weight", vocab_weight))
+    ids = torch.tensor([0, 31, 63, 64], device=device)
+    torch.testing.assert_close(vocab(ids), F.embedding(ids, vocab_weight), rtol=0, atol=0)
+    projections = [weight[:4] + offset for offset in (0, 1, 2)]
+    for name, projection_weight in zip(("q", "k", "v"), projections):
+        load_parameter_weight(qkv.weight, TensorWeightHandle(name, projection_weight), name)
+    local_projection = qkv(x)
+    expected_projection = torch.cat(
+        [
+            F.linear(x, projection_weight).chunk(tp.world_size, dim=-1)[tp.rank_in_group]
+            for projection_weight in projections
+        ],
+        dim=-1,
+    )
+    torch.testing.assert_close(local_projection, expected_projection, rtol=1e-6, atol=1e-6)
+
+    sequence = meshes["denoiser"].get_group("sp")
+    with torch.device(device):
+        projection = LinearBase(4, 8, layer_config=config, bias=False, sequence_group=sequence)
+    load_parameter_weight(projection.weight, TensorWeightHandle("weight", weight))
+    local = x + rank
+    workspace = torch.empty(
+        local.numel() * sequence.world_size * local.element_size(), dtype=torch.uint8, device=device
+    )
+    result = projection.forward_sequence_parallel(local, workspace)
+    global_x = torch.cat([x + member for member in sequence.ranks])
+    torch.testing.assert_close(result, F.linear(global_x, weight), rtol=1e-6, atol=1e-6)
+    environment.close()
+    dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("backend", ["gloo", pytest.param("nccl", marks=pytest.mark.gpu)])
+def test_component_collectives_and_loaded_linears(tmp_path: Path, backend: str):
+    rendezvous = (tmp_path / "rendezvous").as_uri()
+    mp.spawn(_run_groups, (rendezvous, backend), nprocs=4, join=True)

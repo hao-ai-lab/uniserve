@@ -30,8 +30,8 @@ from uniserve_worker.foundation.errors import (
     unsupported_setup,
 )
 from uniserve_worker.media.mux import AvMuxConfig, AvMuxSession, require_media_codecs
+from uniserve_worker.models.runtime import WorkerDeployment
 from uniserve_worker.models.video import DecodeKind, VideoOutputGeometry, VideoRunner
-from uniserve_worker.nn.mesh import DeviceMesh
 from uniserve_worker.profiling import profile_range
 from uniserve_worker.runtime.cpu import CpuTaskReservation
 from uniserve_worker.transfer.tickets import ShmTransport
@@ -64,10 +64,7 @@ class VideoOutputRing:
         if min(self.video_capacity, self.audio_capacity) < 1:
             raise ValueError("video output-ring capacities must be positive")
         video_bytes = (
-            int(max_video_frames_per_round)
-            * int(max_geometry.height)
-            * int(max_geometry.width)
-            * 3
+            int(max_video_frames_per_round) * int(max_geometry.height) * int(max_geometry.width) * 3
         )
         audio_bytes = (
             round(
@@ -169,9 +166,7 @@ class VideoOutputRingLease:
             self.release()
             return
         self._released = True
-        capture.buffer.retain_until_ready(
-            _DeferredRingRelease(self._ring, self.kind, self.index)
-        )
+        capture.buffer.retain_until_ready(_DeferredRingRelease(self._ring, self.kind, self.index))
 
     def __del__(self) -> None:
         """Release an unclosed output-ring lease during finalization."""
@@ -200,16 +195,13 @@ class _DeferredRingRelease:
 class VideoMuxCoordinator:
     """Request-indexed mux sessions with independent video and audio tails."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, rank: int) -> None:
         """Initialize per-request mux sessions and temporal overlap tails."""
 
+        self.rank = rank
         self._sessions: dict[RequestKey, AvMuxSession] = {}
-        self._video_tails: dict[
-            RequestKey, concurrent.futures.Future[object] | None
-        ] = {}
-        self._audio_tails: dict[
-            RequestKey, concurrent.futures.Future[object] | None
-        ] = {}
+        self._video_tails: dict[RequestKey, concurrent.futures.Future[object] | None] = {}
+        self._audio_tails: dict[RequestKey, concurrent.futures.Future[object] | None] = {}
 
     def open(self, request_key: RequestKey, *, geometry) -> None:
         """Create the request-owned mux session for a validated output geometry."""
@@ -251,9 +243,7 @@ class VideoMuxCoordinator:
             capture=capture,
             dependencies=dependencies,
             release=None if ring_lease is None else ring_lease.release,
-            defer_release=(
-                None if ring_lease is None else ring_lease.defer_until_capture_ready
-            ),
+            defer_release=(None if ring_lease is None else ring_lease.defer_until_capture_ready),
             profile_name=profile_name,
         )
 
@@ -273,16 +263,14 @@ class VideoMuxCoordinator:
         task = self._task(
             request_key,
             reservation,
-            lambda session: session.write_video(
-                start_unit, unit_count, capture.numpy()
-            ),
+            lambda session: session.write_video(start_unit, unit_count, capture.numpy()),
             capture,
             () if dependency is None else (dependency,),
             ring_lease,
             profile_name=(
                 f"uniserve.video.mux request={_key_label(request_key)} "
                 f"op={operation_id} kind=video start_unit={start_unit} "
-                f"unit_count={unit_count} rank=0"
+                f"unit_count={unit_count} rank={self.rank}"
             ),
         )
         self._video_tails[request_key] = task.promise
@@ -310,7 +298,7 @@ class VideoMuxCoordinator:
             ring_lease,
             profile_name=(
                 f"uniserve.video.mux request={_key_label(request_key)} "
-                f"op={operation_id} kind=audio rank=0"
+                f"op={operation_id} kind=audio rank={self.rank}"
             ),
         )
         self._audio_tails[request_key] = task.promise
@@ -351,7 +339,7 @@ class VideoMuxCoordinator:
             dependencies,
             profile_name=(
                 f"uniserve.video.mux request={_key_label(request_key)} "
-                f"op={operation_id} kind=artifact rank=0"
+                f"op={operation_id} kind=artifact rank={self.rank}"
             ),
         )
 
@@ -395,9 +383,7 @@ def trajectory_placement(lane: RunLane, operation: Operation):
     return selected[0]
 
 
-def decode_placement(
-    lane: RunLane, operation: Operation
-) -> DecodePlacement:
+def decode_placement(lane: RunLane, operation: Operation) -> DecodePlacement:
     """Return the unique reconstruction placement assigned to an operation."""
 
     selected = tuple(
@@ -407,9 +393,7 @@ def decode_placement(
         and int(placement.op_id) == int(operation.op_id)
     )
     if len(selected) != 1:
-        raise invalid_descriptor(
-            "video decode operation has no exact decode placement"
-        )
+        raise invalid_descriptor("video decode operation has no exact decode placement")
     return selected[0]
 
 
@@ -442,7 +426,7 @@ def validate_batch(runtime: ExecutionResources, batch: Run) -> None:
 
 def execute_action(
     model: VideoRunner,
-    mesh: DeviceMesh,
+    deployment: WorkerDeployment,
     mux: object | None,
     operation: Operation,
     lane: RunLane,
@@ -465,19 +449,17 @@ def execute_action(
         return ()
     if variant is RunKind.DIFFUSION_DECODE:
         placement = decode_placement(lane, operation)
-        decoded = model.decode(
-            slot, int(placement.cursor), int(placement.max_units)
-        )
+        decoded = model.decode(slot, int(placement.cursor), int(placement.max_units))
         if decoded.kind is DecodeKind.VIDEO:
             rgb = decoded.value
-            if mesh.coord("sp") != 0:
+            if deployment.rank != deployment.output_rank:
                 return ()
             if rgb is None or reservation is None or ring_lease is None or mux is None:
-                raise RuntimeError("rank zero lost its video capture resources")
+                raise RuntimeError("output owner lost its video capture resources")
             with profile_range(
                 f"uniserve.video.decode_copy request={_request_label(operation)} "
                 f"op={operation.op_id} kind=video unit={decoded.unit_offset} "
-                f"rank={mesh.coord('sp')}"
+                f"rank={deployment.rank}"
             ):
                 capture = buffer.capture_bytes_into(rgb, ring_lease.storage)
             try:
@@ -498,13 +480,13 @@ def execute_action(
         if decoded.kind is not DecodeKind.AUDIO:
             raise invalid_descriptor("video bounded decode returned an unexpected action")
         pcm = decoded.value
-        if mesh.coord("sp") != 0:
+        if deployment.rank != deployment.output_rank:
             return ()
         if pcm is None or reservation is None or ring_lease is None or mux is None:
-            raise RuntimeError("rank zero lost its audio capture resources")
+            raise RuntimeError("output owner lost its audio capture resources")
         with profile_range(
             f"uniserve.video.decode_copy request={_request_label(operation)} "
-            f"op={operation.op_id} kind=audio rank={mesh.coord('sp')}"
+            f"op={operation.op_id} kind=audio rank={deployment.rank}"
         ):
             capture = buffer.capture_bytes_into(pcm.view(torch.uint8), ring_lease.storage)
         try:
@@ -522,16 +504,14 @@ def execute_action(
             raise
     if variant is RunKind.DIFFUSION_FINALIZE:
         placement = decode_placement(lane, operation)
-        decoded = model.decode(
-            slot, int(placement.cursor), int(placement.max_units)
-        )
+        decoded = model.decode(slot, int(placement.cursor), int(placement.max_units))
         if decoded.kind is not DecodeKind.FINALIZE:
             raise invalid_descriptor("video final decode did not select artifact finalization")
         model.finalize(slot)
-        if mesh.coord("sp") != 0:
+        if deployment.rank != deployment.output_rank:
             return ()
         if reservation is None or mux is None:
-            raise RuntimeError("rank zero lost its artifact reservation")
+            raise RuntimeError("output owner lost its artifact reservation")
         return (mux.finalize_artifact(operation.request_key, reservation, operation.op_id),)
     raise invalid_descriptor(f"unsupported video work variant {variant.value!r}")
 
@@ -556,15 +536,15 @@ def run_action(runtime: ExecutionResources, state: OperationState) -> bool:
     request = runtime.request_row(scope, operation.request_key.request_id)
     slot = runtime.requests.model_state_slot(request.request_pool_idx)
     mux = runtime._media_mux
-    if runtime.mesh.coord("sp") == 0 and mux is None:
-        raise unsupported_setup("rank zero has no video mux resources")
+    if runtime.deployment.rank == runtime.deployment.output_rank and mux is None:
+        raise unsupported_setup("output owner has no video mux resources")
     identity = runtime.operation_identity(operation)
     if operation.kind is RunKind.DIFFUSION_PREPARE:
         admission = scope.admissions.get(operation.request_key)
         if admission is None:
             raise invalid_descriptor("video preparation has no matching start command")
         model.prepare(slot, admission)
-        if runtime.mesh.coord("sp") == 0:
+        if runtime.deployment.rank == runtime.deployment.output_rank:
             assert mux is not None
             media = admission.diffusion
             if media is None:
@@ -573,7 +553,7 @@ def run_action(runtime: ExecutionResources, state: OperationState) -> bool:
             mux.open(operation.request_key, geometry=geometry)
     tasks = execute_action(
         model,
-        runtime.mesh,
+        runtime.deployment,
         mux,
         operation,
         scope.lane,

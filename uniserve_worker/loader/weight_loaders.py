@@ -221,11 +221,27 @@ def packed_weight_loader(
 ) -> None:
     """Copy one logical packed shard into its assigned interval of a merged parameter."""
 
-    if shard_id is None:
-        raise ValueError("packed parameters require a checkpoint shard id")
     plan = _required_plan(parameter)
     if plan.shard_axis is None:
         raise ValueError("packed parameter plan has no shard axis")
+    if shard_id is None:
+        # A checkpoint may concatenate its logical branches in one tensor.
+        # Slice each branch in checkpoint coordinates before installing the
+        # local packed order; a contiguous slice of the merged tensor is wrong.
+        axis = plan.shard_axis
+        slots = sorted(plan.slots.values(), key=lambda slot: slot.offset)
+        extents = [slot.size * (1 if slot.shard.replicated else slot.shard.size) for slot in slots]
+        if handle.shape[axis] != sum(extents) or any(slot.shard.axis != axis for slot in slots):
+            raise ValueError("packed checkpoint does not match its logical branch extents")
+        parameter = _materialize(parameter, dtype=_target_dtype(parameter, handle))
+        offset = 0
+        for slot, extent in zip(slots, extents):
+            start = offset + (0 if slot.shard.replicated else slot.shard.rank * slot.size)
+            target = parameter.data.narrow(axis, slot.offset, slot.size)
+            _copy(target, handle.narrow(axis, start, slot.size), parameter)
+            offset += extent
+        _mark_loaded(parameter)
+        return
     slot = plan.slot_for(shard_id)
     if slot is None:
         raise ValueError(f"unknown packed checkpoint shard id {shard_id!r}")
@@ -344,7 +360,9 @@ def fp8_weight_loader(
     target_dtype = (
         torch.float8_e4m3fn
         if offline
-        else serving_dtype if isinstance(serving_dtype, torch.dtype) else parameter.dtype
+        else serving_dtype
+        if isinstance(serving_dtype, torch.dtype)
+        else parameter.dtype
     )
     parameter = _materialize(parameter, dtype=target_dtype)
     set_skip_serving_cast(parameter, offline)
@@ -423,7 +441,9 @@ def _payload_for_plan(
     return _payload_for_shard(handle, plan.shard, target_shape)
 
 
-def _payload_for_shard(handle: WeightHandle, shard: Any, target_shape: tuple[int, ...]) -> torch.Tensor:
+def _payload_for_shard(
+    handle: WeightHandle, shard: Any, target_shape: tuple[int, ...]
+) -> torch.Tensor:
     """Materialize a replicated value or the rank-local interval along one shard axis."""
 
     axis = int(shard.axis)

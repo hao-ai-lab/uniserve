@@ -761,7 +761,7 @@ def _nvtx_category(text: str, marker: bool) -> str:
     lower = text.lower()
     if "nccl" in lower:
         return "nccl"
-    if text.startswith("uniserve.h3.collective"):
+    if text.startswith("uniserve.collective"):
         return "collective"
     return "nvtx_marker" if marker else "nvtx"
 

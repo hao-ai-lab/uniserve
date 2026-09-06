@@ -11,9 +11,9 @@ from torch import nn
 from ...execution.fixed_graph import StaticCudaGraph
 from ...nn.quant.nvfp4 import replace_nvfp4_linears
 from .precision import VideoVAELinearPrecision
-from .video_vae_decoder import MiniMaxH3VideoDecoder
+from .video_vae_decoder import MiniMaxH3VideoDecoder, blend_decoded_overlap
 
-__all__ = ["MiniMaxH3VideoVAE"]
+__all__ = ["MiniMaxH3VideoVAE", "H3VideoAssembler"]
 
 
 class MiniMaxH3VideoVAE(nn.Module):
@@ -117,25 +117,6 @@ class MiniMaxH3VideoVAE(nn.Module):
             torch.tensor(std, dtype=torch.float32, device=self.device).view(1, 24, 1, 1, 1),
             persistent=False,
         )
-        self.register_buffer(
-            "pixel_mean",
-            torch.tensor(
-                (0.485, 0.456, 0.406),
-                dtype=torch.float32,
-                device=self.device,
-            ).view(1, 3, 1, 1, 1),
-            persistent=False,
-        )
-        self.register_buffer(
-            "pixel_std",
-            torch.tensor(
-                (0.229, 0.224, 0.225),
-                dtype=torch.float32,
-                device=self.device,
-            ).view(1, 3, 1, 1, 1),
-            persistent=False,
-        )
-
         # Graph input storage remains stable for the lifetime of the captured
         # decoder graph and is installed only when capture is requested.
         self.decode_graph = StaticCudaGraph[torch.Tensor](self.device)
@@ -266,36 +247,6 @@ class MiniMaxH3VideoVAE(nn.Module):
         return self.decode_graph.replay()
 
     @torch.inference_mode()
-    def assemble_segment(
-        self,
-        segment: torch.Tensor,
-        previous_overlap: torch.Tensor | None,
-        *,
-        final_unit: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Join one decoded segment and return RGB24 frames plus its successor overlap."""
-
-        if segment.shape != (1, 3, 25, 768, 1344):
-            raise ValueError("an H3 decoded video segment must have shape [1, 3, 25, 768, 1344]")
-        body_frames = int(self.vae.tokens_chunk_size) * int(
-            self.vae.temporal_compression_ratio
-        ) - int(self.vae.frame_pre_padding)
-        body = segment[:, :, :body_frames]
-        if previous_overlap is not None:
-            body = self.vae._blend(
-                previous_overlap,
-                body,
-                int(self.vae.frame_overlap),
-                dim=-3,
-            )
-        next_overlap = segment[:, :, body_frames + int(self.vae.frame_pre_padding) :].contiguous()
-        if final_unit:
-            body = torch.cat((body, next_overlap[:, :, :5]), dim=2)
-        pixels = (body.float() * self.pixel_std + self.pixel_mean).clamp_(0.0, 1.0)
-        rgb24 = pixels[0].permute(1, 2, 3, 0).mul_(255.0).round_().to(torch.uint8).contiguous()
-        return rgb24, next_overlap[:, :, :5].contiguous()
-
-    @torch.inference_mode()
     def capture_decoder(self, normalized_latents: torch.Tensor) -> torch.Tensor:
         """Warm and capture the fixed-shape segment decoder."""
 
@@ -307,3 +258,60 @@ class MiniMaxH3VideoVAE(nn.Module):
             lambda: self._decode_normalized_segment(self.decode_graph_input),
             warmup=lambda: self._decode_normalized_segment(self.decode_graph_input),
         )
+
+
+class H3VideoAssembler(nn.Module):
+    """Own temporal overlap and RGB conversion independently of VAE weights."""
+
+    def __init__(self, device: torch.device) -> None:
+        super().__init__()
+        self.register_buffer(
+            "pixel_mean",
+            torch.tensor(
+                (0.485, 0.456, 0.406),
+                dtype=torch.float32,
+                device=device,
+            ).view(1, 3, 1, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "pixel_std",
+            torch.tensor(
+                (0.229, 0.224, 0.225),
+                dtype=torch.float32,
+                device=device,
+            ).view(1, 3, 1, 1, 1),
+            persistent=False,
+        )
+
+    @torch.inference_mode()
+    def forward(
+        self,
+        segment: torch.Tensor,
+        previous_overlap: torch.Tensor | None,
+        *,
+        final_unit: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Join one decoded segment and return RGB24 frames plus its successor overlap."""
+
+        if segment.shape != (1, 3, 25, 768, 1344):
+            raise ValueError("an H3 decoded video segment must have shape [1, 3, 25, 768, 1344]")
+        body_frames = int(MiniMaxH3VideoDecoder.tokens_chunk_size) * int(
+            MiniMaxH3VideoDecoder.temporal_compression_ratio
+        ) - int(MiniMaxH3VideoDecoder.frame_pre_padding)
+        body = segment[:, :, :body_frames]
+        if previous_overlap is not None:
+            body = blend_decoded_overlap(
+                previous_overlap,
+                body,
+                int(MiniMaxH3VideoDecoder.frame_overlap),
+                dim=-3,
+            )
+        next_overlap = segment[
+            :, :, body_frames + int(MiniMaxH3VideoDecoder.frame_pre_padding) :
+        ].contiguous()
+        if final_unit:
+            body = torch.cat((body, next_overlap[:, :, :5]), dim=2)
+        pixels = (body.float() * self.pixel_std + self.pixel_mean).clamp_(0.0, 1.0)
+        rgb24 = pixels[0].permute(1, 2, 3, 0).mul_(255.0).round_().to(torch.uint8).contiguous()
+        return rgb24, next_overlap[:, :, :5].contiguous()

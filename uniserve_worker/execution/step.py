@@ -55,7 +55,6 @@ from uniserve_worker.execution.batch import (
 from uniserve_worker.execution.forward_batch import (
     AttentionSelection,
     ModelPhase,
-    RouteMeshView,
 )
 from uniserve_worker.execution.graph_bucket import GraphBucket
 from uniserve_worker.execution.output import (
@@ -224,10 +223,12 @@ def create_execution_resources(
     if cache_pool is not None and attention is None:
         raise unsupported_setup("packed-forward execution requires attention selection")
     media_model = isinstance(model, VideoRunner)
-    if media_model and mesh.coord("sp") == 0 and (
-        media_mux is None or media_output_ring is None
+    if (
+        media_model
+        and deployment.rank == deployment.output_rank
+        and (media_mux is None or media_output_ring is None)
     ):
-        raise unsupported_setup("rank-zero video execution requires mux and output-ring resources")
+        raise unsupported_setup("video output ownership requires mux and output-ring resources")
     if not media_model and (media_mux is not None or media_output_ring is not None):
         raise unsupported_setup("packed-forward execution cannot own media output resources")
     device = canonical_device(deployment.device)
@@ -344,9 +345,14 @@ def plan_run(runtime, batch: Run) -> Run:
         grouped.setdefault(operation.domain, []).append((index, operation))
     lanes: list[RunLane] = []
     for lane_id, (domain, members) in enumerate(grouped.items(), start=1):
-        global_to_local = {global_index: local_index for local_index, (global_index, _operation) in enumerate(members)}
+        global_to_local = {
+            global_index: local_index
+            for local_index, (global_index, _operation) in enumerate(members)
+        }
         member_operations = tuple(operation for _index, operation in members)
-        identities = {(operation.request_key, int(operation.op_id)) for operation in member_operations}
+        identities = {
+            (operation.request_key, int(operation.op_id)) for operation in member_operations
+        }
         rows = tuple(
             replace(row, operation_index=global_to_local[int(row.operation_index)])
             for row in batch.forward_rows
@@ -355,7 +361,10 @@ def plan_run(runtime, batch: Run) -> Run:
         request_slots = {int(row.request_pool_index) for row in rows}
         attention = (
             AttentionRegime.CAUSAL
-            if all(operation.kind in {RunKind.AR_EXTEND, RunKind.AR_DECODE, RunKind.AR_VERIFY} for operation in member_operations)
+            if all(
+                operation.kind in {RunKind.AR_EXTEND, RunKind.AR_DECODE, RunKind.AR_VERIFY}
+                for operation in member_operations
+            )
             else AttentionRegime.HYBRID
             if any(operation.kind is RunKind.DIFFUSION_STEP for operation in member_operations)
             else AttentionRegime.NONE
@@ -370,11 +379,27 @@ def plan_run(runtime, batch: Run) -> Run:
                 attention=attention,
                 shape_class=0,
                 operations=member_operations,
-                block_tables=tuple(table for table in batch.block_tables if int(table.request_pool_idx) in request_slots),
-                new_cache_pages=tuple(allocation for allocation in batch.new_cache_pages if int(allocation.request_pool_idx) in request_slots),
+                block_tables=tuple(
+                    table
+                    for table in batch.block_tables
+                    if int(table.request_pool_idx) in request_slots
+                ),
+                new_cache_pages=tuple(
+                    allocation
+                    for allocation in batch.new_cache_pages
+                    if int(allocation.request_pool_idx) in request_slots
+                ),
                 forward_rows=rows,
-                latent_placements=tuple(placement for placement in batch.latent_placements if (placement.request_key, int(placement.op_id)) in identities),
-                decode_placements=tuple(placement for placement in batch.decode_placements if (placement.request_key, int(placement.op_id)) in identities),
+                latent_placements=tuple(
+                    placement
+                    for placement in batch.latent_placements
+                    if (placement.request_key, int(placement.op_id)) in identities
+                ),
+                decode_placements=tuple(
+                    placement
+                    for placement in batch.decode_placements
+                    if (placement.request_key, int(placement.op_id)) in identities
+                ),
                 buffer_placements=tuple(
                     placement
                     for placement in batch.buffer_placements
@@ -414,9 +439,7 @@ def prepare_batch(runtime, batch: Run) -> PreparedExecution | None:
     from . import transfer
 
     entries = tuple(
-        payload
-        for payload in batch.input_products
-        if isinstance(payload.payload, TransferHandle)
+        payload for payload in batch.input_products if isinstance(payload.payload, TransferHandle)
     )
     transport = runtime.transport
     if entries and transport is None:
@@ -853,9 +876,7 @@ def _execute(
             continue
 
         if propagate_errors and execution_errors:
-            first_lane = next(
-                lane for lane in lanes if lane.lane_id in execution_errors
-            )
+            first_lane = next(lane for lane in lanes if lane.lane_id in execution_errors)
             classified = _classify_lane_failure(
                 runtime,
                 first_lane,
@@ -1261,9 +1282,7 @@ def _execute_lane_group(
         )
         for device in _completion_devices(runtime, active):
             scope.completion.begin_device(device)
-    grouped: list[list[Outcome | None]] = [
-        [None] * len(scope.lane.operations) for scope in scopes
-    ]
+    grouped: list[list[Outcome | None]] = [[None] * len(scope.lane.operations) for scope in scopes]
     group_active = tuple(
         operation
         for scope in scopes
@@ -1403,9 +1422,7 @@ def _run_ready_set(
                 continue
             sample = token.pack_sample(state)
             if sample is not None:
-                samples[state.lane.lane.lane_id].append(
-                    (state, cast(SampleWork, sample))
-                )
+                samples[state.lane.lane.lane_id].append((state, cast(SampleWork, sample)))
         if samples:
             for lane_id, candidates in samples.items():
                 state = candidates[0][0]
@@ -1545,7 +1562,7 @@ def _commit_lane(
         )
     ):
         _validate_completion_products(runtime, operation, outcome.products)
-        if int(runtime.deployment.tp_rank) == 0:
+        if runtime.deployment.rank == runtime.deployment.output_rank:
             report_products.extend(outcome.products)
         pending = PendingOutput(
             (
@@ -1799,13 +1816,13 @@ def _reserve_cpu_tasks(
     """Reserve bounded CPU slots for active operations that schedule host-side work."""
 
     video_model = isinstance(runtime.model, VideoRunner)
-    rank_zero = runtime.mesh.coord("sp") == 0 if video_model else True
+    owns_output = not video_model or runtime.deployment.rank == runtime.deployment.output_rank
     for operation in operations:
         if operation.kind is not RunKind.DIFFUSION_FINALIZE and not (
             video_model and operation.kind is RunKind.DIFFUSION_DECODE
         ):
             continue
-        if not rank_zero:
+        if not owns_output:
             continue
         identity = _operation_identity(operation)
         if identity in scope.cpu_tasks:
@@ -1823,16 +1840,12 @@ def _reserve_cpu_tasks(
                     None,
                 )
                 if placement is None:
-                    raise invalid_descriptor(
-                        "video decode operation has no exact decode placement"
-                    )
+                    raise invalid_descriptor("video decode operation has no exact decode placement")
                 request = runtime.request_row(scope, operation.request_key.request_id)
                 slot = runtime.requests.model_state_slot(request.request_pool_idx)
                 kind = runtime.model.decode_kind(slot, int(placement.cursor))
                 if kind not in {DecodeKind.VIDEO, DecodeKind.AUDIO}:
-                    raise invalid_descriptor(
-                        "video decode placement does not capture media output"
-                    )
+                    raise invalid_descriptor("video decode placement does not capture media output")
                 scope.media_output_leases[identity] = runtime.media_output_ring().reserve(
                     kind.value
                 )
@@ -1922,7 +1935,8 @@ def _build_error_lane(
             else EncoderResult
             if operation.kind in {RunKind.ENCODER_VISION, RunKind.ENCODER_LATENT}
             else DiffusionResult
-            if operation.kind in {
+            if operation.kind
+            in {
                 RunKind.DIFFUSION_PREPARE,
                 RunKind.DIFFUSION_STEP,
                 RunKind.DIFFUSION_DECODE,
@@ -2004,9 +2018,7 @@ def _validate_batch(runtime, batch: Run) -> None:
     for lanes in groups.values():
         if len(lanes) < 2:
             continue
-        variants = {
-            operation.kind for lane in lanes for operation in lane.operations
-        }
+        variants = {operation.kind for lane in lanes for operation in lane.operations}
         if not runtime.model.tensorized_mixed or variants != {
             RunKind.AR_DECODE,
             RunKind.DIFFUSION_STEP,
@@ -2018,11 +2030,11 @@ def _validate_batch(runtime, batch: Run) -> None:
         if bucket not in runtime.mixed_buckets:
             raise invalid_descriptor("tensorized mixed submission has no exact qualified bucket")
     runtime.model.validate_run(runtime, batch)
-    validate_collective_sequence(runtime.mesh, runtime._collective_history, batch)
+    validate_collective_sequence(runtime.deployment.world_size, runtime._collective_history, batch)
 
 
 def validate_collective_sequence(
-    mesh: DeviceMesh,
+    process_world_size: int,
     history: OrderedDict[int, object],
     batch: Run,
 ) -> None:
@@ -2037,7 +2049,7 @@ def validate_collective_sequence(
         if existing != collective_identity:
             raise invalid_descriptor("collective sequence was reused with different work")
         return
-    if mesh.tp_size > 1 and history and collective_seq <= next(reversed(history)):
+    if process_world_size > 1 and history and collective_seq <= next(reversed(history)):
         raise invalid_descriptor("collective sequence does not advance")
     history[collective_seq] = collective_identity
     while len(history) > 4096:
@@ -2069,9 +2081,7 @@ def _mixed_bucket(
     """Resolve a shared captured-graph bucket for a compatible mixed lane group."""
 
     decode_rows = sum(
-        operation.kind is RunKind.AR_DECODE
-        for lane in lanes
-        for operation in lane.operations
+        operation.kind is RunKind.AR_DECODE for lane in lanes for operation in lane.operations
     )
     flow_operations = tuple(
         operation
@@ -2174,8 +2184,7 @@ def _reserve_outputs(
     if persistent_bindings:
         groups = (*groups, tuple(persistent_bindings))
     request_slots = {
-        request.request_key: int(request.request_pool_idx)
-        for request in scope.request_candidates
+        request.request_key: int(request.request_pool_idx) for request in scope.request_candidates
     }
     bound_groups = runtime.device_products.bind_output_groups(
         groups,
@@ -2189,8 +2198,7 @@ def _reserve_outputs(
         runtime.encoder_cache.bind_outputs(
             tuple(encoder_bindings),
             buffer_placements={
-                placement.buffer: placement
-                for placement in scope.lane.buffer_placements
+                placement.buffer: placement for placement in scope.lane.buffer_placements
             },
         )
     )
@@ -2530,9 +2538,7 @@ def _bind_latent_rows(
             identity = placement.request_key, int(placement.op_id)
             selected = operations.get(identity)
             if selected is None:
-                raise invalid_descriptor(
-                    "latent placement names an operation outside its lane"
-                )
+                raise invalid_descriptor("latent placement names an operation outside its lane")
             operation, request = selected
             slot = int(request.request_pool_idx)
             if placement.page_table != (slot,):
@@ -2875,9 +2881,7 @@ def _stage_input_products(
                 if len(tensors) != 1:
                     raise invalid_descriptor("latent transfer produced an invalid tensor set")
                 consumers = tuple(
-                    operation
-                    for operation in scope.lane.operations
-                    if product in operation.inputs
+                    operation for operation in scope.lane.operations if product in operation.inputs
                 )
                 if len(consumers) != 1:
                     raise invalid_descriptor("latent transfer must have one lane consumer")
@@ -2951,8 +2955,7 @@ def _stage_input_products(
                     ((product, device),),
                     request_slots=request_slots,
                     buffer_placements={
-                        placement.buffer: placement
-                        for placement in scope.lane.buffer_placements
+                        placement.buffer: placement for placement in scope.lane.buffer_placements
                     },
                 )[0]
                 scope.device_writes.append(binding)
@@ -2982,8 +2985,7 @@ def _stage_input_products(
             encoder_binding = runtime.encoder_cache.bind_outputs(
                 ((product, device),),
                 buffer_placements={
-                    placement.buffer: placement
-                    for placement in scope.lane.buffer_placements
+                    placement.buffer: placement for placement in scope.lane.buffer_placements
                 },
             )[0]
             scope.encoder_writes.append(encoder_binding)
@@ -3314,7 +3316,7 @@ def _broadcast_tp_selection(runtime, value: torch.Tensor) -> torch.Tensor:
 
     if runtime.mesh.tp_size <= 1:
         return value
-    transport = runtime.mesh.transport("tp")
+    transport = runtime.mesh.get_group("tp")
     return transport.broadcast(value, src=0)
 
 
@@ -3369,12 +3371,10 @@ def _run_forward_group(
         if all(task.phase in {ModelPhase.TEXT, ModelPhase.DENOISE} for task in tasks)
         else _dense_attention_columns(len(tasks), tuple(task.query_tokens for task in tasks))
     )
-    mesh = RouteMeshView(runtime.mesh, _phase_topology(runtime, tasks[0].phase))
     result = runtime.runner.run(
         tasks,
         device=target,
         attention=attention,
-        mesh=mesh,
         graph_shape=_group_graph_shape(runtime, tasks),
         graph_eligible=(
             scope.graph_eligible

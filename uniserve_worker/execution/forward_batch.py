@@ -11,121 +11,12 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING, TypeAlias
+from typing import TYPE_CHECKING
 
 import torch
 
-from ..nn.mesh import CollectiveTransport, DeviceMesh, LocalP2PTransport
-
 if TYPE_CHECKING:
     from ..backends.attention.base import AttentionBackend
-
-
-@dataclass(frozen=True, slots=True)
-class EmptyMeshView:
-    """Implements mesh collectives as identity operations for a single-device route."""
-
-    def all_reduce(self, value: torch.Tensor, axis: str) -> torch.Tensor:
-        """Preserve the local value because the requested axis has one participant."""
-
-        del axis
-        return value
-
-    def all_gather(self, value: torch.Tensor, axis: str, dimension: int) -> torch.Tensor:
-        """Preserve rank and storage because there are no remote shards to concatenate."""
-
-        del axis, dimension
-        return value
-
-    def dispatch(self, value: torch.Tensor, axis: str, coordinate: int) -> torch.Tensor:
-        """Preserve the local value for the sole valid route coordinate."""
-
-        del axis, coordinate
-        return value
-
-    def combine(
-        self,
-        value: torch.Tensor,
-        axis: str,
-        coordinate: int,
-        target: torch.device,
-    ) -> torch.Tensor:
-        """Return the local tensor unchanged because no distributed mesh is active."""
-
-        del axis, coordinate
-        return value.to(target) if value.device != target else value
-
-
-class RouteMeshView:
-    """Restricted view of the mesh axes declared by one physical model route."""
-
-    def __init__(self, mesh: DeviceMesh, axes: tuple[str, ...]) -> None:
-        """Restrict a physical device mesh to axes declared by one model route."""
-
-        self._mesh = mesh
-        self._axes = frozenset(axes)
-        if any(not axis for axis in self._axes):
-            raise ValueError("mesh axis names must not be empty")
-
-    def all_reduce(self, value: torch.Tensor, axis: str) -> torch.Tensor:
-        """Reduce a tensor across the requested mesh axis for the active model route."""
-
-        transport = self._transport(axis)
-        if transport is None:
-            return value
-        if not isinstance(transport, CollectiveTransport):
-            raise RuntimeError(f"mesh axis {axis!r} does not support all-reduce")
-        return transport.all_reduce(value)
-
-    def all_gather(self, value: torch.Tensor, axis: str, dimension: int) -> torch.Tensor:
-        """Gather tensor shards along a dimension across the requested route mesh axis."""
-
-        transport = self._transport(axis)
-        if transport is None:
-            return value
-        if not isinstance(transport, CollectiveTransport):
-            raise RuntimeError(f"mesh axis {axis!r} does not support all-gather")
-        return transport.all_gather(value, dimension)
-
-    def dispatch(self, value: torch.Tensor, axis: str, coordinate: int) -> torch.Tensor:
-        """Select the requested mesh coordinate and exchange route-local tensor shards."""
-
-        transport = self._transport(axis)
-        if transport is None:
-            return value
-        if not isinstance(transport, LocalP2PTransport):
-            raise RuntimeError(f"mesh axis {axis!r} does not support peer dispatch")
-        return transport.copy_to(value, coord=int(coordinate))
-
-    def combine(
-        self,
-        value: torch.Tensor,
-        axis: str,
-        coordinate: int,
-        target: torch.device,
-    ) -> torch.Tensor:
-        """Collect route-local shards on the target device and compose the requested mesh axis."""
-
-        self._require_axis(axis)
-        del coordinate
-        return value if value.device == target else value.to(target, non_blocking=True)
-
-    def _transport(self, axis: str):
-        """Return the transport for a declared route axis after validating access."""
-
-        self._require_axis(axis)
-        if self._mesh.is_trivial(axis):
-            return None
-        return self._mesh.transport(axis)
-
-    def _require_axis(self, axis: str) -> None:
-        """Reject collective access to an axis outside the physical route."""
-
-        if axis not in self._axes:
-            raise RuntimeError(f"mesh axis {axis!r} is outside this forward route")
-
-
-MeshView: TypeAlias = EmptyMeshView | RouteMeshView
 
 
 @dataclass(frozen=True, slots=True)
@@ -295,7 +186,6 @@ class ForwardBatch:
     decode_latents: tuple[torch.Tensor, ...] = ()
     decode_heights: tuple[int, ...] = ()
     decode_widths: tuple[int, ...] = ()
-    mesh: MeshView = EmptyMeshView()
 
     def __post_init__(self) -> None:
         """Validate borrowed batch columns against attention mode and row geometry."""
@@ -372,13 +262,10 @@ class ForwardOutput:
 
 __all__ = [
     "AttentionMode",
-    "EmptyMeshView",
     "ExpertRoute",
     "FlowPatches",
     "ForwardBatch",
     "ForwardOutput",
-    "MeshView",
-    "RouteMeshView",
     "RouteSpan",
     "ModelPhase",
     "TokenSelection",

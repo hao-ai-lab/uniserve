@@ -9,7 +9,6 @@ from torch import nn
 from uniserve_worker.execution.batch import RunKind
 from uniserve_worker.execution.forward_batch import (
     AttentionMode,
-    EmptyMeshView,
     ForwardBatch,
     ModelPhase,
     TokenSelection,
@@ -149,7 +148,6 @@ def _text_batch(
         input_ids=torch.zeros(total, dtype=torch.long),
         positions=torch.arange(total, dtype=torch.long),
         token_selections=(TokenSelection.LAST_LOGITS,) * rows,
-        mesh=EmptyMeshView(),
     )
 
 

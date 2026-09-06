@@ -19,7 +19,9 @@ pub struct WorkerProcessArgs {
     pub model: String,
     /// Device specification supplied to the worker.
     pub device: String,
-    /// Number of tensor-parallel worker ranks.
+    /// Explicit component deployment, resolved before physical worker launch.
+    pub deployment: Option<crate::executor::StageDeployConfig>,
+    /// Number of physical worker processes.
     pub world_size: usize,
     /// Maximum number of physical runs concurrently in flight per rank.
     pub pipeline_depth: usize,
@@ -61,8 +63,8 @@ pub struct WorkerProcessArgs {
     pub kv_memory_fraction: f64,
     /// Optional device mesh specification for staged model components.
     pub mesh: Option<String>,
-    /// Optional tensor-parallel communication backend.
-    pub tp_backend: Option<String>,
+    /// Optional process-world communication backend.
+    pub distributed_backend: Option<String>,
     /// Deployment-static execution lane descriptors.
     pub lanes: Vec<LaneConfig>,
     /// Whether decode execution may use captured CUDA graphs.

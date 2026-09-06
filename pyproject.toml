@@ -54,20 +54,21 @@ bench = [
     "httpx>=0.27",
     "pillow>=10.4",
 ]
-# Optional accelerator kernels. Worker imports are guarded and fall back to a
-# pure-PyTorch attention path when absent. Install only wheels that exist for
-# your platform. UniServe-authored optional kernels live in the independent
-# `uniserve-kernel` pack (jagged FlashAttention is
-# `uniserve-kernel[flash_attn_jagged]`). MiniMax H3 SM100a sparse attention uses
-# FastVideo and cuDNN Frontend CuTe DSL providers.
+# Optional accelerator kernels. Model bindings require their declared native
+# capabilities at startup. UniServe kernels live in the independent
+# `uniserve-kernel` pack. H3 uses its SM100a sparse-attention
+# extensions plus cuDNN Frontend CuTe DSL; native builds require a CUDA 13 toolkit.
 gpu = [
     "flashinfer-python",
 ]
 h3 = [
-    "fastvideo-kernel==0.3.4",
+    "uniserve-kernel[sparse_attention]",
     "nvidia-cudnn-frontend[cutedsl]==1.27.0",
     "nvidia-cutlass-dsl[cu13]==4.6.1",
 ]
+
+[tool.uv.sources]
+uniserve-kernel = { path = "uniserve_kernel", editable = true }
 
 [project.scripts]
 uniserve-worker = "uniserve_worker.main:main"

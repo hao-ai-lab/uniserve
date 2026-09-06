@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import hashlib
+import json
+from dataclasses import asdict, dataclass
 
 from ..execution.batch import logical_op_kinds
 from ..foundation.errors import invalid_descriptor
 from ..foundation.math import ceil_div
 from ..models.generation import GenerationPipeline, LatentLayout
 from ..models.runtime import ExecutionModel, WorkerDeployment, active_latent_capacity_tokens
+from ..nn.linear import LinearBase
+from ..nn.quant.base import QuantizeMethodBase
 from .capacity import (
     derive_runtime_kv_capacity,
     device_total_bytes,
@@ -16,6 +20,7 @@ from .capacity import (
     operation_window,
 )
 from .execution_config import graph_memory_budget_bytes, graph_padding_block_count
+from .plan import ComponentDeployConfig
 from .worker_info import (
     KvCacheConfig,
     KvGroup,
@@ -24,7 +29,7 @@ from .worker_info import (
     WorkerInfo,
 )
 
-__all__ = ["WorkerLayout", "build_worker_info", "build_worker_layout"]
+__all__ = ["WorkerLayout", "build_worker_info", "build_worker_layout", "configuration_identity"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +50,59 @@ class WorkerLayout:
     encoder_cache_entries: int
     incremental_kv_publication: bool
     model_dtype: str
+
+
+def configuration_identity(
+    model: ExecutionModel,
+    deployment: WorkerDeployment,
+    layout: WorkerLayout,
+    components: tuple[tuple[str, ComponentDeployConfig], ...],
+    attention_identity: str | None,
+) -> str:
+    """Identify resolved placement, numerical storage, operators, and shape bounds.
+
+    Weight contents have their separate version. This identity describes the
+    initialized worker configuration; graph and arena objects retain their own
+    lifetimes and cannot be reused by a differently initialized worker.
+    """
+
+    numerical = {}
+    for name, module in model.named_modules():
+        method = getattr(module, "quant_method", None)
+        if isinstance(method, QuantizeMethodBase):
+            numerical[name] = {
+                "linear": f"{type(module).__module__}.{type(module).__qualname__}",
+                "method": f"{type(method).__module__}.{type(method).__qualname__}",
+                "input_scale_domain": method.input_scale_domain,
+                "weight_scale_domain": method.weight_scale_domain,
+                "weight_shard_axis": (
+                    module.weight_shard_axis if isinstance(module, LinearBase) else None
+                ),
+                "logical_input_row_partitions": (
+                    module.logical_input_row_partitions if isinstance(module, LinearBase) else 1
+                ),
+            }
+    encoded = json.dumps(
+        {
+            "deployment": asdict(deployment),
+            "layout": asdict(layout),
+            "components": {name: component.to_dict() for name, component in components},
+            "attention": attention_identity,
+            "model": f"{type(model).__module__}.{type(model).__qualname__}",
+            "numerical": numerical,
+            "parameters": [
+                (name, tuple(value.shape), str(value.dtype))
+                for name, value in model.named_parameters()
+            ],
+            "buffers": [
+                (name, tuple(value.shape), str(value.dtype))
+                for name, value in model.named_buffers()
+            ],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(encoded.encode()).hexdigest()
 
 
 def build_worker_info(
@@ -169,7 +227,7 @@ def build_worker_layout(
     info = WorkerInfo(
         model_name=model_name,
         weight_version=weight_version,
-        rank=RankInfo(tp_rank=int(deployment.tp_rank), tp_size=int(deployment.tp_size)),
+        rank=RankInfo(rank=int(deployment.rank), world_size=int(deployment.world_size)),
         supported_ops=supported_ops,
         queue_depth=int(queue_depth),
         max_batch_ops=int(deployment.max_batch_operations),
@@ -251,7 +309,7 @@ def _dedicated_state_worker_layout(
     info = WorkerInfo(
         model_name=model_name,
         weight_version=weight_version,
-        rank=RankInfo(tp_rank=int(geometry.rank), tp_size=int(geometry.size)),
+        rank=RankInfo(rank=int(deployment.rank), world_size=int(deployment.world_size)),
         supported_ops=logical_op_kinds(tuple(model.supported_work)),
         queue_depth=depth,
         max_batch_ops=max_operations,

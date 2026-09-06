@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 
 from ..execution.batch import RunKind
+from ..execution.device_transfer import DeviceTransfer
 from ..execution.forward_batch import (
     AttentionMode,
     ForwardBatch,
@@ -201,10 +202,17 @@ class BagelConfig:
 class _BagelGraph(nn.Module):
     """Owns the MoT, VAE, ViT, and flow-matching projections as one neural graph."""
 
-    def __init__(self, cfg: BagelConfig, *, layer_config: LayerConfig) -> None:
+    def __init__(
+        self,
+        cfg: BagelConfig,
+        *,
+        layer_config: LayerConfig,
+        transfers: DeviceTransfer = DeviceTransfer(),
+    ) -> None:
         """Construct all route components against one placement and quantization policy."""
 
         super().__init__()
+        self.transfers = transfers
         self.cfg = cfg
         hidden = cfg.llm.hidden_size
 
@@ -222,6 +230,7 @@ class _BagelGraph(nn.Module):
                 head_dim=cfg.llm.head_dim,
             ),
             layer_config=layer_config,
+            transfers=transfers,
         )
         self.lm_head = ParallelLMHead(
             hidden,
@@ -268,7 +277,7 @@ class _BagelGraph(nn.Module):
     def embed_tokens(self, ids: torch.Tensor, context: ForwardBatch) -> torch.Tensor:
         """Embed token identifiers with the batch's tensor-parallel mesh."""
 
-        return self.lm.embed_tokens(ids, context.mesh)
+        return self.lm.embed_tokens(ids)
 
     def gen_segment_embeds(
         self,
@@ -317,7 +326,7 @@ class _BagelGraph(nn.Module):
     ) -> torch.Tensor:
         """Project selected hidden rows into tensor-parallel vocabulary logits."""
 
-        return self.lm_head(hidden_last_row, context.mesh)
+        return self.lm_head(hidden_last_row)
 
     @torch.no_grad()
     def velocity_from_hidden(self, hidden, num_vae) -> torch.Tensor:
@@ -499,24 +508,31 @@ def _bagel_checkpoint_name(name: str) -> str | None:
 class BagelForConditionalGeneration(ExecutionModel):
     """Exposes the stateless BAGEL graph through scheduler-owned execution routes."""
 
+    ordered_collective_execution = True
+
     def load_weights(self, weights: Iterable[WeightHandle]) -> LoadReport:
         """Load BAGEL's root checkpoint into its language, vision, and connector graph."""
 
-        parameter_names = set(dict(self.model.named_parameters()))
+        parameters = dict(self.model.named_parameters())
         report = LoadReport()
 
-        # External names are normalized before stacked QKV and MLP shards are resolved.
+        # Decoder projections are packed; the vision encoder owns separate
+        # Q/K/V parameters despite sharing their checkpoint suffixes.
         for handle in weights:
             source_name = handle.name
             renamed = _bagel_checkpoint_name(source_name)
             if renamed is None:
                 report.skipped.append(source_name)
                 continue
-            target_name, shard_id = stacked_weight_name(renamed, _BAGEL_STACKED_WEIGHTS)
-            if target_name not in parameter_names:
+            target_name, shard_id = (
+                stacked_weight_name(renamed, _BAGEL_STACKED_WEIGHTS)
+                if renamed.startswith("lm.layers.")
+                else (renamed, None)
+            )
+            if target_name not in parameters:
                 report.unexpected.append(source_name)
                 continue
-            parameter = dict(self.model.named_parameters())[target_name]
+            parameter = parameters[target_name]
             load_parameter_weight(parameter, handle, shard_id)
             report.loaded.add(target_name)
         return report
@@ -545,16 +561,22 @@ class BagelForConditionalGeneration(ExecutionModel):
         config: BagelConfig,
         *,
         layer_config: LayerConfig,
+        transfers: DeviceTransfer = DeviceTransfer(),
         graph: _BagelGraph | None = None,
     ) -> None:
         """Bind graph geometry and route capabilities to the worker execution model."""
 
         super().__init__()
+        self.transfers = transfers
         if graph is not None and graph.cfg != config:
             raise ValueError("BAGEL graph and root must use the same immutable configuration")
         self.cfg = config
         self._parallel = layer_config.parallel
-        self.model = graph if graph is not None else _BagelGraph(config, layer_config=layer_config)
+        self.model = (
+            graph
+            if graph is not None
+            else _BagelGraph(config, layer_config=layer_config, transfers=transfers)
+        )
         llm = self.cfg.llm
         self.architecture = "BagelForConditionalGeneration"
 
@@ -803,7 +825,9 @@ class BagelForConditionalGeneration(ExecutionModel):
         features = self.model.vit_encode_batch(torch.stack(pixels, dim=0), batch)
         return ForwardOutput(tuple(features[index] for index in range(len(pixels))))
 
-    def encoder_latent(self, pixels: tuple[torch.Tensor, ...], batch: ForwardBatch) -> ForwardOutput:
+    def encoder_latent(
+        self, pixels: tuple[torch.Tensor, ...], batch: ForwardBatch
+    ) -> ForwardOutput:
         """Encode a uniform image batch into clean VAE latent patch tokens."""
 
         del batch

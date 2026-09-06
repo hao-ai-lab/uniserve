@@ -169,6 +169,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         snapshot.sampling_controls,
         route_max_model_len,
         config.reasoning_parsing,
+        &snapshot.components,
     )
     .context("failed to bind the configured model description")?;
     let runtime = ServingRuntime::new(model, Arc::clone(&engine), config.log_stats);

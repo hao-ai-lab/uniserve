@@ -150,10 +150,10 @@ pub(crate) struct SharedRuntimeArgs {
     /// Python interpreter used to launch the forward-only worker.
     #[arg(long, default_value_os_t = default_worker_python(), hide = true)]
     pub worker_python: std::path::PathBuf,
-    /// Number of tensor-parallel worker rank processes behind each engine.
-    #[arg(long = "tp-size", default_value_t = 1, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    /// Number of physical worker processes when deployment is omitted.
+    #[arg(long = "worker-ranks", default_value_t = 1, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub worker_ranks: usize,
-    /// Staged-worker topology, e.g. `encoder:2,prefill:1:tp=4,decode:1:tp=4`.
+    /// Staged-worker topology, e.g. `encoder:2,prefill:1:ranks=4,decode:1:ranks=4`.
     /// Unset = a single Full pool; a multi-stage layout composes local pools
     /// behind a StagedExecutor.
     #[arg(long, hide = true)]
@@ -263,7 +263,15 @@ impl SharedRuntimeArgs {
         worker_process.python = self.worker_python.clone();
         worker_process.model = self.model.clone();
         worker_process.device = self.device.clone();
-        worker_process.world_size = self.worker_ranks;
+        if worker_process.deployment.is_none() && is_media {
+            worker_process.deployment = Some(uniserve_engine::StageDeployConfig::h3(
+                (0..self.worker_ranks).collect(),
+            ));
+        }
+        worker_process.world_size = worker_process
+            .deployment
+            .as_ref()
+            .map_or(self.worker_ranks, |deployment| deployment.devices.len());
         worker_process.pipeline_depth = self.pipeline_depth;
         worker_process.resp_slot_cap = if is_media {
             EngineSettings::MEDIA_IPC_SLOT_CAP
@@ -292,7 +300,7 @@ impl SharedRuntimeArgs {
             workers: self
                 .workers
                 .clone()
-                .unwrap_or_else(|| WorkerTopology::single_full(self.worker_ranks)),
+                .unwrap_or_else(|| WorkerTopology::single_full(worker_process.world_size)),
             transfer: self.transfer.clone().unwrap_or_default(),
             worker_process,
         }
@@ -362,8 +370,11 @@ pub(crate) struct WorkerProcessOptions {
     /// `tower=text:cuda:0;gen:cuda:1,tower-kv-capacity=65536`.
     #[arg(long, hide = true)]
     pub worker_mesh: Option<String>,
+    /// JSON device placement and per-component parallel configuration.
+    #[arg(long)]
+    pub deployment: Option<uniserve_engine::StageDeployConfig>,
     #[arg(long, hide = true)]
-    pub tp_backend: Option<String>,
+    pub distributed_backend: Option<String>,
     /// Repeatable JSON descriptor for a deployment-static execution lane.
     #[arg(long = "lane")]
     pub lanes: Vec<LaneConfig>,
@@ -411,7 +422,8 @@ impl WorkerProcessOptions {
             kv_cache_dtype: self.kv_cache_dtype.clone(),
             kv_memory_fraction: self.kv_memory_fraction.clone(),
             mesh: self.worker_mesh.clone(),
-            tp_backend: self.tp_backend.clone(),
+            deployment: self.deployment.clone(),
+            distributed_backend: self.distributed_backend.clone(),
             lanes: self.lanes.clone(),
             cuda_graph: self.cuda_graph,
             decode_graph_batch_sizes: self.decode_graph_batch_sizes.clone(),
@@ -523,7 +535,7 @@ mod tests {
             "qwen3",
             "--device",
             "cpu",
-            "--tp-size",
+            "--worker-ranks",
             "2",
             "--page-size",
             "128",
@@ -566,7 +578,7 @@ mod tests {
             "--lane",
             r#"{"lane_id":"decode","sm_budget":64,"domains":["decode"]}"#,
             "--workers",
-            "prefill:1:tp=2,decode:1:tp=2",
+            "prefill:1:ranks=2,decode:1:ranks=2",
             "--transfer",
             "prefill->decode=shm",
         ])

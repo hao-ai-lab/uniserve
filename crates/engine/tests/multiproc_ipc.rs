@@ -1,4 +1,4 @@
-//! Multiprocess framing, replay idempotency, and tensor-parallel rank recovery.
+//! Multiprocess framing, replay idempotency, and physical-rank recovery.
 
 #![cfg(target_os = "linux")]
 
@@ -11,13 +11,14 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use anyhow::Context as _;
 use uniserve_core::{
     BlockId, DiffusionRequest, Event, MediaGeometry, Request, RequestId, RuntimeFamily,
     SamplingParams,
 };
 use uniserve_engine::{
-    ControlTokens, EngineHandle, EngineLoop, Executor, MultiprocExecutor, PhysicalExecutor,
-    SchedulerConfig, TransferBackend, WorkerExecError, WorkerLossError, WorkerProcessArgs,
+    EngineCore, EngineCoreConfig, Executor, MultiprocExecutor, PhysicalExecutor, RuntimeProfile,
+    TransferBackend, WorkerExecError, WorkerLossError, WorkerProcessArgs, WorkerTopology,
 };
 use uniserve_worker_ipc::{
     ArRequestParams, BatchCommand, BlockTable, Bounds, CachePageAllocation, Checkpoint,
@@ -29,31 +30,31 @@ use uniserve_worker_ipc::{
 
 const WORLD_SIZE: usize = 2;
 const PIPELINE_DEPTH: usize = 2;
+static CHILD_LAUNCH_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn multiprocess_topology_handles_rank_failure_and_capacity_limits() -> anyhow::Result<()> {
     check_rank_ipc()?;
-    qualify_failed_media_admission_reclamation()?;
     qualify_slow_transfer()?;
     qualify_peer_replacement()?;
     Ok(())
 }
 
-fn qualify_failed_media_admission_reclamation() -> anyhow::Result<()> {
-    let executor = spawn_rank_group_with_slot_capacity(128 << 10)?;
-    let request_capacity = usize::try_from(executor.info().single_pool().request_slots)?;
-    let scheduler = EngineLoop::with_config_for_family(
-        Box::new(executor),
-        ControlTokens::default(),
-        SchedulerConfig {
-            max_batch: PIPELINE_DEPTH * 8,
-            ..SchedulerConfig::default()
-        },
-        RuntimeFamily::Diffusion,
-    );
-    let (command_tx, command_rx) = crossbeam_channel::unbounded();
-    let handle = EngineHandle::new(command_tx);
-    let scheduler_thread = thread::spawn(move || scheduler.run(command_rx));
+#[test]
+fn media_admission_failures_release_capacity_through_command_ingress() -> anyhow::Result<()> {
+    let mut config = EngineCoreConfig::sim("stub");
+    config.runtime_family = RuntimeFamily::Diffusion;
+    config.runtime_profile = RuntimeProfile::diffusion(uniserve_core::ModelDtype::BFloat16);
+    config.max_batch = PIPELINE_DEPTH * 8;
+    config.workers = WorkerTopology::single_full(WORLD_SIZE);
+    config.worker_process = rank_group_args(128 << 10, 128 << 10);
+    let engine = {
+        let _launch_guard = CHILD_LAUNCH_ENV_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("child-launch environment lock is poisoned"))?;
+        EngineCore::new(config)?
+    };
+    let request_capacity = usize::try_from(engine.info().request_slots)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()?;
@@ -70,7 +71,7 @@ fn qualify_failed_media_admission_reclamation() -> anyhow::Result<()> {
                 vec![100_000 + index as u32]
             };
             let prompt_tokens = u32::try_from(prompt_token_ids.len())?;
-            let events = handle.submit(Request::Diffusion(DiffusionRequest {
+            let events = engine.submit(Request::Diffusion(DiffusionRequest {
                 request_id,
                 prompt_token_ids,
                 seed: index as u64,
@@ -85,9 +86,11 @@ fn qualify_failed_media_admission_reclamation() -> anyhow::Result<()> {
             requests.push((request_id, events));
         }
         for (request_id, mut events) in requests {
-            let event = runtime.block_on(async {
-                tokio::time::timeout(Duration::from_secs(10), events.recv()).await
-            })?;
+            let event = runtime
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(10), events.recv()).await
+                })
+                .with_context(|| format!("timed out waiting for media request {request_id:?}"))?;
             let event = event.ok_or_else(|| {
                 anyhow::anyhow!("media event stream closed for request {request_id:?}")
             })?;
@@ -99,20 +102,20 @@ fn qualify_failed_media_admission_reclamation() -> anyhow::Result<()> {
         Ok(())
     })();
 
-    handle.shutdown();
-    let engine_died = scheduler_thread
-        .join()
-        .map_err(|_| anyhow::anyhow!("scheduler thread panicked"))?;
+    engine.shutdown();
     result?;
-    assert!(!engine_died, "media admission failures killed the engine");
+    assert!(
+        !engine.is_dead(),
+        "media admission failures killed the engine"
+    );
     Ok(())
 }
 
 fn check_rank_ipc() -> anyhow::Result<()> {
     let mut executor = spawn_rank_group()?;
     let info = executor.info().single_pool();
-    assert_eq!(info.rank.tp_rank, 0);
-    assert_eq!(info.rank.tp_size, WORLD_SIZE as u32);
+    assert_eq!(info.rank.rank, 0);
+    assert_eq!(info.rank.world_size, WORLD_SIZE as u32);
     assert_eq!(info.max_batch_ops, 256);
     assert_eq!(info.max_batch_tokens, 256);
     assert_eq!(info.queue_depth as usize, PIPELINE_DEPTH);
@@ -259,9 +262,12 @@ fn check_rank_ipc() -> anyhow::Result<()> {
 }
 
 fn qualify_peer_replacement() -> anyhow::Result<()> {
-    // This integration-test process has one test thread and no live worker
-    // group at this point, so changing its child-launch environment cannot
-    // race another environment access in this process.
+    // Cargo may execute the media test in this binary concurrently. Serialize
+    // child launch while the replacement fault is injected so unrelated
+    // workers cannot inherit the process-wide test environment.
+    let launch_guard = CHILD_LAUNCH_ENV_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("child-launch environment lock is poisoned"))?;
     unsafe {
         std::env::set_var("UNISERVE_STUB_DIE_AFTER", "1");
         std::env::set_var("UNISERVE_STUB_DIE_RANK", "1");
@@ -271,6 +277,7 @@ fn qualify_peer_replacement() -> anyhow::Result<()> {
         std::env::remove_var("UNISERVE_STUB_DIE_AFTER");
         std::env::remove_var("UNISERVE_STUB_DIE_RANK");
     }
+    drop(launch_guard);
 
     let first_admission = text_admission(21, 1, 1)?;
     let first_root = Checkpoint::admission_root(OpId(0));
@@ -598,14 +605,20 @@ fn spawn_rank_group() -> anyhow::Result<MultiprocExecutor> {
     spawn_rank_group_with_capacities(1 << 20, 8 << 20)
 }
 
-fn spawn_rank_group_with_slot_capacity(slot_capacity: usize) -> anyhow::Result<MultiprocExecutor> {
-    spawn_rank_group_with_capacities(slot_capacity, slot_capacity)
-}
-
 fn spawn_rank_group_with_capacities(
     request_slot_capacity: usize,
     response_slot_capacity: usize,
 ) -> anyhow::Result<MultiprocExecutor> {
+    MultiprocExecutor::spawn(rank_group_args(
+        request_slot_capacity,
+        response_slot_capacity,
+    ))
+}
+
+fn rank_group_args(
+    request_slot_capacity: usize,
+    response_slot_capacity: usize,
+) -> WorkerProcessArgs {
     let worker = worker_python();
     let config = WorkerProcessArgs {
         stub: true,
@@ -613,7 +626,7 @@ fn spawn_rank_group_with_capacities(
         prefill_cuda_graph: false,
         ..WorkerProcessArgs::default()
     };
-    MultiprocExecutor::spawn(WorkerProcessArgs {
+    WorkerProcessArgs {
         python: worker,
         model: String::new(),
         device: "cpu".into(),
@@ -629,7 +642,7 @@ fn spawn_rank_group_with_capacities(
         supported_ops: uniserve_worker_ipc::OpKind::ALL.to_vec(),
         transfer_backend: TransferBackend::Inproc,
         ..config
-    })
+    }
 }
 
 fn worker_python() -> PathBuf {

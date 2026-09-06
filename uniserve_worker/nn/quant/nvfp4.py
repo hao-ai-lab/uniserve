@@ -10,7 +10,7 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-from .base import QuantizeMethodBase
+from .base import PreparedLinearInput, QuantizeMethodBase
 
 __all__ = [
     "DynamicW4A4NvFp4LinearMethod",
@@ -287,6 +287,14 @@ class DynamicW4A4NvFp4LinearMethod(QuantizeMethodBase):
 
     is_quantized = True
 
+    @property
+    def weight_scale_domain(self):
+        return "tensor"
+
+    @property
+    def input_scale_domain(self):
+        return "tensor"
+
     def create_weights(
         self,
         module: nn.Module,
@@ -329,16 +337,31 @@ class DynamicW4A4NvFp4LinearMethod(QuantizeMethodBase):
             raise RuntimeError("NVFP4 linear execution requires a CUDA device")
         if torch.cuda.get_device_capability(linear.weight.device) < (10, 0):
             raise RuntimeError("NVFP4 linear execution requires an SM100-class CUDA device")
-        weight_scale_2 = _global_scale_2(linear.weight)
+        if linear.weight.dtype == torch.uint8:
+            return
+        if linear.logical_weight_absmax is None:
+            raise RuntimeError("NVFP4 weights require resolved logical scale domains")
+        weight_scale_2 = _scale_2_from_absmax(linear.logical_weight_absmax)
         flashinfer = _flashinfer()
-        packed, block_scale = flashinfer.nvfp4_quantize(
-            linear.weight,
-            1.0 / weight_scale_2,
-            sfLayout=flashinfer.SfLayout.layout_128x4,
-            backend="cute-dsl",
+        packed_parts, scale_parts = [], []
+        offset = 0
+        for index, rows in enumerate(linear.weight_output_partitions):
+            if len(linear.weight_output_partitions) > 1 and rows % 128:
+                raise ValueError("NVFP4 logical output partitions must align to 128 rows")
+            packed, block_scale = flashinfer.nvfp4_quantize(
+                linear.weight[offset : offset + rows],
+                1.0 / weight_scale_2[index].reshape(()),
+                sfLayout=flashinfer.SfLayout.layout_128x4,
+                backend="cute-dsl",
+            )
+            packed_parts.append(packed)
+            scale_parts.append(block_scale)
+            offset += rows
+        linear.weight = nn.Parameter(
+            packed_parts[0] if len(packed_parts) == 1 else torch.cat(packed_parts),
+            requires_grad=False,
         )
-        linear.weight = nn.Parameter(packed.contiguous(), requires_grad=False)
-        linear.weight_scale = block_scale
+        linear.weight_scale = scale_parts[0] if len(scale_parts) == 1 else torch.cat(scale_parts)
         linear.weight_scale_2 = weight_scale_2
 
     def quantize_activation(
@@ -381,15 +404,22 @@ class DynamicW4A4NvFp4LinearMethod(QuantizeMethodBase):
         weight_scale_2 = getattr(linear, "weight_scale_2", None)
         if linear.weight.dtype != torch.uint8 or weight_scale is None or weight_scale_2 is None:
             raise RuntimeError("NVFP4 linear execution requires finalized FP4 weights")
-        output = _nvfp4_mm_bf16(
-            activation.packed,
-            linear.weight.T,
-            activation.block_scale,
-            weight_scale.T,
-            activation.scale_2 * weight_scale_2,
-        )
-        if include_bias and linear.bias is not None:
-            output = output + linear.bias.to(device=output.device, dtype=output.dtype)
+        outputs = []
+        offset = 0
+        for index, rows in enumerate(linear.weight_output_partitions):
+            outputs.append(
+                _nvfp4_mm_bf16(
+                    activation.packed,
+                    linear.weight[offset : offset + rows].T,
+                    activation.block_scale,
+                    weight_scale[offset : offset + ((rows + 127) // 128) * 128].T,
+                    activation.scale_2 * weight_scale_2[index].reshape(()),
+                )
+            )
+            offset += rows
+        output = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=-1)
+        if include_bias and linear.execution_bias is not None:
+            output = output + linear.execution_bias.to(device=output.device, dtype=output.dtype)
         return output.reshape(*activation.shape, linear.output_size)
 
     def _apply(
@@ -417,67 +447,54 @@ class DynamicW4A4NvFp4LinearMethod(QuantizeMethodBase):
 
         return self._apply(module, x, include_bias=False)
 
-    def apply_sequence_parallel(
+    def input_scale(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dtype != torch.bfloat16:
+            raise RuntimeError("NVFP4 input preparation requires bfloat16 activations")
+        return _global_scale_2(x)
+
+    def prepare_input(
+        self,
+        x: torch.Tensor,
+        scale: torch.Tensor | None,
+    ) -> PreparedLinearInput:
+        if scale is None:
+            raise ValueError("NVFP4 input preparation requires a shared activation scale")
+        values, block_scales = _nvfp4_quantize_linear(x, 1.0 / scale)
+        return PreparedLinearInput(values, block_scales, scale)
+
+    def apply_prepared(
         self,
         module: nn.Module,
-        x: torch.Tensor,
-        mesh: object,
-        workspace: torch.Tensor,
+        prepared: PreparedLinearInput,
         *,
-        group: str,
+        output_dtype: torch.dtype,
     ) -> torch.Tensor:
-        """Quantize rank-local rows, gather packed rows/scales, and project the global sequence."""
-
         from ..linear import LinearBase
-        from ..mesh import DeviceMesh
 
         linear = cast(LinearBase, module)
-        device_mesh = cast(DeviceMesh, mesh)
         weight_scale = linear.weight_scale
         weight_scale_2 = getattr(linear, "weight_scale_2", None)
         if linear.weight.dtype != torch.uint8 or weight_scale is None or weight_scale_2 is None:
-            raise RuntimeError("sequence-parallel NVFP4 execution requires finalized FP4 weights")
-        if x.dtype != torch.bfloat16:
-            raise RuntimeError("sequence-parallel NVFP4 execution requires bfloat16 activations")
-
-        # A shared global scale keeps independently quantized rank shards in one
-        # numeric domain before their packed values and block scales are gathered.
-        input_scale_2 = _global_scale_2(x)
-        device_mesh.all_reduce_max(input_scale_2, group)
-        local_packed, local_scale = _nvfp4_quantize_linear(
-            x,
-            1.0 / input_scale_2,
-        )
-
-        global_rows = int(x.shape[0]) * device_mesh.size(group)
-        packed_elements = global_rows * int(x.shape[1]) // 2
-        scale_elements = global_rows * int(x.shape[1]) // 16
-        required_elements = packed_elements + scale_elements
-        if int(workspace.numel()) < required_elements:
-            raise RuntimeError(
-                f"NVFP4 sequence-parallel workspace requires {required_elements} bytes, "
-                f"got {workspace.numel()}"
+            raise RuntimeError("prepared NVFP4 GEMM requires finalized FP4 weights")
+        if prepared.block_scales is None or prepared.global_scale is None:
+            raise ValueError("prepared NVFP4 input requires block scales and a global scale")
+        scales = _nvfp4_interleave_scale(prepared.block_scales)
+        outputs = []
+        offset = 0
+        for index, rows in enumerate(linear.weight_output_partitions):
+            outputs.append(
+                _nvfp4_mm_bf16_cute(
+                    prepared.values,
+                    linear.weight[offset : offset + rows].T,
+                    scales,
+                    weight_scale[offset : offset + ((rows + 127) // 128) * 128].T,
+                    prepared.global_scale * weight_scale_2[index].reshape(()),
+                )
             )
-        # The byte workspace stores packed nibbles followed by linear-layout scales.
-        gathered_packed = workspace[:packed_elements].view(
-            global_rows,
-            int(x.shape[1]) // 2,
-        )
-        gathered_linear_scale = workspace[packed_elements : packed_elements + scale_elements].view(
-            global_rows, int(x.shape[1]) // 16
-        )
-        device_mesh.all_gather_into_tensor(gathered_packed, local_packed, group)
-        device_mesh.all_gather_into_tensor(gathered_linear_scale, local_scale, group)
-        gathered_scale = _nvfp4_interleave_scale(gathered_linear_scale)
-        output = _nvfp4_mm_bf16_cute(
-            gathered_packed,
-            linear.weight.T,
-            gathered_scale,
-            weight_scale.T,
-            input_scale_2 * weight_scale_2,
-        )
-        if linear.bias is not None:
-            output = output + linear.bias.to(device=output.device, dtype=output.dtype)
+            offset += rows
+        output = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=-1)
+        if linear.execution_bias is not None:
+            output = output + linear.execution_bias.to(device=output.device, dtype=output.dtype)
         return output
 
 
@@ -501,8 +518,18 @@ class NvFp4Linear(nn.Module):
         )
         self.register_buffer("weight_scale", None, persistent=False)
         self.register_buffer("weight_scale_2", None, persistent=False)
+        self.weight_output_partitions = (self.output_size,)
+        self.register_buffer(
+            "logical_weight_absmax",
+            self.weight.float().abs().amax().reshape(1, 1),
+            persistent=False,
+        )
         self.quant_method = DynamicW4A4NvFp4LinearMethod()
         self.quant_method.process_weights_after_loading(self)
+
+    @property
+    def execution_bias(self) -> torch.Tensor | None:
+        return self.bias
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
         """Project values through resident FP4 weights, including the source bias."""

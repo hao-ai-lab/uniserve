@@ -215,7 +215,9 @@ def _row_normalized_modulation_fp8_kernel(
 def _value_first_swiglu_kernel(value_gate_ptr, output_ptr, elements, BLOCK: tl.constexpr):
     """Evaluate fixed-width SwiGLU from a packed value-then-gate projection."""
 
-    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    offsets = (
+        tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    ).to(tl.int64)
     mask = offsets < elements
     row = offsets // _FFN_SIZE_TL
     column = offsets - row * _FFN_SIZE_TL
@@ -243,7 +245,7 @@ def _value_first_swiglu_fp8_kernel(
 ):
     """Evaluate one packed SwiGLU row and quantize it with a rowwise scale."""
 
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     columns = tl.arange(0, BLOCK)
     mask = columns < _FFN_SIZE_TL
     value = tl.load(

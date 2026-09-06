@@ -54,6 +54,14 @@ impl KvCacheConfig {
         Ok(())
     }
 }
+/// One component's finalized deployment shared by all worker descriptions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComponentInfo {
+    pub name: String,
+    #[serde(flatten)]
+    pub deployment: uniserve_core::ComponentDeployConfig,
+}
+
 /// Post-load worker geometry, limits, supported work, and model identity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkerInfo {
@@ -61,8 +69,14 @@ pub struct WorkerInfo {
     pub model_name: String,
     /// Model-weight revision used to reject cross-version products.
     pub weight_version: u64,
-    /// Tensor-parallel rank topology.
+    /// Physical process rank topology.
     pub rank: RankInfo,
+    /// Stable identity of the expanded component configuration.
+    #[serde(default)]
+    pub configuration_id: String,
+    /// Finalized component membership and logical degrees.
+    #[serde(default)]
+    pub components: Vec<ComponentInfo>,
     /// Operation families accepted by the worker.
     pub supported_ops: Vec<OpKind>,
     /// Maximum unresolved physical runs.
@@ -109,6 +123,50 @@ impl WorkerInfo {
 
     /// Validates worker identity, capacity, operation, and rank invariants.
     pub fn validate(&self) -> ValidationResult<()> {
+        ensure_valid!(
+            self.rank.world_size > 0 && self.rank.rank < self.rank.world_size,
+            "worker process rank is outside its world"
+        );
+        let mut names = HashSet::new();
+        for component in &self.components {
+            ensure_valid!(
+                !component.name.is_empty() && names.insert(&component.name),
+                "worker repeats or omits a component name"
+            );
+            let placement = &component.deployment;
+            ensure_valid!(
+                !placement.ranks.is_empty()
+                    && placement
+                        .ranks
+                        .iter()
+                        .all(|&rank| rank < self.rank.world_size as usize),
+                "component membership is outside the process world"
+            );
+            ensure_valid!(
+                placement.ranks.iter().collect::<HashSet<_>>().len() == placement.ranks.len(),
+                "component repeats process ranks"
+            );
+            let degree = placement
+                .parallel_config
+                .world_size()
+                .map_err(|error| invalid_message!("{error}"))?;
+            ensure_valid!(
+                degree <= u32::MAX as usize,
+                "parallel degrees exceed protocol range"
+            );
+            ensure_valid!(
+                placement.units_per_rank > 0 && placement.units_per_rank <= u32::MAX as usize,
+                "component unit capacity is outside protocol range"
+            );
+            ensure_valid!(
+                if placement.distribution.is_some() {
+                    degree == 1
+                } else {
+                    degree == placement.ranks.len()
+                },
+                "component membership disagrees with parallel degrees"
+            );
+        }
         // Capability and scheduling limits must describe a usable worker.
         ensure_valid!(
             !self.supported_ops.is_empty(),
@@ -173,6 +231,8 @@ impl Default for WorkerInfo {
             model_name: "model".to_owned(),
             weight_version: 0,
             rank: RankInfo::default(),
+            configuration_id: String::new(),
+            components: Vec::new(),
             supported_ops: vec![OpKind::ArExtend, OpKind::ArDecode],
             queue_depth: 1,
             max_batch_ops: 1,

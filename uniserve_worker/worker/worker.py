@@ -21,8 +21,9 @@ from ..bootstrap.execution_config import (
     LaneConfig,
     graph_memory_budget_bytes,
 )
+from ..bootstrap.plan import ComponentDeployConfig
 from ..bootstrap.worker_info import WorkerInfo
-from ..bootstrap.worker_info_builder import build_worker_layout
+from ..bootstrap.worker_info_builder import build_worker_layout, configuration_identity
 from ..execution.batch import (
     Domain,
     Finish,
@@ -55,6 +56,7 @@ from ..foundation.errors import invalid_descriptor, unsupported_setup
 from ..foundation.math import ceil_div
 from ..loader.update import WeightUpdater
 from ..loader.weight_set import WeightSet
+from ..models.inputs import FeatureLayout
 from ..models.runtime import ExecutionModel, WorkerDeployment
 from ..nn.diffusion.cfg import build_flow_cfg_plan
 from ..nn.mesh import DeviceMesh
@@ -108,21 +110,62 @@ class Worker:
         from ..bootstrap.model_loader import materialize_worker_model
         from ..bootstrap.plan import resolve_worker_plan
         from ..nn.placement import place_towers
-        from ..runtime.distributed import build_device_mesh
+        from ..runtime.distributed import init_distributed_environment, initialize_model_parallel
 
-        plan = resolve_worker_plan(config.supported_ops)
+        plan = resolve_worker_plan(config.supported_ops, config.components, config.placement.rank)
         configure_triton_toolchain()
-        mesh = build_device_mesh(
-            tp_rank=config.placement.tp_rank,
-            tp_size=config.placement.tp_size,
+        environment = init_distributed_environment(
+            rank=config.placement.rank,
+            local_rank=config.placement.local_rank,
+            world_size=config.placement.world_size,
             device=config.placement.device,
-            tower_devices=config.placement.tower_devices,
-            tower_primary=0,
-            tp_backend=config.placement.tp_backend,
-            tp_init_method=config.placement.tp_init_method,
+            backend=config.placement.distributed_backend,
+            init_method=config.placement.distributed_init_method,
         )
-        loaded = materialize_worker_model(config, plan, mesh)
-        place_towers(loaded.model, mesh)
+        meshes = initialize_model_parallel(
+            environment,
+            {
+                name: (component.ranks, component.parallel_config)
+                for name, component in config.components
+                if component.distribution is None
+            },
+        )
+        # A temporal decoder is a local model on each of its assigned ranks.
+        # Its temporal width remains component placement, not a parallel axis.
+        for name, component in plan.components:
+            if component.distribution is not None:
+                meshes[name] = DeviceMesh(
+                    (config.placement.rank,),
+                    config.placement.rank,
+                    component.parallel_config,
+                    environment.local_device,
+                )
+        primary = next(
+            (
+                name
+                for name in (
+                    "denoiser",
+                    "model",
+                    "text_encoder",
+                    "video_decoder",
+                    "audio_decoder",
+                    "output",
+                )
+                if name in meshes
+            ),
+            None,
+        )
+        if primary is None:
+            raise unsupported_setup("worker has no executable component assignment")
+        mesh = meshes[primary]
+        loaded = materialize_worker_model(
+            config,
+            plan,
+            mesh,
+            component_meshes=meshes,
+            process_group=environment.process_group,
+        )
+        place_towers(loaded.model, config.placement.tower_devices)
         attention = (
             resolve_attention_selection(
                 loaded.deployment.attention_backend or "auto",
@@ -132,7 +175,7 @@ class Worker:
             if loaded.model.resource_geometry.kv
             else None
         )
-        return cls(
+        worker = cls(
             loaded.model,
             mesh=mesh,
             deployment=loaded.deployment,
@@ -146,7 +189,10 @@ class Worker:
             weight_sidecars=loaded.weight_sidecars,
             pipeline_depth=config.ipc.pipeline_depth,
             completion_payload_bytes=config.ipc.max_payload_bytes,
+            components=config.components,
         )
+        worker.distributed_environment = environment
+        return worker
 
     def __init__(
         self,
@@ -164,6 +210,7 @@ class Worker:
         weight_sidecars: tuple[str, ...] = ("config.json",),
         pipeline_depth: int,
         completion_payload_bytes: int,
+        components: tuple[tuple[str, ComponentDeployConfig], ...] = (),
     ) -> None:
         """Assemble all bounded runtime stores and execution lanes for one model replica."""
 
@@ -174,6 +221,7 @@ class Worker:
         if not isinstance(deployment, WorkerDeployment):
             raise unsupported_setup("model worker requires a worker deployment")
         self.model = model
+        self.distributed_environment = None
         self.mesh = mesh
         self.deployment = deployment
         self._weight_condition = Condition(RLock())
@@ -190,6 +238,20 @@ class Worker:
             weight_version=self.weight_version,
             queue_depth=int(pipeline_depth),
             completion_payload_bytes=int(completion_payload_bytes),
+        )
+        layout = replace(
+            layout,
+            info=replace(
+                layout.info,
+                configuration_id=configuration_identity(
+                    model,
+                    deployment,
+                    layout,
+                    components,
+                    None if attention is None else attention.identity,
+                ),
+                components=components,
+            ),
         )
         self._layout = layout
         declared = layout.info
@@ -224,10 +286,7 @@ class Worker:
         if not advertised_work:
             raise unsupported_setup(f"{type(self).__name__} advertises no executable work")
         lane_operation_bound = min(
-            (
-                int(lane.max_batch_operations or declared.max_batch_ops)
-                for lane in execution.lanes
-            ),
+            (int(lane.max_batch_operations or declared.max_batch_ops) for lane in execution.lanes),
             default=int(declared.max_batch_ops),
         )
         lane_token_bound = min(
@@ -409,7 +468,18 @@ class Worker:
         # Derive fixed staging and graph catalogs from the intersection of model,
         # lane, cache, latent, and scheduler capacities.
         max_staged_rows = max_rows * (1 if flow is None else int(flow.max_cfg_branches))
-        max_text_staged_tokens = int(self._info.max_batch_tokens)
+        image_processor = model.image_processor
+        image_injection = None if image_processor is None else image_processor.feature_injection
+        image_span = (
+            0
+            if image_injection is None
+            else max(int(layout.max_vit_grid_tokens), int(layout.max_vae_grid_tokens))
+            + (2 if image_injection.layout is FeatureLayout.FRAMED else 0)
+        )
+        # Image ingestion is atomic and may consume the remaining text budget.
+        # Reserve its complete bounded feature span, including framing tokens,
+        # after any text already admitted into the same batch.
+        max_text_staged_tokens = int(self._info.max_batch_tokens) + image_span
         max_flow_staged_tokens = (
             0
             if flow is None
@@ -577,12 +647,7 @@ class Worker:
             for text_batch_size in mixed_text_batch_sizes
         )
         flow_prefix_lengths: dict[int, tuple[int, ...]] = {}
-        if (
-            flow is not None
-            and owns_kv
-            and packed_model.tensorized_mixed
-            and flow_graph_buckets
-        ):
+        if flow is not None and owns_kv and packed_model.tensorized_mixed and flow_graph_buckets:
             for cfg_branches in flow_cfg_branches:
                 image = _startup_image_parameters(
                     cfg_branches,
@@ -894,7 +959,7 @@ class Worker:
             self._end_model_call()
             raise
         if prepared is None:
-            if int(self.info.rank.tp_size) > 1:
+            if int(self.info.rank.world_size) > 1:
                 prepared = PreparedExecution(batch=batch, transfers=())
             else:
                 self._end_model_call()
@@ -1077,6 +1142,8 @@ class Worker:
         self.persistent_buffers.close()
         self.output_pool.close()
         self.device_events.close()
+        if self.distributed_environment is not None:
+            self.distributed_environment.close()
 
     def set_completion_wake(
         self,

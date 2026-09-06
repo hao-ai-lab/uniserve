@@ -7,20 +7,20 @@ from enum import Enum, auto
 
 import torch.nn as nn
 
-from .mesh import DeviceMesh, TensorParallel
+from .mesh import TensorParallel
 
 __all__ = [
-    'WeightMode',
-    'Shard',
-    'ShardSlot',
-    'ShardPlan',
-    'shard_for',
-    'get_shard_plan',
-    'set_shard_plan',
+    "WeightMode",
+    "Shard",
+    "ShardSlot",
+    "ShardPlan",
+    "shard_for",
+    "get_shard_plan",
+    "set_shard_plan",
     # tower-axis module placement
-    'set_tower_coord',
-    'get_tower_coord',
-    'place_towers',
+    "set_tower_coord",
+    "get_tower_coord",
+    "place_towers",
 ]
 
 
@@ -131,17 +131,12 @@ def get_tower_coord(module: nn.Module) -> int | None:
     return int(coord) if coord is not None else None
 
 
-def place_towers(model: nn.Module, mesh: DeviceMesh) -> None:
-    """Move each assigned modality-tower subtree to its coordinate's device."""
-    axis = mesh.axis("tower") if mesh is not None else None
-    if axis is None or int(axis.size) <= 1 or axis.transport is None:
+def place_towers(model: nn.Module, devices: tuple[str, str] | None) -> None:
+    """Materialize each assigned modality subtree on its deployment device."""
+
+    if devices is None:
         return
-    device_for = getattr(axis.transport, "device", None)
-    if not callable(device_for):
-        raise RuntimeError("tower transport does not expose its local devices")
-    primary = int(axis.coord)
     for module in model.modules():
-        coord = get_tower_coord(module)
-        if coord is None or coord == primary:
-            continue
-        module.to(device_for(coord))
+        coordinate = get_tower_coord(module)
+        if coordinate is not None:
+            module.to(devices[coordinate])

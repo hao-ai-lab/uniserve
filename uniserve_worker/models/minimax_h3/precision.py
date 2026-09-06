@@ -8,7 +8,7 @@ from typing import Literal, TypeAlias, cast
 
 LinearPrecision: TypeAlias = Literal["bf16", "fp8", "mxfp8", "nvfp4"]
 AttentionLinearPrecision: TypeAlias = Literal["bf16", "fp8", "nvfp4"]
-TextEncoderLinearPrecision: TypeAlias = Literal["bf16", "nvfp4"]
+TextEncoderLinearPrecision: TypeAlias = Literal["bf16", "fp8", "nvfp4"]
 VideoVAELinearPrecision: TypeAlias = Literal["fp16", "bf16", "nvfp4"]
 H3QuantizationMode: TypeAlias = Literal[
     "quality",
@@ -56,7 +56,7 @@ class H3LinearPrecisionPolicy:
             return cls(
                 transformer_attention="nvfp4",
                 transformer_mlp="mxfp8",
-                text_encoder="bf16",
+                text_encoder="fp8",
                 video_vae="nvfp4",
             )
         raise ValueError(f"unsupported H3 quantization mode {mode!r}")
@@ -184,7 +184,7 @@ class H3LinearPrecisionPolicy:
         )
         text_encoder = cast(
             TextEncoderLinearPrecision | None,
-            component("text_encoder", {"bf16", "nvfp4"}),
+            component("text_encoder", {"bf16", "fp8", "nvfp4"}),
         )
         video_vae = cast(
             VideoVAELinearPrecision | None,

@@ -14,17 +14,30 @@ from ...backends.attention.video_sparse import (
     VideoSparseAttentionWorkspace,
     build_video_sparse_metadata,
 )
-from ...nn.diffusion.modulation import prepare_modulation_plan, select_modulation_step
+from ...nn.diffusion.modulation import ModulationPlan
 from ...nn.layer import LayerConfig
-from ...nn.linear import InterleavedMergedColumnParallelLinear, LinearBase
-from ...nn.mesh import DeviceMesh, SymmetricMemoryWorkspace, TensorParallel
+from ...nn.linear import (
+    InterleavedMergedColumnParallelLinear,
+    LinearBase,
+    MergedColumnParallelLinear,
+    RowParallelLinear,
+)
+from ...nn.mesh import DeviceMesh, TensorParallel
+from ...nn.parallel_attention import (
+    Attention2D,
+    AttentionContextWorkspace,
+    GatherAttention,
+    RingAttention,
+    UlyssesAttention,
+)
+from ...nn.parallel_pipeline import LayerPipeline
 from ...nn.quant import (
     DynamicW4A4NvFp4LinearMethod,
     DynamicW8A8Fp8LinearMethod,
     DynamicW8A8MxFp8LinearMethod,
     QuantizeMethodBase,
-    UnquantizedLinearMethod,
 )
+from ...nn.quant.base import UnquantizedLinearMethod
 from ...ops import qk_norm_rope
 from .fusions import (
     attention_residual_modulated_rmsnorm,
@@ -89,6 +102,19 @@ def _dynamic_quantized_linear(
             bias=bias,
         )
     return linear
+
+
+def _row_linear(input_size, output_size, *, linear_precision, layer_config, device):
+    """Construct the H3 output projection for the selected numerical format."""
+
+    with torch.device(device):
+        return RowParallelLinear(
+            input_size,
+            output_size,
+            layer_config=layer_config,
+            bias=False,
+            quant_method=_dynamic_quant_method(linear_precision),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,14 +189,14 @@ class _SwiGLUProjection(nn.Module):
         """Build the value-first gated projection at the selected linear precision."""
 
         super().__init__()
-        self.proj = _dynamic_quantized_linear(
-            width,
-            expanded * 2,
-            linear_precision=linear_precision,
-            bias=False,
-            layer_config=layer_config,
-            device=device,
-        )
+        with torch.device(device):
+            self.proj = MergedColumnParallelLinear(
+                width,
+                (expanded, expanded),
+                quant_method=_dynamic_quant_method(linear_precision),
+                bias=False,
+                layer_config=layer_config,
+            )
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
         """Project hidden rows into value/gate halves and apply value-first SwiGLU."""
@@ -188,6 +214,7 @@ class _FeedForward(nn.Module):
         linear_precision: LinearPrecision,
         layer_config: LayerConfig,
         device: torch.device | str,
+        logical_input_row_partitions: int = 1,
     ) -> None:
         """Build the H3 gated expansion and hidden-width output projection."""
 
@@ -202,24 +229,29 @@ class _FeedForward(nn.Module):
                     device=device,
                 ),
                 nn.Identity(),
-                _dynamic_quantized_linear(
+                _row_linear(
                     config.ffn_dim,
                     config.hidden_size,
                     linear_precision=linear_precision,
-                    bias=False,
                     layer_config=layer_config,
                     device=device,
                 ),
             )
         )
+        self.net[0].proj.logical_input_row_partitions = logical_input_row_partitions
+        self.net[2].logical_input_row_partitions = logical_input_row_partitions
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
         """Transform hidden rows through the gated expansion and output projection."""
 
         if self.accepts_prequantized_fp8:
             value_gate = self.net[0].proj(value)
+            if self.net[2].tp_group.world_size > 1:
+                return self.net[2](value_first_swiglu(value_gate))
             activated, activated_scale = value_first_swiglu_fp8(value_gate)
-            return self.net[2].forward_prequantized(activated, activated_scale)
+            return self.net[2].reduce_output(
+                self.net[2].forward_prequantized(activated, activated_scale)
+            )
         return self.net[2](self.net[0](value))
 
     @property
@@ -242,8 +274,12 @@ class _FeedForward(nn.Module):
         if not self.accepts_prequantized_fp8:
             raise RuntimeError("feed-forward precision cannot consume prequantized FP8 input")
         value_gate = self.net[0].proj.forward_prequantized(value, scale)
+        if self.net[2].tp_group.world_size > 1:
+            return self.net[2](value_first_swiglu(value_gate))
         activated, activated_scale = value_first_swiglu_fp8(value_gate)
-        return self.net[2].forward_prequantized(activated, activated_scale)
+        return self.net[2].reduce_output(
+            self.net[2].forward_prequantized(activated, activated_scale)
+        )
 
 
 class _RotaryEmbedding(nn.Module):
@@ -297,7 +333,7 @@ class _RotaryEmbedding(nn.Module):
             sine[:, start + 3 * width : stop + 3 * width].copy_(sine[:, start:stop])
 
 
-class _TimeEmbedding(nn.Module):
+class H3TimestepEmbedding(nn.Module):
     """Embeds diffusion timesteps into conditioning vectors for adaptive modulation."""
 
     def __init__(
@@ -443,28 +479,66 @@ class _H3Attention(nn.Module):
         super().__init__()
         inner = config.heads * config.head_dim
         self.config = config
-        self.mesh = mesh
-        self.vsa = vsa
+        self.sequence_size = mesh.size("ulysses")
+        self.tensor_heads = config.heads // mesh.size("tp")
+        self.local_heads = self.tensor_heads // self.sequence_size
+        self.context_size = mesh.size("cp")
+        self.context_rank = mesh.coord("cp")
+        self.projected_head = mesh.size("tp") == 1 and self.context_size == 1
+        projection_group = (
+            mesh.get_group("ulysses") if self.projected_head else mesh.get_group("tp")
+        )
+        projection_config = LayerConfig(
+            TensorParallel(projection_group.rank_in_group, projection_group.world_size),
+            None,
+            projection_group,
+        )
+        self.parallel_attention: UlyssesAttention
+        if self.context_size == 1:
+            self.parallel_attention = UlyssesAttention(vsa, ulysses_group=mesh.get_group("ulysses"))
+        elif mesh.parallel_config.sequence_parallel.kind == "attention2d":
+            self.parallel_attention = Attention2D(
+                vsa,
+                ulysses_group=mesh.get_group("ulysses"),
+                row_group=mesh.get_group("cp_row"),
+                col_group=mesh.get_group("cp_col"),
+                context_group=mesh.get_group("cp"),
+            )
+        elif mesh.parallel_config.sequence_parallel.kind in ("ring", "hybrid"):
+            self.parallel_attention = RingAttention(
+                vsa,
+                ulysses_group=mesh.get_group("ulysses"),
+                context_group=mesh.get_group("cp"),
+            )
+        else:
+            self.parallel_attention = GatherAttention(
+                vsa,
+                ulysses_group=mesh.get_group("ulysses"),
+                context_group=mesh.get_group("cp"),
+            )
         with torch.device(device):
             self.to_qkvg = InterleavedMergedColumnParallelLinear(
                 config.hidden_size,
                 inner,
                 4,
                 config.head_dim,
-                layer_config=layer_config,
+                layer_config=projection_config,
+                sequence_group=mesh.get_group("sp"),
+                input_scale_group=mesh.get_group("sp"),
+                weight_scale_partition_size=14 * 4 * config.head_dim,
                 quant_method=_dynamic_quant_method(linear_precision, tensorwise=True),
                 bias=False,
             )
         self.to_out = nn.Sequential(
-            _dynamic_quantized_linear(
+            _row_linear(
                 inner,
                 config.hidden_size,
                 linear_precision=linear_precision,
-                bias=False,
                 layer_config=layer_config,
                 device=device,
             )
         )
+        self.to_out[0].logical_input_row_partitions = 4 // mesh.size("sp")
         self.norm_q = _RMSNorm(config.head_dim, config.qk_norm_eps, device=device)
         self.norm_k = _RMSNorm(config.head_dim, config.qk_norm_eps, device=device)
 
@@ -477,11 +551,11 @@ class _H3Attention(nn.Module):
         dense_key_indices: torch.Tensor,
         prefix_count: torch.Tensor,
         projection_peers: tuple[torch.Tensor, ...],
-        projection_exchange: SymmetricMemoryWorkspace,
         projection_sync_input: torch.Tensor,
         projection_sync_output: torch.Tensor,
         attention_workspace: torch.Tensor,
         attention_output: torch.Tensor,
+        context_workspace: AttentionContextWorkspace | None,
         tile_scores: torch.Tensor,
         block_counts: torch.Tensor,
         block_indices: torch.Tensor,
@@ -494,27 +568,23 @@ class _H3Attention(nn.Module):
         """Exchange sequence shards, run sparse global attention, and project local rows."""
 
         local = hidden[0]
-        heads, head_dim = self.config.heads, self.config.head_dim
+        head_dim = self.config.head_dim
         local_rows = local.shape[0]
-        sp_size = self.mesh.size("sp")
-        local_heads = heads // sp_size
-        global_rows = local_rows * sp_size
-
-        # The fused Q/K/V/gate projection exchanges rank-local rows while
-        # retaining only this rank's head shard across the global sequence.
-        exchanged = self.to_qkvg.forward_sequence_parallel(
-            local,
-            self.mesh,
-            attention_workspace,
-            group="sp",
-        ).view(
-            global_rows,
-            local_heads,
-            4,
-            head_dim,
-        )
+        global_rows = local_rows * self.sequence_size
+        if self.projected_head:
+            exchanged = self.to_qkvg.forward_sequence_parallel(local, attention_workspace).view(
+                global_rows,
+                self.local_heads,
+                4,
+                head_dim,
+            )
+        else:
+            projected = self.to_qkvg(local).view(local_rows, self.tensor_heads, 4, head_dim)
+            exchanged = self.parallel_attention.exchange_projection(projected)
         query, key, value, gate = exchanged.unbind(2)
         cosine, sine = rotary
+        start = self.context_rank * global_rows
+        cosine, sine = cosine[start : start + global_rows], sine[start : start + global_rows]
 
         # Query/key normalization and rotary application mutate their views of
         # the shared projection buffer before sparse block selection.
@@ -529,10 +599,6 @@ class _H3Attention(nn.Module):
             in_place=True,
         )
         workspace = VideoSparseAttentionWorkspace(
-            exchange=projection_exchange,
-            exchange_outputs=projection_peers,
-            exchange_sync_input=projection_sync_input,
-            exchange_sync_output=projection_sync_output,
             attention_output=attention_output,
             tile_scores=tile_scores,
             block_counts=block_counts,
@@ -545,7 +611,7 @@ class _H3Attention(nn.Module):
         )
 
         # VSA returns local sequence rows with globally composed head shards.
-        local_output = self.vsa.forward_local(
+        local_output = self.parallel_attention(
             query,
             key,
             value,
@@ -555,27 +621,12 @@ class _H3Attention(nn.Module):
             dense_key_indices,
             prefix_count,
             workspace,
+            outputs=projection_peers,
+            sync_input=projection_sync_input,
+            sync_output=projection_sync_output,
+            context_workspace=context_workspace,
         )
         return self.to_out(local_output.reshape(1, local_output.shape[0], -1))
-
-
-class _AdaModulation(nn.Module):
-    """Produces per-block adaptive normalization scales, shifts, and gates from timestep conditioning."""
-
-    def __init__(self, config: H3TransformerConfig, *, device: torch.device | str) -> None:
-        """Build the projection that emits six modulation vectors per modality."""
-
-        super().__init__()
-        self.hidden_size = config.hidden_size
-        self.linear = nn.Linear(config.time_dim, config.hidden_size * 6 * MODALITIES, device=device)
-
-    def forward(self, time: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        """Produce attention and feed-forward shift, scale, and gate vectors."""
-
-        values = self.linear(F.silu(time).to(self.linear.weight.dtype)).reshape(
-            -1, self.hidden_size * 6
-        )
-        return values.chunk(6, dim=-1)
 
 
 class _TransformerBlock(nn.Module):
@@ -607,11 +658,12 @@ class _TransformerBlock(nn.Module):
         self.norm2 = _RMSNorm(config.hidden_size, config.norm_eps, device=device)
         self.ff = _FeedForward(
             config,
+            logical_input_row_partitions=4 // mesh.size("sp"),
             linear_precision=mlp_linear_precision,
             layer_config=layer_config,
             device=device,
         )
-        self.adaln_proj = _AdaModulation(config, device=device)
+        self.hidden_size = config.hidden_size
 
     def forward(
         self,
@@ -624,11 +676,11 @@ class _TransformerBlock(nn.Module):
         dense_key_indices: torch.Tensor,
         prefix_count: torch.Tensor,
         projection_peers: tuple[torch.Tensor, ...],
-        projection_exchange: SymmetricMemoryWorkspace,
         projection_sync_input: torch.Tensor,
         projection_sync_output: torch.Tensor,
         attention_workspace: torch.Tensor,
         attention_output: torch.Tensor,
+        context_workspace: AttentionContextWorkspace | None,
         tile_scores: torch.Tensor,
         block_counts: torch.Tensor,
         block_indices: torch.Tensor,
@@ -644,7 +696,7 @@ class _TransformerBlock(nn.Module):
         # six-vector modulation tuple for each packed hidden row.
         shift_attn, scale_attn, gate_attn, shift_ffn, scale_ffn, gate_ffn = (
             tensor.to(hidden.dtype)
-            for tensor in adaln_values.reshape(-1, self.adaln_proj.hidden_size * 6).chunk(6, dim=-1)
+            for tensor in adaln_values.reshape(-1, self.hidden_size * 6).chunk(6, dim=-1)
         )
         normalized = row_modulated_rmsnorm(
             hidden,
@@ -662,11 +714,11 @@ class _TransformerBlock(nn.Module):
             dense_key_indices,
             prefix_count,
             projection_peers,
-            projection_exchange,
             projection_sync_input,
             projection_sync_output,
             attention_workspace,
             attention_output,
+            context_workspace,
             tile_scores,
             block_counts,
             block_indices,
@@ -722,17 +774,8 @@ class _OutputNorm(nn.Module):
 
         super().__init__()
         self.norm = _RMSNorm(config.hidden_size, config.norm_eps, device=device)
-        self.linear = nn.Linear(config.time_dim, config.hidden_size * 2, device=device)
 
     def forward(
-        self, hidden: torch.Tensor, time: torch.Tensor, timestep_indices: torch.Tensor
-    ) -> torch.Tensor:
-        """Derive final adaptive shift and scale from branch timesteps."""
-
-        shift, scale = self.linear(F.silu(time).to(self.linear.weight.dtype)).chunk(2, dim=-1)
-        return self.forward_precomputed(hidden, shift, scale, timestep_indices)
-
-    def forward_precomputed(
         self,
         hidden: torch.Tensor,
         shift: torch.Tensor,
@@ -765,63 +808,77 @@ class MiniMaxH3Transformer(nn.Module):
 
         super().__init__()
         config = H3TransformerConfig()
-        if config.heads % mesh.size("sp"):
+        if config.heads % (mesh.size("tp") * mesh.size("ulysses")):
             raise ValueError("H3 attention heads must divide the sequence-parallel size")
         self.config = config
         self.mesh = mesh
+        self.pipeline = LayerPipeline(mesh.get_group("pp"), config.layers)
         self.layout = layout
         self.attention_linear_precision = attention_linear_precision
         self.mlp_linear_precision = mlp_linear_precision
 
-        # Sequence-parallel rank coordinates also determine tensor-parallel
-        # projection shards for the packed global sequence.
         layer_config = LayerConfig(
-            parallel=TensorParallel(
-                rank=mesh.coord("sp"),
-                size=mesh.size("sp"),
-            ),
+            parallel=TensorParallel.from_mesh(mesh),
             quantization=None,
+            tp_group=mesh.get_group("tp"),
         )
         execution = self.build_execution(layout)
 
         # Input and output projections retain modality-specific widths around a
         # common hidden stream shared by text, video, and audio rows.
         video_patch_width = config.video_channels * 4
-        self.proj_in = nn.Linear(video_patch_width, config.hidden_size, device=parameter_device)
-        self.audio_proj_in = nn.Linear(
-            config.audio_channels, config.hidden_size, device=parameter_device
+        self.proj_in = (
+            nn.Linear(video_patch_width, config.hidden_size, device=parameter_device)
+            if self.pipeline.first
+            else None
         )
-        self.context_embedder = nn.Linear(
-            config.text_dim, config.hidden_size, device=parameter_device
+        self.audio_proj_in = (
+            nn.Linear(config.audio_channels, config.hidden_size, device=parameter_device)
+            if self.pipeline.first
+            else None
         )
-        self.time_embedder = _TimeEmbedding(
-            config,
-            device=parameter_device,
-            buffer_device=mesh.local_device,
+        self.context_embedder = (
+            nn.Linear(config.text_dim, config.hidden_size, device=parameter_device)
+            if self.pipeline.first
+            else None
         )
+        self.modulation_plan: ModulationPlan
         self.rope = _RotaryEmbedding(config, device=mesh.local_device)
-        self.token_refiner = _TokenRefiner(
-            config,
-            linear_precision="bf16",
-            layer_config=layer_config,
-            device=parameter_device,
-        )
-        self.transformer_blocks = nn.ModuleList(
-            _TransformerBlock(
+        self.token_refiner = (
+            _TokenRefiner(
                 config,
-                mesh,
-                execution.vsa,
-                attention_linear_precision=attention_linear_precision,
-                mlp_linear_precision=mlp_linear_precision,
+                linear_precision="bf16",
                 layer_config=layer_config,
                 device=parameter_device,
             )
-            for _ in range(config.layers)
+            if self.pipeline.first
+            else None
         )
-        self.norm_out = _OutputNorm(config, device=parameter_device)
-        self.proj_out = nn.Linear(config.hidden_size, video_patch_width, device=parameter_device)
-        self.audio_proj_out = nn.Linear(
-            config.hidden_size, config.audio_channels, device=parameter_device
+        # Global layer names remain checkpoint identities on every stage.
+        self.transformer_blocks = nn.ModuleDict(
+            {
+                str(layer): _TransformerBlock(
+                    config,
+                    mesh,
+                    execution.vsa,
+                    attention_linear_precision=attention_linear_precision,
+                    mlp_linear_precision=mlp_linear_precision,
+                    layer_config=layer_config,
+                    device=parameter_device,
+                )
+                for layer in self.pipeline.layers
+            }
+        )
+        self.norm_out = _OutputNorm(config, device=parameter_device) if self.pipeline.last else None
+        self.proj_out = (
+            nn.Linear(config.hidden_size, video_patch_width, device=parameter_device)
+            if self.pipeline.last
+            else None
+        )
+        self.audio_proj_out = (
+            nn.Linear(config.hidden_size, config.audio_channels, device=parameter_device)
+            if self.pipeline.last
+            else None
         )
 
         # Execution indexes are immutable layout metadata, not checkpoint state;
@@ -853,10 +910,7 @@ class MiniMaxH3Transformer(nn.Module):
             valid_sizes=layout.packed.tile_valid_sizes,
             device=self.mesh.local_device,
         )
-        vsa = getattr(self, "vsa", None)
-        if vsa is None:
-            vsa = VideoSparseAttentionBackend(metadata)
-            self.vsa = vsa
+        vsa = VideoSparseAttentionBackend(metadata)
         local_tags = layout.packed.token_tags[layout.local_start : layout.local_end]
         timestep_indices = (local_tags == AUDIO_TAG).to(torch.long)
         global_text = layout.packed.text_indices[
@@ -893,92 +947,65 @@ class MiniMaxH3Transformer(nn.Module):
             "non_text_mask",
         ):
             setattr(self, name, getattr(execution, name))
-        for block in self.transformer_blocks:
-            block.attn.vsa = execution.vsa
+        for block in self.transformer_blocks.values():
+            block.attn.parallel_attention.backend = execution.vsa
 
     def refine_text(self, encoder_hidden: torch.Tensor) -> torch.Tensor:
         """Project encoder states to H3 width and apply the conditioning refiner."""
 
+        if self.context_embedder is None or self.token_refiner is None:
+            raise RuntimeError("text refinement belongs to the first pipeline stage")
         return self.token_refiner(
             self.context_embedder(encoder_hidden.to(self.context_embedder.weight.dtype))
         )
 
-    @torch.inference_mode()
-    def prepare_adaln_plan(
-        self,
-        slot: H3StateSlot,
-        video_timesteps: torch.Tensor,
-        audio_timesteps: torch.Tensor,
-    ) -> None:
-        """Precompute every block and output AdaLN projection for all solver steps."""
+    def select_adaln_step(self, scratch: H3Scratch, step: int) -> None:
+        """Bind the fixed solver ladder's modulation products to execution scratch."""
 
-        activated_time = torch.stack(
-            tuple(
-                F.silu(
-                    self.time_embedder(torch.stack((video_timesteps[step], audio_timesteps[step])))
-                )
-                for step in range(int(video_timesteps.numel()))
-            )
-        ).flatten(0, 1)
-        prepare_modulation_plan(
-            activated_time,
-            tuple(
-                block.adaln_proj.linear for block in self.transformer_blocks
-            ),
-            self.norm_out.linear,
-            slot.block_adaln_plan,
-            slot.final_adaln_plan,
-        )
-
-    @staticmethod
-    def select_adaln_step(slot: H3StateSlot, scratch: H3Scratch, step: int) -> None:
-        """Copy one solver step's resident modulation slices into execution scratch."""
-
-        select_modulation_step(
-            slot.block_adaln_plan,
-            slot.final_adaln_plan,
-            step,
-            scratch.block_adaln_params,
-            scratch.final_adaln_params,
-        )
+        self.modulation_plan.copy_step(step, scratch.block_adaln_params, scratch.final_adaln_params)
 
     def forward_local_prepared(
         self,
         slot: H3StateSlot,
         scratch: H3Scratch,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run the fixed-shape local forward from caller-populated timestep storage."""
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Run assigned layers and publish media predictions on the final stage."""
 
         hidden = scratch.packed_hidden
-        hidden.zero_()
+        if self.pipeline.first:
+            assert self.proj_in is not None and self.audio_proj_in is not None
+            hidden.zero_()
 
-        # Assemble rank-local packed rows from persistent text, video, and audio state.
-        if self.local_text_indices.numel():
-            torch.index_select(
-                slot.text_condition,
-                1,
-                self.global_text_indices,
-                out=scratch.local_text_hidden,
-            )
-            hidden.index_copy_(1, self.local_text_indices, scratch.local_text_hidden)
-        for rows, projection, indices in (
-            (slot.video_rows, self.proj_in, self.local_video_indices),
-            (slot.audio_rows, self.audio_proj_in, self.local_audio_indices),
-        ):
-            projected = scratch.projected_input[: rows.shape[0]]
-            torch.addmm(
-                projection.bias,
-                rows,
-                projection.weight.t(),
-                out=projected,
-            )
-            projected_bf16 = scratch.projected_input_bf16[: rows.shape[0]]
-            projected_bf16.copy_(projected)
-            hidden[0].index_copy_(0, indices, projected_bf16)
+            # Assemble rank-local packed rows from persistent text, video, and audio state.
+            if self.local_text_indices.numel():
+                torch.index_select(
+                    slot.text_condition,
+                    1,
+                    self.global_text_indices,
+                    out=scratch.local_text_hidden,
+                )
+                hidden.index_copy_(1, self.local_text_indices, scratch.local_text_hidden)
+            for rows, projection, indices in (
+                (slot.video_rows, self.proj_in, self.local_video_indices),
+                (slot.audio_rows, self.audio_proj_in, self.local_audio_indices),
+            ):
+                projected = scratch.projected_input[: rows.shape[0]]
+                torch.addmm(
+                    projection.bias,
+                    rows,
+                    projection.weight.t(),
+                    out=projected,
+                )
+                projected_bf16 = scratch.projected_input_bf16[: rows.shape[0]]
+                projected_bf16.copy_(projected)
+                hidden[0].index_copy_(0, indices, projected_bf16)
+
+        else:
+            self.pipeline.receive_activation(hidden)
 
         # Every block consumes the same layout metadata and caller-owned collective buffers.
         rotary = (slot.rotary_cosine, slot.rotary_sine)
-        for layer, block in enumerate(self.transformer_blocks):
+        for layer, block in enumerate(self.transformer_blocks.values()):
             hidden = block(
                 hidden,
                 scratch.block_adaln_params[layer],
@@ -989,11 +1016,11 @@ class MiniMaxH3Transformer(nn.Module):
                 slot.dense_key_indices,
                 slot.prefix_count,
                 scratch.projection_peers,
-                scratch.projection_exchange,
                 scratch.projection_sync_input,
                 scratch.projection_sync_output,
                 scratch.attention_workspace,
                 scratch.attention_output,
+                scratch.context_workspace,
                 scratch.tile_scores,
                 scratch.block_counts,
                 scratch.block_indices,
@@ -1003,9 +1030,14 @@ class MiniMaxH3Transformer(nn.Module):
                 scratch.compressed_tiles,
                 scratch.topk_indices_i32,
             )
+        self.pipeline.send_activation(hidden)
+        if not self.pipeline.last:
+            return None
+        assert self.norm_out is not None and self.proj_out is not None
+        assert self.audio_proj_out is not None
         # Final adaptive normalization precedes separate rank-local media heads.
         final_shift, final_scale = scratch.final_adaln_params.chunk(2, dim=-1)
-        hidden = self.norm_out.forward_precomputed(
+        hidden = self.norm_out(
             hidden,
             final_shift,
             final_scale,

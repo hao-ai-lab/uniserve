@@ -325,6 +325,35 @@ class _TransformerBlock(nn.Module):
         return hidden, feed_forward, feed_forward_bias
 
 
+def blend_decoded_overlap(
+    previous: torch.Tensor,
+    current: torch.Tensor,
+    extent: int,
+    dim: int,
+) -> torch.Tensor:
+    """Cross-fade an overlap extent between adjacent decoded tiles along one dimension."""
+
+    extent = min(previous.shape[dim], current.shape[dim], extent)
+    positions = torch.arange(extent, device=current.device, dtype=current.dtype)
+    shape = [1] * current.ndim
+    shape[dim] = extent
+    previous_weight = (1 - positions / extent).view(shape)
+    current_weight = (positions / extent).view(shape)
+    previous_slice = [slice(None)] * current.ndim
+    current_slice = [slice(None)] * current.ndim
+    previous_slice[dim] = slice(-extent, None)
+    current_slice[dim] = slice(0, extent)
+    blended = (
+        previous[tuple(previous_slice)] * previous_weight
+        + current[tuple(current_slice)] * current_weight
+    )
+    if extent == current.shape[dim]:
+        return blended
+    remainder = [slice(None)] * current.ndim
+    remainder[dim] = slice(extent, None)
+    return torch.cat((blended, current[tuple(remainder)]), dim=dim)
+
+
 class MiniMaxH3VideoDecoder(nn.Module):
     """Checkpoint-defined 36-layer ViT decoder and latent-channel projection."""
 
@@ -384,35 +413,6 @@ class MiniMaxH3VideoDecoder(nn.Module):
             starts.append(starts[-1] + tile_size - overlap)
         return starts, [tile_size] * tile_count, overlaps
 
-    @staticmethod
-    def _blend(
-        previous: torch.Tensor,
-        current: torch.Tensor,
-        extent: int,
-        dim: int,
-    ) -> torch.Tensor:
-        """Cross-fade an overlap extent between adjacent decoded tiles along one dimension."""
-
-        extent = min(previous.shape[dim], current.shape[dim], extent)
-        positions = torch.arange(extent, device=current.device, dtype=current.dtype)
-        shape = [1] * current.ndim
-        shape[dim] = extent
-        previous_weight = (1 - positions / extent).view(shape)
-        current_weight = (positions / extent).view(shape)
-        previous_slice = [slice(None)] * current.ndim
-        current_slice = [slice(None)] * current.ndim
-        previous_slice[dim] = slice(-extent, None)
-        current_slice[dim] = slice(0, extent)
-        blended = (
-            previous[tuple(previous_slice)] * previous_weight
-            + current[tuple(current_slice)] * current_weight
-        )
-        if extent == current.shape[dim]:
-            return blended
-        remainder = [slice(None)] * current.ndim
-        remainder[dim] = slice(extent, None)
-        return torch.cat((blended, current[tuple(remainder)]), dim=dim)
-
     def _stitch_tiles(
         self,
         tiles: list[list[torch.Tensor]],
@@ -426,14 +426,14 @@ class MiniMaxH3VideoDecoder(nn.Module):
             assembled: list[torch.Tensor] = []
             for column_index, tile in enumerate(row):
                 if row_index:
-                    tile = self._blend(
+                    tile = blend_decoded_overlap(
                         tiles[row_index - 1][column_index],
                         tile,
                         height_overlaps[row_index - 1],
                         -2,
                     )
                 if column_index:
-                    tile = self._blend(
+                    tile = blend_decoded_overlap(
                         row[column_index - 1],
                         tile,
                         width_overlaps[column_index - 1],

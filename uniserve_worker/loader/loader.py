@@ -334,7 +334,9 @@ def _construct_model(
     dtype = _serving_dtype(request.execution.model_dtype)
     quantization = QuantizationConfig.from_model_config(config)
     _validate_quantization(quantization, request.device, dtype)
-    layer_config = LayerConfig(parallel=request.parallel, quantization=quantization)
+    layer_config = LayerConfig(
+        parallel=request.parallel, quantization=quantization, tp_group=request.tp_group
+    )
     use_meta = request.load.load_format is LoadFormat.LAYERED or (
         entry.architecture == "NEOChatModel" and request.scope.value != "whole"
     )
@@ -343,7 +345,16 @@ def _construct_model(
     construction_device = torch.device("meta" if use_meta else request.device)
     with _default_dtype(dtype), torch.device(construction_device):
         if entry.architecture == "NEOChatModel":
-            model = entry.model_class(config, layer_config=layer_config, scope=request.scope.value)
+            model = entry.model_class(
+                config,
+                layer_config=layer_config,
+                transfers=request.transfers,
+                scope=request.scope.value,
+            )
+        elif entry.architecture == "BagelForConditionalGeneration":
+            model = entry.model_class(
+                config, layer_config=layer_config, transfers=request.transfers
+            )
         else:
             model = entry.model_class(config, layer_config=layer_config)
     if not isinstance(model, nn.Module):

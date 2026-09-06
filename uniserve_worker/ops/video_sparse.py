@@ -43,6 +43,9 @@ if triton is not None:
         output_stride_tile: tl.constexpr,
         output_stride_head: tl.constexpr,
         heads: tl.constexpr,
+        query_tiles: tl.constexpr,
+        query_tile_offset: tl.constexpr,
+        key_tile_offset: tl.constexpr,
         tile_rows: tl.constexpr,
         width: tl.constexpr,
     ):
@@ -50,30 +53,29 @@ if triton is not None:
 
         tile = tl.program_id(0)
         head = tl.program_id(1)
-        row_offsets = tile * tile_rows + tl.arange(0, tile_rows)
+        row_offsets = (tile * tile_rows + tl.arange(0, tile_rows)).to(tl.int64)
         columns = tl.arange(0, width)
-        valid_rows = tl.load(valid_sizes + tile)
+        valid_rows = tl.load(valid_sizes + key_tile_offset + tile)
         mask = tl.arange(0, tile_rows)[:, None] < valid_rows
         output_offsets = tile * output_stride_tile + head * output_stride_head + columns
 
-        # Q, K, and V share tiling but retain independent source strides and
-        # output buffers. Empty tiles use a denominator of one and sum to zero.
-        query_values = tl.load(
-            query
-            + row_offsets[:, None] * query_stride_row
-            + head * query_stride_head
-            + columns[None, :],
-            mask=mask,
-            other=0.0,
-        ).to(tl.float32)
-        query_mean = tl.sum(query_values, axis=0) / tl.maximum(valid_rows, 1)
-        tl.store(pooled_query + output_offsets, query_mean)
+        # Query and key owners may cover different global tile intervals.
+        # Keep the same reduction and rounding for all physical partitions.
+        if tile < query_tiles:
+            query_valid_rows = tl.load(valid_sizes + query_tile_offset + tile)
+            query_values = tl.load(
+                query
+                + row_offsets[:, None] * query_stride_row
+                + head * query_stride_head
+                + columns[None, :],
+                mask=tl.arange(0, tile_rows)[:, None] < query_valid_rows,
+                other=0.0,
+            ).to(tl.float32)
+            query_mean = tl.sum(query_values, axis=0) / tl.maximum(query_valid_rows, 1)
+            tl.store(pooled_query + output_offsets, query_mean)
 
         key_values = tl.load(
-            key
-            + row_offsets[:, None] * key_stride_row
-            + head * key_stride_head
-            + columns[None, :],
+            key + row_offsets[:, None] * key_stride_row + head * key_stride_head + columns[None, :],
             mask=mask,
             other=0.0,
         ).to(tl.float32)
@@ -149,10 +151,7 @@ if triton is not None:
         chosen = (values >= lower) & valid
         positions = tl.cumsum(chosen.to(tl.int32), axis=0) - 1
         tl.store(
-            output
-            + head * output_stride_head
-            + query_row * output_stride_row
-            + positions,
+            output + head * output_stride_head + query_row * output_stride_row + positions,
             offsets.to(tl.int32),
             mask=chosen & (positions < selected),
         )
@@ -179,13 +178,11 @@ if triton is not None:
     ):
         """Pack row-major Q/K/V into contiguous ``[3, heads, rows, width]`` storage."""
 
-        row_offsets = tl.program_id(0) * block_rows + tl.arange(0, block_rows)
+        row_offsets = (tl.program_id(0) * block_rows + tl.arange(0, block_rows)).to(tl.int64)
         head = tl.program_id(1)
         columns = tl.arange(0, width)
         mask = row_offsets[:, None] < rows
-        destination = (
-            head * rows * width + row_offsets[:, None] * width + columns[None, :]
-        )
+        destination = head * rows * width + row_offsets[:, None] * width + columns[None, :]
 
         # Each component uses its own source strides and a component-sized
         # offset into the shared destination allocation.
@@ -215,9 +212,7 @@ if triton is not None:
             mask=mask,
             other=0.0,
         )
-        tl.store(
-            packed + 2 * heads * rows * width + destination, value_values, mask=mask
-        )
+        tl.store(packed + 2 * heads * rows * width + destination, value_values, mask=mask)
 
     @triton.jit
     def _unpack_add_compression_kernel(
@@ -240,7 +235,7 @@ if triton is not None:
     ):
         """Compose head-major attention output with per-tile compression values."""
 
-        row_offsets = tl.program_id(0) * block_rows + tl.arange(0, block_rows)
+        row_offsets = (tl.program_id(0) * block_rows + tl.arange(0, block_rows)).to(tl.int64)
         head = tl.program_id(1)
         columns = tl.arange(0, width)
         mask = row_offsets[:, None] < rows
@@ -285,10 +280,7 @@ if triton is not None:
         attended,
         gate,
         compressed,
-        output_0,
-        output_1,
-        output_2,
-        output_3,
+        outputs,
         attended_stride_head: tl.constexpr,
         attended_stride_row: tl.constexpr,
         gate_stride_row: tl.constexpr,
@@ -304,9 +296,9 @@ if triton is not None:
         tile_rows: tl.constexpr,
         block_rows: tl.constexpr,
     ):
-        """Compose values and route them into four destination-rank head shards."""
+        """Compose values and route them into destination-rank head shards."""
 
-        row_offsets = tl.program_id(0) * block_rows + tl.arange(0, block_rows)
+        row_offsets = (tl.program_id(0) * block_rows + tl.arange(0, block_rows)).to(tl.int64)
         local_row_offsets = row_offsets % local_rows
         head = tl.program_id(1)
         columns = tl.arange(0, width)
@@ -346,10 +338,12 @@ if triton is not None:
             + columns[None, :]
         )
         destination_rank = row_offsets[:, None] // local_rows
-        tl.store(output_0 + destination, values, mask=valid & (destination_rank == 0))
-        tl.store(output_1 + destination, values, mask=valid & (destination_rank == 1))
-        tl.store(output_2 + destination, values, mask=valid & (destination_rank == 2))
-        tl.store(output_3 + destination, values, mask=valid & (destination_rank == 3))
+        for destination_index in tl.static_range(len(outputs)):
+            tl.store(
+                outputs[destination_index] + destination,
+                values,
+                mask=valid & (destination_rank == destination_index),
+            )
 
 
 def _pack_qkv(
@@ -404,6 +398,8 @@ def _pool_qkv_means(
     pooled_query: torch.Tensor,
     pooled_key: torch.Tensor,
     pooled_value: torch.Tensor,
+    query_tile_offset: int = 0,
+    key_tile_offset: int = 0,
 ) -> None:
     """Average each Q/K/V head across fixed 64-row tiles into output buffers."""
 
@@ -411,9 +407,20 @@ def _pool_qkv_means(
         raise RuntimeError("FastH3 VSA fused pooling requires Triton")
 
     rows, heads, width = (int(size) for size in query.shape)
-    tiles = int(valid_sizes.numel())
-    if rows != tiles * 64:
-        raise ValueError("FastH3 VSA pooling metadata does not match the input rows")
+    tiles = key.shape[0] // 64
+    query_tiles = rows // 64
+    if (
+        rows % 64
+        or key.shape[0] % 64
+        or query_tiles > tiles
+        or key.shape != value.shape
+        or key.shape[1:] != query.shape[1:]
+        or query_tile_offset < 0
+        or key_tile_offset < 0
+        or query_tile_offset + query_tiles > valid_sizes.numel()
+        or key_tile_offset + tiles > valid_sizes.numel()
+    ):
+        raise ValueError("FastH3 VSA pooling metadata does not cover Q/K tile intervals")
 
     # One program owns a tile/head pair and reduces only the live prefix given
     # by ``valid_sizes``; the final tile may therefore be partially occupied.
@@ -434,6 +441,9 @@ def _pool_qkv_means(
         int(pooled_query.stride(0)),
         int(pooled_query.stride(1)),
         heads,
+        query_tiles,
+        query_tile_offset,
+        key_tile_offset,
         64,
         width,
         num_warps=1,
@@ -453,6 +463,8 @@ def _pool_qkv_means_custom(
     pooled_query: torch.Tensor,
     pooled_key: torch.Tensor,
     pooled_value: torch.Tensor,
+    query_tile_offset: int = 0,
+    key_tile_offset: int = 0,
 ) -> None:
     """Expose in-place pooled outputs through the registered custom operator."""
 
@@ -464,6 +476,8 @@ def _pool_qkv_means_custom(
         pooled_query,
         pooled_key,
         pooled_value,
+        query_tile_offset,
+        key_tile_offset,
     )
 
 
@@ -476,10 +490,13 @@ def _pool_qkv_means_fake(
     pooled_query: torch.Tensor,
     pooled_key: torch.Tensor,
     pooled_value: torch.Tensor,
+    query_tile_offset: int = 0,
+    key_tile_offset: int = 0,
 ) -> None:
     """Declare the pooled custom operator's fake-tensor mutation contract."""
 
     del query, key, value, valid_sizes, pooled_query, pooled_key, pooled_value
+    del query_tile_offset, key_tile_offset
 
 
 def _threshold_topk_indices(scores: torch.Tensor, output: torch.Tensor) -> None:
@@ -569,10 +586,10 @@ def _compose_to_head_shards(
     attended: torch.Tensor,
     gate: torch.Tensor,
     compressed: torch.Tensor,
-    outputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    outputs: tuple[torch.Tensor, ...],
     source_rank: int,
 ) -> None:
-    """Compose values and scatter this rank's heads into four exchange shards."""
+    """Compose values and scatter this rank's heads into exchange shards."""
 
     if triton is None or not triton_available(attended.device):
         raise RuntimeError("FastH3 SM100a output exchange requires Triton")
@@ -581,17 +598,14 @@ def _compose_to_head_shards(
     local_rows = int(outputs[0].shape[0])
     global_heads = int(outputs[0].shape[1])
 
-    # The source row axis concatenates four destination-rank segments. Each
+    # The source row axis concatenates destination-rank segments. Each
     # output receives one segment in the global head range owned by source_rank.
     block_rows = 8
     _compose_to_head_shards_kernel[(triton.cdiv(rows, block_rows), local_heads)](
         attended,
         gate,
         compressed,
-        outputs[0],
-        outputs[1],
-        outputs[2],
-        outputs[3],
+        outputs,
         int(attended.stride(1)),
         int(attended.stride(2)),
         int(gate.stride(0)),
@@ -631,6 +645,8 @@ class PoolQKVMeansReq:
     pooled_query: torch.Tensor
     pooled_key: torch.Tensor
     pooled_value: torch.Tensor
+    query_tile_offset: int = 0
+    key_tile_offset: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -705,6 +721,8 @@ class _TritonPoolQKVMeans(Operator):
             req.pooled_query,
             req.pooled_key,
             req.pooled_value,
+            req.query_tile_offset,
+            req.key_tile_offset,
         )
 
 
@@ -755,12 +773,10 @@ class _TritonComposeHeadShards(Operator):
         super().__init__("triton", "video_sparse_compose_head_shards")
 
     def can_run(self, req: ComposeHeadShardsReq) -> bool:
-        """Return whether Triton and the four-destination layout are available."""
+        """Return whether Triton and the destination layout are available."""
 
         return (
-            triton is not None
-            and triton_available(req.attended.device)
-            and len(req.outputs) == 4
+            triton is not None and triton_available(req.attended.device) and len(req.outputs) >= 1
         )
 
     def run(self, req: ComposeHeadShardsReq) -> None:
@@ -810,9 +826,7 @@ def compose_head_shards_dispatcher() -> Dispatcher[ComposeHeadShardsReq, None]:
     return Dispatcher("video_sparse_compose_head_shards", [_TritonComposeHeadShards()])
 
 
-def pack_qkv(
-    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
-) -> torch.Tensor:
+def pack_qkv(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
     """Return Q/K/V packed from ``[rows, heads, width]`` to component-head order."""
 
     return pack_qkv_dispatcher().run(PackQKVReq(query, key, value))
@@ -826,6 +840,8 @@ def pool_qkv_means(
     pooled_query: torch.Tensor,
     pooled_key: torch.Tensor,
     pooled_value: torch.Tensor,
+    query_tile_offset: int = 0,
+    key_tile_offset: int = 0,
 ) -> None:
     """Fill per-tile Q/K/V means using ``valid_sizes`` for partial tiles."""
 
@@ -838,6 +854,8 @@ def pool_qkv_means(
             pooled_query,
             pooled_key,
             pooled_value,
+            query_tile_offset,
+            key_tile_offset,
         )
     )
 
@@ -856,9 +874,7 @@ def unpack_add_compression(
 ) -> None:
     """Fill row-major output with gated per-tile compression added to attention."""
 
-    add_compression_dispatcher().run(
-        AddCompressionReq(attended, gate, compressed, output)
-    )
+    add_compression_dispatcher().run(AddCompressionReq(attended, gate, compressed, output))
 
 
 def compose_to_head_shards(
@@ -868,7 +884,7 @@ def compose_to_head_shards(
     outputs: tuple[torch.Tensor, ...],
     source_rank: int,
 ) -> None:
-    """Compose local heads into four destination shards at ``source_rank``'s head range."""
+    """Compose local heads into destination shards at ``source_rank``'s head range."""
 
     compose_head_shards_dispatcher().run(
         ComposeHeadShardsReq(attended, gate, compressed, outputs, int(source_rank))

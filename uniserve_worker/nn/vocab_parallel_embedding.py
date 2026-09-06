@@ -13,7 +13,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..execution.forward_batch import MeshView
 from .layer import LayerConfig
 from .linear import ColumnParallelLinear
 
@@ -74,6 +73,7 @@ class VocabParallelEmbedding(nn.Module):
         """Allocate this rank's padded vocabulary interval and checkpoint-load metadata."""
 
         super().__init__()
+        self.tp_group = layer_config.tensor_group()
         parallel = layer_config.parallel
         self.num_embeddings = int(num_embeddings)
         self.embedding_dim = int(embedding_dim)
@@ -116,7 +116,7 @@ class VocabParallelEmbedding(nn.Module):
             self.weight,
         )
 
-    def forward(self, input_ids: torch.Tensor, mesh: MeshView) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Embed locally owned ids and sum masked shard outputs across TP ranks."""
 
         mask = (
@@ -127,7 +127,7 @@ class VocabParallelEmbedding(nn.Module):
         local_ids = (input_ids - self.vocab_start_index).masked_fill(mask, 0)
         out = F.embedding(local_ids, self.weight)
         out = out.masked_fill(mask.unsqueeze(-1), 0)
-        return mesh.all_reduce(out, "tp")
+        return self.tp_group.all_reduce(out)
 
 
 class ParallelLMHead(ColumnParallelLinear):
@@ -146,6 +146,7 @@ class ParallelLMHead(ColumnParallelLinear):
     ) -> None:
         """Shard a padded vocabulary projection and configure optional global-logit gathering."""
 
+        self.tp_group = layer_config.tensor_group()
         parallel = layer_config.parallel
         self.vocab_size = int(vocab_size)
         self.padded_vocab_size = pad_vocab_size(
@@ -197,11 +198,11 @@ class ParallelLMHead(ColumnParallelLinear):
                 self.bias,
             )
 
-    def forward(self, x: torch.Tensor, mesh: MeshView) -> torch.Tensor:  # type: ignore[override]
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
         """Project local vocabulary logits and optionally gather the unpadded vocabulary."""
 
         local_logits = super().forward(x)
         if not self.gather_output:
             return local_logits
-        logits = mesh.all_gather(local_logits, "tp", -1)
+        logits = self.tp_group.all_gather(local_logits, -1)
         return logits[..., : self.vocab_size]

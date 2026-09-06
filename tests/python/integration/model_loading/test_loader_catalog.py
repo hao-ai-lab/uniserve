@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -15,18 +16,20 @@ from uniserve_worker.bootstrap.catalog import resolve_catalog_entry
 from uniserve_worker.bootstrap.execution_config import ExecutionConfig
 from uniserve_worker.bootstrap.model_loader import WorkerModelLoadRequest, load_worker_model
 from uniserve_worker.bootstrap.plan import ModelLoadScope
+from uniserve_worker.bootstrap.worker_info_builder import (
+    build_worker_layout,
+    configuration_identity,
+)
 from uniserve_worker.loader import LoadConfig, LoadFormat, LoadRequest, WeightSet, get_model_loader
-from uniserve_worker.loader.handles import TensorWeightHandle
 from uniserve_worker.loader.source import (
     read_model_config,
     resolve_model_root,
     resolve_weight_sources,
 )
 from uniserve_worker.loader.update import BucketTensor, WeightUpdater
-from uniserve_worker.loader.weight_loaders import attach_parameter_loaders, load_parameter_weight
+from uniserve_worker.loader.weight_loaders import attach_parameter_loaders
 from uniserve_worker.models.qwen3 import Qwen3ForCausalLM
 from uniserve_worker.nn.layer import LayerConfig
-from uniserve_worker.nn.linear import ColumnParallelLinear, QKVParallelLinear
 from uniserve_worker.nn.mesh import TensorParallel
 from uniserve_worker.nn.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -211,6 +214,21 @@ def test_indexed_qwen_checkpoint_installs_packed_weights_on_the_requested_device
         torch.testing.assert_close(parameter, reference.state_dict()[name].to(torch.bfloat16))
 
 
+def test_resolved_configuration_identity_distinguishes_loaded_precision(tmp_path):
+    _write_qwen_checkpoint(tmp_path)
+    identities = []
+    for dtype in ("bfloat16", "float32", "bfloat16"):
+        request = replace(_qwen_request(str(tmp_path)), execution=_execution(dtype))
+        loaded = load_worker_model(request)
+        layout = build_worker_layout(loaded.model, loaded.deployment)
+        identities.append(
+            configuration_identity(loaded.model, loaded.deployment, layout, (), "torch_sdpa")
+        )
+
+    assert identities[0] == identities[2]
+    assert identities[0] != identities[1]
+
+
 def test_index_is_the_closed_weight_set_for_loading(tmp_path):
     _write_qwen_checkpoint(tmp_path, indexed=True)
     load_worker_model(_qwen_request(str(tmp_path)))
@@ -332,33 +350,6 @@ def test_remote_resolution_fetches_only_weights_index_and_architecture_sidecars(
         "model.safetensors.index.json",
         "weights.safetensors",
     }
-
-
-def test_partition_loaders_copy_rank_slices_packed_slots_and_vocab_overlap():
-    layer_config = LayerConfig(parallel=_parallel(rank=1, size=2), quantization=None)
-    column = ColumnParallelLinear(4, 6, layer_config=layer_config, bias=False)
-    qkv = QKVParallelLinear(4, 2, 2, 2, layer_config=layer_config, bias=False)
-    vocab = VocabParallelEmbedding(65, 2, layer_config=layer_config, init_weights=False)
-    graph = torch.nn.ModuleDict({"column": column, "qkv": qkv, "vocab": vocab})
-    attach_parameter_loaders(graph, device="cpu", dtype=torch.float32)
-
-    global_column = torch.arange(24, dtype=torch.float32).view(6, 4)
-    load_parameter_weight(column.weight, TensorWeightHandle("column.weight", global_column))
-    torch.testing.assert_close(column.weight, global_column[3:])
-
-    projections = {
-        "q": torch.arange(16, dtype=torch.float32).view(4, 4),
-        "k": torch.arange(16, 32, dtype=torch.float32).view(4, 4),
-        "v": torch.arange(32, 48, dtype=torch.float32).view(4, 4),
-    }
-    for shard_id, tensor in projections.items():
-        load_parameter_weight(qkv.weight, TensorWeightHandle(shard_id, tensor), shard_id)
-    torch.testing.assert_close(qkv.weight, torch.cat([value[2:] for value in projections.values()]))
-
-    global_vocab = torch.arange(130, dtype=torch.float32).view(65, 2)
-    load_parameter_weight(vocab.weight, TensorWeightHandle("vocab.weight", global_vocab))
-    torch.testing.assert_close(vocab.weight[0], global_vocab[64])
-    assert torch.count_nonzero(vocab.weight[1:]) == 0
 
 
 def test_missing_packed_shard_and_unexpected_tensor_fail_completeness(tmp_path):

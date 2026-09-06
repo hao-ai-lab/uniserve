@@ -73,9 +73,8 @@ pub struct EngineSettings {
     pub max_model_len: Option<u32>,
     /// Largest request duration resident media state is sized to serve.
     pub max_video_seconds: f64,
-    /// Number of tensor-parallel worker rank processes (tp size of the single
-    /// Full pool in the default topology).
-    /// Staged-worker topology, e.g. `encoder:2,prefill:1:tp=4,decode:1:tp=4`.
+    /// Number of physical worker rank processes in the default Full pool.
+    /// Staged-worker topology, e.g. `encoder:2,prefill:1:ranks=4,decode:1:ranks=4`.
     /// `None` selects one Full pool. A multi-stage layout
     /// composes pools behind a `StagedExecutor`.
     pub workers: WorkerTopology,
@@ -263,10 +262,10 @@ impl EngineSettings {
                 && self.workers.pools.iter().all(|pool| {
                     !pool.id.0.is_empty()
                         && !pool.device.is_empty()
-                        && pool.tensor_parallel_size > 0
+                        && pool.worker_ranks > 0
                         && !pool.supported_ops.is_empty()
                 }),
-            "workers must contain explicit ids, devices, supported operations, and positive tensor-parallel sizes"
+            "workers must contain explicit ids, devices, supported operations, and positive physical worker counts"
         );
         Ok(())
     }

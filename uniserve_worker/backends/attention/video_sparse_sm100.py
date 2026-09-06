@@ -6,14 +6,14 @@ from typing import Any
 
 import torch
 
-from ...nn.mesh import SymmetricMemoryWorkspace
-from ...ops.video_sparse import compose_to_head_shards, pack_qkv
+from ...nn.parallel_attention import AttentionOutputTargets
+from ...ops.video_sparse import compose_to_head_shards, pack_qkv, unpack_add_compression
 from . import video_sparse_cute
 
 _IMPORT_ERROR: BaseException | None = None
 _provider: Any | None
 try:  # pragma: no cover - deployment-only CUDA provider.
-    from fastvideo_kernel import block_sparse_attn_sm100a as _provider_module
+    from uniserve_kernel import sparse_attention as _provider_module
 except BaseException as error:  # pragma: no cover
     _IMPORT_ERROR = error
     _provider = None
@@ -27,11 +27,7 @@ def available() -> bool:
     if _provider is None or not torch.cuda.is_available():
         return False
     major, _minor = torch.cuda.get_device_capability()
-    return (
-        major == 10
-        and bool(getattr(_provider, "_HAS_VSA_SM100A", False))
-        and video_sparse_cute.available()
-    )
+    return major == 10 and _provider.available() and video_sparse_cute.available()
 
 
 def import_error() -> BaseException | None:
@@ -61,13 +57,11 @@ def _block_sparse_custom(
     """Dispatch sparse attention and write dense-compressed rank-local output shards."""
 
     if not available() or _provider is None:
-        raise RuntimeError(
-            "SM100a sparse video attention is unavailable"
-        ) from import_error()
-    # The CuTe route consumes unpacked Q/K/V and may tile a single output's head
-    # axis to satisfy its fixed 14-head kernel geometry.
+        raise RuntimeError("SM100a sparse video attention is unavailable") from import_error()
+    # The provider's size boundary covers the key sequence traversed by each
+    # query, including when query rows are distributed across devices.
     if video_sparse_cute.should_use(
-        rows=int(query.shape[0]),
+        rows=key.shape[0],
         prefix_tiles=prefix_tiles,
     ):
         attended = video_sparse_cute.block_sparse_attention(
@@ -80,19 +74,28 @@ def _block_sparse_custom(
             valid_sizes,
         )
     else:
-        # The extension route expects Q/K/V packed as head-major tensors with an
-        # explicit singleton batch axis.
-        packed = pack_qkv(query, key, value)
-        attended, _ = _provider.block_sparse_attn_sm100a(
-            packed[0].unsqueeze(0),
-            packed[1].unsqueeze(0),
-            packed[2].unsqueeze(0),
-            mask_block_indices.unsqueeze(0),
-            mask_block_count.unsqueeze(0),
+        # Queries are head-major; K/V retain independently strided storage so
+        # peer-backed keys do not materialize a full local replica.
+        if query.shape[0] == key.shape[0]:
+            packed = tuple(pack_qkv(query, key, value).unbind(0))
+        else:
+            packed = (
+                query.transpose(0, 1).contiguous(),
+                key.transpose(0, 1),
+                value.transpose(0, 1),
+            )
+        attended = _provider.block_sparse_attention(
+            *(tensor.unsqueeze(0) for tensor in packed),
+            mask_block_indices,
+            mask_block_count,
             valid_sizes,
-            need_lse=False,
         )
-    compose_to_head_shards(attended, gate, compressed, tuple(outputs), source_rank)
+    # A single-rank output can fuse compression locally; multi-rank execution
+    # composes head shards through the declared source coordinate.
+    if len(outputs) == 1:
+        unpack_add_compression(attended, gate, compressed, outputs[0])
+    else:
+        compose_to_head_shards(attended, gate, compressed, tuple(outputs), source_rank)
 
 
 @_block_sparse_custom.register_fake
@@ -141,35 +144,24 @@ def block_sparse_attention(
     gate: torch.Tensor,
     compressed: torch.Tensor,
     attention_output: torch.Tensor,
-    exchange: SymmetricMemoryWorkspace,
-    exchange_outputs: tuple[torch.Tensor, ...],
-    exchange_sync_input: torch.Tensor,
-    exchange_sync_output: torch.Tensor,
+    targets: AttentionOutputTargets,
 ) -> torch.Tensor:
     """Execute SM100 block-sparse attention using per-query block counts and indices."""
 
     if not available():
-        raise RuntimeError(
-            "SM100a sparse video attention is unavailable"
-        ) from import_error()
+        raise RuntimeError("SM100a sparse video attention is unavailable") from import_error()
     if tile_size != 64 or query.shape[-1] != 128:
-        raise ValueError(
-            "sparse video attention requires tile 64 and head dimension 128"
-        )
-    if query.shape != key.shape or query.shape != value.shape or query.ndim != 3:
-        raise ValueError(
-            "sparse video attention expects matching [sequence, heads, 128] Q/K/V"
-        )
-    if valid_sizes.ndim != 1 or valid_sizes.numel() * tile_size != query.shape[0]:
+        raise ValueError("sparse video attention requires tile 64 and head dimension 128")
+    if key.shape != value.shape or query.shape[1:] != key.shape[1:] or query.ndim != 3:
+        raise ValueError("sparse video attention expects matching K/V and Q/K head geometry")
+    if valid_sizes.ndim != 1 or valid_sizes.numel() * tile_size != key.shape[0]:
         raise ValueError("sparse video attention metadata does not match the sequence")
     if gate.shape != query.shape or compressed.shape != (
         query.shape[1],
-        valid_sizes.numel(),
+        query.shape[0] // tile_size,
         query.shape[2],
     ):
-        raise ValueError(
-            "sparse video compression buffers do not match attention geometry"
-        )
+        raise ValueError("sparse video compression buffers do not match attention geometry")
     if (
         attention_output.shape != query.shape
         or attention_output.dtype != query.dtype
@@ -177,15 +169,15 @@ def block_sparse_attention(
     ):
         raise ValueError("sparse video attention output does not match Q/K/V")
     expected_output_shape = (
-        query.shape[0] // exchange.size,
-        query.shape[1] * exchange.size,
+        query.shape[0] // len(targets.buffers),
+        query.shape[1] * len(targets.buffers),
         query.shape[2],
     )
     if any(
         output.shape != expected_output_shape
         or output.dtype != query.dtype
         or output.device != query.device
-        for output in exchange_outputs
+        for output in targets.buffers
     ):
         raise ValueError("symmetric exchange outputs do not match attention geometry")
     _block_sparse_custom(
@@ -198,12 +190,11 @@ def block_sparse_attention(
         gate,
         compressed,
         attention_output,
-        list(exchange_outputs),
-        exchange.rank,
+        list(targets.buffers),
+        targets.source_rank,
         prefix_tiles,
     )
-    exchange.fence(exchange_sync_input, exchange_sync_output)
-    return exchange_outputs[exchange.rank]
+    return targets.buffers[targets.source_rank]
 
 
 __all__ = ["available", "block_sparse_attention", "import_error"]

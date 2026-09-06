@@ -8,9 +8,9 @@ import json
 from pathlib import Path
 
 from .config import DEFAULT_CONFIG, load_config, server_launch
+from .nsys import NsysCapture
 from .pipeline.run import run_point
 from .pipeline.setup import applied_environment, describe_launch, host_lock, prepare_launch
-from .nsys import NsysCapture
 from .server import ManagedServer
 
 
@@ -74,7 +74,11 @@ def run(args: argparse.Namespace) -> None:
             point_dir = output_root / point.name
             log_path = output_root / "server-logs" / f"{point.name}.log"
             capture = (
-                NsysCapture(point.name, output_root / "nsys" / point.name)
+                NsysCapture(
+                    point.name,
+                    output_root / "nsys" / point.name,
+                    cuda_trace=args.nsys_cuda_trace,
+                )
                 if args.nsys
                 else None
             )
@@ -141,6 +145,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--nsys",
         action="store_true",
         help="capture the warmed measurement window with Nsight Systems",
+    )
+    command.add_argument(
+        "--nsys-cuda-trace",
+        choices=("cuda", "cuda-sw"),
+        default="cuda",
+        help="select Nsight's default CUDA tracing or explicit software instrumentation",
     )
     command.set_defaults(function=run)
     return parser

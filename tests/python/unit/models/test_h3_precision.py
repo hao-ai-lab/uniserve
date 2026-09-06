@@ -35,7 +35,7 @@ def test_h3_uses_balanced_mode_when_config_is_empty() -> None:
         ),
         (
             "maximum",
-            H3LinearPrecisionPolicy("nvfp4", "mxfp8", "bf16", "nvfp4"),
+            H3LinearPrecisionPolicy("nvfp4", "mxfp8", "fp8", "nvfp4"),
         ),
     ],
 )
@@ -96,6 +96,7 @@ def test_h3_component_quantization_config_resolves_policy() -> None:
             "mode": "balanced",
             "components": {
                 "transformer.mlp": "fp8",
+                "text_encoder": "fp8",
                 "video_vae": "fp16",
             },
         }
@@ -103,7 +104,7 @@ def test_h3_component_quantization_config_resolves_policy() -> None:
     assert policy == H3LinearPrecisionPolicy(
         transformer_attention="bf16",
         transformer_mlp="fp8",
-        text_encoder="bf16",
+        text_encoder="fp8",
         video_vae="fp16",
     )
 

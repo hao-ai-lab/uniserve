@@ -32,6 +32,7 @@ from .requests import (
     VisibleEndAttention,
 )
 from .rope import apply_rotary_emb, apply_rotary_pos_emb, rotate_half
+from .silu import silu_and_mul_fp8
 
 __all__ = [
     "AddRmsNormReq",
@@ -60,4 +61,5 @@ __all__ = [
     "rope",
     "rotate_half",
     "silu_and_mul",
+    "silu_and_mul_fp8",
 ]

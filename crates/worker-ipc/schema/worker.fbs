@@ -120,14 +120,38 @@ table KvCacheConfig {
 }
 
 table RankInfo {
-  tp_rank:uint;
-  tp_size:uint = 1;
+  rank:uint;
+  world_size:uint = 1;
+}
+
+table LocalSequence {}
+table UlyssesSequence { ulysses_degree:uint = 1; }
+table RingSequence { ring_degree:uint = 1; }
+table HybridSequence { ulysses_degree:uint = 1; ring_degree:uint = 1; }
+table GatherSequence { allgather_degree:uint = 1; }
+table Attention2dSequence { attn2d_row_size:uint = 1; attn2d_col_size:uint = 1; ulysses_degree:uint = 1; }
+union SequenceParallel { LocalSequence, UlyssesSequence, RingSequence, HybridSequence, GatherSequence, Attention2dSequence }
+table ParallelConfig {
+  tensor_parallel_size:uint = 1;
+  pipeline_parallel_size:uint = 1;
+  sequence_parallel:SequenceParallel;
+}
+enum ComponentDistribution:ubyte { Local, TemporalUnits }
+
+table ComponentInfo {
+  name:string;
+  ranks:[ulong];
+  parallel_config:ParallelConfig;
+  distribution:ComponentDistribution;
+  units_per_rank:uint = 1;
 }
 
 table WorkerInfo {
   model_name:string;
   weight_version:ulong;
   rank:RankInfo;
+  configuration_id:string;
+  components:[ComponentInfo];
   supported_ops:[OpKind];
   queue_depth:uint;
   max_batch_ops:uint;

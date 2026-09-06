@@ -2,7 +2,7 @@
 
 UniServe is an OpenAI-compatible inference server for configured text and omni models. Rust owns HTTP admission, tokenization, scheduling, generation state, cache accounting, and response assembly; Python workers own model forward execution and device tensors.
 
-The configured model descriptions are `qwen3`, `sensenova`, and `bagel`. A server process loads exactly one description and exposes one served-model identity.
+The configured model descriptions are `qwen3`, `sensenova`, `bagel`, and `minimax-h3`. A server process loads exactly one description and exposes one served-model identity.
 
 ## Requirements
 
@@ -113,12 +113,13 @@ curl -s http://127.0.0.1:8000/v1/images/generations \
 | Option | Default | Purpose |
 | --- | --- | --- |
 | Positional `MODEL` | Required | Local model directory or Hugging Face repository |
-| `--model-description` | Required | `qwen3`, `sensenova`, or `bagel` request processing and output behavior |
+| `--model-description` | Required | `qwen3`, `sensenova`, `bagel`, or `minimax-h3` request processing and output behavior |
 | `--served-model-name` | Resolved model ID | Single public model ID |
 | `--host`, `--port` | `127.0.0.1`, `8000` | TCP listener |
 | `--uds` | Unset | Unix-domain listener instead of TCP |
 | `--device` | `cuda` | Worker device |
-| `--tp-size` | `1` | Tensor-parallel worker ranks |
+| `--worker-ranks` | `1` | Physical worker processes when deployment is omitted |
+| `--deployment` | Model defaults | JSON devices, ordered component membership, and parallel configuration |
 | `--max-model-len` | Model configuration | Context-length ceiling |
 | `--max-total-tokens` | Runtime sizing | KV token-capacity override |
 | `--max-running-requests` | `128` | Scheduler active-request bound |
@@ -136,8 +137,10 @@ For tensor-parallel execution, select one rank per participating GPU:
 uniserve serve /models/Qwen3-32B \
   --model-description qwen3 \
   --served-model-name Qwen3-32B \
-  --tp-size 4
+  --worker-ranks 4
 ```
+
+See [parallel serving configuration](docs/parallelism.md) for independent component placement, ordered groups, and H3 execution support.
 
 ## Development and verification
 

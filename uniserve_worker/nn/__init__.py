@@ -31,7 +31,7 @@ _EXPORTS: dict[str, str] = {
     "LogitsProcessor": "logits",
     # mesh (parallelism topology + transports)
     "DeviceMesh": "mesh",
-    "MeshAxis": "mesh",
+    "GroupCoordinator": "mesh",
     "TensorParallel": "mesh",
     "SymmetricMemoryWorkspace": "mesh",
     "divide": "mesh",
@@ -90,7 +90,7 @@ __all__ = [
     "LogitsProcessor",
     "MLPConnector",
     "MergedColumnParallelLinear",
-    "MeshAxis",
+    "GroupCoordinator",
     "MoTDecoderLayer",
     "MoTModel",
     "NeoVitEncoder",
@@ -169,7 +169,7 @@ if TYPE_CHECKING:  # Expose concrete definitions to type checkers without import
     from .logits import LogitsProcessor
     from .mesh import (
         DeviceMesh,
-        MeshAxis,
+        GroupCoordinator,
         SymmetricMemoryWorkspace,
         TensorParallel,
         divide,
@@ -177,9 +177,9 @@ if TYPE_CHECKING:  # Expose concrete definitions to type checkers without import
     from .moe import FusedMoE, TopK
     from .norm import RMSNorm
     from .placement import (
+        Shard,
         ShardPlan,
         ShardSlot,
-        Shard,
         WeightMode,
         get_shard_plan,
         get_tower_coord,

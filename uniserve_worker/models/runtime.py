@@ -95,12 +95,16 @@ class DedicatedStateGeometry:
     def __post_init__(self) -> None:
         """Validate slot, persistent-unit, VAE-grid, and rank geometry."""
 
-        if min(
-            self.slot_count,
-            self.persistent_units,
-            self.max_vae_grid_tokens,
-            self.size,
-        ) < 1 or not 0 <= self.rank < self.size:
+        if (
+            min(
+                self.slot_count,
+                self.persistent_units,
+                self.max_vae_grid_tokens,
+                self.size,
+            )
+            < 1
+            or not 0 <= self.rank < self.size
+        ):
             raise invalid_descriptor("dedicated model-state geometry is invalid")
 
 
@@ -110,8 +114,8 @@ class WorkerDeployment:
 
     device: str
     model_scope: str
-    tp_rank: int
-    tp_size: int
+    rank: int
+    world_size: int
     block_size: int
     kv_token_capacity: int | None
     attention_backend: str | None
@@ -122,14 +126,17 @@ class WorkerDeployment:
     max_batch_tokens: int
     max_request_pool_size: int
     generation_device: str | None
+    output_rank: int = 0
 
     def __post_init__(self) -> None:
         """Validate topology axes, device placement, batch bounds, and dtype policies."""
 
         if not self.device or not self.model_scope:
             raise invalid_descriptor("worker deployment placement must be named")
-        if self.tp_size < 1 or not 0 <= self.tp_rank < self.tp_size:
-            raise invalid_descriptor("worker deployment TP rank is invalid")
+        if self.world_size < 1 or not 0 <= self.rank < self.world_size:
+            raise invalid_descriptor("worker deployment process rank is invalid")
+        if not 0 <= self.output_rank < self.world_size:
+            raise invalid_descriptor("worker deployment output owner is invalid")
         if (
             self.block_size < 1
             or self.max_batch_operations < 1
@@ -162,6 +169,7 @@ class ExecutionModel(nn.Module):
     generation: GenerationPipeline | None = None
     media_profile: str | None = None
     supports_weight_updates: bool = True
+    ordered_collective_execution: bool = False
     dedicated_state_geometry: DedicatedStateGeometry | None = None
 
     def warmup(self, context: WarmupContext) -> None:

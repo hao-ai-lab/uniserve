@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import abc
-from typing import ClassVar, Iterable, cast
+from dataclasses import dataclass
+from typing import ClassVar, Iterable, Literal, cast
 
 import torch
 import torch.nn as nn
@@ -15,11 +16,33 @@ __all__ = [
     "process_quantized_modules",
 ]
 
+
+@dataclass(frozen=True)
+class PreparedLinearInput:
+    """Quantized values, optional per-block scales, and their shared scale domain."""
+
+    values: torch.Tensor
+    block_scales: torch.Tensor | None = None
+    global_scale: torch.Tensor | None = None
+
+
 class QuantizeMethodBase(abc.ABC):
     """Defines parameter creation, loading finalization, and execution for a linear quantization method."""
 
     # Cross-cutting flag read by consumers to decide quantized-only handling.
     is_quantized: ClassVar[bool] = False
+
+    @property
+    def weight_scale_domain(self) -> Literal["tensor", "row", "block"]:
+        """Axes whose extrema must cover the logical weight before physical sharding."""
+
+        return "block"
+
+    @property
+    def input_scale_domain(self) -> Literal["tensor", "row", "block"]:
+        """Whether physical input-column shards share an activation scale."""
+
+        return "block"
 
     @abc.abstractmethod
     def create_weights(
@@ -59,6 +82,27 @@ class QuantizeMethodBase(abc.ABC):
         del module, x, scale, output_dtype
         raise RuntimeError("linear quantization method cannot consume prequantized activations")
 
+    def input_scale(self, x: torch.Tensor) -> torch.Tensor | None:
+        """Return local activation scales for the declared tensor or row domain."""
+
+        raise RuntimeError("linear format has no explicit input-scale preparation")
+
+    def prepare_input(
+        self,
+        x: torch.Tensor,
+        scale: torch.Tensor | None,
+    ) -> PreparedLinearInput:
+        raise RuntimeError("linear format has no prepared-input representation")
+
+    def apply_prepared(
+        self,
+        module: nn.Module,
+        prepared: PreparedLinearInput,
+        *,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        raise RuntimeError("linear format has no prepared GEMM")
+
 
 class UnquantizedLinearMethod(QuantizeMethodBase):
     """Implements dense linear execution with loader-managed unquantized weights."""
@@ -96,31 +140,41 @@ class UnquantizedLinearMethod(QuantizeMethodBase):
         from ..linear import LinearBase
 
         linear = cast(LinearBase, module)
-        return F.linear(x, linear.weight, linear.bias)
+        return F.linear(x, linear.weight, linear.execution_bias)
 
-    def apply_sequence_parallel(
+    def input_scale(self, x: torch.Tensor) -> torch.Tensor | None:
+        return None
+
+    def prepare_input(
+        self,
+        x: torch.Tensor,
+        scale: torch.Tensor | None,
+    ) -> PreparedLinearInput:
+        return PreparedLinearInput(x)
+
+    def apply_prepared(
         self,
         module: nn.Module,
-        x: torch.Tensor,
-        mesh: object,
-        workspace: torch.Tensor,
+        prepared: PreparedLinearInput,
         *,
-        group: str,
+        output_dtype: torch.dtype,
     ) -> torch.Tensor:
-        """Gather row shards into caller-owned scratch and project the global sequence."""
-
         from ..linear import LinearBase
-        from ..mesh import DeviceMesh
 
         linear = cast(LinearBase, module)
-        device_mesh = cast(DeviceMesh, mesh)
-        global_rows = int(x.shape[0]) * device_mesh.size(group)
-        gathered = workspace.view(x.dtype)[: global_rows * x.shape[1]].view(
-            global_rows,
-            x.shape[1],
+        values = prepared.values
+        if output_dtype == values.dtype:
+            return self.apply(module, values)
+        if output_dtype != torch.float32 or values.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("dense prepared GEMM supports input dtype or FP32 output")
+        if values.is_cuda:
+            output = torch.mm(values, linear.weight.T, out_dtype=output_dtype)
+            bias = linear.execution_bias
+            return output if bias is None else output + bias
+        bias = linear.execution_bias
+        return F.linear(
+            values.float(), linear.weight.float(), None if bias is None else bias.float()
         )
-        device_mesh.all_gather_into_tensor(gathered, x, group)
-        return F.linear(gathered, linear.weight, linear.bias)
 
 
 def process_quantized_modules(modules: Iterable[nn.Module]) -> None:
@@ -129,4 +183,9 @@ def process_quantized_modules(modules: Iterable[nn.Module]) -> None:
     for module in modules:
         method = getattr(module, "quant_method", None)
         if isinstance(method, QuantizeMethodBase):
-            method.process_weights_after_loading(module)
+            from ..linear import LinearBase
+
+            if isinstance(module, LinearBase):
+                module.finalize_weights()
+            else:
+                method.process_weights_after_loading(module)

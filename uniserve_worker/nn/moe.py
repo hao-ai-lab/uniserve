@@ -5,8 +5,6 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from ..execution.forward_batch import MeshView
-
 __all__ = [
     "TopK",
     "FusedMoE",
@@ -62,7 +60,6 @@ class FusedMoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
-        mesh: MeshView,
     ) -> torch.Tensor:
         """Route flattened rows to top-k experts and reduce tensor-parallel partial outputs."""
 
@@ -76,6 +73,6 @@ class FusedMoE(nn.Module):
             # Summing the one-hot top-k matches yields this expert's scalar gate
             # for every token and zero for tokens routed elsewhere.
             gate = (weights * (expert_ids == expert_idx)).sum(dim=-1)
-            expert_out = expert(flat, mesh)
+            expert_out = expert(flat)
             out += expert_out * gate.unsqueeze(-1).to(expert_out.dtype)
         return out.reshape(original_shape)

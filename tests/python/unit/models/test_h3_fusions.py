@@ -4,6 +4,7 @@ import pytest
 import torch
 from torch.nn import functional as F
 
+from uniserve_worker import ops
 from uniserve_worker.models.minimax_h3.fusions import (
     attention_residual_modulated_rmsnorm,
     attention_residual_modulated_rmsnorm_fp8,
@@ -161,3 +162,27 @@ def test_h3_fp8_boundaries_match_bf16_reference() -> None:
     assert torch.equal(actual_fp8, expected_fp8)
     assert torch.equal(actual_swiglu_scale, expected_swiglu_scale)
     assert torch.equal(actual_swiglu_fp8, expected_swiglu_fp8)
+
+
+def test_h3_text_fp8_swiglu_matches_unfused_boundary() -> None:
+    if torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("FP8 execution requires compute capability 9 or newer")
+    torch.manual_seed(37)
+    rows = 8
+    intermediate_size = 25_600
+    gate_up = torch.randn(
+        rows,
+        2 * intermediate_size,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    expected_activated = ops.silu_and_mul(gate_up)
+    expected_activated_scale = fp8_scale_from(expected_activated.float(), dim=1)
+    expected_activated_fp8 = fp8_quantize(
+        expected_activated.float(),
+        expected_activated_scale,
+    )
+    actual_activated_fp8, actual_activated_scale = ops.silu_and_mul_fp8(gate_up)
+
+    assert torch.equal(actual_activated_scale, expected_activated_scale)
+    assert torch.equal(actual_activated_fp8, expected_activated_fp8)

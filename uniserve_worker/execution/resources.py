@@ -80,6 +80,7 @@ class ExecutionResources:
     trace: ExecutionTrace
     _device: torch.device
     _generation_device: torch.device
+
     _qualified_mixed_buckets: set[GraphBucket] = field(default_factory=set)
     _collective_history: OrderedDict[int, object] = field(default_factory=OrderedDict)
     _transport_publications: dict[OperationIdentity, tuple[Locator, ...]] = field(
@@ -99,9 +100,7 @@ class ExecutionResources:
         try:
             return scope.request_rows[int(request_id)]
         except KeyError:
-            raise invalid_descriptor(
-                f"lane has no request row for request {request_id}"
-            ) from None
+            raise invalid_descriptor(f"lane has no request row for request {request_id}") from None
 
     def generation(self) -> GenerationPipeline:
         """Require the model's diffusion generation contract for the active operation."""
@@ -127,10 +126,10 @@ class ExecutionResources:
         return self._media_mux
 
     def media_output_ring(self) -> Any:
-        """Require rank-zero bounded storage for asynchronous encoded media output."""
+        """Require output-owner bounded storage for asynchronous encoded media output."""
 
         if self._media_output_ring is None:
-            raise unsupported_setup("operation requires a rank-zero media output ring")
+            raise unsupported_setup("operation requires the media output owner's ring")
         return self._media_output_ring
 
     def cache_coordinates(
@@ -276,7 +275,7 @@ class ExecutionResources:
 
         if self.mesh.tp_size <= 1:
             return value
-        transport = self.mesh.transport("tp")
+        transport = self.mesh.get_group("tp")
         return transport.broadcast(value, src=0)
 
     def run_observed_forward_group(

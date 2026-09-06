@@ -185,7 +185,7 @@ class DynamicW8A8MxFp8LinearMethod(QuantizeMethodBase):
             linear.weight_scale,
         )
 
-        if linear.bias is not None:
-            output = output + linear.bias.to(device=output.device, dtype=output.dtype)
+        if linear.execution_bias is not None:
+            output = output + linear.execution_bias.to(device=output.device, dtype=output.dtype)
 
         return output.reshape(*original_shape, linear.output_size)

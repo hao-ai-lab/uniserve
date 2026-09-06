@@ -60,9 +60,10 @@ def test_persistent_buffer_capacity_includes_active_encoder_output() -> None:
         layout.max_latent_feature_bytes,
         layout.max_vision_feature_bytes,
     )
-    assert layout.info.buffer_pool_bytes == (
-        int(TEST_MODEL.resource_geometry.encoder_cache_entries) + 1
-    ) * feature_bytes
+    assert (
+        layout.info.buffer_pool_bytes
+        == (int(TEST_MODEL.resource_geometry.encoder_cache_entries) + 1) * feature_bytes
+    )
 
 
 def test_transfer_capacity_covers_one_maximum_float32_trajectory_per_ticket() -> None:
@@ -96,8 +97,8 @@ def test_transfer_capacity_covers_one_maximum_float32_trajectory_per_ticket() ->
 @pytest.mark.parametrize(
     "deployment",
     [
-        lambda: replace(TEST_DEPLOYMENT, tp_rank=1, tp_size=1),
-        lambda: replace(TEST_DEPLOYMENT, tp_size=0),
+        lambda: replace(TEST_DEPLOYMENT, rank=1, world_size=1),
+        lambda: replace(TEST_DEPLOYMENT, world_size=0),
         lambda: replace(TEST_DEPLOYMENT, block_size=0),
         lambda: replace(TEST_DEPLOYMENT, model_dtype="bf16"),
     ],

@@ -5,6 +5,13 @@
 //! the request and product identities needed to correlate completions.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+#[path = "deployment.rs"]
+mod deployment;
+pub use deployment::{
+    ComponentDeployConfig, ComponentDistribution, ParallelConfig, SequenceParallel,
+    StageDeployConfig,
+};
+
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -634,8 +641,8 @@ pub struct PoolConfig {
     pub id: PoolId,
     /// Device selector forwarded to worker processes.
     pub device: String,
-    /// Number of tensor-parallel worker ranks.
-    pub tensor_parallel_size: usize,
+    /// Number of physical worker ranks.
+    pub worker_ranks: usize,
     /// Logical operation families accepted by this pool.
     pub supported_ops: Vec<OpKind>,
     /// Maximum number of unresolved physical runs.
@@ -650,13 +657,13 @@ pub struct WorkerTopology {
 }
 
 impl WorkerTopology {
-    /// Builds the default single-pool topology with the given tensor-parallel size.
-    pub fn single_full(tp: usize) -> Self {
+    /// Builds the default single-pool topology with the given physical worker count.
+    pub fn single_full(worker_ranks: usize) -> Self {
         Self {
             pools: vec![PoolConfig {
                 id: PoolId("full".to_owned()),
                 device: "cuda".to_owned(),
-                tensor_parallel_size: tp.max(1),
+                worker_ranks,
                 supported_ops: OpKind::ALL.to_vec(),
                 queue_depth: 0,
             }],
@@ -677,7 +684,7 @@ impl WorkerTopology {
     }
 
     /// Expands CLI convenience profiles such as
-    /// `prefill:1:tp=4,decode:1:tp=4` into concrete pool configuration.
+    /// `prefill:1:ranks=4,decode:1:ranks=4` into concrete pool configuration.
     pub fn parse(s: &str) -> Result<Self, WorkerTopologyError> {
         // JSON topology input already names every concrete pool.
         if s.trim_start().starts_with('[') {
@@ -712,21 +719,18 @@ impl WorkerTopology {
                 }
             };
             let mut count = 1usize;
-            let mut tp = 1usize;
+            let mut worker_ranks = 1usize;
             let mut device = "cuda".to_owned();
             let mut queue_depth = 0usize;
 
             for part in parts {
                 let part = part.trim();
-                if let Some(tp_str) = part.strip_prefix("tp=") {
-                    tp = tp_str
-                        .parse::<usize>()
-                        .map_err(|_| {
-                            WorkerTopologyError::message(format!(
-                                "invalid tensor-parallel size in entry {entry:?}"
-                            ))
-                        })?
-                        .max(1);
+                if let Some(ranks_str) = part.strip_prefix("ranks=") {
+                    worker_ranks = ranks_str.parse::<usize>().map_err(|_| {
+                        WorkerTopologyError::message(format!(
+                            "invalid physical worker count in entry {entry:?}"
+                        ))
+                    })?;
                 } else if let Some(value) = part.strip_prefix("device=") {
                     if value.is_empty() {
                         return Err(WorkerTopologyError::message(format!(
@@ -741,15 +745,18 @@ impl WorkerTopology {
                         ))
                     })?;
                 } else {
-                    count = part
-                        .parse::<usize>()
-                        .map_err(|_| {
-                            WorkerTopologyError::message(format!(
-                                "invalid worker count in entry {entry:?}"
-                            ))
-                        })?
-                        .max(1);
+                    count = part.parse::<usize>().map_err(|_| {
+                        WorkerTopologyError::message(format!(
+                            "invalid worker count in entry {entry:?}"
+                        ))
+                    })?;
                 }
+            }
+
+            if count == 0 || worker_ranks == 0 {
+                return Err(WorkerTopologyError::message(format!(
+                    "pool count and physical worker count must be positive in entry {entry:?}"
+                )));
             }
 
             // Expand repeated profile instances into independently routable pools.
@@ -762,7 +769,7 @@ impl WorkerTopology {
                 pools.push(PoolConfig {
                     id: PoolId::new(name)?,
                     device: device.clone(),
-                    tensor_parallel_size: tp,
+                    worker_ranks: worker_ranks,
                     supported_ops: supported_ops.clone(),
                     queue_depth,
                 });
@@ -790,9 +797,9 @@ impl WorkerTopology {
                     pool.id
                 )));
             }
-            if pool.device.is_empty() || pool.tensor_parallel_size == 0 {
+            if pool.device.is_empty() || pool.worker_ranks == 0 {
                 return Err(WorkerTopologyError::message(format!(
-                    "pool {} has an invalid device or tensor-parallel size",
+                    "pool {} has an invalid device or physical worker count",
                     pool.id
                 )));
             }
@@ -1122,19 +1129,21 @@ mod tests {
             single.with_process_defaults("cuda:1", 3).pools[0].queue_depth,
             3
         );
-        let epd = WorkerTopology::parse("prefill:1:tp=4,decode:1:tp=4").unwrap();
+        let epd = WorkerTopology::parse("prefill:1:ranks=4,decode:1:ranks=4").unwrap();
         assert_eq!(epd.pools.len(), 2);
         assert_eq!(epd.pools[0].id, PoolId("prefill".to_owned()));
-        assert_eq!(epd.pools[0].tensor_parallel_size, 4);
+        assert_eq!(epd.pools[0].worker_ranks, 4);
         assert_eq!(epd.pools[0].supported_ops, vec![OpKind::ArExtend]);
         assert_eq!(epd.pools[1].id, PoolId("decode".to_owned()));
-        assert_eq!(epd.pools[1].tensor_parallel_size, 4);
+        assert_eq!(epd.pools[1].worker_ranks, 4);
         assert!(epd.pools[1].supported_ops.contains(&OpKind::ArDecode));
         assert_eq!(epd.total_pools(), 2);
         assert!(!epd.is_single_full());
         assert!(WorkerTopology::parse("full:1").unwrap().is_single_full());
         assert!(WorkerTopology::parse("bogus:1").is_err());
         assert!(WorkerTopology::parse("").is_err());
+        assert!(WorkerTopology::parse("full:1:ranks=0").is_err());
+        assert!(WorkerTopology::parse("full:0:ranks=1").is_err());
     }
 
     #[test]

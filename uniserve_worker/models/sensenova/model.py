@@ -12,6 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ...execution.batch import RunKind
+from ...execution.device_transfer import DeviceTransfer
 from ...execution.forward_batch import (
     AttentionMode,
     ExpertRoute,
@@ -129,17 +130,18 @@ def _module_tensor(
     value: torch.Tensor,
     *,
     context: ForwardBatch,
+    transfers: DeviceTransfer,
     coordinate: int,
     target: torch.device,
     call: Callable[[nn.Module, torch.Tensor, ForwardBatch], torch.Tensor],
 ) -> torch.Tensor:
     """Dispatch one tensor to a tower coordinate, execute its module, and restore its device."""
 
-    staged = context.mesh.dispatch(value, "tower", coordinate)
+    staged = transfers.dispatch(value, coordinate)
     result = call(module, staged, context)
     if not isinstance(result, torch.Tensor):
         raise TypeError("SenseNova neural sublayer must return a tensor")
-    return context.mesh.combine(result, "tower", coordinate, target)
+    return transfers.combine(result, target)
 
 
 def _route_modules(
@@ -148,6 +150,7 @@ def _route_modules(
     text_module: nn.Module,
     flow_module: nn.Module,
     context: ForwardBatch,
+    transfers: DeviceTransfer,
     call: Callable[[nn.Module, torch.Tensor, ForwardBatch], torch.Tensor],
 ) -> RoutedTensor:
     """Execute text and flow tensors on their tower coordinates and combine outputs."""
@@ -162,6 +165,7 @@ def _route_modules(
             coordinate=_TEXT_COORDINATE,
             target=item.device,
             call=call,
+            transfers=transfers,
         )
 
     def apply_flow(item: torch.Tensor) -> torch.Tensor:
@@ -174,6 +178,7 @@ def _route_modules(
             coordinate=_FLOW_COORDINATE,
             target=item.device,
             call=call,
+            transfers=transfers,
         )
 
     return value.map(apply_text, apply_flow)
@@ -188,16 +193,6 @@ def _plain_call(
 
     del context
     return cast(torch.Tensor, module(value))
-
-
-def _parallel_call(
-    module: nn.Module,
-    value: torch.Tensor,
-    context: ForwardBatch,
-) -> torch.Tensor:
-    """Invoke a module with the route-restricted mesh view."""
-
-    return cast(torch.Tensor, module(value, context.mesh))
 
 
 @dataclass(frozen=True, slots=True)
@@ -289,10 +284,18 @@ class _VisionModel(nn.Module):
 class _SenseAttention(nn.Module):
     """SenseNova dual-expert QKV projection over one explicit attention plan."""
 
-    def __init__(self, config: NeoLlmConfig, layer: int, *, layer_config: LayerConfig) -> None:
+    def __init__(
+        self,
+        config: NeoLlmConfig,
+        layer: int,
+        *,
+        layer_config: LayerConfig,
+        transfers: DeviceTransfer = DeviceTransfer(),
+    ) -> None:
         """Build text and flow projection towers around one shared attention backend."""
 
         super().__init__()
+        self.transfers = transfers
         hidden_size = int(getattr(config, "hidden_size"))
         total_heads = int(getattr(config, "num_attention_heads"))
         total_kv_heads = int(getattr(config, "num_key_value_heads"))
@@ -405,7 +408,7 @@ class _SenseAttention(nn.Module):
 
         coordinate = _FLOW_COORDINATE if generation else _TEXT_COORDINATE
         target = hidden.device
-        staged = context.mesh.dispatch(hidden, "tower", coordinate)
+        staged = self.transfers.dispatch(hidden, coordinate)
         qkv_module = self.qkv_proj_mot_gen if generation else self.qkv_proj
         split_sizes = tuple(int(size) for size in qkv_module.output_sizes)
         if generation and int(staged.shape[0]) == 1:
@@ -434,8 +437,8 @@ class _SenseAttention(nn.Module):
         query_norm_hw = self.q_norm_hw_mot_gen if generation else self.q_norm_hw
         key_norm = self.k_norm_mot_gen if generation else self.k_norm
         key_norm_hw = self.k_norm_hw_mot_gen if generation else self.k_norm_hw
-        local_cos = tuple(context.mesh.dispatch(item, "tower", coordinate) for item in rope.cos)
-        local_sin = tuple(context.mesh.dispatch(item, "tower", coordinate) for item in rope.sin)
+        local_cos = tuple(self.transfers.dispatch(item, coordinate) for item in rope.cos)
+        local_sin = tuple(self.transfers.dispatch(item, coordinate) for item in rope.sin)
         query, key = qk_norm_rope(
             query,
             key,
@@ -447,9 +450,9 @@ class _SenseAttention(nn.Module):
             axis_dims=(self.head_dim // 2, self.head_dim // 4, self.head_dim // 4),
         )
         return (
-            context.mesh.combine(query, "tower", coordinate, target),
-            context.mesh.combine(key, "tower", coordinate, target),
-            context.mesh.combine(value, "tower", coordinate, target),
+            self.transfers.combine(query, target),
+            self.transfers.combine(key, target),
+            self.transfers.combine(value, target),
         )
 
     def forward(
@@ -498,20 +501,31 @@ class _SenseAttention(nn.Module):
             text_module=self.o_proj,
             flow_module=self.o_proj_mot_gen,
             context=context,
-            call=_parallel_call,
+            call=_plain_call,
+            transfers=self.transfers,
         )
 
 
 class _SenseLayer(nn.Module):
     """Routes packed text and flow tokens through shared attention and modality-specific feed-forward experts."""
 
-    def __init__(self, config: NeoLlmConfig, layer: int, *, layer_config: LayerConfig) -> None:
+    def __init__(
+        self,
+        config: NeoLlmConfig,
+        layer: int,
+        *,
+        layer_config: LayerConfig,
+        transfers: DeviceTransfer = DeviceTransfer(),
+    ) -> None:
         """Assemble shared attention with route-specific norms and feed-forward towers."""
 
         super().__init__()
+        self.transfers = transfers
         hidden = int(getattr(config, "hidden_size"))
         epsilon = float(getattr(config, "rms_norm_eps"))
-        self.self_attn = _SenseAttention(config, layer, layer_config=layer_config)
+        self.self_attn = _SenseAttention(
+            config, layer, layer_config=layer_config, transfers=transfers
+        )
         self.mlp = Qwen3MLP(
             config,
             layer_config=layer_config,
@@ -550,6 +564,7 @@ class _SenseLayer(nn.Module):
             flow_module=self.input_layernorm_mot_gen,
             context=context,
             call=_plain_call,
+            transfers=self.transfers,
         )
         hidden = hidden.add(
             self.self_attn(
@@ -566,13 +581,15 @@ class _SenseLayer(nn.Module):
             flow_module=self.post_attention_layernorm_mot_gen,
             context=context,
             call=_plain_call,
+            transfers=self.transfers,
         )
         feed_forward = _route_modules(
             normalized,
             text_module=self.mlp,
             flow_module=self.mlp_mot_gen,
             context=context,
-            call=_parallel_call,
+            call=_plain_call,
+            transfers=self.transfers,
         )
         return hidden.add(feed_forward)
 
@@ -580,10 +597,17 @@ class _SenseLayer(nn.Module):
 class _SenseDecoder(nn.Module):
     """One packed text/flow decoder with no serving state."""
 
-    def __init__(self, config: NeoLlmConfig, *, layer_config: LayerConfig) -> None:
+    def __init__(
+        self,
+        config: NeoLlmConfig,
+        *,
+        layer_config: LayerConfig,
+        transfers: DeviceTransfer = DeviceTransfer(),
+    ) -> None:
         """Build the packed decoder and bind flow-specific modules to their mesh coordinate."""
 
         super().__init__()
+        self.transfers = transfers
         hidden = int(getattr(config, "hidden_size"))
         self.embed_tokens = VocabParallelEmbedding(
             int(getattr(config, "vocab_size")),
@@ -593,7 +617,7 @@ class _SenseDecoder(nn.Module):
             init_weights=False,
         )
         self.layers = nn.ModuleList(
-            _SenseLayer(config, index, layer_config=layer_config)
+            _SenseLayer(config, index, layer_config=layer_config, transfers=transfers)
             for index in range(int(getattr(config, "num_hidden_layers")))
         )
         epsilon = float(getattr(config, "rms_norm_eps"))
@@ -660,17 +684,25 @@ class _SenseDecoder(nn.Module):
             flow_module=self.norm_mot_gen,
             context=context,
             call=_plain_call,
+            transfers=self.transfers,
         ).packed(spans)
 
 
 class _LanguageModel(nn.Module):
     """Owns the SenseNova token embedding, decoder, normalization, and vocabulary projection stack."""
 
-    def __init__(self, config: NeoLlmConfig, *, layer_config: LayerConfig) -> None:
+    def __init__(
+        self,
+        config: NeoLlmConfig,
+        *,
+        layer_config: LayerConfig,
+        transfers: DeviceTransfer = DeviceTransfer(),
+    ) -> None:
         """Build the decoder and tensor-parallel vocabulary projection."""
 
         super().__init__()
-        self.model = _SenseDecoder(config, layer_config=layer_config)
+        self.transfers = transfers
+        self.model = _SenseDecoder(config, layer_config=layer_config, transfers=transfers)
         self.lm_head = ParallelLMHead(
             int(getattr(config, "hidden_size")),
             int(getattr(config, "vocab_size")),
@@ -681,6 +713,8 @@ class _LanguageModel(nn.Module):
 
 class NEOChatModel(ExecutionModel):
     """Concrete stateless SenseNova model for mixed text, flow, and vision rows."""
+
+    ordered_collective_execution = True
 
     def load_weights(
         self,
@@ -719,11 +753,13 @@ class NEOChatModel(ExecutionModel):
         config: NeoChatConfig,
         *,
         layer_config: LayerConfig,
+        transfers: DeviceTransfer = DeviceTransfer(),
         scope: str = "whole",
     ) -> None:
         """Construct selected SenseNova towers and publish their serving geometry."""
 
         super().__init__()
+        self.transfers = transfers
         if scope not in {"whole", "understanding", "generation"}:
             raise ValueError(f"unknown SenseNova model scope {scope!r}")
         self._load_scope = scope
@@ -731,7 +767,9 @@ class NEOChatModel(ExecutionModel):
         hidden = int(config.llm_config.hidden_size)
         self.vision_model = _VisionModel(vision)
         self._parallel = layer_config.parallel
-        self.language_model = _LanguageModel(config.llm_config, layer_config=layer_config)
+        self.language_model = _LanguageModel(
+            config.llm_config, layer_config=layer_config, transfers=transfers
+        )
         self.fm_modules = nn.ModuleDict(
             {
                 "vision_model_mot_gen": _VisionModel(vision),
@@ -900,8 +938,8 @@ class NEOChatModel(ExecutionModel):
         target = batch.flow_latents[0].device
         pixels = torch.cat(tuple(value.pixels for value in typed), dim=0)
         grids = torch.cat(tuple(value.grid for value in typed), dim=0)
-        local_pixels = batch.mesh.dispatch(pixels, "tower", _FLOW_COORDINATE)
-        local_grids = batch.mesh.dispatch(grids, "tower", _FLOW_COORDINATE)
+        local_pixels = self.transfers.dispatch(pixels, _FLOW_COORDINATE)
+        local_grids = self.transfers.dispatch(grids, _FLOW_COORDINATE)
         tower = self.fm_modules["vision_model_mot_gen"]
         feature_dtype = next(tower.parameters()).dtype
         # Each flow row's image patch grid (height/patch, width/patch) is known
@@ -916,12 +954,7 @@ class NEOChatModel(ExecutionModel):
         features = tower(local_pixels.to(dtype=feature_dtype), local_grids, grid_shapes=grid_shapes)
         if not isinstance(features, torch.Tensor):
             raise TypeError("SenseNova flow vision tower must return a tensor")
-        features = batch.mesh.combine(
-            features,
-            "tower",
-            _FLOW_COORDINATE,
-            target,
-        )
+        features = self.transfers.combine(features, target)
         expected = sum(batch.flow_image_tokens)
         if int(features.shape[0]) != expected:
             raise ValueError("SenseNova flow vision features do not match row geometry")
@@ -944,6 +977,7 @@ class NEOChatModel(ExecutionModel):
             coordinate=_FLOW_COORDINATE,
             target=target,
             call=_plain_call,
+            transfers=self.transfers,
         )
         features = features + time_features
         if self._add_noise_embedding:
@@ -962,6 +996,7 @@ class NEOChatModel(ExecutionModel):
                 coordinate=_FLOW_COORDINATE,
                 target=target,
                 call=_plain_call,
+                transfers=self.transfers,
             )
 
         # Restore the packed tower output to scheduler row identities.
@@ -988,7 +1023,7 @@ class NEOChatModel(ExecutionModel):
             if batch.flow_row_indices:
                 raise TypeError("SenseNova paged decode accepts token rows only")
             decode_positions = positions
-        token_embeds = self.language_model.model.embed_tokens(input_ids.reshape(-1), batch.mesh)
+        token_embeds = self.language_model.model.embed_tokens(input_ids.reshape(-1))
         if batch.input_embeddings is not None:
             if batch.embedding_mask is None:
                 raise RuntimeError("SenseNova embedding input lost its selection mask")
@@ -1070,7 +1105,7 @@ class NEOChatModel(ExecutionModel):
                 selected = (
                     selected_rows[0] if len(selected_rows) == 1 else torch.cat(selected_rows, dim=0)
                 )
-            projected = self.language_model.lm_head(selected, batch.mesh)
+            projected = self.language_model.lm_head(selected)
 
         # Reassemble heterogeneous outputs in the scheduler's original row order.
         outputs: list[torch.Tensor] = []
@@ -1113,21 +1148,9 @@ class NEOChatModel(ExecutionModel):
         was_flat = latent.ndim == 2
         latent_batch = latent.unsqueeze(0) if was_flat else latent
         hidden_batch = hidden.unsqueeze(0)
-        local_hidden = context.mesh.dispatch(
-            hidden_batch,
-            "tower",
-            _FLOW_COORDINATE,
-        )
-        local_latent = context.mesh.dispatch(
-            latent_batch,
-            "tower",
-            _FLOW_COORDINATE,
-        )
-        local_timestep = context.mesh.dispatch(
-            timestep.reshape(1),
-            "tower",
-            _FLOW_COORDINATE,
-        )
+        local_hidden = self.transfers.dispatch(hidden_batch, _FLOW_COORDINATE)
+        local_latent = self.transfers.dispatch(latent_batch, _FLOW_COORDINATE)
+        local_timestep = self.transfers.dispatch(timestep.reshape(1), _FLOW_COORDINATE)
         batch, latent_tokens = int(local_latent.shape[0]), int(local_latent.shape[1])
         # Checkpoint metadata selects one of three equivalent prediction heads.
         if self._use_pixel_head:
@@ -1168,12 +1191,7 @@ class NEOChatModel(ExecutionModel):
         # Convert the predicted clean sample to the flow-matching velocity used
         # by the scheduler, with a bounded denominator at the terminal endpoint.
         velocity = (predicted - local_latent) / (1 - local_timestep).clamp_min(_GENERATION_EPSILON)
-        velocity = context.mesh.combine(
-            velocity,
-            "tower",
-            _FLOW_COORDINATE,
-            target,
-        )
+        velocity = self.transfers.combine(velocity, target)
         return velocity[0] if was_flat else velocity
 
     def encode(self, pixels: tuple[torch.Tensor, ...], batch: ForwardBatch) -> ForwardOutput:

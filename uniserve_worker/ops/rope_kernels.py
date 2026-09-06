@@ -175,7 +175,9 @@ if triton is not None:
     ):
         """Normalize Q/K in place and rotate an even prefix of each head."""
 
-        row_offsets = tl.program_id(0) * block_rows + tl.arange(0, block_rows)
+        row_offsets = (
+            tl.program_id(0) * block_rows + tl.arange(0, block_rows)
+        ).to(tl.int64)
         head = tl.program_id(1)
         columns = tl.arange(0, head_dim)
         valid = row_offsets[:, None] < rows

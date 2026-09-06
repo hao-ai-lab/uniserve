@@ -27,6 +27,7 @@ def test_worker_info_reports_schedulable_work_and_bounds() -> None:
     )
     assert info["request_slots"] > 0
     assert info["model_name"]
+    assert len(info["configuration_id"]) == 64
 
 
 def test_action_model_reports_zero_kv_geometry() -> None:
@@ -39,8 +40,8 @@ def test_action_model_reports_zero_kv_geometry() -> None:
     deployment = WorkerDeployment(
         device="cpu",
         model_scope="whole",
-        tp_rank=0,
-        tp_size=1,
+        rank=0,
+        world_size=1,
         block_size=64,
         kv_token_capacity=None,
         attention_backend=None,

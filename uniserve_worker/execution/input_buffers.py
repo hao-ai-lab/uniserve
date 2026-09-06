@@ -9,10 +9,8 @@ from uniserve_worker.runtime.device import HostStagingRing, fill_cpu_bools, fill
 
 from .forward_batch import (
     AttentionMode,
-    EmptyMeshView,
     FlowPatches,
     ForwardBatch,
-    MeshView,
     ModelPhase,
     TokenSelection,
     packed_tensor_views,
@@ -142,7 +140,6 @@ class InputBuffers:
         decode_heights: tuple[int, ...] = (),
         decode_widths: tuple[int, ...] = (),
         attention: dict[str, object],
-        mesh: MeshView = EmptyMeshView(),
     ) -> ForwardBatch:
         """Copy row metadata and model inputs into fixed-address lane buffers and return bounded views."""
 
@@ -196,7 +193,6 @@ class InputBuffers:
                 token_positions=token_positions,
                 token_selections=token_selections,
                 attention=attention,
-                mesh=mesh,
             )
         self._scrub(
             attention["forward_mode"],
@@ -369,7 +365,6 @@ class InputBuffers:
             decode_latents=tuple(self._device_view(value) for value in decode_latents),
             decode_heights=decode_heights,
             decode_widths=decode_widths,
-            mesh=mesh,
         )
 
     def _stage_request_indexed_decode(
@@ -386,7 +381,6 @@ class InputBuffers:
         token_positions: tuple[torch.Tensor, ...],
         token_selections: tuple[TokenSelection, ...],
         attention: dict[str, object],
-        mesh: MeshView,
     ) -> ForwardBatch:
         """Gather one-token decode rows from request-indexed state into fixed buffers."""
 
@@ -483,7 +477,6 @@ class InputBuffers:
             input_ids=self.input_ids[:row_count],
             positions=self.positions[0, :row_count],
             token_selections=token_selections,
-            mesh=mesh,
         )
 
     def stage_attention(self, attention: dict[str, object]) -> dict[str, object]:

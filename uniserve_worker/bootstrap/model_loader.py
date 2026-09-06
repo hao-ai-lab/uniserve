@@ -9,18 +9,20 @@ from typing import Any
 import torch
 from torch import nn
 
+from ..execution.device_transfer import DeviceTransfer
 from ..foundation.errors import unsupported_setup
 from ..loader import LoadConfig, LoadRequest, WeightSet, get_model_loader
 from ..loader.source import read_model_config, resolve_model_root
 from ..models.minimax_h3 import MiniMaxH3Runner
+from ..models.minimax_h3.placement import H3Placement
 from ..models.minimax_h3.precision import H3LinearPrecisionPolicy
 from ..models.runtime import ExecutionModel, WorkerDeployment
-from ..nn.mesh import DeviceMesh, TensorParallel
+from ..nn.mesh import DeviceMesh, GroupCoordinator, TensorParallel
 from .capacity import DEFAULT_MAX_REQUEST_POOL_SIZE
 from .catalog import CatalogEntry, resolve_catalog_entry
 from .config import WorkerProcessArgs
 from .execution_config import ExecutionConfig
-from .plan import ModelLoadScope, WorkerPlan
+from .plan import ComponentDeployConfig, ModelLoadScope, WorkerPlan
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +43,8 @@ class WorkerModelLoadRequest:
     attention_backend: str | None
     execution: ExecutionConfig
     parallel: TensorParallel
+    process_rank: int = 0
+    process_world_size: int = 1
     max_model_len: int = 8192
     max_video_seconds: float = 15.0
     quantization_config: dict[str, object] = field(default_factory=dict)
@@ -66,6 +70,9 @@ def load_worker_model(
     *,
     mesh: DeviceMesh | None = None,
     pipeline_depth: int | None = None,
+    component_meshes: dict[str, DeviceMesh] | None = None,
+    component_deployment: dict[str, ComponentDeployConfig] | None = None,
+    process_group: GroupCoordinator | None = None,
 ) -> LoadedWorkerModel:
     """Resolve architecture, sources, deployment geometry, and checkpoint weights for one model."""
 
@@ -80,6 +87,18 @@ def load_worker_model(
             entry,
             mesh=mesh,
             pipeline_depth=pipeline_depth,
+            component_meshes=component_meshes,
+            component_deployment=component_deployment,
+            process_group=process_group,
+        )
+
+    if mesh is not None and (mesh.size("sp") != 1 or mesh.size("pp") != 1):
+        raise unsupported_setup(
+            f"{entry.architecture} requires an executing sequence/pipeline binding for the requested layout"
+        )
+    if component_meshes is not None and set(component_meshes) != {"model"}:
+        raise unsupported_setup(
+            f"{entry.architecture} requires an executing placement binding for these component names"
         )
 
     quantization_config = request.quantization_config or {}
@@ -99,7 +118,13 @@ def load_worker_model(
         device=request.device,
         execution=request.execution,
         parallel=request.parallel,
+        tp_group=mesh.get_group("tp") if mesh is not None else None,
         scope=request.scope,
+        transfers=DeviceTransfer(
+            (torch.device(request.device), torch.device(request.generation_device))
+            if request.generation_device is not None
+            else ()
+        ),
         load=request.load,
         attention_backend=request.attention_backend,
     )
@@ -131,6 +156,9 @@ def materialize_worker_model(
     config: WorkerProcessArgs,
     plan: WorkerPlan,
     mesh: DeviceMesh,
+    *,
+    component_meshes: dict[str, DeviceMesh] | None = None,
+    process_group: GroupCoordinator | None = None,
 ) -> LoadedWorkerModel:
     """Construct the configured model scope or the explicitly enabled deterministic stub."""
 
@@ -140,6 +168,9 @@ def materialize_worker_model(
         _checkpoint_request(config, plan, mesh),
         mesh=mesh,
         pipeline_depth=config.ipc.pipeline_depth,
+        component_meshes=component_meshes,
+        component_deployment=dict(config.components),
+        process_group=process_group,
     )
 
 
@@ -149,16 +180,25 @@ def _load_h3_worker_model(
     *,
     mesh: DeviceMesh | None,
     pipeline_depth: int | None,
+    component_meshes: dict[str, DeviceMesh] | None,
+    component_deployment: dict[str, ComponentDeployConfig] | None,
+    process_group: GroupCoordinator | None,
 ) -> LoadedWorkerModel:
     """Load an SM100 H3 replica and derive capacities from its resident state pool."""
 
-    # H3 couples tensor and sequence parallelism because every rank owns one
-    # contiguous slice of the packed video sequence.
-    if mesh is None or pipeline_depth is None:
-        raise unsupported_setup("MiniMax H3 loading requires the worker device mesh")
-    if request.parallel.size != 4 or mesh.size("tp") != 4 or mesh.size("sp") != 4:
-        raise unsupported_setup("MiniMax H3 requires one TP4/SP4 replica")
-    if mesh.local_device.type != "cuda" or torch.cuda.get_device_capability(mesh.local_device) < (
+    if (
+        pipeline_depth is None
+        or component_meshes is None
+        or component_deployment is None
+        or process_group is None
+    ):
+        raise unsupported_setup(
+            "MiniMax H3 loading requires resolved component placement and process transfers"
+        )
+    placement = H3Placement(component_deployment, component_meshes, process_group)
+    if process_group.device.type != "cuda" or torch.cuda.get_device_capability(
+        process_group.device
+    ) < (
         10,
         0,
     ):
@@ -184,7 +224,7 @@ def _load_h3_worker_model(
     )
     model = MiniMaxH3Runner.from_pretrained(
         request.model_path,
-        mesh,
+        placement,
         max_state_slots=max_state_slots,
         max_text_rows=request.max_model_len,
         max_video_seconds=request.max_video_seconds,
@@ -199,6 +239,7 @@ def _load_h3_worker_model(
     max_operations = min(state_slots, int(request.max_batch_operations))
     deployment = replace(
         _deployment(request),
+        output_rank=placement.output_rank,
         kv_token_capacity=None,
         attention_backend=None,
         max_batch_operations=max_operations,
@@ -243,6 +284,8 @@ def _checkpoint_request(
         attention_backend=model.attention_backend,
         execution=config.execution,
         parallel=TensorParallel.from_mesh(mesh),
+        process_rank=config.placement.rank,
+        process_world_size=config.placement.world_size,
         scope=plan.model_scope,
         generation_device=config.placement.generation_device,
         load=config.load,
@@ -267,8 +310,8 @@ def _stub_worker_model(config: WorkerProcessArgs, plan: WorkerPlan) -> LoadedWor
             ),
             device=config.placement.device,
             model_scope=plan.model_scope.value,
-            tp_rank=config.placement.tp_rank,
-            tp_size=config.placement.tp_size,
+            rank=config.placement.rank,
+            world_size=config.placement.world_size,
             kv_token_capacity=config.resources.kv_token_capacity,
             model_dtype=config.execution.model_dtype,
             kv_cache_dtype=config.execution.kv_cache_dtype,
@@ -319,8 +362,8 @@ def _deployment(request: WorkerModelLoadRequest) -> WorkerDeployment:
     return WorkerDeployment(
         device=request.device,
         model_scope=request.scope.value,
-        tp_rank=request.parallel.rank,
-        tp_size=request.parallel.size,
+        rank=request.process_rank,
+        world_size=request.process_world_size,
         block_size=request.block_size,
         kv_token_capacity=request.kv_token_capacity,
         attention_backend=request.attention_backend,

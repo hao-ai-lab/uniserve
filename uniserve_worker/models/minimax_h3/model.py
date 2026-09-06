@@ -12,26 +12,27 @@ from ...execution.batch import (
     NewRequest,
     RunKind,
 )
-from ...nn.diffusion.modulation import modulation_plan_shapes
-from ...nn.mesh import DeviceMesh
+from ...execution.device_transfer import ComponentTensorTransfer
 from ...profiling import profile_range, synchronize_profile_range
 from ..runtime import DedicatedStateGeometry, ResourceGeometry
 from ..video import DecodeKind, DecodeOutput, VideoOutputGeometry, VideoRunner
 from .packing import audio_latent_frames, patchify_video, unpatchify_video_into
+from .placement import H3Placement
 from .precision import H3LinearPrecisionPolicy
 from .schedule import solver_step
 from .state import (
-    FASTH3_STEPS,
     MIN_H3_FRAMES,
     PROFILE_AUDIO_RATE,
     PROFILE_FPS,
     PROFILE_HEIGHT,
     PROFILE_WIDTH,
     H3Layout,
+    H3MediaScratch,
     H3Scratch,
     H3StatePool,
     H3StateSlot,
 )
+from .video_vae import H3VideoAssembler
 from .weights import H3Components, load_h3_components
 
 if TYPE_CHECKING:
@@ -45,7 +46,8 @@ class _H3PageExecution:
     """Binds an H3 layout to scratch storage, transformer indices, and sparse-attention page metadata."""
 
     layout: H3Layout
-    scratch: H3Scratch
+    scratch: H3Scratch | None
+    media: H3MediaScratch
     transformer_execution: Any
     base_tile_valid_sizes: torch.Tensor
     prompt_prefix_indices: torch.Tensor
@@ -54,7 +56,7 @@ class _H3PageExecution:
 
 
 class MiniMaxH3Runner(VideoRunner):
-    """One sequence-parallel replica with matching tensor-parallel conditioning."""
+    """Execute assigned H3 components and transfer products within one instance."""
 
     architecture = "MiniMaxH3Transformer3DModel"
     serving_dtype = "bfloat16"
@@ -72,10 +74,11 @@ class MiniMaxH3Runner(VideoRunner):
     tensorized_mixed = False
     media_profile = "minimax_h3"
     supports_weight_updates = False
+    ordered_collective_execution = True
 
     def __init__(
         self,
-        mesh: DeviceMesh,
+        placement: H3Placement,
         components: H3Components,
         layout: H3Layout,
         *,
@@ -84,49 +87,71 @@ class MiniMaxH3Runner(VideoRunner):
         """Bind H3 model components to runtime-owned state, scratch, and device products."""
 
         super().__init__()
-        if mesh.size("sp") != 4 or mesh.size("tp") != 4:
-            raise ValueError("the production FastH3 topology requires TP4/SP4")
-        self.mesh = mesh
+
+        self.placement = placement
+        self.device = placement.process_group.device
         self.layout = layout
         self.transformer = components.transformer
         self.encoder = components.encoder
         self.video_vae = components.video_vae
         self.audio_vae = components.audio_vae
-        self.preparation_stream = torch.cuda.Stream(device=mesh.local_device)
-
-        # Modulation plans are persistent per request, while the execution
-        # scratch is shared serially across state slots on this rank.
-        block_plan_shape, final_plan_shape = modulation_plan_shapes(
-            tuple(
-                block.adaln_proj.linear
-                for block in self.transformer.transformer_blocks
-            ),
-            self.transformer.norm_out.linear,
-            steps=FASTH3_STEPS,
-            input_rows=2,
+        for name, module in (
+            ("denoiser", self.transformer),
+            ("text_encoder", self.encoder),
+            ("video_decoder", self.video_vae),
+            ("audio_decoder", self.audio_vae),
+        ):
+            if placement.owns(name) != (module is not None):
+                raise ValueError(f"H3 {name} materialization disagrees with assigned membership")
+        self.video_assembler = H3VideoAssembler(self.device) if placement.owns("output") else None
+        self.preparation_stream = torch.cuda.Stream(device=self.device)
+        group = placement.process_group
+        self.video_latent_transfer = ComponentTensorTransfer(
+            group, placement.latent_producers, placement.decoder_ranks
         )
-        self.scratch_storage = H3Scratch.allocate(
-            layout,
-            mesh,
-            block_params_shape=block_plan_shape[1:],
-            final_params_shape=final_plan_shape[1:],
-            attention_workspace_dtype=(
-                torch.bfloat16
+        self.video_output_transfer = ComponentTensorTransfer(
+            group, placement.decoder_ranks, (placement.output_rank,)
+        )
+        self.audio_latent_transfer = ComponentTensorTransfer(
+            group, placement.latent_producers, (placement.audio_rank,)
+        )
+        self.audio_output_transfer = ComponentTensorTransfer(
+            group, (placement.audio_rank,), (placement.output_rank,)
+        )
+        encoder_members = placement.components["text_encoder"].ranks
+        encoder_consumers = tuple(
+            rank for rank in placement.input_ranks if rank not in encoder_members
+        )
+        self.encoder_transfer = (
+            ComponentTensorTransfer(group, encoder_members[:1], encoder_consumers)
+            if encoder_consumers
+            else None
+        )
+        self.scratch_storage = None
+        if self.transformer is not None:
+            self.scratch_storage = H3Scratch.allocate(
+                layout,
+                placement.denoiser_mesh,
+                block_params_shape=tuple(self.transformer.modulation_plan.blocks.shape[1:]),
+                final_params_shape=(
+                    tuple(self.transformer.modulation_plan.final.shape[1:])
+                    if self.transformer.modulation_plan.final is not None
+                    else (0,)
+                ),
+                attention_workspace_dtype=torch.bfloat16
                 if self.transformer.attention_linear_precision == "bf16"
-                else torch.uint8
-            ),
-        )
-        self._state_block_plan_shape = block_plan_shape
-        self._state_final_plan_shape = final_plan_shape
+                else torch.uint8,
+            )
+        self.media_storage = H3MediaScratch.allocate(layout, placement)
         self.page_executions: dict[tuple[int, int, int], _H3PageExecution] = {}
         self.prompt_device = torch.empty(
             (1 + int(layout.packed.text_indices.numel()),),
             dtype=torch.long,
-            device=mesh.local_device,
+            device=self.device,
         )
         self.prompt_host = (
             torch.empty_like(self.prompt_device, device="cpu", pin_memory=True)
-            if mesh.coord("tp") == 0
+            if placement.owns("output")
             else None
         )
 
@@ -135,16 +160,14 @@ class MiniMaxH3Runner(VideoRunner):
         if int(max_state_slots) < 2:
             raise ValueError("the FastH3 serving topology requires at least two state slots")
         torch.cuda.empty_cache()
-        free_bytes, _total_bytes = torch.cuda.mem_get_info(mesh.local_device)
+        free_bytes, _total_bytes = torch.cuda.mem_get_info(self.device)
         state_slots = min(
             int(max_state_slots),
-            int(free_bytes)
-            // H3StatePool.bytes_per_slot(
-                layout,
-                block_plan_shape=block_plan_shape,
-                final_plan_shape=final_plan_shape,
-            ),
+            int(free_bytes) // H3StatePool.bytes_per_slot(layout),
         )
+        shared_slots = torch.tensor(state_slots, device=self.device, dtype=torch.int64)
+        placement.process_group.all_reduce_min(shared_slots)
+        state_slots = int(shared_slots.item())
         if state_slots < 2:
             raise RuntimeError("MiniMax H3 has insufficient CUDA memory for two state slots")
         self._state_slot_count = state_slots
@@ -152,8 +175,8 @@ class MiniMaxH3Runner(VideoRunner):
             slot_count=int(state_slots),
             persistent_units=int(layout.persistent_units),
             max_vae_grid_tokens=int(layout.packed.video_indices.numel()),
-            rank=int(mesh.coord("sp")),
-            size=int(mesh.size("sp")),
+            rank=placement.process_group.rank,
+            size=placement.process_group.world_size,
         )
 
     def _build_page_execution(self, layout: H3Layout) -> _H3PageExecution:
@@ -169,20 +192,23 @@ class MiniMaxH3Runner(VideoRunner):
         )
         return _H3PageExecution(
             layout=layout,
-            scratch=self.scratch_storage.view(layout),
-            transformer_execution=self.transformer.build_execution(layout),
-            base_tile_valid_sizes=layout.packed.tile_valid_sizes.to(self.mesh.local_device),
-            prompt_prefix_indices=prefix.to(self.mesh.local_device),
-            prompt_dense_indices=dense.to(self.mesh.local_device),
+            scratch=self.scratch_storage.view(layout) if self.scratch_storage is not None else None,
+            media=self.media_storage.view(layout),
+            transformer_execution=self.transformer.build_execution(layout)
+            if self.transformer is not None
+            else None,
+            base_tile_valid_sizes=layout.packed.tile_valid_sizes.to(self.device),
+            prompt_prefix_indices=prefix.to(self.device),
+            prompt_dense_indices=dense.to(self.device),
             prompt_prefix_counts=torch.tensor(
                 layout.packed.prefix_tiles,
                 dtype=torch.int32,
-                device=self.mesh.local_device,
+                device=self.device,
             ),
         )
 
     def create_media_runtime(self, unresolved_window: int) -> tuple[object | None, object | None]:
-        """Create rank-zero video muxing and bounded output-ring state."""
+        """Create muxing and bounded output storage on the declared output owner."""
 
         from ...execution.video import (
             VideoMuxCoordinator,
@@ -190,7 +216,7 @@ class MiniMaxH3Runner(VideoRunner):
             require_video_codecs,
         )
 
-        if self.mesh.coord("sp") != 0:
+        if not self.placement.owns("output"):
             return None, None
         require_video_codecs()
         geometry = VideoOutputGeometry(
@@ -202,7 +228,7 @@ class MiniMaxH3Runner(VideoRunner):
             audio_rate=PROFILE_AUDIO_RATE,
         )
         return (
-            VideoMuxCoordinator(),
+            VideoMuxCoordinator(rank=self.placement.output_rank),
             VideoOutputRing(
                 state_slots=self._state_slot_count,
                 unresolved_window=int(unresolved_window),
@@ -217,21 +243,19 @@ class MiniMaxH3Runner(VideoRunner):
         return H3StatePool(
             self.layout,
             self._state_slot_count,
-            self.mesh.local_device,
-            block_plan_shape=self._state_block_plan_shape,
-            final_plan_shape=self._state_final_plan_shape,
+            self.device,
         )
 
     def synchronize_runtime(self) -> None:
         """Wait for all H3 work submitted to the local CUDA device."""
 
-        torch.cuda.synchronize(self.mesh.local_device)
+        torch.cuda.synchronize(self.device)
 
     @classmethod
     def from_pretrained(
         cls,
         checkpoint: str,
-        mesh: DeviceMesh,
+        placement: H3Placement,
         *,
         max_state_slots: int,
         max_text_rows: int,
@@ -249,21 +273,21 @@ class MiniMaxH3Runner(VideoRunner):
             raise ValueError("H3 deployment capacity is smaller than a legal request")
         max_audio_frames = audio_latent_frames(max_frames)
         layout = H3Layout.build(
-            mesh,
+            placement,
             frames=max_frames,
             text_rows=text_capacity,
             audio_frames=max_audio_frames,
         )
         components = load_h3_components(
             checkpoint,
-            mesh,
+            placement,
             layout,
             cache_dir=cache_dir,
             revision=revision,
             precision_policy=precision_policy,
         )
         return cls(
-            mesh,
+            placement,
             components,
             layout,
             max_state_slots=max_state_slots,
@@ -289,7 +313,7 @@ class MiniMaxH3Runner(VideoRunner):
         execution = self.page_executions.get(shape_key)
         if execution is None:
             page_layout = H3Layout.build(
-                self.mesh,
+                self.placement,
                 frames=frame_count,
                 text_rows=page_rows,
                 audio_frames=audio_frames,
@@ -314,13 +338,13 @@ class MiniMaxH3Runner(VideoRunner):
         prompt_token_ids: tuple[int, ...],
         expected_tokens: int,
     ) -> torch.Tensor:
-        """Validate prompt length and distribute rank-zero token identifiers across the TP mesh."""
+        """Validate and distribute canonical token identifiers to component participants."""
 
         token_error: BaseException | None = None
-        if self.mesh.coord("tp") == 0:
+        if self.placement.owns("output"):
             host = self.prompt_host
             if host is None:
-                raise RuntimeError("rank zero has no H3 prompt staging buffer")
+                raise RuntimeError("H3 output owner has no prompt staging buffer")
             try:
                 token_ids = tuple(int(value) for value in prompt_token_ids)
                 if len(token_ids) != int(expected_tokens):
@@ -336,12 +360,15 @@ class MiniMaxH3Runner(VideoRunner):
                 host[0] = 0
                 token_error = error
             self.prompt_device.copy_(host, non_blocking=True)
-        self.mesh.broadcast(self.prompt_device, src=0, group="tp")
+        self.placement.process_group.broadcast(
+            self.prompt_device,
+            src=self.placement.process_group.ranks.index(self.placement.output_rank),
+        )
         count = int(self.prompt_device[0].item())
         if token_error is not None:
             raise token_error
         if not 1 <= count <= self.layout.packed.text_indices.numel():
-            raise ValueError("H3 prompt tokenization failed on rank zero")
+            raise ValueError("H3 prompt tokenization failed on its input owner")
         return self.prompt_device[1 : 1 + count].view(1, -1)
 
     def _prepare_tile_metadata(
@@ -406,15 +433,51 @@ class MiniMaxH3Runner(VideoRunner):
             audio_frames=audio_latent_frames(media.geometry.frame_count),
             token_count=media.geometry.prompt_tokens,
         )
-        expected_decode_units = (execution.layout.video_reconstruction_units + 3) // 4 + 2
+        expected_decode_units = (
+            execution.layout.video_reconstruction_units + execution.layout.decoder_width - 1
+        ) // execution.layout.decoder_width + 2
         if int(media.geometry.decode_units) != expected_decode_units:
             raise ValueError("the H3 worker received an invalid decode bound")
 
         slot.bind(execution.layout)
         layout = execution.layout
+        if self.transformer is not None:
+            self._initialize_latents(slot, layout, media.seed)
+        # Text conditioning and all shape-dependent metadata are stable across
+        # the four denoiser steps, so they are materialized once at admission.
+        encoded = self.encoder(token_ids) if self.encoder is not None else None
+        if self.encoder_transfer is not None:
+            received = (
+                execution.media.encoder_hidden[:, : token_ids.shape[1]]
+                if self.placement.process_group.rank in self.encoder_transfer.consumers
+                else None
+            )
+            self.encoder_transfer.broadcast(encoded, received)
+            if received is not None:
+                encoded = received
+        if self.transformer is not None:
+            if self.transformer.pipeline.first:
+                if encoded is None:
+                    raise RuntimeError("denoiser input owner did not receive text conditioning")
+                refined = self.transformer.refine_text(encoded)
+                slot.text_condition.zero_()
+                slot.text_condition[:, : refined.shape[1]].copy_(refined)
+            self._prepare_tile_metadata(execution, slot, int(token_ids.shape[1]))
+            self._prepare_rotary(execution, slot, int(token_ids.shape[1]))
+            torch.cuda.current_stream(self.device).wait_stream(self.preparation_stream)
+        if slot.video_overlap is not None:
+            slot.video_overlap.zero_()
+        slot.request_key = admission.request_key
+        slot.denoise_step = 0
+        slot.next_video_unit = 0
+        slot.audio_reconstructed = False
+
+    def _initialize_latents(self, slot: H3StateSlot, layout: H3Layout, seed: int) -> None:
+        """Initialize owned rows with the checkpoint's physical-layout-independent noise."""
+
         # Diffusers' CPU-generator path draws the full video tensor first and
         # then the audio rows. Reproducing that order preserves the public seed.
-        generator = torch.Generator(device="cpu").manual_seed(int(media.seed))
+        generator = torch.Generator(device="cpu").manual_seed(int(seed))
         video_noise = torch.empty(
             (1, 24, layout.packed.video_frames, 48, 84),
             dtype=torch.float32,
@@ -458,27 +521,6 @@ class MiniMaxH3Runner(VideoRunner):
             slot.video_rows.copy_(video_source, non_blocking=True)
             slot.audio_rows.copy_(audio_source, non_blocking=True)
 
-        # Text conditioning and all shape-dependent metadata are stable across
-        # the four denoiser steps, so they are materialized once at admission.
-        encoded = self.encoder(token_ids)
-        refined = self.transformer.refine_text(encoded)
-        slot.text_condition.zero_()
-        slot.text_condition[:, : refined.shape[1]].copy_(refined)
-        self._prepare_tile_metadata(execution, slot, int(refined.shape[1]))
-        self._prepare_rotary(execution, slot, int(refined.shape[1]))
-        self.transformer.prepare_adaln_plan(
-            slot,
-            layout.schedule.video_timesteps,
-            layout.schedule.audio_timesteps,
-        )
-        torch.cuda.current_stream(self.mesh.local_device).wait_stream(self.preparation_stream)
-        if slot.video_overlap is not None:
-            slot.video_overlap.zero_()
-        slot.request_key = admission.request_key
-        slot.denoise_step = 0
-        slot.next_video_unit = 0
-        slot.audio_reconstructed = False
-
     @torch.inference_mode()
     def denoise(self, slot: H3StateSlot, start_step: int, step_count: int) -> None:
         """Advance both resident media latents by exactly one scheduled solver step."""
@@ -489,196 +531,166 @@ class MiniMaxH3Runner(VideoRunner):
             raise ValueError("H3 denoise placements must advance exactly one current step")
         if not 0 <= start_step < 4:
             raise ValueError("H3 denoise step is outside the four-evaluation ladder")
+        if self.transformer is None:
+            slot.denoise_step += 1
+            return
         execution = self._page_execution_for_slot(slot)
         schedule = execution.layout.schedule
         scratch = execution.scratch
 
         # Modulation parameters are selected from the admission-time plan; the
         # transformer writes rank-local velocity tensors into shared scratch.
-        self.transformer.select_adaln_step(slot, scratch, start_step)
+        self.transformer.select_adaln_step(scratch, start_step)
         self.transformer.bind_execution(execution.transformer_execution)
         with profile_range("uniserve.h3.denoise"):
             self.transformer.forward_local_prepared(slot, scratch)
-            video_velocity = scratch.video_velocity
-            audio_velocity = scratch.audio_velocity
-            solver_step(
-                slot.video_rows,
-                video_velocity,
-                schedule.video_timesteps[start_step],
-                schedule.video_sigmas[start_step],
-                schedule.video_sigmas[start_step + 1],
-            )
-            solver_step(
-                slot.audio_rows,
-                audio_velocity,
-                schedule.audio_timesteps[start_step],
-                schedule.audio_sigmas[start_step],
-                schedule.audio_sigmas[start_step + 1],
-            )
-            synchronize_profile_range(self.mesh.local_device)
+            if self.transformer.pipeline.last:
+                video_velocity = scratch.video_velocity
+                audio_velocity = scratch.audio_velocity
+                solver_step(
+                    slot.video_rows,
+                    video_velocity,
+                    schedule.video_timesteps[start_step],
+                    schedule.video_sigmas[start_step],
+                    schedule.video_sigmas[start_step + 1],
+                )
+                solver_step(
+                    slot.audio_rows,
+                    audio_velocity,
+                    schedule.audio_timesteps[start_step],
+                    schedule.audio_sigmas[start_step],
+                    schedule.audio_sigmas[start_step + 1],
+                )
+            self.transformer.pipeline.feedback((slot.video_rows, slot.audio_rows))
+            synchronize_profile_range(self.device)
         slot.denoise_step += 1
 
     def _exchange_video_round(
-        self,
-        slot: H3StateSlot,
-        start_unit: int,
-        unit_count: int,
-    ) -> torch.Tensor:
-        """Exchange one decoded video-unit range across sequence-parallel ranks in display order."""
+        self, slot: H3StateSlot, start_unit: int, unit_count: int
+    ) -> torch.Tensor | None:
+        """Reconstruct decoder units from unique denoiser row owners."""
 
         execution = self._page_execution_for_slot(slot)
-        layout = execution.layout
-        frame_count = 7
-        rows_per_frame = 24 * 42
-        scratch = execution.scratch
-        send = scratch.latent_send
+        scratch = execution.media
+        send = scratch.video_send
         send.zero_()
-        raster = scratch.local_video_raster
-        rows = scratch.reconstruction_rows[: frame_count * rows_per_frame]
-        for offset in range(unit_count):
-            start_frame = (start_unit + offset) * 5
-            start_row = start_frame * rows_per_frame
-            stop_row = (start_frame + frame_count) * rows_per_frame
-            rows.zero_()
-            selected = (raster >= start_row) & (raster < stop_row)
-            rows.index_copy_(
-                0,
-                raster[selected] - start_row,
-                slot.video_rows[selected],
-            )
-            unpatchify_video_into(
-                rows,
-                send[offset].unsqueeze(0),
-                frames=frame_count,
-                height=48,
-                width=84,
-            )
-        exchange = scratch.latent_exchange
-        values_per_rank = int(send[0].numel())
-        with profile_range(
-            f"uniserve.h3.collective kind=video_latent_exchange rank={layout.sp_rank}"
-        ):
-            self.mesh.all_to_all_single_into(
-                exchange.reshape(-1),
-                send.reshape(-1),
-                (values_per_rank,) * layout.sp_size,
-                (values_per_rank,) * layout.sp_size,
-            )
-        torch.sum(exchange, dim=0, out=scratch.latent_input)
-        return scratch.latent_input.unsqueeze(0)
+        if self.placement.process_group.rank in self.placement.latent_producers:
+            raster = scratch.local_video_raster
+            rows = scratch.reconstruction_rows
+            rows_per_frame = 24 * 42
+            for offset in range(unit_count):
+                start_frame = (start_unit + offset) * 5
+                start_row = start_frame * rows_per_frame
+                stop_row = (start_frame + 7) * rows_per_frame
+                rows.zero_()
+                selected = (raster >= start_row) & (raster < stop_row)
+                rows.index_copy_(0, raster[selected] - start_row, slot.video_rows[selected])
+                unpatchify_video_into(
+                    rows,
+                    send[offset].unsqueeze(0),
+                    frames=7,
+                    height=48,
+                    width=84,
+                )
+        with profile_range("uniserve.collective kind=video_latent_exchange"):
+            self.video_latent_transfer.exchange(send, scratch.video_receive)
+        if self.video_vae is None:
+            return None
+        torch.sum(scratch.video_receive, dim=0, out=scratch.video_input[0])
+        return scratch.video_input
 
     @torch.inference_mode()
     def reconstruct_video(
         self, slot: H3StateSlot, start_unit: int, unit_count: int
     ) -> torch.Tensor | None:
-        """Decode one sequence-parallel round and assemble RGB frames on rank zero."""
+        """Decode assigned temporal units and assemble them on the output owner."""
 
         execution = self._page_execution_for_slot(slot)
         layout = execution.layout
-        start_unit = int(start_unit)
-        unit_count = int(unit_count)
-        expected_count = min(
-            layout.sp_size,
-            layout.video_reconstruction_units - start_unit,
-        )
+        start_unit, unit_count = int(start_unit), int(unit_count)
+        expected_count = min(layout.decoder_width, layout.video_reconstruction_units - start_unit)
         if (
             start_unit != slot.next_video_unit
-            or start_unit % layout.sp_size != 0
+            or start_unit % layout.decoder_width != 0
             or unit_count != expected_count
             or not 0 <= start_unit < layout.video_reconstruction_units
         ):
             raise ValueError("invalid H3 video reconstruction placement")
-        scratch = execution.scratch
-
-        # Each rank receives a complete latent segment assembled from the rows
-        # owned by all ranks, then decodes at most one segment for the round.
+        scratch = execution.media
         latents = self._exchange_video_round(slot, start_unit, unit_count)
-        if layout.sp_rank < unit_count:
-            segment = self.video_vae.decode_segment(latents)
-        else:
-            segment = scratch.segment_placeholder
-        if segment.dtype != torch.float16:
-            raise RuntimeError("H3 video decoder returned an unexpected segment dtype")
-        with profile_range(
-            f"uniserve.h3.collective kind=video_segment_gather rank={layout.sp_rank}"
-        ):
-            self.mesh.gather_into_tensor(
-                scratch.segment_gather,
-                segment,
-                dst=0,
-                group="sp",
+        send = scratch.empty_segments
+        decoder_index = self.placement.decoder_index
+        if self.video_vae is not None:
+            if latents is None or decoder_index is None:
+                raise RuntimeError("video decoder did not receive its latent product")
+            segment = (
+                self.video_vae.decode_segment(latents)
+                if decoder_index < unit_count
+                else scratch.segment_placeholder
             )
+            if segment.dtype != torch.float16:
+                raise RuntimeError("H3 video decoder returned an unexpected segment dtype")
+            send = segment.unsqueeze(0)
+        with profile_range("uniserve.collective kind=video_segment_gather"):
+            self.video_output_transfer.exchange(send, scratch.segment_receive)
         slot.next_video_unit += unit_count
-        if layout.sp_rank != 0:
+        if self.video_assembler is None:
             return None
-
-        # Rank zero joins temporal overlaps and emits only each unit's valid body.
-        gathered = scratch.segment_gather
-        output = scratch.rgb_round
-        if gathered is None or output is None or slot.video_overlap is None:
-            raise RuntimeError("rank zero lost its H3 video assembly storage")
+        if slot.video_overlap is None:
+            raise RuntimeError("H3 output owner lost its temporal overlap storage")
         overlap = None if start_unit == 0 else slot.video_overlap
         frame_start = 0
         for offset in range(unit_count):
             unit = start_unit + offset
-            rgb, overlap = self.video_vae.assemble_segment(
-                gathered[offset],
+            rgb, overlap = self.video_assembler(
+                scratch.segment_receive[offset],
                 overlap,
                 final_unit=unit + 1 == layout.video_reconstruction_units,
             )
             valid_frames = layout.reconstruction_unit_frames[unit]
             if int(rgb.shape[0]) != valid_frames:
                 raise RuntimeError("H3 video decoder returned an unexpected frame count")
-            output[frame_start : frame_start + valid_frames].copy_(rgb)
+            scratch.rgb_round[frame_start : frame_start + valid_frames].copy_(rgb)
             frame_start += valid_frames
         slot.video_overlap.copy_(overlap)
-        return output[:frame_start]
+        return scratch.rgb_round[:frame_start]
 
     @torch.inference_mode()
     def reconstruct_audio(self, slot: H3StateSlot) -> torch.Tensor | None:
-        """Gather the sharded audio latent and decode duration-matched PCM on rank zero."""
+        """Reconstruct unique audio rows, decode once, and transfer ordered PCM."""
 
         if slot.audio_reconstructed:
             raise ValueError("invalid H3 audio reconstruction placement")
         execution = self._page_execution_for_slot(slot)
-        layout = execution.layout
-        scratch = execution.scratch
-        scratch.audio_input.zero_()
-        raster = scratch.local_audio_raster
-        scratch.audio_input.index_copy_(0, raster, slot.audio_rows)
-
-        # Every rank contributes a zero-filled full timeline, so summation after
-        # all-gather reconstructs the unique channel-major latent without overlap.
-        with profile_range(
-            f"uniserve.h3.collective kind=audio_latent_gather rank={layout.sp_rank}"
-        ):
-            self.mesh.all_gather_into_tensor(
-                scratch.audio_gather.reshape(
-                    layout.sp_size * layout.packed.audio_indices.numel(), 32
-                ),
-                scratch.audio_input,
-                "sp",
+        layout, scratch = execution.layout, execution.media
+        scratch.audio_send.zero_()
+        if self.placement.process_group.rank in self.placement.latent_producers:
+            scratch.audio_send[0].index_copy_(0, scratch.local_audio_raster, slot.audio_rows)
+        with profile_range("uniserve.collective kind=audio_latent_gather"):
+            self.audio_latent_transfer.exchange(scratch.audio_send, scratch.audio_receive)
+        pcm = None
+        if self.audio_vae is not None:
+            torch.sum(scratch.audio_receive, dim=0, out=scratch.audio_input)
+            scratch.audio_latents.copy_(
+                scratch.audio_input.view(2, layout.packed.audio_frames, 32).permute(0, 2, 1)
             )
-        torch.sum(scratch.audio_gather, dim=0, out=scratch.audio_input)
+            decoded = self.audio_vae.decode(scratch.audio_latents)
+            target_samples = round(layout.frame_count * PROFILE_AUDIO_RATE / PROFILE_FPS)
+            if decoded.shape[0] < target_samples:
+                raise RuntimeError("H3 audio decoder returned less than the fixed video duration")
+            pcm = decoded[:target_samples]
+        output = scratch.pcm if self.placement.owns("output") else None
+        self.audio_output_transfer.broadcast(pcm, output)
         slot.audio_reconstructed = True
-        if layout.sp_rank != 0:
-            return None
-        if self.audio_vae is None:
-            raise RuntimeError("rank zero has no resident H3 audio VAE")
-        scratch.audio_latents.copy_(
-            scratch.audio_input.view(2, layout.packed.audio_frames, 32).permute(0, 2, 1)
-        )
-        pcm = self.audio_vae.decode(scratch.audio_latents)
-        target_samples = round(layout.frame_count * PROFILE_AUDIO_RATE / PROFILE_FPS)
-        if pcm.shape[0] < target_samples:
-            raise RuntimeError("H3 audio decoder returned less than the fixed video duration")
-        return pcm[:target_samples]
+        return output
 
     def decode_kind(self, slot: H3StateSlot, cursor: int) -> DecodeKind:
         """Map the bounded output cursor to video, audio, or finalization work."""
 
         layout = self._page_execution_for_slot(slot).layout
-        video_rounds = (layout.video_reconstruction_units + layout.sp_size - 1) // layout.sp_size
+        video_rounds = (
+            layout.video_reconstruction_units + layout.decoder_width - 1
+        ) // layout.decoder_width
         if 0 <= int(cursor) < video_rounds:
             return DecodeKind.VIDEO
         if int(cursor) == video_rounds:
@@ -688,9 +700,7 @@ class MiniMaxH3Runner(VideoRunner):
         raise ValueError("H3 decode cursor is outside the request output bound")
 
     @torch.inference_mode()
-    def decode(
-        self, slot: H3StateSlot, cursor: int, max_units: int
-    ) -> DecodeOutput:
+    def decode(self, slot: H3StateSlot, cursor: int, max_units: int) -> DecodeOutput:
         """Execute one bounded output unit and describe its position in the media stream."""
 
         if int(max_units) != 1:
@@ -698,9 +708,9 @@ class MiniMaxH3Runner(VideoRunner):
         kind = self.decode_kind(slot, cursor)
         layout = self._page_execution_for_slot(slot).layout
         if kind is DecodeKind.VIDEO:
-            start_unit = int(cursor) * layout.sp_size
+            start_unit = int(cursor) * layout.decoder_width
             unit_count = min(
-                layout.sp_size,
+                layout.decoder_width,
                 layout.video_reconstruction_units - start_unit,
             )
             return DecodeOutput(
@@ -740,73 +750,64 @@ class MiniMaxH3Runner(VideoRunner):
         state_pool = context.requests.model_state
         if not isinstance(state_pool, H3StatePool):
             raise RuntimeError("H3 warmup requires request-pool state")
-        schedule = self.layout.schedule
-        max_rows = int(self.layout.packed.text_indices.numel())
+        if self.transformer is not None:
+            max_rows = int(self.layout.packed.text_indices.numel())
 
-        def capacity_execution(token_count: int) -> _H3PageExecution:
-            """Resolve the maximum media layout at one padded prompt capacity."""
+            def capacity_execution(token_count: int) -> _H3PageExecution:
+                """Resolve the maximum media layout at one padded prompt capacity."""
 
-            return self._page_execution_for_geometry(
-                frame_count=self.layout.frame_count,
-                audio_frames=self.layout.packed.audio_frames,
-                token_count=token_count,
+                return self._page_execution_for_geometry(
+                    frame_count=self.layout.frame_count,
+                    audio_frames=self.layout.packed.audio_frames,
+                    token_count=token_count,
+                )
+
+            # Cover the minimum request, every text-page residue class used by the
+            # sparse kernels, and the configured maximum-capacity page shape.
+            min_execution = self._page_execution_for_geometry(
+                frame_count=MIN_H3_FRAMES,
+                audio_frames=audio_latent_frames(MIN_H3_FRAMES),
+                token_count=1,
             )
-
-        # Cover the minimum request, every text-page residue class used by the
-        # sparse kernels, and the configured maximum-capacity page shape.
-        min_execution = self._page_execution_for_geometry(
-            frame_count=MIN_H3_FRAMES,
-            audio_frames=audio_latent_frames(MIN_H3_FRAMES),
-            token_count=1,
-        )
-        generic_execution = capacity_execution(65)
-        residue_executions = tuple(
-            capacity_execution(token_count) for token_count in (129, 193, 257)
-        )
-        max_execution = capacity_execution(max_rows)
-        for slot in state_pool.slots:
-            slot.bind(max_execution.layout)
-            self.transformer.prepare_adaln_plan(
-                slot,
-                schedule.video_timesteps,
-                schedule.audio_timesteps,
+            generic_execution = capacity_execution(65)
+            residue_executions = tuple(
+                capacity_execution(token_count) for token_count in (129, 193, 257)
             )
-        warmup_executions = (
-            generic_execution,
-            min_execution,
-            *residue_executions,
-            max_execution,
-        )
-        for execution in warmup_executions:
-            page_rows = int(execution.layout.packed.text_indices.numel())
-            self.transformer.bind_execution(execution.transformer_execution)
-            for slot in state_pool.slots:
-                slot.bind(execution.layout)
-                slot.text_condition.zero_()
-                slot.video_rows.zero_()
-                slot.audio_rows.zero_()
-                self._prepare_tile_metadata(execution, slot, page_rows)
-                self._prepare_rotary(execution, slot, page_rows)
-            slot = state_pool.slots[0]
-            self.transformer.select_adaln_step(slot, execution.scratch, 0)
-            self.transformer.forward_local_prepared(slot, execution.scratch)
-        self.transformer.bind_execution(max_execution.transformer_execution)
-        # Decoder graph capture owns stable input storage for the lifetime of the runner.
-        video_latents = torch.zeros(
-            (1, 24, 7, 48, 84),
-            dtype=torch.float32,
-            device=self.mesh.local_device,
-        )
-        segment = self.video_vae.capture_decoder(video_latents)
-        if self.layout.sp_rank == 0:
-            self.video_vae.assemble_segment(segment, None, final_unit=False)
+            max_execution = capacity_execution(max_rows)
+            warmup_executions = (
+                generic_execution,
+                min_execution,
+                *residue_executions,
+                max_execution,
+            )
+            for execution in warmup_executions:
+                page_rows = int(execution.layout.packed.text_indices.numel())
+                self.transformer.bind_execution(execution.transformer_execution)
+                for slot in state_pool.slots:
+                    slot.bind(execution.layout)
+                    slot.text_condition.zero_()
+                    slot.video_rows.zero_()
+                    slot.audio_rows.zero_()
+                    self._prepare_tile_metadata(execution, slot, page_rows)
+                    self._prepare_rotary(execution, slot, page_rows)
+                slot = state_pool.slots[0]
+                self.transformer.select_adaln_step(execution.scratch, 0)
+                self.transformer.forward_local_prepared(slot, execution.scratch)
+            self.transformer.bind_execution(max_execution.transformer_execution)
+        if self.video_vae is not None:
+            video_latents = torch.zeros((1, 24, 7, 48, 84), dtype=torch.float32, device=self.device)
+            self.video_vae.capture_decoder(video_latents)
+        if self.video_assembler is not None:
+            segment = self.media_storage.segment_receive[0]
+            segment.zero_()
+            self.video_assembler(segment, None, final_unit=False)
         if self.audio_vae is not None:
             audio_latents = torch.zeros(
                 (2, 32, self.layout.packed.audio_frames),
                 dtype=torch.float32,
-                device=self.mesh.local_device,
+                device=self.device,
             )
             self.audio_vae.warmup_decoder(audio_latents)
-        torch.cuda.synchronize(self.mesh.local_device)
+        torch.cuda.synchronize(self.device)
         for slot in state_pool.slots:
             slot.clear()

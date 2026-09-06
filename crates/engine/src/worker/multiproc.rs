@@ -1,6 +1,7 @@
-//! Tensor-parallel rank fan-out, completion agreement, and process recovery.
+//! Physical worker fan-out, completion agreement, and process recovery.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt::Write as _;
 use std::net::TcpListener;
 use std::time::{Duration, Instant};
 
@@ -9,6 +10,7 @@ use crate::executor::{
     PhysicalExecutor, PhysicalSubmitError, PoolId, WorkerExecError, WorkerLossError, lower_batch,
 };
 use anyhow::Context;
+use sha2::{Digest as _, Sha256};
 use uniserve_core::{CommandWaker, RequestId};
 use uniserve_worker_ipc::{ModelOutput, Run as PhysicalRun, RunResult, WorkerInfo};
 
@@ -18,24 +20,30 @@ use crate::worker::WorkerProcessArgs;
 const NEXT_RESULT_DEADLINE: Duration = Duration::from_secs(300);
 
 impl WorkerProcessArgs {
-    /// Launches and connects every rank in one tensor-parallel worker group.
+    /// Launches and connects every rank in one physical worker group.
     fn launch(
         &self,
     ) -> anyhow::Result<(Vec<Box<dyn PhysicalExecutor>>, Vec<CommandWaker>, Vec<i32>)> {
-        let tp_init_method = if self.world_size > 1 {
-            Some(allocate_tp_init_method()?)
+        let distributed_init_method = if self.world_size > 1 {
+            Some(allocate_distributed_init_method()?)
         } else {
             None
         };
+        let components = self.resolved_components()?;
         let mut launched = Vec::with_capacity(self.world_size);
         for rank in 0..self.world_size {
-            let rank_device = device_for_rank(&self.device, rank, self.world_size);
+            let rank_device = if let Some(deployment) = &self.deployment {
+                format!("cuda:{}", deployment.devices[rank])
+            } else {
+                device_for_rank(&self.device, rank, self.world_size)
+            };
             launched.push(crate::UniprocExecutor::spawn_rank_deferred(
                 self,
                 &rank_device,
                 rank as u32,
                 self.world_size as u32,
-                tp_init_method.as_deref(),
+                distributed_init_method.as_deref(),
+                &components,
             )?);
         }
         let mut workers: Vec<Box<dyn PhysicalExecutor>> = Vec::with_capacity(self.world_size);
@@ -51,7 +59,7 @@ impl WorkerProcessArgs {
     }
 }
 
-/// Tensor-parallel worker processes with one iceoryx2 service per rank.
+/// Cooperative worker processes with one iceoryx2 service per rank.
 pub struct MultiprocExecutor {
     workers: Vec<Box<dyn PhysicalExecutor>>,
     buffers: Vec<VecDeque<RunResult>>,
@@ -90,13 +98,38 @@ fn operation_identity(
     )
 }
 
+/// Combine rank-local resolved identities into one ordered process-world identity.
+fn process_world_configuration_id(workers: &[Box<dyn PhysicalExecutor>]) -> String {
+    if workers.len() == 1 {
+        return workers[0]
+            .physical_info()
+            .single_pool()
+            .configuration_id
+            .clone();
+    }
+
+    let mut digest = Sha256::new();
+    digest.update(b"uniserve-process-world-configuration-v1\0");
+    for worker in workers {
+        let info = worker.physical_info().single_pool();
+        digest.update(info.rank.rank.to_le_bytes());
+        digest.update((info.configuration_id.len() as u64).to_le_bytes());
+        digest.update(info.configuration_id.as_bytes());
+    }
+    let mut identity = String::with_capacity(64);
+    for byte in digest.finalize() {
+        write!(&mut identity, "{byte:02x}").expect("writing to a String is infallible");
+    }
+    identity
+}
+
 impl MultiprocExecutor {
-    /// Constructs a tensor-parallel executor from connected physical ranks.
+    /// Constructs a cooperative executor from connected physical ranks.
     pub fn new(workers: Vec<Box<dyn PhysicalExecutor>>) -> anyhow::Result<Self> {
         Self::from_workers(workers, Vec::new(), Vec::new(), None)
     }
 
-    /// Validates rank topology and constructs shared tensor-parallel executor state.
+    /// Validates rank topology and constructs shared cooperative executor state.
     fn from_workers(
         workers: Vec<Box<dyn PhysicalExecutor>>,
         command_wakers: Vec<CommandWaker>,
@@ -105,28 +138,36 @@ impl MultiprocExecutor {
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(!workers.is_empty(), "need >= 1 worker");
         let n = workers.len();
-        let tp_size = u32::try_from(n).context("TP world size exceeds the IPC representation")?;
-        let info = workers[0].physical_info().single_pool().clone();
+        let world_size =
+            u32::try_from(n).context("process world size exceeds the IPC representation")?;
+        let mut info = workers[0].physical_info().single_pool().clone();
         let mut canonical = info.clone();
-        canonical.rank.tp_rank = 0;
+        canonical.rank.rank = 0;
+        canonical.configuration_id.clear();
         for (rank, worker) in workers.iter().enumerate() {
             let rank_info = worker.physical_info().single_pool();
             rank_info
                 .validate()
-                .with_context(|| format!("TP rank {rank} reported invalid worker info"))?;
+                .with_context(|| format!("physical rank {rank} reported invalid worker info"))?;
             anyhow::ensure!(
-                rank_info.rank.tp_rank == rank as u32 && rank_info.rank.tp_size == tp_size,
-                "TP rank {rank} reported topology ({}/{}) for launched topology ({rank}/{tp_size})",
-                rank_info.rank.tp_rank,
-                rank_info.rank.tp_size,
+                rank_info.rank.rank == rank as u32 && rank_info.rank.world_size == world_size,
+                "physical rank {rank} reported topology ({}/{}) for launched topology ({rank}/{world_size})",
+                rank_info.rank.rank,
+                rank_info.rank.world_size,
             );
             let mut normalized = rank_info.clone();
-            normalized.rank.tp_rank = 0;
+            normalized.rank.rank = 0;
+            // The resolved identity includes rank-local parameter and buffer
+            // layouts. Component placement may therefore give each physical
+            // rank a distinct identity while all scheduling/resource bounds
+            // still have to agree.
+            normalized.configuration_id.clear();
             anyhow::ensure!(
                 normalized == canonical,
-                "TP rank {rank} worker info disagree with rank 0"
+                "physical rank {rank} worker info disagree with rank 0"
             );
         }
+        info.configuration_id = process_world_configuration_id(&workers);
         let depth = info.queue_depth.max(1) as usize;
         let buffers = (0..n).map(|_| VecDeque::new()).collect();
         Ok(Self {
@@ -153,7 +194,7 @@ impl MultiprocExecutor {
         })
     }
 
-    /// Spawns every tensor-parallel rank and validates their shared capabilities.
+    /// Spawns every physical rank and validates their shared capabilities.
     pub fn spawn(args: WorkerProcessArgs) -> anyhow::Result<Self> {
         anyhow::ensure!(args.world_size > 0, "worker world size must be positive");
         let (workers, wakers, progress_fds) = args.launch()?;
@@ -164,7 +205,10 @@ impl MultiprocExecutor {
     fn pump_once(&mut self) -> anyhow::Result<()> {
         for rank in 0..self.workers.len() {
             loop {
-                match self.workers[rank].poll_run(Duration::ZERO) {
+                let result = self.workers[rank].poll_run(Duration::ZERO);
+                let command_wake = self.workers[rank].take_command_wake();
+                self.command_wake_pending |= command_wake;
+                match result {
                     Ok(Some(result)) => {
                         let run_id = result.run_id;
                         let expected = self
@@ -200,8 +244,7 @@ impl MultiprocExecutor {
                     Ok(None) => break,
                     Err(error) => self.record_rank_error(rank, &error)?,
                 }
-                if self.workers[rank].take_command_wake() {
-                    self.command_wake_pending = true;
+                if command_wake {
                     break;
                 }
             }
@@ -268,6 +311,10 @@ impl MultiprocExecutor {
         for (rank, worker) in workers.iter().enumerate() {
             validate_replacement_info(&self.info, worker.physical_info().single_pool(), rank)?;
         }
+        anyhow::ensure!(
+            process_world_configuration_id(&workers) == self.info.configuration_id,
+            "replacement worker process-world configuration changed"
+        );
         self.workers = workers;
         self.command_wakers = command_wakers;
         self.progress_fds = progress_fds;
@@ -355,9 +402,20 @@ impl MultiprocExecutor {
         for (rank, report) in per_rank.iter_mut().enumerate() {
             validate_and_order_rank_report(batch, report, rank)?;
         }
-        let mut out = per_rank.remove(0);
-        for (rank, report) in per_rank.iter().enumerate() {
-            merge_rank_report(batch, &mut out, report, rank + 1)?;
+        let output_rank = self
+            .info
+            .components
+            .iter()
+            .find(|component| component.name == "output")
+            .map_or(0, |component| component.deployment.ranks[0]);
+        let mut out = per_rank.remove(output_rank);
+        for (index, report) in per_rank.iter().enumerate() {
+            let rank = if index >= output_rank {
+                index + 1
+            } else {
+                index
+            };
+            merge_rank_report(batch, &mut out, report, rank)?;
         }
         let remaining = self
             .pending_operations
@@ -415,9 +473,14 @@ impl MultiprocExecutor {
                 .filter_map(|(rank, entries)| entries.get(&run_id).map(|error| (rank, error)))
                 .collect::<Vec<_>>();
             if errors.len() != self.workers.len() {
+                let details = errors
+                    .iter()
+                    .map(|(rank, error)| format!("rank {rank}: {error}"))
+                    .collect::<Vec<_>>()
+                    .join("; ");
                 self.finish_step(run_id);
                 anyhow::bail!(
-                    "tensor-parallel ranks disagreed between success and failure for step {run_id}"
+                    "worker ranks disagreed between success and failure for step {run_id}: {details}"
                 );
             }
             let canonical = errors[0].1.clone();
@@ -483,38 +546,37 @@ fn report_operation_ids(report: &RunResult) -> Vec<OperationIdentity> {
     ids
 }
 
-/// Joins one step's per-rank completion reports into rank 0's. Tensor-parallel
-/// ranks run the identical operation set, so every rank must report the same
-/// semantic completion for each operation; only the per-rank product shards
-/// differ and are concatenated in rank order.
+/// Join cooperative completion reports into the designated output owner's report.
+/// Every participant agrees on semantic completion; only the output owner
+/// publishes host products.
 fn merge_rank_report(
     batch: &PhysicalRun,
-    rank0: &mut RunResult,
-    rankn: &RunResult,
+    canonical_report: &mut RunResult,
+    participant_report: &RunResult,
     rank: usize,
 ) -> anyhow::Result<()> {
     let run_id = batch.run_id;
-    if rankn.run_id != run_id {
+    if participant_report.run_id != run_id {
         anyhow::bail!(
             "rank {rank} completion report run_id mismatch while joining step {run_id}: got {}",
-            rankn.run_id
+            participant_report.run_id
         );
     }
     anyhow::ensure!(
-        rankn.done == rank0.done,
-        "rank {rank} completion flag differs from rank 0 for step {run_id}"
+        participant_report.done == canonical_report.done,
+        "rank {rank} completion flag differs from the output owner for step {run_id}"
     );
-    if rankn.completions.len() != rank0.completions.len() {
+    if participant_report.completions.len() != canonical_report.completions.len() {
         anyhow::bail!(
             "rank {rank} report for step {run_id} has {} completions, expected {}",
-            rankn.completions.len(),
-            rank0.completions.len()
+            participant_report.completions.len(),
+            canonical_report.completions.len()
         );
     }
-    for (completion_index, (canonical, actual)) in rank0
+    for (completion_index, (canonical, actual)) in canonical_report
         .completions
         .iter_mut()
-        .zip(&rankn.completions)
+        .zip(&participant_report.completions)
         .enumerate()
     {
         anyhow::ensure!(
@@ -527,18 +589,18 @@ fn merge_rank_report(
         );
         if let Err(error) = merge_completion_record(canonical, actual) {
             anyhow::bail!(
-                "rank {rank} report for step {run_id} completion {completion_index} differs from rank 0: {error:#}"
+                "rank {rank} report for step {run_id} completion {completion_index} differs from the output owner: {error:#}"
             );
         }
     }
     anyhow::ensure!(
-        rankn.products.is_empty(),
+        participant_report.products.is_empty(),
         "rank {rank} published host products despite designated-rank ownership"
     );
-    rank0.worker_exec_us = rank0
+    canonical_report.worker_exec_us = canonical_report
         .worker_exec_us
         .into_iter()
-        .chain(rankn.worker_exec_us)
+        .chain(participant_report.worker_exec_us)
         .max();
     Ok(())
 }
@@ -637,22 +699,25 @@ fn validate_replacement_info(
         .validate()
         .with_context(|| format!("replacement rank {rank} reported invalid worker info"))?;
     let mut normalized_expected = expected.clone();
-    normalized_expected.rank.tp_rank = rank as u32;
+    normalized_expected.rank.rank = rank as u32;
+    normalized_expected.configuration_id.clear();
+    let mut normalized_actual = actual.clone();
+    normalized_actual.configuration_id.clear();
     anyhow::ensure!(
-        normalized_expected == *actual,
+        normalized_expected == normalized_actual,
         "replacement rank {rank} worker info changed"
     );
     Ok(())
 }
 
-/// Allocates a tensor-parallel initialization endpoint.
-fn allocate_tp_init_method() -> anyhow::Result<String> {
+/// Allocates a process-world initialization endpoint.
+fn allocate_distributed_init_method() -> anyhow::Result<String> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let addr = listener.local_addr()?;
     Ok(format!("tcp://127.0.0.1:{}", addr.port()))
 }
 
-/// Returns the device assigned to a tensor-parallel rank.
+/// Returns the device assigned to a physical worker rank.
 fn device_for_rank(device: &str, rank: usize, world_size: usize) -> String {
     let trimmed = device.trim();
     if world_size > 1 && matches!(trimmed, "cuda" | "gpu") {
@@ -718,7 +783,9 @@ impl PhysicalExecutor for MultiprocExecutor {
             if let Err(error) = worker.submit_run(batch.clone()) {
                 let error = match error {
                     PhysicalSubmitError::WouldBlock(_) => {
-                        anyhow::anyhow!("rank {rank} rejected an admitted TP batch as full")
+                        anyhow::anyhow!(
+                            "physical rank {rank} rejected an admitted cooperative batch as full"
+                        )
                     }
                     PhysicalSubmitError::Failed(error) => {
                         error.context(format!("submit to rank {rank} failed"))
@@ -800,7 +867,7 @@ impl PhysicalExecutor for MultiprocExecutor {
             }
             if self.inflight > 0 && self.last_progress.elapsed() >= NEXT_RESULT_DEADLINE {
                 let error = anyhow::anyhow!(
-                    "tensor-parallel workers produced no progress within {:?}",
+                    "cooperative workers produced no progress within {:?}",
                     NEXT_RESULT_DEADLINE
                 );
                 self.recover_workers(&error)?;

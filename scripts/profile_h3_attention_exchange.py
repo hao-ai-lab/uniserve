@@ -6,10 +6,14 @@ import os
 import torch
 import torch.distributed as dist
 
-from uniserve_worker.nn.mesh import CollectiveTransport, DeviceMesh, MeshAxis
+from uniserve_worker.nn.parallel import ParallelConfig, UlyssesSequence
 from uniserve_worker.ops.video_sparse import (
     compose_to_head_shards,
     unpack_add_compression,
+)
+from uniserve_worker.runtime.distributed import (
+    init_distributed_environment,
+    initialize_model_parallel,
 )
 
 
@@ -69,19 +73,21 @@ def main() -> None:
     candidate_output = torch.empty_like(reference)
     sync_input = torch.full((1,), rank, device=device, dtype=torch.int32)
     sync_output = torch.empty((world,), device=device, dtype=torch.int32)
-    mesh = DeviceMesh.of(
-        MeshAxis(
-            "sp",
-            world,
-            rank,
-            transport=CollectiveTransport("sp", world, rank),
-        ),
-        device=device,
+    environment = init_distributed_environment(
+        rank=rank, local_rank=rank, world_size=world, device=str(device)
     )
-    workspace = mesh.symmetric_memory(
+    mesh = initialize_model_parallel(
+        environment,
+        {
+            "denoiser": (
+                tuple(range(world)),
+                ParallelConfig(sequence_parallel=UlyssesSequence(world)),
+            ),
+        },
+    )["denoiser"]
+    workspace = mesh.get_group("sp").symmetric_memory(
         (local_rows, global_heads, width),
         dtype=torch.bfloat16,
-        group="sp",
         name="profile_video_attention_heads",
     )
 

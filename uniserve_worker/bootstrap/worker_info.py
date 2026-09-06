@@ -9,6 +9,7 @@ from typing import Any, TypeVar, cast
 
 from ..execution.batch import OpKind
 from ..foundation.errors import invalid_descriptor
+from .plan import ComponentDeployConfig
 
 
 class RequestKind(StrEnum):
@@ -86,14 +87,19 @@ class KvCacheConfig:
     def __post_init__(self) -> None:
         """Validate published KV dimensions, dtype, token capacity, and group coverage."""
 
-        if min(
-            self.block_size,
-            self.num_blocks,
-            self.num_layers,
-            self.num_kv_heads,
-            self.head_dim,
-            self.bytes_per_token,
-        ) < 1 or not self.groups or not self.dtype:
+        if (
+            min(
+                self.block_size,
+                self.num_blocks,
+                self.num_layers,
+                self.num_kv_heads,
+                self.head_dim,
+                self.bytes_per_token,
+            )
+            < 1
+            or not self.groups
+            or not self.dtype
+        ):
             raise invalid_descriptor("worker info declares incomplete KV geometry")
         if any(group.num_blocks < 1 for group in self.groups):
             raise invalid_descriptor("worker info KV groups must be physical page partitions")
@@ -138,31 +144,31 @@ class KvCacheConfig:
 class RankInfo:
     """Describes one rank’s identity within the worker topology."""
 
-    tp_rank: int = 0
-    tp_size: int = 1
+    rank: int = 0
+    world_size: int = 1
 
     def __post_init__(self) -> None:
         """Validate rank coordinates against the declared topology size."""
 
-        if self.tp_size < 1 or not 0 <= self.tp_rank < self.tp_size:
-            raise invalid_descriptor("rank.tp must satisfy 0 <= rank < size")
+        if self.world_size < 1 or not 0 <= self.rank < self.world_size:
+            raise invalid_descriptor("rank must satisfy 0 <= rank < world_size")
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "rank") -> RankInfo:
-        """Decode and validate tensor-parallel rank identity from the wire mapping."""
+        """Decode and validate physical process rank identity from the wire mapping."""
 
         data = _map(value, where)
         return cls(
-            tp_rank=_uint(data.get("tp_rank", 0), f"{where}.tp_rank"),
-            tp_size=_uint(data.get("tp_size", 1), f"{where}.tp_size"),
+            rank=_uint(data.get("rank", 0), f"{where}.rank"),
+            world_size=_uint(data.get("world_size", 1), f"{where}.world_size"),
         )
 
     def to_mapping(self) -> dict[str, int]:
-        """Encode tensor-parallel rank identity for scheduler discovery."""
+        """Encode physical process rank identity for scheduler discovery."""
 
         return {
-            "tp_rank": self.tp_rank,
-            "tp_size": self.tp_size,
+            "rank": self.rank,
+            "world_size": self.world_size,
         }
 
 
@@ -183,6 +189,8 @@ class WorkerInfo:
     latent_pages: int
     buffer_pool_bytes: int
     max_unresolved_ops: int
+    configuration_id: str = ""
+    components: tuple[tuple[str, ComponentDeployConfig], ...] = ()
 
     @property
     def latent_capacity_units(self) -> int:
@@ -228,9 +236,7 @@ class WorkerInfo:
         has_latent_geometry = bool(self.latent_page_units or self.latent_pages)
         if has_latent_geometry:
             if self.latent_page_units < 1 or self.latent_pages < 2:
-                raise invalid_descriptor(
-                    "worker info declares incomplete latent pool capacity"
-                )
+                raise invalid_descriptor("worker info declares incomplete latent pool capacity")
         addresses_latent = any(
             variant
             in {
@@ -250,6 +256,16 @@ class WorkerInfo:
 
         data = _map(value, where)
         return cls(
+            configuration_id=str(data.get("configuration_id", "")),
+            components=tuple(
+                (
+                    item["name"],
+                    ComponentDeployConfig.from_dict(
+                        {key: value for key, value in item.items() if key != "name"}
+                    ),
+                )
+                for item in data.get("components", ())
+            ),
             model_name=_str(data.get("model_name", ""), f"{where}.model_name"),
             weight_version=_uint(data.get("weight_version", 0), f"{where}.weight_version"),
             rank=RankInfo.from_mapping(data.get("rank"), f"{where}.rank"),
@@ -270,12 +286,8 @@ class WorkerInfo:
             ),
             latent_page_units=_uint(data.get("latent_page_units"), f"{where}.latent_page_units"),
             latent_pages=_uint(data.get("latent_pages"), f"{where}.latent_pages"),
-            buffer_pool_bytes=_uint(
-                data.get("buffer_pool_bytes"), f"{where}.buffer_pool_bytes"
-            ),
-            max_unresolved_ops=_uint(
-                data.get("max_unresolved_ops"), f"{where}.max_unresolved_ops"
-            ),
+            buffer_pool_bytes=_uint(data.get("buffer_pool_bytes"), f"{where}.buffer_pool_bytes"),
+            max_unresolved_ops=_uint(data.get("max_unresolved_ops"), f"{where}.max_unresolved_ops"),
         )
 
     def to_mapping(self) -> dict[str, object]:
@@ -285,6 +297,10 @@ class WorkerInfo:
             "model_name": self.model_name,
             "weight_version": self.weight_version,
             "rank": self.rank.to_mapping(),
+            "configuration_id": self.configuration_id,
+            "components": [
+                {"name": name, **component.to_dict()} for name, component in self.components
+            ],
             "supported_ops": [value.value for value in self.supported_ops],
             "queue_depth": self.queue_depth,
             "max_batch_ops": self.max_batch_ops,

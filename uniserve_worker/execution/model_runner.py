@@ -20,7 +20,6 @@ from uniserve_worker.execution.cuda_graph import (
 from uniserve_worker.execution.forward_batch import (
     ForwardBatch,
     ForwardOutput,
-    MeshView,
     ModelPhase,
     TokenSelection,
 )
@@ -226,9 +225,7 @@ class ModelRunner:
             try:
                 lane_runtime.graphs.complete_startup()
             except GraphExecutionError as error:
-                raise GraphExecutionError(
-                    f"execution lane {lane_id} failed startup"
-                ) from error
+                raise GraphExecutionError(f"execution lane {lane_id} failed startup") from error
             lane_runtime.verify_stream()
             logger.info("verified CUDA graph catalog lane=%s", lane_id)
         signature = tuple(
@@ -275,7 +272,6 @@ class ModelRunner:
         *,
         device: torch.device | str,
         attention: dict[str, object],
-        mesh: MeshView,
         graph_shape: tuple[object, ...],
         graph_eligible: bool,
         domain: Domain,
@@ -321,7 +317,9 @@ class ModelRunner:
             if lane_runtime.stream is not None:
                 lane_runtime.order_after(torch.cuda.current_stream(target))
             stream_context = (
-                nullcontext() if lane_runtime.stream is None else torch.cuda.stream(lane_runtime.stream)
+                nullcontext()
+                if lane_runtime.stream is None
+                else torch.cuda.stream(lane_runtime.stream)
             )
             with stream_context:
                 batch = buffers.stage(
@@ -417,7 +415,6 @@ class ModelRunner:
                         if task.latent is not None and task.image_tokens == 0
                     ),
                     attention=attention,
-                    mesh=mesh,
                 )
                 request_pool_indices = batch.request_pool_indices
         except Exception as error:

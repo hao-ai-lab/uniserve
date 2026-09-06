@@ -142,6 +142,35 @@ impl std::str::FromStr for FlashInferBackend {
 /// Error returned for an unsupported FlashInfer backend name.
 pub struct FlashInferBackendParseError(String);
 
+impl WorkerProcessArgs {
+    /// Expand ordered component membership once before any process is launched.
+    pub(crate) fn resolved_components(
+        &self,
+    ) -> anyhow::Result<std::collections::BTreeMap<String, crate::executor::ComponentDeployConfig>>
+    {
+        let components = if let Some(deployment) = &self.deployment {
+            deployment.validate()?;
+            anyhow::ensure!(
+                deployment.devices.len() == self.world_size,
+                "deployment device count disagrees with launched world"
+            );
+            deployment.components.clone()
+        } else {
+            std::collections::BTreeMap::from([(
+                "model".to_owned(),
+                crate::executor::ComponentDeployConfig::parallel(
+                    (0..self.world_size).collect(),
+                    crate::executor::ParallelConfig {
+                        tensor_parallel_size: self.world_size,
+                        ..Default::default()
+                    },
+                ),
+            )])
+        };
+        Ok(components)
+    }
+}
+
 impl Default for WorkerProcessArgs {
     /// Returns worker launch settings suitable for a single local rank.
     fn default() -> Self {
@@ -150,6 +179,7 @@ impl Default for WorkerProcessArgs {
             model: String::new(),
             device: "cuda".into(),
             world_size: 1,
+            deployment: None,
             pipeline_depth: 2,
             req_slot_cap: 1 << 20,
             resp_slot_cap: 8 << 20,
@@ -170,7 +200,7 @@ impl Default for WorkerProcessArgs {
             kv_cache_dtype: None,
             kv_memory_fraction: 0.70,
             mesh: None,
-            tp_backend: None,
+            distributed_backend: None,
             lanes: Vec::new(),
             cuda_graph: true,
             decode_graph_batch_sizes: None,
@@ -221,8 +251,8 @@ impl WorkerProcessArgs {
         if let Some(value) = &self.mesh {
             cmd.arg("--mesh").arg(value);
         }
-        if let Some(value) = &self.tp_backend {
-            cmd.arg("--tp-backend").arg(value);
+        if let Some(value) = &self.distributed_backend {
+            cmd.arg("--distributed-backend").arg(value);
         }
         for lane in &self.lanes {
             cmd.arg("--lane").arg(lane.worker_arg());
@@ -283,7 +313,8 @@ pub struct UniprocExecutor {
     child: Child,
     depth: usize,
     rank: u32,
-    tp_size: u32,
+    world_size: u32,
+    expected_components: Vec<uniserve_worker_ipc::ComponentInfo>,
     pending: HashMap<u64, PendingRecord>,
     ready: VecDeque<RunResult>,
     next_call_id: u64,
@@ -328,7 +359,18 @@ impl UniprocExecutor {
             args.world_size == 1,
             "uniproc worker world size must be one"
         );
-        let mut me = Self::spawn_rank_deferred(&args, &args.device, 0, 1, None)?;
+        let device = if let Some(deployment) = &args.deployment {
+            deployment.validate()?;
+            anyhow::ensure!(
+                deployment.devices.len() == 1,
+                "uniproc requires one deployment device"
+            );
+            format!("cuda:{}", deployment.devices[0])
+        } else {
+            args.device.clone()
+        };
+        let components = args.resolved_components()?;
+        let mut me = Self::spawn_rank_deferred(&args, &device, 0, 1, None, &components)?;
         me.finish_startup()?;
         Ok(me)
     }
@@ -337,13 +379,14 @@ impl UniprocExecutor {
     pub(crate) fn spawn_rank_deferred(
         args: &WorkerProcessArgs,
         device: &str,
-        tp_rank: u32,
-        tp_size: u32,
-        tp_init_method: Option<&str>,
+        rank: u32,
+        world_size: u32,
+        distributed_init_method: Option<&str>,
+        components: &std::collections::BTreeMap<String, crate::executor::ComponentDeployConfig>,
     ) -> anyhow::Result<Self> {
         let depth = args.pipeline_depth.max(1);
         let max_payload = args.req_slot_cap.max(args.resp_slot_cap).max(1);
-        let service = service_name(&format!("{}_{}_{}", std::process::id(), tp_rank, nano_id()));
+        let service = service_name(&format!("{}_{}_{}", std::process::id(), rank, nano_id()));
         let mut cmd = Command::new(&args.python);
         cmd.arg("-m")
             .arg("uniserve_worker.main")
@@ -367,10 +410,14 @@ impl UniprocExecutor {
             .arg(args.max_batch_operations.to_string())
             .arg("--max-batch-tokens")
             .arg(args.max_batch_tokens.to_string())
-            .arg("--tp-rank")
-            .arg(tp_rank.to_string())
-            .arg("--tp-size")
-            .arg(tp_size.to_string());
+            .arg("--rank")
+            .arg(rank.to_string())
+            .arg("--world-size")
+            .arg(world_size.to_string());
+        cmd.arg("--local-rank")
+            .arg(rank.to_string())
+            .arg("--component-deployment")
+            .arg(serde_json::to_string(&components)?);
         if args.supported_ops != uniserve_worker_ipc::OpKind::ALL {
             cmd.arg("--supported-ops").arg(
                 args.supported_ops
@@ -388,10 +435,10 @@ impl UniprocExecutor {
             cmd.arg("--transfer-backend")
                 .arg(args.transfer_backend.as_str());
         }
-        cmd.env("RANK", tp_rank.to_string())
-            .env("WORLD_SIZE", tp_size.to_string())
-            .env("LOCAL_RANK", tp_rank.to_string())
-            .env("LOCAL_WORLD_SIZE", tp_size.to_string());
+        cmd.env("RANK", rank.to_string())
+            .env("WORLD_SIZE", world_size.to_string())
+            .env("LOCAL_RANK", rank.to_string())
+            .env("LOCAL_WORLD_SIZE", world_size.to_string());
         // Serving batches change shape continuously, and fixed-size cached
         // segments strand device memory that later shapes cannot use.
         // Expandable segments let the allocator resize its mapping instead, so
@@ -400,10 +447,10 @@ impl UniprocExecutor {
         if std::env::var_os("PYTORCH_CUDA_ALLOC_CONF").is_none() {
             cmd.env("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True");
         }
-        if tp_size > 1
-            && let Some(init_method) = tp_init_method
+        if world_size > 1
+            && let Some(init_method) = distributed_init_method
         {
-            cmd.arg("--tp-init-method").arg(init_method);
+            cmd.arg("--distributed-init-method").arg(init_method);
         }
         if let Some(c) = args.kv_token_capacity {
             cmd.arg("--kv-token-capacity").arg(c.to_string());
@@ -422,13 +469,18 @@ impl UniprocExecutor {
             client,
             info: WorkerInfo::default(),
             executor_info: ExecutorInfo::single(
-                PoolId(format!("rank-{tp_rank}")),
+                PoolId(format!("rank-{rank}")),
                 WorkerInfo::default(),
             ),
             child,
             depth,
-            rank: tp_rank,
-            tp_size,
+            rank,
+            world_size,
+            expected_components: components
+                .clone()
+                .into_iter()
+                .map(|(name, deployment)| uniserve_worker_ipc::ComponentInfo { name, deployment })
+                .collect(),
             pending: HashMap::new(),
             ready: VecDeque::new(),
             next_call_id: 1,
@@ -443,8 +495,8 @@ impl UniprocExecutor {
     /// Completes the worker information handshake and validates rank capabilities.
     pub(crate) fn finish_startup(&mut self) -> anyhow::Result<()> {
         tracing::info!(
-            tp_rank = self.rank,
-            tp_size = self.tp_size,
+            rank = self.rank,
+            world_size = self.world_size,
             "waiting for worker to load model + report info..."
         );
         let call_id = self.alloc_call_id();
@@ -471,12 +523,20 @@ impl UniprocExecutor {
             host_depth
         );
         anyhow::ensure!(
-            info.rank.tp_rank == self.rank && info.rank.tp_size == self.tp_size,
-            "worker TP rank/size ({}/{}) does not match launched topology ({}/{})",
-            info.rank.tp_rank,
-            info.rank.tp_size,
+            info.rank.rank == self.rank && info.rank.world_size == self.world_size,
+            "worker process rank/world_size ({}/{}) does not match launched topology ({}/{})",
+            info.rank.rank,
+            info.rank.world_size,
             self.rank,
-            self.tp_size
+            self.world_size
+        );
+        anyhow::ensure!(
+            info.components == self.expected_components,
+            "worker resolved component configuration disagrees with deployment"
+        );
+        anyhow::ensure!(
+            info.configuration_id.len() == 64,
+            "worker omitted resolved configuration identity"
         );
         self.executor_info =
             ExecutorInfo::single(PoolId(format!("rank-{}", self.rank)), info.clone());
@@ -899,7 +959,7 @@ pub(crate) fn nano_id() -> u64 {
     // would collide for workers spawned within the same wall-clock second; the counter
     // makes ids produced within any 65536-call window distinct regardless of clock
     // resolution or non-monotonicity, while the timestamp separates ids across windows.
-    // The full service name also includes pid + tp_rank, so any residual aliasing in the
+    // The full service name also includes pid + rank, so any residual aliasing in the
     // shifted timestamp bits cannot produce a real cross-worker collision.
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()

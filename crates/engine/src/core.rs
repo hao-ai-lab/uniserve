@@ -147,21 +147,21 @@ impl EngineCore {
         Self::assemble(config, executor, command_waker)
     }
 
-    /// Spawns the single Full pool. `tp == 1` uses a `UniprocExecutor`; `tp > 1`
-    /// uses a `MultiprocExecutor`.
+    /// Spawns the single Full pool. One rank uses a `UniprocExecutor`; multiple
+    /// physical ranks use a `MultiprocExecutor`.
     fn spawn_full_pool(
         config: &EngineCoreConfig,
         pool: &PoolConfig,
     ) -> anyhow::Result<(Box<dyn Executor>, CommandWaker)> {
         let args = WorkerProcessArgs {
             device: pool.device.clone(),
-            world_size: pool.tensor_parallel_size,
+            world_size: pool.worker_ranks,
             pipeline_depth: pool.queue_depth,
             supported_ops: pool.supported_ops.clone(),
             transfer_backend: TransferBackend::Inproc,
             ..config.worker_process.clone()
         };
-        if pool.tensor_parallel_size > 1 {
+        if pool.worker_ranks > 1 {
             let workers = MultiprocExecutor::spawn(args)
                 .context("failed to spawn forward-only worker ranks")?;
             let waker = workers.command_waker();
@@ -213,7 +213,7 @@ impl EngineCore {
             );
             let exec = MultiprocExecutor::spawn(WorkerProcessArgs {
                 device: pool.device.clone(),
-                world_size: pool.tensor_parallel_size.max(1),
+                world_size: pool.worker_ranks,
                 pipeline_depth: pool.queue_depth.max(1),
                 supported_ops: pool.supported_ops.clone(),
                 transfer_backend: incident.first().copied().unwrap_or_default(),
@@ -221,8 +221,8 @@ impl EngineCore {
             })
             .with_context(|| {
                 format!(
-                    "failed to spawn staged pool {} (tp={})",
-                    pool.id, pool.tensor_parallel_size
+                    "failed to spawn staged pool {} (ranks={})",
+                    pool.id, pool.worker_ranks
                 )
             })?;
             command_wakers.push(exec.command_waker());

@@ -120,6 +120,7 @@ fn try_resolved_model(
         uniserve_server::serving::ServedSamplingControl::ALL.to_vec(),
         4096,
         true,
+        &std::collections::BTreeMap::new(),
     )?;
     Ok((directory, tokenizer, model))
 }

@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Literal
 
 from .config import ServerLaunch
 from .nsys_timeline import transform_timeline
@@ -16,7 +17,14 @@ from .nsys_timeline import transform_timeline
 class NsysCapture:
     """Profiles post-warmup load and exports a normalized timeline."""
 
-    def __init__(self, point_name: str, output_dir: Path, *, trace_cuda: bool = True) -> None:
+    def __init__(
+        self,
+        point_name: str,
+        output_dir: Path,
+        *,
+        trace_cuda: bool = True,
+        cuda_trace: Literal["cuda", "cuda-sw"] = "cuda",
+    ) -> None:
         """Create a unique profiler session for a benchmark point."""
 
         executable = shutil.which("nsys")
@@ -30,6 +38,7 @@ class NsysCapture:
         self.report_prefix = self.output_dir / "trace"
         self.log_path = self.output_dir / "nsys.log"
         self.trace_cuda = trace_cuda
+        self.cuda_trace = cuda_trace
         self._started = False
         self._stopped = False
 
@@ -39,7 +48,7 @@ class NsysCapture:
         if self.output_dir.exists() and any(self.output_dir.iterdir()):
             raise FileExistsError(f"nsys result directory is not empty: {self.output_dir}")
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        trace = "cuda,nvtx,osrt,cublas,cudnn" if self.trace_cuda else "nvtx,osrt"
+        trace = f"{self.cuda_trace},nvtx,osrt,cublas,cudnn" if self.trace_cuda else "nvtx,osrt"
         cuda_options = (
             (
                 "--cuda-graph-trace=node",
@@ -129,7 +138,9 @@ class NsysCapture:
             "session": self.session,
             "output_directory": str(self.output_dir),
             "trace": (
-                ["cuda", "nvtx", "osrt", "cublas", "cudnn"] if self.trace_cuda else ["nvtx", "osrt"]
+                [self.cuda_trace, "nvtx", "osrt", "cublas", "cudnn"]
+                if self.trace_cuda
+                else ["nvtx", "osrt"]
             ),
             "cuda_graph_trace": "node" if self.trace_cuda else None,
             "measurement_window": "post-warmup load",

@@ -78,19 +78,26 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--kv-memory-fraction", type=float, default=0.70)
     parser.add_argument("--model-dtype", default="bfloat16")
     parser.add_argument(
-        "--tp-rank",
+        "--rank",
         type=int,
         default=0,
-        help="tensor-parallel rank",
+        help="process rank",
     )
     parser.add_argument(
-        "--tp-size",
+        "--world-size",
         type=int,
         default=1,
-        help="tensor-parallel world size",
+        help="process world size",
     )
-    parser.add_argument("--tp-backend", default=None)
-    parser.add_argument("--tp-init-method", default=None)
+    parser.add_argument("--local-rank", type=int, default=0)
+    parser.add_argument(
+        "--component-deployment",
+        type=_json_object,
+        default={"model": {"ranks": [0], "parallel_config": {}}},
+        help="host-expanded component membership and logical parallel settings",
+    )
+    parser.add_argument("--distributed-backend", default=None)
+    parser.add_argument("--distributed-init-method", default=None)
     parser.add_argument(
         "--lane",
         action="append",

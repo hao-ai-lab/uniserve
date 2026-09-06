@@ -124,9 +124,9 @@ def _raw_request_ids(request: Mapping[str, Any]) -> frozenset[int]:
             if not isinstance(value, Mapping):
                 continue
             key = value.get("request_key")
-            request = value.get("request")
-            if key is None and isinstance(request, Mapping):
-                key = request.get("request_key")
+            request_value = value.get("request")
+            if key is None and isinstance(request_value, Mapping):
+                key = request_value.get("request_key")
             request_id = key.get("request_id") if isinstance(key, Mapping) else None
             if isinstance(request_id, int) and not isinstance(request_id, bool):
                 requests.add(int(request_id))
@@ -220,6 +220,7 @@ class WorkerProcess:
         self._runnable: deque[_Request] = deque()
         self._tasks: dict[int, _Request] = {}
         self._request_tails: dict[int, _Request] = {}
+        self._cooperative_tail: _Request | None = None
         self._run_waiters: dict[int, list[_Request]] = {}
         self._preparation_ready: SimpleQueue[WorkerRun] = SimpleQueue()
         self._device_fifo: deque[WorkerRun] = deque()
@@ -230,7 +231,11 @@ class WorkerProcess:
         self._shutdown_response: dict[str, Any] | None = None
         self._accepting_closed = False
         self._fatal_shutdown = False
-        self._launch_reorder = int(worker.info.rank.tp_size) == 1
+        self._launch_reorder = int(worker.info.rank.world_size) == 1
+        self._cooperative_order = (
+            int(worker.info.rank.world_size) > 1
+            and worker.model.ordered_collective_execution
+        )
         self._execute_count = 0
         self._terminate_after = env_int("UNISERVE_STUB_DIE_AFTER", default=0)
         self._terminate_rank = env_optional_int("UNISERVE_STUB_DIE_RANK")
@@ -279,9 +284,7 @@ class WorkerProcess:
 
         return request.get("call_id")
 
-    def _with_call_id(
-        self, response: dict[str, Any], request: Mapping[str, Any]
-    ) -> dict[str, Any]:
+    def _with_call_id(self, response: dict[str, Any], request: Mapping[str, Any]) -> dict[str, Any]:
         """Copy the caller correlation identifier onto a response when present."""
 
         call_id = self._call_id(request)
@@ -289,9 +292,7 @@ class WorkerProcess:
             response["call_id"] = call_id
         return response
 
-    def _error_response(
-        self, error: WorkerError, request: Mapping[str, Any]
-    ) -> dict[str, Any]:
+    def _error_response(self, error: WorkerError, request: Mapping[str, Any]) -> dict[str, Any]:
         """Encode a classified error and preserve the request correlation identifier."""
 
         fields = error.to_mapping()
@@ -314,9 +315,7 @@ class WorkerProcess:
             error.op_kind,
         )
 
-    def _boxed_error(
-        self, request: Mapping[str, Any], error: BaseException
-    ) -> dict[str, Any]:
+    def _boxed_error(self, request: Mapping[str, Any], error: BaseException) -> dict[str, Any]:
         """Classify an exception, record it, and encode the protocol error response."""
 
         classified = (
@@ -347,20 +346,29 @@ class WorkerProcess:
             # sequence position until all earlier responses have drained.
             if kind is RequestKind.CLOSE:
                 self._accepting_closed = True
-                self._shutdown_response = self._with_call_id(dispatch(self.worker, request), request)
+                self._shutdown_response = self._with_call_id(
+                    dispatch(self.worker, request), request
+                )
                 return sequence
             run: Run | None = None
             early = False
             if kind is RequestKind.SUBMIT:
                 self._profile_executes += 1
-                if self._profile_state is not None and self._profile_executes >= self._profile_start_execute:
+                if (
+                    self._profile_state is not None
+                    and self._profile_executes >= self._profile_start_execute
+                ):
                     self._profile_tick()
                 terminate_this_rank = self._terminate_rank in {
                     None,
-                    int(self.worker.info.rank.tp_rank),
+                    int(self.worker.info.rank.rank),
                 }
                 self._execute_count += 1
-                if self._terminate_after and terminate_this_rank and self._execute_count > self._terminate_after:
+                if (
+                    self._terminate_after
+                    and terminate_this_rank
+                    and self._execute_count > self._terminate_after
+                ):
                     os._exit(1)
                 raw_run = _required(request, "run", kind)
                 raw_run_id = (
@@ -374,8 +382,7 @@ class WorkerProcess:
                     run = raw_run if isinstance(raw_run, Run) else Run.from_mapping(raw_run)
                 requests = _run_requests(run)
                 early = self._launch_reorder and any(
-                    operation.kind.encode_mode is not None
-                    or operation.kind is RunKind.AR_EXTEND
+                    operation.kind.encode_mode is not None or operation.kind is RunKind.AR_EXTEND
                     for operation in run.operations
                 )
 
@@ -391,14 +398,23 @@ class WorkerProcess:
             )
             predecessors = {
                 id(predecessor): predecessor
-                for request in requests
-                if (predecessor := self._request_tails.get(request)) is not None
+                for request_id in requests
+                if (predecessor := self._request_tails.get(request_id)) is not None
             }
+            # Component participants can finish the same operation at different
+            # times. Preserve the host's cooperative submission order even when
+            # a later, independent request has already satisfied its own lineage.
+            # Release at successor visibility keeps device and CPU completion
+            # overlap under the existing execution credits.
+            if kind is RequestKind.SUBMIT and self._cooperative_order:
+                if self._cooperative_tail is not None:
+                    predecessors[id(self._cooperative_tail)] = self._cooperative_tail
+                self._cooperative_tail = pending
             pending.dependencies = len(predecessors)
             for predecessor in predecessors.values():
                 predecessor.successors.append(pending)
-            for request in requests:
-                self._request_tails[request] = pending
+            for request_id in requests:
+                self._request_tails[request_id] = pending
             self._tasks[sequence] = pending
             if pending.dependencies == 0:
                 self._enqueue(pending)
@@ -427,6 +443,8 @@ class WorkerProcess:
             return
         pending.released = True
         self._tasks.pop(pending.sequence, None)
+        if self._cooperative_tail is pending:
+            self._cooperative_tail = None
         for request in pending.requests:
             if self._request_tails.get(request) is pending:
                 del self._request_tails[request]
@@ -545,6 +563,7 @@ class WorkerProcess:
                     f"execution run contains work variants unsupported by this worker: {names!r}"
                 )
             prepared = self.worker.prepare_execute(run.run) if run.run.operations else None
+            source: RunResult | PreparedExecution
             if prepared is None:
                 with profile_range(self._profile_name("model_execute", run_id=run.run_id)):
                     source = self.worker.execute(run.run)
@@ -567,9 +586,7 @@ class WorkerProcess:
         run_id = _integer(pending.request, "run_id", RequestKind.POLL)
         reader = self.poll_readers.pop(run_id, None)
         if reader is None:
-            raise invalid_descriptor(
-                f"poll names run {run_id} with no pending results"
-            )
+            raise invalid_descriptor(f"poll names run {run_id} with no pending results")
         response = self._with_call_id(
             _response(ResponseKind.RESULT, result=reader), pending.request
         )
@@ -646,14 +663,8 @@ class WorkerProcess:
     def _retain_terminal(self, run: WorkerRun) -> None:
         """Retain request identities whose terminal releases must wait for response delivery."""
 
-        retains_finish = any(
-            isinstance(command, Finish) for command in run.run.commands
-        )
-        if (
-            run.epochs
-            and run.epochs.issubset(self._ended_epochs)
-            and not retains_finish
-        ):
+        retains_finish = any(isinstance(command, Finish) for command in run.run.commands)
+        if run.epochs and run.epochs.issubset(self._ended_epochs) and not retains_finish:
             if self.runs.get(run.run_id) is run:
                 del self.runs[run.run_id]
             self.replay.remove(run.run_id)
@@ -667,9 +678,7 @@ class WorkerProcess:
     def _prune_ended_epochs(self) -> None:
         """Retain terminal epochs still referenced by completed resident runs."""
 
-        referenced = {
-            epoch for run in self.runs.values() if run.complete for epoch in run.epochs
-        }
+        referenced = {epoch for run in self.runs.values() if run.complete for epoch in run.epochs}
         self._ended_epochs.intersection_update(referenced)
 
     def _advance_device_fifo(self) -> bool:
@@ -764,7 +773,7 @@ class WorkerProcess:
     def _profile_name(self, boundary: str, *, run_id: int | None = None) -> str:
         """Build a rank- and run-qualified profiler range name."""
 
-        name = f"uniserve.worker.{boundary} rank={int(self.worker.info.rank.tp_rank)}"
+        name = f"uniserve.worker.{boundary} rank={int(self.worker.info.rank.rank)}"
         return f"{name} run={run_id}" if run_id is not None and run_id >= 0 else name
 
     def _drain_continuations(self) -> None:

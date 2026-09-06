@@ -10,12 +10,19 @@ from torch.nn import functional as F
 
 from ... import ops
 from ...nn.layer import LayerConfig
-from ...nn.linear import MergedColumnParallelLinear, QKVParallelLinear, RowParallelLinear
+from ...nn.linear import (
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from ...nn.mesh import DeviceMesh, TensorParallel
 from ...nn.norm import RMSNorm
 from ...nn.placement import WeightMode
+from ...nn.quant.base import QuantizeMethodBase, UnquantizedLinearMethod
+from ...nn.quant.fp8 import DynamicW8A8Fp8LinearMethod, quantize_fp8_rowwise
 from ...nn.quant.nvfp4 import DynamicW4A4NvFp4LinearMethod
 from ...nn.vocab_parallel_embedding import VocabParallelEmbedding
+from .precision import TextEncoderLinearPrecision
 
 __all__ = ["H3TextEncoderConfig", "MiniMaxH3TextEncoder"]
 
@@ -41,22 +48,17 @@ class H3TextEncoderConfig:
     max_text_rows: int = 1_024
 
 
-def _enable_nvfp4(module: nn.Module) -> None:
-    """Finalize eligible text projections for dynamic NVFP4 execution."""
+def _accepts_prequantized_fp8(module: nn.Module) -> bool:
+    """Identify a linear projection with the row-scaled dynamic FP8 contract."""
 
-    if not isinstance(module, (MergedColumnParallelLinear, QKVParallelLinear, RowParallelLinear)):
-        return
-    if not hasattr(module, "weight_scale"):
-        module.register_buffer("weight_scale", None, persistent=False)
-    if not hasattr(module, "weight_scale_2"):
-        module.register_buffer("weight_scale_2", None, persistent=False)
-    method = DynamicW4A4NvFp4LinearMethod()
-    module.quant_method = method
-    method.process_weights_after_loading(module)
+    method = getattr(module, "quant_method", None)
+    return isinstance(method, DynamicW8A8Fp8LinearMethod) and not method.tensorwise
 
 
 class _TextRotaryEmbedding(nn.Module):
     """Qwen3-VL mRoPE reduced to the text-only position path."""
+
+    inv_freq: torch.Tensor
 
     def __init__(self, config: H3TextEncoderConfig, *, device: torch.device | str) -> None:
         """Precompute text rotary frequencies on the execution device."""
@@ -86,7 +88,12 @@ class _TextRotaryEmbedding(nn.Module):
 class _Attention(nn.Module):
     """Applies grouped-query self-attention with rotary query and key coordinates."""
 
-    def __init__(self, config: H3TextEncoderConfig, layer_config: LayerConfig) -> None:
+    def __init__(
+        self,
+        config: H3TextEncoderConfig,
+        layer_config: LayerConfig,
+        linear_precision: TextEncoderLinearPrecision,
+    ) -> None:
         """Build rank-sharded grouped-query projections and per-head normalization."""
 
         super().__init__()
@@ -95,12 +102,19 @@ class _Attention(nn.Module):
         self.kv_heads = config.kv_heads // parallel.size
         self.head_dim = config.head_dim
         self.scaling = config.head_dim**-0.5
+        # FP8 encoder policy applies to the MLP only.
+        quant_method = (
+            DynamicW4A4NvFp4LinearMethod()
+            if linear_precision == "nvfp4"
+            else UnquantizedLinearMethod()
+        )
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
             config.head_dim,
             config.heads,
             config.kv_heads,
             layer_config=layer_config,
+            quant_method=quant_method,
             bias=False,
         )
         self.q_size, self.kv_size, _ = self.qkv_proj.output_sizes
@@ -108,6 +122,7 @@ class _Attention(nn.Module):
             config.heads * config.head_dim,
             config.hidden_size,
             layer_config=layer_config,
+            quant_method=quant_method,
             bias=False,
         )
         self.q_norm = RMSNorm(config.head_dim, config.norm_eps)
@@ -117,7 +132,6 @@ class _Attention(nn.Module):
         self,
         hidden: torch.Tensor,
         rotary: tuple[torch.Tensor, torch.Tensor],
-        mesh: DeviceMesh,
     ) -> torch.Tensor:
         """Run grouped-query causal attention over one encoded prompt sequence."""
 
@@ -146,20 +160,31 @@ class _Attention(nn.Module):
             scale=self.scaling,
             enable_gqa=self.heads != self.kv_heads,
         )
-        return self.o_proj(output.transpose(1, 2).reshape(batch, rows, -1), mesh)
+        return self.o_proj(output.transpose(1, 2).reshape(batch, rows, -1))
 
 
 class _MLP(nn.Module):
     """Applies the gated feed-forward projection used by each H3 text layer."""
 
-    def __init__(self, config: H3TextEncoderConfig, layer_config: LayerConfig) -> None:
-        """Build the tensor-parallel gated expansion and reduction projections."""
+    def __init__(
+        self,
+        config: H3TextEncoderConfig,
+        layer_config: LayerConfig,
+        linear_precision: TextEncoderLinearPrecision,
+    ) -> None:
+        """Build gated expansion and its precision-qualified output projection."""
 
         super().__init__()
+        quant_method: QuantizeMethodBase = UnquantizedLinearMethod()
+        if linear_precision == "fp8":
+            quant_method = DynamicW8A8Fp8LinearMethod()
+        elif linear_precision == "nvfp4":
+            quant_method = DynamicW4A4NvFp4LinearMethod()
         self.gate_up_proj = MergedColumnParallelLinear(
             config.hidden_size,
             (config.intermediate_size, config.intermediate_size),
             layer_config=layer_config,
+            quant_method=quant_method,
             bias=False,
             weight_mode=WeightMode.FUSED_GATE_UP_LINEAR,
         )
@@ -167,24 +192,55 @@ class _MLP(nn.Module):
             config.intermediate_size,
             config.hidden_size,
             layer_config=layer_config,
+            quant_method=quant_method,
             bias=False,
         )
 
-    def forward(self, hidden: torch.Tensor, mesh: DeviceMesh) -> torch.Tensor:
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         """Apply the sharded gated expansion and tensor-parallel output projection."""
 
-        return self.down_proj(ops.silu_and_mul(self.gate_up_proj(hidden)), mesh)
+        return self.down_proj(ops.silu_and_mul(self.gate_up_proj(hidden)))
+
+    @property
+    def accepts_prequantized_fp8(self) -> bool:
+        """Report whether both projections use row-scaled dynamic FP8."""
+
+        return _accepts_prequantized_fp8(self.gate_up_proj) and _accepts_prequantized_fp8(
+            self.down_proj
+        )
+
+    def forward_prequantized_fp8(
+        self,
+        hidden: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the gated MLP from normalized E4M3 input through its FP8 boundaries."""
+
+        if not self.accepts_prequantized_fp8:
+            raise RuntimeError("MLP precision cannot consume prequantized FP8 input")
+        gate_up = self.gate_up_proj.forward_prequantized(hidden, scale)
+        if self.down_proj.tp_group.world_size > 1:
+            return self.down_proj(ops.silu_and_mul(gate_up))
+        activated, activated_scale = ops.silu_and_mul_fp8(gate_up)
+        return self.down_proj.reduce_output(
+            self.down_proj.forward_prequantized(activated, activated_scale)
+        )
 
 
 class _DecoderLayer(nn.Module):
     """Composes pre-normalized attention and gated MLP residual updates for the H3 text encoder."""
 
-    def __init__(self, config: H3TextEncoderConfig, layer_config: LayerConfig) -> None:
+    def __init__(
+        self,
+        config: H3TextEncoderConfig,
+        layer_config: LayerConfig,
+        linear_precision: TextEncoderLinearPrecision,
+    ) -> None:
         """Assemble one pre-normalized attention and feed-forward residual layer."""
 
         super().__init__()
-        self.self_attn = _Attention(config, layer_config)
-        self.mlp = _MLP(config, layer_config)
+        self.self_attn = _Attention(config, layer_config, linear_precision)
+        self.mlp = _MLP(config, layer_config, linear_precision)
         self.input_layernorm = RMSNorm(config.hidden_size, config.norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.norm_eps)
 
@@ -193,7 +249,6 @@ class _DecoderLayer(nn.Module):
         hidden: torch.Tensor,
         residual: torch.Tensor | None,
         rotary: tuple[torch.Tensor, torch.Tensor],
-        mesh: DeviceMesh,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Advance the fused residual stream through attention and gated MLP updates."""
 
@@ -206,13 +261,19 @@ class _DecoderLayer(nn.Module):
                 residual,
                 in_place=True,
             )
-        attention_output = self.self_attn(attention_input, rotary, mesh)
+        attention_output = self.self_attn(attention_input, rotary)
         mlp_input, residual = self.post_attention_layernorm.forward_with_residual(
             attention_output,
             residual,
             in_place=True,
         )
-        return self.mlp(mlp_input, mesh), residual
+
+        if self.mlp.accepts_prequantized_fp8:
+            mlp_fp8, mlp_scale = quantize_fp8_rowwise(mlp_input.reshape(-1, mlp_input.shape[-1]))
+            mlp_fp8 = mlp_fp8.reshape(mlp_input.shape)
+            return self.mlp.forward_prequantized_fp8(mlp_fp8, mlp_scale), residual
+
+        return self.mlp(mlp_input), residual
 
 
 class _LanguageModel(nn.Module):
@@ -224,6 +285,7 @@ class _LanguageModel(nn.Module):
         mesh: DeviceMesh,
         *,
         parameter_device: torch.device | str,
+        linear_precision: TextEncoderLinearPrecision,
     ) -> None:
         """Allocate retained text layers and bind them to the encoder device mesh."""
 
@@ -231,6 +293,7 @@ class _LanguageModel(nn.Module):
         layer_config = LayerConfig(
             parallel=TensorParallel.from_mesh(mesh),
             quantization=None,
+            tp_group=mesh.get_group("tp"),
         )
         with torch.device(parameter_device):
             self.embed_tokens = VocabParallelEmbedding(
@@ -240,7 +303,8 @@ class _LanguageModel(nn.Module):
                 init_weights=False,
             )
             self.layers = nn.ModuleList(
-                _DecoderLayer(config, layer_config) for _ in range(config.retained_layers)
+                _DecoderLayer(config, layer_config, linear_precision)
+                for _ in range(config.retained_layers)
             )
         self.rotary_emb = _TextRotaryEmbedding(config, device=mesh.local_device)
         self.mesh = mesh
@@ -248,14 +312,14 @@ class _LanguageModel(nn.Module):
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         """Encode one bounded token sequence into checkpoint-layer-50 conditioning states."""
 
-        hidden = self.embed_tokens(token_ids, self.mesh)
+        hidden = self.embed_tokens(token_ids)
         positions = torch.arange(
             token_ids.shape[1], dtype=torch.long, device=token_ids.device
         ).view(1, -1)
         rotary = self.rotary_emb(hidden, positions)
         residual: torch.Tensor | None = None
         for layer in self.layers:
-            hidden, residual = layer(hidden, residual, rotary, self.mesh)
+            hidden, residual = layer(hidden, residual, rotary)
         if residual is not None:
             hidden = hidden + residual
         return hidden
@@ -273,20 +337,27 @@ class MiniMaxH3TextEncoder(nn.Module):
         max_text_rows: int,
         parameter_device: torch.device | str = "meta",
         dtype: torch.dtype = torch.bfloat16,
+        linear_precision: TextEncoderLinearPrecision = "bf16",
     ) -> None:
         """Configure a bounded BF16 text-conditioning path on the supplied mesh."""
 
         super().__init__()
         if dtype != torch.bfloat16:
             raise ValueError("the H3 text encoder uses bfloat16 activations")
+        if linear_precision not in ("bf16", "fp8", "nvfp4"):
+            raise ValueError(f"unsupported H3 text encoder linear precision {linear_precision!r}")
         self.config = H3TextEncoderConfig(max_text_rows=int(max_text_rows))
-        if mesh.size("tp") != 4:
-            raise ValueError("the H3 text encoder requires TP4")
+        if any(
+            width % mesh.size("tp")
+            for width in (self.config.heads, self.config.kv_heads, self.config.intermediate_size)
+        ):
+            raise ValueError("H3 text encoder TP must divide query/KV heads and MLP width")
         self.mesh = mesh
         self.language_model = _LanguageModel(
             self.config,
             mesh,
             parameter_device=parameter_device,
+            linear_precision=linear_precision,
         )
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
@@ -299,8 +370,3 @@ class MiniMaxH3TextEncoder(nn.Module):
                 f"H3 prompt token count must be between 1 and {self.config.max_text_rows}"
             )
         return self.language_model(token_ids)
-
-    def enable_nvfp4(self) -> None:
-        """Quantize eligible resident text projections to dynamic NVFP4 execution."""
-
-        self.apply(_enable_nvfp4)

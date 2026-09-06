@@ -81,7 +81,7 @@ def production_server(tmp_path: Path, model: Path) -> Iterator[str]:
         "4096",
         "--prefill-cuda-graph",
         "true",
-        "--tp-size",
+        "--worker-ranks",
         "2",
         "--lane",
         '{"lane_id":"decode","sm_budget":64,"domains":["decode"]}',

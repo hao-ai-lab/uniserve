@@ -8,7 +8,8 @@ from typing import cast
 
 from ..bootstrap.execution_config import ExecutionConfig
 from ..bootstrap.plan import ModelLoadScope
-from ..nn.mesh import TensorParallel
+from ..execution.device_transfer import DeviceTransfer
+from ..nn.mesh import GroupCoordinator, TensorParallel
 
 __all__ = ["LoadConfig", "LoadFormat", "LoadRequest"]
 
@@ -70,11 +71,11 @@ class LoadConfig:
             resolved_format = LoadFormat(str(load_format))
         except ValueError as error:
             choices = ", ".join(value.value for value in LoadFormat)
-            raise ValueError(f"unknown load format {load_format!r}; expected one of {choices}") from error
+            raise ValueError(
+                f"unknown load format {load_format!r}; expected one of {choices}"
+            ) from error
         explicit_threads = num_threads is not _DEFAULT_THREADS
-        if explicit_threads and (
-            isinstance(num_threads, bool) or not isinstance(num_threads, int)
-        ):
+        if explicit_threads and (isinstance(num_threads, bool) or not isinstance(num_threads, int)):
             raise TypeError("load num_threads must be an integer")
         resolved_threads = 8 if not explicit_threads else int(cast(int, num_threads))
         if resolved_threads < 1:
@@ -116,6 +117,8 @@ class LoadRequest:
     execution: ExecutionConfig
     parallel: TensorParallel
     scope: ModelLoadScope
+    tp_group: GroupCoordinator | None = None
+    transfers: DeviceTransfer = DeviceTransfer()
     load: LoadConfig = LoadConfig()
     attention_backend: str | None = None
 

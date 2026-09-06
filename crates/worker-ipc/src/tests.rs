@@ -618,13 +618,49 @@ fn commit_command_requires_a_fixed_selected_version() {
 
 #[test]
 fn worker_info_round_trips() {
-    let info = WorkerInfo::default();
-    let response = WorkerResponse::info(info.clone());
-    let decoded = decode_response(&encode_response(&response).unwrap()).unwrap();
-    let WorkerResponse::Info { info: decoded, .. } = decoded else {
-        panic!("decoded response must preserve its info variant");
-    };
-    assert_eq!(decoded, info);
+    use uniserve_core::{ComponentDeployConfig, ParallelConfig, SequenceParallel};
+    let strategies = [
+        SequenceParallel::Local,
+        SequenceParallel::Ulysses { ulysses_degree: 2 },
+        SequenceParallel::Ring { ring_degree: 2 },
+        SequenceParallel::Hybrid {
+            ulysses_degree: 2,
+            ring_degree: 2,
+        },
+        SequenceParallel::Allgather {
+            allgather_degree: 2,
+        },
+        SequenceParallel::Attention2d {
+            attn2d_row_size: 2,
+            attn2d_col_size: 2,
+            ulysses_degree: 2,
+        },
+    ];
+    for sequence_parallel in strategies {
+        let config = ParallelConfig {
+            sequence_parallel,
+            ..Default::default()
+        };
+        let count = config.world_size().unwrap();
+        let info = WorkerInfo {
+            rank: RankInfo {
+                rank: 0,
+                world_size: count as u32,
+            },
+            configuration_id: "a".repeat(64),
+            components: vec![ComponentInfo {
+                name: "denoiser".into(),
+                deployment: ComponentDeployConfig::parallel((0..count).rev().collect(), config),
+            }],
+            ..Default::default()
+        };
+        let response = WorkerResponse::info(info.clone());
+        let decoded = decode_response(&encode_response(&response).unwrap()).unwrap();
+        let WorkerResponse::Info { info: decoded, .. } = decoded else {
+            panic!("decoded response must preserve its info variant");
+        };
+        assert_eq!(decoded, info);
+    }
 }
 
 #[test]
@@ -909,8 +945,8 @@ fn full_caps() -> WorkerInfo {
             ..WorkerInfo::default().kv_cache.unwrap()
         }),
         rank: RankInfo {
-            tp_rank: 1,
-            tp_size: 2,
+            rank: 1,
+            world_size: 2,
         },
         queue_depth: 2,
         max_batch_ops: 64,

@@ -43,6 +43,18 @@ The evaluator holds a host-wide lock for the selected point or suite. Every poin
 
 Finite `request_rate` uses seeded Poisson arrivals. Infinite request rate submits the selected rows immediately, optionally bounded by `max_concurrency`. Throughput always uses the complete timed region.
 
+## Profiling
+
+Add `--nsys` to capture the post-warmup measurement window with Nsight Systems, including individual CUDA graph nodes. Reports, SQLite exports, and a normalized timeline are written under the result root's `nsys` directory. Keep instrumented diagnostic results separate from uninstrumented performance comparisons.
+
+`--nsys-cuda-trace cuda` uses Nsight's default CUDA trace method. `--nsys-cuda-trace cuda-sw` explicitly selects software instrumentation on Nsight versions that support it; graph-node detail is retained. The selected method is recorded in capture provenance. NVIDIA describes the methods and their platform requirements in the [Nsight Systems user guide](https://docs.nvidia.com/nsight-systems/UserGuide/index.html#cuda-trace-methods).
+
+```bash
+uniserve-eval run minimax-h3-15s-10k \
+  --nsys --nsys-cuda-trace cuda-sw \
+  --output-root /path/to/diagnostics
+```
+
 ## Task semantics
 
 Text with `ignore_eos = true` must reach each row's requested completion length and obtain prompt and completion counts from server usage. Natural-EOS I2T obtains server usage without requiring the token ceiling to be reached.

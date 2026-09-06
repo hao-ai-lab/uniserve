@@ -56,6 +56,22 @@ def _triton_act_row_chunks(rows: int, n_cols: int) -> Iterator[tuple[int, int]]:
 
 
 if triton is not None:
+    _FP8_MAX_TL = tl.constexpr(448.0)
+    _FP8_SCALE_EPS_TL = tl.constexpr(1.0e-12)
+
+    @triton.jit
+    def _fp8_divide_rn(dividend, divisor):
+        """Divide FP32 operands with explicit nearest-even PTX semantics."""
+
+        return tl.inline_asm_elementwise(
+            asm="div.rn.f32 $0, $1, $2;",
+            constraints="=f,f,f",
+            args=[dividend, divisor],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
+
 
     @triton.jit
     def _silu_and_mul_kernel(x_ptr, out_ptr, n_cols: tl.constexpr, block: tl.constexpr):
@@ -74,6 +90,34 @@ if triton is not None:
         out = silu * y
         tl.store(out_ptr + row * n_cols + cols, out, mask=mask)
 
+    @triton.jit
+    def _silu_and_mul_fp8_kernel(
+        x_ptr,
+        out_ptr,
+        scale_ptr,
+        n_cols: tl.constexpr,
+        block: tl.constexpr,
+    ):
+        """Apply packed SwiGLU and emit its BF16-rounded row-scaled E4M3 output."""
+
+        row = tl.program_id(0)
+        cols = tl.arange(0, block)
+        mask = cols < n_cols
+        base = row * (n_cols * 2)
+        gate = tl.load(x_ptr + base + cols, mask=mask, other=0.0).to(tl.float32)
+        value = tl.load(x_ptr + base + n_cols + cols, mask=mask, other=0.0).to(tl.float32)
+        activated = gate / (1.0 + tl.exp(-gate))
+        output = (activated * value).to(tl.bfloat16)
+        output_fp32 = tl.where(mask, output.to(tl.float32), 0.0)
+        scale = tl.maximum(tl.max(tl.abs(output_fp32), axis=0), _FP8_SCALE_EPS_TL)
+        scale = scale / _FP8_MAX_TL
+        quantized = tl.maximum(
+            tl.minimum(_fp8_divide_rn(output_fp32, scale), _FP8_MAX_TL),
+            -_FP8_MAX_TL,
+        )
+        tl.store(out_ptr + row * n_cols + cols, quantized, mask=mask)
+        tl.store(scale_ptr + row, scale)
+
 
 def _act_inputs_eligible(x: torch.Tensor) -> bool:
     """Check the device, layout, gradient, and packed-width kernel contract."""
@@ -84,6 +128,33 @@ def _act_inputs_eligible(x: torch.Tensor) -> bool:
         or not x.is_contiguous()
         or x.shape[-1] % 2 != 0
     )
+
+
+def silu_and_mul_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply packed SwiGLU and emit its BF16-rounded row-scaled E4M3 output."""
+
+    if not _act_inputs_eligible(x) or triton is None or not triton_available(x.device):
+        from ..nn.quant.fp8 import quantize_fp8_rowwise
+
+        output = F.silu(x[..., : x.shape[-1] // 2]) * x[..., x.shape[-1] // 2 :]
+        rows = output.reshape(-1, output.shape[-1])
+        quantized, scale = quantize_fp8_rowwise(rows)
+        return quantized.reshape(output.shape), scale
+
+    n_cols = int(x.shape[-1] // 2)
+    rows = x.numel() // (2 * n_cols)
+    output = torch.empty((*x.shape[:-1], n_cols), dtype=torch.float8_e4m3fn, device=x.device)
+    scale = torch.empty((rows, 1), dtype=torch.float32, device=x.device)
+    block = triton.next_power_of_2(n_cols)
+    _silu_and_mul_fp8_kernel[(rows,)](
+        x,
+        output,
+        scale,
+        n_cols,
+        block,
+        num_warps=32 if block >= 32_768 else 16,
+    )
+    return output, scale
 
 
 class TritonSiluAndMul(Operator):

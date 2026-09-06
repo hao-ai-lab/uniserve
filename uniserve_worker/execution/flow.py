@@ -64,7 +64,6 @@ def consume_forward(
 ) -> None:
     """Publish prefix conditioning or integrate denoise predictions into latent state."""
 
-
     if state.phase == "prefix_pending":
         if len(outputs) != len(state.rows):
             raise RuntimeError("flow prefix result is not aligned")
@@ -124,7 +123,6 @@ def integrate(runtime: ExecutionResources, state: OperationState) -> bool:
 
 
 def _initialize(runtime: ExecutionResources, state: OperationState) -> None:
-
     """Create a diffusion trajectory from deterministic noise and publish its initial state."""
 
     operation = state.operation
@@ -203,7 +201,6 @@ def _initialize(runtime: ExecutionResources, state: OperationState) -> None:
 
 
 def _prepare_step(runtime: ExecutionResources, state: OperationState) -> None:
-
     """Gather current latent pages and construct one guided diffusion-step batch."""
 
     operation = state.operation
@@ -275,7 +272,6 @@ def _prepare_step(runtime: ExecutionResources, state: OperationState) -> None:
 
 
 def _pack_denoise(runtime: ExecutionResources, state: OperationState) -> None:
-
     """Assemble denoising rows, branch weights, positions, and timestep conditioning."""
 
     data = state.data
@@ -298,7 +294,6 @@ def _pack_denoise(runtime: ExecutionResources, state: OperationState) -> None:
 
 
 def _finish(runtime: ExecutionResources, state: OperationState) -> None:
-
     """Integrate predicted velocity, write the next latent bank, and prepare publication."""
 
     operation = state.operation
@@ -385,7 +380,10 @@ def publish_latent_transfer(
     if (
         transport is None
         or transport.name == "local"
-        or (runtime.deployment is not None and int(runtime.deployment.tp_rank) != 0)
+        or (
+            runtime.deployment is not None
+            and runtime.deployment.rank != runtime.deployment.output_rank
+        )
     ):
         return ()
     locator = transport.publish_async(value.detach().contiguous())

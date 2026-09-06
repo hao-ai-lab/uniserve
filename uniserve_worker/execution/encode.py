@@ -94,7 +94,6 @@ def run_action(runtime: ExecutionResources, state: OperationState) -> bool:
 
 
 def _pack_encode(runtime: ExecutionResources, state: OperationState) -> tuple[object, ...]:
-
     """Stage image tensors and build the model batch for one encoder operation."""
 
     operation = state.operation
@@ -142,7 +141,6 @@ def _pack_encode(runtime: ExecutionResources, state: OperationState) -> tuple[ob
 def _consume_encode(
     runtime: ExecutionResources, state: OperationState, output: torch.Tensor
 ) -> None:
-
     """Split encoded features by request and prepare cache or product publication."""
 
     operation = state.operation
@@ -160,7 +158,7 @@ def _consume_encode(
     if (
         runtime.transport is not None
         and runtime.transport.name != "local"
-        and int(runtime.deployment.tp_rank) == 0
+        and runtime.deployment.rank == runtime.deployment.output_rank
     ):
         locator = runtime.transport.publish_async(resident)
         locator = replace(
@@ -192,8 +190,9 @@ def _consume_encode(
     state.phase = "done"
 
 
-def _pack_diffusion_finalize(runtime: ExecutionResources, state: OperationState) -> tuple[object, ...]:
-
+def _pack_diffusion_finalize(
+    runtime: ExecutionResources, state: OperationState
+) -> tuple[object, ...]:
     """Gather the final latent trajectory and build its decoder batch."""
 
     operation = state.operation
@@ -259,7 +258,6 @@ def _pack_diffusion_finalize(runtime: ExecutionResources, state: OperationState)
 
 
 def _finish_diffusion_finalize(runtime: ExecutionResources, state: OperationState) -> None:
-
     """Decode final latents and schedule bounded image-output publication."""
 
     operation = state.operation
