@@ -63,6 +63,125 @@ if triton is not None:
         )
 
     @triton.jit
+    def _residual_value(
+        hidden_ptr,
+        update_ptr,
+        gate_ptr,
+        offsets,
+        columns,
+        mask,
+        modulation_row,
+        gate_row_stride,
+        HAS_UPDATE: tl.constexpr,
+    ):
+        value = tl.load(hidden_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        if HAS_UPDATE:
+            update = tl.load(update_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+            gate = tl.load(
+                gate_ptr + modulation_row * gate_row_stride + columns,
+                mask=mask,
+                other=0.0,
+            ).to(tl.float32)
+            value = _round_to_bf16(value + _round_to_bf16(gate * update))
+        return value
+
+    @triton.jit
+    def _modulated_rms_kernel(
+        hidden_ptr,
+        update_ptr,
+        gate_ptr,
+        weight_ptr,
+        shift_ptr,
+        scale_ptr,
+        row_indices_ptr,
+        output_ptr,
+        output_scale_ptr,
+        gate_row_stride,
+        shift_row_stride,
+        scale_row_stride,
+        WIDTH: tl.constexpr,
+        REDUCE_X: tl.constexpr,
+        REDUCE_Y: tl.constexpr,
+        BLOCK: tl.constexpr,
+        EPS: tl.constexpr,
+        HAS_UPDATE: tl.constexpr,
+        FP8_OUTPUT: tl.constexpr,
+    ):
+        """Fuse the residual, FP32 RMS reduction and indexed BF16 affine edges."""
+
+        row = tl.program_id(0)
+        modulation_row = tl.load(row_indices_ptr + row)
+        STEP: tl.constexpr = REDUCE_X * REDUCE_Y
+        lanes = tl.arange(0, STEP * 4)
+        acc0 = tl.full((STEP,), 0.0, tl.float32)
+        acc1 = tl.full((STEP,), 0.0, tl.float32)
+        acc2 = tl.full((STEP,), 0.0, tl.float32)
+        acc3 = tl.full((STEP,), 0.0, tl.float32)
+        # Contiguous FP32 mean uses four strided per-thread accumulators.
+        # Their ordered combination precedes the X, then Y reduction trees.
+        for tile in range(tl.cdiv(WIDTH, STEP * 4)):
+            columns = tile * STEP * 4 + lanes
+            value = _residual_value(
+                hidden_ptr,
+                update_ptr,
+                gate_ptr,
+                row * WIDTH + columns,
+                columns,
+                columns < WIDTH,
+                modulation_row,
+                gate_row_stride,
+                HAS_UPDATE,
+            )
+            even, odd = tl.split(tl.reshape(value, (STEP, 2, 2)))
+            value0, value2 = tl.split(even)
+            value1, value3 = tl.split(odd)
+            acc0 += value0 * value0
+            acc1 += value1 * value1
+            acc2 += value2 * value2
+            acc3 += value3 * value3
+        accumulated = ((acc0 + acc1) + acc2) + acc3
+        row_sums = tl.sum(tl.reshape(accumulated, (REDUCE_Y, REDUCE_X)), axis=1)
+        mean_square = tl.sum(row_sums, axis=0) * (1.0 / WIDTH)
+        inverse_rms = tl.rsqrt(mean_square + EPS)
+
+        columns = tl.arange(0, BLOCK)
+        mask = columns < WIDTH
+        offsets = row * WIDTH + columns
+        value = _residual_value(
+            hidden_ptr,
+            update_ptr,
+            gate_ptr,
+            offsets,
+            columns,
+            mask,
+            modulation_row,
+            gate_row_stride,
+            HAS_UPDATE,
+        )
+        if HAS_UPDATE:
+            tl.store(update_ptr + offsets, value.to(tl.bfloat16), mask=mask)
+        weight = tl.load(weight_ptr + columns, mask=mask, other=0.0).to(tl.float32)
+        normalized = _round_to_bf16(_multiply_rn(_multiply_rn(value, inverse_rms), weight))
+        shift = tl.load(
+            shift_ptr + modulation_row * shift_row_stride + columns, mask=mask, other=0.0
+        ).to(tl.float32)
+        scale = tl.load(
+            scale_ptr + modulation_row * scale_row_stride + columns, mask=mask, other=0.0
+        ).to(tl.float32)
+        scale = _round_to_bf16(1.0 + scale)
+        output = (_round_to_bf16(normalized * scale) + shift).to(tl.bfloat16)
+        if FP8_OUTPUT:
+            output_fp32 = tl.where(mask, output.to(tl.float32), 0.0)
+            output_scale = tl.maximum(tl.max(tl.abs(output_fp32), axis=0), _SCALE_EPS_TL)
+            output_scale /= _FP8_MAX_TL
+            output = tl.maximum(
+                tl.minimum(_fp8_divide_rn(output_fp32, output_scale), _FP8_MAX_TL),
+                -_FP8_MAX_TL,
+            )
+            tl.store(output_scale_ptr + row, output_scale)
+        tl.store(output_ptr + offsets, output, mask=mask)
+
+    @triton.jit
     def _row_normalized_modulation_kernel(
         value_ptr,
         weight_ptr,
@@ -217,6 +336,73 @@ def _rmsnorm(value: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Ten
     return (normalized * weight.float()).to(value.dtype)
 
 
+def _fused_modulation_eligible(value: torch.Tensor, *operands: torch.Tensor) -> bool:
+    width = int(value.shape[-1])
+    return (
+        128 <= width <= 32768
+        and width % 4 == 0
+        and value.numel() > 0
+        and _modulation_inputs_eligible(value, *operands)
+    )
+
+
+def _fused_modulation(
+    value: torch.Tensor,
+    weight: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    row_indices: torch.Tensor,
+    eps: float,
+    *,
+    update: torch.Tensor | None = None,
+    gate: torch.Tensor | None = None,
+    fp8: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Preserve contiguous FP32 mean's vector and tree accumulation order.
+
+    These row-aligned widths use one CTA per reduction in ATen's ReduceConfig.
+    Geometry depends on row count and width, independently of the GPU model.
+    """
+
+    width = int(value.shape[-1])
+    rows = value.numel() // width
+    dim0 = min(512, 1 << ((width // 4).bit_length() - 1))
+    dim1 = min(512, 1 << (rows.bit_length() - 1))
+    block_x = min(dim0, 32)
+    block_y = min(dim1, 512 // block_x)
+    block_x = min(dim0, 512 // block_y)
+    values_per_thread = (width + block_x - 1) // block_x
+    reduce_y = block_y if values_per_thread >= min(block_y * 16, 256) else 1
+    output = torch.empty_like(value, dtype=torch.float8_e4m3fn if fp8 else value.dtype)
+    output_scale = (
+        torch.empty((rows, 1), dtype=torch.float32, device=value.device) if fp8 else None
+    )
+    _modulated_rms_kernel[(rows,)](
+        value,
+        value if update is None else update,
+        shift if gate is None else gate,
+        weight,
+        shift,
+        scale,
+        row_indices,
+        output,
+        output if output_scale is None else output_scale,
+        0 if gate is None else gate.stride(0),
+        shift.stride(0),
+        scale.stride(0),
+        WIDTH=width,
+        REDUCE_X=block_x,
+        REDUCE_Y=reduce_y,
+        BLOCK=triton.next_power_of_2(width),
+        EPS=eps,
+        HAS_UPDATE=update is not None,
+        FP8_OUTPUT=fp8,
+        num_warps=max(8 if width >= 4096 else 4, block_x * reduce_y // 32),
+        enable_fp_fusion=False,
+    )
+    return output, output_scale
+
+
 def modulated_rms_norm(
     value: torch.Tensor,
     weight: torch.Tensor,
@@ -233,6 +419,8 @@ def modulated_rms_norm(
     All affine arithmetic rounds through the value dtype at the stated edges.
     """
 
+    if _fused_modulation_eligible(value, weight, shift, scale, row_indices):
+        return _fused_modulation(value, weight, shift, scale, row_indices, eps)[0]
     if _modulation_inputs_eligible(value, weight, shift, scale, row_indices):
         inverse_rms = torch.rsqrt(value.float().pow(2).mean(-1, keepdim=True) + eps)
         output = torch.empty_like(value)
@@ -305,6 +493,13 @@ def gated_residual_rms_norm(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return the gated residual and its row-modulated normalization."""
 
+    if update.is_contiguous() and _fused_modulation_eligible(
+        hidden, update, gate, weight, shift, scale, row_indices
+    ):
+        normalized, _ = _fused_modulation(
+            hidden, weight, shift, scale, row_indices, eps, update=update, gate=gate
+        )
+        return update, normalized
     residual = gated_residual(hidden, update, gate, row_indices)
     normalized = modulated_rms_norm(
         residual,
@@ -330,6 +525,22 @@ def gated_residual_rms_norm_fp8(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Produce a gated residual plus row-scaled FP8 modulated normalization."""
 
+    if update.is_contiguous() and _fused_modulation_eligible(
+        hidden, update, gate, weight, shift, scale, row_indices
+    ):
+        values, scales = _fused_modulation(
+            hidden,
+            weight,
+            shift,
+            scale,
+            row_indices,
+            eps,
+            update=update,
+            gate=gate,
+            fp8=True,
+        )
+        assert scales is not None
+        return update, values, scales
     residual = gated_residual(hidden, update, gate, row_indices)
     width = int(residual.shape[-1])
     if (

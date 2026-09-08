@@ -27,16 +27,24 @@ def _rmsnorm(value: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Ten
     return (normalized * weight.float()).to(value.dtype)
 
 
-@pytest.mark.parametrize("width", [128, 5376])
-def test_block_edges_match_strided_bf16_reference(width) -> None:
+@pytest.mark.parametrize(
+    "width,rows,weight_dtype",
+    [
+        (128, 8, torch.bfloat16),
+        (5376, 8, torch.bfloat16),
+        (5376, 21888, torch.float32),
+        (16384, 16, torch.float32),
+        (132, 3, torch.float32),
+    ],
+)
+def test_block_edges_match_strided_bf16_reference(width, rows, weight_dtype) -> None:
     torch.manual_seed(23)
-    rows = 8
     states = 6
     eps = 1e-5
     hidden = torch.randn(rows, width, device="cuda", dtype=torch.bfloat16)
     attention = torch.randn_like(hidden)
     feed_forward = torch.randn_like(hidden)
-    weight = torch.randn(width, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(width, device="cuda", dtype=weight_dtype)
     parameters = torch.randn(
         states,
         6 * width,
