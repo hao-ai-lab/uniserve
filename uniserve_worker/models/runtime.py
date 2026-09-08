@@ -182,9 +182,8 @@ class ExecutionModel(nn.Module):
             for output in outputs
         )
 
-    @property
-    def local_product_storage_bytes(self) -> int:
-        """Physical persistent storage required by one request on this rank."""
+    def local_product_storage_bytes(self, *, max_unresolved_ops: int) -> int:
+        """Bound rank-local products retained by one request's execution window."""
 
         return self.product_storage_bytes
 

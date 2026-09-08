@@ -32,6 +32,7 @@ from .capacity import (
     model_arena_capacity,
     operation_window,
     packed_input_geometry,
+    request_tensor_window,
 )
 from .worker_info import (
     KvCacheConfig,
@@ -399,11 +400,7 @@ def _request_tensor_worker_layout(
         raise RuntimeError("request tensor worker info requires declared tensor storage")
     slots = int(worker_config.max_request_pool_size)
     depth = int(queue_depth)
-    unresolved_window = depth // slots - 1
-    if unresolved_window < 2 or depth < slots * (unresolved_window + 1):
-        raise invalid_descriptor(
-            "request tensor pipeline depth does not provide two unresolved outputs per state slot"
-        )
+    unresolved_window = request_tensor_window(depth, slots)
     max_operations = min(slots, int(worker_config.max_batch_operations))
     info = WorkerInfo(
         model_name=model_name,
@@ -440,7 +437,9 @@ def _request_tensor_worker_layout(
         ),
         input_geometry=None,
         fixed_device_bytes=(),
-        physical_buffer_pool_bytes=slots * model.local_product_storage_bytes,
+        physical_buffer_pool_bytes=slots * model.local_product_storage_bytes(
+            max_unresolved_ops=unresolved_window
+        ),
         latent_width=1,
         latent_dtype="float32",
         latent_downsample=1,

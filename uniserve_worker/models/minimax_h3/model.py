@@ -258,10 +258,11 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
             kv=False, request_tensors=request_tensor_schema(layout)
         )
 
-    @property
-    def local_product_storage_bytes(self) -> int:
-        """Return rank-local storage while retaining global Tensor result bounds."""
+    def local_product_storage_bytes(self, *, max_unresolved_ops: int) -> int:
+        """Bound retained decode batches and persistent conditioning/latent results."""
 
+        if max_unresolved_ops < 1:
+            raise ValueError("H3 product storage requires a positive execution window")
         rank = self.bindings.process_group.rank
         total = 0
         for entry, outputs in self.entry_outputs.items():
@@ -275,10 +276,17 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
             for output in outputs:
                 size = output.max_bytes
                 if entry == "video_decoder":
+                    # Each unresolved decode can publish another complete rank
+                    # group of segments. Their total is bounded by the video.
+                    live_units = min(
+                        self.layout.video_reconstruction_units,
+                        max_unresolved_ops
+                        * len(self.bindings.entries[entry].ranks)
+                        * self.bindings.entries[entry].units_per_rank,
+                    )
                     size = (
                         size
-                        * len(self.bindings.entries[entry].ranks)
-                        * self.bindings.entries[entry].units_per_rank
+                        * live_units
                         // self.layout.video_reconstruction_units
                     )
                 total += ((size + 255) // 256) * 256

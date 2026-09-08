@@ -11,6 +11,7 @@ from tests.python.fixtures.model_execution import TEST_MODEL, TEST_WORKER_CONFIG
 from uniserve_worker.bootstrap.capacity import (
     latent_trajectory_bytes,
     model_arena_capacity,
+    request_tensor_window,
     tensor_slot_capacity,
 )
 from uniserve_worker.bootstrap.worker_info_builder import build_worker_layout
@@ -35,7 +36,7 @@ def test_request_capacity_charges_only_device_storage_against_device_budget():
             maximum=8,
             minimum=2,
             available_bytes=2048,
-            product_bytes_per_request=512,
+            auxiliary_bytes=lambda slots: slots * 512,
         )
         == 2
     )
@@ -46,8 +47,23 @@ def test_request_capacity_charges_only_device_storage_against_device_budget():
             maximum=8,
             minimum=2,
             available_bytes=2047,
-            product_bytes_per_request=512,
+            auxiliary_bytes=lambda slots: slots * 512,
         )
+
+
+def test_request_capacity_accounts_for_the_candidate_output_horizon():
+    schema = {"state": TensorSchema((128,), torch.float32)}
+    # At depth 12, two, three, and four requests retain 10, 9, and 8
+    # output batches respectively. Smaller counts need more product storage.
+    count = tensor_slot_capacity(
+        schema,
+        Communicator(),
+        maximum=4,
+        minimum=2,
+        available_bytes=10_240,
+        auxiliary_bytes=lambda slots: slots * request_tensor_window(12, slots) * 1024,
+    )
+    assert count == 4
 
 
 def test_worker_info_projects_model_behavior_and_resource_geometry():

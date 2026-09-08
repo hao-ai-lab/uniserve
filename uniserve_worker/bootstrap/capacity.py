@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -91,28 +91,42 @@ def tensor_slot_capacity(
     maximum: int,
     minimum: int,
     available_bytes: int,
-    product_bytes_per_request: int = 0,
+    auxiliary_bytes: Callable[[int], int],
 ) -> int:
-    """Size identical request-slot counts within every participating device's grant."""
+    """Choose the largest slot count whose complete storage fits on every rank.
 
-    bytes_per_slot = (
-        sum(field.nbytes for field in schema.values() if field.memory != "pinned")
-        + product_bytes_per_request
-    )
+    ``auxiliary_bytes(slots)`` includes products and runtime arenas. Its cost
+    may increase when fewer slots allow more in-flight outputs per request,
+    so ranks agree on feasible counts rather than reducing local maxima.
+    """
+
+    bytes_per_slot = sum(field.nbytes for field in schema.values() if field.memory != "pinned")
     if bytes_per_slot < 1 or minimum < 1 or maximum < minimum:
         raise ValueError("request tensor capacity requires valid byte and slot bounds")
-    available = min(maximum, available_bytes // bytes_per_slot)
-    agreed = torch.tensor(available, dtype=torch.int64, device=group.device)
+    candidates = range(minimum, maximum + 1)
+    requirements = [count * bytes_per_slot + auxiliary_bytes(count) for count in candidates]
+    agreed = torch.tensor(
+        [required <= available_bytes for required in requirements],
+        dtype=torch.int32,
+        device=group.device,
+    )
     group.all_reduce_min(agreed)
-    count = int(agreed.item())
-    if count < minimum:
-        required_bytes = minimum * bytes_per_slot
-        raise RuntimeError(
-            "insufficient device memory for the required request tensor slots: "
-            f"{required_bytes} bytes required for {minimum} slots at "
-            f"{bytes_per_slot} bytes per slot, {available_bytes} bytes available"
-        )
-    return count
+    feasible = [count for count, fits in zip(candidates, agreed.cpu().tolist()) if fits]
+    if feasible:
+        return feasible[-1]
+    raise RuntimeError(
+        "insufficient device memory for a common request tensor slot count: "
+        f"candidate range {minimum}..{maximum}, local requirements {requirements}, "
+        f"{available_bytes} bytes available"
+    )
+
+
+def request_tensor_window(pipeline_depth: int, request_slots: int) -> int:
+    """Return the output horizon after reserving one pipeline slot per request."""
+
+    if request_slots < 1 or pipeline_depth < 3 * request_slots:
+        raise ValueError("request tensor pipeline requires two unresolved outputs per slot")
+    return pipeline_depth // request_slots - 1
 
 
 @dataclass(frozen=True)
@@ -199,7 +213,7 @@ def request_tensor_arena_capacity(
     max_operations = int(worker_config.max_batch_operations)
     state_slots = int(worker_config.max_request_pool_size)
     slots = depth * max_operations
-    unresolved_window = depth // state_slots - 1
+    unresolved_window = request_tensor_window(depth, state_slots)
     device_products = _DEVICE_PRODUCTS_PER_OPERATION * (
         slots + _DEVICE_PRODUCT_RETIREMENT_BATCHES * max_operations
     )
@@ -251,7 +265,9 @@ def model_arena_capacity(
         return request_tensor_arena_capacity(
             worker_config,
             pipeline_depth=depth,
-            product_bytes_per_request=model.local_product_storage_bytes,
+            product_bytes_per_request=model.local_product_storage_bytes(
+                max_unresolved_ops=request_tensor_window(depth, request_pool_size)
+            ),
         )
     transfer_tickets = min(slots, _MAX_TRANSFER_ENTRIES)
     block_size = int(worker_config.block_size)

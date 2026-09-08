@@ -19,6 +19,7 @@ from uniserve_worker.nn.parallel import EntryConfig
 from ..bootstrap.capacity import (
     device_total_bytes,
     request_tensor_arena_capacity,
+    request_tensor_window,
     tensor_slot_capacity,
 )
 from ..bootstrap.worker_info import EntryInfo, WorkerInfo
@@ -265,18 +266,31 @@ class Worker:
             if schema:
                 if distributed_environment is None:
                     raise unsupported_setup("request tensor sizing requires its rank group")
-                public_arena = request_tensor_arena_capacity(
-                    worker_config,
-                    pipeline_depth=pipeline_depth,
-                    product_bytes_per_request=model.local_product_storage_bytes,
-                )
+
+                def auxiliary_bytes(count: int) -> int:
+                    capacity_config = replace(
+                        worker_config,
+                        max_request_pool_size=count,
+                        max_batch_operations=min(count, worker_config.max_batch_operations),
+                        max_batch_tokens=min(count, worker_config.max_batch_tokens),
+                    )
+                    product_bytes = model.local_product_storage_bytes(
+                        max_unresolved_ops=request_tensor_window(pipeline_depth, count)
+                    )
+                    arena = request_tensor_arena_capacity(
+                        capacity_config,
+                        pipeline_depth=pipeline_depth,
+                        product_bytes_per_request=product_bytes,
+                    )
+                    return count * product_bytes + arena.device_product_bytes
+
                 slots = tensor_slot_capacity(
                     schema,
                     distributed_environment.process_group,
-                    maximum=worker_config.max_request_pool_size,
+                    maximum=min(worker_config.max_request_pool_size, pipeline_depth // 3),
                     minimum=worker_config.min_request_pool_size,
-                    available_bytes=max(0, available - public_arena.device_product_bytes),
-                    product_bytes_per_request=model.local_product_storage_bytes,
+                    available_bytes=available,
+                    auxiliary_bytes=auxiliary_bytes,
                 )
                 worker_config = replace(
                     worker_config,
