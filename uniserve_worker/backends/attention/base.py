@@ -145,6 +145,7 @@ class AttentionBackend:
     head_geometries: frozenset[tuple[int, int, int]] = frozenset()
     cuda_only: bool = False
     min_compute_version: tuple[int, int] | None = None
+    max_compute_version: tuple[int, int] | None = None
     dense_ranks: frozenset[int] = frozenset({3, 4})
     accepts_dense_mask: bool = False
 
@@ -238,6 +239,11 @@ class AttentionBackend:
             if device.type != "cuda":
                 return False
             if torch.cuda.get_device_capability(device) < self.min_compute_version:
+                return False
+        if self.max_compute_version is not None:
+            if device.type != "cuda":
+                return False
+            if torch.cuda.get_device_capability(device) > self.max_compute_version:
                 return False
         return True
 
@@ -386,10 +392,14 @@ class AttentionBackend:
 
         if self.cuda_only and tensor.device.type != "cuda":
             return False
-        if self.min_compute_version is None:
+        if self.min_compute_version is None and self.max_compute_version is None:
             return True
-        return tensor.device.type == "cuda" and (
-            torch.cuda.get_device_capability(tensor.device) >= self.min_compute_version
+        if tensor.device.type != "cuda":
+            return False
+        compute_version = torch.cuda.get_device_capability(tensor.device)
+        return bool(
+            (self.min_compute_version is None or compute_version >= self.min_compute_version)
+            and (self.max_compute_version is None or compute_version <= self.max_compute_version)
         )
 
     def _paged_storage_supported(self, req: object) -> bool:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import logging
 from collections.abc import Callable, Hashable, Iterator, Sequence
 from contextlib import nullcontext
@@ -25,6 +26,7 @@ from uniserve_worker.runtime.cache_pool import CachePool
 
 logger = logging.getLogger(__name__)
 TOKEN_CONTINUATION_BIT = 1 << 31
+_GRAPH_BINDINGS = itertools.count(1)
 
 
 class GraphExecutionError(RuntimeError):
@@ -369,7 +371,6 @@ class CudaGraphRunner:
         self._warmed: set[tuple[object, ...]] = set()
         self._warmed_exact: set[tuple[object, ...]] = set()
         self._covered_exact: set[tuple[object, ...]] = set()
-        self._next_binding = 1
         self._device: torch.device | None = None
         self._pool_handle: Any = None
         self._sealed = False
@@ -494,7 +495,13 @@ class CudaGraphRunner:
         if batch.forward_mode is AttentionMode.PACKED and _quantized_kv(self):
             return GraphRun(self._eager(batch, forward), "eager", rows, rows)
         try:
-            _graph_provider(self.attention, batch.forward_mode)
+            _graph_provider(
+                self.attention,
+                batch.forward_mode,
+                head_dim=self.cache.head_dim,
+                block_size=self.block_size,
+                device=batch.req_pool_indices.device,
+            )
         except _GraphMiss:
             return GraphRun(self._eager(batch, forward), "eager", rows, rows)
 
@@ -680,10 +687,9 @@ class CudaGraphRunner:
         self._device = _batch_device(batch)
         static = _graph_batch(
             batch,
-            self._next_binding,
+            next(_GRAPH_BINDINGS),
             own_inputs=not startup_resident,
         )
-        self._next_binding += 1
         releases = self._prepare_attention(static, batch, capture=True)
         entry = None
         try:
@@ -848,8 +854,14 @@ class CudaGraphRunner:
         if static.forward_mode not in {AttentionMode.PAGED_DECODE, AttentionMode.PAGED_VARLEN}:
             return ()
         prepared = _live_attention(static, live)
-        backend = _graph_provider(self.attention, static.forward_mode)
         key_cache, _value_cache = self.cache_pool.layer_cache(0, static.group_id)
+        backend = _graph_provider(
+            self.attention,
+            static.forward_mode,
+            head_dim=self.cache.head_dim,
+            block_size=self.block_size,
+            device=key_cache.device,
+        )
         q_dtype = key_cache.dtype
         kv_dtype = key_cache.dtype
         releases: list[Callable[[], None]] = []
@@ -1352,12 +1364,33 @@ def _copy_into_leaves(
         raise _GraphMiss(f"{structure} tensor structure changed")
 
 
-def _graph_provider(selection: AttentionSelection, mode: AttentionMode):
-    """Resolve the concrete paged-attention backend for a graph mode."""
+def _graph_provider(
+    selection: AttentionSelection,
+    mode: AttentionMode,
+    *,
+    head_dim: int,
+    block_size: int,
+    device: torch.device,
+):
+    """Resolve the geometry-bound paged-attention backend for a graph mode."""
 
     for provider in selection.providers:
-        if provider.supports(mode, cuda_graph=True):
+        if not provider.can_bind(
+            mode,
+            head_dim=head_dim,
+            block_size=block_size,
+            device=device,
+        ):
+            continue
+        if provider.can_bind(
+            mode,
+            head_dim=head_dim,
+            block_size=block_size,
+            device=device,
+            cuda_graph=True,
+        ):
             return provider
+        break
     raise _GraphMiss("no provisioned attention provider is graph-safe")
 
 

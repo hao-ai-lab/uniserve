@@ -10,6 +10,7 @@ from typing import Any, NamedTuple
 import torch
 
 from .flashinfer_plan import (
+    _binding_identity,
     _decode_fast_plan_signature,
     _DecodePlanWorkspace,
     _fast_decode_plan_with_cpu_metadata,
@@ -277,12 +278,13 @@ class _WrapperPool(PagedAttentionPlanPool):
 
         if binding is None:
             return None
-        entry = self._binding_prefill_graph_wrappers.get(id(binding))
+        binding_key = _binding_identity(binding)
+        entry = self._binding_prefill_graph_wrappers.get(binding_key)
         if entry is None:
             return None
         wrapper_key, binding_ref = entry
         if binding_ref is not None and binding_ref() is not binding:
-            self._binding_prefill_graph_wrappers.pop(id(binding), None)
+            self._binding_prefill_graph_wrappers.pop(binding_key, None)
             return None
         wrapper = self._prefill_wrappers.get(wrapper_key)
         if wrapper is None:
@@ -599,12 +601,13 @@ class _WrapperPool(PagedAttentionPlanPool):
 
         if binding is None:
             return None
-        entry = self._binding_graph_wrappers.get(id(binding))
+        binding_key = _binding_identity(binding)
+        entry = self._binding_graph_wrappers.get(binding_key)
         if entry is None:
             return None
         wrapper_key, binding_ref = entry
         if binding_ref is not None and binding_ref() is not binding:
-            self._binding_graph_wrappers.pop(id(binding), None)
+            self._binding_graph_wrappers.pop(binding_key, None)
             return None
         wrapper = self._decode_wrappers.get(wrapper_key)
         if wrapper is None:

@@ -85,6 +85,16 @@ class _FastDecodePlanHostTensors:
     kv_lens: torch.Tensor
 
 
+def _binding_identity(binding: Any) -> int | None:
+    """Return the stable key carried by a graph binding token."""
+
+    if binding is None:
+        return None
+    if isinstance(binding, int):
+        return int(binding)
+    return id(binding)
+
+
 class _PlanCache:
     """Per-domain wrapper plan-key cache (decode or prefill).
 
@@ -198,7 +208,7 @@ def _decode_plan_key_from_shape(
 
     return (
         wrapper_key,
-        id(binding) if binding is not None else None,
+        _binding_identity(binding),
         int(block_table.data_ptr()),
         int(cache_seqlens.data_ptr()),
         tuple(int(dim) for dim in block_table.shape),
@@ -230,7 +240,7 @@ def _prefill_plan_key(
 
     return (
         wrapper_key,
-        id(binding) if binding is not None else None,
+        _binding_identity(binding),
         int(block_table.data_ptr()),
         int(cu_seqlens_q.data_ptr()),
         int(cu_seqlens_k.data_ptr()),

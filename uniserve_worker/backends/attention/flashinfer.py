@@ -21,6 +21,7 @@ from .flashinfer_kernels import (
     _write_decode_token,
 )
 from .flashinfer_plan import (
+    _binding_identity,
     _cpu_last_page_len,
     _cpu_paged_indptr,
     _decode_plan_key,
@@ -389,9 +390,9 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         # other forwards keep the shared prefill wrapper.
         graph_wrapper = self._prefill_graph_wrapper_for_binding(binding)
         if graph_wrapper is not None:
-            wrapper_key, wrapper = graph_wrapper
-        else:
-            wrapper_key, wrapper = self._prefill_wrapper(inputs.q.device)
+            _wrapper_key, wrapper = graph_wrapper
+            return wrapper.run(inputs.q, (k, v))
+        wrapper_key, wrapper = self._prefill_wrapper(inputs.q.device)
         plan_key = _prefill_plan_key(
             binding,
             inputs.block_table,
@@ -823,8 +824,14 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
             cpu_last_page_len=inputs.cpu_last_page_len,
         )
         self._decode_plan_cache.remember(inputs.wrapper_key, plan_key, binding)
-        self._binding_graph_wrappers[id(binding)] = (inputs.wrapper_key, _weakref_or_none(binding))
-        self.bind_graph((id(binding), "decode"), inputs.wrapper_key)
+        binding_key = _binding_identity(binding)
+        if binding_key is None:
+            raise RuntimeError("paged decode graph preparation requires a binding token")
+        self._binding_graph_wrappers[binding_key] = (
+            inputs.wrapper_key,
+            _weakref_or_none(binding),
+        )
+        self.bind_graph((binding_key, "decode"), inputs.wrapper_key)
 
     def bind_paged_prefill_graph_wrapper(
         self,
@@ -867,13 +874,16 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
             batch_size=batch_size,
             max_indices=max(1, int(block_table.numel())),
         )
-        self._binding_prefill_graph_wrappers[id(binding)] = (key, _weakref_or_none(binding))
-        self.bind_graph((id(binding), "prefill"), key)
+        binding_key = _binding_identity(binding)
+        if binding_key is None:
+            raise RuntimeError("paged prefill graph binding requires a binding token")
+        self._binding_prefill_graph_wrappers[binding_key] = (key, _weakref_or_none(binding))
+        self.bind_graph((binding_key, "prefill"), key)
 
     def release_paged_prefill_graph_wrapper(self, binding: Any) -> None:
         """Drop the exclusive prefill wrapper (and its caches) bound to ``binding``."""
 
-        entry = self._binding_prefill_graph_wrappers.pop(id(binding), None)
+        entry = self._binding_prefill_graph_wrappers.pop(_binding_identity(binding), None)
         if entry is None:
             return
         wrapper_key, _binding_ref = entry
@@ -884,7 +894,7 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
     def release_paged_decode_graph_binding(self, binding: Any) -> None:
         """Release one binding while retaining shape-shared decode buffers."""
 
-        self._binding_graph_wrappers.pop(id(binding), None)
+        self._binding_graph_wrappers.pop(_binding_identity(binding), None)
 
     def _decode_graph_plan_inputs(
         self,
