@@ -43,9 +43,13 @@ def _all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor, group_nam
     with profile_range(
         f"uniserve.collective kind=all_gather group={group_name} rank={dist.get_rank()}"
     ):
-        work = dist.all_gather_into_tensor(
-            output, input, group=_process_group(group_name), async_op=True
-        )
+        group = _process_group(group_name)
+        # In-place AllGather registers one stable allocation for both source
+        # and destination. Symmetric workspaces can then use NCCL copy engines.
+        local = output.view(-1).narrow(0, group.rank() * input.numel(), input.numel())
+        local = local.view_as(input)
+        local.copy_(input)
+        work = dist.all_gather_into_tensor(output, local, group=group, async_op=True)
         _finish(work, input)
 
 

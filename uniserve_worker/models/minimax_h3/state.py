@@ -365,6 +365,11 @@ def scratch_tensor_schema(
     local_video = min(int(layout.packed.video_indices.numel()), rows)
     local_audio = min(int(layout.packed.audio_indices.numel()), rows)
     projected = max(local_video, local_audio)
+    gather_group = (
+        mesh.get_group("sp")
+        if mesh.size("tp") == 1 and mesh.size("cp") == 1 and mesh.size("sp") > 1
+        else None
+    )
     schema = {
         "packed_hidden": TensorSchema((1, rows, 5376), torch.bfloat16),
         "local_text_hidden": TensorSchema((1, local_text, 5376), torch.bfloat16),
@@ -382,7 +387,12 @@ def scratch_tensor_schema(
         ),
         "projection_sync_input": TensorSchema((1,), torch.int32, fill=layout.sp_rank),
         "projection_sync_output": TensorSchema((layout.ulysses_size,), torch.int32),
-        "attention_workspace": TensorSchema((global_rows * 5376,), attention_workspace_dtype),
+        "attention_workspace": TensorSchema(
+            (global_rows * 5376,),
+            attention_workspace_dtype,
+            memory="symmetric" if gather_group is not None else "device",
+            group=gather_group,
+        ),
         "attention_output": TensorSchema((query_rows, heads, 128), torch.bfloat16),
         "tile_scores": TensorSchema((heads, query_tiles, tiles), torch.float32),
         "block_indices": TensorSchema(

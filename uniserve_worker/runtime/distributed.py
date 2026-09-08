@@ -220,11 +220,13 @@ def init_distributed_environment(
     return environment
 
 
-def _group_options(backend: str):
+def _group_options(backend: str, *, copy_engine: bool = False):
     if backend != "nccl":
         return None
     options = dist.ProcessGroupNCCL.Options()
     options.use_pg_for_symm_mem_rendezvous = True
+    if copy_engine:
+        options.config.cta_policy = dist.ProcessGroupNCCL.NCCL_CTA_POLICY_ZERO
     return options
 
 
@@ -264,7 +266,10 @@ def initialize_model_parallel(
                     group = dist.new_group(
                         ranks=list(backend_members),
                         backend=environment.backend,
-                        pg_options=_group_options(environment.backend),
+                        pg_options=_group_options(
+                            environment.backend,
+                            copy_engine=name in {"ulysses", "sp"},
+                        ),
                         device_id=environment.local_device
                         if environment.backend == "nccl"
                         else None,
