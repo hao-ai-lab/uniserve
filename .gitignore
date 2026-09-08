@@ -48,3 +48,6 @@ specs/*
 AGENTS.md
 
 profile/
+
+# Standalone applications are developed and versioned outside this repository.
+/apps/
