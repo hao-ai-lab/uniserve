@@ -24,10 +24,14 @@ class BeansDataset(Dataset):
 
         point = self.point
         load_dataset = getattr(importlib.import_module("datasets"), "load_dataset")
-        dataset = load_dataset(
-            BEANS_REPOSITORY,
-            split="train",
-            revision=point.dataset_revision,
+        dataset = (
+            load_dataset("parquet", data_files=point.dataset_path, split="train")
+            if point.dataset_path
+            else load_dataset(
+                BEANS_REPOSITORY,
+                split="train",
+                revision=point.dataset_revision,
+            )
         )
         indices = list(range(len(dataset)))
         random.Random(point.load.seed).shuffle(indices)
