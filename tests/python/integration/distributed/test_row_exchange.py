@@ -32,11 +32,11 @@ def _run_exchange(rank: int, rendezvous: str) -> None:
         {"ordered": ((0, 1), parallel), "reversed": ((1, 0), parallel)},
     )
     try:
-        for shape, mesh, chunked in (
-            (shape, mesh, chunked)
+        for shape, mesh, mode in (
+            (shape, mesh, mode)
             for shape in ((64, 4, 128), (32784, 16, 128))
             for mesh in meshes.values()
-            for chunked in (False, True)
+            for mode in ("whole", "chunked", "produced")
         ):
             group = mesh.get_group("ulysses")
             attention = ParallelAttention(mesh=mesh)
@@ -59,8 +59,16 @@ def _run_exchange(rank: int, rendezvous: str) -> None:
             ).to(torch.bfloat16)
 
             def execute():
-                exchange = AttentionRowExchange(attention, outgoing, staging)
-                if not chunked:
+                def produce(interval, destinations):
+                    for owner, destination in enumerate(destinations):
+                        destination.copy_(outgoing.view(2, local_rows, *shape[1:])[owner, interval])
+
+                exchange = (
+                    AttentionRowExchange(attention, staging, outgoing, produce)
+                    if mode == "produced"
+                    else AttentionRowExchange(attention, outgoing, staging)
+                )
+                if mode == "whole":
                     return exchange.materialize()
                 result = torch.empty_like(expected)
                 for interval, values in exchange.chunks(incoming):
@@ -82,7 +90,7 @@ def _run_exchange(rank: int, rendezvous: str) -> None:
                 rtol=0,
                 atol=0,
                 msg=lambda message: (
-                    f"rank={rank}, members={group.ranks}, shape={shape}, chunked={chunked}\n{message}"
+                    f"rank={rank}, members={group.ranks}, shape={shape}, mode={mode}\n{message}"
                 ),
             )
             graph.reset()

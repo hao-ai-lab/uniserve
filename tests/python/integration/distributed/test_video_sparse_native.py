@@ -48,9 +48,7 @@ def test_sparse_attention_heads_preserve_block_mask_and_partial_tiles(heads):
         indices[head, :, 1] = 2 if head % 2 == 0 else 1
     counts = torch.full((heads, 4), 2, device="cuda", dtype=torch.int32)
     output = torch.empty((rows, heads, width), device="cuda", dtype=torch.bfloat16)
-    actual = _available_sparse_attention(
-        query, key, value, output, indices, counts, valid_sizes
-    )
+    actual = _available_sparse_attention(query, key, value, output, indices, counts, valid_sizes)
     mask = torch.zeros((heads, rows, rows), device="cuda", dtype=torch.bool)
     for head in range(heads):
         mask[head, :, :64] = True
@@ -73,7 +71,8 @@ def test_sparse_attention_heads_preserve_block_mask_and_partial_tiles(heads):
 
 
 @pytest.mark.parametrize("members", [1, 2])
-def test_flashinfer_sparse_attention_replays_dynamic_maps_across_output_shards(members):
+@pytest.mark.parametrize("chunk_rows", [None, 64, 192])
+def test_flashinfer_sparse_attention_replays_dynamic_maps_across_output_shards(members, chunk_rows):
     if not video_sparse_flashinfer.available(torch.device("cuda")):
         pytest.skip("FlashInfer sparse attention is unavailable")
 
@@ -90,11 +89,33 @@ def test_flashinfer_sparse_attention_replays_dynamic_maps_across_output_shards(m
     compressed = torch.randn((heads, 4, width), device="cuda")
     attention_output = torch.empty_like(query)
     outputs = tuple(
-        torch.zeros((rows // members, heads * members, width), device="cuda", dtype=torch.bfloat16)
+        torch.zeros(
+            (rows // members, heads * (members if chunk_rows is None else 1), width),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
         for _ in range(members)
     )
 
     def invoke() -> None:
+        if chunk_rows is not None:
+            produce = video_sparse_flashinfer.prepare_sparse_attention_rows(
+                query,
+                key,
+                value,
+                mask_block_indices=indices,
+                valid_sizes=valid_sizes,
+                prefix_tiles=1,
+                gate=gate,
+                compressed=compressed,
+                attention_output=attention_output,
+                owners=members,
+                chunk_rows=chunk_rows,
+            )
+            for start in range(0, rows // members, chunk_rows):
+                interval = slice(start, min(start + chunk_rows, rows // members))
+                produce(interval, tuple(output[interval] for output in outputs))
+            return
         video_sparse_flashinfer.execute_sparse_attention(
             query,
             key,
@@ -114,7 +135,9 @@ def test_flashinfer_sparse_attention_replays_dynamic_maps_across_output_shards(m
         mask = torch.zeros((heads, rows, rows), device="cuda", dtype=torch.bool)
         mask[:, :tile, : 3 * tile] = True
         mask[:, tile : 3 * tile, :tile] = True
-        mask[:, tile : 3 * tile, selected_video_tile * tile : (selected_video_tile + 1) * tile] = True
+        mask[:, tile : 3 * tile, selected_video_tile * tile : (selected_video_tile + 1) * tile] = (
+            True
+        )
         mask[:, 3 * tile :, :tile] = True
         key_valid = torch.arange(rows, device="cuda") % tile < valid_sizes.repeat_interleave(tile)
         mask &= key_valid.view(1, 1, -1)
@@ -130,8 +153,8 @@ def test_flashinfer_sparse_attention_replays_dynamic_maps_across_output_shards(m
         ).to(torch.bfloat16)
 
     def assert_matches(expected: torch.Tensor) -> None:
-        valid_queries = (
-            torch.arange(rows, device="cuda") % tile < valid_sizes.repeat_interleave(tile)
+        valid_queries = torch.arange(rows, device="cuda") % tile < valid_sizes.repeat_interleave(
+            tile
         )
         for destination, shard in enumerate(outputs):
             begin = destination * (rows // members)

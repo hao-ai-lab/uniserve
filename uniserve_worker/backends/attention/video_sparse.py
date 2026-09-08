@@ -266,6 +266,7 @@ class VideoSparseAttentionBackend:
         sync_input: torch.Tensor,
         sync_output: torch.Tensor,
         context_workspace: AttentionContextWorkspace | None,
+        consume_row_intervals: bool = False,
     ) -> torch.Tensor | AttentionRowExchange:
         """Compose global sparse selection with shared head and context exchanges."""
 
@@ -340,6 +341,37 @@ class VideoSparseAttentionBackend:
             if context.world_size == 1 and group.world_size > 1
             else None
         )
+        if (
+            local_output is not None
+            and consume_row_intervals
+            and self.kernel is video_sparse_flashinfer.execute_sparse_attention
+        ):
+            self.prepare_local(
+                query,
+                key,
+                value,
+                valid_sizes,
+                prefix_key_indices,
+                dense_key_indices,
+                prefix_count,
+                workspace,
+            )
+            producer = video_sparse_flashinfer.prepare_sparse_attention_rows(
+                query,
+                key,
+                value,
+                mask_block_indices=workspace.block_indices,
+                valid_sizes=valid_sizes,
+                prefix_tiles=self.metadata.prefix_tiles,
+                gate=gate,
+                compressed=workspace.compressed_tiles,
+                attention_output=workspace.attention_output,
+                owners=group.world_size,
+                chunk_rows=AttentionRowExchange.chunk_rows(local_output),
+            )
+            return AttentionRowExchange(
+                parallel, local_output, workspace.attention_output, producer
+            )
         self.forward_local(
             query,
             key,
@@ -380,6 +412,43 @@ class VideoSparseAttentionBackend:
     ) -> torch.Tensor:
         """Evaluate the complete selected key set for this owner's query rows."""
 
+        self.prepare_local(
+            query,
+            key,
+            value,
+            valid_sizes,
+            prefix_key_indices,
+            dense_key_indices,
+            prefix_count,
+            workspace,
+            query_tile_offset=query_tile_offset,
+        )
+        return self.forward_selected(
+            query,
+            key,
+            value,
+            gate,
+            valid_sizes,
+            workspace,
+            block_indices=workspace.block_indices,
+            targets=targets,
+        )
+
+    def prepare_local(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        valid_sizes: torch.Tensor,
+        prefix_key_indices: torch.Tensor,
+        dense_key_indices: torch.Tensor,
+        prefix_count: torch.Tensor,
+        workspace: VideoSparseAttentionWorkspace,
+        *,
+        query_tile_offset: int = 0,
+    ) -> None:
+        """Prepare one selected key domain shared by all fine-query intervals."""
+
         video_sparse_ops.pool_qkv_means(
             query,
             key,
@@ -397,16 +466,6 @@ class VideoSparseAttentionBackend:
             prefix_count,
             workspace,
             query_tile_offset=query_tile_offset,
-        )
-        return self.forward_selected(
-            query,
-            key,
-            value,
-            gate,
-            valid_sizes,
-            workspace,
-            block_indices=workspace.block_indices,
-            targets=targets,
         )
 
     def forward_selected(

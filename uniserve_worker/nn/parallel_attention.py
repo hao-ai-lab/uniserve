@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import torch
 
-from .mesh import Communicator, DeviceMesh
+from .mesh import Communicator, DeviceMesh, RowChunkProducer
 
 
 @dataclass(frozen=True)
@@ -76,33 +76,45 @@ class AttentionRowExchange:
     parallel: ParallelAttention
     tensor: torch.Tensor
     workspace: torch.Tensor
+    producer: RowChunkProducer | None = None
 
     def materialize(self) -> torch.Tensor:
         """Return all sequence-local rows with their complete head vectors."""
 
-        return self.parallel.restore_rows(self.tensor, workspace=self.workspace)
+        if self.producer is None:
+            return self.parallel.restore_rows(self.tensor, workspace=self.workspace)
+        return torch.cat([rows for _, rows in self.chunks(torch.empty_like(self.tensor))], dim=0)
+
+    @staticmethod
+    def chunk_rows(tensor: torch.Tensor) -> int:
+        """Bound each peer payload while preserving tile-aligned row intervals."""
+
+        payload = tensor[0].numel() * tensor.element_size()
+        return max(128, (32 * 1024 * 1024 // payload // 128) * 128)
 
     def chunks(self, receive_workspace: torch.Tensor) -> Iterator[tuple[slice, torch.Tensor]]:
         """Restore head vectors using disjoint caller-owned receive byte capacity.
 
         Receive storage must accommodate the complete head-shard payload on
         the same device. Registered buffers enable copy-engine transport.
-        The iterator must finish before any of its three buffers is reused.
+        The iterator must finish before any borrowed buffer is reused.
         """
 
         group = self.parallel.ulysses_group
         rows = self.tensor.shape[0] // group.world_size
-        payload = self.tensor[0].numel() * self.tensor.element_size()
-        # A bounded peer interval releases row-local consumers before the full
-        # exchange completes, limiting the pipeline's initial transfer bubble.
-        chunk_rows = max(128, (32 * 1024 * 1024 // payload // 128) * 128)
+        chunk_rows = self.chunk_rows(self.tensor)
         outgoing = self.tensor.view(group.world_size, rows, *self.tensor.shape[1:])
         byte_count = self.tensor.numel() * self.tensor.element_size()
         incoming = receive_workspace.view(torch.uint8).view(-1)[:byte_count].view(self.tensor.dtype)
-        for interval, sources in group.exchange_row_chunks(
-            outgoing, self.workspace, incoming, chunk_rows
-        ):
-            yield interval, torch.cat(sources, dim=1)
+        if self.producer is None:
+            intervals = group.exchange_row_chunks(outgoing, self.workspace, incoming, chunk_rows)
+        else:
+            intervals = group.produce_row_chunks(
+                outgoing.shape, self.tensor, incoming, chunk_rows, self.producer
+            )
+        # The returned iterator owns only the communication dependency; keeping
+        # this object alive would retain the producer's QKV through feed-forward.
+        return ((interval, torch.cat(sources, dim=1)) for interval, sources in intervals)
 
 
 class ParallelAttention:

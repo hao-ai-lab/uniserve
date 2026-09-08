@@ -415,6 +415,7 @@ class _H3Attention(nn.Module):
         compressed_tiles: torch.Tensor,
         topk_indices_i32: torch.Tensor,
         backend: VideoSparseAttentionBackend,
+        consume_row_intervals: bool = False,
     ) -> torch.Tensor | AttentionRowExchange:
         """Compute sparse global attention and publish its row-exchange dependency."""
 
@@ -476,6 +477,7 @@ class _H3Attention(nn.Module):
             sync_input=projection_sync_input,
             sync_output=projection_sync_output,
             context_workspace=context_workspace,
+            consume_row_intervals=consume_row_intervals,
         )
 
 
@@ -595,6 +597,7 @@ class _TransformerBlock(nn.Module):
             compressed_tiles,
             topk_indices_i32,
             backend,
+            consume_row_intervals=self.overlap_output_exchange,
         )
         del normalized
 
@@ -603,7 +606,9 @@ class _TransformerBlock(nn.Module):
                 output = torch.empty_like(hidden)
                 # QKVG projection has consumed this registered gather buffer.
                 # Reuse it for receives while keeping composed input read-only.
-                for interval, rows in attention.chunks(attention_workspace):
+                intervals = attention.chunks(attention_workspace)
+                del attention
+                for interval, rows in intervals:
                     projected = self.attn.to_out(rows.reshape(1, rows.shape[0], -1))
                     output[:, interval] = self._finish_attention(
                         hidden[:, interval],

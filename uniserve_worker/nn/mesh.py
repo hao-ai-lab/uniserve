@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from itertools import product
 from math import prod
@@ -14,6 +14,8 @@ import torch.distributed as dist
 
 from ..profiling import profile_range
 from .parallel import EntryConfig, ParallelConfig
+
+RowChunkProducer = Callable[[slice, tuple[torch.Tensor, ...]], None]
 
 
 def divide(numerator: int, denominator: int) -> int:
@@ -88,9 +90,7 @@ def _all_gather_linear(
     # Stage every source before submitting collectives, so later NCCL waits
     # refer only to staging work and cannot depend on earlier GEMM consumers.
     pending = [
-        dist.all_gather_into_tensor(
-            gathered, sources[local_rank], group=group, async_op=True
-        )
+        dist.all_gather_into_tensor(gathered, sources[local_rank], group=group, async_op=True)
         for _, _, gathered, sources in segments
     ]
     output = input.new_empty((rows * members, weight.shape[0]))
@@ -132,8 +132,7 @@ def _all_to_all_single_into(
         # Empty split lists select the native equal-count collective. Explicit
         # lists select variable-count send/recv, including when counts match.
         equal_counts = (
-            input.numel() == output.numel()
-            and len(set(output_splits + input_splits)) == 1
+            input.numel() == output.numel() and len(set(output_splits + input_splits)) == 1
         )
         work = dist.all_to_all_single(
             output,
@@ -349,7 +348,9 @@ class Communicator:
             return torch.nn.functional.linear(input, weight, bias)
         byte_count = input.numel() * input.element_size() * self.world_size
         if not workspace.is_contiguous() or workspace.device != input.device:
-            raise ValueError("gathered projection requires contiguous workspace on the input device")
+            raise ValueError(
+                "gathered projection requires contiguous workspace on the input device"
+            )
         if workspace.numel() * workspace.element_size() < byte_count:
             raise ValueError("gathered projection workspace cannot hold all input rows")
         gathered = workspace.view(torch.uint8).view(-1)[:byte_count].view(input.dtype)
@@ -424,32 +425,70 @@ class Communicator:
             or len({input.data_ptr(), workspace.data_ptr(), output.data_ptr()}) != 3
         ):
             raise ValueError("chunked exchange requires distinct matching contiguous buffers")
-        rows = input.shape[1]
-        if self.world_size == 1:
-            yield slice(0, rows), (input[0],)
-            return
-        group = self._require()
+
+        def produce(interval: slice, destinations: tuple[torch.Tensor, ...]) -> None:
+            for rank, destination in enumerate(destinations):
+                destination.copy_(input[rank, interval])
+
+        return self.produce_row_chunks(input.shape, workspace, output, chunk_rows, produce)
+
+    def produce_row_chunks(
+        self,
+        shape: tuple[int, ...],
+        workspace: torch.Tensor,
+        output: torch.Tensor,
+        chunk_rows: int,
+        producer: RowChunkProducer,
+    ) -> Iterator[tuple[slice, tuple[torch.Tensor, ...]]]:
+        """Exchange row intervals as a stream-ordered producer publishes them.
+
+        Shape axes are logical destination, row, and payload. The producer
+        writes each supplied logical destination view on the current stream.
+        It must finish enqueuing its writes before returning. Transport owns
+        ordering and scratch layout, and starts each exchange immediately.
+        All production is enqueued before yielding to consumers, allowing its
+        temporary inputs to be released before consumer allocations begin.
+        Both distinct scratch buffers remain live until iterator exhaustion.
+        """
+
+        if len(shape) < 3 or shape[0] != self.world_size or min(shape) < 1 or chunk_rows < 1:
+            raise ValueError("row production requires a member axis and positive row chunks")
+        if (
+            not workspace.is_contiguous()
+            or not output.is_contiguous()
+            or workspace.numel() != prod(shape)
+            or output.numel() != prod(shape)
+            or workspace.device != output.device
+            or workspace.dtype != output.dtype
+            or workspace.data_ptr() == output.data_ptr()
+        ):
+            raise ValueError("row production requires distinct matching contiguous buffers")
+        rows = shape[1]
+        group = self._require() if self.world_size > 1 else None
         order = self._backend_order
-        row_elements = prod(input.shape[2:])
+        row_elements = prod(shape[2:])
         source_flat, target_flat = workspace.view(-1), output.view(-1)
         segments = []
         for start in range(0, rows, chunk_rows):
             count = min(chunk_rows, rows - start)
             offset = start * self.world_size * row_elements
             elements = count * self.world_size * row_elements
-            shape = (self.world_size, count, *input.shape[2:])
-            source = source_flat.narrow(0, offset, elements).view(shape)
-            target = target_flat.narrow(0, offset, elements).view(shape)
-            for backend_rank, logical_rank in enumerate(order):
-                source[backend_rank].copy_(input[logical_rank, start : start + count])
-            segments.append((slice(start, start + count), source, target))
+            segment_shape = (self.world_size, count, *shape[2:])
+            source = source_flat.narrow(0, offset, elements).view(segment_shape)
+            target = target_flat.narrow(0, offset, elements).view(segment_shape)
+            interval = slice(start, start + count)
+            producer(interval, tuple(source[order.index(rank)] for rank in range(self.world_size)))
+            if group is None:
+                target.copy_(source)
+                work = None
+            else:
+                work = dist.all_to_all_single(target, source, group=group, async_op=True)
+            segments.append((interval, target, work))
 
-        pending = [
-            dist.all_to_all_single(target, source, group=group, async_op=True)
-            for _, source, target in segments
-        ]
-        for (interval, _, target), work in zip(segments, pending, strict=True):
-            _finish(work, input)
+        del producer
+        for interval, target, work in segments:
+            if work is not None:
+                _finish(work, workspace)
             yield interval, tuple(target[order.index(rank)] for rank in range(self.world_size))
 
     def gather_into_tensor(
