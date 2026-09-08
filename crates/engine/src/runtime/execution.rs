@@ -411,11 +411,16 @@ impl EngineLoop {
 
         let batch_id = self.inflight.next_batch_id();
         let submit_at = Instant::now();
+        let candidate_requests = candidates
+            .iter()
+            .map(|(_, _, id, _)| *id)
+            .collect::<HashSet<_>>();
         let commands = self.take_commands(|command| {
-            matches!(
-                command,
-                BatchCommand::Finish { .. } | BatchCommand::Retire { .. }
-            )
+            candidate_requests.contains(&command.request_key().request_id)
+                || matches!(
+                    command,
+                    BatchCommand::Finish { .. } | BatchCommand::Retire { .. }
+                )
         });
         let mut admissions = Vec::new();
         let mut logical_ops = Vec::with_capacity(candidates.len());
@@ -1348,6 +1353,7 @@ impl EngineLoop {
         let Some(state) = self.media_state(id) else {
             return;
         };
+        let mut consumed_products = Vec::new();
         let already_failed = matches!(state.terminal_intent, TerminalIntent::Failure(_));
         let media_output = record.media_output().cloned();
         let media_output_valid =
@@ -1371,6 +1377,26 @@ impl EngineLoop {
                 }
             } else if let Some(state) = self.media_state_mut(id) {
                 state.committed = advance_media_cursor(state.committed, quantum);
+                match quantum {
+                    MediaQuantum::Append {
+                        track: MediaTrack::Video,
+                        cursor,
+                        ..
+                    } => {
+                        if let Some((_count, product)) = state.video_segments.remove(&cursor) {
+                            consumed_products.push(product);
+                        }
+                    }
+                    MediaQuantum::Append {
+                        track: MediaTrack::Audio,
+                        ..
+                    } => {
+                        if let Some(product) = state.audio.take() {
+                            consumed_products.push(product);
+                        }
+                    }
+                    _ => {}
+                }
                 if let Some(output) = media_output {
                     state.artifact = Some(ArtifactEvent {
                         media_kind: MediaKind::Video,
@@ -1390,6 +1416,9 @@ impl EngineLoop {
                     };
                 }
             }
+        }
+        if !consumed_products.is_empty() {
+            self.free_products(consumed_products);
         }
 
         let terminal = self.media_state(id).and_then(|state| {
