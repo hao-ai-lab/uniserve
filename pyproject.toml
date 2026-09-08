@@ -51,7 +51,7 @@ dev = [
 ]
 bench = [
     "datasets>=2.0",
-    "httpx>=0.27",
+    "httpx[socks]>=0.27",
     "pillow>=10.4",
 ]
 # Optional accelerator kernels. Model bindings require their declared native
@@ -60,6 +60,8 @@ bench = [
 # extensions plus cuDNN Frontend CuTe DSL; native builds require a CUDA 13 toolkit.
 gpu = [
     "flashinfer-python",
+    "ninja>=1.11",
+    "requests[socks]>=2",
     "uniserve-kernel[peer_memory]",
 ]
 h3 = [
