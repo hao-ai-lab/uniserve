@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import itertools
 import logging
-from collections.abc import Callable, Hashable, Iterator, Sequence
+from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, fields, is_dataclass, replace
 from typing import Any, Generic, TypeVar, cast
@@ -37,6 +37,29 @@ class _GraphMiss(RuntimeError):
     """Signals that a requested CUDA graph signature has no captured executable."""
 
     pass
+
+
+def graph_mode_available(
+    selection: AttentionSelection,
+    mode: AttentionMode,
+    *,
+    head_dim: int,
+    block_size: int,
+    device: torch.device,
+) -> bool:
+    """Report whether the selected eager provider also supports graph capture."""
+
+    try:
+        _graph_provider(
+            selection,
+            mode,
+            head_dim=head_dim,
+            block_size=block_size,
+            device=device,
+        )
+    except _GraphMiss:
+        return False
+    return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -334,7 +357,7 @@ class CudaGraphRunner:
         prefill_row_sizes: tuple[int, ...] = (8, 16),
         stream: torch.cuda.Stream | None = None,
         expected_context: int | None = None,
-        expected_resident_executables: int | None = None,
+        required_resident_families: Mapping[str, int] | None = None,
         output_slot_count: int = 2,
     ) -> None:
         """Configure one lane's bounded graph catalog, workspaces, and capture identity."""
@@ -376,11 +399,10 @@ class CudaGraphRunner:
         self._sealed = False
         self._stream = stream
         self._expected_context = expected_context
-        self._expected_resident_executables = (
-            None
-            if expected_resident_executables is None
-            else max(0, int(expected_resident_executables))
-        )
+        self._required_resident_families = {
+            str(family): max(0, int(count))
+            for family, count in (required_resident_families or {}).items()
+        }
         self._output_slot_count = int(output_slot_count)
 
     @property
@@ -411,15 +433,16 @@ class CudaGraphRunner:
         self._warmed_exact.clear()
         if self._warmed:
             raise GraphExecutionError("startup left configured graph buckets uncaptured")
-        if (
-            self._expected_resident_executables is not None
-            and len(self._states) != self._expected_resident_executables
-        ):
+        resident_families = self._resident_family_counts()
+        missing_families = {
+            family: (resident_families.get(family, 0), required)
+            for family, required in self._required_resident_families.items()
+            if resident_families.get(family, 0) != required
+        }
+        if missing_families:
             raise GraphExecutionError(
-                "resident CUDA graph count does not match the physical executable catalog: "
-                f"resident={len(self._states)} "
-                f"expected={self._expected_resident_executables} "
-                f"families={self._resident_family_counts()!r}"
+                "resident CUDA graph families do not match the required bucket catalog: "
+                f"mismatches={missing_families!r} resident={resident_families!r}"
             )
         self._complete_equivalence_checks()
         if self.resident_bytes > self.memory_budget_bytes:

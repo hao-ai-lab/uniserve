@@ -49,6 +49,7 @@ from ..execution.batch import (
 from ..execution.cuda_graph import (
     CudaGraphRunner,
     PrefixCapture,
+    graph_mode_available,
     select_flow_captures,
     select_mixed_captures,
     select_prefill_captures,
@@ -820,34 +821,39 @@ class Worker:
                 if owns_model_compute and Domain.FLOW in domains
                 else ()
             )
-            # The expected count reserves catalog metadata and provides a precise
-            # post-warmup completeness bound for this lane.
-            expected_resident_executables = 0
+            # Padded decode and prefill buckets are mandatory resident graphs.
+            # Exact packed shapes remain opportunistic: warmup retains repeated
+            # shapes and deliberately discards singleton candidates at sealing.
+            required_resident_families: dict[str, int] = {}
+            graph_mode_support = {
+                mode: graph_mode_available(
+                    attention,
+                    mode,
+                    head_dim=packed_model.cache_geometry.head_dim,
+                    block_size=worker_config.block_size,
+                    device=device,
+                )
+                for mode in (
+                    AttentionMode.PAGED_DECODE,
+                    AttentionMode.PAGED_VARLEN,
+                )
+            }
             if worker_config.cuda_graph:
-                if OpCode.AR_DECODE in self._effective_work_variants:
-                    expected_resident_executables += len(lane_decode_buckets)
+                if (
+                    OpCode.AR_DECODE in self._effective_work_variants
+                    and graph_mode_support[AttentionMode.PAGED_DECODE]
+                ):
+                    required_resident_families["paged_decode_bucket"] = len(
+                        lane_decode_buckets
+                    )
                 if (
                     worker_config.prefill_cuda_graph
                     and OpCode.AR_EXTEND in self._effective_work_variants
+                    and not packed_model.tensorized_mixed
+                    and graph_mode_support[AttentionMode.PAGED_VARLEN]
                 ):
-                    expected_resident_executables += (
-                        len(lane_prefill_buckets)
-                        if packed_model.tensorized_mixed
-                        else len(lane_prefill_catalog)
-                    )
-                if worker_config.prefill_cuda_graph and {
-                    OpCode.DIFFUSION_PREPARE,
-                    OpCode.DIFFUSION_STEP,
-                }.issubset(self._effective_work_variants):
-                    expected_resident_executables += len(
-                        {bucket.executable_key for bucket in lane_flow_buckets}
-                    )
-                    if OpCode.AR_DECODE in self._effective_work_variants:
-                        expected_resident_executables += len(
-                            {bucket.executable_key for bucket in lane_mixed_flow_buckets}
-                        )
-                    expected_resident_executables += len(
-                        {bucket.executable_key for bucket in lane_flow_prefix_buckets}
+                    required_resident_families["paged_prefill_bucket"] = len(
+                        lane_prefill_catalog
                     )
             output_slots = int(
                 (pipeline_depth if lane is None else lane.max_inflight or pipeline_depth) + 1
@@ -873,7 +879,7 @@ class Worker:
                 prefill_row_sizes=lane_prefill_row_sizes,
                 stream=stream,
                 expected_context=expected_context,
-                expected_resident_executables=expected_resident_executables,
+                required_resident_families=required_resident_families,
                 output_slot_count=output_slots,
             )
 
