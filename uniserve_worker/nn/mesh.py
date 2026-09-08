@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from itertools import product
@@ -16,6 +17,121 @@ from ..profiling import profile_range
 from .parallel import EntryConfig, ParallelConfig
 
 RowChunkProducer = Callable[[slice, tuple[torch.Tensor, ...]], None]
+
+
+class GatheredLinear:
+    """Project an ordered stream of equal row shards through two gather slots.
+
+    The caller publishes contiguous local intervals on the current stream.
+    Each publication starts its collective and local GEMM. Before reusing a
+    slot, its completed remote rows are projected into the full logical output.
+    The caller owns registered scratch storage until ``finish`` consumes the
+    remaining transfers. Output allocation is deferred until the first input
+    publication, allowing a preceding computation to release its temporaries.
+    """
+
+    def __init__(
+        self,
+        group: Communicator,
+        rows: int,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        workspace: torch.Tensor,
+    ) -> None:
+        if rows < 1 or weight.ndim != 2 or not workspace.is_contiguous():
+            raise ValueError("streamed projection requires positive rows and contiguous scratch")
+        if workspace.device != weight.device:
+            raise ValueError("streamed projection scratch must share the weight device")
+        self.group = group
+        self.rows = rows
+        self.weight = weight
+        self.bias = bias
+        members, width = group.world_size, weight.shape[1]
+        elements = workspace.numel() * workspace.element_size() // weight.element_size()
+        capacity_rows = elements // (2 * members * width)
+        if capacity_rows < 1:
+            raise ValueError("streamed projection scratch must hold two complete member rows")
+        # Limit individual peer transfers, then align rows when capacity allows.
+        capacity_rows = min(capacity_rows, (64 * 1024 * 1024) // (width * weight.element_size()))
+        self.chunk_rows = capacity_rows // 128 * 128 if capacity_rows >= 128 else capacity_rows
+        slot_elements = members * self.chunk_rows * width
+        byte_count = 2 * slot_elements * weight.element_size()
+        self.storage = workspace.view(torch.uint8).view(-1)[:byte_count].view(weight.dtype)
+        self.storage = self.storage.view(2, members, self.chunk_rows, width)
+        self.pending: deque[tuple[int, int, torch.Tensor, Any]] = deque()
+        self.output: torch.Tensor | None = None
+        self.published_rows = 0
+        self.next_slot = 0
+
+    def _project(self, source: torch.Tensor, target: torch.Tensor) -> None:
+        if self.bias is None:
+            torch.mm(source, self.weight.t(), out=target)
+        else:
+            torch.addmm(self.bias, source, self.weight.t(), out=target)
+
+    def _consume(self) -> None:
+        start, count, gathered, work = self.pending.popleft()
+        if work is not None:
+            _finish(work, gathered)
+        assert self.output is not None
+        targets = self.output.view(self.group.world_size, self.rows, self.weight.shape[0])
+        for backend_rank, logical_rank in enumerate(self.group._backend_order):
+            if logical_rank != self.group.rank_in_group:
+                self._project(gathered[backend_rank], targets[logical_rank, start : start + count])
+
+    def append(self, start: int, input: torch.Tensor) -> None:
+        """Publish the next local interval; inputs stay caller-owned and read-only."""
+
+        if (
+            input.ndim != 2
+            or input.shape[1] != self.weight.shape[1]
+            or input.dtype != self.weight.dtype
+            or input.device != self.weight.device
+            or start != self.published_rows
+            or input.shape[0] < 1
+            or start + input.shape[0] > self.rows
+        ):
+            raise ValueError("streamed projection requires ordered matching input row intervals")
+        if self.output is None:
+            self.output = input.new_empty((self.rows * self.group.world_size, self.weight.shape[0]))
+        targets = self.output.view(self.group.world_size, self.rows, self.weight.shape[0])
+        backend_rank = self.group._backend_order.index(self.group.rank_in_group)
+        for offset in range(0, input.shape[0], self.chunk_rows):
+            if len(self.pending) == 2:
+                self._consume()
+            count = min(self.chunk_rows, input.shape[0] - offset)
+            # Compact the member stride for tails so native equal-count gather
+            # operates on contiguous storage within the registered slot.
+            gathered = self.storage[self.next_slot].view(-1)[
+                : self.group.world_size * count * input.shape[1]
+            ]
+            gathered = gathered.view(self.group.world_size, count, input.shape[1])
+            local = input[offset : offset + count]
+            gathered[backend_rank].copy_(local)
+            if self.group.world_size > 1:
+                work = dist.all_gather_into_tensor(
+                    gathered.flatten(0, 1),
+                    gathered[backend_rank],
+                    group=self.group._require(),
+                    async_op=True,
+                )
+            else:
+                work = None
+            begin = start + offset
+            self._project(local, targets[self.group.rank_in_group, begin : begin + count])
+            self.pending.append((begin, count, gathered, work))
+            self.next_slot = (self.next_slot + 1) % 2
+        self.published_rows += input.shape[0]
+
+    def finish(self) -> torch.Tensor:
+        """Consume the complete row domain and transfer output ownership to the caller."""
+
+        if self.published_rows != self.rows or self.output is None:
+            raise ValueError("streamed projection must publish every row before completion")
+        while self.pending:
+            self._consume()
+        output, self.output = self.output, None
+        return output
 
 
 def divide(numerator: int, denominator: int) -> int:

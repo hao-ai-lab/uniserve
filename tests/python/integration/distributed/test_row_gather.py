@@ -39,11 +39,7 @@ def _run_gather(rank: int, rendezvous: str) -> None:
             group = mesh.get_group("sp")
             for dtype in (torch.bfloat16, torch.uint8):
                 storage = BoundedTensorStorage.allocate(
-                    {
-                        "rows": TensorSchema(
-                            (8192,), dtype, memory="symmetric", group=group
-                        )
-                    },
+                    {"rows": TensorSchema((8192,), dtype, memory="symmetric", group=group)},
                     device,
                     environment=environment,
                 )
@@ -102,9 +98,7 @@ def _run_gather(rank: int, rendezvous: str) -> None:
                         layer.weight[columns, columns * 7 % width] = 1
                     if layer.bias is not None:
                         layer.bias.copy_(torch.arange(256, device=device) / 16)
-                    expected = torch.nn.functional.linear(
-                        expected_rows, layer.weight, layer.bias
-                    )
+                    expected = torch.nn.functional.linear(expected_rows, layer.weight, layer.bias)
                     actual = layer.forward_sequence_parallel(rows, storage.capacity["rows"])
                     torch.testing.assert_close(
                         actual,
@@ -120,9 +114,7 @@ def _run_gather(rank: int, rendezvous: str) -> None:
                     rows.add_(1)
                     expected_rows.add_(1)
                     graph.replay()
-                    expected = torch.nn.functional.linear(
-                        expected_rows, layer.weight, layer.bias
-                    )
+                    expected = torch.nn.functional.linear(expected_rows, layer.weight, layer.bias)
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
                     graph.reset()
                     actual = layer.forward_sequence_parallel(
@@ -131,6 +123,27 @@ def _run_gather(rank: int, rendezvous: str) -> None:
                     torch.testing.assert_close(
                         actual, expected.view(16, local_rows // 8, 256), rtol=0, atol=0
                     )
+
+                    def produce():
+                        projection = layer.stream_sequence_parallel(
+                            local_rows, storage.capacity["rows"]
+                        )
+                        interval_rows = 3072 if local_rows > 128 else 48
+                        for start in range(0, local_rows, interval_rows):
+                            projection.append(start, rows[start : start + interval_rows])
+                        return projection.finish()
+
+                    actual = produce()
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                    torch.cuda.synchronize(device)
+                    with torch.cuda.graph(graph):
+                        actual = produce()
+                    rows.add_(1)
+                    expected_rows.add_(1)
+                    graph.replay()
+                    expected = torch.nn.functional.linear(expected_rows, layer.weight, layer.bias)
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                    graph.reset()
                 del storage
     finally:
         environment.close()

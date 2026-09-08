@@ -310,8 +310,6 @@ class H3Scratch:
     local_text_hidden: torch.Tensor
     projected_input: torch.Tensor
     projected_input_bf16: torch.Tensor
-    local_video_hidden: torch.Tensor
-    local_audio_hidden: torch.Tensor
     video_velocity: torch.Tensor
     audio_velocity: torch.Tensor
     projection_peers: tuple[torch.Tensor, ...]
@@ -371,17 +369,13 @@ def scratch_tensor_schema(
         else None
     )
     output_group = (
-        mesh.get_group("ulysses")
-        if mesh.size("cp") == 1 and mesh.size("ulysses") > 1
-        else None
+        mesh.get_group("ulysses") if mesh.size("cp") == 1 and mesh.size("ulysses") > 1 else None
     )
     schema = {
         "packed_hidden": TensorSchema((1, rows, 5376), torch.bfloat16),
         "local_text_hidden": TensorSchema((1, local_text, 5376), torch.bfloat16),
         "projected_input": TensorSchema((projected, 5376), torch.float32),
         "projected_input_bf16": TensorSchema((projected, 5376), torch.bfloat16),
-        "local_video_hidden": TensorSchema((local_video, 5376), torch.bfloat16),
-        "local_audio_hidden": TensorSchema((local_audio, 5376), torch.bfloat16),
         "video_velocity": TensorSchema((local_video, 96), torch.float32),
         "audio_velocity": TensorSchema((local_audio, 32), torch.float32),
         "projection": TensorSchema(
@@ -471,8 +465,6 @@ def bind_compute_tensors(
                 "local_text_hidden": (1, local_text, 5376),
                 "projected_input": (projected_rows, 5376),
                 "projected_input_bf16": (projected_rows, 5376),
-                "local_video_hidden": (local_video, 5376),
-                "local_audio_hidden": (local_audio, 5376),
                 "video_velocity": (local_video, 96),
                 "audio_velocity": (local_audio, 32),
                 "attention_workspace": (global_rows * 5376,),

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -26,7 +27,7 @@ from ...nn.linear import (
     InterleavedMergedColumnParallelLinear,
     RowParallelLinear,
 )
-from ...nn.mesh import DeviceMesh
+from ...nn.mesh import DeviceMesh, GatheredLinear
 from ...nn.mlp import GatedMLP
 from ...nn.norm import RMSNorm
 from ...nn.parallel_attention import (
@@ -416,6 +417,7 @@ class _H3Attention(nn.Module):
         topk_indices_i32: torch.Tensor,
         backend: VideoSparseAttentionBackend,
         consume_row_intervals: bool = False,
+        prepared_projection: GatheredLinear | None = None,
     ) -> torch.Tensor | AttentionRowExchange:
         """Compute sparse global attention and publish its row-exchange dependency."""
 
@@ -423,7 +425,11 @@ class _H3Attention(nn.Module):
         head_dim = self.config.head_dim
         local_rows = local.shape[0]
         global_rows = local_rows * self.sequence_size
-        if self.projected_head:
+        if prepared_projection is not None:
+            exchanged = prepared_projection.finish().view(
+                global_rows, self.local_heads, 4, head_dim
+            )
+        elif self.projected_head:
             exchanged = self.to_qkvg.forward_sequence_parallel(local, attention_workspace).view(
                 global_rows,
                 self.local_heads,
@@ -558,6 +564,8 @@ class _TransformerBlock(nn.Module):
         compressed_tiles: torch.Tensor,
         topk_indices_i32: torch.Tensor,
         backend: VideoSparseAttentionBackend,
+        prepared_projection: GatheredLinear | None = None,
+        row_consumer: Callable[[slice, torch.Tensor], None] | None = None,
     ) -> torch.Tensor:
         """Apply one time-modulated sparse-attention and feed-forward residual block."""
 
@@ -567,13 +575,17 @@ class _TransformerBlock(nn.Module):
             tensor.to(hidden.dtype)
             for tensor in adaln_values.reshape(-1, self.hidden_size * 6).chunk(6, dim=-1)
         )
-        normalized = modulated_rms_norm(
-            hidden,
-            self.norm1.weight,
-            shift_attn,
-            scale_attn,
-            adaln_indices,
-            eps=self.norm1.eps,
+        normalized = (
+            hidden
+            if prepared_projection is not None
+            else modulated_rms_norm(
+                hidden,
+                self.norm1.weight,
+                shift_attn,
+                scale_attn,
+                adaln_indices,
+                eps=self.norm1.eps,
+            )
         )
         attention = self.attn(
             normalized,
@@ -598,6 +610,7 @@ class _TransformerBlock(nn.Module):
             topk_indices_i32,
             backend,
             consume_row_intervals=self.overlap_output_exchange,
+            prepared_projection=prepared_projection,
         )
         del normalized
 
@@ -619,12 +632,17 @@ class _TransformerBlock(nn.Module):
                         gate_ffn,
                         adaln_indices[interval],
                     )
+                    if row_consumer is not None:
+                        row_consumer(interval, output[:, interval])
                 return output
             attention = attention.materialize()
         projected = self.attn.to_out(attention.reshape(1, attention.shape[0], -1))
-        return self._finish_attention(
+        output = self._finish_attention(
             hidden, projected, gate_attn, shift_ffn, scale_ffn, gate_ffn, adaln_indices
         )
+        if row_consumer is not None:
+            row_consumer(slice(0, output.shape[1]), output)
+        return output
 
     def _finish_attention(
         self,
@@ -872,7 +890,43 @@ class MiniMaxH3Transformer(nn.Module):
 
         # Every block consumes the same layout metadata and caller-owned collective buffers.
         rotary = (slot.rotary_cosine, slot.rotary_sine)
-        for layer, block in enumerate(self.transformer_blocks.values()):
+        blocks = tuple(self.transformer_blocks.values())
+        prepared_projection = None
+        for layer, block in enumerate(blocks):
+            next_block = blocks[layer + 1] if layer + 1 < len(blocks) else None
+            next_projection = None
+            row_consumer = None
+            if (
+                next_block is not None
+                and block.overlap_output_exchange
+                and block.attn.sequence_size > 1
+                and metadata.vsa.supports_row_production
+                and not next_block.attn.to_qkvg.quant_method.is_quantized
+            ):
+                # Query production releases attention compute scratch before
+                # any row consumer runs. Its registered allocation can then
+                # carry the next layer's two-slot input gather pipeline.
+                next_projection = next_block.attn.to_qkvg.stream_sequence_parallel(
+                    hidden.shape[1], scratch.attention_output
+                )
+                shift, scale = (
+                    scratch.block_adaln_params[layer + 1]
+                    .reshape(-1, next_block.hidden_size * 6)
+                    .chunk(6, dim=-1)[:2]
+                )
+
+                def consume(interval: slice, rows: torch.Tensor) -> None:
+                    normalized = modulated_rms_norm(
+                        rows,
+                        next_block.norm1.weight,
+                        shift,
+                        scale,
+                        metadata.adaln_indices[interval],
+                        eps=next_block.norm1.eps,
+                    )
+                    next_projection.append(interval.start, normalized[0])
+
+                row_consumer = consume
             hidden = block(
                 hidden,
                 scratch.block_adaln_params[layer],
@@ -897,7 +951,10 @@ class MiniMaxH3Transformer(nn.Module):
                 scratch.compressed_tiles,
                 scratch.topk_indices_i32,
                 metadata.vsa,
+                prepared_projection=prepared_projection,
+                row_consumer=row_consumer,
             )
+            prepared_projection = next_projection
         self.pipeline.send_activation(hidden)
         if not self.pipeline.last:
             return None

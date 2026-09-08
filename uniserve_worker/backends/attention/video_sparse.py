@@ -119,6 +119,12 @@ class VideoSparseAttentionBackend:
         self.metadata = metadata
         self.kernel = _resolve_kernel()
 
+    @property
+    def supports_row_production(self) -> bool:
+        """Declare whether fine attention releases its compute scratch before row consumers."""
+
+        return self.kernel is video_sparse_flashinfer.execute_sparse_attention
+
     def _compressed_tiles(
         self,
         q_mean: torch.Tensor,
@@ -341,11 +347,7 @@ class VideoSparseAttentionBackend:
             if context.world_size == 1 and group.world_size > 1
             else None
         )
-        if (
-            local_output is not None
-            and consume_row_intervals
-            and self.kernel is video_sparse_flashinfer.execute_sparse_attention
-        ):
+        if local_output is not None and consume_row_intervals and self.supports_row_production:
             self.prepare_local(
                 query,
                 key,

@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 
 from .layer import LayerConfig
-from .mesh import Communicator, divide
+from .mesh import Communicator, GatheredLinear, divide
 from .quant.base import (
     LinearMethod,
     PreparedLinearInput,
@@ -222,6 +222,20 @@ class LinearBase(nn.Module):
             include_bias=include_bias,
         )
 
+    def stream_sequence_parallel(self, rows: int, workspace: torch.Tensor) -> GatheredLinear:
+        """Accept ordered dense row production before the complete input is ready.
+
+        Tensor-wide quantization scales require their complete input domain and
+        use ``forward_sequence_parallel``. The returned projection owns stream
+        dependencies; the caller supplies registered scratch through completion.
+        """
+
+        if self.sequence_group is None or self.quant_method.is_quantized:
+            raise ValueError("streamed sequence projection requires a dense sequence-bound layer")
+        return GatheredLinear(
+            self.sequence_group, rows, self.weight, self.execution_bias, workspace
+        )
+
     def forward_sequence_parallel(
         self,
         x: torch.Tensor,
@@ -243,9 +257,7 @@ class LinearBase(nn.Module):
             projected = group.all_gather_linear(
                 x.reshape(-1, x.shape[-1]), self.weight, self.execution_bias, workspace
             )
-            return projected.view(
-                x.shape[0] * group.world_size, *x.shape[1:-1], self.output_size
-            )
+            return projected.view(x.shape[0] * group.world_size, *x.shape[1:-1], self.output_size)
         scale = self.quant_method.input_scale(x)
         if scale is not None and self.quant_method.input_scale_domain == "tensor":
             group.all_reduce_max(scale)
