@@ -220,7 +220,7 @@ def plan_run(runtime: Worker, batch: Run) -> Run:
     if batch.lanes or not batch.operations:
         return batch
     if any(
-        params.offset + params.bytes > runtime.encoder_cache.byte_capacity
+        params.offset + params.bytes > runtime.info.buffer_pool_bytes
         for params in batch.buffer_allocations
     ):
         raise invalid_descriptor("run buffer params exceeds the worker buffer pool")

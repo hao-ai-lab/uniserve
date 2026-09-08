@@ -268,7 +268,7 @@ class Worker:
                 public_arena = request_tensor_arena_capacity(
                     worker_config,
                     pipeline_depth=pipeline_depth,
-                    product_bytes_per_request=model.product_storage_bytes,
+                    product_bytes_per_request=model.local_product_storage_bytes,
                 )
                 slots = tensor_slot_capacity(
                     schema,
@@ -276,7 +276,7 @@ class Worker:
                     maximum=worker_config.max_request_pool_size,
                     minimum=worker_config.min_request_pool_size,
                     available_bytes=max(0, available - public_arena.device_product_bytes),
-                    product_bytes_per_request=model.product_storage_bytes,
+                    product_bytes_per_request=model.local_product_storage_bytes,
                 )
                 worker_config = replace(
                     worker_config,
@@ -497,8 +497,9 @@ class Worker:
             event_pool=self.device_events,
         )
         self.persistent_buffers = PersistentBuffers(
-            byte_capacity=int(self._info.buffer_pool_bytes),
+            byte_capacity=int(layout.physical_buffer_pool_bytes),
             devices=owner_devices,
+            compact=layout.physical_buffer_pool_bytes < self._info.buffer_pool_bytes,
         )
         self.device_products = DeviceProducts(
             capacity=arena.device_products,

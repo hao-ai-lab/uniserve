@@ -258,6 +258,32 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
             kv=False, request_tensors=request_tensor_schema(layout)
         )
 
+    @property
+    def local_product_storage_bytes(self) -> int:
+        """Return rank-local storage while retaining global Tensor result bounds."""
+
+        rank = self.bindings.process_group.rank
+        total = 0
+        for entry, outputs in self.entry_outputs.items():
+            stores_output = rank in self.bindings.output_ranks(entry)
+            imports_output = (
+                entry == "text_encoder"
+                and rank in self.bindings.entries["denoiser"].ranks
+            )
+            if not stores_output and not imports_output:
+                continue
+            for output in outputs:
+                size = output.max_bytes
+                if entry == "video_decoder":
+                    size = (
+                        size
+                        * len(self.bindings.entries[entry].ranks)
+                        * self.bindings.entries[entry].units_per_rank
+                        // self.layout.video_reconstruction_units
+                    )
+                total += ((size + 255) // 256) * 256
+        return total
+
     def _build_page_execution(
         self,
         layout: H3Layout,

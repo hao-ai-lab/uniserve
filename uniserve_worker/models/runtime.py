@@ -182,6 +182,12 @@ class ExecutionModel(nn.Module):
             for output in outputs
         )
 
+    @property
+    def local_product_storage_bytes(self) -> int:
+        """Physical persistent storage required by one request on this rank."""
+
+        return self.product_storage_bytes
+
     @classmethod
     def build_checkpoint(
         cls, config: dict[str, Any], context: ModelBuildContext

@@ -106,7 +106,12 @@ def tensor_slot_capacity(
     group.all_reduce_min(agreed)
     count = int(agreed.item())
     if count < minimum:
-        raise RuntimeError("insufficient device memory for the required request tensor slots")
+        required_bytes = minimum * bytes_per_slot
+        raise RuntimeError(
+            "insufficient device memory for the required request tensor slots: "
+            f"{required_bytes} bytes required for {minimum} slots at "
+            f"{bytes_per_slot} bytes per slot, {available_bytes} bytes available"
+        )
     return count
 
 
@@ -246,7 +251,7 @@ def model_arena_capacity(
         return request_tensor_arena_capacity(
             worker_config,
             pipeline_depth=depth,
-            product_bytes_per_request=model.product_storage_bytes,
+            product_bytes_per_request=model.local_product_storage_bytes,
         )
     transfer_tickets = min(slots, _MAX_TRANSFER_ENTRIES)
     block_size = int(worker_config.block_size)

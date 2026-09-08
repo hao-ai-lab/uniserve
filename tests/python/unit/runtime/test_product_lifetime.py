@@ -29,6 +29,74 @@ from uniserve_worker.transfer.layout import TensorRegion
 from uniserve_worker.transfer.tickets import make_transport
 
 
+def test_compact_persistent_buffers_remap_live_logical_allocations() -> None:
+    reference = ProductRef(
+        request_key=RequestKey(1, 1, 1),
+        producer_op_id=1,
+        output_index=0,
+        generation=1,
+        kind=ProductKind.TENSOR,
+        storage_class=StorageClass.DEVICE_TENSOR,
+        dtype=DType.F32,
+        shape_bound=ShapeBound((StaticDim(32),)),
+        point_range=PointRange(),
+    )
+    second = replace(reference, producer_op_id=2)
+    third = replace(reference, producer_op_id=3)
+    buffers = PersistentBuffers(byte_capacity=512, devices=("cpu",), compact=True)
+    first_binding = buffers.bind(
+        reference,
+        BufferAllocation(reference.buffer_id, 4096, 512),
+        device="cpu",
+        dtype=torch.float32,
+        shape=(32,),
+    )
+    second_binding = buffers.bind(
+        second,
+        BufferAllocation(second.buffer_id, 8192, 512),
+        device="cpu",
+        dtype=torch.float32,
+        shape=(32,),
+    )
+    first_binding.tensor.fill_(1)
+    second_binding.tensor.fill_(2)
+
+    try:
+        torch.testing.assert_close(
+            first_binding.tensor,
+            torch.full_like(first_binding.tensor, 1),
+            rtol=0,
+            atol=0,
+        )
+        with pytest.raises(WorkerError, match="exceeds the worker buffer pool"):
+            buffers.bind(
+                third,
+                BufferAllocation(third.buffer_id, 12288, 512),
+                device="cpu",
+                dtype=torch.float32,
+                shape=(32,),
+            )
+        buffers.release(first_binding)
+        third_binding = buffers.bind(
+            third,
+            BufferAllocation(third.buffer_id, 12288, 512),
+            device="cpu",
+            dtype=torch.float32,
+            shape=(32,),
+        )
+        third_binding.tensor.fill_(3)
+        torch.testing.assert_close(
+            second_binding.tensor,
+            torch.full_like(second_binding.tensor, 2),
+            rtol=0,
+            atol=0,
+        )
+        buffers.release(third_binding)
+    finally:
+        buffers.release(second_binding)
+        buffers.close()
+
+
 @pytest.mark.parametrize("device", ("cpu", pytest.param("cuda:0", marks=pytest.mark.gpu)))
 @pytest.mark.parametrize("abandoned", (False, True))
 def test_kv_computation_retains_pages_through_output_completion_and_reuse(

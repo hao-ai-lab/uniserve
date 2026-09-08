@@ -51,6 +51,7 @@ class WorkerLayout:
     arena: ArenaCapacity
     input_geometry: InputGeometry | None
     fixed_device_bytes: tuple[tuple[str, int], ...]
+    physical_buffer_pool_bytes: int
     latent_width: int
     latent_dtype: str
     latent_downsample: int
@@ -359,6 +360,7 @@ def build_worker_layout(
         arena=arena,
         input_geometry=input_geometry,
         fixed_device_bytes=tuple(fixed_bytes.items()),
+        physical_buffer_pool_bytes=buffer_pool_bytes,
         latent_width=latent_width,
         latent_dtype=worker_config.model_dtype if flow is not None else "",
         latent_downsample=int(flow.latent_downsample) if flow is not None else 1,
@@ -438,6 +440,7 @@ def _request_tensor_worker_layout(
         ),
         input_geometry=None,
         fixed_device_bytes=(),
+        physical_buffer_pool_bytes=slots * model.local_product_storage_bytes,
         latent_width=1,
         latent_dtype="float32",
         latent_downsample=1,
