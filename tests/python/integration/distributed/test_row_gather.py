@@ -66,49 +66,72 @@ def _run_gather(rank: int, rendezvous: str) -> None:
                 torch.testing.assert_close(gathered, expected + 1, rtol=0, atol=0)
                 graph.reset()
                 del gathered, storage
-            storage = BoundedTensorStorage.allocate(
-                {
-                    "rows": TensorSchema(
-                        (256 * 512 * 2,), torch.uint8, memory="symmetric", group=group
+            for local_rows, width in ((128, 512), (16392, 2048)):
+                storage = BoundedTensorStorage.allocate(
+                    {
+                        "rows": TensorSchema(
+                            (local_rows * width * 4,),
+                            torch.uint8,
+                            memory="symmetric",
+                            group=group,
+                        )
+                    },
+                    device,
+                    environment=environment,
+                )
+                columns = (torch.arange(width, device=device) % 17).bfloat16() / 16
+                rows = columns.repeat(local_rows, 1).add_(rank)
+                rows.add_((torch.arange(local_rows, device=device) % 7).bfloat16()[:, None] / 16)
+                expected_rows = torch.cat([rows - rank + member for member in group.ranks])
+                for use_bias in (False, True):
+                    layer = LinearBase(
+                        width,
+                        256,
+                        layer_config=LayerConfig(Communicator(), None),
+                        bias=use_bias,
+                        sequence_group=group,
+                    ).to(device=device, dtype=torch.bfloat16)
+                    layer.weight.copy_(
+                        (torch.arange(256 * width, device=device).reshape(256, width) % 11) / 16
                     )
-                },
-                device,
-                environment=environment,
-            )
-            rows = (torch.arange(128 * 512, device=device).reshape(128, 512) % 17).bfloat16()
-            rows.mul_(1 / 16).add_(rank)
-            expected_rows = torch.cat([rows - rank + member for member in group.ranks])
-            for use_bias in (False, True):
-                layer = LinearBase(
-                    512,
-                    256,
-                    layer_config=LayerConfig(Communicator(), None),
-                    bias=use_bias,
-                    sequence_group=group,
-                ).to(device=device, dtype=torch.bfloat16)
-                layer.weight.copy_(
-                    (torch.arange(256 * 512, device=device).reshape(256, 512) % 11) / 16
-                )
-                if layer.bias is not None:
-                    layer.bias.copy_(torch.arange(256, device=device) / 16)
-                expected = torch.nn.functional.linear(expected_rows, layer.weight, layer.bias)
-                actual = layer.forward_sequence_parallel(rows, storage.capacity["rows"])
-                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-                torch.cuda.synchronize(device)
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
+                    if local_rows > 128:
+                        # The transport-tail case selects columns exactly, so
+                        # GEMM reduction heuristics cannot alter its oracle.
+                        layer.weight.zero_()
+                        columns = torch.arange(256, device=device)
+                        layer.weight[columns, columns * 7 % width] = 1
+                    if layer.bias is not None:
+                        layer.bias.copy_(torch.arange(256, device=device) / 16)
+                    expected = torch.nn.functional.linear(
+                        expected_rows, layer.weight, layer.bias
+                    )
                     actual = layer.forward_sequence_parallel(rows, storage.capacity["rows"])
-                rows.add_(1)
-                expected_rows.add_(1)
-                graph.replay()
-                expected = torch.nn.functional.linear(expected_rows, layer.weight, layer.bias)
-                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-                graph.reset()
-                actual = layer.forward_sequence_parallel(
-                    rows.view(8, 16, 512), storage.capacity["rows"]
-                )
-                torch.testing.assert_close(actual, expected.view(16, 16, 256), rtol=0, atol=0)
-            del storage
+                    torch.testing.assert_close(
+                        actual,
+                        expected,
+                        rtol=0,
+                        atol=0,
+                        msg=f"ranks={group.ranks}, rows={local_rows}, bias={use_bias}",
+                    )
+                    torch.cuda.synchronize(device)
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        actual = layer.forward_sequence_parallel(rows, storage.capacity["rows"])
+                    rows.add_(1)
+                    expected_rows.add_(1)
+                    graph.replay()
+                    expected = torch.nn.functional.linear(
+                        expected_rows, layer.weight, layer.bias
+                    )
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                    graph.reset()
+                    actual = layer.forward_sequence_parallel(
+                        rows.view(8, local_rows // 8, width), storage.capacity["rows"]
+                    )
+                    torch.testing.assert_close(
+                        actual, expected.view(16, local_rows // 8, 256), rtol=0, atol=0
+                    )
+                del storage
     finally:
         environment.close()
         dist.destroy_process_group()

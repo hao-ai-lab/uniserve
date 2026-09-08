@@ -69,14 +69,31 @@ def _all_gather_linear(
 ) -> torch.Tensor:
     group = _process_group(group_name)
     rows = input.shape[0]
-    sources = workspace.view(len(backend_order), *input.shape)
+    width = input.shape[1]
+    members = len(backend_order)
     local_rank = group.rank()
-    sources[local_rank].copy_(input)
-    work = dist.all_gather_into_tensor(
-        workspace, sources[local_rank], group=group, async_op=True
-    )
-    output = input.new_empty((rows * len(backend_order), weight.shape[0]))
-    targets = output.view(len(backend_order), rows, weight.shape[0])
+    # Bound each peer transfer while retaining contiguous GEMM row intervals.
+    # All segments share the caller's registered allocation; the transport
+    # layout is segment-major, then backend rank, then local row.
+    segment_rows = max(1, ((64 * 1024 * 1024) // (width * input.element_size()) // 128) * 128)
+    segments = []
+    for start in range(0, rows, segment_rows):
+        count = min(segment_rows, rows - start)
+        gathered = workspace.narrow(0, start * members, count * members)
+        sources = gathered.view(members, count, width)
+        sources[local_rank].copy_(input[start : start + count])
+        segments.append((start, count, gathered, sources))
+
+    # Stage every source before submitting collectives, so later NCCL waits
+    # refer only to staging work and cannot depend on earlier GEMM consumers.
+    pending = [
+        dist.all_gather_into_tensor(
+            gathered, sources[local_rank], group=group, async_op=True
+        )
+        for _, _, gathered, sources in segments
+    ]
+    output = input.new_empty((rows * members, weight.shape[0]))
+    targets = output.view(members, rows, weight.shape[0])
 
     def project(source: torch.Tensor, target: torch.Tensor) -> None:
         if bias is None:
@@ -84,14 +101,14 @@ def _all_gather_linear(
         else:
             torch.addmm(bias, source, weight.t(), out=target)
 
-    # The local input is independent of the peer writes. Compute its projection
-    # while the communication stream gathers the remaining rows, then consume
-    # those rows only after the collective has joined the calling stream.
+    # The local input is independent of peer writes. Each completed segment
+    # unlocks its remote GEMM while later transfers continue on the NCCL stream.
     project(input, targets[backend_order[local_rank]])
-    _finish(work, input)
-    for backend_rank, logical_rank in enumerate(backend_order):
-        if backend_rank != local_rank:
-            project(sources[backend_rank], targets[logical_rank])
+    for (start, count, _, sources), work in zip(segments, pending, strict=True):
+        _finish(work, input)
+        for backend_rank, logical_rank in enumerate(backend_order):
+            if backend_rank != local_rank:
+                project(sources[backend_rank], targets[logical_rank, start : start + count])
     return output
 
 
@@ -322,7 +339,7 @@ class Communicator:
 
         The caller owns contiguous workspace for all input rows. Registered
         symmetric storage permits the backend to gather through copy engines.
-        Its contents are scratch and remain in backend rank order on return.
+        Its contents are scratch with a transport-owned segmented layout.
         """
 
         if input.ndim != 2 or weight.ndim != 2 or input.shape[1] != weight.shape[1]:
