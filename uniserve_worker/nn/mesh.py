@@ -58,6 +58,48 @@ def _all_gather_into_tensor_fake(output, input, group_name):
     pass
 
 
+@torch.library.custom_op("uniserve_worker::all_gather_linear", mutates_args=("workspace",))
+def _all_gather_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    workspace: torch.Tensor,
+    group_name: str,
+    backend_order: list[int],
+) -> torch.Tensor:
+    group = _process_group(group_name)
+    rows = input.shape[0]
+    sources = workspace.view(len(backend_order), *input.shape)
+    local_rank = group.rank()
+    sources[local_rank].copy_(input)
+    work = dist.all_gather_into_tensor(
+        workspace, sources[local_rank], group=group, async_op=True
+    )
+    output = input.new_empty((rows * len(backend_order), weight.shape[0]))
+    targets = output.view(len(backend_order), rows, weight.shape[0])
+
+    def project(source: torch.Tensor, target: torch.Tensor) -> None:
+        if bias is None:
+            torch.mm(source, weight.t(), out=target)
+        else:
+            torch.addmm(bias, source, weight.t(), out=target)
+
+    # The local input is independent of the peer writes. Compute its projection
+    # while the communication stream gathers the remaining rows, then consume
+    # those rows only after the collective has joined the calling stream.
+    project(input, targets[backend_order[local_rank]])
+    _finish(work, input)
+    for backend_rank, logical_rank in enumerate(backend_order):
+        if backend_rank != local_rank:
+            project(sources[backend_rank], targets[logical_rank])
+    return output
+
+
+@_all_gather_linear.register_fake
+def _all_gather_linear_fake(input, weight, bias, workspace, group_name, backend_order):
+    return input.new_empty((input.shape[0] * len(backend_order), weight.shape[0]))
+
+
 @torch.library.custom_op("uniserve_worker::all_to_all_single_into", mutates_args=("output",))
 def _all_to_all_single_into(
     output: torch.Tensor,
@@ -268,6 +310,35 @@ class Communicator:
             targets = output.reshape(self.world_size, *input.shape)
             for backend_rank, logical_rank in enumerate(self._backend_order):
                 targets[logical_rank].copy_(sources[backend_rank])
+
+    def all_gather_linear(
+        self,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        workspace: torch.Tensor,
+    ) -> torch.Tensor:
+        """Project equal row shards into logical rank order with communication overlap.
+
+        The caller owns contiguous workspace for all input rows. Registered
+        symmetric storage permits the backend to gather through copy engines.
+        Its contents are scratch and remain in backend rank order on return.
+        """
+
+        if input.ndim != 2 or weight.ndim != 2 or input.shape[1] != weight.shape[1]:
+            raise ValueError("gathered projection requires compatible input and weight matrices")
+        if self.world_size == 1:
+            return torch.nn.functional.linear(input, weight, bias)
+        byte_count = input.numel() * input.element_size() * self.world_size
+        if not workspace.is_contiguous() or workspace.device != input.device:
+            raise ValueError("gathered projection requires contiguous workspace on the input device")
+        if workspace.numel() * workspace.element_size() < byte_count:
+            raise ValueError("gathered projection workspace cannot hold all input rows")
+        gathered = workspace.view(torch.uint8).view(-1)[:byte_count].view(input.dtype)
+        gathered = gathered.view(input.shape[0] * self.world_size, input.shape[1])
+        return _all_gather_linear(
+            input, weight, bias, gathered, self._require().group_name, list(self._backend_order)
+        )
 
     def all_to_all_single_into(
         self,

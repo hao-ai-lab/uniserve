@@ -239,6 +239,13 @@ class LinearBase(nn.Module):
             raise RuntimeError("sequence projection requires a construction-time sequence_group")
         if group.world_size == 1:
             return self.forward(x)
+        if not self.quant_method.is_quantized and x.is_cuda:
+            projected = group.all_gather_linear(
+                x.reshape(-1, x.shape[-1]), self.weight, self.execution_bias, workspace
+            )
+            return projected.view(
+                x.shape[0] * group.world_size, *x.shape[1:-1], self.output_size
+            )
         scale = self.quant_method.input_scale(x)
         if scale is not None and self.quant_method.input_scale_domain == "tensor":
             group.all_reduce_max(scale)
