@@ -35,7 +35,7 @@ class WarmupFailure(RuntimeError):
         """Capture warmup outputs and summarize the first failure."""
 
         self.outputs = tuple(outputs)
-        first = outputs[0] if outputs else None
+        first = next((output for output in outputs if not getattr(output, "success", False)), None)
         super().__init__(
             "Warmup failed -- check the benchmark arguments and server. "
             f"First classifier: {getattr(first, 'classifier', None)}; "
@@ -72,20 +72,8 @@ async def run_load(
     if not rows:
         return LoadResult((), (), 0.0)
 
-    # Warmup exercises the same request path but remains outside both the profiler
-    # window and the reported duration.
-    warmup_outputs: list[T] = []
-    if warmup_requests > 0:
-        warmup_outputs = await asyncio.gather(
-            *[submit(rows[0], None) for _ in range(warmup_requests)]
-        )
-        if not all(getattr(output, "success", False) for output in warmup_outputs):
-            raise WarmupFailure(list(warmup_outputs))
-
-    await asyncio.sleep(1.0)
-
-    # The semaphore bounds in-flight requests without changing the configured
-    # arrival schedule; queueing behind it remains part of request latency.
+    # Warmup and measurement share the declared in-flight limit. Queueing at
+    # this boundary leaves measured arrival timestamps unchanged.
     semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else None
 
     async def limited(row: Example, scheduled: float | None) -> T:
@@ -95,6 +83,18 @@ async def run_load(
             return await submit(row, scheduled)
         async with semaphore:
             return await submit(row, scheduled)
+
+    # Warmup exercises the same request path but remains outside both the profiler
+    # window and the reported duration.
+    warmup_outputs: list[T] = []
+    if warmup_requests > 0:
+        warmup_outputs = await asyncio.gather(
+            *[limited(rows[0], None) for _ in range(warmup_requests)]
+        )
+        if not all(getattr(output, "success", False) for output in warmup_outputs):
+            raise WarmupFailure(list(warmup_outputs))
+
+    await asyncio.sleep(1.0)
 
     if measurement is not None:
         measurement.start()
