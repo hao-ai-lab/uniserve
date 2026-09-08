@@ -26,7 +26,6 @@ impl EngineClient {
             max_model_len: self.max_model_len(),
             model_dtype: self.model_dtype(),
             generation_limits: self.generation_limits(),
-            components: self.component_deployment(),
             sampling_controls: if self.supports_token_sampling() {
                 crate::serving::ServedSamplingControl::ALL.to_vec()
             } else {
@@ -59,8 +58,6 @@ pub struct EngineSnapshot {
     pub model_dtype: uniserve_core::ModelDtype,
     /// Runtime generation features and resource limits.
     pub generation_limits: uniserve_core::GenerationLimits,
-    /// Finalized component geometry reported by the running workers.
-    pub components: std::collections::BTreeMap<String, uniserve_core::ComponentDeployConfig>,
     /// Sampling controls supported by this engine.
     pub sampling_controls: Vec<crate::serving::ServedSamplingControl>,
 }

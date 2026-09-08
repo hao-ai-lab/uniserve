@@ -11,17 +11,69 @@ use uniserve_core::{
     ContextSegment, FeedbackNextToken, FeedbackSource, GeneratedImageFeedbackRecipe,
     GenerationBehaviorDescriptor, GenerationConstraint, GenerationLimits,
     GenerationPolicyDescriptor, GenerationRequest, GenerationResourceBounds, ImageIngestRecipe,
-    ImageKvEffect, ImageParams, ImageSegment, RequestId, SamplingParams, SegmentPlacement,
+    ImageKvEffect, ImageParams, ImageSegment, RequestId, SamplingParams, SegmentPosition,
     TriggerPolicyDescriptor, UndVisibility,
 };
 use uniserve_core::{Event, FinishReason};
 use uniserve_engine::{
-    ControlTokens, EngineHandle, EngineLoop, Executor, MultiprocExecutor, PhysicalExecutor,
-    SchedulingPolicy, SimEngine, SimExecutor,
+    ControlTokens, EngineHandle, EngineLoop, SchedulingPolicy, SimEngine, SimExecutor,
 };
 
 fn ctrl() -> ControlTokens {
     ControlTokens::default()
+}
+
+#[test]
+fn generation_capabilities_require_complete_paths_and_distinct_encoders() {
+    use uniserve_core::GenerationFeatures;
+    use uniserve_worker_ipc::OpCode;
+
+    let image_path = vec![
+        OpCode::DiffusionPrepare,
+        OpCode::DiffusionStep,
+        OpCode::DiffusionFinalize,
+    ];
+    let cases = [
+        (
+            vec![OpCode::EncoderVision],
+            GenerationFeatures::VISION_ENCODE,
+        ),
+        (
+            vec![OpCode::EncoderLatent],
+            GenerationFeatures::LATENT_ENCODE,
+        ),
+        (
+            vec![OpCode::EncoderVision, OpCode::EncoderLatent],
+            GenerationFeatures::VISION_ENCODE | GenerationFeatures::LATENT_ENCODE,
+        ),
+        (image_path, GenerationFeatures::IMAGE_GENERATION),
+        (
+            vec![OpCode::DiffusionStep, OpCode::DiffusionFinalize],
+            GenerationFeatures::empty(),
+        ),
+        (
+            vec![OpCode::DiffusionPrepare, OpCode::DiffusionFinalize],
+            GenerationFeatures::empty(),
+        ),
+        (
+            vec![
+                OpCode::DiffusionPrepare,
+                OpCode::DiffusionStep,
+                OpCode::DiffusionDecode,
+            ],
+            GenerationFeatures::empty(),
+        ),
+    ];
+    for (operations, expected) in cases {
+        let mut sim = SimEngine::new();
+        sim.mut_info_for_test().supported_ops = vec![OpCode::ArExtend, OpCode::ArDecode];
+        sim.mut_info_for_test().supported_ops.extend(operations);
+        let scheduler = EngineLoop::new(Box::new(SimExecutor::new(sim)), ctrl(), 32);
+        assert_eq!(
+            scheduler.runtime_profile().generation_limits.features,
+            GenerationFeatures::UNDERSTANDING | expected,
+        );
+    }
 }
 
 fn text_context(token_ids: Vec<u32>) -> Vec<ContextSegment> {
@@ -48,7 +100,7 @@ fn context_with_image(
             image: ImageSegment {
                 hash,
                 b64: "aW1hZ2U=".to_string(),
-                placement: SegmentPlacement::AtToken { position },
+                position: SegmentPosition::AtToken { position },
             },
             ingest: ImageIngestRecipe::vit_only(
                 logical_positions,
@@ -1191,11 +1243,12 @@ fn multimodal_encode_then_cache_hit() {
     use std::sync::atomic::Ordering;
     let mut sim = SimEngine::new();
     sim.set_pipeline_depth(2);
-    let executor = Box::new(SimExecutor::new(sim));
-    let sched = EngineLoop::new(executor, ctrl(), 32);
+    let executor = SimExecutor::new(sim);
+    let wake = executor.command_waker();
+    let sched = EngineLoop::new(Box::new(executor), ctrl(), 32);
     let stats = sched.stats_handle();
     let (tx, rx) = crossbeam_channel::unbounded();
-    let handle = EngineHandle::new(tx);
+    let handle = EngineHandle::with_waker(tx, wake);
     let jh = thread::spawn(move || sched.run(rx));
 
     let run_img = |rid: u64, handle: &EngineHandle| -> (bool, Vec<String>) {
@@ -1917,61 +1970,6 @@ fn commit_eos_finishes_without_spending_remaining_budget() {
     assert_eq!(
         text, 0,
         "the gen commit should not emit hidden Und text filler"
-    );
-}
-
-/// the async Executor seam fronts a MultiWorkerExecutor (2 ranks) with no
-/// scheduler change — a batch fans out to both ranks, results join, and requests
-/// complete identically to the single-worker path.
-#[test]
-fn multiworker_executor_drives_scheduler_unchanged() {
-    let mk = |rank| {
-        let mut sim = SimEngine::new();
-        sim.set_pipeline_depth(2);
-        sim.mut_info_for_test().rank.rank = rank;
-        sim.mut_info_for_test().rank.world_size = 2;
-        Box::new(SimExecutor::new(sim)) as Box<dyn PhysicalExecutor>
-    };
-    let executor = Box::new(MultiprocExecutor::new(vec![mk(0), mk(1)]).unwrap());
-    // rank-aware info reflect the topology at the handshake.
-    assert_eq!(executor.info().single_pool().rank.world_size, 2);
-    let sched = EngineLoop::new(executor, ctrl(), 32);
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let handle = EngineHandle::new(tx);
-    let jh = thread::spawn(move || sched.run(rx));
-
-    let mut rxs = std::collections::HashMap::new();
-    for id in 1..=3u64 {
-        let erx = handle
-            .submit(generation_request(
-                RequestId(id),
-                text_context(vec![1, 2, 3]),
-                SamplingParams::default(),
-                ImageParams::default(),
-                GenerationConstraint::UndOnly,
-                16,
-            ))
-            .unwrap();
-        rxs.insert(RequestId(id), erx);
-    }
-    let mut done = 0;
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let total = rxs.len();
-    while done < total && Instant::now() < deadline {
-        for erx in rxs.values_mut() {
-            while let Ok(ev) = erx.try_recv() {
-                if matches!(ev, Event::Finished { .. }) {
-                    done += 1;
-                }
-            }
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
-    handle.shutdown();
-    let _ = jh.join();
-    assert_eq!(
-        done, total,
-        "all requests must finish under the multi-worker executor"
     );
 }
 

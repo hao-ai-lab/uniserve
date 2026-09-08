@@ -6,6 +6,7 @@ from collections.abc import Sequence
 
 import torch
 
+from ..execution.bounded_storage import BoundedTensorStorage, TensorSchema
 from ..foundation.errors import invalid_descriptor
 from .device import HostStagingRing, fill_cpu_ints
 
@@ -49,30 +50,24 @@ class ReqToTokenPool:
         ):
             raise invalid_descriptor("request-to-token pool geometry is invalid")
 
-        rows = self.request_pool_size + 1
-        self.page_tables = torch.zeros(
-            (self.group_count, rows, self.max_blocks_per_request),
-            dtype=torch.int32,
-            device=device,
-        )
-        self.verified_lens = torch.zeros(rows, dtype=torch.int32, device=device)
-        self.alloced_lens = torch.zeros(rows, dtype=torch.int32, device=device)
+        self._table_capacity = self.request_pool_size * self.group_count
+        tensors = BoundedTensorStorage.allocate(
+            self.tensor_schema(
+                group_count=self.group_count,
+                request_pool_size=self.request_pool_size,
+                max_blocks_per_request=self.max_blocks_per_request,
+            ),
+            device,
+        ).capacity
+        self.page_tables = tensors["page_tables"]
+        self.verified_lens = tensors["verified_lens"]
+        self.alloced_lens = tensors["alloced_lens"]
+        self._page_staging = tensors["_page_staging"]
+        self._slot_staging = tensors["_slot_staging"]
+        self._group_staging = tensors["_group_staging"]
+        self._allocated_staging = tensors["_allocated_staging"]
         self._host_tables: dict[tuple[int, int], tuple[int, ...]] = {}
         self._host_alloced_lens: dict[int, int] = {}
-
-        # A single install may replace every request/group table, so staging is
-        # sized for the full Cartesian capacity rather than the live batch.
-        self._table_capacity = self.request_pool_size * self.group_count
-        self._page_staging = torch.empty(
-            (self._table_capacity, self.max_blocks_per_request),
-            dtype=torch.int32,
-            device=device,
-        )
-        self._slot_staging = torch.empty(self._table_capacity, dtype=torch.int64, device=device)
-        self._group_staging = torch.empty_like(self._slot_staging)
-        self._allocated_staging = torch.empty(
-            self._table_capacity, dtype=torch.int32, device=device
-        )
 
         # Generation-safe pinned rings retain CPU sources until asynchronous
         # copies into all four device staging tensors have completed.
@@ -100,6 +95,27 @@ class ReqToTokenPool:
             depth=staging_depth,
             device=self.page_tables.device,
         )
+
+    @staticmethod
+    def tensor_schema(
+        *, group_count: int, request_pool_size: int, max_blocks_per_request: int
+    ) -> dict[str, TensorSchema]:
+        """Describe page tables and the full request/group installation workspace."""
+
+        if min(group_count, request_pool_size, max_blocks_per_request) < 1:
+            raise invalid_descriptor("request-to-token pool geometry is invalid")
+        rows, tables = request_pool_size + 1, request_pool_size * group_count
+        return {
+            "page_tables": TensorSchema(
+                (group_count, rows, max_blocks_per_request), torch.int32, fill=0
+            ),
+            "verified_lens": TensorSchema((rows,), torch.int32, fill=0),
+            "alloced_lens": TensorSchema((rows,), torch.int32, fill=0),
+            "_page_staging": TensorSchema((tables, max_blocks_per_request), torch.int32),
+            "_slot_staging": TensorSchema((tables,), torch.int64),
+            "_group_staging": TensorSchema((tables,), torch.int64),
+            "_allocated_staging": TensorSchema((tables,), torch.int32),
+        }
 
     def install(
         self,

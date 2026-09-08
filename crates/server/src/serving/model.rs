@@ -4,7 +4,7 @@
 //! output processing. Its [`ResolvedModel::tokenize`] method lowers
 //! [`GenerateReqInput`] into [`TokenizedGenerateReqInput`].
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -14,7 +14,7 @@ use crate::profile::omni::bagel::BagelProfile;
 use crate::profile::omni::sensenova::SenseNovaProfile;
 use crate::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer, TokenizerError};
 use crate::profile::{
-    CommonModelProfile, ModelDescription, ModelIdentity, ModelProfile, ProfileDeploymentConfig,
+    CommonModelProfile, ModelDescription, ModelIdentity, ModelProfile, ProfileOverrides,
 };
 use thiserror::Error;
 use uniserve_core::{
@@ -225,12 +225,6 @@ pub enum OmniPreprocessing {
 #[derive(Debug, Error)]
 /// Failure while resolving a configured model and its assets.
 pub enum ModelResolutionError {
-    /// A required component has no finalized executing geometry.
-    #[error("running workers did not publish valid `{component}` component geometry")]
-    ComponentGeometry {
-        /// Required component identity.
-        component: &'static str,
-    },
     /// Model files or profile metadata cannot be resolved.
     #[error(transparent)]
     Assets(#[from] crate::profile::assets::Error),
@@ -287,7 +281,7 @@ impl ResolvedAssets {
 
         let files = ResolvedModelFiles::new(&config.model).await?;
         let tokenizer: DynTokenizer = Arc::new(HuggingFaceTokenizer::new(&files.tokenizer_path)?);
-        let deployment = ProfileDeploymentConfig {
+        let configuration = ProfileOverrides {
             chat_template_override: config.chat_template.clone(),
             max_model_tokens: config.engine.max_model_len,
         };
@@ -295,7 +289,7 @@ impl ResolvedAssets {
             config.model_description,
             &served_name,
             &files,
-            &deployment,
+            &configuration,
             tokenizer.as_ref(),
         )?;
         let max_model_tokens = config
@@ -343,7 +337,7 @@ impl ResolvedAssets {
         description: ModelDescription,
         served_name: &str,
         files: &ResolvedModelFiles,
-        deployment: &ProfileDeploymentConfig,
+        configuration: &ProfileOverrides,
         tokenizer: DynTokenizer,
         renderer: HfChatRenderer,
     ) -> std::result::Result<Self, ModelResolutionError> {
@@ -351,7 +345,7 @@ impl ResolvedAssets {
             description,
             served_name,
             files,
-            deployment,
+            configuration,
             tokenizer.as_ref(),
         )?;
         Ok(match profile {
@@ -491,7 +485,6 @@ pub struct MiniMaxH3Desc {
     tokenizer: DynTokenizer,
     max_prompt_tokens: u32,
     max_video_seconds: f64,
-    decoder_width: u32,
 }
 
 impl ResolvedModel {
@@ -505,7 +498,6 @@ impl ResolvedModel {
         sampling_controls: Vec<ServedSamplingControl>,
         max_model_tokens: u32,
         parse_reasoning: bool,
-        components: &BTreeMap<String, uniserve_core::ComponentDeployConfig>,
     ) -> Result<Self> {
         // Resolution validates each asset family against the runtime features
         // required by its public serving contract.
@@ -589,33 +581,12 @@ impl ResolvedModel {
                 profile,
                 tokenizer,
                 max_video_seconds,
-            } => {
-                let decoder = components
-                    .get("video_decoder")
-                    .filter(|component| {
-                        component.distribution
-                            == Some(uniserve_core::ComponentDistribution::TemporalUnits)
-                            && component.units_per_rank == 1
-                            && !component.ranks.is_empty()
-                    })
-                    .ok_or_else(|| {
-                        ServeError::ModelResolution(ModelResolutionError::ComponentGeometry {
-                            component: "video_decoder",
-                        })
-                    })?;
-                let decoder_width = u32::try_from(decoder.ranks.len()).map_err(|_| {
-                    ServeError::ModelResolution(ModelResolutionError::ComponentGeometry {
-                        component: "video_decoder",
-                    })
-                })?;
-                Ok(Self::Media(MiniMaxH3Desc {
-                    identity: profile.identity,
-                    tokenizer,
-                    max_prompt_tokens: max_model_tokens,
-                    max_video_seconds,
-                    decoder_width,
-                }))
-            }
+            } => Ok(Self::Media(MiniMaxH3Desc {
+                identity: profile.identity,
+                tokenizer,
+                max_prompt_tokens: max_model_tokens,
+                max_video_seconds,
+            })),
         }
     }
 
@@ -686,7 +657,7 @@ impl ResolvedModel {
             return Err(ServeError::Tokenize {
                 request_id: request_id.clone(),
                 source: crate::serving::TokenizeError::Invalid(
-                    "video duration cannot be represented by the deployment".to_string(),
+                    "video duration cannot be represented by the configuration".to_string(),
                 ),
             });
         }
@@ -708,16 +679,12 @@ impl ResolvedModel {
                     "video prompt token count exceeds the protocol width".to_string(),
                 ),
             })?;
-        // Temporal decoder placement rounds video units up across its owners and
-        // reserves two terminal units for the media pipeline.
+        // Reconstruction windows are part of the model's temporal geometry.
         let video_units = (frame_count - 5) / 17;
-        let decode_units = video_units
-            .div_ceil(description.decoder_width)
-            .saturating_add(2);
         Ok((
             uniserve_core::MediaGeometry {
                 frame_count,
-                decode_units,
+                video_units,
                 prompt_tokens,
                 denoise_steps: 4,
             },

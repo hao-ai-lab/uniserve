@@ -1,4 +1,5 @@
 """CFG post-guidance renorm and RMSNorm against an explicit fp32 reference."""
+
 from __future__ import annotations
 
 import pytest
@@ -191,3 +192,27 @@ def test_rmsnorm_matches_fp32_reference_exactly_on_cuda():
     expected = _rms_reference(x, weight, 1e-6)
 
     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_rmsnorm_fp32_affine_rounds_only_the_weighted_result(device, dtype):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA RMSNorm needs a device")
+    generator = torch.Generator(device=device).manual_seed(181)
+    module = RMSNorm(128, 1e-5, affine_in_fp32=True, device=device).to(dtype)
+    with torch.no_grad():
+        module.weight.copy_(torch.randn((128,), generator=generator, device=device))
+        values = torch.randn((3, 5, 128), generator=generator, device=device).to(dtype)
+        residual = torch.randn(values.shape, generator=generator, device=device).to(dtype)
+        expected = torch.nn.functional.rms_norm(
+            values.float(), (128,), weight=module.weight.float(), eps=1e-5
+        ).to(dtype)
+        torch.testing.assert_close(module(values), expected)
+        normalized, combined = module.forward_with_residual(values, residual)
+        expected_sum = values + residual
+        expected_normalized = torch.nn.functional.rms_norm(
+            expected_sum.float(), (128,), weight=module.weight.float(), eps=1e-5
+        ).to(dtype)
+        torch.testing.assert_close(combined, expected_sum, rtol=0, atol=0)
+        torch.testing.assert_close(normalized, expected_normalized)

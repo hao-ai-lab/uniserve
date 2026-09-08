@@ -11,7 +11,7 @@ use serde_json::Value;
 use uniserve_engine::{
     DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
     DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS, SchedulingPolicy, TransportMap,
-    WorkerProcessArgs, WorkerTopology,
+    WorkerConfig, WorkerProcessArgs,
 };
 
 /// How the HTTP server obtains its listening socket.
@@ -73,11 +73,8 @@ pub struct EngineSettings {
     pub max_model_len: Option<u32>,
     /// Largest request duration resident media state is sized to serve.
     pub max_video_seconds: f64,
-    /// Number of physical worker rank processes in the default Full pool.
-    /// Staged-worker topology, e.g. `encoder:2,prefill:1:ranks=4,decode:1:ranks=4`.
-    /// `None` selects one Full pool. A multi-stage layout
-    /// composes pools behind a `StagedExecutor`.
-    pub workers: WorkerTopology,
+    /// Static Worker configurations with ordered ranks and named computation entries.
+    pub workers: Vec<WorkerConfig>,
     /// Per-edge data-plane transfer backend (`--transfer`), e.g.
     /// `encoder->prefill=shm,prefill->decode=cuda_ipc`.
     pub transfer: TransportMap,
@@ -98,7 +95,7 @@ impl Default for EngineSettings {
             scheduler_policy: SchedulingPolicy::Fcfs,
             max_model_len: None,
             max_video_seconds: 15.0,
-            workers: WorkerTopology::single_full(1),
+            workers: vec![WorkerConfig::model("cuda", 1, 2)],
             transfer: TransportMap::default(),
             worker_process: WorkerProcessArgs {
                 resp_slot_cap: EngineSettings::DEFAULT_RESP_SLOT_CAP,
@@ -257,16 +254,7 @@ impl EngineSettings {
             self.worker_process.resp_slot_cap > 0,
             "resp_slot_cap must be greater than 0"
         );
-        anyhow::ensure!(
-            !self.workers.pools.is_empty()
-                && self.workers.pools.iter().all(|pool| {
-                    !pool.id.0.is_empty()
-                        && !pool.device.is_empty()
-                        && pool.worker_ranks > 0
-                        && !pool.supported_ops.is_empty()
-                }),
-            "workers must contain explicit ids, devices, supported operations, and positive physical worker counts"
-        );
+        WorkerConfig::validate_all(&self.workers)?;
         Ok(())
     }
 }

@@ -13,7 +13,7 @@ use crate::serving::text::TextDecodeOptions;
 use crate::serving::text::tokenizer::DynTokenizer;
 use crate::serving::{CacheAccounting, ResourceAccounting, ServeRequestId};
 
-/// One supported public input image. Model-specific placement is resolved by
+/// One supported public input image. Model-specific params is resolved by
 /// [`crate::serving::model::ResolvedModel::tokenize`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageInput {

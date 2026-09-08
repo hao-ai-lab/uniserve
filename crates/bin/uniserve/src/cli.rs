@@ -15,7 +15,7 @@ use uniserve_core::{KvCacheDtype, ModelDtype};
 use uniserve_engine::{
     AttentionBackend, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
     DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS,
-    FlashInferBackend, LaneConfig, TransportMap, WorkerProcessArgs, WorkerTopology,
+    FlashInferBackend, LaneConfig, TransportMap, WorkerConfig, WorkerProcessArgs,
 };
 use uniserve_server::{
     ChatTemplateContentFormatOption, Config, EngineBackendKind, EngineSettings, HttpListenerMode,
@@ -127,7 +127,7 @@ pub(crate) struct SharedRuntimeArgs {
     /// context length (`max_position_embeddings`) is used.
     #[arg(long = "max-model-len")]
     pub max_model_len: Option<u32>,
-    /// Maximum request duration provisioned by a media deployment.
+    /// Maximum request duration provisioned by a media configuration.
     #[arg(long = "max-video-seconds", default_value_t = 15.0)]
     pub max_video_seconds: f64,
     /// Optional explicit KV token capacity override for the worker.
@@ -150,17 +150,14 @@ pub(crate) struct SharedRuntimeArgs {
     /// Python interpreter used to launch the forward-only worker.
     #[arg(long, default_value_os_t = default_worker_python(), hide = true)]
     pub worker_python: std::path::PathBuf,
-    /// Number of physical worker processes when deployment is omitted.
+    /// Number of physical worker processes when configuration is omitted.
     #[arg(long = "worker-ranks", default_value_t = 1, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub worker_ranks: usize,
-    /// Staged-worker topology, e.g. `encoder:2,prefill:1:ranks=4,decode:1:ranks=4`.
-    /// Unset = a single Full pool; a multi-stage layout composes local pools
-    /// behind a StagedExecutor.
-    #[arg(long, hide = true)]
-    pub workers: Option<WorkerTopology>,
-    /// Per-edge data-plane transfer backend, e.g.
-    /// `encoder->prefill=shm,prefill->decode=cuda_ipc`.
-    #[arg(long, hide = true)]
+    /// JSON array of Worker configurations, including each replica's node/device ranks.
+    #[arg(long, value_parser = parse_workers)]
+    pub workers: Option<Box<[WorkerConfig]>>,
+    /// Directed product bindings: source[:rank]->destination[:rank]=backend.
+    #[arg(long)]
     pub transfer: Option<TransportMap>,
     /// KV block size in tokens (the page size).
     #[arg(long = "page-size", default_value_t = 64, value_parser = clap::builder::RangedU64ValueParser::<u32>::new().range(1..))]
@@ -262,16 +259,6 @@ impl SharedRuntimeArgs {
         let mut worker_process = self.worker_process.to_args();
         worker_process.python = self.worker_python.clone();
         worker_process.model = self.model.clone();
-        worker_process.device = self.device.clone();
-        if worker_process.deployment.is_none() && is_media {
-            worker_process.deployment = Some(uniserve_engine::StageDeployConfig::h3(
-                (0..self.worker_ranks).collect(),
-            ));
-        }
-        worker_process.world_size = worker_process
-            .deployment
-            .as_ref()
-            .map_or(self.worker_ranks, |deployment| deployment.devices.len());
         worker_process.pipeline_depth = self.pipeline_depth;
         worker_process.resp_slot_cap = if is_media {
             EngineSettings::MEDIA_IPC_SLOT_CAP
@@ -297,10 +284,13 @@ impl SharedRuntimeArgs {
             // an explicit `--max-model-len` overrides it.
             max_model_len: self.max_model_len,
             max_video_seconds: self.max_video_seconds,
-            workers: self
-                .workers
-                .clone()
-                .unwrap_or_else(|| WorkerTopology::single_full(worker_process.world_size)),
+            workers: self.workers.clone().map(Vec::from).unwrap_or_else(|| {
+                vec![if is_media {
+                    WorkerConfig::h3(&self.device, self.worker_ranks, self.pipeline_depth)
+                } else {
+                    WorkerConfig::model(&self.device, self.worker_ranks, self.pipeline_depth)
+                }]
+            }),
             transfer: self.transfer.clone().unwrap_or_default(),
             worker_process,
         }
@@ -367,15 +357,12 @@ pub(crate) struct WorkerProcessOptions {
     #[arg(long = "mem-fraction-static", default_value = "0.70")]
     pub kv_memory_fraction: f64,
     /// Parallelism mesh forwarded to the Python worker, e.g.
-    /// `tower=text:cuda:0;gen:cuda:1,tower-kv-capacity=65536`.
+    /// `tower=text:cuda:0;gen:cuda:1`.
     #[arg(long, hide = true)]
     pub worker_mesh: Option<String>,
-    /// JSON device placement and per-component parallel configuration.
-    #[arg(long)]
-    pub deployment: Option<uniserve_engine::StageDeployConfig>,
     #[arg(long, hide = true)]
     pub distributed_backend: Option<String>,
-    /// Repeatable JSON descriptor for a deployment-static execution lane.
+    /// Repeatable JSON descriptor for a configuration-static execution lane.
     #[arg(long = "lane")]
     pub lanes: Vec<LaneConfig>,
     #[arg(long, action = ArgAction::Set, default_value_t = true, hide = true)]
@@ -422,7 +409,6 @@ impl WorkerProcessOptions {
             kv_cache_dtype: self.kv_cache_dtype.clone(),
             kv_memory_fraction: self.kv_memory_fraction.clone(),
             mesh: self.worker_mesh.clone(),
-            deployment: self.deployment.clone(),
             distributed_backend: self.distributed_backend.clone(),
             lanes: self.lanes.clone(),
             cuda_graph: self.cuda_graph,
@@ -578,7 +564,7 @@ mod tests {
             "--lane",
             r#"{"lane_id":"decode","sm_budget":64,"domains":["decode"]}"#,
             "--workers",
-            "prefill:1:ranks=2,decode:1:ranks=2",
+            r#"[{"id":"prefill","ranks":[{"node":"localhost","device":"cpu"},{"node":"localhost","device":"cpu"}],"entries":{"model":{"ranks":[0,1],"parallel_config":{"tensor_parallel_size":2}}},"queue_depth":1},{"id":"decode","ranks":[{"node":"localhost","device":"cpu"},{"node":"localhost","device":"cpu"}],"entries":{"model":{"ranks":[0,1],"parallel_config":{"tensor_parallel_size":2}}},"queue_depth":1}]"#,
             "--transfer",
             "prefill->decode=shm",
         ])
@@ -636,4 +622,12 @@ mod tests {
         .expect_err("quantization config must be an object");
         assert!(error.to_string().contains("expected a JSON object"));
     }
+}
+
+/// Parses the canonical worker list without a second configuration wrapper.
+fn parse_workers(value: &str) -> Result<Box<[WorkerConfig]>, String> {
+    let workers: Vec<WorkerConfig> =
+        serde_json::from_str(value).map_err(|error| error.to_string())?;
+    WorkerConfig::validate_all(&workers).map_err(|error| error.to_string())?;
+    Ok(workers.into_boxed_slice())
 }

@@ -1,4 +1,4 @@
-"""Virtual tensor views over runtime-owned CUDA peer allocations."""
+"""CUDA peer allocation and mapping primitives for public resource owners."""
 
 from functools import lru_cache
 from pathlib import Path
@@ -37,3 +37,49 @@ def allocate(shape: tuple[int, ...], *, dtype: torch.dtype, device: torch.device
     """
 
     return _extension().PeerAllocation(torch.empty(0, dtype=dtype, device=device), list(shape))
+
+
+def export_ipc(tensor: torch.Tensor) -> tuple[bytes, int, int]:
+    """Export an allocation handle, byte capacity, and tensor byte offset.
+
+    The caller owns the source and must keep its published contents immutable
+    until all mapped readers have completed and closed their mappings.
+    """
+
+    return _extension().export_ipc(tensor)
+
+
+def import_ipc(
+    prototype: torch.Tensor,
+    handle: bytes,
+    allocation_bytes: int,
+    byte_offset: int,
+    shape: tuple[int, ...],
+    strides: tuple[int, ...],
+) -> torch.Tensor:
+    """Map a bounded tensor on the prototype's CUDA device and dtype.
+
+    The returned tensor closes its mapping when released. Its transfer lease
+    must retain it through the last GPU read and acknowledge the producer only
+    after releasing it. This primitive does not synchronize consumer streams.
+    """
+
+    return _extension().import_ipc(
+        prototype, handle, allocation_bytes, byte_offset, list(shape), list(strides)
+    )
+
+
+def copy_host_device(
+    destination: torch.Tensor, source: torch.Tensor, stream: torch.cuda.Stream
+) -> None:
+    """Enqueue an exact strided copy between pinned host and CUDA storage.
+
+    The caller owns both views through stream completion. Shape and dtype must
+    agree; this primitive performs no conversion or GPU packing allocation.
+    Destination elements must be disjoint, as validated by the transfer owner.
+    """
+
+    device = source.device if source.is_cuda else destination.device
+    if device != stream.device:
+        raise ValueError("host/device copy stream belongs to another device")
+    _extension().copy_host_device(destination, source, int(stream.cuda_stream))

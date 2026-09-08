@@ -2,37 +2,27 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
 import torch.nn as nn
 import triton
 import triton.language as tl
 
-from .base import PreparedLinearInput, QuantizeMethodBase
+from .base import BlockScaleLayout, LinearMethod, PreparedLinearInput
+
+if TYPE_CHECKING:
+    from ..linear import LinearBase
+
 
 __all__ = [
     "DynamicW4A4NvFp4LinearMethod",
-    "NvFp4Activation",
-    "NvFp4Linear",
-    "replace_nvfp4_linears",
 ]
 
 _NVFP4_MAX = float(torch.finfo(torch.float8_e4m3fn).max) * 6.0
 _SCALE_EPS = 1.0e-12
 _FUSED_ABSMAX_MIN_ELEMENTS = 1 << 25
 _FUSED_ABSMAX_BLOCK = 1 << 16
-
-
-@dataclass(frozen=True, slots=True)
-class NvFp4Activation:
-    """Holds packed FP4 activations, block scales, global scale, and original shape."""
-
-    packed: torch.Tensor
-    block_scale: torch.Tensor
-    scale_2: torch.Tensor
-    shape: tuple[int, ...]
 
 
 def _flashinfer() -> Any:
@@ -282,10 +272,11 @@ def _nvfp4_mm_bf16_cute_fake(
     return left.new_empty((left.shape[0], right.shape[1]), dtype=torch.bfloat16)
 
 
-class DynamicW4A4NvFp4LinearMethod(QuantizeMethodBase):
+class DynamicW4A4NvFp4LinearMethod(LinearMethod):
     """Load-time FP4 weights with dynamically quantized FP4 activations."""
 
     is_quantized = True
+    preferred_block_scale_layout: ClassVar[BlockScaleLayout] = "128x4"
 
     @property
     def weight_scale_domain(self):
@@ -297,7 +288,7 @@ class DynamicW4A4NvFp4LinearMethod(QuantizeMethodBase):
 
     def create_weights(
         self,
-        module: nn.Module,
+        module: LinearBase,
         *,
         input_size: int,
         output_size: int,
@@ -320,19 +311,17 @@ class DynamicW4A4NvFp4LinearMethod(QuantizeMethodBase):
         module.register_buffer("weight_scale_2", None, persistent=False)
         from ...loader.weight_loaders import attach_weight_loader, default_weight_loader
 
-        weight = cast(nn.Parameter, module.weight)
+        weight = module.weight
         attach_weight_loader(weight, default_weight_loader)
-        bias_parameter = cast(nn.Parameter | None, module.bias)
+        bias_parameter = module.bias
         if bias_parameter is not None:
             attach_weight_loader(bias_parameter, default_weight_loader)
 
     @torch.no_grad()
-    def process_weights_after_loading(self, module: nn.Module) -> None:
+    def process_weights_after_loading(self, module: LinearBase) -> None:
         """Quantize loaded BF16 weights into SM100 NVFP4 values and block scales."""
 
-        from ..linear import LinearBase
-
-        linear = cast(LinearBase, module)
+        linear = module
         if linear.weight.device.type != "cuda":
             raise RuntimeError("NVFP4 linear execution requires a CUDA device")
         if torch.cuda.get_device_capability(linear.weight.device) < (10, 0):
@@ -364,223 +353,82 @@ class DynamicW4A4NvFp4LinearMethod(QuantizeMethodBase):
         linear.weight_scale = scale_parts[0] if len(scale_parts) == 1 else torch.cat(scale_parts)
         linear.weight_scale_2 = weight_scale_2
 
-    def quantize_activation(
+    def apply(self, module: LinearBase, x: torch.Tensor) -> torch.Tensor:
+        """Dynamically quantize BF16 input using the swizzled NVFP4 contract."""
+
+        value = x.to(torch.bfloat16)
+        flat = value.reshape(-1, value.shape[-1])
+        prepared = self.prepare_input(
+            flat, self.input_scale(flat), block_scale_layout=self.preferred_block_scale_layout
+        )
+        output = self.apply_prepared(module, prepared, output_dtype=torch.bfloat16)
+        return output.reshape(*x.shape[:-1], module.output_size)
+
+    def input_scale(self, x: torch.Tensor, *, absmax: torch.Tensor | None = None) -> torch.Tensor:
+        return (
+            _global_scale_2(x.to(torch.bfloat16))
+            if absmax is None
+            else _scale_2_from_absmax(absmax)
+        )
+
+    def prepare_input(
         self,
         x: torch.Tensor,
+        scale: torch.Tensor | None,
         *,
-        absmax: torch.Tensor | None = None,
-    ) -> NvFp4Activation:
-        """Pack BF16 activations and retain block/global scales plus leading shape."""
-
-        if x.dtype != torch.bfloat16:
-            raise RuntimeError("NVFP4 linear execution requires bfloat16 activations")
-        original_shape = tuple(int(size) for size in x.shape[:-1])
-        x_2d = x.reshape(-1, x.shape[-1])
-        input_scale_2 = _global_scale_2(x_2d) if absmax is None else _scale_2_from_absmax(absmax)
-        packed, block_scale = _nvfp4_quantize_128x4(
-            x_2d,
-            1.0 / input_scale_2,
+        block_scale_layout: BlockScaleLayout = "linear",
+    ) -> PreparedLinearInput:
+        if scale is None:
+            raise ValueError("NVFP4 input preparation requires a shared activation scale")
+        quantize = (
+            _nvfp4_quantize_128x4 if block_scale_layout == "128x4" else _nvfp4_quantize_linear
         )
-        return NvFp4Activation(
-            packed=packed,
-            block_scale=block_scale,
-            scale_2=input_scale_2,
-            shape=original_shape,
+        values, block_scales = quantize(x.to(torch.bfloat16), 1.0 / scale)
+        return PreparedLinearInput(
+            values, block_scales, tensor_scale=scale, block_scale_layout=block_scale_layout
         )
 
-    def apply_packed(
+    def apply_prepared(
         self,
-        module: nn.Module,
-        activation: NvFp4Activation,
+        module: LinearBase,
+        prepared: PreparedLinearInput,
         *,
-        include_bias: bool,
+        output_dtype: torch.dtype,
+        include_bias: bool = True,
     ) -> torch.Tensor:
-        """Multiply a packed activation by finalized FP4 weights with optional bias."""
-
-        from ..linear import LinearBase
-
-        linear = cast(LinearBase, module)
+        if output_dtype != torch.bfloat16:
+            raise ValueError("NVFP4 GEMM supports BF16 output")
+        linear = module
         weight_scale = linear.weight_scale
-        weight_scale_2 = getattr(linear, "weight_scale_2", None)
+        weight_scale_2 = linear.weight_scale_2
         if linear.weight.dtype != torch.uint8 or weight_scale is None or weight_scale_2 is None:
-            raise RuntimeError("NVFP4 linear execution requires finalized FP4 weights")
+            raise RuntimeError("prepared NVFP4 GEMM requires finalized FP4 weights")
+        if prepared.block_scales is None or prepared.tensor_scale is None:
+            raise ValueError("prepared NVFP4 input requires block scales and a global scale")
+        values = prepared.values
+        if values.dtype != torch.uint8 or values.shape[-1] * 2 != linear.input_size:
+            raise ValueError("NVFP4 input requires packed bytes with the linear input width")
+        flat = values.reshape(-1, values.shape[-1])
+        if prepared.block_scale_layout == "128x4":
+            scales = prepared.block_scales
+            gemm = _nvfp4_mm_bf16
+        else:
+            scales = _nvfp4_interleave_scale(prepared.block_scales)
+            gemm = _nvfp4_mm_bf16_cute
         outputs = []
         offset = 0
         for index, rows in enumerate(linear.weight_output_partitions):
             outputs.append(
-                _nvfp4_mm_bf16(
-                    activation.packed,
+                gemm(
+                    flat,
                     linear.weight[offset : offset + rows].T,
-                    activation.block_scale,
+                    scales,
                     weight_scale[offset : offset + ((rows + 127) // 128) * 128].T,
-                    activation.scale_2 * weight_scale_2[index].reshape(()),
+                    prepared.tensor_scale * weight_scale_2[index].reshape(()),
                 )
             )
             offset += rows
         output = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=-1)
         if include_bias and linear.execution_bias is not None:
             output = output + linear.execution_bias.to(device=output.device, dtype=output.dtype)
-        return output.reshape(*activation.shape, linear.output_size)
-
-    def _apply(
-        self,
-        module: nn.Module,
-        x: torch.Tensor,
-        *,
-        include_bias: bool,
-    ) -> torch.Tensor:
-        """Quantize activations, execute packed FP4 GEMM, and optionally add bias."""
-
-        return self.apply_packed(
-            module,
-            self.quantize_activation(x),
-            include_bias=include_bias,
-        )
-
-    def apply(self, module: nn.Module, x: torch.Tensor) -> torch.Tensor:
-        """Dynamically quantize BF16 input and execute the finalized FP4 linear."""
-
-        return self._apply(module, x, include_bias=True)
-
-    def apply_unbiased(self, module: nn.Module, x: torch.Tensor) -> torch.Tensor:
-        """Execute the FP4 linear while deferring its bias to a fused consumer."""
-
-        return self._apply(module, x, include_bias=False)
-
-    def input_scale(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dtype != torch.bfloat16:
-            raise RuntimeError("NVFP4 input preparation requires bfloat16 activations")
-        return _global_scale_2(x)
-
-    def prepare_input(
-        self,
-        x: torch.Tensor,
-        scale: torch.Tensor | None,
-    ) -> PreparedLinearInput:
-        if scale is None:
-            raise ValueError("NVFP4 input preparation requires a shared activation scale")
-        values, block_scales = _nvfp4_quantize_linear(x, 1.0 / scale)
-        return PreparedLinearInput(values, block_scales, scale)
-
-    def apply_prepared(
-        self,
-        module: nn.Module,
-        prepared: PreparedLinearInput,
-        *,
-        output_dtype: torch.dtype,
-    ) -> torch.Tensor:
-        from ..linear import LinearBase
-
-        linear = cast(LinearBase, module)
-        weight_scale = linear.weight_scale
-        weight_scale_2 = getattr(linear, "weight_scale_2", None)
-        if linear.weight.dtype != torch.uint8 or weight_scale is None or weight_scale_2 is None:
-            raise RuntimeError("prepared NVFP4 GEMM requires finalized FP4 weights")
-        if prepared.block_scales is None or prepared.global_scale is None:
-            raise ValueError("prepared NVFP4 input requires block scales and a global scale")
-        scales = _nvfp4_interleave_scale(prepared.block_scales)
-        outputs = []
-        offset = 0
-        for index, rows in enumerate(linear.weight_output_partitions):
-            outputs.append(
-                _nvfp4_mm_bf16_cute(
-                    prepared.values,
-                    linear.weight[offset : offset + rows].T,
-                    scales,
-                    weight_scale[offset : offset + ((rows + 127) // 128) * 128].T,
-                    prepared.global_scale * weight_scale_2[index].reshape(()),
-                )
-            )
-            offset += rows
-        output = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=-1)
-        if linear.execution_bias is not None:
-            output = output + linear.execution_bias.to(device=output.device, dtype=output.dtype)
-        return output
-
-
-class NvFp4Linear(nn.Module):
-    """A load-finalized NVFP4 replacement for an ordinary dense linear."""
-
-    def __init__(self, source: nn.Linear) -> None:
-        """Copy a dense layer into BF16 staging parameters for load-time NVFP4 packing."""
-
-        super().__init__()
-        self.input_size = int(source.in_features)
-        self.output_size = int(source.out_features)
-        self.weight = nn.Parameter(
-            source.weight.detach().to(torch.bfloat16),
-            requires_grad=False,
-        )
-        self.bias = (
-            nn.Parameter(source.bias.detach().to(torch.bfloat16), requires_grad=False)
-            if source.bias is not None
-            else None
-        )
-        self.register_buffer("weight_scale", None, persistent=False)
-        self.register_buffer("weight_scale_2", None, persistent=False)
-        self.weight_output_partitions = (self.output_size,)
-        self.register_buffer(
-            "logical_weight_absmax",
-            self.weight.float().abs().amax().reshape(1, 1),
-            persistent=False,
-        )
-        self.quant_method = DynamicW4A4NvFp4LinearMethod()
-        self.quant_method.process_weights_after_loading(self)
-
-    @property
-    def execution_bias(self) -> torch.Tensor | None:
-        return self.bias
-
-    def forward(self, value: torch.Tensor) -> torch.Tensor:
-        """Project values through resident FP4 weights, including the source bias."""
-
-        return self.quant_method.apply(self, value.to(torch.bfloat16))
-
-    def forward_unbiased(self, value: torch.Tensor) -> torch.Tensor:
-        """Project values while returning bias application to the caller."""
-
-        return self.quant_method.apply_unbiased(self, value.to(torch.bfloat16))
-
-    def quantize_activation(
-        self,
-        value: torch.Tensor,
-        *,
-        absmax: torch.Tensor | None = None,
-    ) -> NvFp4Activation:
-        """Pack an activation once for reuse by multiple FP4 projections."""
-
-        return self.quant_method.quantize_activation(
-            value.to(torch.bfloat16),
-            absmax=absmax,
-        )
-
-    def forward_prequantized(
-        self,
-        activation: NvFp4Activation,
-        *,
-        include_bias: bool,
-    ) -> torch.Tensor:
-        """Project a reusable packed activation with optional bias application."""
-
-        return self.quant_method.apply_packed(
-            self,
-            activation,
-            include_bias=include_bias,
-        )
-
-
-def replace_nvfp4_linears(module: nn.Module) -> int:
-    """Replace every block-aligned dense child with a finalized NVFP4 linear."""
-
-    count = 0
-    for name, child in tuple(module.named_children()):
-        if (
-            isinstance(child, nn.Linear)
-            and child.in_features % 16 == 0
-            and child.out_features % 16 == 0
-        ):
-            setattr(module, name, NvFp4Linear(child))
-            count += 1
-        else:
-            count += replace_nvfp4_linears(child)
-    return count
+        return output.reshape(*values.shape[:-1], linear.output_size)

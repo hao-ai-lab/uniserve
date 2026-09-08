@@ -10,11 +10,11 @@ import tempfile
 import torch
 import torch.distributed as dist
 
-from ..nn.mesh import GroupCoordinator
+from ..nn.mesh import Communicator
 
 
 def allocate_peer_tensor(
-    group: GroupCoordinator,
+    group: Communicator,
     shape: tuple[int, ...],
     *,
     dtype: torch.dtype,

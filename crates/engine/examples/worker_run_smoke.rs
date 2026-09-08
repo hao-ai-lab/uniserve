@@ -16,7 +16,8 @@ use uniserve_core::{
     UndVisibility,
 };
 use uniserve_engine::{
-    Command, ControlTokens, EngineHandle, EngineLoop, UniprocExecutor, WorkerProcessArgs,
+    Command, ControlTokens, EngineHandle, EngineLoop, Worker, WorkerExecutor, WorkerId,
+    WorkerProcessArgs,
 };
 
 type Rxs = HashMap<RequestId, uniserve_engine::EventRx>;
@@ -85,15 +86,16 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let worker_config = WorkerProcessArgs {
+        worker_id: "local".into(),
         stub: true,
         cuda_graph: false,
         ..WorkerProcessArgs::default()
     };
-    let engine = UniprocExecutor::spawn(uniserve_engine::WorkerProcessArgs {
+    let engine = Worker::spawn(uniserve_engine::WorkerProcessArgs {
+        worker_id: "local".into(),
         python: "python3".into(),
         model: String::new(),
-        device: "cpu".into(),
-        world_size: 1,
+        ranks: uniserve_engine::WorkerConfig::model("cpu", 1, 2).ranks,
         pipeline_depth: 2,
         req_slot_cap: 1 << 20,
         resp_slot_cap: 8 << 20,
@@ -102,10 +104,12 @@ fn main() -> anyhow::Result<()> {
         max_batch_operations: 32,
         max_batch_tokens: 8192,
         attention_backend: uniserve_engine::AttentionBackend::Auto,
-        supported_ops: uniserve_worker_ipc::OpKind::ALL.to_vec(),
-        transfer_backend: uniserve_engine::TransferBackend::Inproc,
+        supported_ops: uniserve_worker_ipc::OpCode::ALL.to_vec(),
+        transfer: Default::default(),
         ..worker_config
     })?;
+    let engine =
+        WorkerExecutor::try_new(vec![(WorkerId("local".into()), engine)], Default::default())?;
     let waker = engine.command_waker();
     let sched = EngineLoop::new(Box::new(engine), ControlTokens::default(), 32);
 

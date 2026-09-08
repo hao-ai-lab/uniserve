@@ -1,6 +1,6 @@
-//! Request-family runtimes and the single-owner engine control loop.
+//! Request algorithms and the single-owner engine control loop.
 //!
-//! The loop combines request progress, scheduler policy, memory placement, and
+//! The loop combines request progress, scheduler policy, memory params, and
 //! asynchronous executor completions. All mutable engine state stays on its
 //! owner thread.
 //!
@@ -26,7 +26,7 @@ mod logits;
 pub(crate) mod output;
 
 pub(crate) use crate::executor::{
-    Batch, BatchResult, Executor, ExecutorSubmitError, Op as LogicalOp, OpPlacement,
+    Batch, BatchResult, Executor, ExecutorSubmitError, Op as LogicalOp,
 };
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -45,7 +45,7 @@ use crate::handle::{
     Command, EVENT_BUFFER_CAPACITY, EventRx, EventSendError, EventTx, event_channel,
 };
 use crate::kv::{BlockPool, BlockTable, KvCacheCoordinator};
-use crate::memory::{Allocation, Memory, MemoryLayout, Placement, worker_kv_state};
+use crate::memory::{Allocation, AllocationRegion, Memory, MemoryLayout, worker_kv_state};
 use crate::scheduler::{
     MAX_NUM_SEQS, MAX_NUM_WAITING, SchedStats, Scheduler, SchedulerConfig, SchedulingPolicy,
 };
@@ -58,15 +58,15 @@ use uniserve_core::{
 use uniserve_core::{BlockId, CfgParams, ImageIngestStep, encoder_cache_key};
 use uniserve_core::{HashAlgo, RequestId, RuntimeFamily};
 use uniserve_worker_ipc::{
-    ArRequestParams, BatchCommand, BlockTable as IpcBlockTable, Bounds, BufferId, BufferPlacement,
-    CachePageAllocation, Checkpoint, CheckpointPoint, CloseReason, DType, DecodePlacement,
-    DiffusionRequestParams, Disposition, LatentPlacement, MediaGeometry, ModelOutput, NewRequest,
-    OpId, OpKind, OpPayload, OpStatus, Operation, PointRange, ProductKind, ProductPayload,
-    ProductRef, RequestKey, RowGeometry, RunKind, SamplingState, ShapeBound, StorageClass,
+    ArRequestParams, BatchCommand, BlockTable as IpcBlockTable, Bounds, BufferAllocation, BufferId,
+    CachePageAllocation, Checkpoint, CheckpointPoint, CloseReason, DType, DecodeRange,
+    DiffusionRequestParams, DimBound, Disposition, LatentParams, MediaGeometry, MediaTrack,
+    ModelOutput, NewRequest, OpCode, OpId, OpPayload, OpStatus, Operation, PointRange, ProductKind,
+    ProductPayload, ProductRef, RequestKey, RowGeometry, SamplingState, ShapeBound, StorageClass,
     TimingCounters, UmmRequestParams, WorkerForwardStats, WorkerInfo,
 };
 
-use crate::executor::{WorkerExecError, WorkerLossError};
+use crate::executor::WorkerFailure;
 use crate::runtime::image_artifact::validate_png_artifact;
 use inflight::{
     InflightApply, InflightOp, InflightWindow, PendingCompletion, PendingFinish,
@@ -243,20 +243,26 @@ pub(crate) struct ReqState {
     pub(crate) terminal_intent: TerminalIntent,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 /// Terminal action deferred until outstanding work is reconciled.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) enum TerminalIntent {
     #[default]
     None,
-    Cancel,
-    Abort,
-    StopMatched,
+    Finish(FinishReason),
+    Failure(String),
 }
 
 impl TerminalIntent {
-    /// Returns whether the state is terminal.
-    pub(crate) const fn is_terminal(self) -> bool {
+    /// Returns whether accepted descendants must drain before retirement.
+    pub(crate) const fn is_terminal(&self) -> bool {
         !matches!(self, Self::None)
+    }
+
+    /// Records a terminal reason without replacing a previously resolved failure.
+    fn finish(&mut self, reason: FinishReason) {
+        if matches!(self, Self::None) {
+            *self = Self::Finish(reason);
+        }
     }
 }
 
@@ -278,10 +284,11 @@ impl FlowPrefixState {
     }
 }
 
+/// Allocation ownership retained until the exact request epoch closes on every rank.
 struct RetiringRequest {
     request_key: RequestKey,
-    allocations: RequestAllocations,
-    flow_prefix: Option<FlowPrefixState>,
+    allocations: Vec<Allocation>,
+    buffers: HashMap<BufferId, Allocation>,
 }
 
 struct RequestAllocations {
@@ -314,16 +321,19 @@ impl RequestAllocations {
         self.buffers.remove(&id)
     }
 
+    /// Consumes this active layout into the allocation handles needed for reclamation.
+    fn into_allocations(self) -> impl Iterator<Item = Allocation> {
+        self.buffers
+            .into_values()
+            .chain(self.latent)
+            .chain([self.kv, self.request_slot])
+    }
+
     /// Releases the owned request allocation.
     fn free(self, memory: &mut Memory) {
-        for allocation in self.buffers.into_values() {
+        for allocation in self.into_allocations() {
             memory.free(allocation);
         }
-        if let Some(latent) = self.latent {
-            memory.free(latent);
-        }
-        memory.free(self.kv);
-        memory.free(self.request_slot);
     }
 }
 
@@ -414,86 +424,133 @@ impl ReqState {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct MediaCursor {
+    encoded: bool,
     prepared: bool,
     denoise_step: u32,
-    decode_cursor: u32,
+    video_decoded: u32,
+    video_written: u32,
+    audio_decoded: bool,
+    audio_written: bool,
+    finalized: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MediaQuantum {
+    Encode,
     Prepare,
     Denoise {
         step: u32,
     },
     Decode {
+        track: MediaTrack,
         cursor: u32,
         max_units: u32,
-        finalizes: bool,
     },
+    Append {
+        track: MediaTrack,
+        cursor: u32,
+        max_units: u32,
+    },
+    Finalize,
 }
 
-/// Returns the next schedulable media quantum.
-fn next_media_quantum(cursor: MediaCursor, geometry: MediaGeometry) -> Option<MediaQuantum> {
-    if !cursor.prepared {
-        Some(MediaQuantum::Prepare)
-    } else if cursor.denoise_step < geometry.denoise_steps {
-        Some(MediaQuantum::Denoise {
-            step: cursor.denoise_step,
-        })
-    } else if cursor.decode_cursor < geometry.decode_units {
-        Some(MediaQuantum::Decode {
-            cursor: cursor.decode_cursor,
-            max_units: 1,
-            finalizes: cursor.decode_cursor.saturating_add(1) == geometry.decode_units,
-        })
-    } else {
-        None
+impl MediaQuantum {
+    fn target(self) -> (OpCode, &'static str) {
+        match self {
+            Self::Encode => (OpCode::EncoderText, "text_encoder"),
+            Self::Prepare => (OpCode::DiffusionPrepare, "denoiser"),
+            Self::Denoise { .. } => (OpCode::DiffusionStep, "denoiser"),
+            Self::Decode {
+                track: MediaTrack::Video,
+                ..
+            } => (OpCode::DiffusionDecode, "video_decoder"),
+            Self::Decode {
+                track: MediaTrack::Audio,
+                ..
+            } => (OpCode::DiffusionDecode, "audio_decoder"),
+            Self::Append { .. } => (OpCode::MediaAppend, "output"),
+            Self::Finalize => (OpCode::DiffusionFinalize, "output"),
+        }
     }
 }
 
-/// Advances the request media cursor.
+/// Apply only the completed branch; independent completions cannot overwrite each other.
 fn advance_media_cursor(mut cursor: MediaCursor, quantum: MediaQuantum) -> MediaCursor {
     match quantum {
+        MediaQuantum::Encode => cursor.encoded = true,
         MediaQuantum::Prepare => cursor.prepared = true,
-        MediaQuantum::Denoise { step } => cursor.denoise_step = step.saturating_add(1),
+        MediaQuantum::Denoise { step } => cursor.denoise_step = step + 1,
         MediaQuantum::Decode {
-            cursor: decode_cursor,
+            track: MediaTrack::Video,
             max_units,
             ..
-        } => cursor.decode_cursor = decode_cursor.saturating_add(max_units),
+        } => cursor.video_decoded += max_units,
+        MediaQuantum::Decode {
+            track: MediaTrack::Audio,
+            ..
+        } => cursor.audio_decoded = true,
+        MediaQuantum::Append {
+            track: MediaTrack::Video,
+            max_units,
+            ..
+        } => cursor.video_written += max_units,
+        MediaQuantum::Append {
+            track: MediaTrack::Audio,
+            ..
+        } => cursor.audio_written = true,
+        MediaQuantum::Finalize => cursor.finalized = true,
     }
     cursor
-}
-
-/// Returns the request remaining media work.
-fn media_work(quantum: MediaQuantum) -> RunKind {
-    match quantum {
-        MediaQuantum::Prepare => RunKind::DiffusionPrepare,
-        MediaQuantum::Denoise { .. } => RunKind::DiffusionStep,
-        MediaQuantum::Decode {
-            finalizes: true, ..
-        } => RunKind::DiffusionFinalize,
-        MediaQuantum::Decode { .. } => RunKind::DiffusionDecode,
-    }
 }
 
 struct MediaFlowState {
     request: DiffusionRequest,
     event_tx: EventTx,
     allocations: MediaAllocations,
+    conditioning: ProductRef,
+    latents: Vec<ProductRef>,
+    video_segments: BTreeMap<u32, (u32, ProductRef)>,
+    audio: Option<ProductRef>,
     admission: NewRequest,
     admission_state: DiffusionRequestParamsState,
     committed: MediaCursor,
     projected: MediaCursor,
     fixed_parent: Checkpoint,
     projected_parent: Checkpoint,
-    terminal_intent: MediaTerminalIntent,
+    terminal_intent: TerminalIntent,
     artifact: Option<ArtifactEvent>,
 }
 
 struct MediaAllocations {
+    tensors: HashMap<(String, u32), MediaTensorAllocation>,
     request_slot: Allocation,
-    latent: Allocation,
+}
+
+/// A request reserves each declared result once. Video ranges occupy disjoint
+/// slices of its temporal result, independent of decoder Worker width.
+struct MediaTensorAllocation {
+    allocation: Allocation,
+    dtype: DType,
+    shape_bound: ShapeBound,
+}
+
+impl MediaTensorAllocation {
+    fn bind(&self, product: &ProductRef, start_unit: u32) -> BufferAllocation {
+        let AllocationRegion::Buffer { offset, .. } = self.allocation.region() else {
+            unreachable!("media tensor has buffer storage");
+        };
+        let unit_bytes = match product.shape_bound.dims.first() {
+            Some(DimBound::Static(units)) if start_unit > 0 => {
+                product.max_bytes() / u64::from(*units)
+            }
+            _ => 0,
+        };
+        BufferAllocation {
+            buffer: product.buffer_id(),
+            offset: offset + u64::from(start_unit) * unit_bytes,
+            bytes: product.max_bytes(),
+        }
+    }
 }
 
 impl MediaAllocations {
@@ -504,18 +561,19 @@ impl MediaAllocations {
             .expect("media request slot allocation")
     }
 
-    /// Returns the latent-page allocations.
-    fn latent_pages(&self) -> &[u32] {
-        match self.latent.placement() {
-            Placement::Latent { pages, .. } => pages,
-            _ => unreachable!("media latent allocation placement"),
-        }
+    /// Consumes media layout metadata once only storage lifetime remains.
+    fn into_allocations(self) -> impl Iterator<Item = Allocation> {
+        self.tensors
+            .into_values()
+            .map(|tensor| tensor.allocation)
+            .chain([self.request_slot])
     }
 
     /// Releases the owned request allocation.
     fn free(self, memory: &mut Memory) {
-        memory.free(self.latent);
-        memory.free(self.request_slot);
+        for allocation in self.into_allocations() {
+            memory.free(allocation);
+        }
     }
 }
 
@@ -526,71 +584,16 @@ enum DiffusionRequestParamsState {
     Registered,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum MediaTerminalIntent {
-    None,
-    Finish(FinishReason),
-    Failure(String),
-}
-
 enum DiffusionTerminal {
     Completed(ArtifactEvent),
     Failed(String),
     Finished(FinishReason),
 }
 
-impl MediaTerminalIntent {
-    /// Returns whether the state is terminal.
-    const fn is_terminal(&self) -> bool {
-        !matches!(self, Self::None)
-    }
-
-    /// Records the first terminal reason while preserving an earlier terminal intent.
-    fn finish(&mut self, reason: FinishReason) {
-        if matches!(self, Self::None) {
-            *self = Self::Finish(reason);
-        }
-    }
-}
-
-struct RetiringMedia {
-    request_key: RequestKey,
-    allocations: MediaAllocations,
-}
-
 struct PendingMedia {
     request: DiffusionRequest,
     event_tx: EventTx,
 }
-
-#[doc(hidden)]
-/// Family-independent generation state shared by runtime wrappers.
-pub struct RuntimeState {
-    ctrl: ControlTokens,
-    logits_pipeline: Vec<crate::runtime::logits::BuiltinLogitsProcessor>,
-    waiting: HashMap<RequestId, ReqState>,
-    waiting_media: HashMap<RequestId, PendingMedia>,
-    running: HashMap<RequestId, ReqState>,
-    running_media: HashMap<RequestId, MediaFlowState>,
-    retiring_requests: HashMap<RequestId, RetiringRequest>,
-    retiring_media: HashMap<RequestId, RetiringMedia>,
-    inflight: InflightWindow,
-    denoise_step_burst: u16,
-    latent_dtype: Option<DType>,
-    pending_commands: VecDeque<BatchCommand>,
-    pending_buffer_frees: HashMap<BufferId, Allocation>,
-    authority_id: u64,
-    next_op_id: u64,
-    next_product_generation: u64,
-    next_epoch: u64,
-}
-
-/// Autoregressive request runtime.
-pub struct ArRuntime(RuntimeState);
-/// Terminal diffusion request runtime.
-pub struct DiffusionRuntime(RuntimeState);
-/// Unified multimodal request runtime.
-pub struct UmmRuntime(RuntimeState);
 
 /// Serving-profile facts consumed by a family runtime. Physical capacities are
 /// resolved from [`WorkerInfo`] during engine construction; model procedure and
@@ -674,16 +677,19 @@ impl RuntimeProfile {
     fn resolved(mut self, info: &WorkerInfo) -> Self {
         let supports = |kind| info.supported_ops.contains(&kind);
         let mut available = uniserve_core::GenerationFeatures::empty();
-        if supports(OpKind::ArExtend) && supports(OpKind::ArDecode) {
+        if supports(OpCode::ArExtend) && supports(OpCode::ArDecode) {
             available.insert(uniserve_core::GenerationFeatures::UNDERSTANDING);
         }
-        if supports(OpKind::EncoderExecute) {
-            available.insert(
-                uniserve_core::GenerationFeatures::VISION_ENCODE
-                    | uniserve_core::GenerationFeatures::LATENT_ENCODE,
-            );
+        if supports(OpCode::EncoderVision) {
+            available.insert(uniserve_core::GenerationFeatures::VISION_ENCODE);
         }
-        if supports(OpKind::DiffusionStep) && supports(OpKind::DiffusionDecode) {
+        if supports(OpCode::EncoderLatent) {
+            available.insert(uniserve_core::GenerationFeatures::LATENT_ENCODE);
+        }
+        if supports(OpCode::DiffusionPrepare)
+            && supports(OpCode::DiffusionStep)
+            && supports(OpCode::DiffusionFinalize)
+        {
             available.insert(uniserve_core::GenerationFeatures::IMAGE_GENERATION);
         }
         self.generation_limits.features &= available;
@@ -722,91 +728,33 @@ impl RuntimeProfile {
     }
 }
 
-/// Runtime state selected by the admitted request family.
-pub enum Runtime {
-    /// Autoregressive text runtime.
-    Ar(ArRuntime),
-    /// Diffusion-only media runtime.
-    Diffusion(DiffusionRuntime),
-    /// Unified multimodal runtime.
-    Umm(UmmRuntime),
-}
-
-impl Runtime {
-    /// Creates an initialized instance.
-    fn new(family: RuntimeFamily, state: RuntimeState) -> Self {
-        match family {
-            RuntimeFamily::Ar => Self::Ar(ArRuntime(state)),
-            RuntimeFamily::Diffusion => Self::Diffusion(DiffusionRuntime(state)),
-            RuntimeFamily::Umm => Self::Umm(UmmRuntime(state)),
-        }
-    }
-
-    /// Returns the operation family.
-    const fn family(&self) -> RuntimeFamily {
-        match self {
-            Self::Ar(_) => RuntimeFamily::Ar,
-            Self::Diffusion(_) => RuntimeFamily::Diffusion,
-            Self::Umm(_) => RuntimeFamily::Umm,
-        }
-    }
-
-    /// Returns whether the pool accepts the operation.
-    const fn accepts(&self, family: RuntimeFamily) -> bool {
-        matches!(
-            (self.family(), family),
-            (RuntimeFamily::Ar, RuntimeFamily::Ar)
-                | (RuntimeFamily::Diffusion, RuntimeFamily::Diffusion)
-                | (RuntimeFamily::Umm, RuntimeFamily::Ar | RuntimeFamily::Umm)
-        )
-    }
-
-    /// Returns shared access to the execution state.
-    fn state(&self) -> &RuntimeState {
-        self
-    }
-
-    /// Returns mutable access to the execution state.
-    fn state_mut(&mut self) -> &mut RuntimeState {
-        self
-    }
-}
-
-impl std::ops::Deref for Runtime {
-    type Target = RuntimeState;
-
-    /// Returns shared access to the wrapped value.
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Ar(runtime) => &runtime.0,
-            Self::Diffusion(runtime) => &runtime.0,
-            Self::Umm(runtime) => &runtime.0,
-        }
-    }
-}
-
-impl std::ops::DerefMut for Runtime {
-    /// Returns mutable access to the wrapped value.
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        match self {
-            Self::Ar(runtime) => &mut runtime.0,
-            Self::Diffusion(runtime) => &mut runtime.0,
-            Self::Umm(runtime) => &mut runtime.0,
-        }
-    }
-}
-
 /// Single-threaded owner of scheduling, memory, execution, and request state.
 pub struct EngineLoop {
     executor: Box<dyn Executor>,
-    pending_submission: Option<Batch>,
+    pending_submissions: VecDeque<Batch>,
+    worker_affinity: HashMap<(RequestKey, String), crate::WorkerId>,
     info: WorkerInfo,
     profile: RuntimeProfile,
     /// Resident resource ownership and reservation accounting.
     memory: Memory,
-    runtime: Runtime,
+    family: RuntimeFamily,
+    ctrl: ControlTokens,
+    logits_pipeline: Vec<crate::runtime::logits::BuiltinLogitsProcessor>,
+    waiting: HashMap<RequestId, ReqState>,
+    waiting_media: HashMap<RequestId, PendingMedia>,
+    running: HashMap<RequestId, ReqState>,
+    running_media: HashMap<RequestId, MediaFlowState>,
+    retiring_requests: HashMap<RequestId, RetiringRequest>,
+    inflight: InflightWindow,
+    denoise_step_burst: u16,
+    latent_dtype: Option<DType>,
+    pending_commands: VecDeque<BatchCommand>,
+    pending_buffer_frees: HashMap<BufferId, Allocation>,
+    authority_id: u64,
+    next_op_id: u64,
+    next_product_generation: u64,
+    next_epoch: u64,
     scheduler: Scheduler,
-    /// Submitted operations, ordered completions, and per-batch timing state.
     /// Diagnostic: keep denoise steps out of batches that carry text rows.
     flow_exclusive_batch: bool,
     /// Engine-fatal latch: set when the executor/worker dies;
@@ -819,19 +767,15 @@ pub struct EngineLoop {
     pub stats: Arc<SchedStats>,
 }
 
-impl std::ops::Deref for EngineLoop {
-    type Target = Runtime;
-
-    /// Returns shared access to the wrapped value.
-    fn deref(&self) -> &Self::Target {
-        &self.runtime
-    }
-}
-
-impl std::ops::DerefMut for EngineLoop {
-    /// Returns mutable access to the wrapped value.
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.runtime
+impl EngineLoop {
+    /// Determines whether this service's configured model accepts a request family.
+    const fn accepts_family(&self, family: RuntimeFamily) -> bool {
+        matches!(
+            (self.family, family),
+            (RuntimeFamily::Ar, RuntimeFamily::Ar)
+                | (RuntimeFamily::Diffusion, RuntimeFamily::Diffusion)
+                | (RuntimeFamily::Umm, RuntimeFamily::Ar | RuntimeFamily::Umm)
+        )
     }
 }
 
@@ -912,24 +856,27 @@ fn ranked_logprobs(entries: Vec<RankedToken>) -> Vec<TokenLogprob> {
 }
 
 /// Returns the operation batch classification.
-fn batch_kind(operation_variant: RunKind) -> BatchKind {
+fn batch_kind(operation_variant: OpCode) -> BatchKind {
     match operation_variant {
-        RunKind::ArExtend | RunKind::EncoderVision | RunKind::EncoderLatent => BatchKind::Prefill,
-        RunKind::ArDecode | RunKind::ArVerify => BatchKind::Decode,
-        RunKind::DiffusionStep
-        | RunKind::DiffusionDecode
-        | RunKind::DiffusionPrepare
-        | RunKind::DiffusionFinalize
-        | RunKind::TransferProduct
-        | RunKind::TransferKvPublish
-        | RunKind::TransferKvInstall => BatchKind::Media,
+        OpCode::ArExtend | OpCode::EncoderText | OpCode::EncoderVision | OpCode::EncoderLatent => {
+            BatchKind::Prefill
+        }
+        OpCode::ArDecode | OpCode::ArVerify => BatchKind::Decode,
+        OpCode::DiffusionStep
+        | OpCode::DiffusionDecode
+        | OpCode::DiffusionPrepare
+        | OpCode::MediaAppend
+        | OpCode::DiffusionFinalize
+        | OpCode::TransferProduct
+        | OpCode::TransferKvPublish
+        | OpCode::TransferKvInstall => BatchKind::Media,
     }
 }
 
 /// Returns the scheduling priority for a completion.
-fn completion_priority(operation_variant: RunKind) -> u8 {
+fn completion_priority(operation_variant: OpCode) -> u8 {
     match operation_variant {
-        RunKind::DiffusionStep | RunKind::DiffusionFinalize | RunKind::TransferKvInstall => 0,
+        OpCode::DiffusionStep | OpCode::DiffusionFinalize | OpCode::TransferKvInstall => 0,
         _ => 1,
     }
 }
@@ -1042,7 +989,7 @@ fn ceil_div_u64(value: u64, divisor: u64) -> u64 {
 /// timestep, so its cost multiplies the compiled latent geometry rather than the
 /// scalar per-step token cost.
 fn planned_op_token_cost(transition: &NextOp) -> usize {
-    if transition.operation_variant != RunKind::DiffusionStep {
+    if transition.operation_variant != OpCode::DiffusionStep {
         return transition.token_cost;
     }
     let latent_tokens = usize::try_from(transition.resources.latent_units)
@@ -1058,7 +1005,7 @@ fn planned_op_token_cost(transition: &NextOp) -> usize {
 /// Computes the event capacity required before scheduling one transition.
 fn transition_output_bound(transition: &NextOp) -> usize {
     match transition.operation_variant {
-        RunKind::ArVerify => transition
+        OpCode::ArVerify => transition
             .validation
             .expected_text_tokens
             .map_or(4, |range| {
@@ -1067,22 +1014,23 @@ fn transition_output_bound(transition: &NextOp) -> usize {
                     .saturating_mul(2)
                     .saturating_add(2)
             }),
-        RunKind::ArExtend | RunKind::ArDecode => 4,
-        RunKind::DiffusionStep => transition.token_cost.saturating_add(2),
-        RunKind::DiffusionDecode => 2,
-        RunKind::DiffusionFinalize => 3,
+        OpCode::ArExtend | OpCode::ArDecode => 4,
+        OpCode::DiffusionStep => transition.token_cost.saturating_add(2),
+        OpCode::DiffusionDecode => 2,
+        OpCode::DiffusionFinalize => 3,
         _ => 2,
     }
 }
 
 /// Records the operation in the optional benchmark trace.
 fn operation_trace(operation: &Operation, apply: &RuntimeApply) -> serde_json::Value {
-    let parent_kind = match operation.parent.point {
-        CheckpointPoint::Fixed(_) => "fixed",
-        CheckpointPoint::DeviceSelected => "device_selected",
+    let parent_kind = match operation.parent.as_ref().map(|parent| &parent.point) {
+        Some(CheckpointPoint::Fixed(_)) => "fixed",
+        Some(CheckpointPoint::DeviceSelected) => "device_selected",
+        None => "none",
     };
     json!({
-        "kind": operation.kind.as_str(),
+        "kind": operation.kind().as_str(),
         "domain": format!("{:?}", operation.domain()),
         "parent_kind": parent_kind,
         "predicated": operation.predicate().is_some(),

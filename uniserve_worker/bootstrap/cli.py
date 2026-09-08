@@ -6,7 +6,7 @@ import argparse
 import json
 from collections.abc import Sequence
 
-from ..execution.batch import RunKind
+from ..execution.batch import OpCode
 from .capacity import DEFAULT_BLOCK_SIZE, DEFAULT_MAX_BATCH_OPS
 from .config import WorkerProcessArgs
 
@@ -24,17 +24,18 @@ def _json_object(value: str) -> dict[str, object]:
 
 
 def create_worker_cli_parser() -> argparse.ArgumentParser:
-    """Build the worker CLI parser with launch, placement, resource, execution, and loading options."""
+    """Build the worker CLI parser with launch, params, resource, execution, and loading options."""
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--service-name", required=True)
+    parser.add_argument("--worker-id", default="worker")
     parser.add_argument("--pipeline-depth", type=int, default=2)
     parser.add_argument("--ipc-payload-cap", type=int, required=True)
     parser.add_argument("--ipc-max-inflight", type=int, default=1)
     parser.add_argument("--model", default="")
     parser.add_argument(
         "--supported-ops",
-        default=",".join(value.value for value in RunKind),
+        default=",".join(value.value for value in OpCode),
         help="comma-separated operation kinds assigned to this pool",
     )
     parser.add_argument("--device", default="cuda")
@@ -42,15 +43,20 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
         "--mesh",
         default="",
         help=(
-            "comma-separated placement entries: "
+            "comma-separated params entries: "
             "tower=text:<device>;gen:<device> and "
             "tower-kv-capacity=<tokens>"
         ),
     )
     parser.add_argument(
-        "--transfer-backend",
+        "--transfer-backends",
         default="local",
-        help="data-plane backend: local, shm, or cuda_ipc",
+        help="comma-separated physical backends: local, shm, cuda_ipc",
+    )
+    parser.add_argument(
+        "--publish-backends",
+        default="local",
+        help="comma-separated bound backends required for outbound products",
     )
     parser.add_argument("--attention-backend", default="auto")
     parser.add_argument(
@@ -91,7 +97,7 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--local-rank", type=int, default=0)
     parser.add_argument(
-        "--component-deployment",
+        "--entries",
         type=_json_object,
         default={"model": {"ranks": [0], "parallel_config": {}}},
         help="host-expanded component membership and logical parallel settings",

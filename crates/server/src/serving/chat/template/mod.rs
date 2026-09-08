@@ -1,12 +1,9 @@
 //! Chat template renderer contracts and implementations.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
-/// Chat-template loading and rendering errors.
-pub mod error;
 /// Model-specific chat-template renderer implementations.
 pub mod renderer;
 
-pub use error::{Error, Result};
 pub use renderer::hf::{ChatTemplateContentFormatOption, HfChatRenderer};
 
 pub use crate::serving::chat::{

@@ -31,8 +31,6 @@ def run_worker(config: WorkerProcessArgs) -> None:
         },
     )
     worker = Worker.from_config(config)
-    # Request admission begins only after the configured first-use kernel work succeeds
-    # and the worker opens a clean serving collective epoch.
     worker.warmup()
     WorkerProcess(worker, endpoint).serve()
 

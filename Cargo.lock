@@ -4168,6 +4168,7 @@ dependencies = [
  "flatc-fork",
  "iceoryx2",
  "iceoryx2-bb-elementary-traits",
+ "libc",
  "serde",
  "serde_bytes",
  "serde_json",

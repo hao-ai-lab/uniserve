@@ -8,7 +8,11 @@ from typing import Callable
 
 import torch
 
-from ...nn.parallel_attention import AttentionOutputTargets
+from ...nn.parallel_attention import (
+    AttentionContextWorkspace,
+    AttentionOutputTargets,
+    ParallelAttention,
+)
 from ...ops import video_sparse as video_sparse_ops
 from . import video_sparse_sm100
 
@@ -239,6 +243,107 @@ class VideoSparseAttentionBackend:
             workspace.compressed_tiles,
             query_valid,
         )
+
+    def forward_parallel(
+        self,
+        parallel: ParallelAttention,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        gate: torch.Tensor,
+        valid_sizes: torch.Tensor,
+        prefix_key_indices: torch.Tensor,
+        dense_key_indices: torch.Tensor,
+        prefix_count: torch.Tensor,
+        workspace: VideoSparseAttentionWorkspace,
+        *,
+        outputs: tuple[torch.Tensor, ...],
+        sync_input: torch.Tensor,
+        sync_output: torch.Tensor,
+        context_workspace: AttentionContextWorkspace | None,
+    ) -> torch.Tensor:
+        """Compose global sparse selection with shared head and context exchanges."""
+
+        context = parallel.context_group
+        group = parallel.ulysses_group
+        if len(outputs) != group.world_size:
+            raise ValueError("attention output destinations disagree with Ulysses membership")
+        if context.world_size > 1 and context_workspace is None:
+            raise ValueError("context attention requires transport storage")
+        if parallel.mapped:
+            transport = context_workspace
+            assert transport is not None
+            rows = key.shape[0]
+            tiles = rows // 64
+            start = context.rank_in_group * tiles
+            pooled_key = workspace.pooled_key[start : start + tiles]
+            pooled_value = workspace.pooled_value[start : start + tiles]
+            video_sparse_ops.pool_qkv_means(
+                query,
+                key,
+                value,
+                valid_sizes,
+                workspace.pooled_query,
+                pooled_key,
+                pooled_value,
+                query_tile_offset=start,
+                key_tile_offset=start,
+            )
+            context.all_gather_into_tensor(workspace.pooled_key, pooled_key.clone())
+            context.all_gather_into_tensor(workspace.pooled_value, pooled_value.clone())
+            owner_rows = key.shape[0] * (
+                parallel.col_group.world_size if parallel.col_group is not None else 1
+            )
+            context_key, context_value = parallel.distribute_key_value(key, value, transport)
+            self.select_from_pooled(
+                valid_sizes,
+                prefix_key_indices,
+                dense_key_indices,
+                prefix_count,
+                workspace,
+                query_tile_offset=start,
+            )
+            owner_tiles = owner_rows // 64
+            capacity_tiles = transport.local_key.shape[0] // 64
+            transport.valid_sizes.zero_()
+            transport.valid_sizes.view(parallel.key_group.world_size, capacity_tiles)[
+                :, :owner_tiles
+            ].copy_(valid_sizes.view(parallel.key_group.world_size, owner_tiles))
+            # Translate logical block IDs to page-padded peer storage. Padding
+            # changes addresses, not the selected key set or validity of its rows.
+            indices = workspace.block_indices
+            physical_indices = torch.div(
+                indices, owner_tiles, rounding_mode="floor"
+            ) * capacity_tiles + indices.remainder(owner_tiles)
+            self.forward_selected(
+                query,
+                context_key,
+                context_value,
+                gate,
+                transport.valid_sizes,
+                workspace,
+                block_indices=physical_indices,
+                targets=AttentionOutputTargets(outputs, group.rank_in_group),
+            )
+            parallel.finish_context(transport)
+            return parallel.finish_output(outputs, sync_input, sync_output)
+
+        query_tile_offset = context.rank_in_group * (query.shape[0] // TILE)
+        key, value = parallel.distribute_key_value(key, value, context_workspace)
+        self.forward_local(
+            query,
+            key,
+            value,
+            gate,
+            valid_sizes,
+            prefix_key_indices,
+            dense_key_indices,
+            prefix_count,
+            workspace,
+            targets=AttentionOutputTargets(outputs, group.rank_in_group),
+            query_tile_offset=query_tile_offset,
+        )
+        return parallel.finish_output(outputs, sync_input, sync_output)
 
     def forward_local(
         self,

@@ -9,13 +9,13 @@ use std::collections::HashSet;
 use uniserve_core::product_blob::LogprobBlob;
 use uniserve_core::{
     BlockId, CfgParams, ContextSegment, GenerationRequest, ImageIngestRecipe, ImageIngestStep,
-    ImageKvEffect, RequestId, SamplingParams, SegmentPlacement, UndTokenAction,
+    ImageKvEffect, RequestId, SamplingParams, SegmentPosition, UndTokenAction,
 };
 use uniserve_worker_ipc::{
     Bounds, Checkpoint, CheckpointPoint, DType, DimBound, DrawLayout, InlineValue, ModelOutput,
-    OpId, OpPayload, OpStatus, Operation, PointRange, ProductKind, ProductPayload, ProductRef,
-    RequestKey, Rng, RunKind, SamplingState, ShapeBound, StorageClass, encode_sampling_state_bytes,
-    encode_token_product_bytes,
+    OpCode, OpId, OpPayload, OpStatus, Operation, PointRange, ProductKind, ProductPayload,
+    ProductRef, RequestKey, Rng, SamplingState, ShapeBound, StorageClass,
+    encode_sampling_state_bytes, encode_token_product_bytes,
 };
 
 use crate::memory::Allocation;
@@ -61,7 +61,7 @@ fn bounded_product(
 fn dtype_bytes(dtype: DType) -> u64 {
     match dtype {
         DType::U8 => 1,
-        DType::U16 | DType::F16 | DType::BF16 => 2,
+        DType::U16 | DType::I16 | DType::F16 | DType::BF16 => 2,
         DType::U32 | DType::I32 | DType::F32 => 4,
         DType::I64 => 8,
     }
@@ -347,9 +347,9 @@ impl RuntimeContext {
                     });
                 }
                 ContextSegment::Image { image, ingest } => {
-                    let position = match image.placement {
-                        SegmentPlacement::AtToken { position } => position,
-                        SegmentPlacement::Append => prompt_ids.len() as u32,
+                    let position = match image.position {
+                        SegmentPosition::AtToken { position } => position,
+                        SegmentPosition::Append => prompt_ids.len() as u32,
                     };
                     if position as usize > prompt_ids.len() {
                         return Err(ContextLoweringError::ImagePositionBeyondContext {
@@ -852,7 +852,7 @@ pub(crate) struct FeedbackCursor {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// Request-local allocation and placement identities.
+/// Request-local allocation and params identities.
 pub(crate) struct ResourceCursor {
     pub(crate) worker_registered: bool,
     pub(crate) blocks_sent: usize,
@@ -1125,7 +1125,7 @@ fn plan_ar_extend(
                 request,
                 cursor,
                 intent,
-                RunKind::ArExtend,
+                OpCode::ArExtend,
                 Vec::new(),
                 outputs,
             )
@@ -1145,7 +1145,7 @@ fn plan_ar_extend(
                 request,
                 cursor,
                 intent,
-                RunKind::ArExtend,
+                OpCode::ArExtend,
                 inputs,
                 Vec::new(),
             )
@@ -1154,7 +1154,7 @@ fn plan_ar_extend(
             request,
             cursor,
             intent,
-            RunKind::ArExtend,
+            OpCode::ArExtend,
             Vec::new(),
             vec![output_product(
                 0,
@@ -1192,7 +1192,7 @@ fn plan_ar_extend(
             )?;
             let inputs = vec![feature.clone()];
 
-            finish_plan(request, cursor, intent, RunKind::ArExtend, inputs, outputs)
+            finish_plan(request, cursor, intent, OpCode::ArExtend, inputs, outputs)
         }
         _ => unreachable!("token-extend planner received another forward mode"),
     }
@@ -1221,9 +1221,9 @@ fn plan_ar_decode(
     }
     let draft_count = spec_token_ids.as_ref().map_or(0, Vec::len);
     let work = if draft_count == 0 {
-        RunKind::ArDecode
+        OpCode::ArDecode
     } else {
-        RunKind::ArVerify
+        OpCode::ArVerify
     };
     let max_points = 1_usize.saturating_add(draft_count).min(u32::MAX as usize) as u32;
     let outputs = token_outputs(
@@ -1261,8 +1261,8 @@ fn plan_encode(
         _ => unreachable!("encode planner received another forward mode"),
     };
     let work = match step {
-        ImageIngestStep::VaeEncode => RunKind::EncoderLatent,
-        ImageIngestStep::VitEncode => RunKind::EncoderVision,
+        ImageIngestStep::VaeEncode => OpCode::EncoderLatent,
+        ImageIngestStep::VitEncode => OpCode::EncoderVision,
     };
     let mut outputs = encode_outputs(step, 0, &request.resources)?;
     if adds_completion {
@@ -1316,7 +1316,7 @@ fn plan_kv_publish(
             image_id,
             physical_kv_len,
         },
-        RunKind::TransferKvPublish,
+        OpCode::TransferKvPublish,
         Vec::new(),
         vec![
             kv,
@@ -1348,7 +1348,7 @@ fn plan_diffusion_prepare(
         request,
         cursor,
         intent,
-        RunKind::DiffusionPrepare,
+        OpCode::DiffusionPrepare,
         inputs,
         vec![
             latent_output(
@@ -1389,7 +1389,7 @@ fn plan_diffusion_step(
         request,
         cursor,
         intent,
-        RunKind::DiffusionStep,
+        OpCode::DiffusionStep,
         inputs,
         vec![
             latent_output(
@@ -1436,7 +1436,7 @@ fn plan_diffusion_finalize(
         request,
         cursor,
         intent,
-        RunKind::DiffusionFinalize,
+        OpCode::DiffusionFinalize,
         inputs,
         outputs,
     )
@@ -1450,7 +1450,7 @@ fn finish_plan(
     request: &GenerationRequest,
     cursor: &GenerationCursor,
     intent: TransitionIntent,
-    kind: RunKind,
+    kind: OpCode,
     inputs: Vec<ProductRef>,
     outputs: Vec<ProductRef>,
 ) -> Result<NextOp, PlanningError> {
@@ -1458,9 +1458,9 @@ fn finish_plan(
     let operation_variant = kind;
     let produces_latent = matches!(
         operation_variant,
-        RunKind::DiffusionPrepare | RunKind::DiffusionStep
+        OpCode::DiffusionPrepare | OpCode::DiffusionStep
     );
-    let is_diffusion_finalize = operation_variant == RunKind::DiffusionFinalize;
+    let is_diffusion_finalize = operation_variant == OpCode::DiffusionFinalize;
     let produces_token = outputs
         .iter()
         .any(|output| output.kind == ProductKind::Token);
@@ -1650,13 +1650,13 @@ fn finish_plan(
         },
         expects_encoder_handle: matches!(
             operation_variant,
-            RunKind::EncoderLatent | RunKind::EncoderVision
+            OpCode::EncoderLatent | OpCode::EncoderVision
         ),
         expects_latent_generation: produces_latent,
         expects_image_artifact: is_diffusion_finalize,
         expected_image_hw: is_diffusion_finalize
             .then_some((request.image.height, request.image.width)),
-        requires_kv_publication: operation_variant == RunKind::TransferKvPublish,
+        requires_kv_publication: operation_variant == OpCode::TransferKvPublish,
         expected_image_kv: match &intent {
             TransitionIntent::IngestImageState {
                 physical_start,
@@ -1697,13 +1697,13 @@ fn finish_plan(
             && request.sampling.generated_logprobs_requested()
             && matches!(
                 operation_variant,
-                RunKind::ArExtend | RunKind::ArDecode | RunKind::ArVerify
+                OpCode::ArExtend | OpCode::ArDecode | OpCode::ArVerify
             ),
         expected_prompt_token_ids,
     };
 
     let bounds = Bounds {
-        max_points: if operation_variant == RunKind::ArVerify {
+        max_points: if operation_variant == OpCode::ArVerify {
             token_cost.min(u32::MAX as usize) as u32
         } else {
             1
@@ -1715,7 +1715,7 @@ fn finish_plan(
         max_transfer_bytes,
     };
 
-    // Random draws are indexed by semantic progress rather than batch placement.
+    // Random draws are indexed by semantic progress rather than batch params.
     let rng = match &intent {
         TransitionIntent::PrepareGen { image_id, .. } => Some(Rng {
             seed: request.image.seed.unwrap_or(0),
@@ -1920,14 +1920,14 @@ pub(crate) enum PlanningError {
 /// Ephemeral scheduler builder consumed when an operation is registered.
 #[derive(Debug)]
 pub(crate) struct NextOp {
-    pub(crate) kind: RunKind,
+    pub(crate) kind: OpCode,
     pub(crate) bounds: Bounds,
     pub(crate) inputs: Vec<ProductRef>,
     pub(crate) outputs: Vec<ProductRef>,
     pub(crate) predicate: Option<ProductRef>,
     pub(crate) rng: Option<Rng>,
     pub(crate) control_seq: u64,
-    pub(crate) operation_variant: RunKind,
+    pub(crate) operation_variant: OpCode,
     pub(crate) request_id: RequestId,
     /// Monotonic microsecond stamps for the two pre-registration lifecycle
     /// phases. They are carried here because an operation gains its canonical
@@ -2075,8 +2075,8 @@ impl NextOp {
         let operation = Operation {
             request_key,
             op_id,
-            parent,
-            kind: self.kind,
+            parent: Some(parent),
+            entry: "model".into(),
             payload: OpPayload::new(
                 self.kind,
                 self.bounds,
@@ -2147,9 +2147,11 @@ impl RuntimeApply {
             });
         }
         if record.status == OpStatus::Predicated {
-            let declared_parent_point = match operation.parent.point {
-                CheckpointPoint::Fixed(point) => point,
-                CheckpointPoint::DeviceSelected => predicated_parent_point.unwrap_or(0),
+            let declared_parent_point = match operation.parent.as_ref().map(|parent| &parent.point)
+            {
+                Some(CheckpointPoint::Fixed(point)) => *point,
+                Some(CheckpointPoint::DeviceSelected) => predicated_parent_point.unwrap_or(0),
+                None => 0,
             };
             let expected_point = predicated_parent_point.unwrap_or(declared_parent_point);
             if operation.predicate().is_none()
@@ -2177,7 +2179,7 @@ impl RuntimeApply {
                 detail: "selected_point_mismatch",
             });
         }
-        self.validation.validate(operation.kind, record, products)
+        self.validation.validate(operation.kind(), record, products)
     }
 }
 
@@ -2249,7 +2251,7 @@ impl TransitionValidation {
     /// Validates status, products, lengths, and sampling metadata for one transition result.
     fn validate(
         &self,
-        operation_variant: RunKind,
+        operation_variant: OpCode,
         record: &ModelOutput,
         products: &[ProductPayload],
     ) -> Result<(), TransitionValidationError> {
@@ -2365,7 +2367,7 @@ impl TransitionValidation {
                 detail: "missing_sampled_token",
             });
         }
-        let accepted_draft_tokens = if operation_variant == RunKind::ArVerify {
+        let accepted_draft_tokens = if operation_variant == OpCode::ArVerify {
             let drafts = self.draft_token_ids.as_deref().unwrap_or_default();
             let listed = record.committed_tokens();
             let terminal_prefix = !listed.is_empty()

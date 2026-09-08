@@ -1,13 +1,10 @@
 //! Assistant output-processor traits and implementations.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
-/// Chat output-processing errors.
-pub mod error;
 pub(crate) mod processor;
 mod qwen3;
 mod structured;
 
-pub use error::{Error, Result};
 pub use qwen3::Qwen3ChatOutputProcessor;
 
 pub use crate::profile::reasoning::ReasoningDelta;

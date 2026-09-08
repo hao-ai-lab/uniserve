@@ -175,21 +175,15 @@ if triton is not None:
     ):
         """Normalize Q/K in place and rotate an even prefix of each head."""
 
-        row_offsets = (
-            tl.program_id(0) * block_rows + tl.arange(0, block_rows)
-        ).to(tl.int64)
+        row_offsets = (tl.program_id(0) * block_rows + tl.arange(0, block_rows)).to(tl.int64)
         head = tl.program_id(1)
         columns = tl.arange(0, head_dim)
         valid = row_offsets[:, None] < rows
         query_offsets = (
-            row_offsets[:, None] * query_stride_row
-            + head * query_stride_head
-            + columns[None, :]
+            row_offsets[:, None] * query_stride_row + head * query_stride_head + columns[None, :]
         )
         key_offsets = (
-            row_offsets[:, None] * key_stride_row
-            + head * key_stride_head
-            + columns[None, :]
+            row_offsets[:, None] * key_stride_row + head * key_stride_head + columns[None, :]
         )
         query_values = tl.load(query + query_offsets, mask=valid, other=0.0).to(tl.float32)
         key_values = tl.load(key + key_offsets, mask=valid, other=0.0).to(tl.float32)
@@ -200,12 +194,12 @@ if triton is not None:
         # prefix consumes sine and cosine factors.
         query_rstd = tl.rsqrt(tl.sum(query_values * query_values, axis=1) / head_dim + eps)
         key_rstd = tl.rsqrt(tl.sum(key_values * key_values, axis=1) / head_dim + eps)
-        normalized_query = (query_values * query_rstd[:, None] * query_weights).to(
-            tl.bfloat16
-        ).to(tl.float32)
-        normalized_key = (key_values * key_rstd[:, None] * key_weights).to(
-            tl.bfloat16
-        ).to(tl.float32)
+        normalized_query = (
+            (query_values * query_rstd[:, None] * query_weights).to(tl.bfloat16).to(tl.float32)
+        )
+        normalized_key = (
+            (key_values * key_rstd[:, None] * key_weights).to(tl.bfloat16).to(tl.float32)
+        )
 
         # Map each feature in the rotary prefix to its partner in the opposite
         # half. Tail features map to themselves and bypass rotation below.
@@ -234,12 +228,14 @@ if triton is not None:
         ).to(tl.float32)
         partner_query_weight = tl.load(query_weight + partner_columns)[None, :].to(tl.float32)
         partner_key_weight = tl.load(key_weight + partner_columns)[None, :].to(tl.float32)
-        partner_query = (partner_query * query_rstd[:, None] * partner_query_weight).to(
-            tl.bfloat16
-        ).to(tl.float32)
-        partner_key = (partner_key * key_rstd[:, None] * partner_key_weight).to(
-            tl.bfloat16
-        ).to(tl.float32)
+        partner_query = (
+            (partner_query * query_rstd[:, None] * partner_query_weight)
+            .to(tl.bfloat16)
+            .to(tl.float32)
+        )
+        partner_key = (
+            (partner_key * key_rstd[:, None] * partner_key_weight).to(tl.bfloat16).to(tl.float32)
+        )
 
         rotary_mask = columns[None, :] < rotary_dim
         cosine_values = tl.load(
@@ -315,9 +311,9 @@ if triton is not None:
         # positions are zero, so normalized values pass through unrotated.
         offs_b = tl.arange(0, block_b)
         mask_b = (offs_b < tail_dim) & row_active
-        xb = tl.load(
-            x_ptr + base + (rope_dim + offs_b) * stride_2, mask=mask_b, other=0.0
-        ).to(tl.float32)
+        xb = tl.load(x_ptr + base + (rope_dim + offs_b) * stride_2, mask=mask_b, other=0.0).to(
+            tl.float32
+        )
         var_b = tl.sum(xb * xb, axis=0) / tail_dim
         wb = tl.load(tail_w_ptr + offs_b, mask=offs_b < tail_dim, other=0.0).to(tl.float32)
         out_b = xb * tl.rsqrt(var_b + eps) * wb
@@ -552,11 +548,28 @@ if triton is not None:
             head = pid - token * q_heads
             base = token * q_stride_0 + head * q_stride_1
             _multi_axis_rms_norm_rope_row(
-                q_ptr, base, q_head_w_ptr, q_tail_w_ptr,
-                cos0_ptr, sin0_ptr, cos1_ptr, sin1_ptr, cos2_ptr, sin2_ptr,
-                q_out_ptr, pid * dim, token,
-                q_stride_2, dim0, half0, axis_dim, axis_half, tail_dim, q_eps,
-                block_a, block_b,
+                q_ptr,
+                base,
+                q_head_w_ptr,
+                q_tail_w_ptr,
+                cos0_ptr,
+                sin0_ptr,
+                cos1_ptr,
+                sin1_ptr,
+                cos2_ptr,
+                sin2_ptr,
+                q_out_ptr,
+                pid * dim,
+                token,
+                q_stride_2,
+                dim0,
+                half0,
+                axis_dim,
+                axis_half,
+                tail_dim,
+                q_eps,
+                block_a,
+                block_b,
             )
         else:
             k_pid = pid - q_rows
@@ -564,11 +577,28 @@ if triton is not None:
             head = k_pid - token * k_heads
             base = token * k_stride_0 + head * k_stride_1
             _multi_axis_rms_norm_rope_row(
-                k_ptr, base, k_head_w_ptr, k_tail_w_ptr,
-                cos0_ptr, sin0_ptr, cos1_ptr, sin1_ptr, cos2_ptr, sin2_ptr,
-                k_out_ptr, k_pid * dim, token,
-                k_stride_2, dim0, half0, axis_dim, axis_half, tail_dim, k_eps,
-                block_a, block_b,
+                k_ptr,
+                base,
+                k_head_w_ptr,
+                k_tail_w_ptr,
+                cos0_ptr,
+                sin0_ptr,
+                cos1_ptr,
+                sin1_ptr,
+                cos2_ptr,
+                sin2_ptr,
+                k_out_ptr,
+                k_pid * dim,
+                token,
+                k_stride_2,
+                dim0,
+                half0,
+                axis_dim,
+                axis_half,
+                tail_dim,
+                k_eps,
+                block_a,
+                block_b,
             )
 
 
@@ -1254,3 +1284,97 @@ class _EagerPackedRope:
         out[..., :half] = x1 * cos - x2 * sin
         out[..., half:] = x2 * cos + x1 * sin
         return out
+
+
+if triton is not None:
+
+    @triton.jit
+    def _qk_rms_norm_partial_rope_kernel(
+        query_ptr,
+        key_ptr,
+        value_ptr,
+        query_bias_ptr,
+        key_bias_ptr,
+        value_bias_ptr,
+        cosine_ptr,
+        sine_ptr,
+        rows: tl.constexpr,
+        heads: tl.constexpr,
+        row_stride: tl.constexpr,
+        head_stride: tl.constexpr,
+        rotary_row_stride: tl.constexpr,
+        HAS_BIAS: tl.constexpr,
+        HAS_VALUE_BIAS: tl.constexpr,
+        HEAD_DIM: tl.constexpr,
+        ROTARY_DIM: tl.constexpr,
+        EPS: tl.constexpr,
+        HEAD_BLOCK: tl.constexpr,
+        ROW_BLOCK: tl.constexpr,
+    ):
+        """Normalize Q/K heads, rotate their leading coordinates, and apply biases."""
+
+        row = tl.program_id(0) * ROW_BLOCK + tl.arange(0, ROW_BLOCK)
+        head = tl.program_id(1)
+        columns = tl.arange(0, HEAD_BLOCK)
+        valid = (row[:, None] < rows) & (columns[None, :] < HEAD_DIM)
+        offsets = row[:, None] * row_stride + head * head_stride + columns[None, :]
+        query = tl.load(query_ptr + offsets, mask=valid, other=0.0).to(tl.float32)
+        key = tl.load(key_ptr + offsets, mask=valid, other=0.0).to(tl.float32)
+        if HAS_BIAS:
+            bias_offsets = head * HEAD_DIM + columns[None, :]
+            query += tl.load(
+                query_bias_ptr + bias_offsets, mask=columns[None, :] < HEAD_DIM, other=0.0
+            ).to(tl.float32)
+            key += tl.load(
+                key_bias_ptr + bias_offsets, mask=columns[None, :] < HEAD_DIM, other=0.0
+            ).to(tl.float32)
+            query = query.to(query_ptr.dtype.element_ty).to(tl.float32)
+            key = key.to(key_ptr.dtype.element_ty).to(tl.float32)
+        if HAS_VALUE_BIAS:
+            value = tl.load(value_ptr + offsets, mask=valid, other=0.0).to(tl.float32)
+            value += tl.load(
+                value_bias_ptr + head * HEAD_DIM + columns[None, :],
+                mask=columns[None, :] < HEAD_DIM,
+                other=0.0,
+            ).to(tl.float32)
+            tl.store(value_ptr + offsets, value.to(value_ptr.dtype.element_ty), mask=valid)
+        query_rstd = tl.rsqrt(tl.sum(query * query, axis=1) / HEAD_DIM + EPS)
+        key_rstd = tl.rsqrt(tl.sum(key * key, axis=1) / HEAD_DIM + EPS)
+        query = (query * query_rstd[:, None]).to(query_ptr.dtype.element_ty).to(tl.float32)
+        key = (key * key_rstd[:, None]).to(key_ptr.dtype.element_ty).to(tl.float32)
+
+        # Partner coordinates come from the opposite half of the rotary subspace.
+        half_rotary: tl.constexpr = ROTARY_DIM // 2
+        partner_columns = tl.where(
+            columns < half_rotary,
+            columns + half_rotary,
+            columns - half_rotary,
+        )
+        partner_columns = tl.where(columns < ROTARY_DIM, partner_columns, columns)
+        partner_offsets = row[:, None] * row_stride + head * head_stride + partner_columns[None, :]
+        query_partner = tl.load(query_ptr + partner_offsets, mask=valid, other=0.0).to(tl.float32)
+        key_partner = tl.load(key_ptr + partner_offsets, mask=valid, other=0.0).to(tl.float32)
+        if HAS_BIAS:
+            partner_bias_offsets = head * HEAD_DIM + partner_columns[None, :]
+            query_partner += tl.load(
+                query_bias_ptr + partner_bias_offsets, mask=columns[None, :] < HEAD_DIM, other=0.0
+            ).to(tl.float32)
+            key_partner += tl.load(
+                key_bias_ptr + partner_bias_offsets, mask=columns[None, :] < HEAD_DIM, other=0.0
+            ).to(tl.float32)
+            query_partner = query_partner.to(query_ptr.dtype.element_ty).to(tl.float32)
+            key_partner = key_partner.to(key_ptr.dtype.element_ty).to(tl.float32)
+        query_partner = (
+            (query_partner * query_rstd[:, None]).to(query_ptr.dtype.element_ty).to(tl.float32)
+        )
+        key_partner = (key_partner * key_rstd[:, None]).to(key_ptr.dtype.element_ty).to(tl.float32)
+
+        rotary_mask = valid & (columns[None, :] < ROTARY_DIM)
+        rotary_offsets = row[:, None] * rotary_row_stride + columns[None, :]
+        cosine = tl.load(cosine_ptr + rotary_offsets, mask=rotary_mask, other=1.0).to(tl.float32)
+        sine = tl.load(sine_ptr + rotary_offsets, mask=rotary_mask, other=0.0).to(tl.float32)
+        sign = tl.where(columns[None, :] < half_rotary, -1.0, 1.0)
+        query_rotated = query * cosine + sign * query_partner * sine
+        key_rotated = key * cosine + sign * key_partner * sine
+        tl.store(query_ptr + offsets, tl.where(rotary_mask, query_rotated, query), mask=valid)
+        tl.store(key_ptr + offsets, tl.where(rotary_mask, key_rotated, key), mask=valid)

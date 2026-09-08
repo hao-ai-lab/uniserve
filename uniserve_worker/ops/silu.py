@@ -72,7 +72,6 @@ if triton is not None:
             pack=1,
         )
 
-
     @triton.jit
     def _silu_and_mul_kernel(x_ptr, out_ptr, n_cols: tl.constexpr, block: tl.constexpr):
         """Apply ``silu(gate) * value`` to one packed activation row."""
@@ -123,10 +122,7 @@ def _act_inputs_eligible(x: torch.Tensor) -> bool:
     """Check the device, layout, gradient, and packed-width kernel contract."""
 
     return not (
-        not x.is_cuda
-        or torch.is_grad_enabled()
-        or not x.is_contiguous()
-        or x.shape[-1] % 2 != 0
+        not x.is_cuda or torch.is_grad_enabled() or not x.is_contiguous() or x.shape[-1] % 2 != 0
     )
 
 
@@ -137,8 +133,8 @@ def silu_and_mul_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         from ..nn.quant.fp8 import quantize_fp8_rowwise
 
         output = F.silu(x[..., : x.shape[-1] // 2]) * x[..., x.shape[-1] // 2 :]
-        rows = output.reshape(-1, output.shape[-1])
-        quantized, scale = quantize_fp8_rowwise(rows)
+        flat_output = output.reshape(-1, output.shape[-1])
+        quantized, scale = quantize_fp8_rowwise(flat_output)
         return quantized.reshape(output.shape), scale
 
     n_cols = int(x.shape[-1] // 2)
@@ -254,3 +250,257 @@ def silu_and_mul_dispatcher() -> Dispatcher[SiluAndMulReq, torch.Tensor]:
         [TritonSiluAndMul(), SglSiluAndMul(), EagerSiluAndMul()],
         env_override="UNISERVE_SILU_AND_MUL_PROVIDER",
     )
+
+
+if triton is not None:
+
+    @triton.jit
+    def _value_first_swiglu_kernel(
+        value_gate_ptr,
+        bias_ptr,
+        output_ptr,
+        partials_ptr,
+        elements,
+        width: tl.constexpr,
+        HAS_BIAS: tl.constexpr,
+        ROUND_ACTIVATION: tl.constexpr,
+        RETURN_ABSMAX: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        """Evaluate value-first SwiGLU over a packed ``[value, gate]`` projection."""
+
+        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        if ROUND_ACTIVATION:
+            offsets = offsets.to(tl.int64)
+        mask = offsets < elements
+        row = offsets // width
+        column = offsets - row * width
+        value = tl.load(value_gate_ptr + row * (2 * width) + column, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        gate = tl.load(
+            value_gate_ptr + row * (2 * width) + width + column,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        if HAS_BIAS:
+            value += tl.load(bias_ptr + column, mask=mask, other=0.0).to(tl.float32)
+            gate += tl.load(bias_ptr + width + column, mask=mask, other=0.0).to(tl.float32)
+            value = value.to(value_gate_ptr.dtype.element_ty).to(tl.float32)
+            gate = gate.to(value_gate_ptr.dtype.element_ty).to(tl.float32)
+        if ROUND_ACTIVATION:
+            activated = (gate / (1.0 + tl.exp(-gate))).to(tl.bfloat16)
+            output = (value.to(tl.bfloat16) * activated).to(output_ptr.dtype.element_ty)
+        else:
+            output = (value * gate / (1.0 + tl.exp(-gate))).to(output_ptr.dtype.element_ty)
+        tl.store(output_ptr + offsets, output, mask=mask)
+        if RETURN_ABSMAX:
+            partial = tl.max(tl.where(mask, tl.abs(output.to(tl.float32)), 0.0), axis=0)
+            tl.store(partials_ptr + tl.program_id(0), partial)
+
+    @triton.jit
+    def _value_first_swiglu_fp8_kernel(
+        value_gate_ptr,
+        output_ptr,
+        output_scale_ptr,
+        width: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        """Evaluate one packed SwiGLU row and quantize it with a rowwise scale."""
+
+        row = tl.program_id(0).to(tl.int64)
+        columns = tl.arange(0, BLOCK)
+        mask = columns < width
+        value = tl.load(
+            value_gate_ptr + row * (2 * width) + columns,
+            mask=mask,
+            other=0.0,
+        ).to(tl.bfloat16)
+        gate = tl.load(
+            value_gate_ptr + row * (2 * width) + width + columns,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        activated_gate = (gate / (1.0 + tl.exp(-gate))).to(tl.bfloat16)
+        output = (value * activated_gate).to(tl.bfloat16)
+        output_fp32 = tl.where(mask, output.to(tl.float32), 0.0)
+        output_scale = tl.maximum(tl.max(tl.abs(output_fp32), axis=0), _FP8_SCALE_EPS_TL)
+        output_scale /= _FP8_MAX_TL
+        quantized = tl.maximum(
+            tl.minimum(_fp8_divide_rn(output_fp32, output_scale), _FP8_MAX_TL),
+            -_FP8_MAX_TL,
+        )
+        tl.store(output_ptr + row * width + columns, quantized, mask=mask)
+        tl.store(output_scale_ptr + row, output_scale)
+
+    @triton.jit
+    def _finish_absmax_kernel(
+        partials_ptr,
+        output_ptr,
+        count: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        """Reduce per-program magnitude partials to one scalar."""
+
+        offsets = tl.arange(0, BLOCK)
+        values = tl.load(partials_ptr + offsets, mask=offsets < count, other=-float("inf"))
+        tl.store(output_ptr, tl.max(values, axis=0))
+
+
+def finish_absmax(partials: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Reduce Triton magnitude partials into a scalar of the requested dtype."""
+
+    maximum = torch.empty((), dtype=dtype, device=partials.device)
+    finish_block = triton.next_power_of_2(int(partials.numel()))
+    _finish_absmax_kernel[(1,)](
+        partials,
+        maximum,
+        count=int(partials.numel()),
+        BLOCK=finish_block,
+        num_warps=8,
+    )
+    return maximum
+
+
+def _value_first_inputs_eligible(value_gate: torch.Tensor) -> bool:
+    """Whether the packed projection can be consumed directly by Triton."""
+
+    return (
+        triton is not None
+        and value_gate.is_cuda
+        and value_gate.is_contiguous()
+        and triton_available(value_gate.device)
+    )
+
+
+def _validate_value_first(
+    value_gate: torch.Tensor,
+    bias: torch.Tensor | None,
+    activation_dtype: torch.dtype | None,
+) -> int:
+    """Validate the packed halves and optional pre-activation rounding contract."""
+
+    if value_gate.ndim < 1 or value_gate.shape[-1] < 2 or value_gate.shape[-1] % 2:
+        raise ValueError("SwiGLU requires two equal, nonempty packed halves")
+    if activation_dtype not in (None, torch.bfloat16):
+        raise ValueError("SwiGLU activation rounding supports bfloat16")
+    if activation_dtype is torch.bfloat16 and value_gate.dtype is not torch.bfloat16:
+        raise ValueError("BF16-rounded SwiGLU requires BF16 projection values")
+    if bias is not None and (
+        bias.shape != value_gate.shape[-1:] or bias.device != value_gate.device
+    ):
+        raise ValueError("SwiGLU bias must match the packed width and device")
+    return int(value_gate.shape[-1]) // 2
+
+
+def _value_first_tensor(
+    value_gate: torch.Tensor,
+    bias: torch.Tensor | None,
+    activation_dtype: torch.dtype | None,
+) -> torch.Tensor:
+    """Evaluate the packed activation with the declared intermediate rounding."""
+
+    if bias is not None:
+        value_gate = (value_gate.float() + bias.float()).to(value_gate.dtype)
+    value, gate = value_gate.chunk(2, dim=-1)
+    if activation_dtype is not None:
+        return value * F.silu(gate.float()).to(activation_dtype)
+    return (value.float() * F.silu(gate.float())).to(value_gate.dtype)
+
+
+def value_first_swiglu(
+    value_gate: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    *,
+    activation_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Apply SiLU gating to packed ``[value, gate]`` projection rows.
+
+    Bias addition rounds through the projection dtype. With ``activation_dtype``
+    set to BF16, SiLU rounds before multiplication; otherwise both operations
+    accumulate in FP32 and only the result rounds to the projection dtype.
+    """
+
+    width = _validate_value_first(value_gate, bias, activation_dtype)
+    if not _value_first_inputs_eligible(value_gate):
+        return _value_first_tensor(value_gate, bias, activation_dtype)
+    output = torch.empty(
+        (*value_gate.shape[:-1], width), dtype=value_gate.dtype, device=value_gate.device
+    )
+    elements = output.numel()
+    _value_first_swiglu_kernel[(triton.cdiv(elements, 1024),)](
+        value_gate,
+        bias,
+        output,
+        None,
+        elements,
+        width,
+        HAS_BIAS=bias is not None,
+        ROUND_ACTIVATION=activation_dtype is not None,
+        RETURN_ABSMAX=False,
+        BLOCK=1024,
+        num_warps=4,
+    )
+    return output
+
+
+def value_first_swiglu_absmax(
+    value_gate: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    *,
+    activation_dtype: torch.dtype | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return value-first SwiGLU and the absolute maximum of its rounded result."""
+
+    width = _validate_value_first(value_gate, bias, activation_dtype)
+    if not _value_first_inputs_eligible(value_gate):
+        output = _value_first_tensor(value_gate, bias, activation_dtype)
+        return output, output.abs().amax()
+    elements = value_gate.numel() // 2
+    block = 32768
+    partial_count = triton.cdiv(elements, block)
+    output = torch.empty(
+        (*value_gate.shape[:-1], width), dtype=value_gate.dtype, device=value_gate.device
+    )
+    partials = torch.empty((partial_count,), dtype=torch.float32, device=value_gate.device)
+    _value_first_swiglu_kernel[(partial_count,)](
+        value_gate,
+        bias,
+        output,
+        partials,
+        elements=elements,
+        width=width,
+        HAS_BIAS=bias is not None,
+        ROUND_ACTIVATION=activation_dtype is not None,
+        RETURN_ABSMAX=True,
+        BLOCK=block,
+        num_warps=8,
+    )
+    return output, finish_absmax(partials, value_gate.dtype)
+
+
+def value_first_swiglu_fp8(value_gate: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize BF16-rounded value-first SwiGLU with one E4M3 scale per row."""
+
+    width = _validate_value_first(value_gate, None, torch.bfloat16)
+    if not _value_first_inputs_eligible(value_gate) or width > 32768:
+        from ..nn.quant.fp8 import quantize_fp8_rowwise
+
+        output = _value_first_tensor(value_gate, None, torch.bfloat16)
+        values, scales = quantize_fp8_rowwise(output.reshape(-1, width))
+        return values.reshape(output.shape), scales
+    rows = value_gate.numel() // (2 * width)
+    output = torch.empty(
+        (*value_gate.shape[:-1], width), dtype=torch.float8_e4m3fn, device=value_gate.device
+    )
+    scales = torch.empty((rows, 1), dtype=torch.float32, device=value_gate.device)
+    block = triton.next_power_of_2(width)
+    _value_first_swiglu_fp8_kernel[(rows,)](
+        value_gate,
+        output,
+        scales,
+        width=width,
+        BLOCK=block,
+        num_warps=32 if block >= 32768 else 16,
+    )
+    return output, scales

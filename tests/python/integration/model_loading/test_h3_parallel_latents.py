@@ -3,6 +3,7 @@
 import os
 from dataclasses import replace
 from pathlib import Path
+from threading import Event
 
 import pytest
 import torch
@@ -12,34 +13,37 @@ from transformers import AutoTokenizer
 
 from uniserve_eval.config import load_config
 from uniserve_eval.datasets.minimax_h3 import MiniMaxH3Dataset
-from uniserve_worker.bootstrap.plan import ComponentDeployConfig
+from uniserve_worker.config import WorkerConfig
 from uniserve_worker.execution.batch import (
-    DiffusionRequestParams,
     MediaGeometry,
-    NewRequest,
-    RequestKey,
+    TensorTransfer,
+    WorkerEndpoint,
 )
-from uniserve_worker.models.minimax_h3.model import MiniMaxH3Runner
+from uniserve_worker.execution.bounded_storage import BoundedTensorStorage
+from uniserve_worker.execution.model_runner import ModelRunner
+from uniserve_worker.execution.trace import ExecutionTrace
+from uniserve_worker.loader import LoadRequest, load_model
 from uniserve_worker.models.minimax_h3.packing import (
     audio_latent_frames,
     build_packed_layout,
     unpatchify_video,
     video_latent_frames,
 )
-from uniserve_worker.models.minimax_h3.placement import H3Placement
-from uniserve_worker.models.minimax_h3.precision import H3LinearPrecisionPolicy
-from uniserve_worker.nn.parallel import (
-    Attention2DSequence,
-    GatherSequence,
-    HybridSequence,
-    ParallelConfig,
-    RingSequence,
-    UlyssesSequence,
+from uniserve_worker.models.minimax_h3.precision import (
+    PRECISION_PRESETS,
+    PRECISION_SHORTHANDS,
+    SUPPORTED_PRECISIONS,
 )
+from uniserve_worker.nn.mesh import EntryBindings
+from uniserve_worker.nn.parallel import EntryConfig, ParallelConfig, SequenceParallel
+from uniserve_worker.nn.quant.config import resolve_component_precisions
+from uniserve_worker.runtime.device_events import DeviceEventPool
 from uniserve_worker.runtime.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from uniserve_worker.transfer.layout import fetch_tensor
+from uniserve_worker.transfer.tickets import make_transport
 
 pytestmark = [
     pytest.mark.integration,
@@ -49,28 +53,34 @@ pytestmark = [
 ]
 
 _LAYOUTS = {
-    "u4": ((3, 1, 2, 0), ParallelConfig(sequence_parallel=UlyssesSequence(4))),
+    "u4": ((3, 1, 2, 0), ParallelConfig(sequence_parallel=SequenceParallel("ulysses", (4,)))),
     "local": ((3,), ParallelConfig()),
-    "u2": ((3, 1), ParallelConfig(sequence_parallel=UlyssesSequence(2))),
+    "u2": ((3, 1), ParallelConfig(sequence_parallel=SequenceParallel("ulysses", (2,)))),
     "t2": ((3, 1), ParallelConfig(tensor_parallel_size=2)),
     "t4": ((3, 1, 2, 0), ParallelConfig(tensor_parallel_size=4)),
     "t2_u2": (
         (3, 1, 2, 0),
-        ParallelConfig(tensor_parallel_size=2, sequence_parallel=UlyssesSequence(2)),
+        ParallelConfig(tensor_parallel_size=2, sequence_parallel=SequenceParallel("ulysses", (2,))),
     ),
-    "gather2": ((3, 1), ParallelConfig(sequence_parallel=GatherSequence(2))),
-    "gather4": ((3, 1, 2, 0), ParallelConfig(sequence_parallel=GatherSequence(4))),
-    "ring2": ((3, 1), ParallelConfig(sequence_parallel=RingSequence(2))),
-    "ring4": ((3, 1, 2, 0), ParallelConfig(sequence_parallel=RingSequence(4))),
-    "attention2d": ((3, 1, 2, 0), ParallelConfig(sequence_parallel=Attention2DSequence(2, 2))),
-    "hybrid": ((3, 1, 2, 0), ParallelConfig(sequence_parallel=HybridSequence(2, 2))),
+    "gather2": ((3, 1), ParallelConfig(sequence_parallel=SequenceParallel("allgather", (2,)))),
+    "gather4": (
+        (3, 1, 2, 0),
+        ParallelConfig(sequence_parallel=SequenceParallel("allgather", (4,))),
+    ),
+    "ring2": ((3, 1), ParallelConfig(sequence_parallel=SequenceParallel("ring", (2,)))),
+    "ring4": ((3, 1, 2, 0), ParallelConfig(sequence_parallel=SequenceParallel("ring", (4,)))),
+    "attention2d": (
+        (3, 1, 2, 0),
+        ParallelConfig(sequence_parallel=SequenceParallel("attention2d", (2, 2, 1))),
+    ),
+    "hybrid": ((3, 1, 2, 0), ParallelConfig(sequence_parallel=SequenceParallel("hybrid", (2, 2)))),
     "pp2": ((3, 1), ParallelConfig(pipeline_parallel_size=2)),
     "pp4": ((3, 1, 2, 0), ParallelConfig(pipeline_parallel_size=4)),
 }
 
 
 def _generate(
-    rank, rendezvous, checkpoint, kind, encoder_tp, precision_policy, requests, directory
+    rank, rendezvous, checkpoint, kind, encoder_tp, component_precisions, requests, directory
 ):
     environment = init_distributed_environment(
         rank=rank,
@@ -82,13 +92,13 @@ def _generate(
     )
     ranks, parallel = _LAYOUTS[kind]
     components = {
-        "denoiser": ComponentDeployConfig(ranks, parallel),
-        "text_encoder": ComponentDeployConfig(
+        "denoiser": EntryConfig(ranks, parallel),
+        "text_encoder": EntryConfig(
             (0, 2, 1, 3)[:encoder_tp], ParallelConfig(tensor_parallel_size=encoder_tp)
         ),
-        "video_decoder": ComponentDeployConfig((2, 0), distribution="temporal_units"),
-        "audio_decoder": ComponentDeployConfig((1,)),
-        "output": ComponentDeployConfig((2,)),
+        "video_decoder": EntryConfig((2, 0), distribution="temporal_units"),
+        "audio_decoder": EntryConfig((1,)),
+        "output": EntryConfig((2,)),
     }
     meshes = initialize_model_parallel(
         environment,
@@ -98,50 +108,119 @@ def _generate(
             if component.distribution is None
         },
     )
-    placement = H3Placement(components, meshes, environment.process_group)
-    runner = MiniMaxH3Runner.from_pretrained(
-        checkpoint,
-        placement,
-        max_state_slots=2,
-        max_text_rows=16384,
-        max_video_seconds=15,
-        precision_policy=precision_policy,
+    bindings = EntryBindings(components, meshes, environment.process_group)
+    loaded = load_model(
+        LoadRequest(
+            model_path=checkpoint,
+            execution=replace(
+                WorkerConfig(model_dtype="bfloat16"),
+                attention_backend=None,
+                block_size=256,
+                device=str(environment.local_device),
+                kv_token_capacity=None,
+                max_batch_operations=2,
+                max_batch_tokens=2,
+                rank=rank,
+                world_size=4,
+            ),
+            bindings=bindings,
+            max_text_rows=16384,
+            max_video_seconds=15,
+            quantization_config={"components": component_precisions},
+            pipeline_depth=8,
+        ),
     )
-    pool = runner.create_request_state()
+    runner = loaded.model
+    schedule = loaded.schedule
+    assert schedule is not None
+    storage = BoundedTensorStorage.allocate(runner.resource_geometry.request_tensors, runner.device)
+    execution = ModelRunner(
+        runner,
+        loaded.worker_config,
+        ExecutionTrace(runner.architecture),
+        environment=environment,
+        schedule=schedule,
+    )
+    scratch = execution.scratch
+    assert scratch is not None
+    context_workspace = execution.context_workspace
+    transfer_events = DeviceEventPool()
+    transport = make_transport(
+        "cuda_ipc",
+        byte_capacity=runner.product_storage_bytes,
+        ticket_capacity=4,
+        event_pool=transfer_events,
+        source=WorkerEndpoint.local("worker", rank=rank),
+    )
     with torch.inference_mode():
         for index, (frames, token_ids) in enumerate(requests):
-            admission = NewRequest.create(
-                RequestKey(1, index + 1, 0),
-                request_pool_idx=1,
-                diffusion=DiffusionRequestParams(
-                    prompt_token_ids=token_ids,
-                    seed=1000,
-                    geometry=MediaGeometry(
-                        frame_count=frames,
-                        decode_units=((frames - 5) // 17 + 1) // 2 + 2,
-                        prompt_tokens=len(token_ids),
-                        denoise_steps=4,
-                    ),
-                ),
+            media = MediaGeometry(
+                frame_count=frames,
+                video_units=(frames - 5) // 17,
+                prompt_tokens=len(token_ids),
+                denoise_steps=4,
             )
-            slot = pool.slots[0]
-            runner.prepare(slot, admission)
+            metadata = runner.build_execution(media, scratch, context_workspace)
+            slot = runner.request_tensors(storage, media, metadata)
+            encoded = None
+            if runner.text_encoder is not None:
+                tokens = execution.stage_text_tokens(token_ids)
+                (encoded,) = execution.run_entry("text_encoder", tokens).values
+            owner = bindings.output_ranks("text_encoder")[0]
+            publication = transport.publish(encoded) if rank == owner else None
+            descriptor = [publication]
+            # The test coordinator distributes only the physical descriptor;
+            # numerical conditioning reaches each input owner through Tensor reads.
+            dist.broadcast_object_list(descriptor, src=owner)
+            location = descriptor[0]
+            tickets = ()
+            if rank in bindings.input_ranks("denoiser") and rank != owner:
+                conditioning = torch.empty(
+                    location.shape, dtype=torch.bfloat16, device=runner.device
+                )
+                tickets = fetch_tensor(
+                    TensorTransfer(shape=location.shape, locations=(location,)),
+                    conditioning,
+                    bindings={(location.source, location.backend): transport},
+                )
+                for ticket in tickets:
+                    ready = Event()
+                    ticket.add_done_callback(ready.set)
+                    assert ready.wait(30), "conditioning Tensor did not become consumable"
+                    ticket.result()
+                encoded = conditioning
+
+            def execute(name: str, value: torch.Tensor) -> torch.Tensor:
+                (result,) = execution.run_module(name, value).values
+                return result
+
+            with execution.preparing_inputs(runner.initialize_tensors(slot, 1000)):
+                runner.prepare(slot, metadata, encoded, len(token_ids), execute)
+            for ticket in tickets:
+                ticket.close()
             for step in range(4):
-                runner.denoise(slot, step, 1)
-            runner.synchronize_runtime()
-            if rank in placement.latent_producers:
-                owner = placement.latent_producers.index(rank)
+                if bindings.owns("denoiser"):
+                    execution.run_module("denoiser", slot, metadata, step, 1, schedule)
+            torch.cuda.synchronize(runner.device)
+            if rank in bindings.output_ranks("denoiser"):
+                owner = bindings.output_ranks("denoiser").index(rank)
                 torch.save(
                     {"video": slot.video_rows.cpu(), "audio": slot.audio_rows.cpu()},
                     Path(directory) / f"case-{index}-owner-{owner}.pt",
                 )
-            slot.clear()
-    del pool, runner
+            dist.barrier()
+            if publication is not None:
+                transport.release(publication)
+            transfer_events.reap()
+    transport.close()
+    transfer_events.close()
+    execution.synchronize()
+    execution.close()
     environment.close()
     dist.destroy_process_group()
 
 
-def _collect(checkpoint, requests, kind, directory, *, encoder_tp=1, precision_policy):
+def _collect(checkpoint, requests, kind, directory, *, encoder_tp=1, component_precisions):
     directory.mkdir()
     mp.spawn(
         _generate,
@@ -150,7 +229,7 @@ def _collect(checkpoint, requests, kind, directory, *, encoder_tp=1, precision_p
             checkpoint,
             kind,
             encoder_tp,
-            precision_policy,
+            component_precisions,
             requests,
             str(directory),
         ),
@@ -218,10 +297,16 @@ def test_parallel_layout_generates_finite_latents(
     generation_requests, tmp_path, precision_name, kind, encoder_tp
 ):
     checkpoint, requests = generation_requests
-    precision_policy = (
-        H3LinearPrecisionPolicy.from_mode("maximum")
-        if precision_name == "maximum"
-        else H3LinearPrecisionPolicy.resolve(precision_name)
+    component_precisions = dict(
+        resolve_component_precisions(
+            {"mode": "maximum"}
+            if precision_name == "maximum"
+            else {"quant_method": precision_name},
+            supported=SUPPORTED_PRECISIONS,
+            presets=PRECISION_PRESETS,
+            shorthands=PRECISION_SHORTHANDS,
+            default_mode="balanced",
+        )
     )
     actual = _collect(
         checkpoint,
@@ -229,7 +314,7 @@ def test_parallel_layout_generates_finite_latents(
         kind,
         tmp_path / f"{precision_name}-{kind}-encoder{encoder_tp}",
         encoder_tp=encoder_tp,
-        precision_policy=precision_policy,
+        component_precisions=component_precisions,
     )
     # Floating-point reduction order can change the denoising trajectory.
     # Require usable decoder inputs, not reproduction of another topology.
@@ -241,10 +326,10 @@ def test_parallel_layout_generates_finite_latents(
             assert latent.isfinite().all(), f"{modality}: nonfinite denoised latents"
             energy = latent.square().mean()
             assert energy.isfinite() and energy > 0, f"{modality}: invalid denoised signal energy"
-            if modality == "video" and precision_policy.video_vae == "fp16":
+            if modality == "video" and component_precisions["video_vae"] == "fp16":
                 assert latent.to(torch.float16).isfinite().all(), "video: FP16 decoder overflow"
             print(
-                precision_policy,
+                component_precisions,
                 kind,
                 "encoder TP",
                 encoder_tp,

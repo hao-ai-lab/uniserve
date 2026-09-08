@@ -3,11 +3,14 @@
 //! [`EngineCore`] owns the scheduler thread and worker lifecycle while exposing
 //! a transport-independent [`EngineHandle`] to request producers.
 
+use std::collections::{BTreeMap, BTreeSet};
+
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use crate::executor::{Executor, PoolConfig, TransferBackend, TransportMap, WorkerTopology};
+use crate::executor::{Executor, TransportMap, WorkerId};
 use crate::handle::{EngineHandle, EventRx, SubmitError};
 use crate::runtime::{ControlTokens, EngineLoop, RuntimeProfile};
 use crate::scheduler::{
@@ -15,17 +18,188 @@ use crate::scheduler::{
     DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS, SchedStats, SchedulerConfig,
     SchedulingPolicy,
 };
-use crate::worker::{MultiprocExecutor, StagedExecutor, UniprocExecutor, WorkerProcessArgs};
+use crate::worker::{Worker, WorkerExecutor, WorkerProcessArgs};
 use anyhow::Context as _;
 use uniserve_core::{
-    CommandWaker, GenerationLimits, ModelDtype, Request, RequestId, RuntimeFamily,
+    CommandWaker, ComponentDistribution, EntryConfig, GenerationLimits, ModelDtype, ParallelConfig,
+    Request, RequestId, RuntimeFamily, SequenceParallel,
 };
 use uniserve_worker_ipc::WorkerInfo;
 
+/// One cooperative member's physical execution endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRank {
+    pub node: String,
+    pub device: String,
+}
+
+/// Static computation entries and their ordered physical rank membership.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerConfig {
+    pub id: WorkerId,
+    pub ranks: Vec<WorkerRank>,
+    pub entries: BTreeMap<String, EntryConfig>,
+    pub queue_depth: usize,
+}
+
+impl WorkerConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        WorkerId::new(self.id.0.clone())?;
+        anyhow::ensure!(
+            self.queue_depth > 0,
+            "worker {} queue depth must be positive",
+            self.id
+        );
+        Self::validate_members(&self.ranks, &self.entries)?;
+        Ok(())
+    }
+
+    pub fn validate_members(
+        ranks: &[WorkerRank],
+        entries: &BTreeMap<String, EntryConfig>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(!ranks.is_empty(), "worker requires rank members");
+        let mut devices = BTreeSet::new();
+        for rank in ranks {
+            anyhow::ensure!(
+                !rank.node.is_empty() && !rank.device.is_empty(),
+                "rank requires node and device"
+            );
+            anyhow::ensure!(
+                devices.insert((&rank.node, &rank.device)) || rank.device == "cpu",
+                "worker repeats a physical device"
+            );
+        }
+        anyhow::ensure!(!entries.is_empty(), "worker requires computation entries");
+        for (name, entry) in entries {
+            anyhow::ensure!(!name.is_empty(), "entry name must not be empty");
+            anyhow::ensure!(
+                !entry.ranks.is_empty() && entry.ranks.iter().all(|&rank| rank < ranks.len()),
+                "entry {name} contains invalid members"
+            );
+            anyhow::ensure!(
+                entry.ranks.iter().collect::<BTreeSet<_>>().len() == entry.ranks.len(),
+                "entry {name} repeats members"
+            );
+            let degree = entry.parallel_config.world_size()?;
+            if entry.distribution.is_some() {
+                anyhow::ensure!(
+                    degree == 1,
+                    "distributed temporal units require local entry geometry"
+                );
+            } else {
+                anyhow::ensure!(
+                    degree == entry.ranks.len(),
+                    "entry {name} parallel degree {degree} disagrees with {} members",
+                    entry.ranks.len()
+                );
+            }
+            anyhow::ensure!(
+                entry.units_per_rank > 0,
+                "entry {name} units_per_rank must be positive"
+            );
+        }
+        Ok(())
+    }
+
+    /// Validates unique Worker identities and one static owner for each entry.
+    pub fn validate_all(workers: &[Self]) -> anyhow::Result<()> {
+        anyhow::ensure!(!workers.is_empty(), "engine requires workers");
+        let mut ids = BTreeSet::new();
+        let mut entries = BTreeSet::new();
+        for worker in workers {
+            worker.validate()?;
+            anyhow::ensure!(ids.insert(&worker.id), "Worker identity is repeated");
+            for entry in worker.entries.keys() {
+                anyhow::ensure!(
+                    entries.insert(entry),
+                    "entry {entry} has multiple Worker owners"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Expands the single-instance CLI shorthand into explicit device membership.
+    pub fn model(device: &str, rank_count: usize, queue_depth: usize) -> Self {
+        let ranks = (0..rank_count)
+            .map(|rank| WorkerRank {
+                node: "localhost".into(),
+                device: if matches!(device, "cuda" | "gpu") {
+                    format!("cuda:{rank}")
+                } else {
+                    device.into()
+                },
+            })
+            .collect();
+        Self {
+            id: WorkerId("model".into()),
+            ranks,
+            entries: BTreeMap::from([(
+                "model".into(),
+                EntryConfig::parallel(
+                    (0..rank_count).collect(),
+                    ParallelConfig {
+                        tensor_parallel_size: rank_count,
+                        ..Default::default()
+                    },
+                ),
+            )]),
+            queue_depth,
+        }
+    }
+
+    /// Resolves the explicit device budget into the established H3 Ulysses params.
+    pub fn h3(device: &str, rank_count: usize, queue_depth: usize) -> Self {
+        let mut worker = Self::model(device, rank_count, queue_depth);
+        let ranks: Vec<_> = (0..rank_count).collect();
+        let denoiser = ParallelConfig {
+            sequence_parallel: SequenceParallel::Ulysses {
+                ulysses_degree: ranks.len(),
+            },
+            ..ParallelConfig::default()
+        };
+        let encoder = ParallelConfig {
+            tensor_parallel_size: ranks.len(),
+            ..ParallelConfig::default()
+        };
+        worker.entries = BTreeMap::from([
+            (
+                "denoiser".into(),
+                EntryConfig::parallel(ranks.clone(), denoiser),
+            ),
+            (
+                "text_encoder".into(),
+                EntryConfig::parallel(ranks.clone(), encoder),
+            ),
+            (
+                "video_decoder".into(),
+                EntryConfig {
+                    ranks,
+                    parallel_config: ParallelConfig::default(),
+                    distribution: Some(ComponentDistribution::TemporalUnits),
+                    units_per_rank: 1,
+                },
+            ),
+            (
+                "audio_decoder".into(),
+                EntryConfig::parallel(vec![0], ParallelConfig::default()),
+            ),
+            (
+                "output".into(),
+                EntryConfig::parallel(vec![0], ParallelConfig::default()),
+            ),
+        ]);
+        worker
+    }
+}
+
 /// Configuration for one in-process engine core.
 #[derive(Debug, Clone)]
-pub struct EngineCoreConfig {
-    /// Request runtime selected for this deployment.
+pub struct EngineConfig {
+    /// Request runtime selected for this configuration.
     pub runtime_family: RuntimeFamily,
     /// Model-family semantics resolved by the serving profile.
     pub runtime_profile: RuntimeProfile,
@@ -44,14 +218,14 @@ pub struct EngineCoreConfig {
     pub scheduler_policy: SchedulingPolicy,
     /// Maximum model context length reported to the frontend.
     pub max_model_len: u32,
-    /// Parsed worker topology.
-    pub workers: WorkerTopology,
+    /// Static computation entries and physical rank membership.
+    pub workers: Vec<WorkerConfig>,
     /// Per-edge data-plane transfer backend selection (`--transfer`), e.g.
     /// `encoder->prefill=shm,prefill->decode=cuda_ipc`. Participating worker
-    /// pools receive the selected transport; unconfigured edges use local
-    /// worker-resident products.
+    /// ranks receive the selected transport. Intra-Worker defaults are resolved
+    /// once from rank node/device coordinates before process launch.
     pub transfer: TransportMap,
-    /// Complete process arguments; staged pools override placement and role.
+    /// Rank launch defaults refined by each Worker configuration.
     pub worker_process: WorkerProcessArgs,
     /// Beginning-of-sequence token identifier.
     pub bos: u32,
@@ -61,7 +235,7 @@ pub struct EngineCoreConfig {
     pub end_of_image: u32,
 }
 
-impl EngineCoreConfig {
+impl EngineConfig {
     /// Builds a minimal configuration for the CPU simulation backend.
     ///
     /// Pair this with [`EngineCore::with_executor`]: [`EngineCore::new`] cannot
@@ -69,7 +243,7 @@ impl EngineCoreConfig {
     pub fn sim(model: impl Into<String>) -> Self {
         let worker_process = WorkerProcessArgs {
             model: model.into(),
-            device: "cpu".into(),
+            ranks: WorkerConfig::model("cpu", 1, 2).ranks,
             block_size: 64,
             pipeline_depth: 2,
             max_batch_operations: DEFAULT_MAX_BATCH as u32,
@@ -89,7 +263,7 @@ impl EngineCoreConfig {
             mixed_prefill_tokens: DEFAULT_MIXED_PREFILL_TOKENS,
             scheduler_policy: SchedulingPolicy::Fcfs,
             max_model_len: 8192,
-            workers: WorkerTopology::single_full(1),
+            workers: vec![WorkerConfig::model("cpu", 1, 2)],
             transfer: TransportMap::default(),
             worker_process,
             // `SimEngine` fabricates this fake EOS id after `text_len` tokens; the
@@ -134,109 +308,45 @@ impl EngineCore {
     ///
     /// Blocks until the worker has loaded the model and answered the
     /// worker-info handshake, including model initialization.
-    pub fn new(config: EngineCoreConfig) -> anyhow::Result<Self> {
-        let workers = config.workers.clone().with_process_defaults(
-            &config.worker_process.device,
-            config.worker_process.pipeline_depth,
-        );
-        let (executor, command_waker) = if workers.is_single_full() {
-            Self::spawn_full_pool(&config, &workers.pools[0])?
-        } else {
-            Self::spawn_staged(&config, &workers)?
-        };
-        Self::assemble(config, executor, command_waker)
-    }
-
-    /// Spawns the single Full pool. One rank uses a `UniprocExecutor`; multiple
-    /// physical ranks use a `MultiprocExecutor`.
-    fn spawn_full_pool(
-        config: &EngineCoreConfig,
-        pool: &PoolConfig,
-    ) -> anyhow::Result<(Box<dyn Executor>, CommandWaker)> {
-        let args = WorkerProcessArgs {
-            device: pool.device.clone(),
-            world_size: pool.worker_ranks,
-            pipeline_depth: pool.queue_depth,
-            supported_ops: pool.supported_ops.clone(),
-            transfer_backend: TransferBackend::Inproc,
-            ..config.worker_process.clone()
-        };
-        if pool.worker_ranks > 1 {
-            let workers = MultiprocExecutor::spawn(args)
-                .context("failed to spawn forward-only worker ranks")?;
-            let waker = workers.command_waker();
-            Ok((Box::new(workers), waker))
-        } else {
-            let worker =
-                UniprocExecutor::spawn(args).context("failed to spawn forward-only worker")?;
-            let waker = worker.command_waker();
-            Ok((Box::new(worker), waker))
-        }
-    }
-
-    /// Composes a staged executor over explicitly configured physical pools.
-    fn spawn_staged(
-        config: &EngineCoreConfig,
-        workers: &WorkerTopology,
-    ) -> anyhow::Result<(Box<dyn Executor>, CommandWaker)> {
+    pub fn new(mut config: EngineConfig) -> anyhow::Result<Self> {
+        config.transfer = config.transfer.with_worker_defaults(&config.workers)?;
+        let instances = config
+            .workers
+            .iter()
+            .map(|worker| worker.id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
         for edge in &config.transfer.edges {
             anyhow::ensure!(
-                workers.pools.iter().any(|pool| pool.id == edge.source_pool),
-                "transfer edge source pool {} is not configured",
-                edge.source_pool
-            );
-            anyhow::ensure!(
-                workers
-                    .pools
-                    .iter()
-                    .any(|pool| pool.id == edge.destination_pool),
-                "transfer edge destination pool {} is not configured",
-                edge.destination_pool
+                instances.contains(&edge.source_worker)
+                    && instances.contains(&edge.destination_worker),
+                "transfer edge names an unconfigured worker"
             );
         }
-        let mut pools: Vec<(PoolConfig, Box<dyn crate::executor::PhysicalExecutor>)> =
-            Vec::with_capacity(workers.total_pools());
-        let mut command_wakers = Vec::with_capacity(workers.total_pools());
-        let mut progress_fds = Vec::new();
-        for pool in &workers.pools {
-            let incident = config
-                .transfer
-                .edges
-                .iter()
-                .filter(|edge| edge.source_pool == pool.id || edge.destination_pool == pool.id)
-                .map(|edge| edge.transport)
-                .collect::<std::collections::BTreeSet<_>>();
-            anyhow::ensure!(
-                incident.len() <= 1,
-                "pool {} has transfer edges with incompatible transports",
-                pool.id
-            );
-            let exec = MultiprocExecutor::spawn(WorkerProcessArgs {
-                device: pool.device.clone(),
-                world_size: pool.worker_ranks,
-                pipeline_depth: pool.queue_depth.max(1),
-                supported_ops: pool.supported_ops.clone(),
-                transfer_backend: incident.first().copied().unwrap_or_default(),
+        let mut bindings = Vec::new();
+        let mut arguments = Vec::new();
+        for worker in &config.workers {
+            arguments.push(WorkerProcessArgs {
+                worker_id: worker.id.to_string(),
+                ranks: worker.ranks.clone(),
+                entries: worker.entries.clone(),
+                pipeline_depth: worker.queue_depth,
+                transfer: config.transfer.clone(),
                 ..config.worker_process.clone()
-            })
-            .with_context(|| {
-                format!(
-                    "failed to spawn staged pool {} (ranks={})",
-                    pool.id, pool.worker_ranks
-                )
-            })?;
-            command_wakers.push(exec.command_waker());
-            progress_fds.extend_from_slice(exec.progress_fds());
-            pools.push((pool.clone(), Box::new(exec)));
+            });
+            bindings.push(worker.id.clone());
         }
-        let executor = StagedExecutor::try_new_with_signals(pools, command_wakers, progress_fds)?;
+        let workers = bindings
+            .into_iter()
+            .zip(Worker::spawn_all(arguments)?)
+            .collect();
+        let executor = WorkerExecutor::try_new(workers, config.transfer.clone())?;
         let waker = executor.command_waker();
-        Ok((Box::new(executor), waker))
+        Self::assemble(config, Box::new(executor), waker)
     }
 
     /// Builds the engine core from an executor supplied by a higher composition layer.
     pub fn with_executor(
-        config: EngineCoreConfig,
+        config: EngineConfig,
         executor: Box<dyn Executor>,
     ) -> anyhow::Result<Self> {
         Self::assemble(config, executor, CommandWaker::noop())
@@ -244,7 +354,7 @@ impl EngineCore {
 
     /// Builds the engine core from an executor with an event-driven command waker.
     pub fn with_executor_and_waker(
-        config: EngineCoreConfig,
+        config: EngineConfig,
         executor: Box<dyn Executor>,
         command_waker: CommandWaker,
     ) -> anyhow::Result<Self> {
@@ -253,7 +363,7 @@ impl EngineCore {
 
     /// Assembles scheduler state and transport channels around an initialized executor.
     fn assemble(
-        config: EngineCoreConfig,
+        config: EngineConfig,
         executor: Box<dyn Executor>,
         waker: CommandWaker,
     ) -> anyhow::Result<Self> {
@@ -329,7 +439,7 @@ impl EngineCore {
         self.info.supported_ops.iter().any(|mode| {
             matches!(
                 mode,
-                uniserve_worker_ipc::OpKind::ArDecode | uniserve_worker_ipc::OpKind::ArVerify
+                uniserve_worker_ipc::OpCode::ArDecode | uniserve_worker_ipc::OpCode::ArVerify
             )
         })
     }
@@ -400,5 +510,48 @@ impl Drop for EngineCore {
     /// Releases resources owned by this value.
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn static_components_validate_their_own_parallel_members() -> anyhow::Result<()> {
+        let mut workers = Vec::new();
+        for (name, degree) in [("text_encoder", 1), ("denoiser", 4), ("video_decoder", 2)] {
+            let mut worker = WorkerConfig::model("cuda", degree, 2);
+            worker.id = WorkerId(name.into());
+            let entry = worker.entries.remove("model").unwrap();
+            worker.entries.insert(name.into(), entry);
+            workers.push(worker);
+        }
+        WorkerConfig::validate_all(&workers)?;
+        workers[1].ranks.pop();
+        assert!(WorkerConfig::validate_all(&workers).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn entry_geometry_uses_unique_ordered_rank_members() {
+        let mut worker = WorkerConfig::h3("cuda", 4, 2);
+        assert!(worker.validate().is_ok());
+        worker.entries.get_mut("denoiser").unwrap().ranks.swap(0, 3);
+        assert!(worker.validate().is_ok());
+        worker.entries.get_mut("denoiser").unwrap().ranks[1] = 3;
+        assert!(worker.validate().is_err());
+    }
+
+    #[test]
+    fn static_bindings_reject_duplicate_identities_and_entry_owners() {
+        let worker = WorkerConfig::model("cuda", 1, 2);
+        let mut other = worker.clone();
+        assert!(WorkerConfig::validate_all(&[worker.clone(), other.clone()]).is_err());
+        other.id = WorkerId("other".into());
+        assert!(WorkerConfig::validate_all(&[worker.clone(), other.clone()]).is_err());
+        let entry = other.entries.remove("model").unwrap();
+        other.entries.insert("text_encoder".into(), entry);
+        assert!(WorkerConfig::validate_all(&[worker, other]).is_ok());
     }
 }

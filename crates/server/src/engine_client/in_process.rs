@@ -42,25 +42,13 @@ fn remove_active_request(active: &Mutex<ActiveRequests>, request_id: &str, rid: 
 }
 
 impl EngineClient {
-    /// Return the deployment accepted by the finalized worker descriptions.
-    pub(super) fn component_deployment(
-        &self,
-    ) -> std::collections::BTreeMap<String, uniserve_core::ComponentDeployConfig> {
-        self.core
-            .info()
-            .components
-            .iter()
-            .map(|component| (component.name.clone(), component.deployment.clone()))
-            .collect()
-    }
-
     /// Returns the shared engine handle.
     fn handle(&self) -> EngineHandle {
         self.core.handle()
     }
 
     /// Starts an engine from its worker-backed core configuration.
-    pub fn connect(config: uniserve_engine::EngineCoreConfig) -> Result<Self> {
+    pub fn connect(config: uniserve_engine::EngineConfig) -> Result<Self> {
         let core = EngineCore::new(config).map_err(|e| Error::ClientClosed {
             message: format!("failed to start the UniServe engine: {e:?}"),
         })?;
@@ -69,7 +57,7 @@ impl EngineClient {
 
     /// Starts an engine over an explicitly supplied executor.
     pub fn connect_with_executor(
-        config: uniserve_engine::EngineCoreConfig,
+        config: uniserve_engine::EngineConfig,
         executor: Box<dyn Executor>,
     ) -> Result<Self> {
         let core =
@@ -81,7 +69,7 @@ impl EngineClient {
 
     /// Starts an engine over an executor and explicit command waker.
     pub fn connect_with_executor_and_waker(
-        config: uniserve_engine::EngineCoreConfig,
+        config: uniserve_engine::EngineConfig,
         executor: Box<dyn Executor>,
         command_waker: uniserve_core::CommandWaker,
     ) -> Result<Self> {
@@ -106,7 +94,7 @@ impl EngineClient {
             let model_name = core.model_name().to_string();
             let guard = Arc::downgrade(&stats_guard);
             tokio::spawn(async move {
-                let mut reporter = crate::scheduler_stats::SchedStatsReporter::default();
+                let mut reporter = uniserve_engine::SchedStatsReporter::default();
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
@@ -325,12 +313,12 @@ mod tests {
         GenerationRequest, GenerationResourceBounds, ImageIngestRecipe, ImageKvEffect, ImageParams,
         RequestId, SamplingParams, TriggerPolicyDescriptor, UndVisibility,
     };
-    use uniserve_engine::EngineCoreConfig;
+    use uniserve_engine::EngineConfig;
 
     #[tokio::test]
     async fn sim_engine_generates_tokens_through_engine_client() {
         let client = EngineClient::connect_with_executor(
-            EngineCoreConfig::sim("sim-model"),
+            EngineConfig::sim("sim-model"),
             Box::new(uniserve_engine::SimExecutor::new(
                 uniserve_engine::SimEngine::new(),
             )),
@@ -398,7 +386,7 @@ mod tests {
     #[tokio::test]
     async fn sim_engine_generates_image_through_engine_client() {
         let client = EngineClient::connect_with_executor(
-            EngineCoreConfig::sim("sim-model"),
+            EngineConfig::sim("sim-model"),
             Box::new(uniserve_engine::SimExecutor::new(
                 uniserve_engine::SimEngine::new(),
             )),

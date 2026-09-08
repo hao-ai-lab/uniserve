@@ -7,12 +7,16 @@ layout consumed by the cuDNN MXFP8 matrix multiplication.
 
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
 
-from .base import QuantizeMethodBase
+from .base import BlockScaleLayout, LinearMethod, PreparedLinearInput
+
+if TYPE_CHECKING:
+    from ..linear import LinearBase
+
 
 __all__ = ["DynamicW8A8MxFp8LinearMethod"]
 
@@ -86,7 +90,7 @@ def _mxfp8_mm_bf16_fake(
     return left.new_empty((left.shape[0], right.shape[1]), dtype=torch.bfloat16)
 
 
-class DynamicW8A8MxFp8LinearMethod(QuantizeMethodBase):
+class DynamicW8A8MxFp8LinearMethod(LinearMethod):
     """MXFP8 linear method with dynamically quantized MXFP8 activations.
 
     Checkpoint weights enter as ordinary floating-point parameters and are
@@ -95,10 +99,11 @@ class DynamicW8A8MxFp8LinearMethod(QuantizeMethodBase):
     """
 
     is_quantized = True
+    preferred_block_scale_layout = "128x4"
 
     def create_weights(
         self,
-        module: nn.Module,
+        module: LinearBase,
         *,
         input_size: int,
         output_size: int,
@@ -126,19 +131,17 @@ class DynamicW8A8MxFp8LinearMethod(QuantizeMethodBase):
         # bias before ``process_weights_after_loading`` finalizes execution state.
         from ...loader.weight_loaders import attach_weight_loader, default_weight_loader
 
-        weight = cast(nn.Parameter, module.weight)
+        weight = module.weight
         attach_weight_loader(weight, default_weight_loader)
-        bias_parameter = cast(nn.Parameter | None, module.bias)
+        bias_parameter = module.bias
         if bias_parameter is not None:
             attach_weight_loader(bias_parameter, default_weight_loader)
 
     @torch.no_grad()
-    def process_weights_after_loading(self, module: nn.Module) -> None:
+    def process_weights_after_loading(self, module: LinearBase) -> None:
         """Finalize a loaded floating-point weight into resident MXFP8 state."""
 
-        from ..linear import LinearBase
-
-        linear = cast(LinearBase, module)
+        linear = module
 
         # MXFP8 kernels and their swizzled scale layout are defined for
         # SM100-class CUDA execution.
@@ -159,33 +162,61 @@ class DynamicW8A8MxFp8LinearMethod(QuantizeMethodBase):
         linear.weight = nn.Parameter(packed.contiguous(), requires_grad=False)
         linear.weight_scale = block_scale
 
-    def apply(self, module: nn.Module, x: torch.Tensor) -> torch.Tensor:
-        """Apply an MXFP8 linear projection while preserving leading dimensions."""
+    def apply(self, module: LinearBase, x: torch.Tensor) -> torch.Tensor:
+        """Project BF16 values through the shared prepared MXFP8 boundary."""
 
-        from ..linear import LinearBase
-
-        linear = cast(LinearBase, module)
-        if linear.weight.dtype != torch.float8_e4m3fn or linear.weight_scale is None:
-            raise RuntimeError("MXFP8 linear execution requires finalized MXFP8 weights")
-        if x.dtype != torch.bfloat16:
-            raise RuntimeError("MXFP8 linear execution requires bfloat16 activations")
-
-        # Matrix kernels consume rank-two operands. Collapse all token-like
-        # leading dimensions and restore them after projection.
-        original_shape = x.shape[:-1]
-        x_2d = x.reshape(-1, x.shape[-1])
-
-        # Activations receive fresh per-block scales; the finalized weight
-        # already owns scales in the matching swizzled representation.
-        packed, block_scale = _mxfp8_quantize(x_2d)
-        output = _mxfp8_mm_bf16(
-            packed,
-            linear.weight.T,
-            block_scale,
-            linear.weight_scale,
+        return self.apply_prepared(
+            module,
+            self.prepare_input(x, None),
+            output_dtype=torch.bfloat16,
         )
 
-        if linear.execution_bias is not None:
-            output = output + linear.execution_bias.to(device=output.device, dtype=output.dtype)
+    def input_scale(self, x: torch.Tensor, *, absmax: torch.Tensor | None = None) -> None:
+        """MXFP8 determines scales independently for each 32-column block."""
 
-        return output.reshape(*original_shape, linear.output_size)
+        return None
+
+    def prepare_input(
+        self,
+        x: torch.Tensor,
+        scale: torch.Tensor | None,
+        *,
+        block_scale_layout: BlockScaleLayout = "128x4",
+    ) -> PreparedLinearInput:
+        """Pack the block representation consumed by the MXFP8 GEMM."""
+
+        if x.dtype != torch.bfloat16 or scale is not None:
+            raise ValueError("MXFP8 preparation requires BF16 values and block-local scaling")
+        if block_scale_layout != "128x4":
+            raise ValueError("MXFP8 preparation requires swizzled block scales")
+        values, scales = _mxfp8_quantize(x.reshape(-1, x.shape[-1]))
+        return PreparedLinearInput(
+            values.reshape(x.shape), block_scales=scales, block_scale_layout="128x4"
+        )
+
+    def apply_prepared(
+        self,
+        module: LinearBase,
+        prepared: PreparedLinearInput,
+        *,
+        output_dtype: torch.dtype,
+        include_bias: bool = True,
+    ) -> torch.Tensor:
+        """Consume swizzled MXFP8 input without another activation quantization."""
+
+        if output_dtype != torch.bfloat16:
+            raise ValueError("MXFP8 GEMM supports BF16 output")
+        if module.weight.dtype != torch.float8_e4m3fn or module.weight_scale is None:
+            raise RuntimeError("MXFP8 execution requires finalized weights")
+        if prepared.block_scales is None or prepared.block_scale_layout != "128x4":
+            raise ValueError("MXFP8 input requires swizzled block scales")
+        values = prepared.values
+        output = _mxfp8_mm_bf16(
+            values.reshape(-1, values.shape[-1]),
+            module.weight.T,
+            prepared.block_scales,
+            module.weight_scale,
+        )
+        if include_bias and module.execution_bias is not None:
+            output = output + module.execution_bias.to(device=output.device, dtype=output.dtype)
+        return output.reshape(*values.shape[:-1], module.output_size)

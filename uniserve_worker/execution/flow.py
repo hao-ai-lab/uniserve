@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import replace
-from typing import cast
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -12,15 +11,14 @@ from uniserve_worker.execution.batch import (
     DrawLayout,
     FinishFlags,
     ImageParams,
+    OpCode,
     Operation,
     OpStatus,
     ProductKind,
     ProductPayload,
     ProductRef,
-    RunKind,
     TokenSpan,
 )
-from uniserve_worker.execution.output import TransferPayload
 from uniserve_worker.foundation.errors import invalid_descriptor
 from uniserve_worker.models.generation import BranchSource, LatentLayout
 from uniserve_worker.models.inputs import PatchTransform
@@ -33,15 +31,17 @@ from uniserve_worker.runtime.request import Request
 
 from . import token
 from .forward_batch import FlowPatches, ModelPhase, TokenSelection
-from .resources import ExecutionResources
 from .rng import flow_noise_seed, normal_noise
 from .rows import ForwardRow, LaneState, LatentExecution, OperationState, Outcome
 
+if TYPE_CHECKING:
+    from ..worker.worker import Worker
 
-def pack_forward(runtime: ExecutionResources, state: OperationState) -> tuple[object, ...]:
+
+def pack_forward(runtime: Worker, state: OperationState) -> tuple[ForwardRow, ...]:
     """Pack diffusion prefix or denoise state into the matching model-forward row."""
 
-    if state.operation.kind is not RunKind.DIFFUSION_STEP:
+    if state.operation.kind is not OpCode.DIFFUSION_STEP:
         return ()
     if state.phase == "initial":
         _initialize(runtime, state)
@@ -58,7 +58,7 @@ def pack_forward(runtime: ExecutionResources, state: OperationState) -> tuple[ob
 
 
 def consume_forward(
-    runtime: ExecutionResources,
+    runtime: Worker,
     state: OperationState,
     outputs: tuple[torch.Tensor, ...],
 ) -> None:
@@ -97,11 +97,13 @@ def consume_forward(
     state.phase = "integrate"
 
 
-def integrate(runtime: ExecutionResources, state: OperationState) -> bool:
+def integrate(runtime: Worker, state: OperationState) -> bool:
     """Advance one latent trajectory step and publish its checkpointed state transition."""
 
     if state.phase != "integrate":
         return False
+
+    request = runtime.request_row(state.lane, state.operation.request_key.request_id)
 
     flow = state.data["flow"]
     current = state.data["current"]
@@ -112,7 +114,7 @@ def integrate(runtime: ExecutionResources, state: OperationState) -> bool:
     elif flow.prediction != "velocity":
         raise invalid_descriptor(f"unsupported flow prediction {flow.prediction!r}")
     current.copy_(euler_step(current, velocity, timestep, state.data["t_next"]))
-    state.data["request"].flow_step = state.data["step"] + 1
+    request.flow_step = state.data["step"] + 1
     state.data["step"] += 1
     if state.data["step"] < state.data["end_step"]:
         state.phase = "step"
@@ -122,7 +124,7 @@ def integrate(runtime: ExecutionResources, state: OperationState) -> bool:
     return True
 
 
-def _initialize(runtime: ExecutionResources, state: OperationState) -> None:
+def _initialize(runtime: Worker, state: OperationState) -> None:
     """Create a diffusion trajectory from deterministic noise and publish its initial state."""
 
     operation = state.operation
@@ -144,15 +146,18 @@ def _initialize(runtime: ExecutionResources, state: OperationState) -> None:
         )
     cache = runtime.cache_coordinates(operation, scope)
     request = runtime.request_row(scope, request_id)
-    runtime.cache_publications.validate_conditioning(
+    publications = runtime.cache_publications
+    if publications is None:
+        raise invalid_descriptor("flow conditioning requires cache publication storage")
+    publications.validate_conditioning(
         request_id,
         conditioning[0],
-        request_pool_idx=request.request_pool_idx,
+        request_pool_idx=request.request.request_pool_idx,
         group_id=cache[1],
         visible_length=cache[2],
         publication=scope.cache_publication_inputs.get(conditioning[0]),
     )
-    image = request.image
+    image = request.request.image
     if image is None:
         raise invalid_descriptor("flow operation has no admitted image parameters")
     if operation.rng is not None:
@@ -169,21 +174,20 @@ def _initialize(runtime: ExecutionResources, state: OperationState) -> None:
         raise invalid_descriptor("flow operation does not name the current latent generation")
     row = runtime.latent_row(operation, scope)
     pool = runtime.require_latent_pool()
-    start_step = int(row.placement.start_step)
-    end_step = start_step + int(row.placement.step_count)
+    start_step = int(row.params.start_step)
+    end_step = start_step + int(row.params.step_count)
     current = pool.gather_current(
         row.request_pool_idx,
         row.staging,
         step=start_step,
         generation=int(latent_input.generation),
-        latent_units=int(row.placement.latent_units),
-        height=int(row.placement.height),
-        width=int(row.placement.width),
+        latent_units=int(row.params.latent_units),
+        height=int(row.params.height),
+        width=int(row.params.width),
     )
     state.data.update(
         flow=flow,
         cache=cache,
-        request=request,
         image=image,
         latent_input=latent_input,
         latent_output=latent_output,
@@ -200,8 +204,10 @@ def _initialize(runtime: ExecutionResources, state: OperationState) -> None:
     state.phase = "step"
 
 
-def _prepare_step(runtime: ExecutionResources, state: OperationState) -> None:
+def _prepare_step(runtime: Worker, state: OperationState) -> None:
     """Gather current latent pages and construct one guided diffusion-step batch."""
+
+    request = runtime.request_row(state.lane, state.operation.request_key.request_id)
 
     operation = state.operation
     scope = state.lane
@@ -234,15 +240,18 @@ def _prepare_step(runtime: ExecutionResources, state: OperationState) -> None:
             continue
         source = branch_source(runtime, branch)
         prefix, copy_conditioning = flow_prefix(
-            runtime, source, data["image_prompt"], data["request"]
+            runtime, source, data["image_prompt"], request.request
         )
         descriptor = denoise_descriptors[branch_index]
         if copy_conditioning:
             entry = data["cache"]
         else:
             slot = int(descriptor.request_pool_index)
-            capacity = runtime.req_to_token_pool.allocated_length(slot)
-            runtime.req_to_token_pool.pages(slot, 0)
+            page_tables = runtime.req_to_token_pool
+            if page_tables is None:
+                raise invalid_descriptor("flow prefixes require request page tables")
+            capacity = page_tables.allocated_length(slot)
+            page_tables.pages(slot, 0)
             has_prefix_forward = any(
                 int(candidate.request_pool_index) == slot
                 and int(candidate.seq_len) == 0
@@ -252,7 +261,7 @@ def _prepare_step(runtime: ExecutionResources, state: OperationState) -> None:
             entry = (slot, 0, 0 if has_prefix_forward else int(descriptor.seq_len), capacity)
         prefix_length = data["cache"][2] if copy_conditioning else len(prefix)
         if prefix_length > entry[3]:
-            raise invalid_descriptor("flow prefix exceeds scheduler placement")
+            raise invalid_descriptor("flow prefix exceeds scheduler params")
         if entry[2] not in {0, prefix_length}:
             raise invalid_descriptor(
                 "flow branch prefix disagrees with its initialized physical state"
@@ -271,7 +280,7 @@ def _prepare_step(runtime: ExecutionResources, state: OperationState) -> None:
         state.phase = "denoise"
 
 
-def _pack_denoise(runtime: ExecutionResources, state: OperationState) -> None:
+def _pack_denoise(runtime: Worker, state: OperationState) -> None:
     """Assemble denoising rows, branch weights, positions, and timestep conditioning."""
 
     data = state.data
@@ -285,16 +294,18 @@ def _pack_denoise(runtime: ExecutionResources, state: OperationState) -> None:
             data["entries"][branch],
             data["current"],
             data["t"],
-            int(row.placement.height),
-            int(row.placement.width),
+            int(row.params.height),
+            int(row.params.width),
             state.lane,
         )
         for branch in data["guide"].branches
     )
 
 
-def _finish(runtime: ExecutionResources, state: OperationState) -> None:
+def _finish(runtime: Worker, state: OperationState) -> None:
     """Integrate predicted velocity, write the next latent bank, and prepare publication."""
+
+    request = runtime.request_row(state.lane, state.operation.request_key.request_id)
 
     operation = state.operation
     scope = state.lane
@@ -306,29 +317,27 @@ def _finish(runtime: ExecutionResources, state: OperationState) -> None:
         row.staging,
         expected_step=data["start_step"],
         expected_generation=int(data["latent_input"].generation),
-        latent_units=int(row.placement.latent_units),
-        height=int(row.placement.height),
-        width=int(row.placement.width),
+        latent_units=int(row.params.latent_units),
+        height=int(row.params.height),
+        width=int(row.params.width),
     )
     scope.latent_publications.append(
         LatentPublication(
             request_pool_idx=row.request_pool_idx,
-            page_table=row.placement.page_table,
+            page_table=row.params.page_table,
             expected_generation=int(data["latent_input"].generation),
             expected_step=data["start_step"],
             generation=int(data["latent_output"].generation),
             step=final_step,
-            latent_units=int(row.placement.latent_units),
-            height=int(row.placement.height),
-            width=int(row.placement.width),
+            latent_units=int(row.params.latent_units),
+            height=int(row.params.height),
+            width=int(row.params.width),
         )
     )
-    data["request"].latent_product = data["latent_output"]
+    request.latent_product = data["latent_output"]
     products = publish_latent_transfer(
         runtime,
-        operation,
         data["latent_output"],
-        data["current"],
         row,
         step=final_step,
         scope=scope,
@@ -338,23 +347,26 @@ def _finish(runtime: ExecutionResources, state: OperationState) -> None:
         selected_point=1,
         logical_lengths=runtime.logical_lengths(
             operation,
-            data["request"],
+            request,
             data["cache"],
             latent_len=final_step,
         ),
-        token_span=TokenSpan(base=data["request"].logical_position, len=0),
+        token_span=TokenSpan(base=request.logical_position, len=0),
         finish_flags=FinishFlags(),
         product_generations=runtime.output_generations(operation),
         products=products,
     )
-    main_slot = int(data["request"].request_pool_idx)
+    main_slot = int(request.request.request_pool_idx)
     alternative_slots = {
         int(entry[0]) for entry in data["entries"].values() if int(entry[0]) != main_slot
     }
     if alternative_slots and final_step >= int(data["image"].steps):
         for slot in alternative_slots:
             scope.runtime_cache_lengths.pop(slot, None)
-        runtime.req_to_token_pool.release(tuple(alternative_slots))
+        page_tables = runtime.req_to_token_pool
+        if page_tables is None:
+            raise RuntimeError("flow prefix retirement lost its request page tables")
+        page_tables.release(tuple(alternative_slots))
         tracked = runtime._flow_prefix_slots.get(operation.request_key)
         if tracked is not None:
             tracked.difference_update(alternative_slots)
@@ -365,10 +377,8 @@ def _finish(runtime: ExecutionResources, state: OperationState) -> None:
 
 
 def publish_latent_transfer(
-    runtime: ExecutionResources,
-    operation: Operation,
+    runtime: Worker,
     product: ProductRef,
-    value: torch.Tensor,
     row: LatentExecution,
     *,
     step: int,
@@ -376,38 +386,26 @@ def publish_latent_transfer(
 ) -> tuple[ProductPayload, ...]:
     """Publish a committed-candidate trajectory for an exact staged consumer."""
 
-    transport = runtime.transport
-    if (
-        transport is None
-        or transport.name == "local"
-        or (
-            runtime.deployment is not None
-            and runtime.deployment.rank != runtime.deployment.output_rank
-        )
+    transports = runtime.publication_transports
+    if not any(name != "local" for name in transports) or (
+        runtime.worker_config is not None
+        and runtime.worker_config.rank != runtime.worker_config.output_rank
     ):
         return ()
-    locator = transport.publish_async(value.detach().contiguous())
-    metadata = {
-        "generation": int(product.generation),
-        "height": int(row.placement.height),
-        "latent_units": int(row.placement.latent_units),
-        "step": int(step),
-        "width": int(row.placement.width),
-    }
-    locator = replace(locator, meta={**locator.meta, **metadata})
-    scope.published.append(locator)
-    scope.stage_publications[runtime.operation_identity(operation)] = (locator,)
-    descriptor = TransferPayload(
-        "latent",
-        {"locator": locator.to_mapping(), **metadata},
-        (locator,),
-        transport,
+    pool = runtime.require_latent_pool()
+    source = pool.reserve_publication(
+        product,
+        request_pool_idx=row.request_pool_idx,
+        page_table=row.params.page_table,
+        latent_units=row.params.latent_units,
     )
-    return (ProductPayload(product=product, payload=cast(bytes, descriptor)),)
+    from .transfer import publish_latent_source
+
+    return (publish_latent_source(runtime, product, source, row, step=step, scope=scope),)
 
 
 def initial_latent(
-    runtime: ExecutionResources,
+    runtime: Worker,
     operation: Operation,
     height: int,
     width: int,
@@ -433,14 +431,14 @@ def initial_latent(
         target.copy_(neural.reshape_as(target))
 
 
-def branch_source(runtime: ExecutionResources, branch: Branch) -> BranchSource:
+def branch_source(runtime: Worker, branch: Branch) -> BranchSource:
     """Resolve a guidance branch to conditioning, negative/start, or start-state input."""
 
     return runtime.generation().branch_source(branch)
 
 
 def flow_prefix(
-    runtime: ExecutionResources,
+    runtime: Worker,
     source: BranchSource,
     image_prompt: str,
     request: Request,
@@ -457,7 +455,7 @@ def flow_prefix(
 
 
 def prefix_row(
-    runtime: ExecutionResources,
+    runtime: Worker,
     operation: Operation,
     tokens: tuple[int, ...],
     entry: tuple[int, int, int, int],
@@ -488,7 +486,7 @@ def prefix_row(
 
 
 def denoise_row(
-    runtime: ExecutionResources,
+    runtime: Worker,
     operation: Operation,
     conditioning_position: int,
     branch: Branch,
@@ -558,21 +556,19 @@ def denoise_row(
 
 
 def _temporal_position(
-    runtime: ExecutionResources,
+    runtime: Worker,
     branch: Branch,
     conditioning_position: int,
     entry: tuple[int, int, int, int],
 ) -> int:
-    """Resolve a branch temporal coordinate from conditioning and latent placement."""
+    """Resolve a branch temporal coordinate from conditioning and latent params."""
 
     if branch is Branch.COND:
         return int(conditioning_position)
     return int(entry[2])
 
 
-def image_token_count(
-    runtime: ExecutionResources, latent: torch.Tensor, height: int, width: int
-) -> int:
+def image_token_count(runtime: Worker, latent: torch.Tensor, height: int, width: int) -> int:
     """Validate latent geometry and return its model-visible patch-token count."""
 
     del latent
@@ -595,14 +591,14 @@ def prediction(output: torch.Tensor) -> torch.Tensor:
     return output
 
 
-def physical_tokens(runtime: ExecutionResources, height: int, width: int) -> int:
+def physical_tokens(runtime: Worker, height: int, width: int) -> int:
     """Return the padded image-token capacity for the requested raster geometry."""
 
     return runtime.generation().physical_tokens(height, width)
 
 
 def _conditioning(
-    runtime: ExecutionResources,
+    runtime: Worker,
     latent: torch.Tensor,
     height: int,
     width: int,
@@ -620,7 +616,7 @@ def _conditioning(
 
 
 def _spatial_positions(
-    runtime: ExecutionResources,
+    runtime: Worker,
     height: int,
     width: int,
     patch: int,

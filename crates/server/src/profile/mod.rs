@@ -77,12 +77,12 @@ impl std::str::FromStr for ModelDescription {
 /// Error returned for an unsupported model-description name.
 pub struct ModelDescriptionParseError(String);
 
-/// Deployment-owned profile inputs applied after repository metadata.
+/// configuration-owned profile inputs applied after repository metadata.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProfileDeploymentConfig {
+pub struct ProfileOverrides {
     /// Optional template text that replaces the repository-provided chat template.
     pub chat_template_override: Option<String>,
-    /// Optional deployment ceiling on the complete model context.
+    /// Optional configuration ceiling on the complete model context.
     pub max_model_tokens: Option<u32>,
 }
 
@@ -187,7 +187,7 @@ impl ModelProfile {
         description: ModelDescription,
         model_id: &str,
         files: &ResolvedModelFiles,
-        deployment: &ProfileDeploymentConfig,
+        configuration: &ProfileOverrides,
         tokenizer: &HuggingFaceTokenizer,
     ) -> assets::Result<Self> {
         let model_config = load_model_config(files.config_path.as_deref())?;
@@ -211,7 +211,7 @@ impl ModelProfile {
             },
             generation_defaults: generation_defaults(&generation_config),
             context_limits: ContextLimits {
-                max_model_tokens: deployment
+                max_model_tokens: configuration
                     .max_model_tokens
                     .or(model_config.max_position_embeddings()),
                 max_output_tokens: generation_config.max_new_tokens,
@@ -305,7 +305,7 @@ mod tests {
     use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
     use uniserve_core::{GenerationConstraint, ImageIngestStep, ImageKvEffect};
 
-    use super::{ModelDescription, ModelProfile, ProfileDeploymentConfig};
+    use super::{ModelDescription, ModelProfile, ProfileOverrides};
     use crate::profile::assets::ResolvedModelFiles;
     use crate::profile::tokenizer::HuggingFaceTokenizer;
 
@@ -385,7 +385,7 @@ mod tests {
                 description,
                 description.id(),
                 &files,
-                &ProfileDeploymentConfig::default(),
+                &ProfileOverrides::default(),
                 &tokenizer,
             )
             .unwrap();
@@ -433,7 +433,7 @@ mod tests {
             ModelDescription::SenseNova,
             "configured-model",
             &files,
-            &ProfileDeploymentConfig::default(),
+            &ProfileOverrides::default(),
             &tokenizer,
         )
         .unwrap_err();
@@ -448,7 +448,7 @@ mod tests {
             ModelDescription::SenseNova,
             "sensenova",
             &files,
-            &ProfileDeploymentConfig::default(),
+            &ProfileOverrides::default(),
             &tokenizer,
         )
         .unwrap() else {
@@ -498,7 +498,7 @@ mod tests {
             ModelDescription::Bagel,
             "bagel",
             &files,
-            &ProfileDeploymentConfig::default(),
+            &ProfileOverrides::default(),
             &tokenizer,
         )
         .unwrap() else {

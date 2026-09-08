@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from collections import deque
-
 import pytest
 
 from tests.python.fixtures.depth_one import (
@@ -13,6 +11,7 @@ from tests.python.fixtures.depth_one import (
     token_operation,
 )
 from tests.python.fixtures.execution_worker import execution_worker
+from tests.python.fixtures.worker_ipc import QueuedWorkerIpc
 from uniserve_worker.execution.batch import (
     NewRequest,
     Operation,
@@ -23,24 +22,6 @@ from uniserve_worker.execution.batch import (
 from uniserve_worker.process import WorkerProcess
 
 pytestmark = pytest.mark.integration
-
-
-class _Endpoint:
-    def __init__(self, requests: tuple[dict[str, object], ...]) -> None:
-        self._requests = deque(requests)
-        self.responses: list[dict[str, object]] = []
-
-    def try_recv(self) -> dict[str, object] | None:
-        return self._requests.popleft() if self._requests else None
-
-    def recv(self) -> dict[str, object]:
-        return self._requests.popleft()
-
-    def wait_incoming(self, timeout_us: int) -> None:
-        del timeout_us
-
-    def respond(self, response: dict[str, object]) -> None:
-        self.responses.append(response)
 
 
 def _request(call_id: int, run: Run) -> dict[str, object]:
@@ -75,7 +56,7 @@ def _token_run(
     )
 
 
-def _by_call(endpoint: _Endpoint) -> dict[int, dict[str, object]]:
+def _by_call(endpoint: QueuedWorkerIpc) -> dict[int, dict[str, object]]:
     return {
         int(response["call_id"]): response
         for response in endpoint.responses
@@ -84,7 +65,7 @@ def _by_call(endpoint: _Endpoint) -> dict[int, dict[str, object]]:
 
 
 def test_info_request_is_served_by_the_process_queue() -> None:
-    endpoint = _Endpoint(
+    endpoint = QueuedWorkerIpc(
         (
             {"kind": "info", "call_id": 1},
             {"kind": "close", "call_id": 2},
@@ -106,7 +87,7 @@ def test_inflight_and_terminal_duplicates_return_one_terminal_report() -> None:
         run_id=7,
         tokens=(8, 9),
     )
-    endpoint = _Endpoint(
+    endpoint = QueuedWorkerIpc(
         (
             _request(1, run),
             _request(2, run),
@@ -155,7 +136,7 @@ def test_conflicting_run_identity_fails_before_new_admission() -> None:
         operations=(operation, next_operation),
         input_products=(payload, next_payload),
     )
-    endpoint = _Endpoint(
+    endpoint = QueuedWorkerIpc(
         (
             _request(1, run),
             _request(2, conflicting_run),
@@ -188,7 +169,7 @@ def test_completed_report_remains_retained_after_later_execution() -> None:
         run_id=12,
         tokens=(3, 4),
     )
-    endpoint = _Endpoint(
+    endpoint = QueuedWorkerIpc(
         (
             _request(1, first_run),
             _request(2, second_run),
@@ -199,7 +180,7 @@ def test_completed_report_remains_retained_after_later_execution() -> None:
     server = WorkerProcess(
         execution_worker(
             pipeline_depth=1,
-                max_batch_operations=1,
+            max_batch_operations=1,
             max_request_pool_size=8,
         ),
         endpoint,

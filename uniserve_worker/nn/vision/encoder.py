@@ -46,10 +46,18 @@ class VisionSelfAttention(nn.Module):
         self.num_heads = int(num_heads)
         self.head_dim = int(hidden_size) // self.num_heads
         self.scale = self.head_dim**-0.5
-        self.q_proj = LinearBase(hidden_size, hidden_size, layer_config=layer_config)
-        self.k_proj = LinearBase(hidden_size, hidden_size, layer_config=layer_config)
-        self.v_proj = LinearBase(hidden_size, hidden_size, layer_config=layer_config)
-        self.out_proj = LinearBase(hidden_size, hidden_size, layer_config=layer_config)
+        self.q_proj = LinearBase(
+            hidden_size, hidden_size, layer_config=layer_config, prefix="q_proj"
+        )
+        self.k_proj = LinearBase(
+            hidden_size, hidden_size, layer_config=layer_config, prefix="k_proj"
+        )
+        self.v_proj = LinearBase(
+            hidden_size, hidden_size, layer_config=layer_config, prefix="v_proj"
+        )
+        self.out_proj = LinearBase(
+            hidden_size, hidden_size, layer_config=layer_config, prefix="out_proj"
+        )
         self.attn = RadixAttention(self.num_heads, self.num_heads, self.head_dim)
 
     def forward(
@@ -121,13 +129,17 @@ class VisionEncoderLayer(nn.Module):
         self.self_attn = VisionSelfAttention(
             cfg.hidden_size,
             cfg.num_attention_heads,
-            layer_config=layer_config,
+            layer_config=layer_config.child("self_attn"),
         )
         self.layer_norm2 = nn.LayerNorm(cfg.hidden_size, eps=cfg.layer_norm_eps)
         self.mlp = nn.Sequential(
-            LinearBase(cfg.hidden_size, cfg.intermediate_size, layer_config=layer_config),
+            LinearBase(
+                cfg.hidden_size, cfg.intermediate_size, layer_config=layer_config, prefix="mlp.fc1"
+            ),
             nn.GELU(approximate="tanh"),
-            LinearBase(cfg.intermediate_size, cfg.hidden_size, layer_config=layer_config),
+            LinearBase(
+                cfg.intermediate_size, cfg.hidden_size, layer_config=layer_config, prefix="mlp.fc2"
+            ),
         )
 
     def forward(
@@ -165,7 +177,8 @@ class VisionEncoder(nn.Module):
 
         super().__init__()
         self.layers = nn.ModuleList(
-            VisionEncoderLayer(cfg, layer_config=layer_config) for _ in range(cfg.num_hidden_layers)
+            VisionEncoderLayer(cfg, layer_config=layer_config.child(f"layers.{index}"))
+            for index in range(cfg.num_hidden_layers)
         )
         self.post_layernorm = (
             nn.LayerNorm(cfg.hidden_size, eps=cfg.layer_norm_eps) if post_norm else nn.Identity()

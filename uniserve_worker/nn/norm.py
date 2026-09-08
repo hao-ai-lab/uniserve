@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 
 from uniserve_worker import ops
+from uniserve_worker.ops.rms import eager_rms_norm
 
 __all__ = [
     "RMSNorm",
@@ -17,15 +18,24 @@ class RMSNorm(nn.Module):
 
     Providers accumulate variance in fp32 to keep composed low-precision model
     execution numerically stable. The module also exposes a fused residual-add
-    entry point used by pre-normalization decoder blocks.
+    entry point used by pre-normalization decoder blocks. ``affine_in_fp32``
+    keeps normalization and weighting in FP32 until a single output cast.
     """
 
-    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        *,
+        affine_in_fp32: bool = False,
+        device: torch.device | str | None = None,
+    ) -> None:
         """Create a unit scale vector for ``hidden_size`` features."""
 
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.weight = nn.Parameter(torch.ones(hidden_size, device=device))
         self.variance_epsilon = eps
+        self.affine_in_fp32 = affine_in_fp32
 
     @property
     def eps(self) -> float:
@@ -36,6 +46,12 @@ class RMSNorm(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Normalize ``hidden_states`` across their final dimension."""
 
+        if self.affine_in_fp32:
+            # This mode includes the tensor reduction's FP32 arithmetic and a
+            # single rounding boundary after learned weighting.
+            return eager_rms_norm(
+                hidden_states, self.weight, self.variance_epsilon, affine_in_fp32=True
+            )
         return ops.rms_norm(hidden_states, self.weight, self.variance_epsilon)
 
     def forward_with_residual(
@@ -51,6 +67,9 @@ class RMSNorm(nn.Module):
         for the residual sum.
         """
 
+        if self.affine_in_fp32:
+            combined = hidden_states + residual
+            return self(combined), combined
         return ops.add_rms_norm(
             hidden_states,
             residual,

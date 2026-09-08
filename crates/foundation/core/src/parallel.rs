@@ -1,4 +1,4 @@
-//! Shared logical parallelism and ordered component placement declarations.
+//! Shared logical parallelism and ordered component params declarations.
 
 use serde::{Deserialize, Serialize};
 
@@ -114,10 +114,10 @@ pub enum ComponentDistribution {
     TemporalUnits,
 }
 
-/// Ordered component membership indexes the deployment's physical device list.
+/// Computation entry members index the ordered ranks of a Worker instance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ComponentDeployConfig {
+pub struct EntryConfig {
     pub ranks: Vec<usize>,
     #[serde(default)]
     pub parallel_config: ParallelConfig,
@@ -127,7 +127,7 @@ pub struct ComponentDeployConfig {
     pub units_per_rank: usize,
 }
 
-impl ComponentDeployConfig {
+impl EntryConfig {
     pub fn parallel(ranks: Vec<usize>, parallel_config: ParallelConfig) -> Self {
         Self {
             ranks,

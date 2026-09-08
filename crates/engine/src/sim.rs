@@ -6,14 +6,15 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::executor::{
     Batch, BatchResult, Executor, ExecutorInfo, ExecutorSubmitError, LogicalResultTracker,
-    PhysicalExecutor, PhysicalSubmitError, PoolId, lower_batch,
+    WorkerId, lower_batch,
 };
+use crate::worker::RunSubmitError;
 use base64::Engine as _;
 use crossbeam_channel::{Receiver, Sender};
 use uniserve_core::philox;
@@ -23,9 +24,9 @@ use uniserve_core::{
 };
 use uniserve_worker_ipc::{
     CheckpointPoint, DrawLayout, ErrorCode, InlineValue, LogicalLengths, ModelOutput, NewRequest,
-    OpKind, OpStatus, Operation, ProductKind, ProductPayload, ProductRef, RegistrationAck,
-    ResultData, ResultPayload, Run as PhysicalRun, RunKind, RunResult, SamplingState,
-    TimingCounters, TokenSpan, WorkerInfo, decode_sampling_state_bytes,
+    OpCode, OpStatus, Operation, ProductKind, ProductPayload, ProductRef, RegistrationAck,
+    ResultData, ResultPayload, Run as PhysicalRun, RunResult, SamplingState, TimingCounters,
+    TokenSpan, WorkerInfo, decode_sampling_state_bytes,
 };
 
 const DEFAULT_TEXT_LEN: usize = 8;
@@ -51,6 +52,8 @@ pub struct SimExecutor {
     handle: Option<JoinHandle<()>>,
     next_collective_seq: u64,
     logical_results: LogicalResultTracker,
+    admissions: HashSet<uniserve_worker_ipc::RequestKey>,
+    products: HashSet<ProductRef>,
 }
 
 impl SimExecutor {
@@ -87,7 +90,7 @@ impl SimExecutor {
             })
             .expect("spawn sim executor thread");
         Self {
-            executor_info: ExecutorInfo::single(PoolId("sim".to_owned()), info.clone()),
+            executor_info: ExecutorInfo::single(WorkerId("sim".to_owned()), info.clone()),
             depth,
             to_worker,
             from_worker,
@@ -97,6 +100,8 @@ impl SimExecutor {
             handle: Some(handle),
             next_collective_seq: 1,
             logical_results: LogicalResultTracker::default(),
+            admissions: HashSet::new(),
+            products: HashSet::new(),
         }
     }
 
@@ -109,30 +114,29 @@ impl SimExecutor {
     }
 }
 
-impl PhysicalExecutor for SimExecutor {
-    /// Returns metadata for the physical worker.
-    fn physical_info(&self) -> &ExecutorInfo {
-        &self.executor_info
-    }
-
+impl SimExecutor {
     /// Submits the run.
-    fn submit_run(&mut self, batch: PhysicalRun) -> Result<(), PhysicalSubmitError> {
+    fn submit_run(&mut self, batch: PhysicalRun) -> Result<(), RunSubmitError> {
         if self.in_flight >= self.depth {
-            return Err(PhysicalSubmitError::WouldBlock(batch));
+            return Err(RunSubmitError::WouldBlock(batch));
         }
         batch
             .validate()
             .map_err(anyhow::Error::from)
-            .map_err(PhysicalSubmitError::Failed)?;
-        self.to_worker.send(Job::Batch(batch)).map_err(|_| {
-            PhysicalSubmitError::Failed(anyhow::anyhow!("sim executor thread gone"))
-        })?;
+            .map_err(RunSubmitError::Failed)?;
+        self.to_worker
+            .send(Job::Batch(batch))
+            .map_err(|_| RunSubmitError::Failed(anyhow::anyhow!("sim executor thread gone")))?;
         self.in_flight += 1;
         Ok(())
     }
 
     /// Returns the result of a submitted physical run.
     fn poll_run(&mut self, timeout: Duration) -> anyhow::Result<Option<RunResult>> {
+        if self.handle.is_none() {
+            let _ = self.progress_rx.recv_timeout(timeout);
+            return Ok(None);
+        }
         let result = crossbeam_channel::select! {
             recv(self.from_worker) -> result => match result {
                 Ok(result) => Ok(Some(result?)),
@@ -151,7 +155,7 @@ impl PhysicalExecutor for SimExecutor {
     }
 
     /// Closes the simulated physical worker.
-    fn close_physical(&mut self) -> anyhow::Result<()> {
+    fn shutdown(&mut self) -> anyhow::Result<()> {
         let _ = self.to_worker.send(Job::Shutdown);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
@@ -161,6 +165,30 @@ impl PhysicalExecutor for SimExecutor {
 }
 
 impl Executor for SimExecutor {
+    fn has_capacity(&self, worker: &WorkerId) -> bool {
+        self.is_ready(worker) && self.in_flight < self.depth
+    }
+
+    fn command_has_capacity(&self, command: &uniserve_worker_ipc::BatchCommand) -> bool {
+        use uniserve_worker_ipc::BatchCommand;
+        let has_owner = match command {
+            BatchCommand::Free { buffer } => self
+                .products
+                .iter()
+                .any(|product| product.buffer_id() == *buffer),
+            _ => self.admissions.contains(&command.request_key()),
+        };
+        !has_owner || (self.handle.is_some() && self.in_flight < self.depth)
+    }
+    fn is_ready(&self, worker: &WorkerId) -> bool {
+        self.handle.is_some()
+            && self
+                .executor_info
+                .workers
+                .iter()
+                .any(|(id, _)| id == worker)
+    }
+
     /// Returns the worker metadata.
     fn info(&self) -> &ExecutorInfo {
         &self.executor_info
@@ -168,6 +196,18 @@ impl Executor for SimExecutor {
 
     /// Lowers and submits a logical batch while preserving executor backpressure semantics.
     fn submit(&mut self, batch: Batch) -> Result<(), ExecutorSubmitError> {
+        if self.handle.is_none() {
+            return Err(ExecutorSubmitError::Failed(anyhow::anyhow!(
+                "Executor is closed"
+            )));
+        }
+        for op in &batch.ops {
+            if !self.is_ready(&op.target.0) {
+                return Err(ExecutorSubmitError::Failed(anyhow::anyhow!(
+                    "Worker cannot accept this request"
+                )));
+            }
+        }
         if self.in_flight >= self.depth {
             return Err(ExecutorSubmitError::WouldBlock(batch));
         }
@@ -177,12 +217,22 @@ impl Executor for SimExecutor {
             .register(&batch)
             .map_err(ExecutorSubmitError::Failed)?;
         match self.submit_run(run) {
-            Ok(()) => Ok(()),
-            Err(PhysicalSubmitError::WouldBlock(_)) => {
+            Ok(()) => {
+                self.admissions
+                    .extend(batch.admissions().map(|request| request.request_key));
+                self.products.extend(
+                    batch
+                        .ops
+                        .iter()
+                        .flat_map(|op| op.payload.outputs.iter().cloned()),
+                );
+                Ok(())
+            }
+            Err(RunSubmitError::WouldBlock(_)) => {
                 self.logical_results.unregister(batch.id);
                 Err(ExecutorSubmitError::WouldBlock(batch))
             }
-            Err(PhysicalSubmitError::Failed(error)) => {
+            Err(RunSubmitError::Failed(error)) => {
                 self.logical_results.unregister(batch.id);
                 Err(ExecutorSubmitError::Failed(error))
             }
@@ -191,21 +241,58 @@ impl Executor for SimExecutor {
 
     /// Polls for the next completed worker operation.
     fn poll(&mut self, timeout: Duration) -> anyhow::Result<Option<BatchResult>> {
-        self.poll_run(timeout)?
-            .map(|report| self.logical_results.apply(report))
-            .transpose()
+        let Some(report) = self.poll_run(timeout)? else {
+            return Ok(None);
+        };
+        let commands = self.logical_results.commands(report.batch_id).to_vec();
+        let result = self.logical_results.apply(report)?;
+        for receipt in &result.command_results {
+            if receipt.outcome == crate::executor::CommandOutcome::Failed {
+                continue;
+            }
+            let command = commands
+                .iter()
+                .filter(|command| {
+                    !matches!(command, uniserve_worker_ipc::BatchCommand::Start { .. })
+                })
+                .nth(receipt.command_index as usize)
+                .expect("logical command has its registered payload");
+            use uniserve_worker_ipc::BatchCommand;
+            match command {
+                BatchCommand::Free { buffer } => self
+                    .products
+                    .retain(|product| product.buffer_id() != *buffer),
+                BatchCommand::Finish {
+                    request_key,
+                    retained_buffers,
+                    ..
+                }
+                | BatchCommand::Retire {
+                    request_key,
+                    retained_buffers,
+                } => {
+                    self.admissions.remove(request_key);
+                    self.products.retain(|product| {
+                        product.request_key != *request_key
+                            || retained_buffers.contains(&product.buffer_id())
+                    });
+                }
+                _ => {}
+            }
+        }
+        Ok(Some(result))
     }
 
     /// Closes the component and releases its resources.
     fn close(&mut self) -> anyhow::Result<()> {
-        self.close_physical()
+        self.shutdown()
     }
 }
 
 impl Drop for SimExecutor {
     /// Releases resources owned by this value.
     fn drop(&mut self) {
-        let _ = self.close_physical();
+        let _ = self.shutdown();
     }
 }
 
@@ -301,7 +388,7 @@ impl SimEngine {
     /// Constructs a simulator with deterministic text and image capabilities.
     pub fn new() -> Self {
         let info = WorkerInfo {
-            supported_ops: OpKind::ALL.to_vec(),
+            supported_ops: OpCode::ALL.to_vec(),
             latent_page_units: 64,
             latent_pages: 1_025,
             buffer_pool_bytes: 257_u64 * (256 << 20),
@@ -455,7 +542,7 @@ impl SimEngine {
                 .collect(),
             error_code: None,
             timing_counters: TimingCounters::default(),
-            payload: ResultPayload::for_kind(operation.kind, ResultData::default()),
+            payload: ResultPayload::for_kind(operation.kind(), ResultData::default()),
         };
         record.logical_lengths_mut().token_len = request.logical_position;
         set_kv_lengths(
@@ -466,8 +553,8 @@ impl SimEngine {
         );
         let mut products = Vec::new();
 
-        match operation.kind {
-            work @ (RunKind::ArExtend | RunKind::ArDecode | RunKind::ArVerify) => {
+        match operation.kind() {
+            work @ (OpCode::ArExtend | OpCode::ArDecode | OpCode::ArVerify) => {
                 let visual_state = operation.inputs().iter().any(|input| {
                     matches!(
                         input.kind,
@@ -573,8 +660,8 @@ impl SimEngine {
                     record.logical_lengths_mut().token_len = 1;
                     if !visual_state {
                         let query_tokens = match work {
-                            RunKind::ArExtend => operation.bounds().max_tokens,
-                            RunKind::ArDecode | RunKind::ArVerify => 1,
+                            OpCode::ArExtend => operation.bounds().max_tokens,
+                            OpCode::ArDecode | OpCode::ArVerify => 1,
                             _ => unreachable!(),
                         };
                         request.logical_position =
@@ -590,8 +677,8 @@ impl SimEngine {
                         );
                     }
                     match work {
-                        RunKind::ArExtend => request.emitted = request.emitted.max(1),
-                        RunKind::ArDecode | RunKind::ArVerify => {
+                        OpCode::ArExtend => request.emitted = request.emitted.max(1),
+                        OpCode::ArDecode | OpCode::ArVerify => {
                             request.emitted = request.emitted.saturating_add(1)
                         }
                         _ => unreachable!(),
@@ -626,11 +713,11 @@ impl SimEngine {
                     }
                 }
             }
-            RunKind::EncoderVision | RunKind::EncoderLatent => {}
-            work @ (RunKind::TransferProduct
-            | RunKind::TransferKvPublish
-            | RunKind::TransferKvInstall) => {
-                if work == RunKind::TransferKvPublish {
+            OpCode::EncoderText | OpCode::EncoderVision | OpCode::EncoderLatent => {}
+            work @ (OpCode::TransferProduct
+            | OpCode::TransferKvPublish
+            | OpCode::TransferKvInstall) => {
+                if work == OpCode::TransferKvPublish {
                     request.kv_published_len = request.kv_visible_len;
                 }
                 set_kv_lengths(
@@ -640,8 +727,8 @@ impl SimEngine {
                     request.kv_published_len,
                 );
             }
-            RunKind::DiffusionPrepare => {}
-            RunKind::DiffusionStep => {
+            OpCode::DiffusionPrepare => {}
+            OpCode::DiffusionStep => {
                 let steps = operation.bounds().max_tokens.max(1) as u16;
                 request.flow_step = request.flow_step.saturating_add(steps);
                 let total = request
@@ -653,8 +740,8 @@ impl SimEngine {
                 // advanced through every scheduled step.
                 record.finish_flags_mut().length = request.flow_step >= total;
             }
-            RunKind::DiffusionDecode => {}
-            RunKind::DiffusionFinalize => {
+            OpCode::DiffusionDecode | OpCode::MediaAppend => {}
+            OpCode::DiffusionFinalize => {
                 request.flow_step = 0;
                 if let Some(image) = request.image().cloned() {
                     let (height, width) = if image.height > 0 && image.width > 0 {
@@ -715,7 +802,7 @@ impl SimEngine {
             error_code: None,
             timing_counters: TimingCounters::default(),
             payload: ResultPayload::for_kind(
-                operation.kind,
+                operation.kind(),
                 ResultData {
                     logical_lengths: LogicalLengths {
                         token_len: request.logical_position,
@@ -901,7 +988,8 @@ impl SimEngine {
             .commands
             .iter()
             .filter_map(|control| match control {
-                uniserve_worker_ipc::BatchCommand::Finish { request_key, .. } => {
+                uniserve_worker_ipc::BatchCommand::Finish { request_key, .. }
+                | uniserve_worker_ipc::BatchCommand::Retire { request_key, .. } => {
                     Some(request_key.request_id)
                 }
                 _ => None,
@@ -954,35 +1042,37 @@ impl SimEngine {
                 "operation identity {:?} does not match its admitted lineage",
                 operation.request_key
             );
-            match &operation.parent.point {
-                CheckpointPoint::Fixed(point) => {
-                    anyhow::ensure!(
-                        *point == request.point_index,
-                        "operation {} ({}) parent point {} does not match request point {}",
-                        operation.op_id.0,
-                        operation.kind.as_str(),
-                        point,
-                        request.point_index
-                    );
-                }
-                CheckpointPoint::DeviceSelected => {
-                    // A device-relay successor roots on its predecessor's
-                    // selected point before host observation. By the time it
-                    // runs, the predecessor has committed and advanced this
-                    // request, so its point is the current request point and its
-                    // terminal record names the referenced producer. The base
-                    // point is the request's tracked point, not the absent
-                    // device point index.
-                    let producer_op_id = operation.parent.op_id.0;
-                    let recorded = request.terminal.get(&producer_op_id).ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "device parent names unknown predecessor op {producer_op_id}"
-                        )
-                    })?;
-                    anyhow::ensure!(
-                        recorded.completion.selected_point == request.point_index,
-                        "device parent predecessor is not the request's committed point"
-                    );
+            if let Some(parent) = &operation.parent {
+                match &parent.point {
+                    CheckpointPoint::Fixed(point) => {
+                        anyhow::ensure!(
+                            *point == request.point_index,
+                            "operation {} ({}) parent point {} does not match request point {}",
+                            operation.op_id.0,
+                            operation.kind().as_str(),
+                            point,
+                            request.point_index
+                        );
+                    }
+                    CheckpointPoint::DeviceSelected => {
+                        // A device-relay successor roots on its predecessor's
+                        // selected point before host observation. By the time it
+                        // runs, the predecessor has committed and advanced this
+                        // request, so its point is the current request point and its
+                        // terminal record names the referenced producer. The base
+                        // point is the request's tracked point, not the absent
+                        // device point index.
+                        let producer_op_id = parent.op_id.0;
+                        let recorded = request.terminal.get(&producer_op_id).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "device parent names unknown predecessor op {producer_op_id}"
+                            )
+                        })?;
+                        anyhow::ensure!(
+                            recorded.completion.selected_point == request.point_index,
+                            "device parent predecessor is not the request's committed point"
+                        );
+                    }
                 }
             }
 
@@ -1118,10 +1208,10 @@ mod tests {
         let operation = Operation {
             request_key,
             op_id: OpId(op_id),
-            parent,
-            kind: RunKind::ArExtend,
+            parent: Some(parent),
+            entry: "model".into(),
             payload: OpPayload::new(
-                RunKind::ArExtend,
+                OpCode::ArExtend,
                 Bounds {
                     max_points: 1,
                     max_tokens: 2,

@@ -1,104 +1,61 @@
-"""Self-contained FastH3 v0.2 component discovery and rank-aware loading."""
+"""H3 component geometry, checkpoint name mapping and numerical precomputation."""
 
 from __future__ import annotations
 
 import json
+import math
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any
 
 import torch
 from torch import nn
 
+from ...loader.component import (
+    CheckpointComponent,
+    ModelBuildContext,
+    ModelConstruction,
+    construction_dtype,
+)
+from ...loader.handles import WeightHandle
+from ...loader.mapping import LoadReport, stacked_weight_name
+from ...loader.weight_loaders import attach_parameter_loaders, load_parameter_weight
+from ...nn.diffusion.schedule import DiffusionSchedule
+from ...nn.layer import LayerConfig
+from ...nn.linear import LinearBase
+from ...nn.mesh import Communicator
+from ...nn.quant.config import QuantizationConfig
 from .audio_vae import MiniMaxH3AudioVAE
 from .encoder import H3TextEncoderConfig, MiniMaxH3TextEncoder
-from .placement import H3Placement
-from .precision import H3LinearPrecisionPolicy
-from .transformer import H3TimestepEmbedding, H3TransformerConfig, MiniMaxH3Transformer
+from .packing import audio_latent_frames
+from .state import MIN_H3_FRAMES, H3Layout
+from .transformer import (
+    H3TimestepEmbedding,
+    H3TransformerConfig,
+    MiniMaxH3Transformer,
+    build_conditioner,
+)
 from .video_vae import MiniMaxH3VideoVAE
-
-__all__ = ["H3Checkpoint", "H3Components", "load_h3_components", "resolve_h3_checkpoint"]
-
-CHECKPOINT_ID = "FastVideo/FastVideo-Minimax-FastH3-Preview-v0.2"
-
-
-@dataclass(frozen=True, slots=True)
-class H3Checkpoint:
-    """Canonical component paths rooted at one H3 checkpoint directory."""
-
-    root: Path
+from .video_vae_decoder import MiniMaxH3VideoDecoder
 
 
 @dataclass(slots=True)
 class H3Components:
-    """Bundles the H3 transformer, text encoder, video VAE, audio VAE, and their checkpoint root."""
+    """Resident computation modules assembled after their public loader finalizes them."""
 
-    checkpoint: H3Checkpoint
     transformer: MiniMaxH3Transformer | None
+    conditioner: nn.Sequential | None
     encoder: MiniMaxH3TextEncoder | None
     video_vae: MiniMaxH3VideoVAE | None
     audio_vae: MiniMaxH3AudioVAE | None
 
 
-def resolve_h3_checkpoint(
-    model_path: str,
-    *,
-    cache_dir: str | None = None,
-    revision: str | None = None,
-) -> H3Checkpoint:
-    """Resolve a local or Hugging Face checkpoint and verify its component manifest."""
-
-    candidate = Path(model_path).expanduser()
-    if candidate.is_dir():
-        root = candidate.resolve()
-    else:
-        from huggingface_hub import snapshot_download
-
-        root = Path(
-            snapshot_download(
-                repo_id=model_path,
-                revision=revision,
-                cache_dir=cache_dir,
-                allow_patterns=[
-                    "modular_model_index.json",
-                    "transformer/*.json",
-                    "transformer/*.safetensors",
-                    "text_encoder/*.json",
-                    "text_encoder/*.safetensors",
-                    "tokenizer/*",
-                    "processor/*",
-                    "scheduler/*",
-                    "audio_scheduler/*",
-                    "vae/*",
-                    "audio_vae/*",
-                ],
-            )
-        ).resolve()
-
-    # Every execution component has an independent config and weight namespace.
-    required = (
-        "modular_model_index.json",
-        "transformer/config.json",
-        "text_encoder/config.json",
-        "vae/config.json",
-        "audio_vae/config.json",
-        "scheduler/scheduler_config.json",
-        "audio_scheduler/scheduler_config.json",
-    )
-    missing = [relative for relative in required if not (root / relative).is_file()]
-    if missing:
-        raise FileNotFoundError(
-            f"FastH3 checkpoint {root} is missing required components {missing!r}"
-        )
-    return H3Checkpoint(root=root)
-
-
-def _require_checkpoint_geometry(checkpoint: H3Checkpoint) -> None:
+def _require_checkpoint_geometry(root: Path) -> None:
     """Validate checkpoint component files and tensor dimensions against the H3 architecture."""
 
-    transformer = json.loads(
-        (checkpoint.root / "transformer" / "config.json").read_text(encoding="utf-8")
-    )
+    transformer = json.loads((root / "transformer" / "config.json").read_text(encoding="utf-8"))
     transformer_config = H3TransformerConfig()
     expected_transformer = {
         "num_attention_heads": transformer_config.heads,
@@ -126,9 +83,9 @@ def _require_checkpoint_geometry(checkpoint: H3Checkpoint) -> None:
                 f"FastH3 transformer {field} must be {expected!r}, got {transformer.get(field)!r}"
             )
 
-    encoder = json.loads(
-        (checkpoint.root / "text_encoder" / "config.json").read_text(encoding="utf-8")
-    ).get("text_config")
+    encoder = json.loads((root / "text_encoder" / "config.json").read_text(encoding="utf-8")).get(
+        "text_config"
+    )
     if not isinstance(encoder, dict):
         raise ValueError("FastH3 text encoder has no Qwen3-VL text configuration")
     encoder_config = H3TextEncoderConfig()
@@ -151,7 +108,7 @@ def _require_checkpoint_geometry(checkpoint: H3Checkpoint) -> None:
 
     for component, expected_shift in (("scheduler", 12.0), ("audio_scheduler", 3.0)):
         scheduler = json.loads(
-            (checkpoint.root / component / "scheduler_config.json").read_text(encoding="utf-8")
+            (root / component / "scheduler_config.json").read_text(encoding="utf-8")
         )
         if scheduler.get("shift") != expected_shift:
             raise ValueError(
@@ -159,98 +116,25 @@ def _require_checkpoint_geometry(checkpoint: H3Checkpoint) -> None:
             )
 
 
-def _weight_map(component: Path) -> dict[str, Any]:
-    """Read and validate the safetensors index that maps parameter names to shard files."""
-
-    from ...loader.handles import SafetensorFileWeightHandle, safetensor_dtype
-
-    indexes = sorted(component.glob("*.safetensors.index.json"))
-    if len(indexes) > 1:
-        raise RuntimeError(f"component {component} contains multiple safetensor indexes")
-    if indexes:
-        payload = json.loads(indexes[0].read_text(encoding="utf-8"))
-        mapping = payload.get("weight_map")
-        if not isinstance(mapping, dict):
-            raise RuntimeError(f"checkpoint index {indexes[0]} has no weight_map")
-        locations = {str(name): component / str(filename) for name, filename in mapping.items()}
-    else:
-        files = sorted(component.glob("*.safetensors"))
-        if len(files) != 1:
-            raise RuntimeError(f"component {component} has no unambiguous safetensor source")
-        from safetensors.torch import safe_open
-
-        with safe_open(files[0], framework="pt", device="cpu") as source:
-            locations = {str(name): files[0] for name in source.keys()}
-    missing = sorted({path for path in locations.values() if not path.is_file()})
-    if missing:
-        raise FileNotFoundError(f"component {component} is missing weight shards {missing!r}")
-    from safetensors.torch import safe_open
-
-    handles: dict[str, Any] = {}
-    by_path: dict[Path, list[str]] = {}
-    for name, path in locations.items():
-        by_path.setdefault(path, []).append(name)
-    for path, names in sorted(by_path.items()):
-        with safe_open(path, framework="pt", device="cpu") as source:
-            available = set(source.keys())
-            absent = sorted(set(names) - available)
-            if absent:
-                raise KeyError(f"checkpoint shard {path} is missing indexed tensor {absent[0]!r}")
-            for name in names:
-                value = source.get_slice(name)
-                handles[name] = SafetensorFileWeightHandle(
-                    name=name,
-                    path=path,
-                    shape=tuple(int(size) for size in value.get_shape()),
-                    dtype=safetensor_dtype(str(value.get_dtype())),
-                )
-    return handles
-
-
-def _set_parameter(module: nn.Module, name: str, value: torch.Tensor) -> None:
-    """Replace a nested parameter by dotted checkpoint name without enabling gradients."""
-
-    path, _, field = name.rpartition(".")
-    owner = module.get_submodule(path)
-    parameter = getattr(owner, field)
-    if not isinstance(parameter, nn.Parameter):
-        raise TypeError(f"target {name!r} is not a parameter")
-    if tuple(parameter.shape) != tuple(value.shape):
-        raise ValueError(
-            f"checkpoint tensor {name!r} shape {tuple(value.shape)} does not match {tuple(parameter.shape)}"
-        )
-    setattr(owner, field, nn.Parameter(value, requires_grad=False))
-
-
-def _transformer_dtype(name: str) -> torch.dtype:
-    """Map a transformer parameter name to its checkpoint storage dtype."""
-
-    fp32_prefixes = (
-        "proj_in.",
-        "audio_proj_in.",
-        "proj_out.",
-        "audio_proj_out.",
-    )
-    return torch.float32 if name.startswith(fp32_prefixes) else torch.bfloat16
-
-
 @torch.inference_mode()
 def _prepare_modulation(
-    model: MiniMaxH3Transformer, sources: dict[str, Any], device: torch.device
+    model: MiniMaxH3Transformer,
+    sources: Mapping[str, WeightHandle],
+    device: torch.device,
+    schedule: DiffusionSchedule,
 ) -> None:
     """Stream fixed-timestep checkpoint projections into model-owned products."""
 
     from ...nn.diffusion.modulation import ModulationPlan
 
     embedding = H3TimestepEmbedding(model.config, device="meta", buffer_device=device)
-    for name, _parameter in tuple(embedding.named_parameters()):
-        value = sources[f"time_embedder.{name}"].full().to(device=device, dtype=torch.float32)
-        _set_parameter(embedding, name, value)
-    schedule = model.layout.schedule
+    attach_parameter_loaders(embedding, device=device, dtype=torch.float32)
+    for name, parameter in tuple(embedding.named_parameters()):
+        load_parameter_weight(parameter, sources[f"time_embedder.{name}"])
     activated = torch.stack(
         tuple(
             torch.nn.functional.silu(embedding(torch.stack((video, audio))))
-            for video, audio in zip(schedule.video_timesteps, schedule.audio_timesteps, strict=True)
+            for video, audio in zip(schedule.timesteps[0], schedule.timesteps[1], strict=True)
         )
     )
     del embedding
@@ -272,179 +156,213 @@ def _prepare_modulation(
     )
 
 
-def _load_transformer(
-    model: MiniMaxH3Transformer,
-    component: Path,
-    device: torch.device,
-) -> None:
-    """Stream transformer shards into resident parameters and finalize quantized projections."""
+def _map_transformer(model: nn.Module, handles: Iterable[WeightHandle]) -> LoadReport:
+    """Map checkpoint attention projections into the rank's packed resident layers."""
 
-    from ...loader.handles import weight_handle_materialization
-    from ...loader.weight_loaders import attach_parameter_loaders, load_parameter_weight
-    from ...nn.placement import get_shard_plan
-    from ...nn.quant import process_quantized_modules
-
-    sources = _weight_map(component)
-    _prepare_modulation(model, sources, device)
-    attach_parameter_loaders(model, device=device, dtype=torch.bfloat16)
-    targets = dict(model.named_parameters())
-    with weight_handle_materialization():
-        for name, target in targets.items():
-            packed_suffix = ".attn.to_qkvg.weight"
-            if name.startswith("transformer_blocks.") and name.endswith(packed_suffix):
-                prefix = name[: -len("to_qkvg.weight")]
-                source_names = tuple(
-                    prefix + suffix
-                    for suffix in (
-                        "to_q.weight",
-                        "to_k.weight",
-                        "to_v.weight",
-                        "to_gate_compress.weight",
-                    )
-                )
-                for projection, source_name in enumerate(source_names):
-                    try:
-                        handle = sources[source_name]
-                    except KeyError as error:
-                        raise KeyError(
-                            f"FastH3 transformer is missing checkpoint tensor {source_name!r}"
-                        ) from error
-                    load_parameter_weight(target, handle, projection)
-                continue
-            try:
-                handle = sources[name]
-            except KeyError as error:
-                raise KeyError(
-                    f"FastH3 transformer is missing checkpoint tensor {name!r}"
-                ) from error
-            if get_shard_plan(target) is not None:
-                load_parameter_weight(target, handle)
-                continue
-            tensor = handle.full().to(
-                device=device,
-                dtype=_transformer_dtype(name),
-                non_blocking=False,
-            )
-            _set_parameter(model, name, tensor)
-    packed_names = {
-        f"transformer_blocks.{index}.attn.to_qkvg.weight" for index in model.pipeline.layers
-    }
-    if not packed_names <= targets.keys():
-        raise RuntimeError("FastH3 transformer did not materialize all attention projections")
-    process_quantized_modules(model.modules())
-
-
-def _load_encoder(
-    model: MiniMaxH3TextEncoder,
-    component: Path,
-    device: torch.device,
-) -> None:
-    """Stream retained text-encoder layers and embeddings into resident parameters."""
-
-    from ...loader.handles import weight_handle_materialization
-    from ...loader.weight_loaders import attach_parameter_loaders, load_parameter_weight
-    from ...nn.quant import process_quantized_modules
-
-    sources = _weight_map(component)
-    attach_parameter_loaders(model, device=device, dtype=torch.bfloat16)
-    targets = dict(model.named_parameters())
-    with weight_handle_materialization():
-        for name, target in targets.items():
-            if name.endswith(".self_attn.qkv_proj.weight"):
-                prefix = name[: -len("qkv_proj.weight")]
-                for shard, projection in (("q", "q_proj"), ("k", "k_proj"), ("v", "v_proj")):
-                    source_name = f"model.{prefix}{projection}.weight"
-                    try:
-                        handle = sources[source_name]
-                    except KeyError as error:
-                        raise KeyError(
-                            f"H3 text encoder is missing checkpoint tensor {source_name!r}"
-                        ) from error
-                    load_parameter_weight(target, handle, shard)
-                continue
-            if name.endswith(".mlp.gate_up_proj.weight"):
-                prefix = name[: -len("gate_up_proj.weight")]
-                for shard, projection in (("gate", "gate_proj"), ("up", "up_proj")):
-                    source_name = f"model.{prefix}{projection}.weight"
-                    try:
-                        handle = sources[source_name]
-                    except KeyError as error:
-                        raise KeyError(
-                            f"H3 text encoder is missing checkpoint tensor {source_name!r}"
-                        ) from error
-                    load_parameter_weight(target, handle, shard)
-                continue
-            source_name = f"model.{name}"
-            try:
-                handle = sources[source_name]
-            except KeyError as error:
-                raise KeyError(
-                    f"H3 text encoder is missing checkpoint tensor {source_name!r}"
-                ) from error
-            load_parameter_weight(target, handle)
-    process_quantized_modules(model.modules())
-
-
-def load_h3_components(
-    checkpoint_path: str,
-    placement: H3Placement,
-    layout: Any,
-    *,
-    cache_dir: str | None = None,
-    revision: str | None = None,
-    precision_policy: H3LinearPrecisionPolicy,
-) -> H3Components:
-    """Validate and materialize the rank-local H3 transformer, encoder, and VAE modules."""
-
-    checkpoint = resolve_h3_checkpoint(
-        checkpoint_path,
-        cache_dir=cache_dir,
-        revision=revision,
+    mapping = tuple(
+        ("attn.to_qkvg", f"attn.{name}", index)
+        for index, name in enumerate(("to_q", "to_k", "to_v", "to_gate_compress"))
     )
-    _require_checkpoint_geometry(checkpoint)
-    device = placement.process_group.device
-    transformer = None
-    mesh = placement.denoiser_mesh
+    parameters = dict(model.named_parameters())
+    report = LoadReport()
+    for handle in handles:
+        checkpoint_name = handle.name.replace(".ff.net.0.proj.", ".ff.gate_up_proj.").replace(
+            ".ff.net.2.", ".ff.down_proj."
+        )
+        # The dense conditioning refiner retains separate Q/K/V projections.
+        name, shard = (
+            (checkpoint_name, None)
+            if checkpoint_name in parameters
+            else stacked_weight_name(checkpoint_name, mapping)
+        )
+        parameter = parameters.get(name)
+        if parameter is None:
+            report.skipped.append(handle.name)
+            continue
+        load_parameter_weight(parameter, handle, shard)
+        report.loaded.add(name)
+    return report
+
+
+def _map_encoder(model: MiniMaxH3TextEncoder, handles: Iterable[WeightHandle]) -> LoadReport:
+    """Select retained Qwen text layers and express their packed checkpoint projection names."""
+
+    mapping = (
+        ("self_attn.qkv_proj", "self_attn.q_proj", "q"),
+        ("self_attn.qkv_proj", "self_attn.k_proj", "k"),
+        ("self_attn.qkv_proj", "self_attn.v_proj", "v"),
+        ("mlp.gate_up_proj", "mlp.gate_proj", 0),
+        ("mlp.gate_up_proj", "mlp.up_proj", 1),
+    )
+    parameters = dict(model.named_parameters())
+    report = LoadReport()
+    for handle in handles:
+        name, shard = stacked_weight_name(handle.name.removeprefix("model."), mapping)
+        parameter = parameters.get(name)
+        if parameter is None:
+            report.skipped.append(handle.name)
+            continue
+        load_parameter_weight(parameter, handle, shard)
+        report.loaded.add(name)
+    return report
+
+
+def _map_video_decoder(model: MiniMaxH3VideoDecoder, handles: Iterable[WeightHandle]) -> LoadReport:
+    """Translate the checkpoint's value-first feed-forward projection names."""
+
+    parameters = dict(model.named_parameters())
+    report = LoadReport()
+    for handle in handles:
+        name = handle.name.replace(".ff.net.0.proj.", ".ff.gate_up_proj.").replace(
+            ".ff.net.2.", ".ff.down_proj."
+        )
+        parameter = parameters.get(name)
+        if parameter is None:
+            report.skipped.append(handle.name)
+            continue
+        load_parameter_weight(parameter, handle)
+        report.loaded.add(name)
+    return report
+
+
+def build_h3_checkpoint(config: dict[str, Any], context: ModelBuildContext) -> ModelConstruction:
+    """Declare resident H3 components; the shared loader owns their materialization."""
+
+    from .model import MiniMaxH3Model, validate_h3_entries
+
+    request = context.request
+    bindings, schedule = request.bindings, context.schedule
+    if schedule is None:
+        raise ValueError("H3 construction requires its diffusion schedule")
+    validate_h3_entries(bindings)
+    _require_checkpoint_geometry(context.root)
+    device = bindings.process_group.device
+    precisions = context.component_precisions
+    text_capacity = ((int(request.max_text_rows) + 63) // 64) * 64
+    raw_frames = math.floor(float(request.max_video_seconds) * 24.0 + 0.5)
+    max_frames = int(raw_frames + (5 - raw_frames) % 17)
+    if text_capacity < 64 or max_frames < MIN_H3_FRAMES:
+        raise ValueError("H3 worker_config capacity is smaller than a legal request")
+    layout = H3Layout.build(
+        bindings,
+        frames=max_frames,
+        text_rows=text_capacity,
+        audio_frames=audio_latent_frames(max_frames),
+    )
+    components = []
+    transformer = encoder = video_decoder = audio_decoder = None
+    conditioner = None
+    mesh = bindings.meshes.get("denoiser")
     if mesh is not None:
         transformer = MiniMaxH3Transformer(
             mesh,
-            layout,
             parameter_device="meta",
-            attention_linear_precision=precision_policy.transformer_attention,
-            mlp_linear_precision=precision_policy.transformer_mlp,
+            attention_linear_precision=precisions["transformer.attention"],
+            mlp_linear_precision=precisions["transformer.mlp"],
         )
-        _load_transformer(transformer, checkpoint.root / "transformer", device)
-    encoder = None
-    encoder_mesh = placement.encoder_mesh
-    if encoder_mesh is not None:
+        if transformer.pipeline.first:
+            conditioner = build_conditioner(mesh, "meta")
+            components.append(
+                CheckpointComponent(
+                    conditioner,
+                    source="denoiser",
+                    map_weights=partial(_map_transformer, conditioner),
+                    dtype=torch.bfloat16,
+                )
+            )
+        components.append(
+            CheckpointComponent(
+                transformer,
+                source="denoiser",
+                map_weights=partial(_map_transformer, transformer),
+                dtype=torch.bfloat16,
+                parameter_dtypes=tuple(
+                    (name, torch.float32)
+                    for name in ("proj_in", "audio_proj_in", "proj_out", "audio_proj_out")
+                    if getattr(transformer, name) is not None
+                ),
+                post_load=partial(
+                    _prepare_modulation, transformer, device=device, schedule=schedule
+                ),
+            )
+        )
+    mesh = bindings.meshes.get("text_encoder")
+    if mesh is not None:
         encoder = MiniMaxH3TextEncoder(
-            encoder_mesh,
-            max_text_rows=int(layout.packed.text_indices.numel()),
+            mesh,
+            max_text_rows=text_capacity,
             parameter_device="meta",
-            linear_precision=precision_policy.text_encoder,
+            linear_precision=precisions["text_encoder"],
         )
-        _load_encoder(encoder, checkpoint.root / "text_encoder", device)
-    video_vae = (
-        MiniMaxH3VideoVAE.from_pretrained(
-            str(checkpoint.root),
-            device=device,
-            local_files_only=True,
-            linear_precision=precision_policy.video_vae,
+        components.append(
+            CheckpointComponent(
+                encoder,
+                source="text_encoder",
+                map_weights=partial(_map_encoder, encoder),
+                dtype=torch.bfloat16,
+            )
         )
-        if placement.owns("video_decoder")
-        else None
-    )
-    audio_vae = (
-        MiniMaxH3AudioVAE.from_pretrained(
-            str(checkpoint.root), device=device, local_files_only=True
+    if bindings.owns("video_decoder"):
+        precision = precisions["video_vae"]
+        dense = precision in {"fp16", "bf16"}
+        dtype = torch.float16 if precision == "fp16" else torch.bfloat16
+        # The 24-channel input projection is not aligned for NVFP4 packing.
+        quantization = (
+            None
+            if dense
+            else QuantizationConfig(method=precision, ignored_layers=("decoder.proj_in",))
         )
-        if placement.owns("audio_decoder")
-        else None
-    )
-    return H3Components(
-        checkpoint=checkpoint,
-        transformer=transformer,
-        encoder=encoder,
-        video_vae=video_vae,
-        audio_vae=audio_vae,
-    )
+        video_decoder = MiniMaxH3VideoDecoder(
+            layer_config=LayerConfig(Communicator(), quantization),
+            parameter_device="meta",
+            buffer_device=device,
+        )
+        components.append(
+            CheckpointComponent(
+                video_decoder,
+                source="video_decoder",
+                map_weights=partial(_map_video_decoder, video_decoder),
+                dtype=torch.float32,
+                parameter_dtypes=tuple(
+                    (name, dtype)
+                    for name, module in video_decoder.named_modules()
+                    if (
+                        isinstance(module, LinearBase)
+                        and (dense or module.quant_method.is_quantized)
+                    )
+                    or (dense and isinstance(module, torch.nn.Conv3d))
+                ),
+                strict=False,
+            )
+        )
+    if bindings.owns("audio_decoder"):
+        from diffusers import AutoencoderKLMiniMaxH3Audio
+
+        audio_config = json.loads((context.root / "audio_vae" / "config.json").read_text())
+        with construction_dtype(torch.float32), torch.device("meta"):
+            audio_decoder = AutoencoderKLMiniMaxH3Audio.from_config(audio_config)
+        components.append(
+            CheckpointComponent(
+                audio_decoder,
+                source="audio_decoder",
+                dtype=torch.float32,
+                persistent_buffers=True,
+            )
+        )
+
+    def assemble() -> MiniMaxH3Model:
+        return MiniMaxH3Model(
+            bindings,
+            H3Components(
+                transformer=transformer,
+                conditioner=conditioner,
+                encoder=encoder,
+                video_vae=MiniMaxH3VideoVAE(video_decoder, linear_precision=precisions["video_vae"])
+                if video_decoder is not None
+                else None,
+                audio_vae=MiniMaxH3AudioVAE(audio_decoder) if audio_decoder is not None else None,
+            ),
+            layout,
+        )
+
+    return ModelConstruction(tuple(components), assemble, config)

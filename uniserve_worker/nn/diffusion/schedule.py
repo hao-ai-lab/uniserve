@@ -2,11 +2,68 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import Enum
 
 import torch
 
+
+def shifted_sigmas(ladder: tuple[int, ...], shift: float, *, scale: float) -> tuple[float, ...]:
+    """Map a descending trained ladder to sigma coordinates with a terminal zero."""
+
+    if shift <= 0 or scale <= 0:
+        raise ValueError("schedule shift and scale must be positive")
+    if not ladder or any(value <= 0 or value > scale for value in ladder):
+        raise ValueError("schedule ladder must contain positive points within its scale")
+    if any(left <= right for left, right in zip(ladder, ladder[1:])):
+        raise ValueError("schedule ladder must be strictly descending")
+    base = (*((value / scale) for value in ladder), 0.0)
+    return tuple(shift * sigma / (1.0 + (shift - 1.0) * sigma) for sigma in base)
+
+
+@dataclass(frozen=True, slots=True)
+class DiffusionSchedule:
+    """Stable sigma and clean-time tensors in the declared modality order."""
+
+    sigmas: tuple[torch.Tensor, ...]
+    timesteps: tuple[torch.Tensor, ...]
+
+    def __post_init__(self) -> None:
+        if not self.sigmas or len(self.sigmas) != len(self.timesteps):
+            raise ValueError("schedule modalities must have sigma and timestep tensors")
+        for sigma, timestep in zip(self.sigmas, self.timesteps):
+            if sigma.ndim != 1 or timestep.ndim != 1 or sigma.numel() != timestep.numel() + 1:
+                raise ValueError("schedule requires one terminal sigma after its timesteps")
+            if timestep.numel() == 0 or sigma.device != timestep.device:
+                raise ValueError("schedule timesteps must be nonempty and share the sigma device")
+            if sigma.dtype != torch.float32 or timestep.dtype != torch.float32:
+                raise ValueError("schedule constants must use FP32")
+
+    @classmethod
+    def build(
+        cls,
+        ladder: tuple[int, ...],
+        shifts: tuple[float, ...],
+        *,
+        scale: float,
+        device: torch.device | str,
+    ) -> DiffusionSchedule:
+        """Materialize immutable FP32 schedule constants before graph capture."""
+
+        if not shifts:
+            raise ValueError("a diffusion schedule requires at least one modality")
+        sigmas = tuple(
+            torch.tensor(
+                shifted_sigmas(ladder, shift, scale=scale), dtype=torch.float32, device=device
+            )
+            for shift in shifts
+        )
+        return cls(sigmas, tuple(1.0 - values[:-1] for values in sigmas))
+
+
 __all__ = [
+    "DiffusionSchedule",
+    "shifted_sigmas",
     "ScheduleDirection",
     "ScheduleShiftDomain",
     "flow_match_coordinate",

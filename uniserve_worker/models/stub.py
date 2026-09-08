@@ -1,7 +1,7 @@
 """Defines a deterministic CPU model for exercising every worker execution route.
 
 The model implements the same cache, forward, projection, vision, latent, and
-diffusion boundaries as a neural deployment while deriving outputs entirely from
+diffusion boundaries as a neural worker_config while deriving outputs entirely from
 request coordinates. Its fixed token cycle makes scheduler outcomes reproducible.
 """
 
@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import torch
 
+from uniserve_worker.config import WorkerConfig
+
 from ..bootstrap.capacity import (
     DEFAULT_BLOCK_SIZE,
     DEFAULT_MAX_BATCH_OPS,
     DEFAULT_MAX_REQUEST_POOL_SIZE,
 )
-from ..execution.batch import RunKind
+from ..execution.batch import OpCode
 from ..execution.forward_batch import (
     AttentionSelection,
     ForwardBatch,
@@ -35,7 +37,6 @@ from ..models.runtime import (
     ExecutionModel,
     PositionLayout,
     ResourceGeometry,
-    WorkerDeployment,
 )
 from ..nn.diffusion.cfg import CfgRecipe
 from ..nn.diffusion.schedule import ScheduleDirection, ScheduleShiftDomain
@@ -54,21 +55,20 @@ __all__ = [
     "STUB_EOS_TOKEN_ID",
     "STUB_IMG_START_TOKEN_ID",
     "StubModel",
-    "stub_deployment",
+    "stub_worker_config",
 ]
 
 
-def stub_deployment(
+def stub_worker_config(
     block_size: int = DEFAULT_BLOCK_SIZE,
     *,
     max_batch_operations: int = DEFAULT_MAX_BATCH_OPS,
     max_batch_tokens: int,
-) -> WorkerDeployment:
-    """Build the single-device deployment geometry required by ``StubModel``."""
+) -> WorkerConfig:
+    """Build the single-device worker_config geometry required by ``StubModel``."""
 
-    return WorkerDeployment(
+    return WorkerConfig(
         device="cpu",
-        model_scope="whole",
         rank=0,
         world_size=1,
         block_size=int(block_size),
@@ -124,6 +124,8 @@ class StubModel(ExecutionModel):
             num_layers=STUB_NUM_LAYERS,
             num_attention_heads=1,
             num_kv_heads=1,
+            total_kv_heads=1,
+            kv_head_offset=0,
             head_dim=1,
             dtype="bfloat16",
             store_dtype="bfloat16",
@@ -155,7 +157,7 @@ class StubModel(ExecutionModel):
             latent_downsample=STUB_LATENT_DOWNSAMPLE,
         )
         self.max_vit_grid_tokens = STUB_MAX_LATENT_SIZE
-        self.supported_work = frozenset(RunKind)
+        self.supported_work = frozenset(OpCode)
         self.vocab_size = _STUB_VOCAB_SIZE
         self.hidden_size = _STUB_HIDDEN_SIZE
         self.text_max_tokens = STUB_MAX_LATENT_SIZE

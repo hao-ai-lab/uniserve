@@ -1,4 +1,4 @@
-"""Complete media and cancellation across independently placed H3 components."""
+"""Complete media and cancellation across statically assigned H3 entries."""
 
 from __future__ import annotations
 
@@ -24,9 +24,9 @@ pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("minimax_h3")]
 
 
 @pytest.mark.parametrize(
-    ("parallel_kind", "precision"),
+    ("parallel_kind", "precision", "grouping"),
     [
-        (kind, precision)
+        (kind, precision, "whole")
         for kind in (
             "ulysses2",
             "ulysses4",
@@ -44,17 +44,18 @@ pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("minimax_h3")]
             "local",
         )
         for precision in ("quality", "balanced", "performance", "maximum")
-    ],
+    ]
+    + [("ulysses4", "balanced", grouping) for grouping in ("split", "mixed")],
 )
-def test_component_placement_releases_cancelled_requests(
-    tmp_path: Path, parallel_kind: str, precision: str
+def test_component_bindings_release_cancelled_requests(
+    tmp_path: Path, parallel_kind: str, precision: str, grouping: str
 ) -> None:
     model_value = os.environ.get("UNISERVE_H3_MODEL")
     if not model_value or not Path(model_value).is_dir():
         pytest.fail("UNISERVE_H3_MODEL must name the FastH3 Preview v0.2 checkpoint directory")
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
-    deployment = {
+    worker_config = {
         "devices": [0, 1, 2, 3],
         "denoiser": {
             "ranks": [3, 1],
@@ -75,7 +76,7 @@ def test_component_placement_releases_cancelled_requests(
         sequence = (
             {"kind": "local"} if degree == 1 else {"kind": "ulysses", "ulysses_degree": degree}
         )
-        deployment = {
+        worker_config = {
             "devices": [3, 1, 2, 0][:degree],
             "denoiser": {"ranks": ranks, "parallel_config": {"sequence_parallel": sequence}},
             "text_encoder": {
@@ -92,22 +93,22 @@ def test_component_placement_releases_cancelled_requests(
         }
     elif parallel_kind in ("pipeline2", "pipeline4"):
         degree = 2 if parallel_kind == "pipeline2" else 4
-        deployment["denoiser"]["ranks"] = [3, 1, 2, 0][:degree]
-        deployment["denoiser"]["parallel_config"] = {"pipeline_parallel_size": degree}
+        worker_config["denoiser"]["ranks"] = [3, 1, 2, 0][:degree]
+        worker_config["denoiser"]["parallel_config"] = {"pipeline_parallel_size": degree}
     elif parallel_kind in ("gather2", "gather4"):
         degree = 2 if parallel_kind == "gather2" else 4
-        deployment["denoiser"]["ranks"] = [3, 1, 2, 0][:degree]
-        deployment["denoiser"]["parallel_config"] = {
+        worker_config["denoiser"]["ranks"] = [3, 1, 2, 0][:degree]
+        worker_config["denoiser"]["parallel_config"] = {
             "sequence_parallel": {"kind": "allgather", "allgather_degree": degree}
         }
     elif parallel_kind in ("ring2", "ring4"):
         degree = 4 if parallel_kind == "ring4" else 2
-        deployment["denoiser"]["ranks"] = [3, 1, 2, 0][:degree]
-        deployment["denoiser"]["parallel_config"] = {
+        worker_config["denoiser"]["ranks"] = [3, 1, 2, 0][:degree]
+        worker_config["denoiser"]["parallel_config"] = {
             "sequence_parallel": {"kind": "ring", "ring_degree": degree}
         }
     elif parallel_kind == "attention2d":
-        deployment["denoiser"] = {
+        worker_config["denoiser"] = {
             "ranks": [3, 1, 2, 0],
             "parallel_config": {
                 "sequence_parallel": {
@@ -118,7 +119,7 @@ def test_component_placement_releases_cancelled_requests(
             },
         }
     elif parallel_kind == "hybrid":
-        deployment["denoiser"] = {
+        worker_config["denoiser"] = {
             "ranks": [3, 1, 2, 0],
             "parallel_config": {
                 "sequence_parallel": {
@@ -129,7 +130,7 @@ def test_component_placement_releases_cancelled_requests(
             },
         }
     elif parallel_kind == "tensor2_ulysses2":
-        deployment["denoiser"] = {
+        worker_config["denoiser"] = {
             "ranks": [3, 1, 2, 0],
             "parallel_config": {
                 "tensor_parallel_size": 2,
@@ -138,10 +139,49 @@ def test_component_placement_releases_cancelled_requests(
         }
     elif parallel_kind in ("tensor2", "tensor4"):
         degree = 2 if parallel_kind == "tensor2" else 4
-        deployment["denoiser"]["ranks"] = [3, 1, 2, 0][:degree]
-        deployment["denoiser"]["parallel_config"] = {"tensor_parallel_size": degree}
+        worker_config["denoiser"]["ranks"] = [3, 1, 2, 0][:degree]
+        worker_config["denoiser"]["parallel_config"] = {"tensor_parallel_size": degree}
     else:
         raise ValueError(f"unsupported H3 test layout {parallel_kind!r}")
+    devices = worker_config.pop("devices")
+    groups = {
+        "whole": [tuple(worker_config)],
+        "split": [(name,) for name in worker_config],
+        "mixed": [("denoiser", "text_encoder"), ("video_decoder", "audio_decoder", "output")],
+    }[grouping]
+    workers = []
+    owners = {}
+    for names in groups:
+        members = sorted({rank for name in names for rank in worker_config[name]["ranks"]})
+        worker_id = names[0]
+        entries = {
+            name: {
+                **worker_config[name],
+                "ranks": [members.index(rank) for rank in worker_config[name]["ranks"]],
+            }
+            for name in names
+        }
+        workers.append(
+            {
+                "id": worker_id,
+                "ranks": [
+                    {"node": "localhost", "device": f"cuda:{devices[rank]}"} for rank in members
+                ],
+                "entries": entries,
+                "queue_depth": 6,
+            }
+        )
+        owners.update({name: worker_id for name in names})
+    edges = {
+        (owners[source], owners[destination])
+        for source, destination in (
+            ("text_encoder", "denoiser"),
+            ("denoiser", "video_decoder"),
+            ("denoiser", "audio_decoder"),
+            ("video_decoder", "output"),
+            ("audio_decoder", "output"),
+        )
+    }
     command = [
         str(require_uniserve_binary()),
         "serve",
@@ -156,8 +196,10 @@ def test_component_placement_releases_cancelled_requests(
         str(port),
         "--worker-python",
         str(Path.cwd() / ".venv" / "bin" / "python"),
-        "--deployment",
-        json.dumps(deployment),
+        "--workers",
+        json.dumps(workers),
+        "--transfer",
+        ",".join(f"{source}->{destination}=cuda_ipc" for source, destination in sorted(edges)),
         "--pipeline-depth",
         "6",
         "--max-batch",

@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use iceoryx2::port::listener::Listener;
 use iceoryx2::port::notifier::Notifier;
@@ -22,6 +22,48 @@ macro_rules! ipc_error {
     ($($arg:tt)*) => {
         IpcError::transport(format!($($arg)*))
     };
+}
+
+/// Park on the event descriptor while preserving the caller's deadline across
+/// signal interruptions. iceoryx2's timed receive erases EINTR into a terminal
+/// InternalFailure, so use its descriptor and then its nonblocking drain.
+fn wait_readable(listener: &Listener<IxService>, timeout: Duration) -> IpcResult<()> {
+    let started = Instant::now();
+    let mut descriptor = libc::pollfd {
+        // SAFETY: the listener owns the descriptor throughout this wait.
+        fd: unsafe { listener.file_descriptor().native_handle() },
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        let milliseconds =
+            remaining.as_millis() + u128::from(!remaining.subsec_nanos().is_multiple_of(1_000_000));
+        // SAFETY: poll borrows one initialized descriptor and retains no pointer.
+        let result = unsafe {
+            libc::poll(
+                &raw mut descriptor,
+                1,
+                milliseconds.min(i32::MAX as u128) as i32,
+            )
+        };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(ipc_error!("waiting on worker event descriptor: {error}"));
+        }
+        if descriptor.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            return Err(ipc_error!("worker event descriptor is unavailable"));
+        }
+        if result > 0 || started.elapsed() >= timeout {
+            return Ok(());
+        }
+    }
 }
 
 /// `evt_host_wake`: the worker signals the host that a response is available.
@@ -162,23 +204,8 @@ impl ClientEvents {
     /// Parks until a wake fires or `timeout` elapses, draining every pending
     /// event id so a backlog cannot cause an immediate re-wake spin.
     pub(crate) fn wait(&self, timeout: Duration) -> IpcResult<WakeEvents> {
-        // Clearing producer coalescing bits transfers responsibility for all
-        // currently visible wakes to this drain.
-        let mut ev = WakeEvents::default();
-        self.command_pending.store(false, Ordering::Release);
-        self.death_pending.store(false, Ordering::Release);
-        self.wake_listener
-            .timed_wait_all(
-                |id| match id.as_value() {
-                    EVT_RESULT => ev.result = true,
-                    EVT_COMMAND => ev.command = true,
-                    EVT_DEATH => ev.death = true,
-                    _ => ev.other = true,
-                },
-                timeout,
-            )
-            .map_err(|e| ipc_error!("waiting on iceoryx2 wake listener: {e:?}"))?;
-        Ok(ev)
+        wait_readable(&self.wake_listener, timeout)?;
+        self.drain()
     }
 
     /// Drains pending host wakes and classifies their event identifiers.
@@ -272,17 +299,8 @@ impl ServerEvents {
     /// an idle server wakes immediately. The timeout belongs to the caller's
     /// liveness or shutdown deadline.
     pub(crate) fn wait_request(&self, timeout: Duration) -> IpcResult<()> {
-        self.wake_listener
-            .timed_wait_all(
-                |id| {
-                    if id.as_value() == EVT_COMPLETION {
-                        self.completion_pending.store(false, Ordering::Release);
-                    }
-                },
-                timeout,
-            )
-            .map_err(|e| ipc_error!("waiting on iceoryx2 server wake listener: {e:?}"))?;
-        Ok(())
+        wait_readable(&self.wake_listener, timeout)?;
+        self.drain_worker_wakes()
     }
 
     /// Drains wake hints after consuming directly from the request ring. A busy

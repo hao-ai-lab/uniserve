@@ -113,7 +113,7 @@ impl Default for SchedulerConfig {
     }
 }
 
-/// Global scheduler policy state. Family progress and placements are owned by
+/// Global scheduler policy state. Family progress and allocations are owned by
 /// Runtime and Memory; this type contains only shared ordering and limits.
 pub struct Scheduler {
     pub(crate) config: SchedulerConfig,

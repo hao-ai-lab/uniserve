@@ -1,6 +1,6 @@
 """Quantization seam for shared layers."""
 
-from .base import QuantizeMethodBase, UnquantizedLinearMethod, process_quantized_modules
+from .base import LinearMethod, UnquantizedLinearMethod, process_quantized_modules
 from .config import QuantizationConfig
 from .fp8 import DynamicW8A8Fp8LinearMethod, W8A8Fp8LinearMethod
 from .kv_cache import (
@@ -18,7 +18,7 @@ from .nvfp4 import DynamicW4A4NvFp4LinearMethod
 
 __all__ = [
     "QuantizationConfig",
-    "QuantizeMethodBase",
+    "LinearMethod",
     "UnquantizedLinearMethod",
     "process_quantized_modules",
     "DynamicW8A8Fp8LinearMethod",

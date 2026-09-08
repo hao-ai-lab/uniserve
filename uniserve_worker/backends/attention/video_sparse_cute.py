@@ -13,7 +13,7 @@ _cute: Any | None
 _from_dlpack: Any | None
 _requires_int64_kv_strides: Any | None
 _kernel_type: Any | None
-try:  # pragma: no cover - deployment-only CUDA provider.
+try:  # pragma: no cover - worker_config-only CUDA provider.
     import cuda.bindings.driver as _cuda_driver_module
     import cutlass.cute as _cute_module
     from cudnn.block_sparse_attention._interface import (

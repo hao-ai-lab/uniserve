@@ -1,6 +1,6 @@
 //! OpenAI-compatible schemas, validation, lowering, and response helpers.
 //!
-//! HTTP routes provide deployment state and convert [`ApiError`] values into
+//! HTTP routes provide configuration state and convert [`ApiError`] values into
 //! transport responses; this module remains independent of routing.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]

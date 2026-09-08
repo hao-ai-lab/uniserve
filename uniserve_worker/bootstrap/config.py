@@ -4,17 +4,14 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 from dataclasses import dataclass
 
-from ..execution.batch import RunKind
+from uniserve_worker.nn.parallel import EntryConfig, parse_entries
+
+from ..config import WorkerConfig, worker_config_from_namespace
+from ..execution.batch import OpCode
 from ..loader.config import LoadConfig
-from .execution_config import ExecutionConfig, execution_config_from_namespace
-from .plan import (
-    ComponentDeployConfig,
-    ModelLoadScope,
-    parse_component_deployment,
-    resolve_worker_plan,
-)
 
 
 @dataclass(frozen=True)
@@ -28,94 +25,76 @@ class WorkerIpcConfig:
 
 
 @dataclass(frozen=True)
-class WorkerPlacement:
-    """Assigns a worker rank to its primary device, process world, and optional tower devices."""
+class ModelLaunchConfig:
+    """Selects checkpoint identity, precision policy, and bounded text/video geometry."""
 
-    device: str
-    rank: int
-    local_rank: int
-    world_size: int
-    distributed_backend: str | None
-    distributed_init_method: str | None
-    tower_devices: tuple[str, str] | None
-
-    @property
-    def generation_device(self) -> str | None:
-        """Expose the flow-tower device when modality towers are split."""
-
-        if self.tower_devices is None:
-            return None
-        return self.tower_devices[1]
-
-
-@dataclass(frozen=True)
-class WorkerResourceConfig:
-    """Caps batch work, model length, video duration, and physical KV allocation."""
-
-    block_size: int
-    max_batch_operations: int
-    max_batch_tokens: int
-    kv_token_capacity: int | None
-    max_model_len: int
+    path: str
+    quantization_config: dict[str, object]
+    max_text_rows: int
     max_video_seconds: float
 
 
 @dataclass(frozen=True)
-class ModelLaunchConfig:
-    """Selects a checkpoint, attention backend, and quantization settings for model construction."""
-
-    path: str
-    attention_backend: str
-    quantization_config: dict[str, object]
-
-
-@dataclass(frozen=True)
 class DataPlaneConfig:
-    """Selects the transport backend used for cross-operation tensor movement."""
+    """Bind receive mechanisms and required publication mechanisms for a rank."""
 
-    backend: str
+    backends: tuple[str, ...]
+    publication_backends: tuple[str, ...]
 
 
 @dataclass(frozen=True)
 class WorkerProcessArgs:
     """Aggregates the validated launch configuration for one worker rank."""
 
-    supported_ops: frozenset[RunKind]
+    worker_id: str
+    supported_ops: frozenset[OpCode]
     ipc: WorkerIpcConfig
-    placement: WorkerPlacement
-    resources: WorkerResourceConfig
+    local_rank: int
+    distributed_backend: str | None
+    distributed_init_method: str | None
     model: ModelLaunchConfig | None
     data_plane: DataPlaneConfig
-    execution: ExecutionConfig
+    execution: WorkerConfig
     load: LoadConfig
     use_stub_model: bool
-    components: tuple[tuple[str, ComponentDeployConfig], ...] = ()
+    components: tuple[tuple[str, EntryConfig], ...] = ()
 
     @classmethod
     def from_namespace(cls, namespace: argparse.Namespace) -> "WorkerProcessArgs":
         """Validate parsed CLI values and resolve them into immutable worker launch configuration."""
 
         supported_ops = _parse_supported_ops(namespace.supported_ops)
-        plan = resolve_worker_plan(supported_ops)
         device = _normalize_device(namespace.device)
-        tower_devices = _parse_mesh(
+        generation_device = _parse_mesh(
             str(namespace.mesh or ""),
             device=device,
         )
-        backend = _normalize_transfer_backend(namespace.transfer_backend)
+        backends = _parse_transfer_backends(namespace.transfer_backends)
+        publication_backends = _parse_transfer_backends(namespace.publish_backends)
         use_stub_model = bool(namespace.no_model)
         model_path = str(namespace.model or "").strip()
 
         _validate_scalars(namespace)
         if use_stub_model and not bool(namespace.allow_stub):
             raise ValueError("--no-model loads synthetic outputs and requires --allow-stub")
-        if use_stub_model and plan.model_scope is not ModelLoadScope.WHOLE:
-            raise ValueError("--no-model cannot emulate partial model materialization")
         if not use_stub_model and not model_path:
             raise ValueError("--model is required for a model worker")
-        _validate_data_plane(backend=backend)
+        if not set(publication_backends).issubset(backends):
+            raise ValueError("publication backends must be bound transports")
+        if "cuda_ipc" in backends and not device.startswith("cuda:"):
+            raise ValueError("CUDA IPC requires a CUDA worker device")
+        allocator = (
+            (os.environ.get("PYTORCH_ALLOC_CONF") or os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""))
+            .replace(" ", "")
+            .lower()
+        )
+        if "cuda_ipc" in publication_backends and (
+            "expandable_segments:true" in allocator or "backend:cudamallocasync" in allocator
+        ):
+            raise ValueError("CUDA IPC publication requires native nonexpandable CUDA allocations")
 
         return cls(
+            worker_id=str(namespace.worker_id),
             supported_ops=supported_ops,
             ipc=WorkerIpcConfig(
                 service_name=str(namespace.service_name),
@@ -123,45 +102,29 @@ class WorkerProcessArgs:
                 max_inflight=int(namespace.ipc_max_inflight),
                 pipeline_depth=int(namespace.pipeline_depth),
             ),
-            placement=WorkerPlacement(
-                device=device,
-                rank=int(namespace.rank),
-                local_rank=int(namespace.local_rank),
-                world_size=int(namespace.world_size),
-                distributed_backend=_optional_text(namespace.distributed_backend),
-                distributed_init_method=_optional_text(namespace.distributed_init_method),
-                tower_devices=tower_devices,
-            ),
-            resources=WorkerResourceConfig(
-                block_size=int(namespace.block_size),
-                max_batch_operations=int(namespace.max_batch_operations),
-                max_batch_tokens=int(namespace.max_batch_tokens),
-                kv_token_capacity=(
-                    int(namespace.kv_token_capacity)
-                    if namespace.kv_token_capacity is not None
-                    else None
-                ),
-                max_model_len=int(namespace.max_model_len),
-                max_video_seconds=float(namespace.max_video_seconds),
-            ),
+            local_rank=int(namespace.local_rank),
+            distributed_backend=_optional_text(namespace.distributed_backend),
+            distributed_init_method=_optional_text(namespace.distributed_init_method),
             model=(
                 ModelLaunchConfig(
                     path=model_path,
-                    attention_backend=str(namespace.attention_backend),
                     quantization_config=dict(namespace.quantization_config),
+                    max_text_rows=int(namespace.max_model_len),
+                    max_video_seconds=float(namespace.max_video_seconds),
                 )
                 if model_path
                 else None
             ),
             data_plane=DataPlaneConfig(
-                backend=backend,
+                backends=backends,
+                publication_backends=publication_backends,
             ),
-            execution=execution_config_from_namespace(namespace),
+            execution=worker_config_from_namespace(
+                namespace, device=device, generation_device=generation_device
+            ),
             load=_load_config(namespace),
             use_stub_model=use_stub_model,
-            components=parse_component_deployment(
-                namespace.component_deployment, int(namespace.world_size)
-            ),
+            components=parse_entries(namespace.entries, int(namespace.world_size)),
         )
 
 
@@ -214,21 +177,14 @@ def _load_config(namespace: argparse.Namespace) -> LoadConfig:
     )
 
 
-def _validate_data_plane(*, backend: str) -> None:
-    """Validate that the selected transfer backend implements the data plane."""
-
-    if backend not in {"local", "shm", "cuda_ipc"}:
-        raise ValueError(f"unknown --transfer-backend {backend!r}")
-
-
-def _parse_supported_ops(value: object) -> frozenset[RunKind]:
+def _parse_supported_ops(value: object) -> frozenset[OpCode]:
     """Parse unique supported operation kinds from text or an iterable."""
 
     names = tuple(part.strip() for part in str(value).split(",") if part.strip())
     if not names:
         raise ValueError("--supported-ops must list at least one operation")
     try:
-        operations = tuple(RunKind(name) for name in names)
+        operations = tuple(OpCode(name) for name in names)
     except ValueError as error:
         raise ValueError(f"unknown operation in --supported-ops {value!r}") from error
     if len(set(operations)) != len(operations):
@@ -240,14 +196,14 @@ def _parse_mesh(
     value: str,
     *,
     device: str,
-) -> tuple[str, str] | None:
+) -> str | None:
     """Parse and validate a named device-mesh declaration."""
 
     text = value.strip()
     if not text:
         return None
 
-    tower_devices: tuple[str, str] | None = None
+    generation_device: str | None = None
     seen: set[str] = set()
     for raw_entry in text.split(","):
         entry = raw_entry.strip()
@@ -259,38 +215,35 @@ def _parse_mesh(
             raise ValueError(f"duplicate --mesh key {key!r}")
         seen.add(normalized_key)
         if normalized_key == "tower":
-            tower_devices = _parse_tower_placement(value, device=device)
+            generation_device = _parse_expert_device(value, device=device)
         else:
             raise ValueError(f"unknown --mesh key {key!r}")
-    return tower_devices
+    return generation_device
 
 
-def _parse_tower_placement(value: str, *, device: str) -> tuple[str, str]:
-    """Parse tower coordinates and validate their mesh-axis assignments."""
+def _parse_expert_device(value: str, *, device: str) -> str:
+    """Resolve the optional flow device while keeping text on the Worker's rank device."""
 
-    import torch
-
-    placements: dict[str, str] = {}
+    parameters: dict[str, str] = {}
     for raw_part in value.split(";"):
         part = raw_part.strip()
         name, separator, target = part.partition(":")
         normalized_name = name.strip().lower()
         if not separator or normalized_name not in {"text", "gen"} or not target.strip():
-            raise ValueError("tower placement must use text:<device>;gen:<device>")
-        if normalized_name in placements:
-            raise ValueError(f"duplicate tower placement {normalized_name!r}")
-        placements[normalized_name] = target.strip()
-    if "gen" not in placements:
-        raise ValueError("tower placement requires gen:<device>")
+            raise ValueError("tower params must use text:<device>;gen:<device>")
+        if normalized_name in parameters:
+            raise ValueError(f"duplicate tower params {normalized_name!r}")
+        parameters[normalized_name] = target.strip()
+    if "gen" not in parameters:
+        raise ValueError("tower params requires gen:<device>")
 
-    understanding_device = placements.get("text") or device
-    understanding = torch.device(understanding_device)
-    if understanding.type == "cuda" and understanding.index is None:
-        understanding_device = "cuda:0"
-    generation_device = placements["gen"]
-    if torch.device(understanding_device) == torch.device(generation_device):
+    understanding_device = _normalize_device(parameters.get("text") or device)
+    if understanding_device != device:
+        raise ValueError("text expert device must match the Worker rank device")
+    generation_device = _normalize_device(parameters["gen"])
+    if understanding_device == generation_device:
         raise ValueError("tower text and gen devices must be different")
-    return understanding_device, generation_device
+    return generation_device
 
 
 def _normalize_device(value: object) -> str:
@@ -302,7 +255,7 @@ def _normalize_device(value: object) -> str:
     not equal ``torch.device("cuda:0")`` — so an unindexed device would reject
     every forward. Each worker process sees its GPU as device 0 under
     ``CUDA_VISIBLE_DEVICES``, so an unindexed CUDA device resolves to ``cuda:0``
-    (this mirrors the tower-placement normalization above).
+    (this mirrors the tower-params normalization above).
     """
 
     import torch
@@ -313,11 +266,15 @@ def _normalize_device(value: object) -> str:
     return str(value)
 
 
-def _normalize_transfer_backend(value: object) -> str:
-    """Canonicalize the configured transfer backend name."""
+def _parse_transfer_backends(value: object) -> tuple[str, ...]:
+    """Decode explicit unique physical mechanisms without fallback selection."""
 
-    backend = str(value or "local").strip().lower()
-    return "local" if backend == "inproc" else backend
+    backends = tuple(part.strip() for part in str(value).split(","))
+    if not backends or len(set(backends)) != len(backends):
+        raise ValueError("transfer backends must be nonempty and unique")
+    if any(name not in {"local", "shm", "cuda_ipc"} for name in backends):
+        raise ValueError("transfer backends must name local, shm, or cuda_ipc")
+    return backends
 
 
 def _optional_text(value: object | None) -> str | None:

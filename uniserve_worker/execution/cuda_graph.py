@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Hashable, Iterator
+from collections.abc import Callable, Hashable, Iterator, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, fields, is_dataclass, replace
-from typing import Any, cast
+from typing import Any, Generic, TypeVar, cast
 
 import torch
 
@@ -38,6 +38,215 @@ class _GraphMiss(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
+class FlowCapture:
+    """A denoise request shape, including its physical guidance branch count."""
+
+    rows: int
+    height: int
+    width: int
+    cfg_branches: int
+
+    @property
+    def executable_key(self) -> tuple[object, ...]:
+        return "flow", self.rows * self.cfg_branches, self.height, self.width
+
+
+@dataclass(frozen=True, slots=True)
+class MixedCapture:
+    """A compatible token-decode and denoise capture configuration."""
+
+    decode_rows: int
+    flow_rows: int
+    height: int
+    width: int
+    cfg_branches: int
+
+    def __post_init__(self) -> None:
+        if min(self.decode_rows, self.flow_rows, self.height, self.width, self.cfg_branches) < 1:
+            raise ValueError("mixed capture requires positive token, flow, and media extents")
+
+    @property
+    def executable_key(self) -> tuple[object, ...]:
+        return (
+            "decode_flow",
+            self.decode_rows,
+            self.flow_rows * self.cfg_branches,
+            self.height,
+            self.width,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PrefixCapture:
+    """Repeated request prefixes that share one physical packed executable."""
+
+    rows: int
+    prefix_lengths: tuple[int, ...]
+
+    @property
+    def executable_key(self) -> tuple[object, ...]:
+        return "flow_prefix", self.prefix_lengths * self.rows
+
+
+@dataclass(frozen=True, slots=True)
+class PrefillCapture:
+    """A padded prefill shape and the minimum live rows exercising its bucket."""
+
+    token_bucket: int
+    row_bucket: int
+    live_rows: int
+
+
+def select_flow_captures(
+    shapes: Sequence[tuple[int, int]],
+    request_counts: Sequence[int],
+    cfg_branches: Sequence[int],
+    *,
+    max_operations: int,
+    max_tokens: int,
+    per_image_capacity: int,
+    latent_capacity: int,
+    physical_tokens: Callable[[int, int], int],
+    image_tokens: Callable[[int, int], int],
+) -> tuple[FlowCapture, ...]:
+    """Intersect requested capture shapes with actual staging and latent bounds."""
+
+    return tuple(
+        FlowCapture(rows, height, width, branches)
+        for height, width in shapes
+        for rows in request_counts
+        for branches in cfg_branches
+        if 0 < rows <= max_operations
+        and rows * physical_tokens(height, width) * branches <= max_tokens
+        and image_tokens(height, width) <= per_image_capacity
+        and rows * image_tokens(height, width) <= latent_capacity
+    )
+
+
+def select_mixed_captures(
+    flow: Sequence[FlowCapture], decode_rows: Sequence[int]
+) -> tuple[MixedCapture, ...]:
+    """Enumerate the supported single-trajectory mixed execution shapes."""
+
+    return tuple(
+        MixedCapture(rows, 1, item.height, item.width, item.cfg_branches)
+        for item in flow
+        if item.rows == 1
+        for rows in decode_rows
+    )
+
+
+def select_prefill_captures(
+    token_sizes: Sequence[int],
+    row_sizes: Sequence[int],
+    *,
+    max_rows: int,
+    max_tokens: int,
+) -> tuple[PrefillCapture, ...]:
+    """Enumerate exactly the padded prefill buckets within the execution bounds."""
+
+    buckets: list[PrefillCapture] = []
+    minimum_rows = 1
+    for row_bucket in sorted({int(value) for value in row_sizes if int(value) > 1}):
+        if minimum_rows > int(max_rows):
+            break
+        minimum_tokens = minimum_rows if minimum_rows == 1 else minimum_rows + 1
+        for token_bucket in sorted(
+            {int(value) for value in token_sizes if minimum_tokens <= int(value) <= int(max_tokens)}
+        ):
+            buckets.append(PrefillCapture(token_bucket, row_bucket, minimum_rows))
+        minimum_rows = row_bucket
+    return tuple(buckets)
+
+
+_Output = TypeVar("_Output")
+
+
+class GraphEntry(Generic[_Output]):
+    """One captured executable and the storage whose addresses it retains.
+
+    The execution owner supplies the capture stream and any shared pool. A
+    shared pool is valid only for serialized calls whose live outputs are
+    consumed or copied before another entry reuses that pool. Omitting the pool
+    gives this entry independent storage. Replay runs on the caller's stream;
+    the caller owns ordering, output readers, and retirement after GPU use.
+    """
+
+    def __init__(
+        self,
+        graph: torch.cuda.CUDAGraph,
+        output: _Output,
+        inputs: tuple[torch.Tensor, ...],
+    ) -> None:
+        self._graph: torch.cuda.CUDAGraph | None = graph
+        self._output: _Output | None = output
+        self.inputs = inputs
+
+    @classmethod
+    def capture(
+        cls,
+        operation: Callable[[], _Output],
+        *,
+        inputs: tuple[torch.Tensor, ...] = (),
+        stream: torch.cuda.Stream | None = None,
+        pool: Any = None,
+        expected_context: int | None = None,
+    ) -> GraphEntry[_Output]:
+        """Capture a warmed computation using caller-provisioned stable inputs."""
+
+        graph = torch.cuda.CUDAGraph(keep_graph=True)
+        try:
+            with torch.cuda.graph(graph, pool=pool, stream=stream):
+                output = operation()
+            graph.instantiate()
+            verify_graph_context(graph, expected_context)
+        except BaseException:
+            graph.reset()
+            raise
+        return cls(graph, output, inputs)
+
+    @property
+    def output(self) -> _Output:
+        """Borrow the output while its executable and storage remain resident."""
+
+        if self._graph is None:
+            raise GraphExecutionError("CUDA graph entry is retired")
+        return cast(_Output, self._output)
+
+    def replay(self, *inputs: torch.Tensor) -> _Output:
+        """Copy supplied inputs into stable storage and enqueue one replay.
+
+        The returned tensors borrow graph storage. The owner must finish their
+        use before replaying this entry or another entry sharing its pool.
+        """
+
+        graph = self._graph
+        if graph is None:
+            raise GraphExecutionError("CUDA graph entry is retired")
+        if inputs:
+            if len(inputs) != len(self.inputs):
+                raise GraphExecutionError("CUDA graph input count changed")
+            for source, target in zip(inputs, self.inputs, strict=True):
+                if source.shape != target.shape or source.dtype != target.dtype:
+                    raise GraphExecutionError("CUDA graph input geometry changed")
+            for source, target in zip(inputs, self.inputs, strict=True):
+                target.copy_(source)
+        graph.replay()
+        return cast(_Output, self._output)
+
+    def close(self) -> None:
+        """Retire a drained executable and release its retained input/output storage."""
+
+        graph = self._graph
+        if graph is None:
+            return
+        graph.reset()
+        self._graph = None
+        self._output = None
+        self.inputs = ()
+
+
+@dataclass(frozen=True, slots=True)
 class GraphGreedyOutput:
     """Carries graph-produced hidden states with device-resident greedy token and validity vectors."""
 
@@ -66,7 +275,7 @@ class GraphRun:
 class _GraphState:
     """Owns one captured graph, its static batch, outputs, pool handle, and release callback."""
 
-    graph: torch.cuda.CUDAGraph
+    entry: GraphEntry[tuple[ForwardOutput, GraphGreedyOutput | None]]
     batch: ForwardBatch
     output: ForwardOutput
     greedy: GraphGreedyOutput | None
@@ -377,7 +586,9 @@ class CudaGraphRunner:
                 self._warmed_exact.discard(state_key)
                 self.captures += 1
                 if force_finish is not None:
-                    execution.decode_force_finish.copy_(force_finish)
+                    finish_buffer = execution.decode_force_finish
+                    assert finish_buffer is not None
+                    finish_buffer.copy_(force_finish)
                 self._replay(state, execution)
                 self._queue_equivalence_check(
                     eager,
@@ -474,17 +685,24 @@ class CudaGraphRunner:
         )
         self._next_binding += 1
         releases = self._prepare_attention(static, batch, capture=True)
-        graph = torch.cuda.CUDAGraph(keep_graph=True)
+        entry = None
         try:
             if self._pool_handle is None:
                 self._pool_handle = torch.cuda.graph_pool_handle()
-            with torch.cuda.graph(graph, pool=self._pool_handle, stream=self._stream):
+
+            def compute() -> tuple[ForwardOutput, GraphGreedyOutput | None]:
                 output = forward(static)
-                greedy = _greedy_decode(static, output, self.decode_predicates)
-            if not isinstance(output, ForwardOutput):
-                raise TypeError("captured model call did not return ForwardOutput")
-            graph.instantiate()
-            verify_graph_context(graph, self._expected_context)
+                if not isinstance(output, ForwardOutput):
+                    raise TypeError("captured model call did not return ForwardOutput")
+                return output, _greedy_decode(static, output, self.decode_predicates)
+
+            entry = GraphEntry.capture(
+                compute,
+                pool=self._pool_handle,
+                stream=self._stream,
+                expected_context=self._expected_context,
+            )
+            output, greedy = entry.output
             context = nullcontext() if self._stream is None else torch.cuda.stream(self._stream)
             with context:
                 published = tuple(
@@ -492,7 +710,7 @@ class CudaGraphRunner:
                     for _ in range(self._output_slot_count)
                 )
             return _GraphState(
-                graph,
+                entry,
                 static,
                 output,
                 greedy,
@@ -506,9 +724,8 @@ class CudaGraphRunner:
         except Exception:
             for release in reversed(releases):
                 release()
-            reset = getattr(graph, "reset", None)
-            if callable(reset):
-                reset()
+            if entry is not None:
+                entry.close()
             raise
 
     def _eager(
@@ -536,7 +753,7 @@ class CudaGraphRunner:
                     "attention",
                 )
             self._prepare_attention(state.batch, execution, capture=False)
-            state.graph.replay()
+            state.entry.replay()
 
     def _publish_output(self, state: _GraphState, rows: int) -> ForwardOutput:
         """Expose graph-owned outputs trimmed to the live row count."""
@@ -1411,9 +1628,7 @@ def _release_state(state: _GraphState) -> None:
             release()
         except Exception:
             logger.warning("attention graph binding release failed", exc_info=True)
-    reset = getattr(state.graph, "reset", None)
-    if callable(reset):
-        reset()
+    state.entry.close()
 
 
-__all__ = ["CudaGraphRunner", "GraphExecutionError", "GraphGreedyOutput", "GraphRun"]
+__all__ = ["GraphEntry", "CudaGraphRunner", "GraphExecutionError", "GraphGreedyOutput", "GraphRun"]

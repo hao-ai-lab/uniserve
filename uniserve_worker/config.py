@@ -12,6 +12,7 @@ from typing import Any, cast
 
 from uniserve_worker.backends.attention.tuning import FlashInferTuningConfig
 from uniserve_worker.execution.batch import Domain
+from uniserve_worker.foundation.errors import invalid_descriptor
 
 __all__ = [
     "DEFAULT_DECODE_GRAPH_BATCH_SIZES",
@@ -21,8 +22,8 @@ __all__ = [
     "graph_padding_block_count",
     "graph_memory_budget_bytes",
     "LaneConfig",
-    "ExecutionConfig",
-    "execution_config_from_namespace",
+    "WorkerConfig",
+    "worker_config_from_namespace",
 ]
 
 
@@ -217,9 +218,22 @@ class LaneConfig:
 
 
 @dataclass(frozen=True)
-class ExecutionConfig:
-    """Defines dtype, cache, lane, CUDA graph, shape-bucket, and FlashInfer execution policy."""
+class WorkerConfig:
+    """Canonical rank configuration for model execution and bounded runtime resources."""
 
+    device: str = "cpu"
+    rank: int = 0
+    world_size: int = 1
+    block_size: int = 64
+    kv_token_capacity: int | None = None
+    attention_backend: str | None = None
+    max_batch_operations: int = 1024
+    max_batch_tokens: int = 8192
+    max_request_pool_size: int = 128
+    generation_device: str | None = None
+    output_rank: int = 0
+    min_request_pool_size: int = 1
+    pool_memory_bytes: int | None = None
     model_dtype: str = "bfloat16"
     kv_cache_dtype: str | None = None
     kv_memory_fraction: float = 0.70
@@ -232,11 +246,54 @@ class ExecutionConfig:
     flow_graph_shapes: tuple[tuple[int, int], ...] = ((1152, 2048), (2048, 1152))
     flashinfer: FlashInferTuningConfig = FlashInferTuningConfig()
 
+    def __post_init__(self) -> None:
+        """Validate topology axes, device identity, batch bounds, and dtype policies."""
 
-def execution_config_from_namespace(namespace: Any) -> ExecutionConfig:
-    """Validate graph buckets, lanes, dtypes, and FlashInfer controls from parsed CLI arguments."""
+        if not self.device:
+            raise invalid_descriptor("worker device must be named")
+        if self.world_size < 1 or not 0 <= self.rank < self.world_size:
+            raise invalid_descriptor("worker configuration process rank is invalid")
+        if not 0 <= self.output_rank < self.world_size:
+            raise invalid_descriptor("worker configuration output owner is invalid")
+        if not 1 <= self.min_request_pool_size <= self.max_request_pool_size:
+            raise invalid_descriptor("worker request slot bounds are invalid")
+        if self.pool_memory_bytes is not None and self.pool_memory_bytes < 0:
+            raise invalid_descriptor("worker pool memory grant must not be negative")
+        if (
+            self.block_size < 1
+            or self.max_batch_operations < 1
+            or self.max_batch_tokens < 1
+            or self.max_request_pool_size < 1
+        ):
+            raise invalid_descriptor("worker configuration capacities must be positive")
+        if not 0 < self.kv_memory_fraction <= 1:
+            raise invalid_descriptor("worker configuration KV memory fraction must be in (0, 1]")
+        if self.model_dtype not in {"float16", "bfloat16", "float32"}:
+            raise invalid_descriptor("worker model dtype is unsupported")
+        if self.kv_cache_dtype is not None and self.kv_cache_dtype not in {
+            "float16",
+            "bfloat16",
+            "float32",
+            "float8_e4m3fn",
+        }:
+            raise invalid_descriptor("worker KV dtype is unsupported")
 
-    return ExecutionConfig(
+
+def worker_config_from_namespace(
+    namespace: Any, *, device: str, generation_device: str | None
+) -> WorkerConfig:
+    """Resolve the complete rank execution and resource configuration from parsed CLI values."""
+
+    return WorkerConfig(
+        device=device,
+        rank=int(namespace.rank),
+        world_size=int(namespace.world_size),
+        generation_device=generation_device,
+        block_size=int(namespace.block_size),
+        max_batch_operations=int(namespace.max_batch_operations),
+        max_batch_tokens=int(namespace.max_batch_tokens),
+        kv_token_capacity=_positive_optional_int(namespace.kv_token_capacity),
+        attention_backend=str(namespace.attention_backend),
         model_dtype=str(namespace.model_dtype),
         kv_cache_dtype=_none_if_empty(namespace.kv_cache_dtype),
         kv_memory_fraction=_bounded_fraction(

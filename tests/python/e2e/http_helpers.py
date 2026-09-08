@@ -25,7 +25,8 @@ def find_free_port() -> int:
 
 
 def require_uniserve_binary() -> Path:
-    path = Path.cwd() / "target" / "debug" / "uniserve"
+    configured = os.environ.get("UNISERVE_BINARY")
+    path = Path(configured) if configured else Path.cwd() / "target" / "debug" / "uniserve"
     if not path.exists():
         raise FileNotFoundError(f"{path} does not exist; run `cargo build -p uniserve` first")
     return path
@@ -45,10 +46,14 @@ def wait_health(base_url: str, process: subprocess.Popen[str], timeout_s: float)
         except Exception as error:  # noqa: BLE001 - readiness polling reports the last failure.
             last_error = f"{type(error).__name__}: {error}"
         time.sleep(1.0)
-    raise TimeoutError(f"server did not become healthy within {timeout_s}s; last error: {last_error}")
+    raise TimeoutError(
+        f"server did not become healthy within {timeout_s}s; last error: {last_error}"
+    )
 
 
-def start_server(args: list[str], log_path: Path, env: dict[str, str] | None = None) -> subprocess.Popen[str]:
+def start_server(
+    args: list[str], log_path: Path, env: dict[str, str] | None = None
+) -> subprocess.Popen[str]:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_file = log_path.open("w", encoding="utf-8")
     merged_env = os.environ.copy()
@@ -77,7 +82,13 @@ def stop_server(process: subprocess.Popen[str]) -> None:
 
 
 @contextmanager
-def server_process(args: list[str], base_url: str, log_path: Path, timeout_s: float, env: dict[str, str] | None = None) -> Iterator[subprocess.Popen[str]]:
+def server_process(
+    args: list[str],
+    base_url: str,
+    log_path: Path,
+    timeout_s: float,
+    env: dict[str, str] | None = None,
+) -> Iterator[subprocess.Popen[str]]:
     process = start_server(args, log_path, env)
     try:
         wait_health(base_url, process, timeout_s)
@@ -86,7 +97,9 @@ def server_process(args: list[str], base_url: str, log_path: Path, timeout_s: fl
         stop_server(process)
 
 
-def post_sse(base_url: str, endpoint: str, payload: dict[str, Any], timeout_s: float = 600.0) -> list[dict[str, Any]]:
+def post_sse(
+    base_url: str, endpoint: str, payload: dict[str, Any], timeout_s: float = 600.0
+) -> list[dict[str, Any]]:
     with httpx.stream("POST", f"{base_url}{endpoint}", json=payload, timeout=timeout_s) as response:
         response.raise_for_status()
         return list(iter_sse_events(response.iter_lines()))

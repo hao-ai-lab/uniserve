@@ -1,0 +1,612 @@
+"""Raw KV import contracts over real physical transport boundaries."""
+
+from __future__ import annotations
+
+import multiprocessing as mp
+from dataclasses import replace
+
+import pytest
+import torch
+
+from tests.python.fixtures.shm_publication import serve_pending_publication
+from uniserve_worker.execution.batch import (
+    Checkpoint,
+    DType,
+    FixedCheckpoint,
+    KvTransferValue,
+    Locator,
+    PointRange,
+    ProductKind,
+    ProductRef,
+    RequestKey,
+    ShapeBound,
+    StaticDim,
+    StorageClass,
+    TensorTransfer,
+)
+from uniserve_worker.foundation.errors import WorkerError
+from uniserve_worker.runtime.cache_pool import CachePool
+from uniserve_worker.runtime.cache_publications import CachePublications
+from uniserve_worker.runtime.device_events import DeviceEventPool
+from uniserve_worker.runtime.req_to_token_pool import ReqToTokenPool
+from uniserve_worker.transfer.tickets import make_transport
+
+pytestmark = pytest.mark.integration
+
+
+def test_cancelled_kv_import_keeps_pages_until_physical_reads_retire() -> None:
+    context = mp.get_context("spawn")
+    parent, child = context.Pipe()
+    shape = (256, 2, 1, 2)
+    process = context.Process(target=serve_pending_publication, args=(child, shape))
+    pool = CachePool(
+        num_layers=2,
+        num_pages=3,
+        page_size=256,
+        num_kv_heads=1,
+        head_dim=2,
+        dtype=torch.float32,
+        device="cpu",
+    )
+    tables = ReqToTokenPool(
+        group_count=1,
+        request_pool_size=2,
+        max_blocks_per_request=1,
+        block_size=256,
+        device="cpu",
+    )
+    publications = CachePublications(pool, tables)
+    events = DeviceEventPool()
+    consumer = make_transport("shm", byte_capacity=8192, ticket_capacity=2, event_pool=events)
+    write = None
+    process.start()
+    child.close()
+    try:
+        assert parent.poll(30), "shared-memory publisher did not start"
+        locator = Locator.from_mapping(parent.recv())
+        source = replace(_product(1), shape_bound=ShapeBound((StaticDim(8192),)))
+        field = TensorTransfer(shape=shape, locations=(locator,))
+        publication = KvTransferValue(
+            generation=source.generation,
+            tensors=(field, field),
+            source=Checkpoint(1, FixedCheckpoint(256)),
+            destination="consumer",
+            base=None,
+            base_extent=0,
+            published_extent=256,
+            group_id=0,
+            compute_dtype="float32",
+            page_size=256,
+        )
+        write = publications.prepare_install(
+            source,
+            publication,
+            request_pool_idx=1,
+            group_id=0,
+            page_ids=(1,),
+            allocated_length=256,
+            initialized_pages=(1,),
+            transports={consumer.name: consumer},
+        )
+        assert parent.poll(30), "publisher did not receive the read"
+        assert parent.recv() == "pending"
+        pool.imports.cancel_requests(frozenset((source.request_key,)))
+        with pytest.raises(WorkerError, match="cancelled"):
+            write.completion.result(timeout=5)
+        assert not pool.retirement_ready(requests=(source.request_key,))
+        with pytest.raises(WorkerError, match="import destination"):
+            pool.zero_pages(0, (1,))
+
+        independent = torch.full((256, 1, 2), 7.0)
+        pool.write(0, (2,), start=0, k=independent, v=independent)
+        for actual in pool.read(0, (2,), start=0, length=256):
+            torch.testing.assert_close(actual, independent, rtol=0, atol=0)
+
+        parent.send("exit")
+        process.join(30)
+        assert process.exitcode == 0
+        write.retirement.result(timeout=5)
+        assert pool.retirement_ready(requests=(source.request_key,))
+        pool.zero_pages(0, (1,))
+        for actual in pool.read(0, (1,), start=0, length=256):
+            assert torch.count_nonzero(actual).item() == 0
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(30)
+        parent.close()
+        if write is not None:
+            pool.imports.abandon(write)
+        pool.imports.stop()
+        consumer.close()
+        pool.close()
+        events.close()
+
+
+def _product(operation: int) -> ProductRef:
+    return ProductRef(
+        request_key=RequestKey(1, 1, 1),
+        producer_op_id=operation,
+        output_index=0,
+        generation=operation,
+        kind=ProductKind.KV,
+        storage_class=StorageClass.PAGED_KV,
+        dtype=DType.U8,
+        shape_bound=ShapeBound((StaticDim(4096),)),
+        point_range=PointRange(),
+    )
+
+
+@pytest.mark.parametrize(
+    "backend,device",
+    (
+        ("local", "cpu"),
+        ("shm", "cpu"),
+        pytest.param("shm", "cuda:0", marks=pytest.mark.gpu),
+        pytest.param("cuda_ipc", "cuda:0", marks=pytest.mark.gpu),
+    ),
+)
+@pytest.mark.parametrize(
+    "source_dtype,target_dtype,page_size",
+    (
+        ("bfloat16", "bfloat16", 3),
+        ("float8_e4m3fn", "float8_e4m3fn", 4),
+        ("float8_e4m3fn", "float8_e4m3fn", 3),
+        ("float8_e4m3fn", "bfloat16", 3),
+        ("bfloat16", "float8_e4m3fn", 3),
+        ("float8_e4m3fn", "float32", 3),
+    ),
+)
+def test_incremental_kv_import_preserves_values_in_reserved_pages(
+    backend: str, device: str, source_dtype: str, target_dtype: str, page_size: int
+) -> None:
+    pools = [
+        CachePool(
+            num_layers=2,
+            num_pages=6,
+            page_size=size,
+            num_kv_heads=1,
+            head_dim=1,
+            dtype=torch.bfloat16,
+            store_dtype=dtype,
+            device=device,
+        )
+        for size, dtype in ((4, source_dtype), (page_size, target_dtype))
+    ]
+    tables = [
+        ReqToTokenPool(
+            group_count=1,
+            request_pool_size=1,
+            max_blocks_per_request=3,
+            block_size=pool.block_size,
+            device=device,
+        )
+        for pool in pools
+    ]
+    pages = ((4, 1), (3, 1, 4) if page_size == 3 else (3, 1))
+    for table, pool, assigned in zip(tables, pools, pages, strict=True):
+        table.install(((1, 0, assigned, len(assigned) * pool.block_size),))
+    publications = [
+        CachePublications(pool, table) for pool, table in zip(pools, tables, strict=True)
+    ]
+    events = [DeviceEventPool(), DeviceEventPool()]
+    transports = [
+        make_transport(backend, byte_capacity=16384, ticket_capacity=16, event_pool=event)
+        for event in events
+    ]
+    # The smaller source values expose BF16 rounding after FP8 dequantization.
+    rounding = target_dtype == "float32"
+    prefix = (1.0, 2.0, 3.0) if rounding else (112.0, 224.0, 448.0)
+    suffix = (6.0, -6.0, 0.375, 0.75, 1.5) if rounding else (896.0, -896.0, 56.0, 112.0, 224.0)
+    if rounding:
+        expected = (0.96484375, 1.9296875, 3.0, 3.0, -6.0, 0.375, 0.75, 1.5)
+    else:
+        fourth = 448.0 if source_dtype == "float8_e4m3fn" else 896.0
+        expected = (*prefix, fourth, *suffix[1:])
+    locators = []
+    writes = []
+    base = None
+    try:
+        for operation, (start, values) in enumerate(((0, prefix), (3, suffix)), start=1):
+            tensor = torch.tensor(values, dtype=torch.bfloat16, device=device).view(-1, 1, 1)
+            for layer in range(2):
+                pools[0].write(
+                    layer, pages[0], start=start, k=tensor * 2**layer, v=-tensor * 2**layer / 2
+                )
+            extent = start + len(values)
+            source = _product(operation)
+            installed = _product(100 + operation)
+            checkpoint = Checkpoint(operation, FixedCheckpoint(extent))
+            if device.startswith("cuda"):
+                torch.cuda.synchronize(device)
+                allocated = torch.cuda.memory_allocated(device)
+                torch.cuda.reset_peak_memory_stats(device)
+            publication = publications[0].publish(
+                request_pool_idx=1,
+                group_id=0,
+                visible_length=extent,
+                source_version=checkpoint,
+                destination="consumer",
+                expected_base=base,
+                product=source,
+                transports={transports[0].name: transports[0]},
+            )
+            locators.extend(
+                location for field in publication.tensors for location in field.locations
+            )
+            publications[0].apply_commit(
+                publications[0].prepare_commit(((source, publication),), ())
+            )
+            if start:
+                for destination_pages, initialized in (
+                    (pages[1], (pages[1][0],)),
+                    (tuple(reversed(pages[1])), ()),
+                ):
+                    with pytest.raises(WorkerError, match="replace its installed base pages"):
+                        publications[1].prepare_install(
+                            source,
+                            publication,
+                            request_pool_idx=1,
+                            group_id=0,
+                            page_ids=destination_pages,
+                            allocated_length=len(pages[1]) * page_size,
+                            initialized_pages=initialized,
+                            transports={transports[1].name: transports[1]},
+                        )
+            write = publications[1].prepare_install(
+                source,
+                publication,
+                request_pool_idx=1,
+                group_id=0,
+                page_ids=pages[1],
+                allocated_length=len(pages[1]) * page_size,
+                initialized_pages=pages[1] if start == 0 else (),
+                transports={transports[1].name: transports[1]},
+            )
+            writes.append(write)
+            write.completion.result(timeout=30)
+            if device.startswith("cuda"):
+                torch.cuda.synchronize(device)
+                assert torch.cuda.max_memory_allocated(device) == allocated
+            result = publications[1].install(
+                request_pool_idx=1,
+                group_id=0,
+                request_id=1,
+                source=source,
+                installed_product=installed,
+                write=write,
+            )
+            publications[1].apply_commit(
+                publications[1].prepare_commit((), ((source, installed, result),))
+            )
+            for layer in range(2):
+                key, value = pools[1].read(layer, pages[1], start=0, length=extent)
+                dtype = (
+                    torch.bfloat16
+                    if target_dtype == "float8_e4m3fn"
+                    else getattr(torch, target_dtype)
+                )
+                wanted = (
+                    torch.tensor(expected[:extent], dtype=dtype, device=device).view(-1, 1, 1)
+                    * 2**layer
+                )
+                torch.testing.assert_close(key, wanted, rtol=0, atol=0)
+                torch.testing.assert_close(value, -wanted / 2, rtol=0, atol=0)
+                untouched = pools[1].read(layer, (2,), start=0, length=page_size)
+                for field in untouched:
+                    assert field is not None
+                    assert torch.count_nonzero(field).item() == 0
+            base = checkpoint
+    finally:
+        for write in writes:
+            pools[1].imports.abandon(write)
+        for location in locators:
+            transports[0].release(location)
+        for pool in pools:
+            pool.imports.stop()
+        for transport in transports:
+            transport.close()
+        for pool in pools:
+            pool.close()
+        for event in events:
+            event.close()
+
+
+@pytest.mark.parametrize(
+    "source_ranks,target_ranks,replicated",
+    ((1, 2, False), (2, 1, False), (3, 2, False), (2, 3, True)),
+)
+@pytest.mark.parametrize(
+    "source_dtype,target_dtype",
+    (
+        ("bfloat16", "bfloat16"),
+        ("float8_e4m3fn", "float8_e4m3fn"),
+        ("float8_e4m3fn", "bfloat16"),
+        ("bfloat16", "float8_e4m3fn"),
+    ),
+)
+@pytest.mark.parametrize("device", ("cpu", pytest.param("cuda:0", marks=pytest.mark.gpu)))
+@pytest.mark.parametrize("target_page_size", (3, 4))
+def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
+    source_ranks: int,
+    target_ranks: int,
+    replicated: bool,
+    source_dtype: str,
+    target_dtype: str,
+    device: str,
+    target_page_size: int,
+) -> None:
+    """Consumer head regions gather only the required producer pages and scales."""
+    total_heads = 6
+    source_heads = total_heads if replicated else total_heads // source_ranks
+    target_heads = total_heads // target_ranks
+    pools = [
+        CachePool(
+            num_layers=2,
+            num_pages=4,
+            page_size=page_size,
+            num_kv_heads=heads,
+            total_kv_heads=total_heads,
+            kv_head_offset=offset,
+            head_dim=1,
+            dtype=torch.bfloat16,
+            store_dtype=dtype,
+            device=device,
+        )
+        for heads, offset, dtype, page_size in (
+            *(
+                (source_heads, 0 if replicated else rank * source_heads, source_dtype, 4)
+                for rank in range(source_ranks)
+            ),
+            *(
+                (target_heads, rank * target_heads, target_dtype, target_page_size)
+                for rank in range(target_ranks)
+            ),
+        )
+    ]
+    tables = [
+        ReqToTokenPool(
+            group_count=1,
+            request_pool_size=1,
+            max_blocks_per_request=2,
+            block_size=pool.block_size,
+            device=device,
+        )
+        for pool in pools
+    ]
+    pages = (3, 1)
+    for pool, table in zip(pools, tables, strict=True):
+        table.install(((1, 0, pages, 2 * pool.block_size),))
+    owners = [CachePublications(pool, table) for pool, table in zip(pools, tables, strict=True)]
+    events = [DeviceEventPool() for _ in pools]
+    backend = "cuda_ipc" if device.startswith("cuda") else "shm"
+    transports = [
+        make_transport(backend, byte_capacity=32768, ticket_capacity=32, event_pool=event)
+        for event in events
+    ]
+    token_values = torch.tensor((112, 224, 448, 112, 224, 448), dtype=torch.bfloat16, device=device)
+    head_values = torch.tensor(
+        [2**head for head in range(total_heads)], dtype=torch.bfloat16, device=device
+    )
+    wanted = token_values[:, None, None] * head_values[None, :, None]
+    publications = []
+    writes = []
+    base = None
+    try:
+        for operation, (start, extent) in enumerate(((0, 3), (3, 6)), start=1):
+            source = _product(operation)
+            checkpoint = Checkpoint(operation, FixedCheckpoint(extent))
+            shards = []
+            for pool, owner, transport in zip(
+                pools[:source_ranks], owners[:source_ranks], transports[:source_ranks], strict=True
+            ):
+                values = wanted[start:extent, pool.kv_head_offset : pool.kv_head_offset + pool.n_kv]
+                for layer in range(2):
+                    pool.write(
+                        layer, pages, start=start, k=values * 2**layer, v=-values * 2**layer / 2
+                    )
+                shard = owner.publish(
+                    request_pool_idx=1,
+                    group_id=0,
+                    visible_length=extent,
+                    source_version=checkpoint,
+                    destination="consumer",
+                    expected_base=base,
+                    product=source,
+                    transports={backend: transport},
+                )
+                publications.append((pool, transport, source, shard))
+                owner.apply_commit(owner.prepare_commit(((source, shard),), ()))
+                shards.append(shard)
+            # Rank descriptors identify one logical value with distributed physical coverage.
+            merged = replace(
+                shards[0],
+                tensors=tuple(
+                    replace(
+                        field,
+                        locations=tuple(
+                            location
+                            for shard in shards
+                            for location in shard.tensors[index].locations
+                        ),
+                    )
+                    for index, field in enumerate(shards[0].tensors)
+                ),
+            )
+            for rank, (pool, owner, transport) in enumerate(
+                zip(
+                    pools[source_ranks:],
+                    owners[source_ranks:],
+                    transports[source_ranks:],
+                    strict=True,
+                )
+            ):
+                write = owner.prepare_install(
+                    source,
+                    merged,
+                    request_pool_idx=1,
+                    group_id=0,
+                    page_ids=pages,
+                    allocated_length=6,
+                    initialized_pages=pages if start == 0 else (),
+                    transports={backend: transport},
+                )
+                writes.append((pool, write))
+                write.completion.result(timeout=30)
+                installed = _product(100 + operation)
+                value = owner.install(
+                    request_pool_idx=1,
+                    group_id=0,
+                    request_id=1,
+                    source=source,
+                    installed_product=installed,
+                    write=write,
+                )
+                owner.apply_commit(owner.prepare_commit((), ((source, installed, value),)))
+                for layer in range(2):
+                    key, value = pool.read(layer, pages, start=0, length=extent)
+                    expected = (
+                        wanted[:extent, rank * target_heads : (rank + 1) * target_heads] * 2**layer
+                    )
+                    torch.testing.assert_close(key, expected, rtol=0, atol=0)
+                    torch.testing.assert_close(value, -expected / 2, rtol=0, atol=0)
+            base = checkpoint
+    finally:
+        for pool, write in writes:
+            pool.imports.abandon(write)
+        for pool, transport, product, publication in publications:
+            for tensor in publication.tensors:
+                for location in tensor.locations:
+                    transport.release(location)
+            pool.release_buffers((product.buffer_id,))
+        for pool in pools:
+            pool.imports.stop()
+        for transport in transports:
+            transport.close()
+        for pool in pools:
+            pool.close()
+        for event in events:
+            event.close()
+
+
+def test_fp8_append_preserves_installed_scale_when_producer_head_group_changes() -> None:
+    pools = [
+        CachePool(
+            num_layers=1,
+            num_pages=2,
+            page_size=4,
+            num_kv_heads=heads,
+            total_kv_heads=4,
+            head_dim=1,
+            dtype=torch.bfloat16,
+            store_dtype="float8_e4m3fn",
+            device="cpu",
+        )
+        for heads in (2, 4, 2)
+    ]
+    tables = [
+        ReqToTokenPool(
+            group_count=1, request_pool_size=1, max_blocks_per_request=1, block_size=4, device="cpu"
+        )
+        for _ in pools
+    ]
+    for table in tables:
+        table.install(((1, 0, (1,), 4),))
+    owners = [CachePublications(pool, table) for pool, table in zip(pools, tables, strict=True)]
+    events = [DeviceEventPool() for _ in pools]
+    transports = [
+        make_transport("local", byte_capacity=4096, ticket_capacity=16, event_pool=event)
+        for event in events
+    ]
+    values = (
+        torch.tensor((112, 224, 448, 896), dtype=torch.bfloat16).reshape(1, 4, 1).expand(4, -1, -1)
+    )
+    publications = []
+    writes = []
+    base = None
+    try:
+        for index in (0, 1):
+            pools[index].write(
+                0,
+                (1,),
+                start=0,
+                k=values[:2, : pools[index].n_kv],
+                v=-values[:2, : pools[index].n_kv],
+            )
+        for operation, source_index, extent in ((1, 0, 2), (2, 1, 4)):
+            checkpoint = Checkpoint(operation, FixedCheckpoint(extent))
+            source = _product(operation)
+            if operation == 2:
+                pools[1].write(0, (1,), start=2, k=values[2:], v=-values[2:])
+            publication = owners[source_index].publish(
+                request_pool_idx=1,
+                group_id=0,
+                visible_length=extent,
+                source_version=checkpoint,
+                destination="consumer",
+                expected_base=base,
+                product=source,
+                transports={"local": transports[source_index]},
+            )
+            publications.append((source_index, source, publication))
+            owners[source_index].apply_commit(
+                owners[source_index].prepare_commit(((source, publication),), ())
+            )
+            write = owners[2].prepare_install(
+                source,
+                publication,
+                request_pool_idx=1,
+                group_id=0,
+                page_ids=(1,),
+                allocated_length=4,
+                initialized_pages=(1,) if operation == 1 else (),
+                transports={"local": transports[2]},
+            )
+            writes.append(write)
+            write.completion.result(timeout=10)
+            installed = _product(100 + operation)
+            result = owners[2].install(
+                request_pool_idx=1,
+                group_id=0,
+                request_id=1,
+                source=source,
+                installed_product=installed,
+                write=write,
+            )
+            owners[2].apply_commit(owners[2].prepare_commit((), ((source, installed, result),)))
+            key, value = pools[2].read(0, (1,), start=0, length=extent)
+            torch.testing.assert_close(key, values[:extent, :2], rtol=0, atol=0)
+            torch.testing.assert_close(value, -values[:extent, :2], rtol=0, atol=0)
+            if operation == 1:
+                # A second producer represents the same checkpoint with a wider
+                # quantization group before publishing its successor generation.
+                other = _product(10)
+                replica = owners[1].publish(
+                    request_pool_idx=1,
+                    group_id=0,
+                    visible_length=extent,
+                    source_version=checkpoint,
+                    destination="consumer",
+                    expected_base=None,
+                    product=other,
+                    transports={"local": transports[1]},
+                )
+                publications.append((1, other, replica))
+                owners[1].apply_commit(owners[1].prepare_commit(((other, replica),), ()))
+            base = checkpoint
+    finally:
+        for write in writes:
+            pools[2].imports.abandon(write)
+        for index, product, publication in publications:
+            for tensor in publication.tensors:
+                for location in tensor.locations:
+                    transports[index].release(location)
+            pools[index].release_buffers((product.buffer_id,))
+        for pool in pools:
+            pool.imports.stop()
+        for transport in transports:
+            transport.close()
+        for pool in pools:
+            pool.close()
+        for event in events:
+            event.close()

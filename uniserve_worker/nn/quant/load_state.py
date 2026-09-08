@@ -8,19 +8,19 @@ from typing import Any
 import torch
 
 __all__ = [
-    'ParamLike',
-    'Fp8LoadPhase',
-    'set_optional_checkpoint',
-    'is_optional_checkpoint',
-    'set_skip_serving_cast',
-    'skip_serving_cast',
-    'init_fp8_phase',
-    'set_fp8_weight_loaded_offline',
-    'fp8_weight_loaded_offline',
-    'set_fp8_scale_loaded',
-    'fp8_scale_loaded',
-    'fp8_load_phase',
-    'copy_tensor_policy',
+    "ParamLike",
+    "Fp8LoadPhase",
+    "set_optional_checkpoint",
+    "is_optional_checkpoint",
+    "set_skip_serving_cast",
+    "skip_serving_cast",
+    "init_fp8_phase",
+    "set_fp8_weight_loaded_offline",
+    "fp8_weight_loaded_offline",
+    "set_fp8_scale_loaded",
+    "fp8_scale_loaded",
+    "fp8_load_phase",
+    "copy_tensor_policy",
 ]
 
 # Loader policy attributes may be attached to parameters, tensors, or modules.
@@ -113,7 +113,7 @@ def fp8_load_phase(module: torch.nn.Module) -> Fp8LoadPhase:
 
 def copy_tensor_policy(src: ParamLike, dst: ParamLike) -> None:
     """Carry immutable checkpoint policy and sharding onto a retyped parameter."""
-    from ..placement import get_shard_plan, set_shard_plan
+    from ..shard import get_shard_plan, set_shard_plan
 
     for name in _TENSOR_POLICY_ATTRS:
         if hasattr(src, name):

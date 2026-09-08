@@ -79,6 +79,7 @@ def qk_norm(
 ):
     """RMS-normalize query and key tensors as one vector or independent axes."""
 
+    req: QKNormReq | MultiAxisQKNormReq
     if axis_dims is None:
         req = QKNormReq(q, k, q_weight, k_weight, float(eps))
     else:
@@ -120,6 +121,7 @@ def qk_norm_rope(
     request when supported by the selected provider.
     """
 
+    req: QKNormRopeReq | MultiAxisQKNormRopeReq
     if axis_dims is None:
         # Single-axis requests carry ordinary weight and factor tensors.
         req = QKNormRopeReq(

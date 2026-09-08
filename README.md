@@ -27,6 +27,8 @@ uv pip install -e .
 
 The installation builds the `uniserve` binary and the native worker IPC extension.
 
+CUDA IPC and peer-memory mappings use the native `uniserve-kernel` package included in the `gpu` extra. Install the source workspace with `uv sync --extra gpu`; building these mappings requires a CUDA toolkit compatible with PyTorch, a C++ compiler, and Ninja.
+
 ## Start a server
 
 Every server invocation supplies the model path or Hugging Face repository and its closed description:
@@ -118,8 +120,8 @@ curl -s http://127.0.0.1:8000/v1/images/generations \
 | `--host`, `--port` | `127.0.0.1`, `8000` | TCP listener |
 | `--uds` | Unset | Unix-domain listener instead of TCP |
 | `--device` | `cuda` | Worker device |
-| `--worker-ranks` | `1` | Physical worker processes when deployment is omitted |
-| `--deployment` | Model defaults | JSON devices, ordered component membership, and parallel configuration |
+| `--worker-ranks` | `1` | Ranks in the default Worker instance when `--workers` is omitted |
+| `--workers` | Model defaults | JSON static Worker bindings, node/device ranks, and entry parallel configuration |
 | `--max-model-len` | Model configuration | Context-length ceiling |
 | `--max-total-tokens` | Runtime sizing | KV token-capacity override |
 | `--max-running-requests` | `128` | Scheduler active-request bound |
@@ -140,7 +142,7 @@ uniserve serve /models/Qwen3-32B \
   --worker-ranks 4
 ```
 
-See [parallel serving configuration](docs/parallelism.md) for independent component placement, ordered groups, and H3 execution support.
+See [parallel serving configuration](docs/parallelism.md) for static component bindings, ordered groups, and H3 execution support.
 
 ## Development and verification
 

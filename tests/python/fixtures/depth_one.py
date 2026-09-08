@@ -16,8 +16,8 @@ from uniserve_worker.execution.batch import (
     BatchCommand,
     BlockTable,
     Bounds,
+    BufferAllocation,
     BufferId,
-    BufferPlacement,
     CachePageAllocation,
     Checkpoint,
     Commit,
@@ -29,8 +29,9 @@ from uniserve_worker.execution.batch import (
     EncodeMode,
     FixedCheckpoint,
     ImageParams,
-    LatentPlacement,
+    LatentParams,
     NewRequest,
+    OpCode,
     Operation,
     OpStatus,
     PointRange,
@@ -41,7 +42,6 @@ from uniserve_worker.execution.batch import (
     Rng,
     RowGeometry,
     Run,
-    RunKind,
     RunLane,
     RunResult,
     SamplingParams,
@@ -77,7 +77,7 @@ _LATENT_PAGE_UNITS = 1
 _LATENT_DOWNSAMPLE = 1
 _ALTERNATIVE_SLOTS: dict[RequestKey, int] = {}
 _ALTERNATIVE_PAGES: dict[RequestKey, tuple[int, ...]] = {}
-_BUFFER_PLACEMENTS: dict[BufferId, BufferPlacement] = {}
+_BUFFER_ALLOCATIONS: dict[BufferId, BufferAllocation] = {}
 
 
 def configure_physical_pool(
@@ -113,8 +113,8 @@ def _reset_request(rk: RequestKey) -> None:
             table.pop(identity, None)
     for product in tuple(product for product in _LATENT_STEPS if product.request_key == rk):
         _LATENT_STEPS.pop(product, None)
-    for buffer in tuple(buffer for buffer in _BUFFER_PLACEMENTS if buffer.owner == rk):
-        _BUFFER_PLACEMENTS.pop(buffer, None)
+    for buffer in tuple(buffer for buffer in _BUFFER_ALLOCATIONS if buffer.owner == rk):
+        _BUFFER_ALLOCATIONS.pop(buffer, None)
     _OP_KV_RESULTS[(rk, 0)] = 0
 
 
@@ -122,7 +122,7 @@ def _kv_page(value: int) -> int:
     return int(value) + 1
 
 
-def _latent_placement(operation: Operation) -> LatentPlacement:
+def _latent_params(operation: Operation) -> LatentParams:
     image = _IMAGE_PARAMS[operation.request_key]
     latent_units = max(
         1,
@@ -134,7 +134,7 @@ def _latent_placement(operation: Operation) -> LatentPlacement:
         None,
     )
     start_step = 0 if latent_input is None else _LATENT_STEPS.get(latent_input, 0)
-    return LatentPlacement(
+    return LatentParams(
         request_key=operation.request_key,
         op_id=operation.op_id,
         page_table=tuple(range(1, page_count + 1)),
@@ -143,7 +143,7 @@ def _latent_placement(operation: Operation) -> LatentPlacement:
         width=int(image.width),
         start_step=start_step,
         step_count=(
-            int(operation.bounds.max_tokens) if operation.kind is RunKind.DIFFUSION_STEP else 0
+            int(operation.bounds.max_tokens) if operation.kind is OpCode.DIFFUSION_STEP else 0
         ),
     )
 
@@ -159,7 +159,7 @@ def record_kv_result(rk: RequestKey, op_id: int, visible_length: int) -> None:
     _OP_KV_RESULTS[(rk, int(op_id))] = int(visible_length)
 
 
-def bind_request_placement(
+def bind_request_allocation(
     rk: RequestKey,
     *,
     request_pool_idx: int,
@@ -167,9 +167,9 @@ def bind_request_placement(
 ) -> None:
     pages = [int(page) for page in page_ids]
     if int(request_pool_idx) < 1 or any(page < 1 for page in pages):
-        raise ValueError("request placement identifiers must be positive")
+        raise ValueError("request params identifiers must be positive")
     if len(set(pages)) != len(pages):
-        raise ValueError("request placement repeats a KV page")
+        raise ValueError("request params repeats a KV page")
     _REQUEST_POOL_INDICES[rk] = int(request_pool_idx)
     _BLOCK_TABLES[rk] = pages
     _UNBOUND_PAGES[rk] = []
@@ -238,21 +238,19 @@ def execution_run(
             _IMAGE_PARAMS[admission.request_key] = admission.umm.image
         _REQUEST_POOL_INDICES[admission.request_key] = int(admission.request_pool_idx)
     for operation in operations:
-        for output in operation.outputs:
-            if not output.uses_persistent_buffer() or output.buffer_id in _BUFFER_PLACEMENTS:
+        for product in (*operation.inputs, *operation.outputs):
+            if not product.uses_persistent_buffer() or product.buffer_id in _BUFFER_ALLOCATIONS:
                 continue
-            required = int(output.max_bytes)
+            required = int(product.max_bytes)
             offset = 0
-            for placement in sorted(
-                _BUFFER_PLACEMENTS.values(), key=lambda value: value.offset
-            ):
+            for params in sorted(_BUFFER_ALLOCATIONS.values(), key=lambda value: value.offset):
                 offset = (offset + 255) & ~255
-                if offset + required <= placement.offset:
+                if offset + required <= params.offset:
                     break
-                offset = max(offset, placement.offset + placement.bytes)
+                offset = max(offset, params.offset + params.bytes)
             offset = (offset + 255) & ~255
-            _BUFFER_PLACEMENTS[output.buffer_id] = BufferPlacement(
-                output.buffer_id,
+            _BUFFER_ALLOCATIONS[product.buffer_id] = BufferAllocation(
+                product.buffer_id,
                 offset,
                 required,
             )
@@ -313,9 +311,10 @@ def execution_run(
                             _REQUEST_POOL_INDICES[operation.request_key],
                             lengths[2],
                             lengths[1],
+                            True,
                         )
                     )
-                if operation.kind is RunKind.DIFFUSION_STEP:
+                if operation.kind is OpCode.DIFFUSION_STEP:
                     image = _IMAGE_PARAMS[operation.request_key]
                     main_slot = _REQUEST_POOL_INDICES[operation.request_key]
                     main_len = 0 if lengths is None else lengths[2]
@@ -352,7 +351,7 @@ def execution_run(
                             allocations.setdefault((alt_slot, 0), set()).update(alt_pages)
                         if negative:
                             forward_rows.append(
-                                RowGeometry(operation_index, alt_slot, 0, len(negative))
+                                RowGeometry(operation_index, alt_slot, 0, len(negative), True)
                             )
                         alternative = (alt_slot, len(negative))
                     for branch in range(branches):
@@ -361,7 +360,9 @@ def execution_run(
                             if branch == 0 or alternative is None
                             else alternative
                         )
-                        forward_rows.append(RowGeometry(operation_index, slot, seq_len, query_len))
+                        forward_rows.append(
+                            RowGeometry(operation_index, slot, seq_len, query_len, False)
+                        )
             for allocation in new_cache_pages:
                 identity = (allocation.request_pool_idx, allocation.group_id)
                 allocations.setdefault(identity, set()).update(allocation.page_ids)
@@ -382,15 +383,15 @@ def execution_run(
                         if pages
                     ),
                     forward_rows=tuple(forward_rows),
-                    latent_placements=tuple(
-                        _latent_placement(operation)
+                    latent_params=tuple(
+                        _latent_params(operation)
                         for operation in domain_operations
-                        if operation.kind in {RunKind.DIFFUSION_PREPARE, RunKind.DIFFUSION_STEP}
+                        if operation.kind in {OpCode.DIFFUSION_PREPARE, OpCode.DIFFUSION_STEP}
                         or any(product.kind is ProductKind.LATENT for product in operation.inputs)
                     ),
-                    buffer_placements=tuple(
+                    buffer_allocations=tuple(
                         {
-                            product.buffer_id: _BUFFER_PLACEMENTS[product.buffer_id]
+                            product.buffer_id: _BUFFER_ALLOCATIONS[product.buffer_id]
                             for operation in domain_operations
                             for product in (*operation.inputs, *operation.outputs)
                             if product.uses_persistent_buffer()
@@ -602,7 +603,7 @@ def token_operation(
         request_key=rk,
         op_id=op_id,
         parent=parent,
-        kind=RunKind.token(mode),
+        kind=OpCode.token(mode),
         bounds=Bounds(
             max_points=max_points,
             max_tokens=max(1, len(tokens)),
@@ -673,7 +674,7 @@ def encode_operation(
         request_key=rk,
         op_id=op_id,
         parent=parent,
-        kind=RunKind.encode(mode),
+        kind=OpCode.encoder(mode),
         bounds=Bounds(max_points=1, max_tokens=64, max_latent_bytes=8_192),
         inputs=(image_ref,),
         outputs=(output_ref,),
@@ -695,6 +696,7 @@ def diffusion_prepare_operation(
     image_index: int = 1,
     control_seq: int = 0,
 ) -> tuple[Operation, ProductRef]:
+    image = _IMAGE_PARAMS[rk]
     latent = ProductRef(
         request_key=rk,
         producer_op_id=op_id,
@@ -703,7 +705,7 @@ def diffusion_prepare_operation(
         kind=ProductKind.LATENT,
         storage_class=StorageClass.LATENT_ARENA,
         dtype=DType.BF16,
-        shape_bound=ShapeBound((DeviceDim(4_096),)),
+        shape_bound=ShapeBound((DeviceDim(3 * int(image.height) * int(image.width)),)),
         point_range=PointRange(),
     )
     ready = ProductRef(
@@ -722,8 +724,8 @@ def diffusion_prepare_operation(
         request_key=rk,
         op_id=op_id,
         parent=parent,
-        kind=RunKind.DIFFUSION_PREPARE,
-        bounds=Bounds(max_points=1, max_tokens=1, max_latent_bytes=8_192),
+        kind=OpCode.DIFFUSION_PREPARE,
+        bounds=Bounds(max_points=1, max_tokens=1, max_latent_bytes=latent.max_bytes),
         inputs=(conditioning,),
         outputs=(latent, ready),
         rng=Rng(
@@ -763,8 +765,8 @@ def diffusion_step_operation(
         request_key=rk,
         op_id=op_id,
         parent=parent,
-        kind=RunKind.DIFFUSION_STEP,
-        bounds=Bounds(max_points=1, max_tokens=int(steps), max_latent_bytes=8_192),
+        kind=OpCode.DIFFUSION_STEP,
+        bounds=Bounds(max_points=1, max_tokens=int(steps), max_latent_bytes=output.max_bytes),
         inputs=(conditioning, latent),
         outputs=(output,),
         control_seq=control_seq,
@@ -796,7 +798,7 @@ def kv_publication_operation(
         request_key=rk,
         op_id=op_id,
         parent=parent,
-        kind=RunKind.TRANSFER_KV_PUBLISH,
+        kind=OpCode.TRANSFER_KV_PUBLISH,
         bounds=Bounds(max_points=1, max_transfer_bytes=1 << 20),
         outputs=(product,),
         control_seq=control_seq,
@@ -844,7 +846,7 @@ def diffusion_finalize_operation(
         request_key=rk,
         op_id=op_id,
         parent=parent,
-        kind=RunKind.DIFFUSION_FINALIZE,
+        kind=OpCode.DIFFUSION_FINALIZE,
         bounds=Bounds(
             max_latent_bytes=(3 * 16 * 16 * 2 if feedback_source else 0),
             max_completion_bytes=65_536,
@@ -897,7 +899,7 @@ def visual_state_operation(
         request_key=rk,
         op_id=op_id,
         parent=parent,
-        kind=RunKind.token(TokenMode.EXTEND),
+        kind=OpCode.token(TokenMode.EXTEND),
         bounds=Bounds(max_points=1, max_tokens=max_tokens),
         inputs=(feature,),
         outputs=outputs,
@@ -907,7 +909,7 @@ def visual_state_operation(
 
 __all__ = [
     "AUTHORITY",
-    "bind_request_placement",
+    "bind_request_allocation",
     "commit_for_completion",
     "encode_operation",
     "execution_run",

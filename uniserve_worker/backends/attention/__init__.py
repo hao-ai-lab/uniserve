@@ -56,7 +56,7 @@ def resolve_attention_selection(
     tuning: FlashInferTuningConfig,
     block_size: int,
 ) -> AttentionSelection:
-    """Resolve one canonical deployment choice without process-global state."""
+    """Resolve one canonical worker_config choice without process-global state."""
 
     requested = str(name)
     if requested not in ATTENTION_BACKENDS:

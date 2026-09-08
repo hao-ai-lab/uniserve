@@ -3,118 +3,60 @@
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
+from ...backends.attention.torch_sdpa import TorchSDPAAttentionBackend
 from ...backends.attention.video_sparse import (
     VideoSparseAttentionBackend,
     VideoSparseAttentionWorkspace,
     build_video_sparse_metadata,
 )
+from ...nn.attention import RadixAttention
+from ...nn.diffusion.integrator import clean_sample_euler_step_
 from ...nn.diffusion.modulation import ModulationPlan
+from ...nn.diffusion.schedule import DiffusionSchedule
 from ...nn.layer import LayerConfig
 from ...nn.linear import (
     InterleavedMergedColumnParallelLinear,
-    LinearBase,
-    MergedColumnParallelLinear,
     RowParallelLinear,
 )
-from ...nn.mesh import DeviceMesh, TensorParallel
+from ...nn.mesh import DeviceMesh
+from ...nn.mlp import GatedMLP
+from ...nn.norm import RMSNorm
 from ...nn.parallel_attention import (
-    Attention2D,
     AttentionContextWorkspace,
-    GatherAttention,
-    RingAttention,
-    UlyssesAttention,
+    ParallelAttention,
 )
 from ...nn.parallel_pipeline import LayerPipeline
-from ...nn.quant import (
-    DynamicW4A4NvFp4LinearMethod,
-    DynamicW8A8Fp8LinearMethod,
-    DynamicW8A8MxFp8LinearMethod,
-    QuantizeMethodBase,
-)
-from ...nn.quant.base import UnquantizedLinearMethod
-from ...ops import qk_norm_rope
-from .fusions import (
-    attention_residual_modulated_rmsnorm,
-    attention_residual_modulated_rmsnorm_fp8,
+from ...nn.quant.base import PreparedLinearInput
+from ...nn.quant.config import LinearPrecision, create_linear_method
+from ...ops import (
     gated_residual,
-    row_modulated_rmsnorm,
-    value_first_swiglu,
-    value_first_swiglu_fp8,
+    gated_residual_rms_norm,
+    gated_residual_rms_norm_fp8,
+    modulated_rms_norm,
+    qk_norm_rope,
 )
+from ...profiling import profile_range
 from .packing import AUDIO_TAG
-from .precision import LinearPrecision
-from .state import H3Layout, H3Scratch, H3StateSlot
+from .state import H3Layout, H3Scratch, H3Tensors
 
 __all__ = [
     "H3TransformerConfig",
-    "H3TransformerExecution",
-    "LinearPrecision",
+    "H3TransformerMetadata",
     "MiniMaxH3Transformer",
 ]
 
 MODALITIES = 3
 
-
-def _dynamic_quant_method(
-    precision: LinearPrecision,
-    *,
-    tensorwise: bool = False,
-) -> QuantizeMethodBase:
-    """Construct the linear quantization method selected by H3 precision policy."""
-
-    if precision == "bf16":
-        return UnquantizedLinearMethod()
-    if precision == "fp8":
-        return DynamicW8A8Fp8LinearMethod(tensorwise=tensorwise)
-    if precision == "mxfp8":
-        if tensorwise:
-            raise ValueError("MXFP8 is not supported at the sequence-parallel attention boundary")
-        return DynamicW8A8MxFp8LinearMethod()
-    if precision == "nvfp4":
-        return DynamicW4A4NvFp4LinearMethod()
-    raise ValueError(f"unsupported dynamic linear precision {precision!r}")
-
-
-def _dynamic_quantized_linear(
-    input_size: int,
-    output_size: int,
-    *,
-    linear_precision: LinearPrecision,
-    layer_config: LayerConfig,
-    device: torch.device | str,
-    bias: bool = True,
-    tensorwise: bool = False,
-) -> LinearBase:
-    """Build a linear layer on the parameter device with the selected dynamic precision."""
-
-    with torch.device(device):
-        linear = LinearBase(
-            input_size,
-            output_size,
-            layer_config=layer_config,
-            quant_method=_dynamic_quant_method(linear_precision, tensorwise=tensorwise),
-            bias=bias,
-        )
-    return linear
-
-
-def _row_linear(input_size, output_size, *, linear_precision, layer_config, device):
-    """Construct the H3 output projection for the selected numerical format."""
-
-    with torch.device(device):
-        return RowParallelLinear(
-            input_size,
-            output_size,
-            layer_config=layer_config,
-            bias=False,
-            quant_method=_dynamic_quant_method(linear_precision),
-        )
+if TYPE_CHECKING:
+    from .model import H3ComputeInputs
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,7 +82,7 @@ class H3TransformerConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class H3TransformerExecution:
+class H3TransformerMetadata:
     """Holds rank-local row indices, routing masks, positions, and sparse-attention metadata for one H3 forward."""
 
     layout: H3Layout
@@ -155,135 +97,41 @@ class H3TransformerExecution:
     non_text_mask: torch.Tensor
 
 
-class _RMSNorm(nn.Module):
-    """Applies RMS normalization with a learned scale and configurable epsilon."""
+def build_transformer_metadata(layout: H3Layout, device: torch.device) -> H3TransformerMetadata:
+    """Build device indices and sparse-attention metadata for one packed page layout."""
 
-    def __init__(self, width: int, eps: float, *, device: torch.device | str) -> None:
-        """Allocate a learned scale for RMS normalization over the final dimension."""
-
-        super().__init__()
-        self.weight = nn.Parameter(torch.empty(width, device=device))
-        self.eps = eps
-
-    def forward(self, value: torch.Tensor) -> torch.Tensor:
-        """Normalize the final dimension in float32 and restore the input dtype."""
-
-        normalized = value.float() * torch.rsqrt(
-            value.float().pow(2).mean(-1, keepdim=True) + self.eps
-        )
-        return (normalized * self.weight.float()).to(value.dtype)
-
-
-class _SwiGLUProjection(nn.Module):
-    """Applies value-first SwiGLU gating and optional FP8 activation quantization."""
-
-    def __init__(
-        self,
-        width: int,
-        expanded: int,
-        *,
-        linear_precision: LinearPrecision,
-        layer_config: LayerConfig,
-        device: torch.device | str,
-    ) -> None:
-        """Build the value-first gated projection at the selected linear precision."""
-
-        super().__init__()
-        with torch.device(device):
-            self.proj = MergedColumnParallelLinear(
-                width,
-                (expanded, expanded),
-                quant_method=_dynamic_quant_method(linear_precision),
-                bias=False,
-                layer_config=layer_config,
-            )
-
-    def forward(self, value: torch.Tensor) -> torch.Tensor:
-        """Project hidden rows into value/gate halves and apply value-first SwiGLU."""
-
-        return value_first_swiglu(self.proj(value))
-
-
-class _FeedForward(nn.Module):
-    """Projects hidden states through the H3 gated feed-forward block."""
-
-    def __init__(
-        self,
-        config: H3TransformerConfig,
-        *,
-        linear_precision: LinearPrecision,
-        layer_config: LayerConfig,
-        device: torch.device | str,
-        logical_input_row_partitions: int = 1,
-    ) -> None:
-        """Build the H3 gated expansion and hidden-width output projection."""
-
-        super().__init__()
-        self.net = nn.ModuleList(
-            (
-                _SwiGLUProjection(
-                    config.hidden_size,
-                    config.ffn_dim,
-                    linear_precision=linear_precision,
-                    layer_config=layer_config,
-                    device=device,
-                ),
-                nn.Identity(),
-                _row_linear(
-                    config.ffn_dim,
-                    config.hidden_size,
-                    linear_precision=linear_precision,
-                    layer_config=layer_config,
-                    device=device,
-                ),
-            )
-        )
-        self.net[0].proj.logical_input_row_partitions = logical_input_row_partitions
-        self.net[2].logical_input_row_partitions = logical_input_row_partitions
-
-    def forward(self, value: torch.Tensor) -> torch.Tensor:
-        """Transform hidden rows through the gated expansion and output projection."""
-
-        if self.accepts_prequantized_fp8:
-            value_gate = self.net[0].proj(value)
-            if self.net[2].tp_group.world_size > 1:
-                return self.net[2](value_first_swiglu(value_gate))
-            activated, activated_scale = value_first_swiglu_fp8(value_gate)
-            return self.net[2].reduce_output(
-                self.net[2].forward_prequantized(activated, activated_scale)
-            )
-        return self.net[2](self.net[0](value))
-
-    @property
-    def accepts_prequantized_fp8(self) -> bool:
-        """Indicate whether both projections share the row-wise dynamic FP8 contract."""
-
-        return all(
-            isinstance(linear.quant_method, DynamicW8A8Fp8LinearMethod)
-            and not linear.quant_method.tensorwise
-            for linear in (self.net[0].proj, self.net[2])
-        )
-
-    def forward_prequantized_fp8(
-        self,
-        value: torch.Tensor,
-        scale: torch.Tensor,
-    ) -> torch.Tensor:
-        """Consume row-wise FP8 values and scales without dequantizing between projections."""
-
-        if not self.accepts_prequantized_fp8:
-            raise RuntimeError("feed-forward precision cannot consume prequantized FP8 input")
-        value_gate = self.net[0].proj.forward_prequantized(value, scale)
-        if self.net[2].tp_group.world_size > 1:
-            return self.net[2](value_first_swiglu(value_gate))
-        activated, activated_scale = value_first_swiglu_fp8(value_gate)
-        return self.net[2].reduce_output(
-            self.net[2].forward_prequantized(activated, activated_scale)
-        )
+    metadata = build_video_sparse_metadata(
+        padded_rows=layout.packed.padded_rows,
+        prefix_tiles=layout.packed.prefix_tiles,
+        video_tiles=layout.packed.video_tiles,
+        valid_sizes=layout.packed.tile_valid_sizes,
+        device=device,
+    )
+    vsa = VideoSparseAttentionBackend(metadata)
+    local_tags = layout.packed.token_tags[layout.local_start : layout.local_end]
+    timestep_indices = (local_tags == AUDIO_TAG).to(torch.long)
+    global_text = layout.packed.text_indices[
+        (layout.packed.text_indices >= layout.local_start)
+        & (layout.packed.text_indices < layout.local_end)
+    ]
+    return H3TransformerMetadata(
+        layout=layout,
+        vsa=vsa,
+        local_text_indices=layout.local_indices(layout.packed.text_indices).to(device),
+        global_text_indices=global_text.to(device),
+        local_video_indices=layout.local_indices(layout.packed.video_indices).to(device),
+        local_audio_indices=layout.local_indices(layout.packed.audio_indices).to(device),
+        timestep_indices=timestep_indices.to(device),
+        adaln_indices=(timestep_indices * MODALITIES + local_tags).to(device),
+        positions=layout.packed.position_ids.to(device=device, dtype=torch.float32),
+        non_text_mask=(layout.packed.token_tags != 1).to(device),
+    )
 
 
 class _RotaryEmbedding(nn.Module):
     """Builds multimodal rotary frequencies and applies them to query and key heads."""
+
+    inv_freq: torch.Tensor
 
     def __init__(self, config: H3TransformerConfig, *, device: torch.device | str) -> None:
         """Precompute three-axis rotary frequencies for packed multimodal positions."""
@@ -336,6 +184,8 @@ class _RotaryEmbedding(nn.Module):
 class H3TimestepEmbedding(nn.Module):
     """Embeds diffusion timesteps into conditioning vectors for adaptive modulation."""
 
+    frequencies: torch.Tensor
+
     def __init__(
         self,
         config: H3TransformerConfig,
@@ -377,12 +227,19 @@ class _DenseAttention(nn.Module):
         inner = config.heads * config.head_dim
         self.heads = config.heads
         self.head_dim = config.head_dim
+        self.attention = RadixAttention(
+            self.heads, self.heads, self.head_dim, dense_provider=TorchSDPAAttentionBackend()
+        )
         self.to_q = nn.Linear(config.hidden_size, inner, bias=False, device=device)
         self.to_k = nn.Linear(config.hidden_size, inner, bias=False, device=device)
         self.to_v = nn.Linear(config.hidden_size, inner, bias=False, device=device)
         self.to_out = nn.Sequential(nn.Linear(inner, config.hidden_size, bias=False, device=device))
-        self.norm_q = _RMSNorm(config.head_dim, config.qk_norm_eps, device=device)
-        self.norm_k = _RMSNorm(config.head_dim, config.qk_norm_eps, device=device)
+        self.norm_q = RMSNorm(
+            config.head_dim, config.qk_norm_eps, affine_in_fp32=True, device=device
+        )
+        self.norm_k = RMSNorm(
+            config.head_dim, config.qk_norm_eps, affine_in_fp32=True, device=device
+        )
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         """Attend over dense ``[batch, rows, hidden]`` refinement sequences."""
@@ -391,8 +248,8 @@ class _DenseAttention(nn.Module):
         query = self.norm_q(self.to_q(hidden).view(batch, rows, self.heads, self.head_dim))
         key = self.norm_k(self.to_k(hidden).view(batch, rows, self.heads, self.head_dim))
         value = self.to_v(hidden).view(batch, rows, self.heads, self.head_dim)
-        result = F.scaled_dot_product_attention(
-            query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2)
+        result = self.attention(
+            query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), None, causal=False
         )
         return self.to_out(result.transpose(1, 2).reshape(batch, rows, -1))
 
@@ -411,15 +268,22 @@ class _TokenRefinerBlock(nn.Module):
         """Assemble one normalized dense-attention and feed-forward refinement block."""
 
         super().__init__()
-        self.norm1 = _RMSNorm(config.hidden_size, config.norm_eps, device=device)
-        self.attn = _DenseAttention(config, device=device)
-        self.norm2 = _RMSNorm(config.hidden_size, config.norm_eps, device=device)
-        self.ff = _FeedForward(
-            config,
-            linear_precision=linear_precision,
-            layer_config=layer_config,
-            device=device,
+        self.norm1 = RMSNorm(
+            config.hidden_size, config.norm_eps, affine_in_fp32=True, device=device
         )
+        self.attn = _DenseAttention(config, device=device)
+        self.norm2 = RMSNorm(
+            config.hidden_size, config.norm_eps, affine_in_fp32=True, device=device
+        )
+        with torch.device(device):
+            self.ff = GatedMLP(
+                config.hidden_size,
+                config.ffn_dim,
+                quant_method=create_linear_method(linear_precision),
+                layer_config=layer_config.child("ff"),
+                order="value_gate",
+                activation_dtype=torch.bfloat16,
+            )
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         """Apply pre-normalized attention and feed-forward residuals to refinement rows."""
@@ -446,12 +310,14 @@ class _TokenRefiner(nn.Module):
             _TokenRefinerBlock(
                 config,
                 linear_precision=linear_precision,
-                layer_config=layer_config,
+                layer_config=layer_config.child(f"refiner_blocks.{index}"),
                 device=device,
             )
-            for _ in range(config.refiner_layers)
+            for index in range(config.refiner_layers)
         )
-        self.final_norm = _RMSNorm(config.hidden_size, config.norm_eps, device=device)
+        self.final_norm = RMSNorm(
+            config.hidden_size, config.norm_eps, affine_in_fp32=True, device=device
+        )
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         """Run every refinement block and normalize the resulting text condition."""
@@ -468,7 +334,6 @@ class _H3Attention(nn.Module):
         self,
         config: H3TransformerConfig,
         mesh: DeviceMesh,
-        vsa: VideoSparseAttentionBackend,
         *,
         linear_precision: LinearPrecision,
         layer_config: LayerConfig,
@@ -488,34 +353,8 @@ class _H3Attention(nn.Module):
         projection_group = (
             mesh.get_group("ulysses") if self.projected_head else mesh.get_group("tp")
         )
-        projection_config = LayerConfig(
-            TensorParallel(projection_group.rank_in_group, projection_group.world_size),
-            None,
-            projection_group,
-        )
-        self.parallel_attention: UlyssesAttention
-        if self.context_size == 1:
-            self.parallel_attention = UlyssesAttention(vsa, ulysses_group=mesh.get_group("ulysses"))
-        elif mesh.parallel_config.sequence_parallel.kind == "attention2d":
-            self.parallel_attention = Attention2D(
-                vsa,
-                ulysses_group=mesh.get_group("ulysses"),
-                row_group=mesh.get_group("cp_row"),
-                col_group=mesh.get_group("cp_col"),
-                context_group=mesh.get_group("cp"),
-            )
-        elif mesh.parallel_config.sequence_parallel.kind in ("ring", "hybrid"):
-            self.parallel_attention = RingAttention(
-                vsa,
-                ulysses_group=mesh.get_group("ulysses"),
-                context_group=mesh.get_group("cp"),
-            )
-        else:
-            self.parallel_attention = GatherAttention(
-                vsa,
-                ulysses_group=mesh.get_group("ulysses"),
-                context_group=mesh.get_group("cp"),
-            )
+        projection_config = LayerConfig(projection_group, None, layer_config.prefix)
+        self.parallel_attention = ParallelAttention(mesh=mesh)
         with torch.device(device):
             self.to_qkvg = InterleavedMergedColumnParallelLinear(
                 config.hidden_size,
@@ -523,24 +362,30 @@ class _H3Attention(nn.Module):
                 4,
                 config.head_dim,
                 layer_config=projection_config,
+                prefix="to_qkvg",
                 sequence_group=mesh.get_group("sp"),
                 input_scale_group=mesh.get_group("sp"),
                 weight_scale_partition_size=14 * 4 * config.head_dim,
-                quant_method=_dynamic_quant_method(linear_precision, tensorwise=True),
+                quant_method=create_linear_method(linear_precision, tensorwise=True),
                 bias=False,
             )
-        self.to_out = nn.Sequential(
-            _row_linear(
-                inner,
-                config.hidden_size,
-                linear_precision=linear_precision,
-                layer_config=layer_config,
-                device=device,
+            self.to_out = nn.Sequential(
+                RowParallelLinear(
+                    inner,
+                    config.hidden_size,
+                    layer_config=layer_config,
+                    prefix="to_out.0",
+                    bias=False,
+                    quant_method=create_linear_method(linear_precision),
+                    logical_input_row_partitions=4 // mesh.size("sp"),
+                )
             )
+        self.norm_q = RMSNorm(
+            config.head_dim, config.qk_norm_eps, affine_in_fp32=True, device=device
         )
-        self.to_out[0].logical_input_row_partitions = 4 // mesh.size("sp")
-        self.norm_q = _RMSNorm(config.head_dim, config.qk_norm_eps, device=device)
-        self.norm_k = _RMSNorm(config.head_dim, config.qk_norm_eps, device=device)
+        self.norm_k = RMSNorm(
+            config.head_dim, config.qk_norm_eps, affine_in_fp32=True, device=device
+        )
 
     def forward(
         self,
@@ -564,6 +409,7 @@ class _H3Attention(nn.Module):
         pooled_value: torch.Tensor,
         compressed_tiles: torch.Tensor,
         topk_indices_i32: torch.Tensor,
+        backend: VideoSparseAttentionBackend,
     ) -> torch.Tensor:
         """Exchange sequence shards, run sparse global attention, and project local rows."""
 
@@ -580,7 +426,7 @@ class _H3Attention(nn.Module):
             )
         else:
             projected = self.to_qkvg(local).view(local_rows, self.tensor_heads, 4, head_dim)
-            exchanged = self.parallel_attention.exchange_projection(projected)
+            exchanged = self.parallel_attention.exchange_heads(projected)
         query, key, value, gate = exchanged.unbind(2)
         cosine, sine = rotary
         start = self.context_rank * global_rows
@@ -611,7 +457,8 @@ class _H3Attention(nn.Module):
         )
 
         # VSA returns local sequence rows with globally composed head shards.
-        local_output = self.parallel_attention(
+        local_output = backend.forward_parallel(
+            self.parallel_attention,
             query,
             key,
             value,
@@ -636,7 +483,6 @@ class _TransformerBlock(nn.Module):
         self,
         config: H3TransformerConfig,
         mesh: DeviceMesh,
-        vsa: VideoSparseAttentionBackend,
         *,
         attention_linear_precision: LinearPrecision,
         mlp_linear_precision: LinearPrecision,
@@ -646,23 +492,29 @@ class _TransformerBlock(nn.Module):
         """Assemble one adaptive sparse-attention and gated feed-forward block."""
 
         super().__init__()
-        self.norm1 = _RMSNorm(config.hidden_size, config.norm_eps, device=device)
+        self.norm1 = RMSNorm(
+            config.hidden_size, config.norm_eps, affine_in_fp32=True, device=device
+        )
         self.attn = _H3Attention(
             config,
             mesh,
-            vsa,
             linear_precision=attention_linear_precision,
-            layer_config=layer_config,
+            layer_config=layer_config.child("attn"),
             device=device,
         )
-        self.norm2 = _RMSNorm(config.hidden_size, config.norm_eps, device=device)
-        self.ff = _FeedForward(
-            config,
-            logical_input_row_partitions=4 // mesh.size("sp"),
-            linear_precision=mlp_linear_precision,
-            layer_config=layer_config,
-            device=device,
+        self.norm2 = RMSNorm(
+            config.hidden_size, config.norm_eps, affine_in_fp32=True, device=device
         )
+        with torch.device(device):
+            self.ff = GatedMLP(
+                config.hidden_size,
+                config.ffn_dim,
+                logical_input_row_partitions=4 // mesh.size("sp"),
+                quant_method=create_linear_method(mlp_linear_precision),
+                layer_config=layer_config.child("ff"),
+                order="value_gate",
+                activation_dtype=torch.bfloat16,
+            )
         self.hidden_size = config.hidden_size
 
     def forward(
@@ -689,6 +541,7 @@ class _TransformerBlock(nn.Module):
         pooled_value: torch.Tensor,
         compressed_tiles: torch.Tensor,
         topk_indices_i32: torch.Tensor,
+        backend: VideoSparseAttentionBackend,
     ) -> torch.Tensor:
         """Apply one time-modulated sparse-attention and feed-forward residual block."""
 
@@ -698,7 +551,7 @@ class _TransformerBlock(nn.Module):
             tensor.to(hidden.dtype)
             for tensor in adaln_values.reshape(-1, self.hidden_size * 6).chunk(6, dim=-1)
         )
-        normalized = row_modulated_rmsnorm(
+        normalized = modulated_rms_norm(
             hidden,
             self.norm1.weight,
             shift_attn,
@@ -727,12 +580,13 @@ class _TransformerBlock(nn.Module):
             pooled_value,
             compressed_tiles,
             topk_indices_i32,
+            backend,
         )
 
         # Dynamic FP8 keeps the normalized feed-forward input quantized across
         # the expansion boundary; other precision modes consume the BF16 view.
         if self.ff.accepts_prequantized_fp8:
-            hidden, normalized, normalized_scale = attention_residual_modulated_rmsnorm_fp8(
+            hidden, normalized, normalized_scale = gated_residual_rms_norm_fp8(
                 hidden,
                 attention,
                 gate_attn,
@@ -742,12 +596,11 @@ class _TransformerBlock(nn.Module):
                 adaln_indices,
                 eps=self.norm2.eps,
             )
-            feed_forward = self.ff.forward_prequantized_fp8(
-                normalized,
-                normalized_scale,
+            feed_forward = self.ff.forward_prepared(
+                PreparedLinearInput(normalized, row_scales=normalized_scale)
             )
         else:
-            hidden, normalized = attention_residual_modulated_rmsnorm(
+            hidden, normalized = gated_residual_rms_norm(
                 hidden,
                 attention,
                 gate_attn,
@@ -773,7 +626,7 @@ class _OutputNorm(nn.Module):
         """Build final adaptive normalization for latent-velocity prediction."""
 
         super().__init__()
-        self.norm = _RMSNorm(config.hidden_size, config.norm_eps, device=device)
+        self.norm = RMSNorm(config.hidden_size, config.norm_eps, affine_in_fp32=True, device=device)
 
     def forward(
         self,
@@ -790,6 +643,24 @@ class _OutputNorm(nn.Module):
         )
 
 
+def build_conditioner(mesh: DeviceMesh, device: torch.device | str) -> nn.Sequential:
+    """Compose the checkpoint's conditioning projection and dense text refiner."""
+
+    config = H3TransformerConfig()
+    layers = LayerConfig(mesh.get_group("tp"), None)
+    return nn.Sequential(
+        OrderedDict(
+            context_embedder=nn.Linear(config.text_dim, config.hidden_size, device=device),
+            token_refiner=_TokenRefiner(
+                config,
+                linear_precision="bf16",
+                layer_config=layers.child("token_refiner"),
+                device=device,
+            ),
+        )
+    )
+
+
 class MiniMaxH3Transformer(nn.Module):
     """DiT weights with sequence-parallel rank-local activations."""
 
@@ -798,7 +669,6 @@ class MiniMaxH3Transformer(nn.Module):
     def __init__(
         self,
         mesh: DeviceMesh,
-        layout: H3Layout,
         *,
         parameter_device: torch.device | str = "meta",
         attention_linear_precision: LinearPrecision,
@@ -813,16 +683,13 @@ class MiniMaxH3Transformer(nn.Module):
         self.config = config
         self.mesh = mesh
         self.pipeline = LayerPipeline(mesh.get_group("pp"), config.layers)
-        self.layout = layout
         self.attention_linear_precision = attention_linear_precision
         self.mlp_linear_precision = mlp_linear_precision
 
         layer_config = LayerConfig(
-            parallel=TensorParallel.from_mesh(mesh),
+            communicator=mesh.get_group("tp"),
             quantization=None,
-            tp_group=mesh.get_group("tp"),
         )
-        execution = self.build_execution(layout)
 
         # Input and output projections retain modality-specific widths around a
         # common hidden stream shared by text, video, and audio rows.
@@ -837,33 +704,17 @@ class MiniMaxH3Transformer(nn.Module):
             if self.pipeline.first
             else None
         )
-        self.context_embedder = (
-            nn.Linear(config.text_dim, config.hidden_size, device=parameter_device)
-            if self.pipeline.first
-            else None
-        )
         self.modulation_plan: ModulationPlan
         self.rope = _RotaryEmbedding(config, device=mesh.local_device)
-        self.token_refiner = (
-            _TokenRefiner(
-                config,
-                linear_precision="bf16",
-                layer_config=layer_config,
-                device=parameter_device,
-            )
-            if self.pipeline.first
-            else None
-        )
         # Global layer names remain checkpoint identities on every stage.
         self.transformer_blocks = nn.ModuleDict(
             {
                 str(layer): _TransformerBlock(
                     config,
                     mesh,
-                    execution.vsa,
                     attention_linear_precision=attention_linear_precision,
                     mlp_linear_precision=mlp_linear_precision,
-                    layer_config=layer_config,
+                    layer_config=layer_config.child(f"transformer_blocks.{layer}"),
                     device=parameter_device,
                 )
                 for layer in self.pipeline.layers
@@ -881,93 +732,54 @@ class MiniMaxH3Transformer(nn.Module):
             else None
         )
 
-        # Execution indexes are immutable layout metadata, not checkpoint state;
-        # rebinding replaces them when the active page geometry changes.
-        for name in (
-            "local_text_indices",
-            "global_text_indices",
-            "local_video_indices",
-            "local_audio_indices",
-            "timestep_indices",
-            "adaln_indices",
-            "positions",
-            "non_text_mask",
-        ):
-            self.register_buffer(
-                name,
-                getattr(execution, name),
-                persistent=False,
-            )
-        self.execution = execution
-
-    def build_execution(self, layout: H3Layout) -> H3TransformerExecution:
-        """Build device indices and sparse-attention metadata for one packed page layout."""
-
-        metadata = build_video_sparse_metadata(
-            padded_rows=layout.packed.padded_rows,
-            prefix_tiles=layout.packed.prefix_tiles,
-            video_tiles=layout.packed.video_tiles,
-            valid_sizes=layout.packed.tile_valid_sizes,
-            device=self.mesh.local_device,
-        )
-        vsa = VideoSparseAttentionBackend(metadata)
-        local_tags = layout.packed.token_tags[layout.local_start : layout.local_end]
-        timestep_indices = (local_tags == AUDIO_TAG).to(torch.long)
-        global_text = layout.packed.text_indices[
-            (layout.packed.text_indices >= layout.local_start)
-            & (layout.packed.text_indices < layout.local_end)
-        ]
-        device = self.mesh.local_device
-        return H3TransformerExecution(
-            layout=layout,
-            vsa=vsa,
-            local_text_indices=layout.local_indices(layout.packed.text_indices).to(device),
-            global_text_indices=global_text.to(device),
-            local_video_indices=layout.local_indices(layout.packed.video_indices).to(device),
-            local_audio_indices=layout.local_indices(layout.packed.audio_indices).to(device),
-            timestep_indices=timestep_indices.to(device),
-            adaln_indices=(timestep_indices * MODALITIES + local_tags).to(device),
-            positions=layout.packed.position_ids.to(device=device, dtype=torch.float32),
-            non_text_mask=(layout.packed.token_tags != 1).to(device),
-        )
-
-    def bind_execution(self, execution: H3TransformerExecution) -> None:
-        """Install a page layout and route every block to its sparse-attention metadata."""
-
-        self.layout = execution.layout
-        self.execution = execution
-        for name in (
-            "local_text_indices",
-            "global_text_indices",
-            "local_video_indices",
-            "local_audio_indices",
-            "timestep_indices",
-            "adaln_indices",
-            "positions",
-            "non_text_mask",
-        ):
-            setattr(self, name, getattr(execution, name))
-        for block in self.transformer_blocks.values():
-            block.attn.parallel_attention.backend = execution.vsa
-
-    def refine_text(self, encoder_hidden: torch.Tensor) -> torch.Tensor:
-        """Project encoder states to H3 width and apply the conditioning refiner."""
-
-        if self.context_embedder is None or self.token_refiner is None:
-            raise RuntimeError("text refinement belongs to the first pipeline stage")
-        return self.token_refiner(
-            self.context_embedder(encoder_hidden.to(self.context_embedder.weight.dtype))
-        )
-
     def select_adaln_step(self, scratch: H3Scratch, step: int) -> None:
         """Bind the fixed solver ladder's modulation products to execution scratch."""
 
         self.modulation_plan.copy_step(step, scratch.block_adaln_params, scratch.final_adaln_params)
 
-    def forward_local_prepared(
+    @torch.inference_mode()
+    def forward(
         self,
-        slot: H3StateSlot,
+        slot: H3Tensors,
+        execution: H3ComputeInputs,
+        start_step: int,
+        step_count: int,
+        schedule: DiffusionSchedule,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Advance explicit media Tensor views through one scheduled solver step."""
+
+        if int(step_count) != 1:
+            raise ValueError("H3 denoise calls evaluate exactly one scheduled step")
+        if not 0 <= start_step < 4:
+            raise ValueError("H3 denoise step is outside the four-evaluation ladder")
+        scratch = execution.scratch
+        assert scratch is not None and execution.transformer_metadata is not None
+        self.select_adaln_step(scratch, start_step)
+        with profile_range("uniserve.h3.denoise"):
+            self._forward_layers(slot, scratch, execution.transformer_metadata)
+            if self.pipeline.last:
+                clean_sample_euler_step_(
+                    slot.video_rows,
+                    scratch.video_velocity,
+                    schedule.timesteps[0][start_step],
+                    schedule.sigmas[0][start_step],
+                    schedule.sigmas[0][start_step + 1],
+                )
+                clean_sample_euler_step_(
+                    slot.audio_rows,
+                    scratch.audio_velocity,
+                    schedule.timesteps[1][start_step],
+                    schedule.sigmas[1][start_step],
+                    schedule.sigmas[1][start_step + 1],
+                )
+            self.pipeline.feedback((slot.video_rows, slot.audio_rows))
+        return slot.video_rows, slot.audio_rows
+
+    def _forward_layers(
+        self,
+        slot: H3Tensors,
         scratch: H3Scratch,
+        metadata: H3TransformerMetadata,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Run assigned layers and publish media predictions on the final stage."""
 
@@ -977,17 +789,17 @@ class MiniMaxH3Transformer(nn.Module):
             hidden.zero_()
 
             # Assemble rank-local packed rows from persistent text, video, and audio state.
-            if self.local_text_indices.numel():
+            if metadata.local_text_indices.numel():
                 torch.index_select(
                     slot.text_condition,
                     1,
-                    self.global_text_indices,
+                    metadata.global_text_indices,
                     out=scratch.local_text_hidden,
                 )
-                hidden.index_copy_(1, self.local_text_indices, scratch.local_text_hidden)
+                hidden.index_copy_(1, metadata.local_text_indices, scratch.local_text_hidden)
             for rows, projection, indices in (
-                (slot.video_rows, self.proj_in, self.local_video_indices),
-                (slot.audio_rows, self.audio_proj_in, self.local_audio_indices),
+                (slot.video_rows, self.proj_in, metadata.local_video_indices),
+                (slot.audio_rows, self.audio_proj_in, metadata.local_audio_indices),
             ):
                 projected = scratch.projected_input[: rows.shape[0]]
                 torch.addmm(
@@ -1009,7 +821,7 @@ class MiniMaxH3Transformer(nn.Module):
             hidden = block(
                 hidden,
                 scratch.block_adaln_params[layer],
-                self.adaln_indices,
+                metadata.adaln_indices,
                 rotary,
                 slot.tile_valid_sizes,
                 slot.prefix_key_indices,
@@ -1029,6 +841,7 @@ class MiniMaxH3Transformer(nn.Module):
                 scratch.pooled_value,
                 scratch.compressed_tiles,
                 scratch.topk_indices_i32,
+                metadata.vsa,
             )
         self.pipeline.send_activation(hidden)
         if not self.pipeline.last:
@@ -1041,11 +854,11 @@ class MiniMaxH3Transformer(nn.Module):
             hidden,
             final_shift,
             final_scale,
-            self.timestep_indices,
+            metadata.timestep_indices,
         )
         for indices, projection, velocity in (
-            (self.local_video_indices, self.proj_out, scratch.video_velocity),
-            (self.local_audio_indices, self.audio_proj_out, scratch.audio_velocity),
+            (metadata.local_video_indices, self.proj_out, scratch.video_velocity),
+            (metadata.local_audio_indices, self.audio_proj_out, scratch.audio_velocity),
         ):
             selected_bf16 = scratch.projected_input_bf16[: indices.numel()]
             torch.index_select(hidden[0], 0, indices, out=selected_bf16)

@@ -13,12 +13,12 @@ from ..linear import LinearBase
 from .timestep import TimestepEmbedder
 
 __all__ = [
-    'FlowHeadConfig',
-    'modulate',
-    'ResBlock',
-    'FlowMatchingHead',
-    'FinalLayer',
-    'ConvDecoder',
+    "FlowHeadConfig",
+    "modulate",
+    "ResBlock",
+    "FlowMatchingHead",
+    "FinalLayer",
+    "ConvDecoder",
 ]
 
 
@@ -66,13 +66,23 @@ class ResBlock(nn.Module):
         self.intermediate_size = int(channels * mlp_ratio)
         self.in_ln = nn.LayerNorm(self.channels, eps=1e-6)
         self.mlp = nn.Sequential(
-            LinearBase(self.channels, self.intermediate_size, layer_config=layer_config),
+            LinearBase(
+                self.channels, self.intermediate_size, layer_config=layer_config, prefix="mlp.0"
+            ),
             nn.SiLU(),
-            LinearBase(self.intermediate_size, self.channels, layer_config=layer_config),
+            LinearBase(
+                self.intermediate_size, self.channels, layer_config=layer_config, prefix="mlp.2"
+            ),
         )
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            LinearBase(self.channels, 3 * self.channels, layer_config=layer_config, bias=True),
+            LinearBase(
+                self.channels,
+                3 * self.channels,
+                layer_config=layer_config,
+                prefix="adaLN_modulation.1",
+                bias=True,
+            ),
         )
 
     def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -91,10 +101,18 @@ class _TimeAdaptiveFinalLayer(nn.Module):
 
         super().__init__()
         self.norm_final = nn.LayerNorm(model_channels, elementwise_affine=False, eps=1e-6)
-        self.linear = LinearBase(model_channels, out_channels, layer_config=layer_config, bias=True)
+        self.linear = LinearBase(
+            model_channels, out_channels, layer_config=layer_config, prefix="linear", bias=True
+        )
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            LinearBase(model_channels, 2 * model_channels, layer_config=layer_config, bias=True),
+            LinearBase(
+                model_channels,
+                2 * model_channels,
+                layer_config=layer_config,
+                prefix="adaLN_modulation.1",
+                bias=True,
+            ),
         )
 
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
@@ -128,14 +146,22 @@ class _TimeConditionedMLPAdaLN(nn.Module):
         self.mlp_ratio = float(mlp_ratio)
 
         self.time_embed = TimestepEmbedder(self.dim)
-        self.input_proj = LinearBase(self.input_dim, self.dim, layer_config=layer_config)
+        self.input_proj = LinearBase(
+            self.input_dim, self.dim, layer_config=layer_config, prefix="input_proj"
+        )
         self.res_blocks = nn.ModuleList(
             [
-                ResBlock(self.dim, layer_config=layer_config, mlp_ratio=self.mlp_ratio)
-                for _ in range(self.layers)
+                ResBlock(
+                    self.dim,
+                    layer_config=layer_config.child(f"res_blocks.{index}"),
+                    mlp_ratio=self.mlp_ratio,
+                )
+                for index in range(self.layers)
             ]
         )
-        self.final_layer = _TimeAdaptiveFinalLayer(self.dim, self.out_dim, layer_config=layer_config)
+        self.final_layer = _TimeAdaptiveFinalLayer(
+            self.dim, self.out_dim, layer_config=layer_config.child("final_layer")
+        )
         # Random init is wasted on the serving path (the checkpoint overwrites it);
         # gate it off by default so construction is cheap and never-loaded weights
         # surface as garbage rather than a plausible random init.
@@ -203,7 +229,7 @@ class FlowMatchingHead(nn.Module):
         self.net = _TimeConditionedMLPAdaLN(
             input_dim=input_dim,
             out_dim=out_dim,
-            layer_config=layer_config,
+            layer_config=layer_config.child("net"),
             dim=dim,
             layers=layers,
             mlp_ratio=mlp_ratio,
@@ -236,7 +262,9 @@ class FinalLayer(nn.Module):
 
         super().__init__()
         self.norm_final = nn.LayerNorm(model_channels, elementwise_affine=False, eps=1e-6)
-        self.linear = LinearBase(model_channels, out_channels, layer_config=layer_config, bias=True)
+        self.linear = LinearBase(
+            model_channels, out_channels, layer_config=layer_config, prefix="linear", bias=True
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Normalize decoder features and project them to output channels."""
@@ -279,10 +307,14 @@ class ConvDecoder(nn.Module):
         # PixelShuffle(final_upscale) folds them back into out_channels.
         conv2_out = self.out_channels * self.final_upscale**2
         self.ps1 = nn.PixelShuffle(_INTERMEDIATE_UPSCALE)
-        self.conv1 = nn.Conv2d(input_dim // _INTERMEDIATE_CHANNEL_DIVISOR, hidden_dim, kernel_size=3, padding=1)
+        self.conv1 = nn.Conv2d(
+            input_dim // _INTERMEDIATE_CHANNEL_DIVISOR, hidden_dim, kernel_size=3, padding=1
+        )
         self.act1 = nn.GELU()
         self.ps2 = nn.PixelShuffle(_INTERMEDIATE_UPSCALE)
-        self.conv2 = nn.Conv2d(hidden_dim // _INTERMEDIATE_CHANNEL_DIVISOR, conv2_out, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(
+            hidden_dim // _INTERMEDIATE_CHANNEL_DIVISOR, conv2_out, kernel_size=3, padding=1
+        )
         self.ps3 = nn.PixelShuffle(self.final_upscale)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

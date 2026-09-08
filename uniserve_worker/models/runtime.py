@@ -2,25 +2,45 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Callable, Hashable, Iterable, Mapping
+from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
 
-from ..execution.batch import RunKind
+from uniserve_worker.config import WorkerConfig
+
+from ..execution.batch import DecodeRange, MediaGeometry, OpCode, TensorSpec
+from ..execution.bounded_storage import BoundedTensorStorage, TensorSchema
 from ..execution.forward_batch import AttentionSelection, ForwardBatch, ForwardOutput
 from ..foundation.errors import invalid_descriptor
+from ..nn.diffusion.schedule import DiffusionSchedule
+from ..nn.parallel_attention import AttentionContextGeometry, AttentionContextWorkspace
+from ..transfer.layout import TensorRegion
 
 if TYPE_CHECKING:
+    from ..loader.component import CheckpointComponent, ModelBuildContext, ModelConstruction
     from ..runtime.cache_pool import CachePool
-    from ..worker.warmup import WarmupContext
     from .generation import GenerationPipeline
     from .inputs import ImageProcessor
 
 _FLOAT_DTYPES = frozenset({"float16", "bfloat16", "float32"})
 _KV_DTYPES = frozenset({*_FLOAT_DTYPES, "float8_e4m3fn"})
+
+
+@dataclass(frozen=True, slots=True)
+class TensorOutputLayout:
+    """Logical result shape and the unique region produced by this rank.
+
+    A missing shape uses the declared capacity. A missing region produces the
+    complete tensor. Storage reservation and publication remain runtime-owned.
+    """
+
+    shape: tuple[int, ...] | None = None
+    region: TensorRegion | None = None
 
 
 class PositionLayout(StrEnum):
@@ -32,21 +52,25 @@ class PositionLayout(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class CacheGeometry:
-    """Defines KV layer count, head geometry, block size, capacity, and storage dtype."""
+    """Defines local KV storage and its head interval in the logical model cache."""
 
     num_layers: int
     num_attention_heads: int
     num_kv_heads: int
+    total_kv_heads: int
+    kv_head_offset: int
     head_dim: int
     dtype: str
     store_dtype: str | None = None
 
     def __post_init__(self) -> None:
-        """Validate positive KV dimensions, capacity, block size, and dtype metadata."""
+        """Validate physical dimensions, global head coverage, and numeric format."""
 
         for name in ("num_layers", "num_attention_heads", "num_kv_heads", "head_dim"):
             if int(getattr(self, name)) < 1:
                 raise invalid_descriptor(f"cache geometry {name} must be positive")
+        if self.kv_head_offset < 0 or self.kv_head_offset + self.num_kv_heads > self.total_kv_heads:
+            raise invalid_descriptor("cache head interval exceeds logical model geometry")
         if self.dtype not in _FLOAT_DTYPES:
             raise invalid_descriptor("cache compute dtype is unsupported")
         if self.store_dtype is not None and self.store_dtype not in _KV_DTYPES:
@@ -60,10 +84,12 @@ class ResourceGeometry:
     kv: bool = True
     encoder_cache_entries: int = 0
     latent_downsample: int | None = None
+    request_tensors: Mapping[str, TensorSchema] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Validate non-negative request, cache, latent, feature, and byte capacities."""
 
+        object.__setattr__(self, "request_tensors", MappingProxyType(dict(self.request_tensors)))
         if self.encoder_cache_entries < 0:
             raise invalid_descriptor("encoder cache capacity must not be negative")
         if self.latent_downsample is not None and self.latent_downsample < 1:
@@ -83,73 +109,16 @@ class ResourceGeometry:
 
 
 @dataclass(frozen=True, slots=True)
-class DedicatedStateGeometry:
-    """Fixed request-state geometry for models with a dedicated execution arena."""
+class ModuleWarmup:
+    """Numerical inputs for one loaded module and optional reusable shape metadata.
 
-    slot_count: int
-    persistent_units: int
-    max_vae_grid_tokens: int
-    rank: int
-    size: int
+    A geometry key must identify the supplied immutable metadata uniquely. The
+    public runner retains that metadata for subsequent request execution.
+    """
 
-    def __post_init__(self) -> None:
-        """Validate slot, persistent-unit, VAE-grid, and rank geometry."""
-
-        if (
-            min(
-                self.slot_count,
-                self.persistent_units,
-                self.max_vae_grid_tokens,
-                self.size,
-            )
-            < 1
-            or not 0 <= self.rank < self.size
-        ):
-            raise invalid_descriptor("dedicated model-state geometry is invalid")
-
-
-@dataclass(frozen=True, slots=True)
-class WorkerDeployment:
-    """Defines device placement, parallel topology, cache geometry, dtype policy, and batch bounds for a model."""
-
-    device: str
-    model_scope: str
-    rank: int
-    world_size: int
-    block_size: int
-    kv_token_capacity: int | None
-    attention_backend: str | None
-    model_dtype: str
-    kv_cache_dtype: str | None
-    kv_memory_fraction: float
-    max_batch_operations: int
-    max_batch_tokens: int
-    max_request_pool_size: int
-    generation_device: str | None
-    output_rank: int = 0
-
-    def __post_init__(self) -> None:
-        """Validate topology axes, device placement, batch bounds, and dtype policies."""
-
-        if not self.device or not self.model_scope:
-            raise invalid_descriptor("worker deployment placement must be named")
-        if self.world_size < 1 or not 0 <= self.rank < self.world_size:
-            raise invalid_descriptor("worker deployment process rank is invalid")
-        if not 0 <= self.output_rank < self.world_size:
-            raise invalid_descriptor("worker deployment output owner is invalid")
-        if (
-            self.block_size < 1
-            or self.max_batch_operations < 1
-            or self.max_batch_tokens < 1
-            or self.max_request_pool_size < 1
-        ):
-            raise invalid_descriptor("worker deployment capacities must be positive")
-        if not 0 < self.kv_memory_fraction <= 1:
-            raise invalid_descriptor("worker deployment KV memory fraction must be in (0, 1]")
-        if self.model_dtype not in _FLOAT_DTYPES:
-            raise invalid_descriptor("worker model dtype is unsupported")
-        if self.kv_cache_dtype is not None and self.kv_cache_dtype not in _KV_DTYPES:
-            raise invalid_descriptor("worker KV dtype is unsupported")
+    name: str
+    inputs: tuple[object, ...]
+    geometry: tuple[Hashable, object] | None = None
 
 
 class ExecutionModel(nn.Module):
@@ -159,46 +128,72 @@ class ExecutionModel(nn.Module):
     serving_dtype: str = "bfloat16"
     cache_geometry: CacheGeometry
     resource_geometry: ResourceGeometry
-    supported_work: frozenset[RunKind]
+    supported_work: frozenset[OpCode]
     vocab_size: int
     hidden_size: int
     text_max_tokens: int
+    max_vit_grid_tokens: int = 0
     text_topology: tuple[str, ...] = ("tp",)
     tensorized_mixed: bool = False
     image_processor: ImageProcessor | None = None
     generation: GenerationPipeline | None = None
     media_profile: str | None = None
+    scratch_schema: Mapping[str, TensorSchema] = MappingProxyType({})
+    context_geometry: AttentionContextGeometry | None = None
+    # Loaded submodules with fixed tensor arguments. The public runner owns
+    # their input storage, capture streams, executables, and output lifetime.
+    capture_inputs: Mapping[str, tuple[TensorSchema, ...]] = MappingProxyType({})
+    # Result declarations contain numerical geometry only. Request identities,
+    # allocation, physical locations and reader lifetimes belong to the runtime.
+    entry_outputs: Mapping[str, tuple[TensorSpec, ...]] = MappingProxyType({})
     supports_weight_updates: bool = True
     ordered_collective_execution: bool = False
-    dedicated_state_geometry: DedicatedStateGeometry | None = None
+    warmup_inputs: (
+        Callable[
+            [
+                tuple[BoundedTensorStorage, ...],
+                BoundedTensorStorage | None,
+                AttentionContextWorkspace | None,
+                DiffusionSchedule | None,
+            ],
+            Iterable[ModuleWarmup],
+        ]
+        | None
+    ) = None
 
-    def warmup(self, context: WarmupContext) -> None:
-        """Run model-owned first-use work before request admission."""
+    def output_layout(
+        self,
+        entry: str,
+        output_index: int,
+        media: MediaGeometry | None,
+        decode: DecodeRange | None,
+    ) -> TensorOutputLayout | None:
+        """Describe numerical result geometry; return None when this rank has no result."""
 
-    def create_media_runtime(self, unresolved_window: int) -> tuple[object | None, object | None]:
-        """Allocate optional model-specific runtime and fixed execution resources."""
+        return TensorOutputLayout()
 
-        return None, None
+    @property
+    def product_storage_bytes(self) -> int:
+        """Per-request persistent storage for the entry's declared Tensor results."""
 
-    def create_request_state(self) -> object | None:
-        """Allocate optional mutable state shared by this model's active requests."""
+        return sum(
+            ((output.max_bytes + 255) // 256) * 256
+            for outputs in self.entry_outputs.values()
+            for output in outputs
+        )
 
-        return None
+    @classmethod
+    def build_checkpoint(
+        cls, config: dict[str, Any], context: ModelBuildContext
+    ) -> ModelConstruction:
+        """Declare checkpoint construction and component ownership for this architecture."""
 
-    def validate_run(self, runtime, batch) -> None:
-        """Validate a model-specific operation batch before execution mutates state."""
+        raise NotImplementedError(f"{cls.__name__} does not declare checkpoint construction")
 
-        return None
+    def checkpoint_components(self) -> tuple[CheckpointComponent, ...]:
+        """Declare resident tensor ownership for architectures supporting weight updates."""
 
-    def run_operation(self, runtime, state) -> bool:
-        """Advance one model-specific operation and report whether it completed."""
-
-        return False
-
-    def synchronize_runtime(self) -> None:
-        """Wait until model-owned asynchronous work is safe to observe on the host."""
-
-        return None
+        raise NotImplementedError(f"{type(self).__name__} does not support checkpoint updates")
 
     def forward(
         self,
@@ -269,10 +264,9 @@ def active_latent_capacity_tokens(
 
 __all__ = [
     "CacheGeometry",
-    "DedicatedStateGeometry",
     "ExecutionModel",
     "PositionLayout",
     "ResourceGeometry",
-    "WorkerDeployment",
+    "WorkerConfig",
     "active_latent_capacity_tokens",
 ]

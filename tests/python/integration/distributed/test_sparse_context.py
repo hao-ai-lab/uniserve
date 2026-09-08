@@ -13,18 +13,10 @@ from uniserve_worker.backends.attention.video_sparse import (
     build_video_sparse_metadata,
     video_sparse_selected_tiles,
 )
-from uniserve_worker.nn.parallel import (
-    Attention2DSequence,
-    GatherSequence,
-    HybridSequence,
-    ParallelConfig,
-    RingSequence,
-)
+from uniserve_worker.nn.parallel import ParallelConfig, SequenceParallel
 from uniserve_worker.nn.parallel_attention import (
-    Attention2D,
-    AttentionContextWorkspace,
-    GatherAttention,
-    RingAttention,
+    AttentionContextGeometry,
+    ParallelAttention,
 )
 from uniserve_worker.runtime.distributed import (
     init_distributed_environment,
@@ -46,11 +38,15 @@ def _run_context(rank: int, rendezvous: str, world_size: int, kind: str) -> None
     )
     ranks = tuple(reversed(range(world_size)))
     if kind == "hybrid":
-        sequence = HybridSequence(2, world_size // 2)
+        sequence = SequenceParallel("hybrid", (2, world_size // 2))
     elif kind == "attention2d":
-        sequence = Attention2DSequence(2, world_size // 2)
+        sequence = SequenceParallel("attention2d", (2, world_size // 2, 1))
     else:
-        sequence = GatherSequence(world_size) if kind == "allgather" else RingSequence(world_size)
+        sequence = (
+            SequenceParallel("allgather", (world_size,))
+            if kind == "allgather"
+            else SequenceParallel("ring", (world_size,))
+        )
     mesh = initialize_model_parallel(
         environment,
         {"denoiser": (ranks, ParallelConfig(sequence_parallel=sequence))},
@@ -81,21 +77,7 @@ def _run_context(rank: int, rendezvous: str, world_size: int, kind: str) -> None
         device=device,
     )
     backend = VideoSparseAttentionBackend(metadata)
-    if kind == "attention2d":
-        attention = Attention2D(
-            backend,
-            ulysses_group=mesh.get_group("ulysses"),
-            row_group=mesh.get_group("cp_row"),
-            col_group=mesh.get_group("cp_col"),
-            context_group=mesh.get_group("cp"),
-        )
-    else:
-        strategy = GatherAttention if kind == "allgather" else RingAttention
-        attention = strategy(
-            backend,
-            ulysses_group=mesh.get_group("ulysses"),
-            context_group=mesh.get_group("cp"),
-        )
+    attention = ParallelAttention(mesh=mesh)
     fine_rows = context_rows
     fine_tiles = fine_rows // 64
     workspace = VideoSparseAttentionWorkspace(
@@ -123,31 +105,39 @@ def _run_context(rank: int, rendezvous: str, world_size: int, kind: str) -> None
             dtype=torch.int32,
         ),
     )
-    exchange = mesh.get_group("ulysses").symmetric_memory(
+    exchange = environment.symmetric_memory(
+        mesh.get_group("ulysses"),
         (local_rows, global_heads, width),
         dtype=torch.bfloat16,
         name="sparse_context_output",
+        layout=(),
     )
     outputs = exchange.peers
     output = exchange.local
     sync_input = torch.zeros(1, device=device, dtype=torch.int32)
     sync_output = torch.empty(mesh.size("ulysses"), device=device, dtype=torch.int32)
     key_group = mesh.get_group("cp_row" if kind == "attention2d" else "cp")
-    context_workspace = AttentionContextWorkspace.allocate(
-        key_group,
-        context_rows * (mesh.size("cp_col") if kind == "attention2d" else 1),
-        heads,
-        mapped=kind != "allgather",
+    context_workspace = environment.attention_context(
+        AttentionContextGeometry(
+            group=key_group,
+            rows=context_rows * (mesh.size("cp_col") if kind == "attention2d" else 1),
+            heads=heads,
+            mapped=kind != "allgather",
+            head_dim=width,
+            dtype=torch.bfloat16,
+            block_size=64,
+        ),
     )
     prefix_indices = torch.arange(prefix, device=device, dtype=torch.int32)
     dense_indices = torch.arange(prefix + video_tiles, device=device, dtype=torch.int32)
     prefix_count = torch.tensor(prefix, device=device, dtype=torch.int32)
 
     def execute():
-        local_query, local_key, local_value, local_gate = attention.exchange_projection(
+        local_query, local_key, local_value, local_gate = attention.exchange_heads(
             projected[begin:end]
         ).unbind(2)
-        return attention(
+        return backend.forward_parallel(
+            attention,
             local_query,
             local_key,
             local_value,

@@ -5,25 +5,22 @@ from __future__ import annotations
 import logging
 import math
 import time
-from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
 
-from ..bootstrap.execution_config import (
-    LaneConfig,
-)
 from ..execution.batch import (
     AttentionRegime,
     BlockTable,
+    BufferAllocation,
     BufferId,
-    BufferPlacement,
     CachePageAllocation,
     Domain,
-    ImageParams,
-    LatentPlacement,
+    LatentParams,
+    ModelOutput,
     NewRequest,
+    OpCode,
     Operation,
     OpStatus,
     ProductKind,
@@ -32,20 +29,19 @@ from ..execution.batch import (
     RequestKey,
     RowGeometry,
     Run,
-    RunKind,
     RunLane,
     RunResult,
     Start,
     StorageClass,
 )
-from ..execution.graph_bucket import GraphBucket
+from ..execution.cuda_graph import FlowCapture, PrefillCapture, select_prefill_captures
+from ..execution.model_runner import capture_image_parameters
 from ..execution.output import (
     finalize_run_result,
     run_result_ready,
 )
 from ..execution.step import (
     execute_startup,
-    parent_runtime,
 )
 from ..foundation.errors import invalid_descriptor
 from ..foundation.math import ceil_div
@@ -64,66 +60,51 @@ class WarmupContext:
     def __init__(self, worker: Worker) -> None:
         """Borrow startup-owned worker resources needed to exercise every execution shape."""
 
-        self._worker = worker
-        self._effective_work_variants = worker._effective_work_variants
-        self._execution = worker._execution
-        self._flow_cfg_branches = worker._flow_cfg_branches
-        self._flow_graph_buckets = worker._flow_graph_buckets
-        self._info = worker._info
-        self._layout = worker._layout
-        self._mixed_buckets = worker._mixed_buckets
-        self._mixed_flow_graph_buckets = worker._mixed_flow_graph_buckets
-        self._prefill_graph_row_sizes = worker._prefill_graph_row_sizes
-        self._prefill_graph_token_sizes = worker._prefill_graph_token_sizes
-        self.cache_pool = worker.cache_pool
-        self.deployment = worker.deployment
-        self.device_products = worker.device_products
-        self.execution = worker.execution
-        self.model = worker.model
-        self.requests = worker.requests
-        self.runner = worker.runner
+        self.worker = worker
         self._warmup_kv_pages: dict[tuple[RequestKey, int], list[int]] = {}
         self._warmup_prefix_pages: dict[RequestKey, list[int]] = {}
         self._warmup_prefix_slots: dict[RequestKey, int] = {}
         self._warmup_latent_pages: dict[RequestKey, list[int]] = {}
-        self._warmup_buffers: dict[int, BufferPlacement] = {}
+        self._warmup_buffers: dict[BufferId, BufferAllocation] = {}
         self._warmup_buffer_free: list[tuple[int, int]] = [
-            (0, int(self._info.buffer_pool_bytes))
+            (0, int(self.worker._info.buffer_pool_bytes))
         ]
         self._warmup_run_id = 0
 
     def drop_request(self, request_id: int) -> None:
         """Release warmup request, runtime, cache, latent, and product state for one identifier."""
 
-        request = self.requests.peek(int(request_id))
-        self._worker.drop_request(request_id)
+        request = self.worker.requests.peek(int(request_id))
+        self.worker.drop_request(request_id)
         if request is None:
             return
-        for group_id in range(0 if self.cache_pool is None else self.cache_pool.group_count):
+        for group_id in range(
+            0 if self.worker.cache_pool is None else self.worker.cache_pool.group_count
+        ):
             self._warmup_kv_pages.pop((request.request_key, group_id), None)
         self._warmup_prefix_pages.pop(request.request_key, None)
         self._warmup_prefix_slots.pop(request.request_key, None)
         self._warmup_latent_pages.pop(request.request_key, None)
         released = tuple(
-            generation
-            for generation, placement in self._warmup_buffers.items()
-            if int(placement.buffer.owner.request_id) == int(request_id)
+            buffer
+            for buffer, allocation in self._warmup_buffers.items()
+            if int(allocation.buffer.owner.request_id) == int(request_id)
         )
-        self._release_buffer_placements(released)
+        self._release_buffer_allocations(released)
 
-    def free_products(self, handles: tuple[int, ...]) -> None:
-        """Release warmup products and recycle their synthetic persistent-buffer placements."""
+    def free_products(self, buffers: tuple[BufferId, ...]) -> None:
+        """Release warmup products and recycle their synthetic persistent-buffer allocations."""
 
-        self._worker.free_products(handles)
-        self._release_buffer_placements(handles)
+        self.worker.free_products(buffers)
+        self._release_buffer_allocations(buffers)
 
-    def _release_buffer_placements(self, generations: tuple[int, ...]) -> None:
-        """Release persistent warmup placements in descending generation order."""
+    def _release_buffer_allocations(self, buffers: tuple[BufferId, ...]) -> None:
+        """Release persistent warmup allocations by exact buffer identity."""
 
-        for generation in generations:
-            placement = self._warmup_buffers.pop(int(generation), None)
-            if placement is not None:
-                self._warmup_buffer_free.append((placement.offset, placement.bytes))
+        for buffer in buffers:
+            allocation = self._warmup_buffers.pop(buffer, None)
+            if allocation is not None:
+                self._warmup_buffer_free.append((allocation.offset, allocation.bytes))
         if not self._warmup_buffer_free:
             return
         merged: list[tuple[int, int]] = []
@@ -135,13 +116,11 @@ class WarmupContext:
                 merged.append((offset, extent))
         self._warmup_buffer_free = merged
 
-    def buffer_placement(self, product: ProductRef) -> BufferPlacement:
+    def buffer_allocation(self, product: ProductRef) -> BufferAllocation:
         """Allocate a deterministic aligned slice of warmup persistent storage for a product."""
 
-        existing = self._warmup_buffers.get(int(product.generation))
+        existing = self._warmup_buffers.get(product.buffer_id)
         if existing is not None:
-            if existing.buffer != product.buffer_id:
-                raise invalid_descriptor("warmup buffer generation has conflicting identity")
             return existing
         alignment = 256
         required = int(product.max_bytes)
@@ -156,138 +135,10 @@ class WarmupContext:
             if end < offset + extent:
                 replacement.append((end, offset + extent - end))
             self._warmup_buffer_free[index : index + 1] = replacement
-            placement = BufferPlacement(product.buffer_id, aligned, required)
-            self._warmup_buffers[int(product.generation)] = placement
-            return placement
-        raise invalid_descriptor("warmup persistent buffer placement exceeds resident capacity")
-
-
-@dataclass(frozen=True, slots=True)
-class _FlowGraphBucket:
-    """Defines a denoise graph bucket by rows, media geometry, and CFG branch count."""
-
-    rows: int
-    height: int
-    width: int
-    cfg_branches: int
-
-
-@dataclass(frozen=True, slots=True)
-class _FlowPrefixGraphBucket:
-    """Defines a flow-prefix graph bucket by rows, CFG branches, and prefix lengths."""
-
-    rows: int
-    cfg_branches: int
-    prefix_lengths: tuple[int, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class _PagedPrefillGraphBucket:
-    """Defines a paged-prefill graph bucket by token capacity, row capacity, and live rows."""
-
-    token_bucket: int
-    row_bucket: int
-    live_rows: int
-
-
-def _flow_graph_executable(bucket: _FlowGraphBucket) -> tuple[object, ...]:
-    """Return whether a flow bucket has every required captured graph."""
-
-    return (
-        "flow",
-        bucket.rows * bucket.cfg_branches,
-        bucket.height,
-        bucket.width,
-    )
-
-
-def _flow_prefix_graph_executable(bucket: _FlowPrefixGraphBucket) -> tuple[object, ...]:
-    """Return whether a flow-prefix bucket has every branch graph."""
-
-    return (
-        "flow_prefix",
-        bucket.prefix_lengths * bucket.rows,
-    )
-
-
-def _mixed_flow_graph_executable(
-    bucket: GraphBucket,
-) -> tuple[object, ...]:
-    """Return whether a mixed flow bucket has all branch and final graphs."""
-
-    return (
-        "decode_flow",
-        bucket.decode_rows,
-        bucket.flow_rows * bucket.cfg_branches,
-        bucket.height,
-        bucket.width,
-    )
-
-
-def _paged_prefill_graph_buckets(
-    token_sizes: Sequence[int],
-    row_sizes: Sequence[int],
-    *,
-    max_rows: int,
-    max_tokens: int,
-) -> tuple[_PagedPrefillGraphBucket, ...]:
-    """Pair row and token graph buckets that can represent bounded paged prefill shapes."""
-
-    buckets: list[_PagedPrefillGraphBucket] = []
-    minimum_rows = 1
-    for row_bucket in sorted({int(value) for value in row_sizes if int(value) > 1}):
-        if minimum_rows > int(max_rows):
-            break
-        minimum_tokens = minimum_rows if minimum_rows == 1 else minimum_rows + 1
-        for token_bucket in sorted(
-            {int(value) for value in token_sizes if minimum_tokens <= int(value) <= int(max_tokens)}
-        ):
-            buckets.append(
-                _PagedPrefillGraphBucket(
-                    token_bucket=token_bucket,
-                    row_bucket=row_bucket,
-                    live_rows=minimum_rows,
-                )
-            )
-        minimum_rows = row_bucket
-    return tuple(buckets)
-
-
-def _startup_image_parameters(
-    cfg_branches: int,
-    *,
-    steps: int,
-    height: int,
-    width: int,
-) -> ImageParams:
-    """Build deterministic bounded image-generation parameters for startup warmup."""
-
-    scales = {
-        1: (1.0, 1.0),
-        2: (4.0, 1.0),
-        3: (4.0, 2.0),
-    }
-    try:
-        text_scale, image_scale = scales[int(cfg_branches)]
-    except KeyError as error:
-        raise invalid_descriptor(
-            "flow CFG branch geometry exceeds the concrete branch set"
-        ) from error
-    return ImageParams(
-        steps=int(steps),
-        cfg_text_scale=text_scale,
-        cfg_img_scale=image_scale,
-        height=int(height),
-        width=int(width),
-        seed=0,
-    )
-
-
-def _has_decode_flow_lane(lanes: tuple[LaneConfig, ...]) -> bool:
-    """Return whether one physical lane can run tensorized decode+flow."""
-
-    required = {Domain.DECODE, Domain.FLOW}
-    return not lanes or any(required <= set(lane.domains) for lane in lanes)
+            allocation = BufferAllocation(product.buffer_id, aligned, required)
+            self._warmup_buffers[product.buffer_id] = allocation
+            return allocation
+        raise invalid_descriptor("warmup persistent buffer allocation exceeds resident capacity")
 
 
 def _warmup_batch(
@@ -298,23 +149,19 @@ def _warmup_batch(
     block_tables: dict[tuple[RequestKey, int], tuple[BlockTable, ...]],
     new_cache_pages: dict[tuple[RequestKey, int], tuple[CachePageAllocation, ...]],
     forward_rows: dict[tuple[RequestKey, int], tuple[RowGeometry, ...]],
-    latent_placements: dict[tuple[RequestKey, int], LatentPlacement],
-    buffer_placements: tuple[BufferPlacement, ...],
+    latent_params: dict[tuple[RequestKey, int], LatentParams],
+    buffer_allocations: tuple[BufferAllocation, ...],
     input_products: tuple[ProductPayload, ...] = (),
     tensorized_mixed: bool = False,
 ) -> Run:
-    """Assemble warmup operations into domain lanes with their physical placements."""
+    """Assemble warmup operations into domain lanes with their physical allocations."""
 
     # Preserve operation order within each execution domain while assigning a
     # shared launch identity only for tensorized mixed qualification.
     groups: list[tuple[Domain, int, list[Operation]]] = []
     for operation in operations:
         existing = next(
-            (
-                members
-                for domain, _route, members in groups
-                if domain is operation.domain
-            ),
+            (members for domain, _route, members in groups if domain is operation.domain),
             None,
         )
         if existing is None:
@@ -356,21 +203,21 @@ def _warmup_batch(
                 for operation_index, operation in enumerate(members)
                 for row in forward_rows.get((operation.request_key, operation.op_id), ())
             ),
-            latent_placements=tuple(
-                latent_placements[(operation.request_key, operation.op_id)]
+            latent_params=tuple(
+                latent_params[(operation.request_key, operation.op_id)]
                 for operation in members
                 if operation.kind
                 in {
-                    RunKind.DIFFUSION_PREPARE,
-                    RunKind.DIFFUSION_STEP,
-                    RunKind.DIFFUSION_FINALIZE,
+                    OpCode.DIFFUSION_PREPARE,
+                    OpCode.DIFFUSION_STEP,
+                    OpCode.DIFFUSION_FINALIZE,
                 }
             ),
-            buffer_placements=tuple(
-                placement
-                for placement in buffer_placements
+            buffer_allocations=tuple(
+                allocation
+                for allocation in buffer_allocations
                 if any(
-                    product.buffer_id == placement.buffer
+                    product.buffer_id == allocation.buffer
                     for operation in members
                     for product in (
                         *operation.inputs,
@@ -432,22 +279,24 @@ def _execute_warmup(
 ) -> RunResult:
     """Execute a synthetic run and optionally retain outputs or catalog captured graphs."""
 
-    report = execute_startup(self.execution, batch, catalog_graphs=catalog_graphs)
+    report = execute_startup(self.worker, batch, catalog_graphs=catalog_graphs)
     while not run_result_ready(report):
         time.sleep(0.00005)
     finalized = finalize_run_result(report)
-    device_generations = tuple(
-        int(output.generation)
+    device_buffers = tuple(
+        output.buffer_id
         for operation in batch.operations
         for output in operation.outputs
-        if output.storage_class
-        in {StorageClass.DEVICE_TENSOR, StorageClass.REQUEST_RELAY}
+        if output.storage_class in {StorageClass.DEVICE_TENSOR, StorageClass.REQUEST_RELAY}
     )
-    failures = tuple(
-        completion for completion in finalized.completions if completion.status is OpStatus.ERROR
-    )
+    failures: list[ModelOutput] = []
+    for completion in finalized.completions:
+        if not isinstance(completion, ModelOutput):
+            raise RuntimeError("finalized warmup result retains unresolved device output")
+        if completion.status is OpStatus.ERROR:
+            failures.append(completion)
     if failures or not retain_device_outputs:
-        self.free_products(device_generations)
+        self.free_products(device_buffers)
     if failures:
         details = ", ".join(
             f"request={completion.request_key.request_id} op={completion.op_id} "
@@ -467,7 +316,7 @@ def _build_warmup_batch(
     tensorized_mixed: bool = False,
     image_geometry: tuple[int, int] | None = None,
 ) -> Run:
-    """Derive cache, latent, buffer, and row placements for a warmup submission."""
+    """Derive cache, latent, buffer, and row allocations for a warmup submission."""
 
     self._warmup_run_id += 1
     admissions_by_key = {admission.request_key: admission for admission in admissions}
@@ -476,9 +325,9 @@ def _build_warmup_batch(
     block_tables: dict[tuple[RequestKey, int], tuple[BlockTable, ...]] = {}
     new_cache_pages: dict[tuple[RequestKey, int], tuple[CachePageAllocation, ...]] = {}
     forward_rows: dict[tuple[RequestKey, int], tuple[RowGeometry, ...]] = {}
-    latent_placements: dict[tuple[RequestKey, int], LatentPlacement] = {}
-    buffer_placements: dict[BufferId, BufferPlacement] = {}
-    # Persistent products reserve stable buffer placements before lane construction.
+    latent_params: dict[tuple[RequestKey, int], LatentParams] = {}
+    buffer_allocations: dict[BufferId, BufferAllocation] = {}
+    # Persistent products reserve stable buffer allocations before lane construction.
     for operation in operations:
         for product in (
             *operation.inputs,
@@ -487,11 +336,11 @@ def _build_warmup_batch(
         ):
             if not product.uses_persistent_buffer():
                 continue
-            placement = self.buffer_placement(product)
-            buffer_placements[placement.buffer] = placement
+            allocation = self.buffer_allocation(product)
+            buffer_allocations[allocation.buffer] = allocation
     # Bind request slots and grow reusable KV leases to each operation's maximum shape.
     for operation in operations:
-        request = self.requests.peek(int(operation.request_key.request_id))
+        request = self.worker.requests.peek(int(operation.request_key.request_id))
         admission = admissions_by_key.get(operation.request_key)
         if request is None and admission is None:
             raise invalid_descriptor("warmup operation has no request-pool binding")
@@ -501,13 +350,13 @@ def _build_warmup_batch(
         else:
             request_pool_indices[operation.request_key] = request.request_pool_idx
         if operation.kind not in {
-            RunKind.AR_EXTEND,
-            RunKind.AR_DECODE,
-            RunKind.AR_VERIFY,
-            RunKind.TRANSFER_KV_PUBLISH,
-            RunKind.TRANSFER_KV_INSTALL,
-            RunKind.DIFFUSION_PREPARE,
-            RunKind.DIFFUSION_STEP,
+            OpCode.AR_EXTEND,
+            OpCode.AR_DECODE,
+            OpCode.AR_VERIFY,
+            OpCode.TRANSFER_KV_PUBLISH,
+            OpCode.TRANSFER_KV_INSTALL,
+            OpCode.DIFFUSION_PREPARE,
+            OpCode.DIFFUSION_STEP,
         }:
             continue
         if (
@@ -519,37 +368,39 @@ def _build_warmup_batch(
             raise invalid_descriptor("warmup KV admission requires an empty prefix")
         visible = 0
         if request is not None:
-            runtime = parent_runtime(self.execution, operation, request)
+            runtime = request.parent_runtime(operation.parent)
             visible = int(runtime.kv_visible_len)
         input_length = (
             int(operation.bounds.max_tokens)
             if operation.kind
             in {
-                RunKind.AR_EXTEND,
-                RunKind.AR_DECODE,
-                RunKind.AR_VERIFY,
+                OpCode.AR_EXTEND,
+                OpCode.AR_DECODE,
+                OpCode.AR_VERIFY,
             }
             else 0
         )
         tables: list[BlockTable] = []
         allocations: list[CachePageAllocation] = []
-        for group_id in range(self.cache_pool.group_count):
+        if self.worker.cache_pool is None:
+            raise invalid_descriptor("warmup KV operation requires cache storage")
+        for group_id in range(self.worker.cache_pool.group_count):
             lease_key = (operation.request_key, group_id)
             block_table = self._warmup_kv_pages.setdefault(lease_key, [])
             target_pages = ceil_div(
                 visible + input_length,
-                int(self.cache_pool.block_size),
+                int(self.worker.cache_pool.block_size),
             )
             missing = target_pages - len(block_table)
             if missing < 0:
                 raise invalid_descriptor("warmup operation regresses its KV capacity")
             allocated = tuple(
                 candidate
-                for candidate in self.cache_pool.page_ids(group_id)
+                for candidate in self.worker.cache_pool.page_ids(group_id)
                 if candidate not in occupied_blocks
             )[:missing]
             if len(allocated) != missing:
-                raise invalid_descriptor("warmup KV placement exceeds resident capacity")
+                raise invalid_descriptor("warmup KV allocation exceeds resident capacity")
             block_table.extend(allocated)
             occupied_blocks.update(allocated)
             tables.append(
@@ -557,7 +408,7 @@ def _build_warmup_batch(
                     request_pool_idx=request_pool_indices[operation.request_key],
                     group_id=group_id,
                     page_ids=tuple(block_table),
-                    allocated_tokens=len(block_table) * self.cache_pool.block_size,
+                    allocated_tokens=len(block_table) * self.worker.cache_pool.block_size,
                 )
             )
             if allocated:
@@ -578,39 +429,40 @@ def _build_warmup_batch(
                     request_pool_index=request_pool_indices[operation.request_key],
                     seq_len=visible,
                     query_len=input_length,
+                    write_kv=True,
                 ),
             )
     height, width = image_geometry or _warmup_image_geometry(self)
     latent_units = max(
         1,
-        (height // max(1, int(self._layout.latent_downsample)))
-        * (width // max(1, int(self._layout.latent_downsample))),
+        (height // max(1, int(self.worker._layout.latent_downsample)))
+        * (width // max(1, int(self.worker._layout.latent_downsample))),
     )
-    page_units = int(self._info.latent_page_units)
+    page_units = int(self.worker._info.latent_page_units)
     latent_page_count = (latent_units + page_units - 1) // page_units if page_units > 0 else 0
     occupied_latent_pages = {page for pages in self._warmup_latent_pages.values() for page in pages}
     for operation in operations:
         if operation.kind not in {
-            RunKind.DIFFUSION_PREPARE,
-            RunKind.DIFFUSION_STEP,
+            OpCode.DIFFUSION_PREPARE,
+            OpCode.DIFFUSION_STEP,
         } and not any(product.kind is ProductKind.LATENT for product in operation.inputs):
             continue
         page_table = self._warmup_latent_pages.setdefault(operation.request_key, [])
         missing = latent_page_count - len(page_table)
         if missing < 0:
-            raise invalid_descriptor("warmup latent placement regresses its physical extent")
+            raise invalid_descriptor("warmup latent allocation regresses its physical extent")
         allocated = tuple(
             page
-            for page in range(1, int(self._info.latent_pages))
+            for page in range(1, int(self.worker._info.latent_pages))
             if page not in occupied_latent_pages
         )[:missing]
         if len(allocated) != missing:
-            raise invalid_descriptor("warmup latent placement exceeds resident capacity")
+            raise invalid_descriptor("warmup latent allocation exceeds resident capacity")
         page_table.extend(allocated)
         occupied_latent_pages.update(allocated)
-        request = self.requests.peek(int(operation.request_key.request_id))
+        request = self.worker.requests.peek(int(operation.request_key.request_id))
         start_step = 0 if request is None else int(request.flow_step)
-        latent_placements[(operation.request_key, operation.op_id)] = LatentPlacement(
+        latent_params[(operation.request_key, operation.op_id)] = LatentParams(
             request_key=operation.request_key,
             op_id=operation.op_id,
             page_table=tuple(page_table),
@@ -619,12 +471,10 @@ def _build_warmup_batch(
             width=width,
             start_step=start_step,
             step_count=(
-                int(operation.bounds.max_tokens)
-                if operation.kind is RunKind.DIFFUSION_STEP
-                else 0
+                int(operation.bounds.max_tokens) if operation.kind is OpCode.DIFFUSION_STEP else 0
             ),
         )
-        if operation.kind is RunKind.DIFFUSION_STEP:
+        if operation.kind is OpCode.DIFFUSION_STEP:
             extra_tables, extra_allocations, flow_rows = _warmup_flow_tables(
                 self,
                 operation,
@@ -646,8 +496,8 @@ def _build_warmup_batch(
         block_tables=block_tables,
         new_cache_pages=new_cache_pages,
         forward_rows=forward_rows,
-        latent_placements=latent_placements,
-        buffer_placements=tuple(buffer_placements.values()),
+        latent_params=latent_params,
+        buffer_allocations=tuple(buffer_allocations.values()),
         input_products=input_products,
         tensorized_mixed=tensorized_mixed,
     )
@@ -666,9 +516,9 @@ def _warmup_flow_tables(
 ]:
     """Build alternative-prefix KV tables and forward rows for all active CFG branches."""
 
-    request = self.requests.get(operation.request_key.request_id)
+    request = self.worker.requests.get(operation.request_key.request_id)
     image = request.image
-    generation = self.model.generation
+    generation = self.worker.model.generation
     if image is None or generation is None:
         raise invalid_descriptor("generation warmup has no admitted image runtime")
     guide = build_flow_cfg_plan(
@@ -679,7 +529,7 @@ def _warmup_flow_tables(
         renorm_min=float(image.cfg_renorm_min),
         use_cfg=True,
     )
-    runtime = parent_runtime(self.execution, operation, request)
+    runtime = request.parent_runtime(operation.parent)
     query = generation.physical_tokens(height, width)
     image_prompt = image.image_prompts[0] if image.image_prompts else ""
     # Branches either reuse the conditioned request slot or share one alternative prefix.
@@ -690,7 +540,7 @@ def _warmup_flow_tables(
             image_prompt=image_prompt,
             negative_prompt=image.negative_prompt,
             negative_token_ids=request.negative_token_ids,
-            tokenizer=self.execution.tokenizer,
+            tokenizer=self.worker.tokenizer,
         )
         branch_prefixes.append((prefix, copy_conditioning))
     alternatives = {
@@ -699,7 +549,9 @@ def _warmup_flow_tables(
     if len(alternatives) > 1:
         raise invalid_descriptor("warmup flow has multiple distinct alternative prefixes")
     alternative = next(iter(alternatives), ())
-    required = ceil_div(len(alternative), self.cache_pool.block_size)
+    if self.worker.cache_pool is None:
+        raise invalid_descriptor("warmup flow requires KV cache storage")
+    required = ceil_div(len(alternative), self.worker.cache_pool.block_size)
     lease = self._warmup_prefix_pages.setdefault(operation.request_key, [])
     missing = required - len(lease)
     occupied = {
@@ -710,7 +562,7 @@ def _warmup_flow_tables(
     }
     occupied.update(page for pages in self._warmup_kv_pages.values() for page in pages)
     # Prefix pages persist across warmup shapes so graph capture observes stable tables.
-    allocated = tuple(page for page in self.cache_pool.page_ids(0) if page not in occupied)[
+    allocated = tuple(page for page in self.worker.cache_pool.page_ids(0) if page not in occupied)[
         :missing
     ]
     if len(allocated) != missing:
@@ -723,7 +575,7 @@ def _warmup_flow_tables(
     if alternative:
         alternative_slot = self._warmup_prefix_slots.setdefault(
             operation.request_key,
-            int(self._info.request_slots) - len(self._warmup_prefix_slots),
+            int(self.worker._info.request_slots) - len(self._warmup_prefix_slots),
         )
         if alternative_slot == main_slot or alternative_slot < 1:
             raise invalid_descriptor("warmup has no request slot for an alternative prefix")
@@ -732,7 +584,7 @@ def _warmup_flow_tables(
                 request_pool_idx=alternative_slot,
                 group_id=0,
                 page_ids=tuple(lease),
-                allocated_tokens=len(lease) * self.cache_pool.block_size,
+                allocated_tokens=len(lease) * self.worker.cache_pool.block_size,
             ),
         )
         if allocated:
@@ -749,6 +601,7 @@ def _warmup_flow_tables(
                 request_pool_index=alternative_slot,
                 seq_len=0,
                 query_len=len(alternative),
+                write_kv=True,
             )
         )
     # Emit row geometry in exact guidance-branch evaluation order.
@@ -759,6 +612,7 @@ def _warmup_flow_tables(
                 request_pool_index=main_slot if copy_conditioning else alternative_slot,
                 seq_len=int(runtime.kv_visible_len) if copy_conditioning else len(prefix),
                 query_len=query,
+                write_kv=False,
             )
         )
     return tables, allocations, tuple(rows)
@@ -775,16 +629,16 @@ def warmup(self: WarmupContext) -> None:
     """
 
     product_devices = (
-        self.deployment.device,
-        self.deployment.generation_device or self.deployment.device,
+        self.worker.worker_config.device,
+        self.worker.worker_config.generation_device or self.worker.worker_config.device,
     )
-    self.device_products.warmup_scattered_publication(product_devices)
-    if torch.device(self.deployment.device).type == "cuda":
+    self.worker.device_products.warmup_scattered_publication(product_devices)
+    if torch.device(self.worker.worker_config.device).type == "cuda":
         _warmup_sequence(self)
         logger.info("completed token CUDA graph warmup")
         _warmup_flow(self)
         logger.info("completed flow CUDA graph warmup")
-    elif self._mixed_buckets:
+    elif self.worker.runner.mixed_captures:
         _warmup_flow(self)
         logger.info("completed mixed execution warmup")
 
@@ -794,10 +648,10 @@ def _warmup_image_geometry(self: WarmupContext) -> tuple[int, int]:
 
     import math
 
-    downsample = max(1, int(self._layout.latent_downsample))
-    capacity = int(self._info.latent_capacity_units)
-    if int(self._layout.max_vae_grid_tokens) > 0:
-        capacity = min(capacity, int(self._layout.max_vae_grid_tokens))
+    downsample = max(1, int(self.worker._layout.latent_downsample))
+    capacity = int(self.worker._info.latent_capacity_units)
+    if int(self.worker._layout.max_vae_grid_tokens) > 0:
+        capacity = min(capacity, int(self.worker._layout.max_vae_grid_tokens))
     side = max(1, math.isqrt(max(1, capacity)))
     return side * downsample, side * downsample
 
@@ -833,26 +687,28 @@ def _warmup_sequence(self: WarmupContext) -> None:
         encode_token_product_bytes,
     )
 
-    variants = self._effective_work_variants
-    if RunKind.AR_EXTEND not in variants:
+    variants = self.worker._effective_work_variants
+    if OpCode.AR_EXTEND not in variants:
         return
-    pool = self.cache_pool
-    if self.requests.request_ids():
+    pool = self.worker.cache_pool
+    if pool is None:
+        raise invalid_descriptor("autoregressive warmup requires KV cache storage")
+    if self.worker.requests.request_ids():
         return
-    if self._execution.cuda_graph and self._execution.prefill_cuda_graph:
+    if self.worker.worker_config.cuda_graph and self.worker.worker_config.prefill_cuda_graph:
         _warmup_prefill_graphs(self)
     configured = (
         tuple(
             sorted(
                 {
                     batch_size
-                    for lane_runtime in self.runner.execution_lanes
+                    for lane_runtime in self.worker.runner.execution_lanes
                     if Domain.DECODE in lane_runtime.domains
                     for batch_size in lane_runtime.graphs.decode_batch_sizes
                 }
             )
         )
-        if (self._execution.cuda_graph and RunKind.AR_DECODE in variants)
+        if (self.worker.worker_config.cuda_graph and OpCode.AR_DECODE in variants)
         else (1,)
     )
     batch_sizes = tuple(
@@ -906,7 +762,7 @@ def _warmup_sequence(self: WarmupContext) -> None:
             request_key=keys[sid],
             op_id=op_id,
             parent=parent,
-            kind=RunKind.AR_EXTEND,
+            kind=OpCode.AR_EXTEND,
             bounds=Bounds(max_points=1, max_tokens=max(1, len(tokens))),
             inputs=(token_ref,),
             outputs=outputs,
@@ -931,7 +787,7 @@ def _warmup_sequence(self: WarmupContext) -> None:
                 predecessor.op_id,
                 DeviceSelected(),
             ),
-            kind=RunKind.AR_DECODE,
+            kind=OpCode.AR_DECODE,
             bounds=Bounds(max_points=1, max_tokens=1),
             outputs=outputs,
             predicate=token_output,
@@ -956,12 +812,12 @@ def _warmup_sequence(self: WarmupContext) -> None:
                 operations=tuple(operations),
                 input_products=tuple(payloads),
             ),
-            retain_device_outputs=RunKind.AR_DECODE in variants,
+            retain_device_outputs=OpCode.AR_DECODE in variants,
         )
         predecessors.update(zip(request_ids, operations, strict=True))
-        if RunKind.AR_DECODE not in variants:
+        if OpCode.AR_DECODE not in variants:
             return
-        repeats = 2 if self._execution.cuda_graph else 1
+        repeats = 2 if self.worker.worker_config.cuda_graph else 1
         for _ in range(repeats):
             for batch_size in batch_sizes:
                 selected = request_ids[:batch_size]
@@ -980,7 +836,7 @@ def _warmup_sequence(self: WarmupContext) -> None:
                 )
                 self.free_products(
                     tuple(
-                        int(output.generation)
+                        output.buffer_id
                         for sid in selected
                         for output in predecessors[sid].outputs
                         if output.storage_class
@@ -989,7 +845,7 @@ def _warmup_sequence(self: WarmupContext) -> None:
                 )
                 predecessors.update(zip(selected, operations, strict=True))
     finally:
-        device = torch.device(self.deployment.device)
+        device = torch.device(self.worker.worker_config.device)
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         for sid in request_ids:
@@ -1019,29 +875,35 @@ def _warmup_prefill_graphs(self: WarmupContext) -> None:
         encode_token_product_bytes,
     )
 
-    pool = self.cache_pool
-    if self.requests.request_ids():
+    pool = self.worker.cache_pool
+    if pool is None:
+        raise invalid_descriptor("prefill warmup requires KV cache storage")
+    if self.worker.requests.request_ids():
         return
-    max_route_tokens = int(self.model.text_max_tokens)
+    max_route_tokens = int(self.worker.model.text_max_tokens)
     capacity = min(
         max_route_tokens,
         max(0, int(pool.num_pages) - 1) * int(pool.block_size),
     )
     token_buckets = tuple(
         sorted(
-            {int(value) for value in self._prefill_graph_token_sizes if 0 < int(value) <= capacity},
+            {
+                int(value)
+                for value in self.worker.runner.prefill_tokens
+                if 0 < int(value) <= capacity
+            },
             reverse=True,
         )
     )
     if not token_buckets:
         return
     catalog = (
-        tuple(_PagedPrefillGraphBucket(value, 1, 1) for value in token_buckets)
-        if self.model.tensorized_mixed
-        else _paged_prefill_graph_buckets(
+        tuple(PrefillCapture(value, 1, 1) for value in token_buckets)
+        if self.worker.model.tensorized_mixed
+        else select_prefill_captures(
             token_buckets,
-            self._prefill_graph_row_sizes,
-            max_rows=int(self._info.request_slots),
+            self.worker.runner.prefill_rows,
+            max_rows=int(self.worker._info.request_slots),
             max_tokens=capacity,
         )
     )
@@ -1096,7 +958,7 @@ def _warmup_prefill_graphs(self: WarmupContext) -> None:
                         request_key=rk,
                         op_id=1,
                         parent=Checkpoint(0, FixedCheckpoint(0)),
-                        kind=RunKind.AR_EXTEND,
+                        kind=OpCode.AR_EXTEND,
                         bounds=Bounds(max_points=1, max_tokens=token_count),
                         inputs=(token_ref,),
                         outputs=_warmup_token_outputs(rk, 1, 2),
@@ -1152,18 +1014,20 @@ def _warmup_flow(self: WarmupContext) -> None:
         encode_token_product_bytes,
     )
 
-    generation = self.model.generation
+    generation = self.worker.model.generation
     if not {
-        RunKind.DIFFUSION_PREPARE,
-        RunKind.DIFFUSION_STEP,
-    }.issubset(self._effective_work_variants) or not isinstance(generation, GenerationPipeline):
+        OpCode.DIFFUSION_PREPARE,
+        OpCode.DIFFUSION_STEP,
+    }.issubset(self.worker._effective_work_variants) or not isinstance(
+        generation, GenerationPipeline
+    ):
         return
-    if self.requests.request_ids():
+    if self.worker.requests.request_ids():
         return
     # Largest buckets run first so resident graph memory pressure is resolved early.
     configured = tuple(
         sorted(
-            self._flow_graph_buckets,
+            self.worker.runner.flow_captures,
             key=lambda value: (
                 value.rows * value.height * value.width * value.cfg_branches,
                 value.rows,
@@ -1175,12 +1039,12 @@ def _warmup_flow(self: WarmupContext) -> None:
         )
     )
     if not configured:
-        if self._execution.cuda_graph:
+        if self.worker.worker_config.cuda_graph:
             return
         height, width = _warmup_image_geometry(self)
         configured = tuple(
-            _FlowGraphBucket(1, height, width, cfg_branches)
-            for cfg_branches in self._flow_cfg_branches
+            FlowCapture(1, height, width, cfg_branches)
+            for cfg_branches in self.worker._flow_cfg_branches
         )
     # Warmup identities and generations are private to this bounded startup sequence.
     next_request_id = 1
@@ -1190,18 +1054,22 @@ def _warmup_flow(self: WarmupContext) -> None:
         height = bucket.height
         width = bucket.width
         cfg_branches = bucket.cfg_branches
-        if batch_size > int(self._info.request_slots):
+        if batch_size > int(self.worker._info.request_slots):
             continue
         mixed_text_sizes = tuple(
             mixed.decode_rows
-            for mixed in self._mixed_flow_graph_buckets
+            for mixed in self.worker.runner.mixed_captures
             if mixed.flow_rows == batch_size
             and mixed.height == height
             and mixed.width == width
             and mixed.cfg_branches == cfg_branches
-            and mixed.decode_rows + batch_size <= int(self._info.request_slots)
+            and mixed.decode_rows + batch_size <= int(self.worker._info.request_slots)
         )
-        mixed_rounds = 3 if self._execution.cuda_graph and self._execution.prefill_cuda_graph else 1
+        mixed_rounds = (
+            3
+            if self.worker.worker_config.cuda_graph and self.worker.worker_config.prefill_cuda_graph
+            else 1
+        )
         request_ids = tuple(range(next_request_id, next_request_id + batch_size))
         next_request_id += batch_size
         keys = tuple(RequestKey(0, request_id, 1) for request_id in request_ids)
@@ -1210,7 +1078,7 @@ def _warmup_flow(self: WarmupContext) -> None:
                 key,
                 request_pool_idx=index,
                 umm=UmmRequestParams(
-                    image=_startup_image_parameters(
+                    image=capture_image_parameters(
                         cfg_branches,
                         steps=2 + mixed_rounds * len(mixed_text_sizes),
                         height=height,
@@ -1260,7 +1128,7 @@ def _warmup_flow(self: WarmupContext) -> None:
                     request_key=key,
                     op_id=1,
                     parent=root,
-                    kind=RunKind.TRANSFER_KV_PUBLISH,
+                    kind=OpCode.TRANSFER_KV_PUBLISH,
                     bounds=Bounds(max_points=1, max_transfer_bytes=1 << 20),
                     outputs=(conditioning,),
                 )
@@ -1303,7 +1171,7 @@ def _warmup_flow(self: WarmupContext) -> None:
                             0,
                             FixedCheckpoint(0),
                         ),
-                        kind=RunKind.AR_EXTEND,
+                        kind=OpCode.AR_EXTEND,
                         bounds=Bounds(max_points=1, max_tokens=1),
                         inputs=(token_ref,),
                         outputs=prompt_outputs,
@@ -1367,7 +1235,7 @@ def _warmup_flow(self: WarmupContext) -> None:
                         request_key=key,
                         op_id=2,
                         parent=root,
-                        kind=RunKind.DIFFUSION_PREPARE,
+                        kind=OpCode.DIFFUSION_PREPARE,
                         bounds=Bounds(
                             max_points=1,
                             max_tokens=1,
@@ -1420,7 +1288,7 @@ def _warmup_flow(self: WarmupContext) -> None:
                                 flow_predecessors[request_id].op_id,
                                 DeviceSelected(),
                             ),
-                            kind=RunKind.DIFFUSION_STEP,
+                            kind=OpCode.DIFFUSION_STEP,
                             bounds=Bounds(
                                 max_points=1,
                                 max_tokens=1,
@@ -1467,7 +1335,7 @@ def _warmup_flow(self: WarmupContext) -> None:
                                     predecessor.op_id,
                                     DeviceSelected(),
                                 ),
-                                kind=RunKind.AR_DECODE,
+                                kind=OpCode.AR_DECODE,
                                 bounds=Bounds(max_points=1, max_tokens=1),
                                 outputs=token_outputs,
                                 predicate=token_output,
@@ -1504,7 +1372,7 @@ def _warmup_flow(self: WarmupContext) -> None:
                                     flow_predecessors[request_id].op_id,
                                     DeviceSelected(),
                                 ),
-                                kind=RunKind.DIFFUSION_STEP,
+                                kind=OpCode.DIFFUSION_STEP,
                                 bounds=Bounds(
                                     max_points=1,
                                     max_tokens=1,
@@ -1528,7 +1396,7 @@ def _warmup_flow(self: WarmupContext) -> None:
                     )
                     self.free_products(
                         tuple(
-                            int(output.generation)
+                            output.buffer_id
                             for request_id in selected_text
                             for output in text_predecessors[request_id].outputs
                             if output.storage_class

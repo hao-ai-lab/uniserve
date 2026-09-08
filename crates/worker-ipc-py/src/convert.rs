@@ -17,14 +17,14 @@ use uniserve_core::{ImageParams, SamplingParams};
 #[cfg(test)]
 use uniserve_worker_ipc::MediaGeometry;
 use uniserve_worker_ipc::{
-    ArRequestParams, ArtifactHandle, BatchCommand, BlockTable, BufferId, BufferPlacement,
-    CachePageAllocation, Checkpoint, CheckpointPoint, CloseReason, DType, DecodePlacement,
+    ArRequestParams, ArtifactHandle, BatchCommand, BlockTable, BufferAllocation, BufferId,
+    CachePageAllocation, Checkpoint, CheckpointPoint, CloseReason, DType, DecodeRange,
     DiffusionRequestParams, DiffusionResult, DimBound, Disposition, DrawLayout, ErrorCode,
-    ErrorOperationIdentity, FinishFlags, InlineValue, LatentPlacement, LogicalLengths, MediaOutput,
-    ModelOutput, NewRequest, OpId, OpPayload, OpStatus, Operation, PointRange, ProductKind,
-    ProductPayload, ProductRef, RegistrationAck, RequestKey, RequestKind, ResultData,
-    ResultPayload, RowGeometry, Run, RunKind, RunResult, ShapeBound, StorageClass, TimingCounters,
-    TokenSpan, TransferHandle, TransferLocator, TransferTransport, UmmRequestParams,
+    ErrorOperationIdentity, FinishFlags, InlineValue, LatentParams, Locator, LogicalLengths,
+    MediaOutput, ModelOutput, NewRequest, OpCode, OpId, OpStatus, Operation, PointRange,
+    ProductKind, ProductPayload, ProductRef, RegistrationAck, RequestKey, RequestKind, ResultData,
+    ResultPayload, RowGeometry, Run, RunResult, ShapeBound, StorageClass, TensorTransfer,
+    TimingCounters, TokenSpan, TransferHandle, TransferTransport, UmmRequestParams, WorkerEndpoint,
     WorkerForwardStats, WorkerRequest, WorkerResponse, WorkerResponseError,
 };
 
@@ -51,17 +51,14 @@ pub(crate) fn execute_request_to_py<'py>(
 /// Cached handles to the worker's operation types and enum members.
 ///
 /// The serve loop constructs one `Run` object per submission; every hot
-/// record (operations, KV placements, commit/close/release controls) is built
+/// record (operations, KV allocations, commit/close/release controls) is built
 /// by calling the operation dataclass constructors positionally, so the worker
 /// never re-decodes those records from IPC maps. Rare members (admissions,
-/// input products and placements) still cross as IPC maps and are decoded by
+/// input products and allocations) still cross as IPC maps and are decoded by
 /// `native_run` on the Python side.
 struct NativeRequestTypes {
     operation: Py<PyAny>,
-    ar_payload: Py<PyAny>,
-    encoder_payload: Py<PyAny>,
-    diffusion_payload: Py<PyAny>,
-    transfer_payload: Py<PyAny>,
+    payload: Py<PyAny>,
     request_key: Py<PyAny>,
     version_ref: Py<PyAny>,
     fixed_point: Py<PyAny>,
@@ -80,15 +77,16 @@ struct NativeRequestTypes {
     start: Py<PyAny>,
     commit: Py<PyAny>,
     finish: Py<PyAny>,
+    retire: Py<PyAny>,
     free: Py<PyAny>,
     native_run: Py<PyAny>,
-    product_kinds: [Py<PyAny>; 10],
+    product_kinds: [Py<PyAny>; 11],
     storage_classes: [Py<PyAny>; 6],
-    dtypes: [Py<PyAny>; 8],
+    dtypes: [Py<PyAny>; 9],
     dispositions: [Py<PyAny>; 3],
     close_reasons: [Py<PyAny>; 4],
     draw_layouts: [Py<PyAny>; 3],
-    works: [Py<PyAny>; 12],
+    works: [Py<PyAny>; OpCode::ALL.len()],
 }
 
 /// Process-wide cache of worker Python constructors and enum members.
@@ -120,10 +118,7 @@ impl NativeRequestTypes {
 
         Ok(Self {
             operation: class("Operation")?,
-            ar_payload: class("ArOpPayload")?,
-            encoder_payload: class("EncoderOpPayload")?,
-            diffusion_payload: class("DiffusionOpPayload")?,
-            transfer_payload: class("TransferOpPayload")?,
+            payload: class("OpPayload")?,
             request_key: class("RequestKey")?,
             version_ref: class("Checkpoint")?,
             fixed_point: class("FixedCheckpoint")?,
@@ -142,6 +137,7 @@ impl NativeRequestTypes {
             start: class("Start")?,
             commit: class("Commit")?,
             finish: class("Finish")?,
+            retire: class("Retire")?,
             free: class("Free")?,
             native_run: class("native_run")?,
 
@@ -161,6 +157,7 @@ impl NativeRequestTypes {
                     "completion",
                     "sampling_state",
                     "selected_point",
+                    "tensor",
                 ],
             )?,
             storage_classes: enum_members(
@@ -178,7 +175,9 @@ impl NativeRequestTypes {
             dtypes: enum_members(
                 &module,
                 "DType",
-                ["u8", "u16", "u32", "i32", "i64", "f16", "bf16", "f32"],
+                [
+                    "u8", "u16", "u32", "i32", "i64", "f16", "bf16", "f32", "i16",
+                ],
             )?,
             dispositions: enum_members(&module, "Disposition", ["publish", "retain", "discard"])?,
             close_reasons: enum_members(
@@ -191,24 +190,7 @@ impl NativeRequestTypes {
                 "DrawLayout",
                 ["target_sampling", "speculative_proposal", "flow_noise"],
             )?,
-            works: enum_members(
-                &module,
-                "RunKind",
-                [
-                    "ar_extend",
-                    "ar_decode",
-                    "ar_verify",
-                    "encoder_vision",
-                    "encoder_latent",
-                    "transfer_product",
-                    "transfer_kv_publish",
-                    "transfer_kv_install",
-                    "diffusion_prepare",
-                    "diffusion_step",
-                    "diffusion_finalize",
-                    "diffusion_decode",
-                ],
-            )?,
+            works: enum_members(&module, "OpCode", OpCode::ALL.map(OpCode::as_str))?,
         })
     }
 
@@ -222,7 +204,7 @@ impl NativeRequestTypes {
     }
 
     /// Returns the Python enum member for a physical run kind.
-    fn kind<'py>(&self, py: Python<'py>, kind: RunKind) -> Bound<'py, PyAny> {
+    fn kind<'py>(&self, py: Python<'py>, kind: OpCode) -> Bound<'py, PyAny> {
         let index = kind as usize;
         self.works[index].bind(py).clone()
     }
@@ -240,6 +222,7 @@ impl NativeRequestTypes {
             ProductKind::Completion => 7,
             ProductKind::SamplingState => 8,
             ProductKind::SelectedPoint => 9,
+            ProductKind::Tensor => 10,
         };
         self.product_kinds[index].bind(py).clone()
     }
@@ -268,6 +251,7 @@ impl NativeRequestTypes {
             DType::F16 => 5,
             DType::BF16 => 6,
             DType::F32 => 7,
+            DType::I16 => 8,
         };
         self.dtypes[index].bind(py).clone()
     }
@@ -394,7 +378,10 @@ impl<'py> NativeRequestConversion<'py> {
         // Resolve identity, lineage, resource bounds, and product references
         // before constructing the family payload.
         let request_key = self.request_key(operation.request_key)?;
-        let parent = self.checkpoint(&operation.parent)?;
+        let parent = match &operation.parent {
+            Some(parent) => self.checkpoint(parent)?,
+            None => self.py.None().into_bound(self.py),
+        };
         let bounds = self.types.bounds.bind(self.py).call1((
             operation.bounds().max_points,
             operation.bounds().max_tokens,
@@ -435,15 +422,9 @@ impl<'py> NativeRequestConversion<'py> {
             })
             .transpose()?;
 
-        // Select the Python payload class from the closed Rust family enum.
         let py = self.py;
-        let payload_type = match operation.payload {
-            OpPayload::Ar { .. } => &self.types.ar_payload,
-            OpPayload::Encoder { .. } => &self.types.encoder_payload,
-            OpPayload::Diffusion { .. } => &self.types.diffusion_payload,
-            OpPayload::Transfer { .. } => &self.types.transfer_payload,
-        };
-        let payload = payload_type.bind(py).call1((
+        let payload = self.types.payload.bind(py).call1((
+            self.types.kind(py, operation.kind()),
             bounds,
             pyo3::types::PyTuple::new(py, inputs)?,
             pyo3::types::PyTuple::new(py, outputs)?,
@@ -462,7 +443,7 @@ impl<'py> NativeRequestConversion<'py> {
                 request_key.into_any(),
                 operation.op_id.0.into_pyobject(py)?.into_any(),
                 parent.into_any(),
-                self.types.kind(py, operation.kind),
+                operation.entry.clone().into_pyobject(py)?.into_any(),
                 payload.into_any(),
             ],
         )?;
@@ -498,6 +479,7 @@ impl<'py> NativeRequestConversion<'py> {
             row.request_pool_index,
             row.seq_len,
             row.query_len,
+            row.write_kv,
         ))
     }
 
@@ -549,10 +531,15 @@ impl<'py> NativeRequestConversion<'py> {
                 control_seq,
                 cutoff,
                 reason,
+                retained_buffers,
             } => {
                 let request = *request_key;
                 let cutoff = self.checkpoint(cutoff)?;
                 let request_key = self.request_key(request)?;
+                let retained = retained_buffers
+                    .iter()
+                    .map(|buffer| self.buffer_id(*buffer))
+                    .collect::<PyResult<Vec<_>>>()?;
                 let reason = match reason {
                     CloseReason::Completed => 0,
                     CloseReason::Cancelled => 1,
@@ -564,9 +551,24 @@ impl<'py> NativeRequestConversion<'py> {
                     *control_seq,
                     cutoff,
                     self.types.close_reasons[reason].bind(self.py).clone(),
+                    pyo3::types::PyTuple::new(self.py, retained)?,
                 ))
             }
 
+            BatchCommand::Retire {
+                request_key,
+                retained_buffers,
+            } => {
+                let request_key = self.request_key(*request_key)?;
+                let retained = retained_buffers
+                    .iter()
+                    .map(|buffer| self.buffer_id(*buffer))
+                    .collect::<PyResult<Vec<_>>>()?;
+                self.types
+                    .retire
+                    .bind(self.py)
+                    .call1((request_key, pyo3::types::PyTuple::new(self.py, retained)?))
+            }
             BatchCommand::Free { buffer } => {
                 let buffer = self.buffer_id(*buffer)?;
                 self.types.free.bind(self.py).call1((buffer,))
@@ -621,77 +623,75 @@ fn run_to_py<'py>(py: Python<'py>, run: &Run) -> PyResult<Bound<'py, PyAny>> {
         pyo3::types::PyTuple::new(py, block_tables)?,
         pyo3::types::PyTuple::new(py, new_cache_pages)?,
         pyo3::types::PyTuple::new(py, forward_rows)?,
-        dict_list(py, &run.latent_placements, |placement| {
-            latent_placement_to_py(py, placement, &mut context)
+        dict_list(py, &run.latent_params, |params| {
+            latent_params_to_py(py, params, &mut context)
         })?,
-        dict_list(py, &run.decode_placements, |placement| {
-            decode_placement_to_py(py, placement, &mut context)
+        dict_list(py, &run.decode_ranges, |params| {
+            decode_range_to_py(py, params, &mut context)
         })?,
-        dict_list(py, &run.buffer_placements, |placement| {
-            buffer_placement_to_py(py, placement, &mut context)
+        dict_list(py, &run.buffer_allocations, |params| {
+            buffer_allocation_to_py(py, params, &mut context)
         })?,
         pyo3::types::PyTuple::new(py, commands)?,
         input_products,
     ))
 }
 
-/// Converts a latent-page placement into its Python mapping shape.
-fn latent_placement_to_py<'py>(
+/// Converts a latent-page params into its Python mapping shape.
+fn latent_params_to_py<'py>(
     py: Python<'py>,
-    placement: &LatentPlacement,
+    params: &LatentParams,
     context: &mut RequestConversion<'py>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item(
         intern!(py, "request_key"),
-        context.request_key(placement.request_key)?,
+        context.request_key(params.request_key)?,
     )?;
-    dict.set_item(intern!(py, "op_id"), placement.op_id.0)?;
-    dict.set_item(
-        intern!(py, "page_table"),
-        u32_list(py, &placement.page_table)?,
-    )?;
-    dict.set_item(intern!(py, "latent_units"), placement.latent_units)?;
-    dict.set_item(intern!(py, "height"), placement.height)?;
-    dict.set_item(intern!(py, "width"), placement.width)?;
-    dict.set_item(intern!(py, "start_step"), placement.start_step)?;
-    dict.set_item(intern!(py, "step_count"), placement.step_count)?;
+    dict.set_item(intern!(py, "op_id"), params.op_id.0)?;
+    dict.set_item(intern!(py, "page_table"), u32_list(py, &params.page_table)?)?;
+    dict.set_item(intern!(py, "latent_units"), params.latent_units)?;
+    dict.set_item(intern!(py, "height"), params.height)?;
+    dict.set_item(intern!(py, "width"), params.width)?;
+    dict.set_item(intern!(py, "start_step"), params.start_step)?;
+    dict.set_item(intern!(py, "step_count"), params.step_count)?;
     Ok(dict)
 }
 
-/// Converts a diffusion decoder placement into its Python mapping shape.
-fn decode_placement_to_py<'py>(
+/// Converts a diffusion decoder params into its Python mapping shape.
+fn decode_range_to_py<'py>(
     py: Python<'py>,
-    placement: &DecodePlacement,
+    params: &DecodeRange,
     context: &mut RequestConversion<'py>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item(
         intern!(py, "request_key"),
-        context.request_key(placement.request_key)?,
+        context.request_key(params.request_key)?,
     )?;
-    dict.set_item(intern!(py, "op_id"), placement.op_id.0)?;
-    dict.set_item(intern!(py, "cursor"), placement.cursor)?;
-    dict.set_item(intern!(py, "max_units"), placement.max_units)?;
+    dict.set_item(intern!(py, "op_id"), params.op_id.0)?;
+    dict.set_item(intern!(py, "track"), params.track.as_str())?;
+    dict.set_item(intern!(py, "cursor"), params.cursor)?;
+    dict.set_item(intern!(py, "max_units"), params.max_units)?;
     Ok(dict)
 }
 
 /// Converts a persistent-buffer byte span into its nested Python mapping.
-fn buffer_placement_to_py<'py>(
+fn buffer_allocation_to_py<'py>(
     py: Python<'py>,
-    placement: &BufferPlacement,
+    params: &BufferAllocation,
     context: &mut RequestConversion<'py>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
-    let id = placement.buffer;
+    let id = params.buffer;
     let buffer = PyDict::new(py);
     buffer.set_item(intern!(py, "owner"), context.request_key(id.owner)?)?;
     buffer.set_item(intern!(py, "producer_op_id"), id.producer_op_id.0)?;
     buffer.set_item(intern!(py, "output_index"), id.output_index)?;
     buffer.set_item(intern!(py, "generation"), id.generation)?;
     dict.set_item(intern!(py, "buffer"), buffer)?;
-    dict.set_item(intern!(py, "offset"), placement.offset)?;
-    dict.set_item(intern!(py, "bytes"), placement.bytes)?;
+    dict.set_item(intern!(py, "offset"), params.offset)?;
+    dict.set_item(intern!(py, "bytes"), params.bytes)?;
     Ok(dict)
 }
 
@@ -847,7 +847,7 @@ fn diffusion_params_to_py<'py>(
     dict.set_item(intern!(py, "seed"), diffusion.seed)?;
     let geometry = PyDict::new(py);
     geometry.set_item(intern!(py, "frame_count"), diffusion.geometry.frame_count)?;
-    geometry.set_item(intern!(py, "decode_units"), diffusion.geometry.decode_units)?;
+    geometry.set_item(intern!(py, "video_units"), diffusion.geometry.video_units)?;
     geometry.set_item(
         intern!(py, "prompt_tokens"),
         diffusion.geometry.prompt_tokens,
@@ -1047,16 +1047,21 @@ fn product_payload_to_py<'py>(
 }
 
 /// Converts tensor metadata and transport coordinates into a Python mapping.
-fn transfer_locator_to_py<'py>(
-    py: Python<'py>,
-    locator: &TransferLocator,
-) -> PyResult<Bound<'py, PyDict>> {
+fn transfer_locator_to_py<'py>(py: Python<'py>, locator: &Locator) -> PyResult<Bound<'py, PyDict>> {
     // Tensor metadata is common to every transport family.
     let dict = PyDict::new(py);
+    let source = PyDict::new(py);
+    source.set_item("worker_id", &locator.source.worker_id)?;
+    source.set_item("rank", locator.source.rank)?;
+    source.set_item("node", &locator.source.node)?;
+    source.set_item("address_space", &locator.source.address_space)?;
+    source.set_item("incarnation", &locator.source.incarnation)?;
+    dict.set_item("source", source)?;
     dict.set_item(intern!(py, "nbytes"), locator.nbytes)?;
     dict.set_item(intern!(py, "dtype"), locator.dtype.as_str())?;
     dict.set_item(intern!(py, "shape"), PyList::new(py, &locator.shape)?)?;
     dict.set_item(intern!(py, "device"), locator.device.as_str())?;
+    dict.set_item(intern!(py, "offset"), PyList::new(py, &locator.offset)?)?;
 
     // The transport tag determines the remaining coordinate fields.
     match &locator.transport {
@@ -1065,28 +1070,20 @@ fn transfer_locator_to_py<'py>(
             dict.set_item(intern!(py, "endpoint"), endpoint.as_str())?;
             dict.set_item(intern!(py, "key"), key)?;
         }
-        TransferTransport::PosixShm {
-            name,
-            ready_header_bytes,
-            ready_semaphore,
-        } => {
+        TransferTransport::PosixShm { endpoint, name } => {
             dict.set_item(intern!(py, "transport"), "posix_shm")?;
+            dict.set_item(intern!(py, "endpoint"), endpoint.as_str())?;
             dict.set_item(intern!(py, "name"), name.as_str())?;
-            dict.set_item(intern!(py, "ready_header_bytes"), ready_header_bytes)?;
-            dict.set_item(intern!(py, "ready_semaphore"), ready_semaphore.as_deref())?;
         }
         TransferTransport::CudaIpc {
             endpoint,
             publication_id,
             storage_handle,
             storage_size_bytes,
-            storage_offset_bytes,
-            tensor_offset,
+            storage_offsets_bytes,
+            span_lengths,
+            span_counts,
             tensor_stride,
-            ref_counter_handle,
-            ref_counter_offset,
-            event_handle,
-            event_sync_required,
             ready_event_handle,
         } => {
             dict.set_item(intern!(py, "transport"), "cuda_ipc")?;
@@ -1097,19 +1094,13 @@ fn transfer_locator_to_py<'py>(
                 PyBytes::new(py, storage_handle),
             )?;
             dict.set_item(intern!(py, "storage_size_bytes"), storage_size_bytes)?;
-            dict.set_item(intern!(py, "storage_offset_bytes"), storage_offset_bytes)?;
-            dict.set_item(intern!(py, "tensor_offset"), tensor_offset)?;
+            dict.set_item(intern!(py, "storage_offsets_bytes"), storage_offsets_bytes)?;
+            dict.set_item(intern!(py, "span_lengths"), span_lengths)?;
+            dict.set_item(intern!(py, "span_counts"), span_counts)?;
             dict.set_item(
                 intern!(py, "tensor_stride"),
                 PyList::new(py, tensor_stride)?,
             )?;
-            dict.set_item(
-                intern!(py, "ref_counter_handle"),
-                PyBytes::new(py, ref_counter_handle),
-            )?;
-            dict.set_item(intern!(py, "ref_counter_offset"), ref_counter_offset)?;
-            dict.set_item(intern!(py, "event_handle"), PyBytes::new(py, event_handle))?;
-            dict.set_item(intern!(py, "event_sync_required"), event_sync_required)?;
             dict.set_item(
                 intern!(py, "ready_event_handle"),
                 PyBytes::new(py, ready_event_handle),
@@ -1157,7 +1148,7 @@ fn transfer_handle_to_py<'py>(
             height,
             width,
             payload_kind,
-            locator,
+            tensor,
         } => {
             dict.set_item(intern!(py, "kind"), "encoder")?;
             value.set_item(intern!(py, "generation"), generation)?;
@@ -1167,43 +1158,44 @@ fn transfer_handle_to_py<'py>(
                 intern!(py, "payload_kind"),
                 product_kind_py(py, *payload_kind),
             )?;
-            value.set_item(intern!(py, "locator"), transfer_locator_to_py(py, locator)?)?;
+            value.set_item(intern!(py, "tensor"), tensor_transfer_to_py(py, tensor)?)?;
         }
         TransferHandle::DeviceProduct {
             generation,
             height,
             width,
             value_range,
-            locator,
+            tensor,
         } => {
             dict.set_item(intern!(py, "kind"), "device_product")?;
             value.set_item(intern!(py, "generation"), generation)?;
             value.set_item(intern!(py, "height"), height)?;
             value.set_item(intern!(py, "width"), width)?;
             value.set_item(intern!(py, "value_range"), value_range.as_str())?;
-            value.set_item(intern!(py, "locator"), transfer_locator_to_py(py, locator)?)?;
+            value.set_item(intern!(py, "tensor"), tensor_transfer_to_py(py, tensor)?)?;
         }
         TransferHandle::Kv {
             generation,
-            locators,
+            tensors,
             source,
             destination,
             base,
             base_extent,
             published_extent,
             group_id,
-            scale_identity,
+            compute_dtype,
+            page_size,
         } => {
             dict.set_item(intern!(py, "kind"), "kv")?;
             value.set_item(intern!(py, "generation"), generation)?;
 
             // KV publications may contain multiple physical tensors but share
             // one semantic checkpoint and destination contract.
-            let locators = locators
+            let tensors = tensors
                 .iter()
-                .map(|locator| transfer_locator_to_py(py, locator))
+                .map(|tensor| tensor_transfer_to_py(py, tensor))
                 .collect::<PyResult<Vec<_>>>()?;
-            value.set_item(intern!(py, "locators"), PyList::new(py, locators)?)?;
+            value.set_item(intern!(py, "tensors"), PyList::new(py, tensors)?)?;
             value.set_item(intern!(py, "source"), checkpoint_mapping_to_py(py, source)?)?;
             value.set_item(intern!(py, "destination"), destination.as_str())?;
             value.set_item(
@@ -1215,7 +1207,8 @@ fn transfer_handle_to_py<'py>(
             value.set_item(intern!(py, "base_extent"), base_extent)?;
             value.set_item(intern!(py, "published_extent"), published_extent)?;
             value.set_item(intern!(py, "group_id"), group_id)?;
-            value.set_item(intern!(py, "scale_identity"), scale_identity.as_str())?;
+            value.set_item(intern!(py, "compute_dtype"), compute_dtype.as_str())?;
+            value.set_item(intern!(py, "page_size"), page_size)?;
         }
         TransferHandle::Latent {
             generation,
@@ -1223,7 +1216,7 @@ fn transfer_handle_to_py<'py>(
             width,
             latent_units,
             step,
-            locator,
+            tensor,
         } => {
             dict.set_item(intern!(py, "kind"), "latent")?;
             value.set_item(intern!(py, "generation"), generation)?;
@@ -1231,7 +1224,7 @@ fn transfer_handle_to_py<'py>(
             value.set_item(intern!(py, "width"), width)?;
             value.set_item(intern!(py, "latent_units"), latent_units)?;
             value.set_item(intern!(py, "step"), step)?;
-            value.set_item(intern!(py, "locator"), transfer_locator_to_py(py, locator)?)?;
+            value.set_item(intern!(py, "tensor"), tensor_transfer_to_py(py, tensor)?)?;
         }
     }
 
@@ -1262,6 +1255,7 @@ fn product_kind_py<'py>(py: Python<'py>, kind: ProductKind) -> &'py Bound<'py, P
         ProductKind::Completion => intern!(py, "completion"),
         ProductKind::SamplingState => intern!(py, "sampling_state"),
         ProductKind::SelectedPoint => intern!(py, "selected_point"),
+        ProductKind::Tensor => intern!(py, "tensor"),
     }
 }
 
@@ -1288,6 +1282,7 @@ fn dtype_py<'py>(py: Python<'py>, dtype: DType) -> &'py Bound<'py, PyString> {
         DType::F16 => intern!(py, "f16"),
         DType::BF16 => intern!(py, "bf16"),
         DType::F32 => intern!(py, "f32"),
+        DType::I16 => intern!(py, "i16"),
     }
 }
 
@@ -1665,27 +1660,27 @@ fn product_payload_from_py(value: &Bound<'_, PyAny>) -> Option<ProductPayload> {
                         payload,
                         intern!(py, "payload_kind"),
                     )?)?,
-                    locator: transfer_locator_from_py(&get(payload, intern!(py, "locator"))?)?,
+                    tensor: tensor_transfer_from_py(&get(payload, intern!(py, "tensor"))?)?,
                 },
                 "device_product" => TransferHandle::DeviceProduct {
                     generation,
                     height: u32_of(&get(payload, intern!(py, "height"))?)?,
                     width: u32_of(&get(payload, intern!(py, "width"))?)?,
                     value_range: string_of(&get(payload, intern!(py, "value_range"))?)?,
-                    locator: transfer_locator_from_py(&get(payload, intern!(py, "locator"))?)?,
+                    tensor: tensor_transfer_from_py(&get(payload, intern!(py, "tensor"))?)?,
                 },
                 "kv" => {
-                    // Preserve locator order because it identifies the worker's
+                    // Preserve tensor order because it identifies the worker's
                     // physical KV tensor layout.
-                    let raw_locators = get(payload, intern!(py, "locators"))?;
-                    let raw_locators = raw_locators.cast::<PyList>().ok()?;
-                    let mut locators = Vec::with_capacity(raw_locators.len());
-                    for locator in raw_locators.iter() {
-                        locators.push(transfer_locator_from_py(&locator)?);
+                    let raw_tensors = get(payload, intern!(py, "tensors"))?;
+                    let raw_tensors = raw_tensors.cast::<PyList>().ok()?;
+                    let mut tensors = Vec::with_capacity(raw_tensors.len());
+                    for tensor in raw_tensors.iter() {
+                        tensors.push(tensor_transfer_from_py(&tensor)?);
                     }
                     TransferHandle::Kv {
                         generation,
-                        locators,
+                        tensors,
                         source: checkpoint_mapping_from_py(&get(payload, intern!(py, "source"))?)?,
                         destination: string_of(&get(payload, intern!(py, "destination"))?)?,
                         base: if absent_or_none(payload, intern!(py, "base"))? {
@@ -1699,7 +1694,8 @@ fn product_payload_from_py(value: &Bound<'_, PyAny>) -> Option<ProductPayload> {
                         base_extent: u32_of(&get(payload, intern!(py, "base_extent"))?)?,
                         published_extent: u32_of(&get(payload, intern!(py, "published_extent"))?)?,
                         group_id: u32_of(&get(payload, intern!(py, "group_id"))?)?,
-                        scale_identity: string_of(&get(payload, intern!(py, "scale_identity"))?)?,
+                        compute_dtype: string_of(&get(payload, intern!(py, "compute_dtype"))?)?,
+                        page_size: u32_of(&get(payload, intern!(py, "page_size"))?)?,
                     }
                 }
                 "latent" => TransferHandle::Latent {
@@ -1708,7 +1704,7 @@ fn product_payload_from_py(value: &Bound<'_, PyAny>) -> Option<ProductPayload> {
                     width: u32_of(&get(payload, intern!(py, "width"))?)?,
                     latent_units: u32_of(&get(payload, intern!(py, "latent_units"))?)?,
                     step: u32_of(&get(payload, intern!(py, "step"))?)?,
-                    locator: transfer_locator_from_py(&get(payload, intern!(py, "locator"))?)?,
+                    tensor: tensor_transfer_from_py(&get(payload, intern!(py, "tensor"))?)?,
                 },
                 _ => return None,
             };
@@ -1725,7 +1721,7 @@ fn product_payload_from_py(value: &Bound<'_, PyAny>) -> Option<ProductPayload> {
 }
 
 /// Decodes transport coordinates and their common logical tensor metadata.
-fn transfer_locator_from_py(value: &Bound<'_, PyAny>) -> Option<TransferLocator> {
+fn transfer_locator_from_py(value: &Bound<'_, PyAny>) -> Option<Locator> {
     let py = value.py();
     let dict = value.cast::<PyDict>().ok()?;
 
@@ -1736,37 +1732,39 @@ fn transfer_locator_from_py(value: &Bound<'_, PyAny>) -> Option<TransferLocator>
             key: u64_of(&get(dict, intern!(py, "key"))?)?,
         },
         "posix_shm" => TransferTransport::PosixShm {
+            endpoint: string_of(&get(dict, intern!(py, "endpoint"))?)?,
             name: string_of(&get(dict, intern!(py, "name"))?)?,
-            ready_header_bytes: u32_of(&get(dict, intern!(py, "ready_header_bytes"))?)?,
-            ready_semaphore: if absent_or_none(dict, intern!(py, "ready_semaphore"))? {
-                None
-            } else {
-                Some(string_of(&get(dict, intern!(py, "ready_semaphore"))?)?)
-            },
         },
         "cuda_ipc" => TransferTransport::CudaIpc {
             endpoint: string_of(&get(dict, intern!(py, "endpoint"))?)?,
             publication_id: string_of(&get(dict, intern!(py, "publication_id"))?)?,
             storage_handle: bytes_of(&get(dict, intern!(py, "storage_handle"))?)?,
             storage_size_bytes: u64_of(&get(dict, intern!(py, "storage_size_bytes"))?)?,
-            storage_offset_bytes: u64_of(&get(dict, intern!(py, "storage_offset_bytes"))?)?,
-            tensor_offset: u64_of(&get(dict, intern!(py, "tensor_offset"))?)?,
+            storage_offsets_bytes: u64_vec(&get(dict, intern!(py, "storage_offsets_bytes"))?)?,
+            span_lengths: u64_vec(&get(dict, intern!(py, "span_lengths"))?)?,
+            span_counts: u32_vec(&get(dict, intern!(py, "span_counts"))?)?,
             tensor_stride: i64_vec(&get(dict, intern!(py, "tensor_stride"))?)?,
-            ref_counter_handle: bytes_of(&get(dict, intern!(py, "ref_counter_handle"))?)?,
-            ref_counter_offset: u64_of(&get(dict, intern!(py, "ref_counter_offset"))?)?,
-            event_handle: bytes_of(&get(dict, intern!(py, "event_handle"))?)?,
-            event_sync_required: bool_of(&get(dict, intern!(py, "event_sync_required"))?)?,
             ready_event_handle: bytes_of(&get(dict, intern!(py, "ready_event_handle"))?)?,
         },
         _ => return None,
     };
     // Common tensor metadata remains independent of the selected transport.
-    Some(TransferLocator {
+    let source_value = get(dict, intern!(py, "source"))?;
+    let source = source_value.cast::<PyDict>().ok()?;
+    Some(Locator {
+        source: WorkerEndpoint {
+            worker_id: string_of(&get(source, intern!(py, "worker_id"))?)?,
+            rank: u32_of(&get(source, intern!(py, "rank"))?)?,
+            node: string_of(&get(source, intern!(py, "node"))?)?,
+            address_space: string_of(&get(source, intern!(py, "address_space"))?)?,
+            incarnation: string_of(&get(source, intern!(py, "incarnation"))?)?,
+        },
         transport,
         nbytes: u64_of(&get(dict, intern!(py, "nbytes"))?)?,
         dtype: string_of(&get(dict, intern!(py, "dtype"))?)?,
         shape: u64_vec(&get(dict, intern!(py, "shape"))?)?,
         device: string_of(&get(dict, intern!(py, "device"))?)?,
+        offset: u64_vec(&get(dict, intern!(py, "offset"))?)?,
     })
 }
 
@@ -1814,6 +1812,7 @@ fn product_ref_from_py(value: &Bound<'_, PyAny>) -> Option<ProductRef> {
         "f16" => DType::F16,
         "bf16" => DType::BF16,
         "f32" => DType::F32,
+        "i16" => DType::I16,
         _ => return None,
     };
     // Reconstruct each dimension from its tagged static-or-device bound.
@@ -1873,6 +1872,7 @@ fn product_kind_from_py(value: &Bound<'_, PyAny>) -> Option<ProductKind> {
         "completion" => ProductKind::Completion,
         "sampling_state" => ProductKind::SamplingState,
         "selected_point" => ProductKind::SelectedPoint,
+        "tensor" => ProductKind::Tensor,
         _ => return None,
     })
 }
@@ -2050,6 +2050,7 @@ fn opt_string(dict: &Bound<'_, PyDict>, key: &Bound<'_, PyString>) -> Option<Opt
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, SystemTime};
+    use uniserve_worker_ipc::OpPayload;
 
     use pythonize::pythonize;
     use uniserve_core::{BlockId, RequestId};
@@ -2105,10 +2106,10 @@ mod tests {
         let operation = Operation {
             request_key,
             op_id: OpId(1),
-            parent: Checkpoint::admission_root(OpId(0)),
-            kind: RunKind::ArExtend,
+            parent: Some(Checkpoint::admission_root(OpId(0))),
+            entry: "model".into(),
             payload: OpPayload::new(
-                RunKind::ArExtend,
+                OpCode::ArExtend,
                 Bounds {
                     max_points: 1,
                     max_tokens: 2,
@@ -2139,6 +2140,7 @@ mod tests {
             request_pool_index: 1,
             seq_len: 0,
             query_len: 2,
+            write_kv: true,
         }];
         let media_key = RequestKey::new(1, RequestId(3), 1);
         let media_prompt_token_ids = vec![17, 23, 65_537];
@@ -2150,7 +2152,7 @@ mod tests {
                 seed: 29,
                 geometry: MediaGeometry {
                     frame_count: 22,
-                    decode_units: 3,
+                    video_units: 3,
                     prompt_tokens: 3,
                     denoise_steps: 4,
                 },
@@ -2160,10 +2162,10 @@ mod tests {
         let media_operation = Operation {
             request_key: media_key,
             op_id: OpId(2),
-            parent: Checkpoint::admission_root(OpId(0)),
-            kind: RunKind::DiffusionPrepare,
+            parent: Some(Checkpoint::admission_root(OpId(0))),
+            entry: "model".into(),
             payload: OpPayload::new(
-                RunKind::DiffusionPrepare,
+                OpCode::DiffusionPrepare,
                 Bounds {
                     max_points: 1,
                     ..Bounds::default()
@@ -2176,7 +2178,7 @@ mod tests {
             ),
         }
         .sealed();
-        let latent_placements = vec![LatentPlacement {
+        let latent_params = vec![LatentParams {
             request_key: media_key,
             op_id: OpId(2),
             page_table: vec![1],
@@ -2194,7 +2196,7 @@ mod tests {
         run.block_tables = block_tables;
         run.new_cache_pages = new_cache_pages;
         run.forward_rows = forward_rows;
-        run.latent_placements = latent_placements;
+        run.latent_params = latent_params;
         let mut request = WorkerRequest::submit(run.with_input_products(vec![ProductPayload {
             product: input,
             value: InlineValue::Bytes(uniserve_worker_ipc::encode_token_product_bytes(&[7, 8])),
@@ -2318,4 +2320,37 @@ mod tests {
             .expect("native result response");
         assert_eq!(response.decode_response().unwrap(), expected);
     }
+}
+
+fn tensor_transfer_to_py<'py>(
+    py: Python<'py>,
+    tensor: &TensorTransfer,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("shape", PyList::new(py, &tensor.shape)?)?;
+    let locations = tensor
+        .locations
+        .iter()
+        .map(|location| transfer_locator_to_py(py, location))
+        .collect::<PyResult<Vec<_>>>()?;
+    dict.set_item("locations", PyList::new(py, locations)?)?;
+    Ok(dict)
+}
+
+fn tensor_transfer_from_py(value: &Bound<'_, PyAny>) -> Option<TensorTransfer> {
+    let py = value.py();
+    let dict = value.cast::<PyDict>().ok()?;
+    let raw = get(dict, intern!(py, "locations"))?;
+    let locations = raw
+        .cast::<PyList>()
+        .ok()?
+        .iter()
+        .map(|location| transfer_locator_from_py(&location))
+        .collect::<Option<Vec<_>>>()?;
+    let tensor = TensorTransfer {
+        shape: u64_vec(&get(dict, intern!(py, "shape"))?)?,
+        locations,
+    };
+    tensor.validate().ok()?;
+    Some(tensor)
 }

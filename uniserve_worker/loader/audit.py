@@ -6,8 +6,8 @@ from collections.abc import Iterable
 
 from torch import nn
 
-from ..nn.placement import get_shard_plan
 from ..nn.quant.load_state import is_optional_checkpoint
+from ..nn.shard import get_shard_plan
 from .mapping import LoadReport
 
 __all__ = ["audit_load_report", "required_parameter_names"]
@@ -27,9 +27,7 @@ def required_parameter_names(
         else {str(name) for name in included}
     )
     marked_optional = {
-        name
-        for name, parameter in module.named_parameters()
-        if is_optional_checkpoint(parameter)
+        name for name, parameter in module.named_parameters() if is_optional_checkpoint(parameter)
     }
     return expected.difference(marked_optional).difference(str(name) for name in optional)
 
@@ -46,7 +44,7 @@ def audit_load_report(
     """Reject an incomplete or inconsistent load report for the selected model scope.
 
     Packed parameters are complete only when every logical shard declared by their
-    placement plan has been installed.
+    assignment plan has been installed.
     """
 
     # Derive the scalar parameter contract before checking packed-shard completeness.
@@ -61,7 +59,9 @@ def audit_load_report(
         loaded_shards = set(getattr(parameter, "_uniserve_checkpoint_shards", set()))
         required_shards = set(plan.slots)
         if not required_shards.issubset(loaded_shards):
-            missing.append(f"{name}[packed shards {sorted(required_shards - loaded_shards, key=str)!r}]")
+            missing.append(
+                f"{name}[packed shards {sorted(required_shards - loaded_shards, key=str)!r}]"
+            )
 
     # Present both sides of the mismatch together so one load attempt is actionable.
     unexpected = sorted(set(report.unexpected))

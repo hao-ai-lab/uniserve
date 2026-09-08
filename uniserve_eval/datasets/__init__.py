@@ -8,8 +8,8 @@ from ..types import BenchmarkPoint, Example
 from .base import Dataset
 from .beans import BeansDataset
 from .jsonl import JsonlDataset
-from .mjhq import MJHQDataset
 from .minimax_h3 import MiniMaxH3Dataset
+from .mjhq import MJHQDataset
 from .pie_bench import PieBenchDataset
 from .sharegpt import ShareGPTDataset
 from .ueval import UEvalDataset

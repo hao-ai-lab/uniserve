@@ -8,12 +8,12 @@ from typing import Any
 
 import torch
 
-from uniserve_worker.bootstrap.execution_config import LaneConfig
+from uniserve_worker.config import LaneConfig
 from uniserve_worker.execution.batch import Domain
 
 
 class ExecutionLaneError(RuntimeError):
-    """A deployment-static execution lane could not be realized exactly."""
+    """A worker_config-static execution lane could not be realized exactly."""
 
 
 @dataclass(slots=True)
@@ -130,6 +130,7 @@ class ExecutionLaneRuntime:
         if self.stream is not None:
             self.stream.synchronize()
         self.graphs.close()
+        self.buffer.close()
         self.buffer = None
         self.graphs = None
         self._ingress_events = ()
@@ -234,9 +235,7 @@ def create_green_contexts(
                 intermediate.append(remainder_green)
                 current_resource = _green_resource(cu, remainder_green)
         if sum(item.sm_count for item in realized) != requested:
-            raise ExecutionLaneError(
-                "lane SM resources do not form the configured disjoint total"
-            )
+            raise ExecutionLaneError("lane SM resources do not form the configured disjoint total")
         return tuple(realized)
     except Exception:
         for item in reversed(realized):
@@ -320,7 +319,7 @@ def _driver() -> Any:
 
     try:
         from cuda.bindings import driver  # pyright: ignore[reportAttributeAccessIssue]
-    except ImportError as error:  # pragma: no cover - CUDA deployments install cuda-python.
+    except ImportError as error:  # pragma: no cover - CUDA configurations install cuda-python.
         raise ExecutionLaneError("CUDA execution lanes require cuda-python") from error
     return driver
 

@@ -13,6 +13,7 @@ from safetensors.torch import safe_open
 from .config import LoadConfig, LoadFormat, LoadRequest
 
 __all__ = [
+    "WeightSourceConfig",
     "WeightSourceSet",
     "read_model_config",
     "resolve_model_root",
@@ -28,8 +29,26 @@ _TRAINING_FILES = frozenset(
         "scaler.pt",
     }
 )
-_SAFETENSORS_INDEX = "model.safetensors.index.json"
-_PT_INDEX = "pytorch_model.bin.index.json"
+_SAFETENSORS_INDEX = "*.safetensors.index.json"
+_PT_INDEX = "*.bin.index.json"
+
+
+@dataclass(frozen=True, slots=True)
+class WeightSourceConfig:
+    """Declare a component directory or ordered checkpoint filename choices."""
+
+    name: str = "primary"
+    directory: str = ""
+    filenames: tuple[str, ...] = ()
+    entry: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            raise ValueError("weight source requires a component name")
+        for value in (self.directory, *self.filenames):
+            path = PurePosixPath(value)
+            if path.is_absolute() or ".." in path.parts:
+                raise ValueError("weight sources must stay within the checkpoint root")
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,9 +143,7 @@ def read_model_config(root: Path) -> dict[str, Any]:
     if not path.is_file():
         path = root / "modular_model_index.json"
     if not path.is_file():
-        raise FileNotFoundError(
-            "checkpoint is missing 'config.json' or 'modular_model_index.json'"
-        )
+        raise FileNotFoundError("checkpoint is missing 'config.json' or 'modular_model_index.json'")
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
         raise TypeError(f"checkpoint {path.name} must contain an object")
@@ -134,9 +151,7 @@ def read_model_config(root: Path) -> dict[str, Any]:
     # Normalize the supported modular pipeline onto the architecture dispatch contract.
     if path.name == "modular_model_index.json":
         if value.get("_class_name") != "MiniMaxH3ModularPipeline":
-            raise ValueError(
-                "checkpoint modular_model_index.json declares an unsupported pipeline"
-            )
+            raise ValueError("checkpoint modular_model_index.json declares an unsupported pipeline")
         return {**value, "architectures": ["MiniMaxH3Transformer3DModel"]}
     return value
 
@@ -144,17 +159,23 @@ def read_model_config(root: Path) -> dict[str, Any]:
 def resolve_weight_sources(
     request: LoadRequest,
     *,
-    architecture: str,
+    sources: tuple[WeightSourceConfig, ...],
     sidecars: tuple[str, ...],
     root: Path,
     repository_id: str | None,
 ) -> tuple[WeightSourceSet, ...]:
-    """Resolve the complete primary and architecture-owned secondary source set."""
+    """Resolve declared component sources using one closed repository inventory."""
 
+    if not sources or len({source.name for source in sources}) != len(sources):
+        raise ValueError("checkpoint sources require unique nonempty component names")
+    sources = tuple(
+        source for source in sources if source.entry is None or request.bindings.owns(source.entry)
+    )
     # Synthetic loading carries a source identity without checkpoint files.
     if request.load.load_format is LoadFormat.DUMMY:
-        return (
-            WeightSourceSet(root=root, weight_files=(), relative_paths=()),
+        return tuple(
+            WeightSourceSet(root=root, weight_files=(), relative_paths=(), source_name=source.name)
+            for source in sources
         )
 
     # Freeze the visible repository inventory before selecting or fetching artifacts.
@@ -166,45 +187,54 @@ def resolve_weight_sources(
         load=request.load,
     )
 
-    # BAGEL assigns its transformer and autoencoder files to separate load owners.
-    if architecture == "BagelForConditionalGeneration":
-        primary_name = next(
-            (name for name in ("ema.safetensors", "model.safetensors") if name in available),
-            None,
-        )
-        if primary_name is None:
-            raise FileNotFoundError("BAGEL checkpoint requires ema.safetensors or model.safetensors")
-        secondary_name = "ae.safetensors"
-        if secondary_name not in available:
-            raise FileNotFoundError("BAGEL checkpoint requires ae.safetensors")
-        primary_path = _fetch_file(primary_name, root, repository_id, request.load)
-        secondary_path = _fetch_file(secondary_name, root, repository_id, request.load)
-        return (
-            WeightSourceSet(root, (primary_path,), (primary_name,)),
-            WeightSourceSet(
-                root,
-                (secondary_path,),
-                (secondary_name,),
-                source_name="autoencoder",
-            ),
-        )
-
-    # Installed-name sharded state selects exactly the file for this tensor-parallel rank.
-    if request.load.load_format is LoadFormat.SHARDED_STATE:
-        name = _rank_file(available, request.parallel.rank, request.parallel.size)
-        path = _fetch_file(name, root, repository_id, request.load)
-        return (WeightSourceSet(root, (path,), (name,)),)
-
-    # Conventional checkpoints resolve one ordered primary shard set.
-    selected = _select_primary(
-        model_path=request.model_path,
-        root=root,
-        available=available,
-        load=request.load,
-        repository_id=repository_id,
-    )
-    paths = tuple(_fetch_file(name, root, repository_id, request.load) for name in selected)
-    return (WeightSourceSet(root, paths, selected),)
+    resolved = []
+    for source in sources:
+        directory = PurePosixPath(source.directory)
+        names: tuple[str, ...]
+        if source.filenames:
+            selected = next(
+                (
+                    (directory / name).as_posix()
+                    for name in source.filenames
+                    if (directory / name).as_posix() in available
+                    and _accepts_suffix(name, request.load.load_format)
+                ),
+                None,
+            )
+            if selected is None:
+                raise FileNotFoundError(
+                    f"component {source.name!r} requires a {request.load.load_format.value} "
+                    f"checkpoint from {source.filenames!r} under {root / source.directory}"
+                )
+            names = (selected,)
+        elif request.load.load_format is LoadFormat.SHARDED_STATE:
+            candidates = tuple(
+                PurePosixPath(name).name
+                for name in available
+                if PurePosixPath(name).parent == directory
+            )
+            entry = source.entry
+            if entry is None:
+                if len(request.bindings.entries) != 1:
+                    raise ValueError("rank checkpoint source must declare its computation entry")
+                entry = next(iter(request.bindings.entries))
+            members = request.bindings.entries[entry].ranks
+            name = _rank_file(
+                candidates, members.index(request.bindings.process_group.rank), len(members)
+            )
+            names = ((directory / name).as_posix(),)
+        else:
+            names = _select_primary(
+                model_path=request.model_path,
+                root=root,
+                available=available,
+                load=request.load,
+                repository_id=repository_id,
+                directory=directory,
+            )
+        paths = tuple(_fetch_file(name, root, repository_id, request.load) for name in names)
+        resolved.append(WeightSourceSet(root, paths, names, source_name=source.name))
+    return tuple(resolved)
 
 
 def _available_files(root: Path, repository_id: str | None, load: LoadConfig) -> tuple[str, ...]:
@@ -232,12 +262,13 @@ def _select_primary(
     available: tuple[str, ...],
     load: LoadConfig,
     repository_id: str | None,
+    directory: PurePosixPath = PurePosixPath("."),
 ) -> tuple[str, ...]:
     """Select an explicit file, indexed shards, or top-level files for the load format."""
 
     # A direct local file bypasses repository-wide candidate selection.
     local_candidate = Path(model_path)
-    if repository_id is None and local_candidate.is_file():
+    if repository_id is None and local_candidate.is_file() and directory == PurePosixPath("."):
         relative = local_candidate.relative_to(root).as_posix()
         if not _accepts_suffix(relative, load.load_format):
             raise ValueError(
@@ -247,15 +278,24 @@ def _select_primary(
 
     # Prefer an index when present; otherwise collect one supported top-level format.
     for index_name, pattern in _format_candidates(load.load_format):
-        if index_name is not None and index_name in available:
-            return _index_weight_files(index_name, root, available, load, repository_id)
+        if index_name is not None:
+            indexes = tuple(
+                name
+                for name in available
+                if PurePosixPath(name).parent == directory
+                and fnmatch.fnmatchcase(PurePosixPath(name).name, index_name)
+            )
+            if len(indexes) > 1:
+                raise ValueError(f"component directory {directory} has multiple checkpoint indexes")
+            if indexes:
+                return _index_weight_files(indexes[0], root, available, load, repository_id)
         if pattern is None:
             continue
         matches = tuple(
             name
             for name in available
-            if PurePosixPath(name).parent == PurePosixPath(".")
-            and fnmatch.fnmatchcase(name, pattern)
+            if PurePosixPath(name).parent == directory
+            and fnmatch.fnmatchcase(PurePosixPath(name).name, pattern)
             and Path(name).name not in _TRAINING_FILES
         )
         if matches:
@@ -297,7 +337,8 @@ def _index_weight_files(
     mapping = value.get("weight_map") if isinstance(value, dict) else None
     if not isinstance(mapping, dict) or not mapping:
         raise ValueError(f"checkpoint index {index_name!r} has no weight_map")
-    names = tuple(sorted({str(name) for name in mapping.values()}))
+    directory = PurePosixPath(index_name).parent
+    names = tuple(sorted({(directory / str(name)).as_posix() for name in mapping.values()}))
     unavailable = [name for name in names if name not in available]
     if unavailable:
         raise FileNotFoundError(f"checkpoint index references missing shard {unavailable[0]!r}")
@@ -371,7 +412,7 @@ def _accepts_suffix(name: str, load_format: LoadFormat) -> bool:
     suffix = Path(name).suffix
     if load_format in {LoadFormat.AUTO, LoadFormat.LAYERED}:
         return suffix in {".safetensors", ".bin", ".pt"}
-    if load_format is LoadFormat.SAFETENSORS:
+    if load_format in {LoadFormat.SAFETENSORS, LoadFormat.SHARDED_STATE}:
         return suffix == ".safetensors"
     if load_format is LoadFormat.PT:
         return suffix in {".bin", ".pt"}

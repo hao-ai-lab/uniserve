@@ -163,7 +163,7 @@ pub enum MediaKind {
     Audio,
 }
 
-/// Runtime family selected once for an engine deployment.
+/// Runtime family selected once for an engine configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeFamily {
@@ -213,8 +213,8 @@ impl ArtifactHandle {
 pub struct MediaGeometry {
     /// Number of output frames.
     pub frame_count: u32,
-    /// Number of latent units decoded into output media.
-    pub decode_units: u32,
+    /// Number of overlapping video reconstruction windows, independent of rank count.
+    pub video_units: u32,
     /// Number of prompt tokens represented by the request.
     pub prompt_tokens: u32,
     /// Number of diffusion denoising steps.
@@ -246,7 +246,7 @@ impl DiffusionRequest {
         // Geometry must describe positive work and carry the same logical
         // prompt size as the token payload.
         if self.geometry.frame_count == 0
-            || self.geometry.decode_units == 0
+            || self.geometry.video_units == 0
             || self.geometry.prompt_tokens == 0
             || usize::try_from(self.geometry.prompt_tokens).ok()
                 != Some(self.prompt_token_ids.len())

@@ -53,7 +53,7 @@ impl ApiError {
         }
     }
 
-    /// Constructs an error for a model name not served by this deployment.
+    /// Constructs an error for a model name not served by this configuration.
     pub fn model_not_found(model: impl Into<String>) -> Self {
         Self::ModelNotFound {
             model: model.into(),

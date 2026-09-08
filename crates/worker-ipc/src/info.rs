@@ -13,6 +13,10 @@ pub struct KvCacheConfig {
     pub num_layers: u32,
     /// KV heads stored per layer.
     pub num_kv_heads: u32,
+    /// Logical model KV heads across all tensor-parallel members.
+    pub total_kv_heads: u32,
+    /// First logical KV head stored by this rank.
+    pub kv_head_offset: u32,
     /// Elements stored per KV head.
     pub head_dim: u32,
     /// Storage consumed by one token across all layers.
@@ -24,6 +28,25 @@ pub struct KvCacheConfig {
 }
 
 impl KvCacheConfig {
+    /// Bound one token's logical publication independently of the producing TP size.
+    /// A partial-page suffix may carry a complete scale for every head group.
+    pub fn publication_bytes_per_token(&self) -> u64 {
+        let width = match self.dtype {
+            KvCacheDtype::Float16 | KvCacheDtype::BFloat16 => 2,
+            KvCacheDtype::Float32 => 4,
+            KvCacheDtype::Float8E4m3Fn => 1,
+        };
+        let head_bytes = u64::from(self.head_dim) * width;
+        let scale_bytes = if self.dtype == KvCacheDtype::Float8E4m3Fn {
+            4
+        } else {
+            0
+        };
+        (2 * u64::from(self.num_layers))
+            .saturating_mul(u64::from(self.total_kv_heads))
+            .saturating_mul(head_bytes + scale_bytes)
+    }
+
     /// Validates positive geometry and a complete non-overlapping group partition.
     pub fn validate(&self) -> ValidationResult<()> {
         // Establish the physical dimensions before summing the group partition.
@@ -32,6 +55,8 @@ impl KvCacheConfig {
                 && self.num_blocks > 0
                 && self.num_layers > 0
                 && self.num_kv_heads > 0
+                && u64::from(self.kv_head_offset) + u64::from(self.num_kv_heads)
+                    <= u64::from(self.total_kv_heads)
                 && self.head_dim > 0
                 && self.bytes_per_token > 0
                 && !self.groups.is_empty(),
@@ -54,12 +79,62 @@ impl KvCacheConfig {
         Ok(())
     }
 }
-/// One component's finalized deployment shared by all worker descriptions.
+/// One component's finalized configuration shared by all worker descriptions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ComponentInfo {
+pub struct EntryInfo {
     pub name: String,
     #[serde(flatten)]
-    pub deployment: uniserve_core::ComponentDeployConfig,
+    pub config: uniserve_core::EntryConfig,
+    /// Named tensor results declared by the loaded computation. Their order
+    /// defines product output indices independently of Worker grouping.
+    pub outputs: Vec<TensorSpec>,
+}
+
+/// A computation's bounded tensor result, before request and storage binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TensorSpec {
+    pub name: String,
+    pub dtype: DType,
+    pub shape_bound: ShapeBound,
+}
+
+impl TensorSpec {
+    /// Validate the logical representation advertised to allocation and routing.
+    pub fn validate(&self) -> ValidationResult<()> {
+        ensure_valid!(!self.name.is_empty(), "tensor result must have a name");
+        self.shape_bound.validate()?;
+        Ok(())
+    }
+}
+
+/// A loaded rank incarnation in an explicitly identified host address space.
+/// Backend addresses and storage generations are carried by each publication.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct WorkerEndpoint {
+    /// Logical instance selected by the engine.
+    pub worker_id: String,
+    /// Member coordinate within that instance.
+    pub rank: u32,
+    /// Host identity, independent of process-local device ordinals.
+    pub node: String,
+    /// Process lifetime identity; multiple Workers may share it.
+    pub address_space: String,
+    /// Lifetime identity of this loaded Worker rank.
+    pub incarnation: String,
+}
+
+impl WorkerEndpoint {
+    /// Checks identities before accepting startup metadata or a publication.
+    pub fn validate(&self) -> ValidationResult<()> {
+        ensure_valid!(
+            !self.worker_id.is_empty()
+                && !self.node.is_empty()
+                && !self.address_space.is_empty()
+                && !self.incarnation.is_empty(),
+            "worker endpoint identity is incomplete"
+        );
+        Ok(())
+    }
 }
 
 /// Post-load worker geometry, limits, supported work, and model identity.
@@ -69,16 +144,22 @@ pub struct WorkerInfo {
     pub model_name: String,
     /// Model-weight revision used to reject cross-version products.
     pub weight_version: u64,
-    /// Physical process rank topology.
-    pub rank: RankInfo,
+    /// Identity of the loaded rank and its host address space.
+    pub endpoint: WorkerEndpoint,
+    /// Rank-local primary compute device used to bind physical transfer edges.
+    pub device: String,
+    /// Physical transfer mechanisms initialized by this rank.
+    pub transfer_backends: Vec<String>,
+    /// Number of physical members in this Worker.
+    pub world_size: u32,
     /// Stable identity of the expanded component configuration.
     #[serde(default)]
     pub configuration_id: String,
     /// Finalized component membership and logical degrees.
     #[serde(default)]
-    pub components: Vec<ComponentInfo>,
+    pub components: Vec<EntryInfo>,
     /// Operation families accepted by the worker.
-    pub supported_ops: Vec<OpKind>,
+    pub supported_ops: Vec<OpCode>,
     /// Maximum unresolved physical runs.
     pub queue_depth: u32,
     /// Maximum operations in one run.
@@ -123,8 +204,20 @@ impl WorkerInfo {
 
     /// Validates worker identity, capacity, operation, and rank invariants.
     pub fn validate(&self) -> ValidationResult<()> {
+        self.endpoint.validate()?;
         ensure_valid!(
-            self.rank.world_size > 0 && self.rank.rank < self.rank.world_size,
+            !self.device.is_empty()
+                && !self.transfer_backends.is_empty()
+                && self
+                    .transfer_backends
+                    .iter()
+                    .all(|name| matches!(name.as_str(), "local" | "shm" | "cuda_ipc"))
+                && self.transfer_backends.iter().collect::<HashSet<_>>().len()
+                    == self.transfer_backends.len(),
+            "worker physical transfer capabilities are incomplete"
+        );
+        ensure_valid!(
+            self.world_size > 0 && self.endpoint.rank < self.world_size,
             "worker process rank is outside its world"
         );
         let mut names = HashSet::new();
@@ -133,20 +226,28 @@ impl WorkerInfo {
                 !component.name.is_empty() && names.insert(&component.name),
                 "worker repeats or omits a component name"
             );
-            let placement = &component.deployment;
+            let mut outputs = HashSet::new();
+            for output in &component.outputs {
+                output.validate()?;
+                ensure_valid!(
+                    outputs.insert(&output.name),
+                    "entry repeats a tensor result name"
+                );
+            }
+            let params = &component.config;
             ensure_valid!(
-                !placement.ranks.is_empty()
-                    && placement
+                !params.ranks.is_empty()
+                    && params
                         .ranks
                         .iter()
-                        .all(|&rank| rank < self.rank.world_size as usize),
+                        .all(|&rank| rank < self.world_size as usize),
                 "component membership is outside the process world"
             );
             ensure_valid!(
-                placement.ranks.iter().collect::<HashSet<_>>().len() == placement.ranks.len(),
+                params.ranks.iter().collect::<HashSet<_>>().len() == params.ranks.len(),
                 "component repeats process ranks"
             );
-            let degree = placement
+            let degree = params
                 .parallel_config
                 .world_size()
                 .map_err(|error| invalid_message!("{error}"))?;
@@ -155,14 +256,14 @@ impl WorkerInfo {
                 "parallel degrees exceed protocol range"
             );
             ensure_valid!(
-                placement.units_per_rank > 0 && placement.units_per_rank <= u32::MAX as usize,
+                params.units_per_rank > 0 && params.units_per_rank <= u32::MAX as usize,
                 "component unit capacity is outside protocol range"
             );
             ensure_valid!(
-                if placement.distribution.is_some() {
+                if params.distribution.is_some() {
                     degree == 1
                 } else {
-                    degree == placement.ranks.len()
+                    degree == params.ranks.len()
                 },
                 "component membership disagrees with parallel degrees"
             );
@@ -193,7 +294,7 @@ impl WorkerInfo {
         let requires_kv = self.supported_ops.iter().any(|variant| {
             matches!(
                 variant,
-                OpKind::ArExtend | OpKind::ArDecode | OpKind::ArVerify
+                OpCode::ArExtend | OpCode::ArDecode | OpCode::ArVerify
             )
         });
         ensure_valid!(
@@ -210,14 +311,6 @@ impl WorkerInfo {
                 "worker info declare incomplete latent pool capacity"
             );
         }
-        let addresses_latent = self
-            .supported_ops
-            .iter()
-            .any(|variant| matches!(variant, OpKind::DiffusionPrepare | OpKind::DiffusionStep));
-        ensure_valid!(
-            !addresses_latent || has_latent_capacity,
-            "worker info advertise latent work without a latent page pool"
-        );
         // Model identity remains mandatory independently of enabled resources.
         ensure_valid!(!self.model_name.is_empty(), "worker model name is empty");
         Ok(())
@@ -230,10 +323,19 @@ impl Default for WorkerInfo {
         Self {
             model_name: "model".to_owned(),
             weight_version: 0,
-            rank: RankInfo::default(),
+            endpoint: WorkerEndpoint {
+                worker_id: "worker".into(),
+                rank: 0,
+                node: "simulation".into(),
+                address_space: "simulation".into(),
+                incarnation: "simulation".into(),
+            },
+            world_size: 1,
+            device: "cpu".into(),
+            transfer_backends: vec!["local".into()],
             configuration_id: String::new(),
             components: Vec::new(),
-            supported_ops: vec![OpKind::ArExtend, OpKind::ArDecode],
+            supported_ops: vec![OpCode::ArExtend, OpCode::ArDecode],
             queue_depth: 1,
             max_batch_ops: 1,
             max_batch_tokens: 8192,
@@ -243,6 +345,8 @@ impl Default for WorkerInfo {
                 num_blocks: 4096,
                 num_layers: 28,
                 num_kv_heads: 8,
+                total_kv_heads: 8,
+                kv_head_offset: 0,
                 head_dim: 128,
                 bytes_per_token: 57_344,
                 groups: vec![KvCacheGroup {

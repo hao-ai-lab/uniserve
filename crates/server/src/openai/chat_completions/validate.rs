@@ -1,4 +1,4 @@
-//! Deployment-dependent validation for chat-completion requests.
+//! configuration-dependent validation for chat-completion requests.
 
 use crate::openai::error::{ApiError, bail_invalid_request};
 use crate::openai::types::ChatCompletionRequest;

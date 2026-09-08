@@ -90,7 +90,7 @@ def _with_transition_predicate(
 def _release_relay_outputs(worker, *operations: Operation) -> None:
     worker.free_products(
         tuple(
-            int(output.generation)
+            output.buffer_id
             for operation in operations
             for output in operation.outputs
             if output.storage_class is StorageClass.REQUEST_RELAY
@@ -114,11 +114,7 @@ def test_feedback_operation_publishes_distinct_completion_relay_outputs() -> Non
         output_index=1,
     )
     transition = replace(
-        next(
-            output
-            for output in with_transition.outputs
-            if output.kind is ProductKind.COMPLETION
-        ),
+        next(output for output in with_transition.outputs if output.kind is ProductKind.COMPLETION),
         storage_class=StorageClass.REQUEST_RELAY,
     )
     completion = ProductRef(

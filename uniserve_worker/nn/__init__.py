@@ -24,6 +24,7 @@ _EXPORTS: dict[str, str] = {
     "QKVParallelLinear": "linear",
     "local_attention_head_count": "linear",
     "local_kv_head_count": "linear",
+    "local_kv_head_offset": "linear",
     "RowParallelLinear": "linear",
     # immutable layer construction
     "LayerConfig": "layer",
@@ -31,8 +32,7 @@ _EXPORTS: dict[str, str] = {
     "LogitsProcessor": "logits",
     # mesh (parallelism topology + transports)
     "DeviceMesh": "mesh",
-    "GroupCoordinator": "mesh",
-    "TensorParallel": "mesh",
+    "Communicator": "mesh",
     "SymmetricMemoryWorkspace": "mesh",
     "divide": "mesh",
     # moe
@@ -40,17 +40,14 @@ _EXPORTS: dict[str, str] = {
     "TopK": "moe",
     # norm
     "RMSNorm": "norm",
-    # parameter and modality-tower placement
-    "ShardPlan": "placement",
-    "ShardSlot": "placement",
-    "Shard": "placement",
-    "WeightMode": "placement",
-    "get_shard_plan": "placement",
-    "get_tower_coord": "placement",
-    "place_towers": "placement",
-    "set_shard_plan": "placement",
-    "set_tower_coord": "placement",
-    "shard_for": "placement",
+    # parameter shards and modality coordinates
+    "ShardPlan": "shard",
+    "ShardSlot": "shard",
+    "Shard": "shard",
+    "WeightMode": "shard",
+    "get_shard_plan": "shard",
+    "set_shard_plan": "shard",
+    "shard_for": "shard",
     # rope
     "HFRotaryEmbedding": "rope",
     "RotaryEmbedding": "rope",
@@ -90,7 +87,7 @@ __all__ = [
     "LogitsProcessor",
     "MLPConnector",
     "MergedColumnParallelLinear",
-    "GroupCoordinator",
+    "Communicator",
     "MoTDecoderLayer",
     "MoTModel",
     "NeoVitEncoder",
@@ -99,6 +96,7 @@ __all__ = [
     "QKVParallelLinear",
     "local_attention_head_count",
     "local_kv_head_count",
+    "local_kv_head_offset",
     "RMSNorm",
     "RotaryEmbedding",
     "RowParallelLinear",
@@ -108,7 +106,6 @@ __all__ = [
     "RadixAttention",
     "SiglipNavitEncoder",
     "SiluAndMul",
-    "TensorParallel",
     "SymmetricMemoryWorkspace",
     "TopK",
     "VisionEncoder",
@@ -122,12 +119,9 @@ __all__ = [
     "get_rope",
     "qk_norm_rope",
     "get_shard_plan",
-    "get_tower_coord",
     "pad_vocab_size",
-    "place_towers",
     "rotate_half",
     "set_shard_plan",
-    "set_tower_coord",
     "shard_for",
 ]
 
@@ -168,26 +162,13 @@ if TYPE_CHECKING:  # Expose concrete definitions to type checkers without import
     )
     from .logits import LogitsProcessor
     from .mesh import (
+        Communicator,
         DeviceMesh,
-        GroupCoordinator,
         SymmetricMemoryWorkspace,
-        TensorParallel,
         divide,
     )
     from .moe import FusedMoE, TopK
     from .norm import RMSNorm
-    from .placement import (
-        Shard,
-        ShardPlan,
-        ShardSlot,
-        WeightMode,
-        get_shard_plan,
-        get_tower_coord,
-        place_towers,
-        set_shard_plan,
-        set_tower_coord,
-        shard_for,
-    )
     from .rope import (
         HFRotaryEmbedding,
         RotaryEmbedding,
@@ -196,6 +177,15 @@ if TYPE_CHECKING:  # Expose concrete definitions to type checkers without import
         get_rope,
         qk_norm_rope,
         rotate_half,
+    )
+    from .shard import (
+        Shard,
+        ShardPlan,
+        ShardSlot,
+        WeightMode,
+        get_shard_plan,
+        set_shard_plan,
+        shard_for,
     )
     from .vae import AutoEncoder, AutoEncoderParams, default_ae_params
     from .vision import MLPConnector, NeoVitEncoder, PatchEmbed, SiglipNavitEncoder, VisionEncoder

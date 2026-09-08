@@ -37,7 +37,5 @@ def _replace_path_segment(name: str, source: str, target: str) -> str | None:
     width = len(source_parts)
     for index in range(len(name_parts) - width + 1):
         if name_parts[index : index + width] == source_parts:
-            return ".".join(
-                (*name_parts[:index], *target.split("."), *name_parts[index + width :])
-            )
+            return ".".join((*name_parts[:index], *target.split("."), *name_parts[index + width :]))
     return None

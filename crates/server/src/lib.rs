@@ -1,6 +1,6 @@
 //! UniServe HTTP frontend, model profiles, request lowering, and output assembly.
 //!
-//! The crate resolves one deployment configuration into shared application
+//! The crate resolves one configuration configuration into shared application
 //! state and exposes OpenAI-compatible routes backed by the in-process engine.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
@@ -13,7 +13,6 @@ pub mod http;
 pub mod openai;
 /// Model assets and behavior profiles.
 pub mod profile;
-mod scheduler_stats;
 /// Model-aware request admission and output streaming.
 pub mod serving;
 mod state;
@@ -28,7 +27,7 @@ use anyhow::{Context as _, Result};
 pub use config::{Config, EngineBackendKind, EngineSettings, HttpListenerMode};
 use tracing::info;
 pub use uniserve_engine::SchedulingPolicy;
-use uniserve_engine::{EngineCoreConfig, SimEngine, SimExecutor, WorkerProcessArgs};
+use uniserve_engine::{EngineConfig, SimEngine, SimExecutor, WorkerProcessArgs};
 
 pub use crate::http::{ApiError, build_router, serve};
 pub use crate::state::AppState;
@@ -89,7 +88,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     let eos = control_tokens.eos.clone();
     info!(
         backend = ?config.engine.backend,
-        device = %config.engine.worker_process.device,
+        workers = ?config.engine.workers,
         block_size = config.engine.worker_process.block_size,
         pipeline_depth = config.engine.worker_process.pipeline_depth,
         "starting UniServe Rust engine"
@@ -113,7 +112,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         max_video_seconds: config.engine.max_video_seconds,
         ..config.engine.worker_process.clone()
     };
-    let engine_config = EngineCoreConfig {
+    let engine_config = EngineConfig {
         runtime_family: match &assets {
             ResolvedAssets::Text { .. } => uniserve_core::RuntimeFamily::Ar,
             ResolvedAssets::Omni { .. } => uniserve_core::RuntimeFamily::Umm,
@@ -169,7 +168,6 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         snapshot.sampling_controls,
         route_max_model_len,
         config.reasoning_parsing,
-        &snapshot.components,
     )
     .context("failed to bind the configured model description")?;
     let runtime = ServingRuntime::new(model, Arc::clone(&engine), config.log_stats);

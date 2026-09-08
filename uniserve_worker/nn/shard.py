@@ -1,4 +1,4 @@
-"""Load-time parameter sharding and modality-tower device placement."""
+"""Load-time parameter shard geometry and fused checkpoint slices."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from enum import Enum, auto
 
 import torch.nn as nn
 
-from .mesh import TensorParallel
+from .mesh import Communicator
 
 __all__ = [
     "WeightMode",
@@ -17,10 +17,6 @@ __all__ = [
     "shard_for",
     "get_shard_plan",
     "set_shard_plan",
-    # tower-axis module placement
-    "set_tower_coord",
-    "get_tower_coord",
-    "place_towers",
 ]
 
 
@@ -71,10 +67,10 @@ class ShardSlot:
 class ShardPlan:
     """Resolved per-parameter load layout, attached as ``_uniserve_shard``.
 
-    ``shard`` is the whole-tensor placement. When the parameter packs several
+    ``shard`` is the whole-tensor shard. When the parameter packs several
     named shards along one axis (merged / fused QKV linears), ``shard_axis``
     names that axis and ``slots`` maps each shard id to its slice + per-shard
-    placement; ``mode`` resolves string shard ids (``"q"``) to slot indices.
+    shard; ``mode`` resolves string shard ids (``"q"``) to slot indices.
     """
 
     shard: Shard
@@ -91,12 +87,12 @@ class ShardPlan:
         return self.slots.get(key)
 
 
-def shard_for(axis: int, parallel: TensorParallel, *, replicated: bool = False) -> Shard:
+def shard_for(axis: int, parallel: Communicator, *, replicated: bool = False) -> Shard:
     """Resolve a tensor-parallel :class:`Shard` for one parameter dimension."""
     return Shard(
         axis=int(axis),
-        rank=int(parallel.rank),
-        size=int(parallel.size),
+        rank=int(parallel.rank_in_group),
+        size=int(parallel.world_size),
         replicated=bool(replicated),
     )
 
@@ -114,29 +110,3 @@ def set_shard_plan(param: nn.Parameter, plan: ShardPlan) -> None:
     """Attach the load-time sharding plan consumed by checkpoint weight loaders."""
 
     setattr(param, _SHARD_PLAN_ATTR, plan)
-
-
-_TOWER_COORD_ATTR = "_uniserve_tower_coord"
-
-
-def set_tower_coord(module: nn.Module, coord: int) -> nn.Module:
-    """Assign a module subtree to one modality-tower coordinate."""
-    setattr(module, _TOWER_COORD_ATTR, int(coord))
-    return module
-
-
-def get_tower_coord(module: nn.Module) -> int | None:
-    """Return a module's tower coordinate, or ``None`` for shared modules."""
-    coord = getattr(module, _TOWER_COORD_ATTR, None)
-    return int(coord) if coord is not None else None
-
-
-def place_towers(model: nn.Module, devices: tuple[str, str] | None) -> None:
-    """Materialize each assigned modality subtree on its deployment device."""
-
-    if devices is None:
-        return
-    for module in model.modules():
-        coordinate = get_tower_coord(module)
-        if coordinate is not None:
-            module.to(devices[coordinate])

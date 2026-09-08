@@ -85,14 +85,14 @@ pub enum ContextSegment {
     },
     /// Input image and its model-specific ingest recipe.
     Image {
-        /// Encoded image payload and logical placement.
+        /// Encoded image payload and logical params.
         image: ImageSegment,
         /// Encoder operations used to ingest the image.
         ingest: ImageIngestRecipe,
     },
 }
 
-/// Input image bytes plus placement in the rendered context stream.
+/// Input image bytes plus params in the rendered context stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageSegment {
     /// Stable content hash used for encoder-cache identity.
@@ -100,13 +100,13 @@ pub struct ImageSegment {
     /// Base64-encoded input image.
     pub b64: String,
     /// Logical position in the rendered context.
-    pub placement: SegmentPlacement,
+    pub position: SegmentPosition,
 }
 
-/// Logical placement of an image segment in the already-rendered Und stream.
+/// Logical params of an image segment in the already-rendered Und stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
-pub enum SegmentPlacement {
+pub enum SegmentPosition {
     /// The image encoder output fills the gap ending at this token index.
     AtToken {
         /// Exclusive token position at the end of the image gap.
@@ -1195,7 +1195,7 @@ impl GenerationRequest {
             validate_ingest_recipe(&feedback.ingest)?;
         }
 
-        // Validate segment placement while deriving the context-dependent cache
+        // Validate segment params while deriving the context-dependent cache
         // identities and token count used by the resource declaration.
         let context_tokens = self.prompt_token_count();
         let mut seen_tokens = 0usize;
@@ -1210,12 +1210,12 @@ impl GenerationRequest {
                         return Err(GenerationRequestError::EmptyImagePayload);
                     }
                     validate_ingest_recipe(ingest)?;
-                    let expected_position = match image.placement {
-                        SegmentPlacement::AtToken { position } => position as usize,
-                        SegmentPlacement::Append => context_tokens,
+                    let expected_position = match image.position {
+                        SegmentPosition::AtToken { position } => position as usize,
+                        SegmentPosition::Append => context_tokens,
                     };
                     if expected_position != seen_tokens {
-                        return Err(GenerationRequestError::ImagePlacementMismatch {
+                        return Err(GenerationRequestError::ImagePositionMismatch {
                             expected: seen_tokens,
                             actual: expected_position,
                         });
@@ -1348,9 +1348,9 @@ pub enum GenerationRequestError {
     EmptyImagePayload,
     /// An image segment does not follow the preceding understanding tokens.
     #[error(
-        "image segment placement does not match ordered context: expected {expected}, got {actual}"
+        "image segment params does not match ordered context: expected {expected}, got {actual}"
     )]
-    ImagePlacementMismatch {
+    ImagePositionMismatch {
         /// Position implied by preceding context segments.
         expected: usize,
         /// Position declared by the image segment.
@@ -1493,7 +1493,7 @@ mod tests {
                     image: ImageSegment {
                         hash: 17,
                         b64: "aW1hZ2U=".into(),
-                        placement: SegmentPlacement::AtToken { position: 2 },
+                        position: SegmentPosition::AtToken { position: 2 },
                     },
                     ingest: ImageIngestRecipe::vae_then_vit(
                         1,
@@ -1695,7 +1695,7 @@ mod tests {
                 image: ImageSegment {
                     hash: 17,
                     b64: "aW1hZ2U=".into(),
-                    placement: SegmentPlacement::AtToken { position: 35 },
+                    position: SegmentPosition::AtToken { position: 35 },
                 },
                 ingest: ImageIngestRecipe::vae_then_vit(
                     1,
@@ -1864,10 +1864,10 @@ mod tests {
         let ContextSegment::Image { image, .. } = &mut misplaced_image.context[1] else {
             panic!("image fixture");
         };
-        image.placement = SegmentPlacement::AtToken { position: 1 };
+        image.position = SegmentPosition::AtToken { position: 1 };
         assert!(matches!(
             misplaced_image.validate(),
-            Err(GenerationRequestError::ImagePlacementMismatch { .. })
+            Err(GenerationRequestError::ImagePositionMismatch { .. })
         ));
 
         let mut invalid_resources = complete_request();

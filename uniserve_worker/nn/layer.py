@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .mesh import GroupCoordinator, TensorParallel
-from .quant import QuantizationConfig, QuantizeMethodBase, UnquantizedLinearMethod
+from .mesh import Communicator
+from .quant import LinearMethod, QuantizationConfig, UnquantizedLinearMethod
 
 __all__ = ["LayerConfig"]
 
@@ -14,25 +14,26 @@ __all__ = ["LayerConfig"]
 class LayerConfig:
     """Checkpoint shard coordinates and corresponding construction-time group binding."""
 
-    parallel: TensorParallel
+    communicator: Communicator
     quantization: QuantizationConfig | None
-    tp_group: GroupCoordinator | None = None
+    prefix: str = ""
 
-    def tensor_group(self) -> GroupCoordinator:
-        """Require communication to agree with the parameter shard coordinates."""
+    def qualify(self, name: str) -> str:
+        """Resolve a child name in this component's checkpoint namespace."""
 
-        group = self.tp_group
-        if group is None:
-            if self.parallel.size != 1:
-                raise ValueError("distributed layers require a construction-time tp_group")
-            return GroupCoordinator()
-        if (group.rank_in_group, group.world_size) != (self.parallel.rank, self.parallel.size):
-            raise ValueError("tp_group membership disagrees with checkpoint shard coordinates")
-        return group
+        return ".".join(part for part in (self.prefix, name) if part)
 
-    def quant_method(self, prefix: str) -> QuantizeMethodBase:
+    def child(self, name: str) -> LayerConfig:
+        """Keep geometry and precision policy while descending into a module."""
+
+        return LayerConfig(self.communicator, self.quantization, self.qualify(name))
+
+    def quant_method(self, prefix: str, *, packed_names: tuple[str, ...] = ()) -> LinearMethod:
         """Resolve a parameter prefix to its configured quantized linear implementation."""
 
         if self.quantization is None:
             return UnquantizedLinearMethod()
-        return self.quantization.get_quant_method(prefix)
+        full_name = self.qualify(prefix)
+        parent, _, _ = full_name.rpartition(".")
+        packed = tuple(".".join(part for part in (parent, name) if part) for name in packed_names)
+        return self.quantization.get_quant_method(full_name, packed_prefixes=packed)

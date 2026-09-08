@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -108,9 +108,7 @@ def build_packed_layout(
     patch_t, patch_h, patch_w = patch_size
     latent_height, latent_width = height // 16, width // 16
     video_frames = video_latent_frames(num_frames)
-    audio_frames = (
-        audio_latent_frames(num_frames) if audio_frames is None else int(audio_frames)
-    )
+    audio_frames = audio_latent_frames(num_frames) if audio_frames is None else int(audio_frames)
     if audio_frames < 1:
         raise ValueError("H3 audio latent frame count must be positive")
     if video_frames % patch_t or latent_height % patch_h or latent_width % patch_w:
@@ -205,9 +203,9 @@ def build_packed_layout(
     for offset in range(audio_block_rows // 64):
         tile_valid_sizes[audio_tile_start + offset] = max(0, min(64, audio_rows - offset * 64))
     video_tile_start = video_start // 64
-    tile_valid_sizes[
-        video_tile_start : video_tile_start + video_tiles
-    ] = torch.tensor(video_valid_sizes, dtype=torch.int32)
+    tile_valid_sizes[video_tile_start : video_tile_start + video_tiles] = torch.tensor(
+        video_valid_sizes, dtype=torch.int32
+    )
     return H3PackedLayout(
         semantic_rows=semantic_rows,
         padded_rows=padded_rows,
@@ -228,7 +226,9 @@ def build_packed_layout(
     )
 
 
-def patchify_video(latents: torch.Tensor, patch_size: tuple[int, int, int] = (1, 2, 2)) -> torch.Tensor:
+def patchify_video(
+    latents: torch.Tensor, patch_size: tuple[int, int, int] = (1, 2, 2)
+) -> torch.Tensor:
     """Flatten `[B, C, T, H, W]` latents into raster-ordered spatiotemporal patch rows."""
 
     patch_t, patch_h, patch_w = patch_size
@@ -243,9 +243,11 @@ def patchify_video(latents: torch.Tensor, patch_size: tuple[int, int, int] = (1,
         width // patch_w,
         patch_w,
     )
-    return rows.permute(0, 2, 4, 6, 1, 3, 5, 7).reshape(
-        batch, -1, channels * patch_t * patch_h * patch_w
-    ).contiguous()
+    return (
+        rows.permute(0, 2, 4, 6, 1, 3, 5, 7)
+        .reshape(batch, -1, channels * patch_t * patch_h * patch_w)
+        .contiguous()
+    )
 
 
 def unpatchify_video(
@@ -270,9 +272,11 @@ def unpatchify_video(
         patch_h,
         patch_w,
     )
-    return value.permute(0, 4, 1, 5, 2, 6, 3, 7).reshape(
-        -1, channels, frames, height, width
-    ).contiguous()
+    return (
+        value.permute(0, 4, 1, 5, 2, 6, 3, 7)
+        .reshape(-1, channels, frames, height, width)
+        .contiguous()
+    )
 
 
 def unpatchify_video_into(

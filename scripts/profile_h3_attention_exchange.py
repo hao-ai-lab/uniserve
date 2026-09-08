@@ -6,7 +6,7 @@ import os
 import torch
 import torch.distributed as dist
 
-from uniserve_worker.nn.parallel import ParallelConfig, UlyssesSequence
+from uniserve_worker.nn.parallel import ParallelConfig, SequenceParallel
 from uniserve_worker.ops.video_sparse import (
     compose_to_head_shards,
     unpack_add_compression,
@@ -81,14 +81,16 @@ def main() -> None:
         {
             "denoiser": (
                 tuple(range(world)),
-                ParallelConfig(sequence_parallel=UlyssesSequence(world)),
+                ParallelConfig(sequence_parallel=SequenceParallel("ulysses", (world,))),
             ),
         },
     )["denoiser"]
-    workspace = mesh.get_group("sp").symmetric_memory(
+    workspace = environment.symmetric_memory(
+        mesh.get_group("sp"),
         (local_rows, global_heads, width),
         dtype=torch.bfloat16,
         name="profile_video_attention_heads",
+        layout=(),
     )
 
     def collective_fence() -> None:

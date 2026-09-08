@@ -60,6 +60,7 @@ bench = [
 # extensions plus cuDNN Frontend CuTe DSL; native builds require a CUDA 13 toolkit.
 gpu = [
     "flashinfer-python",
+    "uniserve-kernel[peer_memory]",
 ]
 h3 = [
     "uniserve-kernel[sparse_attention]",

@@ -11,8 +11,9 @@ import torch
 import torch.distributed as dist
 
 from ..foundation.errors import distributed_setup_error
-from ..nn.mesh import DeviceMesh, GroupCoordinator, PeerTensorWorkspace, SymmetricMemoryWorkspace
+from ..nn.mesh import Communicator, DeviceMesh, PeerTensorWorkspace, SymmetricMemoryWorkspace
 from ..nn.parallel import ParallelConfig
+from ..nn.parallel_attention import AttentionContextGeometry, AttentionContextWorkspace
 
 
 @dataclass
@@ -32,22 +33,20 @@ class DistributedEnvironment:
     )
 
     @property
-    def process_group(self) -> GroupCoordinator:
+    def process_group(self) -> Communicator:
         """Bind component transfers to the instance's ordered physical ranks."""
 
-        return GroupCoordinator(
+        return Communicator(
             tuple(range(self.world_size)),
             self.rank,
             "instance",
             self.local_device,
             dist.group.WORLD if dist.is_initialized() else None,
-            self.symmetric_memory,
-            self.peer_tensor,
         )
 
     def symmetric_memory(
         self,
-        group: GroupCoordinator,
+        group: Communicator,
         shape: tuple[int, ...],
         *,
         dtype: torch.dtype,
@@ -83,7 +82,7 @@ class DistributedEnvironment:
 
     def peer_tensor(
         self,
-        group: GroupCoordinator,
+        group: Communicator,
         shape: tuple[int, ...],
         *,
         dtype: torch.dtype,
@@ -115,6 +114,47 @@ class DistributedEnvironment:
         workspace = PeerTensorWorkspace(group, local, global_tensor)
         self._peer_tensors[key] = workspace
         return workspace
+
+    def attention_context(self, geometry: AttentionContextGeometry) -> AttentionContextWorkspace:
+        """Allocate context K/V and fences using their actual physical row capacity."""
+
+        group, rows = geometry.group, geometry.rows
+        shape = (rows, geometry.heads, geometry.head_dim)
+        if geometry.mapped:
+            keys = self.peer_tensor(
+                group,
+                shape,
+                dtype=geometry.dtype,
+                name="attention_keys",
+                row_multiple=geometry.block_size,
+            )
+            values = self.peer_tensor(
+                group,
+                shape,
+                dtype=geometry.dtype,
+                name="attention_values",
+                row_multiple=geometry.block_size,
+            )
+            key, value = keys.global_tensor, values.global_tensor
+            local_key, local_value = keys.local, values.local
+        else:
+            key = torch.empty(
+                (rows * group.world_size, *shape[1:]), dtype=geometry.dtype, device=group.device
+            )
+            value = torch.empty_like(key)
+            begin = group.rank_in_group * rows
+            local_key, local_value = key[begin : begin + rows], value[begin : begin + rows]
+        return AttentionContextWorkspace(
+            key,
+            value,
+            local_key,
+            local_value,
+            torch.empty(
+                key.shape[0] // geometry.block_size, dtype=torch.int32, device=group.device
+            ),
+            torch.zeros(1, dtype=torch.int32, device=group.device),
+            torch.empty(group.world_size, dtype=torch.int32, device=group.device),
+        )
 
     def close(self) -> None:
         """Release peer allocations and groups after the caller retires runners."""
@@ -195,7 +235,7 @@ def initialize_model_parallel(
     """Construct every component fiber in canonical order on every process.
 
     Nonmembers participate in group construction but receive no local component
-    mesh. Component membership is supplied by deployment, never inferred from
+    mesh. Component membership is supplied by worker_config, never inferred from
     the process-world size.
     """
 
@@ -225,19 +265,20 @@ def initialize_model_parallel(
                         ranks=list(backend_members),
                         backend=environment.backend,
                         pg_options=_group_options(environment.backend),
+                        device_id=environment.local_device
+                        if environment.backend == "nccl"
+                        else None,
                     )
                     process_groups[backend_members] = group
                     if environment.rank in members:
                         environment._groups.append(group)
                 if environment.rank in members:
-                    groups[name] = GroupCoordinator(
+                    groups[name] = Communicator(
                         members,
                         environment.rank,
                         f"{component}.{name}:{','.join(map(str, members))}",
                         environment.local_device,
                         process_groups.get(backend_members),
-                        environment.symmetric_memory,
-                        environment.peer_tensor,
                     )
         if environment.rank in layout.ranks:
             meshes[component] = DeviceMesh(

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
+from multiprocessing import shared_memory
 from typing import Any
 
 import torch
@@ -24,6 +26,42 @@ else:
     _np = _numpy_module
 
 _NUMPY_DTYPES = {torch.int32: "int32", torch.int64: "int64"}
+
+
+def allocate_shared_memory(size: int) -> shared_memory.SharedMemory:
+    """Allocate physically backed POSIX storage or raise before a mapped write.
+
+    The caller owns close/unlink and any ownership transfer after publication.
+    Reserving tmpfs pages avoids an uncatchable SIGBUS from a later copy when
+    the shared-memory filesystem is full.
+    """
+
+    if size < 1:
+        raise ValueError("shared-memory capacity must be positive")
+    storage = shared_memory.SharedMemory(create=True, size=size)
+    try:
+        descriptor = os.open(f"/dev/shm/{storage.name}", os.O_RDWR)
+        try:
+            os.posix_fallocate(descriptor, 0, size)
+        finally:
+            os.close(descriptor)
+    except BaseException:
+        storage.close()
+        storage.unlink()
+        raise
+    return storage
+
+
+def device_memory_budget(device: torch.device | str, fraction: float) -> tuple[int, int]:
+    """Return static-pool and total free bytes after loaded CUDA resources settle."""
+
+    target = canonical_device(device)
+    if target.type != "cuda" or not 0 < fraction <= 1:
+        raise ValueError("device memory sizing requires CUDA and a fraction in (0, 1]")
+    torch.cuda.synchronize(target)
+    torch.cuda.empty_cache()
+    free, total = torch.cuda.mem_get_info(target)
+    return max(0, int(total * fraction) - (total - free)), free
 
 
 class HostStagingRing:
@@ -53,6 +91,8 @@ class HostStagingRing:
     def acquire(self) -> tuple[int, torch.Tensor]:
         """Lease the next pinned host integer buffer and return its generation-tagged slot."""
 
+        if not self._buffers:
+            raise RuntimeError("host staging storage is closed")
         slot = self._cursor % len(self._buffers)
         self._cursor += 1
         event = self._events[slot]
@@ -73,6 +113,19 @@ class HostStagingRing:
             event = torch.cuda.Event(blocking=False)
             self._events[index] = event
         event.record(torch.cuda.current_stream(self.device))
+
+    def close(self) -> None:
+        """Drain copies and release pinned storage while its streams still exist."""
+
+        for event in self._events:
+            if event is not None:
+                event.synchronize()
+        # PyTorch records allocator retirement events when pinned storage is
+        # freed. Dropping only the owner's reference can postpone this until
+        # after an external CUDA stream has been destroyed, for example when a
+        # diagnostic traceback retains the staging owner.
+        self._buffers = ()
+        self._events.clear()
 
 
 def canonical_device(device: torch.device | str) -> torch.device:

@@ -1,488 +1,437 @@
-"""Model-loader registry and the canonical construction and materialization pipeline."""
+"""Shared component construction, checkpoint assignment and finalization."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import logging
-import math
-from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Iterable
-from contextlib import contextmanager
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 from urllib.request import urlopen
 
 import torch
 from torch import nn
 
+from ..config import WorkerConfig
 from ..foundation.errors import unsupported_setup
-from ..nn.layer import LayerConfig
+from ..models.runtime import ExecutionModel
+from ..nn.diffusion.schedule import DiffusionSchedule
 from ..nn.quant import QuantizationConfig
 from ..nn.quant.base import process_quantized_modules
 from .audit import audit_load_report
+from .component import CheckpointComponent, ModelBuildContext, ModelConstruction, construction_dtype
 from .config import LoadFormat, LoadRequest
 from .handles import TensorWeightHandle, WeightHandle, weight_handle_materialization
 from .io import iter_weight_handles
-from .mapping import LoadReport
-from .source import WeightSourceSet, resolve_weight_sources
+from .mapping import LoadReport, stacked_weight_name
+from .source import (
+    WeightSourceConfig,
+    WeightSourceSet,
+    read_model_config,
+    resolve_model_root,
+    resolve_weight_sources,
+)
 from .weight_loaders import (
-    DeferredWeightPlacement,
+    WeightAssignment,
     attach_parameter_loaders,
     default_weight_loader,
     defer_parameter_weights,
+    load_parameter_weight,
 )
 from .weight_set import WeightSet
 
 logger = logging.getLogger(__name__)
 
-__all__ = [
-    "BaseModelLoader",
-    "DefaultModelLoader",
-    "LoadedModel",
-    "get_model_loader",
-]
+if TYPE_CHECKING:
+    from ..bootstrap.catalog import CatalogEntry
+
+__all__ = ["ModelLoader", "LoadedModel", "get_model_loader", "load_model"]
 
 
 @dataclass(frozen=True, slots=True)
 class LoadedModel:
     """Materialized module, tokenizer, live weights, sources, and architecture metadata."""
 
-    model: nn.Module
+    model: ExecutionModel
     tokenizer: Any | None
-    device: str
+    worker_config: WorkerConfig
     weights: WeightSet
     sources: tuple[WeightSourceSet, ...]
     architecture_config: dict[str, Any]
+    weight_sidecars: tuple[str, ...]
+    weight_sources: tuple[WeightSourceConfig, ...]
+    schedule: DiffusionSchedule | None = None
 
 
-class BaseModelLoader(ABC):
-    """Abstract checkpoint discovery and model materialization contract."""
+class ModelLoader:
+    """Load each declared component using one configured materialization strategy."""
 
-    @abstractmethod
+    def __init__(self, load_format: LoadFormat) -> None:
+        self.load_format = load_format
+
     def load(
         self,
-        entry: Any,
+        entry: CatalogEntry,
         config: dict[str, Any],
         request: LoadRequest,
         *,
         root: Path,
         repository_id: str | None,
     ) -> LoadedModel:
-        """Construct and populate a model for one resolved checkpoint request."""
+        """Verify the complete checkpoint before constructing or mutating its components."""
 
-        raise NotImplementedError
-
-
-class DefaultModelLoader(BaseModelLoader):
-    """Name-mapped checkpoint loader for conventionally materialized architectures."""
-
-    def load(
-        self,
-        entry: Any,
-        config: dict[str, Any],
-        request: LoadRequest,
-        *,
-        root: Path,
-        repository_id: str | None,
-    ) -> LoadedModel:
-        """Construct the architecture and load mapped checkpoint handles into its parameters."""
-
-        # Resolve the complete file set and establish its integrity before construction.
+        if request.load.load_format is not self.load_format:
+            raise ValueError("loader format disagrees with the load request")
+        unknown = set(request.bindings.entries) - set(entry.components)
+        if unknown:
+            raise unsupported_setup(
+                f"{entry.architecture} has no computation entries {sorted(unknown)}"
+            )
+        device = torch.device(request.execution.device)
+        capability = entry.minimum_cuda_capability
+        if capability is not None and (
+            device.type != "cuda" or torch.cuda.get_device_capability(device) < capability
+        ):
+            raise unsupported_setup(
+                f"{entry.architecture} requires CUDA compute capability {capability[0]}.{capability[1]}"
+            )
         sources = resolve_weight_sources(
             request,
-            architecture=entry.architecture,
+            sources=entry.sources,
             sidecars=entry.sidecars,
             root=root,
             repository_id=repository_id,
         )
-        _verify_checksums(sources, request.load.checksum_manifest)
-
-        # Architecture preparation may derive geometry directly from checkpoint metadata.
-        prepared = _prepare_architecture_config(entry.architecture, config, root, sources)
-        model, tokenizer = _construct_model(entry, prepared, request, root)
-
-        # Load and audit the primary owner before applying architecture-specific overlays.
-        report = _load_primary(model, entry.architecture, sources[0], request)
-        _materialize_scope_buffers(model, report.loaded, request.device)
-        _audit_primary(model, entry.architecture, report)
-        if len(sources) > 1:
-            _load_secondary(model, entry.architecture, sources[1:], request)
-
-        # Finalize derived quantization state before exposing live tensor identities.
-        _warn_skips(entry.architecture, report)
-        _process_quantization_for_scope(model, entry.architecture, report.loaded)
-        model.eval()
-        return LoadedModel(
-            model=model,
-            tokenizer=tokenizer,
-            device=request.device,
-            weights=WeightSet.from_module(model),
+        verify_checksums(sources, request.load.checksum_manifest)
+        dtype = _serving_dtype(request.execution.model_dtype)
+        quantization = QuantizationConfig.from_model_config(
+            config,
+            overrides=request.quantization_config if entry.component_precisions is None else {},
+        )
+        if quantization is not None:
+            quantization.validate_device(request.execution.device, dtype)
+            config = {**config, "quantization_config": dict(quantization.raw)}
+        schedule = None if entry.create_schedule is None else entry.create_schedule(device)
+        context = ModelBuildContext(
+            root=root,
             sources=sources,
-            architecture_config=_canonical_architecture_config(prepared),
+            request=request,
+            quantization=quantization,
+            component_precisions=(
+                {}
+                if entry.component_precisions is None
+                else entry.component_precisions(request.quantization_config)
+            ),
+            schedule=schedule,
         )
-
-
-class DummyModelLoader(BaseModelLoader):
-    """Deterministic synthetic-weight loader for a fully constructed architecture."""
-
-    def load(
-        self,
-        entry: Any,
-        config: dict[str, Any],
-        request: LoadRequest,
-        *,
-        root: Path,
-        repository_id: str | None,
-    ) -> LoadedModel:
-        """Construct the architecture and fill included parameters with synthetic data."""
-
-        del repository_id
-        sources = (WeightSourceSet(root, (), ()),)
-        prepared = _prepare_architecture_config(entry.architecture, config, root, sources)
-        model, tokenizer = _construct_model(entry, prepared, request, root)
-
-        # Architecture-owned scope selection keeps synthetic materialization aligned
-        # with the same parameter boundary used by real checkpoints.
-        included = (
-            getattr(model, "checkpoint_parameter_names")()
-            if entry.architecture == "NEOChatModel"
-            else {name for name, _ in model.named_parameters()}
+        construction_device = (
+            "meta" if self.load_format is LoadFormat.LAYERED else request.execution.device
         )
-        loaded: set[str] = set()
-
-        # A stable seed per sorted name makes values reproducible across processes.
-        with torch.no_grad():
-            for index, name in enumerate(sorted(included), start=1):
-                current = dict(model.named_parameters()).get(name)
-                if current is None:
-                    continue
-                seed = index
-                generator = torch.Generator(device="cpu")
-                generator.manual_seed(seed)
-                value = torch.empty(
-                    tuple(current.shape),
-                    dtype=current.dtype,
-                    device="cpu",
+        with construction_dtype(dtype), torch.device(construction_device):
+            construction = entry.model_class.build_checkpoint(config, context)
+        if not isinstance(construction, ModelConstruction):
+            raise TypeError("model checkpoint declaration must return ModelConstruction")
+        by_name = {source.source_name: source for source in sources}
+        destinations: dict[int, torch.device] = {}
+        for component in construction.components:
+            for path, _ in (*component.module_devices, *component.parameter_dtypes):
+                component.module.get_submodule(path)
+            for path, owner in component.module.named_modules():
+                device = component.device_for(path, request.execution.device)
+                for parameter in owner.parameters(recurse=False):
+                    assigned = destinations.setdefault(id(parameter), device)
+                    if assigned != device:
+                        raise ValueError("a shared parameter cannot belong to different devices")
+                matching_dtypes = (
+                    (len(prefix), value)
+                    for prefix, value in component.parameter_dtypes
+                    if not prefix or path == prefix or path.startswith(prefix + ".")
                 )
-                if current.is_floating_point():
-                    value.normal_(mean=0.0, std=0.02, generator=generator)
-                else:
-                    value.zero_()
-                default_weight_loader(current, TensorWeightHandle(name, value))
-                loaded.add(name)
-
-        # Complete non-parameter state and quantization-derived representations.
-        _materialize_scope_buffers(model, loaded, request.device)
-        _zero_dummy_vocab_padding(model, loaded)
-        _process_loaded_quantization(model, loaded)
+                parameter_dtype = max(
+                    matching_dtypes,
+                    key=lambda item: item[0],
+                    default=(-1, component.dtype or dtype),
+                )[1]
+                attach_parameter_loaders(
+                    owner,
+                    device=device,
+                    dtype=parameter_dtype,
+                    recurse=False,
+                )
+                for name, buffer in owner.named_buffers(recurse=False):
+                    if not buffer.is_meta and buffer.device != device:
+                        owner._buffers[name] = buffer.to(device)
+        for component in construction.components:
+            load_component(component, by_name[component.source], request)
+        model = construction.assemble()
+        if not isinstance(model, ExecutionModel):
+            raise unsupported_setup(f"{type(model).__name__} must implement ExecutionModel")
         model.eval()
         return LoadedModel(
             model=model,
-            tokenizer=tokenizer,
-            device=request.device,
+            tokenizer=construction.tokenizer,
+            worker_config=request.execution,
             weights=WeightSet.from_module(model),
             sources=sources,
-            architecture_config=_canonical_architecture_config(prepared),
+            architecture_config=_canonical_architecture_config(construction.config),
+            weight_sidecars=entry.sidecars,
+            weight_sources=entry.sources,
+            schedule=schedule,
         )
 
 
-class ShardedStateLoader(BaseModelLoader):
-    """Rank-local loader for checkpoints keyed by installed parameter names."""
+def load_model(request: LoadRequest) -> LoadedModel:
+    """Discover and load a checkpoint, including its input-token declarations."""
 
-    def load(
-        self,
-        entry: Any,
-        config: dict[str, Any],
-        request: LoadRequest,
-        *,
-        root: Path,
-        repository_id: str | None,
-    ) -> LoadedModel:
-        """Construct the architecture and load rank-local tensors by installed parameter name."""
+    from ..bootstrap.catalog import resolve_catalog_entry
 
-        # Resolve exactly one rank-owned source and verify it before model mutation.
-        sources = resolve_weight_sources(
-            request,
-            architecture=entry.architecture,
-            sidecars=entry.sidecars,
-            root=root,
-            repository_id=repository_id,
-        )
-        _verify_checksums(sources, request.load.checksum_manifest)
-        prepared = _prepare_architecture_config(entry.architecture, config, root, sources)
-        model, tokenizer = _construct_model(entry, prepared, request, root)
-
-        # Installed-name checkpoints bypass architecture name mapping but retain scope.
-        report = LoadReport()
-        parameters = dict(model.named_parameters())
-        names = set(parameters)
-        included = (
-            set(getattr(model, "checkpoint_parameter_names")())
-            if entry.architecture == "NEOChatModel"
-            else names
-        )
-        for handle in iter_weight_handles(sources[0], request.load):
-            if handle.name not in names:
-                report.unexpected.append(handle.name)
-                continue
-            if handle.name not in included:
-                continue
-            parameter = parameters[handle.name]
-            default_weight_loader(parameter, handle)
-            report.loaded.add(handle.name)
-
-        # Materialize dependent state, validate completeness, and finalize quantization.
-        _materialize_scope_buffers(model, report.loaded, request.device)
-        audit_load_report(
-            model,
-            report,
-            included=included,
-            label="sharded-state checkpoint",
-            require_packed_shards=False,
-        )
-        _process_quantization_for_scope(model, entry.architecture, report.loaded)
-        model.eval()
-        return LoadedModel(
-            model=model,
-            tokenizer=tokenizer,
-            device=request.device,
-            weights=WeightSet.from_module(model),
-            sources=sources,
-            architecture_config=_canonical_architecture_config(prepared),
-        )
-
-
-class LayeredModelLoader(BaseModelLoader):
-    """Module-at-a-time loader for bounded checkpoint materialization memory."""
-
-    def load(
-        self,
-        entry: Any,
-        config: dict[str, Any],
-        request: LoadRequest,
-        *,
-        root: Path,
-        repository_id: str | None,
-    ) -> LoadedModel:
-        """Load primary and secondary sources one owning module at a time."""
-
-        # Resolve and verify every source before deferred placement begins.
-        sources = resolve_weight_sources(
-            request,
-            architecture=entry.architecture,
-            sidecars=entry.sidecars,
-            root=root,
-            repository_id=repository_id,
-        )
-        _verify_checksums(sources, request.load.checksum_manifest)
-        prepared = _prepare_architecture_config(entry.architecture, config, root, sources)
-        model, tokenizer = _construct_model(entry, prepared, request, root)
-
-        # Each source records logical placements, then materializes them by owner subtree.
-        report = _load_layered_primary(model, entry.architecture, sources[0], request)
-        _materialize_scope_buffers(model, report.loaded, request.device)
-        _audit_primary(model, entry.architecture, report)
-        if len(sources) > 1:
-            _load_layered_secondary(model, entry.architecture, sources[1:], request)
-
-        # Layer materialization performs quantization processing before this final publish.
-        _warn_skips(entry.architecture, report)
-        model.eval()
-        return LoadedModel(
-            model=model,
-            tokenizer=tokenizer,
-            device=request.device,
-            weights=WeightSet.from_module(model),
-            sources=sources,
-            architecture_config=_canonical_architecture_config(prepared),
-        )
-
-
-_LOADERS: dict[LoadFormat, type[BaseModelLoader]] = {
-    LoadFormat.AUTO: DefaultModelLoader,
-    LoadFormat.SAFETENSORS: DefaultModelLoader,
-    LoadFormat.PT: DefaultModelLoader,
-    LoadFormat.DUMMY: DummyModelLoader,
-    LoadFormat.SHARDED_STATE: ShardedStateLoader,
-    LoadFormat.LAYERED: LayeredModelLoader,
-}
-
-
-def get_model_loader(load_format: LoadFormat | str) -> BaseModelLoader:
-    """Resolve the loader implementation selected by a checkpoint format."""
-
-    try:
-        selected = LoadFormat(str(load_format))
-        loader = _LOADERS[selected]
-    except (KeyError, ValueError) as error:
-        raise ValueError(f"unregistered model load format {load_format!r}") from error
-    return loader()
-
-
-def _construct_model(
-    entry: Any,
-    config: Any,
-    request: LoadRequest,
-    root: Path,
-) -> tuple[nn.Module, Any | None]:
-    """Construct an architecture with validated dtype, quantization, and load ownership."""
-
-    # Resolve execution precision and reject unsupported quantization/device pairs.
-    dtype = _serving_dtype(request.execution.model_dtype)
-    quantization = QuantizationConfig.from_model_config(config)
-    _validate_quantization(quantization, request.device, dtype)
-    layer_config = LayerConfig(
-        parallel=request.parallel, quantization=quantization, tp_group=request.tp_group
+    root, repository_id = resolve_model_root(request.model_path, request.load)
+    config = read_model_config(root)
+    entry = resolve_catalog_entry(tuple(str(value) for value in config.get("architectures") or ()))
+    loaded = get_model_loader(request.load.load_format).load(
+        entry, config, request, root=root, repository_id=repository_id
     )
-    use_meta = request.load.load_format is LoadFormat.LAYERED or (
-        entry.architecture == "NEOChatModel" and request.scope.value != "whole"
+    loaded = replace(loaded, worker_config=_loaded_worker_config(loaded.model, request))
+    _resolve_input_tokens(loaded.model, loaded.tokenizer)
+    logger.info(
+        "loaded model architecture=%s weight_version=%d",
+        loaded.model.architecture,
+        loaded.weights.version,
     )
+    return loaded
 
-    # Meta construction defers storage allocation until a scoped or layered owner loads.
-    construction_device = torch.device("meta" if use_meta else request.device)
-    with _default_dtype(dtype), torch.device(construction_device):
-        if entry.architecture == "NEOChatModel":
-            model = entry.model_class(
-                config,
-                layer_config=layer_config,
-                transfers=request.transfers,
-                scope=request.scope.value,
+
+def _loaded_worker_config(model: ExecutionModel, request: LoadRequest) -> WorkerConfig:
+    """Close requested execution bounds over the materialized computation geometry."""
+
+    config = request.execution
+    if "output" in request.bindings.entries:
+        config = replace(config, output_rank=request.bindings.entries["output"].ranks[0])
+    if model.resource_geometry.request_tensors:
+        if request.pipeline_depth is None:
+            raise unsupported_setup("request tensor storage requires its physical pipeline depth")
+        # Two unresolved outputs and one further physical position permit
+        # publication retirement before a resident request slot is reused.
+        state_slots = min(config.max_batch_operations, request.pipeline_depth // 3)
+        if state_slots < 2:
+            raise unsupported_setup(
+                "resident media execution requires two slots with two unresolved outputs each"
             )
-        elif entry.architecture == "BagelForConditionalGeneration":
-            model = entry.model_class(
-                config, layer_config=layer_config, transfers=request.transfers
-            )
-        else:
-            model = entry.model_class(config, layer_config=layer_config)
-    if not isinstance(model, nn.Module):
-        raise unsupported_setup("catalog model constructor did not return torch.nn.Module")
-
-    # Bind parameter owners after construction so tied aliases are known before loading.
-    attach_parameter_loaders(model, device=request.device, dtype=dtype)
-
-    # Text serving requires the tokenizer stored beside the resolved checkpoint config.
-    tokenizer = None
-    if entry.architecture == "NEOChatModel":
-        from transformers import AutoTokenizer
-
-        try:
-            tokenizer = AutoTokenizer.from_pretrained(
-                root,
-                use_fast=False,
-                trust_remote_code=False,
-                local_files_only=True,
-            )
-        except Exception as error:
-            raise RuntimeError(
-                f"failed to load the configured SenseNova tokenizer from {str(root)!r}: {error}"
-            ) from error
-    return model, tokenizer
+        config = replace(
+            config,
+            kv_token_capacity=None,
+            attention_backend=None,
+            max_batch_operations=state_slots,
+            max_batch_tokens=state_slots,
+            max_request_pool_size=state_slots,
+            min_request_pool_size=2,
+            generation_device=None,
+        )
+    return config
 
 
-def _prepare_architecture_config(
-    architecture: str,
-    config: dict[str, Any],
-    root: Path,
-    sources: tuple[WeightSourceSet, ...],
-) -> Any:
-    """Normalize generic checkpoint metadata into an architecture constructor config."""
+def _resolve_input_tokens(model: ExecutionModel, tokenizer: Any | None) -> None:
+    """Resolve model-specific input token identities from tokenizer metadata."""
 
-    # SenseNova owns a typed configuration and validates checkpoint code compatibility.
-    if architecture == "NEOChatModel":
-        from ..models.sensenova.config import NeoChatConfig
-        from ..models.sensenova.model import _check_checkpoint_code_version
-
-        resolved = NeoChatConfig.from_dict(config)
-        _check_checkpoint_code_version(resolved)
-        return resolved
-    if architecture != "BagelForConditionalGeneration":
-        return config
-    from ..models.bagel import BagelConfig
-
-    # BAGEL splits component configuration into sidecars when fields are not inline.
-    raw = dict(config)
-    for field, filename in (
-        ("llm_config", "llm_config.json"),
-        ("vit_config", "vit_config.json"),
-        ("vae_config", "vae_config.json"),
-    ):
-        if field in raw:
+    processor = model.image_processor
+    injection = getattr(processor, "feature_injection", None)
+    if processor is None or injection is None:
+        return
+    updates: dict[str, int] = {}
+    for token_field, id_field in (("start_token", "start_token_id"), ("end_token", "end_token_id")):
+        token = getattr(injection, token_field)
+        token_id = getattr(injection, id_field)
+        if token_id is not None or token is None:
             continue
-        path = root / filename
-        if not path.is_file():
-            raise unsupported_setup(f"BAGEL checkpoint is missing {filename!r} for {field!r}")
-        value = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(value, dict):
-            raise unsupported_setup(f"BAGEL checkpoint file {filename!r} must contain an object")
-        raw[field] = value
-
-    # Positional-embedding shape determines the square latent grid supported by weights.
-    positions = sources[0].preview_shape("latent_pos_embed.pos_embed")[0]
-    max_latent_size = math.isqrt(positions)
-    if max_latent_size * max_latent_size != positions:
-        raise unsupported_setup(f"BAGEL latent position count {positions} is not square")
-    raw["max_latent_size"] = max_latent_size
-    return BagelConfig.from_mapping(raw)
-
-
-def _load_primary(
-    model: nn.Module,
-    architecture: str,
-    source: WeightSourceSet,
-    request: LoadRequest,
-) -> LoadReport:
-    """Stream a primary source through the architecture-owned assignment method."""
-
-    load_weights = getattr(model, "load_weights", None)
-    if not callable(load_weights):
-        raise unsupported_setup(f"{architecture} must implement load_weights")
-    report = load_weights(iter_weight_handles(source, request.load))
-    if not isinstance(report, LoadReport):
-        raise unsupported_setup(f"{architecture}.load_weights must return LoadReport")
-    return report
+        if tokenizer is None:
+            raise unsupported_setup(
+                f"model input declaration requires tokenizer resolution for {token!r}"
+            )
+        resolved = tokenizer.convert_tokens_to_ids(token)
+        if resolved is None or int(resolved) < 0:
+            raise unsupported_setup(f"tokenizer does not define declared token {token!r}")
+        updates[id_field] = int(resolved)
+    if not updates:
+        return
+    resolved_injection = replace(
+        injection,
+        start_token_id=updates.get("start_token_id", injection.start_token_id),
+        end_token_id=updates.get("end_token_id", injection.end_token_id),
+    )
+    model.image_processor = replace(processor, feature_injection=resolved_injection)
 
 
-def _load_layered_primary(
-    model: nn.Module,
-    architecture: str,
-    source: WeightSourceSet,
-    request: LoadRequest,
-) -> LoadReport:
-    """Load a primary source through deferred module-at-a-time placements."""
+def get_model_loader(load_format: LoadFormat | str) -> ModelLoader:
+    """Select checkpoint materialization without architecture-specific loader branches."""
 
-    return _load_layered_weights(
-        model,
-        architecture,
-        iter_weight_handles(source, request.load),
+    return ModelLoader(LoadFormat(str(load_format)))
+
+
+def component_parameter_names(component: CheckpointComponent) -> set[str]:
+    """Return the component's installed parameter scope in component coordinates."""
+
+    return (
+        {name for name, _ in component.module.named_parameters()}
+        if component.included is None
+        else set(component.included)
     )
 
 
-def _load_layered_weights(
-    model: nn.Module,
-    architecture: str,
-    handles: Iterable[WeightHandle],
-) -> LoadReport:
-    """Resolve logical assignments first, then materialize them by owning module."""
+def audit_component(
+    component: CheckpointComponent, report: LoadReport, *, packed: bool = True
+) -> None:
+    """Require all resident parameters and declared persistent buffers to be loaded."""
 
-    load_weights = getattr(model, "load_weights", None)
-    if not callable(load_weights):
-        raise unsupported_setup(f"{architecture} must implement load_weights")
-    with defer_parameter_weights() as placements:
-        report = load_weights(handles)
-    if not isinstance(report, LoadReport):
-        raise unsupported_setup(f"{architecture}.load_weights must return LoadReport")
-    _materialize_layered_placements(model, placements)
+    included = component_parameter_names(component)
+    if component.persistent_buffers:
+        included.update(_persistent_buffers(component.module))
+    audit_load_report(
+        component.module,
+        report,
+        included=included,
+        optional=component.optional,
+        label=f"{component.source} checkpoint",
+        require_packed_shards=packed,
+    )
+
+
+def load_component(
+    component: CheckpointComponent, source: WeightSourceSet, request: LoadRequest
+) -> LoadReport:
+    """Assign, audit and finalize one component using the caller's I/O policy."""
+
+    if request.load.load_format is LoadFormat.DUMMY:
+        if component.post_load is not None:
+            raise ValueError("synthetic loading cannot supply checkpoint-dependent precomputation")
+        report = _load_dummy(component)
+    else:
+        handles: Iterable[WeightHandle] = iter_weight_handles(
+            source, request.load, durable=component.post_load is not None
+        )
+        retained = None
+        if component.post_load is not None:
+            retained = {handle.name: handle for handle in handles}
+            handles = retained.values()
+        report = assign_component(
+            component,
+            handles,
+            device=request.execution.device,
+            layered=request.load.load_format is LoadFormat.LAYERED,
+            installed=request.load.load_format is LoadFormat.SHARDED_STATE,
+        )
+        if component.post_load is not None:
+            assert retained is not None
+            with torch.inference_mode(), weight_handle_materialization():
+                component.post_load(retained)
+    _materialize_scope_buffers(component, report.loaded, request.execution.device)
+    _warn_skips(component.source, report)
+    if request.load.load_format is not LoadFormat.LAYERED:
+        _process_loaded_quantization(component.module, report.loaded)
     return report
 
 
-def _materialize_layered_placements(
+def assign_component(
+    component: CheckpointComponent,
+    handles: Iterable[WeightHandle],
+    *,
+    device: str,
+    layered: bool = False,
+    installed: bool = False,
+) -> LoadReport:
+    """Map and audit checkpoint values; layered mode materializes one owner at a time."""
+
+    def assign() -> LoadReport:
+        if installed or component.map_weights is None:
+            return _load_declared_weights(component, handles, device, packed=not installed)
+        return component.map_weights(handles)
+
+    if layered:
+        with defer_parameter_weights() as assignments:
+            report = assign()
+        _materialize_parameter_weights(component.module, assignments)
+    else:
+        with torch.no_grad(), weight_handle_materialization():
+            report = assign()
+    audit_component(component, report, packed=not installed)
+    return report
+
+
+def _persistent_buffers(module: nn.Module) -> dict[str, torch.Tensor]:
+    """Select buffers that belong to the serialized state, excluding derived workspaces."""
+
+    names = module.state_dict().keys()
+    return {name: value for name, value in module.named_buffers() if name in names}
+
+
+def _load_declared_weights(
+    component: CheckpointComponent,
+    handles: Iterable[WeightHandle],
+    device: str,
+    *,
+    packed: bool,
+) -> LoadReport:
+    parameters = dict(component.module.named_parameters())
+    included = component_parameter_names(component)
+    buffers = _persistent_buffers(component.module) if component.persistent_buffers else {}
+    report = LoadReport()
+    for handle in handles:
+        name, shard = (
+            stacked_weight_name(handle.name, component.weight_name_map)
+            if packed
+            else (handle.name, None)
+        )
+        if name not in parameters and handle.name in parameters:
+            name, shard = handle.name, None
+        if name in parameters:
+            if name not in included:
+                continue
+            if packed:
+                load_parameter_weight(parameters[name], handle, shard)
+            else:
+                default_weight_loader(parameters[name], handle)
+        elif name in buffers:
+            target = buffers[name]
+            if target.shape != torch.Size(handle.shape):
+                raise ValueError(f"checkpoint buffer {name!r} has incompatible shape")
+            value = handle.full().to(device=component.device_for(name, device), dtype=target.dtype)
+            path, _, field = name.rpartition(".")
+            owner = component.module.get_submodule(path)
+            owner.register_buffer(field, value, persistent=True)
+        else:
+            (report.unexpected if component.strict else report.skipped).append(name)
+            continue
+        report.loaded.add(name)
+    return report
+
+
+def _load_dummy(component: CheckpointComponent) -> LoadReport:
+    included = component_parameter_names(component)
+    loaded: set[str] = set()
+    with torch.no_grad():
+        for index, name in enumerate(sorted(included), start=1):
+            current = dict(component.module.named_parameters()).get(name)
+            if current is None:
+                continue
+            generator = torch.Generator(device="cpu").manual_seed(index)
+            value = torch.empty(tuple(current.shape), dtype=current.dtype, device="cpu")
+            if current.is_floating_point():
+                value.normal_(mean=0.0, std=0.02, generator=generator)
+            else:
+                value.zero_()
+            default_weight_loader(current, TensorWeightHandle(name, value))
+            loaded.add(name)
+    _zero_dummy_vocab_padding(component.module, loaded)
+    return LoadReport(loaded=loaded)
+
+
+def _materialize_parameter_weights(
     model: nn.Module,
-    placements: list[DeferredWeightPlacement],
+    assignments: list[WeightAssignment],
 ) -> None:
-    """Group deferred placements by owner and materialize one module subtree at a time.
+    """Group deferred assignments by owner and materialize one module subtree at a time.
 
     The scoped handle cache keeps each shard open only while its owner's parameters and
     quantization-derived tensors are materialized.
@@ -496,13 +445,13 @@ def _materialize_layered_placements(
             owners.setdefault(id(parameter), (module_name, module))
 
     # Preserve checkpoint assignment order within each owning module.
-    grouped: dict[str, list[DeferredWeightPlacement]] = defaultdict(list)
-    for placement in placements:
+    grouped: dict[str, list[WeightAssignment]] = defaultdict(list)
+    for assignment in assignments:
         try:
-            owner_name, _owner = owners[id(placement.parameter)]
+            owner_name, _owner = owners[id(assignment.parameter)]
         except KeyError as error:
-            raise RuntimeError("deferred checkpoint placement has no model owner") from error
-        grouped[owner_name].append(placement)
+            raise RuntimeError("deferred checkpoint assignment has no model owner") from error
+        grouped[owner_name].append(assignment)
 
     # Finalize quantization while the just-loaded module is the active memory unit.
     for module_name, module in ordered_modules:
@@ -510,89 +459,12 @@ def _materialize_layered_placements(
         if not unit:
             continue
         with torch.no_grad(), weight_handle_materialization():
-            for placement in unit:
-                placement.apply()
+            for assignment in unit:
+                assignment.apply()
         process_quantized_modules((module,))
 
 
-def _audit_primary(model: nn.Module, architecture: str, report: LoadReport) -> None:
-    """Validate primary checkpoint completeness against architecture-owned scope."""
-
-    if architecture == "NEOChatModel":
-        included = getattr(model, "checkpoint_parameter_names")()
-        audit_load_report(model, report, included=included, label="SenseNova checkpoint")
-        return
-    if architecture == "BagelForConditionalGeneration":
-        target = getattr(model, "model")
-        included = getattr(model, "checkpoint_parameter_names")()
-        audit_load_report(target, report, included=included, label="BAGEL checkpoint")
-        return
-    audit_load_report(model, report, label="Qwen3 checkpoint")
-
-
-def _load_secondary(
-    model: nn.Module,
-    architecture: str,
-    sources: tuple[WeightSourceSet, ...],
-    request: LoadRequest,
-) -> None:
-    """Load and validate conventionally materialized architecture-owned sources."""
-
-    if architecture != "BagelForConditionalGeneration" or len(sources) != 1:
-        raise unsupported_setup(f"{architecture} does not declare these secondary sources")
-    load_autoencoder = getattr(model, "load_autoencoder_weights", None)
-    if not callable(load_autoencoder):
-        raise unsupported_setup("BAGEL must implement load_autoencoder_weights")
-    report = load_autoencoder(iter_weight_handles(sources[0], request.load))
-    target = getattr(getattr(model, "model"), "vae")
-    optional = _bagel_vae_optional(target)
-    audit_load_report(
-        target,
-        report,
-        optional=optional,
-        label="BAGEL autoencoder checkpoint",
-    )
-    _warn_skips("BAGEL autoencoder", report)
-
-
-def _load_layered_secondary(
-    model: nn.Module,
-    architecture: str,
-    sources: tuple[WeightSourceSet, ...],
-    request: LoadRequest,
-) -> None:
-    """Load and validate secondary sources through deferred owner placements."""
-
-    if architecture != "BagelForConditionalGeneration" or len(sources) != 1:
-        raise unsupported_setup(f"{architecture} does not declare these secondary sources")
-    load_autoencoder = getattr(model, "load_autoencoder_weights", None)
-    if not callable(load_autoencoder):
-        raise unsupported_setup("BAGEL must implement load_autoencoder_weights")
-    target = getattr(getattr(model, "model"), "vae")
-    with defer_parameter_weights() as placements:
-        report = load_autoencoder(iter_weight_handles(sources[0], request.load))
-    if not isinstance(report, LoadReport):
-        raise unsupported_setup("BAGEL autoencoder loader must return LoadReport")
-    _materialize_layered_placements(target, placements)
-    optional = _bagel_vae_optional(target)
-    audit_load_report(
-        target,
-        report,
-        optional=optional,
-        label="BAGEL autoencoder checkpoint",
-    )
-    _warn_skips("BAGEL autoencoder", report)
-
-
-def _bagel_vae_optional(module: nn.Module) -> set[str]:
-    """Return BAGEL VAE regularizer parameters that need not exist in a checkpoint."""
-
-    return {
-        name for name, _ in module.named_parameters() if name == "reg" or name.startswith("reg.")
-    }
-
-
-def _verify_checksums(
+def verify_checksums(
     sources: tuple[WeightSourceSet, ...],
     manifest_location: str | None,
 ) -> None:
@@ -601,7 +473,7 @@ def _verify_checksums(
     if manifest_location is None:
         return
 
-    # The manifest may be a local deployment artifact or an explicit remote URI.
+    # The manifest may be a local worker_config artifact or an explicit remote URI.
     if manifest_location.startswith(("http://", "https://")):
         with urlopen(manifest_location) as response:  # noqa: S310 - explicit configured URI
             payload = response.read().decode("utf-8")
@@ -657,7 +529,7 @@ def _process_loaded_quantization(model: nn.Module, loaded: set[str]) -> None:
 
 
 def _materialize_scope_buffers(
-    model: nn.Module,
+    component: CheckpointComponent,
     loaded: set[str],
     device: str,
 ) -> None:
@@ -670,26 +542,13 @@ def _materialize_scope_buffers(
         active_modules.update(".".join(parts[:end]) for end in range(1, len(parts) + 1))
 
     # Invoke only owners within the loaded scope so excluded meta branches stay deferred.
-    for module_name, module in model.named_modules():
+    for module_name, module in component.module.named_modules():
         parts = module_name.split(".")
         if not any(".".join(parts[:end]) in active_modules for end in range(1, len(parts) + 1)):
             continue
         materialize = getattr(module, "materialize_load_buffers", None)
         if callable(materialize):
-            materialize(device)
-
-
-def _process_quantization_for_scope(
-    model: nn.Module,
-    architecture: str,
-    loaded: set[str],
-) -> None:
-    """Finalize quantization at the architecture's declared model-load scope."""
-
-    if architecture == "NEOChatModel":
-        _process_loaded_quantization(model, loaded)
-    else:
-        process_quantized_modules(model.modules())
+            materialize(str(component.device_for(module_name, device)))
 
 
 def _zero_dummy_vocab_padding(model: nn.Module, loaded: set[str]) -> None:
@@ -738,31 +597,3 @@ def _serving_dtype(name: str) -> torch.dtype:
         raise ValueError(
             f"unknown model dtype {name!r}; expected bfloat16, float16, or float32"
         ) from error
-
-
-def _validate_quantization(
-    config: QuantizationConfig | None,
-    device: str,
-    dtype: torch.dtype,
-) -> None:
-    """Reject quantized execution unsupported by activation dtype or CUDA capability."""
-
-    if config is None or config.method == "unquantized":
-        return
-    if dtype not in {torch.float16, torch.bfloat16}:
-        raise unsupported_setup("W8A8 FP8 requires float16 or bfloat16 activations")
-    target = torch.device(device)
-    if target.type == "cuda" and torch.cuda.get_device_capability(target) < (8, 9):
-        raise unsupported_setup("W8A8 FP8 requires CUDA compute capability 8.9 or newer")
-
-
-@contextmanager
-def _default_dtype(dtype: torch.dtype):
-    """Set PyTorch's construction dtype for a scope and restore it on exit."""
-
-    previous = torch.get_default_dtype()
-    torch.set_default_dtype(dtype)
-    try:
-        yield
-    finally:
-        torch.set_default_dtype(previous)

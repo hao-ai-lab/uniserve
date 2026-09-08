@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import torch
 
-from .mesh import GroupCoordinator
+from .mesh import Communicator
 
 
 @dataclass(frozen=True)
@@ -19,7 +19,7 @@ class LayerPipeline:
     storage through completion on the current execution stream.
     """
 
-    group: GroupCoordinator
+    group: Communicator
     layer_count: int
 
     def __post_init__(self) -> None:

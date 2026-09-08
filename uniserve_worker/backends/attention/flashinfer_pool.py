@@ -9,7 +9,6 @@ from typing import Any, NamedTuple
 
 import torch
 
-from .tuning import FlashInferTuningConfig
 from .flashinfer_plan import (
     _decode_fast_plan_signature,
     _DecodePlanWorkspace,
@@ -17,6 +16,7 @@ from .flashinfer_plan import (
     _PrefillPlanWorkspace,
 )
 from .paged_attention_plan_pool import PagedAttentionPlanPool
+from .tuning import FlashInferTuningConfig
 
 _DEFAULT_WORKSPACE_SIZE = 512 * 1024 * 1024
 

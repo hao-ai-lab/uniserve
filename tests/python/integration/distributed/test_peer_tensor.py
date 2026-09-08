@@ -7,7 +7,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from uniserve_worker.nn.parallel import ParallelConfig, RingSequence
+from uniserve_worker.nn.parallel import ParallelConfig, SequenceParallel
 from uniserve_worker.runtime.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
@@ -29,10 +29,17 @@ def _run_peer_tensor(rank: int, rendezvous: str, world_size: int) -> None:
     ranks = tuple(reversed(range(world_size)))
     mesh = initialize_model_parallel(
         environment,
-        {"model": (ranks, ParallelConfig(sequence_parallel=RingSequence(world_size)))},
+        {
+            "model": (
+                ranks,
+                ParallelConfig(sequence_parallel=SequenceParallel("ring", (world_size,))),
+            )
+        },
     )["model"]
     group = mesh.get_group("cp")
-    workspace = group.peer_tensor((123, 7, 128), dtype=torch.bfloat16, name="rows", row_multiple=64)
+    workspace = environment.peer_tensor(
+        group, (123, 7, 128), dtype=torch.bfloat16, name="rows", row_multiple=64
+    )
     assert workspace.local.shape[0] >= 123 and workspace.local.shape[0] % 64 == 0
     sync_input = torch.zeros(1, dtype=torch.int32, device=device)
     sync_output = torch.empty(world_size, dtype=torch.int32, device=device)

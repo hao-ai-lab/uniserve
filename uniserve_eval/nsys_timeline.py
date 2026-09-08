@@ -70,7 +70,7 @@ def transform_timeline(
                 process_name=process_name,
                 rank=fields.get("rank"),
                 global_tid=global_tid,
-                thread_name=threads.get(global_tid),
+                thread_name=threads.get(global_tid) if global_tid is not None else None,
                 start_ns=start,
                 end_ns=end,
                 name=text.split(maxsplit=1)[0] if text else "nvtx",
@@ -127,7 +127,7 @@ def transform_timeline(
                 process_id=pid,
                 process_name=process_name,
                 global_tid=global_tid,
-                thread_name=threads.get(global_tid),
+                thread_name=threads.get(global_tid) if global_tid is not None else None,
                 start_ns=start,
                 end_ns=end,
                 correlation_id=correlation_id,
@@ -214,7 +214,7 @@ def transform_timeline(
                     process_id=pid,
                     process_name=process_name,
                     global_tid=global_tid,
-                    thread_name=threads.get(global_tid),
+                    thread_name=threads.get(global_tid) if global_tid is not None else None,
                     start_ns=start,
                     end_ns=end,
                     name=_name(row, strings, "nameId", fallback="osrt"),
@@ -468,7 +468,7 @@ def _insert_generic_table(
             process_id=pid,
             process_name=process_name,
             global_tid=global_tid,
-            thread_name=threads.get(global_tid),
+            thread_name=threads.get(global_tid) if global_tid is not None else None,
             device_id=device,
             stream_id=_optional_integer(row, "streamId"),
             start_ns=start,
@@ -613,7 +613,9 @@ def _insert_event(db: sqlite3.Connection, **values: Any) -> int:
         f"VALUES({', '.join('?' for _ in columns)}, ?)",
         (*row, end - start),
     )
-    return int(cursor.lastrowid)
+    event_id = cursor.lastrowid
+    assert event_id is not None, "event insertion must publish its SQLite row identity"
+    return event_id
 
 
 def _link_parent(db: sqlite3.Connection, parent: dict[str, Any] | None, child: int) -> None:

@@ -8,7 +8,7 @@ from threading import RLock
 
 import torch
 
-from ..execution.batch import BufferId, BufferPlacement, ProductRef
+from ..execution.batch import BufferAllocation, BufferId, ProductRef
 from ..foundation.errors import WorkerError, WorkerErrorCode, invalid_descriptor
 from .device import canonical_device
 
@@ -25,7 +25,7 @@ def _invariant(message: str) -> WorkerError:
 
 @dataclass(frozen=True, slots=True)
 class PersistentBufferBinding:
-    """Binds a logical buffer placement to its validated tensor view."""
+    """Binds a logical buffer allocation to its validated tensor view."""
 
     buffer: BufferId
     offset: int
@@ -58,9 +58,7 @@ class PersistentBuffers:
             normalized.append(torch.device("cpu"))
         self.devices = tuple(normalized)
         self._arenas = {
-            str(device): torch.empty(
-                (self.byte_capacity,), dtype=torch.uint8, device=device
-            )
+            str(device): torch.empty((self.byte_capacity,), dtype=torch.uint8, device=device)
             for device in self.devices
         }
         self._active: dict[tuple[str, BufferId], PersistentBufferBinding] = {}
@@ -70,45 +68,45 @@ class PersistentBuffers:
     def bind(
         self,
         reference: ProductRef,
-        placement: BufferPlacement,
+        allocation: BufferAllocation,
         *,
         device: torch.device | str,
         dtype: torch.dtype,
         shape: tuple[int, ...],
     ) -> PersistentBufferBinding:
-        """Validate a buffer placement and return its device tensor view with generation ownership."""
+        """Validate a buffer allocation and return its device tensor view with generation ownership."""
 
         target = canonical_device(device)
         device_name = str(target)
         arena = self._arenas.get(device_name)
         if arena is None:
-            raise invalid_descriptor("buffer placement names an undeclared worker device")
-        if placement.buffer != reference.buffer_id:
-            raise invalid_descriptor("buffer placement does not name its output")
+            raise invalid_descriptor("buffer allocation names an undeclared worker device")
+        if allocation.buffer != reference.buffer_id:
+            raise invalid_descriptor("buffer allocation does not name its output")
         required = int(math.prod(shape)) * int(torch.empty((), dtype=dtype).element_size())
-        end = int(placement.offset) + int(placement.bytes)
-        if required < 1 or required > int(placement.bytes):
-            raise invalid_descriptor("buffer placement is smaller than its output tensor")
+        end = int(allocation.offset) + int(allocation.bytes)
+        if required < 1 or required > int(allocation.bytes):
+            raise invalid_descriptor("buffer allocation is smaller than its output tensor")
         if end > self.byte_capacity:
-            raise invalid_descriptor("buffer placement exceeds the worker buffer pool")
+            raise invalid_descriptor("buffer allocation exceeds the worker buffer pool")
         element_bytes = int(torch.empty((), dtype=dtype).element_size())
-        if int(placement.offset) % element_bytes != 0:
-            raise invalid_descriptor("buffer placement is not aligned for its output dtype")
-        key = (device_name, placement.buffer)
+        if int(allocation.offset) % element_bytes != 0:
+            raise invalid_descriptor("buffer allocation is not aligned for its output dtype")
+        key = (device_name, allocation.buffer)
         with self._lock:
             if key in self._active:
-                raise invalid_descriptor("buffer placement is already bound")
-            start = int(placement.offset)
+                raise invalid_descriptor("buffer allocation is already bound")
+            start = int(allocation.offset)
             for active in self._active.values():
                 if active.device_name != device_name:
                     continue
                 if start < active.offset + active.bytes and active.offset < end:
-                    raise invalid_descriptor("buffer placement overlaps a live worker buffer")
+                    raise invalid_descriptor("buffer allocation overlaps a live worker buffer")
             tensor = arena.narrow(0, start, required).view(dtype).reshape(shape)
             binding = PersistentBufferBinding(
-                buffer=placement.buffer,
+                buffer=allocation.buffer,
                 offset=start,
-                bytes=int(placement.bytes),
+                bytes=int(allocation.bytes),
                 binding_id=self._next_binding_id,
                 device_name=device_name,
                 tensor=tensor,

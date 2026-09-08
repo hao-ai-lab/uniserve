@@ -26,33 +26,11 @@ impl RequestKey {
     }
 }
 
-/// Stable operation kinds understood by Runtime, Scheduler, and Router.
-/// Physical worker modes are represented by [`RunKind`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[repr(u8)]
-pub enum OpKind {
-    /// Extends an autoregressive prefix with prompt tokens.
-    ArExtend = 0,
-    /// Produces the next autoregressive token.
-    ArDecode = 1,
-    /// Verifies speculative autoregressive tokens.
-    ArVerify = 2,
-    /// Executes a multimodal encoder stage.
-    EncoderExecute = 3,
-    /// Initializes a diffusion trajectory.
-    DiffusionPrepare = 4,
-    /// Advances a diffusion trajectory.
-    DiffusionStep = 5,
-    /// Decodes a completed diffusion trajectory into media.
-    DiffusionDecode = 6,
-}
-
 /// Worker-private execution modes carried by a physical [`Run`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
-pub enum RunKind {
+pub enum OpCode {
     /// Extends an autoregressive prefix with prompt tokens.
     ArExtend = 0,
     /// Produces the next autoregressive token.
@@ -77,6 +55,10 @@ pub enum RunKind {
     DiffusionFinalize = 10,
     /// Decodes a completed diffusion trajectory into media.
     DiffusionDecode = 11,
+    /// Encodes prompt tokens into a conditioning tensor.
+    EncoderText = 12,
+    /// Consumes decoded media units into their ordered output stream.
+    MediaAppend = 13,
 }
 
 /// Configured or resolved worker attention implementation.
@@ -190,52 +172,9 @@ impl<'de> Deserialize<'de> for AttentionBackend {
 #[error("unsupported attention backend {0:?}")]
 pub struct AttentionBackendParseError(String);
 
-impl OpKind {
-    /// Logical operation kinds advertised through worker capabilities.
-    pub const ALL: [Self; 7] = [
-        Self::ArExtend,
-        Self::ArDecode,
-        Self::ArVerify,
-        Self::EncoderExecute,
-        Self::DiffusionPrepare,
-        Self::DiffusionStep,
-        Self::DiffusionDecode,
-    ];
-
-    /// Returns the stable wire name for this logical operation kind.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::ArExtend => "ar_extend",
-            Self::ArDecode => "ar_decode",
-            Self::ArVerify => "ar_verify",
-            Self::EncoderExecute => "encoder_execute",
-            Self::DiffusionPrepare => "diffusion_prepare",
-            Self::DiffusionStep => "diffusion_step",
-            Self::DiffusionDecode => "diffusion_decode",
-        }
-    }
-
-    /// Returns physical modes enabled by this logical capability.
-    pub const fn run_kinds(self) -> &'static [RunKind] {
-        match self {
-            Self::ArExtend => &[RunKind::ArExtend],
-            Self::ArDecode => &[RunKind::ArDecode, RunKind::TransferKvPublish],
-            Self::ArVerify => &[RunKind::ArVerify],
-            Self::EncoderExecute => &[
-                RunKind::EncoderVision,
-                RunKind::EncoderLatent,
-                RunKind::TransferProduct,
-            ],
-            Self::DiffusionPrepare => &[RunKind::DiffusionPrepare],
-            Self::DiffusionStep => &[RunKind::DiffusionStep, RunKind::TransferKvInstall],
-            Self::DiffusionDecode => &[RunKind::DiffusionDecode, RunKind::DiffusionFinalize],
-        }
-    }
-}
-
-impl RunKind {
+impl OpCode {
     /// Physical run kinds supported by the protocol.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 14] = [
         Self::ArExtend,
         Self::ArDecode,
         Self::ArVerify,
@@ -248,23 +187,9 @@ impl RunKind {
         Self::DiffusionStep,
         Self::DiffusionFinalize,
         Self::DiffusionDecode,
+        Self::EncoderText,
+        Self::MediaAppend,
     ];
-
-    /// Returns the logical operation capability required by this run kind.
-    pub const fn op_kind(self) -> OpKind {
-        match self {
-            Self::ArExtend => OpKind::ArExtend,
-            Self::ArDecode => OpKind::ArDecode,
-            Self::ArVerify => OpKind::ArVerify,
-            Self::EncoderVision | Self::EncoderLatent => OpKind::EncoderExecute,
-            Self::DiffusionPrepare => OpKind::DiffusionPrepare,
-            Self::DiffusionStep => OpKind::DiffusionStep,
-            Self::DiffusionFinalize | Self::DiffusionDecode => OpKind::DiffusionDecode,
-            Self::TransferProduct => OpKind::EncoderExecute,
-            Self::TransferKvPublish => OpKind::ArDecode,
-            Self::TransferKvInstall => OpKind::DiffusionStep,
-        }
-    }
 
     /// Returns whether this variant advances the authoritative request lineage.
     pub const fn advances_state(self) -> bool {
@@ -275,7 +200,6 @@ impl RunKind {
                 | Self::ArVerify
                 | Self::DiffusionPrepare
                 | Self::DiffusionStep
-                | Self::DiffusionDecode
         )
     }
 
@@ -291,8 +215,10 @@ impl RunKind {
             Self::DiffusionPrepare
             | Self::DiffusionStep
             | Self::DiffusionDecode
-            | Self::DiffusionFinalize => Domain::Flow,
+            | Self::DiffusionFinalize
+            | Self::MediaAppend => Domain::Flow,
             Self::ArExtend
+            | Self::EncoderText
             | Self::EncoderVision
             | Self::EncoderLatent
             | Self::TransferProduct
@@ -308,6 +234,7 @@ impl RunKind {
             Self::ArDecode => "ar_decode",
             Self::ArVerify => "ar_verify",
             Self::EncoderVision => "encoder_vision",
+            Self::EncoderText => "encoder_text",
             Self::EncoderLatent => "encoder_latent",
             Self::TransferProduct => "transfer_product",
             Self::TransferKvPublish => "transfer_kv_publish",
@@ -316,6 +243,7 @@ impl RunKind {
             Self::DiffusionStep => "diffusion_step",
             Self::DiffusionFinalize => "diffusion_finalize",
             Self::DiffusionDecode => "diffusion_decode",
+            Self::MediaAppend => "media_append",
         }
     }
 }
@@ -417,76 +345,22 @@ pub struct Rng {
     pub draw_layout: DrawLayout,
 }
 
-/// Operation-family inputs, outputs, predicates, random coordinates, and bounds.
+/// Executable tag, data dependencies and authorized bounds for a bounded operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "family")]
-pub enum OpPayload {
-    /// Autoregressive operation payload.
-    Ar {
-        /// Scheduler-reserved resource maxima.
-        bounds: Bounds,
-        /// Products consumed by the operation.
-        inputs: Vec<ProductRef>,
-        /// Products declared by the operation.
-        outputs: Vec<ProductRef>,
-        /// Optional device decision that gates execution.
-        predicate: Option<ProductRef>,
-        /// Deterministic draw coordinates for sampling work.
-        rng: Option<Rng>,
-        /// Latest request-control sequence observed by the operation.
-        control_seq: u64,
-    },
-    /// Multimodal encoder operation payload.
-    Encoder {
-        /// Scheduler-reserved resource maxima.
-        bounds: Bounds,
-        /// Products consumed by the operation.
-        inputs: Vec<ProductRef>,
-        /// Products declared by the operation.
-        outputs: Vec<ProductRef>,
-        /// Optional device decision that gates execution.
-        predicate: Option<ProductRef>,
-        /// Deterministic draw coordinates when the encoder samples.
-        rng: Option<Rng>,
-        /// Latest request-control sequence observed by the operation.
-        control_seq: u64,
-    },
-    /// Diffusion operation payload.
-    Diffusion {
-        /// Scheduler-reserved resource maxima.
-        bounds: Bounds,
-        /// Products consumed by the operation.
-        inputs: Vec<ProductRef>,
-        /// Products declared by the operation.
-        outputs: Vec<ProductRef>,
-        /// Optional device decision that gates execution.
-        predicate: Option<ProductRef>,
-        /// Deterministic draw coordinates for diffusion noise.
-        rng: Option<Rng>,
-        /// Latest request-control sequence observed by the operation.
-        control_seq: u64,
-    },
-    /// Cross-stage product transfer payload.
-    Transfer {
-        /// Scheduler-reserved resource maxima.
-        bounds: Bounds,
-        /// Products consumed by the transfer.
-        inputs: Vec<ProductRef>,
-        /// Products declared by the transfer.
-        outputs: Vec<ProductRef>,
-        /// Optional device decision that gates the transfer.
-        predicate: Option<ProductRef>,
-        /// Deterministic draw coordinates when required by the transfer.
-        rng: Option<Rng>,
-        /// Latest request-control sequence observed by the operation.
-        control_seq: u64,
-    },
+#[serde(deny_unknown_fields)]
+pub struct OpPayload {
+    pub code: OpCode,
+    pub bounds: Bounds,
+    pub inputs: Vec<ProductRef>,
+    pub outputs: Vec<ProductRef>,
+    pub predicate: Option<ProductRef>,
+    pub rng: Option<Rng>,
+    pub control_seq: u64,
 }
 
 impl OpPayload {
-    /// Constructs the payload variant required by `kind`.
     pub fn new(
-        kind: RunKind,
+        code: OpCode,
         bounds: Bounds,
         inputs: Vec<ProductRef>,
         outputs: Vec<ProductRef>,
@@ -494,62 +368,17 @@ impl OpPayload {
         rng: Option<Rng>,
         control_seq: u64,
     ) -> Self {
-        let fields = || (bounds, inputs, outputs, predicate, rng, control_seq);
-
-        // The physical run kind selects the payload family while every field
-        // retains the same ownership and ordering contract.
-        match kind {
-            RunKind::ArExtend | RunKind::ArDecode | RunKind::ArVerify => {
-                let (bounds, inputs, outputs, predicate, rng, control_seq) = fields();
-                Self::Ar {
-                    bounds,
-                    inputs,
-                    outputs,
-                    predicate,
-                    rng,
-                    control_seq,
-                }
-            }
-            RunKind::EncoderVision | RunKind::EncoderLatent => {
-                let (bounds, inputs, outputs, predicate, rng, control_seq) = fields();
-                Self::Encoder {
-                    bounds,
-                    inputs,
-                    outputs,
-                    predicate,
-                    rng,
-                    control_seq,
-                }
-            }
-            RunKind::DiffusionPrepare
-            | RunKind::DiffusionStep
-            | RunKind::DiffusionDecode
-            | RunKind::DiffusionFinalize => {
-                let (bounds, inputs, outputs, predicate, rng, control_seq) = fields();
-                Self::Diffusion {
-                    bounds,
-                    inputs,
-                    outputs,
-                    predicate,
-                    rng,
-                    control_seq,
-                }
-            }
-            RunKind::TransferProduct | RunKind::TransferKvPublish | RunKind::TransferKvInstall => {
-                let (bounds, inputs, outputs, predicate, rng, control_seq) = fields();
-                Self::Transfer {
-                    bounds,
-                    inputs,
-                    outputs,
-                    predicate,
-                    rng,
-                    control_seq,
-                }
-            }
+        Self {
+            code,
+            bounds,
+            inputs,
+            outputs,
+            predicate,
+            rng,
+            control_seq,
         }
     }
 
-    /// Returns the shared payload fields independently of the family variant.
     fn fields(
         &self,
     ) -> (
@@ -560,71 +389,13 @@ impl OpPayload {
         Option<Rng>,
         u64,
     ) {
-        // Each family stores the same common fields, so callers can borrow them
-        // without branching on execution domain.
-        match self {
-            Self::Ar {
-                bounds,
-                inputs,
-                outputs,
-                predicate,
-                rng,
-                control_seq,
-            }
-            | Self::Encoder {
-                bounds,
-                inputs,
-                outputs,
-                predicate,
-                rng,
-                control_seq,
-            }
-            | Self::Diffusion {
-                bounds,
-                inputs,
-                outputs,
-                predicate,
-                rng,
-                control_seq,
-            }
-            | Self::Transfer {
-                bounds,
-                inputs,
-                outputs,
-                predicate,
-                rng,
-                control_seq,
-            } => (
-                bounds,
-                inputs,
-                outputs,
-                predicate.as_ref(),
-                *rng,
-                *control_seq,
-            ),
-        }
-    }
-
-    /// Returns whether this payload family accepts `kind`.
-    pub const fn family_matches(&self, kind: RunKind) -> bool {
-        matches!(
-            (self, kind),
-            (
-                Self::Ar { .. },
-                RunKind::ArExtend | RunKind::ArDecode | RunKind::ArVerify
-            ) | (
-                Self::Encoder { .. },
-                RunKind::EncoderVision | RunKind::EncoderLatent
-            ) | (
-                Self::Diffusion { .. },
-                RunKind::DiffusionPrepare
-                    | RunKind::DiffusionStep
-                    | RunKind::DiffusionDecode
-                    | RunKind::DiffusionFinalize
-            ) | (
-                Self::Transfer { .. },
-                RunKind::TransferProduct | RunKind::TransferKvPublish | RunKind::TransferKvInstall
-            )
+        (
+            &self.bounds,
+            &self.inputs,
+            &self.outputs,
+            self.predicate.as_ref(),
+            self.rng,
+            self.control_seq,
         )
     }
 }
@@ -636,15 +407,20 @@ pub struct Operation {
     pub request_key: RequestKey,
     /// Request-local operation identifier.
     pub op_id: OpId,
-    /// State checkpoint from which the operation executes.
-    pub parent: Checkpoint,
-    /// Physical worker execution mode.
-    pub kind: RunKind,
+    /// Exact state dependency, absent for computation determined only by its inputs.
+    pub parent: Option<Checkpoint>,
+    /// Computation entry bound within the selected Worker.
+    pub entry: String,
     /// Family-specific products, bounds, and control state.
     pub payload: OpPayload,
 }
 
 impl Operation {
+    /// Derives the execution code from the closed payload tag.
+    pub const fn kind(&self) -> OpCode {
+        self.payload.code
+    }
+
     /// Marks a payload immutable for subsequent scheduler deltas.
     pub const fn sealed(self) -> Self {
         self
@@ -652,11 +428,11 @@ impl Operation {
 
     /// Returns the static execution domain for this payload.
     pub const fn domain(&self) -> Domain {
-        self.kind.domain()
+        self.kind().domain()
     }
     /// Returns whether successful execution advances request state.
     pub const fn advances_state(&self) -> bool {
-        self.kind.advances_state()
+        self.kind().advances_state()
     }
     /// Returns the scheduler-declared resource maxima.
     pub fn bounds(&self) -> &Bounds {
@@ -672,35 +448,23 @@ impl Operation {
     }
     /// Returns mutable input references for transport lowering.
     pub fn inputs_mut(&mut self) -> &mut Vec<ProductRef> {
-        match &mut self.payload {
-            OpPayload::Ar { inputs, .. }
-            | OpPayload::Encoder { inputs, .. }
-            | OpPayload::Diffusion { inputs, .. }
-            | OpPayload::Transfer { inputs, .. } => inputs,
-        }
+        &mut self.payload.inputs
     }
+
     /// Returns mutable output references for transport lowering.
     pub fn outputs_mut(&mut self) -> &mut Vec<ProductRef> {
-        match &mut self.payload {
-            OpPayload::Ar { outputs, .. }
-            | OpPayload::Encoder { outputs, .. }
-            | OpPayload::Diffusion { outputs, .. }
-            | OpPayload::Transfer { outputs, .. } => outputs,
-        }
+        &mut self.payload.outputs
     }
+
     /// Returns the optional predicate product controlling execution.
     pub fn predicate(&self) -> Option<&ProductRef> {
         self.payload.fields().3
     }
     /// Replaces the optional predicate product.
     pub fn set_predicate(&mut self, value: Option<ProductRef>) {
-        match &mut self.payload {
-            OpPayload::Ar { predicate, .. }
-            | OpPayload::Encoder { predicate, .. }
-            | OpPayload::Diffusion { predicate, .. }
-            | OpPayload::Transfer { predicate, .. } => *predicate = value,
-        }
+        self.payload.predicate = value;
     }
+
     /// Returns deterministic random coordinates when the operation samples.
     pub fn rng(&self) -> Option<Rng> {
         self.payload.fields().4
@@ -714,13 +478,29 @@ impl Operation {
     pub fn validate(&self) -> ValidationResult<()> {
         // Establish operation identity, family, lineage, and declared capacity.
         ensure_valid!(self.op_id.0 > 0, "operation id must be positive");
+        ensure_valid!(!self.entry.is_empty(), "operation entry must not be empty");
+
         ensure_valid!(
-            self.payload.family_matches(self.kind),
-            "operation payload family disagrees with its kind"
+            !(self.advances_state()
+                || self.kind() == OpCode::TransferKvInstall
+                || self
+                    .inputs()
+                    .iter()
+                    .any(|value| value.kind == ProductKind::Latent))
+                || self.parent.is_some(),
+            "state-changing operation requires a predecessor"
         );
-        self.parent.validate()?;
+        if let Some(parent) = &self.parent {
+            parent.validate()?;
+        } else {
+            ensure_valid!(
+                self.control_seq() == 0,
+                "computation without a predecessor has no state control sequence"
+            );
+        }
         ensure_valid!(
-            !self.kind.requires_fixed_parent() || self.parent.is_fixed(),
+            !self.kind().requires_fixed_parent()
+                || self.parent.as_ref().is_some_and(Checkpoint::is_fixed),
             "operation requires a fixed semantic parent"
         );
         self.bounds_are_finite()?;
@@ -965,37 +745,41 @@ pub enum ResultPayload {
 
 impl ResultPayload {
     /// Returns whether this result payload accepts `kind`.
-    pub const fn family_matches(&self, kind: RunKind) -> bool {
+    pub const fn family_matches(&self, kind: OpCode) -> bool {
         matches!(
             (self, kind),
             (
                 Self::Ar(_),
-                RunKind::ArExtend | RunKind::ArDecode | RunKind::ArVerify
+                OpCode::ArExtend | OpCode::ArDecode | OpCode::ArVerify
             ) | (
                 Self::Encoder(_),
-                RunKind::EncoderVision | RunKind::EncoderLatent
+                OpCode::EncoderVision | OpCode::EncoderLatent | OpCode::EncoderText
             ) | (
                 Self::Diffusion(_),
-                RunKind::DiffusionPrepare
-                    | RunKind::DiffusionStep
-                    | RunKind::DiffusionDecode
-                    | RunKind::DiffusionFinalize
+                OpCode::DiffusionPrepare
+                    | OpCode::DiffusionStep
+                    | OpCode::DiffusionDecode
+                    | OpCode::DiffusionFinalize
+                    | OpCode::MediaAppend
             ) | (
                 Self::Transfer(_),
-                RunKind::TransferProduct | RunKind::TransferKvPublish | RunKind::TransferKvInstall
+                OpCode::TransferProduct | OpCode::TransferKvPublish | OpCode::TransferKvInstall
             )
         )
     }
 
     /// Wraps common result data in the payload family required by `kind`.
-    pub fn for_kind(kind: RunKind, data: ResultData) -> Self {
+    pub fn for_kind(kind: OpCode, data: ResultData) -> Self {
         match kind {
-            RunKind::ArExtend | RunKind::ArDecode | RunKind::ArVerify => Self::Ar(data),
-            RunKind::EncoderVision | RunKind::EncoderLatent => Self::Encoder(data),
-            RunKind::DiffusionPrepare
-            | RunKind::DiffusionStep
-            | RunKind::DiffusionDecode
-            | RunKind::DiffusionFinalize => Self::Diffusion(DiffusionResult {
+            OpCode::ArExtend | OpCode::ArDecode | OpCode::ArVerify => Self::Ar(data),
+            OpCode::EncoderVision | OpCode::EncoderLatent | OpCode::EncoderText => {
+                Self::Encoder(data)
+            }
+            OpCode::DiffusionPrepare
+            | OpCode::DiffusionStep
+            | OpCode::DiffusionDecode
+            | OpCode::DiffusionFinalize
+            | OpCode::MediaAppend => Self::Diffusion(DiffusionResult {
                 done: data.finish_flags.eos
                     || data.finish_flags.length
                     || data.finish_flags.stop
@@ -1003,7 +787,7 @@ impl ResultPayload {
                 data,
                 next_cursor: 0,
             }),
-            RunKind::TransferProduct | RunKind::TransferKvPublish | RunKind::TransferKvInstall => {
+            OpCode::TransferProduct | OpCode::TransferKvPublish | OpCode::TransferKvInstall => {
                 Self::Transfer(data)
             }
         }
@@ -1196,11 +980,23 @@ pub enum BatchCommand {
         cutoff: Checkpoint,
         /// Terminal reason recorded for the request.
         reason: CloseReason,
+        /// Persistent products whose allocations remain owned outside this request.
+        /// They stay readable until a subsequent explicit Free command.
+        retained_buffers: Vec<BufferId>,
     },
     /// Free one exact persistent product after its final consumer.
     Free {
         /// Persistent buffer identity to release.
         buffer: BufferId,
+    },
+    /// Retire physical request state without selecting or publishing a checkpoint.
+    /// Used after terminal failure or on auxiliary owners of a finished request.
+    /// Acknowledgement still waits for operations, readers and storage reset.
+    Retire {
+        /// Exact request epoch whose rank-local resources are being retired.
+        request_key: RequestKey,
+        /// Persistent allocations retained by independent owners until Free.
+        retained_buffers: Vec<BufferId>,
     },
 }
 
@@ -1209,7 +1005,9 @@ impl BatchCommand {
     pub fn request_key(&self) -> RequestKey {
         match self {
             Self::Start { request } => request.request_key,
-            Self::Commit { request_key, .. } | Self::Finish { request_key, .. } => *request_key,
+            Self::Commit { request_key, .. }
+            | Self::Finish { request_key, .. }
+            | Self::Retire { request_key, .. } => *request_key,
             Self::Free { buffer } => buffer.owner,
         }
     }
@@ -1221,6 +1019,7 @@ impl BatchCommand {
             Self::Commit { .. } => 1,
             Self::Finish { .. } => 2,
             Self::Free { .. } => 3,
+            Self::Retire { .. } => 4,
         }
     }
 
@@ -1230,7 +1029,7 @@ impl BatchCommand {
             Self::Commit { control_seq, .. } | Self::Finish { control_seq, .. } => {
                 Some(*control_seq)
             }
-            Self::Start { .. } | Self::Free { .. } => None,
+            Self::Start { .. } | Self::Free { .. } | Self::Retire { .. } => None,
         }
     }
 
@@ -1258,6 +1057,30 @@ impl BatchCommand {
                 );
             }
             Self::Free { buffer } => buffer.validate()?,
+            Self::Retire { .. } => {}
+        }
+        if let Self::Finish {
+            request_key,
+            retained_buffers,
+            ..
+        }
+        | Self::Retire {
+            request_key,
+            retained_buffers,
+        } = self
+        {
+            let mut retained = std::collections::HashSet::new();
+            for buffer in retained_buffers {
+                buffer.validate()?;
+                ensure_valid!(
+                    buffer.owner == *request_key,
+                    "retained buffer belongs to another request"
+                );
+                ensure_valid!(
+                    retained.insert(*buffer),
+                    "request retirement repeats a retained buffer"
+                );
+            }
         }
         Ok(())
     }
@@ -1289,7 +1112,7 @@ pub struct MediaGeometry {
     /// Number of frames produced by the request.
     pub frame_count: u32,
     /// Number of decoder work units in the terminal media stage.
-    pub decode_units: u32,
+    pub video_units: u32,
     /// Number of prompt tokens supplied to the diffusion model.
     pub prompt_tokens: u32,
     /// Number of denoising steps in the trajectory.
@@ -1392,7 +1215,7 @@ impl NewRequest {
             );
             ensure_valid!(
                 diffusion.geometry.frame_count > 0
-                    && diffusion.geometry.decode_units > 0
+                    && diffusion.geometry.video_units > 0
                     && diffusion.geometry.prompt_tokens > 0
                     && usize::try_from(diffusion.geometry.prompt_tokens).ok()
                         == Some(diffusion.prompt_token_ids.len())
@@ -1476,6 +1299,8 @@ pub struct RowGeometry {
     pub seq_len: u32,
     /// Number of query tokens evaluated by the row.
     pub query_len: u32,
+    /// Whether the query interval is persisted in the cache after the visible prefix.
+    pub write_kv: bool,
 }
 
 impl RowGeometry {
@@ -1497,16 +1322,16 @@ impl RowGeometry {
     }
 }
 
-/// One operation's complete scheduler-owned latent trajectory placement.
+/// Solver-step range and optional paged storage for one request trajectory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LatentPlacement {
+pub struct LatentParams {
     /// Request lineage that owns the trajectory.
     pub request_key: RequestKey,
     /// Operation that addresses the trajectory.
     pub op_id: OpId,
-    /// Physical latent pages in logical order.
+    /// Physical latent pages in logical order; empty for request-owned tensors.
     pub page_table: Vec<u32>,
-    /// Number of logical units stored by the trajectory.
+    /// Logical units stored in pages; zero when the trajectory uses request tensors.
     pub latent_units: u32,
     /// Output height in pixels.
     pub height: u32,
@@ -1518,50 +1343,77 @@ pub struct LatentPlacement {
     pub step_count: u32,
 }
 
-impl LatentPlacement {
+impl LatentParams {
     /// Validates latent page identities, shape, and byte bounds.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
             self.op_id.0 > 0,
-            "latent placement operation id must be positive"
+            "latent params operation id must be positive"
         );
         ensure_valid!(
-            self.latent_units > 0 && self.height > 0 && self.width > 0,
-            "latent placement geometry must be positive"
+            self.height > 0 && self.width > 0,
+            "latent params geometry must be positive"
         );
         ensure_valid!(
-            !self.page_table.is_empty()
+            (!self.page_table.is_empty() == (self.latent_units > 0))
                 && self.page_table.iter().all(|page| *page > 0)
                 && self.page_table.iter().collect::<HashSet<_>>().len() == self.page_table.len(),
-            "latent placement page table is empty, repeats a page, or carries page zero"
+            "latent params page table disagrees with its units, repeats a page, or carries page zero"
         );
         Ok(())
     }
 }
 
+/// Independent media stream selected by decoding or ordered output consumption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum MediaTrack {
+    /// Overlapping temporal video units.
+    Video = 0,
+    /// Interleaved audio samples.
+    Audio = 1,
+}
+
+impl MediaTrack {
+    /// Stable name used by physical request descriptors.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Video => "video",
+            Self::Audio => "audio",
+        }
+    }
+}
+
 /// Cursor and unit bounds for one diffusion decode operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DecodePlacement {
+pub struct DecodeRange {
     /// Request lineage that owns the media output.
     pub request_key: RequestKey,
-    /// Decode operation receiving the placement.
+    /// Decode operation receiving the params.
     pub op_id: OpId,
+    /// Independent media stream addressed by this range.
+    pub track: MediaTrack,
     /// First decoder unit assigned to the operation.
     pub cursor: u32,
     /// Maximum decoder units the operation may process.
     pub max_units: u32,
 }
 
-impl DecodePlacement {
+impl DecodeRange {
     /// Validates decode identity and unit capacity.
     pub fn validate(&self) -> ValidationResult<()> {
         ensure_valid!(
             self.op_id.0 > 0,
-            "decode placement operation id must be positive"
+            "decode params operation id must be positive"
         );
         ensure_valid!(
             self.max_units > 0,
-            "decode placement unit bound must be positive"
+            "decode params unit bound must be positive"
+        );
+        ensure_valid!(
+            self.track != MediaTrack::Audio || (self.cursor == 0 && self.max_units == 1),
+            "audio decode range must address its single sample stream"
         );
         Ok(())
     }
@@ -1569,7 +1421,7 @@ impl DecodePlacement {
 
 /// Scheduler-selected address span for one cross-operation persistent buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BufferPlacement {
+pub struct BufferAllocation {
     /// Persistent buffer identity receiving the address span.
     pub buffer: BufferId,
     /// Byte offset within the persistent-buffer arena.
@@ -1578,17 +1430,14 @@ pub struct BufferPlacement {
     pub bytes: u64,
 }
 
-impl BufferPlacement {
-    /// Validates aligned non-empty buffer placement.
+impl BufferAllocation {
+    /// Validates aligned non-empty buffer params.
     pub fn validate(self) -> ValidationResult<()> {
         self.buffer.validate()?;
-        ensure_valid!(
-            self.bytes > 0,
-            "buffer placement byte extent must be positive"
-        );
+        ensure_valid!(self.bytes > 0, "buffer params byte extent must be positive");
         ensure_valid!(
             self.offset.checked_add(self.bytes).is_some(),
-            "buffer placement span overflows"
+            "buffer params span overflows"
         );
         Ok(())
     }
@@ -1612,12 +1461,12 @@ pub struct Run {
     pub new_cache_pages: Vec<CachePageAllocation>,
     /// Row-aligned model-forward metadata.
     pub forward_rows: Vec<RowGeometry>,
-    /// Scheduler-owned latent trajectory placements.
-    pub latent_placements: Vec<LatentPlacement>,
-    /// Scheduler-owned media decode placements.
-    pub decode_placements: Vec<DecodePlacement>,
+    /// Scheduler-owned latent trajectory allocations.
+    pub latent_params: Vec<LatentParams>,
+    /// Scheduler-owned media decode allocations.
+    pub decode_ranges: Vec<DecodeRange>,
     /// Address spans for persistent cross-operation buffers.
-    pub buffer_placements: Vec<BufferPlacement>,
+    pub buffer_allocations: Vec<BufferAllocation>,
     /// Ordered request-state and buffer-lifetime commands.
     pub commands: Vec<BatchCommand>,
     /// Host-supplied input product values matched by `ProductRef` identity.
@@ -1635,9 +1484,9 @@ impl Run {
             block_tables: Vec::new(),
             new_cache_pages: Vec::new(),
             forward_rows: Vec::new(),
-            latent_placements: Vec::new(),
-            decode_placements: Vec::new(),
-            buffer_placements: Vec::new(),
+            latent_params: Vec::new(),
+            decode_ranges: Vec::new(),
+            buffer_allocations: Vec::new(),
             commands: admissions
                 .into_iter()
                 .map(|request| BatchCommand::Start { request })
@@ -1676,7 +1525,7 @@ impl Run {
         self
     }
 
-    /// Validates identities, families, placements, products, and commands.
+    /// Validates identities, families, allocations, products, and commands.
     pub fn validate(&self) -> ValidationResult<()> {
         // Establish the run envelope before validating relationships within it.
         ensure_valid!(
@@ -1740,92 +1589,103 @@ impl Run {
         }
 
         // Latent pages are exclusive across every trajectory placed in a run.
-        let mut latent_ids = HashSet::with_capacity(self.latent_placements.len());
+        let mut latent_ids = HashSet::with_capacity(self.latent_params.len());
         let mut latent_pages = HashSet::new();
-        for placement in &self.latent_placements {
-            placement.validate()?;
-            let identity = (placement.request_key, placement.op_id);
+        for params in &self.latent_params {
+            params.validate()?;
+            let identity = (params.request_key, params.op_id);
             ensure_valid!(
                 latent_ids.insert(identity),
-                "run repeats a latent placement identity"
+                "run repeats a latent params identity"
             );
-            let operation = operations.get(&identity).ok_or_else(|| {
-                invalid_message!("latent placement does not name a run operation")
-            })?;
+            let operation = operations
+                .get(&identity)
+                .ok_or_else(|| invalid_message!("latent params does not name a run operation"))?;
             let addresses_trajectory = matches!(
-                operation.kind,
-                RunKind::DiffusionPrepare | RunKind::DiffusionStep
+                operation.kind(),
+                OpCode::DiffusionPrepare | OpCode::DiffusionStep
             ) || operation
                 .inputs()
                 .iter()
                 .any(|value| value.kind == ProductKind::Latent);
             ensure_valid!(
                 addresses_trajectory,
-                "latent placement names work without a trajectory"
+                "latent params names work without a trajectory"
             );
             ensure_valid!(
-                placement
+                params
                     .page_table
                     .iter()
                     .all(|page| latent_pages.insert(*page)),
-                "run latent placements overlap physical pages"
+                "run latent allocations overlap physical pages"
             );
         }
 
         for operation in &self.operations {
             let needs_latent = matches!(
-                operation.kind,
-                RunKind::DiffusionPrepare | RunKind::DiffusionStep
+                operation.kind(),
+                OpCode::DiffusionPrepare | OpCode::DiffusionStep
             ) || operation
                 .inputs()
                 .iter()
                 .any(|value| value.kind == ProductKind::Latent);
             ensure_valid!(
                 !needs_latent || latent_ids.contains(&(operation.request_key, operation.op_id)),
-                "operation that addresses a trajectory has no latent placement"
+                "operation that addresses a trajectory has no latent params"
             );
         }
 
-        // Decode placement is restricted to operations that materialize media.
-        let mut decode_ids = HashSet::with_capacity(self.decode_placements.len());
-        for placement in &self.decode_placements {
-            placement.validate()?;
-            let identity = (placement.request_key, placement.op_id);
+        // Decode params is restricted to operations that materialize media.
+        let mut decode_ids = HashSet::with_capacity(self.decode_ranges.len());
+        for params in &self.decode_ranges {
+            params.validate()?;
+            let identity = (params.request_key, params.op_id);
             ensure_valid!(
                 decode_ids.insert(identity),
-                "run repeats a decode placement identity"
+                "run repeats a decode params identity"
             );
-            let operation = operations.get(&identity).ok_or_else(|| {
-                invalid_message!("decode placement does not name a run operation")
-            })?;
+            let operation = operations
+                .get(&identity)
+                .ok_or_else(|| invalid_message!("decode params does not name a run operation"))?;
             ensure_valid!(
                 matches!(
-                    operation.kind,
-                    RunKind::DiffusionDecode | RunKind::DiffusionFinalize
+                    operation.kind(),
+                    OpCode::DiffusionDecode | OpCode::MediaAppend
                 ),
-                "decode placement does not name media decode work"
+                "decode params does not name media decode work"
+            );
+        }
+
+        for operation in &self.operations {
+            let needs_range = matches!(
+                operation.kind(),
+                OpCode::DiffusionDecode | OpCode::MediaAppend
+            );
+            ensure_valid!(
+                !needs_range || decode_ids.contains(&(operation.request_key, operation.op_id)),
+                "media reconstruction operation has no decode range"
             );
         }
 
         // Persistent buffers use non-overlapping spans and cover every declared output.
-        let mut buffer_ids = HashSet::with_capacity(self.buffer_placements.len());
+        let mut buffer_ids = HashSet::with_capacity(self.buffer_allocations.len());
         let mut buffer_spans = self
-            .buffer_placements
+            .buffer_allocations
             .iter()
-            .map(|placement| {
-                placement.validate()?;
+            .map(|params| {
+                params.validate()?;
                 ensure_valid!(
-                    buffer_ids.insert(placement.buffer),
-                    "run repeats a buffer placement identity"
+                    buffer_ids.insert(params.buffer),
+                    "run repeats a buffer params identity"
                 );
-                Ok((placement.offset, placement.offset + placement.bytes))
+                Ok((params.offset, params.offset + params.bytes))
             })
             .collect::<ValidationResult<Vec<_>>>()?;
         buffer_spans.sort_unstable();
 
         ensure_valid!(
             buffer_spans.windows(2).all(|pair| pair[0].1 <= pair[1].0),
-            "run buffer placements overlap"
+            "run buffer allocations overlap"
         );
 
         for operation in &self.operations {
@@ -1834,16 +1694,16 @@ impl Run {
                 .iter()
                 .filter(|output| output.uses_persistent_buffer())
             {
-                let placement = self
-                    .buffer_placements
+                let params = self
+                    .buffer_allocations
                     .iter()
-                    .find(|placement| placement.buffer == output.buffer_id())
+                    .find(|params| params.buffer == output.buffer_id())
                     .ok_or_else(|| {
-                        invalid_message!("persistent operation output has no buffer placement")
+                        invalid_message!("persistent operation output has no buffer params")
                     })?;
                 ensure_valid!(
-                    placement.bytes >= output.max_bytes(),
-                    "buffer placement is smaller than its declared output"
+                    params.bytes >= output.max_bytes(),
+                    "buffer params is smaller than its declared output"
                 );
             }
         }
@@ -1857,18 +1717,13 @@ impl Run {
             );
         }
 
-        // Every admission is unique and immediately participates in the run.
+        // Admissions create request state independently of entry execution.
         let mut admitted = HashSet::new();
         for admission in self.admissions() {
             admission.validate()?;
             ensure_valid!(
                 admitted.insert(admission.request_key),
                 "a submission batch carries a duplicate admission"
-            );
-            ensure_valid!(
-                self.operations()
-                    .any(|operation| operation.request_key == admission.request_key),
-                "a submission batch admits a request without an operation"
             );
         }
 
@@ -1981,7 +1836,9 @@ pub struct RunResult {
     pub worker_exec_us: Option<u64>,
     /// Model-forward statistics, when reported by the worker.
     pub forward_stats: Option<WorkerForwardStats>,
-    /// Whether this fragment terminates the physical invocation.
+    /// Whether all operations and command-owned physical resources have retired.
+    /// Free/Finish/Retire runs publish a separate empty terminal fragment after any
+    /// operation fragments, even when retirement is immediately ready.
     pub done: bool,
 }
 

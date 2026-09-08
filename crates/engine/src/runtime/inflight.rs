@@ -5,7 +5,7 @@ use super::*;
 /// Runtime-family state updated by a physical completion.
 pub(super) enum InflightApply {
     Generation(RuntimeApply),
-    Media(MediaCursor),
+    Media(MediaQuantum),
 }
 
 /// Submitted operation and timing state awaiting completion.
@@ -112,35 +112,51 @@ impl InflightWindow {
         self.operations
             .values()
             .flatten()
-            .any(|op| op.operation.kind == RunKind::DiffusionStep)
+            .any(|op| op.operation.kind() == OpCode::DiffusionStep)
     }
 
-    /// Removes head-of-line completions in domain-priority and arrival order.
+    /// Stateful operations retain request order. Pure media branches complete
+    /// independently once their actual input producers have resolved.
     pub(super) fn take_ready(&mut self) -> Vec<PendingCompletion> {
-        let mut ready = self
-            .completions
-            .iter()
-            .filter_map(|(id, pending)| {
-                let inflight = self.operations.get(id)?.front()?;
-                let op_id = inflight.operation.op_id.0;
-                let completion = pending.get(&op_id)?;
-                Some((
-                    completion_priority(inflight.operation.kind),
-                    completion.arrival_seq,
-                    *id,
-                    op_id,
-                ))
-            })
-            .collect::<Vec<_>>();
-        ready.sort_unstable_by_key(|(priority, arrival_seq, ..)| (*priority, *arrival_seq));
-        let mut completions = Vec::with_capacity(ready.len());
-        for (_, _, id, op_id) in ready {
-            let Some(pending) = self.completions.get_mut(&id) else {
+        let mut ready = Vec::new();
+        for (id, pending) in &self.completions {
+            let Some(queue) = self.operations.get(id) else {
                 continue;
             };
-            if let Some(completion) = pending.remove(&op_id) {
-                completions.push(completion);
+            for (index, inflight) in queue.iter().enumerate() {
+                let operation = &inflight.operation;
+                let independent = matches!(inflight.apply, InflightApply::Media(_))
+                    && !operation.advances_state();
+                if index > 0 && !independent {
+                    continue;
+                }
+                if independent
+                    && operation.inputs().iter().any(|input| {
+                        queue
+                            .iter()
+                            .any(|producer| producer.operation.op_id == input.producer_op_id)
+                    })
+                {
+                    continue;
+                }
+                if let Some(completion) = pending.get(&operation.op_id.0) {
+                    ready.push((
+                        completion_priority(operation.kind()),
+                        completion.arrival_seq,
+                        *id,
+                        operation.op_id.0,
+                    ));
+                }
             }
+        }
+        ready.sort_unstable_by_key(|(priority, arrival, ..)| (*priority, *arrival));
+        let mut completions = Vec::with_capacity(ready.len());
+        for (_, _, id, op_id) in ready {
+            let pending = self
+                .completions
+                .get_mut(&id)
+                .expect("selected completion exists");
+            completions.push(pending.remove(&op_id).expect("selected operation exists"));
             if pending.is_empty() {
                 self.completions.remove(&id);
             }
@@ -148,27 +164,61 @@ impl InflightWindow {
         completions
     }
 
-    /// Removes the exact head operation and releases its transfer reservation.
+    /// Removes a selected operation and releases its transfer reservation.
     pub(super) fn pop(&mut self, request_key: RequestKey, op_id: u64) -> Option<InflightOp> {
         let id = request_key.request_id;
         let queue = self.operations.get_mut(&id)?;
+        let index = queue.iter().position(|inflight| {
+            inflight.operation.request_key == request_key && inflight.operation.op_id.0 == op_id
+        })?;
+        let selected = &queue[index];
         if op_id == 0
-            || queue.front().is_none_or(|inflight| {
-                inflight.operation.request_key != request_key || inflight.operation.op_id.0 != op_id
-            })
+            || (index > 0
+                && !(matches!(selected.apply, InflightApply::Media(_))
+                    && !selected.operation.advances_state()))
         {
             return None;
         }
-        let inflight = queue.pop_front().expect("front checked above");
-        let empty = queue.is_empty();
+        let inflight = queue.remove(index).expect("selected operation exists");
         if inflight.operation.bounds().max_transfer_bytes > 0 {
             self.inflight_transfers = self
                 .inflight_transfers
                 .checked_sub(1)
-                .expect("completed transfer operation owns one reservation");
+                .expect("completed transfer owns a reservation");
         }
-        if empty {
+        if queue.is_empty() {
             self.operations.remove(&id);
+        }
+        Some(inflight)
+    }
+
+    /// Removes failed operations from the in-flight registry.
+    pub(super) fn retire_operation(
+        &mut self,
+        batch_id: u64,
+        request: RequestKey,
+        op: OpId,
+    ) -> Option<InflightOp> {
+        if !self
+            .batch_operations
+            .get_mut(&batch_id)?
+            .remove(&(request, op))
+        {
+            return None;
+        }
+        let queue = self.operations.get_mut(&request.request_id)?;
+        let position = queue.iter().position(|inflight| {
+            inflight.operation.request_key == request && inflight.operation.op_id == op
+        })?;
+        let inflight = queue.remove(position)?;
+        if queue.is_empty() {
+            self.operations.remove(&request.request_id);
+        }
+        if inflight.operation.bounds().max_transfer_bytes > 0 {
+            self.inflight_transfers = self
+                .inflight_transfers
+                .checked_sub(1)
+                .expect("retired transfer owns a reservation");
         }
         Some(inflight)
     }

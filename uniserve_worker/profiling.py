@@ -26,7 +26,6 @@ __all__ = [
     "WorkerProfileConfig",
     "profile_range",
     "timing_events_enabled",
-    "synchronize_profile_range",
 ]
 
 _PROFILE_NVTX_ENV = "UNISERVE_PROFILE_NVTX"
@@ -222,12 +221,6 @@ def timing_events_enabled() -> bool:
         or flag_from_value(env.get(_NVTX_ENV))
         or flag_from_value(env.get(_CUDA_PROFILER_ENV))
     )
-
-
-def synchronize_profile_range(device: Any) -> None:
-    """Close an NVTX capture range only after its device work is observable."""
-    if _nvtx_ranges_enabled() and torch is not None:
-        torch.cuda.synchronize(device)
 
 
 @contextmanager

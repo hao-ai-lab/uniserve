@@ -22,6 +22,7 @@ class RadixAttention(nn.Module):
         head_dim: int,
         *,
         layer_id: int = 0,
+        dense_provider: AttentionBackend | None = None,
     ) -> None:
         """Validate local head geometry and identify the layer's paged-cache slice."""
 
@@ -37,6 +38,7 @@ class RadixAttention(nn.Module):
         self._selection: AttentionSelection | None = None
         self._providers: dict[AttentionMode, AttentionBackend] = {}
         self._varlen_provider: AttentionBackend | None = None
+        self._dense_provider = dense_provider
 
     def bind(self, cache_pool: CachePool, selection: AttentionSelection) -> None:
         """Bind physical KV storage and select one compatible backend per attention mode."""
@@ -122,7 +124,7 @@ class RadixAttention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        context: ForwardBatch,
+        context: ForwardBatch | None,
         *,
         causal: bool,
         scale: float | None = None,
@@ -131,6 +133,15 @@ class RadixAttention(nn.Module):
         """Dispatch dense or paged attention and commit requested K/V rows to the bound cache."""
 
         effective_scale = self.scale if scale is None else float(scale)
+        if context is None:
+            if self._dense_provider is None:
+                raise RuntimeError("cache-free attention requires an explicit dense provider")
+            return ops.attention(
+                ops.DenseAttention(
+                    q=q, k=k, v=v, causal=causal, scale=effective_scale, attn_mask=attn_mask
+                ),
+                provider=self._dense_provider,
+            )
         if self._selection is None:
             raise RuntimeError("attention module has not been bound to a startup backend")
         if context.forward_mode is AttentionMode.DENSE:
@@ -171,6 +182,7 @@ class RadixAttention(nn.Module):
     ) -> torch.Tensor:
         """Execute one-token paged decode against the selected cache group."""
 
+        assert context.block_table is not None
         if q.ndim != 3 or int(q.shape[0]) != int(context.block_table.shape[0]):
             raise ValueError("paged decode query rows do not match its page table")
         if context.kv_lens is None:

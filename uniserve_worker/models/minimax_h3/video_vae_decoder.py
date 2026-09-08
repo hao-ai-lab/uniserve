@@ -4,49 +4,36 @@
 from __future__ import annotations
 
 import math
+from typing import cast
 
 import torch
 from torch import nn
-from torch.nn import functional as F
 
-from .video_vae_fusions import (
-    qk_rmsnorm_partial_rope_,
+from ...backends.attention.torch_sdpa import TorchSDPAAttentionBackend
+from ...media.codec import blend_decoded_overlap
+from ...nn.attention import RadixAttention
+from ...nn.layer import LayerConfig
+from ...nn.linear import LinearBase, project_with_deferred_bias
+from ...nn.mlp import GatedMLP
+from ...ops.patch import unpatchify_video_tokens
+from ...ops.residual import (
     scaled_residual_,
-    scaled_residual_layernorm,
-    scaled_residual_layernorm_absmax,
-    scaled_residual_rmsnorm_,
-    scaled_residual_rmsnorm_absmax_,
-    value_first_swiglu,
-    value_first_swiglu_absmax,
-    video_patch_output,
-    video_rmsnorm,
-    video_rmsnorm_absmax,
+    scaled_residual_layer_norm,
+    scaled_residual_layer_norm_absmax,
+    scaled_residual_rms_norm_,
+    scaled_residual_rms_norm_absmax_,
+    weighted_rms_norm,
+    weighted_rms_norm_absmax,
 )
+from ...ops.rope import qk_rms_norm_partial_rope_
 
 __all__ = ["MiniMaxH3VideoDecoder"]
 
 
-def _linear_with_deferred_bias(
-    linear: nn.Module,
-    hidden: torch.Tensor,
-    *,
-    absmax: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Run a linear projection while returning bias separately for a fused consumer."""
-
-    quantize = getattr(linear, "quantize_activation", None)
-    prequantized = getattr(linear, "forward_prequantized", None)
-    if absmax is not None and callable(quantize) and callable(prequantized):
-        activation = quantize(hidden, absmax=absmax)
-        return prequantized(activation, include_bias=False), getattr(linear, "bias", None)
-    execute = getattr(linear, "forward_unbiased", None)
-    if callable(execute):
-        return execute(hidden), getattr(linear, "bias", None)
-    return linear(hidden), None
-
-
 class _RotaryEmbedding(nn.Module):
     """Applies partial rotary coordinates to the video decoder’s query and key heads."""
+
+    inv_freq: torch.Tensor
 
     def __init__(
         self,
@@ -77,35 +64,26 @@ class _RotaryEmbedding(nn.Module):
         return angles.cos(), angles.sin()
 
 
-def _apply_rotary(
-    value: torch.Tensor,
-    cosine: torch.Tensor,
-    sine: torch.Tensor,
-) -> torch.Tensor:
-    """Rotate the configured prefix of each head while preserving remaining channels."""
-
-    width = cosine.shape[-1]
-    rotary, passthrough = value[..., :width], value[..., width:]
-    first, second = rotary.chunk(2, dim=-1)
-    rotated = torch.cat((-second, first), dim=-1)
-    return torch.cat((rotary * cosine + rotated * sine, passthrough), dim=-1)
-
-
 class _Attention(nn.Module):
     """Computes self-attention over packed spatiotemporal video tokens."""
 
-    def __init__(self, width: int = 2048, heads: int = 32, head_dim: int = 64) -> None:
+    def __init__(
+        self, layer_config: LayerConfig, width: int = 2048, heads: int = 32, head_dim: int = 64
+    ) -> None:
         """Build dense video self-attention projections and head-wise normalization."""
 
         super().__init__()
         self.heads = heads
         self.head_dim = head_dim
-        self.norm_q = nn.RMSNorm(head_dim, eps=1e-5, elementwise_affine=False)
-        self.norm_k = nn.RMSNorm(head_dim, eps=1e-5, elementwise_affine=False)
-        self.to_q = nn.Linear(width, width, bias=True)
-        self.to_k = nn.Linear(width, width, bias=True)
-        self.to_v = nn.Linear(width, width, bias=True)
-        self.to_out = nn.ModuleList((nn.Linear(width, width, bias=True), nn.Dropout(0.0)))
+        self.attention = RadixAttention(
+            heads, heads, head_dim, dense_provider=TorchSDPAAttentionBackend()
+        )
+        self.to_q = LinearBase(width, width, layer_config=layer_config, prefix="to_q")
+        self.to_k = LinearBase(width, width, layer_config=layer_config, prefix="to_k")
+        self.to_v = LinearBase(width, width, layer_config=layer_config, prefix="to_v")
+        self.to_out = nn.ModuleList(
+            (LinearBase(width, width, layer_config=layer_config, prefix="to_out.0"),)
+        )
 
     def forward(
         self,
@@ -117,31 +95,24 @@ class _Attention(nn.Module):
         """Run dense self-attention and optionally propagate the input activation scale."""
 
         batch, sequence, _ = hidden.shape
-        quantize = getattr(self.to_q, "quantize_activation", None)
-        q_prequantized = getattr(self.to_q, "forward_prequantized", None)
-        k_prequantized = getattr(self.to_k, "forward_prequantized", None)
-        v_prequantized = getattr(self.to_v, "forward_prequantized", None)
-        if all(
-            callable(execute)
-            for execute in (quantize, q_prequantized, k_prequantized, v_prequantized)
-        ):
-            activation = quantize(hidden, absmax=hidden_absmax)
-            query = q_prequantized(activation, include_bias=False)
-            key = k_prequantized(activation, include_bias=False)
-            value = v_prequantized(activation, include_bias=False)
-            query_bias = getattr(self.to_q, "bias", None)
-            key_bias = getattr(self.to_k, "bias", None)
-            value_bias = getattr(self.to_v, "bias", None)
+        if self.to_q.quant_method.is_quantized:
+            activation = self.to_q.prepare_input(hidden, absmax=hidden_absmax)
+            query = self.to_q.forward_prepared(activation, include_bias=False)
+            key = self.to_k.forward_prepared(activation, include_bias=False)
+            value = self.to_v.forward_prepared(activation, include_bias=False)
+            query_bias: torch.Tensor | None = self.to_q.bias
+            key_bias: torch.Tensor | None = self.to_k.bias
+            value_bias = self.to_v.bias
         else:
-            query, query_bias = _linear_with_deferred_bias(self.to_q, hidden)
-            key, key_bias = _linear_with_deferred_bias(self.to_k, hidden)
+            query, query_bias = project_with_deferred_bias(self.to_q, hidden)
+            key, key_bias = project_with_deferred_bias(self.to_k, hidden)
             value = self.to_v(hidden)
             value_bias = None
         query = query.view(batch, sequence, self.heads, self.head_dim)
         key = key.view(batch, sequence, self.heads, self.head_dim)
         value = value.view(batch, sequence, self.heads, self.head_dim)
         cosine, sine = rotary
-        qk_rmsnorm_partial_rope_(
+        qk_rms_norm_partial_rope_(
             query,
             key,
             cosine,
@@ -151,106 +122,33 @@ class _Attention(nn.Module):
             value=value if value_bias is not None else None,
             value_bias=value_bias,
         )
-        attended = F.scaled_dot_product_attention(
+        attended = self.attention(
             query.transpose(1, 2),
             key.transpose(1, 2),
             value.transpose(1, 2),
-            dropout_p=0.0,
-            is_causal=False,
+            None,
+            causal=False,
         )
-        return _linear_with_deferred_bias(
+        return project_with_deferred_bias(
             self.to_out[0],
             attended.transpose(1, 2).reshape(batch, sequence, -1),
         )
 
 
-class _SwiGLU(nn.Module):
-    """Applies value-first SwiGLU gating with optional activation-scale output."""
-
-    def __init__(self, width: int = 2048, intermediate: int = 8192) -> None:
-        """Build the value-first gated expansion projection."""
-
-        super().__init__()
-        self.proj = nn.Linear(width, intermediate * 2, bias=True)
-
-    def forward(
-        self,
-        hidden: torch.Tensor,
-        *,
-        hidden_absmax: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Project hidden rows and apply the decoder's value-first SwiGLU gate."""
-
-        projected, bias = _linear_with_deferred_bias(
-            self.proj,
-            hidden,
-            absmax=hidden_absmax,
-        )
-        return value_first_swiglu(projected, bias)
-
-    def forward_with_absmax(
-        self,
-        hidden: torch.Tensor,
-        *,
-        hidden_absmax: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Apply SwiGLU and return its row-wise absolute maximum for FP8 projection."""
-
-        projected, bias = _linear_with_deferred_bias(
-            self.proj,
-            hidden,
-            absmax=hidden_absmax,
-        )
-        return value_first_swiglu_absmax(projected, bias)
-
-
-class _FeedForward(nn.Module):
-    """Projects video tokens through gated activation and output linear layers."""
-
-    def __init__(self, width: int = 2048, intermediate: int = 8192) -> None:
-        """Build the gated expansion and hidden-width output projection."""
-
-        super().__init__()
-        self.net = nn.ModuleList(
-            (_SwiGLU(width, intermediate), nn.Dropout(0.0), nn.Linear(intermediate, width))
-        )
-
-    def forward(
-        self,
-        hidden: torch.Tensor,
-        *,
-        hidden_absmax: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Run the gated expansion and return any scale reusable by the next block."""
-
-        linear = self.net[2]
-        quantize = getattr(linear, "quantize_activation", None)
-        prequantized = getattr(linear, "forward_prequantized", None)
-        if callable(quantize) and callable(prequantized):
-            hidden, absmax = self.net[0].forward_with_absmax(
-                hidden,
-                hidden_absmax=hidden_absmax,
-            )
-            hidden = self.net[1](hidden)
-            activation = quantize(hidden, absmax=absmax)
-            return prequantized(activation, include_bias=False), getattr(linear, "bias", None)
-        hidden = self.net[0](hidden, hidden_absmax=hidden_absmax)
-        hidden = self.net[1](hidden)
-        return _linear_with_deferred_bias(linear, hidden)
-
-
 class _TransformerBlock(nn.Module):
     """Composes video self-attention and feed-forward residual updates."""
 
-    def __init__(self, width: int = 2048) -> None:
+    def __init__(self, layer_config: LayerConfig, width: int = 2048) -> None:
         """Assemble one scaled attention and feed-forward residual block."""
 
         super().__init__()
         self.norm1 = nn.RMSNorm(width, eps=1e-5, elementwise_affine=True)
-        self.attn = _Attention(width)
+        self.attn = _Attention(layer_config.child("attn"), width)
         self.scale1 = nn.Parameter(torch.empty(width))
         self.norm2 = nn.RMSNorm(width, eps=1e-5, elementwise_affine=True)
-        self.ff = _FeedForward(width)
+        self.ff = GatedMLP(
+            width, 8192, layer_config=layer_config.child("ff"), order="value_gate", bias=True
+        )
         self.scale2 = nn.Parameter(torch.empty(width))
 
     def forward(
@@ -260,15 +158,17 @@ class _TransformerBlock(nn.Module):
     ) -> torch.Tensor:
         """Normalize hidden rows and apply one attention-plus-MLP residual block."""
 
-        quantized_attention = callable(getattr(self.attn.to_q, "quantize_activation", None))
+        quantized_attention = self.attn.to_q.quant_method.is_quantized
         if quantized_attention:
-            normalized, normalized_absmax = video_rmsnorm_absmax(
+            normalized, normalized_absmax = weighted_rms_norm_absmax(
                 hidden,
                 self.norm1.weight,
-                eps=float(self.norm1.eps),
+                eps=cast(float, self.norm1.eps),
             )
         else:
-            normalized = video_rmsnorm(hidden, self.norm1.weight, eps=float(self.norm1.eps))
+            normalized = weighted_rms_norm(
+                hidden, self.norm1.weight, eps=cast(float, self.norm1.eps)
+            )
             normalized_absmax = None
         hidden, feed_forward, feed_forward_bias = self.forward_normalized(
             hidden,
@@ -298,60 +198,50 @@ class _TransformerBlock(nn.Module):
             rotary,
             hidden_absmax=normalized_absmax,
         )
-        quantized_feed_forward = callable(getattr(self.ff.net[0].proj, "quantize_activation", None))
+        quantized_feed_forward = self.ff.gate_up_proj.quant_method.is_quantized
         if quantized_feed_forward:
-            hidden, normalized, feed_forward_absmax = scaled_residual_rmsnorm_absmax_(
+            hidden, normalized, feed_forward_absmax = scaled_residual_rms_norm_absmax_(
                 hidden,
                 attention,
                 self.scale1,
                 self.norm2.weight,
                 update_bias=attention_bias,
-                eps=float(self.norm2.eps),
+                eps=cast(float, self.norm2.eps),
             )
         else:
-            hidden, normalized = scaled_residual_rmsnorm_(
+            hidden, normalized = scaled_residual_rms_norm_(
                 hidden,
                 attention,
                 self.scale1,
                 self.norm2.weight,
                 update_bias=attention_bias,
-                eps=float(self.norm2.eps),
+                eps=cast(float, self.norm2.eps),
             )
             feed_forward_absmax = None
-        feed_forward, feed_forward_bias = self.ff(
+        feed_forward, feed_forward_bias = self.ff.forward_deferred(
             normalized,
-            hidden_absmax=feed_forward_absmax,
+            input_absmax=feed_forward_absmax,
         )
         return hidden, feed_forward, feed_forward_bias
 
 
-def blend_decoded_overlap(
-    previous: torch.Tensor,
-    current: torch.Tensor,
-    extent: int,
-    dim: int,
-) -> torch.Tensor:
-    """Cross-fade an overlap extent between adjacent decoded tiles along one dimension."""
+class _VideoTransformer(nn.Module):
+    """Checkpoint video token projections and residual transformer stack."""
 
-    extent = min(previous.shape[dim], current.shape[dim], extent)
-    positions = torch.arange(extent, device=current.device, dtype=current.dtype)
-    shape = [1] * current.ndim
-    shape[dim] = extent
-    previous_weight = (1 - positions / extent).view(shape)
-    current_weight = (positions / extent).view(shape)
-    previous_slice = [slice(None)] * current.ndim
-    current_slice = [slice(None)] * current.ndim
-    previous_slice[dim] = slice(-extent, None)
-    current_slice[dim] = slice(0, extent)
-    blended = (
-        previous[tuple(previous_slice)] * previous_weight
-        + current[tuple(current_slice)] * current_weight
-    )
-    if extent == current.shape[dim]:
-        return blended
-    remainder = [slice(None)] * current.ndim
-    remainder[dim] = slice(extent, None)
-    return torch.cat((blended, current[tuple(remainder)]), dim=dim)
+    def __init__(self, layer_config: LayerConfig, buffer_device: torch.device | str | None) -> None:
+        super().__init__()
+        width = 2048
+        self.proj_in = LinearBase(24, width, layer_config=layer_config, prefix="proj_in")
+        self.register_tokens = nn.Parameter(torch.empty(1, 4, width))
+        self.transformer_blocks = nn.ModuleList(
+            _TransformerBlock(layer_config.child(f"transformer_blocks.{index}"), width)
+            for index in range(36)
+        )
+        self.norm_out = nn.LayerNorm(width, eps=1e-5)
+        self.proj_out = LinearBase(
+            width, 3 * 4 * 16 * 16, layer_config=layer_config, prefix="proj_out"
+        )
+        self.rope = _RotaryEmbedding(device=buffer_device)
 
 
 class MiniMaxH3VideoDecoder(nn.Module):
@@ -372,24 +262,16 @@ class MiniMaxH3VideoDecoder(nn.Module):
     def __init__(
         self,
         *,
+        layer_config: LayerConfig,
         parameter_device: torch.device | str = "meta",
         buffer_device: torch.device | str | None = None,
     ) -> None:
         """Allocate the checkpoint-defined decoder on its parameter and buffer devices."""
 
         super().__init__()
-        width = 2048
         with torch.device(parameter_device):
             self.post_quant_conv = nn.Conv3d(24, 24, kernel_size=1)
-            self.decoder = nn.Module()
-            self.decoder.proj_in = nn.Linear(24, width)
-            self.decoder.register_tokens = nn.Parameter(torch.empty(1, 4, width))
-            self.decoder.transformer_blocks = nn.ModuleList(
-                _TransformerBlock(width) for _ in range(36)
-            )
-            self.decoder.norm_out = nn.LayerNorm(width, eps=1e-5)
-            self.decoder.proj_out = nn.Linear(width, 3 * 4 * 16 * 16)
-        self.decoder.rope = _RotaryEmbedding(device=buffer_device)
+            self.decoder = _VideoTransformer(layer_config.child("decoder"), buffer_device)
 
     @staticmethod
     def _split_tiles(
@@ -471,19 +353,21 @@ class MiniMaxH3VideoDecoder(nn.Module):
         positions = positions.unsqueeze(0).expand(batch, -1, -1)
         suffix = positions.new_zeros((batch, 5, 3))
         rotary = self.decoder.rope(torch.cat((positions, suffix), dim=1))
-        rotary = tuple(value.to(compute_dtype) for value in rotary)
+        rotary = (rotary[0].to(compute_dtype), rotary[1].to(compute_dtype))
         # The first block establishes the pipelined residual/feed-forward state;
         # subsequent blocks fuse the previous residual with the next normalization.
-        first = self.decoder.transformer_blocks[0]
-        quantized_attention = callable(getattr(first.attn.to_q, "quantize_activation", None))
+        first = cast(_TransformerBlock, self.decoder.transformer_blocks[0])
+        quantized_attention = first.attn.to_q.quant_method.is_quantized
         if quantized_attention:
-            normalized, normalized_absmax = video_rmsnorm_absmax(
+            normalized, normalized_absmax = weighted_rms_norm_absmax(
                 hidden,
                 first.norm1.weight,
-                eps=float(first.norm1.eps),
+                eps=cast(float, first.norm1.eps),
             )
         else:
-            normalized = video_rmsnorm(hidden, first.norm1.weight, eps=float(first.norm1.eps))
+            normalized = weighted_rms_norm(
+                hidden, first.norm1.weight, eps=cast(float, first.norm1.eps)
+            )
             normalized_absmax = None
         hidden, feed_forward, feed_forward_bias = first.forward_normalized(
             hidden,
@@ -492,25 +376,26 @@ class MiniMaxH3VideoDecoder(nn.Module):
             normalized_absmax=normalized_absmax,
         )
         previous = first
-        for block in self.decoder.transformer_blocks[1:]:
-            quantized_attention = callable(getattr(block.attn.to_q, "quantize_activation", None))
+        for module in self.decoder.transformer_blocks[1:]:
+            block = cast(_TransformerBlock, module)
+            quantized_attention = block.attn.to_q.quant_method.is_quantized
             if quantized_attention:
-                hidden, normalized, normalized_absmax = scaled_residual_rmsnorm_absmax_(
+                hidden, normalized, normalized_absmax = scaled_residual_rms_norm_absmax_(
                     hidden,
                     feed_forward,
                     previous.scale2,
                     block.norm1.weight,
                     update_bias=feed_forward_bias,
-                    eps=float(block.norm1.eps),
+                    eps=cast(float, block.norm1.eps),
                 )
             else:
-                hidden, normalized = scaled_residual_rmsnorm_(
+                hidden, normalized = scaled_residual_rms_norm_(
                     hidden,
                     feed_forward,
                     previous.scale2,
                     block.norm1.weight,
                     update_bias=feed_forward_bias,
-                    eps=float(block.norm1.eps),
+                    eps=cast(float, block.norm1.eps),
                 )
                 normalized_absmax = None
             hidden, feed_forward, feed_forward_bias = block.forward_normalized(
@@ -522,9 +407,9 @@ class MiniMaxH3VideoDecoder(nn.Module):
             previous = block
         # Final layer normalization and projection preserve the selected linear
         # method's activation-scale path before patch rows become RGB volumes.
-        quantized_output = callable(getattr(self.decoder.proj_out, "quantize_activation", None))
+        quantized_output = self.decoder.proj_out.quant_method.is_quantized
         if quantized_output:
-            hidden, hidden_absmax = scaled_residual_layernorm_absmax(
+            hidden, hidden_absmax = scaled_residual_layer_norm_absmax(
                 hidden,
                 feed_forward,
                 previous.scale2,
@@ -533,13 +418,13 @@ class MiniMaxH3VideoDecoder(nn.Module):
                 update_bias=feed_forward_bias,
                 eps=float(self.decoder.norm_out.eps),
             )
-            hidden, output_bias = _linear_with_deferred_bias(
+            hidden, output_bias = project_with_deferred_bias(
                 self.decoder.proj_out,
                 hidden,
                 absmax=hidden_absmax,
             )
         else:
-            hidden = scaled_residual_layernorm(
+            hidden = scaled_residual_layer_norm(
                 hidden,
                 feed_forward,
                 previous.scale2,
@@ -548,14 +433,13 @@ class MiniMaxH3VideoDecoder(nn.Module):
                 update_bias=feed_forward_bias,
                 eps=float(self.decoder.norm_out.eps),
             )
-            hidden, output_bias = _linear_with_deferred_bias(
+            hidden, output_bias = project_with_deferred_bias(
                 self.decoder.proj_out,
                 hidden,
             )
-        return video_patch_output(
+        return unpatchify_video_tokens(
             hidden,
             output_bias,
-            frames=frames,
-            height=height,
-            width=width,
+            grid_shape=(frames, height, width),
+            patch_shape=(4, 16, 16),
         )

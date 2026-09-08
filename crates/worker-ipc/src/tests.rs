@@ -50,12 +50,12 @@ fn selected_point_product(op: OpId) -> ProductRef {
 }
 
 fn ar_decode_operation() -> Operation {
-    let kind = RunKind::ArDecode;
+    let kind = OpCode::ArDecode;
     Operation {
         request_key: request_key(),
         op_id: OpId(11),
-        parent: fixed_parent(),
-        kind,
+        parent: Some(fixed_parent()),
+        entry: "model".into(),
         payload: OpPayload::new(
             kind,
             Bounds {
@@ -78,12 +78,12 @@ fn ar_decode_operation() -> Operation {
     .sealed()
 }
 
-fn operation_for(kind: RunKind, op_id: OpId, advances: bool) -> Operation {
+fn operation_for(kind: OpCode, op_id: OpId, advances: bool) -> Operation {
     Operation {
         request_key: request_key(),
         op_id,
-        parent: fixed_parent(),
-        kind,
+        parent: Some(fixed_parent()),
+        entry: "model".into(),
         payload: OpPayload::new(
             kind,
             Bounds {
@@ -147,7 +147,7 @@ fn media_admission(prompt_token_ids: Vec<u32>) -> NewRequest {
         DiffusionRequestParams {
             geometry: MediaGeometry {
                 frame_count: 22,
-                decode_units: 3,
+                video_units: 3,
                 prompt_tokens: u32::try_from(prompt_token_ids.len()).unwrap(),
                 denoise_steps: 4,
             },
@@ -179,7 +179,7 @@ fn batch_with_operations(
         {
             next_buffer_offset = next_buffer_offset.div_ceil(256) * 256;
             let bytes = output.max_bytes();
-            run.buffer_placements.push(BufferPlacement {
+            run.buffer_allocations.push(BufferAllocation {
                 buffer: output.buffer_id(),
                 offset: next_buffer_offset,
                 bytes,
@@ -206,17 +206,18 @@ fn batch_with_operations(
                 request_pool_index: request_pool_idx,
                 seq_len: 0,
                 query_len: operation.bounds().max_tokens.max(1),
+                write_kv: true,
             });
         }
         if matches!(
-            operation.kind,
-            RunKind::DiffusionPrepare | RunKind::DiffusionStep
+            operation.kind(),
+            OpCode::DiffusionPrepare | OpCode::DiffusionStep
         ) || operation
             .inputs()
             .iter()
             .any(|reference| reference.kind == ProductKind::Latent)
         {
-            run.latent_placements.push(LatentPlacement {
+            run.latent_params.push(LatentParams {
                 request_key: operation.request_key,
                 op_id: operation.op_id,
                 page_table: vec![u32::try_from(operation.op_id.0).unwrap()],
@@ -224,11 +225,15 @@ fn batch_with_operations(
                 height: 1,
                 width: 1,
                 start_step: 0,
-                step_count: u32::from(operation.kind == RunKind::DiffusionStep),
+                step_count: u32::from(operation.kind() == OpCode::DiffusionStep),
             });
         }
-        if operation.kind == RunKind::DiffusionDecode {
-            run.decode_placements.push(DecodePlacement {
+        if matches!(
+            operation.kind(),
+            OpCode::DiffusionDecode | OpCode::MediaAppend
+        ) {
+            run.decode_ranges.push(DecodeRange {
+                track: MediaTrack::Video,
                 request_key: operation.request_key,
                 op_id: operation.op_id,
                 cursor: 0,
@@ -262,18 +267,19 @@ fn lane_report(
 #[test]
 fn every_work_variant_round_trips_through_ipc() {
     let variants = [
-        (RunKind::ArExtend, true, Domain::Prefill),
-        (RunKind::ArDecode, true, Domain::Decode),
-        (RunKind::ArVerify, true, Domain::Decode),
-        (RunKind::EncoderVision, false, Domain::Prefill),
-        (RunKind::EncoderLatent, false, Domain::Prefill),
-        (RunKind::TransferProduct, false, Domain::Prefill),
-        (RunKind::TransferKvPublish, false, Domain::Prefill),
-        (RunKind::TransferKvInstall, false, Domain::Prefill),
-        (RunKind::DiffusionPrepare, true, Domain::Flow),
-        (RunKind::DiffusionStep, true, Domain::Flow),
-        (RunKind::DiffusionDecode, true, Domain::Flow),
-        (RunKind::DiffusionFinalize, false, Domain::Flow),
+        (OpCode::ArExtend, true, Domain::Prefill),
+        (OpCode::ArDecode, true, Domain::Decode),
+        (OpCode::ArVerify, true, Domain::Decode),
+        (OpCode::EncoderVision, false, Domain::Prefill),
+        (OpCode::EncoderLatent, false, Domain::Prefill),
+        (OpCode::TransferProduct, false, Domain::Prefill),
+        (OpCode::TransferKvPublish, false, Domain::Prefill),
+        (OpCode::TransferKvInstall, false, Domain::Prefill),
+        (OpCode::DiffusionPrepare, true, Domain::Flow),
+        (OpCode::DiffusionStep, true, Domain::Flow),
+        (OpCode::DiffusionDecode, false, Domain::Flow),
+        (OpCode::DiffusionFinalize, false, Domain::Flow),
+        (OpCode::MediaAppend, false, Domain::Flow),
     ];
     for (index, (work, advances, domain)) in variants.into_iter().enumerate() {
         assert_eq!(
@@ -289,7 +295,66 @@ fn every_work_variant_round_trips_through_ipc() {
             vec![operation.clone()],
         ));
         assert_eq!(batch.operations().next().unwrap(), &operation);
-        assert_eq!(batch.operations().next().unwrap().kind, work);
+        assert_eq!(batch.operations().next().unwrap().kind(), work);
+    }
+}
+
+#[test]
+fn solver_parameters_round_trip_with_request_or_paged_storage() {
+    let operation = operation_for(OpCode::DiffusionStep, OpId(101), true);
+    let mut run = batch_with_operations(1, Vec::new(), vec![operation]);
+    assert_eq!(execute_round_trip(run.clone()), run);
+    run.latent_params[0].page_table.clear();
+    run.latent_params[0].latent_units = 0;
+    assert_eq!(execute_round_trip(run.clone()), run);
+    run.latent_params[0].latent_units = 1;
+    assert!(run.validate().is_err());
+    run.latent_params[0].latent_units = 0;
+    run.latent_params[0].page_table.push(1);
+    assert!(run.validate().is_err());
+}
+
+#[test]
+fn media_tracks_preserve_independent_ranges_and_tensor_dependencies() {
+    let mut latent = output_product(OpId(55));
+    latent.kind = ProductKind::Tensor;
+    latent.storage_class = StorageClass::DeviceTensor;
+    latent.dtype = DType::F32;
+    latent.shape_bound = ShapeBound {
+        dims: vec![DimBound::Static(8), DimBound::Static(32)],
+    };
+    latent.point_range = PointRange::default();
+    for (index, entry) in ["video_decoder", "audio_decoder"].iter().enumerate() {
+        let operation = Operation {
+            request_key: request_key(),
+            op_id: OpId(56 + index as u64),
+            parent: None,
+            entry: (*entry).into(),
+            payload: OpPayload::new(
+                OpCode::DiffusionDecode,
+                Bounds::default(),
+                vec![latent.clone()],
+                Vec::new(),
+                None,
+                None,
+                0,
+            ),
+        }
+        .sealed();
+        let mut run = batch_with_operations(index as u64 + 1, Vec::new(), vec![operation]);
+        if index == 0 {
+            run.decode_ranges[0].cursor = 3;
+            run.decode_ranges[0].max_units = 2;
+        } else {
+            run.decode_ranges[0].track = MediaTrack::Audio;
+        }
+        assert_eq!(execute_round_trip(run.clone()), run);
+        if index == 1 {
+            run.decode_ranges[0].cursor = 1;
+            assert!(run.validate().is_err());
+        }
+        run.decode_ranges.clear();
+        assert!(run.validate().is_err());
     }
 }
 
@@ -302,10 +367,10 @@ fn device_selected_checkpoint_round_trips() {
     let operation = Operation {
         request_key: request_key(),
         op_id: OpId(12),
-        parent: device_parent.clone(),
-        kind: RunKind::ArDecode,
+        parent: Some(device_parent.clone()),
+        entry: "model".into(),
         payload: OpPayload::new(
-            RunKind::ArDecode,
+            OpCode::ArDecode,
             Bounds {
                 max_points: 1,
                 ..Bounds::default()
@@ -319,11 +384,14 @@ fn device_selected_checkpoint_round_trips() {
     }
     .sealed();
     let batch = execute_round_trip(batch_with_operations(2, Vec::new(), vec![operation]));
-    assert_eq!(batch.operations().next().unwrap().parent, device_parent);
+    assert_eq!(
+        batch.operations().next().unwrap().parent,
+        Some(device_parent)
+    );
 }
 
 #[test]
-fn block_table_placement_round_trips_with_the_operation() {
+fn block_table_allocation_round_trips_with_the_operation() {
     let base = ar_decode_operation();
     let batch = execute_round_trip(batch_with_operations(9, Vec::new(), vec![base.clone()]));
     assert_eq!(batch.operations().next().unwrap(), &base);
@@ -352,6 +420,268 @@ fn run_result_round_trips_records_and_product_payloads() {
     let response = WorkerResponse::result(report.clone());
     let decoded = decode_response(&encode_response(&response).unwrap()).unwrap();
     assert_eq!(decoded.report().unwrap(), &report);
+}
+
+#[test]
+fn publication_round_trips_its_registered_view_and_endpoint() {
+    for kind in [ProductKind::Artifact, ProductKind::Tensor] {
+        let mut product = output_product(OpId(11));
+        product.kind = kind;
+        product.storage_class = if kind == ProductKind::Tensor {
+            StorageClass::DeviceTensor
+        } else {
+            StorageClass::LatentArena
+        };
+        product.dtype = DType::F32;
+        product.shape_bound = ShapeBound {
+            dims: vec![DimBound::Static(4)],
+        };
+        for transport in [
+            TransferTransport::CudaIpc {
+                endpoint: "uniserve-cuda-physical-incarnation".into(),
+                publication_id: "0123456789abcdef0123456789abcdef".into(),
+                storage_handle: vec![7; 64],
+                storage_size_bytes: 4096,
+                storage_offsets_bytes: vec![128, 64],
+                span_lengths: vec![2],
+                span_counts: vec![2],
+                tensor_stride: vec![2],
+                ready_event_handle: vec![9; 64],
+            },
+            TransferTransport::PosixShm {
+                endpoint: "uniserve-shm-physical-incarnation".into(),
+                name: "uniserve-publication".into(),
+            },
+        ] {
+            let mut report = lane_report(
+                5,
+                vec![completion_record()],
+                vec![ProductPayload {
+                    product: product.clone(),
+                    value: InlineValue::Transfer(TransferHandle::DeviceProduct {
+                        generation: 3,
+                        height: 0,
+                        width: 0,
+                        value_range: String::new(),
+                        tensor: TensorTransfer {
+                            shape: vec![4],
+                            locations: vec![Locator {
+                                source: WorkerInfo::default().endpoint,
+                                transport,
+                                nbytes: 16,
+                                dtype: "float32".into(),
+                                shape: vec![4],
+                                offset: vec![0],
+                                device: "cuda:1".into(),
+                            }],
+                        },
+                    }),
+                }],
+                true,
+                None,
+                None,
+            );
+            let InlineValue::Transfer(original) = &mut report.products[0].value else {
+                unreachable!()
+            };
+            let mut replica = original.clone();
+            if let TransferHandle::DeviceProduct { tensor, .. } = &mut replica {
+                tensor.locations[0].source.rank = 1;
+            }
+            original.merge_locations(&replica).unwrap();
+            let decoded =
+                decode_response(&encode_response(&WorkerResponse::result(report.clone())).unwrap())
+                    .unwrap();
+            assert_eq!(decoded.report().unwrap(), &report);
+            for (dtype, storage_dtype, nbytes) in
+                [(DType::U32, "int64", 32), (DType::I16, "int16", 8)]
+            {
+                let mut typed_report = report.clone();
+                typed_report.products[0].product.dtype = dtype;
+                let InlineValue::Transfer(TransferHandle::DeviceProduct { tensor, .. }) =
+                    &mut typed_report.products[0].value
+                else {
+                    unreachable!()
+                };
+                for location in &mut tensor.locations {
+                    location.dtype = storage_dtype.into();
+                    location.nbytes = nbytes;
+                }
+                let decoded = decode_response(
+                    &encode_response(&WorkerResponse::result(typed_report.clone())).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(decoded.report().unwrap(), &typed_report);
+            }
+        }
+    }
+}
+
+#[test]
+fn unchanged_kv_publication_round_trips_without_physical_tensors() {
+    let mut product = output_product(OpId(11));
+    product.kind = ProductKind::Kv;
+    product.storage_class = StorageClass::PagedKv;
+    product.dtype = DType::U8;
+    product.shape_bound = ShapeBound {
+        dims: vec![DimBound::Static(4096)],
+    };
+    let mut report = lane_report(
+        5,
+        vec![completion_record()],
+        vec![ProductPayload {
+            product,
+            value: InlineValue::Transfer(TransferHandle::Kv {
+                generation: 3,
+                tensors: Vec::new(),
+                source: fixed_parent(),
+                destination: "decoder".into(),
+                base: Some(fixed_parent()),
+                base_extent: 16,
+                published_extent: 16,
+                group_id: 0,
+                compute_dtype: "bfloat16".into(),
+                page_size: 16,
+            }),
+        }],
+        true,
+        None,
+        None,
+    );
+    let decoded =
+        decode_response(&encode_response(&WorkerResponse::result(report.clone())).unwrap())
+            .unwrap();
+    assert_eq!(decoded.report().unwrap(), &report);
+
+    let InlineValue::Transfer(TransferHandle::Kv {
+        published_extent, ..
+    }) = &mut report.products[0].value
+    else {
+        unreachable!()
+    };
+    *published_extent = 17;
+    assert!(encode_response(&WorkerResponse::result(report)).is_err());
+}
+
+#[test]
+fn tensor_coverage_preserves_replicas_and_detects_missing_regions() {
+    let shard = |offset: Vec<u64>, shape: Vec<u64>| Locator {
+        source: WorkerInfo::default().endpoint,
+        transport: TransferTransport::PosixShm {
+            endpoint: "tensor-publisher".into(),
+            name: "tensor-shard".into(),
+        },
+        nbytes: shape.iter().product::<u64>() * 4,
+        dtype: "float32".into(),
+        device: "cpu".into(),
+        offset,
+        shape,
+    };
+    let mut tensor = TensorTransfer {
+        shape: vec![4, 4],
+        locations: vec![shard(vec![0, 0], vec![4, 2]), shard(vec![0, 2], vec![2, 2])],
+    };
+    assert!(!tensor.has_complete_coverage());
+    tensor.locations.push(shard(vec![2, 2], vec![2, 2]));
+    assert!(tensor.has_complete_coverage());
+    tensor.locations.push(shard(vec![0, 0], vec![4, 4]));
+    tensor.locations.remove(0);
+    assert!(tensor.has_complete_coverage());
+    tensor.locations.pop();
+    assert!(!tensor.has_complete_coverage());
+}
+
+#[test]
+fn raw_kv_publication_round_trips_page_representation_and_exact_lineage() {
+    let mut product = output_product(OpId(11));
+    product.kind = ProductKind::Kv;
+    product.storage_class = StorageClass::PagedKv;
+    product.dtype = DType::U8;
+    product.shape_bound = ShapeBound {
+        dims: vec![DimBound::Static(4096)],
+    };
+    let tensor = |name: &str, dtype: &str, shape: Vec<u64>, itemsize: u64| TensorTransfer {
+        shape: shape.clone(),
+        locations: vec![Locator {
+            source: WorkerInfo::default().endpoint,
+            transport: TransferTransport::PosixShm {
+                endpoint: "uniserve-kv-publisher".into(),
+                name: name.into(),
+            },
+            nbytes: shape.iter().product::<u64>() * itemsize,
+            dtype: dtype.into(),
+            offset: vec![0; shape.len()],
+            shape,
+            device: "cpu".into(),
+        }],
+    };
+    for (dtype, itemsize) in [("bfloat16", 2), ("float8_e4m3fn", 1)] {
+        let mut tensors = vec![
+            tensor("keys", dtype, vec![5, 2, 3, 4], itemsize),
+            tensor("values", dtype, vec![5, 2, 3, 4], itemsize),
+        ];
+        for field in &mut tensors {
+            field.shape[2] = 6;
+            field.locations[0].offset[2] = 3;
+        }
+        if dtype == "float8_e4m3fn" {
+            let mut scales = tensor("scales", "float32", vec![2, 2, 2, 1], 4);
+            scales.shape[3] = 2;
+            scales.locations[0].offset[3] = 1;
+            tensors.push(scales);
+        }
+        let report = lane_report(
+            5,
+            vec![completion_record()],
+            vec![ProductPayload {
+                product: product.clone(),
+                value: InlineValue::Transfer(TransferHandle::Kv {
+                    generation: 3,
+                    tensors,
+                    source: fixed_parent(),
+                    destination: "decoder".into(),
+                    base: Some(fixed_parent()),
+                    base_extent: 3,
+                    published_extent: 8,
+                    group_id: 0,
+                    compute_dtype: "bfloat16".into(),
+                    page_size: 4,
+                }),
+            }],
+            true,
+            None,
+            None,
+        );
+        let decoded =
+            decode_response(&encode_response(&WorkerResponse::result(report.clone())).unwrap())
+                .unwrap();
+        assert_eq!(decoded.report().unwrap(), &report);
+
+        for invalid_field in ["source", "base", "page_size", "scales"] {
+            let mut invalid = report.clone();
+            let InlineValue::Transfer(TransferHandle::Kv {
+                source,
+                base,
+                page_size,
+                tensors,
+                ..
+            }) = &mut invalid.products[0].value
+            else {
+                unreachable!()
+            };
+            match invalid_field {
+                "source" => source.point = CheckpointPoint::DeviceSelected,
+                "base" => base.as_mut().unwrap().point = CheckpointPoint::DeviceSelected,
+                "page_size" => *page_size = 0,
+                "scales" if dtype == "float8_e4m3fn" => {
+                    tensors[2] = tensor("scales", "float32", vec![1, 2, 2], 4);
+                }
+                "scales" => tensors.push(tensor("scales", "float32", vec![2, 2, 2], 4)),
+                _ => unreachable!(),
+            }
+            assert!(encode_response(&WorkerResponse::result(invalid)).is_err());
+        }
+    }
 }
 
 #[test]
@@ -394,6 +724,41 @@ fn error_completion_round_trips_with_its_error_code() {
 }
 
 #[test]
+fn request_retirement_requires_unique_buffers_from_its_lineage() {
+    let product = product_for(request_key(), OpId(7), 0, ProductKind::VisionFeature);
+    for retained_buffers in [
+        vec![product.buffer_id(), product.buffer_id()],
+        vec![BufferId {
+            owner: key_for_request(900),
+            ..product.buffer_id()
+        }],
+    ] {
+        let command = BatchCommand::Finish {
+            request_key: request_key(),
+            control_seq: 1,
+            cutoff: fixed_parent(),
+            reason: CloseReason::Completed,
+            retained_buffers: retained_buffers.clone(),
+        };
+        for command in [
+            command,
+            BatchCommand::Retire {
+                request_key: request_key(),
+                retained_buffers,
+            },
+        ] {
+            assert!(
+                encode_request(&WorkerRequest::submit(
+                    batch_with_operations(3, vec![admission()], vec![ar_decode_operation()])
+                        .with_commands(vec![command]),
+                ))
+                .is_err()
+            );
+        }
+    }
+}
+
+#[test]
 fn every_batch_command_variant_round_trips_through_ipc() {
     let commit = BatchCommand::Commit {
         request_key: request_key(),
@@ -408,9 +773,18 @@ fn every_batch_command_variant_round_trips_through_ipc() {
         control_seq: 2,
         cutoff: fixed_parent(),
         reason: CloseReason::Completed,
+        retained_buffers: vec![
+            product_for(request_key(), OpId(7), 0, ProductKind::VisionFeature).buffer_id(),
+        ],
+    };
+    let retire = BatchCommand::Retire {
+        request_key: request_key(),
+        retained_buffers: vec![
+            product_for(request_key(), OpId(7), 0, ProductKind::VisionFeature).buffer_id(),
+        ],
     };
     let batch = batch_with_operations(3, vec![admission()], vec![ar_decode_operation()])
-        .with_commands(vec![commit.clone(), close.clone()]);
+        .with_commands(vec![commit.clone(), close.clone(), retire.clone()]);
     let decoded = execute_round_trip(batch);
     assert_eq!(
         decoded.commands,
@@ -420,6 +794,7 @@ fn every_batch_command_variant_round_trips_through_ipc() {
             },
             commit,
             close,
+            retire,
         ]
     );
 }
@@ -441,7 +816,7 @@ fn maximum_media_prompt_round_trips() {
     let request = WorkerRequest::submit(batch_with_operations(
         5,
         vec![admission.clone()],
-        vec![operation_for(RunKind::DiffusionPrepare, OpId(12), true)],
+        vec![operation_for(OpCode::DiffusionPrepare, OpId(12), true)],
     ));
 
     let decoded = decode_request(&encode_request(&request).unwrap()).unwrap();
@@ -450,11 +825,11 @@ fn maximum_media_prompt_round_trips() {
 
 #[test]
 fn kv_publication_requires_a_fixed_semantic_parent() {
-    let mut operation = operation_for(RunKind::TransferKvPublish, OpId(12), false);
-    operation.parent = Checkpoint {
+    let mut operation = operation_for(OpCode::TransferKvPublish, OpId(12), false);
+    operation.parent = Some(Checkpoint {
         op_id: OpId(9),
         point: CheckpointPoint::DeviceSelected,
-    };
+    });
 
     assert!(operation.validate().is_err());
 }
@@ -500,9 +875,9 @@ fn batch_rejects_two_operations_for_one_request() {
         block_tables: Vec::new(),
         new_cache_pages: Vec::new(),
         forward_rows: Vec::new(),
-        latent_placements: Vec::new(),
-        decode_placements: Vec::new(),
-        buffer_placements: Vec::new(),
+        latent_params: Vec::new(),
+        decode_ranges: Vec::new(),
+        buffer_allocations: Vec::new(),
         commands: Vec::new(),
         input_products: Vec::new(),
     };
@@ -618,7 +993,7 @@ fn commit_command_requires_a_fixed_selected_version() {
 
 #[test]
 fn worker_info_round_trips() {
-    use uniserve_core::{ComponentDeployConfig, ParallelConfig, SequenceParallel};
+    use uniserve_core::{EntryConfig, ParallelConfig, SequenceParallel};
     let strategies = [
         SequenceParallel::Local,
         SequenceParallel::Ulysses { ulysses_degree: 2 },
@@ -643,17 +1018,29 @@ fn worker_info_round_trips() {
         };
         let count = config.world_size().unwrap();
         let info = WorkerInfo {
-            rank: RankInfo {
-                rank: 0,
-                world_size: count as u32,
-            },
+            world_size: count as u32,
             configuration_id: "a".repeat(64),
-            components: vec![ComponentInfo {
+            components: vec![EntryInfo {
                 name: "denoiser".into(),
-                deployment: ComponentDeployConfig::parallel((0..count).rev().collect(), config),
+                config: EntryConfig::parallel((0..count).rev().collect(), config),
+                outputs: vec![TensorSpec {
+                    name: "conditioning".into(),
+                    dtype: DType::BF16,
+                    shape_bound: ShapeBound {
+                        dims: vec![
+                            DimBound::Static(1),
+                            DimBound::Device { max: 16384 },
+                            DimBound::Static(2560),
+                        ],
+                    },
+                }],
             }],
             ..Default::default()
         };
+        // Python startup metadata crosses the serde mapping boundary before
+        // the binary response is delivered to the native host.
+        let mapped = serde_json::to_value(&info).unwrap();
+        assert_eq!(serde_json::from_value::<WorkerInfo>(mapped).unwrap(), info);
         let response = WorkerResponse::info(info.clone());
         let decoded = decode_response(&encode_response(&response).unwrap()).unwrap();
         let WorkerResponse::Info { info: decoded, .. } = decoded else {
@@ -666,7 +1053,7 @@ fn worker_info_round_trips() {
 #[test]
 fn kv_free_worker_info_round_trips() {
     let info = WorkerInfo {
-        supported_ops: vec![OpKind::DiffusionPrepare, OpKind::DiffusionStep],
+        supported_ops: vec![OpCode::DiffusionPrepare, OpCode::DiffusionStep],
         kv_cache: None,
         latent_page_units: 64,
         latent_pages: 3,
@@ -683,7 +1070,7 @@ fn kv_free_worker_info_round_trips() {
 #[test]
 fn worker_info_rejects_duplicate_set_members() {
     let info = WorkerInfo {
-        supported_ops: vec![OpKind::ArExtend, OpKind::ArDecode, OpKind::ArExtend],
+        supported_ops: vec![OpCode::ArExtend, OpCode::ArDecode, OpCode::ArExtend],
         ..Default::default()
     };
     assert!(encode_response(&WorkerResponse::info(info)).is_err());
@@ -708,6 +1095,7 @@ fn product_for(key: RequestKey, op: OpId, output_index: u16, kind: ProductKind) 
         generation: 3 + u32::from(output_index),
         kind,
         storage_class: match kind {
+            ProductKind::Tensor => StorageClass::DeviceTensor,
             ProductKind::Kv => StorageClass::PagedKv,
             ProductKind::Latent | ProductKind::LatentFeature | ProductKind::VisionFeature => {
                 StorageClass::LatentArena
@@ -790,23 +1178,10 @@ fn full_image() -> ImageParams {
     }
 }
 
-/// One operation per closed `RunKind` variant, each on its own request key so the
+/// One operation per closed `OpCode` variant, each on its own request key so the
 /// batch admits them together; the first two keys also carry admissions.
 fn comprehensive_batch() -> Run {
-    let variants = [
-        RunKind::ArExtend,
-        RunKind::ArDecode,
-        RunKind::ArVerify,
-        RunKind::EncoderVision,
-        RunKind::EncoderLatent,
-        RunKind::TransferProduct,
-        RunKind::TransferKvPublish,
-        RunKind::TransferKvInstall,
-        RunKind::DiffusionPrepare,
-        RunKind::DiffusionStep,
-        RunKind::DiffusionDecode,
-        RunKind::DiffusionFinalize,
-    ];
+    let variants = OpCode::ALL;
     let mut operations = Vec::new();
     for (index, kind) in variants.into_iter().enumerate() {
         let key = key_for_request(100 + index as u64);
@@ -823,8 +1198,8 @@ fn comprehensive_batch() -> Run {
             Operation {
                 request_key: key,
                 op_id,
-                parent,
-                kind,
+                parent: Some(parent),
+                entry: "model".into(),
                 payload: OpPayload::new(
                     kind,
                     Bounds {
@@ -891,6 +1266,7 @@ fn comprehensive_batch() -> Run {
             control_seq: 2,
             cutoff: Checkpoint::admission_root(OpId(1)),
             reason: CloseReason::Preempted,
+            retained_buffers: Vec::new(),
         },
     ];
     let mut input_product = product_for(
@@ -927,7 +1303,7 @@ fn request_fixtures() -> Vec<WorkerRequest> {
 
 fn full_caps() -> WorkerInfo {
     WorkerInfo {
-        supported_ops: OpKind::ALL.to_vec(),
+        supported_ops: OpCode::ALL.to_vec(),
         kv_cache: Some(KvCacheConfig {
             groups: vec![
                 KvCacheGroup {
@@ -944,10 +1320,11 @@ fn full_caps() -> WorkerInfo {
             ],
             ..WorkerInfo::default().kv_cache.unwrap()
         }),
-        rank: RankInfo {
+        endpoint: WorkerEndpoint {
             rank: 1,
-            world_size: 2,
+            ..WorkerInfo::default().endpoint
         },
+        world_size: 2,
         queue_depth: 2,
         max_batch_ops: 64,
         max_batch_tokens: 4096,

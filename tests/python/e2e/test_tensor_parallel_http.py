@@ -27,15 +27,13 @@ pytestmark = [pytest.mark.e2e, pytest.mark.gpu]
         pytest.param("bagel", "UNISERVE_BAGEL_MODEL", marks=pytest.mark.model("bagel")),
     ],
 )
-def test_ordered_tensor_placement_generates_outputs(
-    tmp_path: Path, description: str, model_env: str
-):
+def test_ordered_tensor_bindings_generate_outputs(tmp_path: Path, description: str, model_env: str):
     checkpoint = os.environ.get(model_env, "")
     if not checkpoint or not Path(checkpoint).is_dir():
         pytest.fail(f"{model_env} must name the model checkpoint directory")
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
-    deployment = {
+    worker_config = {
         "devices": [3, 1],
         "model": {"ranks": [1, 0], "parallel_config": {"tensor_parallel_size": 2}},
     }
@@ -53,8 +51,8 @@ def test_ordered_tensor_placement_generates_outputs(
         str(port),
         "--worker-python",
         str(Path.cwd() / ".venv" / "bin" / "python"),
-        "--deployment",
-        json.dumps(deployment),
+        "--worker_config",
+        json.dumps(worker_config),
         "--dtype",
         "bfloat16",
         "--max-total-tokens",

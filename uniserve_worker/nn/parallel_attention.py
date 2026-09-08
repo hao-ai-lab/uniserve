@@ -3,17 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 import torch
 
-from .mesh import GroupCoordinator
-
-if TYPE_CHECKING:
-    from ..backends.attention.video_sparse import (
-        VideoSparseAttentionBackend,
-        VideoSparseAttentionWorkspace,
-    )
+from .mesh import Communicator, DeviceMesh
 
 
 @dataclass(frozen=True)
@@ -31,6 +24,25 @@ class AttentionOutputTargets:
 
 
 @dataclass(frozen=True)
+class AttentionContextGeometry:
+    """Declare the key domain and physical communication used by context attention."""
+
+    group: Communicator
+    rows: int
+    heads: int
+    mapped: bool
+    head_dim: int
+    dtype: torch.dtype
+    block_size: int
+
+    def __post_init__(self) -> None:
+        if min(self.rows, self.heads, self.head_dim, self.block_size) < 1:
+            raise ValueError("attention context extents must be positive")
+        if self.rows % self.block_size:
+            raise ValueError("attention context rows must align to its validity blocks")
+
+
+@dataclass(frozen=True)
 class AttentionContextWorkspace:
     """Fixed-capacity K/V transport storage, separate from sparse compute.
 
@@ -38,6 +50,8 @@ class AttentionContextWorkspace:
     Each owner has a page-aligned row capacity, which can exceed its active
     logical rows. Gather storage instead holds a compact replicated key domain.
     The distributed runtime owns mapped allocation lifetime.
+    ``valid_sizes`` stores valid-row counts for the geometry's explicit block
+    size; numerical backends populate it when masking aligned owner capacity.
     """
 
     key: torch.Tensor
@@ -48,312 +62,150 @@ class AttentionContextWorkspace:
     sync_input: torch.Tensor
     sync_output: torch.Tensor
 
-    @classmethod
-    def allocate(
-        cls,
-        group: GroupCoordinator,
-        rows: int,
-        heads: int,
-        *,
-        mapped: bool,
-    ) -> AttentionContextWorkspace:
-        shape = (rows, heads, 128)
-        if mapped:
-            keys = group.peer_tensor(
-                shape, dtype=torch.bfloat16, name="attention_keys", row_multiple=64
-            )
-            values = group.peer_tensor(
-                shape, dtype=torch.bfloat16, name="attention_values", row_multiple=64
-            )
-            key, value = keys.global_tensor, values.global_tensor
-            local_key, local_value = keys.local, values.local
-        else:
-            key = torch.empty(
-                (rows * group.world_size, heads, 128), dtype=torch.bfloat16, device=group.device
-            )
-            value = torch.empty_like(key)
-            begin = group.rank_in_group * rows
-            local_key, local_value = key[begin : begin + rows], value[begin : begin + rows]
-        return cls(
-            key,
-            value,
-            local_key,
-            local_value,
-            torch.empty(key.shape[0] // 64, dtype=torch.int32, device=group.device),
-            torch.zeros(1, dtype=torch.int32, device=group.device),
-            torch.empty(group.world_size, dtype=torch.int32, device=group.device),
-        )
 
+class ParallelAttention:
+    """Exchange attention tensors independently of the numerical backend.
 
-class UlyssesAttention:
-    """Exchange projected heads and restore sequence rows around local compute.
-
-    The backend consumes global rows and the current member's head shard. It
-    may fuse gate/compression math directly into peer destinations. The bound
-    group establishes visibility before the local destination is consumed.
+    Ulysses partitions heads over the complete sequence. Context bindings
+    gather K/V or expose mapped peer storage; two-dimensional bindings gather
+    columns before publishing row owners. Compute backends retain their mask,
+    selection and softmax semantics. The runtime owns communication storage.
     """
 
-    def __init__(self, backend: VideoSparseAttentionBackend, *, ulysses_group: GroupCoordinator):
-        self.backend = backend
-        self.ulysses_group = ulysses_group
+    def __init__(
+        self,
+        *,
+        mesh: DeviceMesh,
+    ) -> None:
+        self.ulysses_group = mesh.get_group("ulysses")
+        self.context_group = mesh.get_group("cp")
+        strategy = mesh.parallel_config.sequence_parallel.kind
+        self.mapped = self.context_group.world_size > 1 and strategy in {
+            "ring",
+            "hybrid",
+            "attention2d",
+        }
+        self.col_group = mesh.get_group("cp_col") if strategy == "attention2d" else None
+        self.key_group = (
+            mesh.get_group("cp_row") if strategy == "attention2d" else self.context_group
+        )
 
-    def exchange_projection(self, projected: torch.Tensor) -> torch.Tensor:
-        """Map [local rows, TP heads, branches, width] to global rows/local heads."""
+    def exchange_heads(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Exchange [local rows, heads, ...] into [global rows, local heads, ...].
 
+        K/V heads fewer than the group size are replicated over adjacent head
+        owners, as required by grouped-query attention. Otherwise heads divide
+        the group exactly. Trailing dimensions and dtype are preserved.
+        """
+
+        if tensor.ndim < 3 or min(tensor.shape[:2]) < 1:
+            raise ValueError("attention head exchange requires rows, heads and features")
         group = self.ulysses_group
         if group.world_size == 1:
-            return projected
-        rows, heads, branches, width = projected.shape
+            return tensor
+        rows, heads, *features = tensor.shape
+        if heads < group.world_size:
+            if group.world_size % heads:
+                raise ValueError("K/V head replication must divide Ulysses membership")
+            tensor = tensor.repeat_interleave(group.world_size // heads, dim=1)
+            heads = group.world_size
         if heads % group.world_size:
             raise ValueError("projected heads must divide Ulysses membership")
         local_heads = heads // group.world_size
-        outgoing = projected.view(rows, group.world_size, local_heads, branches, width)
-        outgoing = outgoing.permute(1, 0, 2, 3, 4).contiguous()
+        outgoing = tensor.view(rows, group.world_size, local_heads, *features)
+        outgoing = outgoing.transpose(0, 1).contiguous()
         incoming = torch.empty_like(outgoing)
         splits = [1] * group.world_size
         group.all_to_all_single_into(incoming, outgoing, splits, splits)
-        return incoming.reshape(rows * group.world_size, local_heads, branches, width)
+        return incoming.reshape(rows * group.world_size, local_heads, *features)
 
-    def __call__(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        gate: torch.Tensor,
-        valid_sizes: torch.Tensor,
-        prefix_key_indices: torch.Tensor,
-        dense_key_indices: torch.Tensor,
-        prefix_count: torch.Tensor,
-        workspace: VideoSparseAttentionWorkspace,
-        *,
-        outputs: tuple[torch.Tensor, ...],
-        sync_input: torch.Tensor,
-        sync_output: torch.Tensor,
-        context_workspace: AttentionContextWorkspace | None,
-    ) -> torch.Tensor:
-        del context_workspace
+    def restore_rows(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Exchange computed head shards back to the owning sequence rows.
+
+        Backends that write peer output destinations directly can instead call
+        ``finish_output`` after their fused head-to-sequence epilogue.
+        """
+
         group = self.ulysses_group
-        if len(outputs) != group.world_size:
-            raise ValueError("attention output destinations disagree with Ulysses membership")
-        self.backend.forward_local(
-            query,
-            key,
-            value,
-            gate,
-            valid_sizes,
-            prefix_key_indices,
-            dense_key_indices,
-            prefix_count,
-            workspace,
-            targets=AttentionOutputTargets(outputs, group.rank_in_group),
-        )
-        group.all_gather_into_tensor(sync_output, sync_input)
-        return outputs[group.rank_in_group]
+        if tensor.ndim < 3 or tensor.shape[0] % group.world_size:
+            raise ValueError("attention output rows must divide Ulysses membership")
+        if group.world_size == 1:
+            return tensor
+        rows = tensor.shape[0] // group.world_size
+        heads, *features = tensor.shape[1:]
+        outgoing = tensor.reshape(group.world_size, rows, heads, *features).contiguous()
+        incoming = torch.empty_like(outgoing)
+        splits = [1] * group.world_size
+        group.all_to_all_single_into(incoming, outgoing, splits, splits)
+        return incoming.transpose(0, 1).reshape(rows, heads * group.world_size, *features)
 
-
-class GatherAttention(UlyssesAttention):
-    """Retain query rows while gathering the complete ordered K/V sequence.
-
-    Ulysses first exchanges projected heads within each context owner. The
-    context group then gathers those owners' K/V rows. Sparse selection and
-    compression use global key identities, with no partial-softmax merge.
-    """
-
-    def __init__(
+    def distribute_key_value(
         self,
-        backend: VideoSparseAttentionBackend,
-        *,
-        ulysses_group: GroupCoordinator,
-        context_group: GroupCoordinator,
-    ) -> None:
-        super().__init__(backend, ulysses_group=ulysses_group)
-        self.context_group = context_group
-
-    def __call__(
-        self,
-        query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        gate: torch.Tensor,
-        valid_sizes: torch.Tensor,
-        prefix_key_indices: torch.Tensor,
-        dense_key_indices: torch.Tensor,
-        prefix_count: torch.Tensor,
-        workspace: VideoSparseAttentionWorkspace,
-        *,
-        outputs: tuple[torch.Tensor, ...],
-        sync_input: torch.Tensor,
-        sync_output: torch.Tensor,
-        context_workspace: AttentionContextWorkspace | None,
-    ) -> torch.Tensor:
+        workspace: AttentionContextWorkspace | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Publish context K/V and return stream-consumable physical views.
+
+        Gathered views cover the active rows. Mapped views include each owner's
+        aligned capacity; the compute backend applies its validity metadata and
+        calls ``finish_context`` before any owner reuses the physical storage.
+        """
+
         context = self.context_group
-        group = self.ulysses_group
-        if len(outputs) != group.world_size:
-            raise ValueError("attention destinations disagree with Ulysses membership")
-        if context_workspace is None:
+        if context.world_size == 1:
+            return key, value
+        if workspace is None:
             raise ValueError("context attention requires transport storage")
+        owner_rows = key.shape[0] * (self.col_group.world_size if self.col_group is not None else 1)
+        if (
+            key.ndim != 3
+            or key.shape != value.shape
+            or key.shape[1:] != workspace.local_key.shape[1:]
+            or not 0 < owner_rows <= workspace.local_key.shape[0]
+            or key.dtype != workspace.key.dtype
+            or value.dtype != workspace.value.dtype
+            or key.device != workspace.key.device
+            or value.device != workspace.value.device
+        ):
+            raise ValueError("context K/V exceeds its declared tensor storage")
+        if self.mapped:
+            if self.col_group is not None:
+                rows = key.shape[0] * self.col_group.world_size
+                self.col_group.all_gather_into_tensor(workspace.local_key[:rows], key.contiguous())
+                self.col_group.all_gather_into_tensor(
+                    workspace.local_value[:rows], value.contiguous()
+                )
+            else:
+                rows = key.shape[0]
+                workspace.local_key[:rows].copy_(key)
+                workspace.local_value[:rows].copy_(value)
+            self.key_group.all_gather_into_tensor(workspace.sync_output, workspace.sync_input)
+            return workspace.key, workspace.value
         rows = key.shape[0] * context.world_size
-        context_key = context_workspace.key[:rows]
-        context_value = context_workspace.value[:rows]
+        context_key, context_value = workspace.key[:rows], workspace.value[:rows]
         context.all_gather_into_tensor(context_key, key.contiguous())
         context.all_gather_into_tensor(context_value, value.contiguous())
-        self.backend.forward_local(
-            query,
-            context_key,
-            context_value,
-            gate,
-            valid_sizes,
-            prefix_key_indices,
-            dense_key_indices,
-            prefix_count,
-            workspace,
-            targets=AttentionOutputTargets(outputs, group.rank_in_group),
-            query_tile_offset=context.rank_in_group * (query.shape[0] // 64),
-        )
-        group.all_gather_into_tensor(sync_output, sync_input)
-        return outputs[group.rank_in_group]
+        return context_key, context_value
 
+    def finish_context(self, workspace: AttentionContextWorkspace | None) -> None:
+        """Fence all mapped readers before the next K/V publication reuses storage."""
 
-class RingAttention(GatherAttention):
-    """Stream selected peer-owned K/V tiles without replicating their storage.
+        if self.mapped:
+            if workspace is None:
+                raise ValueError("mapped attention requires its reader fence")
+            self.key_group.all_gather_into_tensor(workspace.sync_output, workspace.sync_input)
 
-    On a peer-accessible CUDA mesh, mapped owner storage lets the kernel retain
-    its complete unnormalized softmax state across every selected key tile.
-    There is one physical K/V shard per owner and no owner-wise normalization.
-    Publication and reader-completion collectives bound peer access and reuse.
-    """
-
-    @property
-    def key_group(self) -> GroupCoordinator:
-        return self.context_group
-
-    def publish(
+    def finish_output(
         self,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        workspace: AttentionContextWorkspace,
-    ) -> int:
-        """Publish this owner's active rows; return rows per mapped owner."""
-
-        rows = key.shape[0]
-        workspace.local_key[:rows].copy_(key)
-        workspace.local_value[:rows].copy_(value)
-        return rows
-
-    def __call__(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        gate: torch.Tensor,
-        valid_sizes: torch.Tensor,
-        prefix_key_indices: torch.Tensor,
-        dense_key_indices: torch.Tensor,
-        prefix_count: torch.Tensor,
-        workspace: VideoSparseAttentionWorkspace,
-        *,
         outputs: tuple[torch.Tensor, ...],
         sync_input: torch.Tensor,
         sync_output: torch.Tensor,
-        context_workspace: AttentionContextWorkspace | None,
     ) -> torch.Tensor:
-        from ..ops.video_sparse import pool_qkv_means
+        """Fence fused peer output writes and return this sequence owner's result."""
 
-        context = self.context_group
         group = self.ulysses_group
-        transport = context_workspace
-        if transport is None:
-            raise ValueError("context attention requires transport storage")
         if len(outputs) != group.world_size:
-            raise ValueError("attention destinations disagree with Ulysses membership")
-        rows = key.shape[0]
-        tiles = rows // 64
-        start = context.rank_in_group * tiles
-        pooled_key = workspace.pooled_key[start : start + tiles]
-        pooled_value = workspace.pooled_value[start : start + tiles]
-        pool_qkv_means(
-            query,
-            key,
-            value,
-            valid_sizes,
-            workspace.pooled_query,
-            pooled_key,
-            pooled_value,
-            query_tile_offset=start,
-            key_tile_offset=start,
-        )
-        context.all_gather_into_tensor(workspace.pooled_key, pooled_key.clone())
-        context.all_gather_into_tensor(workspace.pooled_value, pooled_value.clone())
-        owner_rows = self.publish(key, value, transport)
-        self.key_group.all_gather_into_tensor(transport.sync_output, transport.sync_input)
-        self.backend.select_from_pooled(
-            valid_sizes,
-            prefix_key_indices,
-            dense_key_indices,
-            prefix_count,
-            workspace,
-            query_tile_offset=start,
-        )
-        owner_tiles = owner_rows // 64
-        capacity_tiles = transport.local_key.shape[0] // 64
-        transport.valid_sizes.zero_()
-        transport.valid_sizes.view(self.key_group.world_size, capacity_tiles)[
-            :, :owner_tiles
-        ].copy_(valid_sizes.view(self.key_group.world_size, owner_tiles))
-        # Translate logical block IDs to page-padded peer storage. Padding
-        # changes addresses, not the selected key set or validity of its rows.
-        indices = workspace.block_indices
-        physical_indices = torch.div(
-            indices, owner_tiles, rounding_mode="floor"
-        ) * capacity_tiles + indices.remainder(owner_tiles)
-        self.backend.forward_selected(
-            query,
-            transport.key,
-            transport.value,
-            gate,
-            transport.valid_sizes,
-            workspace,
-            block_indices=physical_indices,
-            targets=AttentionOutputTargets(outputs, group.rank_in_group),
-        )
-        self.key_group.all_gather_into_tensor(transport.sync_output, transport.sync_input)
+            raise ValueError("attention outputs disagree with Ulysses membership")
         group.all_gather_into_tensor(sync_output, sync_input)
         return outputs[group.rank_in_group]
-
-
-class Attention2D(RingAttention):
-    """Gather key columns and stream mapped key rows on orthogonal groups.
-
-    Each query stays with its original owner. Column peers assemble one key-row
-    segment; the complete sparse loop reads those segments across the row group.
-    This retains the two-dimensional K/V distribution without normalizing and
-    rounding independent key-owner outputs.
-    """
-
-    def __init__(
-        self,
-        backend: VideoSparseAttentionBackend,
-        *,
-        ulysses_group: GroupCoordinator,
-        row_group: GroupCoordinator,
-        col_group: GroupCoordinator,
-        context_group: GroupCoordinator,
-    ) -> None:
-        super().__init__(backend, ulysses_group=ulysses_group, context_group=context_group)
-        self.row_group = row_group
-        self.col_group = col_group
-
-    @property
-    def key_group(self) -> GroupCoordinator:
-        return self.row_group
-
-    def publish(
-        self,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        workspace: AttentionContextWorkspace,
-    ) -> int:
-        rows = key.shape[0] * self.col_group.world_size
-        self.col_group.all_gather_into_tensor(workspace.local_key[:rows], key.contiguous())
-        self.col_group.all_gather_into_tensor(workspace.local_value[:rows], value.contiguous())
-        return rows

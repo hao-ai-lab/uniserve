@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import cast
 
 import torch
 import torch.nn as nn
 
-from ...execution.device_transfer import DeviceTransfer
+from ...execution.device_transfer import tensor_to_device
 from ...execution.forward_batch import (
     AttentionMode,
     ExpertRoute,
@@ -25,16 +24,12 @@ from ..linear import (
     local_attention_head_count,
     local_kv_head_count,
 )
+from ..mlp import GatedMLP
 from ..norm import RMSNorm
-from ..placement import set_tower_coord
 from ..rope import apply_rotary_emb, get_rope
 from ..vocab_parallel_embedding import VocabParallelEmbedding
-from .qwen import Qwen3MLP
 
 __all__ = ["MoTConfig", "MoTDecoderLayer", "MoTModel"]
-
-_TEXT_COORDINATE = 0
-_FLOW_COORDINATE = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,7 +37,7 @@ class MoTConfig:
     """Defines a Mixture-of-Transformers decoder's tensor geometry.
 
     The configuration fixes hidden width, attention heads, experts, rotary settings,
-    and mesh placement.
+    and mesh params.
     """
 
     hidden_size: int
@@ -57,17 +52,8 @@ class MoTConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class _MlpConfig:
-    """Defines dense or expert feed-forward widths and routing parameters for one decoder layer."""
-
-    hidden_size: int
-    intermediate_size: int
-    hidden_act: str = "silu"
-
-
-@dataclass(frozen=True, slots=True)
 class _Expert:
-    """Groups one Mixture-of-Transformers expert’s norms, projections, MLP, and mesh coordinate."""
+    """Groups one expert’s norms, projections, MLP, and component device."""
 
     input_norm: nn.Module
     qkv: nn.Module
@@ -76,77 +62,7 @@ class _Expert:
     key_norm: nn.Module
     post_norm: nn.Module
     mlp: nn.Module
-    coordinate: int
-
-
-def _apply(
-    module: nn.Module,
-    value: torch.Tensor,
-    *,
-    context: ForwardBatch,
-    transfers: DeviceTransfer,
-    coordinate: int,
-    target: torch.device,
-    call: Callable[[nn.Module, torch.Tensor, ForwardBatch], torch.Tensor],
-) -> torch.Tensor:
-    """Dispatch one routed tensor to an expert coordinate and combine the module output."""
-
-    staged = transfers.dispatch(value, coordinate)
-    result = call(module, staged, context)
-    if not isinstance(result, torch.Tensor):
-        raise TypeError("MoT sublayer must return a tensor")
-    return transfers.combine(result, target)
-
-
-def _route_modules(
-    value: RoutedTensor,
-    *,
-    text_module: nn.Module,
-    flow_module: nn.Module,
-    context: ForwardBatch,
-    transfers: DeviceTransfer,
-    call: Callable[[nn.Module, torch.Tensor, ForwardBatch], torch.Tensor],
-) -> RoutedTensor:
-    """Execute text and flow tensors through their route-specific module replicas."""
-
-    def apply_text(item: torch.Tensor) -> torch.Tensor:
-        """Run the text module on its tower coordinate and restore the caller device."""
-
-        return _apply(
-            text_module,
-            item,
-            context=context,
-            coordinate=_TEXT_COORDINATE,
-            target=item.device,
-            call=call,
-            transfers=transfers,
-        )
-
-    def apply_flow(item: torch.Tensor) -> torch.Tensor:
-        """Run the flow module on its tower coordinate and restore the caller device."""
-
-        return _apply(
-            flow_module,
-            item,
-            context=context,
-            coordinate=_FLOW_COORDINATE,
-            target=item.device,
-            call=call,
-            transfers=transfers,
-        )
-
-    return value.map(apply_text, apply_flow)
-
-
-def _plain_call(
-    module: nn.Module,
-    value: torch.Tensor,
-    context: ForwardBatch,
-) -> torch.Tensor:
-    """Invoke a routed module without mesh-aware arguments."""
-
-    del context
-    return cast(torch.Tensor, module(value))
+    device: torch.device | None
 
 
 class MoTDecoderLayer(nn.Module):
@@ -157,18 +73,18 @@ class MoTDecoderLayer(nn.Module):
         config: MoTConfig,
         *,
         layer_config: LayerConfig,
-        transfers: DeviceTransfer = DeviceTransfer(),
+        generation_device: torch.device | None = None,
     ) -> None:
         """Build text and flow projections around shared paged attention geometry."""
 
         super().__init__()
-        self.transfers = transfers
+        self.generation_device = generation_device
         hidden = int(config.hidden_size)
         head_dim = int(config.head_dim)
         total_heads = int(config.num_attention_heads)
         total_kv_heads = int(config.num_key_value_heads)
-        self.num_heads = local_attention_head_count(total_heads, parallel=layer_config.parallel)
-        self.num_kv_heads = local_kv_head_count(total_kv_heads, parallel=layer_config.parallel)
+        self.num_heads = local_attention_head_count(total_heads, parallel=layer_config.communicator)
+        self.num_kv_heads = local_kv_head_count(total_kv_heads, parallel=layer_config.communicator)
         self.head_dim = head_dim
         self.query_size = self.num_heads * head_dim
         self.total_query_size = total_heads * head_dim
@@ -180,24 +96,24 @@ class MoTDecoderLayer(nn.Module):
             head_dim,
             total_heads,
             total_kv_heads,
-            layer_config=layer_config,
+            layer_config=layer_config.child("self_attn"),
+            prefix="qkv_proj",
             bias=True,
         )
         self.o_proj = RowParallelLinear(
             self.total_query_size,
             hidden,
-            layer_config=layer_config,
+            layer_config=layer_config.child("self_attn"),
+            prefix="o_proj",
             bias=False,
         )
         self.q_norm = RMSNorm(head_dim, config.rms_norm_eps)
         self.k_norm = RMSNorm(head_dim, config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(hidden, config.rms_norm_eps)
-        self.mlp = Qwen3MLP(
-            _MlpConfig(
-                hidden_size=hidden,
-                intermediate_size=int(config.intermediate_size),
-            ),
-            layer_config=layer_config,
+        self.mlp = GatedMLP(
+            hidden,
+            int(config.intermediate_size),
+            layer_config=layer_config.child("mlp"),
         )
 
         self.input_layernorm_moe_gen = RMSNorm(hidden, config.rms_norm_eps)
@@ -206,37 +122,27 @@ class MoTDecoderLayer(nn.Module):
             head_dim,
             total_heads,
             total_kv_heads,
-            layer_config=layer_config,
+            layer_config=layer_config.child("self_attn"),
+            prefix="qkv_proj_moe_gen",
+            packed_names=("q_proj_moe_gen", "k_proj_moe_gen", "v_proj_moe_gen"),
             bias=True,
         )
         self.o_proj_moe_gen = RowParallelLinear(
             self.total_query_size,
             hidden,
-            layer_config=layer_config,
+            layer_config=layer_config.child("self_attn"),
+            prefix="o_proj_moe_gen",
             bias=False,
         )
         self.q_norm_moe_gen = RMSNorm(head_dim, config.rms_norm_eps)
         self.k_norm_moe_gen = RMSNorm(head_dim, config.rms_norm_eps)
         self.post_attention_layernorm_moe_gen = RMSNorm(hidden, config.rms_norm_eps)
-        self.mlp_moe_gen = Qwen3MLP(
-            _MlpConfig(
-                hidden_size=hidden,
-                intermediate_size=int(config.intermediate_size),
-            ),
-            layer_config=layer_config,
+        self.mlp_moe_gen = GatedMLP(
+            hidden,
+            int(config.intermediate_size),
+            layer_config=layer_config.child("mlp_moe_gen"),
         )
         self.attention = RadixAttention(self.num_heads, self.num_kv_heads, head_dim)
-
-        for module in (
-            self.input_layernorm_moe_gen,
-            self.qkv_proj_moe_gen,
-            self.o_proj_moe_gen,
-            self.q_norm_moe_gen,
-            self.k_norm_moe_gen,
-            self.post_attention_layernorm_moe_gen,
-            self.mlp_moe_gen,
-        ):
-            set_tower_coord(module, _FLOW_COORDINATE)
 
         self._text = _Expert(
             input_norm=self.input_layernorm,
@@ -246,7 +152,7 @@ class MoTDecoderLayer(nn.Module):
             key_norm=self.k_norm,
             post_norm=self.post_attention_layernorm,
             mlp=self.mlp,
-            coordinate=_TEXT_COORDINATE,
+            device=None,
         )
         self._flow = _Expert(
             input_norm=self.input_layernorm_moe_gen,
@@ -256,7 +162,7 @@ class MoTDecoderLayer(nn.Module):
             key_norm=self.k_norm_moe_gen,
             post_norm=self.post_attention_layernorm_moe_gen,
             mlp=self.mlp_moe_gen,
-            coordinate=_FLOW_COORDINATE,
+            device=self.generation_device,
         )
 
     def _project(
@@ -270,9 +176,9 @@ class MoTDecoderLayer(nn.Module):
         """Project one expert route into normalized rotary QKV heads."""
 
         target = hidden.device
-        staged = self.transfers.dispatch(hidden, expert.coordinate)
-        staged_cos = self.transfers.dispatch(cos, expert.coordinate)
-        staged_sin = self.transfers.dispatch(sin, expert.coordinate)
+        staged = tensor_to_device(hidden, expert.device)
+        staged_cos = tensor_to_device(cos, expert.device)
+        staged_sin = tensor_to_device(sin, expert.device)
         qkv = expert.qkv(staged)
         if not isinstance(qkv, torch.Tensor):
             raise TypeError("MoT QKV projection must return a tensor")
@@ -289,9 +195,9 @@ class MoTDecoderLayer(nn.Module):
         query = apply_rotary_emb(query, staged_cos, staged_sin).to(torch.bfloat16)
         key = apply_rotary_emb(key, staged_cos, staged_sin).to(torch.bfloat16)
         return (
-            self.transfers.combine(query, target),
-            self.transfers.combine(key, target),
-            self.transfers.combine(value.to(torch.bfloat16), target),
+            tensor_to_device(query, target),
+            tensor_to_device(key, target),
+            tensor_to_device(value.to(torch.bfloat16), target),
         )
 
     def forward(
@@ -307,13 +213,10 @@ class MoTDecoderLayer(nn.Module):
     ) -> RoutedTensor:
         """Apply the selected experts and one shared attention operation."""
 
-        normalized = _route_modules(
-            hidden,
-            text_module=self._text.input_norm,
-            flow_module=self._flow.input_norm,
-            context=context,
-            call=_plain_call,
-            transfers=self.transfers,
+        normalized = hidden.apply(
+            text=self._text.input_norm,
+            flow=self._flow.input_norm,
+            generation_device=self.generation_device,
         )
         text_projection = (
             None
@@ -347,33 +250,20 @@ class MoTDecoderLayer(nn.Module):
             causal=causal,
             scale=self.scale,
         ).reshape(query.shape[0], self.query_size)
-        projected = _route_modules(
-            RoutedTensor.from_packed(attended, spans),
-            text_module=self._text.output,
-            flow_module=self._flow.output,
-            context=context,
-            call=_plain_call,
-            transfers=self.transfers,
+        projected = RoutedTensor.from_packed(attended, spans).apply(
+            text=self._text.output, flow=self._flow.output, generation_device=self.generation_device
         )
         residual = hidden.add(projected)
-        normalized = _route_modules(
-            residual,
-            text_module=self._text.post_norm,
-            flow_module=self._flow.post_norm,
-            context=context,
-            call=_plain_call,
-            transfers=self.transfers,
+        normalized = residual.apply(
+            text=self._text.post_norm,
+            flow=self._flow.post_norm,
+            generation_device=self.generation_device,
         ).map(
             lambda item: item.to(torch.bfloat16),
             lambda item: item.to(torch.bfloat16),
         )
-        feed_forward = _route_modules(
-            normalized,
-            text_module=self._text.mlp,
-            flow_module=self._flow.mlp,
-            context=context,
-            call=_plain_call,
-            transfers=self.transfers,
+        feed_forward = normalized.apply(
+            text=self._text.mlp, flow=self._flow.mlp, generation_device=self.generation_device
         )
         return residual.add(feed_forward)
 
@@ -386,25 +276,28 @@ class MoTModel(nn.Module):
         config: MoTConfig,
         *,
         layer_config: LayerConfig,
-        transfers: DeviceTransfer = DeviceTransfer(),
+        generation_device: torch.device | None = None,
     ) -> None:
         """Build the routed decoder and bind flow normalization to its tower coordinate."""
 
         super().__init__()
-        self.transfers = transfers
+        self.generation_device = generation_device
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
             layer_config=layer_config,
         )
         self.layers = nn.ModuleList(
-            MoTDecoderLayer(config, layer_config=layer_config, transfers=transfers)
-            for _ in range(config.num_hidden_layers)
+            MoTDecoderLayer(
+                config,
+                layer_config=layer_config.child(f"layers.{index}"),
+                generation_device=generation_device,
+            )
+            for index in range(config.num_hidden_layers)
         )
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.norm_moe_gen = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.rotary = get_rope(config.head_dim, theta=config.rope_theta)
-        set_tower_coord(self.norm_moe_gen, _FLOW_COORDINATE)
 
     def forward(
         self,
@@ -452,11 +345,6 @@ class MoTModel(nn.Module):
                 spans=spans,
                 causal=causal,
             )
-        return _route_modules(
-            hidden,
-            text_module=self.norm,
-            flow_module=self.norm_moe_gen,
-            context=context,
-            call=_plain_call,
-            transfers=self.transfers,
+        return hidden.apply(
+            text=self.norm, flow=self.norm_moe_gen, generation_device=self.generation_device
         ).packed(spans)

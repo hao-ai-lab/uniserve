@@ -16,7 +16,7 @@ pub(super) struct FinishedTrace<'a> {
 impl EngineLoop {
     /// Aborts every queued/gated/running request with a terminal event.
     pub(super) fn abort_all_requests(&mut self) {
-        self.pending_submission = None;
+        self.pending_submissions.clear();
         while let Some(id) = self.scheduler.pop_media() {
             let submission = self
                 .waiting_media
@@ -68,12 +68,12 @@ impl EngineLoop {
     pub(super) fn handle_command(&mut self, cmd: Command) -> bool {
         match cmd {
             Command::Submit { request, event_tx } => {
-                if !self.runtime.accepts(request.family()) {
+                if !self.accepts_family(request.family()) {
                     let _ = event_tx.send(Event::Rejected {
                         message: format!(
                             "request family {:?} does not match the {:?} runtime",
                             request.family(),
-                            self.runtime.family()
+                            self.family
                         ),
                     });
                 } else {
@@ -103,6 +103,29 @@ impl EngineLoop {
             Command::Shutdown => return true,
         }
         false
+    }
+
+    /// Selects commands with available destinations without bypassing an older
+    /// command for the same request. Other requests remain independently eligible.
+    pub(super) fn take_commands(
+        &mut self,
+        include: impl Fn(&BatchCommand) -> bool,
+    ) -> Vec<BatchCommand> {
+        let mut blocked = HashSet::new();
+        let mut selected = Vec::new();
+        for command in std::mem::take(&mut self.pending_commands) {
+            let request = command.request_key();
+            if blocked.contains(&request)
+                || !include(&command)
+                || !self.executor.command_has_capacity(&command)
+            {
+                blocked.insert(request);
+                self.pending_commands.push_back(command);
+            } else {
+                selected.push(command);
+            }
+        }
+        selected
     }
 
     /// Enqueues a request directly for deterministic engine-loop tests.
@@ -170,9 +193,9 @@ impl EngineLoop {
                 st.cancel_cutoff = Some(cutoff);
             }
             st.terminal_intent = if abort {
-                TerminalIntent::Abort
+                TerminalIntent::Finish(FinishReason::Aborted)
             } else {
-                TerminalIntent::Cancel
+                TerminalIntent::Finish(FinishReason::Cancelled)
             };
         }
         // also drop from the waiting queue if not yet admitted (reporting the reason)
@@ -266,7 +289,7 @@ impl EngineLoop {
         // dominates it. Prefixes acknowledged before the match already committed.
         state.pending_commits.clear();
         state.cancel_cutoff = Some(cutoff);
-        state.terminal_intent = TerminalIntent::StopMatched;
+        state.terminal_intent = TerminalIntent::Finish(FinishReason::Stop);
     }
 
     /// Returns mutable access to the active trace record.

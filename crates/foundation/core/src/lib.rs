@@ -6,8 +6,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 mod parallel;
 pub use parallel::{
-    ComponentDeployConfig, ComponentDistribution, ParallelConfig, ParallelConfigError,
-    SequenceParallel,
+    ComponentDistribution, EntryConfig, ParallelConfig, ParallelConfigError, SequenceParallel,
 };
 
 use std::sync::{Arc, OnceLock};
@@ -37,7 +36,7 @@ pub use generation::{
     GenerationConstraint, GenerationConstraintParseError, GenerationFeatures, GenerationLimits,
     GenerationPolicyDescriptor, GenerationRequest, GenerationRequestError,
     GenerationResourceBounds, GenerationResourceError, GenerationResources, ImageIngestRecipe,
-    ImageIngestStep, ImageKvEffect, ImageSegment, SegmentPlacement, TerminationPolicyDescriptor,
+    ImageIngestStep, ImageKvEffect, ImageSegment, SegmentPosition, TerminationPolicyDescriptor,
     TriggerPolicyDescriptor, UndTokenAction, UndVisibility, VisibilityPolicyDescriptor,
     encoder_cache_key,
 };
@@ -892,27 +891,6 @@ pub struct KvCacheGroup {
     /// Attention retention policy for the group.
     #[serde(default)]
     pub kind: KvGroupKind,
-}
-
-/// Physical process topology descriptor reported by a worker. The host fans
-/// requests to ranks and joins small results; cross-rank KV movement lives
-/// inside the worker tier, not on the control-plane IPC.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RankInfo {
-    /// Zero-based physical process rank.
-    pub rank: u32,
-    /// Total number of physical processes in this worker group.
-    pub world_size: u32,
-}
-
-impl Default for RankInfo {
-    /// Returns a single-process topology.
-    fn default() -> Self {
-        Self {
-            rank: 0,
-            world_size: 1,
-        }
-    }
 }
 
 /// Algorithm used to derive prefix-cache block keys.

@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
+from concurrent.futures import Future
+from dataclasses import dataclass
+from threading import RLock
 
 import torch
 
 from ..backends.paged_kv_math import paged_kv_write
-from ..foundation.errors import unsupported_setup, compute_error, invalid_descriptor
+from ..execution.batch import BufferId, ProductRef, RequestKey
+from ..foundation.errors import compute_error, invalid_descriptor, resource_error, unsupported_setup
 from ..nn.quant.kv_cache import (
     dequantize_fp8_block,
     fp8_quantize,
@@ -15,8 +19,33 @@ from ..nn.quant.kv_cache import (
     resolve_kv_store_dtype,
     scale_for_fp8_block,
 )
+from .cache_transfer import CacheTransfers, CacheWrite
 
 __all__ = ["CachePool"]
+
+
+@dataclass(slots=True)
+class CacheSource:
+    """An immutable token interval retained by its physical publications.
+
+    Ranges map each physical page to its token offset and token count. A publication
+    covers every layer's K/V for these ranges, so appends outside the interval
+    remain independent even when they share its final physical page.
+    """
+
+    buffer: BufferId
+    ranges: dict[int, tuple[int, int]]
+    retirements: tuple[Future[None], ...] = ()
+    released: bool = False
+
+
+@dataclass(eq=False, slots=True)
+class CacheExecution:
+    """Physical page intervals retained by one computation's existing completion fence."""
+
+    completion: Future[None]
+    requests: set[RequestKey]
+    ranges: dict[int, tuple[int, int]]
 
 
 class CachePool:
@@ -32,8 +61,11 @@ class CachePool:
         head_dim: int,
         device: torch.device | str,
         dtype: torch.dtype,
+        total_kv_heads: int | None = None,
+        kv_head_offset: int = 0,
         store_dtype: torch.dtype | str | None = None,
         group_ranges: Sequence[tuple[int, int]] | None = None,
+        import_capacity: int = 1,
     ) -> None:
         """Allocate layer-major KV pages and optional per-page FP8 scales."""
 
@@ -44,6 +76,8 @@ class CachePool:
         self.num_blocks = self.num_pages
         self.block_size = int(page_size)
         self.n_kv = int(num_kv_heads)
+        self.total_kv_heads = self.n_kv if total_kv_heads is None else int(total_kv_heads)
+        self.kv_head_offset = int(kv_head_offset)
         self.head_dim = int(head_dim)
         self.group_ranges = self._group_ranges(group_ranges)
         self.group_count = len(self.group_ranges)
@@ -56,9 +90,15 @@ class CachePool:
             or self.num_pages < 1
             or self.block_size < 1
             or self.n_kv < 1
+            or self.kv_head_offset < 0
+            or self.kv_head_offset + self.n_kv > self.total_kv_heads
             or self.head_dim < 1
         ):
             raise invalid_descriptor("CachePool geometry is invalid")
+        if self.is_quantized and (
+            self.total_kv_heads % self.n_kv or self.kv_head_offset % self.n_kv
+        ):
+            raise invalid_descriptor("FP8 KV heads must form aligned, uniform scale groups")
 
         # Keys and values use identical layer/page/token/head geometry. FP8
         # storage adds one scale and initialization flag per layer-page pair.
@@ -71,31 +111,266 @@ class CachePool:
         )
         self.k = torch.zeros(shape, device=device, dtype=self.store_dtype)
         self.v = torch.zeros(shape, device=device, dtype=self.store_dtype)
-        self._page_ids = torch.arange(self.num_pages, dtype=torch.long, device=self.k.device)
         scale_shape = (self.num_layers, self.num_pages, 1, 1, 1)
-        self.k_scale = (
-            torch.ones(scale_shape, device=device, dtype=torch.float32)
+        self._scales = (
+            torch.ones((2, *scale_shape), device=device, dtype=torch.float32)
             if self.is_quantized
             else None
         )
-        self.v_scale = (
-            torch.ones(scale_shape, device=device, dtype=torch.float32)
-            if self.is_quantized
-            else None
-        )
-        scale_flags = (self.num_layers, self.num_pages)
-        self.k_scale_set = (
-            torch.zeros(scale_flags, device=device, dtype=torch.bool) if self.is_quantized else None
-        )
-        self.v_scale_set = (
-            torch.zeros(scale_flags, device=device, dtype=torch.bool) if self.is_quantized else None
-        )
+        self.k_scale = None if self._scales is None else self._scales[0]
+        self.v_scale = None if self._scales is None else self._scales[1]
+        # Initialization is host-owned page metadata. A scale is written only
+        # on the first append after page allocation, so an immutable published
+        # scale never receives even a same-value device write during an append.
+        scale_flags = self.num_layers * self.num_pages
+        self._k_scale_set = bytearray(scale_flags) if self.is_quantized else None
+        self._v_scale_set = bytearray(scale_flags) if self.is_quantized else None
 
         # Reuse normalized page tuples after their bounds and group ownership
         # have been established by the validation path.
         self._validated_page_tuples: dict[
             tuple[tuple[int, ...], bool, int | None], tuple[int, ...]
         ] = {}
+        self._sources: dict[BufferId, CacheSource] = {}
+        self._executions: dict[Future[None], CacheExecution] = {}
+        self._execution_pages: dict[int, set[CacheExecution]] = {}
+        self._execution_lock = RLock()
+        self.imports = CacheTransfers(self, capacity=import_capacity)
+
+    @property
+    def has_pending_accesses(self) -> bool:
+        """Whether cache intervals still have publication, computation or import owners."""
+
+        return bool(self._sources) or bool(self._executions) or bool(self.imports)
+
+    def retain_execution(
+        self,
+        request: RequestKey,
+        page_ids: Sequence[int],
+        *,
+        group: int,
+        length: int,
+        completion: Future[None],
+    ) -> None:
+        """Retain scheduler-authorized model accesses until their device work completes.
+
+        Model calls are ordered by the public runner. Their existing output fence
+        also prevents independent import streams and page allocation from reusing
+        these ranges while a producer or consumer kernel is still running.
+        """
+
+        if not length:
+            return
+        pages = self.validate_pages(page_ids, group=group)
+        ranges = tuple(self._spans(pages, 0, length))
+        with self._execution_lock:
+            if completion.done():
+                completion.result()
+                return
+            execution = self._executions.get(completion)
+            register = execution is None
+            if execution is None:
+                execution = CacheExecution(completion, set(), {})
+                self._executions[completion] = execution
+            execution.requests.add(request)
+            for page, offset, count in ranges:
+                previous = execution.ranges.get(page)
+                if previous is not None:
+                    end = max(previous[0] + previous[1], offset + count)
+                    offset = min(previous[0], offset)
+                    count = end - offset
+                execution.ranges[page] = (offset, count)
+                self._execution_pages.setdefault(page, set()).add(execution)
+        if register:
+            completion.add_done_callback(self._execution_completed)
+
+    def _execution_completed(self, completion: Future[None]) -> None:
+        with self._execution_lock:
+            if completion.cancelled() or completion.exception() is not None:
+                return
+            execution = self._executions.pop(completion, None)
+            if execution is None:
+                return
+            for page in execution.ranges:
+                uses = self._execution_pages[page]
+                uses.remove(execution)
+                if not uses:
+                    del self._execution_pages[page]
+
+    def _execution_dependencies(
+        self, ranges: Sequence[tuple[int, int, int]]
+    ) -> tuple[Future[None], ...]:
+        with self._execution_lock:
+            return tuple(
+                {
+                    execution.completion
+                    for page, offset, count in ranges
+                    for execution in self._execution_pages.get(page, ())
+                    if self._ranges_overlap(execution.ranges, ((page, offset, count),))
+                }
+            )
+
+    def require_reusable(
+        self, page_ids: Sequence[int], *, group: int, start: int, length: int
+    ) -> None:
+        """Authorize page initialization or independent-stream import before submission."""
+
+        self.require_writable(page_ids, group=group, start=start, length=length)
+        if self._execution_dependencies(tuple(self._spans(page_ids, start, length))):
+            raise resource_error("KV interval still has an executing producer or consumer")
+
+    def reserve_publication(
+        self,
+        product: ProductRef,
+        page_ids: Sequence[int],
+        *,
+        group: int,
+        start: int,
+        length: int,
+    ) -> CacheSource:
+        """Retain the exact published interval before exporting any of its views.
+
+        The caller attaches every registration's retirement future and releases
+        this reservation if publication is abandoned before semantic visibility.
+        """
+
+        self._reap_sources()
+        pages = self.validate_pages(page_ids, group=group)
+        ranges = {
+            page: (offset, count) for page, offset, count in self._spans(pages, start, length)
+        }
+        if not ranges or product.buffer_id in self._sources:
+            raise invalid_descriptor("KV publication has an empty or already registered interval")
+        source = CacheSource(product.buffer_id, ranges)
+        self._sources[source.buffer] = source
+        return source
+
+    def retain_publication(self, source: CacheSource, retirement: Future[None]) -> None:
+        """Retain the published interval until this physical registration retires."""
+
+        if self._sources.get(source.buffer) is not source or source.released:
+            raise invalid_descriptor("KV publication reservation is no longer active")
+        source.retirements = (*source.retirements, retirement)
+
+    def release_buffers(self, buffers: Iterable[BufferId]) -> None:
+        """Revoke semantic ownership while preserving every pending physical read."""
+
+        selected = tuple(buffers)
+        self.imports.release(selected)
+        for buffer in selected:
+            source = self._sources.get(buffer)
+            if source is not None:
+                source.released = True
+        self._reap_sources()
+
+    def retirement_ready(
+        self,
+        *,
+        buffers: Iterable[BufferId] = (),
+        requests: Iterable[RequestKey] = (),
+        retained: frozenset[BufferId] = frozenset(),
+    ) -> bool:
+        """Observe completion errors only for the selected allocation owners."""
+
+        selected = set(buffers)
+        owners = set(requests)
+        sources = tuple(
+            source
+            for buffer, source in self._sources.items()
+            if buffer in selected or (buffer.owner in owners and buffer not in retained)
+        )
+        for source in sources:
+            for future in source.retirements:
+                if future.done():
+                    future.result()
+        self._reap_sources()
+        with self._execution_lock:
+            executions = tuple(
+                execution
+                for execution in self._executions.values()
+                if execution.requests.intersection(owners | {buffer.owner for buffer in selected})
+            )
+        for execution in executions:
+            if execution.completion.done():
+                execution.completion.result()
+        return (
+            not executions
+            and all(source.buffer not in self._sources for source in sources)
+            and self.imports.retirement_ready(selected, owners, retained)
+        )
+
+    def write_dependencies(
+        self, page_ids: Sequence[int], *, group: int, start: int, length: int
+    ) -> tuple[Future[None], ...]:
+        """Return retirements that must precede writing this physical interval."""
+
+        if not self.has_pending_accesses:
+            return ()
+        self._reap_sources()
+        pages = self.validate_pages(page_ids, group=group)
+        ranges = tuple(self._spans(pages, start, length))
+        return (
+            self._execution_dependencies(ranges)
+            + self.imports.dependencies(ranges)
+            + tuple(
+                future
+                for source in self._sources.values()
+                if self._ranges_overlap(source.ranges, ranges)
+                for future in source.retirements
+            )
+        )
+
+    def require_writable(
+        self, page_ids: Sequence[int], *, group: int, start: int, length: int
+    ) -> None:
+        """Authorize the interval before staging any kernel that can write it.
+
+        Device-indexed attention kernels borrow raw cache views. Their caller
+        must validate the scheduler's write interval here before dispatch; no
+        device-to-host read of per-token addresses is needed in the kernel path.
+        """
+
+        # The runner orders model accesses. Only independent imports and
+        # published immutable ranges add write conflicts at this boundary.
+        if not self._sources and not self.imports:
+            return
+        self._reap_sources()
+        pages = self.validate_pages(page_ids, group=group)
+        ranges = tuple(self._spans(pages, start, length))
+        if any(self._ranges_overlap(source.ranges, ranges) for source in self._sources.values()):
+            raise resource_error("KV interval still has a published version")
+        if self.imports.dependencies(ranges):
+            raise resource_error("KV interval still has an import destination")
+
+    @staticmethod
+    def _ranges_overlap(
+        left: Mapping[int, tuple[int, int]], right: Sequence[tuple[int, int, int]]
+    ) -> bool:
+        return any(
+            (other := left.get(page)) is not None
+            and offset < other[0] + other[1]
+            and other[0] < offset + count
+            for page, offset, count in right
+        )
+
+    def _reap_sources(self) -> None:
+        for buffer, source in tuple(self._sources.items()):
+            if source.released and all(
+                future.done() and not future.cancelled() and future.exception() is None
+                for future in source.retirements
+            ):
+                del self._sources[buffer]
+
+    def close(self) -> None:
+        """Release semantic publications and require known physical retirement."""
+
+        self.imports.stop()
+        self.release_buffers(tuple(self._sources))
+        self.imports.require_retired()
+        if self._executions:
+            raise resource_error("KV cache still has executing producers or consumers")
+        if self._sources:
+            raise resource_error("KV cache still has unretired physical publications")
 
     def _group_ranges(
         self,
@@ -149,11 +424,15 @@ class CachePool:
     ) -> tuple[int, ...]:
         """Validate physical page identifiers against one group, optionally accepting the sentinel page."""
 
-        pages = tuple(int(page) for page in page_ids)
+        # Resident scheduler tables already use immutable integer tuples. Check
+        # their validated identity before normalizing every element again.
+        pages = tuple(page_ids)
         key = (pages, bool(allow_sentinel), group)
         cached = self._validated_page_tuples.get(key)
         if cached is not None:
             return cached
+        pages = tuple(int(page) for page in pages)
+        key = (pages, bool(allow_sentinel), group)
         validated = self._validate_page_tuple(pages, allow_sentinel, group)
         if len(self._validated_page_tuples) >= 16_384:
             self._validated_page_tuples.clear()
@@ -170,17 +449,17 @@ class CachePool:
 
         real_pages = tuple(page for page in pages if page != 0)
         if len(set(real_pages)) != len(real_pages):
-            raise invalid_descriptor("KV placement repeats a physical page")
+            raise invalid_descriptor("KV allocation repeats a physical page")
         lower = 0 if allow_sentinel else 1
         upper = self.num_pages
         if pages and (min(pages) < lower or max(pages) >= upper):
-            raise invalid_descriptor("KV placement exceeds the fixed physical pool")
+            raise invalid_descriptor("KV allocation exceeds the fixed physical pool")
         if group is not None:
             group_id = self.validate_group(group)
             offset, count = self.group_ranges[group_id]
             end = offset + count
             if any(page < offset or page >= end for page in real_pages):
-                raise invalid_descriptor("KV placement addresses another cache group")
+                raise invalid_descriptor("KV allocation addresses another cache group")
         return pages
 
     def zero_pages(self, group: int, page_ids: Iterable[int]) -> None:
@@ -189,125 +468,61 @@ class CachePool:
         pages = self.validate_pages(page_ids, group=group)
         if not pages:
             return
-        indices = self._device_page_indices(pages)
-        self.k.index_fill_(1, indices, 0)
-        self.v.index_fill_(1, indices, 0)
-        if self.k_scale is not None and self.v_scale is not None:
-            self.k_scale.index_fill_(1, indices, 1)
-            self.v_scale.index_fill_(1, indices, 1)
-        if self.k_scale_set is not None and self.v_scale_set is not None:
-            self.k_scale_set.index_fill_(1, indices, False)
-            self.v_scale_set.index_fill_(1, indices, False)
+        self.require_reusable(pages, group=group, start=0, length=len(pages) * self.block_size)
+        self._clear_pages(pages)
 
-    def copy_pages(
-        self,
-        group: int,
-        source_pages: Sequence[int],
-        target_pages: Sequence[int],
-    ) -> None:
-        """Copy complete KV pages between equal-length source and destination page lists."""
+    def initialize_import(self, write: CacheWrite) -> None:
+        """Initialize the new pages covered by this active import reservation."""
 
-        if len(source_pages) != len(target_pages):
-            raise invalid_descriptor("KV page copy requires aligned source and destination pages")
-        source_ids = self.validate_pages(source_pages, group=group)
-        target_ids = self.validate_pages(target_pages, group=group)
-        if not source_ids:
+        if not self.imports.owns(write):
+            raise invalid_descriptor("KV initialization has no destination reservation")
+        if write.initialized_pages:
+            self._clear_pages(write.initialized_pages)
+
+    def mark_import_scales(self, write: CacheWrite) -> None:
+        """Publish initialization metadata for physically copied FP8 page scales."""
+
+        if self._k_scale_set is None or self._v_scale_set is None:
             return
-        source = self._device_page_indices(source_ids)
-        target = self._device_page_indices(target_ids)
-        for store in (
-            self.k,
-            self.v,
-            self.k_scale,
-            self.v_scale,
-            self.k_scale_set,
-            self.v_scale_set,
+        if not self.imports.owns(write):
+            raise invalid_descriptor("KV scale import has no destination reservation")
+        publication = write.publication
+        for page, _, _ in self._spans(
+            write.pages,
+            publication.base_extent,
+            publication.published_extent - publication.base_extent,
         ):
-            if store is not None:
-                store.index_copy_(1, target, store.index_select(1, source))
+            for layer in range(self.num_layers):
+                index = layer * self.num_pages + page
+                self._k_scale_set[index] = 1
+                self._v_scale_set[index] = 1
 
-    def field(self, group: int, layer: int, name: str) -> torch.Tensor:
-        """Return one layer’s key, value, or scale tensor for a validated cache group."""
-
-        self.validate_group(group)
-        layer_id = self._validate_layer(layer)
-        fields = {
-            "key": self.k,
-            "value": self.v,
-            "key_scale": self.k_scale,
-            "value_scale": self.v_scale,
-            "key_scale_set": self.k_scale_set,
-            "value_scale_set": self.v_scale_set,
-        }
-        value = fields.get(str(name))
-        if value is None:
-            raise invalid_descriptor(f"KV field {name!r} is unavailable")
-        return value[layer_id]
-
-    def page_view(
-        self,
-        group: int,
-        page_ids: Iterable[int],
-    ) -> tuple[torch.Tensor, ...]:
-        """Return flattened key/value page views for the selected physical page identifiers."""
-
-        pages = self.validate_pages(page_ids, group=group)
-        index = self._device_page_indices(pages)
-        values: list[torch.Tensor] = [
-            self.k.index_select(1, index),
-            self.v.index_select(1, index),
-        ]
-        for store in (self.k_scale, self.v_scale, self.k_scale_set, self.v_scale_set):
-            if store is not None:
-                values.append(store.index_select(1, index))
-        return tuple(values)
-
-    def restore_pages(
-        self,
-        group: int,
-        page_ids: Sequence[int],
-        tensors: Sequence[torch.Tensor],
-    ) -> None:
-        """Restore flattened page tensors into validated physical KV pages."""
-
-        pages = self.validate_pages(page_ids, group=group)
-        stores = tuple(
-            store
-            for store in (
-                self.k,
-                self.v,
-                self.k_scale,
-                self.v_scale,
-                self.k_scale_set,
-                self.v_scale_set,
-            )
-            if store is not None
-        )
-        if len(tensors) != len(stores):
-            raise invalid_descriptor("KV page payload does not match pool fields")
-        index = self._device_page_indices(pages)
-        for store, tensor in zip(stores, tensors, strict=True):
-            expected = (self.num_layers, len(pages), *store.shape[2:])
-            if tuple(tensor.shape) != expected:
-                raise invalid_descriptor("KV page payload shape does not match pool geometry")
-            store.index_copy_(
-                1,
-                index,
-                tensor.to(device=store.device, dtype=store.dtype),
-            )
-
-    def _device_page_indices(self, pages: tuple[int, ...]) -> torch.Tensor:
-        """Cache and return validated page identifiers on the KV storage device."""
-
-        if not pages:
-            return self._page_ids[:0]
-        first = pages[0]
-        if pages == tuple(range(first, first + len(pages))):
-            return self._page_ids[first : first + len(pages)]
-        return torch.stack(tuple(self._page_ids[page] for page in pages))
+    def _clear_pages(self, pages: tuple[int, ...]) -> None:
+        # Clearing has no logical page order. Merge adjacent physical ranges so
+        # initialization needs neither a gathered GPU index tensor nor one
+        # kernel per page when the scheduler grants a contiguous allocation.
+        ranges: list[tuple[int, int]] = []
+        for page in sorted(pages):
+            if ranges and ranges[-1][1] == page:
+                ranges[-1] = (ranges[-1][0], page + 1)
+            else:
+                ranges.append((page, page + 1))
+        for start, end in ranges:
+            for store in (self.k, self.v):
+                # E4M3 +0 has an all-zero byte representation on CPU and CUDA.
+                values = store.view(torch.uint8) if self.is_quantized else store
+                values[:, start:end].zero_()
+            if self._scales is not None:
+                self._scales[:, :, start:end].fill_(1)
+        if self._k_scale_set is not None and self._v_scale_set is not None:
+            for layer in range(self.num_layers):
+                for page in pages:
+                    index = layer * self.num_pages + page
+                    self._k_scale_set[index] = 0
+                    self._v_scale_set[index] = 0
 
     def layer_cache(self, layer: int, group: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return key and value storage for one layer and cache group."""
+        """Borrow layer storage; kernel callers authorize writes with require_writable()."""
 
         self.validate_group(group)
         layer_id = self._validate_layer(layer)
@@ -316,6 +531,44 @@ class CachePool:
                 "paged attention cannot consume quantized KV storage without scale-aware kernels"
             )
         return self.k[layer_id], self.v[layer_id]
+
+    def transfer_views(
+        self,
+        page_ids: Sequence[int],
+        *,
+        group: int,
+        start: int,
+        length: int,
+    ) -> tuple[tuple[torch.Tensor, ...], ...]:
+        """Borrow raw K, V and optional FP8 scales without packing or conversion.
+
+        K/V have logical shape [tokens, layers, heads, dim]. Scales have shape
+        [pages, 2, layers, 1], including both boundary pages of the token interval.
+        The final scale axis represents this rank's group of local heads.
+        Each field retains one allocation and its physical page order. The
+        caller must hold the source publication or destination write ownership
+        for the complete lifetime of these views and every asynchronous access.
+        """
+
+        pages = self.validate_pages(page_ids, group=group)
+        spans = tuple(self._spans(pages, int(start), int(length)))
+        if not spans:
+            return ()
+        fields = tuple(
+            tuple(
+                store[:, page, offset : offset + count].permute(1, 0, 2, 3)
+                for page, offset, count in spans
+            )
+            for store in (self.k, self.v)
+        )
+        if self._scales is not None:
+            fields += (
+                tuple(
+                    self._scales[:, :, page, 0, 0, 0].unsqueeze(0).unsqueeze(-1)
+                    for page, _, _ in spans
+                ),
+            )
+        return fields
 
     def read(
         self,
@@ -363,12 +616,13 @@ class CachePool:
             raise invalid_descriptor("KV write key/value tensors do not align")
         if k.ndim != 3 or tuple(k.shape[1:]) != (self.n_kv, self.head_dim):
             raise invalid_descriptor("KV write tensors must have shape [tokens, heads, dim]")
+        self.require_writable(pages, group=group, start=start, length=int(k.shape[0]))
         written = 0
         for page, offset, count in self._spans(pages, int(start), int(k.shape[0])):
             self._write_span(
                 self.k,
                 self.k_scale,
-                self.k_scale_set,
+                self._k_scale_set,
                 layer_id,
                 page,
                 offset,
@@ -377,7 +631,7 @@ class CachePool:
             self._write_span(
                 self.v,
                 self.v_scale,
-                self.v_scale_set,
+                self._v_scale_set,
                 layer_id,
                 page,
                 offset,
@@ -392,7 +646,7 @@ class CachePool:
         k: torch.Tensor,
         v: torch.Tensor,
     ) -> None:
-        """Persist selected packed tokens at encoded physical token locations."""
+        """Write packed tokens within the caller's already authorized cache interval."""
 
         layer_id = self._validate_layer(layer)
         flat_locations = locations.reshape(-1).to(device=k.device, dtype=torch.int64)
@@ -430,7 +684,7 @@ class CachePool:
             self._write_span(
                 self.k,
                 self.k_scale,
-                self.k_scale_set,
+                self._k_scale_set,
                 layer_id,
                 page,
                 offset,
@@ -439,7 +693,7 @@ class CachePool:
             self._write_span(
                 self.v,
                 self.v_scale,
-                self.v_scale_set,
+                self._v_scale_set,
                 layer_id,
                 page,
                 offset,
@@ -498,7 +752,7 @@ class CachePool:
         self,
         store: torch.Tensor,
         scales: torch.Tensor | None,
-        scale_set: torch.Tensor | None,
+        scale_set: bytearray | None,
         layer: int,
         page: int,
         offset: int,
@@ -516,12 +770,9 @@ class CachePool:
         if scales is None or scale_set is None:
             raise compute_error("quantized KV storage has no scale state", phase="kv_write")
         values_f32 = values.to(device=store.device, dtype=torch.float32)
-        candidate = scale_for_fp8_block(values_f32).to(device=store.device)
-        scale = torch.where(
-            scale_set[layer, page],
-            scales[layer, page].to(device=store.device),
-            candidate,
-        )
-        scales[layer, page] = scale.to(device=scales.device)
-        scale_set[layer, page] = True
+        index = layer * self.num_pages + page
+        scale = scales[layer, page]
+        if not scale_set[index]:
+            scale.copy_(scale_for_fp8_block(values_f32))
+            scale_set[index] = 1
         store[layer, page, offset : offset + count] = fp8_quantize(values_f32, scale)

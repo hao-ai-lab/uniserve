@@ -47,7 +47,7 @@ _PREFIX_BOUNDS_CACHE: OrderedDict[
 
 _compute_prefix_bounds: Callable[..., torch.Tensor] | None
 _compute_prefix_bounds_varlen: Callable[..., torch.Tensor] | None
-_fa4_flash_attn_fwd: Any | None
+_fa4_flash_attn_fwd: Callable[..., Any] | None
 _hybrid_multimodal_mask: Any | None
 try:  # pragma: no cover - optional CUDA package.
     import uniserve_kernel.flash_attn_jagged as _jagged
@@ -100,9 +100,9 @@ class Fa4CuteAttentionBackend(AttentionBackend):
         if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
             raise ValueError("fa4_cute backend expects q/k/v in [B, H, L, D] layout")
         _validate_unified_trunk_geometry(q.shape[-1], k.shape[-1], v.shape[-1], scale=scale)
-        _require_fa4()
+        forward = _require_fa4()
         out = _fa4_output(
-            _fa4_flash_attn_fwd(
+            forward(
                 q.transpose(1, 2).contiguous(),
                 k.transpose(1, 2).contiguous(),
                 v.transpose(1, 2).contiguous(),
@@ -137,7 +137,7 @@ class Fa4CuteAttentionBackend(AttentionBackend):
             v_cache.shape[-1],
             scale=scale,
         )
-        _require_fa4()
+        forward = _require_fa4()
         cache_seqlens = cache_seqlens.to(device=q_blh.device, dtype=torch.int32).contiguous()
         block_table = block_table.to(device=q_blh.device, dtype=torch.int32).contiguous()
         live_seqlens = cache_seqlens.clone()
@@ -153,12 +153,11 @@ class Fa4CuteAttentionBackend(AttentionBackend):
         max_seqlen_k = _metadata_context_len(context)
         if max_seqlen_k <= 0:
             raise ValueError(
-                "fa4_cute paged forward requires a positive host-known "
-                "maximum KV length"
+                "fa4_cute paged forward requires a positive host-known maximum KV length"
             )
 
         out = _fa4_output(
-            _fa4_flash_attn_fwd(
+            forward(
                 q_blh,
                 k_cache,
                 v_cache,
@@ -200,7 +199,7 @@ class Fa4CuteAttentionBackend(AttentionBackend):
 
         del context
         _validate_unified_trunk_geometry(q.shape[-1], k.shape[-1], v.shape[-1], scale=scale)
-        _require_fa4()
+        forward = _require_fa4()
         visible_end = visible_end.to(device=q.device, dtype=torch.int32).contiguous()
         setattr(visible_end, "__leading_dim__", 1)
         setattr(visible_end, "__assumed_align__", 4)
@@ -216,7 +215,7 @@ class Fa4CuteAttentionBackend(AttentionBackend):
             "num_threads": _FA4_NUM_THREADS,
         }
         if fully_visible:
-            return _fa4_output(_fa4_flash_attn_fwd(q, k, v, **kwargs))
+            return _fa4_output(forward(q, k, v, **kwargs))
         kwargs["aux_tensors"] = [visible_end]
         if use_prefix_bounds and _fa4_accepts_prefix_bounds:
             # FA4 query-tile width (kernel-ABI); unrelated to the paged block size.
@@ -232,7 +231,7 @@ class Fa4CuteAttentionBackend(AttentionBackend):
             kwargs["prefix_bounds"] = prefix_bounds
         else:
             kwargs["mask_mod"] = _hybrid_multimodal_mask
-        return _fa4_output(_fa4_flash_attn_fwd(q, k, v, **kwargs))
+        return _fa4_output(forward(q, k, v, **kwargs))
 
     def forward_segmented(
         self,
@@ -253,7 +252,7 @@ class Fa4CuteAttentionBackend(AttentionBackend):
         """Merge FlashAttention-4 states from the live segment and each cached KV segment."""
 
         del context
-        _require_fa4()
+        forward = _require_fa4()
         if q.ndim != 3 or current_k.shape != current_v.shape or current_k.ndim != 3:
             raise ValueError("FA4 segmented attention expects packed current Q/K/V")
         _validate_unified_trunk_geometry(
@@ -279,11 +278,9 @@ class Fa4CuteAttentionBackend(AttentionBackend):
             setattr(visible, "__assumed_align__", 4)
             current_kwargs["aux_tensors"] = [visible]
             current_kwargs["mask_mod"] = _hybrid_multimodal_mask
-        current_output, current_lse = _fa4_state(
-            _fa4_flash_attn_fwd(q, current_k, current_v, **current_kwargs)
-        )
+        current_output, current_lse = _fa4_state(forward(q, current_k, current_v, **current_kwargs))
         prefix_output, prefix_lse = _fa4_state(
-            _fa4_flash_attn_fwd(
+            forward(
                 q,
                 prefix_k,
                 prefix_v,
@@ -307,7 +304,7 @@ class Fa4CuteAttentionBackend(AttentionBackend):
         return output
 
 
-def _require_fa4() -> None:
+def _require_fa4() -> Callable[..., Any]:
     """Return the loaded FlashAttention-4 module or raise its import failure."""
 
     if _fa4_flash_attn_fwd is None:
@@ -317,6 +314,7 @@ def _require_fa4() -> None:
             "uniserve-kernel[flash_attn_jagged] with its CUTE runtime dependencies"
             f"{detail}"
         )
+    return _fa4_flash_attn_fwd
 
 
 def _fa4_output(result: Any) -> torch.Tensor:

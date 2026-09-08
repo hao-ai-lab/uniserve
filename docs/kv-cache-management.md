@@ -107,8 +107,8 @@ The immutable publication manifest contains transport locators, semantic version
 
 Snapshot creation validates scheduler-supplied recovery tables against the committed request state, resolves their installed mappings through `ReqToTokenPool`, and serializes only the visible dense K/V range for each cache group. Semantic request state, publication state, latent state, and transport-owned assets retain their respective owners.
 
-Restore receives fresh scheduler-issued block tables, installs them into `ReqToTokenPool`, writes the serialized tensors into the assigned `CachePool` pages, restores allocated and verified lengths, and then publishes the recovered request state. Physical page IDs and request slots are placement rather than durable identity.
+Restore receives fresh scheduler-issued block tables, installs them into `ReqToTokenPool`, writes the serialized tensors into the assigned `CachePool` pages, restores allocated and verified lengths, and then publishes the recovered request state. Physical page IDs and request slots are binding rather than durable identity.
 
 ## CUDA graph execution
 
-Captured forwards use fixed tensor bases and stage request-variable indices, sequence lengths, query lengths, output locations, and padded table tails before replay. Padding references page `0`. One qualified graph shape can therefore execute different scheduler placements without embedding request ownership into the capture.
+Captured forwards use fixed tensor bases and stage request-variable indices, sequence lengths, query lengths, output locations, and padded table tails before replay. Padding references page `0`. One qualified graph shape can therefore execute different scheduler bindings without embedding request ownership into the capture.

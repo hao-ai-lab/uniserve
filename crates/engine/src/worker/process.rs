@@ -7,13 +7,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
-use crate::executor::{
-    Batch, BatchResult, Executor, ExecutorInfo, ExecutorSubmitError, LogicalResultTracker,
-    PhysicalExecutor, PhysicalSubmitError, PoolId, WorkerExecError, lower_batch,
-};
+use super::RunSubmitError;
+use crate::executor::WorkerExecError;
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
-use uniserve_core::CommandWaker;
 use uniserve_worker_ipc::{ClientEndpoint, Frame, Pending, service_name};
 use uniserve_worker_ipc::{
     Domain, OpId, RequestKey, Run as PhysicalRun, RunResult, WorkerInfo, WorkerRequest,
@@ -142,44 +139,15 @@ impl std::str::FromStr for FlashInferBackend {
 /// Error returned for an unsupported FlashInfer backend name.
 pub struct FlashInferBackendParseError(String);
 
-impl WorkerProcessArgs {
-    /// Expand ordered component membership once before any process is launched.
-    pub(crate) fn resolved_components(
-        &self,
-    ) -> anyhow::Result<std::collections::BTreeMap<String, crate::executor::ComponentDeployConfig>>
-    {
-        let components = if let Some(deployment) = &self.deployment {
-            deployment.validate()?;
-            anyhow::ensure!(
-                deployment.devices.len() == self.world_size,
-                "deployment device count disagrees with launched world"
-            );
-            deployment.components.clone()
-        } else {
-            std::collections::BTreeMap::from([(
-                "model".to_owned(),
-                crate::executor::ComponentDeployConfig::parallel(
-                    (0..self.world_size).collect(),
-                    crate::executor::ParallelConfig {
-                        tensor_parallel_size: self.world_size,
-                        ..Default::default()
-                    },
-                ),
-            )])
-        };
-        Ok(components)
-    }
-}
-
 impl Default for WorkerProcessArgs {
     /// Returns worker launch settings suitable for a single local rank.
     fn default() -> Self {
         Self {
+            worker_id: "worker".into(),
             python: "python3".into(),
             model: String::new(),
-            device: "cuda".into(),
-            world_size: 1,
-            deployment: None,
+            ranks: crate::WorkerConfig::model("cuda", 1, 2).ranks,
+            entries: crate::WorkerConfig::model("cuda", 1, 2).entries,
             pipeline_depth: 2,
             req_slot_cap: 1 << 20,
             resp_slot_cap: 8 << 20,
@@ -188,8 +156,8 @@ impl Default for WorkerProcessArgs {
             max_batch_operations: 128,
             max_batch_tokens: 16_384,
             attention_backend: uniserve_worker_ipc::AttentionBackend::Auto,
-            supported_ops: uniserve_worker_ipc::OpKind::ALL.to_vec(),
-            transfer_backend: crate::executor::TransferBackend::Inproc,
+            supported_ops: uniserve_worker_ipc::OpCode::ALL.to_vec(),
+            transfer: Default::default(),
             stub: false,
             load_format: "auto".to_string(),
             download_dir: None,
@@ -306,20 +274,18 @@ impl WorkerProcessArgs {
 }
 
 /// Single-process worker executor over iceoryx2 IPC.
-pub struct UniprocExecutor {
+pub(super) struct RankProcess {
     client: ClientEndpoint,
     info: WorkerInfo,
-    executor_info: ExecutorInfo,
+    startup_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     child: Child,
     depth: usize,
     rank: u32,
     world_size: u32,
-    expected_components: Vec<uniserve_worker_ipc::ComponentInfo>,
+    expected_components: std::collections::BTreeMap<String, uniserve_core::EntryConfig>,
     pending: HashMap<u64, PendingRecord>,
     ready: VecDeque<RunResult>,
     next_call_id: u64,
-    next_collective_seq: u64,
-    logical_results: LogicalResultTracker,
     command_wake_pending: bool,
     shutdown_sent: bool,
     /// Edge-triggered worker-death watcher: fires the scheduler park's death
@@ -347,34 +313,7 @@ enum OutstandingKind {
     },
 }
 
-impl UniprocExecutor {
-    /// Spawns one worker process and completes its capability handshake.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for an invalid world size, process or IPC setup failure,
-    /// or an invalid worker capability response.
-    pub fn spawn(args: WorkerProcessArgs) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            args.world_size == 1,
-            "uniproc worker world size must be one"
-        );
-        let device = if let Some(deployment) = &args.deployment {
-            deployment.validate()?;
-            anyhow::ensure!(
-                deployment.devices.len() == 1,
-                "uniproc requires one deployment device"
-            );
-            format!("cuda:{}", deployment.devices[0])
-        } else {
-            args.device.clone()
-        };
-        let components = args.resolved_components()?;
-        let mut me = Self::spawn_rank_deferred(&args, &device, 0, 1, None, &components)?;
-        me.finish_startup()?;
-        Ok(me)
-    }
-
+impl RankProcess {
     /// Spawns one rank and connects its IPC client without waiting for model readiness.
     pub(crate) fn spawn_rank_deferred(
         args: &WorkerProcessArgs,
@@ -382,7 +321,8 @@ impl UniprocExecutor {
         rank: u32,
         world_size: u32,
         distributed_init_method: Option<&str>,
-        components: &std::collections::BTreeMap<String, crate::executor::ComponentDeployConfig>,
+        components: &std::collections::BTreeMap<String, crate::executor::EntryConfig>,
+        startup_abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> anyhow::Result<Self> {
         let depth = args.pipeline_depth.max(1);
         let max_payload = args.req_slot_cap.max(args.resp_slot_cap).max(1);
@@ -390,6 +330,8 @@ impl UniprocExecutor {
         let mut cmd = Command::new(&args.python);
         cmd.arg("-m")
             .arg("uniserve_worker.main")
+            .arg("--worker-id")
+            .arg(&args.worker_id)
             .arg("--service-name")
             .arg(&service)
             .arg("--pipeline-depth")
@@ -416,13 +358,12 @@ impl UniprocExecutor {
             .arg(world_size.to_string());
         cmd.arg("--local-rank")
             .arg(rank.to_string())
-            .arg("--component-deployment")
+            .arg("--entries")
             .arg(serde_json::to_string(&components)?);
-        if args.supported_ops != uniserve_worker_ipc::OpKind::ALL {
+        if args.supported_ops != uniserve_worker_ipc::OpCode::ALL {
             cmd.arg("--supported-ops").arg(
                 args.supported_ops
                     .iter()
-                    .flat_map(|operation| operation.run_kinds())
                     .map(|operation| operation.as_str())
                     .collect::<std::collections::BTreeSet<_>>()
                     .into_iter()
@@ -430,22 +371,33 @@ impl UniprocExecutor {
                     .join(","),
             );
         }
-        // In-process transfer is the worker default and needs no command-line override.
-        if args.transfer_backend != crate::executor::TransferBackend::Inproc {
-            cmd.arg("--transfer-backend")
-                .arg(args.transfer_backend.as_str());
-        }
+        // Resolve mechanism ownership from the physical rank's incident edges.
+        let (backends, publications) = args.transfer.rank_backends(&args.worker_id, rank);
+        let names = |backends: &std::collections::BTreeSet<crate::executor::TransferBackend>| {
+            backends
+                .iter()
+                .map(|backend| backend.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        cmd.arg("--transfer-backends").arg(names(&backends));
+        cmd.arg("--publish-backends").arg(names(&publications));
         cmd.env("RANK", rank.to_string())
             .env("WORLD_SIZE", world_size.to_string())
             .env("LOCAL_RANK", rank.to_string())
             .env("LOCAL_WORLD_SIZE", world_size.to_string());
-        // Serving batches change shape continuously, and fixed-size cached
-        // segments strand device memory that later shapes cannot use.
-        // Expandable segments let the allocator resize its mapping instead, so
-        // the worker keeps serving instead of exhausting the device on a
-        // workload whose geometry keeps moving.
-        if std::env::var_os("PYTORCH_CUDA_ALLOC_CONF").is_none() {
-            cmd.env("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True");
+        // CUDA IPC exports cudaMalloc allocations. Expandable VMM segments
+        // cannot supply its memory handles; other ranks retain expandable
+        // allocation to accommodate varying serving shapes.
+        if std::env::var_os("PYTORCH_ALLOC_CONF").is_none()
+            && std::env::var_os("PYTORCH_CUDA_ALLOC_CONF").is_none()
+        {
+            let allocation = if publications.contains(&crate::executor::TransferBackend::CudaIpc) {
+                "expandable_segments:False"
+            } else {
+                "expandable_segments:True"
+            };
+            cmd.env("PYTORCH_CUDA_ALLOC_CONF", allocation);
         }
         if world_size > 1
             && let Some(init_method) = distributed_init_method
@@ -464,54 +416,42 @@ impl UniprocExecutor {
 
         let client = ClientEndpoint::connect(&service, max_payload, depth)
             .context("connecting to worker IPC service")?;
-        let death_watcher = DeathWatcher::spawn(child.id(), client.death_wake());
+        let death_watcher =
+            DeathWatcher::spawn(child.id(), client.death_wake(), startup_abort.clone());
         Ok(Self {
             client,
             info: WorkerInfo::default(),
-            executor_info: ExecutorInfo::single(
-                PoolId(format!("rank-{rank}")),
-                WorkerInfo::default(),
-            ),
+            startup_cancel: Some(startup_abort),
             child,
             depth,
             rank,
             world_size,
-            expected_components: components
-                .clone()
-                .into_iter()
-                .map(|(name, deployment)| uniserve_worker_ipc::ComponentInfo { name, deployment })
-                .collect(),
+            expected_components: components.clone(),
             pending: HashMap::new(),
             ready: VecDeque::new(),
             next_call_id: 1,
-            next_collective_seq: 1,
-            logical_results: LogicalResultTracker::default(),
             command_wake_pending: false,
             shutdown_sent: false,
             death_watcher,
         })
     }
 
-    /// Completes the worker information handshake and validates rank capabilities.
+    /// Publish capabilities only after model resources and warmup are ready.
     pub(crate) fn finish_startup(&mut self) -> anyhow::Result<()> {
-        tracing::info!(
-            rank = self.rank,
-            world_size = self.world_size,
-            "waiting for worker to load model + report info..."
-        );
         let call_id = self.alloc_call_id();
-        let mut req = WorkerRequest::info();
-        req.set_call_id(Some(call_id));
+        let mut request = WorkerRequest::info();
+        request.set_call_id(Some(call_id));
         let pending =
-            self.send_request_with_timeout(&req, "info handshake", WORKER_CONNECT_TIMEOUT)?;
-        let resp = self.wait_pending_response(&pending, "info handshake")?;
-        let wr = resp.decode_response()?;
-        let info = match wr {
+            self.send_request_with_timeout(&request, "Worker startup", WORKER_CONNECT_TIMEOUT)?;
+        let response = self
+            .wait_pending_response(&pending, "Worker startup")?
+            .decode_response()?;
+        let info = match response {
             WorkerResponse::Info { info, .. } => info,
             WorkerResponse::Error { error, .. } => {
-                bail!("worker error during info: {}", error.message)
+                bail!("Worker startup failed: {}", error.message)
             }
-            other => bail!("unexpected worker info response kind: {:?}", other.kind()),
+            other => bail!("unexpected startup response: {:?}", other.kind()),
         };
         info.validate()
             .context("worker reported invalid worker info during startup")?;
@@ -523,23 +463,26 @@ impl UniprocExecutor {
             host_depth
         );
         anyhow::ensure!(
-            info.rank.rank == self.rank && info.rank.world_size == self.world_size,
+            info.endpoint.rank == self.rank && info.world_size == self.world_size,
             "worker process rank/world_size ({}/{}) does not match launched topology ({}/{})",
-            info.rank.rank,
-            info.rank.world_size,
+            info.endpoint.rank,
+            info.world_size,
             self.rank,
             self.world_size
         );
         anyhow::ensure!(
-            info.components == self.expected_components,
-            "worker resolved component configuration disagrees with deployment"
+            info.components
+                .iter()
+                .map(|entry| (entry.name.clone(), entry.config.clone()))
+                .collect::<std::collections::BTreeMap<_, _>>()
+                == self.expected_components,
+            "worker resolved component configuration disagrees with configuration"
         );
         anyhow::ensure!(
             info.configuration_id.len() == 64,
             "worker omitted resolved configuration identity"
         );
-        self.executor_info =
-            ExecutorInfo::single(PoolId(format!("rank-{}", self.rank)), info.clone());
+        self.check_worker("Worker startup")?;
         self.info = info;
         tracing::info!(?self.info, "worker ready");
         Ok(())
@@ -552,8 +495,33 @@ impl UniprocExecutor {
         id
     }
 
-    /// Checks the worker.
-    fn check_worker(&mut self, context: &str) -> anyhow::Result<()> {
+    /// Cancel unfinished rank startup when a required peer exits.
+    pub(crate) fn set_startup_cancel(
+        &mut self,
+        cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) {
+        self.startup_cancel = cancel;
+    }
+
+    /// Terminates a failed or cancelled rank and waits for process-owned resources to retire.
+    pub(crate) fn terminate(&mut self) {
+        self.shutdown_sent = true;
+        self.death_watcher.take();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.pending.clear();
+        self.ready.clear();
+    }
+
+    /// Checks child liveness and cancellation of an unfinished startup.
+    pub(super) fn check_worker(&mut self, context: &str) -> anyhow::Result<()> {
+        if self
+            .startup_cancel
+            .as_ref()
+            .is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Acquire))
+        {
+            bail!("worker startup cancelled during {context}");
+        }
         if let Some(status) = self.child.try_wait()? {
             bail!("worker process exited during {context}: {status}");
         }
@@ -673,6 +641,16 @@ impl UniprocExecutor {
     ) -> anyhow::Result<()> {
         match wr {
             WorkerResponse::Result { result: r, .. } => {
+                for product in &r.products {
+                    if let uniserve_worker_ipc::InlineValue::Transfer(handle) = &product.value {
+                        anyhow::ensure!(
+                            handle
+                                .locators()
+                                .all(|locator| locator.source == self.info.endpoint),
+                            "worker published a product from an unbound rank incarnation"
+                        );
+                    }
+                }
                 if r.run_id != run_id {
                     bail!(
                         "worker result step id mismatch: expected {run_id}, got {}",
@@ -686,15 +664,16 @@ impl UniprocExecutor {
                     );
                 }
                 anyhow::ensure!(
-                    r.done == remaining_operations.is_empty(),
+                    !r.done || remaining_operations.is_empty(),
                     "worker run completion flag disagrees with remaining physical work"
                 );
                 anyhow::ensure!(
-                    !r.completions.is_empty() || remaining_operations.is_empty(),
+                    !r.completions.is_empty() || r.done,
                     "worker returned an empty partial completion for step {run_id}"
                 );
+                let done = r.done;
                 enqueue_ready(&mut self.ready, r);
-                if !remaining_operations.is_empty() {
+                if !done {
                     self.submit_completion_poll(run_id, remaining_operations)?;
                 }
                 Ok(())
@@ -737,29 +716,23 @@ impl UniprocExecutor {
         Ok(())
     }
 
-    /// Returns a waker for interrupting the worker IPC wait after command enqueue.
-    pub fn command_waker(&self) -> CommandWaker {
-        let sender = self.client.command_wake();
-        CommandWaker::new(move || sender.wake())
-    }
-
     /// Returns the file descriptor that signals worker progress.
     pub(crate) fn progress_fd(&self) -> i32 {
         self.client.wake_file_descriptor()
     }
 }
 
-impl PhysicalExecutor for UniprocExecutor {
+impl RankProcess {
     /// Returns metadata for the physical worker.
-    fn physical_info(&self) -> &ExecutorInfo {
-        &self.executor_info
+    pub(super) fn info(&self) -> &WorkerInfo {
+        &self.info
     }
 
     /// Submits one physical run and records its outstanding operation identities.
-    fn submit_run(&mut self, batch: PhysicalRun) -> Result<(), PhysicalSubmitError> {
-        self.drain_ready().map_err(PhysicalSubmitError::Failed)?;
+    pub(super) fn submit_run(&mut self, batch: PhysicalRun) -> Result<(), RunSubmitError> {
+        self.drain_ready().map_err(RunSubmitError::Failed)?;
         if self.pending.len() >= self.depth {
-            return Err(PhysicalSubmitError::WouldBlock(batch));
+            return Err(RunSubmitError::WouldBlock(batch));
         }
         let run_id = batch.run_id;
         let remaining_operations = batch
@@ -772,7 +745,7 @@ impl PhysicalExecutor for UniprocExecutor {
         req.set_call_id(Some(call_id));
         let pending = self
             .send_request_checked(&req, "batch submit")
-            .map_err(PhysicalSubmitError::Failed)?;
+            .map_err(RunSubmitError::Failed)?;
         self.pending.insert(
             call_id,
             PendingRecord {
@@ -787,7 +760,7 @@ impl PhysicalExecutor for UniprocExecutor {
     }
 
     /// Drives IPC progress until a result, command wake, worker death, or timeout.
-    fn poll_run(&mut self, timeout: Duration) -> anyhow::Result<Option<RunResult>> {
+    pub(super) fn poll_run(&mut self, timeout: Duration) -> anyhow::Result<Option<RunResult>> {
         if self.command_wake_pending {
             return Ok(None);
         }
@@ -827,12 +800,20 @@ impl PhysicalExecutor for UniprocExecutor {
     }
 
     /// Consumes the pending command-wake notification.
-    fn take_command_wake(&mut self) -> bool {
+    pub(crate) fn take_command_wake(&mut self) -> bool {
         std::mem::take(&mut self.command_wake_pending)
     }
 
     /// Drains outstanding calls, requests graceful shutdown, and bounds forced termination.
-    fn close_physical(&mut self) -> anyhow::Result<()> {
+    pub(super) fn close(&mut self) -> anyhow::Result<()> {
+        if self
+            .startup_cancel
+            .as_ref()
+            .is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Acquire))
+        {
+            self.terminate();
+            return Ok(());
+        }
         if self.shutdown_sent {
             return Ok(());
         }
@@ -894,59 +875,10 @@ impl PhysicalExecutor for UniprocExecutor {
     }
 }
 
-impl Executor for UniprocExecutor {
-    /// Returns the worker metadata.
-    fn info(&self) -> &ExecutorInfo {
-        &self.executor_info
-    }
-
-    /// Lowers and submits a logical batch while preserving result-tracker ownership.
-    fn submit(&mut self, batch: Batch) -> Result<(), ExecutorSubmitError> {
-        if self.pending.len() >= self.depth {
-            return Err(ExecutorSubmitError::WouldBlock(batch));
-        }
-        let run = lower_batch(&batch, &mut self.next_collective_seq)
-            .map_err(ExecutorSubmitError::Failed)?;
-        self.logical_results
-            .register(&batch)
-            .map_err(ExecutorSubmitError::Failed)?;
-        match self.submit_run(run) {
-            Ok(()) => Ok(()),
-            Err(PhysicalSubmitError::WouldBlock(_)) => {
-                self.logical_results.unregister(batch.id);
-                Err(ExecutorSubmitError::WouldBlock(batch))
-            }
-            Err(PhysicalSubmitError::Failed(error)) => {
-                self.logical_results.unregister(batch.id);
-                Err(ExecutorSubmitError::Failed(error))
-            }
-        }
-    }
-
-    /// Polls for the next completed worker operation.
-    fn poll(&mut self, timeout: Duration) -> anyhow::Result<Option<BatchResult>> {
-        if self.take_command_wake() {
-            return Ok(None);
-        }
-        let report = self.poll_run(timeout)?;
-        if report.is_none() {
-            self.take_command_wake();
-        }
-        report
-            .map(|report| self.logical_results.apply(report))
-            .transpose()
-    }
-
-    /// Closes the component and releases its resources.
-    fn close(&mut self) -> anyhow::Result<()> {
-        self.close_physical()
-    }
-}
-
-impl Drop for UniprocExecutor {
+impl Drop for RankProcess {
     /// Releases resources owned by this value.
     fn drop(&mut self) {
-        let _ = self.close_physical();
+        let _ = self.close();
     }
 }
 

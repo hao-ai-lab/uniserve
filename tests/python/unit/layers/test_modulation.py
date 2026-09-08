@@ -5,15 +5,15 @@ import torch
 from torch.nn import functional as F
 
 from uniserve_worker import ops
-from uniserve_worker.models.minimax_h3.fusions import (
-    attention_residual_modulated_rmsnorm,
-    attention_residual_modulated_rmsnorm_fp8,
+from uniserve_worker.nn.quant.kv_cache import fp8_quantize, fp8_scale_from
+from uniserve_worker.ops import (
     gated_residual,
-    row_modulated_rmsnorm,
+    gated_residual_rms_norm,
+    gated_residual_rms_norm_fp8,
+    modulated_rms_norm,
     value_first_swiglu,
     value_first_swiglu_fp8,
 )
-from uniserve_worker.nn.quant.kv_cache import fp8_quantize, fp8_scale_from
 
 pytestmark = [
     pytest.mark.unit,
@@ -21,27 +21,25 @@ pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required"),
 ]
 
-_HIDDEN_SIZE = 5376
-_FFN_SIZE = 14336
-
 
 def _rmsnorm(value: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     normalized = value.float() * torch.rsqrt(value.float().pow(2).mean(-1, keepdim=True) + eps)
     return (normalized * weight.float()).to(value.dtype)
 
 
-def test_h3_block_edges_match_strided_bf16_reference() -> None:
+@pytest.mark.parametrize("width", [128, 5376])
+def test_block_edges_match_strided_bf16_reference(width) -> None:
     torch.manual_seed(23)
     rows = 8
     states = 6
     eps = 1e-5
-    hidden = torch.randn(rows, _HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
+    hidden = torch.randn(rows, width, device="cuda", dtype=torch.bfloat16)
     attention = torch.randn_like(hidden)
     feed_forward = torch.randn_like(hidden)
-    weight = torch.randn(_HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(width, device="cuda", dtype=torch.bfloat16)
     parameters = torch.randn(
         states,
-        6 * _HIDDEN_SIZE,
+        6 * width,
         device="cuda",
         dtype=torch.bfloat16,
     )
@@ -55,7 +53,7 @@ def test_h3_block_edges_match_strided_bf16_reference() -> None:
     expected_attn_norm = expected_attn_norm * (
         1.0 + scale_attn.index_select(0, row_indices)
     ) + shift_attn.index_select(0, row_indices)
-    actual_attn_norm = row_modulated_rmsnorm(
+    actual_attn_norm = modulated_rms_norm(
         hidden,
         weight,
         shift_attn,
@@ -69,7 +67,7 @@ def test_h3_block_edges_match_strided_bf16_reference() -> None:
     expected_ffn_norm = expected_ffn_norm * (
         1.0 + scale_ffn.index_select(0, row_indices)
     ) + shift_ffn.index_select(0, row_indices)
-    actual_residual, actual_ffn_norm = attention_residual_modulated_rmsnorm(
+    actual_residual, actual_ffn_norm = gated_residual_rms_norm(
         hidden,
         attention.clone(),
         gate_attn,
@@ -87,40 +85,42 @@ def test_h3_block_edges_match_strided_bf16_reference() -> None:
         row_indices,
     )
 
-    assert shift_attn.stride(0) == 6 * _HIDDEN_SIZE
+    assert shift_attn.stride(0) == 6 * width
     assert torch.equal(actual_attn_norm, expected_attn_norm)
     assert torch.equal(actual_residual, expected_residual)
     assert torch.equal(actual_ffn_norm, expected_ffn_norm)
     assert torch.equal(actual_output, expected_output)
 
 
-def test_h3_swiglu_matches_bf16_reference() -> None:
+@pytest.mark.parametrize("expanded", [128, 14336])
+def test_swiglu_matches_bf16_reference(expanded) -> None:
     torch.manual_seed(29)
     value_gate = torch.randn(
         8,
-        2 * _FFN_SIZE,
+        2 * expanded,
         device="cuda",
         dtype=torch.bfloat16,
     )
     value, gate = value_gate.chunk(2, dim=-1)
     expected = value * F.silu(gate.float()).to(gate.dtype)
 
-    assert torch.equal(value_first_swiglu(value_gate), expected)
+    assert torch.equal(value_first_swiglu(value_gate, activation_dtype=torch.bfloat16), expected)
 
 
-def test_h3_fp8_boundaries_match_bf16_reference() -> None:
+@pytest.mark.parametrize(("width", "expanded"), [(128, 256), (5376, 14336)])
+def test_fp8_boundaries_match_bf16_reference(width, expanded) -> None:
     if torch.cuda.get_device_capability()[0] < 9:
         pytest.skip("FP8 execution requires compute capability 9 or newer")
     torch.manual_seed(31)
     rows = 8
     states = 6
     eps = 1e-5
-    hidden = torch.randn(rows, _HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
+    hidden = torch.randn(rows, width, device="cuda", dtype=torch.bfloat16)
     attention = torch.randn_like(hidden)
-    weight = torch.randn(_HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(width, device="cuda", dtype=torch.bfloat16)
     parameters = torch.randn(
         states,
-        6 * _HIDDEN_SIZE,
+        6 * width,
         device="cuda",
         dtype=torch.bfloat16,
     )
@@ -134,7 +134,7 @@ def test_h3_fp8_boundaries_match_bf16_reference() -> None:
     ) + shift_ffn.index_select(0, row_indices)
     expected_scale = fp8_scale_from(expected_normalized.float(), dim=1)
     expected_fp8 = fp8_quantize(expected_normalized.float(), expected_scale)
-    actual_residual, actual_fp8, actual_scale = attention_residual_modulated_rmsnorm_fp8(
+    actual_residual, actual_fp8, actual_scale = gated_residual_rms_norm_fp8(
         hidden,
         attention.clone(),
         gate_attn,
@@ -147,7 +147,7 @@ def test_h3_fp8_boundaries_match_bf16_reference() -> None:
 
     value_gate = torch.randn(
         rows,
-        2 * _FFN_SIZE,
+        2 * expanded,
         device="cuda",
         dtype=torch.bfloat16,
     )
@@ -164,7 +164,7 @@ def test_h3_fp8_boundaries_match_bf16_reference() -> None:
     assert torch.equal(actual_swiglu_fp8, expected_swiglu_fp8)
 
 
-def test_h3_text_fp8_swiglu_matches_unfused_boundary() -> None:
+def test_text_fp8_swiglu_matches_unfused_boundary() -> None:
     if torch.cuda.get_device_capability()[0] < 9:
         pytest.skip("FP8 execution requires compute capability 9 or newer")
     torch.manual_seed(37)

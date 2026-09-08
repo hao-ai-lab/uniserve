@@ -10,7 +10,7 @@ fn default_video_seconds() -> f64 {
     5.0
 }
 
-/// MiniMax H3 T2VA request. The deployment owns the canvas and capacity while
+/// MiniMax H3 T2VA request. The configuration owns the canvas and capacity while
 /// duration is resolved into immutable media geometry at admission.
 #[derive(Debug, Clone, Deserialize, PartialEq, Validate)]
 #[serde(deny_unknown_fields)]

@@ -2,73 +2,435 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from typing import Any
+from dataclasses import dataclass, replace
+from typing import cast
 
 import torch
 import torch.nn as nn
 
-from ..activation import GeluAndMul
+from ...backends.attention.base import AttentionBackend
+from ...execution.forward_batch import ForwardBatch
+from ..attention import RadixAttention
 from ..layer import LayerConfig
-from ..linear import MergedColumnParallelLinear, RowParallelLinear
-from ..placement import WeightMode
+from ..linear import LinearBase, QKVParallelLinear, RowParallelLinear
+from ..mlp import GatedMLP
+from ..moe import FusedMoE
+from ..norm import RMSNorm
+from ..quant.base import PreparedLinearInput
+from ..quant.config import QuantizationConfig
+from ..quant.fp8 import quantize_fp8_rowwise
+from ..rope import get_rope, qk_norm_rope
+from ..vocab_parallel_embedding import VocabParallelEmbedding
 
 __all__ = [
-    "Qwen3MLP",
-    "qwen3_gate_up_activation",
+    "Qwen3Config",
+    "Qwen3Attention",
+    "Qwen3MoE",
+    "Qwen3DecoderLayer",
+    "Qwen3Model",
 ]
 
 
-def _silu_and_mul(x: torch.Tensor) -> torch.Tensor:
-    """Apply SiLU to one packed half and gate it with the other half."""
+@dataclass(frozen=True, slots=True)
+class Qwen3Config:
+    """Geometry and numerical parameters shared by Qwen language decoders and conditioners."""
 
-    from uniserve_worker import ops
+    vocab_size: int
+    hidden_size: int
+    intermediate_size: int
+    num_hidden_layers: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    head_dim: int
+    hidden_act: str
+    rms_norm_eps: float
+    rope_theta: float
+    max_position_embeddings: int
+    attention_bias: bool
+    tie_word_embeddings: bool
+    num_experts: int
+    num_experts_per_tok: int
+    moe_intermediate_size: int
 
-    return ops.silu_and_mul(x)
 
-
-def qwen3_gate_up_activation(hidden_act: str | None) -> Callable[[torch.Tensor], torch.Tensor]:
-    """Resolve a checkpoint activation name to its fused gate/up operation."""
-
-    key = str(hidden_act or "silu").lower()
-    if key in {"silu", "swish", "silu_and_mul", "swiglu"}:
-        return _silu_and_mul
-    if key in {"gelu", "gelu_and_mul", "geglu"}:
-        return GeluAndMul()
-    if key in {"gelu_pytorch_tanh", "gelu_tanh"}:
-        return GeluAndMul(approximate="tanh")
-    raise ValueError(f"Qwen3MLP does not support hidden_act={hidden_act!r}")
-
-
-class Qwen3MLP(nn.Module):
-    """SwiGLU-style feed-forward block with a fused gate/up projection."""
+class Qwen3Attention(nn.Module):
+    """Multi-head self-attention with QK-norm, RoPE, and paged KV via ``RadixAttention``."""
 
     def __init__(
         self,
-        config: Any,
+        cfg: Qwen3Config,
+        layer_id: int,
         *,
         layer_config: LayerConfig,
-        weight_mode: WeightMode = WeightMode.VANILLA,
+        dense_provider: AttentionBackend | None = None,
     ) -> None:
-        """Build the fused gate/up expansion and tensor-parallel reduction projection."""
+        """Build rank-local QKV projections, rotary normalization, and paged attention."""
 
         super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
-            int(config.hidden_size),
-            (int(config.intermediate_size), int(config.intermediate_size)),
+        self.total_num_heads = cfg.num_attention_heads
+        self.total_num_kv_heads = cfg.num_key_value_heads
+        self.head_dim = cfg.head_dim
+        self.total_q_size = self.total_num_heads * self.head_dim
+        self.scale = self.head_dim**-0.5
+        self.qkv_proj = QKVParallelLinear(
+            cfg.hidden_size,
+            self.head_dim,
+            self.total_num_heads,
+            self.total_num_kv_heads,
             layer_config=layer_config,
-            bias=False,
-            weight_mode=weight_mode,
+            prefix="qkv_proj",
+            bias=cfg.attention_bias,
         )
-        self.act = qwen3_gate_up_activation(getattr(config, "hidden_act", "silu"))
-        self.down_proj = RowParallelLinear(
-            int(config.intermediate_size),
-            int(config.hidden_size),
+        self.q_size = int(self.qkv_proj.output_sizes[0])
+        self.kv_size = int(self.qkv_proj.output_sizes[1])
+        self.num_heads = self.q_size // self.head_dim
+        self.num_kv_heads = self.kv_size // self.head_dim
+        if self.num_heads <= 0 or self.num_kv_heads <= 0:
+            raise ValueError("Qwen3 local attention heads must be positive")
+        self.o_proj = RowParallelLinear(
+            self.total_q_size,
+            cfg.hidden_size,
             layer_config=layer_config,
-            bias=False,
+            prefix="o_proj",
+            bias=cfg.attention_bias,
+        )
+        self.q_norm = RMSNorm(self.head_dim, cfg.rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, cfg.rms_norm_eps)
+        self.rope_theta = float(getattr(cfg, "rope_theta", 1000000.0))
+        self.attn = RadixAttention(
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            layer_id=layer_id,
+            dense_provider=dense_provider,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        context: ForwardBatch | None,
+        *,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        positions: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run QK-normalized rotary attention over packed prefill or batched decode rows."""
+
+        state_shape = hidden_states.shape[:-1]
+        qkv = self.qkv_proj(hidden_states)
+        batched = len(state_shape) == 2
+        batched_decode = context is not None and batched and int(state_shape[1]) == 1
+        fused_prefill = self._try_fused_prefill(
+            qkv, state_shape, context, batched, cos, sin, positions
+        )
+        if fused_prefill is not None:
+            return fused_prefill
+
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if context is None and batched:
+            # Full sequences retain BHLD coordinates and dtype-matched rotary
+            # factors. Flattened cache rows use the packed operator's FP32
+            # rotation contract below; flattening here would change rounding.
+            batch, seq = state_shape
+            q = q.view(batch, seq, self.num_heads, self.head_dim).transpose(1, 2)
+            k = k.view(batch, seq, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            v = v.view(batch, seq, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            q, k = qk_norm_rope(
+                q, k, self.q_norm.weight, self.k_norm.weight, cos, sin, self.q_norm.eps
+            )
+            out = self.attn(q, k, v, context, causal=seq > 1, scale=self.scale)
+            return self.o_proj(out.transpose(1, 2).reshape(*state_shape, self.q_size))
+        q, k = self._prepare_qk(q, k, v, batched_decode, cos, sin)
+        q_attn, k_attn, v_attn = self._attention_inputs(
+            q, k, v, state_shape, batched_decode, batched
+        )
+        out = self.attn(q_attn, k_attn, v_attn, context, causal=True, scale=self.scale)
+        return self.o_proj(
+            self._restore_attention_output(out, state_shape, batched_decode, batched),
+        )
+
+    def _try_fused_prefill(
+        self,
+        qkv: torch.Tensor,
+        state_shape: torch.Size,
+        context: ForwardBatch | None,
+        batched: bool,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        positions: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """Run the flattened fused-prefill path when positions and tensor layout permit it."""
+
+        if batched or positions is None:
+            return None
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q_attn = q.reshape(-1, self.num_heads, self.head_dim)
+        k_attn = k.reshape(-1, self.num_kv_heads, self.head_dim)
+        q_attn, k_attn = qk_norm_rope(
+            q_attn,
+            k_attn,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            cos,
+            sin,
+            self.q_norm.eps,
+        )
+        v_attn = v.reshape(-1, self.num_kv_heads, self.head_dim)
+        q_attn = q_attn.to(dtype=v_attn.dtype)
+        k_attn = k_attn.to(dtype=v_attn.dtype)
+        out = self.attn(q_attn, k_attn, v_attn, context, causal=True, scale=self.scale)
+        return self.o_proj(out.reshape(*state_shape, self.q_size))
+
+    def _prepare_qk(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        batched_decode: bool,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reshape, normalize, and rotate query and key heads for attention."""
+
+        q_heads = q.reshape(-1, self.num_heads, self.head_dim)
+        k_heads = k.reshape(-1, self.num_kv_heads, self.head_dim)
+        q, k = qk_norm_rope(
+            q_heads,
+            k_heads,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            cos,
+            sin,
+            self.q_norm.eps,
+        )
+        v = v.reshape(-1, self.num_kv_heads, self.head_dim)
+        return q.to(dtype=v.dtype), k.to(dtype=v.dtype)
+
+    def _attention_inputs(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        state_shape: torch.Size,
+        batched_decode: bool,
+        batched: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Convert flattened QKV heads to the layout required by the active attention mode."""
+
+        v = v.reshape(-1, self.num_kv_heads, self.head_dim)
+        if batched_decode:
+            batch = int(state_shape[0])
+            return (
+                q.reshape(batch, self.num_heads, self.head_dim).contiguous(),
+                k.reshape(batch, self.num_kv_heads, self.head_dim),
+                v.reshape(batch, self.num_kv_heads, self.head_dim),
+            )
+        if batched:
+            batch, seq = int(state_shape[0]), int(state_shape[1])
+            return (
+                q.reshape(batch, seq, self.num_heads, self.head_dim).transpose(1, 2).contiguous(),
+                k.reshape(batch, seq, self.num_kv_heads, self.head_dim)
+                .transpose(1, 2)
+                .contiguous(),
+                v.reshape(batch, seq, self.num_kv_heads, self.head_dim)
+                .transpose(1, 2)
+                .contiguous(),
+            )
+        return q, k, v
+
+    def _restore_attention_output(
+        self,
+        out: torch.Tensor,
+        state_shape: torch.Size,
+        batched_decode: bool,
+        batched: bool,
+    ) -> torch.Tensor:
+        """Restore backend attention output to the caller's batched or flattened state shape."""
+
+        if batched_decode:
+            return out.reshape(int(state_shape[0]), 1, self.q_size)
+        if batched:
+            return out.transpose(1, 2).reshape(*state_shape, self.q_size)
+        return out.reshape(*state_shape, self.q_size)
+
+
+class Qwen3MoE(nn.Module):
+    """Mixture-of-experts feed-forward routed by a learned gate."""
+
+    def __init__(self, cfg: Qwen3Config, *, layer_config: LayerConfig) -> None:
+        """Build the token router and dense collection of rank-sharded experts."""
+
+        super().__init__()
+        num_experts = cfg.num_experts
+        top_k = cfg.num_experts_per_tok
+        self.gate = LinearBase(
+            cfg.hidden_size, num_experts, layer_config=layer_config, prefix="gate", bias=False
+        )
+        expert_intermediate = int(cfg.moe_intermediate_size or cfg.intermediate_size)
+        self.experts = FusedMoE(
+            [
+                GatedMLP(
+                    cfg.hidden_size,
+                    expert_intermediate,
+                    layer_config=layer_config.child(f"experts.experts.{index}"),
+                )
+                for index in range(num_experts)
+            ],
+            top_k=top_k,
+            norm_topk_prob=True,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Apply gated expansion and reduce the output projection across the mesh."""
+        """Route packed hidden rows through the selected experts and combine their outputs."""
 
-        return self.down_proj(self.act(self.gate_up_proj(hidden_states)))
+        return self.experts(hidden_states, self.gate(hidden_states))
+
+
+class Qwen3DecoderLayer(nn.Module):
+    """One transformer decoder layer (attention + MLP or MoE)."""
+
+    def __init__(
+        self,
+        cfg: Qwen3Config,
+        layer_id: int,
+        *,
+        layer_config: LayerConfig,
+        dense_provider: AttentionBackend | None = None,
+        attention_quantization: QuantizationConfig | None = None,
+        mlp_input_dtype: torch.dtype | None = None,
+    ) -> None:
+        """Assemble one normalized attention layer with dense or expert feed-forward work."""
+
+        super().__init__()
+        attention_config = layer_config.child("self_attn")
+        if attention_quantization is not None:
+            attention_config = replace(attention_config, quantization=attention_quantization)
+        self.self_attn = Qwen3Attention(
+            cfg, layer_id, layer_config=attention_config, dense_provider=dense_provider
+        )
+        self.mlp_input_dtype = mlp_input_dtype
+        self.mlp = (
+            Qwen3MoE(cfg, layer_config=layer_config.child("mlp"))
+            if cfg.num_experts > 0
+            else GatedMLP(
+                cfg.hidden_size,
+                cfg.intermediate_size,
+                hidden_act=cfg.hidden_act,
+                layer_config=layer_config.child("mlp"),
+            )
+        )
+        self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        context: ForwardBatch | None,
+        *,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        positions: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Advance the fused residual stream through attention and dense or expert MLP work."""
+
+        if residual is None:
+            residual = hidden_states
+            attn_in = self.input_layernorm(hidden_states)
+        else:
+            attn_in, residual = self.input_layernorm.forward_with_residual(
+                hidden_states,
+                residual,
+                in_place=True,
+            )
+        attn_out = self.self_attn(attn_in, context, cos=cos, sin=sin, positions=positions)
+        mlp_in, residual = self.post_attention_layernorm.forward_with_residual(
+            attn_out,
+            residual,
+            in_place=True,
+        )
+        if self.mlp_input_dtype is not None:
+            if self.mlp_input_dtype != torch.float8_e4m3fn or not isinstance(self.mlp, GatedMLP):
+                raise ValueError("prepared decoder MLP input requires a row-scaled FP8 gated MLP")
+            values, scales = quantize_fp8_rowwise(mlp_in.reshape(-1, mlp_in.shape[-1]))
+            prepared = PreparedLinearInput(values.reshape(mlp_in.shape), row_scales=scales)
+            return self.mlp.forward_prepared(prepared), residual
+        return self.mlp(mlp_in), residual
+
+
+class Qwen3Model(nn.Module):
+    """Stack of Qwen3 decoder layers with token embeddings and final RMSNorm."""
+
+    def __init__(
+        self,
+        cfg: Qwen3Config,
+        *,
+        layer_config: LayerConfig,
+        dense_provider: AttentionBackend | None = None,
+        attention_quantization: QuantizationConfig | None = None,
+        mlp_input_dtype: torch.dtype | None = None,
+        rotary_dtype: torch.dtype | None = None,
+        normalize_output: bool = True,
+    ) -> None:
+        """Build sharded token embeddings, decoder layers, rotary tables, and final norm."""
+
+        super().__init__()
+        self.embed_tokens = VocabParallelEmbedding(
+            cfg.vocab_size,
+            cfg.hidden_size,
+            layer_config=layer_config,
+            init_weights=False,
+        )
+        self.layers = nn.ModuleList(
+            Qwen3DecoderLayer(
+                cfg,
+                idx,
+                layer_config=layer_config.child(f"layers.{idx}"),
+                dense_provider=dense_provider,
+                attention_quantization=attention_quantization,
+                mlp_input_dtype=mlp_input_dtype,
+            )
+            for idx in range(cfg.num_hidden_layers)
+        )
+        self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps) if normalize_output else None
+        self.rotary_dtype = rotary_dtype
+        self.rotary = get_rope(
+            cfg.head_dim,
+            theta=cfg.rope_theta,
+        )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        context: ForwardBatch | None = None,
+        *,
+        input_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Decode token or supplied embedding rows and return final normalized hidden states."""
+
+        hidden_states = input_embeds if input_embeds is not None else self.embed_tokens(input_ids)
+        cos, sin = self.rotary.cos_sin_1d(positions.reshape(-1))
+        if self.rotary_dtype is not None:
+            cos, sin = cos.to(self.rotary_dtype), sin.to(self.rotary_dtype)
+        if context is None and hidden_states.ndim == 3:
+            shape = (*hidden_states.shape[:-1], -1)
+            cos = torch.cat((cos, cos), dim=-1).reshape(shape)
+            sin = torch.cat((sin, sin), dim=-1).reshape(shape)
+        residual = None
+        for layer_module in self.layers:
+            layer = cast(Qwen3DecoderLayer, layer_module)
+            hidden_states, residual = layer(
+                hidden_states,
+                residual,
+                context,
+                cos=cos,
+                sin=sin,
+                positions=positions,
+            )
+        if self.norm is None:
+            return hidden_states if residual is None else hidden_states + residual
+        if residual is None:
+            return self.norm(hidden_states)
+        hidden_states, _ = self.norm.forward_with_residual(hidden_states, residual, in_place=True)
+        return hidden_states

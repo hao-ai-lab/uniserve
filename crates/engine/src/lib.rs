@@ -8,28 +8,25 @@ mod core;
 mod executor;
 mod handle;
 mod kv;
-/// Scheduler-owned allocation and worker-placement primitives.
+/// Scheduler-owned allocation and worker-params primitives.
 pub mod memory;
 mod runtime;
 mod scheduler;
 mod sim;
 mod worker;
 
-pub use crate::core::{EngineCore, EngineCoreConfig};
+pub use crate::core::{EngineConfig, EngineCore, WorkerConfig, WorkerRank};
 pub use crate::executor::{
-    Batch, BatchResult, ComponentDeployConfig, ComponentDistribution, Executor, ExecutorError,
-    ExecutorInfo, ExecutorSubmitError, Op, OpPlacement, ParallelConfig, PhysicalExecutor,
-    PhysicalSubmitError, PoolConfig, PoolId, SequenceParallel, StageDeployConfig, TransferBackend,
-    TransferEdge, TransportMap, TransportMapError, WorkerExecError, WorkerLossError,
-    WorkerTopology, WorkerTopologyError,
+    Batch, BatchResult, CommandOutcome, ComponentDistribution, EntryConfig, Executor,
+    ExecutorError, ExecutorInfo, ExecutorSubmitError, Op, ParallelConfig, SequenceParallel,
+    TransferBackend, TransferEdge, TransportMap, TransportMapError, WorkerExecError, WorkerFailure,
+    WorkerId,
 };
 pub use crate::handle::{
     Command, EVENT_BUFFER_CAPACITY, EngineHandle, EventRx, EventSendError, EventTx,
     StreamCancelCause, SubmitError,
 };
-pub use crate::runtime::{
-    ArRuntime, ControlTokens, DiffusionRuntime, EngineLoop, Runtime, RuntimeProfile, UmmRuntime,
-};
+pub use crate::runtime::{ControlTokens, EngineLoop, RuntimeProfile};
 pub use crate::scheduler::{
     DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
     DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS, DomainStats, EncoderStats,
@@ -38,7 +35,7 @@ pub use crate::scheduler::{
 };
 pub use crate::sim::{SimEngine, SimExecutor};
 pub use crate::worker::{
-    FlashInferBackend, FlashInferBackendParseError, LaneConfig, MultiprocExecutor, StagedExecutor,
-    UniprocExecutor, WorkerProcessArgs,
+    FlashInferBackend, FlashInferBackendParseError, LaneConfig, RunSubmitError, Worker,
+    WorkerExecutor, WorkerProcessArgs,
 };
 pub use uniserve_worker_ipc::AttentionBackend;

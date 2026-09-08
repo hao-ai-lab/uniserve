@@ -7,6 +7,61 @@
 use tokio::sync::mpsc;
 use uniserve_core::{Event, Request, RequestId};
 
+/// Pollable command ingress whose lifetime is independent of Worker membership.
+pub(crate) struct WakeSignal {
+    reader: std::os::unix::net::UnixStream,
+    waker: uniserve_core::CommandWaker,
+}
+
+impl WakeSignal {
+    pub(crate) fn new() -> std::io::Result<Self> {
+        use std::io::Write as _;
+
+        let (reader, writer) = std::os::unix::net::UnixStream::pair()?;
+        reader.set_nonblocking(true)?;
+        writer.set_nonblocking(true)?;
+        let waker = uniserve_core::CommandWaker::new(move || {
+            loop {
+                match (&writer).write(&[1]) {
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    // A full socket already has a pending notification. A closed
+                    // reader means its control owner has stopped accepting work.
+                    _ => break,
+                }
+            }
+        });
+        Ok(Self { reader, waker })
+    }
+
+    pub(crate) fn waker(&self) -> uniserve_core::CommandWaker {
+        self.waker.clone()
+    }
+
+    pub(crate) fn descriptor(&self) -> i32 {
+        use std::os::fd::AsRawFd as _;
+        self.reader.as_raw_fd()
+    }
+
+    /// Consumes latched notifications before the owner considers parking again.
+    pub(crate) fn drain(&mut self) -> std::io::Result<bool> {
+        use std::io::Read as _;
+
+        let mut received = false;
+        let mut bytes = [0_u8; 256];
+        loop {
+            match self.reader.read(&mut bytes) {
+                Ok(0) => return Ok(received),
+                Ok(_) => received = true,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    return Ok(received);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
 /// Maximum number of generation events buffered for one request consumer.
 pub const EVENT_BUFFER_CAPACITY: usize = 64;
 
@@ -368,6 +423,7 @@ impl EngineHandle {
     pub fn abort(&self, id: RequestId) {
         let _ = self.send(Command::Abort(id));
     }
+
     /// Requests orderly engine shutdown.
     pub fn shutdown(&self) {
         let _ = self.send(Command::Shutdown);

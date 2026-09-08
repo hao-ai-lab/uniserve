@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from collections import deque
 from collections.abc import Iterable, Mapping
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from enum import StrEnum
 from threading import RLock
@@ -13,16 +14,20 @@ from typing import Final, cast
 import torch
 
 from ..execution.batch import (
+    BufferAllocation,
     BufferId,
-    BufferPlacement,
     DType,
     ProductKind,
     ProductRef,
     RequestKey,
     StaticDim,
     StorageClass,
+    TensorTransfer,
+    WorkerEndpoint,
 )
 from ..foundation.errors import WorkerError, WorkerErrorCode, invalid_descriptor, resource_error
+from ..transfer.layout import TensorRegion, fetch_tensor
+from ..transfer.tickets import TransferTicket, Transport
 from .device import canonical_device
 from .device_events import DeviceEventPool
 from .persistent_buffers import PersistentBufferBinding, PersistentBuffers
@@ -33,6 +38,7 @@ _DEVICE_DTYPES: Final[dict[DType, torch.dtype]] = {
     DType.U16: torch.int32,
     DType.U32: torch.long,
     DType.I32: torch.int32,
+    DType.I16: torch.int16,
     DType.I64: torch.long,
     DType.F16: torch.float16,
     DType.BF16: torch.bfloat16,
@@ -56,6 +62,7 @@ _DEVICE_PRODUCT_KINDS: Final[frozenset[ProductKind]] = frozenset(
         ProductKind.ARTIFACT,
         ProductKind.COMPLETION,
         ProductKind.SELECTED_POINT,
+        ProductKind.TENSOR,
     }
 )
 _REQUEST_RELAY_KINDS: Final[frozenset[ProductKind]] = frozenset(
@@ -208,6 +215,11 @@ class DeviceProductWrite:
     slot: _DeviceSlot
     physical_generation: int
     binding_id: int
+    region: TensorRegion | None = None
+    logical_shape: tuple[int, ...] | None = None
+    transfers: tuple[TransferTicket, ...] = ()
+    publications: tuple[Future[None], ...] = ()
+    readers: int = 0
     producer_event: torch.cuda.Event | None = None
     producer_stream: int | None = None
     producer_recorded: bool = False
@@ -232,6 +244,7 @@ class DeviceProductRead:
     tensor: torch.Tensor
     consumer_op_id: int
     _write: DeviceProductWrite = field(repr=False, compare=False)
+    region: TensorRegion | None = None
     _recorded: bool = field(default=False, repr=False, compare=False)
 
     @property
@@ -251,6 +264,61 @@ class DeviceProductRead:
         """Expose producer metadata published with the product, if present."""
 
         return self._write.metadata
+
+
+@dataclass(slots=True)
+class _ProductMaterialization:
+    write: DeviceProductWrite
+    tensor: torch.Tensor
+    tickets: tuple[TransferTicket, ...]
+    metadata: DeviceProductMetadata | None
+    users: int = 0
+    committed: bool = False
+
+
+@dataclass(slots=True)
+class DeviceProductImport:
+    """One preparation's lease on shared, immutable input materialization.
+
+    Multiple consumers may fill the same product once. Closing one lease does
+    not cancel other consumers; the final lease retires the transfer reads.
+    """
+
+    _owner: DeviceProducts = field(repr=False)
+    _value: _ProductMaterialization = field(repr=False)
+    _closed: bool = False
+
+    @property
+    def tensor(self) -> torch.Tensor:
+        return self._value.tensor
+
+    @property
+    def tickets(self) -> tuple[TransferTicket, ...]:
+        return self._value.tickets
+
+    def wait(self) -> None:
+        """Order the calling stream after resident producers and physical reads."""
+
+        if self._closed:
+            raise _invariant("closed product import cannot be consumed")
+        for ticket in self.tickets:
+            ticket.result()
+        event = self._value.write.producer_event
+        if event is not None:
+            torch.cuda.current_stream(self.tensor.device).wait_event(event)
+
+    def commit(self) -> None:
+        """Make complete coverage consumable after establishing stream access."""
+
+        self.wait()
+        self._owner._commit_import(self._value)
+
+    def close(self) -> None:
+        """Release this preparation without revoking any other consumer."""
+
+        if not self._closed:
+            self._closed = True
+            self._owner._release_import(self._value)
 
 
 @dataclass(slots=True)
@@ -316,21 +384,18 @@ class DeviceProducts:
         self._free_slot_queues: dict[str, deque[int]] = {}
         self._compatible_free_slots: dict[_SlotStorageKey, deque[int]] = {}
         self._scalar_arenas: dict[tuple[str, torch.dtype], torch.Tensor] = {}
-        self._relay_arenas: dict[
-            tuple[str, ProductKind, torch.dtype, int], torch.Tensor
-        ] = {}
+        self._relay_arenas: dict[tuple[str, ProductKind, torch.dtype, int], torch.Tensor] = {}
         self._relay_slots: dict[
             tuple[str, int, int, ProductKind, torch.dtype, int], _DeviceSlot
         ] = {}
-        self._relay_operation_lanes: dict[
-            tuple[str, int, RequestKey, int], int
-        ] = {}
+        self._relay_operation_lanes: dict[tuple[str, int, RequestKey, int], int] = {}
 
         # Logical references point at generation-tagged physical writes. The
         # shared event pool owns readiness events until every reader releases.
         self.event_pool = DeviceEventPool() if event_pool is None else event_pool
         self._entries: dict[_ReferenceKey, DeviceProductWrite] = {}
         self._candidates: dict[int, DeviceProductWrite] = {}
+        self._imports: dict[_ReferenceKey, _ProductMaterialization] = {}
         self._operation_writes: dict[
             _OperationKey,
             DeviceProductWrite | list[DeviceProductWrite],
@@ -339,10 +404,32 @@ class DeviceProducts:
         self._binding_token = object()
         self._lock = RLock()
 
+    def resident_bytes(self, device: torch.device | str) -> int:
+        """Return retained backing bytes on a device, counting shared arenas once."""
+
+        name = str(torch.device(device))
+        with self._lock:
+            tensors = [
+                tensor for (owner, _dtype), tensor in self._scalar_arenas.items() if owner == name
+            ]
+            tensors.extend(
+                tensor
+                for (owner, _kind, _dtype, _width), tensor in self._relay_arenas.items()
+                if owner == name
+            )
+            tensors.extend(
+                slot.tensor for slot in self._slots.get(name, ()) if slot.tensor is not None
+            )
+            storages = {
+                tensor.untyped_storage().data_ptr(): tensor.untyped_storage() for tensor in tensors
+            }
+            return sum(storage.nbytes() for storage in storages.values())
+
     def close(self) -> None:
         """Release all resident product slots, events, relay storage, and persistent bindings."""
 
         with self._lock:
+            self._imports.clear()
             self._entries.clear()
             self._candidates.clear()
             self._operation_writes.clear()
@@ -415,14 +502,18 @@ class DeviceProducts:
         bindings: tuple[tuple[ProductRef, torch.device | str], ...],
         *,
         request_slots: Mapping[RequestKey, int] | None = None,
-        buffer_placements: Mapping[BufferId, BufferPlacement] | None = None,
+        buffer_allocations: Mapping[BufferId, BufferAllocation] | None = None,
+        regions: Mapping[ProductRef, TensorRegion] | None = None,
+        shapes: Mapping[ProductRef, tuple[int, ...]] | None = None,
     ) -> tuple[DeviceProductWrite, ...]:
         """Reserve compatible device slots for operation outputs as one atomic binding batch."""
 
         return self.bind_output_batch(
             bindings,
             request_slots=request_slots,
-            buffer_placements=buffer_placements,
+            buffer_allocations=buffer_allocations,
+            regions=regions,
+            shapes=shapes,
         ).writes
 
     def bind_output_batch(
@@ -430,7 +521,9 @@ class DeviceProducts:
         bindings: tuple[tuple[ProductRef, torch.device | str], ...],
         *,
         request_slots: Mapping[RequestKey, int] | None = None,
-        buffer_placements: Mapping[BufferId, BufferPlacement] | None = None,
+        buffer_allocations: Mapping[BufferId, BufferAllocation] | None = None,
+        regions: Mapping[ProductRef, TensorRegion] | None = None,
+        shapes: Mapping[ProductRef, tuple[int, ...]] | None = None,
     ) -> DeviceProductBindingBatch:
         """Atomically bind outputs and retain their direct scalar range."""
 
@@ -442,6 +535,34 @@ class DeviceProducts:
         # group would make rollback and publication semantics ambiguous.
         for reference, _device in device_bindings:
             _validate_owner(reference)
+            region = None if regions is None else regions.get(reference)
+            logical_shape = (
+                _device_shape(reference)
+                if shapes is None
+                else shapes.get(reference, _device_shape(reference))
+            )
+            bounds = reference.shape_bound.dims
+            if (
+                shapes is not None
+                and reference in shapes
+                and (
+                    len(logical_shape) != len(bounds)
+                    or any(
+                        extent < 1
+                        or (
+                            extent != dim.extent
+                            if isinstance(dim, StaticDim)
+                            else extent > dim.bound
+                        )
+                        for extent, dim in zip(logical_shape, bounds, strict=True)
+                    )
+                )
+            ):
+                raise invalid_descriptor("tensor binding shape disagrees with its logical bounds")
+            if region is not None and (
+                reference.kind is not ProductKind.TENSOR or not region.within(logical_shape)
+            ):
+                raise invalid_descriptor("tensor binding region disagrees with its logical bounds")
         relay = tuple(
             reference.storage_class is StorageClass.REQUEST_RELAY
             for reference, _device in device_bindings
@@ -457,14 +578,14 @@ class DeviceProducts:
         )
         if any(persistent):
             if not all(persistent):
-                raise invalid_descriptor(
-                    "persistent-buffer bindings cannot share a generic group"
-                )
-            if buffer_placements is None:
-                raise invalid_descriptor("persistent output has no buffer placement")
+                raise invalid_descriptor("persistent-buffer bindings cannot share a generic group")
+            if buffer_allocations is None:
+                raise invalid_descriptor("persistent output has no buffer allocation")
             return self._bind_persistent_outputs(
                 device_bindings,
-                buffer_placements,
+                buffer_allocations,
+                regions,
+                shapes,
             )
         first_reference, first_raw_device = device_bindings[0]
         first_device_object = _resolved_device(first_raw_device)
@@ -598,7 +719,9 @@ class DeviceProducts:
     def _bind_persistent_outputs(
         self,
         bindings: tuple[tuple[ProductRef, torch.device | str], ...],
-        placements: Mapping[BufferId, BufferPlacement],
+        allocations: Mapping[BufferId, BufferAllocation],
+        regions: Mapping[ProductRef, TensorRegion] | None,
+        shapes: Mapping[ProductRef, tuple[int, ...]] | None,
     ) -> DeviceProductBindingBatch:
         """Bind logical outputs to caller-placed persistent buffers transactionally."""
 
@@ -606,33 +729,31 @@ class DeviceProducts:
             (
                 reference,
                 _resolved_device(device),
-                _device_shape(reference),
+                regions[reference].shape
+                if regions is not None and reference in regions
+                else (
+                    _device_shape(reference)
+                    if shapes is None
+                    else shapes.get(reference, _device_shape(reference))
+                ),
                 _device_dtype(reference.dtype),
             )
             for reference, device in bindings
         )
-        keys = tuple(
-            _reference_key(reference)
-            for reference, _device, _shape, _dtype in requested
-        )
+        keys = tuple(_reference_key(reference) for reference, _device, _shape, _dtype in requested)
         if len(set(keys)) != len(keys):
-            raise invalid_descriptor(
-                "persistent-buffer registration repeats an output identity"
-            )
+            raise invalid_descriptor("persistent-buffer registration repeats an output identity")
         with self._lock:
             # Completed candidates release their slots before capacity planning.
             self._reclaim_ready_locked()
             candidate_keys = {
-                _reference_key(candidate.reference)
-                for candidate in self._candidates.values()
+                _reference_key(candidate.reference) for candidate in self._candidates.values()
             }
-            for (reference, _device, _shape, _dtype), key in zip(
-                requested, keys, strict=True
-            ):
+            for (reference, _device, _shape, _dtype), key in zip(requested, keys, strict=True):
                 if key in self._entries or key in candidate_keys:
                     raise invalid_descriptor("persistent output is already registered")
-                if reference.buffer_id not in placements:
-                    raise invalid_descriptor("persistent output has no buffer placement")
+                if reference.buffer_id not in allocations:
+                    raise invalid_descriptor("persistent output has no buffer allocation")
             slots: list[_DeviceSlot] = []
             reclaimed = False
             try:
@@ -651,19 +772,35 @@ class DeviceProducts:
             try:
                 # PersistentBuffers owns each tensor allocation; the product
                 # slot carries its generation and unpublished write lease.
-                for (reference, device, shape, dtype), slot in zip(
-                    requested, slots, strict=True
-                ):
+                for (reference, device, shape, dtype), slot in zip(requested, slots, strict=True):
+                    allocation = allocations[reference.buffer_id]
+                    region = None if regions is None else regions.get(reference)
+                    logical_shape = (
+                        _device_shape(reference)
+                        if shapes is None
+                        else shapes.get(reference, _device_shape(reference))
+                    )
+                    if region == TensorRegion((0,) * len(logical_shape), logical_shape):
+                        region = None
+                    # Full reservations place shards at logical coordinates so
+                    # later consumers can fill holes without moving live bytes.
+                    full_storage = region is not None and allocation.bytes >= self._tensor_bytes(
+                        logical_shape, dtype
+                    )
                     binding = self.persistent_buffers.bind(
                         reference,
-                        placements[reference.buffer_id],
+                        allocation,
                         device=device,
                         dtype=dtype,
-                        shape=shape,
+                        shape=logical_shape if full_storage else shape,
                     )
                     generation = slot.generation + 1
                     slot.generation = 1 if generation > _MAX_GENERATION else generation
-                    slot.tensor = binding.tensor
+                    slot.tensor = (
+                        binding.tensor[region.slices()]
+                        if full_storage and region is not None
+                        else binding.tensor
+                    )
                     slot.shape = shape
                     slot.dtype = dtype
                     slot.persistent_buffer = binding
@@ -672,6 +809,8 @@ class DeviceProducts:
                         slot=slot,
                         physical_generation=slot.generation,
                         binding_id=self._next_binding_id,
+                        region=region,
+                        logical_shape=logical_shape,
                     )
                     self._next_binding_id += 1
                     slot.owner = write.binding_id
@@ -717,15 +856,12 @@ class DeviceProducts:
             requested_rows.append((reference, device, request_slot, dtype, field))
         requested = tuple(requested_rows)
         if any(
-            slot < 1
-            or slot > self.request_capacity
-            or math.prod(_device_shape(reference)) != 1
+            slot < 1 or slot > self.request_capacity or math.prod(_device_shape(reference)) != 1
             for reference, _device, slot, _dtype, _field in requested
         ):
             raise invalid_descriptor("request-relay output has invalid slot or scalar geometry")
         keys = tuple(
-            _reference_key(reference)
-            for reference, _device, _slot, _dtype, _field in requested
+            _reference_key(reference) for reference, _device, _slot, _dtype, _field in requested
         )
         if len(set(keys)) != len(keys):
             raise invalid_descriptor("request-relay registration repeats an output identity")
@@ -765,16 +901,12 @@ class DeviceProducts:
                         (
                             candidate
                             for candidate in range(self.relay_depth)
-                            if self._relay_lane_free_locked(
-                                str(device), request_slot, candidate
-                            )
+                            if self._relay_lane_free_locked(str(device), request_slot, candidate)
                         ),
                         None,
                     )
                     if lane is None:
-                        raise resource_error(
-                            "request-relay unresolved window is exhausted"
-                        )
+                        raise resource_error("request-relay unresolved window is exhausted")
                 operation_lanes[operation] = lane
 
             writes: list[DeviceProductWrite] = []
@@ -895,7 +1027,9 @@ class DeviceProducts:
         ],
         *,
         request_slots: Mapping[RequestKey, int] | None = None,
-        buffer_placements: Mapping[BufferId, BufferPlacement] | None = None,
+        buffer_allocations: Mapping[BufferId, BufferAllocation] | None = None,
+        regions: Mapping[ProductRef, TensorRegion] | None = None,
+        shapes: Mapping[ProductRef, tuple[int, ...]] | None = None,
     ) -> tuple[DeviceProductBindingBatch, ...]:
         """Atomically bind output groups while preserving direct producer ranges."""
 
@@ -908,7 +1042,9 @@ class DeviceProducts:
                             self.bind_output_batch(
                                 group,
                                 request_slots=request_slots,
-                                buffer_placements=buffer_placements,
+                                buffer_allocations=buffer_allocations,
+                                regions=regions,
+                                shapes=shapes,
                             )
                         )
             except BaseException:
@@ -1115,11 +1251,41 @@ class DeviceProducts:
         target = entry.slot.tensor
         if target is None:
             raise _invariant("device product has no physical tensor")
+        if entry.reference.kind is ProductKind.TENSOR:
+            if value.dtype != target.dtype:
+                raise invalid_descriptor("tensor product changes its declared dtype")
+            if entry.region is not None:
+                shape_matches = tuple(value.shape) == entry.region.shape
+            else:
+                bounds = entry.reference.shape_bound.dims
+                shape_matches = (
+                    value.numel() == 1
+                    if not bounds
+                    else len(value.shape) == len(bounds)
+                    and all(
+                        extent == bound.extent
+                        if isinstance(bound, StaticDim)
+                        else 0 < extent <= bound.bound
+                        for extent, bound in zip(value.shape, bounds, strict=True)
+                    )
+                )
+            if not shape_matches:
+                raise invalid_descriptor("tensor product changes its declared shape")
         flat = value.detach().reshape(-1)
         if flat.numel() > target.numel():
             raise _invariant("device product exceeds its registered shape bound")
-        view = target.reshape(-1)[: flat.numel()]
-        view.copy_(flat.to(dtype=target.dtype), non_blocking=value.device.type == "cuda")
+        view = (
+            target
+            if entry.region is not None
+            else target.reshape(-1)[: flat.numel()].reshape(value.shape)
+        )
+        source = value.detach()
+        if (
+            view.data_ptr() != source.data_ptr()
+            or view.dtype != source.dtype
+            or view.stride() != source.stride()
+        ):
+            view.copy_(source.to(dtype=target.dtype), non_blocking=value.device.type == "cuda")
         if target.device.type == "cuda":
             entry.producer_event, entry.producer_stream = self._producer_event_locked(
                 target.device,
@@ -1398,45 +1564,6 @@ class DeviceProducts:
 
         return self.consume_batch(((reference, consumer_op_id, device),))[0]
 
-    def consume_candidate(
-        self,
-        write: DeviceProductWrite,
-        *,
-        consumer_op_id: int,
-        device: torch.device | str | None = None,
-    ) -> DeviceProductRead:
-        """Read one unpublished candidate inside its producing lane."""
-
-        with self._lock:
-            entry = self._require_write_locked(write)
-            if self._candidates.get(entry.binding_id) is not entry:
-                raise _invariant("device-product candidate is not live")
-            if not entry.producer_recorded:
-                raise invalid_descriptor("device product was consumed before producer readiness")
-            storage = entry.slot.tensor
-            if storage is None:
-                raise _invariant("device product has no physical tensor")
-            target = storage.device if device is None else _resolved_device(device)
-            if target != storage.device:
-                raise invalid_descriptor("device product consumer names a different device")
-            if target.type == "cuda":
-                event = entry.producer_event
-                if event is None:
-                    raise _invariant("CUDA device product has no producer event")
-                stream = torch.cuda.current_stream(target)
-                if entry.producer_stream != int(stream.cuda_stream):
-                    stream.wait_event(event)
-            tensor = (
-                storage
-                if entry.actual_shape == entry.slot.shape
-                else storage.reshape(-1)[: entry.actual_extent].reshape(entry.actual_shape)
-            )
-            return DeviceProductRead(
-                tensor=tensor,
-                consumer_op_id=int(consumer_op_id),
-                _write=entry,
-            )
-
     def consume_batch(
         self,
         requests: tuple[
@@ -1512,11 +1639,14 @@ class DeviceProducts:
                             stream.wait_event(event)
                             shared_waited.add(identity)
 
+                for entry, _tensor, _consumer_op_id in shared_resolved:
+                    entry.readers += 1
                 return tuple(
                     DeviceProductRead(
                         tensor=tensor,
                         consumer_op_id=consumer_op_id,
                         _write=entry,
+                        region=entry.region,
                     )
                     for entry, tensor, consumer_op_id in shared_resolved
                 )
@@ -1579,16 +1709,39 @@ class DeviceProducts:
 
             reads = []
             for entry, tensor, _target, consumer_op_id in resolved:
+                entry.readers += 1
                 reads.append(
                     DeviceProductRead(
                         tensor=tensor,
                         consumer_op_id=consumer_op_id,
                         _write=entry,
+                        region=entry.region,
                     )
                 )
             return tuple(reads)
 
     def record_readers(
+        self,
+        reads: tuple[DeviceProductRead, ...],
+        *,
+        device: torch.device | str | None = None,
+        after_writes: tuple[DeviceProductWrite, ...] = (),
+    ) -> None:
+        """End read leases only after their consumer completion fences are installed."""
+
+        with self._lock:
+            pending = tuple(read for read in reads if not read._recorded)
+            if not pending:
+                return
+            self._record_reader_fences(pending, device=device, after_writes=after_writes)
+            for read in pending:
+                entry = self._require_read_locked(read)
+                entry.readers -= 1
+                read._recorded = True
+                if entry.released:
+                    self._wake_retirement_locked(entry)
+
+    def _record_reader_fences(
         self,
         reads: tuple[DeviceProductRead, ...],
         *,
@@ -1766,40 +1919,111 @@ class DeviceProducts:
                     entry.logical_references = 0
                     entry.released = True
 
-    def release_generations(self, generations: Iterable[int]) -> None:
-        """Release resident products addressed by scheduler-visible generations."""
+    def release_buffers(self, buffers: Iterable[BufferId]) -> None:
+        """Revoke exact buffer identities and preserve all active physical leases."""
 
-        requested = {int(generation) for generation in generations}
-        if not requested:
+        selected = set(buffers)
+        if not selected:
             return
         with self._lock:
-            for entry in self._entries.values():
-                if int(entry.reference.generation) not in requested:
-                    continue
-                self._detach_write_locked(entry)
-                entry.logical_references = 0
-                entry.released = True
+            for entry in (*self._entries.values(), *self._candidates.values()):
+                if entry.reference.buffer_id in selected:
+                    self._release_entry_locked(entry)
             self._reclaim_ready_locked()
 
-    def drop_request(
-        self,
-        request_id: int,
-        *,
-        retained_generations: frozenset[int] = frozenset(),
+    def release_requests(
+        self, requests: Iterable[RequestKey], *, retained: frozenset[BufferId] = frozenset()
     ) -> None:
-        """Release a request’s products except explicitly retained generations."""
+        """Revoke request-owned products while preserving transferred allocation ownership."""
+
+        selected = set(requests)
+        if not selected:
+            return
+        with self._lock:
+            for entry in (*self._entries.values(), *self._candidates.values()):
+                if entry.reference.request_key in selected:
+                    if entry.reference.buffer_id in retained:
+                        if not entry.reference.uses_persistent_buffer():
+                            raise invalid_descriptor("finish cannot retain request-slot storage")
+                    else:
+                        self._release_entry_locked(entry)
+            self._reclaim_ready_locked()
+
+    def retirement_ready(
+        self,
+        *,
+        buffers: frozenset[BufferId],
+        requests: frozenset[RequestKey],
+        retained: frozenset[BufferId] = frozenset(),
+    ) -> bool:
+        """Confirm selected allocations have returned after every physical reader."""
 
         with self._lock:
-            target_request_id = int(request_id)
-            for entry in self._entries.values():
-                if int(entry.reference.request_key.request_id) != target_request_id:
-                    continue
-                if int(entry.reference.generation) in retained_generations:
-                    continue
-                self._detach_write_locked(entry)
-                entry.logical_references = 0
-                entry.released = True
+            for entry in (*self._entries.values(), *self._candidates.values()):
+                if entry.reference.buffer_id in buffers or (
+                    entry.reference.request_key in requests
+                    and entry.reference.buffer_id not in retained
+                ):
+                    for transfer in entry.transfers:
+                        transfer.retirement_ready()
+                    for publication in entry.publications:
+                        if publication.done():
+                            publication.result()
             self._reclaim_ready_locked()
+            return not any(
+                entry.reference.buffer_id in buffers
+                or (
+                    entry.reference.request_key in requests
+                    and entry.reference.buffer_id not in retained
+                )
+                for entry in (*self._entries.values(), *self._candidates.values())
+            )
+
+    def _release_entry_locked(self, entry: DeviceProductWrite) -> None:
+        self._detach_write_locked(entry)
+        entry.logical_references = 0
+        entry.released = True
+        self._wake_retirement_locked(entry)
+        if not entry.producer_recorded:
+            for transfer in entry.transfers:
+                transfer.cancel()
+
+    def _wake_retirement_locked(self, entry: DeviceProductWrite) -> None:
+        readers = entry.reader_events
+        events = (
+            entry.producer_event,
+            *(readers if isinstance(readers, list) else (() if readers is None else (readers,))),
+        )
+        for event in events:
+            if event is not None and not event.query():
+                self.event_pool.schedule_completion_wake(entry.slot.device_name, event)
+
+    def retain_publication(self, write: DeviceProductWrite, retirement: Future[None]) -> None:
+        """Keep a published pool range immutable until its transport registration retires."""
+
+        with self._lock:
+            entry = self._require_write_locked(write)
+            retained = tuple(
+                publication
+                for publication in entry.publications
+                if not publication.done() or publication.exception() is not None
+            )
+            entry.publications = (*retained, retirement)
+
+    def retain_transfer(self, write: DeviceProductWrite, ticket: TransferTicket) -> None:
+        """Guard a reserved destination until its backend finishes physical access."""
+
+        with self._lock:
+            entry = self._require_write_locked(write)
+            if entry.producer_recorded or entry.released:
+                raise _invariant("transfer destination already has a producer")
+            entry.transfers = (*entry.transfers, ticket)
+
+        def reclaim() -> None:
+            with self._lock:
+                self._reclaim_ready_locked()
+
+        ticket.add_retirement_callback(reclaim)
 
     def abandon_writes(self, writes: tuple[DeviceProductWrite, ...]) -> None:
         """Return unpublished reserved writes without creating resident products."""
@@ -1812,6 +2036,179 @@ class DeviceProducts:
                     continue
                 entry.logical_references = 0
                 entry.released = True
+            self._reclaim_ready_locked()
+
+    def import_tensor(
+        self,
+        reference: ProductRef,
+        tensor: TensorTransfer,
+        *,
+        device: torch.device | str,
+        bindings: Mapping[tuple[WorkerEndpoint, str], Transport],
+        request_slots: Mapping[RequestKey, int],
+        buffer_allocations: Mapping[BufferId, BufferAllocation],
+        metadata: DeviceProductMetadata | None = None,
+    ) -> DeviceProductImport:
+        """Borrow resident coverage and fetch only missing immutable regions.
+
+        A shard can be expanded in place only when its scheduler reservation
+        contains the full logical tensor. Compact shard reservations remain
+        valid producer storage but cannot serve a full local consumer.
+        """
+
+        target_device = _resolved_device(device)
+        key = _reference_key(reference)
+        with self._lock:
+            pending = self._imports.get(key)
+            if pending is not None:
+                if (
+                    pending.write.reference != reference
+                    or pending.tensor.device != target_device
+                    or tuple(pending.tensor.shape) != tensor.shape
+                    or pending.metadata != metadata
+                ):
+                    raise invalid_descriptor(
+                        "product import conflicts with pending materialization"
+                    )
+                pending.users += 1
+                return DeviceProductImport(self, pending)
+            existing = self._entries.get(key)
+            missing: tuple[TensorRegion, ...]
+            full = TensorRegion((0,) * len(tensor.shape), tensor.shape)
+            if existing is not None:
+                write = self._require_locked(reference)
+                if write.released or not write.producer_recorded:
+                    raise invalid_descriptor("product import requires a live published generation")
+                if write.slot.device_name != str(target_device) or write.metadata != metadata:
+                    raise invalid_descriptor("product import conflicts with resident ownership")
+                storage = write.slot.tensor
+                assert storage is not None
+                if write.region is None:
+                    if write.actual_shape != tensor.shape:
+                        raise invalid_descriptor("product import changes resident tensor geometry")
+                    destination = (
+                        storage
+                        if tuple(storage.shape) == tensor.shape
+                        else storage.reshape(-1)[: write.actual_extent].reshape(tensor.shape)
+                    )
+                    missing = ()
+                else:
+                    persistent = write.slot.persistent_buffer
+                    if persistent is None or tuple(persistent.tensor.shape) != tensor.shape:
+                        raise invalid_descriptor(
+                            "product import exceeds its reserved logical storage"
+                        )
+                    destination = persistent.tensor
+                    if any(not ticket.retired() for ticket in write.transfers):
+                        raise resource_error("product storage has pending physical reads")
+                    missing = full.subtract(write.region)
+            else:
+                write = self.bind_outputs(
+                    ((reference, target_device),),
+                    request_slots=request_slots,
+                    buffer_allocations=buffer_allocations,
+                    shapes={reference: tensor.shape}
+                    if reference.kind is ProductKind.TENSOR
+                    else None,
+                )[0]
+                destination = self.producer_write_views((write,))[0]
+                destination = destination.reshape(-1)[: math.prod(tensor.shape)].reshape(
+                    tensor.shape
+                )
+                missing = (full,)
+            if str(destination.dtype).removeprefix("torch.") != tensor.dtype:
+                if existing is None:
+                    self.abandon_writes((write,))
+                raise invalid_descriptor("product import changes resident tensor dtype")
+            # This lease protects both existing readers and a not-yet-published
+            # destination through submission, cancellation and final adoption.
+            write.readers += 1
+            tickets: list[TransferTicket] = []
+
+            def retain(ticket: TransferTicket) -> None:
+                write.transfers = (*write.transfers, ticket)
+                tickets.append(ticket)
+
+                def reclaim() -> None:
+                    with self._lock:
+                        self._reclaim_ready_locked()
+
+                ticket.add_retirement_callback(reclaim)
+
+            try:
+                for region in missing:
+                    fetch_tensor(
+                        tensor,
+                        destination[region.slices()],
+                        bindings=bindings,
+                        region=region,
+                        retain=retain,
+                    )
+            except BaseException:
+                for ticket in tickets:
+                    ticket.cancel()
+                    ticket.close()
+                write.readers -= 1
+                if existing is None:
+                    self.abandon_writes((write,))
+                raise
+            materialization = _ProductMaterialization(
+                write,
+                destination,
+                tuple(tickets),
+                metadata,
+                users=1,
+                committed=existing is not None and write.region is None,
+            )
+            self._imports[key] = materialization
+            return DeviceProductImport(self, materialization)
+
+    def _commit_import(self, value: _ProductMaterialization) -> None:
+        with self._lock:
+            write = self._require_write_locked(value.write)
+            for ticket in value.tickets:
+                ticket.result()
+            if value.committed:
+                return
+            if not write.producer_recorded:
+                self.publish_write(write, value.tensor, metadata=value.metadata)
+                self.commit_writes((write,))
+            else:
+                # A new fence covers the original shard and every fetched hole.
+                # Existing read leases retain their original view and region.
+                if write.producer_event is not None:
+                    stream = torch.cuda.current_stream(value.tensor.device)
+                    stream.wait_event(write.producer_event)
+                    previous = write.producer_event
+                    write.producer_event, write.producer_stream = self._record_event_locked(
+                        value.tensor.device
+                    )
+                    self._retain_event_locked(write.producer_event, value.tensor.device)
+                    self._release_event_locked(previous)
+                write.slot.tensor = value.tensor
+                write.slot.shape = tuple(value.tensor.shape)
+                write.region = None
+                write.actual_shape = tuple(value.tensor.shape)
+                write.actual_extent = int(value.tensor.numel())
+            value.committed = True
+
+    def _release_import(self, value: _ProductMaterialization) -> None:
+        with self._lock:
+            write = self._require_write_locked(value.write)
+            if value.tensor.device.type == "cuda":
+                event, _stream = self._record_event_locked(value.tensor.device)
+                self._append_reader_event_locked(write, event, value.tensor.device)
+            value.users -= 1
+            if value.users:
+                return
+            self._imports.pop(_reference_key(write.reference))
+            for ticket in value.tickets:
+                if not value.committed:
+                    ticket.cancel()
+                ticket.close()
+            write.readers -= 1
+            if not write.producer_recorded:
+                self.abandon_writes((write,))
             self._reclaim_ready_locked()
 
     def physical_generation(self, reference: ProductRef) -> int:
@@ -2322,7 +2719,10 @@ class DeviceProducts:
                 for entry in entries:
                     self._append_reader_event_locked(entry, event, device)
         for read in aligned_reads:
+            read._write.readers -= 1
             read._recorded = True
+            if read._write.released:
+                self._wake_retirement_locked(read._write)
 
     def _reclaim_ready_locked(self) -> int:
         """Reclaim released writes whose producer and reader events are query-ready."""
@@ -2369,6 +2769,12 @@ class DeviceProducts:
             if (
                 entry.released
                 and entry.logical_references == 0
+                and entry.readers == 0
+                and all(transfer.retired() for transfer in entry.transfers)
+                and all(
+                    publication.done() and publication.exception() is None
+                    for publication in entry.publications
+                )
                 and ready(entry.producer_event)
                 and readers_ready(entry)
             ):
@@ -2396,6 +2802,12 @@ class DeviceProducts:
             if (
                 entry.released
                 and entry.logical_references == 0
+                and entry.readers == 0
+                and all(transfer.retired() for transfer in entry.transfers)
+                and all(
+                    publication.done() and publication.exception() is None
+                    for publication in entry.publications
+                )
                 and ready(entry.producer_event)
                 and readers_ready(entry)
             ):

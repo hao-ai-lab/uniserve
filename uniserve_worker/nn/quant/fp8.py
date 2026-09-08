@@ -9,7 +9,7 @@ projection contract.
 from __future__ import annotations
 
 from functools import partial
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import torch
 import torch.nn as nn
@@ -17,7 +17,11 @@ import torch.nn.functional as F
 
 from ...backends.triton import triton_available
 from ...foundation.errors import compute_error
-from .base import PreparedLinearInput, QuantizeMethodBase
+from .base import BlockScaleLayout, LinearMethod, PreparedLinearInput
+
+if TYPE_CHECKING:
+    from ..linear import LinearBase
+
 from .kv_cache import fp8_quantize, fp8_scale_from
 from .load_state import (
     Fp8LoadPhase,
@@ -92,7 +96,7 @@ if triton is not None:
         tl.store(scale_ptr + row, scale)
 
 
-class DynamicW8A8Fp8LinearMethod(QuantizeMethodBase):
+class DynamicW8A8Fp8LinearMethod(LinearMethod):
     """Runtime-quantized FP8 linear method with tokenwise or tensorwise scaling."""
 
     is_quantized = True
@@ -112,7 +116,7 @@ class DynamicW8A8Fp8LinearMethod(QuantizeMethodBase):
 
     def create_weights(
         self,
-        module: nn.Module,
+        module: LinearBase,
         *,
         input_size: int,
         output_size: int,
@@ -132,17 +136,15 @@ class DynamicW8A8Fp8LinearMethod(QuantizeMethodBase):
         module.register_buffer("weight_scale", None, persistent=False)
         from ...loader.weight_loaders import attach_weight_loader, default_weight_loader
 
-        attach_weight_loader(cast(nn.Parameter, module.weight), default_weight_loader)
+        attach_weight_loader(module.weight, default_weight_loader)
         if module.bias is not None:
-            attach_weight_loader(cast(nn.Parameter, module.bias), default_weight_loader)
+            attach_weight_loader(module.bias, default_weight_loader)
 
     @torch.no_grad()
-    def process_weights_after_loading(self, module: nn.Module) -> None:
+    def process_weights_after_loading(self, module: LinearBase) -> None:
         """Finalize loaded weights as E4M3 values with serving-time scales."""
 
-        from ..linear import LinearBase
-
-        linear = cast(LinearBase, module)
+        linear = module
 
         # Prequantized checkpoints must provide the scale that reconstructs weight values.
         if linear.weight.dtype == torch.float8_e4m3fn:
@@ -170,12 +172,10 @@ class DynamicW8A8Fp8LinearMethod(QuantizeMethodBase):
         )
         linear.weight_scale = scale.to(device=linear.weight.device, dtype=torch.float32)
 
-    def apply(self, module: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    def apply(self, module: LinearBase, x: torch.Tensor) -> torch.Tensor:
         """Apply dense or dynamically activation-quantized linear projection."""
 
-        from ..linear import LinearBase
-
-        linear = cast(LinearBase, module)
+        linear = module
         if linear.weight.dtype != torch.float8_e4m3fn:
             return F.linear(x, linear.weight, linear.execution_bias)
         if linear.weight_scale is None:
@@ -195,50 +195,9 @@ class DynamicW8A8Fp8LinearMethod(QuantizeMethodBase):
             tensorwise=self.tensorwise,
         )
 
-    def apply_prequantized(
-        self,
-        module: nn.Module,
-        x: torch.Tensor,
-        scale: torch.Tensor,
-        *,
-        output_dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """Multiply E4M3 activations with finalized E4M3 weights and explicit scales."""
-
-        from ..linear import LinearBase
-
-        linear = cast(LinearBase, module)
-        if linear.weight.dtype != torch.float8_e4m3fn or linear.weight_scale is None:
-            raise RuntimeError("prequantized FP8 execution requires finalized FP8 weights")
-        if x.dtype != torch.float8_e4m3fn:
-            raise RuntimeError("prequantized FP8 execution requires float8_e4m3fn activations")
-
-        original_shape = x.shape[:-1]
-        x_2d = x.reshape(-1, x.shape[-1])
-        expected_scale_shape = (1, 1) if self.tensorwise else (x_2d.shape[0], 1)
-        if tuple(scale.shape) != expected_scale_shape:
-            raise ValueError(
-                f"prequantized FP8 scale shape {tuple(scale.shape)} != {expected_scale_shape}"
-            )
-
-        # ``_scaled_mm`` expects B scales in contraction-output orientation.
-        scale_b = (
-            linear.weight_scale.reshape(1, 1)
-            if self.tensorwise
-            else _canonical_scale(linear.weight_scale, linear.weight.shape[0]).t().contiguous()
-        )
-        output = torch._scaled_mm(
-            x_2d,
-            linear.weight.t(),
-            scale_a=scale,
-            scale_b=scale_b,
-            out_dtype=_scaled_mm_output_dtype(output_dtype),
-        )
-        if linear.execution_bias is not None:
-            output = output + linear.execution_bias.to(device=output.device, dtype=output.dtype)
-        return output.reshape(*original_shape, linear.weight.shape[0])
-
-    def input_scale(self, x: torch.Tensor) -> torch.Tensor:
+    def input_scale(self, x: torch.Tensor, *, absmax: torch.Tensor | None = None) -> torch.Tensor:
+        if absmax is not None and self.tensorwise:
+            return fp8_scale_from(absmax.float(), dim=None).reshape(-1, 1)
         return fp8_scale_from(x.to(torch.float32), dim=None if self.tensorwise else 1).reshape(
             -1, 1
         )
@@ -247,25 +206,37 @@ class DynamicW8A8Fp8LinearMethod(QuantizeMethodBase):
         self,
         x: torch.Tensor,
         scale: torch.Tensor | None,
+        *,
+        block_scale_layout: BlockScaleLayout = "linear",
     ) -> PreparedLinearInput:
         if scale is None:
             raise ValueError("FP8 input preparation requires a shared activation scale")
-        return PreparedLinearInput(fp8_quantize(x.to(torch.float32), scale), global_scale=scale)
+        values = fp8_quantize(x.to(torch.float32), scale)
+        return (
+            PreparedLinearInput(values, tensor_scale=scale)
+            if self.tensorwise
+            else PreparedLinearInput(values, row_scales=scale)
+        )
 
     def apply_prepared(
         self,
-        module: nn.Module,
+        module: LinearBase,
         prepared: PreparedLinearInput,
         *,
         output_dtype: torch.dtype,
+        include_bias: bool = True,
     ) -> torch.Tensor:
-        from ..linear import LinearBase
-
-        linear = cast(LinearBase, module)
+        linear = module
         if linear.weight.dtype != torch.float8_e4m3fn or linear.weight_scale is None:
             raise RuntimeError("prepared FP8 GEMM requires finalized FP8 weights")
-        if prepared.global_scale is None:
-            raise ValueError("prepared FP8 input requires activation scales")
+        values = prepared.values
+        if values.dtype != torch.float8_e4m3fn or values.shape[-1] != linear.input_size:
+            raise ValueError("prepared FP8 input requires E4M3 values with the linear input width")
+        flat = values.reshape(-1, values.shape[-1])
+        scale = prepared.tensor_scale if self.tensorwise else prepared.row_scales
+        expected_shape = (1, 1) if self.tensorwise else (flat.shape[0], 1)
+        if scale is None or tuple(scale.shape) != expected_shape:
+            raise ValueError(f"prepared FP8 activation scale must have shape {expected_shape}")
         outputs = []
         offset = 0
         for index, rows in enumerate(linear.weight_output_partitions):
@@ -275,25 +246,24 @@ class DynamicW8A8Fp8LinearMethod(QuantizeMethodBase):
                 if self.tensorwise
                 else linear.weight_scale[offset : offset + rows].t().contiguous()
             )
-            if prepared.values.is_cuda:
+            if values.is_cuda:
                 output = torch._scaled_mm(
-                    prepared.values,
+                    flat,
                     weight.t(),
-                    scale_a=prepared.global_scale,
+                    scale_a=scale,
                     scale_b=weight_scale,
                     out_dtype=_scaled_mm_output_dtype(output_dtype),
                 )
             else:
-                output = (
-                    (prepared.values.float() * prepared.global_scale)
-                    @ (weight.float() * weight_scale.t()).t()
-                ).to(output_dtype)
+                output = ((flat.float() * scale) @ (weight.float() * weight_scale.t()).t()).to(
+                    output_dtype
+                )
             outputs.append(output)
             offset += rows
         output = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=-1)
-        if linear.execution_bias is not None:
+        if include_bias and linear.execution_bias is not None:
             output = output + linear.execution_bias.to(device=output.device, dtype=output.dtype)
-        return output
+        return output.reshape(*values.shape[:-1], linear.output_size)
 
 
 class W8A8Fp8LinearMethod(DynamicW8A8Fp8LinearMethod):
@@ -308,7 +278,7 @@ class W8A8Fp8LinearMethod(DynamicW8A8Fp8LinearMethod):
 
     def create_weights(
         self,
-        module: nn.Module,
+        module: LinearBase,
         *,
         input_size: int,
         output_size: int,
@@ -329,9 +299,7 @@ class W8A8Fp8LinearMethod(DynamicW8A8Fp8LinearMethod):
             "weight_scale",
             nn.Parameter(torch.ones(int(output_size), 1, dtype=torch.float32), requires_grad=False),
         )
-        from ..linear import LinearBase
-
-        linear = cast(LinearBase, module)
+        linear = module
         set_optional_checkpoint(linear.weight_scale, True)
         set_skip_serving_cast(linear.weight_scale, True)
         init_fp8_phase(module)
@@ -349,12 +317,10 @@ class W8A8Fp8LinearMethod(DynamicW8A8Fp8LinearMethod):
             cast(nn.Parameter, linear.weight_scale), partial(fp8_scale_loader, module=module)
         )
 
-    def process_weights_after_loading(self, module: nn.Module) -> None:
+    def process_weights_after_loading(self, module: LinearBase) -> None:
         """Validate prequantized weights or quantize a completed dense checkpoint."""
 
-        from ..linear import LinearBase
-
-        linear = cast(LinearBase, module)
+        linear = module
         weight = linear.weight
         weight_scale = cast(nn.Parameter, linear.weight_scale)
 
@@ -399,12 +365,10 @@ class W8A8Fp8LinearMethod(DynamicW8A8Fp8LinearMethod):
         weight_scale.data = scale.to(device=fp8_weight.device, dtype=torch.float32)
         set_fp8_scale_loaded(module, True)
 
-    def apply(self, module: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    def apply(self, module: LinearBase, x: torch.Tensor) -> torch.Tensor:
         """Apply the finalized projection through its dense or FP8 execution path."""
 
-        from ..linear import LinearBase
-
-        linear = cast(LinearBase, module)
+        linear = module
         weight = linear.weight
         if weight.dtype != torch.float8_e4m3fn:
             return F.linear(x, weight, linear.execution_bias)

@@ -16,6 +16,12 @@ from .facade import (
     rope,
     silu_and_mul,
 )
+from .modulation import (
+    gated_residual,
+    gated_residual_rms_norm,
+    gated_residual_rms_norm_fp8,
+    modulated_rms_norm,
+)
 from .requests import (
     AddRmsNormReq,
     AttentionReq,
@@ -32,9 +38,21 @@ from .requests import (
     VisibleEndAttention,
 )
 from .rope import apply_rotary_emb, apply_rotary_pos_emb, rotate_half
-from .silu import silu_and_mul_fp8
+from .silu import (
+    silu_and_mul_fp8,
+    value_first_swiglu,
+    value_first_swiglu_absmax,
+    value_first_swiglu_fp8,
+)
 
 __all__ = [
+    "modulated_rms_norm",
+    "gated_residual",
+    "gated_residual_rms_norm",
+    "gated_residual_rms_norm_fp8",
+    "value_first_swiglu",
+    "value_first_swiglu_absmax",
+    "value_first_swiglu_fp8",
     "AddRmsNormReq",
     "AttentionReq",
     "DenseAttention",

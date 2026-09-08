@@ -26,7 +26,11 @@ mod imp {
 
     impl DeathWatcher {
         /// Starts a pidfd watcher that wakes the engine when the child exits.
-        pub(crate) fn spawn(pid: u32, wake: WakeSender) -> Option<Self> {
+        pub(crate) fn spawn(
+            pid: u32,
+            wake: WakeSender,
+            startup_abort: Arc<AtomicBool>,
+        ) -> Option<Self> {
             // SAFETY: `pidfd_open` receives the PID of the child just spawned. A
             // negative return leaves liveness monitoring to the caller's probe.
             let pidfd = unsafe {
@@ -40,7 +44,7 @@ mod imp {
             let stop_thread = Arc::clone(&stop);
             let handle = std::thread::Builder::new()
                 .name("uniserve-worker-death".into())
-                .spawn(move || run(pidfd, &stop_thread, &wake))
+                .spawn(move || run(pidfd, &stop_thread, &wake, &startup_abort))
                 .ok()?;
             Some(Self {
                 stop,
@@ -50,7 +54,7 @@ mod imp {
     }
 
     /// Polls the process descriptor until exit or an explicit watcher stop.
-    fn run(pidfd: libc::c_int, stop: &AtomicBool, wake: &WakeSender) {
+    fn run(pidfd: libc::c_int, stop: &AtomicBool, wake: &WakeSender, startup_abort: &AtomicBool) {
         loop {
             if stop.load(Ordering::Relaxed) {
                 break;
@@ -67,6 +71,9 @@ mod imp {
                 continue;
             }
             if n > 0 && (pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0 {
+                // Peers can be alive but waiting for this member during group
+                // initialization. Cancel that incomplete startup as one instance.
+                startup_abort.store(true, Ordering::Release);
                 // The child has exited. Fire the death wake once and stop; the
                 // executor reaps the zombie via its own `try_wait`.
                 wake.wake();
@@ -99,7 +106,11 @@ mod imp {
 
     impl DeathWatcher {
         /// Spawns a watcher that reports unexpected worker termination.
-        pub(crate) fn spawn(_pid: u32, _wake: WakeSender) -> Option<Self> {
+        pub(crate) fn spawn(
+            _pid: u32,
+            _wake: WakeSender,
+            _startup_abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ) -> Option<Self> {
             // No pidfd equivalent off Linux; death is caught by the bounded
             // liveness probe instead.
             None

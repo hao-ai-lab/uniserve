@@ -8,7 +8,7 @@ use uniserve_core::{
     TriggerPolicyDescriptor, UndVisibility,
 };
 use uniserve_engine::{
-    AttentionBackend, ControlTokens, EngineLoop, Executor, TransferBackend, UniprocExecutor,
+    AttentionBackend, ControlTokens, EngineLoop, Executor, Worker, WorkerExecutor, WorkerId,
     WorkerProcessArgs,
 };
 
@@ -18,14 +18,15 @@ fn main() -> anyhow::Result<()> {
         .init();
     // pipeline_depth=2 exercises the descriptor ring with batches in flight.
     let worker_config = WorkerProcessArgs {
+        worker_id: "local".into(),
         stub: true,
         ..WorkerProcessArgs::default()
     };
-    let engine = UniprocExecutor::spawn(WorkerProcessArgs {
+    let engine = Worker::spawn(WorkerProcessArgs {
+        worker_id: "local".into(),
         python: "python3".into(),
         model: String::new(),
-        device: "cpu".into(),
-        world_size: 1,
+        ranks: uniserve_engine::WorkerConfig::model("cpu", 1, 2).ranks,
         pipeline_depth: 2,
         req_slot_cap: 1 << 20,
         resp_slot_cap: 8 << 20,
@@ -34,10 +35,12 @@ fn main() -> anyhow::Result<()> {
         max_batch_operations: 32,
         max_batch_tokens: 8192,
         attention_backend: AttentionBackend::Auto,
-        supported_ops: uniserve_worker_ipc::OpKind::ALL.to_vec(),
-        transfer_backend: TransferBackend::Inproc,
+        supported_ops: uniserve_worker_ipc::OpCode::ALL.to_vec(),
+        transfer: Default::default(),
         ..worker_config
     })?;
+    let engine =
+        WorkerExecutor::try_new(vec![(WorkerId("local".into()), engine)], Default::default())?;
     println!("info from worker: {:?}", engine.info());
 
     let ctrl = ControlTokens {

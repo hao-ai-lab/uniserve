@@ -1,18 +1,7 @@
 namespace uniserve.ipc;
 
-// Stable logical operation algebra used for pool capability and routing.
-enum OpKind : ubyte {
-  ArExtend,
-  ArDecode,
-  ArVerify,
-  EncoderExecute,
-  DiffusionPrepare,
-  DiffusionStep,
-  DiffusionDecode
-}
-
 // Physical worker execution modes. These never enter scheduler policy.
-enum RunKind : ubyte {
+enum OpCode : ubyte {
   ArExtend,
   ArDecode,
   ArVerify,
@@ -24,10 +13,12 @@ enum RunKind : ubyte {
   DiffusionPrepare,
   DiffusionStep,
   DiffusionFinalize,
-  DiffusionDecode
+  DiffusionDecode,
+  EncoderText,
+  MediaAppend
 }
 
-enum DType : ubyte { U8, U16, U32, I32, I64, F16, BF16, F32 }
+enum DType : ubyte { U8, U16, U32, I32, I64, F16, BF16, F32, I16 }
 enum FeatureKind : ubyte { Vision, Latent }
 enum TokenDelivery : ubyte { Inline, Relay }
 enum LogprobFormat : ubyte { PackedBytes, F32Values }
@@ -113,15 +104,20 @@ table KvCacheConfig {
   num_blocks:uint;
   num_layers:uint;
   num_kv_heads:uint;
+  total_kv_heads:uint;
+  kv_head_offset:uint;
   head_dim:uint;
   bytes_per_token:ulong;
   groups:[KvGroup];
   dtype:string;
 }
 
-table RankInfo {
+table WorkerEndpoint {
+  worker_id:string;
   rank:uint;
-  world_size:uint = 1;
+  node:string;
+  address_space:string;
+  incarnation:string;
 }
 
 table LocalSequence {}
@@ -138,21 +134,32 @@ table ParallelConfig {
 }
 enum ComponentDistribution:ubyte { Local, TemporalUnits }
 
-table ComponentInfo {
+table TensorSpec {
+  name:string;
+  dtype:DType;
+  extents:[uint];
+  dynamic_axis:int = -1;
+}
+
+table EntryInfo {
   name:string;
   ranks:[ulong];
   parallel_config:ParallelConfig;
   distribution:ComponentDistribution;
   units_per_rank:uint = 1;
+  outputs:[TensorSpec];
 }
 
 table WorkerInfo {
   model_name:string;
   weight_version:ulong;
-  rank:RankInfo;
+  endpoint:WorkerEndpoint;
+  device:string;
+  transfer_backends:[string];
+  world_size:uint = 1;
   configuration_id:string;
-  components:[ComponentInfo];
-  supported_ops:[OpKind];
+  components:[EntryInfo];
+  supported_ops:[OpCode];
   queue_depth:uint;
   max_batch_ops:uint;
   max_batch_tokens:uint;
@@ -273,6 +280,15 @@ table SelectedPointValue {
   max_points:uint;
 }
 
+table TensorBuffer {
+  buffer:BufferDescriptor;
+  dtype:DType;
+  extents:[uint];
+  dynamic_axis:int = -1;
+  base_point:uint;
+  max_points:uint;
+}
+
 union ValueReference {
   TokenValue,
   LogprobValue,
@@ -282,7 +298,8 @@ union ValueReference {
   ArtifactValue,
   CompletionValue,
   SamplingValue,
-  SelectedPointValue
+  SelectedPointValue,
+  TensorBuffer
 }
 
 table ValueRef { value:ValueReference; }
@@ -293,7 +310,8 @@ table Rng {
   draw_layout:DrawLayout;
 }
 
-table ArOpPayload {
+table OpPayload {
+  code:OpCode;
   max_points:uint;
   max_tokens:uint;
   max_kv_pages:uint;
@@ -306,57 +324,13 @@ table ArOpPayload {
   rng:Rng;
   control_seq:ulong;
 }
-
-table EncoderOpPayload {
-  max_points:uint;
-  max_tokens:uint;
-  max_kv_pages:uint;
-  max_latent_bytes:ulong;
-  max_completion_bytes:ulong;
-  max_transfer_bytes:ulong;
-  inputs:[ValueRef];
-  outputs:[ValueRef];
-  predicate:ValueRef;
-  rng:Rng;
-  control_seq:ulong;
-}
-
-table DiffusionOpPayload {
-  max_points:uint;
-  max_tokens:uint;
-  max_kv_pages:uint;
-  max_latent_bytes:ulong;
-  max_completion_bytes:ulong;
-  max_transfer_bytes:ulong;
-  inputs:[ValueRef];
-  outputs:[ValueRef];
-  predicate:ValueRef;
-  rng:Rng;
-  control_seq:ulong;
-}
-
-table TransferOpPayload {
-  max_points:uint;
-  max_tokens:uint;
-  max_kv_pages:uint;
-  max_latent_bytes:ulong;
-  max_completion_bytes:ulong;
-  max_transfer_bytes:ulong;
-  inputs:[ValueRef];
-  outputs:[ValueRef];
-  predicate:ValueRef;
-  rng:Rng;
-  control_seq:ulong;
-}
-
-union OpPayload { ArOpPayload, EncoderOpPayload, DiffusionOpPayload, TransferOpPayload }
 
 table Operation {
   request_key:RequestKey;
   op_id:ulong;
   parent:Checkpoint;
-  kind:RunKind;
-  payload:OpPayload;
+  entry:string (required);
+  payload:OpPayload (required);
 }
 
 table BlockTable {
@@ -377,11 +351,13 @@ table RowGeometry {
   request_pool_index:uint;
   seq_len:uint;
   query_len:uint;
+  write_kv:bool;
 }
 
-table LatentPlacement {
+table LatentParams {
   request_key:RequestKey;
   op_id:ulong;
+  // Both are empty/zero when fixed request tensors own the trajectory.
   page_table:[uint];
   latent_units:uint;
   height:uint;
@@ -390,14 +366,17 @@ table LatentPlacement {
   step_count:uint;
 }
 
-table DecodePlacement {
+enum MediaTrack : ubyte { Video, Audio }
+
+table DecodeRange {
   request_key:RequestKey;
   op_id:ulong;
+  track:MediaTrack;
   cursor:uint;
   max_units:uint;
 }
 
-table BufferPlacement {
+table BufferAllocation {
   buffer:BufferId;
   offset:ulong;
   bytes:ulong;
@@ -505,15 +484,23 @@ table FinishCommand {
   control_seq:ulong;
   cutoff:Checkpoint;
   reason:CloseReason;
+  retained_buffers:[BufferId];
 }
 
 table FreeCommand { buffer:BufferId; }
 
-union BatchCommand { StartCommand, CommitCommand, FinishCommand, FreeCommand }
+// Release rank-local request storage without selecting a semantic checkpoint.
+// The Runtime has terminated the request or another Worker owns its Finish cutoff.
+table RetireCommand {
+  request_key:RequestKey;
+  retained_buffers:[BufferId];
+}
+
+union BatchCommand { StartCommand, CommitCommand, FinishCommand, FreeCommand, RetireCommand }
 
 table BatchCommandEnvelope { command:BatchCommand; }
 
-// Static request admission and physical run placement.
+// Static request admission and physical run binding.
 
 table ArRequestParams {
   sampling:SamplingParams;
@@ -526,7 +513,7 @@ table UmmRequestParams { image:ImageParams; }
 
 table MediaGeometry {
   frame_count:uint;
-  decode_units:uint;
+  video_units:uint;
   prompt_tokens:uint;
   denoise_steps:uint;
 }
@@ -553,9 +540,9 @@ table Run {
   block_tables:[BlockTable];
   new_cache_pages:[CachePageAllocation];
   forward_rows:[RowGeometry];
-  latent_placements:[LatentPlacement];
-  decode_placements:[DecodePlacement];
-  buffer_placements:[BufferPlacement];
+  latent_params:[LatentParams];
+  decode_ranges:[DecodeRange];
+  buffer_allocations:[BufferAllocation];
   commands:[BatchCommandEnvelope];
   input_products:[ProductPayload];
 }
@@ -565,28 +552,31 @@ table Run {
 table RegistrationAck { visible:bool; }
 
 table BytesValue { bytes:[ubyte]; }
-table TransferLocator {
+table Locator {
+  source:WorkerEndpoint;
   transport:TransferTransportKind;
+  // Required for every transport: the publishing address-space incarnation.
   endpoint:string;
   key:ulong;
   name:string;
-  ready_header_bytes:uint;
-  ready_semaphore:string;
   publication_id:string;
   storage_handle:[ubyte];
   storage_size_bytes:ulong;
-  storage_offset_bytes:ulong;
-  tensor_offset:ulong;
+  storage_offsets_bytes:[ulong];
+  span_lengths:[ulong];
+  span_counts:[uint];
   tensor_stride:[long];
-  ref_counter_handle:[ubyte];
-  ref_counter_offset:ulong;
-  event_handle:[ubyte];
-  event_sync_required:bool;
   ready_event_handle:[ubyte];
   nbytes:ulong;
   dtype:string;
   shape:[ulong];
+  offset:[ulong];
   device:string;
+}
+
+table TensorTransfer {
+  shape:[ulong];
+  locations:[Locator];
 }
 
 table EncoderTransfer {
@@ -594,7 +584,7 @@ table EncoderTransfer {
   height:uint;
   width:uint;
   payload_kind:FeatureKind;
-  locator:TransferLocator;
+  tensor:TensorTransfer;
 }
 
 table DeviceProductTransfer {
@@ -602,19 +592,20 @@ table DeviceProductTransfer {
   height:uint;
   width:uint;
   value_range:string;
-  locator:TransferLocator;
+  tensor:TensorTransfer;
 }
 
 table KvTransfer {
   generation:uint;
-  locators:[TransferLocator];
+  tensors:[TensorTransfer];
   source:Checkpoint;
   destination:string;
   base:Checkpoint;
   base_extent:uint;
   published_extent:uint;
   group_id:uint;
-  scale_identity:string;
+  compute_dtype:string;
+  page_size:uint;
 }
 
 table LatentTransfer {
@@ -623,7 +614,7 @@ table LatentTransfer {
   width:uint;
   latent_units:uint;
   step:uint;
-  locator:TransferLocator;
+  tensor:TensorTransfer;
 }
 
 union TransferData { EncoderTransfer, DeviceProductTransfer, KvTransfer, LatentTransfer }
@@ -643,6 +634,7 @@ table RunResult {
   registration:RegistrationAck;
   worker_exec_us:ulong = null;
   forward_stats:WorkerForwardStats;
+  // Free/Finish/Retire acknowledgement follows operation fragments as an empty terminal result.
   done:bool;
 }
 

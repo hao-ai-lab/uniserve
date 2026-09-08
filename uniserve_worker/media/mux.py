@@ -6,8 +6,15 @@ import io
 from dataclasses import dataclass
 from fractions import Fraction
 from threading import RLock
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from av.audio.stream import AudioStream
+    from av.container.output import OutputContainer
+    from av.packet import Packet
+    from av.video.stream import VideoStream
 
 __all__ = ["AvMuxConfig", "AvMuxSession", "require_media_codecs"]
 
@@ -19,9 +26,7 @@ def require_media_codecs(video_codec: str, audio_codec: str) -> None:
         import av
     except ImportError as error:
         raise RuntimeError("media output requires the PyAV runtime") from error
-    missing = [
-        name for name in (video_codec, audio_codec) if name not in av.codecs_available
-    ]
+    missing = [name for name in (video_codec, audio_codec) if name not in av.codecs_available]
     if missing:
         raise RuntimeError(f"media output is missing required encoders {missing!r}")
     for name in (video_codec, audio_codec):
@@ -56,10 +61,7 @@ class AvMuxConfig:
             < 1
         ):
             raise ValueError("media mux geometry and rates must be positive")
-        if (
-            not self.video_unit_frames
-            or sum(self.video_unit_frames) != self.frame_count
-        ):
+        if not self.video_unit_frames or sum(self.video_unit_frames) != self.frame_count:
             raise ValueError("media mux decode units must cover the output frame count")
 
 
@@ -71,13 +73,13 @@ class AvMuxSession:
 
         self.config = config
         self._buffer = io.BytesIO()
-        self._container = None
-        self._video = None
-        self._audio = None
+        self._container: OutputContainer | None = None
+        self._video: VideoStream | None = None
+        self._audio: AudioStream | None = None
         self._next_unit = 0
         self._video_frames = 0
         self._audio_written = False
-        self._audio_packets: list[object] = []
+        self._audio_packets: list[Packet] = []
         self._closed = False
         self._video_lock = RLock()
         self._audio_lock = RLock()
@@ -95,12 +97,16 @@ class AvMuxSession:
             # be the first to initialize their shared mux destination.
             config = self.config
             container = av.open(self._buffer, mode="w", format="mp4")
-            video = container.add_stream(config.video_codec, rate=config.frame_rate)
+            video = cast(
+                "VideoStream", container.add_stream(config.video_codec, rate=config.frame_rate)
+            )
             video.width = config.width
             video.height = config.height
             video.pix_fmt = "yuv420p"
             video.options = {"preset": "ultrafast", "tune": "zerolatency"}
-            audio = container.add_stream(config.audio_codec, rate=config.audio_rate)
+            audio = cast(
+                "AudioStream", container.add_stream(config.audio_codec, rate=config.audio_rate)
+            )
             audio.layout = "stereo"
             audio.sample_rate = config.audio_rate
             audio.bit_rate = 144_000
@@ -168,23 +174,19 @@ class AvMuxSession:
                 raise RuntimeError("audio stream was not initialized")
 
             # Align audio duration to the video timeline, truncating or zero-padding PCM.
-            target_samples = round(
-                config.frame_count * config.audio_rate / config.frame_rate
-            )
+            target_samples = round(config.frame_count * config.audio_rate / config.frame_rate)
             source = pcm[:target_samples]
             if source.shape[0] < target_samples:
                 source = np.pad(source, ((0, target_samples - source.shape[0]), (0, 0)))
 
             # Encode fixed-size planar frames; the final frame carries zero padding only.
-            packets: list[object] = []
+            packets: list[Packet] = []
             pts = 0
             for start in range(0, target_samples, config.audio_frame_samples):
                 stop = min(start + config.audio_frame_samples, target_samples)
                 planar = np.zeros((2, config.audio_frame_samples), dtype=np.int16)
                 planar[:, : stop - start] = source[start:stop].T
-                frame = av.AudioFrame.from_ndarray(
-                    planar, format="s16p", layout="stereo"
-                )
+                frame = av.AudioFrame.from_ndarray(planar, format="s16p", layout="stereo")
                 frame.sample_rate = config.audio_rate
                 frame.pts = pts
                 frame.time_base = Fraction(1, config.audio_rate)

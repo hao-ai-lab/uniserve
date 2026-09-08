@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from collections.abc import Sequence
 from dataclasses import replace
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import torch
 
@@ -14,12 +14,12 @@ from uniserve_worker.execution.batch import (
     DrawLayout,
     FinishFlags,
     LogicalLengths,
+    OpCode,
     Operation,
     OpStatus,
     ProductKind,
     ProductPayload,
     ProductRef,
-    RunKind,
     SamplingParams,
     SamplingState,
     TokenMode,
@@ -35,13 +35,12 @@ from uniserve_worker.loader.weight_set import WeightSet
 from uniserve_worker.runtime.device_products import (
     DeviceProductWrite,
 )
-from uniserve_worker.runtime.request import Request
+from uniserve_worker.runtime.request import RequestDraft
 
 from . import encode
 from . import sample as sampling
 from .cuda_graph import GraphGreedyOutput
 from .forward_batch import ModelPhase, TokenSelection, packed_tensor_views
-from .resources import ExecutionResources
 from .rng import DRAW_LAYOUT_TARGET, sampling_key, sampling_uniform
 from .rows import (
     DecodeRuntimePublication,
@@ -58,8 +57,11 @@ from .rows import (
     StateOutcome,
 )
 
+if TYPE_CHECKING:
+    from ..worker.worker import Worker
 
-def pack_forward(runtime: ExecutionResources, state: OperationState) -> tuple[object, ...]:
+
+def pack_forward(runtime: Worker, state: OperationState) -> tuple[ForwardRow, ...]:
     """Pack autoregressive extension, decode, or verification work into model-forward rows."""
 
     if state.phase != "initial":
@@ -68,7 +70,7 @@ def pack_forward(runtime: ExecutionResources, state: OperationState) -> tuple[ob
     operation = state.operation
     scope = state.lane
     request = runtime.request_row(scope, operation.request_key.request_id)
-    if request.sampling is None:
+    if request.request.sampling is None:
         raise invalid_descriptor("sequence operation has no admitted sampling state")
     mode = operation.kind.token_mode
     if mode is TokenMode.EXTEND and any(
@@ -77,8 +79,9 @@ def pack_forward(runtime: ExecutionResources, state: OperationState) -> tuple[ob
     ):
         return _pack_visual(runtime, state, request)
     start = int(request.logical_position)
+    tokens: tuple[int | torch.Tensor, ...]
     if mode is TokenMode.EXTEND:
-        if isinstance(operation.parent.point, DeviceSelected) and not any(
+        if isinstance(operation.state_parent.point, DeviceSelected) and not any(
             reference.kind is ProductKind.TOKEN for reference in operation.inputs
         ):
             tokens = (resolve_decode_token(runtime, operation, request, scope),)
@@ -96,7 +99,6 @@ def pack_forward(runtime: ExecutionResources, state: OperationState) -> tuple[ob
             scope,
         )
         state.data.update(
-            request=request,
             start=start,
             tokens=tokens,
             task=task,
@@ -114,9 +116,9 @@ def pack_forward(runtime: ExecutionResources, state: OperationState) -> tuple[ob
             TokenSelection.LAST_LOGITS,
             scope,
         )
-        state.data.update(request=request, start=start, task=task, mode="decode")
+        state.data.update(start=start, task=task, mode="decode")
     else:
-        if isinstance(operation.parent.point, DeviceSelected):
+        if isinstance(operation.state_parent.point, DeviceSelected):
             current = resolve_decode_token(runtime, operation, request, scope)
             draft = operation_token_ids(runtime, operation, scope)
         else:
@@ -138,7 +140,6 @@ def pack_forward(runtime: ExecutionResources, state: OperationState) -> tuple[ob
             scope,
         )
         state.data.update(
-            request=request,
             start=start,
             draft=draft,
             task=task,
@@ -150,12 +151,11 @@ def pack_forward(runtime: ExecutionResources, state: OperationState) -> tuple[ob
 
 
 def consume_forward(
-    runtime: ExecutionResources,
+    runtime: Worker,
     state: OperationState,
     outputs: tuple[torch.Tensor, ...],
 ) -> None:
     """Convert token-model outputs into sampling work, prompt log probabilities, or direct outcomes."""
-
 
     if state.phase != "forward_pending" or len(outputs) != 1:
         raise RuntimeError("token forward result is not aligned")
@@ -163,7 +163,7 @@ def consume_forward(
     scope = state.lane
     task = state.data["task"]
     mode = state.data["mode"]
-    request = state.data["request"]
+    request = runtime.request_row(state.lane, state.operation.request_key.request_id)
     start = state.data["start"]
     if mode == "visual":
         _consume_visual(runtime, state, outputs[0])
@@ -229,20 +229,21 @@ def pack_sample(state: OperationState) -> object | None:
     return state.sample
 
 
-def consume_sample(runtime: ExecutionResources, state: OperationState, value: object) -> None:
+def consume_sample(runtime: Worker, state: OperationState, value: object) -> None:
     """Publish sampled tokens, speculative selections, and request runtime transitions."""
-
 
     if state.phase != "sample_pending":
         raise RuntimeError("token sample result has no pending selection")
     sampled = sampling.sample_result(value)
     operation = state.operation
     scope = state.lane
-    request = state.data["request"]
+    request = runtime.request_row(state.lane, state.operation.request_key.request_id)
     start = state.data["start"]
     task = state.data["task"]
     mode = state.data["mode"]
     sample_work = state.sample
+    if sample_work is None:
+        raise RuntimeError("token sample result lost its pending sampling work")
     if mode == "visual":
         publish_token_product(runtime, operation, sampled, scope)
         request.rng_counter += 1
@@ -343,7 +344,7 @@ def consume_sample(runtime: ExecutionResources, state: OperationState, value: ob
             if accepted_device is None:
                 raise RuntimeError("speculative sampling lost its selected point")
             device_selected = accepted_device.to(dtype=torch.int32) + 1
-        scope.runtime_cache_lengths[int(request.request_pool_idx)] = device_selected + int(
+        scope.runtime_cache_lengths[int(request.request.request_pool_idx)] = device_selected + int(
             task.seq_len
         )
         publish_runtime_samples(
@@ -378,9 +379,8 @@ def consume_sample(runtime: ExecutionResources, state: OperationState, value: ob
 
 
 def _pack_visual(
-    runtime: ExecutionResources, state: OperationState, request: object
-) -> tuple[object, ...]:
-
+    runtime: Worker, state: OperationState, request: RequestDraft
+) -> tuple[ForwardRow, ...]:
     """Resolve image features and interleave them with prompt tokens for model execution."""
 
     operation = state.operation
@@ -393,9 +393,8 @@ def _pack_visual(
     if len(references) != 1:
         raise invalid_descriptor("visual extend requires exactly one feature product")
     reference = references[0]
-    read = runtime.consume_encoder_feature(
+    read = runtime.encoder_cache.consume(
         reference,
-        scope,
         consumer_op_id=operation.op_id,
         device=runtime.operation_device(operation),
     )
@@ -415,7 +414,7 @@ def _pack_visual(
             close_image=close_image,
             logits=sample_token,
         )
-        variant = RunKind.ENCODER_VISION
+        variant = OpCode.ENCODER_VISION
     else:
         task = encode.latent_state_row(
             runtime,
@@ -426,11 +425,10 @@ def _pack_visual(
             position,
             scope,
         )
-        variant = RunKind.ENCODER_LATENT
+        variant = OpCode.ENCODER_LATENT
     if task.query_tokens > int(operation.bounds.max_tokens):
         raise invalid_descriptor("image state query span exceeds the operation token bound")
     state.data.update(
-        request=request,
         start=position,
         task=task,
         mode="visual",
@@ -444,16 +442,16 @@ def _pack_visual(
     return state.rows
 
 
-def _consume_visual(
-    runtime: ExecutionResources, state: OperationState, output: torch.Tensor
-) -> None:
+def _consume_visual(runtime: Worker, state: OperationState, output: torch.Tensor) -> None:
     """Publish encoded visual features and update the request feature reference."""
 
     from . import flow
 
+    request = runtime.request_row(state.lane, state.operation.request_key.request_id)
+
     task = state.data["task"]
     scope = state.lane
-    if state.data["variant"] is RunKind.ENCODER_VISION:
+    if state.data["variant"] is OpCode.ENCODER_VISION:
         value = token_logits_or_hidden(output)
     else:
         flow.prediction(output)
@@ -461,15 +459,16 @@ def _consume_visual(
     commit_kv(runtime, task, task.query_tokens, scope)
     if state.data["sample_token"]:
         assert value is not None
-        flow = runtime.model.generation
+        generation = runtime.model.generation
         sample = build_sample_work(
             runtime,
             state.operation,
             value[-1],
-            state.data["request"],
+            request,
             scope,
             positions=(
-                state.data["start"] + max(1, 1 if flow is None else int(flow.rope_advance)),
+                state.data["start"]
+                + max(1, 1 if generation is None else int(generation.rope_advance)),
             ),
             request_pool_index=sampling.request_pool_index(task),
         )
@@ -480,11 +479,10 @@ def _consume_visual(
     _finish_visual(runtime, state)
 
 
-def _finish_visual(runtime: ExecutionResources, state: OperationState) -> None:
-
+def _finish_visual(runtime: Worker, state: OperationState) -> None:
     """Finalize visual feature publication and advance the encode operation state."""
 
-    request = state.data["request"]
+    request = runtime.request_row(state.lane, state.operation.request_key.request_id)
     position = state.data["start"]
     if state.data["close_image"]:
         flow = runtime.model.generation
@@ -502,7 +500,7 @@ def _finish_visual(runtime: ExecutionResources, state: OperationState) -> None:
 
 
 def decode_batch(
-    runtime: ExecutionResources,
+    runtime: Worker,
     operations: tuple[Operation, ...],
     scope: LaneState,
 ) -> tuple[Outcome, ...]:
@@ -658,9 +656,9 @@ def decode_batch(
 
 
 def _decode_forward_tasks(
-    runtime: ExecutionResources,
+    runtime: Worker,
     operations: tuple[Operation, ...],
-    requests: tuple[Request, ...],
+    requests: tuple[RequestDraft, ...],
     seq_lens: tuple[int, ...],
     weights: tuple[WeightSet, ...],
     starts: list[int],
@@ -669,6 +667,9 @@ def _decode_forward_tasks(
     """Build paged-decode forward rows and stage their runtime-owned scalar columns."""
 
     states = runtime.runtime_states
+    page_tables = runtime.req_to_token_pool
+    if page_tables is None:
+        raise RuntimeError("token decode requires request page tables")
     predicates = tuple(
         scope.predicate_values.get(runtime.operation_identity(operation))
         for operation in operations
@@ -676,10 +677,11 @@ def _decode_forward_tasks(
     request_indexed = (
         states is not None
         and states.device.type == "cuda"
-        and runtime.req_to_token_pool.page_tables.device == states.device
+        and page_tables.page_tables.device == states.device
         and all(value is not None and value[1] for value in predicates)
     )
     if request_indexed:
+        assert states is not None
         placeholder = states.future_input_tokens[0, :1]
         tasks: list[ForwardRow] = []
         for operation, request, seq_len, weight, predicate in zip(
@@ -690,7 +692,7 @@ def _decode_forward_tasks(
             predicates,
             strict=True,
         ):
-            if request.sampling is None or predicate is None:
+            if request.request.sampling is None or predicate is None:
                 raise RuntimeError("request-indexed decode lost its aligned row state")
             sampling_state = scope.sampling_states.get(
                 runtime.operation_identity(operation), SamplingState()
@@ -704,7 +706,7 @@ def _decode_forward_tasks(
                     token_ids=placeholder,
                     positions=placeholder,
                     selection=TokenSelection.LAST_LOGITS,
-                    request_pool_idx=int(request.request_pool_idx),
+                    request_pool_idx=int(request.request.request_pool_idx),
                     seq_len=int(seq_len),
                     write_kv=True,
                     causal=True,
@@ -744,9 +746,9 @@ def _decode_forward_tasks(
 
 
 def project_graph_decode(
-    runtime: ExecutionResources,
+    runtime: Worker,
     operations: tuple[Operation, ...],
-    requests: tuple[Request, ...],
+    requests: tuple[RequestDraft, ...],
     seq_lens: tuple[int, ...],
     tasks: tuple[ForwardRow, ...],
     starts: list[int],
@@ -778,14 +780,14 @@ def project_graph_decode(
 
     token_writes: list[DeviceProductWrite] = []
     for operation, request, task in zip(operations, requests, tasks, strict=True):
-        parameters = request.sampling
+        parameters = request.request.sampling
         state = scope.sampling_states.get(runtime.operation_identity(operation), SamplingState())
         finish_token_ids = (
-            request.finish_token_ids
+            request.request.finish_token_ids
             if not state.finish_token_ids
             else state.finish_token_ids
-            if not request.finish_token_ids
-            else tuple(sorted({*request.finish_token_ids, *state.finish_token_ids}))
+            if not request.request.finish_token_ids
+            else tuple(sorted({*request.request.finish_token_ids, *state.finish_token_ids}))
         )
         write = scope.token_writes.get(runtime.operation_identity(operation))
         if (
@@ -825,9 +827,9 @@ def project_graph_decode(
     states = runtime.runtime_states
     if states is None:
         raise RuntimeError("graph decode has no request runtime-state owner")
-    slots = tuple(int(request.request_pool_idx) for request in requests)
+    slots = tuple(int(request.request.request_pool_idx) for request in requests)
     if any(
-        operation.request_key != request.request_key
+        operation.request_key != request.request.request_key
         for operation, request in zip(
             operations,
             requests,
@@ -877,8 +879,8 @@ def project_graph_decode(
 
 
 def prompt_logprob_details(
-    runtime: ExecutionResources,
-    request: Request,
+    runtime: Worker,
+    request: RequestDraft,
     start: int,
     tokens: torch.Tensor,
     logits: torch.Tensor,
@@ -892,7 +894,7 @@ def prompt_logprob_details(
     states = runtime.runtime_states
     if states is None:
         raise unsupported_setup("prompt scoring has no request-indexed runtime state")
-    slot = int(request.request_pool_idx)
+    slot = int(request.request.request_pool_idx)
     if start == 0:
         score_logits = logits[:-1]
         targets = tokens[1:]
@@ -952,11 +954,11 @@ def prompt_logprob_details(
 
 
 def token_outcome(
-    runtime: ExecutionResources,
+    runtime: Worker,
     operation: Operation,
     scope: LaneState,
     *,
-    request: Request | None = None,
+    request: RequestDraft | None = None,
     task: ForwardRow | None = None,
     base: int,
     tokens: int,
@@ -990,9 +992,7 @@ def token_outcome(
         computed_len=initialized,
     )
     visible = visible_value
-    token_len = (
-        request.logical_position if selection is None else selection.base_logical_position
-    )
+    token_len = request.logical_position if selection is None else selection.base_logical_position
     if sample is not None and selection is not None:
         _publish_selection_products(
             runtime,
@@ -1004,11 +1004,11 @@ def token_outcome(
         status=OpStatus.OK,
         selected_point=(1 if selection is None else 0),
         logical_lengths=LogicalLengths(
-            token_len=cast(int, token_len),
-            kv_visible_len=cast(int, visible),
+            token_len=token_len,
+            kv_visible_len=visible,
             kv_computed_len=lengths.kv_computed_len,
         ),
-        token_span=TokenSpan(base=base, len=cast(int, tokens)),
+        token_span=TokenSpan(base=base, len=tokens),
         finish_flags=FinishFlags(),
         product_generations=runtime.output_generations(operation),
         committed_tokens=committed_tokens,
@@ -1019,9 +1019,9 @@ def token_outcome(
 
 
 def token_task(
-    runtime: ExecutionResources,
+    runtime: Worker,
     operation: Operation,
-    request: Request,
+    request: RequestDraft,
     token_ids: tuple[int | torch.Tensor, ...],
     positions: tuple[int, ...] | torch.Tensor,
     selection: TokenSelection,
@@ -1073,7 +1073,7 @@ def token_task(
 
 
 def commit_kv(
-    runtime: ExecutionResources,
+    runtime: Worker,
     task: ForwardRow,
     tokens: int,
     scope: LaneState,
@@ -1088,14 +1088,17 @@ def commit_kv(
     if count == 0:
         return
     resulting = int(task.seq_len) + count
-    if resulting > runtime.req_to_token_pool.allocated_length(task.request_pool_idx):
+    page_tables = runtime.req_to_token_pool
+    if page_tables is None:
+        raise RuntimeError("KV commit requires request page tables")
+    if resulting > page_tables.allocated_length(task.request_pool_idx):
         raise RuntimeError("KV task exceeds its scheduler block table")
     if publish_runtime and runtime.runtime_states is not None:
         scope.runtime_cache_lengths[int(task.request_pool_idx)] = resulting
 
 
 def operation_token_ids(
-    runtime: ExecutionResources,
+    runtime: Worker,
     operation: Operation,
     scope: LaneState,
 ) -> tuple[int, ...]:
@@ -1116,14 +1119,14 @@ def operation_token_ids(
 
 
 def resolve_decode_token(
-    runtime: ExecutionResources,
+    runtime: Worker,
     operation: Operation,
-    request: Request,
+    request: RequestDraft,
     scope: LaneState,
 ) -> int | torch.Tensor:
     """Resolve one decode input token from an explicit value or device relay product."""
 
-    point = operation.parent.point
+    point = operation.state_parent.point
     if isinstance(point, DeviceSelected):
         predicate = scope.predicate_values.get(runtime.operation_identity(operation))
         if predicate is None:
@@ -1131,7 +1134,7 @@ def resolve_decode_token(
         states = runtime.runtime_states
         if states is None:
             raise unsupported_setup("device continuation has no request runtime state")
-        slot = int(request.request_pool_idx)
+        slot = int(request.request.request_pool_idx)
         pending = _pending_runtime_token(runtime, slot, scope)
         if pending is not None:
             return pending.reshape(-1)[:1].bitwise_and(sampling.TOKEN_VALUE_MASK)
@@ -1143,7 +1146,7 @@ def resolve_decode_token(
 
 
 def resolve_decode_tokens(
-    runtime: ExecutionResources,
+    runtime: Worker,
     operations: tuple[Operation, ...],
     scope: LaneState,
 ) -> tuple[int | torch.Tensor, ...]:
@@ -1151,7 +1154,7 @@ def resolve_decode_tokens(
 
     resolved: list[int | torch.Tensor | None] = [None] * len(operations)
     for index, operation in enumerate(operations):
-        point = operation.parent.point
+        point = operation.state_parent.point
         if isinstance(point, DeviceSelected):
             predicate = scope.predicate_values.get(runtime.operation_identity(operation))
             if predicate is None:
@@ -1160,7 +1163,7 @@ def resolve_decode_tokens(
             if states is None:
                 raise unsupported_setup("device continuation has no request runtime state")
             request = runtime.request_row(scope, operation.request_key.request_id)
-            slot = int(request.request_pool_idx)
+            slot = int(request.request.request_pool_idx)
             pending = _pending_runtime_token(runtime, slot, scope)
             resolved[index] = (
                 states.future_input_tokens[slot, :1]
@@ -1178,7 +1181,7 @@ def resolve_decode_tokens(
 
 
 def _pending_runtime_token(
-    runtime: ExecutionResources,
+    runtime: Worker,
     slot: int,
     scope: LaneState,
 ) -> torch.Tensor | None:
@@ -1198,7 +1201,7 @@ def _pending_runtime_token(
 
 
 def publish_token_product(
-    runtime: ExecutionResources,
+    runtime: Worker,
     operation: Operation,
     sample: SampleResult,
     scope: LaneState,
@@ -1227,9 +1230,9 @@ def publish_token_product(
 
 
 def publish_runtime_samples(
-    runtime: ExecutionResources,
+    runtime: Worker,
     operations: Sequence[Operation],
-    requests: Sequence[Request],
+    requests: Sequence[RequestDraft],
     samples: Sequence[SampleResult],
     *,
     scope: LaneState,
@@ -1255,7 +1258,7 @@ def publish_runtime_samples(
         raise RuntimeError("runtime sampling publication columns are not aligned")
     if decode_increment:
         if any(
-            operation.request_key != request.request_key
+            operation.request_key != request.request.request_key
             for operation, request in zip(operations, requests, strict=True)
         ):
             raise RuntimeError("runtime sampling publication crossed request rows")
@@ -1275,7 +1278,7 @@ def publish_runtime_samples(
                 raise RuntimeError("batched runtime sampling publication is not row-aligned")
             scope.runtime_publications.append(
                 DecodeRuntimePublication(
-                    slots=tuple(int(request.request_pool_idx) for request in requests),
+                    slots=tuple(int(request.request.request_pool_idx) for request in requests),
                     device_slots=batch_vectors.request_pool_indices,
                     tokens=batch_vectors.tokens,
                     predicates=batch_vectors.continuation,
@@ -1295,7 +1298,7 @@ def publish_runtime_samples(
         )
         scope.runtime_publications.append(
             DecodeRuntimePublication(
-                slots=tuple(int(request.request_pool_idx) for request in requests),
+                slots=tuple(int(request.request.request_pool_idx) for request in requests),
                 device_slots=sampling.sample_request_pool_indices(sample_tasks),
                 tokens=sampling.sample_result_vector(samples, "device_token"),
                 predicates=sampling.sample_result_vector(samples, "device_continuation"),
@@ -1315,7 +1318,7 @@ def publish_runtime_samples(
         sampling_positions,
         strict=True,
     ):
-        if operation.request_key != request.request_key:
+        if operation.request_key != request.request.request_key:
             raise RuntimeError("runtime sampling publication crossed request rows")
         token = sample.device_token
         predicate = sample.device_continuation
@@ -1331,7 +1334,7 @@ def publish_runtime_samples(
                 if accepted is None
                 else accepted.to(dtype=torch.int32) + 1
             )
-        slot = int(request.request_pool_idx)
+        slot = int(request.request.request_pool_idx)
         scope.runtime_publications.append(
             RuntimePublication(
                 slot=slot,
@@ -1348,7 +1351,7 @@ def publish_runtime_samples(
 
 
 def publish_token_products(
-    runtime: ExecutionResources,
+    runtime: Worker,
     operations: tuple[Operation, ...],
     samples: tuple[SampleResult, ...],
     scope: LaneState,
@@ -1396,7 +1399,7 @@ def publish_token_products(
 
 
 def _publish_selection_products(
-    runtime: ExecutionResources,
+    runtime: Worker,
     operation: Operation,
     sample: SampleResult,
     scope: LaneState,
@@ -1420,10 +1423,10 @@ def _publish_selection_products(
 
 
 def build_sample_work(
-    runtime: ExecutionResources,
+    runtime: Worker,
     operation: Operation,
     logits: torch.Tensor,
-    request: Request,
+    request: RequestDraft,
     scope: LaneState,
     *,
     positions: tuple[int, ...],
@@ -1440,14 +1443,14 @@ def build_sample_work(
         else parameters.allowed_token_ids
     )
     if not state.finish_token_ids:
-        finish_token_ids = request.finish_token_ids
-    elif not request.finish_token_ids:
+        finish_token_ids = request.request.finish_token_ids
+    elif not request.request.finish_token_ids:
         finish_token_ids = state.finish_token_ids
     else:
         finish_token_ids = tuple(
             sorted(
                 {
-                    *request.finish_token_ids,
+                    *request.request.finish_token_ids,
                     *state.finish_token_ids,
                 }
             )
@@ -1573,8 +1576,8 @@ def build_sample_work(
 
 
 def _request_penalty_base(
-    runtime: ExecutionResources,
-    request: Request,
+    runtime: Worker,
+    request: RequestDraft,
     vocab: int,
     device: torch.device,
 ) -> torch.Tensor:
@@ -1585,18 +1588,18 @@ def _request_penalty_base(
         raise RuntimeError("token sampling has no request runtime-state owner")
     if states.vocab_size != int(vocab) or states.device != device:
         raise unsupported_setup("sampling geometry disagrees with request runtime state")
-    return states.penalty_counts[int(request.request_pool_idx)]
+    return states.penalty_counts[int(request.request.request_pool_idx)]
 
 
 def _candidate_penalty_counts(
-    runtime: ExecutionResources,
-    request: Request,
+    runtime: Worker,
+    request: RequestDraft,
     committed: torch.Tensor,
     scope: LaneState,
 ) -> torch.Tensor:
     """Build penalty counts that combine committed history with speculative candidates."""
 
-    slot = int(request.request_pool_idx)
+    slot = int(request.request.request_pool_idx)
     counts = committed.clone()
     found = False
     for publication in scope.runtime_publications:
@@ -1656,12 +1659,12 @@ def token_logits(output: torch.Tensor) -> torch.Tensor:
     return output
 
 
-def require_sampling(request: Request) -> SamplingParams:
+def require_sampling(request: RequestDraft) -> SamplingParams:
     """Return the sampling parameters required by an autoregressive request."""
 
-    if request.sampling is None:
+    if request.request.sampling is None:
         raise invalid_descriptor("sequence execution requires admitted sampling parameters")
-    return request.sampling
+    return request.request.sampling
 
 
 def token_logits_or_hidden(output: torch.Tensor) -> torch.Tensor:

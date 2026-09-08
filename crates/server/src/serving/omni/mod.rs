@@ -13,7 +13,7 @@ use uniserve_core::{
     ContextSegment as CoreContextSegment, GenerationBehaviorDescriptor,
     GenerationCachePolicyDescriptor, GenerationConstraint, GenerationLimits,
     GenerationPolicyDescriptor, GenerationRequest, GenerationResourceBounds, ImageIngestRecipe,
-    ImageParams, ImageSegment as CoreImageSegment, RequestId, SamplingParams, SegmentPlacement,
+    ImageParams, ImageSegment as CoreImageSegment, RequestId, SamplingParams, SegmentPosition,
     UndVisibility,
 };
 
@@ -386,9 +386,7 @@ fn tokenize_sensenova_with_slots(
         .map(|(image, byte_offset)| -> OmniResult<RenderedImage> {
             let prefix = tokenizer
                 .encode(&clean[..byte_offset], false)
-                .map_err(|error| {
-                    format!("SenseNova image placement tokenization failed: {error}")
-                })?;
+                .map_err(|error| format!("SenseNova image params tokenization failed: {error}"))?;
             let position = prefix
                 .len()
                 .checked_sub(1)
@@ -400,7 +398,7 @@ fn tokenize_sensenova_with_slots(
             }
             let position = position
                 .try_into()
-                .map_err(|_| "SenseNova image placement exceeds the token range".to_string())?;
+                .map_err(|_| "SenseNova image params exceeds the token range".to_string())?;
             Ok(rendered_image(&image, position))
         })
         .collect::<OmniResult<Vec<_>>>()?;
@@ -464,10 +462,10 @@ fn tokenize_bagel_with_slots(
         .map(|(image, byte_offset)| {
             let position = tokenizer
                 .encode(&clean[..byte_offset], false)
-                .map_err(|error| format!("Bagel image placement tokenization failed: {error}"))?
+                .map_err(|error| format!("Bagel image params tokenization failed: {error}"))?
                 .len()
                 .try_into()
-                .map_err(|_| "Bagel image placement exceeds the token range".to_string())?;
+                .map_err(|_| "Bagel image params exceeds the token range".to_string())?;
             Ok(rendered_image(&image, position))
         })
         .collect::<OmniResult<Vec<_>>>()?;
@@ -891,7 +889,7 @@ fn assemble_context(
             image: CoreImageSegment {
                 hash: image.hash,
                 b64: image.b64,
-                placement: SegmentPlacement::AtToken {
+                position: SegmentPosition::AtToken {
                     position: image.position,
                 },
             },

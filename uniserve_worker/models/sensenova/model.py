@@ -3,16 +3,14 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from ...execution.batch import RunKind
-from ...execution.device_transfer import DeviceTransfer
+from ...execution.batch import OpCode
+from ...execution.device_transfer import call_on_device, tensor_to_device
 from ...execution.forward_batch import (
     AttentionMode,
     ExpertRoute,
@@ -21,11 +19,8 @@ from ...execution.forward_batch import (
     RouteSpan,
     TokenSelection,
 )
-from ...loader.handles import WeightHandle
-from ...loader.mapping import LoadReport, WeightNameMap, stacked_weight_name
-from ...loader.weight_loaders import load_parameter_weight
+from ...loader.mapping import WeightNameMap
 from ...nn.attention import RadixAttention
-from ...nn.decoder.qwen import Qwen3MLP
 from ...nn.diffusion import (
     ConvDecoder,
     FlowMatchingHead,
@@ -42,10 +37,12 @@ from ...nn.linear import (
     RowParallelLinear,
     local_attention_head_count,
     local_kv_head_count,
+    local_kv_head_offset,
 )
+from ...nn.mlp import GatedMLP
 from ...nn.norm import RMSNorm
-from ...nn.placement import WeightMode, set_tower_coord
 from ...nn.rope import HFRotaryEmbedding, RotaryEmbedding, get_rope, qk_norm_rope
+from ...nn.shard import WeightMode
 from ...nn.vision import NeoVitConfig, NeoVitEncoder
 from ...nn.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 from ..generation import (
@@ -70,11 +67,13 @@ from ..runtime import (
 )
 from .config import NeoChatConfig, NeoLlmConfig, NeoVisionConfig
 
+if TYPE_CHECKING:
+    from ...loader.component import CheckpointComponent, ModelBuildContext, ModelConstruction
+
+
 __all__ = ["NEOChatModel"]
 
 _MODEL_CODE_VERSION = "0.1.0"
-_TEXT_COORDINATE = 0
-_FLOW_COORDINATE = 1
 _MAX_VISION_TOKENS = 70 * 70
 _MAX_CFG_BRANCHES = 3
 _GENERATION_EPSILON = 0.02
@@ -99,19 +98,6 @@ _STACKED_WEIGHTS: WeightNameMap = (
 )
 
 
-def _scope_includes(name: str, scope: str) -> bool:
-    """Return whether a parameter name belongs to the selected checkpoint tower scope."""
-
-    if scope == "whole":
-        return True
-    generation = name.startswith("fm_modules.") or "_mot_gen." in name
-    if scope == "generation":
-        return generation
-    if scope == "understanding":
-        return not generation
-    raise ValueError(f"unknown SenseNova model scope {scope!r}")
-
-
 def _check_checkpoint_code_version(config: Any) -> None:
     """Validate the checkpoint-declared custom-code version when present."""
 
@@ -123,76 +109,6 @@ def _check_checkpoint_code_version(config: Any) -> None:
     required = raw.get("uniserve_sensenova_min_version")
     if required and Version(_MODEL_CODE_VERSION) < Version(str(required)):
         raise RuntimeError(f"checkpoint requires UniServe model code >= {required}")
-
-
-def _module_tensor(
-    module: nn.Module,
-    value: torch.Tensor,
-    *,
-    context: ForwardBatch,
-    transfers: DeviceTransfer,
-    coordinate: int,
-    target: torch.device,
-    call: Callable[[nn.Module, torch.Tensor, ForwardBatch], torch.Tensor],
-) -> torch.Tensor:
-    """Dispatch one tensor to a tower coordinate, execute its module, and restore its device."""
-
-    staged = transfers.dispatch(value, coordinate)
-    result = call(module, staged, context)
-    if not isinstance(result, torch.Tensor):
-        raise TypeError("SenseNova neural sublayer must return a tensor")
-    return transfers.combine(result, target)
-
-
-def _route_modules(
-    value: RoutedTensor,
-    *,
-    text_module: nn.Module,
-    flow_module: nn.Module,
-    context: ForwardBatch,
-    transfers: DeviceTransfer,
-    call: Callable[[nn.Module, torch.Tensor, ForwardBatch], torch.Tensor],
-) -> RoutedTensor:
-    """Execute text and flow tensors on their tower coordinates and combine outputs."""
-
-    def apply_text(item: torch.Tensor) -> torch.Tensor:
-        """Run the text branch on its tower coordinate and restore the caller device."""
-
-        return _module_tensor(
-            text_module,
-            item,
-            context=context,
-            coordinate=_TEXT_COORDINATE,
-            target=item.device,
-            call=call,
-            transfers=transfers,
-        )
-
-    def apply_flow(item: torch.Tensor) -> torch.Tensor:
-        """Run the flow branch on its tower coordinate and restore the caller device."""
-
-        return _module_tensor(
-            flow_module,
-            item,
-            context=context,
-            coordinate=_FLOW_COORDINATE,
-            target=item.device,
-            call=call,
-            transfers=transfers,
-        )
-
-    return value.map(apply_text, apply_flow)
-
-
-def _plain_call(
-    module: nn.Module,
-    value: torch.Tensor,
-    context: ForwardBatch,
-) -> torch.Tensor:
-    """Invoke a module without mesh-aware arguments."""
-
-    del context
-    return cast(torch.Tensor, module(value))
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,12 +206,12 @@ class _SenseAttention(nn.Module):
         layer: int,
         *,
         layer_config: LayerConfig,
-        transfers: DeviceTransfer = DeviceTransfer(),
+        generation_device: torch.device | None = None,
     ) -> None:
         """Build text and flow projection towers around one shared attention backend."""
 
         super().__init__()
-        self.transfers = transfers
+        self.generation_device = generation_device
         hidden_size = int(getattr(config, "hidden_size"))
         total_heads = int(getattr(config, "num_attention_heads"))
         total_kv_heads = int(getattr(config, "num_key_value_heads"))
@@ -311,6 +227,7 @@ class _SenseAttention(nn.Module):
             total_heads,
             total_kv_heads,
             layer_config=layer_config,
+            prefix="qkv_proj",
             bias=bias,
         )
         self.qkv_proj_mot_gen = QKVParallelLinear(
@@ -319,6 +236,8 @@ class _SenseAttention(nn.Module):
             total_heads,
             total_kv_heads,
             layer_config=layer_config,
+            prefix="qkv_proj_mot_gen",
+            packed_names=("q_proj_mot_gen", "k_proj_mot_gen", "v_proj_mot_gen"),
             bias=bias,
         )
         self.num_heads = int(self.qkv_proj.output_sizes[0]) // self.head_dim
@@ -332,12 +251,13 @@ class _SenseAttention(nn.Module):
             layer_id=layer,
         )
         self.o_proj = RowParallelLinear(
-            query_width, hidden_size, layer_config=layer_config, bias=bias
+            query_width, hidden_size, layer_config=layer_config, prefix="o_proj", bias=bias
         )
         self.o_proj_mot_gen = RowParallelLinear(
             query_width,
             hidden_size,
             layer_config=layer_config,
+            prefix="o_proj_mot_gen",
             bias=bias,
         )
 
@@ -362,16 +282,6 @@ class _SenseAttention(nn.Module):
             "max_position_embeddings_hw",
         )
         self.rotary_emb_hw = get_rope(config=spatial_config, keep_freq_range=True)
-
-        for module in (
-            self.qkv_proj_mot_gen,
-            self.o_proj_mot_gen,
-            self.q_norm_mot_gen,
-            self.q_norm_hw_mot_gen,
-            self.k_norm_mot_gen,
-            self.k_norm_hw_mot_gen,
-        ):
-            set_tower_coord(module, _FLOW_COORDINATE)
 
     def rope(self, indexes: torch.Tensor) -> _PackedRope:
         """Build temporal, height, and width rotary tables for ``[3, tokens]`` indexes."""
@@ -404,28 +314,15 @@ class _SenseAttention(nn.Module):
         generation: bool,
         context: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Project and rotate one route's QKV rows on its assigned tower coordinate."""
+        """Project and rotate one route's QKV rows on its declared component device."""
 
-        coordinate = _FLOW_COORDINATE if generation else _TEXT_COORDINATE
+        device = self.generation_device if generation else None
         target = hidden.device
-        staged = self.transfers.dispatch(hidden, coordinate)
+        staged = tensor_to_device(hidden, device)
         qkv_module = self.qkv_proj_mot_gen if generation else self.qkv_proj
         split_sizes = tuple(int(size) for size in qkv_module.output_sizes)
-        if generation and int(staged.shape[0]) == 1:
-            query_weight, key_weight, value_weight = qkv_module.weight.split(
-                split_sizes,
-                dim=0,
-            )
-            if qkv_module.bias is None:
-                query_bias = key_bias = value_bias = None
-            else:
-                query_bias, key_bias, value_bias = qkv_module.bias.split(
-                    split_sizes,
-                    dim=0,
-                )
-            query_flat = F.linear(staged, query_weight, query_bias)
-            key_flat = F.linear(staged, key_weight, key_bias)
-            value_flat = F.linear(staged, value_weight, value_bias)
+        if generation:
+            query_flat, key_flat, value_flat = qkv_module.forward_branches(staged)
         else:
             projected = qkv_module(staged)
             query_flat, key_flat, value_flat = projected.split(split_sizes, dim=-1)
@@ -437,8 +334,8 @@ class _SenseAttention(nn.Module):
         query_norm_hw = self.q_norm_hw_mot_gen if generation else self.q_norm_hw
         key_norm = self.k_norm_mot_gen if generation else self.k_norm
         key_norm_hw = self.k_norm_hw_mot_gen if generation else self.k_norm_hw
-        local_cos = tuple(self.transfers.dispatch(item, coordinate) for item in rope.cos)
-        local_sin = tuple(self.transfers.dispatch(item, coordinate) for item in rope.sin)
+        local_cos = tuple(tensor_to_device(item, device) for item in rope.cos)
+        local_sin = tuple(tensor_to_device(item, device) for item in rope.sin)
         query, key = qk_norm_rope(
             query,
             key,
@@ -450,9 +347,9 @@ class _SenseAttention(nn.Module):
             axis_dims=(self.head_dim // 2, self.head_dim // 4, self.head_dim // 4),
         )
         return (
-            self.transfers.combine(query, target),
-            self.transfers.combine(key, target),
-            self.transfers.combine(value, target),
+            tensor_to_device(query, target),
+            tensor_to_device(key, target),
+            tensor_to_device(value, target),
         )
 
     def forward(
@@ -496,13 +393,8 @@ class _SenseAttention(nn.Module):
             causal=causal,
             scale=self.scaling,
         ).reshape(query.shape[0], -1)
-        return _route_modules(
-            RoutedTensor.from_packed(attended, spans),
-            text_module=self.o_proj,
-            flow_module=self.o_proj_mot_gen,
-            context=context,
-            call=_plain_call,
-            transfers=self.transfers,
+        return RoutedTensor.from_packed(attended, spans).apply(
+            text=self.o_proj, flow=self.o_proj_mot_gen, generation_device=self.generation_device
         )
 
 
@@ -515,37 +407,38 @@ class _SenseLayer(nn.Module):
         layer: int,
         *,
         layer_config: LayerConfig,
-        transfers: DeviceTransfer = DeviceTransfer(),
+        generation_device: torch.device | None = None,
     ) -> None:
         """Assemble shared attention with route-specific norms and feed-forward towers."""
 
         super().__init__()
-        self.transfers = transfers
+        self.generation_device = generation_device
         hidden = int(getattr(config, "hidden_size"))
         epsilon = float(getattr(config, "rms_norm_eps"))
         self.self_attn = _SenseAttention(
-            config, layer, layer_config=layer_config, transfers=transfers
-        )
-        self.mlp = Qwen3MLP(
             config,
-            layer_config=layer_config,
+            layer,
+            layer_config=layer_config.child("self_attn"),
+            generation_device=generation_device,
+        )
+        self.mlp = GatedMLP(
+            hidden,
+            int(config.intermediate_size),
+            hidden_act=getattr(config, "hidden_act", "silu"),
+            layer_config=layer_config.child("mlp"),
             weight_mode=WeightMode.FUSED_GATE_UP_LINEAR,
         )
-        self.mlp_mot_gen = Qwen3MLP(
-            config,
-            layer_config=layer_config,
+        self.mlp_mot_gen = GatedMLP(
+            hidden,
+            int(config.intermediate_size),
+            hidden_act=getattr(config, "hidden_act", "silu"),
+            layer_config=layer_config.child("mlp_mot_gen"),
             weight_mode=WeightMode.FUSED_GATE_UP_LINEAR,
         )
         self.input_layernorm = RMSNorm(hidden, eps=epsilon)
         self.input_layernorm_mot_gen = RMSNorm(hidden, eps=epsilon)
         self.post_attention_layernorm = RMSNorm(hidden, eps=epsilon)
         self.post_attention_layernorm_mot_gen = RMSNorm(hidden, eps=epsilon)
-        for module in (
-            self.mlp_mot_gen,
-            self.input_layernorm_mot_gen,
-            self.post_attention_layernorm_mot_gen,
-        ):
-            set_tower_coord(module, _FLOW_COORDINATE)
 
     def forward(
         self,
@@ -558,13 +451,10 @@ class _SenseLayer(nn.Module):
     ) -> RoutedTensor:
         """Advance text and flow branches through one normalized attention-plus-MLP layer."""
 
-        normalized = _route_modules(
-            hidden,
-            text_module=self.input_layernorm,
-            flow_module=self.input_layernorm_mot_gen,
-            context=context,
-            call=_plain_call,
-            transfers=self.transfers,
+        normalized = hidden.apply(
+            text=self.input_layernorm,
+            flow=self.input_layernorm_mot_gen,
+            generation_device=self.generation_device,
         )
         hidden = hidden.add(
             self.self_attn(
@@ -575,21 +465,13 @@ class _SenseLayer(nn.Module):
                 causal=causal,
             )
         )
-        normalized = _route_modules(
-            hidden,
-            text_module=self.post_attention_layernorm,
-            flow_module=self.post_attention_layernorm_mot_gen,
-            context=context,
-            call=_plain_call,
-            transfers=self.transfers,
+        normalized = hidden.apply(
+            text=self.post_attention_layernorm,
+            flow=self.post_attention_layernorm_mot_gen,
+            generation_device=self.generation_device,
         )
-        feed_forward = _route_modules(
-            normalized,
-            text_module=self.mlp,
-            flow_module=self.mlp_mot_gen,
-            context=context,
-            call=_plain_call,
-            transfers=self.transfers,
+        feed_forward = normalized.apply(
+            text=self.mlp, flow=self.mlp_mot_gen, generation_device=self.generation_device
         )
         return hidden.add(feed_forward)
 
@@ -602,12 +484,12 @@ class _SenseDecoder(nn.Module):
         config: NeoLlmConfig,
         *,
         layer_config: LayerConfig,
-        transfers: DeviceTransfer = DeviceTransfer(),
+        generation_device: torch.device | None = None,
     ) -> None:
-        """Build the packed decoder and bind flow-specific modules to their mesh coordinate."""
+        """Build the packed decoder with the declared device for its flow components."""
 
         super().__init__()
-        self.transfers = transfers
+        self.generation_device = generation_device
         hidden = int(getattr(config, "hidden_size"))
         self.embed_tokens = VocabParallelEmbedding(
             int(getattr(config, "vocab_size")),
@@ -617,13 +499,17 @@ class _SenseDecoder(nn.Module):
             init_weights=False,
         )
         self.layers = nn.ModuleList(
-            _SenseLayer(config, index, layer_config=layer_config, transfers=transfers)
+            _SenseLayer(
+                config,
+                index,
+                layer_config=layer_config.child(f"layers.{index}"),
+                generation_device=generation_device,
+            )
             for index in range(int(getattr(config, "num_hidden_layers")))
         )
         epsilon = float(getattr(config, "rms_norm_eps"))
         self.norm = RMSNorm(hidden, eps=epsilon)
         self.norm_mot_gen = RMSNorm(hidden, eps=epsilon)
-        set_tower_coord(self.norm_mot_gen, _FLOW_COORDINATE)
 
     def forward(
         self,
@@ -678,13 +564,8 @@ class _SenseDecoder(nn.Module):
                 rope=rope,
                 causal=causal,
             )
-        return _route_modules(
-            hidden,
-            text_module=self.norm,
-            flow_module=self.norm_mot_gen,
-            context=context,
-            call=_plain_call,
-            transfers=self.transfers,
+        return hidden.apply(
+            text=self.norm, flow=self.norm_mot_gen, generation_device=self.generation_device
         ).packed(spans)
 
 
@@ -696,17 +577,20 @@ class _LanguageModel(nn.Module):
         config: NeoLlmConfig,
         *,
         layer_config: LayerConfig,
-        transfers: DeviceTransfer = DeviceTransfer(),
+        generation_device: torch.device | None = None,
     ) -> None:
         """Build the decoder and tensor-parallel vocabulary projection."""
 
         super().__init__()
-        self.transfers = transfers
-        self.model = _SenseDecoder(config, layer_config=layer_config, transfers=transfers)
+        self.generation_device = generation_device
+        self.model = _SenseDecoder(
+            config, layer_config=layer_config.child("model"), generation_device=generation_device
+        )
         self.lm_head = ParallelLMHead(
             int(getattr(config, "hidden_size")),
             int(getattr(config, "vocab_size")),
             layer_config=layer_config,
+            prefix="lm_head",
             bias=False,
         )
 
@@ -716,65 +600,83 @@ class NEOChatModel(ExecutionModel):
 
     ordered_collective_execution = True
 
-    def load_weights(
-        self,
-        weights: Iterable[WeightHandle],
-    ) -> LoadReport:
-        """Stream checkpoint tensors into the selected SenseNova tower scope."""
+    @classmethod
+    def build_checkpoint(
+        cls, config: dict[str, Any], context: ModelBuildContext
+    ) -> ModelConstruction:
+        """Interpret SenseNova configuration and declare its mapped checkpoint tensors."""
 
-        parameter_names = set(dict(self.named_parameters()))
-        included = {name for name in parameter_names if _scope_includes(name, self._load_scope)}
-        report = LoadReport()
-        for handle in weights:
-            source_name = handle.name
-            target_name, shard_id = stacked_weight_name(source_name, _STACKED_WEIGHTS)
-            if target_name not in parameter_names:
-                if source_name in parameter_names:
-                    target_name, shard_id = source_name, None
-                else:
-                    report.unexpected.append(source_name)
-                    continue
-            if target_name not in included:
-                continue
-            parameter = dict(self.named_parameters())[target_name]
-            load_parameter_weight(parameter, handle, shard_id)
-            report.loaded.add(target_name)
-        return report
+        from transformers import AutoTokenizer
 
-    def checkpoint_parameter_names(self) -> set[str]:
-        """List parameters belonging to the configured checkpoint tower scope."""
+        from ...loader.component import ModelConstruction
 
-        return {
-            name for name, _ in self.named_parameters() if _scope_includes(name, self._load_scope)
-        }
+        prepared = NeoChatConfig.from_dict(config)
+        _check_checkpoint_code_version(prepared)
+        model = cls(
+            prepared,
+            layer_config=context.packed_decoder_layers("model"),
+            generation_device=(
+                None
+                if context.request.execution.generation_device is None
+                else torch.device(context.request.execution.generation_device)
+            ),
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            context.root,
+            use_fast=False,
+            trust_remote_code=False,
+            local_files_only=True,
+        )
+        return ModelConstruction(model.checkpoint_components(), lambda: model, prepared, tokenizer)
+
+    def checkpoint_components(self) -> tuple[CheckpointComponent, ...]:
+        """Declare checkpoint projection mapping and branch-specific tensor devices."""
+
+        from ...loader.component import CheckpointComponent
+
+        return (
+            CheckpointComponent(
+                self,
+                weight_name_map=_STACKED_WEIGHTS,
+                module_devices=(
+                    ()
+                    if self.generation_device is None
+                    else tuple(
+                        (name, self.generation_device)
+                        for name, _ in self.named_modules()
+                        if name == "fm_modules" or name.endswith("_mot_gen")
+                    )
+                ),
+            ),
+        )
 
     def __init__(
         self,
         config: NeoChatConfig,
         *,
         layer_config: LayerConfig,
-        transfers: DeviceTransfer = DeviceTransfer(),
-        scope: str = "whole",
+        generation_device: torch.device | None = None,
     ) -> None:
-        """Construct selected SenseNova towers and publish their serving geometry."""
+        """Construct SenseNova neural components and publish their serving geometry."""
 
         super().__init__()
-        self.transfers = transfers
-        if scope not in {"whole", "understanding", "generation"}:
-            raise ValueError(f"unknown SenseNova model scope {scope!r}")
-        self._load_scope = scope
+        self.generation_device = generation_device
         vision = config.vision_config
         hidden = int(config.llm_config.hidden_size)
         self.vision_model = _VisionModel(vision)
-        self._parallel = layer_config.parallel
+        self._parallel = layer_config.communicator
         self.language_model = _LanguageModel(
-            config.llm_config, layer_config=layer_config, transfers=transfers
+            config.llm_config,
+            layer_config=layer_config.child("language_model"),
+            generation_device=generation_device,
         )
         self.fm_modules = nn.ModuleDict(
             {
                 "vision_model_mot_gen": _VisionModel(vision),
                 "timestep_embedder": TimestepEmbedder(hidden),
-                "fm_head": self._flow_head(config, hidden, layer_config),
+                "fm_head": self._flow_head(
+                    config, hidden, layer_config.child("fm_modules.fm_head")
+                ),
             }
         )
         self._patch_size = int(vision.patch_size)
@@ -787,7 +689,6 @@ class NEOChatModel(ExecutionModel):
         self._noise_scale_max = float(getattr(config, "noise_scale_max_value", 1.0))
         if self._add_noise_embedding:
             self.fm_modules["noise_scale_embedder"] = TimestepEmbedder(hidden)
-        set_tower_coord(self.fm_modules, _FLOW_COORDINATE)
         self._configure_runtime(config)
 
     @staticmethod
@@ -810,9 +711,9 @@ class NEOChatModel(ExecutionModel):
                 mlp_ratio=float(getattr(config, "fm_head_mlp_ratio")),
             )
         return nn.Sequential(
-            LinearBase(hidden, 4096, layer_config=layer_config, bias=True),
+            LinearBase(hidden, 4096, layer_config=layer_config, prefix="0", bias=True),
             nn.GELU(),
-            LinearBase(4096, output_dim, layer_config=layer_config, bias=True),
+            LinearBase(4096, output_dim, layer_config=layer_config, prefix="2", bias=True),
         )
 
     def _configure_runtime(self, config: NeoChatConfig) -> None:
@@ -824,7 +725,7 @@ class NEOChatModel(ExecutionModel):
         max_image = max(1, int(getattr(config, "max_image_seq_len", 4096)))
         latent_downsample = int(int(vision.patch_size) * round(1 / float(config.downsample_ratio)))
 
-        # Flow-head patch expansion determines latent placement, positional
+        # Flow-head patch expansion determines latent params, positional
         # coordinates, and scheduler-visible capacity units.
         self.architecture = "NEOChatModel"
         self.generation = GenerationPipeline(
@@ -893,6 +794,10 @@ class NEOChatModel(ExecutionModel):
                 int(llm.num_attention_heads), parallel=self._parallel
             ),
             num_kv_heads=local_kv_head_count(int(llm.num_key_value_heads), parallel=self._parallel),
+            total_kv_heads=int(llm.num_key_value_heads),
+            kv_head_offset=local_kv_head_offset(
+                int(llm.num_key_value_heads), parallel=self._parallel
+            ),
             head_dim=int(llm.head_dim),
             dtype="bfloat16",
             store_dtype="bfloat16",
@@ -906,16 +811,16 @@ class NEOChatModel(ExecutionModel):
         # transitions implemented by this runner.
         self.supported_work = frozenset(
             {
-                RunKind.AR_EXTEND,
-                RunKind.AR_DECODE,
-                RunKind.AR_VERIFY,
-                RunKind.DIFFUSION_PREPARE,
-                RunKind.DIFFUSION_STEP,
-                RunKind.ENCODER_VISION,
-                RunKind.DIFFUSION_FINALIZE,
-                RunKind.TRANSFER_PRODUCT,
-                RunKind.TRANSFER_KV_PUBLISH,
-                RunKind.TRANSFER_KV_INSTALL,
+                OpCode.AR_EXTEND,
+                OpCode.AR_DECODE,
+                OpCode.AR_VERIFY,
+                OpCode.DIFFUSION_PREPARE,
+                OpCode.DIFFUSION_STEP,
+                OpCode.ENCODER_VISION,
+                OpCode.DIFFUSION_FINALIZE,
+                OpCode.TRANSFER_PRODUCT,
+                OpCode.TRANSFER_KV_PUBLISH,
+                OpCode.TRANSFER_KV_INSTALL,
             }
         )
         self.max_vit_grid_tokens = _MAX_VISION_TOKENS
@@ -938,8 +843,8 @@ class NEOChatModel(ExecutionModel):
         target = batch.flow_latents[0].device
         pixels = torch.cat(tuple(value.pixels for value in typed), dim=0)
         grids = torch.cat(tuple(value.grid for value in typed), dim=0)
-        local_pixels = self.transfers.dispatch(pixels, _FLOW_COORDINATE)
-        local_grids = self.transfers.dispatch(grids, _FLOW_COORDINATE)
+        local_pixels = tensor_to_device(pixels, self.generation_device)
+        local_grids = tensor_to_device(grids, self.generation_device)
         tower = self.fm_modules["vision_model_mot_gen"]
         feature_dtype = next(tower.parameters()).dtype
         # Each flow row's image patch grid (height/patch, width/patch) is known
@@ -954,7 +859,7 @@ class NEOChatModel(ExecutionModel):
         features = tower(local_pixels.to(dtype=feature_dtype), local_grids, grid_shapes=grid_shapes)
         if not isinstance(features, torch.Tensor):
             raise TypeError("SenseNova flow vision tower must return a tensor")
-        features = self.transfers.combine(features, target)
+        features = tensor_to_device(features, target)
         expected = sum(batch.flow_image_tokens)
         if int(features.shape[0]) != expected:
             raise ValueError("SenseNova flow vision features do not match row geometry")
@@ -970,14 +875,11 @@ class NEOChatModel(ExecutionModel):
             ),
             dim=0,
         )
-        time_features = _module_tensor(
+        time_features = call_on_device(
             self.fm_modules["timestep_embedder"],
             timesteps,
-            context=batch,
-            coordinate=_FLOW_COORDINATE,
+            device=self.generation_device,
             target=target,
-            call=_plain_call,
-            transfers=self.transfers,
         )
         features = features + time_features
         if self._add_noise_embedding:
@@ -989,14 +891,11 @@ class NEOChatModel(ExecutionModel):
                 dim=0,
             )
             noise = noise / self._noise_scale_max
-            features = features + _module_tensor(
+            features = features + call_on_device(
                 self.fm_modules["noise_scale_embedder"],
                 noise,
-                context=batch,
-                coordinate=_FLOW_COORDINATE,
+                device=self.generation_device,
                 target=target,
-                call=_plain_call,
-                transfers=self.transfers,
             )
 
         # Restore the packed tower output to scheduler row identities.
@@ -1148,9 +1047,9 @@ class NEOChatModel(ExecutionModel):
         was_flat = latent.ndim == 2
         latent_batch = latent.unsqueeze(0) if was_flat else latent
         hidden_batch = hidden.unsqueeze(0)
-        local_hidden = self.transfers.dispatch(hidden_batch, _FLOW_COORDINATE)
-        local_latent = self.transfers.dispatch(latent_batch, _FLOW_COORDINATE)
-        local_timestep = self.transfers.dispatch(timestep.reshape(1), _FLOW_COORDINATE)
+        local_hidden = tensor_to_device(hidden_batch, self.generation_device)
+        local_latent = tensor_to_device(latent_batch, self.generation_device)
+        local_timestep = tensor_to_device(timestep.reshape(1), self.generation_device)
         batch, latent_tokens = int(local_latent.shape[0]), int(local_latent.shape[1])
         # Checkpoint metadata selects one of three equivalent prediction heads.
         if self._use_pixel_head:
@@ -1191,7 +1090,7 @@ class NEOChatModel(ExecutionModel):
         # Convert the predicted clean sample to the flow-matching velocity used
         # by the scheduler, with a bounded denominator at the terminal endpoint.
         velocity = (predicted - local_latent) / (1 - local_timestep).clamp_min(_GENERATION_EPSILON)
-        velocity = self.transfers.combine(velocity, target)
+        velocity = tensor_to_device(velocity, target)
         return velocity[0] if was_flat else velocity
 
     def encode(self, pixels: tuple[torch.Tensor, ...], batch: ForwardBatch) -> ForwardOutput:

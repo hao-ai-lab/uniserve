@@ -10,6 +10,75 @@ from uniserve_worker.execution.batch import Domain
 pytestmark = pytest.mark.unit
 
 
+@pytest.mark.parametrize("mesh", ["tower=gen:cuda:1", "tower=text:cuda;gen:cuda:1"])
+def test_flow_component_device_is_resolved_with_the_rank_device(mesh):
+    config = parse_worker_args(
+        [
+            "--service-name",
+            "component-devices",
+            "--ipc-payload-cap",
+            "65536",
+            "--max-batch-tokens",
+            "8192",
+            "--model",
+            "model",
+            "--device",
+            "cuda:0",
+            "--mesh",
+            mesh,
+        ]
+    )
+    assert config.execution.device == "cuda:0"
+    assert config.execution.generation_device == "cuda:1"
+
+
+@pytest.mark.parametrize("mesh", ["tower=text:cuda:2;gen:cuda:1", "tower=gen:cuda"])
+def test_expert_devices_reject_inconsistent_rank_or_repeated_devices(mesh):
+    with pytest.raises(SystemExit):
+        parse_worker_args(
+            [
+                "--service-name",
+                "component-devices",
+                "--ipc-payload-cap",
+                "65536",
+                "--max-batch-tokens",
+                "8192",
+                "--model",
+                "model",
+                "--device",
+                "cuda:0",
+                "--mesh",
+                mesh,
+            ]
+        )
+
+
+@pytest.mark.parametrize("allocator", ("expandable_segments:True", "backend:cudaMallocAsync"))
+def test_cuda_ipc_publication_rejects_nonexportable_allocations(
+    monkeypatch, allocator: str
+) -> None:
+    monkeypatch.setenv("PYTORCH_ALLOC_CONF", allocator)
+    with pytest.raises(SystemExit):
+        parse_worker_args(
+            [
+                "--service-name",
+                "cuda-publication",
+                "--ipc-payload-cap",
+                "65536",
+                "--model",
+                "model",
+                "--max-batch-tokens",
+                "8192",
+                "--device",
+                "cuda:0",
+                "--transfer-backends",
+                "shm,cuda_ipc",
+                "--publish-backends",
+                "shm,cuda_ipc",
+            ]
+        )
+
+
 def test_quantization_config_defaults_to_model_policy() -> None:
     config = parse_worker_args(
         [
@@ -46,8 +115,8 @@ def test_engine_batch_capacity_reaches_worker_resources() -> None:
         ]
     )
 
-    assert config.resources.max_batch_operations == 128
-    assert config.resources.max_batch_tokens == 16384
+    assert config.execution.max_batch_operations == 128
+    assert config.execution.max_batch_tokens == 16384
 
 
 def test_quantization_config_reaches_model_launch_config() -> None:

@@ -3,20 +3,20 @@
 use std::collections::BTreeMap;
 
 use flatbuffers::FlatBufferBuilder;
-use uniserve_core::{BlockId, KvCacheGroup, KvGroupKind, RankInfo, RequestId, SamplingParams};
+use uniserve_core::{BlockId, KvCacheGroup, KvGroupKind, RequestId, SamplingParams};
 
 use crate::schema::uniserve::ipc as fbs;
 use crate::{
-    ArRequestParams, ArtifactHandle, BatchCommand, BlockTable, Bounds, BufferId, BufferPlacement,
-    CachePageAllocation, Checkpoint, CheckpointPoint, CloseReason, DType, DecodePlacement,
+    ArRequestParams, ArtifactHandle, BatchCommand, BlockTable, Bounds, BufferAllocation, BufferId,
+    CachePageAllocation, Checkpoint, CheckpointPoint, CloseReason, DType, DecodeRange,
     DiffusionRequestParams, DiffusionResult, DimBound, Disposition, DrawLayout, ErrorCode,
-    ErrorOperationIdentity, FinishFlags, InlineValue, KvCacheConfig, LatentPlacement,
-    LogicalLengths, MediaGeometry, MediaOutput, ModelOutput, NewRequest, OpId, OpKind, OpPayload,
-    OpStatus, Operation, PointRange, ProductKind, ProductPayload, ProductRef, RegistrationAck,
-    RequestKey, RequestKind, ResponseKind, ResultData, ResultPayload, Rng, RowGeometry, Run,
-    RunKind, RunResult, ShapeBound, StorageClass, TimingCounters, TokenSpan, TransferHandle,
-    TransferLocator, TransferTransport, UmmRequestParams, WorkerForwardStats, WorkerInfo,
-    WorkerRequest, WorkerResponse, WorkerResponseError,
+    ErrorOperationIdentity, FinishFlags, InlineValue, KvCacheConfig, LatentParams, Locator,
+    LogicalLengths, MediaGeometry, MediaOutput, MediaTrack, ModelOutput, NewRequest, OpCode, OpId,
+    OpPayload, OpStatus, Operation, PointRange, ProductKind, ProductPayload, ProductRef,
+    RegistrationAck, RequestKey, RequestKind, ResponseKind, ResultData, ResultPayload, Rng,
+    RowGeometry, Run, RunResult, ShapeBound, StorageClass, TensorTransfer, TimingCounters,
+    TokenSpan, TransferHandle, TransferTransport, UmmRequestParams, WorkerEndpoint,
+    WorkerForwardStats, WorkerInfo, WorkerRequest, WorkerResponse, WorkerResponseError,
 };
 
 /// Result type returned by FlatBuffers codec operations.
@@ -251,7 +251,7 @@ fn response_from_table(response: fbs::WorkerResponse<'_>) -> CodecResult<WorkerR
     })
 }
 
-/// Decodes an owned run and validates all nested operation and placement contracts.
+/// Decodes an owned run and validates all nested operation and params contracts.
 fn run_from_table(run: fbs::Run<'_>) -> CodecResult<Run> {
     // Preserve wire order for operations, controls, and products because later
     // validation and execution interpret those collections positionally.
@@ -272,7 +272,7 @@ fn run_from_table(run: fbs::Run<'_>) -> CodecResult<Run> {
             .transpose()?
             .unwrap_or_default(),
 
-        // Decode scheduler-owned KV placement metadata.
+        // Decode scheduler-owned KV params metadata.
         block_tables: run
             .block_tables()
             .map(|items| items.iter().map(block_table_from_table).collect())
@@ -286,33 +286,33 @@ fn run_from_table(run: fbs::Run<'_>) -> CodecResult<Run> {
             .map(|items| items.iter().map(row_geometry_from_table).collect())
             .unwrap_or_default(),
 
-        // Decode diffusion and persistent-buffer placement metadata.
-        latent_placements: run
-            .latent_placements()
+        // Decode diffusion and persistent-buffer params metadata.
+        latent_params: run
+            .latent_params()
             .map(|items| {
                 items
                     .iter()
-                    .map(latent_placement_from_table)
+                    .map(latent_params_from_table)
                     .collect::<CodecResult<_>>()
             })
             .transpose()?
             .unwrap_or_default(),
-        decode_placements: run
-            .decode_placements()
+        decode_ranges: run
+            .decode_ranges()
             .map(|items| {
                 items
                     .iter()
-                    .map(decode_placement_from_table)
+                    .map(decode_range_from_table)
                     .collect::<CodecResult<_>>()
             })
             .transpose()?
             .unwrap_or_default(),
-        buffer_placements: run
-            .buffer_placements()
+        buffer_allocations: run
+            .buffer_allocations()
             .map(|items| {
                 items
                     .iter()
-                    .map(buffer_placement_from_table)
+                    .map(buffer_allocation_from_table)
                     .collect::<CodecResult<_>>()
             })
             .transpose()?
@@ -408,7 +408,7 @@ fn diffusion_params_from_table(
         seed: admission.seed(),
         geometry: MediaGeometry {
             frame_count: geometry.frame_count(),
-            decode_units: geometry.decode_units(),
+            video_units: geometry.video_units(),
             prompt_tokens: geometry.prompt_tokens(),
             denoise_steps: geometry.denoise_steps(),
         },
@@ -449,77 +449,76 @@ fn row_geometry_from_table(row: fbs::RowGeometry<'_>) -> RowGeometry {
         request_pool_index: row.request_pool_index(),
         seq_len: row.seq_len(),
         query_len: row.query_len(),
+        write_kv: row.write_kv(),
     }
 }
 
-/// Decodes a latent-page placement bound to a request operation.
-fn latent_placement_from_table(
-    placement: fbs::LatentPlacement<'_>,
-) -> CodecResult<LatentPlacement> {
-    Ok(LatentPlacement {
-        request_key: request_key_from_table(
-            placement.request_key(),
-            "latent placement.request_key",
-        )?,
-        op_id: OpId(placement.op_id()),
-        page_table: placement
+/// Decodes a latent-page params bound to a request operation.
+fn latent_params_from_table(params: fbs::LatentParams<'_>) -> CodecResult<LatentParams> {
+    Ok(LatentParams {
+        request_key: request_key_from_table(params.request_key(), "latent params.request_key")?,
+        op_id: OpId(params.op_id()),
+        page_table: params
             .page_table()
             .map(|items| items.iter().collect())
             .unwrap_or_default(),
-        latent_units: placement.latent_units(),
-        height: placement.height(),
-        width: placement.width(),
-        start_step: placement.start_step(),
-        step_count: placement.step_count(),
+        latent_units: params.latent_units(),
+        height: params.height(),
+        width: params.width(),
+        start_step: params.start_step(),
+        step_count: params.step_count(),
     })
 }
 
-/// Decodes a diffusion decoder placement bound to a request operation.
-fn decode_placement_from_table(
-    placement: fbs::DecodePlacement<'_>,
-) -> CodecResult<DecodePlacement> {
-    Ok(DecodePlacement {
-        request_key: request_key_from_table(
-            placement.request_key(),
-            "decode placement.request_key",
-        )?,
-        op_id: OpId(placement.op_id()),
-        cursor: placement.cursor(),
-        max_units: placement.max_units(),
+/// Decodes a diffusion decoder params bound to a request operation.
+fn decode_range_from_table(params: fbs::DecodeRange<'_>) -> CodecResult<DecodeRange> {
+    Ok(DecodeRange {
+        request_key: request_key_from_table(params.request_key(), "decode params.request_key")?,
+        op_id: OpId(params.op_id()),
+        track: match params.track() {
+            fbs::MediaTrack::Video => MediaTrack::Video,
+            fbs::MediaTrack::Audio => MediaTrack::Audio,
+            value => codec_bail!("unknown media track {}", value.0),
+        },
+        cursor: params.cursor(),
+        max_units: params.max_units(),
     })
 }
 
 /// Decodes a persistent-buffer byte span and validates its buffer identity.
-fn buffer_placement_from_table(
-    placement: fbs::BufferPlacement<'_>,
-) -> CodecResult<BufferPlacement> {
-    Ok(BufferPlacement {
+fn buffer_allocation_from_table(
+    params: fbs::BufferAllocation<'_>,
+) -> CodecResult<BufferAllocation> {
+    Ok(BufferAllocation {
         buffer: buffer_id_from_table(
-            placement
+            params
                 .buffer()
-                .context("buffer placement has no buffer identity")?,
+                .context("buffer params has no buffer identity")?,
         )?,
-        offset: placement.offset(),
-        bytes: placement.bytes(),
+        offset: params.offset(),
+        bytes: params.bytes(),
     })
 }
 
-/// Decodes an operation union and validates its family against the run kind.
+/// Decodes the single executable payload and its entry binding.
 fn operation_from_table(operation: fbs::Operation<'_>) -> CodecResult<Operation> {
-    // Each payload table has the same resource/product shape, but the union
-    // discriminant remains authoritative for the operation family.
-    macro_rules! decode_payload {
-        ($payload:expr, $variant:ident) => {{
-            let payload = $payload.context("operation payload table is missing")?;
-            let bounds = Bounds {
+    let payload = operation.payload();
+    let operation = Operation {
+        request_key: request_key_from_table(operation.request_key(), "operation.request_key")?,
+        op_id: OpId(operation.op_id()),
+        parent: operation.parent().map(checkpoint_from_table).transpose()?,
+        entry: operation.entry().to_owned(),
+        payload: OpPayload {
+            code: op_code_from_fb(payload.code())?,
+            bounds: Bounds {
                 max_points: payload.max_points(),
                 max_tokens: payload.max_tokens(),
                 max_kv_pages: payload.max_kv_pages(),
                 max_latent_bytes: payload.max_latent_bytes(),
                 max_completion_bytes: payload.max_completion_bytes(),
                 max_transfer_bytes: payload.max_transfer_bytes(),
-            };
-            let inputs = payload
+            },
+            inputs: payload
                 .inputs()
                 .map(|items| {
                     items
@@ -528,8 +527,8 @@ fn operation_from_table(operation: fbs::Operation<'_>) -> CodecResult<Operation>
                         .collect::<CodecResult<Vec<_>>>()
                 })
                 .transpose()?
-                .unwrap_or_default();
-            let outputs = payload
+                .unwrap_or_default(),
+            outputs: payload
                 .outputs()
                 .map(|items| {
                     items
@@ -538,46 +537,14 @@ fn operation_from_table(operation: fbs::Operation<'_>) -> CodecResult<Operation>
                         .collect::<CodecResult<Vec<_>>>()
                 })
                 .transpose()?
-                .unwrap_or_default();
-            let predicate = payload
+                .unwrap_or_default(),
+            predicate: payload
                 .predicate()
                 .map(product_ref_from_table)
-                .transpose()?;
-            let rng = payload.rng().map(rng_from_table).transpose()?;
-            OpPayload::$variant {
-                bounds,
-                inputs,
-                outputs,
-                predicate,
-                rng,
-                control_seq: payload.control_seq(),
-            }
-        }};
-    }
-
-    let payload = match operation.payload_type() {
-        fbs::OpPayload::ArOpPayload => {
-            decode_payload!(operation.payload_as_ar_op_payload(), Ar)
-        }
-        fbs::OpPayload::EncoderOpPayload => {
-            decode_payload!(operation.payload_as_encoder_op_payload(), Encoder)
-        }
-        fbs::OpPayload::DiffusionOpPayload => {
-            decode_payload!(operation.payload_as_diffusion_op_payload(), Diffusion)
-        }
-        fbs::OpPayload::TransferOpPayload => {
-            decode_payload!(operation.payload_as_transfer_op_payload(), Transfer)
-        }
-        _ => return Err(CodecError::invalid("operation payload is missing")),
-    };
-
-    // Common identity and lineage fields live outside the family union.
-    let operation = Operation {
-        request_key: request_key_from_table(operation.request_key(), "operation.request_key")?,
-        op_id: OpId(operation.op_id()),
-        parent: checkpoint_from_table(operation.parent().context("operation has no parent")?)?,
-        kind: run_kind_from_fb(operation.kind())?,
-        payload,
+                .transpose()?,
+            rng: payload.rng().map(rng_from_table).transpose()?,
+            control_seq: payload.control_seq(),
+        },
     };
     operation.validate()?;
     Ok(operation)
@@ -638,9 +605,32 @@ fn command_from_table(envelope: fbs::BatchCommandEnvelope<'_>) -> CodecResult<Ba
                     finish.cutoff().context("finish control has no cutoff")?,
                 )?,
                 reason: close_reason_from_fb(finish.reason())?,
+                retained_buffers: finish
+                    .retained_buffers()
+                    .into_iter()
+                    .flatten()
+                    .map(buffer_id_from_table)
+                    .collect::<CodecResult<Vec<_>>>()?,
             }
         }
 
+        fbs::BatchCommand::RetireCommand => {
+            let retire = envelope
+                .command_as_retire_command()
+                .context("retire command table is missing")?;
+            BatchCommand::Retire {
+                request_key: request_key_from_table(
+                    retire.request_key(),
+                    "control.retire.request_key",
+                )?,
+                retained_buffers: retire
+                    .retained_buffers()
+                    .into_iter()
+                    .flatten()
+                    .map(buffer_id_from_table)
+                    .collect::<CodecResult<Vec<_>>>()?,
+            }
+        }
         fbs::BatchCommand::FreeCommand => {
             let free = envelope
                 .command_as_free_command()
@@ -859,6 +849,32 @@ fn product_ref_from_table(reference: fbs::ValueRef<'_>) -> CodecResult<ProductRe
             codec_ensure!(
                 product.max_bytes() == max_bytes,
                 "feature buffer byte bound disagrees with its typed shape"
+            );
+            product
+        }
+        fbs::ValueReference::TensorBuffer => {
+            let value = reference
+                .value_as_tensor_buffer()
+                .context("tensor buffer reference is missing")?;
+            let (request_key, producer_op_id, output_index, generation, max_bytes) =
+                buffer(value.buffer(), "tensor_buffer")?;
+            let product = ProductRef {
+                request_key,
+                producer_op_id,
+                output_index,
+                generation,
+                kind: ProductKind::Tensor,
+                storage_class: StorageClass::DeviceTensor,
+                dtype: dtype_from_fb(value.dtype())?,
+                shape_bound: shape_bound_from_parts(value.extents(), value.dynamic_axis())?,
+                point_range: PointRange {
+                    base_point: value.base_point(),
+                    max_points: value.max_points(),
+                },
+            };
+            codec_ensure!(
+                product.max_bytes() == max_bytes,
+                "tensor buffer byte bound disagrees with its typed shape"
             );
             product
         }
@@ -1253,10 +1269,15 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
     let info = WorkerInfo {
         model_name: required_str(info.model_name(), "info.model_name")?,
         weight_version: info.weight_version(),
-        rank: info
-            .rank()
-            .map(rank_from_table)
-            .context("info have no rank")?,
+        endpoint: endpoint_from_table(info.endpoint().context("info has no endpoint")?)?,
+        device: required_str(info.device(), "info.device")?,
+        transfer_backends: info
+            .transfer_backends()
+            .context("info has no transfer backends")?
+            .iter()
+            .map(str::to_owned)
+            .collect(),
+        world_size: info.world_size(),
         configuration_id: info.configuration_id().unwrap_or_default().to_owned(),
         components: info
             .components()
@@ -1264,9 +1285,9 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
                 items
                     .iter()
                     .map(|item| {
-                        Ok(crate::ComponentInfo {
+                        Ok(crate::EntryInfo {
                             name: required_str(item.name(), "component.name")?,
-                            deployment: uniserve_core::ComponentDeployConfig {
+                            config: uniserve_core::EntryConfig {
                                 ranks: item
                                     .ranks()
                                     .map(|ranks| ranks.iter().map(|rank| rank as usize).collect())
@@ -1278,6 +1299,21 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
                                 distribution: distribution_from_fb(item.distribution())?,
                                 units_per_rank: item.units_per_rank() as usize,
                             },
+                            outputs: item
+                                .outputs()
+                                .context("entry requires tensor result declarations")?
+                                .iter()
+                                .map(|output| {
+                                    Ok(crate::TensorSpec {
+                                        name: required_str(output.name(), "tensor result.name")?,
+                                        dtype: dtype_from_fb(output.dtype())?,
+                                        shape_bound: shape_bound_from_parts(
+                                            output.extents(),
+                                            output.dynamic_axis(),
+                                        )?,
+                                    })
+                                })
+                                .collect::<CodecResult<Vec<_>>>()?,
                         })
                     })
                     .collect::<CodecResult<Vec<_>>>()
@@ -1289,7 +1325,7 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
             .map(|items| {
                 items
                     .iter()
-                    .map(op_kind_from_fb)
+                    .map(op_code_from_fb)
                     .collect::<CodecResult<_>>()
             })
             .transpose()?
@@ -1483,12 +1519,17 @@ fn kv_group_from_table(group: fbs::KvGroup<'_>) -> CodecResult<KvCacheGroup> {
     })
 }
 
-/// Decodes physical process coordinates.
-fn rank_from_table(rank: fbs::RankInfo<'_>) -> RankInfo {
-    RankInfo {
-        rank: rank.rank(),
-        world_size: rank.world_size(),
-    }
+/// Decodes the loaded rank identity used by startup and physical products.
+fn endpoint_from_table(endpoint: fbs::WorkerEndpoint<'_>) -> CodecResult<WorkerEndpoint> {
+    let value = WorkerEndpoint {
+        worker_id: required_str(endpoint.worker_id(), "endpoint.worker_id")?,
+        rank: endpoint.rank(),
+        node: required_str(endpoint.node(), "endpoint.node")?,
+        address_space: required_str(endpoint.address_space(), "endpoint.address_space")?,
+        incarnation: required_str(endpoint.incarnation(), "endpoint.incarnation")?,
+    };
+    value.validate()?;
+    Ok(value)
 }
 
 /// Copies a required non-empty string or reports its protocol field name.
@@ -1558,7 +1599,6 @@ fn response_to_fb(response: &WorkerResponse) -> CodecResult<fbs::WorkerResponseT
     })
 }
 
-/// Converts one physical run into its FlatBuffers object representation.
 fn run_to_fb(run: &Run) -> CodecResult<fbs::RunT> {
     run.validate()?;
 
@@ -1575,7 +1615,7 @@ fn run_to_fb(run: &Run) -> CodecResult<fbs::RunT> {
                 .collect::<CodecResult<_>>()?,
         ),
 
-        // Scheduler-owned placement metadata is already validated as a unit.
+        // Scheduler-owned params metadata is already validated as a unit.
         block_tables: Some(run.block_tables.iter().map(block_table_to_fb).collect()),
         new_cache_pages: Some(
             run.new_cache_pages
@@ -1584,22 +1624,12 @@ fn run_to_fb(run: &Run) -> CodecResult<fbs::RunT> {
                 .collect(),
         ),
         forward_rows: Some(run.forward_rows.iter().map(row_geometry_to_fb).collect()),
-        latent_placements: Some(
-            run.latent_placements
+        latent_params: Some(run.latent_params.iter().map(latent_params_to_fb).collect()),
+        decode_ranges: Some(run.decode_ranges.iter().map(decode_range_to_fb).collect()),
+        buffer_allocations: Some(
+            run.buffer_allocations
                 .iter()
-                .map(latent_placement_to_fb)
-                .collect(),
-        ),
-        decode_placements: Some(
-            run.decode_placements
-                .iter()
-                .map(decode_placement_to_fb)
-                .collect(),
-        ),
-        buffer_placements: Some(
-            run.buffer_placements
-                .iter()
-                .map(buffer_placement_to_fb)
+                .map(buffer_allocation_to_fb)
                 .collect(),
         ),
 
@@ -1666,7 +1696,7 @@ fn diffusion_params_to_fb(admission: &DiffusionRequestParams) -> fbs::DiffusionR
         seed: admission.seed,
         geometry: Some(Box::new(fbs::MediaGeometryT {
             frame_count: admission.geometry.frame_count,
-            decode_units: admission.geometry.decode_units,
+            video_units: admission.geometry.video_units,
             prompt_tokens: admission.geometry.prompt_tokens,
             denoise_steps: admission.geometry.denoise_steps,
         })),
@@ -1699,154 +1729,90 @@ fn row_geometry_to_fb(row: &RowGeometry) -> fbs::RowGeometryT {
         request_pool_index: row.request_pool_index,
         seq_len: row.seq_len,
         query_len: row.query_len,
+        write_kv: row.write_kv,
     }
 }
 
-/// Converts a latent-page placement into its wire table.
-fn latent_placement_to_fb(placement: &LatentPlacement) -> fbs::LatentPlacementT {
-    fbs::LatentPlacementT {
-        request_key: Some(Box::new(request_key_to_fb(placement.request_key))),
-        op_id: placement.op_id.0,
-        page_table: Some(placement.page_table.clone()),
-        latent_units: placement.latent_units,
-        height: placement.height,
-        width: placement.width,
-        start_step: placement.start_step,
-        step_count: placement.step_count,
+/// Converts a latent-page params into its wire table.
+fn latent_params_to_fb(params: &LatentParams) -> fbs::LatentParamsT {
+    fbs::LatentParamsT {
+        request_key: Some(Box::new(request_key_to_fb(params.request_key))),
+        op_id: params.op_id.0,
+        page_table: Some(params.page_table.clone()),
+        latent_units: params.latent_units,
+        height: params.height,
+        width: params.width,
+        start_step: params.start_step,
+        step_count: params.step_count,
     }
 }
 
-/// Converts a diffusion decoder placement into its wire table.
-fn decode_placement_to_fb(placement: &DecodePlacement) -> fbs::DecodePlacementT {
-    fbs::DecodePlacementT {
-        request_key: Some(Box::new(request_key_to_fb(placement.request_key))),
-        op_id: placement.op_id.0,
-        cursor: placement.cursor,
-        max_units: placement.max_units,
+/// Converts a diffusion decoder params into its wire table.
+fn decode_range_to_fb(params: &DecodeRange) -> fbs::DecodeRangeT {
+    fbs::DecodeRangeT {
+        request_key: Some(Box::new(request_key_to_fb(params.request_key))),
+        op_id: params.op_id.0,
+        track: match params.track {
+            MediaTrack::Video => fbs::MediaTrack::Video,
+            MediaTrack::Audio => fbs::MediaTrack::Audio,
+        },
+        cursor: params.cursor,
+        max_units: params.max_units,
     }
 }
 
 /// Converts a persistent-buffer byte span into its wire table.
-fn buffer_placement_to_fb(placement: &BufferPlacement) -> fbs::BufferPlacementT {
-    fbs::BufferPlacementT {
-        buffer: Some(Box::new(buffer_id_to_fb(placement.buffer))),
-        offset: placement.offset,
-        bytes: placement.bytes,
+fn buffer_allocation_to_fb(params: &BufferAllocation) -> fbs::BufferAllocationT {
+    fbs::BufferAllocationT {
+        buffer: Some(Box::new(buffer_id_to_fb(params.buffer))),
+        offset: params.offset,
+        bytes: params.bytes,
     }
 }
 
 /// Converts a validated operation into its family-specific payload union.
 fn operation_to_fb(operation: &Operation) -> CodecResult<fbs::OperationT> {
     operation.validate()?;
-
-    // Operation families share identical bounds and product fields but retain
-    // distinct wire tables so the discriminant remains explicit.
-    macro_rules! payload_fields {
-        ($table:ident, $bounds:expr, $inputs:expr, $outputs:expr, $predicate:expr, $rng:expr, $control_seq:expr) => {
-            fbs::$table {
-                max_points: $bounds.max_points,
-                max_tokens: $bounds.max_tokens,
-                max_kv_pages: $bounds.max_kv_pages,
-                max_latent_bytes: $bounds.max_latent_bytes,
-                max_completion_bytes: $bounds.max_completion_bytes,
-                max_transfer_bytes: $bounds.max_transfer_bytes,
-                inputs: Some(
-                    $inputs
-                        .iter()
-                        .map(product_ref_to_fb)
-                        .collect::<CodecResult<_>>()?,
-                ),
-                outputs: Some(
-                    $outputs
-                        .iter()
-                        .map(product_ref_to_fb)
-                        .collect::<CodecResult<_>>()?,
-                ),
-                predicate: $predicate
-                    .as_ref()
-                    .map(product_ref_to_fb)
-                    .transpose()?
-                    .map(Box::new),
-                rng: $rng.as_ref().map(rng_to_fb).map(Box::new),
-                control_seq: *$control_seq,
-            }
-        };
-    }
-
-    let payload = match &operation.payload {
-        OpPayload::Ar {
-            bounds,
-            inputs,
-            outputs,
-            predicate,
-            rng,
-            control_seq,
-        } => fbs::OpPayloadT::ArOpPayload(Box::new(payload_fields!(
-            ArOpPayloadT,
-            bounds,
-            inputs,
-            outputs,
-            predicate,
-            rng,
-            control_seq
-        ))),
-        OpPayload::Encoder {
-            bounds,
-            inputs,
-            outputs,
-            predicate,
-            rng,
-            control_seq,
-        } => fbs::OpPayloadT::EncoderOpPayload(Box::new(payload_fields!(
-            EncoderOpPayloadT,
-            bounds,
-            inputs,
-            outputs,
-            predicate,
-            rng,
-            control_seq
-        ))),
-        OpPayload::Diffusion {
-            bounds,
-            inputs,
-            outputs,
-            predicate,
-            rng,
-            control_seq,
-        } => fbs::OpPayloadT::DiffusionOpPayload(Box::new(payload_fields!(
-            DiffusionOpPayloadT,
-            bounds,
-            inputs,
-            outputs,
-            predicate,
-            rng,
-            control_seq
-        ))),
-        OpPayload::Transfer {
-            bounds,
-            inputs,
-            outputs,
-            predicate,
-            rng,
-            control_seq,
-        } => fbs::OpPayloadT::TransferOpPayload(Box::new(payload_fields!(
-            TransferOpPayloadT,
-            bounds,
-            inputs,
-            outputs,
-            predicate,
-            rng,
-            control_seq
-        ))),
-    };
-
-    // Common operation identity wraps the family-specific payload union.
+    let payload = &operation.payload;
     Ok(fbs::OperationT {
         request_key: Some(Box::new(request_key_to_fb(operation.request_key))),
         op_id: operation.op_id.0,
-        parent: Some(Box::new(checkpoint_to_fb(&operation.parent))),
-        kind: run_kind_to_fb(operation.kind),
-        payload,
+        parent: operation
+            .parent
+            .as_ref()
+            .map(|parent| Box::new(checkpoint_to_fb(parent))),
+        entry: operation.entry.clone(),
+        payload: Box::new(fbs::OpPayloadT {
+            code: op_code_to_fb(payload.code),
+            max_points: payload.bounds.max_points,
+            max_tokens: payload.bounds.max_tokens,
+            max_kv_pages: payload.bounds.max_kv_pages,
+            max_latent_bytes: payload.bounds.max_latent_bytes,
+            max_completion_bytes: payload.bounds.max_completion_bytes,
+            max_transfer_bytes: payload.bounds.max_transfer_bytes,
+            inputs: Some(
+                payload
+                    .inputs
+                    .iter()
+                    .map(product_ref_to_fb)
+                    .collect::<CodecResult<_>>()?,
+            ),
+            outputs: Some(
+                payload
+                    .outputs
+                    .iter()
+                    .map(product_ref_to_fb)
+                    .collect::<CodecResult<_>>()?,
+            ),
+            predicate: payload
+                .predicate
+                .as_ref()
+                .map(product_ref_to_fb)
+                .transpose()?
+                .map(Box::new),
+            rng: payload.rng.as_ref().map(rng_to_fb).map(Box::new),
+            control_seq: payload.control_seq,
+        }),
     })
 }
 
@@ -1881,11 +1847,32 @@ fn command_to_fb(command: &BatchCommand) -> fbs::BatchCommandT {
             control_seq,
             cutoff,
             reason,
+            retained_buffers,
         } => fbs::BatchCommandT::FinishCommand(Box::new(fbs::FinishCommandT {
             request_key: Some(Box::new(request_key_to_fb(*request_key))),
             control_seq: *control_seq,
             cutoff: Some(Box::new(checkpoint_to_fb(cutoff))),
             reason: close_reason_to_fb(*reason),
+            retained_buffers: Some(
+                retained_buffers
+                    .iter()
+                    .copied()
+                    .map(buffer_id_to_fb)
+                    .collect(),
+            ),
+        })),
+        BatchCommand::Retire {
+            request_key,
+            retained_buffers,
+        } => fbs::BatchCommandT::RetireCommand(Box::new(fbs::RetireCommandT {
+            request_key: Some(Box::new(request_key_to_fb(*request_key))),
+            retained_buffers: Some(
+                retained_buffers
+                    .iter()
+                    .copied()
+                    .map(buffer_id_to_fb)
+                    .collect(),
+            ),
         })),
         BatchCommand::Free { buffer } => {
             fbs::BatchCommandT::FreeCommand(Box::new(fbs::FreeCommandT {
@@ -2040,10 +2027,7 @@ fn product_ref_to_fb(product: &ProductRef) -> CodecResult<fbs::ValueRefT> {
         // agree with the typed shape validated above.
         ProductKind::VisionFeature | ProductKind::LatentFeature => {
             codec_ensure!(
-                matches!(
-                    product.storage_class,
-                    StorageClass::LatentArena | StorageClass::DeviceTensor
-                ),
+                product.storage_class == StorageClass::LatentArena,
                 "feature value must use a persistent device buffer"
             );
             fbs::ValueReferenceT::FeatureBuffer(Box::new(fbs::FeatureBufferT {
@@ -2060,6 +2044,14 @@ fn product_ref_to_fb(product: &ProductRef) -> CodecResult<fbs::ValueRefT> {
                 max_points: point.max_points,
             }))
         }
+        ProductKind::Tensor => fbs::ValueReferenceT::TensorBuffer(Box::new(fbs::TensorBufferT {
+            buffer: Some(Box::new(buffer_descriptor_to_fb(product))),
+            dtype: dtype_to_fb(product.dtype),
+            extents: Some(extents),
+            dynamic_axis,
+            base_point: point.base_point,
+            max_points: point.max_points,
+        })),
         ProductKind::Kv => {
             codec_ensure!(
                 product.storage_class == StorageClass::PagedKv,
@@ -2093,9 +2085,7 @@ fn product_ref_to_fb(product: &ProductRef) -> CodecResult<fbs::ValueRefT> {
         ProductKind::Artifact => {
             let use_ = match product.storage_class {
                 StorageClass::HostStaging => fbs::ArtifactUse::Inline,
-                StorageClass::LatentArena | StorageClass::DeviceTensor => {
-                    fbs::ArtifactUse::Feedback
-                }
+                StorageClass::LatentArena => fbs::ArtifactUse::Feedback,
                 StorageClass::PinnedOutput => fbs::ArtifactUse::Encoded,
                 _ => codec_bail!("artifact value has an invalid use"),
             };
@@ -2310,6 +2300,8 @@ fn kv_cache_from_table(config: fbs::KvCacheConfig<'_>) -> CodecResult<KvCacheCon
         num_blocks: config.num_blocks(),
         num_layers: config.num_layers(),
         num_kv_heads: config.num_kv_heads(),
+        total_kv_heads: config.total_kv_heads(),
+        kv_head_offset: config.kv_head_offset(),
         head_dim: config.head_dim(),
         bytes_per_token: config.bytes_per_token(),
         groups: config
@@ -2333,6 +2325,8 @@ fn kv_cache_to_fb(config: &KvCacheConfig) -> fbs::KvCacheConfigT {
         num_blocks: config.num_blocks,
         num_layers: config.num_layers,
         num_kv_heads: config.num_kv_heads,
+        total_kv_heads: config.total_kv_heads,
+        kv_head_offset: config.kv_head_offset,
         head_dim: config.head_dim,
         bytes_per_token: config.bytes_per_token,
         groups: Some(config.groups.iter().map(kv_group_to_fb).collect()),
@@ -2459,32 +2453,51 @@ fn info_to_fb(info: &WorkerInfo) -> CodecResult<fbs::WorkerInfoT> {
     Ok(fbs::WorkerInfoT {
         model_name: Some(info.model_name.clone()),
         weight_version: info.weight_version,
-        rank: Some(Box::new(rank_to_fb(info.rank))),
+        endpoint: Some(Box::new(endpoint_to_fb(&info.endpoint))),
+        device: Some(info.device.clone()),
+        transfer_backends: Some(info.transfer_backends.clone()),
+        world_size: info.world_size,
         configuration_id: Some(info.configuration_id.clone()),
         components: Some(
             info.components
                 .iter()
                 .map(|component| {
-                    Ok(fbs::ComponentInfoT {
+                    Ok(fbs::EntryInfoT {
                         name: Some(component.name.clone()),
                         ranks: Some(
                             component
-                                .deployment
+                                .config
                                 .ranks
                                 .iter()
                                 .map(|&rank| rank as u64)
                                 .collect(),
                         ),
                         parallel_config: Some(Box::new(parallel_to_fb(
-                            &component.deployment.parallel_config,
+                            &component.config.parallel_config,
                         ))),
-                        distribution: match component.deployment.distribution {
+                        distribution: match component.config.distribution {
                             None => fbs::ComponentDistribution::Local,
                             Some(uniserve_core::ComponentDistribution::TemporalUnits) => {
                                 fbs::ComponentDistribution::TemporalUnits
                             }
                         },
-                        units_per_rank: component.deployment.units_per_rank as u32,
+                        units_per_rank: component.config.units_per_rank as u32,
+                        outputs: Some(
+                            component
+                                .outputs
+                                .iter()
+                                .map(|output| {
+                                    let (extents, dynamic_axis) =
+                                        shape_bound_to_parts(&output.shape_bound);
+                                    fbs::TensorSpecT {
+                                        name: Some(output.name.clone()),
+                                        dtype: dtype_to_fb(output.dtype),
+                                        extents: Some(extents),
+                                        dynamic_axis,
+                                    }
+                                })
+                                .collect(),
+                        ),
                     })
                 })
                 .collect::<CodecResult<Vec<_>>>()?,
@@ -2493,7 +2506,7 @@ fn info_to_fb(info: &WorkerInfo) -> CodecResult<fbs::WorkerInfoT> {
             info.supported_ops
                 .iter()
                 .copied()
-                .map(op_kind_to_fb)
+                .map(op_code_to_fb)
                 .collect(),
         ),
         queue_depth: info.queue_depth,
@@ -2677,66 +2690,48 @@ fn kv_group_to_fb(group: &KvCacheGroup) -> fbs::KvGroupT {
 }
 
 /// Converts physical process coordinates into their wire table.
-fn rank_to_fb(rank: RankInfo) -> fbs::RankInfoT {
-    fbs::RankInfoT {
-        rank: rank.rank,
-        world_size: rank.world_size,
-    }
-}
-
-/// Maps an operation kind to its stable FlatBuffers discriminant.
-fn op_kind_to_fb(variant: OpKind) -> fbs::OpKind {
-    match variant {
-        OpKind::ArExtend => fbs::OpKind::ArExtend,
-        OpKind::ArDecode => fbs::OpKind::ArDecode,
-        OpKind::ArVerify => fbs::OpKind::ArVerify,
-        OpKind::EncoderExecute => fbs::OpKind::EncoderExecute,
-        OpKind::DiffusionPrepare => fbs::OpKind::DiffusionPrepare,
-        OpKind::DiffusionStep => fbs::OpKind::DiffusionStep,
-        OpKind::DiffusionDecode => fbs::OpKind::DiffusionDecode,
+fn endpoint_to_fb(endpoint: &WorkerEndpoint) -> fbs::WorkerEndpointT {
+    fbs::WorkerEndpointT {
+        worker_id: Some(endpoint.worker_id.clone()),
+        rank: endpoint.rank,
+        node: Some(endpoint.node.clone()),
+        address_space: Some(endpoint.address_space.clone()),
+        incarnation: Some(endpoint.incarnation.clone()),
     }
 }
 
 /// Maps a physical run kind to its stable FlatBuffers discriminant.
-fn run_kind_to_fb(variant: RunKind) -> fbs::RunKind {
+fn op_code_to_fb(variant: OpCode) -> fbs::OpCode {
     match variant {
-        RunKind::ArExtend => fbs::RunKind::ArExtend,
-        RunKind::ArDecode => fbs::RunKind::ArDecode,
-        RunKind::ArVerify => fbs::RunKind::ArVerify,
-        RunKind::EncoderVision => fbs::RunKind::EncoderVision,
-        RunKind::EncoderLatent => fbs::RunKind::EncoderLatent,
-        RunKind::TransferProduct => fbs::RunKind::TransferProduct,
-        RunKind::TransferKvPublish => fbs::RunKind::TransferKvPublish,
-        RunKind::TransferKvInstall => fbs::RunKind::TransferKvInstall,
-        RunKind::DiffusionPrepare => fbs::RunKind::DiffusionPrepare,
-        RunKind::DiffusionStep => fbs::RunKind::DiffusionStep,
-        RunKind::DiffusionFinalize => fbs::RunKind::DiffusionFinalize,
-        RunKind::DiffusionDecode => fbs::RunKind::DiffusionDecode,
+        OpCode::ArExtend => fbs::OpCode::ArExtend,
+        OpCode::ArDecode => fbs::OpCode::ArDecode,
+        OpCode::ArVerify => fbs::OpCode::ArVerify,
+        OpCode::EncoderVision => fbs::OpCode::EncoderVision,
+        OpCode::EncoderText => fbs::OpCode::EncoderText,
+        OpCode::EncoderLatent => fbs::OpCode::EncoderLatent,
+        OpCode::TransferProduct => fbs::OpCode::TransferProduct,
+        OpCode::TransferKvPublish => fbs::OpCode::TransferKvPublish,
+        OpCode::TransferKvInstall => fbs::OpCode::TransferKvInstall,
+        OpCode::DiffusionPrepare => fbs::OpCode::DiffusionPrepare,
+        OpCode::DiffusionStep => fbs::OpCode::DiffusionStep,
+        OpCode::DiffusionFinalize => fbs::OpCode::DiffusionFinalize,
+        OpCode::DiffusionDecode => fbs::OpCode::DiffusionDecode,
+        OpCode::MediaAppend => fbs::OpCode::MediaAppend,
     }
 }
 
 /// Resolves a FlatBuffers run discriminant against the complete supported set.
-fn run_kind_from_fb(variant: fbs::RunKind) -> CodecResult<RunKind> {
-    for candidate in RunKind::ALL {
-        if run_kind_to_fb(candidate) == variant {
+fn op_code_from_fb(variant: fbs::OpCode) -> CodecResult<OpCode> {
+    for candidate in OpCode::ALL {
+        if op_code_to_fb(candidate) == variant {
             return Ok(candidate);
         }
     }
     codec_bail!("unknown physical run kind {}", variant.0)
 }
 
-/// Resolves a FlatBuffers operation discriminant against advertised capabilities.
-fn op_kind_from_fb(variant: fbs::OpKind) -> CodecResult<OpKind> {
-    for candidate in OpKind::ALL {
-        if op_kind_to_fb(candidate) == variant {
-            return Ok(candidate);
-        }
-    }
-    codec_bail!("unknown work variant {}", variant.0)
-}
-
 /// Decodes transport-specific storage coordinates and common tensor metadata.
-fn transfer_locator_from_table(value: fbs::TransferLocator<'_>) -> CodecResult<TransferLocator> {
+fn transfer_locator_from_table(value: fbs::Locator<'_>) -> CodecResult<Locator> {
     // The transport discriminant determines which coordinate fields are
     // required; unrelated fields are deliberately ignored.
     let transport = if value.transport() == fbs::TransferTransportKind::Local {
@@ -2749,12 +2744,14 @@ fn transfer_locator_from_table(value: fbs::TransferLocator<'_>) -> CodecResult<T
         }
     } else if value.transport() == fbs::TransferTransportKind::PosixShm {
         TransferTransport::PosixShm {
+            endpoint: value
+                .endpoint()
+                .context("shared-memory transfer endpoint is missing")?
+                .to_owned(),
             name: value
                 .name()
                 .context("shared-memory transfer name is missing")?
                 .to_owned(),
-            ready_header_bytes: value.ready_header_bytes(),
-            ready_semaphore: value.ready_semaphore().map(str::to_owned),
         }
     } else if value.transport() == fbs::TransferTransportKind::CudaIpc {
         TransferTransport::CudaIpc {
@@ -2771,22 +2768,22 @@ fn transfer_locator_from_table(value: fbs::TransferLocator<'_>) -> CodecResult<T
                 .map(|bytes| bytes.bytes().to_vec())
                 .unwrap_or_default(),
             storage_size_bytes: value.storage_size_bytes(),
-            storage_offset_bytes: value.storage_offset_bytes(),
-            tensor_offset: value.tensor_offset(),
+            storage_offsets_bytes: value
+                .storage_offsets_bytes()
+                .map(|items| items.iter().collect())
+                .unwrap_or_default(),
+            span_lengths: value
+                .span_lengths()
+                .map(|items| items.iter().collect())
+                .unwrap_or_default(),
+            span_counts: value
+                .span_counts()
+                .map(|items| items.iter().collect())
+                .unwrap_or_default(),
             tensor_stride: value
                 .tensor_stride()
                 .map(|items| items.iter().collect())
                 .unwrap_or_default(),
-            ref_counter_handle: value
-                .ref_counter_handle()
-                .map(|bytes| bytes.bytes().to_vec())
-                .unwrap_or_default(),
-            ref_counter_offset: value.ref_counter_offset(),
-            event_handle: value
-                .event_handle()
-                .map(|bytes| bytes.bytes().to_vec())
-                .unwrap_or_default(),
-            event_sync_required: value.event_sync_required(),
             ready_event_handle: value
                 .ready_event_handle()
                 .map(|bytes| bytes.bytes().to_vec())
@@ -2797,7 +2794,8 @@ fn transfer_locator_from_table(value: fbs::TransferLocator<'_>) -> CodecResult<T
     };
 
     // Tensor metadata describes the logical view independently of transport.
-    let locator = TransferLocator {
+    let locator = Locator {
+        source: endpoint_from_table(value.source().context("locator has no source endpoint")?)?,
         transport,
         nbytes: value.nbytes(),
         dtype: value
@@ -2808,6 +2806,10 @@ fn transfer_locator_from_table(value: fbs::TransferLocator<'_>) -> CodecResult<T
             .shape()
             .map(|items| items.iter().collect())
             .unwrap_or_default(),
+        offset: value
+            .offset()
+            .map(|items| items.iter().collect())
+            .unwrap_or_default(),
         device: value
             .device()
             .context("transfer device is missing")?
@@ -2816,9 +2818,31 @@ fn transfer_locator_from_table(value: fbs::TransferLocator<'_>) -> CodecResult<T
     Ok(locator)
 }
 
+fn tensor_transfer_from_table(value: fbs::TensorTransfer<'_>) -> CodecResult<TensorTransfer> {
+    let tensor = TensorTransfer {
+        shape: value
+            .shape()
+            .map(|items| items.iter().collect())
+            .unwrap_or_default(),
+        locations: value
+            .locations()
+            .map(|items| items.iter().map(transfer_locator_from_table).collect())
+            .unwrap_or_else(|| Ok(Vec::new()))?,
+    };
+    tensor.validate()?;
+    Ok(tensor)
+}
+
+fn tensor_transfer_to_fb(value: &TensorTransfer) -> fbs::TensorTransferT {
+    fbs::TensorTransferT {
+        shape: Some(value.shape.clone()),
+        locations: Some(value.locations.iter().map(transfer_locator_to_fb).collect()),
+    }
+}
+
 /// Decodes a product-family transfer union and all referenced locators.
 fn transfer_handle_from_table(value: fbs::TransferHandle<'_>) -> CodecResult<TransferHandle> {
-    // The outer union selects product-family metadata; every physical locator
+    // The outer union selects product-family metadata; every physical tensor
     // is decoded through the same transport validator.
     Ok(match value.value_type() {
         fbs::TransferData::EncoderTransfer => {
@@ -2834,10 +2858,10 @@ fn transfer_handle_from_table(value: fbs::TransferHandle<'_>) -> CodecResult<Tra
                     fbs::FeatureKind::Latent => ProductKind::LatentFeature,
                     other => codec_bail!("unknown encoder feature kind {}", other.0),
                 },
-                locator: transfer_locator_from_table(
+                tensor: tensor_transfer_from_table(
                     transfer
-                        .locator()
-                        .context("encoder transfer locator is missing")?,
+                        .tensor()
+                        .context("encoder transfer tensor is missing")?,
                 )?,
             }
         }
@@ -2851,10 +2875,10 @@ fn transfer_handle_from_table(value: fbs::TransferHandle<'_>) -> CodecResult<Tra
                 height: transfer.height(),
                 width: transfer.width(),
                 value_range: transfer.value_range().unwrap_or_default().to_owned(),
-                locator: transfer_locator_from_table(
+                tensor: tensor_transfer_from_table(
                     transfer
-                        .locator()
-                        .context("device-product transfer locator is missing")?,
+                        .tensor()
+                        .context("device-product transfer tensor is missing")?,
                 )?,
             }
         }
@@ -2865,12 +2889,12 @@ fn transfer_handle_from_table(value: fbs::TransferHandle<'_>) -> CodecResult<Tra
                 .context("KV transfer payload is missing")?;
             TransferHandle::Kv {
                 generation: transfer.generation(),
-                locators: transfer
-                    .locators()
+                tensors: transfer
+                    .tensors()
                     .map(|items| {
                         items
                             .iter()
-                            .map(transfer_locator_from_table)
+                            .map(tensor_transfer_from_table)
                             .collect::<CodecResult<Vec<_>>>()
                     })
                     .transpose()?
@@ -2886,9 +2910,10 @@ fn transfer_handle_from_table(value: fbs::TransferHandle<'_>) -> CodecResult<Tra
                 base_extent: transfer.base_extent(),
                 published_extent: transfer.published_extent(),
                 group_id: transfer.group_id(),
-                scale_identity: transfer
-                    .scale_identity()
-                    .context("KV transfer scale identity is missing")?
+                page_size: transfer.page_size(),
+                compute_dtype: transfer
+                    .compute_dtype()
+                    .context("KV transfer compute dtype is missing")?
                     .to_owned(),
             }
         }
@@ -2903,10 +2928,10 @@ fn transfer_handle_from_table(value: fbs::TransferHandle<'_>) -> CodecResult<Tra
                 width: transfer.width(),
                 latent_units: transfer.latent_units(),
                 step: transfer.step(),
-                locator: transfer_locator_from_table(
+                tensor: tensor_transfer_from_table(
                     transfer
-                        .locator()
-                        .context("latent transfer locator is missing")?,
+                        .tensor()
+                        .context("latent transfer tensor is missing")?,
                 )?,
             }
         }
@@ -2915,14 +2940,16 @@ fn transfer_handle_from_table(value: fbs::TransferHandle<'_>) -> CodecResult<Tra
 }
 
 /// Converts common tensor metadata and one transport coordinate set.
-fn transfer_locator_to_fb(value: &TransferLocator) -> fbs::TransferLocatorT {
+fn transfer_locator_to_fb(value: &Locator) -> fbs::LocatorT {
     // Populate transport-independent tensor metadata before selecting the
     // coordinate family stored in the shared FlatBuffers table.
-    let mut output = fbs::TransferLocatorT {
+    let mut output = fbs::LocatorT {
+        source: Some(Box::new(endpoint_to_fb(&value.source))),
         nbytes: value.nbytes,
         dtype: Some(value.dtype.clone()),
         shape: Some(value.shape.clone()),
         device: Some(value.device.clone()),
+        offset: Some(value.offset.clone()),
         ..Default::default()
     };
 
@@ -2932,28 +2959,20 @@ fn transfer_locator_to_fb(value: &TransferLocator) -> fbs::TransferLocatorT {
             output.endpoint = Some(endpoint.clone());
             output.key = *key;
         }
-        TransferTransport::PosixShm {
-            name,
-            ready_header_bytes,
-            ready_semaphore,
-        } => {
+        TransferTransport::PosixShm { endpoint, name } => {
             output.transport = fbs::TransferTransportKind::PosixShm;
+            output.endpoint = Some(endpoint.clone());
             output.name = Some(name.clone());
-            output.ready_header_bytes = *ready_header_bytes;
-            output.ready_semaphore = ready_semaphore.clone();
         }
         TransferTransport::CudaIpc {
             endpoint,
             publication_id,
             storage_handle,
             storage_size_bytes,
-            storage_offset_bytes,
-            tensor_offset,
+            storage_offsets_bytes,
+            span_lengths,
+            span_counts,
             tensor_stride,
-            ref_counter_handle,
-            ref_counter_offset,
-            event_handle,
-            event_sync_required,
             ready_event_handle,
         } => {
             output.transport = fbs::TransferTransportKind::CudaIpc;
@@ -2961,13 +2980,10 @@ fn transfer_locator_to_fb(value: &TransferLocator) -> fbs::TransferLocatorT {
             output.publication_id = Some(publication_id.clone());
             output.storage_handle = Some(storage_handle.clone());
             output.storage_size_bytes = *storage_size_bytes;
-            output.storage_offset_bytes = *storage_offset_bytes;
-            output.tensor_offset = *tensor_offset;
+            output.storage_offsets_bytes = Some(storage_offsets_bytes.clone());
+            output.span_lengths = Some(span_lengths.clone());
+            output.span_counts = Some(span_counts.clone());
             output.tensor_stride = Some(tensor_stride.clone());
-            output.ref_counter_handle = Some(ref_counter_handle.clone());
-            output.ref_counter_offset = *ref_counter_offset;
-            output.event_handle = Some(event_handle.clone());
-            output.event_sync_required = *event_sync_required;
             output.ready_event_handle = Some(ready_event_handle.clone());
         }
     }
@@ -2978,14 +2994,14 @@ fn transfer_locator_to_fb(value: &TransferLocator) -> fbs::TransferLocatorT {
 /// Converts a transfer handle into its product-family wire union.
 fn transfer_handle_to_fb(value: &TransferHandle) -> fbs::TransferHandleT {
     // The product family selects a self-contained transfer metadata table;
-    // physical locator order is preserved within each family.
+    // physical tensor order is preserved within each family.
     let value = match value {
         TransferHandle::Encoder {
             generation,
             height,
             width,
             payload_kind,
-            locator,
+            tensor,
         } => fbs::TransferDataT::EncoderTransfer(Box::new(fbs::EncoderTransferT {
             generation: *generation,
             height: *height,
@@ -2995,7 +3011,7 @@ fn transfer_handle_to_fb(value: &TransferHandle) -> fbs::TransferHandleT {
                 ProductKind::LatentFeature => fbs::FeatureKind::Latent,
                 _ => unreachable!("validated encoder transfer feature kind"),
             },
-            locator: Some(Box::new(transfer_locator_to_fb(locator))),
+            tensor: Some(Box::new(tensor_transfer_to_fb(tensor))),
         })),
 
         TransferHandle::DeviceProduct {
@@ -3003,35 +3019,37 @@ fn transfer_handle_to_fb(value: &TransferHandle) -> fbs::TransferHandleT {
             height,
             width,
             value_range,
-            locator,
+            tensor,
         } => fbs::TransferDataT::DeviceProductTransfer(Box::new(fbs::DeviceProductTransferT {
             generation: *generation,
             height: *height,
             width: *width,
             value_range: Some(value_range.clone()),
-            locator: Some(Box::new(transfer_locator_to_fb(locator))),
+            tensor: Some(Box::new(tensor_transfer_to_fb(tensor))),
         })),
 
         TransferHandle::Kv {
             generation,
-            locators,
+            tensors,
             source,
             destination,
             base,
             base_extent,
             published_extent,
             group_id,
-            scale_identity,
+            compute_dtype,
+            page_size,
         } => fbs::TransferDataT::KvTransfer(Box::new(fbs::KvTransferT {
             generation: *generation,
-            locators: Some(locators.iter().map(transfer_locator_to_fb).collect()),
+            tensors: Some(tensors.iter().map(tensor_transfer_to_fb).collect()),
             source: Some(Box::new(checkpoint_to_fb(source))),
             destination: Some(destination.clone()),
             base: base.as_ref().map(checkpoint_to_fb).map(Box::new),
             base_extent: *base_extent,
             published_extent: *published_extent,
             group_id: *group_id,
-            scale_identity: Some(scale_identity.clone()),
+            compute_dtype: Some(compute_dtype.clone()),
+            page_size: *page_size,
         })),
 
         TransferHandle::Latent {
@@ -3040,14 +3058,14 @@ fn transfer_handle_to_fb(value: &TransferHandle) -> fbs::TransferHandleT {
             width,
             latent_units,
             step,
-            locator,
+            tensor,
         } => fbs::TransferDataT::LatentTransfer(Box::new(fbs::LatentTransferT {
             generation: *generation,
             height: *height,
             width: *width,
             latent_units: *latent_units,
             step: *step,
-            locator: Some(Box::new(transfer_locator_to_fb(locator))),
+            tensor: Some(Box::new(tensor_transfer_to_fb(tensor))),
         })),
     };
 
@@ -3061,6 +3079,7 @@ fn dtype_to_fb(dtype: DType) -> fbs::DType {
         DType::U16 => fbs::DType::U16,
         DType::U32 => fbs::DType::U32,
         DType::I32 => fbs::DType::I32,
+        DType::I16 => fbs::DType::I16,
         DType::I64 => fbs::DType::I64,
         DType::F16 => fbs::DType::F16,
         DType::BF16 => fbs::DType::BF16,
@@ -3075,6 +3094,7 @@ fn dtype_from_fb(dtype: fbs::DType) -> CodecResult<DType> {
         fbs::DType::U16 => DType::U16,
         fbs::DType::U32 => DType::U32,
         fbs::DType::I32 => DType::I32,
+        fbs::DType::I16 => DType::I16,
         fbs::DType::I64 => DType::I64,
         fbs::DType::F16 => DType::F16,
         fbs::DType::BF16 => DType::BF16,

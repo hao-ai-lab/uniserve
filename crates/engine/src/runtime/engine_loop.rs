@@ -51,15 +51,16 @@ impl EngineLoop {
         // Capability families are mutually ordered from diffusion-only through
         // unified multimodal support to autoregressive-only execution.
         let work = &info.supported_ops;
-        let family = if work.contains(&OpKind::DiffusionPrepare)
-            && !work.contains(&OpKind::ArDecode)
-        {
-            RuntimeFamily::Diffusion
-        } else if work.contains(&OpKind::DiffusionStep) || work.contains(&OpKind::EncoderExecute) {
-            RuntimeFamily::Umm
-        } else {
-            RuntimeFamily::Ar
-        };
+        let family =
+            if work.contains(&OpCode::DiffusionPrepare) && !work.contains(&OpCode::ArDecode) {
+                RuntimeFamily::Diffusion
+            } else if work.contains(&OpCode::DiffusionStep)
+                || (work.contains(&OpCode::EncoderVision) || work.contains(&OpCode::EncoderLatent))
+            {
+                RuntimeFamily::Umm
+            } else {
+                RuntimeFamily::Ar
+            };
 
         Self::with_config_for_family(executor, ctrl, config, family)
     }
@@ -115,7 +116,7 @@ impl EngineLoop {
 
         // Unified runtimes reserve one physical slot for the image flow lineage.
         let flow_slot_reserve =
-            usize::from(info.uses_kv() && info.supported_ops.contains(&OpKind::DiffusionStep));
+            usize::from(info.uses_kv() && info.supported_ops.contains(&OpCode::DiffusionStep));
         let request_pool_capacity = info.request_slots as usize;
         let main_request_capacity = request_pool_capacity
             .saturating_sub(flow_slot_reserve)
@@ -187,36 +188,31 @@ impl EngineLoop {
         // Runtime state remains single-owner; executors receive immutable batch
         // snapshots assembled from these queues and cursors.
         let latent_dtype = profile.latent_dtype;
-        let runtime = Runtime::new(
-            family,
-            RuntimeState {
-                ctrl,
-                logits_pipeline: crate::runtime::logits::default_pipeline(),
-                waiting: HashMap::new(),
-                waiting_media: HashMap::new(),
-                running: HashMap::new(),
-                running_media: HashMap::new(),
-                retiring_requests: HashMap::new(),
-                retiring_media: HashMap::new(),
-                inflight: InflightWindow::new(transfer_capacity),
-                denoise_step_burst,
-                latent_dtype,
-                pending_commands: VecDeque::new(),
-                pending_buffer_frees: HashMap::new(),
-                authority_id: 1,
-                next_op_id: 1,
-                next_product_generation: 1,
-                next_epoch: 1,
-            },
-        );
 
         Self {
             executor,
-            pending_submission: None,
+            pending_submissions: VecDeque::new(),
+            worker_affinity: HashMap::new(),
             info,
             profile,
             memory,
-            runtime,
+            family,
+            ctrl,
+            logits_pipeline: crate::runtime::logits::default_pipeline(),
+            waiting: HashMap::new(),
+            waiting_media: HashMap::new(),
+            running: HashMap::new(),
+            running_media: HashMap::new(),
+            retiring_requests: HashMap::new(),
+            inflight: InflightWindow::new(transfer_capacity),
+            denoise_step_burst,
+            latent_dtype,
+            pending_commands: VecDeque::new(),
+            pending_buffer_frees: HashMap::new(),
+            authority_id: 1,
+            next_op_id: 1,
+            next_product_generation: 1,
+            next_epoch: 1,
             scheduler: Scheduler::new(config),
             flow_exclusive_batch,
             fatal: false,
@@ -258,7 +254,7 @@ impl EngineLoop {
     /// Sets the resident sequence limit within the worker slot capacity.
     pub fn set_max_num_seqs(&mut self, n: usize) {
         let flow_slot_reserve = usize::from(
-            self.info.uses_kv() && self.info.supported_ops.contains(&OpKind::DiffusionStep),
+            self.info.uses_kv() && self.info.supported_ops.contains(&OpCode::DiffusionStep),
         );
         let capacity = self
             .memory

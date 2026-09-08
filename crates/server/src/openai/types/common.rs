@@ -422,7 +422,7 @@ pub struct ModelObject {
     pub object: String,
     /// Model creation timestamp in Unix seconds.
     pub created: i64,
-    /// Organization or deployment that owns the model.
+    /// Organization or configuration that owns the model.
     pub owned_by: String,
 }
 
@@ -431,7 +431,7 @@ pub struct ModelObject {
 pub struct ListModelsResponse {
     /// Object type, always `list`.
     pub object: String,
-    /// Models served by this deployment.
+    /// Models served by this configuration.
     pub data: Vec<ModelObject>,
 }
 

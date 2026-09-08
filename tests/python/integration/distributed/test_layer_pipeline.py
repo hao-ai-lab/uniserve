@@ -7,7 +7,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from uniserve_worker.nn.parallel import ParallelConfig, UlyssesSequence
+from uniserve_worker.nn.parallel import ParallelConfig, SequenceParallel
 from uniserve_worker.nn.parallel_pipeline import LayerPipeline
 from uniserve_worker.runtime.distributed import (
     init_distributed_environment,
@@ -33,7 +33,7 @@ def _run_pipeline(rank: int, rendezvous: str, stages: int) -> None:
                 (3, 2, 1, 0),
                 ParallelConfig(
                     pipeline_parallel_size=stages,
-                    sequence_parallel=UlyssesSequence(4 // stages),
+                    sequence_parallel=SequenceParallel("ulysses", (4 // stages,)),
                 ),
             )
         },

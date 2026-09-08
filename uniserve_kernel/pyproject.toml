@@ -13,6 +13,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+peer_memory = [
+  "ninja>=1.13",
+]
 sparse_attention = [
   "ninja>=1.13",
 ]

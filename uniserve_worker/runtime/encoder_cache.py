@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Iterable, Mapping
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from threading import RLock
 from typing import Final
@@ -11,8 +12,8 @@ from typing import Final
 import torch
 
 from ..execution.batch import (
+    BufferAllocation,
     BufferId,
-    BufferPlacement,
     DType,
     ProductKind,
     ProductRef,
@@ -21,6 +22,7 @@ from ..execution.batch import (
     StorageClass,
 )
 from ..foundation.errors import WorkerError, WorkerErrorCode, invalid_descriptor, resource_error
+from ..transfer.tickets import TransferTicket
 from .device import canonical_device
 from .device_events import DeviceEventPool
 from .persistent_buffers import PersistentBufferBinding, PersistentBuffers
@@ -97,6 +99,9 @@ class EncoderWrite:
     physical_generation: int
     binding_id: int
     buffer_binding: PersistentBufferBinding
+    transfers: tuple[TransferTicket, ...] = ()
+    publications: tuple[Future[None], ...] = ()
+    readers: int = 0
     producer_event: torch.cuda.Event | None = None
     producer_stream: int | None = None
     reader_events: list[torch.cuda.Event] = field(default_factory=list)
@@ -188,7 +193,7 @@ class EncoderCache:
         self,
         bindings: tuple[tuple[ProductRef, torch.device | str], ...],
         *,
-        buffer_placements: Mapping[BufferId, BufferPlacement],
+        buffer_allocations: Mapping[BufferId, BufferAllocation],
     ) -> tuple[EncoderWrite, ...]:
         """Reserve shape-compatible encoder slots for operation outputs as one atomic batch."""
 
@@ -201,7 +206,7 @@ class EncoderCache:
             keys = tuple(_reference_key(reference) for reference, _device in bindings)
             if len(set(keys)) != len(keys):
                 raise invalid_descriptor("encoder cache registration repeats a product identity")
-            validated: list[tuple[ProductRef, torch.device, BufferPlacement]] = []
+            validated: list[tuple[ProductRef, torch.device, BufferAllocation]] = []
             requested_by_device: dict[str, int] = {}
             for (reference, raw_device), key in zip(bindings, keys, strict=True):
                 if reference.kind not in {
@@ -216,9 +221,9 @@ class EncoderCache:
                     raise invalid_descriptor("encoder feature dtype is unsupported")
                 if int(reference.max_bytes) > self.max_entry_bytes:
                     raise resource_error("encoder feature exceeds the fixed entry byte capacity")
-                placement = buffer_placements.get(reference.buffer_id)
-                if placement is None:
-                    raise invalid_descriptor("encoder feature has no buffer placement")
+                allocation = buffer_allocations.get(reference.buffer_id)
+                if allocation is None:
+                    raise invalid_descriptor("encoder feature has no buffer allocation")
                 existing = self._entries.get(key)
                 if existing is not None:
                     if existing.reference != reference:
@@ -236,30 +241,26 @@ class EncoderCache:
                 requested_by_device[str(device)] = requested_by_device.get(str(device), 0) + 1
                 if requested_by_device[str(device)] > len(free):
                     raise resource_error("encoder cache has no query-ready device slot")
-                validated.append((reference, device, placement))
-            prepared: list[
-                tuple[ProductRef, torch.device, BufferPlacement, _EncoderSlot]
-            ] = []
+                validated.append((reference, device, allocation))
+            prepared: list[tuple[ProductRef, torch.device, BufferAllocation, _EncoderSlot]] = []
             try:
-                for reference, device, placement in validated:
+                for reference, device, allocation in validated:
                     slot = self._slots[str(device)][self._free[str(device)].popleft()]
-                    prepared.append((reference, device, placement, slot))
+                    prepared.append((reference, device, allocation, slot))
             except BaseException:
-                for _reference, device, _placement, slot in reversed(prepared):
+                for _reference, device, _allocation, slot in reversed(prepared):
                     self._free[str(device)].appendleft(slot.index)
                 raise
             writes: list[EncoderWrite] = []
             try:
-                for (reference, device, placement, slot), key in zip(
-                    prepared, keys, strict=True
-                ):
+                for (reference, device, allocation, slot), key in zip(prepared, keys, strict=True):
                     generation = slot.generation + 1
                     slot.generation = 1 if generation > _MAX_GENERATION else generation
                     binding_id = self._next_binding_id
                     self._next_binding_id += 1
                     buffer_binding = self.persistent_buffers.bind(
                         reference,
-                        placement,
+                        allocation,
                         device=device,
                         dtype=_DTYPES[reference.dtype],
                         shape=_shape(reference),
@@ -280,9 +281,7 @@ class EncoderCache:
                     self.persistent_buffers.release(write.buffer_binding)
                     write.slot.owner = 0
                     self._free[str(write.slot.device)].appendleft(write.slot.index)
-                for _reference, device, _placement, slot in reversed(
-                    prepared[len(writes) :]
-                ):
+                for _reference, device, _allocation, slot in reversed(prepared[len(writes) :]):
                     self._free[str(device)].appendleft(slot.index)
                 raise
             return tuple(writes)
@@ -308,9 +307,11 @@ class EncoderCache:
             if int(flat.numel()) > int(target.numel()):
                 raise _invariant("encoder feature exceeds its registered shape bound")
             resident = target.reshape(-1)[: int(flat.numel())].reshape(value.shape)
-            resident.copy_(
-                flat.reshape(value.shape).to(dtype=dtype), non_blocking=value.device.type == "cuda"
-            )
+            if resident.data_ptr() != flat.data_ptr() or resident.dtype != flat.dtype:
+                resident.copy_(
+                    flat.reshape(value.shape).to(dtype=dtype),
+                    non_blocking=value.device.type == "cuda",
+                )
             if resident.device.type == "cuda":
                 event = self.event_pool.acquire(resident.device)
                 entry.producer_stream = self.event_pool.record(event, resident.device)
@@ -346,38 +347,7 @@ class EncoderCache:
                 stream = torch.cuda.current_stream(target)
                 if int(stream.cuda_stream) != entry.producer_stream:
                     stream.wait_event(event)
-            return EncoderRead(
-                tensor=entry.tensor,
-                metadata=entry.metadata,
-                consumer_op_id=int(consumer_op_id),
-                _write=entry,
-            )
-
-    def consume_candidate(
-        self,
-        write: EncoderWrite,
-        *,
-        consumer_op_id: int,
-        device: torch.device | str | None = None,
-    ) -> EncoderRead:
-        """Read one unpublished feature inside its consuming lane."""
-
-        with self._lock:
-            entry = self._require_write_locked(write)
-            if self._candidates.get(entry.binding_id) is not entry:
-                raise _invariant("encoder feature candidate is not live")
-            if not entry.published or entry.tensor is None or entry.metadata is None:
-                raise invalid_descriptor("encoder feature was consumed before producer readiness")
-            target = entry.tensor.device if device is None else canonical_device(device)
-            if target != entry.tensor.device:
-                raise invalid_descriptor("encoder feature consumer names a different device")
-            if target.type == "cuda":
-                event = entry.producer_event
-                if event is None:
-                    raise _invariant("CUDA encoder feature has no producer event")
-                stream = torch.cuda.current_stream(target)
-                if int(stream.cuda_stream) != entry.producer_stream:
-                    stream.wait_event(event)
+            entry.readers += 1
             return EncoderRead(
                 tensor=entry.tensor,
                 metadata=entry.metadata,
@@ -405,8 +375,11 @@ class EncoderCache:
                     self.event_pool.retain(event, target, len(entries))
                     for _read, entry in entries:
                         entry.reader_events.append(event)
-                for read, _entry in entries:
+                for read, entry in entries:
+                    entry.readers -= 1
                     read._recorded = True
+                    if entry.released:
+                        self._wake_retirement_locked(entry)
 
     def validate_writes(self, writes: tuple[EncoderWrite, ...]) -> None:
         """Verify that encoder writes still refer to active unpublished reservations."""
@@ -443,29 +416,64 @@ class EncoderCache:
                 ).append(entry)
                 self._candidates.pop(entry.binding_id)
 
-    def release_generations(self, generations: Iterable[int]) -> None:
-        """Release resident encoder products belonging to selected generations."""
+    def release_buffers(self, buffers: Iterable[BufferId]) -> None:
+        """Revoke exact buffer identities and preserve all active physical leases."""
 
-        selected = {int(value) for value in generations}
+        selected = set(buffers)
         if not selected:
             return
         with self._lock:
-            for entry in self._entries.values():
-                if int(entry.reference.generation) in selected:
-                    entry.released = True
-                    self._detach_locked(entry)
+            for entry in (*self._entries.values(), *self._candidates.values()):
+                if entry.reference.buffer_id in selected:
+                    self._release_entry_locked(entry)
             self._reclaim_ready_locked()
 
-    def drop_request(self, request_id: int) -> None:
-        """Release every resident encoder feature owned by one request identifier."""
+    def release_requests(
+        self, requests: Iterable[RequestKey], *, retained: frozenset[BufferId] = frozenset()
+    ) -> None:
+        """Revoke request-owned products while preserving transferred allocation ownership."""
 
-        target = int(request_id)
+        selected = set(requests)
+        if not selected:
+            return
         with self._lock:
-            for entry in self._entries.values():
-                if int(entry.reference.request_key.request_id) == target:
-                    entry.released = True
-                    self._detach_locked(entry)
+            for entry in (*self._entries.values(), *self._candidates.values()):
+                if (
+                    entry.reference.request_key in selected
+                    and entry.reference.buffer_id not in retained
+                ):
+                    self._release_entry_locked(entry)
             self._reclaim_ready_locked()
+
+    def retirement_ready(
+        self,
+        *,
+        buffers: frozenset[BufferId],
+        requests: frozenset[RequestKey],
+        retained: frozenset[BufferId] = frozenset(),
+    ) -> bool:
+        """Confirm selected allocations have returned after every physical reader."""
+
+        with self._lock:
+            for entry in (*self._entries.values(), *self._candidates.values()):
+                if entry.reference.buffer_id in buffers or (
+                    entry.reference.request_key in requests
+                    and entry.reference.buffer_id not in retained
+                ):
+                    for transfer in entry.transfers:
+                        transfer.retirement_ready()
+                    for publication in entry.publications:
+                        if publication.done():
+                            publication.result()
+            self._reclaim_ready_locked()
+            return not any(
+                entry.reference.buffer_id in buffers
+                or (
+                    entry.reference.request_key in requests
+                    and entry.reference.buffer_id not in retained
+                )
+                for entry in (*self._entries.values(), *self._candidates.values())
+            )
 
     def release_operations(self, releases: Iterable[tuple[RequestKey, int]]) -> None:
         """Release encoder products associated with completed operation identities."""
@@ -475,6 +483,46 @@ class EncoderCache:
                 for entry in self._operations.pop((request_key, int(raw_op_id)), ()):
                     entry.released = True
             self._reclaim_ready_locked()
+
+    def _release_entry_locked(self, entry: EncoderWrite) -> None:
+        entry.released = True
+        self._detach_locked(entry)
+        self._wake_retirement_locked(entry)
+        if not entry.published:
+            for transfer in entry.transfers:
+                transfer.cancel()
+
+    def _wake_retirement_locked(self, entry: EncoderWrite) -> None:
+        for event in (entry.producer_event, *entry.reader_events):
+            if event is not None and not event.query():
+                self.event_pool.schedule_completion_wake(entry.slot.device, event)
+
+    def retain_publication(self, write: EncoderWrite, retirement: Future[None]) -> None:
+        """Keep a published pool range immutable until its transport registration retires."""
+
+        with self._lock:
+            entry = self._require_write_locked(write)
+            retained = tuple(
+                publication
+                for publication in entry.publications
+                if not publication.done() or publication.exception() is not None
+            )
+            entry.publications = (*retained, retirement)
+
+    def retain_transfer(self, write: EncoderWrite, ticket: TransferTicket) -> None:
+        """Guard a reserved destination until its backend finishes physical access."""
+
+        with self._lock:
+            entry = self._require_write_locked(write)
+            if entry.published or entry.released:
+                raise _invariant("transfer destination already has a producer")
+            entry.transfers = (*entry.transfers, ticket)
+
+        def reclaim() -> None:
+            with self._lock:
+                self._reclaim_ready_locked()
+
+        ticket.add_retirement_callback(reclaim)
 
     def abandon_writes(self, writes: tuple[EncoderWrite, ...]) -> None:
         """Return unpublished encoder reservations to the free pool."""
@@ -559,6 +607,12 @@ class EncoderCache:
         for key, entry in tuple(self._entries.items()):
             if (
                 not entry.released
+                or entry.readers != 0
+                or any(not transfer.retired() for transfer in entry.transfers)
+                or any(
+                    not publication.done() or publication.exception() is not None
+                    for publication in entry.publications
+                )
                 or not ready(entry.producer_event)
                 or not all(ready(event) for event in entry.reader_events)
             ):
@@ -576,6 +630,12 @@ class EncoderCache:
         for binding_id, entry in tuple(self._candidates.items()):
             if (
                 not entry.released
+                or entry.readers != 0
+                or any(not transfer.retired() for transfer in entry.transfers)
+                or any(
+                    not publication.done() or publication.exception() is not None
+                    for publication in entry.publications
+                )
                 or not ready(entry.producer_event)
                 or not all(ready(event) for event in entry.reader_events)
             ):

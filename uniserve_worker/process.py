@@ -9,11 +9,12 @@ import time
 from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from functools import partial
 from queue import SimpleQueue
 from typing import TYPE_CHECKING, Any
 
 from .bootstrap.worker_info import RequestKind, ResponseKind
-from .execution.batch import Finish, Run, RunKind, RunResult
+from .execution.batch import Finish, OpCode, Retire, Run, RunResult
 from .execution.rows import PreparedExecution
 from .execution.run import ReplayWindow, RunReader, WorkerRun
 from .foundation.env import env_int, env_optional_int
@@ -231,10 +232,9 @@ class WorkerProcess:
         self._shutdown_response: dict[str, Any] | None = None
         self._accepting_closed = False
         self._fatal_shutdown = False
-        self._launch_reorder = int(worker.info.rank.world_size) == 1
+        self._launch_reorder = int(worker.info.world_size) == 1
         self._cooperative_order = (
-            int(worker.info.rank.world_size) > 1
-            and worker.model.ordered_collective_execution
+            int(worker.info.world_size) > 1 and worker.model.ordered_collective_execution
         )
         self._execute_count = 0
         self._terminate_after = env_int("UNISERVE_STUB_DIE_AFTER", default=0)
@@ -252,10 +252,7 @@ class WorkerProcess:
 
             self._profile_state = (cProfile.Profile(), None, profile_dir)
         if ipc_endpoint is not None:
-            wake = getattr(ipc_endpoint, "wake", None)
-            wake_on_stream = getattr(ipc_endpoint, "wake_on_stream", None)
-            if callable(wake) and callable(wake_on_stream):
-                worker.set_completion_wake(wake, wake_on_stream)
+            worker.set_completion_wake(ipc_endpoint.wake, ipc_endpoint.wake_on_stream)
 
     def _profile_tick(self) -> None:
         """Advance profiler state at an execution boundary and apply the configured window."""
@@ -361,7 +358,7 @@ class WorkerProcess:
                     self._profile_tick()
                 terminate_this_rank = self._terminate_rank in {
                     None,
-                    int(self.worker.info.rank.rank),
+                    int(self.worker.info.endpoint.rank),
                 }
                 self._execute_count += 1
                 if (
@@ -382,7 +379,7 @@ class WorkerProcess:
                     run = raw_run if isinstance(raw_run, Run) else Run.from_mapping(raw_run)
                 requests = _run_requests(run)
                 early = self._launch_reorder and any(
-                    operation.kind.encode_mode is not None or operation.kind is RunKind.AR_EXTEND
+                    operation.kind.encode_mode is not None or operation.kind is OpCode.AR_EXTEND
                     for operation in run.operations
                 )
 
@@ -576,7 +573,7 @@ class WorkerProcess:
             else:
                 if not isinstance(source, PreparedExecution):
                     raise RuntimeError("pending execution source has no readiness owner")
-                source.on_transfer_completion(lambda: self._preparation_ready.put(run))
+                source.on_dependencies_ready(partial(self._preparation_completed, run))
         except BaseException as error:
             run.fail(error)
 
@@ -652,7 +649,7 @@ class WorkerProcess:
         self._ended_epochs.update(
             (int(command.request_key.request_id), int(command.request_key.epoch))
             for command in run.run.commands
-            if isinstance(command, Finish)
+            if isinstance(command, (Finish, Retire))
         )
         self._run_ready(run)
         for pending in self._run_waiters.pop(run.run_id, ()):
@@ -663,7 +660,7 @@ class WorkerProcess:
     def _retain_terminal(self, run: WorkerRun) -> None:
         """Retain request identities whose terminal releases must wait for response delivery."""
 
-        retains_finish = any(isinstance(command, Finish) for command in run.run.commands)
+        retains_finish = any(isinstance(command, (Finish, Retire)) for command in run.run.commands)
         if run.epochs and run.epochs.issubset(self._ended_epochs) and not retains_finish:
             if self.runs.get(run.run_id) is run:
                 del self.runs[run.run_id]
@@ -681,18 +678,30 @@ class WorkerProcess:
         referenced = {epoch for run in self.runs.values() if run.complete for epoch in run.epochs}
         self._ended_epochs.intersection_update(referenced)
 
+    def _preparation_completed(self, run: WorkerRun) -> None:
+        """Enqueue readiness before waking the IPC loop that consumes it."""
+
+        self._preparation_ready.put(run)
+        if self.ipc_endpoint is not None:
+            self.ipc_endpoint.wake()
+
     def _advance_device_fifo(self) -> bool:
         """Retire device work in submission order once its completion events become ready."""
 
         advanced = False
         if not self._preparation_ready.empty():
             run = self._preparation_ready.get_nowait()
-            before = run.state
             if not run.complete:
-                run.advance_execution()
-            if not run.complete:
-                self._device_fifo.append(run)
-            advanced = run.complete or run.state != before
+                launched = run.advance_execution()
+                if not run.complete:
+                    if launched:
+                        self._device_fifo.append(run)
+                    else:
+                        source = run.source
+                        if not isinstance(source, PreparedExecution):
+                            raise RuntimeError("pending execution source has no readiness owner")
+                        source.on_dependencies_ready(partial(self._preparation_completed, run))
+            advanced = True
         while self._device_fifo:
             run = self._device_fifo[0]
             if run.complete:
@@ -773,7 +782,7 @@ class WorkerProcess:
     def _profile_name(self, boundary: str, *, run_id: int | None = None) -> str:
         """Build a rank- and run-qualified profiler range name."""
 
-        name = f"uniserve.worker.{boundary} rank={int(self.worker.info.rank.rank)}"
+        name = f"uniserve.worker.{boundary} rank={int(self.worker.info.endpoint.rank)}"
         return f"{name} run={run_id}" if run_id is not None and run_id >= 0 else name
 
     def _drain_continuations(self) -> None:

@@ -2,11 +2,21 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+import torch
+
+from uniserve_worker.config import WorkerConfig
+
+from ..execution.bounded_storage import TensorSchema
+from ..execution.input_buffers import InputGeometry
+from ..foundation.math import ceil_div
 from ..models.generation import GenerationPipeline
-from ..models.runtime import ExecutionModel, WorkerDeployment
+from ..models.inputs import FeatureLayout
+from ..models.runtime import ExecutionModel
+from ..nn.mesh import Communicator
 from ..runtime.device_products import device_product_capacity_bytes
 
 _DEVICE_PRODUCTS_PER_OPERATION = 6
@@ -22,29 +32,92 @@ DEFAULT_MAX_REQUEST_POOL_SIZE = 128
 DEFAULT_BLOCK_SIZE = 64
 
 
-@dataclass(frozen=True)
-class CudaKVCapacity:
-    """Records the device memory budget and resulting CUDA KV page capacity."""
+def packed_input_geometry(model: ExecutionModel, config: WorkerConfig) -> InputGeometry:
+    """Size staging for the admitted text span plus one atomic image or CFG operation."""
 
-    device: str
-    free_bytes: int
-    total_bytes: int
-    memory_fraction: float
-    bytes_per_token: int
-    block_size: int
-    token_capacity: int
-    num_blocks: int
+    max_rows = min(
+        config.max_request_pool_size,
+        config.max_batch_operations,
+        *(lane.max_batch_operations or config.max_batch_operations for lane in config.lanes),
+    )
+    max_tokens = (
+        min(
+            config.max_batch_tokens,
+            *(lane.max_batch_tokens or config.max_batch_tokens for lane in config.lanes),
+        )
+        if config.lanes
+        else config.max_batch_tokens
+    )
+    flow = model.generation
+    branches = 1 if flow is None else int(flow.max_cfg_branches)
+    processor = model.image_processor
+    injection = None if processor is None else processor.feature_injection
+    image_span = (
+        0
+        if injection is None
+        else max(
+            int(model.max_vit_grid_tokens), 0 if flow is None else int(flow.max_vae_grid_tokens)
+        )
+        + (2 if injection.layout is FeatureLayout.FRAMED else 0)
+    )
+    text_tokens = max_tokens + image_span
+    flow_tokens = (
+        0
+        if flow is None
+        else branches
+        * max(
+            (
+                int(flow.max_latent_tokens),
+                *(
+                    flow.physical_tokens(height, width)
+                    for height, width in config.flow_graph_shapes
+                ),
+            )
+        )
+    )
+    return InputGeometry(
+        max_rows=max_rows * branches,
+        max_tokens=text_tokens + flow_tokens,
+        max_text_tokens=text_tokens,
+        max_blocks_per_row=max(1, ceil_div(model.text_max_tokens, config.block_size)),
+        hidden_size=model.hidden_size,
+    )
+
+
+def tensor_slot_capacity(
+    schema: Mapping[str, TensorSchema],
+    group: Communicator,
+    *,
+    maximum: int,
+    minimum: int,
+    available_bytes: int,
+    product_bytes_per_request: int = 0,
+) -> int:
+    """Size identical request-slot counts within every participating device's grant."""
+
+    bytes_per_slot = (
+        sum(field.nbytes for field in schema.values() if field.memory != "pinned")
+        + product_bytes_per_request
+    )
+    if bytes_per_slot < 1 or minimum < 1 or maximum < minimum:
+        raise ValueError("request tensor capacity requires valid byte and slot bounds")
+    available = min(maximum, available_bytes // bytes_per_slot)
+    agreed = torch.tensor(available, dtype=torch.int64, device=group.device)
+    group.all_reduce_min(agreed)
+    count = int(agreed.item())
+    if count < minimum:
+        raise RuntimeError("insufficient device memory for the required request tensor slots")
+    return count
 
 
 @dataclass(frozen=True)
 class RuntimeKVCapacity:
-    """Records resolved KV token and page capacity with optional CUDA memory evidence."""
+    """Resolved KV token and page capacity within the assigned physical budget."""
 
     block_size: int
     bytes_per_token: int
     token_capacity: int
     num_blocks: int
-    cuda: CudaKVCapacity | None = None
 
 
 def latent_trajectory_bytes(
@@ -109,9 +182,45 @@ def operation_window(pipeline_depth: int, max_operations: int) -> int:
     return min(depth * operations, max(2, depth))
 
 
+def request_tensor_arena_capacity(
+    worker_config: WorkerConfig,
+    *,
+    pipeline_depth: int,
+    product_bytes_per_request: int,
+) -> ArenaCapacity:
+    """Bound public product, relay and transfer storage for fixed request tensors."""
+
+    depth = int(pipeline_depth)
+    max_operations = int(worker_config.max_batch_operations)
+    state_slots = int(worker_config.max_request_pool_size)
+    slots = depth * max_operations
+    unresolved_window = depth // state_slots - 1
+    device_products = _DEVICE_PRODUCTS_PER_OPERATION * (
+        slots + _DEVICE_PRODUCT_RETIREMENT_BATCHES * max_operations
+    )
+    relay_bytes = (
+        (state_slots + 1)
+        * (max(1, unresolved_window) + _REQUEST_RELAY_RETIREMENT_LANES)
+        * _REQUEST_RELAY_ROW_BYTES
+    )
+    return ArenaCapacity(
+        latent_pool_bytes=0,
+        device_products=device_products,
+        device_product_bytes=(
+            device_product_capacity_bytes(
+                device_products, 1, selected_points_per_operation=1, max_value_bytes=1
+            )
+            + relay_bytes
+        ),
+        transfer_bytes=max(1, state_slots * product_bytes_per_request),
+        transfer_tickets=max(1, min(slots, _MAX_TRANSFER_ENTRIES)),
+        cpu_tasks=state_slots * (unresolved_window + 1),
+    )
+
+
 def model_arena_capacity(
     model: ExecutionModel,
-    deployment: WorkerDeployment,
+    worker_config: WorkerConfig,
     *,
     pipeline_depth: int,
     completion_payload_bytes: int,
@@ -124,46 +233,23 @@ def model_arena_capacity(
     max_vision_feature_bytes: int,
     bytes_per_token: int,
 ) -> ArenaCapacity:
-    """Derive device-product, transfer, latent, and CPU arena bounds from deployment geometry."""
+    """Derive device-product, transfer, latent, and CPU arena bounds from worker_config geometry."""
 
     depth = int(pipeline_depth)
     payload_bytes = int(completion_payload_bytes)
-    max_operations = int(deployment.max_batch_operations)
+    max_operations = int(worker_config.max_batch_operations)
     if depth < 1 or payload_bytes < 1 or max_operations < 1:
         raise ValueError("model arena sizing requires positive runtime bounds")
 
     slots = depth * max_operations
-    state_geometry = model.dedicated_state_geometry
-    if state_geometry is not None:
-        transfer_tickets = min(slots, _MAX_TRANSFER_ENTRIES)
-        state_slots = int(state_geometry.slot_count)
-        unresolved_window = depth // state_slots - 1
-        device_products = _DEVICE_PRODUCTS_PER_OPERATION * (
-            slots + _DEVICE_PRODUCT_RETIREMENT_BATCHES * max_operations
-        )
-        relay_bytes = (
-            (int(request_pool_size) + 1)
-            * (max(1, unresolved_window) + _REQUEST_RELAY_RETIREMENT_LANES)
-            * _REQUEST_RELAY_ROW_BYTES
-        )
-        return ArenaCapacity(
-            latent_pool_bytes=0,
-            device_products=device_products,
-            device_product_bytes=(
-                device_product_capacity_bytes(
-                    device_products,
-                    1,
-                    selected_points_per_operation=1,
-                    max_value_bytes=1,
-                )
-                + relay_bytes
-            ),
-            transfer_bytes=max(1, transfer_tickets),
-            transfer_tickets=max(1, transfer_tickets),
-            cpu_tasks=state_slots * (unresolved_window + 1),
+    if bool(model.resource_geometry.request_tensors):
+        return request_tensor_arena_capacity(
+            worker_config,
+            pipeline_depth=depth,
+            product_bytes_per_request=model.product_storage_bytes,
         )
     transfer_tickets = min(slots, _MAX_TRANSFER_ENTRIES)
-    block_size = int(deployment.block_size)
+    block_size = int(worker_config.block_size)
     flow = model.generation
     if flow is not None and not isinstance(flow, GenerationPipeline):
         raise ValueError("model generation behavior has an invalid type")
@@ -175,9 +261,9 @@ def model_arena_capacity(
             "float16": 2,
             "bfloat16": 2,
             "float32": 4,
-        }.get(str(deployment.model_dtype).removeprefix("torch.").lower())
+        }.get(str(worker_config.model_dtype).removeprefix("torch.").lower())
         if dtype_bytes is None:
-            raise ValueError(f"unsupported latent dtype {deployment.model_dtype!r}")
+            raise ValueError(f"unsupported latent dtype {worker_config.model_dtype!r}")
         latent_pool_bytes = latent_pool_capacity_bytes(
             request_pool_size=int(request_pool_size),
             num_pages=int(num_latent_pages),
@@ -191,7 +277,9 @@ def model_arena_capacity(
             dtype_bytes,
         )
         raw_image_bytes = int(flow.max_vae_grid_tokens) * int(flow.latent_downsample) ** 2 * 3
-        artifact_bytes = ((2 * raw_image_bytes + (1 << 20) + 2) // 3) * 4
+        # Device feedback is the decoded BF16 image. Encoded PNG/base64 bytes
+        # belong to the pinned CPU output owner and consume no device arena.
+        artifact_bytes = raw_image_bytes * 2
     max_transfer_bytes = max(
         int(num_blocks) * block_size * int(bytes_per_token),
         latent_transfer_bytes,
@@ -207,8 +295,8 @@ def model_arena_capacity(
     device_products = _DEVICE_PRODUCTS_PER_OPERATION * device_product_slots
     device_count = len(
         {
-            str(deployment.device),
-            str(deployment.generation_device or deployment.device),
+            str(worker_config.device),
+            str(worker_config.generation_device or worker_config.device),
         }
     )
     device_product_bytes = device_product_capacity_bytes(
@@ -259,90 +347,14 @@ def derive_num_blocks(
     return max(min_blocks, blocks)
 
 
-def device_total_bytes(device: Any) -> int:
-    """Return one device's total CUDA memory, or zero for a non-CUDA device."""
+def device_total_bytes(device: str | torch.device) -> int:
+    """Return CUDA capacity, propagating device errors so an unknown budget cannot become zero."""
 
-    try:
-        import torch
-    except Exception:
-        return 0
-    if not torch.cuda.is_available():
-        return 0
-    try:
-        target = torch.device(device)
-    except Exception:
-        return 0
+    target = torch.device(device)
     if target.type != "cuda":
         return 0
-    try:
-        _free, total = torch.cuda.mem_get_info(target)
-    except Exception:
-        return 0
+    _free, total = torch.cuda.mem_get_info(target)
     return int(total)
-
-
-def derive_cuda_kv_capacity(
-    *,
-    device: Any,
-    block_size: int,
-    bytes_per_token: int,
-    memory_fraction: float,
-    floor: int = 1,
-    resident_copies: int = 1,
-    co_resident_blocks: int = 0,
-) -> CudaKVCapacity | None:
-    """Derive KV token/block capacity from the device static-memory budget.
-
-    ``None`` means CUDA sizing is unavailable and callers should use their
-    non-CUDA capacity policy.
-
-    ``memory_fraction`` is the share of total device memory that static
-    residency may hold: the memory already resident when sizing runs, such as
-    model weights, plus every KV pool provisioned from the derived capacity.
-    A deployment that keeps ``resident_copies`` copies of the derived pool
-    resident at once, plus ``co_resident_blocks`` of fixed KV storage, receives
-    a block count that satisfies
-    ``resident_copies * num_blocks + co_resident_blocks`` within the budget.
-    """
-
-    try:
-        import torch
-    except Exception:
-        return None
-
-    if not torch.cuda.is_available():
-        return None
-    try:
-        cuda_device = torch.device(device)
-    except Exception:
-        return None
-    if cuda_device.type != "cuda":
-        return None
-    block = int(block_size)
-    token_bytes = max(1, int(bytes_per_token))
-    if block <= 0:
-        return None
-    try:
-        free_bytes, total_bytes = torch.cuda.mem_get_info(cuda_device)
-    except Exception:
-        return None
-    fraction = float(memory_fraction)
-    resident_bytes = max(0, int(total_bytes) - int(free_bytes))
-    usable_bytes = max(0, int(float(total_bytes) * fraction) - resident_bytes)
-    budget_blocks = (usable_bytes // token_bytes) // block
-    copies = max(1, int(resident_copies))
-    request_blocks = (budget_blocks - max(0, int(co_resident_blocks))) // copies
-    num_blocks = max(max(1, int(floor)), request_blocks)
-    return CudaKVCapacity(
-        device=str(cuda_device),
-        free_bytes=int(free_bytes),
-        total_bytes=int(total_bytes),
-        memory_fraction=fraction,
-        bytes_per_token=token_bytes,
-        block_size=block,
-        token_capacity=int(num_blocks * block),
-        num_blocks=int(num_blocks),
-    )
 
 
 def derive_runtime_kv_capacity(
@@ -351,64 +363,51 @@ def derive_runtime_kv_capacity(
     kv_token_capacity: int | None,
     bytes_per_token: int,
     device: Any = None,
-    memory_fraction: float = 1.0,
+    available_bytes: int | None = None,
     floor: int = 1,
     default_blocks: int | None = None,
     resident_copies: int = 1,
     co_resident_blocks: int = 0,
 ) -> RuntimeKVCapacity:
-    """Resolve the worker-facing KV capacity policy in one place.
+    """Size one physical KV pool from explicit tokens or a host-owned byte grant.
 
-    Explicit token capacity wins. Otherwise CUDA free-memory sizing is used
-    when available, with ``resident_copies`` and ``co_resident_blocks``
-    describing the KV storage that shares the memory-fraction budget with the
-    request pool. CPU/unavailable-CUDA paths fall back to
-    :func:`derive_num_blocks`.
+    Fixed-capacity callers supply their page count. Automatic CUDA sizing requires
+    a granted budget; CPU geometry uses its declared default page policy.
     """
 
     block = int(block_size)
-    token_bytes = max(1, int(bytes_per_token))
-    if kv_token_capacity is not None and int(kv_token_capacity) > 0:
+    token_bytes = int(bytes_per_token)
+    if block < 1 or token_bytes < 1 or floor < 1 or resident_copies < 1 or co_resident_blocks < 0:
+        raise ValueError("KV capacity geometry must be positive")
+    if available_bytes is not None and available_bytes < 0:
+        raise ValueError("KV memory grant must not be negative")
+    if kv_token_capacity is not None:
+        if kv_token_capacity <= 0:
+            raise ValueError("configured KV token capacity must be positive")
         blocks = derive_num_blocks(block, kv_token_capacity, floor=floor)
-        return RuntimeKVCapacity(
-            block_size=block,
-            bytes_per_token=token_bytes,
-            token_capacity=int(blocks * block),
-            num_blocks=int(blocks),
-            cuda=None,
-        )
-
-    cuda = derive_cuda_kv_capacity(
-        device=device,
-        block_size=block,
-        bytes_per_token=token_bytes,
-        memory_fraction=memory_fraction,
-        floor=floor,
-        resident_copies=resident_copies,
-        co_resident_blocks=co_resident_blocks,
-    )
-    if cuda is not None:
-        return RuntimeKVCapacity(
-            block_size=block,
-            bytes_per_token=token_bytes,
-            token_capacity=int(cuda.token_capacity),
-            num_blocks=int(cuda.num_blocks),
-            cuda=cuda,
-        )
-
-    blocks = derive_num_blocks(block, None, default_blocks=default_blocks, floor=floor)
+    elif available_bytes is not None:
+        blocks = (available_bytes // (block * token_bytes) - co_resident_blocks) // resident_copies
+        if blocks < floor:
+            raise ValueError("device memory grant cannot hold the required KV pool")
+    elif device is not None and torch.device(device).type == "cuda":
+        raise ValueError("automatic CUDA KV sizing requires a host memory grant")
+    else:
+        blocks = derive_num_blocks(block, None, default_blocks=default_blocks, floor=floor)
+    if (
+        available_bytes is not None
+        and (resident_copies * blocks + co_resident_blocks) * block * token_bytes > available_bytes
+    ):
+        raise ValueError("configured KV storage exceeds the device memory grant")
     return RuntimeKVCapacity(
         block_size=block,
         bytes_per_token=token_bytes,
-        token_capacity=int(blocks * block),
-        num_blocks=int(blocks),
-        cuda=None,
+        token_capacity=blocks * block,
+        num_blocks=blocks,
     )
 
 
 __all__ = [
     "ArenaCapacity",
-    "CudaKVCapacity",
     "DEFAULT_BLOCK_SIZE",
     "DEFAULT_MAX_BATCH_OPS",
     "DEFAULT_MAX_REQUEST_POOL_SIZE",

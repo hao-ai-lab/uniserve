@@ -248,7 +248,7 @@ impl EngineLoop {
         mut view: SequenceView,
         prefix_versions: Vec<Checkpoint>,
     ) {
-        let operation_variant = operation.kind;
+        let operation_variant = operation.kind();
 
         // Prompt scores share the completion but precede its phase transition.
         if !view.prompt_logprobs.is_empty() {
@@ -256,12 +256,12 @@ impl EngineLoop {
             self.resolve_prompt_logprobs(id, positions);
         }
 
-        if operation_variant == RunKind::ArDecode {
+        if operation_variant == OpCode::ArDecode {
             return self.resolve_decode_text(id, view, &prefix_versions);
         }
 
         match operation_variant {
-            RunKind::ArExtend => {
+            OpCode::ArExtend => {
                 self.activate_request_tables(id);
 
                 // State-ingest and feedback operations use autoregressive extension
@@ -424,10 +424,30 @@ impl EngineLoop {
                 }
 
                 // Only a complete prompt publishes reusable KV blocks.
-                let (runtime, memory) = (&mut self.runtime, &self.memory);
-                if let Some(st) = runtime.state_mut().running.get_mut(&id) {
+                let state = self
+                    .running
+                    .get(&id)
+                    .expect("prefill request remains active");
+                let key = RequestKey::new(self.authority_id, id, state.epoch);
+                let worker = self
+                    .worker_affinity
+                    .get(&(key, "model".to_owned()))
+                    .expect("prefill has a bound model entry");
+                let source = Arc::new(
+                    self.executor
+                        .info()
+                        .workers
+                        .iter()
+                        .find(|(id, _)| id == worker)
+                        .expect("prefill Worker remains loaded")
+                        .1
+                        .endpoint
+                        .clone(),
+                );
+                let memory = &self.memory;
+                if let Some(st) = self.running.get_mut(&id) {
                     let kv = memory.cache();
-                    cache_prompt_blocks(&kv.coordinator, st, &kv.block_pool);
+                    cache_prompt_blocks(&kv.coordinator, st, &kv.block_pool, &source);
                 }
 
                 // A description-lowered prefix may already end at a branch trigger.
@@ -493,7 +513,7 @@ impl EngineLoop {
                     self.begin_image(id);
                 }
             }
-            RunKind::DiffusionStep => {
+            OpCode::DiffusionStep => {
                 // Publish every newly committed step exactly once, including steps
                 // coalesced into a single worker completion.
                 let (image_id, h, w, steps, prev_sd) = {
@@ -539,8 +559,8 @@ impl EngineLoop {
                 // The host planner enters commit after the configured step count;
                 // worker completion flags do not determine diffusion termination.
             }
-            RunKind::DiffusionDecode => {}
-            RunKind::DiffusionFinalize => {
+            OpCode::DiffusionDecode => {}
+            OpCode::DiffusionFinalize => {
                 // Commit becomes visible before optional feedback state is prepared.
                 let image_id = self
                     .running
@@ -616,7 +636,7 @@ impl EngineLoop {
                     self.finish(id, FinishReason::ImageDone);
                 }
             }
-            RunKind::EncoderVision | RunKind::EncoderLatent => match &apply.intent {
+            OpCode::EncoderVision | OpCode::EncoderLatent => match &apply.intent {
                 crate::runtime::generation::TransitionIntent::EncodeImageStep {
                     encoder_cache_key,
                     ..
@@ -743,12 +763,14 @@ impl EngineLoop {
                 }
                 _ => self.finish(id, FinishReason::Error),
             },
-            RunKind::ArDecode
-            | RunKind::ArVerify
-            | RunKind::DiffusionPrepare
-            | RunKind::TransferProduct
-            | RunKind::TransferKvPublish
-            | RunKind::TransferKvInstall => {}
+            OpCode::EncoderText
+            | OpCode::ArDecode
+            | OpCode::ArVerify
+            | OpCode::DiffusionPrepare
+            | OpCode::MediaAppend
+            | OpCode::TransferProduct
+            | OpCode::TransferKvPublish
+            | OpCode::TransferKvInstall => {}
         }
     }
 
@@ -876,12 +898,12 @@ impl EngineLoop {
         let mut progressed = false;
         for state in self.running.values_mut() {
             if state.output.is_closed() {
-                state.terminal_intent = TerminalIntent::Cancel;
+                state.terminal_intent = TerminalIntent::Finish(FinishReason::Cancelled);
                 continue;
             }
             let before = state.output.journal.len();
             if state.output.flush() {
-                state.terminal_intent = TerminalIntent::Cancel;
+                state.terminal_intent = TerminalIntent::Finish(FinishReason::Cancelled);
             }
             progressed |= state.output.journal.len() != before;
         }
@@ -893,7 +915,7 @@ impl EngineLoop {
     pub(super) fn emit(&mut self, id: RequestId, ev: Event) {
         if let Some(st) = self.running.get_mut(&id) {
             if st.output.enqueue(ev) {
-                st.terminal_intent = TerminalIntent::Cancel;
+                st.terminal_intent = TerminalIntent::Finish(FinishReason::Cancelled);
             }
         }
     }
@@ -1150,25 +1172,44 @@ impl EngineLoop {
         let mut allocations = None;
         let mut flow_prefix = None;
         if let Some(mut st) = self.running.remove(&id) {
+            let request_key = RequestKey::new(self.authority_id, id, st.epoch);
             if st.cursor.resources.worker_registered {
-                let request_key = RequestKey::new(self.authority_id, id, st.epoch);
                 let cutoff = st.cancel_cutoff.clone().unwrap_or_else(|| Checkpoint {
                     op_id: OpId(st.committed_producer_op_id),
                     point: CheckpointPoint::Fixed(st.committed_version as u32),
                 });
                 st.control_seq = st.control_seq.saturating_add(1);
-                self.pending_commands.push_back(BatchCommand::Finish {
-                    request_key,
-                    control_seq: st.control_seq,
-                    cutoff,
-                    reason: close_reason(&reason),
-                });
+                let retained_buffers = self.memory.retained_buffers(request_key);
+                let command = if reason == FinishReason::Error {
+                    BatchCommand::Retire {
+                        request_key,
+                        retained_buffers,
+                    }
+                } else {
+                    BatchCommand::Finish {
+                        request_key,
+                        control_seq: st.control_seq,
+                        cutoff,
+                        reason: close_reason(&reason),
+                        retained_buffers,
+                    }
+                };
+                self.pending_commands.push_back(command);
+                let mut allocation = st.allocations.take().expect("admitted allocations");
+                let buffers = std::mem::take(&mut allocation.buffers);
+                let allocations = st
+                    .flow_prefix
+                    .take()
+                    .into_iter()
+                    .flat_map(|prefix| prefix.allocations.into_allocations())
+                    .chain(allocation.into_allocations())
+                    .collect();
                 self.retiring_requests.insert(
                     id,
                     RetiringRequest {
                         request_key,
-                        allocations: st.allocations.take().expect("admitted allocations"),
-                        flow_prefix: st.flow_prefix.take(),
+                        allocations,
+                        buffers,
                     },
                 );
                 awaits_close = true;
@@ -1243,7 +1284,12 @@ impl EngineLoop {
 }
 
 /// Caches the prompt blocks.
-fn cache_prompt_blocks(coordinator: &KvCacheCoordinator, state: &mut ReqState, pool: &BlockPool) {
+fn cache_prompt_blocks(
+    coordinator: &KvCacheCoordinator,
+    state: &mut ReqState,
+    pool: &BlockPool,
+    source: &Arc<uniserve_worker_ipc::WorkerEndpoint>,
+) {
     if state.cursor.replay.blocks_cached {
         return;
     }
@@ -1254,6 +1300,7 @@ fn cache_prompt_blocks(coordinator: &KvCacheCoordinator, state: &mut ReqState, p
         &prompt,
         &state.cursor.replay.block_hashes,
         state.req.cache.write,
+        source,
     ) {
         state.cursor.replay.blocks_cached = true;
     }

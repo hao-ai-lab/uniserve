@@ -2,54 +2,28 @@
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
-
 import torch
 from torch import nn
 
-from ...execution.fixed_graph import StaticCudaGraph
-from ...nn.quant.nvfp4 import replace_nvfp4_linears
-from .precision import VideoVAELinearPrecision
-from .video_vae_decoder import MiniMaxH3VideoDecoder, blend_decoded_overlap
+from ...nn.quant.config import LinearPrecision
+from .video_vae_decoder import MiniMaxH3VideoDecoder
 
-__all__ = ["MiniMaxH3VideoVAE", "H3VideoAssembler"]
+__all__ = ["MiniMaxH3VideoVAE"]
 
 
 class MiniMaxH3VideoVAE(nn.Module):
     """Own one resident checkpoint VAE and decode temporal segments."""
 
-    def __init__(
-        self, vae: MiniMaxH3VideoDecoder, *, linear_precision: VideoVAELinearPrecision
-    ) -> None:
+    latents_mean: torch.Tensor
+    latents_std: torch.Tensor
+
+    def __init__(self, vae: MiniMaxH3VideoDecoder, *, linear_precision: LinearPrecision) -> None:
         """Prepare one resident video decoder with fixed precision and normalization buffers."""
 
         super().__init__()
-        self.vae = vae.float()
+        self.vae = vae
         self.linear_precision = linear_precision
         self.autocast_dtype = torch.float16 if linear_precision == "fp16" else torch.bfloat16
-
-        # Dense modes cast every eligible projection uniformly. NVFP4 replaces
-        # only aligned decoder linears and validates the checkpoint architecture.
-        if linear_precision in {"fp16", "bf16"}:
-            for module in self.vae.modules():
-                if isinstance(module, (nn.Linear, nn.Conv3d)):
-                    module.to(dtype=self.autocast_dtype)
-        else:
-            replaced = replace_nvfp4_linears(self.vae.decoder)
-            if replaced != 217:
-                raise RuntimeError(
-                    f"MiniMax H3 video decoder expected 217 aligned linear layers, got {replaced}"
-                )
-        required = (
-            "tokens_chunk_size",
-            "token_overlap",
-            "frame_pre_padding",
-            "frame_overlap",
-        )
-        missing = [name for name in required if not hasattr(vae, name)]
-        if missing:
-            raise TypeError(f"MiniMax H3 video VAE is missing {missing!r}")
 
         # Channel-wise latent statistics invert checkpoint normalization before
         # reconstruction; pixel statistics restore the decoder's RGB domain.
@@ -117,50 +91,6 @@ class MiniMaxH3VideoVAE(nn.Module):
             torch.tensor(std, dtype=torch.float32, device=self.device).view(1, 24, 1, 1, 1),
             persistent=False,
         )
-        # Graph input storage remains stable for the lifetime of the captured
-        # decoder graph and is installed only when capture is requested.
-        self.decode_graph = StaticCudaGraph[torch.Tensor](self.device)
-        self.register_buffer("decode_graph_input", None, persistent=False)
-
-    @classmethod
-    def from_pretrained(
-        cls,
-        checkpoint: str,
-        *,
-        device: torch.device,
-        local_files_only: bool = False,
-        linear_precision: VideoVAELinearPrecision,
-    ) -> "MiniMaxH3VideoVAE":
-        """Materialize the indexed decoder checkpoint on one device at the selected precision."""
-
-        del local_files_only
-        vae = MiniMaxH3VideoDecoder(parameter_device="meta", buffer_device=device)
-        component = Path(checkpoint) / "vae"
-        indexes = tuple(component.glob("*.safetensors.index.json"))
-        if len(indexes) != 1:
-            raise RuntimeError("H3 video decoder requires one safetensor index")
-        weight_map = json.loads(indexes[0].read_text(encoding="utf-8")).get("weight_map")
-        if not isinstance(weight_map, dict):
-            raise RuntimeError("H3 video decoder checkpoint index has no weight map")
-        targets = dict(vae.named_parameters())
-        by_file: dict[Path, list[str]] = {}
-        for name in targets:
-            filename = weight_map.get(name)
-            if not isinstance(filename, str):
-                raise KeyError(f"H3 video decoder is missing checkpoint tensor {name!r}")
-            by_file.setdefault(component / filename, []).append(name)
-        from safetensors.torch import safe_open
-
-        for path, names in sorted(by_file.items()):
-            with safe_open(path, framework="pt", device="cpu") as source:
-                for name in names:
-                    value = source.get_tensor(name).to(device=device, dtype=torch.float32)
-                    owner: nn.Module = vae
-                    fields = name.split(".")
-                    for field in fields[:-1]:
-                        owner = owner[int(field)] if field.isdigit() else getattr(owner, field)
-                    setattr(owner, fields[-1], nn.Parameter(value, requires_grad=False))
-        return cls(vae, linear_precision=linear_precision)
 
     @property
     def device(self) -> torch.device:
@@ -217,12 +147,14 @@ class MiniMaxH3VideoVAE(nn.Module):
         ]
         return self.vae._stitch_tiles(rows, y_overlaps, x_overlaps)
 
-    def _decode_normalized_segment(
+    def forward(
         self,
         normalized_latents: torch.Tensor,
     ) -> torch.Tensor:
         """Denormalize one latent segment and decode it through the spatial tiling path."""
 
+        if normalized_latents.shape != (1, 24, 7, 48, 84):
+            raise ValueError("an H3 video decode unit must have shape [1, 24, 7, 48, 84]")
         latents = normalized_latents.to(device=self.device, dtype=torch.float32)
         latents = latents * self.latents_std + self.latents_mean
         with torch.autocast(
@@ -231,87 +163,3 @@ class MiniMaxH3VideoVAE(nn.Module):
             enabled=self.device.type == "cuda",
         ):
             return self._decode_segment(latents).to(torch.float16)
-
-    @torch.inference_mode()
-    def decode_segment(
-        self,
-        normalized_latents: torch.Tensor,
-    ) -> torch.Tensor:
-        """Replay the captured decoder for one `[1, 24, 7, 48, 84]` latent segment."""
-
-        if normalized_latents.shape != (1, 24, 7, 48, 84):
-            raise ValueError("an H3 video decode unit must have shape [1, 24, 7, 48, 84]")
-        if self.decode_graph_input is None:
-            raise RuntimeError("the H3 video decoder graph has not been captured")
-        self.decode_graph_input.copy_(normalized_latents)
-        return self.decode_graph.replay()
-
-    @torch.inference_mode()
-    def capture_decoder(self, normalized_latents: torch.Tensor) -> torch.Tensor:
-        """Warm and capture the fixed-shape segment decoder."""
-
-        if normalized_latents.shape != (1, 24, 7, 48, 84):
-            raise ValueError("an H3 video decode unit must have shape [1, 24, 7, 48, 84]")
-        self.decode_graph_input = torch.empty_like(normalized_latents, device=self.device)
-        self.decode_graph_input.copy_(normalized_latents)
-        return self.decode_graph.capture(
-            lambda: self._decode_normalized_segment(self.decode_graph_input),
-            warmup=lambda: self._decode_normalized_segment(self.decode_graph_input),
-        )
-
-
-class H3VideoAssembler(nn.Module):
-    """Own temporal overlap and RGB conversion independently of VAE weights."""
-
-    def __init__(self, device: torch.device) -> None:
-        super().__init__()
-        self.register_buffer(
-            "pixel_mean",
-            torch.tensor(
-                (0.485, 0.456, 0.406),
-                dtype=torch.float32,
-                device=device,
-            ).view(1, 3, 1, 1, 1),
-            persistent=False,
-        )
-        self.register_buffer(
-            "pixel_std",
-            torch.tensor(
-                (0.229, 0.224, 0.225),
-                dtype=torch.float32,
-                device=device,
-            ).view(1, 3, 1, 1, 1),
-            persistent=False,
-        )
-
-    @torch.inference_mode()
-    def forward(
-        self,
-        segment: torch.Tensor,
-        previous_overlap: torch.Tensor | None,
-        *,
-        final_unit: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Join one decoded segment and return RGB24 frames plus its successor overlap."""
-
-        if segment.shape != (1, 3, 25, 768, 1344):
-            raise ValueError("an H3 decoded video segment must have shape [1, 3, 25, 768, 1344]")
-        body_frames = int(MiniMaxH3VideoDecoder.tokens_chunk_size) * int(
-            MiniMaxH3VideoDecoder.temporal_compression_ratio
-        ) - int(MiniMaxH3VideoDecoder.frame_pre_padding)
-        body = segment[:, :, :body_frames]
-        if previous_overlap is not None:
-            body = blend_decoded_overlap(
-                previous_overlap,
-                body,
-                int(MiniMaxH3VideoDecoder.frame_overlap),
-                dim=-3,
-            )
-        next_overlap = segment[
-            :, :, body_frames + int(MiniMaxH3VideoDecoder.frame_pre_padding) :
-        ].contiguous()
-        if final_unit:
-            body = torch.cat((body, next_overlap[:, :, :5]), dim=2)
-        pixels = (body.float() * self.pixel_std + self.pixel_mean).clamp_(0.0, 1.0)
-        rgb24 = pixels[0].permute(1, 2, 3, 0).mul_(255.0).round_().to(torch.uint8).contiguous()
-        return rgb24, next_overlap[:, :, :5].contiguous()

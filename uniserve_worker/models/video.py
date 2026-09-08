@@ -2,29 +2,17 @@
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
+from collections.abc import Hashable
 from dataclasses import dataclass
-from enum import StrEnum
-from typing import Any
+from typing import Generic, TypeVar
 
+import torch
+
+from ..execution.batch import MediaGeometry, MediaTrack
+from ..execution.bounded_storage import BoundedTensorStorage
+from ..nn.parallel_attention import AttentionContextWorkspace
 from .runtime import ExecutionModel
-
-
-class DecodeKind(StrEnum):
-    """Selects video reconstruction, audio reconstruction, or final artifact assembly."""
-
-    VIDEO = "video"
-    AUDIO = "audio"
-    FINALIZE = "finalize"
-
-
-@dataclass(frozen=True, slots=True)
-class DecodeOutput:
-    """Returns a reconstructed tensor, optional PCM audio, and completed media-unit count."""
-
-    kind: DecodeKind
-    value: Any | None
-    unit_offset: int
-    unit_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,47 +27,109 @@ class VideoOutputGeometry:
     audio_rate: int
 
 
-class VideoRunner(ExecutionModel):
-    """Model-owned prepare, denoise, bounded decode, and finalize behavior."""
+MetadataT = TypeVar("MetadataT")
+TensorViewsT = TypeVar("TensorViewsT")
 
-    def prepare(self, batch) -> None:
-        """Initialize persistent request state from an admitted media descriptor."""
 
-        raise NotImplementedError
+class VideoModel(ExecutionModel, Generic[MetadataT, TensorViewsT], ABC):
+    """Numerical operations over explicitly supplied media tensor views."""
 
-    def denoise(self, batch) -> None:
-        """Advance resident media state through the requested solver steps."""
+    owns_media_output: bool = False
+    output_capacity: VideoOutputGeometry
+    decode_frame_capacity: int
+    text_encoder: torch.nn.Module | None
+    denoiser: torch.nn.Module | None
+    conditioner: torch.nn.Sequential | None
 
-        raise NotImplementedError
-
-    def decode(self, batch, cursor: int, max_units: int) -> DecodeOutput:
-        """Materialize at most ``max_units`` outputs beginning at a bounded cursor."""
-
-        raise NotImplementedError
-
-    def finalize(self, request):
-        """Assemble any terminal artifact after all bounded decode units complete."""
+    @abstractmethod
+    def execution_key(self, geometry: MediaGeometry) -> Hashable:
+        """Validate geometry and identify reusable mathematical metadata."""
 
         raise NotImplementedError
 
-    def output_geometry(self, request) -> VideoOutputGeometry:
+    @abstractmethod
+    def build_execution(
+        self,
+        geometry: MediaGeometry,
+        storage: BoundedTensorStorage,
+        context: AttentionContextWorkspace | None,
+    ) -> MetadataT:
+        """Materialize immutable mathematical metadata for the public shape cache."""
+
+        raise NotImplementedError
+
+    @abstractmethod
+    def request_tensors(
+        self, storage: BoundedTensorStorage, geometry: MediaGeometry, metadata: MetadataT
+    ) -> TensorViewsT:
+        """Borrow immutable views for the declared geometry from public storage."""
+
+        raise NotImplementedError
+
+    @abstractmethod
+    def prepare_tensors(
+        self,
+        tensors: TensorViewsT,
+        metadata: MetadataT,
+        encoded: torch.Tensor | None,
+        text_rows: int,
+    ) -> None:
+        """Install computed conditioning and mathematical metadata into request tensor views."""
+
+        raise NotImplementedError
+
+    @abstractmethod
+    def initialize_tensors(
+        self, tensors: TensorViewsT, seed: int
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+        """Fill reserved initial values and return destination/source pairs to stage.
+
+        Numerical initialization may use CPU RNG. The public executor owns
+        copies and stream ordering; request storage retains every source until
+        the preparation operation physically completes.
+        """
+
+        raise NotImplementedError
+
+    @abstractmethod
+    def decoder_input(
+        self,
+        metadata: MetadataT,
+        latents: torch.Tensor,
+        track: MediaTrack,
+        cursor: int,
+        max_units: int,
+    ) -> torch.Tensor:
+        """Pack immutable latent rows into the selected decoder's numerical layout."""
+
+        raise NotImplementedError
+
+    @abstractmethod
+    def decoder_output(
+        self, metadata: MetadataT, value: torch.Tensor, track: MediaTrack
+    ) -> torch.Tensor:
+        """Expose the logical decoded tensor, including the requested sample extent."""
+
+        raise NotImplementedError
+
+    @abstractmethod
+    def assemble_video(
+        self,
+        tensors: TensorViewsT,
+        metadata: MetadataT,
+        segments: torch.Tensor,
+        start_unit: int,
+        unit_count: int,
+    ) -> torch.Tensor:
+        """Apply numerical overlap and pixel transforms to ordered video segments."""
+
+        raise NotImplementedError
+
+    @abstractmethod
+    def output_geometry(self, geometry: MediaGeometry) -> VideoOutputGeometry:
         """Describe the raster, timing, and unit boundaries used by output muxing."""
 
         raise NotImplementedError
 
-    def validate_run(self, runtime, batch) -> None:
-        """Validate media operations against runtime state before execution."""
 
-        from ..execution.video import validate_batch
-
-        validate_batch(runtime, batch)
-
-    def run_operation(self, runtime, state) -> bool:
-        """Advance one prepared media operation and report terminal completion."""
-
-        from ..execution.video import run_action
-
-        return run_action(runtime, state)
-
-
-__all__ = ["DecodeKind", "DecodeOutput", "VideoOutputGeometry", "VideoRunner"]
+__all__ = ["VideoOutputGeometry", "VideoModel"]

@@ -1,4 +1,4 @@
-"""Observable checkpoint loading, placement, identity, and update behavior."""
+"""Observable checkpoint loading, params, identity, and update behavior."""
 
 from __future__ import annotations
 
@@ -12,15 +12,21 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from tests.python.fixtures.model_execution import tensor_parallel_bindings
 from uniserve_worker.bootstrap.catalog import resolve_catalog_entry
-from uniserve_worker.bootstrap.execution_config import ExecutionConfig
-from uniserve_worker.bootstrap.model_loader import WorkerModelLoadRequest, load_worker_model
-from uniserve_worker.bootstrap.plan import ModelLoadScope
 from uniserve_worker.bootstrap.worker_info_builder import (
     build_worker_layout,
     configuration_identity,
 )
-from uniserve_worker.loader import LoadConfig, LoadFormat, LoadRequest, WeightSet, get_model_loader
+from uniserve_worker.config import WorkerConfig
+from uniserve_worker.loader import (
+    LoadConfig,
+    LoadFormat,
+    LoadRequest,
+    WeightSet,
+    get_model_loader,
+    load_model,
+)
 from uniserve_worker.loader.source import (
     read_model_config,
     resolve_model_root,
@@ -30,7 +36,7 @@ from uniserve_worker.loader.update import BucketTensor, WeightUpdater
 from uniserve_worker.loader.weight_loaders import attach_parameter_loaders
 from uniserve_worker.models.qwen3 import Qwen3ForCausalLM
 from uniserve_worker.nn.layer import LayerConfig
-from uniserve_worker.nn.mesh import TensorParallel
+from uniserve_worker.nn.mesh import Communicator
 from uniserve_worker.nn.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -40,12 +46,8 @@ from uniserve_worker.nn.vocab_parallel_embedding import (
 pytestmark = pytest.mark.integration
 
 
-def _parallel(rank: int = 0, size: int = 1) -> TensorParallel:
-    return TensorParallel(rank=rank, size=size)
-
-
-def _execution(dtype: str = "float32") -> ExecutionConfig:
-    return ExecutionConfig(model_dtype=dtype, cuda_graph=False, prefill_cuda_graph=False)
+def _execution(dtype: str = "float32") -> WorkerConfig:
+    return WorkerConfig(model_dtype=dtype, cuda_graph=False, prefill_cuda_graph=False)
 
 
 def _qwen_config() -> dict[str, object]:
@@ -102,7 +104,7 @@ def _sense_config() -> dict[str, object]:
 def _qwen_reference(config: dict[str, object]) -> Qwen3ForCausalLM:
     model = Qwen3ForCausalLM(
         config,
-        layer_config=LayerConfig(parallel=_parallel(), quantization=None),
+        layer_config=LayerConfig(communicator=Communicator(), quantization=None),
     )
     with torch.no_grad():
         for index, parameter in enumerate(model.parameters(), start=1):
@@ -149,19 +151,18 @@ def _qwen_request(
     path: str,
     *,
     load: LoadConfig = LoadConfig(),
-    scope: ModelLoadScope = ModelLoadScope.WHOLE,
-) -> WorkerModelLoadRequest:
-    return WorkerModelLoadRequest(
+) -> LoadRequest:
+    return LoadRequest(
         model_path=path,
-        device="cpu",
-        block_size=16,
-        max_batch_operations=4,
-        max_batch_tokens=4096,
-        kv_token_capacity=64,
-        attention_backend="torch_sdpa",
-        execution=_execution("bfloat16"),
-        parallel=_parallel(),
-        scope=scope,
+        execution=replace(
+            _execution("bfloat16"),
+            attention_backend="torch_sdpa",
+            block_size=16,
+            kv_token_capacity=64,
+            max_batch_operations=4,
+            max_batch_tokens=4096,
+        ),
+        bindings=tensor_parallel_bindings(),
         load=load,
     )
 
@@ -189,7 +190,6 @@ def test_modular_h3_manifest_resolves_through_the_model_catalog(tmp_path):
     entry = resolve_catalog_entry(tuple(config["architectures"]))
 
     assert entry.architecture == "MiniMaxH3Transformer3DModel"
-    assert entry.scopes == (ModelLoadScope.WHOLE, ModelLoadScope.GENERATION)
 
 
 def test_unknown_modular_pipeline_is_rejected_at_discovery(tmp_path):
@@ -205,13 +205,76 @@ def test_unknown_modular_pipeline_is_rejected_at_discovery(tmp_path):
 def test_indexed_qwen_checkpoint_installs_packed_weights_on_the_requested_device(tmp_path):
     reference = _write_qwen_checkpoint(tmp_path, indexed=True)
 
-    loaded = load_worker_model(_qwen_request(str(tmp_path)))
+    loaded = load_model(_qwen_request(str(tmp_path)))
 
-    assert loaded.architecture == "Qwen3ForCausalLM"
+    assert loaded.model.architecture == "Qwen3ForCausalLM"
     assert loaded.weights.version == 0
     assert {parameter.device.type for parameter in loaded.model.parameters()} == {"cpu"}
     for name, parameter in loaded.model.state_dict().items():
         torch.testing.assert_close(parameter, reference.state_dict()[name].to(torch.bfloat16))
+
+
+@pytest.mark.parametrize(
+    ("ignored", "dense"),
+    [
+        (
+            ["model.layers.0.self_attn.o_proj", "model.layers.0.mlp"],
+            ["self_attn.o_proj", "mlp.gate_up_proj", "mlp.down_proj"],
+        ),
+        (
+            [
+                "model.layers.0.self_attn.q_proj",
+                "model.layers.0.self_attn.k_proj",
+                "model.layers.0.self_attn.v_proj",
+                "model.layers.0.mlp.gate_proj",
+                "model.layers.0.mlp.up_proj",
+            ],
+            ["self_attn.qkv_proj", "mlp.gate_up_proj"],
+        ),
+    ],
+)
+@pytest.mark.parametrize("configuration_source", ["checkpoint", "worker"])
+def test_qwen_quantization_honors_excluded_layers(tmp_path, ignored, dense, configuration_source):
+    reference = _write_qwen_checkpoint(tmp_path)
+    config = _qwen_config()
+    quantization = {"quant_method": "fp8", "ignored_layers": ignored}
+    request = _qwen_request(str(tmp_path))
+    if configuration_source == "checkpoint":
+        config["quantization_config"] = quantization
+        (tmp_path / "config.json").write_text(json.dumps(config))
+    else:
+        request = replace(request, quantization_config=quantization)
+    loaded = load_model(request)
+    exported = loaded.model.state_dict()
+    for projection in (
+        "self_attn.qkv_proj",
+        "self_attn.o_proj",
+        "mlp.gate_up_proj",
+        "mlp.down_proj",
+    ):
+        name = f"model.layers.0.{projection}.weight"
+        if projection in dense:
+            torch.testing.assert_close(exported[name], reference.state_dict()[name].bfloat16())
+        else:
+            assert exported[name].dtype == torch.float8_e4m3fn
+
+
+@pytest.mark.parametrize("method", ["fp8", "unquantized"])
+def test_qwen_packed_projection_requires_one_precision(tmp_path, method):
+    reference = _write_qwen_checkpoint(tmp_path)
+    config = _qwen_config()
+    config["quantization_config"] = {
+        "quant_method": method,
+        "ignored_layers": ["model.layers.0.self_attn.q_proj"],
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    if method == "fp8":
+        with pytest.raises(ValueError, match="same precision"):
+            load_model(_qwen_request(str(tmp_path)))
+    else:
+        loaded = load_model(_qwen_request(str(tmp_path)))
+        for name, parameter in loaded.model.state_dict().items():
+            torch.testing.assert_close(parameter, reference.state_dict()[name].bfloat16())
 
 
 def test_resolved_configuration_identity_distinguishes_loaded_precision(tmp_path):
@@ -219,10 +282,10 @@ def test_resolved_configuration_identity_distinguishes_loaded_precision(tmp_path
     identities = []
     for dtype in ("bfloat16", "float32", "bfloat16"):
         request = replace(_qwen_request(str(tmp_path)), execution=_execution(dtype))
-        loaded = load_worker_model(request)
-        layout = build_worker_layout(loaded.model, loaded.deployment)
+        loaded = load_model(request)
+        layout = build_worker_layout(loaded.model, loaded.worker_config)
         identities.append(
-            configuration_identity(loaded.model, loaded.deployment, layout, (), "torch_sdpa")
+            configuration_identity(loaded.model, loaded.worker_config, layout, (), "torch_sdpa")
         )
 
     assert identities[0] == identities[2]
@@ -231,17 +294,17 @@ def test_resolved_configuration_identity_distinguishes_loaded_precision(tmp_path
 
 def test_index_is_the_closed_weight_set_for_loading(tmp_path):
     _write_qwen_checkpoint(tmp_path, indexed=True)
-    load_worker_model(_qwen_request(str(tmp_path)))
+    load_model(_qwen_request(str(tmp_path)))
     save_file({"unused": torch.tensor([1.0])}, tmp_path / "extra.safetensors")
     (tmp_path / "unused.pth").write_bytes(b"not a checkpoint")
-    load_worker_model(_qwen_request(str(tmp_path)))
+    load_model(_qwen_request(str(tmp_path)))
 
     index = json.loads((tmp_path / "model.safetensors.index.json").read_text(encoding="utf-8"))
     missing_name = "model-00002-of-00002.safetensors"
     index["weight_map"]["model.norm.weight"] = missing_name
     (tmp_path / "model.safetensors.index.json").write_text(json.dumps(index), encoding="utf-8")
     with pytest.raises(FileNotFoundError, match=missing_name):
-        load_worker_model(_qwen_request(str(tmp_path)))
+        load_model(_qwen_request(str(tmp_path)))
 
 
 def test_checksum_manifest_gates_checkpoint_materialization(tmp_path):
@@ -254,11 +317,11 @@ def test_checksum_manifest_gates_checkpoint_materialization(tmp_path):
     )
     load = LoadConfig(checksum_manifest=str(manifest))
 
-    load_worker_model(_qwen_request(str(tmp_path), load=load))
+    load_model(_qwen_request(str(tmp_path), load=load))
 
     manifest.write_text(json.dumps({checkpoint.name: "0" * 64}), encoding="utf-8")
     with pytest.raises(ValueError, match="checksum mismatch"):
-        load_worker_model(_qwen_request(str(tmp_path), load=load))
+        load_model(_qwen_request(str(tmp_path), load=load))
 
 
 def test_pt_index_selects_only_its_declared_shards(tmp_path):
@@ -283,9 +346,7 @@ def test_pt_index_selects_only_its_declared_shards(tmp_path):
     )
     (tmp_path / "extra.bin").write_bytes(b"unread")
 
-    loaded = load_worker_model(
-        _qwen_request(str(tmp_path), load=LoadConfig(load_format=LoadFormat.PT))
-    )
+    loaded = load_model(_qwen_request(str(tmp_path), load=LoadConfig(load_format=LoadFormat.PT)))
 
     for name, value in loaded.model.state_dict().items():
         torch.testing.assert_close(value, reference.state_dict()[name].to(torch.bfloat16))
@@ -329,16 +390,14 @@ def test_remote_resolution_fetches_only_weights_index_and_architecture_sidecars(
     root, repository_id = resolve_model_root("owner/model", load)
     request = LoadRequest(
         model_path="owner/model",
-        device="cpu",
         execution=_execution(),
-        parallel=_parallel(),
-        scope=ModelLoadScope.WHOLE,
+        bindings=tensor_parallel_bindings(),
         load=load,
     )
 
     sources = resolve_weight_sources(
         request,
-        architecture="Qwen3ForCausalLM",
+        sources=resolve_catalog_entry(("Qwen3ForCausalLM",)).sources,
         sidecars=resolve_catalog_entry(("Qwen3ForCausalLM",)).sidecars,
         root=root,
         repository_id=repository_id,
@@ -361,7 +420,7 @@ def test_missing_packed_shard_and_unexpected_tensor_fail_completeness(tmp_path):
     save_file(checkpoint, tmp_path / "model.safetensors")
 
     with pytest.raises(RuntimeError, match="packed shards.*unexpected=1"):
-        load_worker_model(_qwen_request(str(tmp_path)))
+        load_model(_qwen_request(str(tmp_path)))
 
 
 def test_dummy_load_is_deterministic_and_does_not_read_weight_bytes(tmp_path):
@@ -369,8 +428,8 @@ def test_dummy_load_is_deterministic_and_does_not_read_weight_bytes(tmp_path):
     (tmp_path / "model.safetensors").write_bytes(b"invalid checkpoint bytes")
     load = LoadConfig(load_format=LoadFormat.DUMMY)
 
-    first = load_worker_model(_qwen_request(str(tmp_path), load=load))
-    second = load_worker_model(_qwen_request(str(tmp_path), load=load))
+    first = load_model(_qwen_request(str(tmp_path), load=load))
+    second = load_model(_qwen_request(str(tmp_path), load=load))
 
     for name, value in first.model.state_dict().items():
         torch.testing.assert_close(value, second.model.state_dict()[name])
@@ -386,7 +445,7 @@ def test_sharded_state_loads_installed_names_without_hugging_face_remapping(tmp_
     )
     load = LoadConfig(load_format=LoadFormat.SHARDED_STATE)
 
-    loaded = load_worker_model(_qwen_request(str(tmp_path), load=load))
+    loaded = load_model(_qwen_request(str(tmp_path), load=load))
 
     for name, value in loaded.model.state_dict().items():
         torch.testing.assert_close(value, reference.state_dict()[name].to(torch.bfloat16))
@@ -396,50 +455,167 @@ def test_layered_load_materializes_the_complete_graph_from_file_backed_handles(t
     reference = _write_qwen_checkpoint(tmp_path, indexed=True)
     load = LoadConfig(load_format=LoadFormat.LAYERED)
 
-    loaded = load_worker_model(_qwen_request(str(tmp_path), load=load))
+    loaded = load_model(_qwen_request(str(tmp_path), load=load))
 
     assert {parameter.device.type for parameter in loaded.model.parameters()} == {"cpu"}
     for name, value in loaded.model.state_dict().items():
         torch.testing.assert_close(value, reference.state_dict()[name].to(torch.bfloat16))
 
 
-def test_sensenova_dummy_scopes_materialize_only_selected_parameters(tmp_path, monkeypatch):
+@pytest.mark.parametrize("branch", ["text", "flow"])
+@pytest.mark.parametrize("load_format", [LoadFormat.AUTO, LoadFormat.LAYERED])
+def test_sensenova_checkpoint_component_materializes_selected_expert_parameters(
+    tmp_path, branch, load_format
+):
+    from uniserve_worker.loader.loader import load_component
+    from uniserve_worker.loader.source import WeightSourceSet
+    from uniserve_worker.models.sensenova.config import NeoChatConfig
+    from uniserve_worker.models.sensenova.model import NEOChatModel
+
+    config = NeoChatConfig.from_dict(_sense_config())
+    layers = LayerConfig(Communicator(), None)
+    reference = NEOChatModel(config, layer_config=layers)
+    with torch.no_grad():
+        for index, parameter in enumerate(reference.parameters(), start=1):
+            parameter.fill_(index / 37)
+        head = reference.language_model.lm_head
+        zero_vocab_padding(head.vocab_size, head.vocab_start_index, head.output_size, head.weight)
+        embedding = reference.language_model.model.embed_tokens
+        zero_vocab_padding(
+            embedding.num_embeddings,
+            embedding.vocab_start_index,
+            embedding.num_embeddings_per_partition,
+            embedding.weight,
+        )
+    expected = reference.state_dict()
+    checkpoint = {}
+    for name, value in expected.items():
+        if ".qkv_proj" in name:
+            packed = "qkv_proj_mot_gen" if "qkv_proj_mot_gen" in name else "qkv_proj"
+            suffix = "_mot_gen" if packed.endswith("_mot_gen") else ""
+            for part, tensor in zip(("q", "k", "v"), value.split((8, 4, 4), dim=0), strict=True):
+                checkpoint[name.replace(packed, f"{part}_proj{suffix}")] = tensor.contiguous()
+        elif ".gate_up_proj." in name:
+            for part, tensor in zip(("gate", "up"), value.chunk(2, dim=0), strict=True):
+                checkpoint[name.replace("gate_up_proj", f"{part}_proj")] = tensor.contiguous()
+        else:
+            checkpoint[name] = value.contiguous()
+    path = tmp_path / "model.safetensors"
+    save_file(checkpoint, path)
+    included = frozenset(
+        name
+        for name, _ in reference.named_parameters()
+        if (name.startswith("fm_modules.") or "_mot_gen." in name) == (branch == "flow")
+    )
+    with torch.device("meta"):
+        model = NEOChatModel(config, layer_config=layers)
+    attach_parameter_loaders(model, device="cpu", dtype=torch.float32)
+    component = replace(model.checkpoint_components()[0], included=included)
+    request = LoadRequest(
+        model_path=str(tmp_path),
+        execution=_execution(),
+        bindings=tensor_parallel_bindings(),
+        load=LoadConfig(load_format=load_format),
+    )
+    load_component(component, WeightSourceSet(tmp_path, (path,), (path.name,)), request)
+    for name, parameter in model.named_parameters():
+        if name in included:
+            torch.testing.assert_close(parameter, expected[name], rtol=0, atol=0)
+        else:
+            assert parameter.device.type == "meta"
+    for name, buffer in model.named_buffers():
+        flow_buffer = name.startswith("fm_modules.")
+        shared_language_buffer = name.startswith("language_model.")
+        active = (flow_buffer or shared_language_buffer) if branch == "flow" else not flow_buffer
+        assert buffer.device.type == ("cpu" if active else "meta")
+
+
+@pytest.mark.parametrize(
+    "generation_device",
+    [
+        None,
+        pytest.param(
+            "cuda:1",
+            marks=[
+                pytest.mark.gpu,
+                pytest.mark.skipif(
+                    torch.cuda.device_count() < 2, reason="two CUDA devices are required"
+                ),
+            ],
+        ),
+    ],
+)
+@pytest.mark.parametrize("deep_head", [False, True])
+def test_sensenova_checkpoint_layer_exclusions_preserve_projection_weights(
+    tmp_path, monkeypatch, deep_head, generation_device
+):
     from transformers import AutoTokenizer
 
+    from uniserve_worker.models.sensenova.config import NeoChatConfig
+    from uniserve_worker.models.sensenova.model import NEOChatModel
+
     config = _sense_config()
-    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    if deep_head:
+        config.update(fm_head_layers=3, fm_head_dim=8, fm_head_mlp_ratio=2.0)
+    reference = NEOChatModel(
+        NeoChatConfig.from_dict(config), layer_config=LayerConfig(Communicator(), None)
+    )
+    with torch.no_grad():
+        for index, parameter in enumerate(reference.parameters(), start=1):
+            parameter.fill_(index / 37)
+        head = reference.language_model.lm_head
+        zero_vocab_padding(head.vocab_size, head.vocab_start_index, head.output_size, head.weight)
+    state = reference.state_dict()
+    save_file(state, tmp_path / "model.safetensors")
+    ignored = [
+        "language_model.model.layers.0.self_attn.o_proj",
+        "language_model.model.layers.0.self_attn.q_proj_mot_gen",
+        "language_model.model.layers.0.self_attn.k_proj_mot_gen",
+        "language_model.model.layers.0.self_attn.v_proj_mot_gen",
+        "language_model.model.layers.0.mlp_mot_gen",
+        "language_model.lm_head",
+    ]
+    dense_heads = ("net.res_blocks.0.mlp.0", "net.final_layer.linear") if deep_head else ("2",)
+    ignored.extend(f"fm_modules.fm_head.{name}" for name in dense_heads)
+    config["quantization_config"] = {"quant_method": "fp8", "ignored_layers": ignored}
+    (tmp_path / "config.json").write_text(json.dumps(config))
     monkeypatch.setattr(AutoTokenizer, "from_pretrained", lambda *args, **kwargs: object())
-    entry = resolve_catalog_entry(("NEOChatModel",))
-    load = LoadConfig(load_format=LoadFormat.DUMMY)
-    for scope in (ModelLoadScope.UNDERSTANDING, ModelLoadScope.GENERATION):
-        request = LoadRequest(
-            model_path=str(tmp_path),
-            device="cpu",
-            execution=_execution(),
-            parallel=_parallel(),
-            scope=scope,
-            load=load,
-        )
-        loaded = get_model_loader(load.load_format).load(
-            entry,
-            config,
-            request,
-            root=tmp_path,
-            repository_id=None,
-        )
-        for name, parameter in loaded.model.named_parameters():
-            generation = name.startswith("fm_modules.") or "_mot_gen." in name
-            selected = generation if scope is ModelLoadScope.GENERATION else not generation
-            assert parameter.device.type == ("cpu" if selected else "meta")
-        for name, buffer in loaded.model.named_buffers():
-            generation_buffer = name.startswith("fm_modules.")
-            shared_language_buffer = name.startswith("language_model.")
-            selected = (
-                generation_buffer or shared_language_buffer
-                if scope is ModelLoadScope.GENERATION
-                else not generation_buffer
-            )
-            assert buffer.device.type == ("cpu" if selected else "meta")
+    request = LoadRequest(
+        model_path=str(tmp_path),
+        execution=replace(_execution("bfloat16"), generation_device=generation_device),
+        bindings=tensor_parallel_bindings(),
+        load=LoadConfig(),
+    )
+    loaded = get_model_loader(request.load.load_format).load(
+        resolve_catalog_entry(("NEOChatModel",)),
+        config,
+        request,
+        root=tmp_path,
+        repository_id=None,
+    )
+    exported = loaded.model.state_dict()
+    for name in (
+        "language_model.model.layers.0.self_attn.o_proj.weight",
+        "language_model.model.layers.0.self_attn.qkv_proj_mot_gen.weight",
+        "language_model.model.layers.0.mlp_mot_gen.gate_up_proj.weight",
+        "language_model.model.layers.0.mlp_mot_gen.down_proj.weight",
+        "language_model.lm_head.weight",
+        *(f"fm_modules.fm_head.{name}.weight" for name in dense_heads),
+    ):
+        torch.testing.assert_close(exported[name].cpu(), state[name].bfloat16(), rtol=0, atol=0)
+    for name in (
+        "language_model.model.layers.0.self_attn.o_proj_mot_gen.weight",
+        "language_model.model.layers.0.self_attn.qkv_proj.weight",
+        "language_model.model.layers.0.mlp.gate_up_proj.weight",
+        f"fm_modules.fm_head.{'net.input_proj' if deep_head else '0'}.weight",
+    ):
+        assert exported[name].dtype == torch.float8_e4m3fn
+    device = torch.device(generation_device or "cpu")
+    normalized = loaded.model.language_model.model.norm_mot_gen(
+        torch.ones((2, 8), dtype=torch.bfloat16, device=device)
+    )
+    expected = state["language_model.model.norm_mot_gen.weight"].bfloat16().expand(2, 8)
+    torch.testing.assert_close(normalized.cpu(), expected, rtol=0, atol=0)
 
 
 def test_weight_update_publishes_version_and_rolls_back_partial_failure():
@@ -448,8 +624,6 @@ def test_weight_update_publishes_version_and_rolls_back_partial_failure():
     initial = WeightSet.from_module(model)
     updater = WeightUpdater(
         model,
-        architecture="Qwen3ForCausalLM",
-        scope="whole",
         weights=initial,
     )
     replacement = torch.full_like(model.model.norm.weight, 3)
@@ -503,13 +677,11 @@ def test_online_fp8_weights_remain_replaceable_after_post_load_finalize(tmp_path
     (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
     reference = _qwen_reference(config)
     save_file(_qwen_hugging_face_weights(reference), tmp_path / "model.safetensors")
-    loaded = load_worker_model(
+    loaded = load_model(
         _qwen_request(str(tmp_path), load=LoadConfig(load_format=LoadFormat.LAYERED))
     )
     updater = WeightUpdater(
         loaded.model,
-        architecture="Qwen3ForCausalLM",
-        scope="whole",
         weights=loaded.weights,
     )
     name = "model.layers.0.self_attn.o_proj.weight"
@@ -529,7 +701,33 @@ def test_online_fp8_weights_remain_replaceable_after_post_load_finalize(tmp_path
     assert dict(loaded.model.named_parameters())[name].dtype == torch.float8_e4m3fn
 
 
-def test_qwen_rejects_partial_model_materialization(tmp_path):
-    (tmp_path / "config.json").write_text(json.dumps(_qwen_config()), encoding="utf-8")
-    with pytest.raises(Exception, match="does not support 'generation'"):
-        load_worker_model(_qwen_request(str(tmp_path), scope=ModelLoadScope.GENERATION))
+@pytest.mark.parametrize("load_format", [LoadFormat.AUTO, LoadFormat.LAYERED])
+def test_merged_checkpoint_projections_load_as_complete_tensors(tmp_path, load_format):
+    config = _qwen_config()
+    reference = _qwen_reference(config)
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    save_file(
+        {name: tensor.contiguous() for name, tensor in reference.state_dict().items()},
+        tmp_path / "model.safetensors",
+    )
+    loaded = load_model(_qwen_request(str(tmp_path), load=LoadConfig(load_format=load_format)))
+    for name, tensor in loaded.model.state_dict().items():
+        torch.testing.assert_close(tensor, reference.state_dict()[name].bfloat16())
+
+
+@pytest.mark.parametrize("method", ["mxfp8", "nvfp4"])
+def test_block_quantization_requires_its_cuda_backend(tmp_path, method):
+    _write_qwen_checkpoint(tmp_path)
+    request = replace(_qwen_request(str(tmp_path)), quantization_config={"quant_method": method})
+    with pytest.raises(ValueError, match="SM100-class CUDA device"):
+        load_model(request)
+
+
+def test_quantization_override_requires_declared_checkpoint_format_conversion(tmp_path):
+    _write_qwen_checkpoint(tmp_path)
+    config = _qwen_config()
+    config["quantization_config"] = {"quant_method": "fp8"}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    request = replace(_qwen_request(str(tmp_path)), quantization_config={"quant_method": "nvfp4"})
+    with pytest.raises(ValueError, match="requires checkpoint format conversion"):
+        load_model(request)

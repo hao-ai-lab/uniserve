@@ -10,9 +10,7 @@
 use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
-use uniserve_core::{
-    BlockId, ImageParams, KvCacheDtype, KvCacheGroup, RankInfo, RequestId, SamplingParams,
-};
+use uniserve_core::{BlockId, ImageParams, KvCacheDtype, KvCacheGroup, RequestId, SamplingParams};
 pub use uniserve_core::{OpId, WorkerForwardStats};
 
 /// Result type for semantic worker-message validation.

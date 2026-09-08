@@ -11,7 +11,7 @@ use super::common::Normalizable;
 pub struct ImageGenerationRequest {
     /// Text prompt describing the requested image.
     pub prompt: String,
-    /// Served model name, or the deployment default when omitted.
+    /// Served model name, or the configuration default when omitted.
     #[serde(default)]
     pub model: Option<String>,
     /// Number of images to generate.

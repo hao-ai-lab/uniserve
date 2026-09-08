@@ -5,13 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from itertools import product
 from math import prod
-from typing import Any, Callable, Mapping
+from types import MappingProxyType
+from typing import Any, Mapping
 
 import torch
 import torch.distributed as dist
 
 from ..profiling import profile_range
-from .parallel import ParallelConfig
+from .parallel import EntryConfig, ParallelConfig
 
 
 def divide(numerator: int, denominator: int) -> int:
@@ -125,7 +126,7 @@ def _send_recv_fake(value, output, dst, src, group_name):
 class SymmetricMemoryWorkspace:
     """Runtime-owned allocation with peer views ordered by logical membership."""
 
-    coordinator: GroupCoordinator
+    coordinator: Communicator
     local: torch.Tensor
     peers: tuple[torch.Tensor, ...]
     handle: Any
@@ -155,7 +156,7 @@ class PeerTensorWorkspace:
     storage. The distributed runtime owns both the allocation and its mapping.
     """
 
-    coordinator: GroupCoordinator
+    coordinator: Communicator
     local: torch.Tensor
     global_tensor: torch.Tensor
 
@@ -168,11 +169,11 @@ class PeerTensorWorkspace:
 
 
 @dataclass(frozen=True)
-class GroupCoordinator:
+class Communicator:
     """Tensor communication with group-local roots and ordered logical members.
 
     The distributed runtime supplies the backend and owns its lifetime. Torch
-    sorts process-group ranks; this interface preserves deployment order even
+    sorts process-group ranks; this interface preserves worker_config order even
     when it differs from backend order. Singleton operations need no backend.
     """
 
@@ -181,16 +182,6 @@ class GroupCoordinator:
     name: str = "local"
     device: torch.device = torch.device("cpu")
     _group: Any = field(default=None, repr=False, compare=False)
-    _allocate_symmetric: Callable[..., SymmetricMemoryWorkspace] | None = field(
-        default=None,
-        repr=False,
-        compare=False,
-    )
-    _allocate_peer_tensor: Callable[..., PeerTensorWorkspace] | None = field(
-        default=None,
-        repr=False,
-        compare=False,
-    )
 
     def __post_init__(self) -> None:
         if not self.ranks or len(set(self.ranks)) != len(self.ranks):
@@ -383,40 +374,6 @@ class GroupCoordinator:
             return
         _send_recv(value.contiguous(), output, global_dst, global_src, self._require().group_name)
 
-    def symmetric_memory(
-        self,
-        shape: tuple[int, ...],
-        *,
-        dtype: torch.dtype,
-        name: str = "workspace",
-        layout: tuple[object, ...] = (),
-    ) -> SymmetricMemoryWorkspace:
-        """Borrow a stable allocation from the owning distributed runtime."""
-
-        if self._allocate_symmetric is None:
-            raise RuntimeError(f"group {self.name!r} has no symmetric-memory resource owner")
-        return self._allocate_symmetric(self, shape, dtype=dtype, name=name, layout=layout)
-
-    def peer_tensor(
-        self,
-        shape: tuple[int, ...],
-        *,
-        dtype: torch.dtype,
-        name: str,
-        row_multiple: int = 1,
-    ) -> PeerTensorWorkspace:
-        """Borrow peer storage with a page-aligned leading-axis capacity.
-
-        ``shape`` is the minimum per-owner capacity. Physical rows may include
-        alignment padding; consumers retain their own logical row geometry.
-        """
-
-        if self._allocate_peer_tensor is None:
-            raise RuntimeError(f"group {self.name!r} has no peer-tensor resource owner")
-        return self._allocate_peer_tensor(
-            self, shape, dtype=dtype, name=name, row_multiple=row_multiple
-        )
-
 
 @dataclass(frozen=True)
 class DeviceMesh:
@@ -426,7 +383,7 @@ class DeviceMesh:
     rank: int = 0
     parallel_config: ParallelConfig = ParallelConfig()
     local_device: torch.device = torch.device("cpu")
-    groups: Mapping[str, GroupCoordinator] = field(default_factory=dict)
+    groups: Mapping[str, Communicator] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if len(self.ranks) != self.parallel_config.world_size:
@@ -476,14 +433,14 @@ class DeviceMesh:
             fibers.setdefault(fixed, []).append(rank)
         return tuple(tuple(fiber) for fiber in fibers.values())
 
-    def get_group(self, name: str) -> GroupCoordinator:
+    def get_group(self, name: str) -> Communicator:
         self._selection(name)
         if name in self.groups:
             return self.groups[name]
         members = next(members for members in self.group_members(name) if self.rank in members)
         if len(members) != 1:
             raise RuntimeError(f"mesh group {name!r} has not been initialized")
-        return GroupCoordinator(ranks=members, rank=self.rank, name=name, device=self.local_device)
+        return Communicator(ranks=members, rank=self.rank, name=name, device=self.local_device)
 
     def size(self, name: str) -> int:
         selected = self._selection(name)
@@ -510,17 +467,61 @@ class DeviceMesh:
         return cls(local_device=torch.device(device))
 
 
-@dataclass(frozen=True, slots=True)
-class TensorParallel:
-    """Transport-free parameter ownership for shared checkpoint sharding."""
+@dataclass(frozen=True)
+class EntryBindings:
+    """Bind configured entries to this rank's meshes and process communicator.
 
-    rank: int
-    size: int
+    The configured member order defines pipeline coordinates. Tensor replicas
+    share one logical output; sequence and temporal members retain their rows.
+    """
+
+    entries: Mapping[str, EntryConfig]
+    meshes: Mapping[str, DeviceMesh]
+    process_group: Communicator
 
     def __post_init__(self) -> None:
-        if self.size <= 0 or not 0 <= self.rank < self.size:
-            raise ValueError("tensor-parallel rank must satisfy 0 <= rank < positive size")
+        object.__setattr__(self, "entries", MappingProxyType(dict(self.entries)))
+        object.__setattr__(self, "meshes", MappingProxyType(dict(self.meshes)))
+        if not self.entries or not any(self.owns(name) for name in self.entries):
+            raise ValueError("rank has no configured computation entry")
+        for name, entry in self.entries.items():
+            if any(rank not in self.process_group.ranks for rank in entry.ranks):
+                raise ValueError(f"entry {name} members lie outside its Worker")
+            if entry.distribution is None:
+                mesh = self.meshes.get(name)
+                if (mesh is not None) != self.owns(name):
+                    raise ValueError(f"entry {name} requires its local mesh")
+                if mesh is not None and (
+                    mesh.ranks != entry.ranks or mesh.parallel_config != entry.parallel_config
+                ):
+                    raise ValueError(f"entry {name} mesh disagrees with configuration")
 
-    @classmethod
-    def from_mesh(cls, mesh: DeviceMesh) -> TensorParallel:
-        return cls(rank=mesh.coord("tp"), size=mesh.size("tp"))
+    def owns(self, entry: str) -> bool:
+        """Whether this rank executes the configured entry."""
+        configured = self.entries.get(entry)
+        return configured is not None and self.process_group.rank in configured.ranks
+
+    def input_ranks(self, entry: str) -> tuple[int, ...]:
+        """First pipeline-stage input members in configured order."""
+        config = self.entries[entry]
+        if config.distribution is not None:
+            return config.ranks
+        width = config.parallel_config.world_size // config.parallel_config.pipeline_parallel_size
+        return config.ranks[:width]
+
+    def output_ranks(self, entry: str) -> tuple[int, ...]:
+        """Final pipeline-stage members with tensor replicas counted once."""
+        config = self.entries[entry]
+        if config.distribution is not None:
+            return config.ranks
+        geometry = DeviceMesh(
+            config.ranks, config.ranks[0], config.parallel_config, self.process_group.device
+        )
+        axes = tuple(name for name, _ in geometry.dimensions)
+        return tuple(
+            rank
+            for rank in config.ranks
+            if geometry.get_coordinate(rank)[axes.index("tp")] == 0
+            and geometry.get_coordinate(rank)[axes.index("pp")]
+            == config.parallel_config.pipeline_parallel_size - 1
+        )

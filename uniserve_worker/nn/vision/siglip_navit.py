@@ -61,6 +61,7 @@ class SiglipNavitEncoder(nn.Module):
             self.num_channels * self.patch_size * self.patch_size,
             hidden,
             layer_config=layer_config,
+            prefix="embeddings.patch_embedding",
             bias=True,
         )
         self.position_embedding = nn.Embedding(self.max_num_patch_per_side**2, hidden)
@@ -72,7 +73,7 @@ class SiglipNavitEncoder(nn.Module):
                 num_hidden_layers=layers,
                 layer_norm_eps=eps,
             ),
-            layer_config=layer_config,
+            layer_config=layer_config.child("encoder"),
         )
 
     def forward(

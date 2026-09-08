@@ -1,6 +1,8 @@
 //! Per-page cache metadata and intrusive free-queue links.
 
 use crate::kv::BlockState;
+use std::sync::Arc;
+use uniserve_worker_ipc::WorkerEndpoint;
 
 /// Mutable ownership and cache metadata for one physical KV page.
 pub(crate) struct BlockMeta {
@@ -8,6 +10,8 @@ pub(crate) struct BlockMeta {
     pub ref_cnt: u32,
     /// Prefix-cache hash this block holds, if any. Cleared on eviction.
     pub hash: Option<u64>,
+    /// Loaded Worker whose rank group retains this cached page.
+    pub source: Option<Arc<WorkerEndpoint>>,
     /// Exact token content used to disambiguate equal prefix hashes.
     ///
     /// The value is empty outside the cached state and is cleared on eviction.
@@ -25,6 +29,7 @@ impl BlockMeta {
             state,
             ref_cnt: 0,
             hash: None,
+            source: None,
             tokens: Vec::new(),
             fq_prev: None,
             fq_next: None,

@@ -6,7 +6,7 @@ import pytest
 import torch
 from torch import nn
 
-from uniserve_worker.execution.batch import RunKind
+from uniserve_worker.execution.batch import OpCode
 from uniserve_worker.execution.forward_batch import (
     AttentionMode,
     ForwardBatch,
@@ -19,13 +19,13 @@ from uniserve_worker.models.sensenova.config import NeoChatConfig
 from uniserve_worker.models.sensenova.model import NEOChatModel
 from uniserve_worker.nn.diffusion.schedule import ScheduleDirection
 from uniserve_worker.nn.layer import LayerConfig
-from uniserve_worker.nn.mesh import TensorParallel
+from uniserve_worker.nn.mesh import Communicator
 
 pytestmark = pytest.mark.unit
 
 
 def _layer_config() -> LayerConfig:
-    return LayerConfig(TensorParallel(rank=0, size=1), None)
+    return LayerConfig(Communicator(), None)
 
 
 def _qwen_config() -> dict[str, object]:
@@ -178,9 +178,9 @@ def test_qwen_constructs_runtime_behavior_from_checkpoint_configuration():
     assert model.cache_geometry.num_layers == 1
     assert model.text_max_tokens == 128
     assert model.supported_work == {
-        RunKind.AR_EXTEND,
-        RunKind.AR_DECODE,
-        RunKind.AR_VERIFY,
+        OpCode.AR_EXTEND,
+        OpCode.AR_DECODE,
+        OpCode.AR_VERIFY,
     }
 
 
@@ -250,3 +250,24 @@ def test_sensenova_freezes_runtime_behavior_at_construction():
     assert model.generation.latent_downsample == 4
     assert model.generation.max_latent_tokens == 16
     assert model.generation.schedule_direction is ScheduleDirection.ASCENDING
+
+
+@pytest.mark.parametrize(
+    "total_kv_heads,intervals", ((8, ((2, 0), (2, 2), (2, 4), (2, 6))), (2, ((2, 0),) * 4))
+)
+def test_cache_geometry_preserves_tp_member_order(total_kv_heads, intervals):
+    ranks = (7, 3, 11, 5)
+    config = {
+        **_qwen_config(),
+        "hidden_size": 32,
+        "intermediate_size": 64,
+        "num_attention_heads": 8,
+        "num_key_value_heads": total_kv_heads,
+    }
+    for rank, (heads, offset) in zip(ranks, intervals, strict=True):
+        model = Qwen3ForCausalLM(
+            config, layer_config=LayerConfig(Communicator(ranks=ranks, rank=rank), None)
+        )
+        geometry = model.cache_geometry
+        assert geometry.total_kv_heads == total_kv_heads
+        assert (geometry.num_kv_heads, geometry.kv_head_offset) == (heads, offset)

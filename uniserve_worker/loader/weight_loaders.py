@@ -1,4 +1,4 @@
-"""Parameter-owned checkpoint placement, sharding, and materialization policies."""
+"""Parameter-owned checkpoint assignment, sharding, and materialization policies."""
 
 from __future__ import annotations
 
@@ -12,7 +12,6 @@ from typing import Any
 import torch
 from torch import nn
 
-from ..nn.placement import ShardPlan, get_shard_plan
 from ..nn.quant.load_state import (
     copy_tensor_policy,
     set_fp8_scale_loaded,
@@ -20,6 +19,7 @@ from ..nn.quant.load_state import (
     set_skip_serving_cast,
     skip_serving_cast,
 )
+from ..nn.shard import ShardPlan, get_shard_plan
 from .handles import WeightHandle
 
 # A parameter owns the policy that maps one checkpoint handle and logical shard into storage.
@@ -27,7 +27,7 @@ WeightLoader = Callable[[nn.Parameter, WeightHandle, str | int | None], None]
 
 __all__ = [
     "WeightLoader",
-    "DeferredWeightPlacement",
+    "WeightAssignment",
     "attach_parameter_loaders",
     "attach_weight_loader",
     "copy_parameter_loader_state",
@@ -55,8 +55,8 @@ _BINDINGS_ATTR = "_uniserve_parameter_bindings"
 
 
 @dataclass(frozen=True, slots=True)
-class DeferredWeightPlacement:
-    """One model-resolved checkpoint placement awaiting subtree materialization."""
+class WeightAssignment:
+    """One model-resolved checkpoint assignment awaiting subtree materialization."""
 
     parameter: nn.Parameter
     handle: WeightHandle
@@ -68,8 +68,8 @@ class DeferredWeightPlacement:
         load_parameter_weight(_current_parameter(self.parameter), self.handle, self.shard_id)
 
 
-_DEFERRED_PLACEMENTS: ContextVar[list[DeferredWeightPlacement] | None] = ContextVar(
-    "uniserve_deferred_weight_placements",
+_PENDING_WEIGHTS: ContextVar[list[WeightAssignment] | None] = ContextVar(
+    "uniserve_pending_weights",
     default=None,
 )
 
@@ -85,8 +85,9 @@ def attach_parameter_loaders(
     *,
     device: str | torch.device,
     dtype: torch.dtype,
+    recurse: bool = True,
 ) -> None:
-    """Bind parameter ownership, serving placement, and default assignment policies.
+    """Bind parameter ownership, serving assignment, and default assignment policies.
 
     Every alias of a tied parameter is retained so meta-device materialization can
     replace all owning module slots with one shared parameter object.
@@ -95,7 +96,7 @@ def attach_parameter_loaders(
     target = str(torch.device(device))
 
     # Record each direct owner; tied parameters may accumulate multiple bindings.
-    for owner in module.modules():
+    for owner in module.modules() if recurse else (module,):
         for name, parameter in owner.named_parameters(recurse=False):
             bindings = list(getattr(parameter, _BINDINGS_ATTR, ()))
             if not any(
@@ -135,10 +136,10 @@ def load_parameter_weight(
 ) -> None:
     """Dispatch checkpoint assignment through the parameter's attached loader."""
 
-    # Layered construction records logical placements before allocating their owners.
-    deferred = _DEFERRED_PLACEMENTS.get()
+    # Layered construction records logical assignments before allocating their owners.
+    deferred = _PENDING_WEIGHTS.get()
     if deferred is not None:
-        deferred.append(DeferredWeightPlacement(parameter, handle, shard_id))
+        deferred.append(WeightAssignment(parameter, handle, shard_id))
         return
 
     # Resolve a replacement created through another tied binding before assignment.
@@ -150,15 +151,15 @@ def load_parameter_weight(
 
 
 @contextmanager
-def defer_parameter_weights() -> Iterator[list[DeferredWeightPlacement]]:
-    """Record architecture-resolved placements without materializing parameters."""
+def defer_parameter_weights() -> Iterator[list[WeightAssignment]]:
+    """Record architecture-resolved assignments without materializing parameters."""
 
-    placements: list[DeferredWeightPlacement] = []
-    token = _DEFERRED_PLACEMENTS.set(placements)
+    assignments: list[WeightAssignment] = []
+    token = _PENDING_WEIGHTS.set(assignments)
     try:
-        yield placements
+        yield assignments
     finally:
-        _DEFERRED_PLACEMENTS.reset(token)
+        _PENDING_WEIGHTS.reset(token)
 
 
 def copy_parameter_loader_state(source: nn.Parameter, target: nn.Parameter) -> None:
@@ -225,21 +226,8 @@ def packed_weight_loader(
     if plan.shard_axis is None:
         raise ValueError("packed parameter plan has no shard axis")
     if shard_id is None:
-        # A checkpoint may concatenate its logical branches in one tensor.
-        # Slice each branch in checkpoint coordinates before installing the
-        # local packed order; a contiguous slice of the merged tensor is wrong.
-        axis = plan.shard_axis
-        slots = sorted(plan.slots.values(), key=lambda slot: slot.offset)
-        extents = [slot.size * (1 if slot.shard.replicated else slot.shard.size) for slot in slots]
-        if handle.shape[axis] != sum(extents) or any(slot.shard.axis != axis for slot in slots):
-            raise ValueError("packed checkpoint does not match its logical branch extents")
         parameter = _materialize(parameter, dtype=_target_dtype(parameter, handle))
-        offset = 0
-        for slot, extent in zip(slots, extents):
-            start = offset + (0 if slot.shard.replicated else slot.shard.rank * slot.size)
-            target = parameter.data.narrow(axis, slot.offset, slot.size)
-            _copy(target, handle.narrow(axis, start, slot.size), parameter)
-            offset += extent
+        _copy_packed_tensor(parameter, handle, plan)
         _mark_loaded(parameter)
         return
     slot = plan.slot_for(shard_id)
@@ -370,12 +358,15 @@ def fp8_weight_loader(
     # Ordinary shard plans and packed logical shards share the same materialization path.
     plan = get_shard_plan(parameter)
     if shard_id is None:
-        payload = (
-            handle.full()
-            if plan is None
-            else _payload_for_plan(handle, plan, tuple(parameter.shape))
-        )
-        _copy(parameter.data, payload, parameter, preserve_dtype=offline)
+        if plan is not None and plan.slots:
+            _copy_packed_tensor(parameter, handle, plan, preserve_dtype=offline)
+        else:
+            payload = (
+                handle.full()
+                if plan is None
+                else _payload_for_plan(handle, plan, tuple(parameter.shape))
+            )
+            _copy(parameter.data, payload, parameter, preserve_dtype=offline)
     else:
         _copy_packed(parameter, handle, shard_id, preserve_dtype=offline)
         _mark_shard_loaded(parameter, _required_plan(parameter), shard_id)
@@ -395,15 +386,61 @@ def fp8_scale_loader(
     parameter = _materialize(parameter, dtype=torch.float32)
     if shard_id is None:
         plan = get_shard_plan(parameter)
-        target_shape = tuple(parameter.shape)
-        payload = handle.full() if plan is None else _payload_for_plan(handle, plan, target_shape)
-        payload = payload.reshape(-1, 1) if payload.ndim == 1 else payload
-        _copy(parameter.data, payload, parameter, preserve_dtype=True)
+        if plan is not None and plan.slots:
+            _copy_packed_tensor(parameter, handle, plan, preserve_dtype=True, reshape_scale=True)
+        else:
+            target_shape = tuple(parameter.shape)
+            payload = (
+                handle.full() if plan is None else _payload_for_plan(handle, plan, target_shape)
+            )
+            payload = payload.reshape(-1, 1) if payload.ndim == 1 else payload
+            _copy(parameter.data, payload, parameter, preserve_dtype=True)
     else:
         _copy_packed(parameter, handle, shard_id, preserve_dtype=True, reshape_scale=True)
         _mark_shard_loaded(parameter, _required_plan(parameter), shard_id)
     set_fp8_scale_loaded(module, True)
     _mark_loaded(parameter)
+
+
+def _copy_packed_tensor(
+    parameter: nn.Parameter,
+    handle: WeightHandle,
+    plan: ShardPlan,
+    *,
+    preserve_dtype: bool = False,
+    reshape_scale: bool = False,
+) -> None:
+    """Install a complete merged tensor using each branch's checkpoint coordinates.
+
+    A rank's packed projection contains an interval from every logical branch.
+    Slicing the concatenated source once would select the wrong branches. Scale
+    columns use the same coordinates as the weights they reconstruct.
+    """
+
+    axis = plan.shard_axis
+    if axis is None:
+        raise ValueError("packed parameter plan has no shard axis")
+    slots = sorted(plan.slots.values(), key=lambda slot: slot.offset)
+    extents = [slot.size * (1 if slot.shard.replicated else slot.shard.size) for slot in slots]
+    local = handle.shape[axis] == parameter.shape[axis]
+    if (not local and handle.shape[axis] != sum(extents)) or any(
+        slot.shard.axis != axis for slot in slots
+    ):
+        raise ValueError("packed checkpoint does not match its logical branch extents")
+    offset = 0
+    for slot, extent in zip(slots, extents):
+        start = (
+            slot.offset
+            if local
+            else offset + (0 if slot.shard.replicated else slot.shard.rank * slot.size)
+        )
+        target = parameter.data.narrow(axis, slot.offset, slot.size)
+        payload = handle.narrow(axis, start, slot.size)
+        if reshape_scale and payload.ndim == 1:
+            payload = payload.reshape(-1, 1)
+        _copy(target, payload, parameter, preserve_dtype=preserve_dtype)
+        offset += extent
+    setattr(parameter, _SHARDS_ATTR, set(plan.slots))
 
 
 def _copy_packed(
@@ -414,7 +451,7 @@ def _copy_packed(
     preserve_dtype: bool,
     reshape_scale: bool = False,
 ) -> None:
-    """Copy one packed logical shard into its placement slot."""
+    """Copy one packed logical shard into its assignment slot."""
 
     plan = _required_plan(parameter)
     if plan.shard_axis is None:
@@ -460,7 +497,7 @@ def _payload_for_shard(
 
 
 def _required_plan(parameter: nn.Parameter) -> ShardPlan:
-    """Return a parameter's placement plan or reject missing sharding metadata."""
+    """Return a parameter's assignment plan or reject missing sharding metadata."""
 
     plan = get_shard_plan(parameter)
     if plan is None:
@@ -480,16 +517,17 @@ def _target_dtype(parameter: nn.Parameter, handle: WeightHandle) -> torch.dtype:
 def _materialize(parameter: nn.Parameter, *, dtype: torch.dtype) -> nn.Parameter:
     """Allocate or retype a parameter and rebind every recorded owner alias."""
 
-    # A resident parameter with the requested dtype already satisfies the contract.
-    if not parameter.is_meta and parameter.dtype == dtype:
+    device = getattr(parameter, _DEVICE_ATTR, None)
+    target = parameter.device if device is None else torch.device(device)
+    # Both numerical format and physical destination belong to the assignment.
+    if not parameter.is_meta and parameter.dtype == dtype and parameter.device == target:
         return parameter
 
     # Retype resident storage without replacing the Parameter identity.
-    if not parameter.is_meta and parameter.dtype != dtype:
-        parameter.data = torch.empty_like(parameter.data, dtype=dtype)
+    if not parameter.is_meta:
+        parameter.data = torch.empty_like(parameter.data, device=target, dtype=dtype)
         return parameter
     bindings = getattr(parameter, _BINDINGS_ATTR, ())
-    device = getattr(parameter, _DEVICE_ATTR, None)
     if not bindings or not isinstance(device, str):
         raise RuntimeError("meta parameter has no materialization owner")
 

@@ -10,7 +10,8 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
-use uniserve_core::{BlockId, HashAlgo, KvGroupKind, Modality};
+use uniserve_core::{BlockId, HashAlgo, Modality};
+use uniserve_worker_ipc::WorkerEndpoint;
 
 mod encoder_cache;
 mod freeq;
@@ -102,7 +103,6 @@ pub(crate) struct BlockPoolStats {
 }
 
 struct Group {
-    kind: KvGroupKind,
     fq_head: Option<u32>,
     fq_tail: Option<u32>,
     free_count: usize,
@@ -115,7 +115,7 @@ struct PoolInner {
     meta: Vec<BlockMeta>,
     groups: Vec<Group>,
     block_group: Vec<u32>,
-    hash_to_block: HashMap<u64, BlockId>,
+    hash_to_blocks: HashMap<u64, Vec<BlockId>>,
     events: VecDeque<CacheEvent>,
     events_cap: usize,
     stats: BlockPoolStats,
@@ -185,6 +185,27 @@ impl PoolInner {
             self.events.pop_front();
         }
         self.events.push_back(event);
+    }
+
+    /// Removes only this physical copy from the prefix index, preserving active references.
+    fn remove_cached(&mut self, block: BlockId) {
+        let meta = &mut self.meta[block.0 as usize];
+        let Some(hash) = meta.hash.take() else {
+            return;
+        };
+        meta.source = None;
+        meta.tokens.clear();
+        if meta.state == BlockState::Cached {
+            meta.state = BlockState::Free;
+        }
+        if let Some(copies) = self.hash_to_blocks.get_mut(&hash) {
+            copies.retain(|candidate| *candidate != block);
+            if copies.is_empty() {
+                self.hash_to_blocks.remove(&hash);
+            }
+        }
+        self.stats.evictions += 1;
+        self.push_event(CacheEvent::BlockRemoved { hash, block });
     }
 
     /// Releases one reference to a KV block.
@@ -298,7 +319,6 @@ impl BlockPool {
             num_blocks,
             block_size,
             &[(
-                KvGroupKind::Full,
                 0,
                 u32::try_from(num_blocks).expect("physical KV page capacity exceeds u32"),
             )],
@@ -308,13 +328,16 @@ impl BlockPool {
     /// Validates that cache groups partition the complete physical page range exactly once.
     pub(crate) fn validate_group_specs(
         num_blocks: usize,
-        group_specs: &[(KvGroupKind, u32, u32)],
+        group_specs: &[(u32, u32)],
     ) -> Result<(), BlockPoolConfigError> {
-        if num_blocks == 0 || block_size_invalid(group_specs) {
+        if num_blocks == 0
+            || group_specs.is_empty()
+            || group_specs.iter().any(|(_, count)| *count == 0)
+        {
             return Err(BlockPoolConfigError::EmptyCapacity);
         }
         let mut covered = vec![false; num_blocks];
-        for (group, (_, first, count)) in group_specs.iter().enumerate() {
+        for (group, (first, count)) in group_specs.iter().enumerate() {
             let end = u64::from(*first)
                 .checked_add(u64::from(*count))
                 .ok_or(BlockPoolConfigError::RangeOverflow { group })?;
@@ -352,7 +375,7 @@ impl BlockPool {
     pub(crate) fn with_groups(
         num_blocks: usize,
         block_size: usize,
-        group_specs: &[(KvGroupKind, u32, u32)],
+        group_specs: &[(u32, u32)],
     ) -> Self {
         assert!(block_size > 0, "KV block size must be positive");
         if let Err(error) = Self::validate_group_specs(num_blocks, group_specs) {
@@ -363,12 +386,11 @@ impl BlockPool {
             .collect::<Vec<_>>();
         let mut block_group = vec![0; num_blocks];
         let mut groups = Vec::with_capacity(group_specs.len());
-        for (group, (kind, first, count)) in group_specs.iter().enumerate() {
+        for (group, (first, count)) in group_specs.iter().enumerate() {
             for page in *first..(*first + *count) {
                 block_group[page as usize] = group as u32;
             }
             groups.push(Group {
-                kind: *kind,
                 fq_head: None,
                 fq_tail: None,
                 free_count: 0,
@@ -381,7 +403,7 @@ impl BlockPool {
             meta,
             groups,
             block_group,
-            hash_to_block: HashMap::new(),
+            hash_to_blocks: HashMap::new(),
             events: VecDeque::new(),
             events_cap: 4096,
             stats: BlockPoolStats {
@@ -389,7 +411,7 @@ impl BlockPool {
                 ..BlockPoolStats::default()
             },
         };
-        for (group, (_, first, count)) in group_specs.iter().enumerate() {
+        for (group, (first, count)) in group_specs.iter().enumerate() {
             for page in *first..(*first + *count) {
                 if page != 0 {
                     inner.fq_push_back(group, BlockId(page));
@@ -420,11 +442,6 @@ impl BlockPool {
         lock(&self.inner).groups.len()
     }
 
-    /// Returns the kind of a KV group.
-    pub(crate) fn group_kind(&self, group: usize) -> Option<KvGroupKind> {
-        lock(&self.inner).groups.get(group).map(|value| value.kind)
-    }
-
     /// Returns the block capacity of a KV group.
     pub(crate) fn group_capacity(&self, group: usize) -> usize {
         lock(&self.inner)
@@ -437,11 +454,6 @@ impl BlockPool {
     pub(crate) fn request_page_capacity(&self) -> usize {
         let inner = lock(&self.inner);
         inner.groups.iter().map(|group| group.total).sum()
-    }
-
-    /// Returns the number of free KV blocks.
-    pub(crate) fn free_blocks(&self) -> usize {
-        lock(&self.inner).total_free()
     }
 
     /// Returns the number of free blocks in a KV group.
@@ -482,14 +494,7 @@ impl BlockPool {
         let mut refs = Vec::with_capacity(count);
         for _ in 0..count {
             let page = inner.fq_pop_front(group).expect("free-count invariant");
-            if let Some(hash) = inner.meta[page.0 as usize].hash.take() {
-                inner.meta[page.0 as usize].tokens.clear();
-                if inner.hash_to_block.get(&hash) == Some(&page) {
-                    inner.hash_to_block.remove(&hash);
-                }
-                inner.stats.evictions += 1;
-                inner.push_event(CacheEvent::BlockRemoved { hash, block: page });
-            }
+            inner.remove_cached(page);
             let meta = &mut inner.meta[page.0 as usize];
             meta.state = BlockState::Reserved;
             meta.ref_cnt = 1;
@@ -517,11 +522,6 @@ impl BlockPool {
         }
     }
 
-    /// Returns the block reference count.
-    pub(crate) fn ref_count(&self, block: BlockId) -> u32 {
-        lock(&self.inner).meta[block.0 as usize].ref_cnt
-    }
-
     /// Returns the block lifecycle state.
     pub(crate) fn block_state(&self, block: BlockId) -> BlockState {
         lock(&self.inner).meta[block.0 as usize].state
@@ -535,17 +535,30 @@ impl BlockPool {
             .map(|group| *group as usize)
     }
 
-    /// Caches the block.
-    pub(crate) fn cache_block(&self, block: &CacheBlockRef, hash: u64, tokens: &[u32]) {
+    /// Publishes one physical prefix copy under its loaded Worker identity.
+    pub(crate) fn cache_block(
+        &self,
+        block: &CacheBlockRef,
+        hash: u64,
+        tokens: &[u32],
+        source: &Arc<WorkerEndpoint>,
+    ) {
         let mut inner = lock(&self.inner);
-        if inner.hash_to_block.contains_key(&hash) {
+        if inner.hash_to_blocks.get(&hash).is_some_and(|copies| {
+            copies.iter().any(|candidate| {
+                let meta = &inner.meta[candidate.0 as usize];
+                meta.source.as_deref() == Some(source.as_ref()) && meta.tokens == tokens
+            })
+        }) {
             return;
         }
+        inner.remove_cached(block.id);
         let meta = &mut inner.meta[block.id.0 as usize];
         meta.hash = Some(hash);
+        meta.source = Some(Arc::clone(source));
         meta.tokens.clear();
         meta.tokens.extend_from_slice(tokens);
-        inner.hash_to_block.insert(hash, block.id);
+        inner.hash_to_blocks.entry(hash).or_default().push(block.id);
         inner.stats.blocks_stored += 1;
         inner.push_event(CacheEvent::BlockStored {
             hash,
@@ -553,11 +566,23 @@ impl BlockPool {
         });
     }
 
-    /// Looks up the cached.
-    pub(crate) fn lookup_cached(&self, hash: u64, tokens: &[u32]) -> Option<BlockId> {
+    /// Finds a prefix copy retained by this exact loaded Worker.
+    pub(crate) fn lookup_cached(
+        &self,
+        hash: u64,
+        tokens: &[u32],
+        source: &WorkerEndpoint,
+    ) -> Option<BlockId> {
         let inner = lock(&self.inner);
-        let block = *inner.hash_to_block.get(&hash)?;
-        (inner.meta[block.0 as usize].tokens == tokens).then_some(block)
+        inner
+            .hash_to_blocks
+            .get(&hash)?
+            .iter()
+            .copied()
+            .find(|block| {
+                let meta = &inner.meta[block.0 as usize];
+                meta.source.as_deref() == Some(source) && meta.tokens == tokens
+            })
     }
 
     /// Acquires an active reference when a cached page still matches its hash and token payload.
@@ -566,10 +591,14 @@ impl BlockPool {
         block: BlockId,
         hash: u64,
         tokens: &[u32],
+        source: &WorkerEndpoint,
     ) -> Option<CacheBlockRef> {
         let mut inner = lock(&self.inner);
         let meta = inner.meta.get(block.0 as usize)?;
-        if meta.hash != Some(hash) || meta.tokens != tokens {
+        if meta.hash != Some(hash)
+            || meta.tokens != tokens
+            || meta.source.as_deref() != Some(source)
+        {
             return None;
         }
         inner.fq_unlink(block);
@@ -585,7 +614,21 @@ impl BlockPool {
 
     /// Returns the cached prefix blocks.
     pub(crate) fn cached_blocks(&self) -> usize {
-        lock(&self.inner).hash_to_block.len()
+        lock(&self.inner)
+            .hash_to_blocks
+            .values()
+            .map(Vec::len)
+            .sum()
+    }
+
+    /// Revokes cache lookup for one lost incarnation without freeing live request pages.
+    pub(crate) fn invalidate_source(&self, source: &WorkerEndpoint) {
+        let mut inner = lock(&self.inner);
+        for index in 0..inner.meta.len() {
+            if inner.meta[index].source.as_deref() == Some(source) {
+                inner.remove_cached(BlockId(index as u32));
+            }
+        }
     }
 
     /// Drains pending cache events in publication order.
@@ -612,7 +655,6 @@ pub(crate) struct BlockTable {
     group_id: usize,
     block_size: usize,
     blocks: Vec<CacheBlockRef>,
-    token_starts: Option<Vec<usize>>,
 }
 
 impl BlockTable {
@@ -623,7 +665,6 @@ impl BlockTable {
             group_id,
             block_size,
             blocks: Vec::new(),
-            token_starts: None,
         }
     }
 
@@ -635,11 +676,6 @@ impl BlockTable {
     /// Returns the number of entries.
     pub(crate) fn len(&self) -> usize {
         self.blocks.len()
-    }
-
-    /// Returns whether the collection contains no entries.
-    pub(crate) fn is_empty(&self) -> bool {
-        self.blocks.is_empty()
     }
 
     /// Returns the table capacity in tokens.
@@ -668,7 +704,6 @@ impl BlockTable {
             return false;
         }
         self.blocks.push(block);
-        self.token_starts = None;
         true
     }
 
@@ -683,43 +718,12 @@ impl BlockTable {
         let acquired = pool.allocate(self.group_id, additional)?;
         let page_ids = acquired.iter().map(CacheBlockRef::id).collect();
         self.blocks.extend(acquired);
-        self.token_starts = None;
         Some(page_ids)
     }
 
     /// Activates the requested KV allocation.
     pub(crate) fn activate(&self, pool: &BlockPool) {
         pool.activate(&self.blocks);
-    }
-
-    /// Releases sliding-window pages that lie outside both the sink and active window.
-    pub(crate) fn trim(&mut self, pool: &BlockPool, position_tokens: usize) {
-        let Some(KvGroupKind::SlidingWindow { window, sink }) = pool.group_kind(self.group_id)
-        else {
-            return;
-        };
-        let starts = self.token_starts.clone();
-        let mut kept = Vec::with_capacity(self.blocks.len());
-        let mut kept_starts = Vec::with_capacity(self.blocks.len());
-        for (index, block) in self.blocks.drain(..).enumerate() {
-            let start = starts
-                .as_ref()
-                .and_then(|values| values.get(index).copied())
-                .unwrap_or(index * self.block_size);
-            let end = start + self.block_size;
-            if start < sink as usize || end > position_tokens.saturating_sub(window as usize) {
-                kept.push(block);
-                kept_starts.push(start);
-            }
-        }
-        self.blocks = kept;
-        self.token_starts = Some(kept_starts);
-    }
-
-    /// Clears all retained entries.
-    pub(crate) fn clear(&mut self) {
-        self.blocks.clear();
-        self.token_starts = None;
     }
 }
 
@@ -811,6 +815,7 @@ impl KvCacheCoordinator {
         cache_read: bool,
         has_images: bool,
         isolation_key: Option<u64>,
+        source: &WorkerEndpoint,
     ) -> PrefixHit {
         let groups = pool.num_groups();
         let mut hit = PrefixHit {
@@ -830,7 +835,7 @@ impl KvCacheCoordinator {
             let tokens = &prompt[index * block_size..(index + 1) * block_size];
             let mut blocks = Vec::with_capacity(groups);
             for (group, group_hashes) in hashes.iter().enumerate() {
-                let Some(block) = pool.lookup_cached(group_hashes[index], tokens) else {
+                let Some(block) = pool.lookup_cached(group_hashes[index], tokens, source) else {
                     return hit;
                 };
                 if pool.block_group(block) != Some(group) {
@@ -857,6 +862,7 @@ impl KvCacheCoordinator {
         cache_read: bool,
         has_images: bool,
         isolation_key: Option<u64>,
+        source: &WorkerEndpoint,
     ) -> Option<PrefixLookup> {
         let groups = pool.num_groups();
         if tables.len() != groups
@@ -884,7 +890,7 @@ impl KvCacheCoordinator {
             let mut candidates = Vec::with_capacity(groups);
             for (group, table) in tables.iter().enumerate() {
                 let hash = result.block_hashes[group][index];
-                let Some(block) = pool.lookup_cached(hash, tokens) else {
+                let Some(block) = pool.lookup_cached(hash, tokens, source) else {
                     return Some(result);
                 };
                 if pool.block_group(block) != Some(group) || table.contains(block) {
@@ -894,7 +900,7 @@ impl KvCacheCoordinator {
             }
             let mut references = Vec::with_capacity(groups);
             for (block, hash) in candidates {
-                let Some(reference) = pool.acquire_cached(block, hash, tokens) else {
+                let Some(reference) = pool.acquire_cached(block, hash, tokens, source) else {
                     return Some(result);
                 };
                 references.push(reference);
@@ -917,6 +923,7 @@ impl KvCacheCoordinator {
         prompt: &[u32],
         hashes: &[Vec<u64>],
         cache_write: bool,
+        source: &Arc<WorkerEndpoint>,
     ) -> bool {
         if !self.prefix_enabled || !cache_write {
             return true;
@@ -937,7 +944,7 @@ impl KvCacheCoordinator {
                 else {
                     continue;
                 };
-                pool.cache_block(block, *hash, tokens);
+                pool.cache_block(block, *hash, tokens, source);
             }
         }
         true
@@ -982,11 +989,6 @@ fn prefix_lookup_limit(prompt_tokens: usize, block_size: usize) -> usize {
     }
 }
 
-/// Returns whether the configured block size is invalid.
-fn block_size_invalid(group_specs: &[(KvGroupKind, u32, u32)]) -> bool {
-    group_specs.is_empty() || group_specs.iter().any(|(_, _, count)| *count == 0)
-}
-
 /// Locks the shared state and recovers it after poisoning.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -1004,22 +1006,16 @@ mod tests {
         let mut first = BlockTable::new(0, 4);
         assert_eq!(first.ensure_capacity(&pool, 4), Some(vec![BlockId(1)]));
         let second = first.clone();
-        assert_eq!(pool.ref_count(BlockId(1)), 2);
-        first.clear();
-        assert_eq!(pool.ref_count(BlockId(1)), 1);
-        assert_eq!(pool.free_blocks(), 2);
+        assert!(pool.allocate(0, 3).is_none());
+        drop(first);
+        assert!(pool.allocate(0, 3).is_none());
         drop(second);
-        assert_eq!(pool.ref_count(BlockId(1)), 0);
-        assert_eq!(pool.free_blocks(), 3);
+        assert_eq!(pool.allocate(0, 3).unwrap().len(), 3);
     }
 
     #[test]
     fn coordinator_allocates_complete_group_tables_atomically() {
-        let pool = BlockPool::with_groups(
-            7,
-            4,
-            &[(KvGroupKind::Full, 0, 4), (KvGroupKind::Full, 4, 3)],
-        );
+        let pool = BlockPool::with_groups(7, 4, &[(0, 4), (4, 3)]);
         let mut tables = vec![BlockTable::new(0, 4), BlockTable::new(1, 4)];
         let coordinator = KvCacheCoordinator::default();
         assert!(coordinator.ensure_capacity(&pool, &mut tables, 8).is_some());
@@ -1040,30 +1036,27 @@ mod tests {
         let mut first = BlockTable::new(0, 4);
         first.ensure_capacity(&pool, 4).unwrap();
         let hash = block_hash(0, 0, 0, &[1, 2, 3, 4], HashAlgo::Fnv1a);
-        pool.cache_block(first.block(0).unwrap(), hash, &[1, 2, 3, 4]);
-        let block = pool.lookup_cached(hash, &[1, 2, 3, 4]).unwrap();
-        let reference = pool.acquire_cached(block, hash, &[1, 2, 3, 4]).unwrap();
+        let source = Arc::new(uniserve_worker_ipc::WorkerInfo::default().endpoint);
+        pool.cache_block(first.block(0).unwrap(), hash, &[1, 2, 3, 4], &source);
+        let block = pool.lookup_cached(hash, &[1, 2, 3, 4], &source).unwrap();
+        let reference = pool
+            .acquire_cached(block, hash, &[1, 2, 3, 4], &source)
+            .unwrap();
         let mut second = BlockTable::new(0, 4);
         assert!(second.append_cached(reference));
         assert_eq!(first.page_ids(), second.page_ids());
-        assert_eq!(pool.ref_count(block), 2);
     }
 
     #[test]
     fn group_validation_rejects_gaps_and_overlap() {
-        use KvGroupKind::Full;
-        assert!(BlockPool::validate_group_specs(8, &[(Full, 0, 3), (Full, 3, 5)]).is_ok());
-        assert!(BlockPool::validate_group_specs(8, &[(Full, 0, 4), (Full, 3, 5)]).is_err());
-        assert!(BlockPool::validate_group_specs(8, &[(Full, 0, 7)]).is_err());
+        assert!(BlockPool::validate_group_specs(8, &[(0, 3), (3, 5)]).is_ok());
+        assert!(BlockPool::validate_group_specs(8, &[(0, 4), (3, 5)]).is_err());
+        assert!(BlockPool::validate_group_specs(8, &[(0, 7)]).is_err());
     }
 
     #[test]
     fn prefix_reuse_advances_only_at_a_boundary_cached_in_every_group() {
-        let pool = BlockPool::with_groups(
-            7,
-            4,
-            &[(KvGroupKind::Full, 0, 4), (KvGroupKind::Full, 4, 3)],
-        );
+        let pool = BlockPool::with_groups(7, 4, &[(0, 4), (4, 3)]);
         let coordinator = KvCacheCoordinator::default();
         let prompt = [1, 2, 3, 4, 5, 6, 7, 8];
         let mut source = vec![BlockTable::new(0, 4), BlockTable::new(1, 4)];
@@ -1071,18 +1064,72 @@ mod tests {
             .ensure_capacity(&pool, &mut source, prompt.len())
             .unwrap();
         let hashes = coordinator.prefix_hashes(&prompt, 2, 4, None);
-        assert!(coordinator.cache_prefix(&pool, &source, &prompt, &hashes, true));
+        let endpoint = Arc::new(uniserve_worker_ipc::WorkerInfo::default().endpoint);
+        assert!(coordinator.cache_prefix(&pool, &source, &prompt, &hashes, true, &endpoint));
 
-        let hit = coordinator.probe_prefix(&pool, &prompt, true, false, None);
+        let hit = coordinator.probe_prefix(&pool, &prompt, true, false, None, &endpoint);
         assert_eq!(hit.cached_blocks, 1);
         assert_eq!(hit.cached_free_blocks, vec![0, 0]);
 
         let mut target = vec![BlockTable::new(0, 4), BlockTable::new(1, 4)];
         let lookup = coordinator
-            .acquire_prefix(&pool, &mut target, &prompt, true, false, None)
+            .acquire_prefix(&pool, &mut target, &prompt, true, false, None, &endpoint)
             .unwrap();
         assert_eq!(lookup.cached_blocks, 1);
         assert_eq!(target[0].page_ids(), source[0].page_ids()[..1]);
         assert_eq!(target[1].page_ids(), source[1].page_ids()[..1]);
+    }
+
+    #[test]
+    fn prefix_copies_follow_worker_incarnations_without_releasing_active_pages() {
+        let pool = BlockPool::new(5, 4);
+        let coordinator = KvCacheCoordinator::default();
+        let prompt = [1, 2, 3, 4, 5];
+        let hashes = coordinator.prefix_hashes(&prompt, 1, 4, None);
+        let first = Arc::new(uniserve_worker_ipc::WorkerInfo::default().endpoint);
+        let second = Arc::new(WorkerEndpoint {
+            worker_id: "replica".into(),
+            incarnation: "replica-loaded".into(),
+            ..first.as_ref().clone()
+        });
+        let mut tables = [vec![BlockTable::new(0, 4)], vec![BlockTable::new(0, 4)]];
+        for (source, table) in [&first, &second].into_iter().zip(&mut tables) {
+            coordinator.ensure_capacity(&pool, table, 4).unwrap();
+            assert!(coordinator.cache_prefix(&pool, table, &prompt, &hashes, true, source));
+            assert_eq!(
+                coordinator
+                    .probe_prefix(&pool, &prompt, true, false, None, source)
+                    .cached_blocks,
+                1
+            );
+        }
+        let replacement = WorkerEndpoint {
+            incarnation: "reloaded".into(),
+            ..first.as_ref().clone()
+        };
+        assert_eq!(
+            coordinator
+                .probe_prefix(&pool, &prompt, true, false, None, &replacement)
+                .cached_blocks,
+            0
+        );
+
+        let free_before = pool.free_blocks_in_group(0);
+        pool.invalidate_source(&first);
+        assert_eq!(pool.free_blocks_in_group(0), free_before);
+        assert_eq!(
+            coordinator
+                .probe_prefix(&pool, &prompt, true, false, None, &first)
+                .cached_blocks,
+            0
+        );
+        let mut consumer = vec![BlockTable::new(0, 4)];
+        let reused = coordinator
+            .acquire_prefix(&pool, &mut consumer, &prompt, true, false, None, &second)
+            .unwrap();
+        assert_eq!(reused.cached_blocks, 1);
+        assert_eq!(consumer[0].page_ids(), tables[1][0].page_ids());
+        drop(tables[0].pop());
+        assert_eq!(pool.free_blocks_in_group(0), free_before + 1);
     }
 }

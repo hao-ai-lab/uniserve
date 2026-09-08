@@ -7,6 +7,112 @@
 use super::*;
 
 impl EngineLoop {
+    /// Enumerates loaded entries that can execute the requested operation.
+    pub(super) fn worker_candidates(
+        &self,
+        kind: OpCode,
+    ) -> impl Iterator<Item = (&crate::WorkerId, &str, &WorkerInfo)> {
+        let entry = match kind {
+            OpCode::EncoderText => "text_encoder",
+            OpCode::DiffusionPrepare => "denoiser",
+            OpCode::DiffusionStep => "denoiser",
+            OpCode::MediaAppend => "output",
+            OpCode::DiffusionFinalize => "denoiser",
+            OpCode::DiffusionDecode => "video_decoder",
+            OpCode::EncoderVision => "vision_encoder",
+            OpCode::EncoderLatent => "latent_encoder",
+            _ => "model",
+        };
+        self.entry_candidates(kind, entry)
+    }
+
+    pub(super) fn entry_candidates<'a>(
+        &'a self,
+        kind: OpCode,
+        entry: &'a str,
+    ) -> impl Iterator<Item = (&'a crate::WorkerId, &'a str, &'a WorkerInfo)> {
+        self.executor
+            .info()
+            .workers
+            .iter()
+            .filter_map(move |(id, info)| {
+                if !info.supported_ops.contains(&kind) {
+                    return None;
+                }
+                let bound_entry = if info.components.iter().any(|binding| binding.name == entry) {
+                    entry
+                } else if info.components.is_empty()
+                    || info
+                        .components
+                        .iter()
+                        .any(|binding| binding.name == "model")
+                {
+                    "model"
+                } else {
+                    return None;
+                };
+                Some((id, bound_entry, info))
+            })
+    }
+
+    /// Uses the static entry owner when it has destination capacity.
+    pub(super) fn worker_target(
+        &self,
+        _request: RequestKey,
+        kind: OpCode,
+    ) -> Option<(&crate::WorkerId, &str)> {
+        let (id, bound_entry, _) = self.worker_candidates(kind).next()?;
+        self.executor.has_capacity(id).then_some((id, bound_entry))
+    }
+
+    /// Binds planned work to its configured entry and records request residency.
+    pub(super) fn select_worker(&mut self, operation: &Operation) -> (crate::WorkerId, String) {
+        let (id, bound_entry) = if operation.entry == "model" {
+            self.worker_target(operation.request_key, operation.kind())
+        } else {
+            self.entry_candidates(operation.kind(), &operation.entry)
+                .find(|(id, _, _)| self.executor.has_capacity(id))
+                .map(|(id, entry, _)| (id, entry))
+        }
+        .expect("planned operation retains an executable entry");
+        let target = (id.clone(), bound_entry.to_owned());
+        self.worker_affinity
+            .insert((operation.request_key, target.1.clone()), target.0.clone());
+        target
+    }
+
+    /// Includes lifecycle commands in destination ordering, even when a batch has no compute.
+    fn batch_workers(&self, batch: &Batch) -> HashSet<crate::WorkerId> {
+        let mut targets = batch
+            .ops
+            .iter()
+            .map(|op| op.target.0.clone())
+            .collect::<HashSet<_>>();
+        for command in &batch.commands {
+            targets.extend(
+                self.worker_affinity
+                    .iter()
+                    .filter_map(|((request, _), worker)| {
+                        (*request == command.request_key()).then_some(worker.clone())
+                    }),
+            );
+        }
+        targets
+    }
+
+    /// Retains destination order when earlier work is waiting for local capacity.
+    pub(super) fn submit_bound_batch(&mut self, batch: Batch) -> Result<(), ExecutorSubmitError> {
+        let targets = self.batch_workers(&batch);
+        if self
+            .pending_submissions
+            .iter()
+            .any(|pending| !self.batch_workers(pending).is_disjoint(&targets))
+        {
+            return Err(ExecutorSubmitError::WouldBlock(batch));
+        }
+        self.executor.submit(batch)
+    }
+
     /// Releases the request latent.
     fn free_request_latent(&mut self, id: RequestId) {
         let allocation = self
@@ -66,13 +172,29 @@ impl EngineLoop {
     /// Drains ready work, admits requests, and fills every available executor slot.
     pub(super) fn refill_executor(&mut self) -> bool {
         let mut progressed = false;
+        self.worker_affinity.retain(|(request, _), _| {
+            let id = request.request_id;
+            self.running.contains_key(&id)
+                || self.running_media.contains_key(&id)
+                || self.retiring_requests.contains_key(&id)
+        });
 
-        if let Some(batch) = self.pending_submission.take() {
+        let pending_count = self.pending_submissions.len();
+        let mut blocked_workers = HashSet::new();
+        for _ in 0..pending_count {
+            let batch = self
+                .pending_submissions
+                .pop_front()
+                .expect("pending count is fixed");
+            if !self.batch_workers(&batch).is_disjoint(&blocked_workers) {
+                self.pending_submissions.push_back(batch);
+                continue;
+            }
             match self.executor.submit(batch) {
                 Ok(()) => progressed = true,
                 Err(ExecutorSubmitError::WouldBlock(batch)) => {
-                    self.pending_submission = Some(batch);
-                    return false;
+                    blocked_workers.extend(self.batch_workers(&batch));
+                    self.pending_submissions.push_back(batch);
                 }
                 Err(ExecutorSubmitError::Failed(error)) => {
                     self.on_executor_error(error);
@@ -122,25 +244,15 @@ impl EngineLoop {
                 .all(|op| batch_kind(op.operation_variant) == BatchKind::Prefill);
             let commands: Vec<BatchCommand> = if prompt_batch {
                 let requests: HashSet<RequestId> = ops.iter().map(|op| op.request_id).collect();
-                let mut blocked_foreign = HashSet::new();
-                let mut own = VecDeque::new();
-                let mut foreign = VecDeque::new();
-                for command in self.pending_commands.drain(..) {
-                    let request_id = command.request_key().request_id;
-                    if requests.contains(&request_id)
-                        || (matches!(command, BatchCommand::Finish { .. })
-                            && !blocked_foreign.contains(&request_id))
-                    {
-                        own.push_back(command);
-                    } else {
-                        blocked_foreign.insert(request_id);
-                        foreign.push_back(command);
-                    }
-                }
-                self.pending_commands = foreign;
-                own.into()
+                self.take_commands(|command| {
+                    requests.contains(&command.request_key().request_id)
+                        || matches!(
+                            command,
+                            BatchCommand::Finish { .. } | BatchCommand::Retire { .. }
+                        )
+                })
             } else {
-                self.pending_commands.drain(..).collect()
+                self.take_commands(|_| true)
             };
             if !self.submit_batch(new_reqs, ops, commands) {
                 break;
@@ -148,11 +260,14 @@ impl EngineLoop {
             self.scheduler.prefer_media = true;
             progressed = true;
         }
-        while self.pending_submission.is_none()
+        while self.pending_submissions.is_empty()
             && !self.pending_commands.is_empty()
             && self.inflight.batch_started.len() < self.info.queue_depth.max(1) as usize
         {
-            let commands = self.pending_commands.drain(..).collect();
+            let commands = self.take_commands(|_| true);
+            if commands.is_empty() {
+                break;
+            }
             if !self.submit_batch(Vec::new(), Vec::new(), commands) {
                 break;
             }
@@ -187,7 +302,86 @@ impl EngineLoop {
         }
     }
 
-    /// Selects eligible media requests and submits one bounded diffusion batch.
+    /// Select a ready branch with capacity at its actual static computation entry.
+    fn next_media_quantum(&self, state: &MediaFlowState) -> Option<MediaQuantum> {
+        let cursor = state.projected;
+        let geometry = state.request.geometry;
+        let mut ready = Vec::new();
+        if !cursor.encoded {
+            ready.push(MediaQuantum::Encode);
+        } else if !cursor.prepared {
+            ready.push(MediaQuantum::Prepare);
+        } else if cursor.denoise_step < geometry.denoise_steps {
+            ready.push(MediaQuantum::Denoise {
+                step: cursor.denoise_step,
+            });
+        } else {
+            let produced = |product: &ProductRef| {
+                !self
+                    .inflight
+                    .operations
+                    .get(&state.request.request_id)
+                    .is_some_and(|ops| {
+                        ops.iter()
+                            .any(|op| op.operation.op_id == product.producer_op_id)
+                    })
+            };
+            if let Some((count, product)) = state.video_segments.get(&cursor.video_written)
+                && produced(product)
+            {
+                ready.push(MediaQuantum::Append {
+                    track: MediaTrack::Video,
+                    cursor: cursor.video_written,
+                    max_units: *count,
+                });
+            }
+            if !cursor.audio_written && state.audio.as_ref().is_some_and(produced) {
+                ready.push(MediaQuantum::Append {
+                    track: MediaTrack::Audio,
+                    cursor: 0,
+                    max_units: 1,
+                });
+            }
+            if cursor.video_decoded < geometry.video_units {
+                if let Some((_, entry, info)) = self
+                    .entry_candidates(OpCode::DiffusionDecode, "video_decoder")
+                    .next()
+                {
+                    let component = info
+                        .components
+                        .iter()
+                        .find(|component| component.name == entry)?;
+                    let width = u32::try_from(component.config.ranks.len()).ok()?;
+                    ready.push(MediaQuantum::Decode {
+                        track: MediaTrack::Video,
+                        cursor: cursor.video_decoded,
+                        max_units: width.min(geometry.video_units - cursor.video_decoded),
+                    });
+                }
+            }
+            if !cursor.audio_decoded {
+                ready.push(MediaQuantum::Decode {
+                    track: MediaTrack::Audio,
+                    cursor: 0,
+                    max_units: 1,
+                });
+            }
+            if !cursor.finalized
+                && state.committed.video_written == geometry.video_units
+                && state.committed.audio_written
+            {
+                ready.push(MediaQuantum::Finalize);
+            }
+        }
+        ready.into_iter().find(|quantum| {
+            let (kind, entry) = quantum.target();
+            self.entry_candidates(kind, entry)
+                .any(|(worker, _, _)| self.executor.has_capacity(worker))
+        })
+    }
+
+    /// Select eligible media requests and submit one bounded batch. Independent
+    /// audio and video branches carry Tensor edges, without a state predecessor.
     pub(super) fn submit_media_batch(&mut self) -> bool {
         let max_unresolved =
             usize::try_from(self.info.max_unresolved_ops.max(1)).unwrap_or(usize::MAX);
@@ -197,26 +391,19 @@ impl EngineLoop {
             .iter()
             .enumerate()
             .filter_map(|(index, id)| {
-                self.media_state(*id).and_then(|state| {
-                    let inflight = self.inflight.len(*id);
-                    (!state.terminal_intent.is_terminal()
-                        && state.admission_state != DiffusionRequestParamsState::InFlight
-                        && inflight < max_unresolved
-                        && next_media_quantum(
-                            state.projected,
-                            state
-                                .admission
-                                .diffusion
-                                .as_ref()
-                                .expect("media admission")
-                                .geometry,
-                        )
-                        .is_some())
-                    .then_some((inflight, index, *id))
-                })
+                let state = self.media_state(*id)?;
+                let inflight = self.inflight.len(*id);
+                if state.terminal_intent.is_terminal()
+                    || state.admission_state == DiffusionRequestParamsState::InFlight
+                    || inflight >= max_unresolved
+                {
+                    return None;
+                }
+                self.next_media_quantum(state)
+                    .map(|quantum| (inflight, index, *id, quantum))
             })
             .collect::<Vec<_>>();
-        candidates.sort_unstable_by_key(|(inflight, index, _)| (*inflight > 0, *index));
+        candidates.sort_unstable_by_key(|(inflight, index, ..)| (*inflight > 0, *index));
         candidates.truncate(self.scheduler.config.max_batch);
         if candidates.is_empty() {
             return false;
@@ -224,70 +411,136 @@ impl EngineLoop {
 
         let batch_id = self.inflight.next_batch_id();
         let submit_at = Instant::now();
+        let commands = self.take_commands(|command| {
+            matches!(
+                command,
+                BatchCommand::Finish { .. } | BatchCommand::Retire { .. }
+            )
+        });
         let mut admissions = Vec::new();
-        let mut operations = Vec::with_capacity(candidates.len());
-        let mut latent_placements = Vec::new();
-        let mut decode_placements = Vec::new();
-        let (media_finishes, remaining_commands): (VecDeque<_>, VecDeque<_>) = self
-            .pending_commands
-            .drain(..)
-            .partition(|command| matches!(command, BatchCommand::Finish { .. }));
-        self.pending_commands = remaining_commands;
-        let commands = media_finishes.into_iter().collect::<Vec<_>>();
-
-        for (_, _, id) in candidates {
-            let (request_key, parent, predicate, quantum, cursor_after) = {
-                let state = self.media_state(id).expect("media candidate exists");
-                let quantum = next_media_quantum(
-                    state.projected,
-                    state
-                        .admission
-                        .diffusion
-                        .as_ref()
-                        .expect("media admission")
-                        .geometry,
-                )
-                .expect("media candidate is runnable");
-                let predicate = self
-                    .inflight
+        let mut logical_ops = Vec::with_capacity(candidates.len());
+        for (_, _, id, quantum) in candidates {
+            let op_id = if quantum == MediaQuantum::Encode {
+                self.media_state(id)
+                    .expect("media state exists")
+                    .conditioning
+                    .producer_op_id
+            } else {
+                let op = OpId(self.next_op_id.max(1));
+                self.next_op_id = op.0.saturating_add(1);
+                op
+            };
+            let (work, entry) = quantum.target();
+            let state = self.media_state(id).expect("media candidate exists");
+            let request_key = state.admission.request_key;
+            let stateful = work.advances_state();
+            let last_step = matches!(quantum, MediaQuantum::Denoise { step } if step + 1 == state.request.geometry.denoise_steps);
+            let predicate = if stateful {
+                self.inflight
                     .operations
                     .get(&id)
-                    .and_then(|inflight| inflight.back())
-                    .and_then(|inflight| inflight.operation.outputs().first().cloned());
-                (
-                    state.admission.request_key,
-                    state.projected_parent.clone(),
-                    predicate,
-                    quantum,
-                    advance_media_cursor(state.projected, quantum),
-                )
-            };
-            let op_id = OpId(self.next_op_id.max(1));
-            self.next_op_id = self.next_op_id.saturating_add(1);
-            let work = media_work(quantum);
-            let outputs = if matches!(
-                quantum,
-                MediaQuantum::Decode {
-                    finalizes: true,
-                    ..
-                }
-            ) {
-                Vec::new()
+                    .and_then(|ops| {
+                        ops.iter()
+                            .find(|op| op.operation.op_id == state.projected_parent.op_id)
+                    })
+                    .and_then(|op| {
+                        op.operation
+                            .outputs()
+                            .iter()
+                            .find(|output| output.kind == ProductKind::Completion)
+                    })
+                    .cloned()
             } else {
-                vec![self.media_completion_product(request_key, op_id)]
+                None
             };
+            let inputs = match quantum {
+                MediaQuantum::Prepare => vec![state.conditioning.clone()],
+                MediaQuantum::Decode { track, .. } => {
+                    vec![state.latents[usize::from(track == MediaTrack::Audio)].clone()]
+                }
+                MediaQuantum::Append {
+                    track: MediaTrack::Video,
+                    cursor,
+                    ..
+                } => vec![state.video_segments[&cursor].1.clone()],
+                MediaQuantum::Append {
+                    track: MediaTrack::Audio,
+                    ..
+                } => vec![state.audio.as_ref().expect("audio is ready").clone()],
+                _ => Vec::new(),
+            };
+            let mut buffers = Vec::new();
+            let mut outputs = Vec::new();
+            if quantum == MediaQuantum::Encode
+                || last_step
+                || matches!(quantum, MediaQuantum::Decode { .. })
+            {
+                let count = if last_step { 2 } else { 1 };
+                for index in 0..count {
+                    let reserved = &state.allocations.tensors[&(entry.to_owned(), index)];
+                    let mut shape_bound = reserved.shape_bound.clone();
+                    let start = if let MediaQuantum::Decode {
+                        track: MediaTrack::Video,
+                        cursor,
+                        max_units,
+                    } = quantum
+                    {
+                        shape_bound.dims[0] = DimBound::Static(max_units);
+                        cursor
+                    } else {
+                        0
+                    };
+                    let product = ProductRef {
+                        request_key,
+                        producer_op_id: op_id,
+                        output_index: index as u16,
+                        generation: 1,
+                        kind: ProductKind::Tensor,
+                        storage_class: StorageClass::DeviceTensor,
+                        dtype: reserved.dtype,
+                        shape_bound,
+                        point_range: PointRange::default(),
+                    };
+                    buffers.push(reserved.bind(&product, start));
+                    outputs.push(product);
+                }
+            }
+            let latent = if stateful {
+                let (start_step, step_count) = if let MediaQuantum::Denoise { step } = quantum {
+                    (step, 1)
+                } else {
+                    (0, 0)
+                };
+                Some(LatentParams {
+                    request_key,
+                    op_id,
+                    page_table: Vec::new(),
+                    latent_units: 0,
+                    height: 768,
+                    width: 1344,
+                    start_step,
+                    step_count,
+                })
+            } else {
+                None
+            };
+            let parent = stateful.then(|| state.projected_parent.clone());
+            if outputs.is_empty() && stateful {
+                let completion = self.media_completion_product(request_key, op_id);
+                outputs.push(completion);
+            }
             let operation = Operation {
                 request_key,
                 op_id,
                 parent,
-                kind: work,
+                entry: entry.to_owned(),
                 payload: OpPayload::new(
                     work,
                     Bounds {
-                        max_points: 1,
+                        max_points: u32::from(stateful),
                         ..Bounds::default()
                     },
-                    Vec::new(),
+                    inputs,
                     outputs,
                     predicate,
                     None,
@@ -295,80 +548,68 @@ impl EngineLoop {
                 ),
             }
             .sealed();
-            if matches!(
-                quantum,
-                MediaQuantum::Prepare | MediaQuantum::Denoise { .. }
-            ) {
-                let (start_step, step_count) = match quantum {
-                    MediaQuantum::Denoise { step } => (step, 1),
-                    _ => (0, 0),
-                };
-                latent_placements.push(LatentPlacement {
-                    request_key,
-                    op_id,
-                    page_table: self
-                        .media_state(id)
-                        .expect("media state exists")
-                        .allocations
-                        .latent_pages()
-                        .to_vec(),
-                    latent_units: self.info.latent_page_units,
-                    height: 768,
-                    width: 1344,
-                    start_step,
-                    step_count,
-                });
-            }
-            if let MediaQuantum::Decode {
-                cursor, max_units, ..
-            } = quantum
-            {
-                decode_placements.push(DecodePlacement {
-                    request_key,
-                    op_id,
+            let decode = match quantum {
+                MediaQuantum::Decode {
+                    track,
                     cursor,
                     max_units,
-                });
-            }
-            let projected_parent = Checkpoint {
-                op_id,
-                point: CheckpointPoint::DeviceSelected,
+                }
+                | MediaQuantum::Append {
+                    track,
+                    cursor,
+                    max_units,
+                } => Some(DecodeRange {
+                    request_key,
+                    op_id,
+                    track,
+                    cursor,
+                    max_units,
+                }),
+                _ => None,
             };
             let state = self.media_state_mut(id).expect("media candidate exists");
             if state.admission_state == DiffusionRequestParamsState::Unsubmitted {
                 admissions.push(state.admission.clone());
                 state.admission_state = DiffusionRequestParamsState::InFlight;
             }
-            state.projected = cursor_after;
-            state.projected_parent = projected_parent;
-            let operation_for_batch = operation.clone();
-            self.register_media_inflight(operation, cursor_after, submit_at);
-            operations.push(operation_for_batch);
+            state.projected = advance_media_cursor(state.projected, quantum);
+            if stateful {
+                state.projected_parent = Checkpoint {
+                    op_id,
+                    point: CheckpointPoint::DeviceSelected,
+                };
+            }
+            if last_step {
+                state.latents = operation.outputs().to_vec();
+            }
+            match quantum {
+                MediaQuantum::Decode {
+                    track: MediaTrack::Video,
+                    cursor,
+                    max_units,
+                } => {
+                    state
+                        .video_segments
+                        .insert(cursor, (max_units, operation.outputs()[0].clone()));
+                }
+                MediaQuantum::Decode {
+                    track: MediaTrack::Audio,
+                    ..
+                } => state.audio = Some(operation.outputs()[0].clone()),
+                _ => {}
+            }
+            let target = self.select_worker(&operation);
+            self.register_media_inflight(operation.clone(), quantum, submit_at);
+            logical_ops.push(LogicalOp {
+                block_tables: Vec::new(),
+                new_cache_pages: Vec::new(),
+                forward_rows: Vec::new(),
+                latent,
+                decode,
+                buffers,
+                ..LogicalOp::new(operation, target)
+            });
         }
-
-        let logical_ops = operations
-            .into_iter()
-            .map(|operation| {
-                let identity = (operation.request_key, operation.op_id);
-                LogicalOp::new(
-                    operation,
-                    OpPlacement {
-                        block_tables: Vec::new(),
-                        new_cache_pages: Vec::new(),
-                        forward_rows: Vec::new(),
-                        latent: latent_placements
-                            .iter()
-                            .find(|placement| (placement.request_key, placement.op_id) == identity)
-                            .cloned(),
-                        decode: decode_placements
-                            .iter()
-                            .find(|placement| (placement.request_key, placement.op_id) == identity)
-                            .cloned(),
-                        buffers: Vec::new(),
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
         self.inflight.batch_started.insert(batch_id, submit_at);
         self.inflight.batch_operations.insert(
             batch_id,
@@ -389,18 +630,19 @@ impl EngineLoop {
         if !commands.is_empty() {
             self.inflight.command_batches.insert(batch_id, commands);
         }
-        match self.executor.submit(batch) {
+        match self.submit_bound_batch(batch) {
             Ok(()) => true,
             Err(ExecutorSubmitError::WouldBlock(batch)) => {
-                self.pending_submission = Some(batch);
-                false
+                self.pending_submissions.push_back(batch);
+                true
             }
             Err(ExecutorSubmitError::Failed(error)) => {
+                tracing::error!(batch_id, "media submission failed: {error:#}");
                 self.inflight.batch_started.remove(&batch_id);
                 self.inflight.batch_operations.remove(&batch_id);
                 self.inflight.batch_group_worker_exec_us.remove(&batch_id);
                 self.inflight.command_batches.remove(&batch_id);
-                if error.downcast_ref::<WorkerLossError>().is_some() {
+                if error.downcast_ref::<WorkerFailure>().is_some() {
                     self.on_executor_error(error);
                 } else {
                     self.fatal = true;
@@ -491,7 +733,7 @@ impl EngineLoop {
                 .get(&id)
                 .into_iter()
                 .flatten()
-                .any(|op| op.operation.kind == RunKind::DiffusionStep)
+                .any(|op| op.operation.kind() == OpCode::DiffusionStep)
     }
 
     /// Projects committed request state through every queued state-advancing operation.
@@ -624,32 +866,15 @@ impl EngineLoop {
                         self.retiring_requests
                             .get_mut(&id)
                             .filter(|state| state.request_key == buffer.owner)
-                            .and_then(|state| state.allocations.take_buffer(*buffer))
+                            .and_then(|state| state.buffers.remove(buffer))
                     });
                 if let Some(allocation) = allocation {
                     self.memory.free(allocation);
                 }
-            } else if let BatchCommand::Finish { request_key, .. } = command {
-                // Media and text requests retain different allocation bundles,
-                // but both require an exact epoch match before reclamation.
+            } else if let BatchCommand::Finish { request_key, .. }
+            | BatchCommand::Retire { request_key, .. } = command
+            {
                 let id = request_key.request_id;
-                if let Some(retiring) = self.retiring_media.get(&id) {
-                    if retiring.request_key != *request_key {
-                        tracing::error!(
-                            request_id = id.0,
-                            "media close acknowledgement mismatched its request"
-                        );
-                        self.fatal = true;
-                        continue;
-                    }
-                    let retiring = self
-                        .retiring_media
-                        .remove(&id)
-                        .expect("retiring media exists");
-                    retiring.allocations.free(&mut self.memory);
-                    continue;
-                }
-
                 let Some(retiring) = self.retiring_requests.get(&id) else {
                     tracing::error!(
                         request_id = id.0,
@@ -673,10 +898,9 @@ impl EngineLoop {
                     .retiring_requests
                     .remove(&id)
                     .expect("retiring request exists");
-                if let Some(prefix) = retiring.flow_prefix {
-                    prefix.allocations.free(&mut self.memory);
+                for allocation in retiring.buffers.into_values().chain(retiring.allocations) {
+                    self.memory.free(allocation);
                 }
-                retiring.allocations.free(&mut self.memory);
             }
         }
     }
@@ -685,7 +909,7 @@ impl EngineLoop {
     /// predecessor's not-yet-observed selected point. Eligibility requires an
     /// exact projected cursor and a reachable predicate product for the target
     /// work leaf.
-    pub(super) fn can_queue_successor(&self, id: RequestId, target: RunKind) -> bool {
+    pub(super) fn can_queue_successor(&self, id: RequestId, target: OpCode) -> bool {
         // Successor projection requires both live runtime state and an unresolved
         // predecessor from which to derive the device-selected checkpoint.
         let Some(state) = self.running.get(&id) else {
@@ -725,7 +949,7 @@ impl EngineLoop {
 
         // Decode successors support both feedback continuation and ordinary
         // prompt/decode pipelining, with different cursor evidence for each.
-        if target == RunKind::ArDecode {
+        if target == OpCode::ArDecode {
             let feedback_continuation = matches!(
                 predecessor.generation_apply().intent,
                 TransitionIntent::FeedbackState {
@@ -746,7 +970,7 @@ impl EngineLoop {
             if feedback_continuation {
                 return self
                     .projected_inflight_variant(id)
-                    .is_some_and(|variant| variant == RunKind::ArDecode)
+                    .is_some_and(|variant| variant == OpCode::ArDecode)
                     && state.cursor.und.tokens_emitted.saturating_add(1)
                         < state.req.max_und_tokens;
             }
@@ -755,7 +979,7 @@ impl EngineLoop {
                 || (state.cursor.phase == Phase::Prefill && state.starts_gen_after_context())
                 || queue
                     .iter()
-                    .any(|op| !matches!(op.operation.kind, RunKind::ArExtend | RunKind::ArDecode))
+                    .any(|op| !matches!(op.operation.kind(), OpCode::ArExtend | OpCode::ArDecode))
             {
                 return false;
             }
@@ -782,7 +1006,7 @@ impl EngineLoop {
     }
 
     /// Infers the next pipelined operation kind from projected in-flight request state.
-    pub(super) fn projected_inflight_variant(&self, id: RequestId) -> Option<RunKind> {
+    pub(super) fn projected_inflight_variant(&self, id: RequestId) -> Option<OpCode> {
         if !self.inflight.contains(id) {
             return None;
         }
@@ -821,17 +1045,17 @@ impl EngineLoop {
             return None;
         }
         Some(match cursor.phase {
-            Phase::Prefill | Phase::DecodeUnd => RunKind::ArDecode,
-            Phase::CloseKv | Phase::FeedbackState => RunKind::ArExtend,
-            Phase::PublishKv => RunKind::TransferKvPublish,
-            Phase::PrepareGen => RunKind::DiffusionPrepare,
-            Phase::DenoiseGen => RunKind::DiffusionStep,
-            Phase::CommitGen => RunKind::DiffusionFinalize,
+            Phase::Prefill | Phase::DecodeUnd => OpCode::ArDecode,
+            Phase::CloseKv | Phase::FeedbackState => OpCode::ArExtend,
+            Phase::PublishKv => OpCode::TransferKvPublish,
+            Phase::PrepareGen => OpCode::DiffusionPrepare,
+            Phase::DenoiseGen => OpCode::DiffusionStep,
+            Phase::CommitGen => OpCode::DiffusionFinalize,
             Phase::FeedbackEncode => {
                 let feedback = state.req.policy.feedback.as_ref()?;
                 match feedback.ingest.steps.get(cursor.feedback.ingest_step)? {
-                    ImageIngestStep::VaeEncode => RunKind::EncoderLatent,
-                    ImageIngestStep::VitEncode => RunKind::EncoderVision,
+                    ImageIngestStep::VaeEncode => OpCode::EncoderLatent,
+                    ImageIngestStep::VitEncode => OpCode::EncoderVision,
                 }
             }
             Phase::Encode | Phase::IngestState => return None,
@@ -881,7 +1105,15 @@ impl EngineLoop {
         !self.inflight.finishes.contains_key(&id)
             && self.output_window_ready(id)
             && self.running.get(&id).is_some_and(|state| {
-                !state.speculative_chain_invalidated && self.pending_commit_horizon_open(state)
+                !state.speculative_chain_invalidated
+                    && self.pending_commit_horizon_open(state)
+                    && self.peek_next_operation_variant(id).is_none_or(|kind| {
+                        self.worker_target(
+                            RequestKey::new(self.authority_id, id, state.epoch),
+                            kind,
+                        )
+                        .is_some()
+                    })
             })
             && (!self.inflight.contains(id)
                 || self
@@ -925,9 +1157,9 @@ impl EngineLoop {
     /// Returns the output-size bound for the next operation.
     pub(super) fn next_output_bound(&self, id: RequestId) -> usize {
         match self.peek_next_operation_variant(id) {
-            Some(RunKind::ArExtend | RunKind::ArDecode) => 4,
-            Some(RunKind::DiffusionStep) => usize::from(self.denoise_step_burst).saturating_add(2),
-            Some(RunKind::DiffusionFinalize) => 3,
+            Some(OpCode::ArExtend | OpCode::ArDecode) => 4,
+            Some(OpCode::DiffusionStep) => usize::from(self.denoise_step_burst).saturating_add(2),
+            Some(OpCode::DiffusionFinalize) => 3,
             Some(_) | None => 2,
         }
     }
@@ -952,10 +1184,10 @@ impl EngineLoop {
     pub(super) fn register_media_inflight(
         &mut self,
         operation: Operation,
-        cursor_after: MediaCursor,
+        quantum: MediaQuantum,
         started: Instant,
     ) {
-        self.register_inflight_apply(operation, InflightApply::Media(cursor_after), started, 0);
+        self.register_inflight_apply(operation, InflightApply::Media(quantum), started, 0);
     }
 
     /// Registers a submitted operation and charges its domain and transfer credits.
@@ -1086,7 +1318,7 @@ impl EngineLoop {
                 "op_id": op_id,
             }));
             if let Some(state) = self.media_state_mut(id) {
-                state.terminal_intent = MediaTerminalIntent::Failure(
+                state.terminal_intent = TerminalIntent::Failure(
                     "worker returned an unknown media operation".to_string(),
                 );
             } else if self.running.contains_key(&id) {
@@ -1109,17 +1341,17 @@ impl EngineLoop {
     pub(super) fn apply_media_completion(
         &mut self,
         operation: Operation,
-        cursor_after: MediaCursor,
+        quantum: MediaQuantum,
         record: ModelOutput,
     ) {
         let id = record.request_key.request_id;
         let Some(state) = self.media_state(id) else {
             return;
         };
-        let already_failed = matches!(state.terminal_intent, MediaTerminalIntent::Failure(_));
+        let already_failed = matches!(state.terminal_intent, TerminalIntent::Failure(_));
         let media_output = record.media_output().cloned();
         let media_output_valid =
-            (operation.kind == RunKind::DiffusionFinalize) == media_output.is_some();
+            (operation.kind() == OpCode::DiffusionFinalize) == media_output.is_some();
         let valid = record.status == OpStatus::Ok
             && record.request_key == operation.request_key
             && record.op_id == operation.op_id
@@ -1135,10 +1367,10 @@ impl EngineLoop {
             if !valid {
                 if let Some(state) = self.media_state_mut(id) {
                     state.terminal_intent =
-                        MediaTerminalIntent::Failure("media worker operation failed".to_string());
+                        TerminalIntent::Failure("media worker operation failed".to_string());
                 }
             } else if let Some(state) = self.media_state_mut(id) {
-                state.committed = cursor_after;
+                state.committed = advance_media_cursor(state.committed, quantum);
                 if let Some(output) = media_output {
                     state.artifact = Some(ArtifactEvent {
                         media_kind: MediaKind::Video,
@@ -1164,12 +1396,12 @@ impl EngineLoop {
             if self.inflight.contains(id) {
                 return None;
             }
-            if let MediaTerminalIntent::Failure(message) = &state.terminal_intent {
+            if let TerminalIntent::Failure(message) = &state.terminal_intent {
                 Some((
                     DiffusionTerminal::Failed(message.clone()),
                     CloseReason::Error,
                 ))
-            } else if let MediaTerminalIntent::Finish(reason) = &state.terminal_intent {
+            } else if let TerminalIntent::Finish(reason) = &state.terminal_intent {
                 Some((
                     DiffusionTerminal::Finished(reason.clone()),
                     CloseReason::Cancelled,
@@ -1179,7 +1411,7 @@ impl EngineLoop {
                     DiffusionTerminal::Finished(FinishReason::Cancelled),
                     CloseReason::Cancelled,
                 ))
-            } else if state.committed.decode_cursor >= state.request.geometry.decode_units {
+            } else if state.committed.finalized {
                 let event = state.artifact.clone().map_or_else(
                     || DiffusionTerminal::Failed("media output was not finalized".to_string()),
                     DiffusionTerminal::Completed,
@@ -1260,20 +1492,33 @@ impl EngineLoop {
                 state.allocations.free(&mut self.memory);
                 return;
             }
-            DiffusionRequestParamsState::InFlight | DiffusionRequestParamsState::Registered => {}
+            _ => {}
         }
         let request_key = state.admission.request_key;
-        self.pending_commands.push_back(BatchCommand::Finish {
-            request_key,
-            control_seq: 1,
-            cutoff: cutoff.unwrap_or(state.fixed_parent),
-            reason,
-        });
-        self.retiring_media.insert(
+        self.pending_commands.push_back(
+            if reason == CloseReason::Error
+                || state.admission_state == DiffusionRequestParamsState::Unsubmitted
+            {
+                BatchCommand::Retire {
+                    request_key,
+                    retained_buffers: Vec::new(),
+                }
+            } else {
+                BatchCommand::Finish {
+                    request_key,
+                    control_seq: 1,
+                    cutoff: cutoff.unwrap_or(state.fixed_parent),
+                    reason,
+                    retained_buffers: Vec::new(),
+                }
+            },
+        );
+        self.retiring_requests.insert(
             id,
-            RetiringMedia {
+            RetiringRequest {
                 request_key,
-                allocations: state.allocations,
+                allocations: state.allocations.into_allocations().collect(),
+                buffers: HashMap::new(),
             },
         );
     }
@@ -1291,11 +1536,12 @@ impl EngineLoop {
 
     /// Releases product allocations owned by completed operations.
     pub(super) fn free_products(&mut self, products: Vec<ProductRef>) {
-        let mut products = products;
-        products.sort_unstable_by_key(|product| product.generation);
-        products.dedup_by_key(|product| product.generation);
+        let mut released = HashSet::new();
         for product in products {
             let buffer = product.buffer_id();
+            if !released.insert(buffer) {
+                continue;
+            }
             if let Some(allocation) = self.memory.take_encoder_buffer(buffer) {
                 if let Some(previous) = self.pending_buffer_frees.insert(buffer, allocation) {
                     tracing::error!(?buffer, "buffer free identity was already pending");
@@ -1308,54 +1554,27 @@ impl EngineLoop {
         }
     }
 
-    /// Applies the failure policy for an executor or worker error.
-    /// A typed non-fatal [`WorkerExecError`] fails the in-flight requests but
-    /// keeps the engine alive to serve subsequent requests; anything else (a
-    /// fatal worker error, ring/transport death) latches the engine fatal.
-    ///
-    /// The typed taxonomy's `code` and `retryable` drive
-    /// real policy rather than being log-only. The worker's `fatal` bit is the
-    /// baseline, but the host *escalates* host-bug classes to fatal even when
-    /// the worker marked them non-fatal (a `SCHEDULER_BUG`/`INVARIANT_VIOLATION`
-    /// leaves the control-plane state untrustworthy), and it picks the log
-    /// severity by class so a benign `InputError` does not spam warnings.
-    pub(super) fn on_executor_error(&mut self, e: anyhow::Error) {
-        if e.downcast_ref::<WorkerLossError>().is_some() {
-            tracing::warn!("worker state was reset; terminating affected live requests: {e}");
-            self.fail_all_after_worker_loss(&e.to_string());
+    /// Preserve unrelated requests after a reconciled Worker failure. Unclassified
+    /// executor errors and control-plane invariant violations remain fatal.
+    pub(super) fn on_executor_error(&mut self, error: anyhow::Error) {
+        if let Some(failure) = error.downcast_ref::<WorkerFailure>() {
+            let execution = failure.execution.as_ref();
+            let code = execution.and_then(|value| value.code.as_deref());
+            let retryable = execution.is_some_and(|value| value.retryable);
+            if matches!(code, Some("SchedulerBug" | "InvariantViolation")) {
+                self.fatal = true;
+                tracing::error!(worker = %failure.worker_id, ?code, "control-plane invariant failed: {error}");
+            } else if code == Some("InputError") {
+                tracing::info!(worker = %failure.worker_id, ?code, "Worker rejected request: {error}");
+            } else {
+                tracing::warn!(worker = %failure.worker_id, ?code, retryable, "Worker failed affected work: {error}");
+            }
+            self.fail_after_worker_failure(failure);
             return;
         }
-        let exec = e.downcast_ref::<WorkerExecError>();
-        let worker_fatal = exec.map(|w| w.fatal).unwrap_or(true);
-        let code = exec.and_then(|w| w.code.as_deref());
-        let retryable = exec.map(|w| w.retryable).unwrap_or(false);
-        // Host-bug classes are latched fatal regardless of the worker's bit:
-        // continuing to schedule against a violated invariant is unsafe.
-        let host_escalates_fatal =
-            matches!(code, Some("SchedulerBug") | Some("InvariantViolation"));
-        let fatal = worker_fatal || host_escalates_fatal;
-        if fatal {
-            tracing::error!(
-                ?code,
-                retryable,
-                "fatal executor error (engine will stop): {e}"
-            );
-            self.fatal = true;
-        } else if matches!(code, Some("InputError")) {
-            // A malformed request is the client's fault, not a worker problem:
-            // fail just that request at info level instead of warn-spam.
-            tracing::info!(?code, "request rejected by worker (failing in-flight): {e}");
-        } else {
-            // Non-fatal worker errors keep the worker up. `retryable` is
-            // surfaced so a recoverable class (OOM/transient) is visible to
-            // operators; no automatic requeue is attempted here.
-            tracing::warn!(
-                ?code,
-                retryable,
-                "non-fatal worker error (failing in-flight, worker stays up): {e}"
-            );
-        }
-        self.fail_all_inflight(&format!("{e}"));
+        self.fatal = true;
+        tracing::error!("fatal executor error: {error}");
+        self.fail_all_inflight(&error.to_string());
     }
 
     /// Reconciles one physical batch result with logical operations, state, and ownership.
@@ -1500,7 +1719,32 @@ impl EngineLoop {
         if batch_complete {
             self.inflight.batch_operations.remove(&result_batch_id);
             if let Some(commands) = self.inflight.command_batches.remove(&result_batch_id) {
-                self.acknowledge_commands(&commands);
+                for (index, command) in commands.into_iter().enumerate() {
+                    let failed = report.command_results.iter().any(|result| {
+                        result.command_index == index as u32
+                            && result.outcome == crate::executor::CommandOutcome::Failed
+                    });
+                    if failed {
+                        match command {
+                            BatchCommand::Finish {
+                                request_key,
+                                retained_buffers,
+                                ..
+                            } => {
+                                self.pending_commands.push_back(BatchCommand::Retire {
+                                    request_key,
+                                    retained_buffers,
+                                });
+                            }
+                            BatchCommand::Free { .. } | BatchCommand::Retire { .. } => {
+                                self.pending_commands.push_back(command);
+                            }
+                            BatchCommand::Start { .. } | BatchCommand::Commit { .. } => {}
+                        }
+                    } else {
+                        self.acknowledge_commands(std::slice::from_ref(&command));
+                    }
+                }
             }
         }
 
@@ -1591,7 +1835,7 @@ impl EngineLoop {
                         "op_id": op_id,
                     }));
                     if let Some(state) = self.media_state_mut(id) {
-                        state.terminal_intent = MediaTerminalIntent::Failure(
+                        state.terminal_intent = TerminalIntent::Failure(
                             "worker returned an out-of-order media operation".to_string(),
                         );
                     } else if self.running.contains_key(&id) {
@@ -1600,18 +1844,29 @@ impl EngineLoop {
                     continue;
                 };
 
-                let operation_variant = operation.kind;
+                let operation_variant = operation.kind();
                 let roundtrip_us = started.elapsed().as_micros() as u64;
 
                 // Media operations update their independent cursor immediately;
                 // generation operations continue through semantic validation.
                 let apply = match apply {
-                    InflightApply::Media(cursor_after) => {
-                        self.apply_media_completion(operation, cursor_after, record);
+                    InflightApply::Media(quantum) => {
+                        self.apply_media_completion(operation, quantum, record);
                         continue;
                     }
                     InflightApply::Generation(apply) => apply,
                 };
+
+                if self
+                    .inflight
+                    .finishes
+                    .get(&id)
+                    .is_some_and(|finish| finish.reason == FinishReason::Error)
+                {
+                    self.free_products(operation.outputs().to_vec());
+                    self.finish_pending_if_idle(id);
+                    continue;
+                }
 
                 let discard_invalidated_descendant = self
                     .running
@@ -1809,7 +2064,7 @@ impl EngineLoop {
                     let public_event_limit = self.public_limit_for(id, &apply);
                     let decoder_decision_required = matches!(
                         operation_variant,
-                        RunKind::ArExtend | RunKind::ArDecode | RunKind::ArVerify
+                        OpCode::ArExtend | OpCode::ArDecode | OpCode::ArVerify
                     ) && self
                         .running
                         .get(&id)
@@ -1823,7 +2078,7 @@ impl EngineLoop {
 
                 // Reclaim resources whose lifetime ends at this transition before
                 // making its public output eligible for resolution.
-                let free_flow_prefix = operation_variant == RunKind::DiffusionStep
+                let free_flow_prefix = operation_variant == OpCode::DiffusionStep
                     && record.status == OpStatus::Ok
                     && match &apply.intent {
                         TransitionIntent::DenoiseGen {
@@ -1835,7 +2090,7 @@ impl EngineLoop {
                         }),
                         _ => false,
                     };
-                if operation_variant == RunKind::DiffusionStep
+                if operation_variant == OpCode::DiffusionStep
                     && record.status == OpStatus::Ok
                     && let Some(prefix) = self
                         .running
@@ -1852,7 +2107,7 @@ impl EngineLoop {
                 }
                 if matches!(
                     operation_variant,
-                    RunKind::DiffusionStep | RunKind::DiffusionFinalize
+                    OpCode::DiffusionStep | OpCode::DiffusionFinalize
                 ) {
                     let consumed_latents = operation
                         .inputs()
@@ -1916,8 +2171,8 @@ impl EngineLoop {
             ) in to_resolve
             {
                 let token_operation = matches!(
-                    operation.kind,
-                    RunKind::ArExtend | RunKind::ArDecode | RunKind::ArVerify
+                    operation.kind(),
+                    OpCode::ArExtend | OpCode::ArDecode | OpCode::ArVerify
                 );
                 if self.running.contains_key(&id) && !self.inflight.finishes.contains_key(&id) {
                     self.resolve(id, operation, apply, view, prefix_versions.clone());
@@ -2151,7 +2406,7 @@ impl EngineLoop {
 
     /// Fails every submitted operation while preserving requests that can be rescheduled.
     pub(super) fn fail_all_inflight(&mut self, msg: &str) {
-        self.pending_submission = None;
+        self.pending_submissions.clear();
         self.fail_inflight_domain_credits();
         // Submitted batches cannot return after this boundary, so their timing
         // and command ownership must be retired together.
@@ -2177,60 +2432,192 @@ impl EngineLoop {
         }
     }
 
-    /// Reconciles all in-flight and resident state after the worker loses device allocations.
-    fn fail_all_after_worker_loss(&mut self, message: &str) {
-        self.pending_submission = None;
-        self.fail_inflight_domain_credits();
-        let _ = self.inflight.clear_failed();
-        self.pending_commands.clear();
-
-        for state in self.running_media.values_mut() {
-            state.admission_state = DiffusionRequestParamsState::Unsubmitted;
-        }
-        let media = self.media_ids();
-        for id in media {
-            self.finish_media(
-                id,
-                DiffusionTerminal::Failed(message.to_string()),
-                CloseReason::Error,
-                None,
-            );
-        }
-
-        for state in self.running.values_mut() {
-            state.cursor.resources.worker_registered = false;
-        }
-        let ids = self.running.keys().copied().collect::<Vec<_>>();
-        for id in ids {
-            self.emit(
-                id,
-                Event::Error {
-                    message: message.to_string(),
-                },
-            );
-            self.finish(id, FinishReason::Error);
-        }
-
-        let retiring_media = std::mem::take(&mut self.retiring_media);
-        for (_, retiring) in retiring_media {
-            retiring.allocations.free(&mut self.memory);
-        }
-
-        let retiring_requests = std::mem::take(&mut self.retiring_requests);
-        for (_, retiring) in retiring_requests {
-            if let Some(prefix) = retiring.flow_prefix {
-                prefix.allocations.free(&mut self.memory);
+    /// Reconciles failed work without resetting allocations owned by live consumers.
+    fn fail_after_worker_failure(&mut self, loss: &WorkerFailure) {
+        if let Some(cache) = &self.memory.cache {
+            for endpoint in &loss.endpoints {
+                cache.block_pool.invalidate_source(endpoint);
             }
-            retiring.allocations.free(&mut self.memory);
         }
-        self.pending_commands.clear();
-        self.pending_buffer_frees.clear();
-        self.memory.reset_after_worker_loss(&self.info);
+        let mut requests = loss.requests.iter().copied().collect::<HashSet<_>>();
+        let mut products = loss.products.iter().cloned().collect::<HashSet<_>>();
+        loop {
+            let before = (requests.len(), products.len());
+            for batch in &self.pending_submissions {
+                for op in &batch.ops {
+                    if (!loss.endpoints.is_empty() && op.target.0 == loss.worker_id)
+                        || op
+                            .payload
+                            .inputs
+                            .iter()
+                            .chain(op.payload.predicate.iter())
+                            .any(|product| products.contains(product))
+                    {
+                        requests.insert(op.request);
+                    }
+                    if requests.contains(&op.request) {
+                        products.extend(op.payload.outputs.iter().cloned());
+                    }
+                }
+            }
+            if before == (requests.len(), products.len()) {
+                break;
+            }
+        }
+        let reclaimable = self.memory.encoder_cache.invalidate_products(&products);
+        self.free_products(reclaimable);
+        let mut retired = loss.retired.clone();
+        let mut pending = VecDeque::new();
+        for mut batch in std::mem::take(&mut self.pending_submissions) {
+            retired.extend(
+                batch
+                    .retire_requests(&requests)
+                    .into_iter()
+                    .map(|op| (batch.id, op.request, op.id)),
+            );
+            if let Some(commands) = self.inflight.command_batches.get_mut(&batch.id) {
+                *commands = batch
+                    .commands
+                    .iter()
+                    .filter(|command| !matches!(command, BatchCommand::Start { .. }))
+                    .cloned()
+                    .collect();
+            }
+            pending.push_back(batch);
+        }
+        for (batch_id, request, op) in retired {
+            let Some(inflight) = self.inflight.retire_operation(batch_id, request, op) else {
+                self.fatal = true;
+                tracing::error!(
+                    batch_id,
+                    ?request,
+                    ?op,
+                    "Worker failure named an unknown pending operation"
+                );
+                return;
+            };
+            self.reclaim_domain_credit(inflight.operation.domain(), true);
+        }
+        for batch in pending {
+            if batch.ops.is_empty() && batch.commands.is_empty() {
+                self.inflight.batch_operations.remove(&batch.id);
+                self.inflight.batch_started.remove(&batch.id);
+                self.inflight.prefill_steps.remove(&batch.id);
+                self.inflight.batch_group_worker_exec_us.remove(&batch.id);
+                self.inflight.command_batches.remove(&batch.id);
+            } else {
+                self.pending_submissions.push_back(batch);
+            }
+        }
+        self.pending_commands.retain_mut(|command| {
+            if !requests.contains(&command.request_key()) {
+                return true;
+            }
+            match command {
+                BatchCommand::Start { .. } | BatchCommand::Commit { .. } => false,
+                BatchCommand::Finish {
+                    request_key,
+                    retained_buffers,
+                    ..
+                } => {
+                    *command = BatchCommand::Retire {
+                        request_key: *request_key,
+                        retained_buffers: std::mem::take(retained_buffers),
+                    };
+                    true
+                }
+                BatchCommand::Free { .. } | BatchCommand::Retire { .. } => true,
+            }
+        });
+        let authority_id = self.authority_id;
+        for request in requests {
+            let id = request.request_id;
+            let error_emitted = self
+                .inflight
+                .finishes
+                .get(&id)
+                .is_some_and(|finish| finish.reason == FinishReason::Error);
+            if let Some(state) = self.media_state_mut(id) {
+                if state.admission.request_key == request {
+                    state.terminal_intent = TerminalIntent::Failure(loss.message.clone());
+                }
+            } else if let Some(state) = self.running.get_mut(&id) {
+                if request != RequestKey::new(authority_id, id, state.epoch) {
+                    continue;
+                }
+                state.pending_commits.clear();
+                if !error_emitted {
+                    self.emit(
+                        id,
+                        Event::Error {
+                            message: loss.message.clone(),
+                        },
+                    );
+                }
+                self.inflight.finishes.insert(
+                    id,
+                    PendingFinish {
+                        reason: FinishReason::Error,
+                        stop_reason: None,
+                    },
+                );
+            }
+            // A successful later completion may already be waiting behind the now
+            // abandoned operation. It owns real completion evidence and can drain.
+            loop {
+                let Some(op_id) = self
+                    .inflight
+                    .operations
+                    .get(&id)
+                    .and_then(|queue| queue.front())
+                    .filter(|inflight| inflight.operation.request_key == request)
+                    .map(|inflight| inflight.operation.op_id.0)
+                else {
+                    break;
+                };
+                let Some(completion) = self
+                    .inflight
+                    .completions
+                    .get_mut(&id)
+                    .and_then(|values| values.remove(&op_id))
+                else {
+                    break;
+                };
+                let Some((operation, _, _)) = self.pop_inflight(request, op_id) else {
+                    unreachable!("ready completion owns its operation");
+                };
+                drop(completion);
+                self.free_products(operation.outputs().to_vec());
+            }
+            if self
+                .inflight
+                .completions
+                .get(&id)
+                .is_some_and(BTreeMap::is_empty)
+            {
+                self.inflight.completions.remove(&id);
+            }
+            if self
+                .media_state(id)
+                .is_some_and(|state| state.admission.request_key == request)
+            {
+                if !self.inflight.contains(id) {
+                    self.finish_media(
+                        id,
+                        DiffusionTerminal::Failed(loss.message.clone()),
+                        CloseReason::Error,
+                        None,
+                    );
+                }
+            } else if self.running.contains_key(&id) {
+                self.finish_after_inflight(id, FinishReason::Error, None);
+            }
+        }
     }
 
     /// Fails every queued and running request and releases scheduler-owned resources.
     pub(super) fn fail_all_running(&mut self, message: &str) {
-        self.pending_submission = None;
+        self.pending_submissions.clear();
         self.fail_inflight_domain_credits();
         let _ = self.inflight.clear_failed();
         while let Some(id) = self.scheduler.pop_media() {

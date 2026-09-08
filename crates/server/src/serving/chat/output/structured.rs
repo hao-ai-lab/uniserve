@@ -8,8 +8,9 @@ use asynk_strim_attr::{TryYielder, try_stream};
 use futures::{StreamExt as _, pin_mut};
 
 use super::processor::AssistantEvent;
-use crate::serving::chat::output::error::Error;
-use crate::serving::chat::output::{FinishReason, Result};
+use crate::serving::chat::Error;
+use crate::serving::chat::Result;
+use crate::serving::chat::output::FinishReason;
 use crate::serving::chat::{
     AssistantBlockKind, AssistantContentBlock, AssistantMessage, AssistantToolCall, ChatEvent,
 };

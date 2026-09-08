@@ -5,13 +5,14 @@ from __future__ import annotations
 import copy
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import TYPE_CHECKING, cast
 
 from ..execution.batch import (
     BatchCommand,
     Checkpoint,
     Commit,
     CompletionState,
+    DeviceSelected,
     Finish,
     FixedCheckpoint,
     ImageParams,
@@ -21,9 +22,15 @@ from ..execution.batch import (
     OpStatus,
     ProductRef,
     RequestKey,
+    Retire,
     SamplingParams,
+    Start,
 )
+from ..execution.bounded_storage import BoundedTensorStorage, TensorSchema
 from ..foundation.errors import invalid_descriptor
+
+if TYPE_CHECKING:
+    import torch
 
 MAX_REQUEST_HISTORY_POINTS = 262_144
 
@@ -32,12 +39,12 @@ MAX_REQUEST_HISTORY_POINTS = 262_144
 class RequestRuntime:
     """Host-visible logical coordinates associated with one resolved point."""
 
-    logical_position: int
-    rng_counter: int
-    latent_product: ProductRef | None
-    flow_step: int
-    kv_visible_len: int
-    kv_computed_len: int
+    logical_position: int = 0
+    rng_counter: int = 0
+    latent_product: ProductRef | None = None
+    flow_step: int = 0
+    kv_visible_len: int = 0
+    kv_computed_len: int = 0
 
     def __post_init__(self) -> None:
         """Validate logical, sampling, cache, and RNG coordinates for one resolved point."""
@@ -49,13 +56,6 @@ class RequestRuntime:
             or self.latent_product.storage_class.value != "latent_arena"
         ):
             raise invalid_descriptor("resolved request latent identity is invalid")
-        if not isinstance(self.kv_visible_len, int):
-            if (
-                not callable(getattr(self.kv_visible_len, "ready", None))
-                or self.kv_computed_len < 0
-            ):
-                raise invalid_descriptor("resolved request pending KV extent is invalid")
-            return
         if not (0 <= self.kv_visible_len <= self.kv_computed_len):
             raise invalid_descriptor("resolved request KV extents are not contained")
 
@@ -66,7 +66,6 @@ class _RequestCommit:
 
     operation: Operation
     candidate: RequestDraft
-    base: Request | None
     selected: Checkpoint
     runtime: RequestRuntime
     completion: CompletionState | None
@@ -88,7 +87,7 @@ class _ResolvedCommit:
 class RequestPublication:
     """Owns a prepared request transition until it is finished atomically or cancelled."""
 
-    table_token: object
+    pool: RequestPool
     run_id: int
     assignments: tuple[_RequestCommit, ...]
     _finished: bool = field(default=False, init=False, repr=False, compare=False)
@@ -103,30 +102,21 @@ class RequestPublication:
     def reserve(self) -> None:
         """Reserve this publication's unresolved lineage in its owning request pool."""
 
-        table = self.table_token
-        if not isinstance(table, RequestPool):
-            raise RuntimeError("request reservation lost its request-pool owner")
-        table.reserve(self)
+        self.pool.reserve(self)
 
     def finish(self, completions: tuple[ModelOutput, ...]) -> None:
         """Commit the prepared request transitions using finalized operation completions."""
 
         if self._finished:
             return
-        table = self.table_token
-        if not isinstance(table, RequestPool):
-            raise RuntimeError("request publication lost its request-pool owner")
-        table.publish(self, completions)
+        self.pool.publish(self, completions)
 
     def cancel(self) -> None:
         """Discard all prepared request transitions in this publication."""
 
         if self._finished:
             return
-        table = self.table_token
-        if not isinstance(table, RequestPool):
-            raise RuntimeError("request publication lost its request-pool owner")
-        table.cancel(self)
+        self.pool.cancel(self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,13 +156,17 @@ class Request:
     pending_operations: dict[int, CompletionState] = field(default_factory=dict)
     unresolved_operations: dict[int, _RequestCommit] = field(default_factory=dict)
     declared_parents: dict[int, Checkpoint] = field(default_factory=dict)
-    terminal_cutoff: Checkpoint | None = None
+    closed: bool = False
     retired: bool = False
     latent_product: ProductRef | None = None
     prompt_logits_ready: bool = False
     logical_position: int = 0
     flow_step: int = 0
     rng_counter: int = 0
+    # Output assembly owns temporal ordering independently of latent checkpoints.
+    media_video_units: int = 0
+    media_audio_written: bool = False
+    media_finalized: bool = False
     last_op_id: int | None = None
     last_run_id: int | None = None
 
@@ -233,13 +227,42 @@ class Request:
         return int(version.op_id), int(point.point_index)
 
     def runtime_for(self, version: Checkpoint) -> RequestRuntime | None:
-        """Resolve an exact committed checkpoint to its immutable runtime state."""
+        """Resolve checkpoint progress, including reserved non-state publications."""
 
-        runtime = self.resolved_runtime.get(self.point_key(version))
-        if runtime is not None:
-            return runtime
-        pending = self.unresolved_operations.get(int(version.op_id))
-        return pending.runtime if pending is not None and pending.selected == version else None
+        return self._runtime_at_point(*self.point_key(version))
+
+    def _runtime_at_point(self, op_id: int, point_index: int) -> RequestRuntime | None:
+        # Non-state work preserves its semantic parent while retiring physical
+        # state, such as a materialized image's latent trajectory. Its reserved
+        # update is already visible to successors even if the host has not read
+        # the artifact report. Prefer the latest such update over an older
+        # materialized snapshot of the same checkpoint.
+        for pending in reversed(self.unresolved_operations.values()):
+            selected = pending.selected
+            if (
+                int(selected.op_id) == op_id
+                and isinstance(selected.point, FixedCheckpoint)
+                and int(selected.point.point_index) == point_index
+            ):
+                return pending.runtime
+        return self.resolved_runtime.get((op_id, point_index))
+
+    def parent_runtime(self, parent: Checkpoint | None) -> RequestRuntime:
+        """Resolve the initialized execution state consumed at one semantic parent."""
+
+        if parent is None:
+            return RequestRuntime()
+        runtime = (
+            self.execution_runtime_for_operation(parent.op_id, 1)
+            if isinstance(parent.point, DeviceSelected)
+            else None
+        )
+        if runtime is None:
+            selected = self.resolve_version(parent)
+            runtime = None if selected is None else self.runtime_for(selected)
+        if runtime is None:
+            raise invalid_descriptor("operation parent has no resolved runtime state")
+        return runtime
 
     def selected_for_operation(self, op_id: int) -> Checkpoint | None:
         """Return the device-selected checkpoint committed for an operation, if resolved."""
@@ -250,9 +273,11 @@ class Request:
         pending = self.unresolved_operations.get(int(op_id))
         return None if pending is None else pending.selected
 
-    def resolve_version(self, version: Checkpoint) -> Checkpoint | None:
+    def resolve_version(self, version: Checkpoint | None) -> Checkpoint | None:
         """Resolve a device-selected checkpoint through its operation publication."""
 
+        if version is None:
+            return None
         if isinstance(version.point, FixedCheckpoint):
             return version
         return self.selected_for_operation(version.op_id)
@@ -264,7 +289,7 @@ class Request:
     ) -> RequestRuntime | None:
         """Return the initialized runtime state at a specific operation checkpoint point."""
 
-        runtime = self.resolved_runtime.get((int(op_id), int(point_index)))
+        runtime = self._runtime_at_point(int(op_id), int(point_index))
         if runtime is not None:
             return runtime
         projected = self.projected_runtime.get(int(op_id))
@@ -323,7 +348,7 @@ class Request:
         self.resolved_operations[int(operation.op_id)] = selected
         if completion is not None:
             self.pending_operations[int(operation.op_id)] = completion
-        self.declared_parents[int(operation.op_id)] = operation.parent
+        self.declared_parents[int(operation.op_id)] = operation.state_parent
         self.last_op_id = int(operation.op_id)
         self.last_run_id = int(run_id)
         self.unresolved_operations.pop(int(operation.op_id), None)
@@ -344,18 +369,13 @@ class RequestDraft:
     def __init__(self, request: Request, source: RequestDraft | None = None) -> None:
         """Snapshot mutable request progress while sharing immutable history storage."""
 
-        self.request = request
+        self.request: Request = request
         state = request if source is None else source
-        self.logical_position = int(state.logical_position)
-        self.rng_counter = int(state.rng_counter)
-        self.latent_product = state.latent_product
-        self.flow_step = int(state.flow_step)
-        self.prompt_logits_ready = bool(state.prompt_logits_ready)
-
-    def __getattr__(self, name: str) -> object:
-        """Delegate immutable request fields to the underlying committed row."""
-
-        return getattr(self.request, name)
+        self.logical_position: int = int(state.logical_position)
+        self.rng_counter: int = int(state.rng_counter)
+        self.latent_product: ProductRef | None = state.latent_product
+        self.flow_step: int = int(state.flow_step)
+        self.prompt_logits_ready: bool = bool(state.prompt_logits_ready)
 
     def install_runtime(self, runtime: RequestRuntime) -> None:
         """Replace this draft’s runtime state while preserving its base request identity."""
@@ -378,6 +398,8 @@ class RequestPool:
         max_request_pool_size: int,
         *,
         history_capacity: int = MAX_REQUEST_HISTORY_POINTS,
+        tensor_schema: Mapping[str, TensorSchema] | None = None,
+        device: torch.device | str = "cpu",
     ) -> None:
         """Allocate fixed request rows plus reserved history capacity for each live slot."""
 
@@ -389,44 +411,23 @@ class RequestPool:
         self.history_capacity = history
         self._rows: list[Request | None] = [None] * (size + 1)
         self._slots_by_request: dict[int, int] = {}
-        self._model_state: object | None = None
+        self.tensor_slots = (
+            tuple(BoundedTensorStorage.allocate(tensor_schema, device) for _ in range(size))
+            if tensor_schema
+            else ()
+        )
 
-    def attach_model_state(self, state: object | None) -> None:
-        """Attach deployment-specific state storage before admitting requests."""
+    def tensors(self, request_pool_idx: int) -> BoundedTensorStorage:
+        """Borrow fixed tensor storage at a validated scheduler slot.
 
-        if state is None:
-            return
-        if self._model_state is not None:
-            raise RuntimeError("request pool already owns model request state")
-        slot_count = getattr(state, "slot_count", None)
-        if slot_count is None or int(slot_count) != self.max_request_pool_size:
-            raise invalid_descriptor("model request-state capacity does not match request slots")
-        self._model_state = state
+        Callers must hold the request's execution lease until device readers
+        finish. Slot reuse changes the public admission, never the allocation.
+        """
 
-    @property
-    def model_state(self) -> object | None:
-        """Expose deployment-specific request state owned alongside generic rows."""
-
-        return self._model_state
-
-    def model_state_slot(self, request_pool_idx: int) -> Any:
-        """Return deployment-specific state for a validated request-pool slot."""
-
-        state = self._model_state
-        get = None if state is None else getattr(state, "get", None)
-        if not callable(get):
-            raise invalid_descriptor("request has no model-owned state pool")
-        return get(self._validate_slot(request_pool_idx))
-
-    def abort_model_admissions(self, admissions: Sequence[NewRequest]) -> None:
-        """Release deployment-specific state reserved for admissions that did not commit."""
-
-        if self._model_state is None:
-            return
-        abort = getattr(self._model_state, "abort_admissions", None)
-        if not callable(abort):
-            raise invalid_descriptor("model request-state pool cannot roll back admissions")
-        abort(tuple(admissions))
+        slot = self._validate_slot(request_pool_idx)
+        if not self.tensor_slots:
+            raise invalid_descriptor("request has no declared persistent tensor storage")
+        return self.tensor_slots[slot - 1]
 
     def get(self, request_id: int) -> Request:
         """Resolve a live request or reject an unknown identifier."""
@@ -455,9 +456,8 @@ class RequestPool:
     def stage_lane(
         self,
         operations: Sequence[Operation],
-        admissions: Sequence[NewRequest],
         request_pool_indices: Sequence[int],
-    ) -> tuple[tuple[RequestDraft, ...], tuple[Request | None, ...]]:
+    ) -> tuple[RequestDraft, ...]:
         """Build scalar drafts without changing stable request slots."""
 
         if len(operations) != len(request_pool_indices):
@@ -467,74 +467,35 @@ class RequestPool:
         slots = tuple(self._validate_slot(value) for value in request_pool_indices)
         if len(set(slots)) != len(slots):
             raise invalid_descriptor("a lane repeats a request-pool index")
-        admitted = {value.request_key.request_id: value for value in admissions}
-        if len(admitted) != len(admissions):
-            raise invalid_descriptor("a lane repeats an admission")
-        operation_requests = {operation.request_key.request_id for operation in operations}
-        if set(admitted) - operation_requests:
-            raise invalid_descriptor("a lane admission has no operation")
-
         candidates: list[RequestDraft] = []
-        bases: list[Request | None] = []
         for operation, slot in zip(operations, slots, strict=True):
             request_id = int(operation.request_key.request_id)
-            admission = admitted.get(request_id)
             base = self.peek(request_id)
-            if (
-                admission is not None
-                and base is not None
-                and base.retired
-                and base.request_key != admission.request_key
-            ):
-                self._evict_retired_slot(int(base.request_pool_idx))
-                base = None
-            occupant = self._rows[slot]
-            if (
-                admission is not None
-                and occupant is not None
-                and occupant.retired
-                and occupant.request_key != admission.request_key
-            ):
-                self._evict_retired_slot(slot)
-                occupant = None
             if base is None:
-                if admission is None:
-                    raise invalid_descriptor(
-                        f"operation {operation.op_id} references an unknown request"
-                    )
-                if occupant is not None:
-                    raise invalid_descriptor(
-                        f"request-pool index {slot} is occupied by request {occupant.request_id}"
-                    )
-                request = self._admission_row(admission)
-            else:
-                if occupant is not base or int(base.request_pool_idx) != slot:
-                    raise invalid_descriptor(
-                        f"operation {operation.op_id} names request-pool index {slot}; "
-                        f"request index is {base.request_pool_idx}"
-                    )
-                if admission is not None and admission != base.admission:
-                    raise invalid_descriptor(
-                        f"request {request_id} admission conflicts with committed state"
-                    )
-                request = base
+                raise invalid_descriptor(
+                    f"operation {operation.op_id} references an unknown request"
+                )
+            if self._rows[slot] is not base or int(base.request_pool_idx) != slot:
+                raise invalid_descriptor(
+                    f"operation {operation.op_id} names request-pool index {slot}; "
+                    f"request index is {base.request_pool_idx}"
+                )
+            request = base
             source: RequestDraft | None = None
-            if base is not None:
-                selected_parent = base.resolve_version(operation.parent)
-                if selected_parent is not None:
-                    source = next(
-                        (
-                            pending.candidate
-                            for pending in reversed(base.unresolved_operations.values())
-                            if pending.selected == selected_parent
-                        ),
-                        None,
-                    )
+            selected_parent = base.resolve_version(operation.parent)
+            if selected_parent is not None:
+                source = next(
+                    (
+                        pending.candidate
+                        for pending in reversed(base.unresolved_operations.values())
+                        if pending.selected == selected_parent
+                    ),
+                    None,
+                )
             candidate = RequestDraft(request, source)
-            self._validate_operation(candidate, operation, slot)
+            self._validate_operation(request, operation, slot)
             candidates.append(candidate)
-            bases.append(base)
-        return tuple(candidates), tuple(bases)
+        return tuple(candidates)
 
     def prepare_publication(
         self,
@@ -542,7 +503,6 @@ class RequestPool:
         run_id: int,
         operations: Sequence[Operation],
         candidates: Sequence[RequestDraft],
-        bases: Sequence[Request | None],
         selected_versions: Mapping[int, Checkpoint],
         runtimes: Mapping[int, RequestRuntime],
         completions: Mapping[int, CompletionState],
@@ -550,14 +510,16 @@ class RequestPool:
     ) -> RequestPublication:
         """Validate and freeze one stable-slot request commit."""
 
-        if len(operations) != len(candidates) or len(operations) != len(bases):
+        if len(operations) != len(candidates):
             raise RuntimeError("request-row publication columns are not aligned")
         assignments: list[_RequestCommit] = []
-        for operation, row, base in zip(operations, candidates, bases, strict=True):
+        for operation, row in zip(operations, candidates, strict=True):
+            if operation.parent is None:
+                continue
             request_id = int(operation.request_key.request_id)
-            slot = int(row.request_pool_idx)
+            slot = int(row.request.request_pool_idx)
             current = self._rows[slot]
-            if current is not base or (base is not None and self.peek(request_id) is not base):
+            if current is not row.request or self.peek(request_id) is not row.request:
                 raise RuntimeError(f"request {request_id} changed before row publication")
             selected = selected_versions.get(request_id)
             runtime = runtimes.get(request_id)
@@ -571,20 +533,20 @@ class RequestPool:
                 raise RuntimeError("published request version must be fixed")
             additions = 1 if operation.advances_state and isinstance(point.point_index, int) else 0
             if (
-                len(row.resolved_versions)
-                + len(row.unresolved_operations)
+                len(row.request.resolved_versions)
+                + len(row.request.unresolved_operations)
                 + additions
                 > self.history_capacity
             ):
                 raise invalid_descriptor("request history capacity is exhausted")
             parent = operation.parent
-            resolved_parent = row.resolve_version(parent)
+            resolved_parent = row.request.resolve_version(parent)
             parent_matches = (
-                row.committed_version() == parent
+                row.request.committed_version() == parent
                 if parent.is_fixed()
                 else resolved_parent is not None
             )
-            if row.request_key != operation.request_key or not parent_matches:
+            if row.request.request_key != operation.request_key or not parent_matches:
                 raise RuntimeError(f"request {request_id} candidate has a stale parent")
             if not operation.advances_state and selected != resolved_parent:
                 raise RuntimeError("non-state request publication changed its resolved parent")
@@ -592,7 +554,6 @@ class RequestPool:
                 _RequestCommit(
                     operation=operation,
                     candidate=row,
-                    base=base,
                     selected=selected,
                     runtime=runtime,
                     completion=completion,
@@ -600,7 +561,7 @@ class RequestPool:
                 )
             )
         return RequestPublication(
-            table_token=self,
+            pool=self,
             run_id=int(run_id),
             assignments=tuple(assignments),
         )
@@ -608,7 +569,7 @@ class RequestPool:
     def reserve(self, publication: RequestPublication) -> None:
         """Install bounded unresolved lineage without changing committed request state."""
 
-        if publication.table_token is not self:
+        if publication.pool is not self:
             raise RuntimeError("request reservation belongs to another request pool")
         if publication._reserved:
             return
@@ -621,17 +582,10 @@ class RequestPool:
             if existing is not None and existing is not assignment:
                 raise invalid_descriptor("request operation already has unresolved state")
             current = self._rows[int(row.request_pool_idx)]
-            if assignment.base is None:
-                if current is not None and current is not row:
-                    raise RuntimeError("request reservation lost its admission slot")
-            elif current is not assignment.base:
+            if current is not row:
                 raise RuntimeError("request reservation lost its stable request slot")
         for assignment in publication.assignments:
             row = assignment.candidate.request
-            slot = int(row.request_pool_idx)
-            if assignment.base is None and self._rows[slot] is None:
-                self._rows[slot] = row
-                self._slots_by_request[int(row.request_id)] = slot
             operation_id = int(assignment.operation.op_id)
             row.unresolved_operations[operation_id] = assignment
             row.projected_runtime[operation_id] = assignment.runtime
@@ -646,13 +600,11 @@ class RequestPool:
     ) -> None:
         """Finish every prepared draft against its stable request slot."""
 
-        if publication.table_token is not self:
+        if publication.pool is not self:
             raise RuntimeError("request-row publication belongs to another table")
         if publication._finished:
             return
-        by_operation = {
-            (record.request_key, int(record.op_id)): record for record in completions
-        }
+        by_operation = {(record.request_key, int(record.op_id)): record for record in completions}
         if len(by_operation) != len(completions):
             raise RuntimeError("lane completion repeats an operation identity")
         resolved: list[_ResolvedCommit] = []
@@ -667,10 +619,13 @@ class RequestPool:
                 continue
             draft = assignment.candidate
             row = draft.request
-            base = assignment.base
+            if row.closed:
+                # Completion retires the physical work but cannot advance a
+                # request whose semantic cutoff was already fixed by Finish.
+                self._cancel_assignment(assignment)
+                continue
             slot = int(row.request_pool_idx)
-            expected = row if publication._reserved else base
-            if self._rows[slot] is not expected:
+            if self._rows[slot] is not row:
                 raise RuntimeError(f"request {row.request_id} changed before row assignment")
             selected = assignment.selected
             unresolved_runtime = assignment.runtime
@@ -682,8 +637,7 @@ class RequestPool:
                 unresolved_runtime = RequestRuntime(
                     logical_position=int(record.logical_lengths.token_len),
                     rng_counter=(
-                        int(assignment.speculative.base_rng_counter)
-                        + int(record.selected_point)
+                        int(assignment.speculative.base_rng_counter) + int(record.selected_point)
                     ),
                     latent_product=draft.latent_product,
                     flow_step=int(draft.flow_step),
@@ -735,10 +689,6 @@ class RequestPool:
             assignment = commit.assignment
             draft = assignment.candidate
             row = draft.request
-            if assignment.base is None and not publication._reserved:
-                slot = int(row.request_pool_idx)
-                self._rows[slot] = row
-                self._slots_by_request[int(row.request_id)] = slot
             row.finish(
                 draft,
                 operation=assignment.operation,
@@ -756,9 +706,9 @@ class RequestPool:
         object.__setattr__(publication, "_finished", True)
 
     def cancel(self, publication: RequestPublication) -> None:
-        """Cancel a prepared publication and restore its request slots."""
+        """Cancel provisional progress while retaining the admitted request."""
 
-        if publication.table_token is not self:
+        if publication.pool is not self:
             raise RuntimeError("request cancellation belongs to another request pool")
         if publication._finished:
             return
@@ -775,14 +725,6 @@ class RequestPool:
             row.unresolved_operations.pop(operation_id)
             row.projected_runtime.pop(operation_id, None)
             row.pending_operations.pop(operation_id, None)
-        if (
-            assignment.base is None
-            and not row.unresolved_operations
-            and row.resolved_op_id == 0
-            and self._rows[int(row.request_pool_idx)] is row
-        ):
-            self._rows[int(row.request_pool_idx)] = None
-            self._slots_by_request.pop(int(row.request_id), None)
 
     def _speculative_prefixes(
         self,
@@ -797,13 +739,15 @@ class RequestPool:
             return ()
         tokens = tuple(int(value) for value in record.committed_tokens)
         selected_point = len(tokens)
-        if selected_point != int(record.selected_point) or selected_point > len(plan.draft_tokens) + 1:
+        if (
+            selected_point != int(record.selected_point)
+            or selected_point > len(plan.draft_tokens) + 1
+        ):
             raise RuntimeError("speculative completion selection is inconsistent")
         selected_kv = int(plan.base_kv_visible) + selected_point
-        if (
-            int(record.logical_lengths.kv_computed_len) != int(plan.initialized_kv)
-            or selected_kv > int(record.logical_lengths.kv_computed_len)
-        ):
+        if int(record.logical_lengths.kv_computed_len) != int(
+            plan.initialized_kv
+        ) or selected_kv > int(record.logical_lengths.kv_computed_len):
             raise RuntimeError("speculative KV selection is outside initialized state")
         return tuple(
             (
@@ -823,14 +767,24 @@ class RequestPool:
             for point_index in range(1, selected_point + 1)
         )
 
-    def apply_commands(self, commands: Sequence[BatchCommand]) -> None:
-        """Apply an ordered sequence of start, commit, finish, and free lifecycle commands."""
+    def apply_commands(self, commands: Sequence[BatchCommand]) -> tuple[int, ...]:
+        """Apply ordered controls and return newly created slots for device initialization."""
 
+        started = []
         for command in commands:
-            if isinstance(command, Commit):
+            if isinstance(command, Start):
+                slot = self._apply_start(command.request)
+                if slot is not None:
+                    started.append(slot)
+            elif isinstance(command, Commit):
                 self._apply_commit(command)
             elif isinstance(command, Finish):
                 self._apply_finish(command)
+            elif isinstance(command, Retire):
+                row = self.peek(command.request_key.request_id)
+                if row is not None and row.request_key == command.request_key:
+                    row.closed = True
+        return tuple(started)
 
     def resolve_predicated(
         self,
@@ -889,7 +843,10 @@ class RequestPool:
             if version.op_id != int(op_id):
                 raise invalid_descriptor("resolved token prefix has the wrong lineage")
             point = version.point
-            if not isinstance(point, FixedCheckpoint) or int(point.point_index) != previous_point + 1:
+            if (
+                not isinstance(point, FixedCheckpoint)
+                or int(point.point_index) != previous_point + 1
+            ):
                 raise invalid_descriptor("resolved token prefixes are not contiguous")
             key = row.point_key(version)
             row.resolved_versions[key] = version
@@ -904,17 +861,12 @@ class RequestPool:
         return selected, runtime
 
     def drop(self, request_id: int) -> None:
-        """Remove a request immediately and release its slot and deployment-specific state."""
+        """Remove a request after its execution leases have been released."""
 
         selected = int(request_id)
         slot = self._slots_by_request.pop(selected, None)
-        row = None if slot is None else self._rows[slot]
         if slot is not None:
             self._rows[slot] = None
-        state = self._model_state
-        drop = None if state is None else getattr(state, "drop_request", None)
-        if callable(drop) and row is not None and not row.retired:
-            drop(selected)
 
     def retire(self, request_id: int) -> None:
         """Remove a request after verifying that no unresolved operation state remains."""
@@ -922,13 +874,22 @@ class RequestPool:
         row = self.get(request_id)
         if row.retired:
             return
-        if row.terminal_cutoff is None:
-            raise RuntimeError("request retirement requires an applied finish command")
-        state = self._model_state
-        drop = None if state is None else getattr(state, "drop_request", None)
-        if callable(drop):
-            drop(int(request_id))
+        if not row.closed:
+            raise RuntimeError("request retirement requires an applied close command")
+        if not self.retirement_ready(row.request_key):
+            raise RuntimeError("request retirement still has physical operations")
+        row.pending_operations.clear()
         row.retired = True
+
+    def retirement_ready(self, request_key: RequestKey) -> bool:
+        """Observe physical operation completion without changing the terminal cutoff."""
+
+        row = self.peek(request_key.request_id)
+        if row is None:
+            return True
+        if row.request_key != request_key:
+            raise invalid_descriptor("request retirement has a stale request key")
+        return all(completion.ready() for completion in row.pending_operations.values())
 
     def _evict_retired_slot(self, slot: int) -> None:
         """Remove a retired request row and clear its slot ownership mapping."""
@@ -1021,6 +982,34 @@ class RequestPool:
             )
         return slot
 
+    def _apply_start(self, admission: NewRequest) -> int | None:
+        """Establish a request's root state without requiring numerical work."""
+
+        slot = self._validate_slot(admission.request_pool_idx)
+        base = self.peek(admission.request_key.request_id)
+        if base is not None and base.retired and base.request_key != admission.request_key:
+            self._evict_retired_slot(int(base.request_pool_idx))
+            base = None
+        occupant = self._rows[slot]
+        if (
+            occupant is not None
+            and occupant.retired
+            and occupant.request_key != admission.request_key
+        ):
+            self._evict_retired_slot(slot)
+            occupant = None
+        if base is not None:
+            if base.admission != admission or occupant is not base:
+                raise invalid_descriptor("request admission conflicts with resident state")
+            return None
+        if occupant is not None:
+            raise invalid_descriptor(
+                f"request-pool index {slot} is occupied by request {occupant.request_id}"
+            )
+        self._rows[slot] = self._admission_row(admission)
+        self._slots_by_request[int(admission.request_key.request_id)] = slot
+        return slot
+
     def _admission_row(self, admission: NewRequest) -> Request:
         """Create bounded host request state from one validated admission descriptor."""
 
@@ -1059,8 +1048,10 @@ class RequestPool:
             raise invalid_descriptor(f"operation {operation.op_id} has a stale request key")
         if int(row.request_pool_idx) != int(slot):
             raise invalid_descriptor(f"operation {operation.op_id} has a stale request slot")
-        if row.terminal_cutoff is not None:
+        if row.closed:
             raise invalid_descriptor(f"operation {operation.op_id} targets a closed request")
+        if operation.parent is None:
+            return
         if operation.control_seq != row.applied_control_seq:
             raise invalid_descriptor(
                 f"operation {operation.op_id} requires control sequence "
@@ -1111,7 +1102,7 @@ class RequestPool:
         duplicate, identity = self._control_identity(row, control)
         if duplicate:
             return
-        if row.terminal_cutoff is not None:
+        if row.closed:
             raise invalid_descriptor("commit control targets a closed request")
         if control.expected_parent != row.committed_version():
             raise invalid_descriptor("commit control expected parent is not current")
@@ -1147,9 +1138,11 @@ class RequestPool:
             for op_id, parent in row.declared_parents.items()
             if int(op_id) > frontier
         }
-        retained_ops = referenced | {frontier} | {
-            int(op_id) for op_id in row.resolved_operations if int(op_id) > frontier
-        }
+        retained_ops = (
+            referenced
+            | {frontier}
+            | {int(op_id) for op_id in row.resolved_operations if int(op_id) > frontier}
+        )
         row.resolved_operations = {
             op_id: version
             for op_id, version in row.resolved_operations.items()
@@ -1174,7 +1167,11 @@ class RequestPool:
     def _apply_finish(self, control: Finish) -> None:
         """Validate terminal state and release one request slot from host ownership."""
 
-        row = self.get(control.request_key.request_id)
+        # An aborted admission may never install a live row. Finishing that
+        # lineage still releases sidecar storage at the execution boundary.
+        row = self.peek(control.request_key.request_id)
+        if row is None:
+            return
         if control.request_key != row.request_key:
             raise invalid_descriptor("finish command has a stale request key")
         duplicate, identity = self._control_identity(row, control)
@@ -1198,7 +1195,7 @@ class RequestPool:
         row.version = int(point.point_index)
         row.resolved_op_id = int(cutoff.op_id)
         row.install_runtime(runtime)
-        row.terminal_cutoff = cutoff
+        row.closed = True
         row.applied_control_seq = int(control.control_seq)
         row.control_history[identity] = control
         key = row.point_key(cutoff)
@@ -1206,7 +1203,6 @@ class RequestPool:
         row.resolved_runtime = {key: runtime}
         row.resolved_operations = {int(cutoff.op_id): cutoff}
         row.projected_runtime = {}
-        row.pending_operations = {}
         row.unresolved_operations = {}
         row.declared_parents = {int(cutoff.op_id): cutoff}
 

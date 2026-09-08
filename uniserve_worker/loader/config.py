@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import cast
 
-from ..bootstrap.execution_config import ExecutionConfig
-from ..bootstrap.plan import ModelLoadScope
-from ..execution.device_transfer import DeviceTransfer
-from ..nn.mesh import GroupCoordinator, TensorParallel
+from ..config import WorkerConfig
+from ..nn.mesh import EntryBindings
 
 __all__ = ["LoadConfig", "LoadFormat", "LoadRequest"]
 
@@ -110,22 +109,21 @@ class LoadConfig:
 
 @dataclass(frozen=True, slots=True)
 class LoadRequest:
-    """Model construction scope, device placement, and checkpoint policy for one load."""
+    """Computation bindings, execution configuration, and checkpoint policy for one load."""
 
     model_path: str
-    device: str
-    execution: ExecutionConfig
-    parallel: TensorParallel
-    scope: ModelLoadScope
-    tp_group: GroupCoordinator | None = None
-    transfers: DeviceTransfer = DeviceTransfer()
+    execution: WorkerConfig
+    bindings: EntryBindings
     load: LoadConfig = LoadConfig()
-    attention_backend: str | None = None
+    quantization_config: Mapping[str, object] = field(default_factory=dict)
+    max_text_rows: int = 8192
+    max_video_seconds: float = 15.0
+    pipeline_depth: int | None = None
 
     def __post_init__(self) -> None:
         """Reject requests that cannot identify a checkpoint or destination device."""
 
         if not self.model_path:
             raise ValueError("model_path must not be empty")
-        if not self.device:
-            raise ValueError("load device must not be empty")
+        if self.pipeline_depth is not None and self.pipeline_depth < 1:
+            raise ValueError("load pipeline depth must be positive")

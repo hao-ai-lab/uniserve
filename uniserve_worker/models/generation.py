@@ -9,7 +9,7 @@ from typing import Any
 import torch
 
 from ..execution.forward_batch import FlowPatches
-from ..foundation.errors import unsupported_setup, invalid_descriptor
+from ..foundation.errors import invalid_descriptor, unsupported_setup
 from ..nn.diffusion.cfg import Branch, CfgRecipe
 from ..nn.diffusion.schedule import (
     ScheduleDirection,

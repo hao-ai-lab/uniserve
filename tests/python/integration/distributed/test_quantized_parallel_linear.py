@@ -17,13 +17,12 @@ from uniserve_worker.nn.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from uniserve_worker.nn.mesh import TensorParallel
+from uniserve_worker.nn.mesh import Communicator
 from uniserve_worker.nn.parallel import ParallelConfig
 from uniserve_worker.nn.quant import (
-    DynamicW4A4NvFp4LinearMethod,
     DynamicW8A8Fp8LinearMethod,
-    DynamicW8A8MxFp8LinearMethod,
 )
+from uniserve_worker.nn.quant.config import QuantizationConfig
 from uniserve_worker.runtime.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
@@ -33,11 +32,9 @@ pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
 
 def _method(format):
-    return {
-        "fp8": DynamicW8A8Fp8LinearMethod,
-        "nvfp4": DynamicW4A4NvFp4LinearMethod,
-        "mxfp8": DynamicW8A8MxFp8LinearMethod,
-    }[format]()
+    return QuantizationConfig.from_model_config(
+        {"quantization_config": {"quant_method": format}}
+    ).get_quant_method()
 
 
 def _load(module, path, name, shape, shard=None):
@@ -65,7 +62,7 @@ def _run(rank, rendezvous, checkpoint):
             "one": ((2,), ParallelConfig()),
         },
     )
-    local = LayerConfig(TensorParallel(0, 1), None)
+    local = LayerConfig(Communicator(), None)
     torch.manual_seed(107)
     x = (torch.rand(128, 512, device=device) + 0.25).bfloat16()
     # Input-column groups have distinct magnitudes, so local scale domains do
@@ -75,19 +72,28 @@ def _run(rank, rendezvous, checkpoint):
         if name not in meshes:
             continue
         group = meshes[name].get_group("tp")
-        config = LayerConfig(TensorParallel(group.rank_in_group, group.world_size), None, group)
+        config = LayerConfig(group, None)
         for format in ("fp8", "nvfp4", "mxfp8"):
             with torch.device(device):
                 reference = LinearBase(
-                    512, 256, layer_config=local, bias=False, quant_method=_method(format)
+                    512,
+                    256,
+                    layer_config=local,
+                    bias=False,
+                    quant_method=_method(format),
+                    logical_input_row_partitions=4,
                 )
                 sharded = RowParallelLinear(
-                    512, 256, layer_config=config, bias=False, quant_method=_method(format)
+                    512,
+                    256,
+                    layer_config=config,
+                    bias=False,
+                    quant_method=_method(format),
+                    logical_input_row_partitions=4,
                 )
             for module in (reference, sharded):
                 _load(module, checkpoint, "row", (256, 512))
                 module.finalize_weights()
-                module.logical_input_row_partitions = 4
             expected = reference(x)
             actual = sharded(x.chunk(group.world_size, dim=-1)[group.rank_in_group].contiguous())
             # Positive operands avoid cancellation. Each BF16 partial and its
@@ -96,6 +102,21 @@ def _run(rank, rendezvous, checkpoint):
             gamma = operations * 2**-8 / (1 - operations * 2**-8)
             torch.testing.assert_close(
                 actual, expected, rtol=gamma, atol=0, msg=f"{name}/{format}: logical row projection"
+            )
+            prepared_output = torch.cat(
+                [
+                    reference.forward_prepared(
+                        reference.prepare_input(part, absmax=part.abs().amax())
+                    )
+                    for part in x.chunk(4, dim=0)
+                ]
+            )
+            torch.testing.assert_close(
+                prepared_output,
+                expected,
+                rtol=gamma,
+                atol=0,
+                msg=f"{name}/{format}: reusable activation preparation",
             )
 
         for format in ("fp8", "nvfp4"):
@@ -148,7 +169,7 @@ def _run(rank, rendezvous, checkpoint):
                         quant_method=method,
                         bias=False,
                         weight_scale_partition_size=256,
-                        sequence_group=layout.tensor_group(),
+                        sequence_group=layout.communicator,
                     )
                 for branch in range(4):
                     _load(projection, checkpoint, f"branch{branch}", (256, 512), branch)

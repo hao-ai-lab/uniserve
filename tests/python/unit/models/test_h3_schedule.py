@@ -4,7 +4,9 @@ import pytest
 import torch
 
 from uniserve_worker.models.minimax_h3.packing import audio_latent_frames
-from uniserve_worker.models.minimax_h3.schedule import shifted_sigmas, solver_step
+from uniserve_worker.models.minimax_h3.schedule import FASTH3_LADDER, FASTH3_TIME_SCALE
+from uniserve_worker.nn.diffusion.integrator import clean_sample_euler_step_
+from uniserve_worker.nn.diffusion.schedule import shifted_sigmas
 
 pytestmark = pytest.mark.unit
 
@@ -17,7 +19,7 @@ pytestmark = pytest.mark.unit
     ),
 )
 def test_fasth3_checkpoint_schedule(shift: float, expected: tuple[float, ...]) -> None:
-    assert shifted_sigmas(shift) == pytest.approx(expected)
+    assert shifted_sigmas(FASTH3_LADDER, shift, scale=FASTH3_TIME_SCALE) == pytest.approx(expected)
 
 
 @pytest.mark.parametrize(("video_frames", "expected"), ((124, 207), (362, 604)))
@@ -29,7 +31,7 @@ def test_fasth3_solver_follows_clean_time_interval() -> None:
     sample = torch.tensor([2.0, -1.0], dtype=torch.float32)
     velocity = torch.tensor([0.5, 2.0], dtype=torch.float32)
 
-    solver_step(
+    clean_sample_euler_step_(
         sample,
         velocity,
         timestep=torch.tensor(0.25),

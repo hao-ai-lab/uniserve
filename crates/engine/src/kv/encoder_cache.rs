@@ -38,7 +38,7 @@ pub(crate) struct EncoderCacheManager {
     // computation may reactivate an equivalent handle under the same hash.
     retired: HashMap<u64, Vec<Entry>>, // content hash -> pinned retired generations
     // Index of evictable (ref_cnt == 0) entries ordered by LRU tick, so the
-    // victim search and `can_insert` are O(log n) / O(1) instead of full scans
+    // victim search is O(log n) instead of full scans
     // of `entries`. Invariant: a hash is in `evictable` keyed by its current
     // `Entry::lru` iff its `ref_cnt == 0`. Ticks are globally unique (monotonic
     // `next_tick`), so each entry occupies at most one key here.
@@ -64,10 +64,6 @@ impl EncoderCacheManager {
     pub(crate) fn len(&self) -> usize {
         self.entries.len() + self.retired.values().map(Vec::len).sum::<usize>()
     }
-    /// Returns whether the collection contains no entries.
-    pub(crate) fn is_empty(&self) -> bool {
-        self.entries.is_empty() && self.retired.is_empty()
-    }
     /// Returns the cache byte budget.
     pub(crate) fn budget(&self) -> usize {
         self.budget
@@ -76,6 +72,33 @@ impl EncoderCacheManager {
     /// Returns a resident output without changing LRU order or cache metrics.
     pub(crate) fn peek_product(&self, hash: u64) -> Option<ProductRef> {
         self.entries.get(&hash).map(|entry| entry.product.clone())
+    }
+
+    /// Revokes unavailable products from lookup while preserving active consumer pins.
+    pub(crate) fn invalidate_products(
+        &mut self,
+        products: &std::collections::HashSet<ProductRef>,
+    ) -> Vec<ProductRef> {
+        let hashes = self
+            .entries
+            .iter()
+            .filter_map(|(hash, entry)| products.contains(&entry.product).then_some(*hash))
+            .collect::<Vec<_>>();
+        let mut reclaimable = Vec::new();
+        for hash in hashes {
+            let entry = self
+                .entries
+                .remove(&hash)
+                .expect("selected cache entry exists");
+            self.evictable.remove(&entry.lru);
+            self.stats.evictions += 1;
+            if entry.ref_cnt == 0 {
+                reclaimable.push(entry.product);
+            } else {
+                self.retired.entry(hash).or_default().push(entry);
+            }
+        }
+        reclaimable
     }
 
     /// Returns and advances the cache recency counter.
@@ -104,13 +127,6 @@ impl EncoderCacheManager {
         }
     }
 
-    /// Returns whether capacity can be made available from unreferenced entries
-    /// to insert another entry without exceeding the budget by referenced ones.
-    pub(crate) fn can_insert(&self) -> bool {
-        // An unreferenced entry can be evicted even when the nominal budget is full.
-        self.len() < self.budget || !self.evictable.is_empty()
-    }
-
     /// Removes the least-recently-used unpinned entry so its worker buffer can
     /// be freed before a replacement encoder operation is admitted.
     pub(crate) fn evict_one(&mut self) -> Option<ProductRef> {
@@ -134,8 +150,8 @@ impl EncoderCacheManager {
     /// to evict and the live set grows by one; this is bounded by the number of
     /// concurrently-pinned entries (the scheduler admits at most
     /// `max_num_seqs` requests) and is counted in `stats.over_budget_inserts` so
-    /// the over-subscription is observable rather than silent. The hard cap is
-    /// enforced upstream via [`can_insert`](Self::can_insert) at admission.
+    /// the over-subscription is observable. Admission reserves encoder-product
+    /// capacity before submitting the computation.
     pub(crate) fn insert(&mut self, hash: u64, product: ProductRef) -> Option<ProductRef> {
         if self.entries.contains_key(&hash) {
             let tick = self.next_tick();
@@ -305,5 +321,25 @@ mod tests {
         cache.insert(2, product(200));
         assert_eq!(cache.lookup_product(1), Some(pinned));
         assert_eq!(cache.stats.over_budget_inserts, 1);
+    }
+
+    #[test]
+    fn invalidation_preserves_pins_and_independent_replacements() {
+        let mut cache = EncoderCacheManager::new(4);
+        let pinned = product(100);
+        let unpinned = product(200);
+        let replacement = product(300);
+        cache.insert(1, pinned.clone());
+        cache.insert(2, unpinned.clone());
+        assert_eq!(cache.acquire(1), Some(pinned.clone()));
+        assert_eq!(cache.acquire(1), Some(pinned.clone()));
+        let lost = [pinned.clone(), unpinned.clone()].into_iter().collect();
+        assert_eq!(cache.invalidate_products(&lost), vec![unpinned]);
+        assert_eq!(cache.lookup_product(1), None);
+        assert_eq!(cache.insert(1, replacement.clone()), None);
+        assert_eq!(cache.release(1, &pinned), None);
+        assert_eq!(cache.release(1, &pinned), Some(pinned.clone()));
+        assert_eq!(cache.release(1, &pinned), None);
+        assert_eq!(cache.lookup_product(1), Some(replacement));
     }
 }

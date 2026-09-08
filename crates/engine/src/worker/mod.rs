@@ -2,27 +2,39 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 mod death_watch;
-mod multiproc;
-mod staged_executor;
-mod uniproc;
+mod executor;
+mod instance;
+mod process;
 
-pub use multiproc::MultiprocExecutor;
-pub use staged_executor::StagedExecutor;
-pub use uniproc::{FlashInferBackend, FlashInferBackendParseError, LaneConfig, UniprocExecutor};
+pub use executor::WorkerExecutor;
+pub use instance::Worker;
+use process::RankProcess;
+pub use process::{FlashInferBackend, FlashInferBackendParseError, LaneConfig};
+
+/// Backpressure and terminal failures returned by a Worker run submission.
+#[derive(Debug, thiserror::Error)]
+pub enum RunSubmitError {
+    /// Returns the unaccepted physical submission when the instance has no capacity.
+    #[error("worker run queue is full")]
+    WouldBlock(uniserve_worker_ipc::Run),
+    /// Reports a terminal transport or execution failure.
+    #[error(transparent)]
+    Failed(anyhow::Error),
+}
 
 /// Everything required to create or recreate one worker rank process.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct WorkerProcessArgs {
+    /// Logical instance identity assigned by the engine.
+    pub worker_id: String,
     /// Python interpreter used to launch the worker entry point.
     pub python: std::path::PathBuf,
     /// Model identifier or local model path.
     pub model: String,
-    /// Device specification supplied to the worker.
-    pub device: String,
-    /// Explicit component deployment, resolved before physical worker launch.
-    pub deployment: Option<crate::executor::StageDeployConfig>,
-    /// Number of physical worker processes.
-    pub world_size: usize,
+    /// Ordered physical members of this Worker instance.
+    pub ranks: Vec<crate::WorkerRank>,
+    /// Computation entry membership and parallel geometry.
+    pub entries: std::collections::BTreeMap<String, crate::EntryConfig>,
     /// Maximum number of physical runs concurrently in flight per rank.
     pub pipeline_depth: usize,
     /// Request IPC slot capacity in bytes.
@@ -40,9 +52,9 @@ pub struct WorkerProcessArgs {
     /// Attention implementation selected for model execution.
     pub attention_backend: uniserve_worker_ipc::AttentionBackend,
     /// Logical operation kinds exposed by the worker pool.
-    pub supported_ops: Vec<uniserve_worker_ipc::OpKind>,
+    pub supported_ops: Vec<uniserve_worker_ipc::OpCode>,
     /// Product transport exposed by the worker pool.
-    pub transfer_backend: crate::executor::TransferBackend,
+    pub transfer: crate::executor::TransportMap,
     /// Whether to launch the deterministic worker stub without model weights.
     pub stub: bool,
     /// Checkpoint loader format.
@@ -65,7 +77,7 @@ pub struct WorkerProcessArgs {
     pub mesh: Option<String>,
     /// Optional process-world communication backend.
     pub distributed_backend: Option<String>,
-    /// Deployment-static execution lane descriptors.
+    /// configuration-static execution lane descriptors.
     pub lanes: Vec<LaneConfig>,
     /// Whether decode execution may use captured CUDA graphs.
     pub cuda_graph: bool,

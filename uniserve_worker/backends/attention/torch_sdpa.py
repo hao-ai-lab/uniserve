@@ -62,9 +62,7 @@ class TorchSDPAAttentionBackend(AttentionBackend):
         plan = context
         base_lens = getattr(plan, "seq_lens_cpu", None)
         if base_lens is None:
-            raise ValueError(
-                "torch_sdpa paged decode requires host-known sequence lengths"
-            )
+            raise ValueError("torch_sdpa paged decode requires host-known sequence lengths")
         del cache_seqlens
         lengths = tuple(int(value) for value in base_lens)
         q_rows, restore = _paged_query_rows(q, int(block_table.shape[0]))
@@ -213,8 +211,7 @@ class TorchSDPAAttentionBackend(AttentionBackend):
             kv_lens = getattr(plan, "kv_lens_cpu", None)
             if query_lens is None or kv_lens is None:
                 raise ValueError(
-                    "torch_sdpa paged varlen requires host-known "
-                    "query_lens_cpu and kv_seqlens_cpu"
+                    "torch_sdpa paged varlen requires host-known query_lens_cpu and kv_seqlens_cpu"
                 )
             q_offsets = _offsets_from_lengths(query_lens)
             k_offsets = _offsets_from_lengths(kv_lens)
@@ -358,7 +355,7 @@ class TorchSDPAAttentionBackend(AttentionBackend):
 
         lq, n_heads, _ = q.shape
         lk, _, _ = k.shape
-        k, v = _expand_gqa(k, v, n_heads, head_axis=1)
+        grouped = n_heads != int(k.shape[1])
         q4 = q.permute(1, 0, 2).unsqueeze(0)
         k4 = k.permute(1, 0, 2).unsqueeze(0)
         v4 = v.permute(1, 0, 2).unsqueeze(0)
@@ -381,7 +378,7 @@ class TorchSDPAAttentionBackend(AttentionBackend):
         if mask is not None and mask.ndim == 2:
             mask = mask[None, None]
         out = F.scaled_dot_product_attention(
-            q4, k4, v4, attn_mask=mask, is_causal=use_is_causal, scale=scale
+            q4, k4, v4, attn_mask=mask, is_causal=use_is_causal, scale=scale, enable_gqa=grouped
         )
         return out.squeeze(0).permute(1, 0, 2)
 
@@ -397,7 +394,6 @@ class TorchSDPAAttentionBackend(AttentionBackend):
     ) -> torch.Tensor:
         """Run SDPA for batch-head-length-dimension tensors with optional masking."""
 
-        k, v = _expand_gqa(k, v, q.shape[1], head_axis=1)
         mask = _normalize_mask(attn_mask, q)
         out = F.scaled_dot_product_attention(
             q,
@@ -406,6 +402,7 @@ class TorchSDPAAttentionBackend(AttentionBackend):
             attn_mask=mask,
             is_causal=causal and mask is None,
             scale=scale,
+            enable_gqa=q.shape[1] != k.shape[1],
         )
         return out
 

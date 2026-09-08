@@ -7,9 +7,10 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, TypeVar, cast
 
-from ..execution.batch import OpKind
+from uniserve_worker.nn.parallel import EntryConfig
+
+from ..execution.batch import OpCode, TensorSpec, WorkerEndpoint
 from ..foundation.errors import invalid_descriptor
-from .plan import ComponentDeployConfig
 
 
 class RequestKind(StrEnum):
@@ -79,6 +80,8 @@ class KvCacheConfig:
     num_blocks: int
     num_layers: int
     num_kv_heads: int
+    total_kv_heads: int
+    kv_head_offset: int
     head_dim: int
     bytes_per_token: int
     groups: tuple[KvGroup, ...]
@@ -101,6 +104,8 @@ class KvCacheConfig:
             or not self.dtype
         ):
             raise invalid_descriptor("worker info declares incomplete KV geometry")
+        if self.kv_head_offset < 0 or self.kv_head_offset + self.num_kv_heads > self.total_kv_heads:
+            raise invalid_descriptor("worker KV head interval exceeds its logical geometry")
         if any(group.num_blocks < 1 for group in self.groups):
             raise invalid_descriptor("worker info KV groups must be physical page partitions")
         if sum(group.num_blocks for group in self.groups) != self.num_blocks:
@@ -116,6 +121,8 @@ class KvCacheConfig:
             num_blocks=_uint(data.get("num_blocks"), f"{where}.num_blocks"),
             num_layers=_uint(data.get("num_layers"), f"{where}.num_layers"),
             num_kv_heads=_uint(data.get("num_kv_heads"), f"{where}.num_kv_heads"),
+            total_kv_heads=_uint(data.get("total_kv_heads"), f"{where}.total_kv_heads"),
+            kv_head_offset=_uint(data.get("kv_head_offset"), f"{where}.kv_head_offset"),
             head_dim=_uint(data.get("head_dim"), f"{where}.head_dim"),
             bytes_per_token=_uint(data.get("bytes_per_token"), f"{where}.bytes_per_token"),
             groups=tuple(
@@ -133,6 +140,8 @@ class KvCacheConfig:
             "num_blocks": self.num_blocks,
             "num_layers": self.num_layers,
             "num_kv_heads": self.num_kv_heads,
+            "total_kv_heads": self.total_kv_heads,
+            "kv_head_offset": self.kv_head_offset,
             "head_dim": self.head_dim,
             "bytes_per_token": self.bytes_per_token,
             "groups": [group.to_mapping() for group in self.groups],
@@ -141,34 +150,38 @@ class KvCacheConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class RankInfo:
-    """Describes one rank’s identity within the worker topology."""
+class EntryInfo:
+    """Loaded entry membership and the tensor results its computation can publish."""
 
-    rank: int = 0
-    world_size: int = 1
+    name: str
+    config: EntryConfig
+    outputs: tuple[TensorSpec, ...] = ()
 
     def __post_init__(self) -> None:
-        """Validate rank coordinates against the declared topology size."""
-
-        if self.world_size < 1 or not 0 <= self.rank < self.world_size:
-            raise invalid_descriptor("rank must satisfy 0 <= rank < world_size")
+        if not self.name:
+            raise invalid_descriptor("entry must have a name")
+        if len({output.name for output in self.outputs}) != len(self.outputs):
+            raise invalid_descriptor("entry repeats a tensor result name")
 
     @classmethod
-    def from_mapping(cls, value: object, where: str = "rank") -> RankInfo:
-        """Decode and validate physical process rank identity from the wire mapping."""
-
+    def from_mapping(cls, value: object, where: str = "entry") -> EntryInfo:
         data = _map(value, where)
         return cls(
-            rank=_uint(data.get("rank", 0), f"{where}.rank"),
-            world_size=_uint(data.get("world_size", 1), f"{where}.world_size"),
+            name=_str(data.get("name"), f"{where}.name"),
+            config=EntryConfig.from_dict(
+                {key: value for key, value in data.items() if key not in {"name", "outputs"}}
+            ),
+            outputs=tuple(
+                TensorSpec.from_mapping(output, f"{where}.outputs[{index}]")
+                for index, output in enumerate(_seq(data.get("outputs", ()), f"{where}.outputs"))
+            ),
         )
 
-    def to_mapping(self) -> dict[str, int]:
-        """Encode physical process rank identity for scheduler discovery."""
-
+    def to_mapping(self) -> dict[str, object]:
         return {
-            "rank": self.rank,
-            "world_size": self.world_size,
+            "name": self.name,
+            **self.config.to_dict(),
+            "outputs": [output.to_mapping() for output in self.outputs],
         }
 
 
@@ -178,8 +191,9 @@ class WorkerInfo:
 
     model_name: str
     weight_version: int
-    rank: RankInfo
-    supported_ops: tuple[OpKind, ...]
+    endpoint: WorkerEndpoint
+    world_size: int
+    supported_ops: tuple[OpCode, ...]
     queue_depth: int
     max_batch_ops: int
     max_batch_tokens: int
@@ -190,7 +204,9 @@ class WorkerInfo:
     buffer_pool_bytes: int
     max_unresolved_ops: int
     configuration_id: str = ""
-    components: tuple[tuple[str, ComponentDeployConfig], ...] = ()
+    components: tuple[EntryInfo, ...] = ()
+    device: str = "cpu"
+    transfer_backends: tuple[str, ...] = ("local",)
 
     @property
     def latent_capacity_units(self) -> int:
@@ -207,6 +223,13 @@ class WorkerInfo:
     def __post_init__(self) -> None:
         """Validate advertised worker topology, capacities, variants, and cache-group geometry."""
 
+        if (
+            not self.device
+            or not self.transfer_backends
+            or len(set(self.transfer_backends)) != len(self.transfer_backends)
+            or any(name not in {"local", "shm", "cuda_ipc"} for name in self.transfer_backends)
+        ):
+            raise invalid_descriptor("worker physical transfer capabilities are incomplete")
         for name in (
             "queue_depth",
             "max_batch_ops",
@@ -216,8 +239,10 @@ class WorkerInfo:
         ):
             if getattr(self, name) < 1:
                 raise invalid_descriptor(f"worker info.{name} must be positive")
+        if self.world_size < 1 or self.endpoint.rank >= self.world_size:
+            raise invalid_descriptor("endpoint rank must satisfy 0 <= rank < world_size")
         requires_kv = any(
-            variant in {OpKind.AR_EXTEND, OpKind.AR_DECODE, OpKind.AR_VERIFY}
+            variant in {OpCode.AR_EXTEND, OpCode.AR_DECODE, OpCode.AR_VERIFY}
             for variant in self.supported_ops
         )
         if requires_kv and self.kv_cache is None:
@@ -237,16 +262,6 @@ class WorkerInfo:
         if has_latent_geometry:
             if self.latent_page_units < 1 or self.latent_pages < 2:
                 raise invalid_descriptor("worker info declares incomplete latent pool capacity")
-        addresses_latent = any(
-            variant
-            in {
-                OpKind.DIFFUSION_PREPARE,
-                OpKind.DIFFUSION_STEP,
-            }
-            for variant in self.supported_ops
-        )
-        if addresses_latent and not has_latent_geometry:
-            raise invalid_descriptor("worker info advertise latent work without a latent page pool")
         if not self.model_name or self.weight_version < 0:
             raise invalid_descriptor("worker model name and weight version are invalid")
 
@@ -258,19 +273,22 @@ class WorkerInfo:
         return cls(
             configuration_id=str(data.get("configuration_id", "")),
             components=tuple(
-                (
-                    item["name"],
-                    ComponentDeployConfig.from_dict(
-                        {key: value for key, value in item.items() if key != "name"}
-                    ),
+                EntryInfo.from_mapping(item, f"{where}.components[{index}]")
+                for index, item in enumerate(
+                    _seq(data.get("components", ()), f"{where}.components")
                 )
-                for item in data.get("components", ())
             ),
             model_name=_str(data.get("model_name", ""), f"{where}.model_name"),
             weight_version=_uint(data.get("weight_version", 0), f"{where}.weight_version"),
-            rank=RankInfo.from_mapping(data.get("rank"), f"{where}.rank"),
+            endpoint=WorkerEndpoint.from_mapping(data.get("endpoint"), f"{where}.endpoint"),
+            device=_str(data.get("device"), f"{where}.device"),
+            transfer_backends=tuple(
+                _str(name, f"{where}.transfer_backends")
+                for name in _seq(data.get("transfer_backends"), f"{where}.transfer_backends")
+            ),
+            world_size=_uint(data.get("world_size"), f"{where}.world_size"),
             supported_ops=tuple(
-                _enum(OpKind, item, f"{where}.supported_ops[{index}]")
+                _enum(OpCode, item, f"{where}.supported_ops[{index}]")
                 for index, item in enumerate(
                     _seq(data.get("supported_ops"), f"{where}.supported_ops")
                 )
@@ -296,11 +314,12 @@ class WorkerInfo:
         return {
             "model_name": self.model_name,
             "weight_version": self.weight_version,
-            "rank": self.rank.to_mapping(),
+            "endpoint": self.endpoint.to_mapping(),
+            "device": self.device,
+            "transfer_backends": list(self.transfer_backends),
+            "world_size": self.world_size,
             "configuration_id": self.configuration_id,
-            "components": [
-                {"name": name, **component.to_dict()} for name, component in self.components
-            ],
+            "components": [component.to_mapping() for component in self.components],
             "supported_ops": [value.value for value in self.supported_ops],
             "queue_depth": self.queue_depth,
             "max_batch_ops": self.max_batch_ops,
@@ -378,7 +397,6 @@ __all__ = [
     "KvCacheConfig",
     "KvGroup",
     "KvGroupKind",
-    "RankInfo",
     "RequestKind",
     "ResponseKind",
     "WorkerInfo",

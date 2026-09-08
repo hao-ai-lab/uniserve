@@ -11,20 +11,20 @@ import torch
 from uniserve_worker.backends.triton import triton_available
 from uniserve_worker.execution.batch import SamplingParams
 from uniserve_worker.execution.forward_batch import packed_tensor_views
-from uniserve_worker.foundation.errors import unsupported_setup, invalid_descriptor
+from uniserve_worker.execution.output import (
+    LogprobCapture,
+    LogprobOutputRow,
+    OutputBuffer,
+    SamplingCapture,
+    SamplingOutputRow,
+)
+from uniserve_worker.foundation.errors import invalid_descriptor, unsupported_setup
 from uniserve_worker.foundation.math import bucketed_length
 from uniserve_worker.runtime.device_products import (
     DeviceProductRead,
     DeviceProducts,
     DeviceProductScalarBatch,
     DeviceProductWrite,
-)
-from uniserve_worker.execution.output import (
-    LogprobCapture,
-    LogprobOutputRow,
-    SamplingCapture,
-    SamplingOutputRow,
-    OutputBuffer,
 )
 
 from .cuda_graph import GraphGreedyOutput
@@ -327,9 +327,7 @@ def sample_device_greedy_group(
     )
     packed_output = product_batch.tensor if product_batch is not None else None
     transition_writes = tuple(
-        cast(DeviceProductWrite, task.transition_product)
-        for task in tasks
-        if task.transition_product is not None
+        task.transition_product for task in tasks if task.transition_product is not None
     )
     transition_batch: DeviceProductScalarBatch | None = None
     if transition_writes and device_products is not None:
@@ -460,7 +458,7 @@ def sample_device_greedy_group(
             valid,
             active,
             device_tokens,
-            cast(torch.Tensor, device_finish) if empty_finish else torch.zeros_like(device_tokens),
+            device_finish if empty_finish else torch.zeros_like(device_tokens),
             completion,
         )
     )
@@ -656,9 +654,7 @@ def _run_fused_top_k_sampling(
     """Run the compiled fixed-top-k sampler after validating CUDA toolchain availability."""
 
     if not triton_available(logits.device):
-        raise unsupported_setup(
-            "fused top-k sampling requires a supported CUDA compile toolchain"
-        )
+        raise unsupported_setup("fused top-k sampling requires a supported CUDA compile toolchain")
     return sample_top_k(
         logits,
         draws,
@@ -1126,7 +1122,7 @@ def _sampled_transition_values(
     if int(tokens.numel()) != len(tasks) or int(eligibility.numel()) != len(tasks):
         raise RuntimeError("sampling transition vectors do not align")
     indexes = tuple(index for index, _task, _write in selected)
-    writes = tuple(cast(DeviceProductWrite, write) for _index, _task, write in selected)
+    writes = tuple(write for _index, _task, write in selected)
     selected_tokens = select_device_values(tokens, indexes)
     selected_eligibility = select_device_values(eligibility, indexes)
 
@@ -1628,7 +1624,4 @@ def logprob_details(
             max_count,
             max_requested,
         )
-    return {
-        result_index: LogprobOutputRow(batch, result_index)
-        for result_index in requested_rows
-    }
+    return {result_index: LogprobOutputRow(batch, result_index) for result_index in requested_rows}

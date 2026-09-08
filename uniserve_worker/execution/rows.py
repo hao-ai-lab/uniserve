@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from threading import Lock
 from typing import TYPE_CHECKING, Any, TypeAlias
@@ -10,13 +11,14 @@ from typing import TYPE_CHECKING, Any, TypeAlias
 import torch
 
 from uniserve_worker.execution.batch import (
+    BufferId,
     FinishFlags,
-    LatentPlacement,
+    KvTransferValue,
+    LatentParams,
+    Locator,
     LogicalLengths,
-    NewRequest,
     Operation,
     OpStatus,
-    ProductKind,
     ProductPayload,
     ProductRef,
     RequestKey,
@@ -27,6 +29,7 @@ from uniserve_worker.execution.batch import (
     SamplingParams,
     SamplingState,
     TokenSpan,
+    TransferValue,
 )
 from uniserve_worker.execution.forward_batch import FlowPatches, ModelPhase, TokenSelection
 from uniserve_worker.execution.output import (
@@ -39,21 +42,26 @@ from uniserve_worker.execution.output import (
 )
 from uniserve_worker.foundation.errors import WorkerError, classify, invalid_descriptor
 from uniserve_worker.loader.weight_set import WeightSet
+from uniserve_worker.runtime.cache_transfer import CacheWrite
 from uniserve_worker.runtime.cpu import CpuTaskReservation
 from uniserve_worker.runtime.device_products import (
-    DeviceProductMetadata,
+    DeviceProductImport,
     DeviceProductRead,
     DeviceProductWrite,
 )
 from uniserve_worker.runtime.encoder_cache import EncoderRead, EncoderWrite
-from uniserve_worker.runtime.latent_pool import LatentPublication, LatentRelease, LatentStaging
-from uniserve_worker.runtime.request import Request, RequestDraft
-from uniserve_worker.transfer.connector import CachePublication
-from uniserve_worker.transfer.tickets import Locator, TransferTicket
+from uniserve_worker.runtime.latent_pool import (
+    LatentPublication,
+    LatentRelease,
+    LatentStaging,
+    LatentWrite,
+)
+from uniserve_worker.runtime.request import RequestDraft
+from uniserve_worker.transfer.tickets import TransferTicket
 
 if TYPE_CHECKING:
-
     from .model_runner import RunObservation
+    from .video import VideoOutputRingLease
 
 OperationIdentity: TypeAlias = tuple[RequestKey, int]
 
@@ -227,42 +235,91 @@ class PromptLogitsPublication:
     logits: torch.Tensor
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class PreparedTransferInput:
-    """Owns fetched transfer tickets, tensor locators, metadata, and any retained source snapshot."""
+    """Retain one canonical product descriptor and its bounded physical reads."""
 
     product: ProductRef
-    kind: str
-    locators: tuple[Locator, ...]
+    value: TransferValue
     tickets: tuple[TransferTicket, ...]
-    payload_kind: ProductKind | None
-    height: int | None
-    width: int | None
-    latent_units: int | None
-    step: int | None
-    generation: int | None
-    device_metadata: DeviceProductMetadata | None
-    snapshot: CachePublication | None
+    buffers: tuple[torch.Tensor | tuple[torch.Tensor, ...], ...]
+    destination: (
+        DeviceProductImport | DeviceProductWrite | EncoderWrite | LatentWrite | CacheWrite | None
+    ) = None
+    _discard_destination: Callable[[], None] | None = field(default=None, repr=False)
+
+    def adopt_destination(self) -> None:
+        """Transfer a completed destination reservation to its resident product store."""
+
+        self._discard_destination = None
+
+    @property
+    def destination_adopted(self) -> bool:
+        """Indicate whether resident storage owns this input independently of preparation."""
+
+        return self._discard_destination is None
+
+    def discard_destination(self) -> None:
+        """Cancel unconsumed reads and retire a destination that no lane adopted."""
+
+        discard = self._discard_destination
+        if discard is None:
+            return
+        self._discard_destination = None
+        if not isinstance(self.destination, DeviceProductImport):
+            for ticket in self.tickets:
+                ticket.cancel()
+        discard()
+
+    def close(self) -> None:
+        """Release preparation access while preserving shared materialization."""
+
+        self.discard_destination()
+        if isinstance(self.destination, DeviceProductImport):
+            self.destination.close()
+        else:
+            for ticket in self.tickets:
+                ticket.close()
 
     def ready(self) -> bool:
         """Indicate whether every remote product tensor is available to consume."""
 
-        return all(ticket.ready() for ticket in self.tickets)
+        return all(ticket.ready() for ticket in self.tickets) and (
+            not isinstance(self.destination, CacheWrite) or self.destination.completion.done()
+        )
 
     def tensors(self) -> tuple[torch.Tensor, ...]:
         """Return fetched tensors only after every transfer ticket is ready."""
 
         if not self.ready():
             raise RuntimeError("prepared transfer input was observed before readiness")
-        tensors = tuple(ticket.result() for ticket in self.tickets)
-        for locator, tensor in zip(self.locators, tensors, strict=True):
+        if isinstance(self.destination, DeviceProductImport):
+            self.destination.wait()
+        else:
+            for ticket in self.tickets:
+                ticket.result()
+        if isinstance(self.value, KvTransferValue):
+            raise RuntimeError("KV inputs are consumed through their physical cache reservation")
+        representations = (self.value.tensor,)
+        tensors: list[torch.Tensor] = []
+        for representation, value in zip(representations, self.buffers, strict=True):
+            spans = value if isinstance(value, tuple) else (value,)
+            shape = (
+                (sum(int(span.shape[0]) for span in spans), *spans[0].shape[1:])
+                if isinstance(value, tuple)
+                else tuple(value.shape)
+            )
             if (
-                tuple(int(value) for value in tensor.shape) != locator.shape
-                or str(tensor.dtype).removeprefix("torch.") != locator.dtype
-                or int(tensor.numel()) * int(tensor.element_size()) != int(locator.nbytes)
+                shape != representation.shape
+                or any(
+                    str(span.dtype).removeprefix("torch.") != representation.dtype for span in spans
+                )
+                or sum(int(span.numel()) * int(span.element_size()) for span in spans)
+                != int(representation.nbytes)
             ):
-                raise invalid_descriptor("transport result disagrees with its exact locator")
-        return tensors
+                raise invalid_descriptor("transport result disagrees with its logical tensor")
+            tensors.extend(spans)
+        return tuple(tensors)
 
 
 @dataclass(slots=True)
@@ -342,6 +399,10 @@ class PreparedExecution:
     batch: Run
     transfers: tuple[PreparedTransferInput, ...]
     predicates: PreparedPredicateBatch | None = None
+    storage_dependencies: tuple[Future[None], ...] = ()
+    _prepare_inputs: (
+        Callable[[], tuple[tuple[PreparedTransferInput, ...], PreparedPredicateBatch | None]] | None
+    ) = field(default=None, repr=False)
     _execute: Callable[[PreparedExecution], RunResult] | None = field(
         default=None,
         repr=False,
@@ -350,22 +411,54 @@ class PreparedExecution:
     _finished: bool = field(default=False, init=False, repr=False)
 
     def ready(self) -> bool:
-        """Indicate whether transfers and device predicates can be consumed without blocking."""
+        """Query input readiness and the retirements required for destination reuse."""
 
-        return all(transfer.ready() for transfer in self.transfers) and (
-            self.predicates is None or self.predicates.ready()
+        return (
+            self._prepare_inputs is None
+            and all(dependency.done() for dependency in self.storage_dependencies)
+            and all(transfer.ready() for transfer in self.transfers)
+            and (self.predicates is None or self.predicates.ready())
         )
+
+    def advance(self) -> bool:
+        """Submit deferred inputs on the execution thread once their storage retires."""
+
+        if self._finished:
+            return False
+        prepare_inputs = self._prepare_inputs
+        if prepare_inputs is not None:
+            if not all(dependency.done() for dependency in self.storage_dependencies):
+                return False
+            try:
+                for dependency in self.storage_dependencies:
+                    dependency.result()
+                self._prepare_inputs = None
+                self.transfers, self.predicates = prepare_inputs()
+            except BaseException:
+                self._finish()
+                raise
+        return self.ready()
 
     def predicate_values(self) -> dict[OperationIdentity, bool]:
         """Resolve staged device predicates by request generation and operation id."""
 
         return {} if self.predicates is None else self.predicates.resolve()
 
-    def on_transfer_completion(self, callback: Callable[[], None]) -> None:
-        """Invoke a callback immediately or after all staged transfer tickets complete."""
+    def on_dependencies_ready(self, callback: Callable[[], None]) -> None:
+        """Wake the execution thread when the next preparation stage can advance.
+
+        Deferred reads first wait for storage retirement. After submitting them,
+        the owner registers again if their physical inputs are still pending.
+        Callbacks only wake the owner; they never submit device work themselves.
+        """
 
         tickets = tuple(ticket for transfer in self.transfers for ticket in transfer.tickets)
-        if not tickets:
+        dependencies = self.storage_dependencies + tuple(
+            transfer.destination.completion
+            for transfer in self.transfers
+            if isinstance(transfer.destination, CacheWrite)
+        )
+        if not tickets and not dependencies:
             callback()
             return
         lock = Lock()
@@ -375,7 +468,11 @@ class PreparedExecution:
             """Invoke the callback once after every transfer ticket reports readiness."""
 
             nonlocal fired
-            if not all(ticket.ready() for ticket in tickets):
+            if self._finished:
+                return
+            if not all(ticket.ready() for ticket in tickets) or not all(
+                dependency.done() for dependency in dependencies
+            ):
                 return
             with lock:
                 if fired:
@@ -385,6 +482,8 @@ class PreparedExecution:
 
         for ticket in tickets:
             ticket.add_done_callback(notify_if_ready)
+        for dependency in dependencies:
+            dependency.add_done_callback(lambda _future: notify_if_ready())
         notify_if_ready()
 
     def bind(
@@ -403,12 +502,16 @@ class PreparedExecution:
     def resolve(self) -> RunResult:
         """Execute the bound batch once and guarantee release of its preparation resources."""
 
-        if not self.ready():
-            raise RuntimeError("prepared execution was observed before transfer readiness")
+        if self._finished:
+            raise RuntimeError("prepared execution has already finished")
+        if not self.advance():
+            raise RuntimeError("prepared execution was observed before dependency readiness")
         execute = self._execute
         if execute is None:
             raise RuntimeError("prepared execution has no worker binding")
         try:
+            for dependency in self.storage_dependencies:
+                dependency.result()
             return execute(self)
         finally:
             self._finish()
@@ -422,6 +525,10 @@ class PreparedExecution:
     def abandon(self) -> None:
         """Release predicate captures, transfer reads, and bound output candidates."""
 
+        if self._finished:
+            return
+        for transfer in self.transfers:
+            transfer.discard_destination()
         if self.predicates is not None:
             self.predicates.abandon()
         self._finish()
@@ -433,8 +540,22 @@ class PreparedExecution:
             return
         self._finished = True
         release = self._release
-        if release is not None:
-            release()
+        self._release = None
+        self._execute = None
+        self._prepare_inputs = None
+        error: BaseException | None = None
+        try:
+            for transfer in self.transfers:
+                try:
+                    transfer.close()
+                except BaseException as failure:
+                    if error is None:
+                        error = failure
+        finally:
+            if release is not None:
+                release()
+        if error is not None:
+            raise error
 
     def __del__(self) -> None:
         """Release unfinished preparation resources during finalization."""
@@ -473,9 +594,9 @@ class LaneLayout:
 
 @dataclass(frozen=True, slots=True)
 class LatentExecution:
-    """Binds a latent placement and request slot to its staged trajectory view."""
+    """Binds a latent params and request slot to its staged trajectory view."""
 
-    placement: LatentPlacement
+    params: LatentParams
     request_pool_idx: int
     staging: LatentStaging
 
@@ -488,23 +609,19 @@ class LaneState:
     started_ns: int
     graph_eligible: bool
     request_candidates: tuple[RequestDraft, ...]
-    request_bases: tuple[Request | None, ...]
     request_rows: dict[int, RequestDraft]
     completion: OutputBuffer
-    admissions: dict[RequestKey, NewRequest] = field(default_factory=dict)
     input_tokens: dict[ProductRef, tuple[int, ...]] = field(default_factory=dict)
     input_images: dict[ProductRef, str] = field(default_factory=dict)
     forward_rows: dict[OperationIdentity, tuple[RowGeometry, ...]] = field(default_factory=dict)
     layout: LaneLayout | None = None
     prepared_transfers: dict[ProductRef, PreparedTransferInput] = field(default_factory=dict)
-    transferred_device_products: dict[ProductRef, DeviceProductWrite] = field(default_factory=dict)
-    transferred_encoder_features: dict[ProductRef, EncoderWrite] = field(default_factory=dict)
-    cache_publication_inputs: dict[ProductRef, CachePublication] = field(default_factory=dict)
-    cache_publications: list[tuple[ProductRef, CachePublication]] = field(default_factory=list)
-    cache_installations: list[tuple[ProductRef, ProductRef, CachePublication]] = field(
+    cache_publication_inputs: dict[ProductRef, KvTransferValue] = field(default_factory=dict)
+    cache_publications: list[tuple[ProductRef, KvTransferValue]] = field(default_factory=list)
+    cache_installations: list[tuple[ProductRef, ProductRef, KvTransferValue]] = field(
         default_factory=list
     )
-    stage_publications: dict[OperationIdentity, tuple[Locator, ...]] = field(default_factory=dict)
+    stage_publications: dict[BufferId, tuple[Locator, ...]] = field(default_factory=dict)
     published: list[Locator] = field(default_factory=list)
     observations: list[RunObservation] = field(default_factory=list)
     component_us: dict[str, int] = field(default_factory=dict)
@@ -531,7 +648,7 @@ class LaneState:
     runtime_cache_lengths: dict[int, int | torch.Tensor] = field(default_factory=dict)
     registration_visible: bool = False
     cpu_tasks: dict[OperationIdentity, CpuTaskReservation] = field(default_factory=dict)
-    media_output_leases: dict[OperationIdentity, Any] = field(default_factory=dict)
+    media_output_leases: dict[OperationIdentity, VideoOutputRingLease] = field(default_factory=dict)
     latent_rows: dict[OperationIdentity, LatentExecution] = field(default_factory=dict)
     latent_publications: list[LatentPublication] = field(default_factory=list)
     latent_releases: list[LatentRelease] = field(default_factory=list)
@@ -598,12 +715,12 @@ class OperationState:
     """Tracks one operation from candidate preparation through result publication."""
 
     operation: Operation
-    lane: Any
+    lane: LaneState
     phase: str = "initial"
     data: dict[str, Any] = field(default_factory=dict)
-    rows: tuple[Any, ...] = ()
-    sample: Any | None = None
-    outcome: Any | None = None
+    rows: tuple[ForwardRow, ...] = ()
+    sample: SampleWork | None = None
+    outcome: Outcome | None = None
 
 
 def dependencies_ready(

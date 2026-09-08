@@ -10,13 +10,12 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
 import torch
 import torch.nn as nn
 
-from ..execution.batch import RunKind
-from ..execution.device_transfer import DeviceTransfer
+from ..execution.batch import OpCode
 from ..execution.forward_batch import (
     AttentionMode,
     ForwardBatch,
@@ -33,6 +32,7 @@ from ..nn import (
     ParallelLMHead,
     local_attention_head_count,
     local_kv_head_count,
+    local_kv_head_offset,
 )
 from ..nn.decoder import MoTConfig, MoTModel
 from ..nn.diffusion import (
@@ -68,6 +68,10 @@ from .runtime import (
     PositionLayout,
     ResourceGeometry,
 )
+
+if TYPE_CHECKING:
+    from ..loader.component import CheckpointComponent, ModelBuildContext, ModelConstruction
+
 
 __all__ = [
     "LLMConfig",
@@ -207,12 +211,12 @@ class _BagelGraph(nn.Module):
         cfg: BagelConfig,
         *,
         layer_config: LayerConfig,
-        transfers: DeviceTransfer = DeviceTransfer(),
+        generation_device: torch.device | None = None,
     ) -> None:
-        """Construct all route components against one placement and quantization policy."""
+        """Construct all route components against one params and quantization policy."""
 
         super().__init__()
-        self.transfers = transfers
+        self.generation_device = generation_device
         self.cfg = cfg
         hidden = cfg.llm.hidden_size
 
@@ -229,17 +233,22 @@ class _BagelGraph(nn.Module):
                 rope_theta=cfg.llm.rope_theta,
                 head_dim=cfg.llm.head_dim,
             ),
-            layer_config=layer_config,
-            transfers=transfers,
+            layer_config=layer_config.child("language_model.model"),
+            generation_device=generation_device,
         )
         self.lm_head = ParallelLMHead(
             hidden,
             cfg.llm.vocab_size,
             layer_config=layer_config,
+            prefix="language_model.lm_head",
             bias=False,
         )
-        self.vae2llm = LinearBase(cfg.patch_latent_dim, hidden, layer_config=layer_config)
-        self.llm2vae = LinearBase(hidden, cfg.patch_latent_dim, layer_config=layer_config)
+        self.vae2llm = LinearBase(
+            cfg.patch_latent_dim, hidden, layer_config=layer_config, prefix="vae2llm"
+        )
+        self.llm2vae = LinearBase(
+            hidden, cfg.patch_latent_dim, layer_config=layer_config, prefix="llm2vae"
+        )
         self.time_embedder = TimestepEmbedder(hidden)
         self.latent_pos_embed = PositionEmbedding(cfg.max_latent_size, hidden, init_sincos=False)
         self.vae = AutoEncoder(default_ae_params())
@@ -255,7 +264,7 @@ class _BagelGraph(nn.Module):
                 num_hidden_layers=cfg.vit_num_hidden_layers,
                 layer_norm_eps=cfg.vit_layer_norm_eps,
             ),
-            layer_config=layer_config,
+            layer_config=layer_config.child("vit_model.vision_model"),
         )
         self.connector = MLPConnector(cfg.vit_hidden_size, hidden, cfg.connector_act)
         self.vit_pos_embed = PositionEmbedding(
@@ -510,6 +519,86 @@ class BagelForConditionalGeneration(ExecutionModel):
 
     ordered_collective_execution = True
 
+    @classmethod
+    def build_checkpoint(
+        cls, config: dict[str, Any], context: ModelBuildContext
+    ) -> ModelConstruction:
+        """Interpret BAGEL component metadata and declare its two checkpoint namespaces."""
+
+        import json
+        import math
+
+        from ..foundation.errors import unsupported_setup
+        from ..loader.component import ModelConstruction
+
+        raw = dict(config)
+        for config_field, filename in (
+            ("llm_config", "llm_config.json"),
+            ("vit_config", "vit_config.json"),
+            ("vae_config", "vae_config.json"),
+        ):
+            if config_field in raw:
+                continue
+            path = context.root / filename
+            if not path.is_file():
+                raise unsupported_setup(
+                    f"BAGEL checkpoint is missing {filename!r} for {config_field!r}"
+                )
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(value, dict):
+                raise unsupported_setup(
+                    f"BAGEL checkpoint file {filename!r} must contain an object"
+                )
+            raw[config_field] = value
+        positions = context.sources[0].preview_shape("latent_pos_embed.pos_embed")[0]
+        max_latent_size = math.isqrt(positions)
+        if max_latent_size * max_latent_size != positions:
+            raise unsupported_setup(f"BAGEL latent position count {positions} is not square")
+        raw["max_latent_size"] = max_latent_size
+        prepared = BagelConfig.from_mapping(raw)
+        model = cls(
+            prepared,
+            layer_config=context.packed_decoder_layers("model"),
+            generation_device=(
+                None
+                if context.request.execution.generation_device is None
+                else torch.device(context.request.execution.generation_device)
+            ),
+        )
+        return ModelConstruction(model.checkpoint_components(), lambda: model, prepared)
+
+    def checkpoint_components(self) -> tuple[CheckpointComponent, ...]:
+        """Declare language/vision tensors and the independently serialized autoencoder."""
+
+        from ..loader.component import CheckpointComponent
+
+        return (
+            CheckpointComponent(
+                self.model,
+                map_weights=self.load_weights,
+                included=frozenset(self.checkpoint_parameter_names()),
+                module_devices=(
+                    ()
+                    if self.generation_device is None
+                    else tuple(
+                        (name, self.generation_device)
+                        for name, _ in self.model.named_modules()
+                        if name.endswith("_moe_gen")
+                    )
+                ),
+            ),
+            CheckpointComponent(
+                self.model.vae,
+                source="autoencoder",
+                map_weights=self.load_autoencoder_weights,
+                optional=frozenset(
+                    name
+                    for name, _ in self.model.vae.named_parameters()
+                    if name == "reg" or name.startswith("reg.")
+                ),
+            ),
+        )
+
     def load_weights(self, weights: Iterable[WeightHandle]) -> LoadReport:
         """Load BAGEL's root checkpoint into its language, vision, and connector graph."""
 
@@ -561,21 +650,21 @@ class BagelForConditionalGeneration(ExecutionModel):
         config: BagelConfig,
         *,
         layer_config: LayerConfig,
-        transfers: DeviceTransfer = DeviceTransfer(),
+        generation_device: torch.device | None = None,
         graph: _BagelGraph | None = None,
     ) -> None:
         """Bind graph geometry and route capabilities to the worker execution model."""
 
         super().__init__()
-        self.transfers = transfers
+        self.generation_device = generation_device
         if graph is not None and graph.cfg != config:
             raise ValueError("BAGEL graph and root must use the same immutable configuration")
         self.cfg = config
-        self._parallel = layer_config.parallel
+        self._parallel = layer_config.communicator
         self.model = (
             graph
             if graph is not None
-            else _BagelGraph(config, layer_config=layer_config, transfers=transfers)
+            else _BagelGraph(config, layer_config=layer_config, generation_device=generation_device)
         )
         llm = self.cfg.llm
         self.architecture = "BagelForConditionalGeneration"
@@ -636,6 +725,10 @@ class BagelForConditionalGeneration(ExecutionModel):
                 int(llm.num_attention_heads), parallel=self._parallel
             ),
             num_kv_heads=local_kv_head_count(int(llm.num_key_value_heads), parallel=self._parallel),
+            total_kv_heads=int(llm.num_key_value_heads),
+            kv_head_offset=local_kv_head_offset(
+                int(llm.num_key_value_heads), parallel=self._parallel
+            ),
             head_dim=int(llm.head_dim),
             dtype="bfloat16",
             store_dtype="bfloat16",
@@ -646,17 +739,17 @@ class BagelForConditionalGeneration(ExecutionModel):
         )
         self.supported_work = frozenset(
             {
-                RunKind.AR_EXTEND,
-                RunKind.AR_DECODE,
-                RunKind.AR_VERIFY,
-                RunKind.DIFFUSION_PREPARE,
-                RunKind.DIFFUSION_STEP,
-                RunKind.ENCODER_VISION,
-                RunKind.ENCODER_LATENT,
-                RunKind.DIFFUSION_FINALIZE,
-                RunKind.TRANSFER_PRODUCT,
-                RunKind.TRANSFER_KV_PUBLISH,
-                RunKind.TRANSFER_KV_INSTALL,
+                OpCode.AR_EXTEND,
+                OpCode.AR_DECODE,
+                OpCode.AR_VERIFY,
+                OpCode.DIFFUSION_PREPARE,
+                OpCode.DIFFUSION_STEP,
+                OpCode.ENCODER_VISION,
+                OpCode.ENCODER_LATENT,
+                OpCode.DIFFUSION_FINALIZE,
+                OpCode.TRANSFER_PRODUCT,
+                OpCode.TRANSFER_KV_PUBLISH,
+                OpCode.TRANSFER_KV_INSTALL,
             }
         )
         self.max_vit_grid_tokens = int(self.cfg.vit_token_capacity) + _BAGEL_IMAGE_MARKER_TOKENS

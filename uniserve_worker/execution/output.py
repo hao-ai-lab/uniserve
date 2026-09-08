@@ -7,6 +7,7 @@ import struct
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
+from functools import partial
 from threading import RLock
 from typing import Any, Final, cast
 
@@ -25,13 +26,12 @@ from ..execution.batch import (
     LogicalLengths,
     MediaOutput,
     ModelOutput,
+    OpCode,
     OpStatus,
     RequestKey,
-    RunKind,
     RunResult,
     TimingCounters,
     TokenSpan,
-    TransferHandle,
     TransferResult,
 )
 from ..foundation.errors import WorkerError, WorkerErrorCode, invalid_descriptor, resource_error
@@ -41,7 +41,6 @@ from ..runtime.cpu import CpuTaskReservation
 from ..runtime.device import canonical_device
 from ..runtime.device_events import DeviceEventPool
 from ..runtime.request import RequestRuntime
-from ..transfer.tickets import Locator, Transport, encode_transfer_handle
 
 __all__ = [
     "CpuJob",
@@ -52,7 +51,6 @@ __all__ = [
     "LogprobPayload",
     "SamplingCapture",
     "SamplingOutputRow",
-    "TransferPayload",
     "ByteCapture",
     "OutputBuffer",
     "OutputPool",
@@ -153,6 +151,8 @@ class OutputBuffer:
         "_timing",
         "_timing_events",
         "_retained_until_ready",
+        "_completion_future",
+        "_completion_registered",
         "_release_to_pool",
         "_released_to_pool",
     )
@@ -210,6 +210,8 @@ class OutputBuffer:
         self._timing: tuple[int, int, int, int] | None = None
         self._timing_events = timing_events_enabled()
         self._retained_until_ready: list[object] = []
+        self._completion_future: concurrent.futures.Future[None] | None = None
+        self._completion_registered = False
         self._release_to_pool = release_to_pool
         self._released_to_pool = False
 
@@ -271,6 +273,8 @@ class OutputBuffer:
         self._timing = None
         self._timing_events = timing_events_enabled()
         self._retained_until_ready.clear()
+        self._completion_future = None
+        self._completion_registered = False
         self._released_to_pool = False
 
     @property
@@ -452,6 +456,7 @@ class OutputBuffer:
             self.event_pool.schedule_completion_wake(device, event)
         self._sealed = True
         self._sealed_ns = time.perf_counter_ns()
+        self._bind_completion()
 
     def ready(self) -> bool:
         """Return whether all sealed device-copy events have completed."""
@@ -464,7 +469,52 @@ class OutputBuffer:
             return False
         self._ready_ns = time.perf_counter_ns()
         self._retained_until_ready.clear()
+        self._complete_dependents()
         return True
+
+    def completion_future(self) -> concurrent.futures.Future[None]:
+        """Expose this output lease's existing device fence to physical storage owners.
+
+        The future belongs to this lease even after the pinned buffer is reused.
+        It adds no CUDA event or host/device payload allocation.
+        """
+
+        if self._completion_future is None:
+            self._completion_future = concurrent.futures.Future()
+        future = self._completion_future
+        self._bind_completion()
+        if self.ready():
+            self._complete_dependents()
+        return future
+
+    def _bind_completion(self) -> None:
+        future = self._completion_future
+        if not self._sealed or future is None or self._completion_registered:
+            return
+        self._completion_registered = True
+        if self._ready_ns or self._events_released or not self._events:
+            self._resolve_completion(future)
+            return
+        # Physical retirement is independent of whether a host reads the output
+        # report. Retain the existing fences until the event loop observes them,
+        # and bind the callback to this lease's future across buffer reuse.
+        for device in self.devices:
+            self.event_pool.retain(self._events[str(device)], device)
+        self.event_pool.defer_release(
+            tuple(self._events.values()),
+            future,
+            completed=partial(self._resolve_completion, future),
+        )
+
+    @staticmethod
+    def _resolve_completion(future: concurrent.futures.Future[None]) -> None:
+        if not future.done():
+            future.set_result(None)
+
+    def _complete_dependents(self) -> None:
+        future = self._completion_future
+        if future is not None:
+            self._resolve_completion(future)
 
     def retain_until_ready(self, owner: object) -> None:
         """Keep an external resource alive until every registered copy completes."""
@@ -614,7 +664,7 @@ class OutputBuffer:
         events = self._all_events()
         if events:
             self._release_pending = True
-            self.event_pool.defer_release(events, self)
+            self.event_pool.defer_release(events, self, completed=self.events_released)
         else:
             self._events_released = True
             self._return_to_pool()
@@ -624,6 +674,7 @@ class OutputBuffer:
 
         self._release_pending = False
         self._events_released = True
+        self._complete_dependents()
         self._return_to_pool()
 
     def _return_to_pool(self) -> None:
@@ -699,12 +750,20 @@ class OutputPool:
             self._free.append(buffer)
 
     def close(self) -> None:
-        """Prevent new leases and release references to every pooled output buffer."""
+        """Stop admission and retire every output lease through its existing device fences."""
 
         with self._lock:
             self._closed = True
+            buffers = tuple(self._buffers)
             self._free.clear()
             self._buffers.clear()
+        for buffer in buffers:
+            if not buffer._events_released:
+                buffer.seal()
+                for event in buffer._all_events():
+                    event.synchronize()
+            buffer.abandon()
+        self.event_pool.reap()
 
 
 class _InvalidSamplingDistribution(RuntimeError):
@@ -946,11 +1005,7 @@ class LogprobOutputRow:
         """Return the maximum unique log-probability entries this row can encode."""
 
         local = self.capture.rows.index(int(self.index))
-        return (
-            1
-            + int(self.capture.counts[local])
-            + len(self.capture.requested_ids[local])
-        )
+        return 1 + int(self.capture.counts[local]) + len(self.capture.requested_ids[local])
 
 
 class CpuJob:
@@ -1097,7 +1152,7 @@ class LogprobPayload:
 
         self.selected = selected
         self.prompt = prompt
-        self._value: TransferHandle | None = None
+        self._value: bytes | None = None
 
     def ready(self) -> bool:
         """Return whether every selected and prompt log-probability capture is query-ready."""
@@ -1146,57 +1201,6 @@ class LogprobPayload:
         """Serialize captured log-probability records to their binary payload."""
 
         return self.finalize()
-
-
-class TransferPayload:
-    """Owns an asynchronous transfer ticket until its encoded handle is ready."""
-
-    __slots__ = (
-        "kind",
-        "descriptor_value",
-        "locators",
-        "transport",
-        "_value",
-    )
-
-    def __init__(
-        self,
-        kind: str,
-        descriptor_value: dict[str, object],
-        locators: tuple[Locator, ...],
-        transport: Transport,
-    ) -> None:
-        """Retain transport locators until every producer becomes externally readable."""
-
-        self.kind = kind
-        self.descriptor_value = descriptor_value
-        self.locators = locators
-        self.transport = transport
-        self._value: TransferHandle | None = None
-
-    def ready(self) -> bool:
-        """Indicate whether every asynchronous transfer descriptor is available."""
-
-        return self._value is not None or all(
-            self.transport.ready(locator) for locator in self.locators
-        )
-
-    def max_encoded_bytes(self) -> int:
-        """Bound the encoded transport handle using its kind and descriptor schema."""
-
-        return encode_transfer_handle(self.kind, self.descriptor_value).encoded_size_bound()
-
-    def finalize(self) -> TransferHandle:
-        """Return the encoded transfer handle after its asynchronous ticket completes."""
-
-        if self._value is None:
-            if not self.ready():
-                raise RuntimeError("transport descriptor was observed before producer readiness")
-            self._value = encode_transfer_handle(
-                self.kind,
-                self.descriptor_value,
-            )
-        return self._value
 
 
 class ImagePayload:
@@ -1285,7 +1289,7 @@ class OutputRecord:
 
     request_key: RequestKey
     op_id: int
-    kind: RunKind
+    kind: OpCode
     completion_slot_generation: int
     status: OpStatus
     selected_point: int
@@ -1329,7 +1333,7 @@ class PendingOutput:
         parent: CompletionState | None,
         buffer: OutputBuffer,
         row: int,
-        predicated_parent: Callable[[], tuple[Checkpoint, RequestRuntime]],
+        predicated_parent: Callable[[], tuple[Checkpoint | None, RequestRuntime]],
         *,
         status: OpStatus,
         selected_point: int,
@@ -1348,7 +1352,7 @@ class PendingOutput:
         self._observed = False
         self._invalid_sampling = False
         self._predicated = status is OpStatus.PREDICATED
-        self._predicated_parent: Callable[[], tuple[Checkpoint, RequestRuntime]] | None = (
+        self._predicated_parent: Callable[[], tuple[Checkpoint | None, RequestRuntime]] | None = (
             predicated_parent
         )
         self._selected_point = int(selected_point)
@@ -1374,7 +1378,7 @@ class PendingOutput:
         return self
 
     @property
-    def request_key(self) -> object:
+    def request_key(self) -> RequestKey:
         """Identify the request generation that owns the bound completion record."""
 
         if self._record is None:
@@ -1498,10 +1502,10 @@ class PendingOutput:
         if predicated_parent is None:
             raise RuntimeError("predicated completion lost its parent resolver")
         selected, runtime = predicated_parent()
-        point = selected.point
-        if not isinstance(point, FixedCheckpoint):
+        point = None if selected is None else selected.point
+        if point is not None and not isinstance(point, FixedCheckpoint):
             raise RuntimeError("predicated operation selected a non-fixed parent")
-        self._selected_point = int(point.point_index)
+        self._selected_point = 0 if point is None else int(point.point_index)
         self._selected_runtime = runtime
 
     def completion_timing(self) -> tuple[int, int, int, int]:
@@ -1568,16 +1572,16 @@ class PendingOutput:
             buffer.discard(self._row, self._generation)
 
 
-def _record_ready(record: ModelOutput | PendingOutput) -> bool:
+def _record_ready(record: ModelOutput | CompletionState) -> bool:
     """Return whether a completion's device and CPU output work has landed."""
 
-    return record.ready() if isinstance(record, PendingOutput) else True
+    return isinstance(record, ModelOutput) or record.ready()
 
 
-def _finalized_record(record: ModelOutput | PendingOutput) -> ModelOutput:
+def _finalized_record(record: ModelOutput | CompletionState) -> ModelOutput:
     """Require and return a concrete model-output record."""
 
-    return record.finalize() if isinstance(record, PendingOutput) else record
+    return record if isinstance(record, ModelOutput) else record.finalize()
 
 
 def _concrete_record(
@@ -1628,15 +1632,17 @@ def _concrete_record(
         span = TokenSpan(base=int(span.base), len=int(span.len))
     payload_type = (
         ArResult
-        if record.kind in {RunKind.AR_EXTEND, RunKind.AR_DECODE, RunKind.AR_VERIFY}
+        if record.kind in {OpCode.AR_EXTEND, OpCode.AR_DECODE, OpCode.AR_VERIFY}
         else EncoderResult
-        if record.kind in {RunKind.ENCODER_VISION, RunKind.ENCODER_LATENT}
+        if record.kind in {OpCode.ENCODER_VISION, OpCode.ENCODER_LATENT, OpCode.ENCODER_TEXT}
         else DiffusionResult
-        if record.kind in {
-            RunKind.DIFFUSION_PREPARE,
-            RunKind.DIFFUSION_STEP,
-            RunKind.DIFFUSION_DECODE,
-            RunKind.DIFFUSION_FINALIZE,
+        if record.kind
+        in {
+            OpCode.DIFFUSION_PREPARE,
+            OpCode.DIFFUSION_STEP,
+            OpCode.DIFFUSION_DECODE,
+            OpCode.MEDIA_APPEND,
+            OpCode.DIFFUSION_FINALIZE,
         }
         else TransferResult
     )
@@ -1739,7 +1745,7 @@ def run_result_ready(report: RunResult) -> bool:
     for product in report.products:
         if not _completion_payload_ready(product.payload):
             return False
-    return True
+    return report.retirement is None or report.retirement()
 
 
 def lane_completion_ready(lane: LaneResult) -> bool:
@@ -1760,7 +1766,7 @@ def _completion_payload_ready(payload: object) -> bool:
     return (
         not isinstance(
             payload,
-            (ImagePayload, LogprobPayload, TransferPayload),
+            (ImagePayload, LogprobPayload),
         )
         or payload.ready()
     )
@@ -1777,9 +1783,7 @@ def finalize_run_result(report: RunResult) -> RunResult:
             for record in lane.completions
         )
         nonpublishing_ops = {
-            int(record.op_id)
-            for record in completions
-            if record.status is not OpStatus.OK
+            int(record.op_id) for record in completions if record.status is not OpStatus.OK
         }
         retained_products = tuple(
             product
@@ -1793,7 +1797,6 @@ def finalize_run_result(report: RunResult) -> RunResult:
                 (
                     ImagePayload,
                     LogprobPayload,
-                    TransferPayload,
                 ),
             )
             and product.payload.ready()
@@ -1801,9 +1804,8 @@ def finalize_run_result(report: RunResult) -> RunResult:
             for product in retained_products
         )
         for product in products:
-            if (
-                isinstance(product.payload, bytes)
-                and len(product.payload) > int(product.product.max_bytes)
+            if isinstance(product.payload, bytes) and len(product.payload) > int(
+                product.product.max_bytes
             ):
                 raise invalid_descriptor(
                     "completion product exceeds its registered product byte bound"
@@ -1815,12 +1817,13 @@ def finalize_run_result(report: RunResult) -> RunResult:
             and all(
                 not isinstance(
                     product.payload,
-                    (ImagePayload, LogprobPayload, TransferPayload),
+                    (ImagePayload, LogprobPayload),
                 )
                 for product in products
             )
         )
         if publication_ready:
+            assert publication is not None
             publication.finish(cast(tuple[ModelOutput, ...], completions))
         if (
             not all(new is old for new, old in zip(completions, lane.completions, strict=True))
@@ -1836,4 +1839,8 @@ def finalize_run_result(report: RunResult) -> RunResult:
                 publication=None if publication_ready else publication,
             )
         lanes.append(lane)
-    return replace(report, lanes=tuple(lanes)) if changed else report
+    retirement = report.retirement
+    if retirement is not None and retirement():
+        retirement = None
+        changed = True
+    return replace(report, lanes=tuple(lanes), retirement=retirement) if changed else report

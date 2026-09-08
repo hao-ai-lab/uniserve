@@ -6,7 +6,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 
 from ..foundation.errors import WorkerError, classify, invalid_descriptor
-from .batch import LaneResult, Run, RunResult, TransferHandle
+from .batch import Finish, Free, LaneResult, ModelOutput, Retire, Run, RunResult, TransferHandle
 from .output import _completion_payload_ready, _record_ready, finalize_run_result
 from .rows import PreparedExecution
 
@@ -44,9 +44,7 @@ def _validate_report(run: WorkerRun, report: RunResult) -> None:
         raise invalid_descriptor("result run identity does not match its submission")
     if tuple(int(lane.lane_id) for lane in report.lanes) != run.lane_order:
         raise invalid_descriptor("terminal report lane identity does not match its submission")
-    for lane, expected_keys in zip(
-        report.lanes, run.lane_operation_keys, strict=True
-    ):
+    for lane, expected_keys in zip(report.lanes, run.lane_operation_keys, strict=True):
         actual_keys = tuple(
             (
                 int(record.request_key.request_id),
@@ -145,15 +143,13 @@ class LaneRun:
         if len(report.lanes) != 1:
             raise RuntimeError("completion materialization changed lane cardinality")
         result = report.lanes[0]
+        for record in result.completions:
+            if not isinstance(record, ModelOutput):
+                raise RuntimeError("materialized completion still has a pending output")
+            if any(type(token) is not int for token in record.committed_tokens):
+                raise RuntimeError("materialized completion carries an unresolved committed token")
         if any(
-            type(token) is not int
-            for record in result.completions
-            for token in record.committed_tokens
-        ):
-            raise RuntimeError("materialized completion carries an unresolved committed token")
-        if any(
-            not isinstance(product.payload, (bytes, TransferHandle))
-            for product in result.products
+            not isinstance(product.payload, (bytes, TransferHandle)) for product in result.products
         ):
             raise RuntimeError("materialized completion contains an unresolved product payload")
         self.result = result
@@ -190,6 +186,8 @@ class WorkerRun:
         "error",
         "report",
         "active_readers",
+        "requires_command_ack",
+        "_retirement",
         "_source",
         "_on_successors_ready",
         "_on_ready",
@@ -216,8 +214,7 @@ class WorkerRun:
         self.epochs = epochs
         self.lane_order = tuple(int(lane.lane_id) for lane in run.lanes)
         self.lane_operation_keys = tuple(
-            tuple(_operation_key(operation) for operation in lane.operations)
-            for lane in run.lanes
+            tuple(_operation_key(operation) for operation in lane.operations) for lane in run.lanes
         )
         self.lanes = tuple(LaneRun(value) for value in self.lane_order)
         self.weight = max(1, len(run.operations))
@@ -225,6 +222,10 @@ class WorkerRun:
         self.error: WorkerError | None = None
         self.report: RunResult | None = None
         self.active_readers = 0
+        self.requires_command_ack = any(
+            isinstance(command, (Free, Finish, Retire)) for command in run.commands
+        )
+        self._retirement: Callable[[], bool] | None = None
         self._source: RunResult | PreparedExecution | None = None
         self._on_successors_ready = on_successors_ready
         self._on_ready = on_ready
@@ -274,10 +275,7 @@ class WorkerRun:
     def advance_execution(self) -> bool:
         """Launch a prepared batch once its input transfers and predicates are ready."""
 
-        if self.complete or (
-            self.lanes
-            and all(lane.state != "PREPARED" for lane in self.lanes)
-        ):
+        if self.complete or self.state == "FINISHING":
             return True
         source = self._source
         if source is None:
@@ -286,22 +284,17 @@ class WorkerRun:
             if isinstance(source, RunResult):
                 report = source
             else:
-                if not source.ready():
+                if not source.advance():
                     return False
                 report = source.resolve()
             _validate_report(self, report)
             for lane, raw in zip(self.lanes, report.lanes, strict=True):
                 lane.launch(raw)
+            self._retirement = report.retirement
             self._source = None
             self.state = "FINISHING"
-            if all(lane.successors_ready for lane in self.lanes):
+            if self.lanes and all(lane.successors_ready for lane in self.lanes):
                 self._notify_successors_ready()
-            if not self.lanes:
-                self.report = RunResult(
-                    batch_id=self.batch_id, run_id=self.run_id, lanes=(), done=True
-                )
-                self.state = "TERMINAL"
-                self._notify_terminal()
             return True
         except BaseException as error:
             self.fail(error, context="execute")
@@ -320,12 +313,14 @@ class WorkerRun:
                 self._on_ready(self)
             if any(lane.result is None for lane in self.lanes):
                 return
+            if self._retirement is not None:
+                if not self._retirement():
+                    return
+                self._retirement = None
             report = RunResult(
                 batch_id=self.batch_id,
                 run_id=self.run_id,
-                lanes=tuple(
-                    lane.result for lane in self.lanes if lane.result is not None
-                ),
+                lanes=tuple(lane.result for lane in self.lanes if lane.result is not None),
                 done=True,
             )
             _validate_report(self, report)
@@ -362,14 +357,14 @@ class WorkerRun:
 class RunReader:
     """Independent wire cursor over the immutable results of one physical run."""
 
-    __slots__ = ("run", "_sent", "_empty_sent", "_error_sent", "_closed", "_on_close")
+    __slots__ = ("run", "_sent", "_terminal_sent", "_error_sent", "_closed", "_on_close")
 
     def __init__(self, run: WorkerRun, on_close: Callable[[RunReader], None]) -> None:
         """Create a cursor that emits each published lane or terminal error once."""
 
         self.run = run
         self._sent: set[int] = set()
-        self._empty_sent = False
+        self._terminal_sent = False
         self._error_sent = False
         self._closed = False
         self._on_close = on_close
@@ -404,12 +399,9 @@ class RunReader:
         self.run.advance()
         if self.run.error is not None:
             return not self._error_sent
-        if any(
-            int(lane.lane_id) not in self._sent
-            for lane in self.run.published_lanes()
-        ):
+        if any(int(lane.lane_id) not in self._sent for lane in self.run.published_lanes()):
             return True
-        return bool(self.run.complete and not self.run.lane_order and not self._empty_sent)
+        return self.run.complete and not self._terminal_sent
 
     def take_ready(self) -> RunResult:
         """Return the next report at the cursor and advance past completed lanes."""
@@ -418,21 +410,29 @@ class RunReader:
         if self.run.error is not None:
             raise RuntimeError("terminal error must be consumed through take_error")
         lanes = tuple(
-            lane
-            for lane in self.run.published_lanes()
-            if int(lane.lane_id) not in self._sent
+            lane for lane in self.run.published_lanes() if int(lane.lane_id) not in self._sent
         )
         if lanes:
+            # A fragment's aggregate counters belong to one computation entry.
+            # Entry participants can differ even within the same physical run.
+            entries = {int(lane.lane_id): lane.operations[0].entry for lane in self.run.run.lanes}
+            entry = entries[int(lanes[0].lane_id)]
+            lanes = tuple(lane for lane in lanes if entries[int(lane.lane_id)] == entry)
             self._sent.update(int(lane.lane_id) for lane in lanes)
-            done = self.run.complete and len(self._sent) == len(self.run.lane_order)
+            done = (
+                self.run.complete
+                and len(self._sent) == len(self.run.lane_order)
+                and not self.run.requires_command_ack
+            )
+            self._terminal_sent = done
             return RunResult(
                 batch_id=self.run.batch_id,
                 run_id=self.run.run_id,
                 lanes=lanes,
                 done=done,
             )
-        if self.run.complete and not self.run.lane_order and not self._empty_sent:
-            self._empty_sent = True
+        if self.run.complete and not self._terminal_sent:
+            self._terminal_sent = True
             return RunResult(
                 batch_id=self.run.batch_id, run_id=self.run.run_id, lanes=(), done=True
             )
@@ -448,18 +448,11 @@ class RunReader:
         return error
 
     def pending(self) -> bool:
-        """Return the number of lanes at or beyond the reader cursor that remain incomplete."""
+        """Indicate whether the cursor still owes a result or terminal acknowledgement."""
 
         if self.run.error is not None:
             return not self._error_sent
-        if not self.run.complete:
-            return True
-        if not self.run.lane_order:
-            return not self._empty_sent
-        return any(
-            int(lane.lane_id) not in self._sent
-            for lane in self.run.published_lanes()
-        )
+        return not self._terminal_sent
 
     def close(self) -> None:
         """Release this reader’s reference to the underlying worker run."""

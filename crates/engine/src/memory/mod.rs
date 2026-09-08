@@ -1,12 +1,12 @@
-//! Scheduler-owned logical device allocations and worker placement descriptors.
+//! Scheduler-owned logical device allocations and worker region descriptors.
 //!
 //! The manager reserves request slots, paged KV blocks, latent regions, and
 //! aligned buffers. Allocation identities remain host-side; workers receive
-//! immutable placements derived from them.
+//! immutable regions derived from them.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use uniserve_core::{BlockId, HashAlgo, RequestId};
+use uniserve_core::{BlockId, HashAlgo};
 use uniserve_worker_ipc::{BufferId, RequestKey, WorkerInfo};
 
 use crate::kv::{BlockPool, BlockTable, EncoderCacheManager, KvCacheCoordinator};
@@ -41,9 +41,9 @@ pub enum MemoryLayout {
     },
 }
 
-/// Immutable worker-visible placement of a logical allocation.
+/// Immutable worker-visible region of a logical allocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Placement {
+pub enum AllocationRegion {
     /// Stable request-state row assigned to the allocation.
     RequestSlot {
         /// Positive row index; zero remains reserved for inactive graph input.
@@ -58,7 +58,7 @@ pub enum Placement {
     Latent {
         /// Latent page identifiers in logical order.
         pages: Vec<u32>,
-        /// Logical latent units covered by the placement.
+        /// Logical latent units covered by the region.
         units: u64,
     },
     /// Address span in the persistent-buffer arena.
@@ -74,8 +74,15 @@ pub enum Placement {
 enum AllocationBacking {
     RequestSlot(u32),
     Kv(Vec<BlockTable>),
-    Latent(RequestId),
-    Buffer { offset: u64, bytes: u64 },
+    Latent {
+        pages: Vec<u32>,
+        units: u64,
+    },
+    Buffer {
+        offset: u64,
+        bytes: u64,
+        capacity: u64,
+    },
 }
 
 /// An owned logical allocation. The handle is intentionally not cloneable;
@@ -84,8 +91,6 @@ enum AllocationBacking {
 pub struct Allocation {
     id: AllocationId,
     owner: RequestKey,
-    layout: MemoryLayout,
-    placement: Placement,
     backing: AllocationBacking,
 }
 
@@ -100,14 +105,24 @@ impl Allocation {
         self.owner
     }
 
-    /// Returns the requested logical resource shape.
-    pub fn layout(&self) -> &MemoryLayout {
-        &self.layout
-    }
-
-    /// Returns the worker-visible physical placement.
-    pub fn placement(&self) -> &Placement {
-        &self.placement
+    /// Projects the currently authorized physical region from its owned storage.
+    pub fn region(&self) -> AllocationRegion {
+        match &self.backing {
+            AllocationBacking::RequestSlot(index) => {
+                AllocationRegion::RequestSlot { index: *index }
+            }
+            AllocationBacking::Kv(tables) => AllocationRegion::Kv {
+                tables: tables.iter().map(BlockTable::page_ids).collect(),
+            },
+            AllocationBacking::Latent { pages, units } => AllocationRegion::Latent {
+                pages: pages.clone(),
+                units: *units,
+            },
+            AllocationBacking::Buffer { offset, bytes, .. } => AllocationRegion::Buffer {
+                offset: *offset,
+                bytes: *bytes,
+            },
+        }
     }
 
     /// Returns the request-slot identifier.
@@ -220,88 +235,55 @@ impl RequestSlotPool {
 /// Fixed-size page allocator for request-owned latent storage.
 pub(crate) struct LatentPagePool {
     page_units: u32,
+    capacity: usize,
     free: Vec<u32>,
-    owners: Vec<Option<RequestId>>,
-    allocations: HashMap<RequestId, Vec<u32>>,
 }
 
 impl LatentPagePool {
-    /// Creates an allocator for the supplied capacity.
+    /// Creates an allocator with page zero reserved for inactive input.
     fn new(num_pages: u32, page_units: u32) -> Self {
         Self {
             page_units,
+            capacity: num_pages.saturating_sub(1) as usize,
             free: (1..num_pages).rev().collect(),
-            owners: vec![None; num_pages as usize],
-            allocations: HashMap::new(),
         }
     }
 
-    /// Computes the number of pages required for a byte count.
+    /// Computes the number of physical pages needed for logical latent units.
     fn pages_needed(&self, units: u64) -> Option<usize> {
         if units == 0 {
             return Some(0);
         }
-        let page_units = u64::from(self.page_units);
-        if page_units == 0 {
+        if self.page_units == 0 {
             return None;
         }
-        usize::try_from(units.div_ceil(page_units)).ok()
+        usize::try_from(units.div_ceil(u64::from(self.page_units))).ok()
     }
 
-    /// Returns whether the requested page count can be reserved.
-    pub(crate) fn can_reserve(&self, request_id: RequestId, units: u64) -> bool {
+    /// Extends an allocation atomically; narrowing retains its backing pages.
+    fn reserve(&mut self, pages: &mut Vec<u32>, units: u64) -> bool {
         let Some(needed) = self.pages_needed(units) else {
             return false;
         };
-        let held = self.allocations.get(&request_id).map_or(0, Vec::len);
-        needed.saturating_sub(held) <= self.free.len()
-    }
-
-    /// Reserves the requested capacity.
-    pub(crate) fn reserve(&mut self, request_id: RequestId, units: u64) -> bool {
-        if !self.can_reserve(request_id, units) {
+        let additional = needed.saturating_sub(pages.len());
+        if additional > self.free.len() {
             return false;
         }
-        let needed = self.pages_needed(units).unwrap_or_default();
-        let held = self.allocations.get(&request_id).map_or(0, Vec::len);
-        let mut pages = Vec::with_capacity(needed.saturating_sub(held));
-        for _ in held..needed {
-            let page = self.free.pop().expect("latent free-page invariant");
-            self.owners[page as usize] = Some(request_id);
-            pages.push(page);
+        pages.reserve(additional);
+        for _ in 0..additional {
+            pages.push(self.free.pop().expect("latent free-page invariant"));
         }
-        self.allocations
-            .entry(request_id)
-            .or_default()
-            .extend(pages);
         true
     }
 
-    /// Returns the pages owned by an allocation.
-    pub(crate) fn pages_for(&self, request_id: RequestId) -> &[u32] {
-        self.allocations
-            .get(&request_id)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
-    }
-
-    /// Releases the supplied allocation.
-    pub(crate) fn release(&mut self, request_id: RequestId) {
-        if let Some(pages) = self.allocations.remove(&request_id) {
-            for page in pages.into_iter().rev() {
-                self.owners[page as usize] = None;
-                self.free.push(page);
-            }
-        }
+    /// Returns exclusively owned pages after the allocation retires.
+    fn release(&mut self, pages: Vec<u32>) {
+        self.free.extend(pages.into_iter().rev());
     }
 
     /// Returns the number of allocated pages.
     pub(crate) fn used_pages(&self) -> usize {
-        self.owners
-            .iter()
-            .skip(1)
-            .filter(|owner| owner.is_some())
-            .count()
+        self.capacity - self.free.len()
     }
 }
 
@@ -323,7 +305,7 @@ pub(crate) fn worker_kv_state(info: &WorkerInfo) -> Option<KvMemoryState> {
                 .groups
                 .iter()
                 .map(|group| {
-                    let shape = (group.kind, offset, group.num_blocks);
+                    let shape = (offset, group.num_blocks);
                     offset = offset.saturating_add(group.num_blocks);
                     shape
                 })
@@ -498,7 +480,7 @@ impl Memory {
         id
     }
 
-    /// Reserves one request-owned resource and returns its immutable placement.
+    /// Reserves one request-owned resource and returns its immutable region.
     ///
     /// # Errors
     ///
@@ -509,20 +491,15 @@ impl Memory {
         owner: RequestKey,
         layout: MemoryLayout,
     ) -> Result<Allocation, OutOfMemory> {
-        let recorded_layout = layout.clone();
-
         // Each resource class records enough backing state to release or grow
-        // the placement without consulting the caller's requested layout.
-        let (placement, backing) = match layout {
+        // the region without consulting the caller's requested layout.
+        let backing = match layout {
             MemoryLayout::RequestSlot => {
                 let index = self
                     .request_slots
                     .acquire()
                     .ok_or(OutOfMemory::RequestSlots)?;
-                (
-                    Placement::RequestSlot { index },
-                    AllocationBacking::RequestSlot(index),
-                )
+                AllocationBacking::RequestSlot(index)
             }
             MemoryLayout::Kv { tokens, groups } => {
                 let cache = self.cache.as_ref().ok_or(OutOfMemory::Kv)?;
@@ -536,20 +513,14 @@ impl Memory {
                     .coordinator
                     .ensure_capacity(&cache.block_pool, &mut tables, tokens as usize)
                     .ok_or(OutOfMemory::Kv)?;
-                let placement = Placement::Kv {
-                    tables: tables.iter().map(BlockTable::page_ids).collect(),
-                };
-                (placement, AllocationBacking::Kv(tables))
+                AllocationBacking::Kv(tables)
             }
             MemoryLayout::Latent { units } => {
-                if !self.latent_pages.reserve(owner.request_id, units) {
+                let mut pages = Vec::new();
+                if !self.latent_pages.reserve(&mut pages, units) {
                     return Err(OutOfMemory::Latent);
                 }
-                let pages = self.latent_pages.pages_for(owner.request_id).to_vec();
-                (
-                    Placement::Latent { pages, units },
-                    AllocationBacking::Latent(owner.request_id),
-                )
+                AllocationBacking::Latent { pages, units }
             }
             MemoryLayout::Buffer { bytes, alignment } => {
                 if bytes == 0 || alignment == 0 || !alignment.is_power_of_two() {
@@ -559,21 +530,16 @@ impl Memory {
                     .buffers
                     .alloc(bytes, alignment)
                     .ok_or(OutOfMemory::Buffer)?;
-                (
-                    Placement::Buffer { offset, bytes },
-                    AllocationBacking::Buffer { offset, bytes },
-                )
+                AllocationBacking::Buffer {
+                    offset,
+                    bytes,
+                    capacity: bytes,
+                }
             }
         };
 
         let id = self.allocation_id();
-        Ok(Allocation {
-            id,
-            owner,
-            layout: recorded_layout,
-            placement,
-            backing,
-        })
+        Ok(Allocation { id, owner, backing })
     }
 
     /// Expands or narrows a live allocation within its existing resource class.
@@ -586,15 +552,13 @@ impl Memory {
         &mut self,
         allocation: &mut Allocation,
         layout: MemoryLayout,
-    ) -> Result<Placement, OutOfMemory> {
+    ) -> Result<AllocationRegion, OutOfMemory> {
         if !self.live.contains(&allocation.id) {
             return Err(OutOfMemory::InvalidLayout);
         }
 
-        let placement = match (&mut allocation.backing, &layout) {
-            (AllocationBacking::RequestSlot(index), MemoryLayout::RequestSlot) => {
-                Placement::RequestSlot { index: *index }
-            }
+        match (&mut allocation.backing, &layout) {
+            (AllocationBacking::RequestSlot(_), MemoryLayout::RequestSlot) => {}
             (AllocationBacking::Kv(tables), MemoryLayout::Kv { tokens, groups }) => {
                 let cache = self.cache.as_ref().ok_or(OutOfMemory::Kv)?;
                 if *groups as usize != tables.len() {
@@ -604,62 +568,56 @@ impl Memory {
                     .coordinator
                     .ensure_capacity(&cache.block_pool, tables, *tokens as usize)
                     .ok_or(OutOfMemory::Kv)?;
-                Placement::Kv {
-                    tables: tables.iter().map(BlockTable::page_ids).collect(),
-                }
-            }
-            (AllocationBacking::Latent(request_id), MemoryLayout::Latent { units }) => {
-                if !self.latent_pages.reserve(*request_id, *units) {
-                    return Err(OutOfMemory::Latent);
-                }
-                Placement::Latent {
-                    pages: self.latent_pages.pages_for(*request_id).to_vec(),
-                    units: *units,
-                }
             }
             (
-                AllocationBacking::Buffer { offset, bytes },
+                AllocationBacking::Latent {
+                    pages,
+                    units: held_units,
+                },
+                MemoryLayout::Latent { units },
+            ) => {
+                if !self.latent_pages.reserve(pages, *units) {
+                    return Err(OutOfMemory::Latent);
+                }
+                *held_units = *units;
+            }
+            (
+                AllocationBacking::Buffer {
+                    offset,
+                    bytes,
+                    capacity,
+                },
                 MemoryLayout::Buffer {
                     bytes: requested,
                     alignment,
                 },
             ) => {
-                if *requested <= *bytes {
-                    Placement::Buffer {
-                        offset: *offset,
-                        bytes: *requested,
-                    }
-                } else {
-                    if *alignment == 0 || !alignment.is_power_of_two() {
-                        return Err(OutOfMemory::InvalidLayout);
-                    }
-
-                    // Preserve the current buffer unless replacement allocation
-                    // succeeds; an in-place extension keeps its stable offset.
-                    let new_offset = if self.buffers.grow_in_place(*offset, *bytes, *requested) {
-                        *offset
-                    } else {
-                        let new_offset = self
-                            .buffers
-                            .alloc(*requested, *alignment)
-                            .ok_or(OutOfMemory::Buffer)?;
-                        self.buffers.free(*offset, *bytes);
-                        new_offset
-                    };
-                    *offset = new_offset;
-                    *bytes = *requested;
-                    Placement::Buffer {
-                        offset: new_offset,
-                        bytes: *requested,
-                    }
+                if *requested == 0 || *alignment == 0 || !alignment.is_power_of_two() {
+                    return Err(OutOfMemory::InvalidLayout);
                 }
+                let aligned = offset.is_multiple_of(u64::from(*alignment));
+                if *requested > *capacity || !aligned {
+                    // Keep the current reservation until a suitably aligned
+                    // extension or replacement has succeeded.
+                    let new_offset =
+                        if aligned && self.buffers.grow_in_place(*offset, *capacity, *requested) {
+                            *offset
+                        } else {
+                            let new_offset = self
+                                .buffers
+                                .alloc(*requested, *alignment)
+                                .ok_or(OutOfMemory::Buffer)?;
+                            self.buffers.free(*offset, *capacity);
+                            new_offset
+                        };
+                    *offset = new_offset;
+                    *capacity = *requested;
+                }
+                *bytes = *requested;
             }
             _ => return Err(OutOfMemory::InvalidLayout),
-        };
-
-        allocation.layout = layout;
-        allocation.placement = placement.clone();
-        Ok(placement)
+        }
+        Ok(allocation.region())
     }
 
     /// Releases an allocation and returns its backing capacity to the owning pool.
@@ -676,8 +634,10 @@ impl Memory {
                 debug_assert!(result.is_ok(), "request slot allocation was not live");
             }
             AllocationBacking::Kv(tables) => drop(tables),
-            AllocationBacking::Latent(request_id) => self.latent_pages.release(request_id),
-            AllocationBacking::Buffer { offset, bytes } => self.buffers.free(offset, bytes),
+            AllocationBacking::Latent { pages, .. } => self.latent_pages.release(pages),
+            AllocationBacking::Buffer {
+                offset, capacity, ..
+            } => self.buffers.free(offset, capacity),
         }
     }
 
@@ -713,6 +673,24 @@ impl Memory {
         self.encoder_buffers.remove(&buffer)
     }
 
+    /// Returns allocations transferred from this lineage to the shared encoder cache.
+    pub(crate) fn retained_buffers(&self, request: RequestKey) -> Vec<BufferId> {
+        let mut buffers: Vec<_> = self
+            .encoder_buffers
+            .keys()
+            .copied()
+            .filter(|buffer| buffer.owner == request)
+            .collect();
+        buffers.sort_unstable_by_key(|buffer| {
+            (
+                buffer.producer_op_id.0,
+                buffer.output_index,
+                buffer.generation,
+            )
+        });
+        buffers
+    }
+
     /// Returns shared access to the KV cache.
     pub(crate) fn cache(&self) -> &KvMemoryState {
         self.cache
@@ -745,32 +723,12 @@ impl Memory {
             cache.coordinator.set_hash_algo(algo);
         }
     }
-
-    /// Resets allocator and cache state after worker loss.
-    pub(crate) fn reset_after_worker_loss(&mut self, info: &WorkerInfo) {
-        let coordinator = self.cache.take().map(|state| state.coordinator);
-        let mut cache = worker_kv_state(info);
-        if let (Some(cache), Some(coordinator)) = (&mut cache, coordinator) {
-            cache.coordinator = coordinator;
-        }
-        let encoder_cache_budget = self.encoder_cache.budget();
-        let request_pool_capacity = self.request_slots.capacity();
-        let mut replacement = Self::new(
-            cache,
-            encoder_cache_budget,
-            request_pool_capacity,
-            info.latent_pages,
-            info.latent_page_units,
-        );
-        replacement.buffers = BufferPool::new(info.buffer_pool_bytes);
-        replacement.next_allocation_id = self.next_allocation_id;
-        *self = replacement;
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uniserve_core::RequestId;
 
     fn owner(request_id: u64) -> RequestKey {
         RequestKey::new(1, RequestId(request_id), 1)
@@ -802,15 +760,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            first.placement(),
-            &Placement::Buffer {
+            first.region(),
+            AllocationRegion::Buffer {
                 offset: 0,
                 bytes: 200
             }
         );
         assert_eq!(
-            second.placement(),
-            &Placement::Buffer {
+            second.region(),
+            AllocationRegion::Buffer {
                 offset: 256,
                 bytes: 200,
             }
@@ -848,7 +806,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let placement = first.placement().clone();
+        let region = first.region();
         let stats = memory.stats();
 
         assert_eq!(
@@ -861,7 +819,7 @@ mod tests {
             ),
             Err(OutOfMemory::Buffer)
         );
-        assert_eq!(first.placement(), &placement);
+        assert_eq!(first.region(), region);
         assert_eq!(memory.stats(), stats);
 
         memory.free(second);
@@ -875,12 +833,174 @@ mod tests {
                     },
                 )
                 .unwrap(),
-            Placement::Buffer {
+            AllocationRegion::Buffer {
                 offset: 0,
                 bytes: 768,
             }
         );
         memory.free(first);
+        assert_eq!(memory.stats().free_buffer_bytes, 1_024);
+    }
+
+    #[test]
+    fn latent_allocations_keep_independent_pages_for_one_request() {
+        let info = WorkerInfo {
+            latent_pages: 4,
+            latent_page_units: 4,
+            ..WorkerInfo::default()
+        };
+        let mut memory = Memory::from_worker_info(&info);
+        let mut first = memory
+            .alloc(owner(1), MemoryLayout::Latent { units: 4 })
+            .unwrap();
+        let second = memory
+            .alloc(owner(1), MemoryLayout::Latent { units: 4 })
+            .unwrap();
+        let AllocationRegion::Latent {
+            pages: first_pages, ..
+        } = first.region()
+        else {
+            panic!("latent allocation returned another resource class");
+        };
+        let AllocationRegion::Latent {
+            pages: second_pages,
+            ..
+        } = second.region()
+        else {
+            panic!("latent allocation returned another resource class");
+        };
+        assert!(first_pages.iter().all(|page| !second_pages.contains(page)));
+        let region = first.region();
+        let stats = memory.stats();
+        assert_eq!(
+            memory.grow(&mut first, MemoryLayout::Latent { units: 12 }),
+            Err(OutOfMemory::Latent),
+        );
+        assert_eq!(first.region(), region);
+        assert_eq!(memory.stats(), stats);
+        memory.free(second);
+        let grown = memory
+            .grow(&mut first, MemoryLayout::Latent { units: 12 })
+            .unwrap();
+        let AllocationRegion::Latent { pages, units } = grown else {
+            panic!("latent growth returned another resource class");
+        };
+        assert_eq!(units, 12);
+        assert_eq!(pages.len(), 3);
+        assert!(pages.starts_with(&first_pages));
+        memory.free(first);
+        assert_eq!(memory.stats().used_latent_pages, 0);
+        assert!(
+            memory
+                .alloc(owner(2), MemoryLayout::Latent { units: 12 })
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn buffer_narrowing_retains_capacity_until_release() {
+        let info = WorkerInfo {
+            buffer_pool_bytes: 1_024,
+            ..WorkerInfo::default()
+        };
+        let mut memory = Memory::from_worker_info(&info);
+        let mut allocation = memory
+            .alloc(
+                owner(1),
+                MemoryLayout::Buffer {
+                    bytes: 512,
+                    alignment: 256,
+                },
+            )
+            .unwrap();
+        let region = memory
+            .grow(
+                &mut allocation,
+                MemoryLayout::Buffer {
+                    bytes: 128,
+                    alignment: 256,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            region,
+            AllocationRegion::Buffer {
+                offset: 0,
+                bytes: 128
+            }
+        );
+        assert_eq!(memory.stats().free_buffer_bytes, 512);
+        assert!(
+            memory
+                .grow(
+                    &mut allocation,
+                    MemoryLayout::Buffer {
+                        bytes: 512,
+                        alignment: 256
+                    },
+                )
+                .is_ok()
+        );
+        memory.free(allocation);
+        assert_eq!(memory.stats().free_buffer_bytes, 1_024);
+    }
+
+    #[test]
+    fn buffer_resize_preserves_alignment_and_failed_reservations() {
+        let info = WorkerInfo {
+            buffer_pool_bytes: 1_024,
+            ..WorkerInfo::default()
+        };
+        let mut memory = Memory::from_worker_info(&info);
+        let prefix = memory
+            .alloc(
+                owner(1),
+                MemoryLayout::Buffer {
+                    bytes: 256,
+                    alignment: 256,
+                },
+            )
+            .unwrap();
+        let mut allocation = memory
+            .alloc(
+                owner(2),
+                MemoryLayout::Buffer {
+                    bytes: 256,
+                    alignment: 256,
+                },
+            )
+            .unwrap();
+        let suffix = memory
+            .alloc(
+                owner(3),
+                MemoryLayout::Buffer {
+                    bytes: 512,
+                    alignment: 256,
+                },
+            )
+            .unwrap();
+        let region = allocation.region();
+        let stats = memory.stats();
+        let layout = MemoryLayout::Buffer {
+            bytes: 128,
+            alignment: 512,
+        };
+        assert_eq!(
+            memory.grow(&mut allocation, layout.clone()),
+            Err(OutOfMemory::Buffer)
+        );
+        assert_eq!(allocation.region(), region);
+        assert_eq!(memory.stats(), stats);
+        memory.free(suffix);
+        let AllocationRegion::Buffer { offset, bytes } =
+            memory.grow(&mut allocation, layout).unwrap()
+        else {
+            panic!("buffer resize returned another resource class");
+        };
+        assert_eq!(offset % 512, 0);
+        assert_eq!(bytes, 128);
+        memory.free(allocation);
+        memory.free(prefix);
         assert_eq!(memory.stats().free_buffer_bytes, 1_024);
     }
 }

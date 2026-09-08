@@ -1,4 +1,4 @@
-//! Batch selection, operation planning, and physical placement assembly.
+//! Batch selection, operation planning, and physical params assembly.
 //!
 //! Each pass selects a compatible execution lane, applies sequence and token
 //! budgets, and emits at most one planned operation per eligible request.
@@ -30,7 +30,7 @@ impl EngineLoop {
     /// Reserves persistent buffers, latent pages, and transfer capacity for one transition.
     fn reserve_transition_resources(&mut self, transition: &mut NextOp) -> bool {
         let id = transition.request_id;
-        if transition.operation_variant == RunKind::DiffusionStep && !self.ensure_flow_prefix(id) {
+        if transition.operation_variant == OpCode::DiffusionStep && !self.ensure_flow_prefix(id) {
             return false;
         }
         let resources = &transition.resources;
@@ -45,6 +45,12 @@ impl EngineLoop {
         let Some(request_key) = request_key else {
             return false;
         };
+        if self
+            .worker_target(request_key, transition.operation_variant)
+            .is_none()
+        {
+            return false;
+        }
         let mut buffer_allocations = Vec::new();
         for bytes in transition
             .outputs
@@ -73,9 +79,9 @@ impl EngineLoop {
             buffer_allocations.push(allocation);
         }
         if resources.latent_units > 0 && self.worker_tracks_image_latent() {
-            let (runtime, memory) = (&mut self.runtime, &mut self.memory);
-            let authority_id = runtime.state().authority_id;
-            let Some(state) = runtime.state_mut().running.get_mut(&id) else {
+            let memory = &mut self.memory;
+            let authority_id = self.authority_id;
+            let Some(state) = self.running.get_mut(&id) else {
                 return false;
             };
             let request_key = RequestKey::new(authority_id, id, state.epoch);
@@ -176,7 +182,7 @@ impl EngineLoop {
                 }
             {
                 mixed_prefill = target == BatchKind::Decode
-                    && operation_variant == RunKind::ArExtend
+                    && operation_variant == OpCode::ArExtend
                     && mixed_left > 0
                     && self.running.get(&id).is_some_and(|st| {
                         st.is_replayable_text() && !st.req.sampling.prompt_logprobs_requested()
@@ -185,7 +191,7 @@ impl EngineLoop {
                     continue;
                 }
             }
-            if next_type == Some(RunKind::DiffusionStep)
+            if next_type == Some(OpCode::DiffusionStep)
                 && (denoise_occupies_decode_pipeline || !self.flow_prefix_is_schedulable(id))
             {
                 continue;
@@ -195,7 +201,7 @@ impl EngineLoop {
             // the flag is set a flow op only opens an empty batch, and the loop
             // below closes the batch as soon as one is placed.
             if self.flow_exclusive_batch
-                && next_type == Some(RunKind::DiffusionStep)
+                && next_type == Some(OpCode::DiffusionStep)
                 && !(ops.is_empty() && mixed_ops.is_empty())
             {
                 continue;
@@ -225,8 +231,8 @@ impl EngineLoop {
                     .get(&id)
                     .map(|state| state.finish_token_ids.clone())
                     .unwrap_or_default();
-                let authority_id = self.runtime.state().authority_id;
-                if let Some(st) = self.runtime.state_mut().running.get_mut(&id)
+                let authority_id = self.authority_id;
+                if let Some(st) = self.running.get_mut(&id)
                     && !st.cursor.resources.worker_registered
                 {
                     st.cursor.resources.worker_registered = true;
@@ -263,7 +269,7 @@ impl EngineLoop {
                     admissions.push(admission);
                 }
                 selected.insert(id);
-                let placed_denoise = op.operation_variant == RunKind::DiffusionStep;
+                let placed_denoise = op.operation_variant == OpCode::DiffusionStep;
                 if mixed_prefill {
                     mixed_ops.push(op);
                 } else {
@@ -340,23 +346,28 @@ impl EngineLoop {
     /// Returns the scheduling priority used during batch assembly.
     pub(super) fn assembly_priority(&self, id: RequestId) -> u8 {
         match self.peek_next_operation_variant(id) {
-            Some(RunKind::EncoderVision | RunKind::EncoderLatent | RunKind::ArExtend) => 0,
             Some(
-                RunKind::ArDecode
-                | RunKind::ArVerify
-                | RunKind::DiffusionFinalize
-                | RunKind::TransferKvInstall,
+                OpCode::EncoderText
+                | OpCode::EncoderVision
+                | OpCode::EncoderLatent
+                | OpCode::ArExtend,
+            ) => 0,
+            Some(
+                OpCode::ArDecode
+                | OpCode::ArVerify
+                | OpCode::DiffusionFinalize
+                | OpCode::TransferKvInstall,
             ) => 1,
-            Some(RunKind::DiffusionStep | RunKind::DiffusionDecode) => 2,
+            Some(OpCode::DiffusionStep | OpCode::DiffusionDecode | OpCode::MediaAppend) => 2,
             Some(
-                RunKind::DiffusionPrepare | RunKind::TransferProduct | RunKind::TransferKvPublish,
+                OpCode::DiffusionPrepare | OpCode::TransferProduct | OpCode::TransferKvPublish,
             )
             | None => 3,
         }
     }
 
     /// Determines the next operation kind without mutating request or resource state.
-    pub(super) fn peek_next_operation_variant(&self, id: RequestId) -> Option<RunKind> {
+    pub(super) fn peek_next_operation_variant(&self, id: RequestId) -> Option<OpCode> {
         let st = self.running.get(&id)?;
         if st.cursor.image_gen.branch_pending {
             return None;
@@ -376,34 +387,34 @@ impl EngineLoop {
             })
         {
             return st.pending_image_step().map(|step| match step {
-                ImageIngestStep::VaeEncode => RunKind::EncoderLatent,
-                ImageIngestStep::VitEncode => RunKind::EncoderVision,
+                ImageIngestStep::VaeEncode => OpCode::EncoderLatent,
+                ImageIngestStep::VitEncode => OpCode::EncoderVision,
             });
         }
         Some(match st.cursor.phase {
             Phase::Encode => match st.pending_image_step()? {
-                ImageIngestStep::VaeEncode => RunKind::EncoderLatent,
-                ImageIngestStep::VitEncode => RunKind::EncoderVision,
+                ImageIngestStep::VaeEncode => OpCode::EncoderLatent,
+                ImageIngestStep::VitEncode => OpCode::EncoderVision,
             },
-            Phase::IngestState => RunKind::ArExtend,
-            Phase::Prefill => RunKind::ArExtend,
-            Phase::DecodeUnd => RunKind::ArDecode,
-            Phase::CloseKv => RunKind::ArExtend,
-            Phase::PublishKv => RunKind::TransferKvPublish,
-            Phase::PrepareGen => RunKind::DiffusionPrepare,
+            Phase::IngestState => OpCode::ArExtend,
+            Phase::Prefill => OpCode::ArExtend,
+            Phase::DecodeUnd => OpCode::ArDecode,
+            Phase::CloseKv => OpCode::ArExtend,
+            Phase::PublishKv => OpCode::TransferKvPublish,
+            Phase::PrepareGen => OpCode::DiffusionPrepare,
             Phase::DenoiseGen if st.cursor.image_gen.steps_done >= st.req.image.steps => {
-                RunKind::DiffusionFinalize
+                OpCode::DiffusionFinalize
             }
-            Phase::DenoiseGen => RunKind::DiffusionStep,
-            Phase::CommitGen => RunKind::DiffusionFinalize,
+            Phase::DenoiseGen => OpCode::DiffusionStep,
+            Phase::CommitGen => OpCode::DiffusionFinalize,
             Phase::FeedbackEncode => {
                 let feedback = st.req.policy.feedback.as_ref()?;
                 match feedback.ingest.steps.get(st.cursor.feedback.ingest_step)? {
-                    ImageIngestStep::VaeEncode => RunKind::EncoderLatent,
-                    ImageIngestStep::VitEncode => RunKind::EncoderVision,
+                    ImageIngestStep::VaeEncode => OpCode::EncoderLatent,
+                    ImageIngestStep::VitEncode => OpCode::EncoderVision,
                 }
             }
-            Phase::FeedbackState => RunKind::ArExtend,
+            Phase::FeedbackState => OpCode::ArExtend,
         })
     }
 
@@ -419,7 +430,7 @@ impl EngineLoop {
         let batch_id = self.inflight.next_batch_id();
         let submit_at = Instant::now();
 
-        // Placement maps are keyed by the registered operation identity and are
+        // AllocationRegion maps are keyed by the registered operation identity and are
         // joined with logical operations only after every transition is lowered.
         let mut operations = Vec::with_capacity(transitions.len());
         let mut input_products = Vec::new();
@@ -433,8 +444,8 @@ impl EngineLoop {
         let mut block_tables = HashMap::with_capacity(transitions.len());
         let mut new_cache_pages = HashMap::with_capacity(transitions.len());
         let mut forward_rows = HashMap::with_capacity(transitions.len());
-        let mut latent_placements = HashMap::with_capacity(transitions.len());
-        let mut buffer_placements = HashMap::with_capacity(transitions.len());
+        let mut latent_params = HashMap::with_capacity(transitions.len());
+        let mut buffer_allocations = HashMap::with_capacity(transitions.len());
 
         for mut transition in transitions {
             let oid = self.next_op_id;
@@ -505,7 +516,7 @@ impl EngineLoop {
                     self.fatal = true;
                     return false;
                 };
-                let predicate_kind = if transition.operation_variant == RunKind::ArDecode {
+                let predicate_kind = if transition.operation_variant == OpCode::ArDecode {
                     ProductKind::Token
                 } else {
                     ProductKind::Completion
@@ -606,6 +617,7 @@ impl EngineLoop {
                             .expect("registered request has a live slot"),
                         seq_len: lengths.visible,
                         query_len: lengths.input,
+                        write_kv: true,
                     });
                 }
             }
@@ -667,25 +679,25 @@ impl EngineLoop {
                 return false;
             };
             for (buffer, allocation) in persistent_outputs.into_iter().zip(reserved_buffers) {
-                let (offset, bytes) = match allocation.placement() {
-                    Placement::Buffer { offset, bytes } => (*offset, *bytes),
-                    _ => unreachable!("persistent output allocation has a non-buffer placement"),
+                let (offset, bytes) = match allocation.region() {
+                    AllocationRegion::Buffer { offset, bytes } => (offset, bytes),
+                    _ => unreachable!("persistent output allocation has a non-buffer params"),
                 };
                 let replaced = state.allocations_mut().buffers.insert(buffer, allocation);
                 debug_assert!(replaced.is_none(), "buffer identity was reused");
-                operation_buffers.push(BufferPlacement {
+                operation_buffers.push(BufferAllocation {
                     buffer,
                     offset,
                     bytes,
                 });
             }
             if !operation_buffers.is_empty() {
-                buffer_placements.insert(operation_identity, operation_buffers);
+                buffer_allocations.insert(operation_identity, operation_buffers);
             }
 
             // Diffusion rows include the positive branch and any negative CFG
             // branch, each bound to its own request-state row.
-            if operation.kind == RunKind::DiffusionStep {
+            if operation.kind() == OpCode::DiffusionStep {
                 let conditioning_tokens = match &apply.intent {
                     TransitionIntent::DenoiseGen {
                         physical_kv_len, ..
@@ -741,6 +753,7 @@ impl EngineLoop {
                             request_pool_index: prefix.request_pool_idx(),
                             seq_len: 0,
                             query_len: prefix_len,
+                            write_kv: true,
                         });
                     }
                     alternative = Some((prefix.request_pool_idx(), prefix_len));
@@ -756,6 +769,7 @@ impl EngineLoop {
                         request_pool_index,
                         seq_len,
                         query_len,
+                        write_kv: false,
                     });
                 }
             }
@@ -770,11 +784,11 @@ impl EngineLoop {
                 forward_rows.insert(operation_identity, operation_forward_rows);
             }
 
-            // Latent placements describe the request-owned page table and the
+            // Latent allocations describe the request-owned page table and the
             // exact denoising interval executed by this operation.
             if matches!(
-                operation.kind,
-                RunKind::DiffusionPrepare | RunKind::DiffusionStep
+                operation.kind(),
+                OpCode::DiffusionPrepare | OpCode::DiffusionStep
             ) || operation
                 .inputs()
                 .iter()
@@ -788,8 +802,8 @@ impl EngineLoop {
                     .allocations()
                     .latent
                     .as_ref()
-                    .and_then(|allocation| match allocation.placement() {
-                        Placement::Latent { pages, .. } => Some(pages.clone()),
+                    .and_then(|allocation| match allocation.region() {
+                        AllocationRegion::Latent { pages, .. } => Some(pages),
                         _ => None,
                     })
                     .unwrap_or_default();
@@ -805,16 +819,16 @@ impl EngineLoop {
                     _ => {
                         tracing::error!(
                             request_id = request_id.0,
-                            operation = operation.kind.as_str(),
-                            "latent operation has no declared schedule placement"
+                            operation = operation.kind().as_str(),
+                            "latent operation has no declared schedule params"
                         );
                         self.fatal = true;
                         return false;
                     }
                 };
-                latent_placements.insert(
+                latent_params.insert(
                     (operation.request_key, operation.op_id),
-                    LatentPlacement {
+                    LatentParams {
                         request_key: operation.request_key,
                         op_id: operation.op_id,
                         page_table,
@@ -827,7 +841,7 @@ impl EngineLoop {
                 );
             }
 
-            let operation_variant = operation.kind.as_str();
+            let operation_variant = operation.kind().as_str();
             if let Some(trace_ops) = trace_ops.as_mut() {
                 let phase = self
                     .running
@@ -888,12 +902,12 @@ impl EngineLoop {
         let mixed = operations.first().is_some_and(|first| {
             operations
                 .iter()
-                .any(|operation| operation.kind != first.kind)
+                .any(|operation| operation.kind() != first.kind())
         });
         self.inflight.batch_started.insert(batch_id, submit_at);
         if operations
             .iter()
-            .any(|operation| batch_kind(operation.kind) == BatchKind::Prefill)
+            .any(|operation| batch_kind(operation.kind()) == BatchKind::Prefill)
         {
             self.inflight.prefill_steps.insert(batch_id);
         }
@@ -901,7 +915,7 @@ impl EngineLoop {
         if let Some(trace_ops) = trace_ops {
             let operation_types: Vec<&'static str> = operations
                 .iter()
-                .map(|operation| operation.kind.as_str())
+                .map(|operation| operation.kind().as_str())
                 .collect();
             let req_ids: Vec<u64> = operations
                 .iter()
@@ -939,7 +953,7 @@ impl EngineLoop {
         if mixed {
             let operation_types: Vec<&'static str> = operations
                 .iter()
-                .map(|operation| operation.kind.as_str())
+                .map(|operation| operation.kind().as_str())
                 .collect();
             let req_ids: Vec<u64> = operations
                 .iter()
@@ -953,23 +967,22 @@ impl EngineLoop {
             );
         }
 
-        // Join each registered operation with the placement records accumulated
+        // Join each registered operation with the params records accumulated
         // under its identity, then record the exact expected completion set.
         let logical_ops = operations
             .into_iter()
             .map(|operation| {
+                let target = self.select_worker(&operation);
                 let identity = (operation.request_key, operation.op_id);
-                LogicalOp::new(
-                    operation,
-                    OpPlacement {
-                        block_tables: block_tables.remove(&identity).unwrap_or_default(),
-                        new_cache_pages: new_cache_pages.remove(&identity).unwrap_or_default(),
-                        forward_rows: forward_rows.remove(&identity).unwrap_or_default(),
-                        latent: latent_placements.remove(&identity),
-                        decode: None,
-                        buffers: buffer_placements.remove(&identity).unwrap_or_default(),
-                    },
-                )
+                LogicalOp {
+                    block_tables: block_tables.remove(&identity).unwrap_or_default(),
+                    new_cache_pages: new_cache_pages.remove(&identity).unwrap_or_default(),
+                    forward_rows: forward_rows.remove(&identity).unwrap_or_default(),
+                    latent: latent_params.remove(&identity),
+                    decode: None,
+                    buffers: buffer_allocations.remove(&identity).unwrap_or_default(),
+                    ..LogicalOp::new(operation, target)
+                }
             })
             .collect::<Vec<_>>();
         self.inflight.batch_operations.insert(
@@ -995,11 +1008,11 @@ impl EngineLoop {
 
         // Backpressure retains the fully lowered batch for a later retry; a
         // terminal failure removes every in-flight index created above.
-        match self.executor.submit(batch) {
+        match self.submit_bound_batch(batch) {
             Ok(()) => true,
             Err(ExecutorSubmitError::WouldBlock(batch)) => {
-                self.pending_submission = Some(batch);
-                false
+                self.pending_submissions.push_back(batch);
+                true
             }
             Err(ExecutorSubmitError::Failed(error)) => {
                 self.inflight.batch_started.remove(&batch_id);
@@ -1014,7 +1027,7 @@ impl EngineLoop {
                     "error": format!("{error}"),
                 }));
                 tracing::error!("executor submit failed: {error}");
-                if error.downcast_ref::<WorkerLossError>().is_some() {
+                if error.downcast_ref::<WorkerFailure>().is_some() {
                     self.on_executor_error(error);
                 } else {
                     self.fatal = true;
@@ -1071,8 +1084,8 @@ impl EngineLoop {
 
     /// Ensures the request capacity.
     pub(super) fn ensure_request_capacity(&mut self, id: RequestId, total_tokens: usize) -> bool {
-        let (runtime, memory) = (&mut self.runtime, &mut self.memory);
-        let Some(state) = runtime.state_mut().running.get_mut(&id) else {
+        let memory = &mut self.memory;
+        let Some(state) = self.running.get_mut(&id) else {
             return false;
         };
         let groups = state.block_tables().len() as u32;
@@ -1135,7 +1148,7 @@ impl EngineLoop {
                 .info
                 .kv_cache
                 .as_ref()
-                .map_or(0, |cache| cache.bytes_per_token);
+                .map_or(0, |cache| cache.publication_bytes_per_token());
             plan(
                 self.latent_dtype,
                 kv_bytes_per_token,

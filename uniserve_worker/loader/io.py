@@ -29,7 +29,9 @@ from .source import WeightSourceSet
 __all__ = ["iter_weight_handles"]
 
 
-def iter_weight_handles(source: WeightSourceSet, load: LoadConfig) -> Iterator[WeightHandle]:
+def iter_weight_handles(
+    source: WeightSourceSet, load: LoadConfig, *, durable: bool = False
+) -> Iterator[WeightHandle]:
     """Yield unique handles from a closed source set in deterministic file/name order.
 
     Reader threads may decode files concurrently, but results are consumed in source
@@ -45,8 +47,8 @@ def iter_weight_handles(source: WeightSourceSet, load: LoadConfig) -> Iterator[W
         _prefetch_files(files)
 
     # Layered loading must retain durable file-backed handles because assignment is
-    # deferred until placements have been grouped by owning module.
-    if load.load_format is LoadFormat.LAYERED:
+    # deferred until assignments have been grouped by owning module.
+    if durable or load.load_format is LoadFormat.LAYERED:
         for path in files:
             yield from _unique_handles(
                 _read_durable_file(path, source.name_prefix, load),
@@ -65,8 +67,7 @@ def iter_weight_handles(source: WeightSourceSet, load: LoadConfig) -> Iterator[W
     # Decode files concurrently, then publish each completed list in canonical order.
     with ThreadPoolExecutor(max_workers=load.reader_count) as pool:
         futures: dict[Path, Future[list[WeightHandle]]] = {
-            path: pool.submit(_read_file_list, path, source.name_prefix, load)
-            for path in files
+            path: pool.submit(_read_file_list, path, source.name_prefix, load) for path in files
         }
         for path in files:
             handles = futures[path].result()
@@ -139,9 +140,7 @@ def _read_durable_file(path: Path, prefix: str, load: LoadConfig) -> Iterator[We
                 SafetensorFileWeightHandle(
                     name=str(name),
                     path=path,
-                    shape=tuple(
-                        int(size) for size in checkpoint.get_slice(name).get_shape()
-                    ),
+                    shape=tuple(int(size) for size in checkpoint.get_slice(name).get_shape()),
                     dtype=safetensor_dtype(str(checkpoint.get_slice(name).get_dtype())),
                     mmap=load.mmap,
                 )

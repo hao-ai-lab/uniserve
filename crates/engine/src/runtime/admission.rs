@@ -130,6 +130,57 @@ impl EngineLoop {
         self.waiting.insert(request_id, st);
     }
 
+    /// Resolve storage from loaded numerical result contracts before admission.
+    fn media_tensor_specs(
+        &self,
+        geometry: uniserve_core::MediaGeometry,
+    ) -> Option<Vec<(String, u32, DType, ShapeBound)>> {
+        let mut specs = Vec::new();
+        for (kind, entry, outputs) in [
+            (OpCode::EncoderText, "text_encoder", 1),
+            (OpCode::DiffusionStep, "denoiser", 2),
+            (OpCode::DiffusionDecode, "video_decoder", 1),
+            (OpCode::DiffusionDecode, "audio_decoder", 1),
+        ] {
+            let (_, bound, info) = self.entry_candidates(kind, entry).next()?;
+            let component = info
+                .components
+                .iter()
+                .find(|component| component.name == bound)?;
+            if component.outputs.len() != outputs {
+                return None;
+            }
+            for (index, output) in component.outputs.iter().enumerate() {
+                let mut shape = output.shape_bound.clone();
+                if entry == "text_encoder" {
+                    let mut selected = false;
+                    for dim in &mut shape.dims {
+                        if let DimBound::Device { max } = *dim {
+                            if geometry.prompt_tokens == 0 || geometry.prompt_tokens > max {
+                                return None;
+                            }
+                            *dim = DimBound::Static(geometry.prompt_tokens);
+                            selected = true;
+                        }
+                    }
+                    if !selected {
+                        return None;
+                    }
+                } else if entry == "video_decoder" {
+                    let Some(DimBound::Device { max }) = shape.dims.first().copied() else {
+                        return None;
+                    };
+                    if geometry.video_units == 0 || geometry.video_units > max {
+                        return None;
+                    }
+                    shape.dims[0] = DimBound::Static(geometry.video_units);
+                }
+                specs.push((entry.to_owned(), index as u32, output.dtype, shape));
+            }
+        }
+        Some(specs)
+    }
+
     /// Validates and queues one terminal media-generation request.
     pub(super) fn enqueue_media(&mut self, submission: PendingMedia) {
         let request = &submission.request;
@@ -140,9 +191,12 @@ impl EngineLoop {
             return;
         }
         let required = [
-            OpKind::DiffusionPrepare,
-            OpKind::DiffusionStep,
-            OpKind::DiffusionDecode,
+            OpCode::EncoderText,
+            OpCode::DiffusionPrepare,
+            OpCode::DiffusionStep,
+            OpCode::DiffusionDecode,
+            OpCode::DiffusionFinalize,
+            OpCode::MediaAppend,
         ];
         if required
             .iter()
@@ -153,10 +207,14 @@ impl EngineLoop {
             });
             return;
         }
-        if self.info.request_slots < 2
-            || self.info.latent_pages < 3
-            || self.info.latent_page_units == 0
-        {
+        if self.media_tensor_specs(request.geometry).is_none() {
+            let _ = submission.event_tx.send(Event::Rejected {
+                message: "loaded media entries cannot represent the requested tensor geometry"
+                    .into(),
+            });
+            return;
+        }
+        if self.info.request_slots < 2 {
             let _ = submission.event_tx.send(Event::Rejected {
                 message: "worker does not provide two resident media state slots".to_string(),
             });
@@ -177,7 +235,7 @@ impl EngineLoop {
         self.scheduler.enqueue_media(request_id);
     }
 
-    /// Admits queued media requests while request-slot and latent capacity remain available.
+    /// Admits queued media requests while request and product storage remain available.
     pub(super) fn admit_media(&mut self) {
         while self.running_request_count() < self.scheduler.config.max_num_seqs {
             let Some(id) = self.scheduler.pop_media() else {
@@ -189,25 +247,84 @@ impl EngineLoop {
                 .expect("scheduler media order names runtime state");
             let epoch = self.next_epoch;
             let request_key = RequestKey::new(self.authority_id, id, epoch);
+            let geometry = submission.request.geometry;
+            let required = [
+                (OpCode::EncoderText, "text_encoder"),
+                (OpCode::DiffusionPrepare, "denoiser"),
+                (OpCode::DiffusionStep, "denoiser"),
+                (OpCode::DiffusionDecode, "video_decoder"),
+                (OpCode::DiffusionDecode, "audio_decoder"),
+                (OpCode::MediaAppend, "output"),
+                (OpCode::DiffusionFinalize, "output"),
+            ];
+            if required.iter().any(|(kind, entry)| {
+                !self
+                    .entry_candidates(*kind, entry)
+                    .any(|(worker, _, _)| self.executor.is_ready(worker))
+            }) {
+                self.waiting_media.insert(id, submission);
+                self.scheduler.push_media_front(id);
+                break;
+            }
             let Ok(request_slot) = self.memory.alloc(request_key, MemoryLayout::RequestSlot) else {
                 self.waiting_media.insert(id, submission);
                 self.scheduler.push_media_front(id);
                 break;
             };
-            let Ok(latent) = self.memory.alloc(
-                request_key,
-                MemoryLayout::Latent {
-                    units: u64::from(self.info.latent_page_units),
-                },
-            ) else {
+            let specs = self
+                .media_tensor_specs(geometry)
+                .expect("queued media has valid result geometry");
+            let mut tensors = HashMap::new();
+            let mut reserved = true;
+            for (entry, index, dtype, shape_bound) in specs {
+                let bytes = shape_bound
+                    .max_elements()
+                    .saturating_mul(dtype.element_bytes());
+                let Ok(allocation) = self.memory.alloc(
+                    request_key,
+                    MemoryLayout::Buffer {
+                        bytes,
+                        alignment: 256,
+                    },
+                ) else {
+                    reserved = false;
+                    break;
+                };
+                tensors.insert(
+                    (entry, index),
+                    MediaTensorAllocation {
+                        allocation,
+                        dtype,
+                        shape_bound,
+                    },
+                );
+            }
+            if !reserved {
+                for tensor in tensors.into_values() {
+                    self.memory.free(tensor.allocation);
+                }
                 self.memory.free(request_slot);
                 self.waiting_media.insert(id, submission);
                 self.scheduler.push_media_front(id);
                 break;
+            }
+            let encoder_op = OpId(self.next_op_id.max(1));
+            let encoded = &tensors[&("text_encoder".to_owned(), 0)];
+            let conditioning = ProductRef {
+                request_key,
+                producer_op_id: encoder_op,
+                output_index: 0,
+                generation: 1,
+                kind: ProductKind::Tensor,
+                storage_class: StorageClass::DeviceTensor,
+                dtype: encoded.dtype,
+                shape_bound: encoded.shape_bound.clone(),
+                point_range: PointRange::default(),
             };
+            self.next_op_id = encoder_op.0.saturating_add(1);
             let allocations = MediaAllocations {
                 request_slot,
-                latent,
+                tensors,
             };
             let request_pool_idx = allocations.request_slot();
             self.next_epoch = self.next_epoch.saturating_add(1);
@@ -219,7 +336,7 @@ impl EngineLoop {
                     seed: submission.request.seed,
                     geometry: MediaGeometry {
                         frame_count: submission.request.geometry.frame_count,
-                        decode_units: submission.request.geometry.decode_units,
+                        video_units: submission.request.geometry.video_units,
                         prompt_tokens: submission.request.geometry.prompt_tokens,
                         denoise_steps: submission.request.geometry.denoise_steps,
                     },
@@ -233,13 +350,17 @@ impl EngineLoop {
                     request: submission.request,
                     event_tx: submission.event_tx,
                     allocations,
+                    conditioning,
+                    latents: Vec::new(),
+                    video_segments: BTreeMap::new(),
+                    audio: None,
                     admission,
                     admission_state: DiffusionRequestParamsState::Unsubmitted,
                     committed: MediaCursor::default(),
                     projected: MediaCursor::default(),
                     fixed_parent: root.clone(),
                     projected_parent: root,
-                    terminal_intent: MediaTerminalIntent::None,
+                    terminal_intent: TerminalIntent::None,
                     artifact: None,
                 },
             );
@@ -380,13 +501,12 @@ impl EngineLoop {
             .filter(|(id, state)| {
                 state.terminal_intent.is_terminal() && !self.inflight.contains(**id)
             })
-            .map(|(id, state)| (*id, state.terminal_intent))
+            .map(|(id, state)| (*id, state.terminal_intent.clone()))
             .collect();
         for (id, intent) in cancelled {
             let reason = match intent {
-                TerminalIntent::StopMatched => FinishReason::Stop,
-                TerminalIntent::Abort => FinishReason::Aborted,
-                TerminalIntent::Cancel => FinishReason::Cancelled,
+                TerminalIntent::Finish(reason) => reason,
+                TerminalIntent::Failure(_) => FinishReason::Error,
                 TerminalIntent::None => continue,
             };
             self.finish(id, reason);
@@ -406,13 +526,13 @@ impl EngineLoop {
             .collect::<Vec<_>>();
         for (id, intent) in media {
             let (event, reason) = match intent {
-                MediaTerminalIntent::Failure(message) => {
+                TerminalIntent::Failure(message) => {
                     (DiffusionTerminal::Failed(message), CloseReason::Error)
                 }
-                MediaTerminalIntent::Finish(reason) => {
+                TerminalIntent::Finish(reason) => {
                     (DiffusionTerminal::Finished(reason), CloseReason::Cancelled)
                 }
-                MediaTerminalIntent::None => continue,
+                TerminalIntent::None => continue,
             };
             self.finish_media(id, event, reason, None);
         }
@@ -464,10 +584,13 @@ impl EngineLoop {
                     continue;
                 }
                 if self.memory.free_blocks() >= need && encoder_ok {
+                    let Some((target, _)) = self.prefill_target(head) else {
+                        break;
+                    };
                     let id = self.scheduler.pop().unwrap();
                     let st = self.waiting.remove(&id).unwrap();
                     let id = st.req.request_id;
-                    self.admit_running(st);
+                    self.admit_running(st, target);
                     // Physically allocate the worst case now: nothing can take
                     // these blocks, so this request can never fail mid-flight.
                     self.ensure_request_capacity(id, need * bs);
@@ -480,11 +603,9 @@ impl EngineLoop {
                     .map(|group| self.memory.cache().block_pool.group_capacity(group))
                     .min()
                     .unwrap_or_default();
-                let prefix_hit = prefix_hit(
-                    &self.memory.cache().coordinator,
-                    head,
-                    &self.memory.cache().block_pool,
-                );
+                let Some((target, prefix_hit)) = self.prefill_target(head) else {
+                    break;
+                };
                 let cached_prefix_blocks = prefix_hit.cached_blocks;
                 let cached_prefix_blocks = cached_prefix_blocks.min(n.div_ceil(bs));
                 let cached_prefix_tokens = cached_prefix_blocks.saturating_mul(bs);
@@ -530,7 +651,7 @@ impl EngineLoop {
                 if capacity_available {
                     let id = self.scheduler.pop().unwrap();
                     let st = self.waiting.remove(&id).unwrap();
-                    self.admit_running(st);
+                    self.admit_running(st, target);
                     continue;
                 }
             }
@@ -542,10 +663,44 @@ impl EngineLoop {
         }
     }
 
+    /// Probes the prefix cache on the configured prefill owner.
+    fn prefill_target(
+        &self,
+        state: &ReqState,
+    ) -> Option<((crate::WorkerId, String), crate::kv::PrefixHit)> {
+        let cache = self.memory.cache();
+        self.worker_candidates(OpCode::ArExtend)
+            .filter(|(worker, _, _)| self.executor.is_ready(worker))
+            .map(|(worker, entry, info)| {
+                let hit = cache.coordinator.probe_prefix(
+                    &cache.block_pool,
+                    state.effective_prompt(),
+                    state.req.cache.read,
+                    state.has_context_images(),
+                    state.req.cache.isolation_key,
+                    &info.endpoint,
+                );
+                ((worker.clone(), entry.to_owned()), hit)
+            })
+            .next()
+    }
+
     /// Reserves request resources and moves one validated request into the runnable set.
-    pub(super) fn admit_running(&mut self, mut st: ReqState) {
+    pub(super) fn admit_running(&mut self, mut st: ReqState, target: (crate::WorkerId, String)) {
         let id = st.req.request_id;
         let request_key = RequestKey::new(self.authority_id, id, st.epoch);
+        let source = self
+            .executor
+            .info()
+            .workers
+            .iter()
+            .find(|(worker, _)| *worker == target.0)
+            .expect("selected prefill Worker remains loaded")
+            .1
+            .endpoint
+            .clone();
+        self.worker_affinity
+            .insert((request_key, target.1), target.0);
 
         // Admission owns the request row and an initially empty table for every
         // KV group before the request enters the runnable set.
@@ -601,7 +756,7 @@ impl EngineLoop {
             queued_at: q,
             scheduled_at,
         }) {
-            st.terminal_intent = TerminalIntent::Cancel;
+            st.terminal_intent = TerminalIntent::Finish(FinishReason::Cancelled);
         }
 
         // Running order, resource reservations, and runtime ownership advance
@@ -635,27 +790,12 @@ impl EngineLoop {
 
         // Prefix-cache acquisition pins every reused block to this request's
         // newly installed block tables.
-        let (runtime, memory) = (&mut self.runtime, &self.memory);
-        if let Some(st) = runtime.state_mut().running.get_mut(&id) {
+        let memory = &self.memory;
+        if let Some(st) = self.running.get_mut(&id) {
             let kv = memory.cache();
-            acquire_cached_prefix(&kv.coordinator, st, &kv.block_pool, &self.stats);
+            acquire_cached_prefix(&kv.coordinator, st, &kv.block_pool, &self.stats, &source);
         }
     }
-}
-
-/// Returns the reusable prefix length for an admitted request.
-fn prefix_hit(
-    coordinator: &KvCacheCoordinator,
-    state: &ReqState,
-    pool: &BlockPool,
-) -> crate::kv::PrefixHit {
-    coordinator.probe_prefix(
-        pool,
-        state.effective_prompt(),
-        state.req.cache.read,
-        state.has_context_images(),
-        state.req.cache.isolation_key,
-    )
 }
 
 /// Acquires a complete cross-group prefix hit and records cache accounting on the request.
@@ -664,6 +804,7 @@ fn acquire_cached_prefix(
     state: &mut ReqState,
     pool: &BlockPool,
     stats: &SchedStats,
+    source: &uniserve_worker_ipc::WorkerEndpoint,
 ) {
     let prompt = state.effective_prompt().to_vec();
     let has_context_images = state.has_context_images();
@@ -677,6 +818,7 @@ fn acquire_cached_prefix(
             cache_read,
             has_context_images,
             isolation_key,
+            source,
         )
         .expect("request cache groups match the KV coordinator");
     let block_size = pool.block_size();

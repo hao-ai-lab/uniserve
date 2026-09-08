@@ -2,19 +2,131 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Literal, NotRequired, TypeAlias, TypedDict
+
 import torch
 
 from uniserve_worker.ops.staging import gather_request_decode_inputs
 from uniserve_worker.runtime.device import HostStagingRing, fill_cpu_bools, fill_cpu_ints
 
+from .bounded_storage import BoundedTensorStorage, TensorSchema
 from .forward_batch import (
     AttentionMode,
     FlowPatches,
     ForwardBatch,
     ModelPhase,
+    RouteSpan,
     TokenSelection,
     packed_tensor_views,
 )
+
+
+class AttentionColumns(TypedDict):
+    """Materialized attention inputs copied into a lane's fixed tensor storage."""
+
+    forward_mode: Literal[
+        AttentionMode.DENSE,
+        AttentionMode.PAGED_DECODE,
+        AttentionMode.PAGED_VARLEN,
+        AttentionMode.PACKED,
+    ]
+    seq_lens: torch.Tensor
+    query_lens: torch.Tensor
+    out_cache_loc: torch.Tensor
+    has_cache_writes: bool
+    block_table: NotRequired[torch.Tensor | None]
+    kv_lens: NotRequired[torch.Tensor | None]
+    cu_seqlens_q: NotRequired[torch.Tensor | None]
+    cu_seqlens_k: NotRequired[torch.Tensor | None]
+    output_indices: NotRequired[torch.Tensor | None]
+    attention_indexes: NotRequired[torch.Tensor | None]
+    visible_end: NotRequired[torch.Tensor | None]
+    route_spans: NotRequired[tuple[RouteSpan, ...]]
+    max_seqlen_q: NotRequired[int]
+    max_seqlen_k: NotRequired[int]
+    causal: NotRequired[bool]
+    causal_rows_cpu: NotRequired[tuple[bool, ...]]
+    seq_lens_cpu: NotRequired[tuple[int, ...]]
+    query_lens_cpu: NotRequired[tuple[int, ...]]
+    kv_lens_cpu: NotRequired[tuple[int, ...]]
+    group_id: NotRequired[int]
+    fully_visible: NotRequired[bool]
+    binding: NotRequired[int]
+
+
+class RequestDecodeColumns(TypedDict):
+    """Resident request columns gathered directly into decode staging storage."""
+
+    forward_mode: Literal[AttentionMode.REQUEST_INDEXED_DECODE]
+    seq_lens_cpu: tuple[int, ...]
+    query_lens_cpu: tuple[int, ...]
+    kv_lens_cpu: tuple[int, ...]
+    causal_rows_cpu: tuple[bool, ...]
+    causal: bool
+    group_id: int
+    binding: int
+    request_page_tables: torch.Tensor
+    request_cache_lengths: torch.Tensor
+    request_tokens: torch.Tensor
+    request_positions: torch.Tensor
+    table_width: int
+    page_size: int
+
+
+AttentionInputs: TypeAlias = AttentionColumns | RequestDecodeColumns
+
+
+@dataclass(frozen=True, slots=True)
+class InputGeometry:
+    """Fixed row, token and embedding bounds shared by sizing and allocation."""
+
+    max_rows: int
+    max_tokens: int
+    max_text_tokens: int
+    max_blocks_per_row: int
+    hidden_size: int
+
+    def __post_init__(self) -> None:
+        if min(self.max_rows, self.max_tokens, self.max_blocks_per_row) < 1:
+            raise ValueError("input-buffer row, token, and block bounds must be positive")
+        if self.hidden_size < 0:
+            raise ValueError("input-buffer hidden bound must not be negative")
+        if not 1 <= self.max_text_tokens <= self.max_tokens:
+            raise ValueError("input-buffer text-token capacity is invalid")
+
+    def tensor_schema(self) -> dict[str, TensorSchema]:
+        """Describe every resident device field, excluding pinned CPU copy sources."""
+
+        rows, tokens, text = self.max_rows, self.max_tokens, self.max_text_tokens
+        schema = {
+            "input_ids": TensorSchema((text,), torch.int64, fill=1),
+            "positions": TensorSchema((3, tokens), torch.int64, fill=0),
+            "embedding_mask": TensorSchema((text,), torch.bool, fill=0),
+            "request_pool_indices": TensorSchema((rows,), torch.int64, fill=0),
+            "decode_force_finish": TensorSchema((rows,), torch.bool, fill=0),
+            "block_tables": TensorSchema((rows, self.max_blocks_per_row), torch.int32, fill=0),
+            "cache_lengths": TensorSchema((rows,), torch.int32, fill=0),
+            "kv_lengths": TensorSchema((rows,), torch.int32, fill=1),
+            "query_lengths": TensorSchema((rows,), torch.int32, fill=1),
+            "cumulative_query_lengths": TensorSchema((rows + 1,), torch.int32, fill=0),
+            "cumulative_kv_lengths": TensorSchema((rows + 1,), torch.int32, fill=0),
+            "output_indices": TensorSchema((rows,), torch.int64, fill=0),
+            "decode_page_ids": TensorSchema((tokens,), torch.int64, fill=0),
+            "decode_page_offsets": TensorSchema((tokens,), torch.int64, fill=0),
+            "attention_indexes": TensorSchema((3, tokens), torch.int64, fill=0),
+            "visible_end": TensorSchema((rows, tokens), torch.int64, fill=0),
+            "seqused_k": TensorSchema((rows,), torch.int32, fill=0),
+            "write_page_ids": TensorSchema((tokens,), torch.int64, fill=0),
+            "write_page_offsets": TensorSchema((tokens,), torch.int64, fill=0),
+            "write_token_indices": TensorSchema((tokens,), torch.int64, fill=0),
+            "flow_timesteps": TensorSchema((rows,), torch.float32, fill=0),
+        }
+        if self.hidden_size:
+            schema["input_embeddings"] = TensorSchema(
+                (text, self.hidden_size), torch.bfloat16, fill=0
+            )
+        return schema
 
 
 class InputBuffers:
@@ -23,94 +135,53 @@ class InputBuffers:
     def __init__(
         self,
         *,
-        max_rows: int,
-        max_tokens: int,
-        max_text_tokens: int | None = None,
-        max_blocks_per_row: int,
-        hidden_size: int,
+        geometry: InputGeometry,
         device: torch.device | str,
         max_inflight: int = 1,
     ) -> None:
         """Allocate fixed-address row, token, attention, and host-staging buffers."""
 
-        if min(max_rows, max_tokens, max_blocks_per_row) < 1:
-            raise ValueError("input-buffer row, token, and block bounds must be positive")
-        if hidden_size < 0:
-            raise ValueError("input-buffer hidden bound must not be negative")
-        self.max_rows = int(max_rows)
-        self.max_tokens = int(max_tokens)
-        self.max_text_tokens = int(max_tokens if max_text_tokens is None else max_text_tokens)
-        if self.max_text_tokens < 1 or self.max_text_tokens > self.max_tokens:
-            raise ValueError("input-buffer text-token capacity is invalid")
-        self.max_blocks_per_row = int(max_blocks_per_row)
-        self.hidden_size = int(hidden_size)
+        self.max_rows = geometry.max_rows
+        self.max_tokens = geometry.max_tokens
+        self.max_text_tokens = geometry.max_text_tokens
+        self.max_blocks_per_row = geometry.max_blocks_per_row
+        self.hidden_size = geometry.hidden_size
         self.device = torch.device(device)
-
-        self.input_ids = torch.ones(self.max_text_tokens, dtype=torch.int64, device=self.device)
-        self.positions = torch.zeros((3, self.max_tokens), dtype=torch.int64, device=self.device)
-        self.input_embeddings = (
-            None
-            if self.hidden_size == 0
-            else torch.zeros(
-                (self.max_text_tokens, self.hidden_size),
-                dtype=torch.bfloat16,
-                device=self.device,
-            )
-        )
-        self.embedding_mask = torch.zeros(
-            self.max_text_tokens, dtype=torch.bool, device=self.device
-        )
-        self.request_pool_indices = torch.zeros(
-            self.max_rows, dtype=torch.int64, device=self.device
-        )
+        tensors = BoundedTensorStorage.allocate(geometry.tensor_schema(), self.device).capacity
+        self.input_ids = tensors["input_ids"]
+        self.positions = tensors["positions"]
+        self.embedding_mask = tensors["embedding_mask"]
+        self.request_pool_indices = tensors["request_pool_indices"]
+        self.decode_force_finish = tensors["decode_force_finish"]
+        self.block_tables = tensors["block_tables"]
+        self.cache_lengths = tensors["cache_lengths"]
+        self.kv_lengths = tensors["kv_lengths"]
+        self.query_lengths = tensors["query_lengths"]
+        self.cumulative_query_lengths = tensors["cumulative_query_lengths"]
+        self.cumulative_kv_lengths = tensors["cumulative_kv_lengths"]
+        self.output_indices = tensors["output_indices"]
+        self.decode_page_ids = tensors["decode_page_ids"]
+        self.decode_page_offsets = tensors["decode_page_offsets"]
+        self.attention_indexes = tensors["attention_indexes"]
+        self.visible_end = tensors["visible_end"]
+        self.seqused_k = tensors["seqused_k"]
+        self.write_page_ids = tensors["write_page_ids"]
+        self.write_page_offsets = tensors["write_page_offsets"]
+        self.write_token_indices = tensors["write_token_indices"]
+        self.flow_timesteps = tensors["flow_timesteps"]
+        self.input_embeddings = tensors.get("input_embeddings")
         self._request_pool_indices_host = HostStagingRing(
-            self.max_rows,
-            dtype=torch.int64,
-            depth=max_inflight,
-            device=self.device,
+            self.max_rows, dtype=torch.int64, depth=max_inflight, device=self.device
         )
-        self.decode_force_finish = torch.zeros(self.max_rows, dtype=torch.bool, device=self.device)
         self._decode_force_finish_host = HostStagingRing(
-            self.max_rows,
-            dtype=torch.bool,
-            depth=max_inflight,
-            device=self.device,
-        )
-        self.block_tables = torch.zeros(
-            (self.max_rows, self.max_blocks_per_row),
-            dtype=torch.int32,
-            device=self.device,
+            self.max_rows, dtype=torch.bool, depth=max_inflight, device=self.device
         )
 
-        self.cache_lengths = torch.zeros(self.max_rows, dtype=torch.int32, device=self.device)
-        self.kv_lengths = torch.ones(self.max_rows, dtype=torch.int32, device=self.device)
-        self.query_lengths = torch.ones(self.max_rows, dtype=torch.int32, device=self.device)
-        self.cumulative_query_lengths = torch.zeros(
-            self.max_rows + 1, dtype=torch.int32, device=self.device
-        )
-        self.cumulative_kv_lengths = torch.zeros(
-            self.max_rows + 1, dtype=torch.int32, device=self.device
-        )
-        self.output_indices = torch.zeros(self.max_rows, dtype=torch.int64, device=self.device)
-        self.decode_page_ids = torch.zeros(self.max_tokens, dtype=torch.int64, device=self.device)
-        self.decode_page_offsets = torch.zeros(
-            self.max_tokens, dtype=torch.int64, device=self.device
-        )
-        self.attention_indexes = torch.zeros(
-            (3, self.max_tokens), dtype=torch.int64, device=self.device
-        )
-        self.visible_end = torch.zeros(
-            (self.max_rows, self.max_tokens), dtype=torch.int64, device=self.device
-        )
-        self.seqused_k = torch.zeros(self.max_rows, dtype=torch.int32, device=self.device)
-        self.write_page_ids = torch.zeros(self.max_tokens, dtype=torch.int64, device=self.device)
-        self.write_page_offsets = torch.zeros(
-            self.max_tokens, dtype=torch.int64, device=self.device
-        )
-        self.write_token_indices = torch.zeros(
-            self.max_tokens, dtype=torch.int64, device=self.device
-        )
-        self.flow_timesteps = torch.zeros(self.max_rows, dtype=torch.float32, device=self.device)
+    def close(self) -> None:
+        """Release host copy sources before the execution lane destroys its stream."""
+
+        self._request_pool_indices_host.close()
+        self._decode_force_finish_host.close()
 
     def stage(
         self,
@@ -139,7 +210,7 @@ class InputBuffers:
         decode_latents: tuple[torch.Tensor, ...] = (),
         decode_heights: tuple[int, ...] = (),
         decode_widths: tuple[int, ...] = (),
-        attention: dict[str, object],
+        attention: AttentionInputs,
     ) -> ForwardBatch:
         """Copy row metadata and model inputs into fixed-address lane buffers and return bounded views."""
 
@@ -161,7 +232,7 @@ class InputBuffers:
             )
         ):
             raise ValueError("forward token columns are not aligned")
-        if attention.get("forward_mode") is AttentionMode.REQUEST_INDEXED_DECODE:
+        if attention["forward_mode"] is AttentionMode.REQUEST_INDEXED_DECODE:
             if any(
                 (
                     flow_row_indices,
@@ -380,7 +451,7 @@ class InputBuffers:
         token_embedding_masks: tuple[torch.Tensor | None, ...],
         token_positions: tuple[torch.Tensor, ...],
         token_selections: tuple[TokenSelection, ...],
-        attention: dict[str, object],
+        attention: RequestDecodeColumns,
     ) -> ForwardBatch:
         """Gather one-token decode rows from request-indexed state into fixed buffers."""
 
@@ -479,13 +550,12 @@ class InputBuffers:
             token_selections=token_selections,
         )
 
-    def stage_attention(self, attention: dict[str, object]) -> dict[str, object]:
+    def stage_attention(self, attention: AttentionInputs) -> AttentionColumns:
         """Copy validated attention side tables into their fixed-address staging buffers."""
 
-        mode = attention["forward_mode"]
-        if mode is AttentionMode.REQUEST_INDEXED_DECODE:
+        if attention["forward_mode"] is AttentionMode.REQUEST_INDEXED_DECODE:
             raise ValueError("request-indexed decode must use fused input staging")
-        staged = dict(attention)
+        staged = attention.copy()
         staged["seq_lens"] = self._copy_vector(self.cache_lengths, attention["seq_lens"])
         staged["query_lens"] = self._copy_vector(self.query_lengths, attention["query_lens"])
         staged["out_cache_loc"] = self._copy_vector(self.write_page_ids, attention["out_cache_loc"])
@@ -493,12 +563,18 @@ class InputBuffers:
         staged["block_table"] = (
             None if block_table is None else self._copy_matrix(self.block_tables, block_table)
         )
-        for key, target in (
+        vectors: tuple[
+            tuple[
+                Literal["kv_lens", "cu_seqlens_q", "cu_seqlens_k", "output_indices"], torch.Tensor
+            ],
+            ...,
+        ] = (
             ("kv_lens", self.kv_lengths),
             ("cu_seqlens_q", self.cumulative_query_lengths),
             ("cu_seqlens_k", self.cumulative_kv_lengths),
             ("output_indices", self.output_indices),
-        ):
+        )
+        for key, target in vectors:
             value = attention.get(key)
             staged[key] = None if value is None else self._copy_vector(target, value)
         indexes = attention.get("attention_indexes")
@@ -511,7 +587,7 @@ class InputBuffers:
         )
         return staged
 
-    def _scrub(self, mode: object, *, embeddings: bool) -> None:
+    def _scrub(self, mode: AttentionMode, *, embeddings: bool) -> None:
         """Zero reusable fields whose stale values could affect the next staged mode."""
 
         if mode is AttentionMode.REQUEST_INDEXED_DECODE:

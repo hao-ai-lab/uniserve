@@ -9,11 +9,11 @@ use tempfile::tempdir;
 use tokenizers::models::bpe::{BPE, Vocab};
 use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 use uniserve_core::{
-    ContextSegment, GenerationLimits, ImageIngestStep, ImageKvEffect, SegmentPlacement,
+    ContextSegment, GenerationLimits, ImageIngestStep, ImageKvEffect, SegmentPosition,
 };
 use uniserve_server::profile::assets::ResolvedModelFiles;
 use uniserve_server::profile::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
-use uniserve_server::profile::{ModelDescription, ProfileDeploymentConfig};
+use uniserve_server::profile::{ModelDescription, ProfileOverrides};
 use uniserve_server::serving::chat::{
     ChatContentPart, ChatMessage, ChatTemplateContentFormatOption, HfChatRenderer,
 };
@@ -109,7 +109,7 @@ fn try_resolved_model(
         description,
         description.id(),
         &files,
-        &ProfileDeploymentConfig::default(),
+        &ProfileOverrides::default(),
         Arc::clone(&tokenizer),
         renderer,
     )
@@ -120,7 +120,6 @@ fn try_resolved_model(
         uniserve_server::serving::ServedSamplingControl::ALL.to_vec(),
         4096,
         true,
-        &std::collections::BTreeMap::new(),
     )?;
     Ok((directory, tokenizer, model))
 }
@@ -142,7 +141,7 @@ fn runtime_limits() -> GenerationLimits {
 
 fn image_chat_request() -> GenerateReqInput {
     GenerateReqInput::chat(
-        "image-placement",
+        "image-params",
         vec![ChatMessage::user(vec![
             ChatContentPart::text("literal </img> before "),
             ChatContentPart::image_url(format!("data:image/png;base64,{PNG_1X1}")),
@@ -222,18 +221,18 @@ fn sensenova_places_the_input_image_at_its_rendered_slot() {
         .filter_map(|(index, token)| (*token == end_image).then_some(index as u32))
         .collect::<Vec<_>>();
     assert_eq!(marker_positions.len(), 2);
-    let (placement, steps) = tokenized
+    let (params, steps) = tokenized
         .request
         .context
         .iter()
         .find_map(|segment| match segment {
-            ContextSegment::Image { image, ingest } => Some((image.placement, &ingest.steps)),
+            ContextSegment::Image { image, ingest } => Some((image.position, &ingest.steps)),
             ContextSegment::UndTokens { .. } => None,
         })
         .unwrap();
     assert_eq!(
-        placement,
-        SegmentPlacement::AtToken {
+        params,
+        SegmentPosition::AtToken {
             position: marker_positions[1]
         }
     );
@@ -256,16 +255,16 @@ fn bagel_places_the_input_image_between_surrounding_chat_text() {
     let request = image_chat_request();
     model.validate_request(&request).unwrap();
     let tokenized = model.tokenize(request).unwrap();
-    let (placement, steps) = tokenized
+    let (params, steps) = tokenized
         .request
         .context
         .iter()
         .find_map(|segment| match segment {
-            ContextSegment::Image { image, ingest } => Some((image.placement, &ingest.steps)),
+            ContextSegment::Image { image, ingest } => Some((image.position, &ingest.steps)),
             ContextSegment::UndTokens { .. } => None,
         })
         .unwrap();
-    let SegmentPlacement::AtToken { position } = placement else {
+    let SegmentPosition::AtToken { position } = params else {
         panic!("Bagel chat image must have a token position")
     };
     assert!(position > 0);

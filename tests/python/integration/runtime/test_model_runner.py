@@ -13,7 +13,7 @@ from PIL import Image
 
 from tests.python.fixtures.depth_one import (
     ar_params,
-    bind_request_placement,
+    bind_request_allocation,
     commit_for_completion,
     diffusion_finalize_operation,
     diffusion_prepare_operation,
@@ -28,6 +28,7 @@ from tests.python.fixtures.depth_one import (
     visual_state_operation,
 )
 from tests.python.fixtures.execution_worker import execution_worker
+from uniserve_worker.config import LaneConfig, WorkerConfig
 from uniserve_worker.execution.batch import (
     ArRequestParams,
     BlockTable,
@@ -35,23 +36,27 @@ from uniserve_worker.execution.batch import (
     Checkpoint,
     Commit,
     DeviceDim,
+    DeviceProductTransferValue,
     DeviceSelected,
+    Domain,
     DType,
+    EncoderTransferValue,
     ErrorCode,
     Free,
     ImageParams,
     NewRequest,
+    OpCode,
     Operation,
     OpStatus,
     PointRange,
     ProductKind,
     ProductPayload,
     ProductRef,
-    RunKind,
     SamplingState,
     ShapeBound,
     StaticDim,
     StorageClass,
+    TensorTransfer,
     TokenMode,
     TransferHandle,
     UmmRequestParams,
@@ -64,7 +69,6 @@ from uniserve_worker.execution.forward_batch import (
 from uniserve_worker.execution.output import finalize_run_result, run_result_ready
 from uniserve_worker.foundation.errors import WorkerError, WorkerErrorCode
 from uniserve_worker.models.stub import StubModel, _next_token
-from uniserve_worker.transfer.tickets import decode_transfer_handle
 
 pytestmark = pytest.mark.integration
 
@@ -75,10 +79,13 @@ class _MisalignedOutputModel(StubModel):
     def __init__(self) -> None:
         super().__init__()
         self.misaligned = False
+        self.failure_delay_cycles = 0
 
     def project(self, hidden: torch.Tensor, batch: ForwardBatch) -> ForwardOutput:
         output = super().project(hidden, batch)
         if self.misaligned:
+            if self.failure_delay_cycles:
+                torch.cuda._sleep(self.failure_delay_cycles)
             return ForwardOutput(output.values[:-1])
         return output
 
@@ -95,9 +102,7 @@ def _publish_conditioning(worker: object, admission: NewRequest, *, op_id: int, 
         op_id=op_id,
         parent=root_parent(admission),
     )
-    worker.execute(
-        execution_run(run_id=run_id, admissions=(admission,), operations=(publication,))
-    )
+    worker.execute(execution_run(run_id=run_id, admissions=(admission,), operations=(publication,)))
     return product
 
 
@@ -271,7 +276,7 @@ def test_prefix_reuse_continues_from_the_admitted_logical_position():
     assert report.completions[0].logical_lengths.token_len == 3
 
 
-def test_invalid_physical_placement_reports_error_behind_an_unobserved_parent() -> None:
+def test_invalid_physical_allocation_reports_error_behind_an_unobserved_parent() -> None:
     worker = execution_worker(pipeline_depth=2)
     admission = ar_params(9, block_ids=(0,))
     parent, parent_input = token_operation(
@@ -413,15 +418,17 @@ def test_mixed_token_and_flow_match_homogeneous_results():
         tokens=(3, 4),
     )
 
-    mixed_result = finalized_report(mixed.execute(
-        execution_run(
-            run_id=4,
-            admissions=(),
-            operations=(sequence, flow),
-            commands=(mixed_preparation_commit, sequence_control),
-            input_products=(sequence_input,),
+    mixed_result = finalized_report(
+        mixed.execute(
+            execution_run(
+                run_id=4,
+                admissions=(),
+                operations=(sequence, flow),
+                commands=(mixed_preparation_commit, sequence_control),
+                input_products=(sequence_input,),
+            )
         )
-    ))
+    )
 
     split = execution_worker()
     split_conditioning = _publish_conditioning(split, flow_admission, op_id=10, run_id=1)
@@ -449,24 +456,28 @@ def test_mixed_token_and_flow_match_homogeneous_results():
         run_id=3,
         tokens=(3, 4),
     )
-    sequence_result = finalized_report(split.execute(
-        execution_run(
-            run_id=4,
-            admissions=(),
-            operations=(split_sequence,),
-            commands=(split_sequence_control,),
-            input_products=(split_sequence_input,),
+    sequence_result = finalized_report(
+        split.execute(
+            execution_run(
+                run_id=4,
+                admissions=(),
+                operations=(split_sequence,),
+                commands=(split_sequence_control,),
+                input_products=(split_sequence_input,),
+            )
         )
-    ))
-    flow_result = finalized_report(split.execute(
-        execution_run(
-            run_id=5,
-            admissions=(),
-            operations=(split_flow,),
-            commands=(split_preparation_commit,),
-            input_products=(),
+    )
+    flow_result = finalized_report(
+        split.execute(
+            execution_run(
+                run_id=5,
+                admissions=(),
+                operations=(split_flow,),
+                commands=(split_preparation_commit,),
+                input_products=(),
+            )
         )
-    ))
+    )
 
     assert (
         mixed_result.completions[0].committed_tokens
@@ -494,6 +505,84 @@ def test_mixed_token_and_flow_match_homogeneous_results():
         op_id=13,
         run_id=6,
     )
+
+
+@pytest.mark.parametrize("device_parent", [False, True])
+def test_next_image_can_start_before_the_previous_artifact_is_observed(device_parent) -> None:
+    worker = execution_worker(pipeline_depth=3)
+    admission = umm_params(12, ImageParams(steps=1, height=16, width=16, seed=29, max_images=2))
+    try:
+        conditioning = _publish_conditioning(worker, admission, op_id=1, run_id=1)
+        initial, prepared = _prepare_media(
+            worker, admission, conditioning, op_id=2, parent=root_parent(admission), run_id=2
+        )
+        step, latent = diffusion_step_operation(
+            admission.request_key,
+            op_id=3,
+            parent=prepared.selected,
+            conditioning=conditioning,
+            latent=initial,
+            steps=1,
+            control_seq=prepared.control_seq,
+        )
+        stepped = worker.execute(execution_run(run_id=3, operations=(step,), commands=(prepared,)))
+        committed = commit_for_completion(step, stepped)
+        finalize = diffusion_finalize_operation(
+            admission.request_key,
+            op_id=4,
+            parent=(
+                Checkpoint(committed.selected.op_id, DeviceSelected())
+                if device_parent
+                else committed.selected
+            ),
+            latent=latent,
+            control_seq=committed.control_seq,
+        )
+        first_image = worker.execute(
+            execution_run(run_id=4, operations=(finalize,), commands=(committed,))
+        )
+        initial, prepared = _prepare_media(
+            worker,
+            admission,
+            conditioning,
+            op_id=5,
+            parent=(
+                Checkpoint(committed.selected.op_id, DeviceSelected())
+                if device_parent
+                else committed.selected
+            ),
+            run_id=5,
+            control_seq=committed.control_seq,
+            image_index=2,
+        )
+        prepared = replace(prepared, expected_parent=committed.selected)
+        # Reading an earlier artifact must not restore its retired trajectory.
+        first_report = finalized_report(first_image)
+        assert first_report.completions[0].status is OpStatus.OK
+        first_png = next(
+            value.payload
+            for value in first_report.products
+            if value.product.kind is ProductKind.ARTIFACT
+        )
+        with Image.open(io.BytesIO(base64.b64decode(first_png, validate=True))) as image:
+            assert image.size == (16, 16)
+        step, latent = diffusion_step_operation(
+            admission.request_key,
+            op_id=6,
+            parent=prepared.selected,
+            conditioning=conditioning,
+            latent=initial,
+            steps=1,
+            control_seq=prepared.control_seq,
+        )
+        stepped = worker.execute(execution_run(run_id=6, operations=(step,), commands=(prepared,)))
+        second_png = _finalized_artifact(
+            worker, admission, latent, commit_for_completion(step, stepped), op_id=7, run_id=7
+        )
+        with Image.open(io.BytesIO(base64.b64decode(second_png, validate=True))) as image:
+            assert image.size == (16, 16)
+    finally:
+        worker.close()
 
 
 def test_mixed_submission_requires_tensorized_model_support():
@@ -581,19 +670,86 @@ def test_request_scoped_operation_identity_preserves_homogeneous_decode():
         decode_ops.append(operation)
         decode_inputs.append(payload)
         commits.append(commit)
-    decoded = finalized_report(worker.execute(
-        execution_run(
-            run_id=2,
-            admissions=(),
-            operations=tuple(decode_ops),
-            commands=tuple(commits),
-            input_products=tuple(decode_inputs),
+    decoded = finalized_report(
+        worker.execute(
+            execution_run(
+                run_id=2,
+                admissions=(),
+                operations=tuple(decode_ops),
+                commands=tuple(commits),
+                input_products=tuple(decode_inputs),
+            )
         )
-    ))
+    )
 
     assert tuple(record.committed_tokens for record in decoded.completions) == tuple(
         (_next_token(_next_token(token)),) for token in last_tokens
     )
+
+
+@pytest.mark.gpu
+def test_failed_lane_keeps_kv_pages_until_submitted_device_work_finishes() -> None:
+    model = _MisalignedOutputModel()
+    worker = execution_worker(
+        model,
+        device="cuda:0",
+        execution=WorkerConfig(
+            cuda_graph=False,
+            prefill_cuda_graph=False,
+            lanes=(LaneConfig("compute", 64, tuple(Domain)),),
+        ),
+    )
+    admission = ar_params(4, block_ids=(4,))
+    initial, initial_input = token_operation(
+        admission.request_key,
+        op_id=31,
+        parent=root_parent(admission),
+        mode=TokenMode.EXTEND,
+        tokens=(12, 13),
+    )
+    try:
+        initial_report = finalized_report(
+            worker.execute(
+                execution_run(
+                    run_id=11,
+                    admissions=(admission,),
+                    operations=(initial,),
+                    input_products=(initial_input,),
+                )
+            )
+        )
+        commit = commit_for_completion(initial, initial_report)
+        retry, retry_input = token_operation(
+            admission.request_key,
+            op_id=32,
+            parent=commit.selected,
+            mode=TokenMode.DECODE,
+            tokens=(_next_token(13),),
+            control_seq=commit.control_seq,
+        )
+        model.misaligned = True
+        model.failure_delay_cycles = 1_000_000_000
+        failed = worker.execute(
+            execution_run(
+                run_id=12,
+                commands=(commit,),
+                operations=(retry,),
+                input_products=(retry_input,),
+            )
+        )
+        assert failed.completions[0].status is OpStatus.ERROR
+        assert failed.completions[0].error_code is ErrorCode.COMPUTE_ERROR
+        assert not worker.cache_pool.retirement_ready(requests=(admission.request_key,))
+        with pytest.raises(WorkerError, match="executing producer or consumer"):
+            worker.cache_pool.zero_pages(0, (5,))
+
+        worker.runner.synchronize()
+        torch.cuda.current_stream("cuda:0").synchronize()
+        worker.device_events.reap()
+        assert worker.cache_pool.retirement_ready(requests=(admission.request_key,))
+        worker.cache_pool.zero_pages(0, (5,))
+    finally:
+        worker.close()
 
 
 def test_output_validation_failure_discards_all_candidate_state():
@@ -643,13 +799,15 @@ def test_output_validation_failure_discards_all_candidate_state():
         tokens=(_next_token(13),),
         control_seq=commit.control_seq,
     )
-    result = finalized_report(worker.execute(
-        execution_run(
-            run_id=14,
-            operations=(replacement,),
-            input_products=(replacement_input,),
+    result = finalized_report(
+        worker.execute(
+            execution_run(
+                run_id=14,
+                operations=(replacement,),
+                input_products=(replacement_input,),
+            )
         )
-    ))
+    )
     assert result.completions[0].committed_tokens == (_next_token(_next_token(13)),)
     assert result.completions[0].logical_lengths.kv_visible_len == 3
 
@@ -804,15 +962,17 @@ def test_mixed_lane_descriptor_failure_preserves_the_other_domain_candidate():
         steps=1,
         control_seq=preparation_commit.control_seq,
     )
-    report = finalized_report(worker.execute(
-        execution_run(
-            run_id=4,
-            admissions=(),
-            operations=(sequence, flow),
-            commands=(preparation_commit, sequence_control),
-            input_products=(sequence_input,),
+    report = finalized_report(
+        worker.execute(
+            execution_run(
+                run_id=4,
+                admissions=(),
+                operations=(sequence, flow),
+                commands=(preparation_commit, sequence_control),
+                input_products=(sequence_input,),
+            )
         )
-    ))
+    )
 
     by_request = {record.request_key.request_id: record for record in report.completions}
     assert by_request[61].status is OpStatus.OK
@@ -922,13 +1082,15 @@ def test_multi_step_quantum_matches_the_serial_model_artifact(
                 steps=count,
                 control_seq=commit.control_seq,
             )
-            report = finalized_report(worker.execute(
-                execution_run(
-                    run_id=op_id,
-                    operations=(operation,),
-                    commands=(commit,),
+            report = finalized_report(
+                worker.execute(
+                    execution_run(
+                        run_id=op_id,
+                        operations=(operation,),
+                        commands=(commit,),
+                    )
                 )
-            ))
+            )
             assert report.completions[0].status is OpStatus.OK
             step += count
             assert report.completions[0].logical_lengths.latent_len == step
@@ -961,11 +1123,16 @@ def test_decode_grows_logical_capacity_across_a_kv_page_boundary():
         mode=TokenMode.EXTEND,
         tokens=(3, 4),
     )
-    extended = finalized_report(worker.execute(
-        execution_run(
-            run_id=1, admissions=(admission,), operations=(extend,), input_products=(extend_input,)
+    extended = finalized_report(
+        worker.execute(
+            execution_run(
+                run_id=1,
+                admissions=(admission,),
+                operations=(extend,),
+                input_products=(extend_input,),
+            )
         )
-    ))
+    )
     committed = list(extended.completions[0].committed_tokens)
     commit = commit_for_completion(extend, extended)
     next_block = 1
@@ -988,15 +1155,17 @@ def test_decode_grows_logical_capacity_across_a_kv_page_boundary():
             block_table_delta=logical_delta,
             control_seq=commit.control_seq,
         )
-        report = finalized_report(worker.execute(
-            execution_run(
-                run_id=2 + step,
-                admissions=(),
-                operations=(decode,),
-                commands=(commit,),
-                input_products=(decode_input,),
+        report = finalized_report(
+            worker.execute(
+                execution_run(
+                    run_id=2 + step,
+                    admissions=(),
+                    operations=(decode,),
+                    commands=(commit,),
+                    input_products=(decode_input,),
+                )
             )
-        ))
+        )
         assert report.completions[0].logical_lengths.kv_visible_len == length + 1
         committed.extend(report.completions[0].committed_tokens)
         commit = commit_for_completion(decode, report)
@@ -1034,15 +1203,17 @@ def test_flow_run_results_cumulative_denoise_step_in_latent_len():
         steps=1,
         control_seq=preparation_commit.control_seq,
     )
-    first_report = finalized_report(worker.execute(
-        execution_run(
-            run_id=3,
-            admissions=(),
-            operations=(first,),
-            commands=(preparation_commit,),
-            input_products=(),
+    first_report = finalized_report(
+        worker.execute(
+            execution_run(
+                run_id=3,
+                admissions=(),
+                operations=(first,),
+                commands=(preparation_commit,),
+                input_products=(),
+            )
         )
-    ))
+    )
     commit = commit_for_completion(first, first_report)
     second, _second_latent = diffusion_step_operation(
         admission.request_key,
@@ -1053,15 +1224,17 @@ def test_flow_run_results_cumulative_denoise_step_in_latent_len():
         steps=1,
         control_seq=commit.control_seq,
     )
-    second_report = finalized_report(worker.execute(
-        execution_run(
-            run_id=4,
-            admissions=(),
-            operations=(second,),
-            commands=(commit,),
-            input_products=(),
+    second_report = finalized_report(
+        worker.execute(
+            execution_run(
+                run_id=4,
+                admissions=(),
+                operations=(second,),
+                commands=(commit,),
+                input_products=(),
+            )
         )
-    ))
+    )
 
     assert first_report.completions[0].logical_lengths.latent_len == 1
     assert second_report.completions[0].logical_lengths.latent_len == 2
@@ -1092,13 +1265,15 @@ def test_trajectory_advances_across_many_generations_and_rejects_a_stale_referen
             steps=1,
             control_seq=commit.control_seq,
         )
-        report = finalized_report(worker.execute(
-            execution_run(
-                run_id=3 + index,
-                operations=(operation,),
-                commands=(commit,),
+        report = finalized_report(
+            worker.execute(
+                execution_run(
+                    run_id=3 + index,
+                    operations=(operation,),
+                    commands=(commit,),
+                )
             )
-        ))
+        )
         assert report.completions[0].status is OpStatus.OK
         assert report.completions[0].logical_lengths.latent_len == index + 1
         releasable = current
@@ -1128,8 +1303,8 @@ def test_trajectory_advances_across_many_generations_and_rejects_a_stale_referen
 
 
 def test_cross_stage_feature_transfer_rebinds_exact_product_without_request_thread_wait() -> None:
-    producer = execution_worker(transfer_backend="shm")
-    consumer = execution_worker(transfer_backend="shm")
+    producer = execution_worker(transfer_backends=("shm",))
+    consumer = execution_worker(transfer_backends=("shm",))
     admission = ar_params(73, block_ids=(0,))
     image = io.BytesIO()
     Image.new("RGB", (16, 16), (64, 96, 128)).save(image, format="PNG")
@@ -1182,6 +1357,8 @@ def test_cross_stage_feature_transfer_rebinds_exact_product_without_request_thre
         assert prepared.ready()
         consumed = consumer.execute_prepared(prepared)
         assert consumed.completions[0].status is OpStatus.OK
+        with pytest.raises(RuntimeError, match="already finished"):
+            consumer.execute_prepared(prepared)
         producer.execute(
             execution_run(
                 run_id=3,
@@ -1193,9 +1370,57 @@ def test_cross_stage_feature_transfer_rebinds_exact_product_without_request_thre
         consumer.close()
 
 
+def test_free_preserves_another_requests_feature_with_the_same_generation() -> None:
+    worker = execution_worker(transfer_backends=("shm",))
+    admissions = (ar_params(93, block_ids=(0,)), ar_params(94, block_ids=(1,)))
+    image = io.BytesIO()
+    Image.new("RGB", (16, 16), (64, 96, 128)).save(image, format="PNG")
+    encoded = base64.b64encode(image.getvalue()).decode("ascii")
+    pairs = tuple(
+        encode_operation(
+            admission.request_key,
+            op_id=1,
+            parent=root_parent(admission),
+            image_base64=encoded,
+            encoder_handle=11,
+        )
+        for admission in admissions
+    )
+    operations = tuple(operation for operation, _source in pairs)
+    try:
+        produced = finalized_report(
+            worker.execute(
+                execution_run(
+                    run_id=1,
+                    admissions=admissions,
+                    operations=operations,
+                    input_products=tuple(
+                        source for _operation, source in pairs if source is not None
+                    ),
+                )
+            )
+        )
+        assert all(completion.status is OpStatus.OK for completion in produced.completions)
+        worker.execute(
+            execution_run(run_id=2, commands=(Free(operations[0].outputs[0].buffer_id),))
+        )
+        visual = visual_state_operation(
+            admissions[1].request_key,
+            op_id=2,
+            parent=root_parent(admissions[1]),
+            feature=operations[1].outputs[0],
+            sample_continuation=False,
+            max_tokens=2,
+        )
+        consumed = finalized_report(worker.execute(execution_run(run_id=3, operations=(visual,))))
+        assert consumed.completions[0].status is OpStatus.OK
+    finally:
+        worker.close()
+
+
 def test_cross_stage_device_product_transfer_preserves_generation_and_value() -> None:
-    producer = execution_worker(transfer_backend="shm")
-    consumer = execution_worker(transfer_backend="shm")
+    producer = execution_worker(transfer_backends=("shm",))
+    consumer = execution_worker(transfer_backends=("shm",))
     admission = ar_params(77, block_ids=(0,))
     extend, extend_input = token_operation(
         admission.request_key,
@@ -1222,7 +1447,7 @@ def test_cross_stage_device_product_transfer_preserves_generation_and_value() ->
             request_key=admission.request_key,
             op_id=2,
             parent=commit.selected,
-            kind=RunKind.TRANSFER_PRODUCT,
+            kind=OpCode.TRANSFER_PRODUCT,
             bounds=Bounds(max_transfer_bytes=source.max_bytes),
             inputs=(source,),
             outputs=(transferred,),
@@ -1240,9 +1465,10 @@ def test_cross_stage_device_product_transfer_preserves_generation_and_value() ->
         assert len(transfer_report.products) == 1
         payload = transfer_report.products[0]
         assert payload.product == transferred
-        kind, descriptor = decode_transfer_handle(payload.payload)
-        assert kind == "device_product"
-        assert descriptor["generation"] == transferred.generation
+        assert isinstance(payload.payload, TransferHandle)
+        descriptor = payload.payload.value
+        assert isinstance(descriptor, DeviceProductTransferValue)
+        assert descriptor.generation == transferred.generation
 
         consume, consume_input = token_operation(
             admission.request_key,
@@ -1285,9 +1511,206 @@ def test_cross_stage_device_product_transfer_preserves_generation_and_value() ->
         consumer.close()
 
 
+@pytest.mark.parametrize("output_dtype", (DType.BF16, DType.F32))
+def test_local_transfer_retains_its_value_when_the_source_buffer_is_reused(
+    output_dtype: DType,
+) -> None:
+    worker = execution_worker()
+    admission = ar_params(95, block_ids=(0,))
+
+    def encoded_operation(op_id: int, color: tuple[int, int, int]):
+        image = io.BytesIO()
+        Image.new("RGB", (16, 16), color).save(image, format="PNG")
+        return encode_operation(
+            admission.request_key,
+            op_id=op_id,
+            parent=root_parent(admission),
+            image_base64=base64.b64encode(image.getvalue()).decode("ascii"),
+            encoder_handle=op_id,
+        )
+
+    original, image = encoded_operation(1, (64, 96, 128))
+    assert image is not None
+    initial = execution_run(
+        run_id=1,
+        admissions=(admission,),
+        operations=(original,),
+        input_products=(image,),
+    )
+    source = original.outputs[0]
+    output = replace(source, producer_op_id=2, generation=2, dtype=output_dtype)
+    transfer = Operation.registered(
+        request_key=admission.request_key,
+        op_id=2,
+        parent=root_parent(admission),
+        kind=OpCode.TRANSFER_PRODUCT,
+        bounds=Bounds(max_transfer_bytes=source.max_bytes),
+        inputs=(source,),
+        outputs=(output,),
+    )
+    ticket = None
+    try:
+        finalized_report(worker.execute(initial))
+        report = finalized_report(worker.execute(execution_run(run_id=2, operations=(transfer,))))
+        if output_dtype is not source.dtype:
+            assert report.completions[0].status is OpStatus.ERROR
+            return
+        handle = report.products[0].payload
+        assert isinstance(handle, TransferHandle)
+        assert isinstance(handle.value, EncoderTransferValue)
+        locator = handle.value.tensor.locations[0]
+        ticket = worker.transports[locator.backend].fetch(locator, device=torch.device("cpu"))
+        expected = ticket.result().clone()
+        finalized_report(
+            worker.execute(execution_run(run_id=3, commands=(Free(source.buffer_id),)))
+        )
+
+        replacement, replacement_image = encoded_operation(3, (192, 160, 32))
+        assert replacement_image is not None
+        reuse = execution_run(
+            run_id=4,
+            operations=(replacement,),
+            input_products=(replacement_image,),
+        )
+        source_allocation = next(
+            item for item in initial.buffer_allocations if item.buffer == source.buffer_id
+        )
+        reuse = replace(
+            reuse,
+            lanes=tuple(
+                replace(
+                    lane,
+                    buffer_allocations=tuple(
+                        replace(item, offset=source_allocation.offset)
+                        if item.buffer == replacement.outputs[0].buffer_id
+                        else item
+                        for item in lane.buffer_allocations
+                    ),
+                )
+                for lane in reuse.lanes
+            ),
+        )
+        finalized_report(worker.execute(reuse))
+        torch.testing.assert_close(ticket.result(), expected, rtol=0, atol=0)
+
+        released = worker.execute(execution_run(run_id=5, commands=(Free(output.buffer_id),)))
+        assert not run_result_ready(released)
+        ticket.close()
+        assert finalized_report(released).done
+    finally:
+        if ticket is not None:
+            ticket.close()
+        worker.close()
+
+
+@pytest.mark.parametrize("backend", ("local", "shm"))
+@pytest.mark.parametrize("dtype", (DType.BF16, DType.F32, DType.U16, DType.U32, DType.I16))
+def test_tensor_entry_input_preserves_values_through_output_release(
+    backend: str,
+    dtype: DType,
+) -> None:
+    from threading import Event
+
+    from uniserve_worker.execution.batch import WorkerEndpoint
+    from uniserve_worker.runtime.device_events import DeviceEventPool
+    from uniserve_worker.transfer.tickets import make_transport
+
+    events = DeviceEventPool()
+    producer = make_transport(
+        backend,
+        byte_capacity=4096,
+        ticket_capacity=2,
+        event_pool=events,
+        source=WorkerEndpoint.local("text_encoder"),
+    )
+    worker = execution_worker(transfer_backends=(backend,))
+    admission = ar_params(97, block_ids=(0,))
+    source = ProductRef(
+        request_key=admission.request_key,
+        producer_op_id=1,
+        output_index=0,
+        generation=1,
+        kind=ProductKind.TENSOR,
+        storage_class=StorageClass.DEVICE_TENSOR,
+        dtype=dtype,
+        shape_bound=ShapeBound((StaticDim(3), StaticDim(4))),
+        point_range=PointRange(),
+    )
+    output = replace(source, producer_op_id=2, generation=2)
+    operation = Operation.registered(
+        request_key=admission.request_key,
+        op_id=2,
+        parent=root_parent(admission),
+        kind=OpCode.TRANSFER_PRODUCT,
+        bounds=Bounds(max_transfer_bytes=source.max_bytes),
+        inputs=(source,),
+        outputs=(output,),
+    )
+    storage_dtype = {
+        DType.BF16: torch.bfloat16,
+        DType.F32: torch.float32,
+        DType.U16: torch.int32,
+        DType.U32: torch.int64,
+        DType.I16: torch.int16,
+    }[dtype]
+    expected = torch.arange(12, dtype=storage_dtype).reshape(3, 4)
+    if dtype is DType.I16:
+        expected[0] = torch.tensor([-32768, -1, 0, 32767], dtype=storage_dtype)
+    location = producer.publish(expected)
+    payload = ProductPayload(
+        product=source,
+        payload=TransferHandle(
+            DeviceProductTransferValue(
+                generation=source.generation,
+                height=0,
+                width=0,
+                value_range="",
+                tensor=TensorTransfer(shape=(3, 4), locations=(location,)),
+            )
+        ),
+    )
+    reader = None
+    try:
+        prepared = worker.prepare_execute(
+            execution_run(
+                run_id=1,
+                admissions=(admission,),
+                operations=(operation,),
+                input_products=(payload,),
+            )
+        )
+        assert prepared is not None
+        deadline = time.monotonic() + 5
+        while not prepared.ready() and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert prepared.ready()
+        report = finalized_report(worker.execute_prepared(prepared))
+        assert report.completions[0].status is OpStatus.OK
+        descriptor = report.products[0].payload
+        assert isinstance(descriptor, TransferHandle)
+        assert isinstance(descriptor.value, DeviceProductTransferValue)
+        locator = descriptor.value.tensor.locations[0]
+        reader = worker.transports[backend].fetch(locator, device=torch.device("cpu"))
+        ready = Event()
+        reader.add_done_callback(ready.set)
+        assert ready.wait(5)
+        torch.testing.assert_close(reader.result(), expected, rtol=0, atol=0)
+        released = worker.execute(execution_run(run_id=2, commands=(Free(output.buffer_id),)))
+        torch.testing.assert_close(reader.result(), expected, rtol=0, atol=0)
+        reader.close()
+        assert finalized_report(released).done
+    finally:
+        if reader is not None:
+            reader.close()
+        worker.close()
+        producer.release(location)
+        producer.close()
+        events.close()
+
+
 def test_cross_stage_completion_predicate_preserves_device_continuation() -> None:
-    producer = execution_worker(transfer_backend="shm")
-    consumer = execution_worker(transfer_backend="shm")
+    producer = execution_worker(transfer_backends=("shm",))
+    consumer = execution_worker(transfer_backends=("shm",))
     generation = umm_params(79, ImageParams(steps=1, height=16, width=16, seed=31))
     admission = NewRequest.create(
         generation.request_key,
@@ -1295,7 +1718,7 @@ def test_cross_stage_completion_predicate_preserves_device_continuation() -> Non
         ar=ArRequestParams(),
         umm=generation.umm,
     )
-    bind_request_placement(
+    bind_request_allocation(
         admission.request_key,
         request_pool_idx=admission.request_pool_idx,
         page_ids=(1,),
@@ -1321,7 +1744,7 @@ def test_cross_stage_completion_predicate_preserves_device_continuation() -> Non
             request_key=admission.request_key,
             op_id=3,
             parent=preparation_commit.selected,
-            kind=RunKind.TRANSFER_PRODUCT,
+            kind=OpCode.TRANSFER_PRODUCT,
             bounds=Bounds(max_transfer_bytes=source.max_bytes),
             inputs=(source,),
             outputs=(transferred,),
@@ -1368,10 +1791,14 @@ def test_cross_stage_completion_predicate_preserves_device_continuation() -> Non
         consumer.close()
 
 
-def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact() -> None:
-    producer = execution_worker(transfer_backend="shm")
-    consumer = execution_worker(transfer_backend="shm")
-    admission = umm_params(75, ImageParams(steps=1, height=16, width=16, seed=29))
+@pytest.mark.parametrize("height", (16, 80))
+@pytest.mark.parametrize("publication", ("pages", "shards", "transfer"))
+def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact(
+    height: int, publication: str
+) -> None:
+    producer = execution_worker(transfer_backends=("shm",))
+    consumer = execution_worker(transfer_backends=("shm",))
+    admission = umm_params(75, ImageParams(steps=1, height=height, width=height, seed=29))
     conditioning = _publish_conditioning(producer, admission, op_id=1, run_id=1)
     initial_latent, preparation_commit = _prepare_media(
         producer,
@@ -1402,30 +1829,108 @@ def test_cross_stage_latent_transfer_preserves_generation_step_and_artifact() ->
         time.sleep(0.001)
     assert run_result_ready(produced)
     produced = finalize_run_result(produced)
-    transferred = tuple(product for product in produced.products if product.product == final_latent)
+    flow_commit = commit_for_completion(flow, produced)
+    exported_latent = final_latent
+    if publication == "transfer":
+        exported_latent = replace(final_latent, producer_op_id=4, generation=904)
+        transfer = Operation.registered(
+            request_key=admission.request_key,
+            op_id=4,
+            parent=flow_commit.selected,
+            kind=OpCode.TRANSFER_PRODUCT,
+            bounds=Bounds(max_transfer_bytes=final_latent.max_bytes),
+            inputs=(final_latent,),
+            outputs=(exported_latent,),
+            control_seq=flow_commit.control_seq,
+        )
+        exported = finalized_report(
+            producer.execute(
+                execution_run(run_id=4, operations=(transfer,), commands=(flow_commit,))
+            )
+        )
+        assert exported.completions[0].status is OpStatus.OK
+        transferred = tuple(
+            product for product in exported.products if product.product == exported_latent
+        )
+    else:
+        transferred = tuple(
+            product for product in produced.products if product.product == final_latent
+        )
     assert len(transferred) == 1
     assert isinstance(transferred[0].payload, TransferHandle)
+    if publication == "shards":
+        from uniserve_worker.transfer.layout import fetch_tensor
 
-    flow_commit = commit_for_completion(flow, produced)
+        descriptor = transferred[0].payload.value
+        tensor = descriptor.tensor
+        source_value = torch.empty(tensor.shape, dtype=getattr(torch, tensor.dtype))
+        tickets = fetch_tensor(
+            tensor,
+            source_value,
+            bindings={
+                (location.source, location.backend): producer.transports[location.backend]
+                for location in tensor.locations
+            },
+        )
+        deadline = time.monotonic() + 5.0
+        while not all(ticket.ready() for ticket in tickets) and time.monotonic() < deadline:
+            time.sleep(0.001)
+        for ticket in tickets:
+            ticket.result()
+        axis = 0 if source_value.shape[0] > 1 else 1
+        first, second = source_value.chunk(2, dim=axis)
+        offset = tuple(first.shape[axis] if index == axis else 0 for index in range(2))
+        locations = (
+            producer.transports["shm"].publish(first),
+            producer.transports["shm"].publish(second, offset=offset),
+        )
+        transferred = (
+            replace(
+                transferred[0],
+                payload=TransferHandle(
+                    replace(
+                        descriptor, tensor=TensorTransfer(shape=tensor.shape, locations=locations)
+                    )
+                ),
+            ),
+        )
+
     source_artifact = _finalized_artifact(
         producer,
         admission,
         final_latent,
         flow_commit,
-        op_id=4,
-        run_id=4,
+        op_id=5,
+        run_id=5,
     )
     diffusion_finalize = diffusion_finalize_operation(
         admission.request_key,
-        op_id=4,
+        op_id=5,
         parent=root_parent(admission),
-        latent=final_latent,
+        latent=exported_latent,
     )
     batch = execution_run(
-        run_id=4,
+        run_id=5,
         admissions=(admission,),
         operations=(diffusion_finalize,),
         input_products=transferred,
+    )
+    # The consumer's physical page order is independent of the publisher's.
+    batch = replace(
+        batch,
+        operations=(),
+        lanes=tuple(
+            replace(
+                lane,
+                latent_params=tuple(
+                    replace(
+                        allocation, page_table=tuple(reversed(allocation.page_table)), start_step=1
+                    )
+                    for allocation in lane.latent_params
+                ),
+            )
+            for lane in batch.lanes
+        ),
     )
     prepared = consumer.prepare_execute(batch)
     assert prepared is not None
@@ -1461,11 +1966,16 @@ def test_encode_publishes_an_immutable_feature_without_advancing_state():
         mode=TokenMode.EXTEND,
         tokens=(3, 4),
     )
-    extended = finalized_report(worker.execute(
-        execution_run(
-            run_id=1, admissions=(admission,), operations=(extend,), input_products=(extend_input,)
+    extended = finalized_report(
+        worker.execute(
+            execution_run(
+                run_id=1,
+                admissions=(admission,),
+                operations=(extend,),
+                input_products=(extend_input,),
+            )
         )
-    ))
+    )
     session_kv_before = 2
 
     buffer = io.BytesIO()
@@ -1481,15 +1991,17 @@ def test_encode_publishes_an_immutable_feature_without_advancing_state():
         encoder_handle=handle,
         control_seq=commit.control_seq,
     )
-    report = finalized_report(worker.execute(
-        execution_run(
-            run_id=2,
-            admissions=(),
-            operations=(encode,),
-            commands=(commit,),
-            input_products=(encode_input,),
+    report = finalized_report(
+        worker.execute(
+            execution_run(
+                run_id=2,
+                admissions=(),
+                operations=(encode,),
+                commands=(commit,),
+                input_products=(encode_input,),
+            )
         )
-    ))
+    )
     completion = report.completions[0]
     assert completion.logical_lengths.kv_visible_len == session_kv_before
     assert completion.logical_lengths.token_len == 2
@@ -1660,14 +2172,16 @@ def test_generated_feedback_commits_absolute_visual_token_state():
         rng=state.rng,
         control_seq=state.control_seq,
     )
-    report = finalized_report(worker.execute(
-        execution_run(
-            run_id=7,
-            admissions=(),
-            operations=(state,),
-            input_products=(ProductPayload(sampling_product, sampling_bytes),),
+    report = finalized_report(
+        worker.execute(
+            execution_run(
+                run_id=7,
+                admissions=(),
+                operations=(state,),
+                input_products=(ProductPayload(sampling_product, sampling_bytes),),
+            )
         )
-    ))
+    )
 
     completion = report.completions[0]
     assert completion.committed_tokens == (next_token,)
@@ -1710,13 +2224,15 @@ def test_generated_feedback_commits_absolute_visual_token_state():
         steps=2,
         control_seq=_next_preparation_commit.control_seq,
     )
-    next_report = finalized_report(worker.execute(
-        execution_run(
-            run_id=10,
-            operations=(next_flow,),
-            commands=(_next_preparation_commit,),
+    next_report = finalized_report(
+        worker.execute(
+            execution_run(
+                run_id=10,
+                operations=(next_flow,),
+                commands=(_next_preparation_commit,),
+            )
         )
-    ))
+    )
     assert next_report.completions[0].status is OpStatus.OK
     assert next_report.completions[0].logical_lengths.latent_len == 2
     next_commit = commit_for_completion(next_flow, next_report)
@@ -1732,7 +2248,9 @@ def test_generated_feedback_commits_absolute_visual_token_state():
         validate=True,
     ).startswith(_PNG_MAGIC)
 
-    artifacts = [p for p in diffusion_finalize_report.products if p.product.kind is ProductKind.ARTIFACT]
+    artifacts = [
+        p for p in diffusion_finalize_report.products if p.product.kind is ProductKind.ARTIFACT
+    ]
     assert len(artifacts) == 1
     # The Artifact product carries the base64 PNG string as bytes: the scheduler
     # recovers it with String::from_utf8 and hands it to validate_png_artifact,
@@ -1742,3 +2260,129 @@ def test_generated_feedback_commits_absolute_visual_token_state():
     assert png_bytes[:8] == _PNG_MAGIC
     with Image.open(io.BytesIO(png_bytes)) as image:
         assert image.size == (16, 16)
+
+
+def test_latent_bank_reuse_waits_for_a_reader_after_free_without_blocking_independent_work() -> (
+    None
+):
+    import hashlib
+    import json
+    import socket
+    from threading import Event
+
+    worker = execution_worker(transfer_backends=("shm",))
+    admission = umm_params(76, ImageParams(steps=3, height=16, width=16, seed=29))
+    conditioning = _publish_conditioning(worker, admission, op_id=1, run_id=1)
+    initial, commit = _prepare_media(
+        worker, admission, conditioning, op_id=2, parent=root_parent(admission), run_id=2
+    )
+    first, first_latent = diffusion_step_operation(
+        admission.request_key,
+        op_id=3,
+        parent=commit.selected,
+        conditioning=conditioning,
+        latent=initial,
+        steps=1,
+        control_seq=commit.control_seq,
+    )
+    first_report = finalized_report(
+        worker.execute(
+            execution_run(
+                run_id=3,
+                operations=(first,),
+                commands=(commit,),
+            )
+        )
+    )
+    payload = next(
+        product.payload for product in first_report.products if product.product == first_latent
+    )
+    assert isinstance(payload, TransferHandle)
+    locator = payload.value.tensor.locations[0].to_mapping()
+    digest = hashlib.sha256(
+        json.dumps(locator, sort_keys=True, separators=(",", ":")).encode()
+    ).digest()
+    key = hashlib.sha256(locator["name"].encode()).digest()
+    prepared = None
+    try:
+        # This host consumer holds a real publication grant across semantic Free.
+        with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as reader:
+            reader.settimeout(5)
+            reader.connect("\0" + locator["endpoint"])
+            reader.sendall(key + digest)
+            assert reader.recv(1) == b"G"
+            try:
+                commit = commit_for_completion(first, first_report)
+                second, second_latent = diffusion_step_operation(
+                    admission.request_key,
+                    op_id=4,
+                    parent=commit.selected,
+                    conditioning=conditioning,
+                    latent=first_latent,
+                    steps=1,
+                    control_seq=commit.control_seq,
+                )
+                second_report = finalized_report(
+                    worker.execute(
+                        execution_run(
+                            run_id=4,
+                            operations=(second,),
+                            commands=(commit, Free(initial.buffer_id)),
+                        )
+                    )
+                )
+                assert second_report.completions[0].status is OpStatus.OK
+                commit = commit_for_completion(second, second_report)
+                third, _final_latent = diffusion_step_operation(
+                    admission.request_key,
+                    op_id=5,
+                    parent=commit.selected,
+                    conditioning=conditioning,
+                    latent=second_latent,
+                    steps=1,
+                    control_seq=commit.control_seq,
+                )
+                prepared = worker.prepare_execute(
+                    execution_run(
+                        run_id=5,
+                        operations=(third,),
+                        commands=(commit, Free(first_latent.buffer_id)),
+                    )
+                )
+                assert not prepared.ready()
+                woke = Event()
+                prepared.on_dependencies_ready(woke.set)
+                assert not woke.is_set()
+
+                independent = ar_params(77, block_ids=(7,))
+                operation, tokens = token_operation(
+                    independent.request_key,
+                    op_id=1,
+                    parent=root_parent(independent),
+                    mode=TokenMode.EXTEND,
+                    tokens=(3, 4),
+                )
+                report = finalized_report(
+                    worker.execute(
+                        execution_run(
+                            run_id=6,
+                            admissions=(independent,),
+                            operations=(operation,),
+                            input_products=(tokens,),
+                        )
+                    )
+                )
+                assert report.completions[0].status is OpStatus.OK
+                assert not prepared.ready()
+            finally:
+                reader.sendall(b"A")
+                assert reader.recv(1) == b"D"
+            assert woke.wait(5), "retired source read did not wake the bank writer"
+        assert prepared.ready()
+        report = finalized_report(worker.execute_prepared(prepared))
+        assert report.completions[0].status is OpStatus.OK
+        assert report.completions[0].logical_lengths.latent_len == 3
+    finally:
+        if prepared is not None:
+            prepared.abandon()
+        worker.close()

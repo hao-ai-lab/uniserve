@@ -28,8 +28,8 @@ from .rope_kernels import (
     _TritonPackedRope,
     can_run_triton_qk_rms_norm_rope,
     can_run_triton_qk_rms_norm_rope_inplace,
-    triton_qk_rms_norm_rope_inplace,
     triton,
+    triton_qk_rms_norm_rope_inplace,
     try_triton_qk_multi_axis_rms_norm_rope,
     try_triton_qk_rms_norm_rope,
     try_triton_qk_split_rms_norm_rope,
@@ -569,7 +569,7 @@ class TritonQKNormRope(Operator):
             (sin_tables[0], sin_tables[1], sin_tables[2]),
             req.eps,
             req.eps,
-            axis_dims=tuple(int(v) for v in plan.axis_dims),
+            axis_dims=(int(plan.axis_dims[0]), int(plan.axis_dims[1]), int(plan.axis_dims[2])),
         )
 
     def _can_run_multi_axis(self, req: MultiAxisQKNormRopeReq) -> bool:
@@ -703,12 +703,8 @@ class TritonQKNormRope(Operator):
                 q_rot = _triton_packed.run(q_normed_part, cos_flat, sin_flat)
                 k_rot = _triton_packed.run(k_normed_part, cos_flat, sin_flat)
                 axis_dim = int(plan.axis_dims[axis])
-                out_q.append(
-                    _unflatten_heads(q_rot, (*q_shape[:-1], axis_dim), q_was_flattened)
-                )
-                out_k.append(
-                    _unflatten_heads(k_rot, (*k_shape[:-1], axis_dim), k_was_flattened)
-                )
+                out_q.append(_unflatten_heads(q_rot, (*q_shape[:-1], axis_dim), q_was_flattened))
+                out_k.append(_unflatten_heads(k_rot, (*k_shape[:-1], axis_dim), k_was_flattened))
 
         return torch.cat(out_q, dim=-1), torch.cat(out_k, dim=-1)
 
@@ -761,10 +757,9 @@ class EagerQKNormRope(Operator):
                 rotated = torch.cat((-second, first), dim=-1)
                 table_shape = (req.cos.shape[0], 1, rotary_dim)
                 output = value.clone()
-                output[..., :rotary_dim] = (
-                    head * req.cos.view(table_shape)
-                    + rotated * req.sin.view(table_shape)
-                )
+                output[..., :rotary_dim] = head * req.cos.view(
+                    table_shape
+                ) + rotated * req.sin.view(table_shape)
                 return output
 
             req.q.copy_(partial_rope(q))
@@ -837,3 +832,118 @@ def qk_norm_rope_dispatcher() -> Dispatcher[QKNormRopeRequest, tuple[torch.Tenso
         [TritonQKNormRope(), EagerQKNormRope()],
         env_override="UNISERVE_QK_NORM_ROPE_PROVIDER",
     )
+
+
+def qk_rms_norm_partial_rope_(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    cosine: torch.Tensor,
+    sine: torch.Tensor,
+    query_bias: torch.Tensor | None = None,
+    key_bias: torch.Tensor | None = None,
+    value: torch.Tensor | None = None,
+    value_bias: torch.Tensor | None = None,
+    *,
+    eps: float = 1e-5,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Normalize Q/K heads and rotate their leading split-half coordinates in place.
+
+    Optional projection biases are rounded through the operand dtype before
+    normalization. When supplied, the value bias is also applied in place so the
+    three attention projections share one launch.
+    """
+
+    if (query_bias is None) != (key_bias is None):
+        raise ValueError("partial Q/K normalization requires both biases or neither")
+    if (value is None) != (value_bias is None):
+        raise ValueError("partial Q/K normalization requires both value and value bias or neither")
+
+    if query.shape != key.shape or query.ndim < 3 or query.numel() == 0:
+        raise ValueError("partial Q/K normalization requires equal nonempty head tensors")
+    head_dim, heads = int(query.shape[-1]), int(query.shape[-2])
+    if cosine.ndim < 1:
+        raise ValueError("rotary tables must contain an explicit coordinate dimension")
+    rotary_dim = int(cosine.shape[-1])
+    rows = query.numel() // (heads * head_dim)
+    if (
+        rotary_dim < 2
+        or rotary_dim % 2
+        or rotary_dim > head_dim
+        or cosine.shape != sine.shape
+        or cosine.numel() != rows * rotary_dim
+    ):
+        raise ValueError("rotary tables must contain one even-width prefix per token")
+    if any(tensor.device != query.device for tensor in (key, cosine, sine)):
+        raise ValueError("partial Q/K normalization operands must share one device")
+    if query.dtype != key.dtype or not query.is_floating_point():
+        raise ValueError("partial Q/K normalization requires matching floating dtypes")
+    for bias in (query_bias, key_bias, value_bias):
+        if bias is not None and (bias.numel() != heads * head_dim or bias.device != query.device):
+            raise ValueError("projection bias must match the complete head width and device")
+    if value is not None and (value.shape != query.shape or value.device != query.device):
+        raise ValueError("value projection must match Q/K geometry and device")
+    operands = (query, key, cosine, sine, query_bias, key_bias, value, value_bias)
+    if not (
+        query.is_cuda
+        and triton_available(query.device)
+        and head_dim <= 256
+        and all(tensor is None or tensor.is_contiguous() for tensor in operands)
+    ):
+        q = (
+            query
+            if query_bias is None
+            else (query.float() + query_bias.reshape(heads, head_dim).float()).to(query.dtype)
+        )
+        k = (
+            key
+            if key_bias is None
+            else (key.float() + key_bias.reshape(heads, head_dim).float()).to(key.dtype)
+        )
+        q = (q.float() * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + eps)).to(
+            query.dtype
+        )
+        k = (k.float() * torch.rsqrt(k.float().square().mean(-1, keepdim=True) + eps)).to(key.dtype)
+        table_shape = (*query.shape[:-2], 1, rotary_dim)
+        cos = cosine.reshape(table_shape).float()
+        sin = sine.reshape(table_shape).float()
+        for normalized, target in ((q, query), (k, key)):
+            prefix = normalized[..., :rotary_dim].float()
+            first, second = prefix.chunk(2, dim=-1)
+            rotated = prefix * cos + torch.cat((-second, first), dim=-1) * sin
+            normalized[..., :rotary_dim].copy_(rotated)
+            target.copy_(normalized)
+        if value is not None and value_bias is not None:
+            value.copy_(
+                (value.float() + value_bias.reshape(heads, head_dim).float()).to(value.dtype)
+            )
+        return query, key
+
+    rows = query.numel() // (int(query.shape[-2]) * head_dim)
+    heads = int(query.shape[-2])
+    from .rope_kernels import _qk_rms_norm_partial_rope_kernel
+
+    row_block = 8
+    _qk_rms_norm_partial_rope_kernel[(triton.cdiv(rows, row_block), heads)](
+        query,
+        key,
+        value,
+        query_bias,
+        key_bias,
+        value_bias,
+        cosine,
+        sine,
+        rows,
+        heads,
+        int(query.stride(-3)),
+        int(query.stride(-2)),
+        rotary_dim,
+        HAS_BIAS=query_bias is not None,
+        HAS_VALUE_BIAS=value_bias is not None,
+        HEAD_DIM=head_dim,
+        ROTARY_DIM=rotary_dim,
+        EPS=eps,
+        HEAD_BLOCK=triton.next_power_of_2(head_dim),
+        ROW_BLOCK=row_block,
+        num_warps=4,
+    )
+    return query, key

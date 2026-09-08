@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 import math
+from collections.abc import Sequence
 from typing import ClassVar
 
 from ..types import (
@@ -33,13 +33,9 @@ class VideoTask(BenchmarkTask):
             {
                 "model": self.point.model,
                 "prompt": example.prompt,
-                "seed": int(
-                    example.seed if example.seed is not None else self.point.load.seed
-                ),
+                "seed": int(example.seed if example.seed is not None else self.point.load.seed),
                 "seconds": float(
-                    example.seconds
-                    if example.seconds is not None
-                    else self.point.video.seconds
+                    example.seconds if example.seconds is not None else self.point.video.seconds
                 ),
             },
             stream=False,
@@ -57,8 +53,7 @@ class VideoTask(BenchmarkTask):
         return ValidationResult(
             checks={
                 "decoded_video": present,
-                "h264_video": present
-                and all(video.video_codec == "h264" for video in videos),
+                "h264_video": present and all(video.video_codec == "h264" for video in videos),
                 "fixed_video_geometry": present
                 and all(
                     video.width == 1344
@@ -76,8 +71,7 @@ class VideoTask(BenchmarkTask):
                 ),
                 "audio_spans_video": present
                 and all(
-                    abs(video.audio_duration_s - video.video_duration_s)
-                    <= duration_tolerance_s
+                    abs(video.audio_duration_s - video.video_duration_s) <= duration_tolerance_s
                     for video in videos
                 ),
             },

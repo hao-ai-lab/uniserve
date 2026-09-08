@@ -73,18 +73,18 @@ class VocabParallelEmbedding(nn.Module):
         """Allocate this rank's padded vocabulary interval and checkpoint-load metadata."""
 
         super().__init__()
-        self.tp_group = layer_config.tensor_group()
-        parallel = layer_config.parallel
+        self.tp_group = layer_config.communicator
+        parallel = layer_config.communicator
         self.num_embeddings = int(num_embeddings)
         self.embedding_dim = int(embedding_dim)
         self.padding_idx = None if padding_idx is None else int(padding_idx)
         self.padded_num_embeddings = pad_vocab_size(
             self.num_embeddings,
             pad_to=pad_vocab_size_to,
-            tp_size=parallel.size,
+            tp_size=parallel.world_size,
         )
-        self.num_embeddings_per_partition = self.padded_num_embeddings // int(parallel.size)
-        self.vocab_start_index = int(parallel.rank) * self.num_embeddings_per_partition
+        self.num_embeddings_per_partition = self.padded_num_embeddings // int(parallel.world_size)
+        self.vocab_start_index = int(parallel.rank_in_group) * self.num_embeddings_per_partition
         self.vocab_end_index = self.vocab_start_index + self.num_embeddings_per_partition
         self.weight = nn.Parameter(
             torch.empty(self.num_embeddings_per_partition, self.embedding_dim)
@@ -146,13 +146,13 @@ class ParallelLMHead(ColumnParallelLinear):
     ) -> None:
         """Shard a padded vocabulary projection and configure optional global-logit gathering."""
 
-        self.tp_group = layer_config.tensor_group()
-        parallel = layer_config.parallel
+        self.tp_group = layer_config.communicator
+        parallel = layer_config.communicator
         self.vocab_size = int(vocab_size)
         self.padded_vocab_size = pad_vocab_size(
             self.vocab_size,
             pad_to=pad_vocab_size_to,
-            tp_size=parallel.size,
+            tp_size=parallel.world_size,
         )
         self.gather_output = bool(gather_output)
         super().__init__(
@@ -162,7 +162,7 @@ class ParallelLMHead(ColumnParallelLinear):
             bias=bias,
             prefix=prefix,
         )
-        self.vocab_start_index = int(parallel.rank) * self.output_size
+        self.vocab_start_index = int(parallel.rank_in_group) * self.output_size
         self.vocab_end_index = self.vocab_start_index + self.output_size
         from ..loader.weight_loaders import set_vocab_layout
 

@@ -9,6 +9,8 @@ import torch
 
 from uniserve_worker.backends.triton import triton_available
 
+from ..execution.bounded_storage import BoundedTensorStorage, TensorSchema
+
 try:  # pragma: no cover - availability depends on the serving environment.
     import triton
     import triton.language as tl
@@ -147,9 +149,7 @@ class RuntimeStates:
         # same one-based indexes assigned by the request pool.
         rows = self.request_pool_size + 1
         if valid_cache_lengths is None:
-            self.valid_cache_lengths = torch.zeros(
-                rows, dtype=torch.int32, device=self.device
-            )
+            self.valid_cache_lengths = torch.zeros(rows, dtype=torch.int32, device=self.device)
         else:
             if (
                 valid_cache_lengths.shape != (rows,)
@@ -158,29 +158,24 @@ class RuntimeStates:
             ):
                 raise ValueError("runtime cache-length storage is incompatible")
             self.valid_cache_lengths = valid_cache_lengths
-        self.logical_lengths = torch.zeros(rows, dtype=torch.int32, device=self.device)
-        self.sampling_positions = torch.zeros(rows, dtype=torch.int64, device=self.device)
-        self.future_input_tokens = torch.ones(
-            (rows, self.continuation_width), dtype=torch.int64, device=self.device
-        )
-        self.penalty_counts = torch.zeros(
-            (rows, self.vocab_size), dtype=torch.int32, device=self.device
-        )
-        self.prompt_logits = torch.empty(
-            (rows, self.vocab_size), dtype=self.logits_dtype, device=self.device
-        )
-        self.predicates = torch.zeros(rows, dtype=torch.bool, device=self.device)
-        self.selected_points = torch.zeros(rows, dtype=torch.int32, device=self.device)
-        self._ones_int32 = torch.ones(
-            self.request_pool_size,
-            dtype=torch.int32,
-            device=self.device,
-        )
-        self._ones_int64 = torch.ones(
-            self.request_pool_size,
-            dtype=torch.int64,
-            device=self.device,
-        )
+        tensors = BoundedTensorStorage.allocate(
+            self.tensor_schema(
+                request_pool_size=self.request_pool_size,
+                vocab_size=self.vocab_size,
+                continuation_width=self.continuation_width,
+                logits_dtype=self.logits_dtype,
+            ),
+            self.device,
+        ).capacity
+        self.logical_lengths = tensors["logical_lengths"]
+        self.sampling_positions = tensors["sampling_positions"]
+        self.future_input_tokens = tensors["future_input_tokens"]
+        self.penalty_counts = tensors["penalty_counts"]
+        self.prompt_logits = tensors["prompt_logits"]
+        self.predicates = tensors["predicates"]
+        self.selected_points = tensors["selected_points"]
+        self._ones_int32 = tensors["_ones_int32"]
+        self._ones_int64 = tensors["_ones_int64"]
 
         # Zero-count launches compile representative block sizes without
         # modifying any request row.
@@ -205,6 +200,33 @@ class RuntimeStates:
                     has_selected=False,
                     block_size=block_size,
                 )
+
+    @staticmethod
+    def tensor_schema(
+        *,
+        request_pool_size: int,
+        vocab_size: int,
+        continuation_width: int,
+        logits_dtype: torch.dtype,
+    ) -> dict[str, TensorSchema]:
+        """Describe continuation storage; verified lengths belong to the page-table owner."""
+
+        if min(request_pool_size, vocab_size, continuation_width) < 1:
+            raise ValueError("runtime-state geometry must be positive")
+        if not logits_dtype.is_floating_point:
+            raise ValueError("runtime prompt-logit dtype must be floating point")
+        rows = request_pool_size + 1
+        return {
+            "logical_lengths": TensorSchema((rows,), torch.int32, fill=0),
+            "sampling_positions": TensorSchema((rows,), torch.int64, fill=0),
+            "future_input_tokens": TensorSchema((rows, continuation_width), torch.int64, fill=1),
+            "penalty_counts": TensorSchema((rows, vocab_size), torch.int32, fill=0),
+            "prompt_logits": TensorSchema((rows, vocab_size), logits_dtype),
+            "predicates": TensorSchema((rows,), torch.bool, fill=0),
+            "selected_points": TensorSchema((rows,), torch.int32, fill=0),
+            "_ones_int32": TensorSchema((request_pool_size,), torch.int32, fill=1),
+            "_ones_int64": TensorSchema((request_pool_size,), torch.int64, fill=1),
+        }
 
     def reset(
         self,

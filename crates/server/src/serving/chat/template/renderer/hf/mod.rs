@@ -18,8 +18,9 @@ use self::format::{
 };
 use self::template::{CompiledChatTemplate, TemplateContext};
 use self::value::{TemplateValue, to_template_value};
-use crate::serving::chat::template::error::Result;
-use crate::serving::chat::template::{ChatTemplateLoadOptions, Error, Tool};
+use crate::serving::chat::Error;
+use crate::serving::chat::Result;
+use crate::serving::chat::template::{ChatTemplateLoadOptions, Tool};
 use crate::serving::chat::{ChatContent, ChatContentPart, ChatMessage, ChatRequest};
 
 mod error;
@@ -33,7 +34,7 @@ pub use template::{load_chat_template, resolve_chat_template};
 pub use self::format::ChatTemplateContentFormatOption;
 
 #[derive(Debug, Clone)]
-/// Rendered image placements and hashes aligned with prompt content.
+/// Rendered image allocations and hashes aligned with prompt content.
 pub struct MultimodalRenderInfo {
     /// Template token inserted at each rendered image position.
     pub placeholder_token: String,
@@ -74,7 +75,7 @@ impl HfChatRenderer {
         self
     }
 
-    /// Attaches ordered multimodal placement metadata to the renderer.
+    /// Attaches ordered multimodal params metadata to the renderer.
     pub fn with_multimodal(mut self, multimodal: Option<MultimodalRenderInfo>) -> Self {
         self.multimodal = multimodal;
         self
@@ -441,7 +442,7 @@ mod tests {
     use serde_json::Value;
 
     use super::{ChatTemplateContentFormatOption, HfChatRenderer, MultimodalRenderInfo};
-    use crate::serving::chat::template::{AssistantContentBlock, Error, Result};
+    use crate::serving::chat::{AssistantContentBlock, Error, Result};
     use crate::serving::chat::{
         ChatContentPart, ChatMessage, ChatRequest, ChatRole, ChatToolChoice, GenerationPromptMode,
         ReasoningEffort, Tool,

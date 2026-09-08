@@ -17,8 +17,8 @@ from uniserve_worker.nn.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from uniserve_worker.nn.mesh import TensorParallel
-from uniserve_worker.nn.parallel import ParallelConfig, UlyssesSequence
+from uniserve_worker.nn.mesh import DeviceMesh
+from uniserve_worker.nn.parallel import ParallelConfig, SequenceParallel
 from uniserve_worker.nn.vocab_parallel_embedding import VocabParallelEmbedding
 from uniserve_worker.runtime.distributed import (
     init_distributed_environment,
@@ -41,7 +41,10 @@ def _run_groups(rank: int, rendezvous: str, backend: str):
     meshes = initialize_model_parallel(
         environment,
         {
-            "denoiser": ((0, 1, 2, 3), ParallelConfig(2, sequence_parallel=UlyssesSequence(2))),
+            "denoiser": (
+                (0, 1, 2, 3),
+                ParallelConfig(2, sequence_parallel=SequenceParallel("ulysses", (2,))),
+            ),
             "encoder": ((3, 1), ParallelConfig(2)),
             "output": ((2,), ParallelConfig()),
         },
@@ -89,54 +92,8 @@ def _run_groups(rank: int, rendezvous: str, backend: str):
                 atol=0,
             )
 
-    from uniserve_worker.execution.device_transfer import ComponentTensorTransfer
-
-    products = ComponentTensorTransfer(environment.process_group, (3, 1), (2, 0))
-    send = (
-        torch.stack(
-            [
-                torch.full((2, 3), rank * 10 + destination, device=device)
-                for destination in products.consumers
-            ]
-        )
-        if rank in products.producers
-        else torch.empty((0, 2, 3), device=device, dtype=torch.int64)
-    )
-    receive = torch.empty(
-        (len(products.producers) if rank in products.consumers else 0, 2, 3),
-        dtype=torch.int64,
-        device=device,
-    )
-    products.exchange(send, receive)
-    if rank in products.consumers:
-        expected = torch.stack(
-            [torch.full((2, 3), source * 10 + rank, device=device) for source in products.producers]
-        )
-        torch.testing.assert_close(receive, expected, rtol=0, atol=0)
-    conditioning = ComponentTensorTransfer(environment.process_group, (3,), (2, 0))
-    source = torch.full((2, 3), 17.0, device=device) if rank == 3 else None
-    target = torch.empty((2, 3), device=device) if rank in conditioning.consumers else None
-    conditioning.broadcast(source, target)
-    # PCM is a signed 16-bit stage product; transport preserves its bytes even
-    # when the collective backend has no numerical primitive for that dtype.
-    pcm = (
-        torch.tensor([-32768, -1, 0, 32767, 42, -42, 256, -256], device=device, dtype=torch.int16)
-        .reshape(2, 4)
-        .T
-    )
-    pcm_target = torch.empty((2, 4), device=device, dtype=torch.int16).T if rank in (2, 0) else None
-    conditioning.broadcast(pcm if rank == 3 else None, pcm_target)
-    if pcm_target is not None:
-        torch.testing.assert_close(pcm_target, pcm, rtol=0, atol=0)
-    if target is not None:
-        torch.testing.assert_close(target, torch.full_like(target, 17.0), rtol=0, atol=0)
-
     if backend == "nccl":
-        from uniserve_worker.backends.attention.video_sparse import (
-            VideoSparseAttentionBackend,
-            build_video_sparse_metadata,
-        )
-        from uniserve_worker.nn.parallel_attention import UlyssesAttention
+        from uniserve_worker.nn.parallel_attention import ParallelAttention
         from uniserve_worker.ops.video_sparse import compose_to_head_shards
 
         for component, dimension in (("denoiser", "ulysses"), ("encoder", "tp"), ("output", "tp")):
@@ -147,21 +104,21 @@ def _run_groups(rank: int, rendezvous: str, backend: str):
             count = group.world_size
             # Projection transport does not invoke the backend. The public
             # exchange contract can be checked with exact rank/row/head values.
-            metadata = build_video_sparse_metadata(
-                padded_rows=128,
-                prefix_tiles=0,
-                video_tiles=2,
-                valid_sizes=torch.full((2,), 64, dtype=torch.int32),
-                device=torch.device(device),
+            projection_mesh = DeviceMesh(
+                group.ranks,
+                group.rank,
+                ParallelConfig(sequence_parallel=SequenceParallel("ulysses", (count,))),
+                torch.device(device),
+                {"ulysses": group},
             )
-            parallel_attention = UlyssesAttention(
-                VideoSparseAttentionBackend(metadata), ulysses_group=group
+            parallel_attention = ParallelAttention(
+                mesh=projection_mesh,
             )
             projected = torch.arange(
                 rows * count * local_heads * 4 * width, device=device, dtype=torch.float32
             )
             projected = projected.view(rows, count * local_heads, 4, width) + rank * 1_000_000
-            exchanged = parallel_attention.exchange_projection(projected)
+            exchanged = parallel_attention.exchange_heads(projected)
             reference = torch.cat(
                 [
                     (projected - rank * 1_000_000 + member * 1_000_000).chunk(count, dim=1)[
@@ -171,8 +128,12 @@ def _run_groups(rank: int, rendezvous: str, backend: str):
                 ]
             )
             torch.testing.assert_close(exchanged, reference, rtol=0, atol=0)
-            workspace = group.symmetric_memory(
-                (rows, count * local_heads, width), dtype=torch.bfloat16, name="attention_output"
+            workspace = environment.symmetric_memory(
+                group,
+                (rows, count * local_heads, width),
+                dtype=torch.bfloat16,
+                name="attention_output",
+                layout=(),
             )
             global_rows = rows * count
             attended = torch.full(
@@ -222,7 +183,7 @@ def _run_groups(rank: int, rendezvous: str, backend: str):
             graph.reset()
 
     tp = meshes["denoiser"].get_group("tp")
-    config = LayerConfig(TensorParallel(tp.rank_in_group, tp.world_size), None, tp)
+    config = LayerConfig(tp, None)
     weight = torch.arange(32, dtype=torch.float32, device=device).reshape(8, 4) / 32
     down_weight = torch.arange(24, dtype=torch.float32, device=device).reshape(3, 8) / 16
     bias = torch.tensor([2.0, -1.0, 0.5], device=device)

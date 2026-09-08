@@ -12,7 +12,7 @@ from . import video_sparse_cute
 
 _IMPORT_ERROR: BaseException | None = None
 _provider: Any | None
-try:  # pragma: no cover - deployment-only CUDA provider.
+try:  # pragma: no cover - worker_config-only CUDA provider.
     from uniserve_kernel import sparse_attention as _provider_module
 except BaseException as error:  # pragma: no cover
     _IMPORT_ERROR = error

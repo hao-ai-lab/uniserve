@@ -3,22 +3,23 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 
 import torch
 import torch.nn as nn
 
 from .layer import LayerConfig
-from .mesh import GroupCoordinator, TensorParallel, divide
-from .placement import (
+from .mesh import Communicator, divide
+from .quant.base import (
+    LinearMethod,
+    PreparedLinearInput,
+)
+from .shard import (
     ShardPlan,
     ShardSlot,
     WeightMode,
     set_shard_plan,
     shard_for,
-)
-from .quant.base import (
-    PreparedLinearInput,
-    QuantizeMethodBase,
 )
 
 __all__ = [
@@ -37,6 +38,7 @@ class LinearBase(nn.Module):
     weight: nn.Parameter
     bias: nn.Parameter | None
     weight_scale: torch.Tensor | None
+    weight_scale_2: torch.Tensor | None
     logical_weight_absmax: torch.Tensor | None
 
     def __init__(
@@ -45,32 +47,53 @@ class LinearBase(nn.Module):
         output_size: int,
         *,
         layer_config: LayerConfig,
-        quant_method: QuantizeMethodBase | None = None,
+        quant_method: LinearMethod | None = None,
         bias: bool = True,
         prefix: str = "",
-        sequence_group: GroupCoordinator | None = None,
-        input_scale_group: GroupCoordinator | None = None,
+        sequence_group: Communicator | None = None,
+        input_scale_group: Communicator | None = None,
+        logical_input_row_partitions: int = 1,
+        weight_group: Communicator | None = None,
+        weight_shard_axis: int | None = None,
+        weight_output_offset: int = 0,
+        weight_global_output: int | None = None,
+        weight_scale_partition_size: int | None = None,
     ) -> None:
         """Create loadable weight storage through the layer's selected quantization method."""
 
         super().__init__()
         self.input_size = int(input_size)
         self.output_size = int(output_size)
+        if self.input_size <= 0 or self.output_size <= 0 or logical_input_row_partitions <= 0:
+            raise ValueError("linear dimensions and logical row partitions must be positive")
         self.sequence_group = sequence_group
         self.input_scale_group = input_scale_group
-        self.logical_input_row_partitions = 1
-        self.weight_group = GroupCoordinator()
-        self.weight_shard_axis: int | None = None
-        self.weight_output_offset = 0
-        self.weight_global_output = self.output_size
-        self.weight_scale_partition_size: int | None = None
+        self.logical_input_row_partitions = logical_input_row_partitions
+        self.weight_group = Communicator() if weight_group is None else weight_group
+        self.weight_shard_axis = weight_shard_axis
+        self.weight_output_offset = weight_output_offset
+        self.weight_global_output = (
+            self.output_size if weight_global_output is None else weight_global_output
+        )
+        self.weight_scale_partition_size = weight_scale_partition_size
         self.weight_output_partitions: tuple[int, ...] = (self.output_size,)
         self.register_buffer("logical_weight_absmax", None, persistent=False)
-        self.prefix = str(prefix)
+        self.prefix = layer_config.qualify(str(prefix))
         self.has_bias = bool(bias)
         self.quant_method = (
-            layer_config.quant_method(self.prefix) if quant_method is None else quant_method
+            layer_config.quant_method(str(prefix)) if quant_method is None else quant_method
         )
+        groups = []
+        domain = self.quant_method.input_scale_domain
+        if domain != "block" and self.weight_shard_axis == 1 and self.weight_group.world_size > 1:
+            groups.append(self.weight_group)
+        if (
+            domain == "tensor"
+            and self.input_scale_group is not None
+            and self.input_scale_group.world_size > 1
+        ):
+            groups.append(self.input_scale_group)
+        self.input_scale_groups = tuple(groups)
         self.quant_method.create_weights(
             self,
             input_size=self.input_size,
@@ -107,16 +130,7 @@ class LinearBase(nn.Module):
     def _project(self, x: torch.Tensor, *, output_dtype: torch.dtype | None = None) -> torch.Tensor:
         """Compose scale-domain communication with numerical input preparation."""
 
-        groups = []
-        domain = self.quant_method.input_scale_domain
-        if domain != "block" and self.weight_shard_axis == 1 and self.weight_group.world_size > 1:
-            groups.append(self.weight_group)
-        if (
-            domain == "tensor"
-            and self.input_scale_group is not None
-            and self.input_scale_group.world_size > 1
-        ):
-            groups.append(self.input_scale_group)
+        groups = self.input_scale_groups
         output_dtype = x.dtype if output_dtype is None else output_dtype
         if not groups and output_dtype == x.dtype:
             return self.quant_method.apply(self, x)
@@ -128,6 +142,29 @@ class LinearBase(nn.Module):
         prepared = self.quant_method.prepare_input(flat, scale)
         return self.quant_method.apply_prepared(self, prepared, output_dtype=output_dtype).reshape(
             *x.shape[:-1], self.output_size
+        )
+
+    def prepare_input(
+        self, value: torch.Tensor, *, absmax: torch.Tensor | None = None
+    ) -> PreparedLinearInput:
+        """Prepare reusable activations in this GEMM's preferred physical layout.
+
+        A supplied magnitude covers every local row and channel. Shared scale
+        domains still combine their ranks before format packing. Row-addressable
+        exchange calls the format method with its explicit linear layout.
+        """
+
+        flat = value.reshape(-1, value.shape[-1])
+        scale = self.quant_method.input_scale(flat, absmax=absmax)
+        if scale is not None:
+            for group in self.input_scale_groups:
+                group.all_reduce_max(scale)
+        prepared = self.quant_method.prepare_input(
+            flat, scale, block_scale_layout=self.quant_method.preferred_block_scale_layout
+        )
+        return replace(
+            prepared,
+            values=prepared.values.reshape(*value.shape[:-1], prepared.values.shape[-1]),
         )
 
     @torch.no_grad()
@@ -169,20 +206,20 @@ class LinearBase(nn.Module):
                 self.logical_weight_absmax = maximum[domains].reshape(-1, 1)
         self.quant_method.process_weights_after_loading(self)
 
-    def forward_prequantized(
+    def forward_prepared(
         self,
-        x: torch.Tensor,
-        scale: torch.Tensor,
+        prepared: PreparedLinearInput,
         *,
         output_dtype: torch.dtype = torch.bfloat16,
+        include_bias: bool = True,
     ) -> torch.Tensor:
-        """Apply a quantized linear to caller-supplied FP8 activation storage and scale."""
+        """Consume a fused producer's typed values and scales without requantizing."""
 
-        return self.quant_method.apply_prequantized(
+        return self.quant_method.apply_prepared(
             self,
-            x,
-            scale,
+            prepared,
             output_dtype=output_dtype,
+            include_bias=include_bias,
         )
 
     def forward_sequence_parallel(
@@ -205,7 +242,9 @@ class LinearBase(nn.Module):
         scale = self.quant_method.input_scale(x)
         if scale is not None and self.quant_method.input_scale_domain == "tensor":
             group.all_reduce_max(scale)
-        prepared = self.quant_method.prepare_input(x, scale)
+        prepared = self.quant_method.prepare_input(x, scale, block_scale_layout="linear")
+        if prepared.block_scales is not None and prepared.block_scale_layout != "linear":
+            raise ValueError("sequence row exchange requires row-addressable block scales")
         cursor = 0
 
         def gather(value: torch.Tensor) -> torch.Tensor:
@@ -222,14 +261,35 @@ class LinearBase(nn.Module):
 
         values = gather(prepared.values)
         scales = gather(prepared.block_scales) if prepared.block_scales is not None else None
-        global_scale = prepared.global_scale
-        if global_scale is not None and self.quant_method.input_scale_domain == "row":
-            global_scale = gather(global_scale)
+        row_scales = gather(prepared.row_scales) if prepared.row_scales is not None else None
         return self.quant_method.apply_prepared(
             self,
-            PreparedLinearInput(values, scales, global_scale),
+            PreparedLinearInput(
+                values, scales, prepared.tensor_scale, row_scales, prepared.block_scale_layout
+            ),
             output_dtype=x.dtype,
         )
+
+
+def project_with_deferred_bias(
+    linear: nn.Module,
+    value: torch.Tensor,
+    *,
+    absmax: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Project values and expose quantized bias for a fused numerical consumer.
+
+    Dense projection retains its GEMM bias rounding. Quantized projections
+    return the unapplied channel bias after any required row-shard reduction.
+    """
+
+    if isinstance(linear, LinearBase) and linear.quant_method.is_quantized:
+        prepared = linear.prepare_input(value, absmax=absmax)
+        output = linear.forward_prepared(prepared, include_bias=False)
+        if isinstance(linear, RowParallelLinear):
+            output = linear.weight_group.all_reduce(output)
+        return output, linear.bias
+    return linear(value), None
 
 
 def _attach_shard_plan(module: LinearBase, plan_for: Callable[[nn.Parameter], ShardPlan]) -> None:
@@ -268,16 +328,17 @@ class ColumnParallelLinear(LinearBase):
         output_size: int,
         *,
         layer_config: LayerConfig,
-        quant_method: QuantizeMethodBase | None = None,
+        quant_method: LinearMethod | None = None,
         bias: bool = True,
         prefix: str = "",
+        logical_input_row_partitions: int = 1,
     ) -> None:
         """Shard the output dimension across tensor-parallel ranks at construction time."""
 
-        parallel = layer_config.parallel
+        parallel = layer_config.communicator
         self.global_input_size = int(input_size)
         self.global_output_size = int(output_size)
-        local_output = divide(self.global_output_size, parallel.size)
+        local_output = divide(self.global_output_size, parallel.world_size)
         super().__init__(
             input_size,
             local_output,
@@ -285,12 +346,13 @@ class ColumnParallelLinear(LinearBase):
             quant_method=quant_method,
             bias=bias,
             prefix=prefix,
+            logical_input_row_partitions=logical_input_row_partitions,
+            weight_group=layer_config.communicator,
+            weight_shard_axis=0,
+            weight_output_offset=parallel.rank_in_group * local_output,
+            weight_global_output=self.global_output_size,
         )
         partition = shard_for(0, parallel)
-        self.weight_group = layer_config.tensor_group()
-        self.weight_shard_axis = 0
-        self.weight_output_offset = parallel.rank * local_output
-        self.weight_global_output = self.global_output_size
         _attach_shard_plan(self, lambda _param: ShardPlan(shard=partition))
 
 
@@ -305,14 +367,15 @@ class RowParallelLinear(LinearBase):
         layer_config: LayerConfig,
         bias: bool = True,
         prefix: str = "",
-        quant_method: QuantizeMethodBase | None = None,
+        logical_input_row_partitions: int = 1,
+        quant_method: LinearMethod | None = None,
     ) -> None:
         """Shard the input dimension and configure tensor-parallel output reduction."""
 
-        parallel = layer_config.parallel
+        parallel = layer_config.communicator
         self.global_input_size = int(input_size)
         self.global_output_size = int(output_size)
-        local_input = divide(self.global_input_size, parallel.size)
+        local_input = divide(self.global_input_size, parallel.world_size)
         super().__init__(
             local_input,
             output_size,
@@ -320,10 +383,10 @@ class RowParallelLinear(LinearBase):
             quant_method=quant_method,
             bias=bias,
             prefix=prefix,
+            logical_input_row_partitions=logical_input_row_partitions,
+            weight_group=layer_config.communicator,
+            weight_shard_axis=1,
         )
-        self.tp_group = layer_config.tensor_group()
-        self.weight_group = self.tp_group
-        self.weight_shard_axis = 1
         # The weight shards on the input axis; the per-channel weight_scale is
         # replicated across ranks (its rows index the unsharded output axis).
         set_shard_plan(self.weight, ShardPlan(shard=shard_for(1, parallel)))
@@ -335,7 +398,7 @@ class RowParallelLinear(LinearBase):
         if isinstance(weight_scale, nn.Parameter):
             set_shard_plan(
                 weight_scale,
-                ShardPlan(shard=shard_for(0, parallel, replicated=parallel.size > 1)),
+                ShardPlan(shard=shard_for(0, parallel, replicated=parallel.world_size > 1)),
             )
 
     def forward(
@@ -359,7 +422,7 @@ class RowParallelLinear(LinearBase):
     def reduce_output(self, out: torch.Tensor) -> torch.Tensor:
         """Sum input-shard partial outputs across the tensor-parallel axis."""
 
-        out = self.tp_group.all_reduce(out)
+        out = self.weight_group.all_reduce(out)
         return out if self.bias is None else out + self.bias
 
 
@@ -374,18 +437,19 @@ class MergedColumnParallelLinear(LinearBase):
         layer_config: LayerConfig,
         bias: bool = True,
         prefix: str = "",
+        logical_input_row_partitions: int = 1,
         local_output_sizes: list[int] | tuple[int, ...] | None = None,
         weight_mode: WeightMode = WeightMode.VANILLA,
-        quant_method: QuantizeMethodBase | None = None,
+        quant_method: LinearMethod | None = None,
     ):
         """Pack multiple output branches while retaining their global and local extents."""
 
-        parallel = layer_config.parallel
+        parallel = layer_config.communicator
         self.global_output_sizes = tuple(int(s) for s in output_sizes)
         self.output_sizes = (
             tuple(int(s) for s in local_output_sizes)
             if local_output_sizes is not None
-            else tuple(divide(size, parallel.size) for size in self.global_output_sizes)
+            else tuple(divide(size, parallel.world_size) for size in self.global_output_sizes)
         )
         if len(self.output_sizes) != len(self.global_output_sizes):
             raise ValueError("local_output_sizes must match output_sizes")
@@ -396,14 +460,15 @@ class MergedColumnParallelLinear(LinearBase):
             quant_method=quant_method,
             bias=bias,
             prefix=prefix,
+            logical_input_row_partitions=logical_input_row_partitions,
+            weight_group=layer_config.communicator,
+            weight_shard_axis=0,
+            weight_global_output=sum(self.global_output_sizes),
         )
         slots: dict[int | str, ShardSlot] = {}
-        self.weight_group = layer_config.tensor_group()
-        self.weight_shard_axis = 0
-        self.weight_global_output = sum(self.global_output_sizes)
         cursor = 0
         for idx, (size, global_size) in enumerate(zip(self.output_sizes, self.global_output_sizes)):
-            replicated = size == global_size and parallel.size > 1
+            replicated = size == global_size and parallel.world_size > 1
             slots[idx] = ShardSlot(
                 offset=cursor,
                 size=size,
@@ -420,6 +485,27 @@ class MergedColumnParallelLinear(LinearBase):
             ),
         )
 
+    def forward_branches(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """Return named packed branches while respecting their weight representation.
+
+        A single dense row uses the independent projection GEMVs. Quantized
+        weights retain their common preparation, scale and GEMM contract before
+        the logical output is split; packed bytes are never treated as dense weights.
+        """
+
+        if not self.quant_method.is_quantized and x.numel() == self.input_size:
+            weights = self.weight.split(self.output_sizes, dim=0)
+            biases = (
+                (None,) * len(weights)
+                if self.bias is None
+                else self.bias.split(self.output_sizes, dim=0)
+            )
+            return tuple(
+                torch.nn.functional.linear(x, weight, bias)
+                for weight, bias in zip(weights, biases, strict=True)
+            )
+        return self(x).split(self.output_sizes, dim=-1)
+
 
 class InterleavedMergedColumnParallelLinear(LinearBase):
     """Column-parallel branches interleaved by fixed-width output groups."""
@@ -432,16 +518,17 @@ class InterleavedMergedColumnParallelLinear(LinearBase):
         group_width: int,
         *,
         layer_config: LayerConfig,
-        quant_method: QuantizeMethodBase | None = None,
+        quant_method: LinearMethod | None = None,
         bias: bool = True,
         prefix: str = "",
-        sequence_group: GroupCoordinator | None = None,
+        logical_input_row_partitions: int = 1,
+        sequence_group: Communicator | None = None,
         weight_scale_partition_size: int | None = None,
-        input_scale_group: GroupCoordinator | None = None,
+        input_scale_group: Communicator | None = None,
     ) -> None:
         """Partition fixed-width groups from every branch across tensor-parallel ranks."""
 
-        parallel = layer_config.parallel
+        parallel = layer_config.communicator
         branch_output_size = int(branch_output_size)
         branches = int(branches)
         group_width = int(group_width)
@@ -449,7 +536,7 @@ class InterleavedMergedColumnParallelLinear(LinearBase):
             raise ValueError("interleaved merged linear dimensions must be positive")
         if branch_output_size % group_width:
             raise ValueError("branch output size must divide into fixed-width groups")
-        local_branch = divide(branch_output_size, parallel.size)
+        local_branch = divide(branch_output_size, parallel.world_size)
         if local_branch % group_width:
             raise ValueError("local branch output must divide into fixed-width groups")
         self.global_branch_output_size = branch_output_size
@@ -463,16 +550,16 @@ class InterleavedMergedColumnParallelLinear(LinearBase):
             quant_method=quant_method,
             bias=bias,
             prefix=prefix,
+            logical_input_row_partitions=logical_input_row_partitions,
+            weight_group=layer_config.communicator,
+            weight_shard_axis=0,
+            weight_output_offset=parallel.rank_in_group * local_branch * branches,
+            weight_global_output=branch_output_size * branches,
+            weight_scale_partition_size=weight_scale_partition_size,
             sequence_group=sequence_group,
             input_scale_group=input_scale_group,
         )
         from functools import partial
-
-        self.weight_group = layer_config.tensor_group()
-        self.weight_shard_axis = 0
-        self.weight_output_offset = parallel.rank * local_branch * branches
-        self.weight_global_output = branch_output_size * branches
-        self.weight_scale_partition_size = weight_scale_partition_size
 
         from ..loader.weight_loaders import (
             attach_weight_loader,
@@ -483,20 +570,20 @@ class InterleavedMergedColumnParallelLinear(LinearBase):
             self.weight,
             partial(
                 interleaved_packed_weight_loader,
-                rank=parallel.rank,
-                size=parallel.size,
+                rank=parallel.rank_in_group,
+                size=parallel.world_size,
                 branches=branches,
                 group_width=group_width,
             ),
         )
 
 
-def local_attention_head_count(total_heads: int, *, parallel: TensorParallel) -> int:
+def local_attention_head_count(total_heads: int, *, parallel: Communicator) -> int:
     """Return this tensor-parallel rank's query-head count."""
-    return divide(int(total_heads), parallel.size)
+    return divide(int(total_heads), parallel.world_size)
 
 
-def local_kv_head_count(total_kv_heads: int, *, parallel: TensorParallel) -> int:
+def local_kv_head_count(total_kv_heads: int, *, parallel: Communicator) -> int:
     """Return this tensor-parallel rank's KV-head count.
 
     The single owner of the attention KV sharding rule: a KV group divides
@@ -506,10 +593,21 @@ def local_kv_head_count(total_kv_heads: int, *, parallel: TensorParallel) -> int
     layouts can never drift from what sharded attention actually writes.
     """
     total = int(total_kv_heads)
-    tp_size = int(parallel.size)
+    tp_size = int(parallel.world_size)
     if tp_size <= 1 or total < tp_size:
         return total
     return divide(total, tp_size)
+
+
+def local_kv_head_offset(total_kv_heads: int, *, parallel: Communicator) -> int:
+    """Return the global head coordinate of the rank's actual KV projection.
+
+    Replicated KV groups cover the full head interval on every member. Sharded
+    groups follow communicator order, independently of physical rank numbers.
+    """
+
+    count = local_kv_head_count(total_kv_heads, parallel=parallel)
+    return 0 if count == int(total_kv_heads) else int(parallel.rank_in_group) * count
 
 
 class QKVParallelLinear(MergedColumnParallelLinear):
@@ -523,13 +621,14 @@ class QKVParallelLinear(MergedColumnParallelLinear):
         total_num_kv_heads: int,
         *,
         layer_config: LayerConfig,
-        quant_method: QuantizeMethodBase | None = None,
+        quant_method: LinearMethod | None = None,
         bias: bool = True,
         prefix: str = "",
+        packed_names: tuple[str, str, str] = ("q_proj", "k_proj", "v_proj"),
     ) -> None:
         """Derive rank-local query and KV head counts before packing their projections."""
 
-        parallel = layer_config.parallel
+        parallel = layer_config.communicator
         self.head_size = head_size
         self.total_num_heads = total_num_heads
         self.total_num_kv_heads = total_num_kv_heads
@@ -544,7 +643,11 @@ class QKVParallelLinear(MergedColumnParallelLinear):
             hidden_size,
             (q_size, kv_size, kv_size),
             layer_config=layer_config,
-            quant_method=quant_method,
+            quant_method=(
+                layer_config.quant_method(prefix, packed_names=packed_names)
+                if quant_method is None
+                else quant_method
+            ),
             bias=bias,
             prefix=prefix,
             local_output_sizes=(q_size_local, kv_size_local, kv_size_local),

@@ -27,6 +27,8 @@ pub enum ProductKind {
     SamplingState = 8,
     /// Device-selected checkpoint point.
     SelectedPoint = 9,
+    /// A bounded tensor passed between model computation entries.
+    Tensor = 10,
 }
 
 /// The worker store family that backs a product.
@@ -70,6 +72,15 @@ pub enum DType {
     BF16 = 6,
     /// IEEE 754 single precision.
     F32 = 7,
+    /// Signed 16-bit integer.
+    I16 = 8,
+}
+
+impl DType {
+    /// Physical tensor storage width, including signed 16-bit PCM values.
+    pub fn element_bytes(self) -> u64 {
+        transfer_dtype(self).1
+    }
 }
 
 /// One dimension of a bounded shape.
@@ -116,7 +127,7 @@ impl ShapeBound {
     }
 
     /// Returns the maximum number of elements represented by this shape.
-    pub(crate) fn max_elements(&self) -> u64 {
+    pub fn max_elements(&self) -> u64 {
         self.dims.iter().fold(1_u64, |elements, dim| {
             elements.saturating_mul(u64::from(match dim {
                 DimBound::Static(value) => *value,
@@ -197,16 +208,19 @@ impl ProductRef {
             self.generation > 0,
             "product reference has no logical generation"
         );
+        ensure_valid!(
+            self.kind != ProductKind::Tensor || self.storage_class == StorageClass::DeviceTensor,
+            "tensor product must use persistent device storage"
+        );
         self.shape_bound.validate()
     }
 
     /// Returns the maximum encoded byte size allowed by the shape and dtype.
     pub fn max_bytes(&self) -> u64 {
-        let element_bytes = match self.dtype {
-            DType::U8 => 1,
-            DType::U16 | DType::F16 | DType::BF16 => 2,
-            DType::U32 | DType::I32 | DType::F32 => 4,
-            DType::I64 => 8,
+        let element_bytes = if self.kind == ProductKind::Tensor {
+            transfer_dtype(self.dtype).1
+        } else {
+            product_dtype(self.dtype).1
         };
         self.shape_bound
             .max_elements()
@@ -215,18 +229,15 @@ impl ProductRef {
 
     /// Returns whether this value needs an address-stable shared allocation.
     ///
-    /// KV and diffusion trajectories use dedicated page placements;
+    /// KV and diffusion trajectories use dedicated page allocations;
     /// request-relay scalars and host results do not consume this pool.
     pub const fn uses_persistent_buffer(&self) -> bool {
         matches!(
             self.kind,
-            ProductKind::VisionFeature | ProductKind::LatentFeature
+            ProductKind::VisionFeature | ProductKind::LatentFeature | ProductKind::Tensor
         ) || matches!(
             (self.kind, self.storage_class),
-            (
-                ProductKind::Artifact,
-                StorageClass::DeviceTensor | StorageClass::LatentArena
-            )
+            (ProductKind::Artifact, StorageClass::LatentArena)
         )
     }
 }
@@ -250,14 +261,12 @@ pub enum TransferTransport {
         /// Endpoint-local publication key.
         key: u64,
     },
-    /// POSIX shared-memory publication with optional asynchronous readiness.
+    /// POSIX shared-memory publication with endpoint-driven readiness and ownership.
     PosixShm {
+        /// Publishing address-space incarnation and reader-lease endpoint.
+        endpoint: String,
         /// Shared-memory object name.
         name: String,
-        /// Bytes reserved for the readiness header.
-        ready_header_bytes: u32,
-        /// Semaphore name used when readiness is asynchronous.
-        ready_semaphore: Option<String>,
     },
     /// CUDA IPC publication with shared lifetime and readiness handles.
     CudaIpc {
@@ -270,22 +279,14 @@ pub enum TransferTransport {
         storage_handle: Vec<u8>,
         /// Exported allocation size in bytes.
         storage_size_bytes: u64,
-        /// Byte offset of the exported storage region.
-        storage_offset_bytes: u64,
-        /// Element offset of the tensor view.
-        tensor_offset: u64,
+        /// Byte offsets of ordered first-axis spans within one allocation.
+        storage_offsets_bytes: Vec<u64>,
+        /// First-axis lengths of consecutive runs of equally sized physical spans.
+        span_lengths: Vec<u64>,
+        /// Number of spans in each length run; trailing geometry and strides are shared.
+        span_counts: Vec<u32>,
         /// Tensor stride in elements.
         tensor_stride: Vec<i64>,
-        /// Opaque CUDA handle for shared reference-count storage.
-        #[serde(with = "serde_bytes")]
-        ref_counter_handle: Vec<u8>,
-        /// Byte offset of the shared reference counter.
-        ref_counter_offset: u64,
-        /// Opaque CUDA completion-event handle.
-        #[serde(with = "serde_bytes")]
-        event_handle: Vec<u8>,
-        /// Whether consumers must synchronize on the completion event.
-        event_sync_required: bool,
         /// Opaque CUDA event handle signaling publication readiness.
         #[serde(with = "serde_bytes")]
         ready_event_handle: Vec<u8>,
@@ -296,7 +297,9 @@ pub enum TransferTransport {
 /// are opaque bytes only where the underlying CUDA API defines an opaque handle;
 /// semantic transfer metadata remains typed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TransferLocator {
+pub struct Locator {
+    /// Loaded producer rank that owns this publication.
+    pub source: WorkerEndpoint,
     /// Transport-specific publication descriptor.
     pub transport: TransferTransport,
     /// Tensor payload size in bytes.
@@ -305,8 +308,116 @@ pub struct TransferLocator {
     pub dtype: String,
     /// Tensor extents in logical order.
     pub shape: Vec<u64>,
+    /// Logical element offset of this shard within its tensor.
+    pub offset: Vec<u64>,
     /// Device containing the published tensor.
     pub device: String,
+}
+
+/// Actual logical tensor shape and immutable shard or replica locations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TensorTransfer {
+    pub shape: Vec<u64>,
+    pub locations: Vec<Locator>,
+}
+
+impl TensorTransfer {
+    /// Returns whether the available shard/replica boxes cover the complete logical tensor.
+    /// Partial rank reports are valid descriptors, so completeness is a separate question.
+    pub fn has_complete_coverage(&self) -> bool {
+        if self.validate().is_err() {
+            return false;
+        }
+        let mut uncovered = vec![(vec![0; self.shape.len()], self.shape.clone())];
+        for location in &self.locations {
+            let mut remaining = Vec::new();
+            for (start, end) in uncovered {
+                let lower = start
+                    .iter()
+                    .zip(&location.offset)
+                    .map(|(a, b)| (*a).max(*b))
+                    .collect::<Vec<_>>();
+                let upper = end
+                    .iter()
+                    .zip(&location.offset)
+                    .zip(&location.shape)
+                    .map(|((end, offset), extent)| (*end).min(offset.saturating_add(*extent)))
+                    .collect::<Vec<_>>();
+                if lower.iter().zip(&upper).any(|(a, b)| a >= b) {
+                    remaining.push((start, end));
+                    continue;
+                }
+                let (mut middle_start, mut middle_end) = (start, end);
+                for axis in 0..self.shape.len() {
+                    if middle_start[axis] < lower[axis] {
+                        let mut slab_end = middle_end.clone();
+                        slab_end[axis] = lower[axis];
+                        remaining.push((middle_start.clone(), slab_end));
+                        middle_start[axis] = lower[axis];
+                    }
+                    if upper[axis] < middle_end[axis] {
+                        let mut slab_start = middle_start.clone();
+                        slab_start[axis] = upper[axis];
+                        remaining.push((slab_start, middle_end.clone()));
+                        middle_end[axis] = upper[axis];
+                    }
+                }
+            }
+            if remaining.is_empty() {
+                return true;
+            }
+            uncovered = remaining;
+        }
+        false
+    }
+
+    /// Validates physical coverage and returns the logical, replica-independent byte size.
+    pub fn validate(&self) -> ValidationResult<u64> {
+        ensure_valid!(
+            !self.shape.is_empty() && self.shape.iter().all(|&n| n > 0),
+            "tensor transfer has no geometry"
+        );
+        let first = self
+            .locations
+            .first()
+            .ok_or_else(|| invalid_message!("tensor transfer has no locations"))?;
+        first.validate()?;
+        let elements = tensor_elements(&first.shape)?;
+        ensure_valid!(
+            first.nbytes >= elements && first.nbytes % elements == 0,
+            "tensor transfer has an invalid element size"
+        );
+        let element_bytes = first.nbytes / elements;
+        for location in &self.locations {
+            location.validate()?;
+            ensure_valid!(
+                location.shape.len() == self.shape.len()
+                    && location
+                        .offset
+                        .iter()
+                        .zip(&location.shape)
+                        .zip(&self.shape)
+                        .all(|((&offset, &extent), &bound)| offset
+                            .checked_add(extent)
+                            .is_some_and(|end| end <= bound))
+                    && location.dtype == first.dtype
+                    && tensor_elements(&location.shape)?.checked_mul(element_bytes)
+                        == Some(location.nbytes),
+                "tensor location disagrees with its logical representation"
+            );
+        }
+        tensor_elements(&self.shape)?
+            .checked_mul(element_bytes)
+            .ok_or_else(|| invalid_message!("logical tensor byte size overflows"))
+    }
+}
+
+fn tensor_elements(shape: &[u64]) -> ValidationResult<u64> {
+    shape.iter().try_fold(1u64, |count, &extent| {
+        count
+            .checked_mul(extent)
+            .ok_or_else(|| invalid_message!("tensor element count overflows"))
+    })
 }
 
 /// Kind of product carried by a cross-pool transfer.
@@ -341,7 +452,7 @@ pub enum TransferHandle {
         /// Vision or latent feature product kind.
         payload_kind: ProductKind,
         /// Published feature tensor.
-        locator: TransferLocator,
+        tensor: TensorTransfer,
     },
     /// Device-resident artifact used by another model stage.
     DeviceProduct {
@@ -354,14 +465,14 @@ pub enum TransferHandle {
         /// Semantic numeric range of the tensor values.
         value_range: String,
         /// Published artifact tensor.
-        locator: TransferLocator,
+        tensor: TensorTransfer,
     },
     /// One or more tensors representing paged KV state.
     Kv {
         /// Producer allocation generation.
         generation: u32,
         /// Published KV tensors.
-        locators: Vec<TransferLocator>,
+        tensors: Vec<TensorTransfer>,
         /// Source request checkpoint represented by the publication.
         source: Checkpoint,
         /// Destination worker or pool identity.
@@ -374,8 +485,10 @@ pub enum TransferHandle {
         published_extent: u32,
         /// KV cache group identity.
         group_id: u32,
-        /// Quantization or scale metadata identity.
-        scale_identity: String,
+        /// Compute precision used when reading quantized source pages.
+        compute_dtype: String,
+        /// Tokens per source page, including the boundary scale interpretation.
+        page_size: u32,
     },
     /// Diffusion trajectory tensor.
     Latent {
@@ -390,7 +503,7 @@ pub enum TransferHandle {
         /// Denoising step represented by the tensor.
         step: u32,
         /// Published latent tensor.
-        locator: TransferLocator,
+        tensor: TensorTransfer,
     },
 }
 
@@ -415,14 +528,206 @@ impl TransferHandle {
         }
     }
 
-    /// Returns the ordered physical locators carried by this transfer.
-    fn locators(&self) -> &[TransferLocator] {
+    /// Returns logical tensors in their product-family order.
+    pub fn tensors(&self) -> &[TensorTransfer] {
         match self {
-            Self::Encoder { locator, .. }
-            | Self::DeviceProduct { locator, .. }
-            | Self::Latent { locator, .. } => std::slice::from_ref(locator),
-            Self::Kv { locators, .. } => locators,
+            Self::Encoder { tensor, .. }
+            | Self::DeviceProduct { tensor, .. }
+            | Self::Latent { tensor, .. } => std::slice::from_ref(tensor),
+            Self::Kv { tensors, .. } => tensors,
         }
+    }
+
+    /// Conservative size bound for the complete wire descriptor, including replicas.
+    pub fn encoded_size_bound(&self) -> usize {
+        let mut size = 512usize;
+        if let Self::Kv {
+            destination,
+            compute_dtype,
+            ..
+        } = self
+        {
+            size = size
+                .saturating_add(destination.len())
+                .saturating_add(compute_dtype.len());
+        }
+        for tensor in self.tensors() {
+            size = size
+                .saturating_add(64)
+                .saturating_add(8usize.saturating_mul(tensor.shape.len()));
+            for location in &tensor.locations {
+                let source = &location.source;
+                size = size
+                    .saturating_add(256)
+                    .saturating_add(location.dtype.len())
+                    .saturating_add(location.device.len())
+                    .saturating_add(16usize.saturating_mul(location.shape.len()))
+                    .saturating_add(source.worker_id.len())
+                    .saturating_add(source.node.len())
+                    .saturating_add(source.address_space.len())
+                    .saturating_add(source.incarnation.len());
+                let native = match &location.transport {
+                    TransferTransport::Local { endpoint, .. } => endpoint.len().saturating_add(16),
+                    TransferTransport::PosixShm { endpoint, name } => {
+                        endpoint.len().saturating_add(name.len()).saturating_add(16)
+                    }
+                    TransferTransport::CudaIpc {
+                        endpoint,
+                        publication_id,
+                        storage_handle,
+                        ready_event_handle,
+                        tensor_stride,
+                        span_lengths,
+                        storage_offsets_bytes,
+                        ..
+                    } => endpoint
+                        .len()
+                        .saturating_add(publication_id.len())
+                        .saturating_add(storage_handle.len())
+                        .saturating_add(ready_event_handle.len())
+                        .saturating_add(8usize.saturating_mul(tensor_stride.len()))
+                        .saturating_add(8usize.saturating_mul(storage_offsets_bytes.len()))
+                        .saturating_add(12usize.saturating_mul(span_lengths.len()))
+                        .saturating_add(64),
+                };
+                size = size.saturating_add(native);
+            }
+        }
+        size
+    }
+
+    /// Adds locations of the same immutable logical value without changing its metadata.
+    pub fn merge_locations(&mut self, other: &Self) -> ValidationResult<()> {
+        let agrees = self.generation() == other.generation()
+            && match (&*self, other) {
+                (
+                    Self::Encoder {
+                        height,
+                        width,
+                        payload_kind,
+                        ..
+                    },
+                    Self::Encoder {
+                        height: other_height,
+                        width: other_width,
+                        payload_kind: other_payload_kind,
+                        ..
+                    },
+                ) => {
+                    height == other_height
+                        && width == other_width
+                        && payload_kind == other_payload_kind
+                }
+                (
+                    Self::DeviceProduct {
+                        height,
+                        width,
+                        value_range,
+                        ..
+                    },
+                    Self::DeviceProduct {
+                        height: other_height,
+                        width: other_width,
+                        value_range: other_value_range,
+                        ..
+                    },
+                ) => {
+                    height == other_height
+                        && width == other_width
+                        && value_range == other_value_range
+                }
+                (
+                    Self::Latent {
+                        height,
+                        width,
+                        latent_units,
+                        step,
+                        ..
+                    },
+                    Self::Latent {
+                        height: other_height,
+                        width: other_width,
+                        latent_units: other_latent_units,
+                        step: other_step,
+                        ..
+                    },
+                ) => {
+                    height == other_height
+                        && width == other_width
+                        && latent_units == other_latent_units
+                        && step == other_step
+                }
+                (
+                    Self::Kv {
+                        source,
+                        destination,
+                        base,
+                        base_extent,
+                        published_extent,
+                        group_id,
+                        compute_dtype,
+                        page_size,
+                        ..
+                    },
+                    Self::Kv {
+                        source: other_source,
+                        destination: other_destination,
+                        base: other_base,
+                        base_extent: other_base_extent,
+                        published_extent: other_published_extent,
+                        group_id: other_group_id,
+                        compute_dtype: other_compute_dtype,
+                        page_size: other_page_size,
+                        ..
+                    },
+                ) => {
+                    source == other_source
+                        && destination == other_destination
+                        && base == other_base
+                        && base_extent == other_base_extent
+                        && published_extent == other_published_extent
+                        && group_id == other_group_id
+                        && compute_dtype == other_compute_dtype
+                        && page_size == other_page_size
+                }
+                _ => false,
+            };
+        ensure_valid!(agrees, "product locations disagree on semantic metadata");
+        ensure_valid!(
+            self.tensors().len() == other.tensors().len(),
+            "product locations disagree on tensor count"
+        );
+        let mut candidate = self.clone();
+        let tensors = match &mut candidate {
+            Self::Encoder { tensor, .. }
+            | Self::DeviceProduct { tensor, .. }
+            | Self::Latent { tensor, .. } => std::slice::from_mut(tensor),
+            Self::Kv { tensors, .. } => tensors.as_mut_slice(),
+        };
+        for (destination, source) in tensors.iter_mut().zip(other.tensors()) {
+            ensure_valid!(
+                destination.validate()? == source.validate()?
+                    && destination.shape == source.shape
+                    && destination.locations[0].dtype == source.locations[0].dtype,
+                "product locations disagree on logical tensor representation"
+            );
+            for location in &source.locations {
+                if !destination.locations.contains(location) {
+                    destination.locations.push(location.clone());
+                }
+            }
+        }
+        ensure_valid!(
+            candidate.encoded_size_bound() <= MAX_TRANSFER_HANDLE_BYTES,
+            "merged product locations exceed their descriptor byte bound"
+        );
+        *self = candidate;
+        Ok(())
+    }
+
+    /// Returns every physical shard and replica carried by this product.
+    pub fn locators(&self) -> impl Iterator<Item = &Locator> {
+        self.tensors().iter().flat_map(|tensor| &tensor.locations)
     }
 }
 
@@ -515,9 +820,10 @@ impl ProductPayload {
 /// Maximum serialized size accepted for an external transfer handle.
 pub const MAX_TRANSFER_HANDLE_BYTES: usize = 64 * 1024;
 
-impl TransferLocator {
+impl Locator {
     /// Validates common tensor bounds and transport-specific opening metadata.
     fn validate(&self) -> ValidationResult<()> {
+        self.source.validate()?;
         // Tensor metadata is transport-independent and establishes the minimum
         // shape needed to validate every publication mechanism.
         ensure_valid!(
@@ -525,7 +831,8 @@ impl TransferLocator {
                 && !self.dtype.is_empty()
                 && !self.shape.is_empty()
                 && self.shape.iter().all(|extent| *extent > 0)
-                && !self.device.is_empty(),
+                && !self.device.is_empty()
+                && self.offset.len() == self.shape.len(),
             "transfer locator has invalid tensor bounds"
         );
 
@@ -535,46 +842,55 @@ impl TransferLocator {
             TransferTransport::Local { endpoint, .. } => {
                 ensure_valid!(!endpoint.is_empty(), "local transfer endpoint is empty");
             }
-            TransferTransport::PosixShm {
-                name,
-                ready_header_bytes,
-                ready_semaphore,
-            } => {
-                ensure_valid!(!name.is_empty(), "shared-memory transfer name is empty");
+            TransferTransport::PosixShm { endpoint, name } => {
                 ensure_valid!(
-                    *ready_header_bytes == 0
-                        || ready_semaphore
-                            .as_ref()
-                            .is_some_and(|name| !name.is_empty()),
-                    "asynchronous shared-memory transfer has no readiness semaphore"
+                    !endpoint.is_empty(),
+                    "shared-memory transfer endpoint is empty"
                 );
+                ensure_valid!(!name.is_empty(), "shared-memory transfer name is empty");
             }
             TransferTransport::CudaIpc {
                 endpoint,
                 publication_id,
                 storage_handle,
                 storage_size_bytes,
+                storage_offsets_bytes,
+                span_lengths,
+                span_counts,
                 tensor_stride,
-                ref_counter_handle,
-                event_handle,
                 ready_event_handle,
                 ..
             } => {
                 ensure_valid!(
                     !endpoint.is_empty()
-                        && !publication_id.is_empty()
-                        && !storage_handle.is_empty()
+                        && publication_id.len() == 32
+                        && storage_handle.len() == 64
                         && *storage_size_bytes > 0
+                        && !storage_offsets_bytes.is_empty()
+                        && span_counts.len() == span_lengths.len()
+                        && span_counts.iter().all(|count| *count > 0)
+                        && span_counts
+                            .iter()
+                            .map(|count| u64::from(*count))
+                            .sum::<u64>()
+                            == storage_offsets_bytes.len() as u64
+                        && storage_offsets_bytes
+                            .iter()
+                            .all(|offset| offset < storage_size_bytes)
+                        && span_lengths.iter().all(|length| *length > 0)
+                        && span_lengths.iter().zip(span_counts).try_fold(
+                            0u64,
+                            |sum, (length, count)| {
+                                sum.checked_add(length.checked_mul(u64::from(*count))?)
+                            }
+                        ) == self.shape.first().copied()
                         && tensor_stride.len() == self.shape.len()
-                        && !ref_counter_handle.is_empty()
-                        && !event_handle.is_empty()
-                        && !ready_event_handle.is_empty(),
+                        && ready_event_handle.len() == 64
+                        && tensor_stride.iter().all(|stride| *stride >= 0),
                     "CUDA IPC transfer handle is incomplete"
                 );
                 let opaque_bytes = storage_handle
                     .len()
-                    .saturating_add(ref_counter_handle.len())
-                    .saturating_add(event_handle.len())
                     .saturating_add(ready_event_handle.len());
 
                 ensure_valid!(
@@ -631,31 +947,97 @@ fn validate_transfer_handle(
             "device-product transfer geometry is incomplete"
         ),
         TransferHandle::Kv {
-            locators,
+            tensors,
             source,
             destination,
             base,
             base_extent,
             published_extent,
-            scale_identity,
+            compute_dtype,
+            page_size,
             ..
         } => {
             ensure_valid!(
                 product.kind == ProductKind::Kv,
                 "KV transfer names a non-KV product"
             );
-            ensure_valid!(!locators.is_empty(), "KV transfer has no physical values");
+            ensure_valid!(
+                tensors.is_empty() == (published_extent == base_extent),
+                "KV tensor presence disagrees with its incremental extent"
+            );
             source.validate()?;
+            ensure_valid!(
+                matches!(source.point, CheckpointPoint::Fixed(_)),
+                "KV publication source identity is not exact"
+            );
             if let Some(base) = base {
                 base.validate()?;
+                ensure_valid!(
+                    matches!(base.point, CheckpointPoint::Fixed(_)),
+                    "KV publication base identity is not exact"
+                );
             }
             ensure_valid!(
                 !destination.is_empty()
-                    && !scale_identity.is_empty()
+                    && matches!(
+                        compute_dtype.as_str(),
+                        "float16" | "bfloat16" | "float32" | "float64"
+                    )
+                    && *page_size > 0
                     && *base_extent <= *published_extent
                     && (base.is_some() || *base_extent == 0),
                 "KV transfer publication metadata is invalid"
             );
+            if published_extent > base_extent {
+                ensure_valid!(
+                    matches!(tensors.len(), 2 | 3),
+                    "KV transfer requires raw keys, values and optional scales"
+                );
+                let key = &tensors[0];
+                let value = &tensors[1];
+                let dtype = key
+                    .locations
+                    .first()
+                    .map(|location| location.dtype.as_str());
+                ensure_valid!(
+                    key.shape.len() == 4
+                        && key.shape[0] == u64::from(published_extent - base_extent)
+                        && value.shape == key.shape
+                        && value
+                            .locations
+                            .first()
+                            .map(|location| location.dtype.as_str())
+                            == dtype
+                        && matches!(
+                            dtype,
+                            Some("float16" | "bfloat16" | "float32" | "float64" | "float8_e4m3fn")
+                        ),
+                    "KV transfer has invalid raw token/layer/head geometry"
+                );
+                let quantized = dtype == Some("float8_e4m3fn");
+                ensure_valid!(
+                    (tensors.len() == 3) == quantized,
+                    "KV transfer scale presence disagrees with its storage"
+                );
+                if quantized {
+                    let scales = &tensors[2];
+                    let tokens = u64::from(base_extent % page_size)
+                        + u64::from(published_extent - base_extent);
+                    let pages = tokens.div_ceil(u64::from(*page_size));
+                    ensure_valid!(
+                        scales.shape.len() == 4
+                            && scales.shape[..3] == [pages, 2, key.shape[1]]
+                            && scales.shape[3] > 0
+                            && key.shape[2] % scales.shape[3] == 0
+                            && scales
+                                .locations
+                                .first()
+                                .map(|location| location.dtype.as_str())
+                                == Some("float32"),
+                        "KV transfer scales disagree with its source pages"
+                    );
+                }
+            }
         }
         TransferHandle::Latent {
             height,
@@ -670,16 +1052,79 @@ fn validate_transfer_handle(
 
     // Validate each locator and bound their combined payload by the declared
     // maximum product shape.
-    let mut total_bytes = 0_u64;
-    for locator in handle.locators() {
-        locator.validate()?;
-        total_bytes = total_bytes.saturating_add(locator.nbytes);
+    if !matches!(handle, TransferHandle::Kv { .. }) {
+        let tensor = &handle.tensors()[0];
+        let (dtype, element_bytes) = transfer_dtype(product.dtype);
+        let nbytes = tensor.validate()?;
+        ensure_valid!(
+            tensor.locations[0].dtype == dtype
+                && tensor_elements(&tensor.shape)?.checked_mul(element_bytes) == Some(nbytes),
+            "transfer tensor dtype disagrees with its product"
+        );
+        let bounds = &product.shape_bound.dims;
+        let shape_matches = if bounds
+            .iter()
+            .any(|bound| matches!(bound, DimBound::Device { .. }))
+        {
+            tensor_elements(&tensor.shape)? <= product.shape_bound.max_elements()
+        } else if bounds.is_empty() {
+            tensor_elements(&tensor.shape)? == 1
+        } else {
+            tensor.shape.len() == bounds.len() && tensor.shape.iter().zip(bounds).all(|(&size, bound)| {
+                matches!(bound, DimBound::Static(expected) if size == u64::from(*expected))
+            })
+        };
+        ensure_valid!(
+            shape_matches,
+            "transfer tensor shape disagrees with its product"
+        );
     }
+    let mut total_bytes = 0_u64;
+    for tensor in handle.tensors() {
+        total_bytes = total_bytes.saturating_add(tensor.validate()?);
+    }
+    let byte_bound = if matches!(handle, TransferHandle::Kv { .. }) {
+        product.max_bytes()
+    } else {
+        product
+            .shape_bound
+            .max_elements()
+            .saturating_mul(transfer_dtype(product.dtype).1)
+    };
     ensure_valid!(
-        total_bytes <= product.max_bytes(),
+        total_bytes <= byte_bound,
         "transfer values exceed their product byte bound"
     );
+    ensure_valid!(
+        handle.encoded_size_bound() <= MAX_TRANSFER_HANDLE_BYTES,
+        "transfer handle exceeds its byte bound"
+    );
     Ok(())
+}
+
+/// Device products use signed arithmetic storage for unsigned token/point values.
+/// The logical wire dtype still defines inline encoding; transport copies the
+/// declared device representation without changing either its width or values.
+fn transfer_dtype(dtype: DType) -> (&'static str, u64) {
+    match dtype {
+        DType::U16 => ("int32", 4),
+        DType::U32 => ("int64", 8),
+        other => product_dtype(other),
+    }
+}
+
+fn product_dtype(dtype: DType) -> (&'static str, u64) {
+    match dtype {
+        DType::U8 => ("uint8", 1),
+        DType::U16 => ("uint16", 2),
+        DType::U32 => ("uint32", 4),
+        DType::I32 => ("int32", 4),
+        DType::I16 => ("int16", 2),
+        DType::I64 => ("int64", 8),
+        DType::F16 => ("float16", 2),
+        DType::BF16 => ("bfloat16", 2),
+        DType::F32 => ("float32", 4),
+    }
 }
 
 /// Encodes a `ProductKind::Token` product value: a little-endian `u32` count
