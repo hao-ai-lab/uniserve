@@ -142,7 +142,7 @@ uniserve serve /models/Qwen3-32B \
   --worker-ranks 4
 ```
 
-See [parallel serving configuration](docs/parallelism.md) for static component bindings, ordered groups, and H3 execution support.
+For text-to-video-and-audio generation with `FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree`, use the [FastH3 cheat sheet](docs/fast_h3/fast_h3.md).
 
 ## Development and verification
 
@@ -166,7 +166,7 @@ UNISERVE_RUN_GPU_E2E=1 \
 just test-python-gpu
 ```
 
-Serving benchmark usage is documented in [`docs/benchmarking.md`](docs/benchmarking.md), and the evaluator points are defined in [`uniserve_eval/profiles.toml`](uniserve_eval/profiles.toml).
+Serving evaluator points are defined in [`uniserve_eval/profiles.toml`](uniserve_eval/profiles.toml).
 
 ## Repository layout
 
@@ -182,7 +182,7 @@ crates/bin/uniserve/                     `serve` and `engine` CLI entrypoints
 uniserve_worker/                          Forward-only Python model workers
 uniserve_eval/                            Serving evaluator
 specs/                                    Builder-facing implementation notes
-docs/                                     User-facing runtime and evaluation documentation
+docs/fast_h3/                             FastH3 deployment cheat sheet and container files
 ```
 
 ## License
