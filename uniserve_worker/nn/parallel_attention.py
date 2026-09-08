@@ -93,7 +93,9 @@ class AttentionRowExchange:
         group = self.parallel.ulysses_group
         rows = self.tensor.shape[0] // group.world_size
         payload = self.tensor[0].numel() * self.tensor.element_size()
-        chunk_rows = max(128, (64 * 1024 * 1024 // payload // 128) * 128)
+        # A bounded peer interval releases row-local consumers before the full
+        # exchange completes, limiting the pipeline's initial transfer bubble.
+        chunk_rows = max(128, (32 * 1024 * 1024 // payload // 128) * 128)
         outgoing = self.tensor.view(group.world_size, rows, *self.tensor.shape[1:])
         byte_count = self.tensor.numel() * self.tensor.element_size()
         incoming = receive_workspace.view(torch.uint8).view(-1)[:byte_count].view(self.tensor.dtype)

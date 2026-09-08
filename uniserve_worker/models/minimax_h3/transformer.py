@@ -377,7 +377,11 @@ class _H3Attention(nn.Module):
                     layer_config=layer_config,
                     prefix="to_out.0",
                     bias=False,
-                    quant_method=create_linear_method(linear_precision),
+                    quant_method=(
+                        UnquantizedLinearMethod(accumulation_dtype=torch.float32)
+                        if linear_precision == "bf16"
+                        else create_linear_method(linear_precision)
+                    ),
                     logical_input_row_partitions=4 // mesh.size("sp"),
                 )
             )
