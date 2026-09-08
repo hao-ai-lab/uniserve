@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import partial
+from pathlib import Path
 from typing import Callable, Mapping
 
 import torch
@@ -17,7 +18,7 @@ from ..models.minimax_h3.precision import (
     PRECISION_SHORTHANDS,
     SUPPORTED_PRECISIONS,
 )
-from ..models.minimax_h3.schedule import FASTH3_LADDER, FASTH3_SHIFTS, FASTH3_TIME_SCALE
+from ..models.minimax_h3.schedule import load_fasth3_schedule
 from ..models.qwen3 import Qwen3ForCausalLM
 from ..models.runtime import ExecutionModel
 from ..models.sensenova.model import NEOChatModel
@@ -40,7 +41,7 @@ class CatalogEntry:
     component_precisions: Callable[[Mapping[str, object]], Mapping[str, LinearPrecision]] | None = (
         None
     )
-    create_schedule: Callable[[torch.device], DiffusionSchedule] | None = None
+    create_schedule: Callable[[Path, torch.device], DiffusionSchedule] | None = None
 
     def __post_init__(self) -> None:
         """Validate architecture identity, checkpoint sources, and computation names."""
@@ -98,12 +99,7 @@ MINIMAX_H3_ENTRY = CatalogEntry(
         shorthands=PRECISION_SHORTHANDS,
         default_mode="balanced",
     ),
-    create_schedule=lambda device: DiffusionSchedule.build(
-        FASTH3_LADDER,
-        FASTH3_SHIFTS,
-        scale=FASTH3_TIME_SCALE,
-        device=device,
-    ),
+    create_schedule=load_fasth3_schedule,
     sources=(
         WeightSourceConfig("denoiser", "transformer", entry="denoiser"),
         WeightSourceConfig("text_encoder", "text_encoder", entry="text_encoder"),
@@ -112,6 +108,7 @@ MINIMAX_H3_ENTRY = CatalogEntry(
     ),
     sidecars=(
         "modular_model_index.json",
+        "fastvideo_inference.json",
         "transformer/config.json",
         "text_encoder/config.json",
         "vae/config.json",
