@@ -119,9 +119,16 @@ class ParallelAttention:
         group.all_to_all_single_into(incoming, outgoing, splits, splits)
         return incoming.reshape(rows * group.world_size, local_heads, *features)
 
-    def restore_rows(self, tensor: torch.Tensor) -> torch.Tensor:
+    def restore_rows(
+        self,
+        tensor: torch.Tensor,
+        *,
+        workspace: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Exchange computed head shards back to the owning sequence rows.
 
+        A caller-owned workspace must match the contiguous payload's size,
+        dtype and device. Registered storage enables copy-engine transport.
         Backends that write peer output destinations directly can instead call
         ``finish_output`` after their fused head-to-sequence epilogue.
         """
@@ -134,7 +141,17 @@ class ParallelAttention:
         rows = tensor.shape[0] // group.world_size
         heads, *features = tensor.shape[1:]
         outgoing = tensor.reshape(group.world_size, rows, heads, *features).contiguous()
-        incoming = torch.empty_like(outgoing)
+        if workspace is None:
+            incoming = torch.empty_like(outgoing)
+        else:
+            if (
+                workspace.numel() != outgoing.numel()
+                or workspace.dtype != outgoing.dtype
+                or workspace.device != outgoing.device
+                or not workspace.is_contiguous()
+            ):
+                raise ValueError("attention row exchange workspace must match its payload")
+            incoming = workspace.view_as(outgoing)
         splits = [1] * group.world_size
         group.all_to_all_single_into(incoming, outgoing, splits, splits)
         return incoming.transpose(0, 1).reshape(rows, heads * group.world_size, *features)

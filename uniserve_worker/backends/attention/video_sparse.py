@@ -334,6 +334,11 @@ class VideoSparseAttentionBackend:
 
         query_tile_offset = context.rank_in_group * (query.shape[0] // TILE)
         key, value = parallel.distribute_key_value(key, value, context_workspace)
+        local_output = (
+            outputs[group.rank_in_group].view_as(query)
+            if context.world_size == 1 and group.world_size > 1
+            else None
+        )
         self.forward_local(
             query,
             key,
@@ -344,9 +349,17 @@ class VideoSparseAttentionBackend:
             dense_key_indices,
             prefix_count,
             workspace,
-            targets=AttentionOutputTargets(outputs, group.rank_in_group),
+            targets=(
+                AttentionOutputTargets((local_output,), 0)
+                if local_output is not None
+                else AttentionOutputTargets(outputs, group.rank_in_group)
+            ),
             query_tile_offset=query_tile_offset,
         )
+        if local_output is not None:
+            # The epilogue has consumed the sparse provider's output; its
+            # registered buffer can now receive the head-to-row exchange.
+            return parallel.restore_rows(local_output, workspace=workspace.attention_output)
         return parallel.finish_output(outputs, sync_input, sync_output)
 
     def forward_local(

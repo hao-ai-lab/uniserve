@@ -69,11 +69,17 @@ def _all_to_all_single_into(
     with profile_range(
         f"uniserve.collective kind=all_to_all group={group_name} rank={dist.get_rank()}"
     ):
+        # Empty split lists select the native equal-count collective. Explicit
+        # lists select variable-count send/recv, including when counts match.
+        equal_counts = (
+            input.numel() == output.numel()
+            and len(set(output_splits + input_splits)) == 1
+        )
         work = dist.all_to_all_single(
             output,
             input,
-            output_split_sizes=output_splits,
-            input_split_sizes=input_splits,
+            output_split_sizes=None if equal_counts else output_splits,
+            input_split_sizes=None if equal_counts else input_splits,
             group=_process_group(group_name),
             async_op=True,
         )

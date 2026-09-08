@@ -370,6 +370,11 @@ def scratch_tensor_schema(
         if mesh.size("tp") == 1 and mesh.size("cp") == 1 and mesh.size("sp") > 1
         else None
     )
+    output_group = (
+        mesh.get_group("ulysses")
+        if mesh.size("cp") == 1 and mesh.size("ulysses") > 1
+        else None
+    )
     schema = {
         "packed_hidden": TensorSchema((1, rows, 5376), torch.bfloat16),
         "local_text_hidden": TensorSchema((1, local_text, 5376), torch.bfloat16),
@@ -393,7 +398,12 @@ def scratch_tensor_schema(
             memory="symmetric" if gather_group is not None else "device",
             group=gather_group,
         ),
-        "attention_output": TensorSchema((query_rows, heads, 128), torch.bfloat16),
+        "attention_output": TensorSchema(
+            (query_rows, heads, 128),
+            torch.bfloat16,
+            memory="symmetric" if output_group is not None else "device",
+            group=output_group,
+        ),
         "tile_scores": TensorSchema((heads, query_tiles, tiles), torch.float32),
         "block_indices": TensorSchema(
             (heads, query_tiles, layout.packed.prefix_tiles + layout.packed.video_tiles),
