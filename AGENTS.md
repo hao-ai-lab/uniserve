@@ -77,8 +77,8 @@ This policy covers tests, builds, lint, type checks, benchmarks, smoke tests, he
 - Diagnose degradation from a complete reading of the request path or the finest-grained effective timeline profiling available. Ground experiments in that evidence; do not substitute intuition, isolated microbenchmarks, plausible subsystem stories, or trial and error for an established understanding of the relevant code.
 - Build a clear optimization plan that links evidence to the mechanism, proposed change, expected system effect, and end-to-end measurement. Preserve correctness, quality, and the fixed benchmark protocol.
 - Prioritize changes that materially affect end-to-end performance and address the governing bottleneck. Local kernel tweaks, cleanup, and easier changes cannot substitute for the actual performance objective.
-- Validate optimizations against end-to-end measurements before committing them. A measured speedup below `1.03x` is insufficient: revert the attempt's code, tests, configuration, and documentation completely. Preserve the measurement evidence and record the failed attempt and lesson in the engineering work log; these records are the explicit exception to removing the attempt's artifacts.
-- A speedup of at least `1.03x` is necessary but does not alone establish that the performance objective is met. Retain only changes with decisive, material benefit, and report measured effects separately from unsupported causal explanations.
+- Validate optimizations against end-to-end measurements before committing them. A measured speedup below `1.015x` is insufficient: revert the attempt's code, tests, configuration, and documentation completely. Preserve the measurement evidence and record the failed attempt and lesson in the engineering work log; these records are the explicit exception to removing the attempt's artifacts.
+- A speedup of at least `1.015x` is necessary but does not alone establish that the performance objective is met. Retain only changes with decisive, material benefit, and report measured effects separately from unsupported causal explanations.
 
 ## Prerequisites and Failure Handling
 
