@@ -239,6 +239,7 @@ class WorkerConfig:
     kv_memory_fraction: float = 0.70
     lanes: tuple[LaneConfig, ...] = ()
     cuda_graph: bool = True
+    graph_policy: str = "auto"
     decode_graph_batch_sizes: tuple[int, ...] = DEFAULT_DECODE_GRAPH_BATCH_SIZES
     prefill_cuda_graph: bool = False
     prefill_graph_token_sizes: tuple[int, ...] = DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS
@@ -249,6 +250,12 @@ class WorkerConfig:
     def __post_init__(self) -> None:
         """Validate topology axes, device identity, batch bounds, and dtype policies."""
 
+        if self.graph_policy not in {"off", "auto", "full"}:
+            raise invalid_descriptor("graph policy must be off, auto, or full")
+        if self.graph_policy == "off":
+            object.__setattr__(self, "cuda_graph", False)
+        if self.graph_policy == "full" and not self.cuda_graph:
+            raise invalid_descriptor("full graph policy requires CUDA graphs")
         if not self.device:
             raise invalid_descriptor("worker device must be named")
         if self.world_size < 1 or not 0 <= self.rank < self.world_size:
@@ -301,7 +308,9 @@ def worker_config_from_namespace(
             "kv-memory-fraction",
         ),
         lanes=_parse_lanes(getattr(namespace, "lane", ())),
-        cuda_graph=bool(namespace.cuda_graph),
+        cuda_graph=bool(namespace.cuda_graph)
+        and getattr(namespace, "graph_policy", "auto") != "off",
+        graph_policy=getattr(namespace, "graph_policy", "auto"),
         decode_graph_batch_sizes=_parse_positive_int_csv(
             namespace.decode_graph_batch_sizes,
             default=DEFAULT_DECODE_GRAPH_BATCH_SIZES,

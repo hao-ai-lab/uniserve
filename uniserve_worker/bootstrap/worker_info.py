@@ -11,6 +11,7 @@ from uniserve_worker.nn.parallel import EntryConfig
 
 from ..execution.batch import OpCode, TensorSpec, WorkerEndpoint
 from ..foundation.errors import invalid_descriptor
+from ..models.video import MediaExecutionPlan, MediaPlanRepeat, MediaPlanStage
 
 
 class RequestKind(StrEnum):
@@ -207,6 +208,13 @@ class WorkerInfo:
     components: tuple[EntryInfo, ...] = ()
     device: str = "cpu"
     transfer_backends: tuple[str, ...] = ("local",)
+    media_plan: MediaExecutionPlan | None = None
+
+    @property
+    def denoise_steps(self) -> int:
+        """Return the learned-prediction count from the model's execution plan."""
+
+        return 0 if self.media_plan is None else self.media_plan.denoise_steps
 
     @property
     def latent_capacity_units(self) -> int:
@@ -258,6 +266,10 @@ class WorkerInfo:
             raise invalid_descriptor("worker info must support a work variant")
         if len(set(self.supported_ops)) != len(self.supported_ops):
             raise invalid_descriptor("worker info repeats a work variant")
+        if self.media_plan is not None and not self.media_plan.operations <= set(
+            self.supported_ops
+        ):
+            raise invalid_descriptor("media plan uses an operation the worker does not support")
         has_latent_geometry = bool(self.latent_page_units or self.latent_pages)
         if has_latent_geometry:
             if self.latent_page_units < 1 or self.latent_pages < 2:
@@ -271,6 +283,7 @@ class WorkerInfo:
 
         data = _map(value, where)
         return cls(
+            media_plan=_media_plan(data.get("media_plan"), f"{where}.media_plan"),
             configuration_id=str(data.get("configuration_id", "")),
             components=tuple(
                 EntryInfo.from_mapping(item, f"{where}.components[{index}]")
@@ -312,6 +325,7 @@ class WorkerInfo:
         """Encode worker capabilities and resource bounds for IPC discovery."""
 
         return {
+            "media_plan": None if self.media_plan is None else self.media_plan.to_mapping(),
             "model_name": self.model_name,
             "weight_version": self.weight_version,
             "endpoint": self.endpoint.to_mapping(),
@@ -331,6 +345,53 @@ class WorkerInfo:
             "buffer_pool_bytes": self.buffer_pool_bytes,
             "max_unresolved_ops": self.max_unresolved_ops,
         }
+
+
+def _media_plan(value: object, where: str) -> MediaExecutionPlan | None:
+    """Decode the finite model-declared media graph from worker discovery."""
+
+    if value is None:
+        return None
+    data = _map(value, where)
+    try:
+        return MediaExecutionPlan(
+            tuple(
+                MediaPlanStage(
+                    name=_str(stage.get("name"), f"{where}.stages[{index}].name"),
+                    operation=_enum(
+                        OpCode,
+                        stage.get("operation"),
+                        f"{where}.stages[{index}].operation",
+                    ),
+                    entry=_str(stage.get("entry"), f"{where}.stages[{index}].entry"),
+                    dependencies=tuple(
+                        _str(item, f"{where}.stages[{index}].dependencies")
+                        for item in _seq(
+                            stage.get("dependencies"),
+                            f"{where}.stages[{index}].dependencies",
+                        )
+                    ),
+                    input_from=(
+                        None
+                        if stage.get("input_from") is None
+                        else _str(
+                            stage.get("input_from"),
+                            f"{where}.stages[{index}].input_from",
+                        )
+                    ),
+                    repeat=_enum(
+                        MediaPlanRepeat,
+                        stage.get("repeat"),
+                        f"{where}.stages[{index}].repeat",
+                    ),
+                    count=_uint(stage.get("count"), f"{where}.stages[{index}].count"),
+                )
+                for index, item in enumerate(_seq(data.get("stages"), f"{where}.stages"))
+                for stage in (_map(item, f"{where}.stages[{index}]"),)
+            )
+        )
+    except ValueError as error:
+        raise invalid_descriptor(str(error)) from error
 
 
 _E = TypeVar("_E", bound=StrEnum)

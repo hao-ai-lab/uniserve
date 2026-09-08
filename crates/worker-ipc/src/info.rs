@@ -90,6 +90,140 @@ pub struct EntryInfo {
     pub outputs: Vec<TensorSpec>,
 }
 
+/// Expansion rule for one stage of a finite terminal-media plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaPlanRepeat {
+    Once,
+    Fixed,
+    VideoUnits,
+}
+
+/// Bounded operation role implemented by the terminal-media executor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MediaStageRole {
+    Encode,
+    Prepare,
+    Denoise,
+    VideoDecode,
+    AudioDecode,
+    VideoAppend,
+    AudioAppend,
+    Finalize,
+}
+
+impl MediaStageRole {
+    const ALL: [Self; 8] = [
+        Self::Encode,
+        Self::Prepare,
+        Self::Denoise,
+        Self::VideoDecode,
+        Self::AudioDecode,
+        Self::VideoAppend,
+        Self::AudioAppend,
+        Self::Finalize,
+    ];
+}
+
+/// One model-declared computation stage and its upstream contracts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaPlanStage {
+    pub name: String,
+    pub operation: OpCode,
+    pub entry: String,
+    #[serde(default)]
+    pub dependencies: Vec<String>,
+    #[serde(default)]
+    pub input_from: Option<String>,
+    pub repeat: MediaPlanRepeat,
+    pub count: u32,
+}
+
+impl MediaPlanStage {
+    /// Resolve executor behavior from the operation family and expansion rule.
+    pub fn role(&self) -> Option<MediaStageRole> {
+        match (self.operation, self.repeat) {
+            (OpCode::EncoderText, MediaPlanRepeat::Once) => Some(MediaStageRole::Encode),
+            (OpCode::DiffusionPrepare, MediaPlanRepeat::Once) => Some(MediaStageRole::Prepare),
+            (OpCode::DiffusionStep, MediaPlanRepeat::Fixed) => Some(MediaStageRole::Denoise),
+            (OpCode::DiffusionDecode, MediaPlanRepeat::VideoUnits) => {
+                Some(MediaStageRole::VideoDecode)
+            }
+            (OpCode::DiffusionDecode, MediaPlanRepeat::Once) => Some(MediaStageRole::AudioDecode),
+            (OpCode::MediaAppend, MediaPlanRepeat::VideoUnits) => Some(MediaStageRole::VideoAppend),
+            (OpCode::MediaAppend, MediaPlanRepeat::Once) => Some(MediaStageRole::AudioAppend),
+            (OpCode::DiffusionFinalize, MediaPlanRepeat::Once) => Some(MediaStageRole::Finalize),
+            _ => None,
+        }
+    }
+}
+
+/// Ordered finite graph used by the shared terminal-media scheduler.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaExecutionPlan {
+    pub stages: Vec<MediaPlanStage>,
+}
+
+impl MediaExecutionPlan {
+    /// Validate the bounded stage vocabulary implemented by the media scheduler.
+    pub fn validate(&self) -> ValidationResult<()> {
+        let mut declared = HashSet::new();
+        let mut roles = HashSet::new();
+        for stage in &self.stages {
+            ensure_valid!(
+                !stage.name.is_empty()
+                    && !stage.entry.is_empty()
+                    && !declared.contains(stage.name.as_str()),
+                "media plan repeats or omits a stage name"
+            );
+            ensure_valid!(
+                stage
+                    .dependencies
+                    .iter()
+                    .all(|dependency| declared.contains(dependency.as_str()))
+                    && stage
+                        .input_from
+                        .as_ref()
+                        .is_none_or(|input| declared.contains(input.as_str())),
+                "media plan references a later or missing stage"
+            );
+            ensure_valid!(
+                match stage.repeat {
+                    MediaPlanRepeat::Fixed => stage.count > 0,
+                    MediaPlanRepeat::Once | MediaPlanRepeat::VideoUnits => stage.count == 1,
+                },
+                "media plan declares an invalid repetition count"
+            );
+            let role = stage
+                .role()
+                .ok_or_else(|| invalid_message!("media plan contains an unsupported stage role"))?;
+            ensure_valid!(
+                roles.insert(role),
+                "media plan repeats one terminal-media stage role"
+            );
+            declared.insert(stage.name.as_str());
+        }
+        ensure_valid!(
+            MediaStageRole::ALL.iter().all(|role| roles.contains(role)),
+            "media plan omits a required terminal-media stage role"
+        );
+        Ok(())
+    }
+
+    pub fn stage(&self, name: &str) -> Option<&MediaPlanStage> {
+        self.stages.iter().find(|stage| stage.name == name)
+    }
+
+    pub fn stage_by_role(&self, role: MediaStageRole) -> Option<&MediaPlanStage> {
+        self.stages.iter().find(|stage| stage.role() == Some(role))
+    }
+
+    pub fn denoise_steps(&self) -> u32 {
+        self.stage_by_role(MediaStageRole::Denoise)
+            .map_or(0, |stage| stage.count)
+    }
+}
+
 /// A computation's bounded tensor result, before request and storage binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TensorSpec {
@@ -142,6 +276,9 @@ impl WorkerEndpoint {
 pub struct WorkerInfo {
     /// Loaded model identity.
     pub model_name: String,
+    /// Model-declared finite terminal-media computation, when supported.
+    #[serde(default)]
+    pub media_plan: Option<MediaExecutionPlan>,
     /// Model-weight revision used to reject cross-version products.
     pub weight_version: u64,
     /// Identity of the loaded rank and its host address space.
@@ -181,6 +318,13 @@ pub struct WorkerInfo {
 }
 
 impl WorkerInfo {
+    /// Returns the fixed prediction count from the model-declared plan.
+    pub fn denoise_steps(&self) -> u32 {
+        self.media_plan
+            .as_ref()
+            .map_or(0, MediaExecutionPlan::denoise_steps)
+    }
+
     /// Returns the advertised KV page size, or zero when KV is unsupported.
     pub fn kv_block_size(&self) -> u32 {
         self.kv_cache.as_ref().map_or(0, |config| config.block_size)
@@ -282,6 +426,15 @@ impl WorkerInfo {
                 == self.supported_ops.len(),
             "worker info repeat a work variant"
         );
+        if let Some(plan) = &self.media_plan {
+            plan.validate()?;
+            ensure_valid!(
+                plan.stages
+                    .iter()
+                    .all(|stage| self.supported_ops.contains(&stage.operation)),
+                "media plan uses an operation the worker does not support"
+            );
+        }
         ensure_valid!(
             self.max_batch_ops > 0
                 && self.max_batch_tokens > 0
@@ -322,6 +475,7 @@ impl Default for WorkerInfo {
     fn default() -> Self {
         Self {
             model_name: "model".to_owned(),
+            media_plan: None,
             weight_version: 0,
             endpoint: WorkerEndpoint {
                 worker_id: "worker".into(),

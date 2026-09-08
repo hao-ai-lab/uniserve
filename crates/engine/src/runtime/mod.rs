@@ -455,21 +455,62 @@ enum MediaQuantum {
 }
 
 impl MediaQuantum {
-    fn target(self) -> (OpCode, &'static str) {
+    fn stage_role(self) -> uniserve_worker_ipc::MediaStageRole {
+        use uniserve_worker_ipc::MediaStageRole;
+
         match self {
-            Self::Encode => (OpCode::EncoderText, "text_encoder"),
-            Self::Prepare => (OpCode::DiffusionPrepare, "denoiser"),
-            Self::Denoise { .. } => (OpCode::DiffusionStep, "denoiser"),
+            Self::Encode => MediaStageRole::Encode,
+            Self::Prepare => MediaStageRole::Prepare,
+            Self::Denoise { .. } => MediaStageRole::Denoise,
             Self::Decode {
                 track: MediaTrack::Video,
                 ..
-            } => (OpCode::DiffusionDecode, "video_decoder"),
+            } => MediaStageRole::VideoDecode,
             Self::Decode {
                 track: MediaTrack::Audio,
                 ..
-            } => (OpCode::DiffusionDecode, "audio_decoder"),
-            Self::Append { .. } => (OpCode::MediaAppend, "output"),
-            Self::Finalize => (OpCode::DiffusionFinalize, "output"),
+            } => MediaStageRole::AudioDecode,
+            Self::Append {
+                track: MediaTrack::Video,
+                ..
+            } => MediaStageRole::VideoAppend,
+            Self::Append {
+                track: MediaTrack::Audio,
+                ..
+            } => MediaStageRole::AudioAppend,
+            Self::Finalize => MediaStageRole::Finalize,
+        }
+    }
+
+    fn target<'a>(
+        self,
+        plan: &'a uniserve_worker_ipc::MediaExecutionPlan,
+    ) -> Option<(OpCode, &'a str)> {
+        let stage = plan.stage_by_role(self.stage_role())?;
+        Some((stage.operation, stage.entry.as_str()))
+    }
+}
+
+impl MediaCursor {
+    /// Return whether this request has projected completion of one declared stage.
+    fn completed(
+        self,
+        stage: &uniserve_worker_ipc::MediaPlanStage,
+        denoise_steps: u32,
+        video_units: u32,
+    ) -> bool {
+        use uniserve_worker_ipc::MediaStageRole;
+
+        match stage.role() {
+            Some(MediaStageRole::Encode) => self.encoded,
+            Some(MediaStageRole::Prepare) => self.prepared,
+            Some(MediaStageRole::Denoise) => self.denoise_step == denoise_steps,
+            Some(MediaStageRole::VideoDecode) => self.video_decoded == video_units,
+            Some(MediaStageRole::AudioDecode) => self.audio_decoded,
+            Some(MediaStageRole::VideoAppend) => self.video_written == video_units,
+            Some(MediaStageRole::AudioAppend) => self.audio_written,
+            Some(MediaStageRole::Finalize) => self.finalized,
+            None => false,
         }
     }
 }

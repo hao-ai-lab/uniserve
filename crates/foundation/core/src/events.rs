@@ -124,6 +124,13 @@ pub enum Event {
         /// Base64-encoded PNG payload.
         pixels_png_b64: String,
     },
+    /// Reports actual media computation progress committed by the engine.
+    MediaProgress {
+        /// Current numerical or output phase.
+        phase: String,
+        /// Number of completed denoising steps.
+        completed_steps: u32,
+    },
     /// Publishes a transport-backed media artifact.
     Artifact(ArtifactEvent),
     /// Terminates a successfully accepted request.

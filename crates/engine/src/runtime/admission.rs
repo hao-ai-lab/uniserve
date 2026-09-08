@@ -135,14 +135,20 @@ impl EngineLoop {
         &self,
         geometry: uniserve_core::MediaGeometry,
     ) -> Option<Vec<(String, u32, DType, ShapeBound)>> {
+        use uniserve_worker_ipc::MediaStageRole;
+
+        let plan = self.info.media_plan.as_ref()?;
         let mut specs = Vec::new();
-        for (kind, entry, outputs) in [
-            (OpCode::EncoderText, "text_encoder", 1),
-            (OpCode::DiffusionStep, "denoiser", 2),
-            (OpCode::DiffusionDecode, "video_decoder", 1),
-            (OpCode::DiffusionDecode, "audio_decoder", 1),
+        for (role, outputs) in [
+            (MediaStageRole::Encode, 1),
+            (MediaStageRole::Denoise, 2),
+            (MediaStageRole::VideoDecode, 1),
+            (MediaStageRole::AudioDecode, 1),
         ] {
-            let (_, bound, info) = self.entry_candidates(kind, entry).next()?;
+            let stage = plan.stage_by_role(role)?;
+            let (_, bound, info) = self
+                .entry_candidates(stage.operation, &stage.entry)
+                .next()?;
             let component = info
                 .components
                 .iter()
@@ -152,7 +158,7 @@ impl EngineLoop {
             }
             for (index, output) in component.outputs.iter().enumerate() {
                 let mut shape = output.shape_bound.clone();
-                if entry == "text_encoder" {
+                if role == MediaStageRole::Encode {
                     let mut selected = false;
                     for dim in &mut shape.dims {
                         if let DimBound::Device { max } = *dim {
@@ -166,7 +172,7 @@ impl EngineLoop {
                     if !selected {
                         return None;
                     }
-                } else if entry == "video_decoder" {
+                } else if role == MediaStageRole::VideoDecode {
                     let Some(DimBound::Device { max }) = shape.dims.first().copied() else {
                         return None;
                     };
@@ -175,7 +181,7 @@ impl EngineLoop {
                     }
                     shape.dims[0] = DimBound::Static(geometry.video_units);
                 }
-                specs.push((entry.to_owned(), index as u32, output.dtype, shape));
+                specs.push((stage.entry.clone(), index as u32, output.dtype, shape));
             }
         }
         Some(specs)
@@ -190,20 +196,26 @@ impl EngineLoop {
             });
             return;
         }
-        let required = [
-            OpCode::EncoderText,
-            OpCode::DiffusionPrepare,
-            OpCode::DiffusionStep,
-            OpCode::DiffusionDecode,
-            OpCode::DiffusionFinalize,
-            OpCode::MediaAppend,
-        ];
-        if required
+        let Some(plan) = self.info.media_plan.as_ref() else {
+            let _ = submission.event_tx.send(Event::Rejected {
+                message: "worker does not declare a terminal media plan".to_string(),
+            });
+            return;
+        };
+        if plan
+            .stages
             .iter()
-            .any(|variant| !self.info.supported_ops.contains(variant))
+            .any(|stage| !self.info.supported_ops.contains(&stage.operation))
         {
             let _ = submission.event_tx.send(Event::Rejected {
-                message: "worker does not support the fixed media flow".to_string(),
+                message: "worker does not support its declared media plan".to_string(),
+            });
+            return;
+        }
+        if request.geometry.denoise_steps != plan.denoise_steps() {
+            let _ = submission.event_tx.send(Event::Rejected {
+                message: "request prediction count disagrees with the loaded media plan"
+                    .to_string(),
             });
             return;
         }
@@ -248,18 +260,14 @@ impl EngineLoop {
             let epoch = self.next_epoch;
             let request_key = RequestKey::new(self.authority_id, id, epoch);
             let geometry = submission.request.geometry;
-            let required = [
-                (OpCode::EncoderText, "text_encoder"),
-                (OpCode::DiffusionPrepare, "denoiser"),
-                (OpCode::DiffusionStep, "denoiser"),
-                (OpCode::DiffusionDecode, "video_decoder"),
-                (OpCode::DiffusionDecode, "audio_decoder"),
-                (OpCode::MediaAppend, "output"),
-                (OpCode::DiffusionFinalize, "output"),
-            ];
-            if required.iter().any(|(kind, entry)| {
+            let plan = self
+                .info
+                .media_plan
+                .as_ref()
+                .expect("queued media retains a validated execution plan");
+            if plan.stages.iter().any(|stage| {
                 !self
-                    .entry_candidates(*kind, entry)
+                    .entry_candidates(stage.operation, &stage.entry)
                     .any(|(worker, _, _)| self.executor.is_ready(worker))
             }) {
                 self.waiting_media.insert(id, submission);
@@ -309,7 +317,11 @@ impl EngineLoop {
                 break;
             }
             let encoder_op = OpId(self.next_op_id.max(1));
-            let encoded = &tensors[&("text_encoder".to_owned(), 0)];
+            let encode_entry = &plan
+                .stage_by_role(uniserve_worker_ipc::MediaStageRole::Encode)
+                .expect("validated media plan has an encode stage")
+                .entry;
+            let encoded = &tensors[&(encode_entry.clone(), 0)];
             let conditioning = ProductRef {
                 request_key,
                 producer_op_id: encoder_op,

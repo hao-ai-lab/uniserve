@@ -110,6 +110,16 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/chat/completions", post(openai::chat_completions))
         .route("/v1/images/generations", post(openai::images_generations))
         .route("/v1/videos/sync", post(openai::videos_sync))
+        .route("/v1/capabilities", get(openai::capabilities))
+        .route(
+            "/v1/videos",
+            get(openai::videos_list).post(openai::videos_create),
+        )
+        .route(
+            "/v1/videos/{id}",
+            get(openai::videos_get).delete(openai::videos_delete),
+        )
+        .route("/v1/videos/{id}/content", get(openai::videos_content))
         .with_state(Arc::clone(&state));
 
     if let Some(timeout) = request_timeout {

@@ -127,6 +127,8 @@ class ModelLoader:
             ),
             schedule=schedule,
         )
+        if context.component_precisions:
+            logger.info("resolved component precisions: %s", dict(context.component_precisions))
         construction_device = (
             "meta" if self.load_format is LoadFormat.LAYERED else request.execution.device
         )

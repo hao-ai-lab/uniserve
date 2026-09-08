@@ -63,7 +63,11 @@ gpu = [
     "uniserve-kernel[peer_memory]",
 ]
 h3 = [
-    "uniserve-kernel[sparse_attention]",
+    # H3 audio decoding and the default NVFP4/peer-transfer paths must work
+    # when this extra is installed without the general GPU extra.
+    "diffusers>=0.40",
+    "flashinfer-python",
+    "uniserve-kernel[peer_memory,sparse_attention]",
     "nvidia-cudnn-frontend[cutedsl]==1.27.0",
     "nvidia-cutlass-dsl[cu13]==4.6.1",
 ]

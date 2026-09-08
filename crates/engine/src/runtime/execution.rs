@@ -304,49 +304,46 @@ impl EngineLoop {
 
     /// Select a ready branch with capacity at its actual static computation entry.
     fn next_media_quantum(&self, state: &MediaFlowState) -> Option<MediaQuantum> {
+        use uniserve_worker_ipc::MediaStageRole;
+
+        let plan = self.info.media_plan.as_ref()?;
         let cursor = state.projected;
         let geometry = state.request.geometry;
         let mut ready = Vec::new();
-        if !cursor.encoded {
-            ready.push(MediaQuantum::Encode);
-        } else if !cursor.prepared {
-            ready.push(MediaQuantum::Prepare);
-        } else if cursor.denoise_step < geometry.denoise_steps {
-            ready.push(MediaQuantum::Denoise {
-                step: cursor.denoise_step,
-            });
-        } else {
-            let produced = |product: &ProductRef| {
-                !self
-                    .inflight
-                    .operations
-                    .get(&state.request.request_id)
-                    .is_some_and(|ops| {
-                        ops.iter()
-                            .any(|op| op.operation.op_id == product.producer_op_id)
-                    })
-            };
-            if let Some((count, product)) = state.video_segments.get(&cursor.video_written)
-                && produced(product)
-            {
-                ready.push(MediaQuantum::Append {
-                    track: MediaTrack::Video,
-                    cursor: cursor.video_written,
-                    max_units: *count,
-                });
+        let produced = |product: &ProductRef| {
+            !self
+                .inflight
+                .operations
+                .get(&state.request.request_id)
+                .is_some_and(|ops| {
+                    ops.iter()
+                        .any(|op| op.operation.op_id == product.producer_op_id)
+                })
+        };
+        for stage in &plan.stages {
+            if stage.dependencies.iter().any(|dependency| {
+                plan.stage(dependency).is_none_or(|dependency| {
+                    !cursor.completed(dependency, geometry.denoise_steps, geometry.video_units)
+                })
+            }) {
+                continue;
             }
-            if !cursor.audio_written && state.audio.as_ref().is_some_and(produced) {
-                ready.push(MediaQuantum::Append {
-                    track: MediaTrack::Audio,
-                    cursor: 0,
-                    max_units: 1,
-                });
-            }
-            if cursor.video_decoded < geometry.video_units {
-                if let Some((_, entry, info)) = self
-                    .entry_candidates(OpCode::DiffusionDecode, "video_decoder")
-                    .next()
+            match stage.role() {
+                Some(MediaStageRole::Encode) if !cursor.encoded => ready.push(MediaQuantum::Encode),
+                Some(MediaStageRole::Prepare) if !cursor.prepared => {
+                    ready.push(MediaQuantum::Prepare)
+                }
+                Some(MediaStageRole::Denoise) if cursor.denoise_step < stage.count => {
+                    ready.push(MediaQuantum::Denoise {
+                        step: cursor.denoise_step,
+                    });
+                }
+                Some(MediaStageRole::VideoDecode)
+                    if cursor.video_decoded < geometry.video_units =>
                 {
+                    let (_, entry, info) = self
+                        .entry_candidates(stage.operation, &stage.entry)
+                        .next()?;
                     let component = info
                         .components
                         .iter()
@@ -358,25 +355,57 @@ impl EngineLoop {
                         max_units: width.min(geometry.video_units - cursor.video_decoded),
                     });
                 }
-            }
-            if !cursor.audio_decoded {
-                ready.push(MediaQuantum::Decode {
-                    track: MediaTrack::Audio,
-                    cursor: 0,
-                    max_units: 1,
-                });
-            }
-            if !cursor.finalized
-                && state.committed.video_written == geometry.video_units
-                && state.committed.audio_written
-            {
-                ready.push(MediaQuantum::Finalize);
+                Some(MediaStageRole::AudioDecode) if !cursor.audio_decoded => {
+                    ready.push(MediaQuantum::Decode {
+                        track: MediaTrack::Audio,
+                        cursor: 0,
+                        max_units: 1,
+                    })
+                }
+                Some(MediaStageRole::VideoAppend) => {
+                    if let Some((count, product)) = state.video_segments.get(&cursor.video_written)
+                        && produced(product)
+                    {
+                        ready.push(MediaQuantum::Append {
+                            track: MediaTrack::Video,
+                            cursor: cursor.video_written,
+                            max_units: *count,
+                        });
+                    }
+                }
+                Some(MediaStageRole::AudioAppend)
+                    if !cursor.audio_written && state.audio.as_ref().is_some_and(produced) =>
+                {
+                    ready.push(MediaQuantum::Append {
+                        track: MediaTrack::Audio,
+                        cursor: 0,
+                        max_units: 1,
+                    });
+                }
+                Some(MediaStageRole::Finalize)
+                    if !cursor.finalized
+                        && stage.dependencies.iter().all(|dependency| {
+                            plan.stage(dependency).is_some_and(|dependency| {
+                                state.committed.completed(
+                                    dependency,
+                                    geometry.denoise_steps,
+                                    geometry.video_units,
+                                )
+                            })
+                        }) =>
+                {
+                    ready.push(MediaQuantum::Finalize);
+                }
+                _ => {}
             }
         }
+        // Consume completed decoder products before starting more decode work.
+        ready.sort_by_key(|quantum| !matches!(quantum, MediaQuantum::Append { .. }));
         ready.into_iter().find(|quantum| {
-            let (kind, entry) = quantum.target();
-            self.entry_candidates(kind, entry)
-                .any(|(worker, _, _)| self.executor.has_capacity(worker))
+            quantum.target(plan).is_some_and(|(kind, entry)| {
+                self.entry_candidates(kind, entry)
+                    .any(|(worker, _, _)| self.executor.has_capacity(worker))
+            })
         })
     }
 
@@ -430,7 +459,15 @@ impl EngineLoop {
                 self.next_op_id = op.0.saturating_add(1);
                 op
             };
-            let (work, entry) = quantum.target();
+            let plan = self
+                .info
+                .media_plan
+                .as_ref()
+                .expect("admitted media retains its model execution plan");
+            let (work, entry) = quantum
+                .target(plan)
+                .expect("media quantum belongs to its validated model plan");
+            let entry = entry.to_owned();
             let state = self.media_state(id).expect("media candidate exists");
             let request_key = state.admission.request_key;
             let stateful = work.advances_state();
@@ -453,21 +490,38 @@ impl EngineLoop {
             } else {
                 None
             };
-            let inputs = match quantum {
-                MediaQuantum::Prepare => vec![state.conditioning.clone()],
-                MediaQuantum::Decode { track, .. } => {
+            let input_from = plan
+                .stage_by_role(quantum.stage_role())
+                .and_then(|stage| stage.input_from.as_deref());
+            let input_role = input_from
+                .and_then(|stage| plan.stage(stage))
+                .and_then(uniserve_worker_ipc::MediaPlanStage::role);
+            let inputs = match (input_role, quantum) {
+                (Some(uniserve_worker_ipc::MediaStageRole::Encode), _) => {
+                    vec![state.conditioning.clone()]
+                }
+                (
+                    Some(uniserve_worker_ipc::MediaStageRole::Denoise),
+                    MediaQuantum::Decode { track, .. },
+                ) => {
                     vec![state.latents[usize::from(track == MediaTrack::Audio)].clone()]
                 }
-                MediaQuantum::Append {
-                    track: MediaTrack::Video,
-                    cursor,
-                    ..
-                } => vec![state.video_segments[&cursor].1.clone()],
-                MediaQuantum::Append {
-                    track: MediaTrack::Audio,
-                    ..
-                } => vec![state.audio.as_ref().expect("audio is ready").clone()],
-                _ => Vec::new(),
+                (
+                    Some(uniserve_worker_ipc::MediaStageRole::VideoDecode),
+                    MediaQuantum::Append {
+                        track: MediaTrack::Video,
+                        cursor,
+                        ..
+                    },
+                ) => vec![state.video_segments[&cursor].1.clone()],
+                (
+                    Some(uniserve_worker_ipc::MediaStageRole::AudioDecode),
+                    MediaQuantum::Append { .. },
+                ) => {
+                    vec![state.audio.as_ref().expect("audio is ready").clone()]
+                }
+                (None, _) => Vec::new(),
+                _ => unreachable!("validated media plan input disagrees with its stage role"),
             };
             let mut buffers = Vec::new();
             let mut outputs = Vec::new();
@@ -1371,6 +1425,22 @@ impl EngineLoop {
                 }
             } else if let Some(state) = self.media_state_mut(id) {
                 state.committed = advance_media_cursor(state.committed, quantum);
+                let phase = match quantum {
+                    MediaQuantum::Encode => "preparing",
+                    MediaQuantum::Prepare | MediaQuantum::Denoise { .. } => {
+                        if state.committed.denoise_step == state.request.geometry.denoise_steps {
+                            "decoding"
+                        } else {
+                            "denoising"
+                        }
+                    }
+                    MediaQuantum::Decode { .. } | MediaQuantum::Append { .. } => "decoding",
+                    MediaQuantum::Finalize => "finalizing",
+                };
+                let _ = state.event_tx.send(Event::MediaProgress {
+                    phase: phase.to_owned(),
+                    completed_steps: state.committed.denoise_step,
+                });
                 if let Some(output) = media_output {
                     state.artifact = Some(ArtifactEvent {
                         media_kind: MediaKind::Video,

@@ -3,131 +3,28 @@
 //! Completed video bytes are streamed from POSIX shared memory and unlinked
 //! after the response acquires its own open descriptor.
 
-use std::ffi::CString;
 use std::sync::Arc;
 
+use crate::http::media::SharedMedia;
 use crate::openai::VideoGenerationRequest;
 use crate::openai::serve_error_to_api;
 use crate::openai::videos::lower_video_generation_request;
-use axum::body::{Body, Bytes};
+use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use uniserve_core::{ArtifactEvent, Event, FinishReason};
+use uniserve_core::{Event, FinishReason};
 
 use crate::AppState;
-use crate::http::routes::openai::utils::validated_json::ValidatedJson;
+
 use crate::http::utils::resolve_request_context;
 use crate::openai::ApiError;
-
-struct SharedMedia {
-    address: *mut libc::c_void,
-    bytes: usize,
-}
-
-// The mapping is immutable after publication and remains valid until the final Arc drops.
-unsafe impl Send for SharedMedia {}
-unsafe impl Sync for SharedMedia {}
-
-impl SharedMedia {
-    /// Claims and maps a generated shared-memory artifact for response streaming.
-    fn open(artifact: &ArtifactEvent) -> Result<Self, String> {
-        let bytes = usize::try_from(artifact.bytes)
-            .map_err(|_| "generated media is too large for this host".to_string())?;
-        if bytes == 0
-            || artifact.artifact.posix_shm_name().is_empty()
-            || artifact.artifact.posix_shm_name().contains('/')
-        {
-            return Err("generated media has an invalid shared-memory locator".to_string());
-        }
-        let name = CString::new(format!("/{}", artifact.artifact.posix_shm_name()))
-            .map_err(|_| "generated media has an invalid shared-memory name".to_string())?;
-        // SAFETY: name is a valid NUL-terminated POSIX shm name.
-        let descriptor = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
-        if descriptor < 0 {
-            return Err(format!(
-                "failed to open generated media shared memory: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        // The response is the sole consumer. Claim the object as soon as it is open; the
-        // descriptor keeps the bytes alive across inspection and mapping failures.
-        // SAFETY: name identifies the object opened above.
-        if unsafe { libc::shm_unlink(name.as_ptr()) } != 0 {
-            let error = std::io::Error::last_os_error();
-            // SAFETY: descriptor is open.
-            unsafe { libc::close(descriptor) };
-            return Err(format!(
-                "failed to claim generated media shared memory: {error}"
-            ));
-        }
-        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-        // SAFETY: descriptor is open and stat points to writable storage.
-        let stat_result = unsafe { libc::fstat(descriptor, stat.as_mut_ptr()) };
-        if stat_result != 0 {
-            let error = std::io::Error::last_os_error();
-            // SAFETY: descriptor is open.
-            unsafe { libc::close(descriptor) };
-            return Err(format!(
-                "failed to inspect generated media shared memory: {error}"
-            ));
-        }
-        // SAFETY: fstat initialized stat on success.
-        let extent = unsafe { stat.assume_init() }.st_size;
-        if extent < 0
-            || u64::try_from(extent)
-                .ok()
-                .is_none_or(|value| value < artifact.bytes)
-        {
-            // SAFETY: descriptor is open.
-            unsafe { libc::close(descriptor) };
-            return Err("generated media shared memory is shorter than its locator".to_string());
-        }
-        // SAFETY: descriptor names a readable shared-memory object of at least `bytes` bytes.
-        let address = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                bytes,
-                libc::PROT_READ,
-                libc::MAP_SHARED,
-                descriptor,
-                0,
-            )
-        };
-        // SAFETY: this scope exclusively owns the valid descriptor; the mapping retains its
-        // kernel object independently after the descriptor is closed.
-        unsafe { libc::close(descriptor) };
-        if address == libc::MAP_FAILED {
-            return Err(format!(
-                "failed to map generated media shared memory: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        Ok(Self { address, bytes })
-    }
-
-    /// Wraps bytes as an HTTP response-body frame.
-    fn chunk(&self, offset: usize, count: usize) -> Bytes {
-        // SAFETY: caller bounds offset/count to the mapping extent and the mapping is immutable.
-        let value =
-            unsafe { std::slice::from_raw_parts((self.address as *const u8).add(offset), count) };
-        Bytes::copy_from_slice(value)
-    }
-}
-
-impl Drop for SharedMedia {
-    /// Releases resources owned by this value.
-    fn drop(&mut self) {
-        // SAFETY: address is the live mapping created in `open` with exactly this extent.
-        unsafe { libc::munmap(self.address, self.bytes) };
-    }
-}
 
 /// Validates and streams one completed video artifact synchronously.
 pub(crate) async fn videos_sync(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    ValidatedJson(body): ValidatedJson<VideoGenerationRequest>,
+    VideoBody(body): VideoBody,
 ) -> Response {
     let started_at = std::time::Instant::now();
 
@@ -147,7 +44,10 @@ pub(crate) async fn videos_sync(
     let mut artifact = None;
     loop {
         match stream.next().await {
-            Some(Event::Artifact(value)) => artifact = Some(value),
+            Some(Event::Artifact(value)) => match SharedMedia::open(&value) {
+                Ok(media) => artifact = Some((value, Arc::new(media))),
+                Err(message) => return ApiError::server_error(message).into_response(),
+            },
             Some(Event::Finished {
                 reason: FinishReason::Completed,
                 ..
@@ -164,7 +64,7 @@ pub(crate) async fn videos_sync(
             Some(Event::Error { message }) => {
                 return ApiError::server_error(message).into_response();
             }
-            Some(Event::Scheduled { .. }) => {}
+            Some(Event::Scheduled { .. } | Event::MediaProgress { .. }) => {}
             Some(_) => {
                 return ApiError::server_error(
                     "video runtime emitted an incompatible event".to_string(),
@@ -178,17 +78,11 @@ pub(crate) async fn videos_sync(
         }
     }
 
-    let Some(artifact) = artifact else {
+    let Some((artifact, media)) = artifact else {
         return ApiError::server_error("video generation produced no artifact".to_string())
             .into_response();
     };
 
-    // Map the immutable shared-memory artifact once and retain the mapping for
-    // the lifetime of every response-body chunk.
-    let media = match SharedMedia::open(&artifact) {
-        Ok(media) => Arc::new(media),
-        Err(message) => return ApiError::server_error(message).into_response(),
-    };
     let length = artifact.bytes;
 
     // Copy bounded chunks from the mapping so the HTTP body owns each yielded buffer.
@@ -216,4 +110,354 @@ pub(crate) async fn videos_sync(
             ApiError::server_error(format!("failed to construct media response: {error}"))
                 .into_response()
         })
+}
+
+/// JSON and multipart share the same strict typed request and capability validation.
+pub(crate) struct VideoBody(pub VideoGenerationRequest);
+
+impl<S: Send + Sync> axum::extract::FromRequest<S> for VideoBody {
+    type Rejection = Response;
+
+    async fn from_request(
+        request: axum::extract::Request,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let content_type = request
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        if content_type.starts_with("multipart/form-data") {
+            let mut multipart = axum::extract::Multipart::from_request(request, state)
+                .await
+                .map_err(|error| {
+                    ApiError::invalid_request(error.to_string(), None).into_response()
+                })?;
+            let mut fields = serde_json::Map::new();
+            while let Some(field) = multipart.next_field().await.map_err(|error| {
+                ApiError::invalid_request(error.to_string(), None).into_response()
+            })? {
+                let name = field.name().unwrap_or("").to_owned();
+                if !["model", "prompt", "seconds", "seed"].contains(&name.as_str())
+                    || field.file_name().is_some()
+                {
+                    return Err(ApiError::invalid_request(
+                        format!("unsupported video field {name:?}; this checkpoint accepts text-to-video-and-audio only"),
+                        None,
+                    ).into_response());
+                }
+                if fields.contains_key(&name) {
+                    return Err(ApiError::invalid_request(
+                        format!("duplicate video field {name:?}"),
+                        None,
+                    )
+                    .into_response());
+                }
+                let value = field.text().await.map_err(|error| {
+                    ApiError::invalid_request(error.to_string(), None).into_response()
+                })?;
+                let value = match name.as_str() {
+                    "seconds" => serde_json::to_value(value.parse::<f64>().map_err(|_| {
+                        ApiError::invalid_request("seconds must be numeric", Some("seconds"))
+                            .into_response()
+                    })?)
+                    .unwrap_or_default(),
+                    "seed" => serde_json::Value::from(value.parse::<u64>().map_err(|_| {
+                        ApiError::invalid_request("seed must be an unsigned integer", Some("seed"))
+                            .into_response()
+                    })?),
+                    _ => serde_json::Value::String(value),
+                };
+                fields.insert(name, value);
+            }
+            serde_json::from_value(serde_json::Value::Object(fields))
+                .map(Self)
+                .map_err(|error| ApiError::invalid_request(error.to_string(), None).into_response())
+        } else if content_type
+            .split(';')
+            .next()
+            .is_some_and(|value| value.trim() == "application/json")
+        {
+            let axum::Json(value) =
+                axum::Json::<VideoGenerationRequest>::from_request(request, state)
+                    .await
+                    .map_err(|error| {
+                        ApiError::invalid_request(error.to_string(), None).into_response()
+                    })?;
+            Ok(Self(value))
+        } else {
+            Err((
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                axum::Json(serde_json::json!({"error": {
+                    "code": "unsupported_media_type",
+                    "message": "use application/json or multipart/form-data"
+                }})),
+            )
+                .into_response())
+        }
+    }
+}
+
+pub(crate) async fn videos_create(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    VideoBody(body): VideoBody,
+) -> Response {
+    use crate::video_jobs::{VideoFailure, VideoJob, timestamp};
+    let requested_seconds = body.seconds;
+    let input = match lower_video_generation_request(
+        body,
+        state.served_model_name(),
+        resolve_request_context(&headers),
+    ) {
+        Ok(input) => input,
+        Err(error) => return error.into_response(),
+    };
+    let submission = match state.runtime().prepare_video(input) {
+        Ok(submission) => submission,
+        Err(error) => return ApiError::from(serve_error_to_api(error)).into_response(),
+    };
+    // Public IDs are server-generated; caller request-ID headers cannot collide with retained jobs.
+    let id = format!("video_{}", uuid::Uuid::new_v4().simple());
+    let submission = crate::engine_client::MediaSubmission {
+        external_request_id: id.clone(),
+        ..submission
+    };
+    let record = VideoJob {
+        id: id.clone(),
+        object: "video",
+        model: state.served_model_name().to_owned(),
+        revision: state
+            .model_contract
+            .as_ref()
+            .and_then(|value| value["revision"].as_str())
+            .map(str::to_owned),
+        created_at: timestamp(),
+        completed_at: None,
+        expires_at: None,
+        seconds: requested_seconds,
+        actual_seconds: f64::from(submission.geometry.frame_count) / 24.0,
+        status: "queued",
+        phase: "queued".to_owned(),
+        completed_steps: 0,
+        total_steps: submission.geometry.denoise_steps,
+        error: None,
+    };
+    let cancellation = match state.videos.insert(record.clone()) {
+        Ok(token) => token,
+        Err(message) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                axum::Json(serde_json::json!({"error": {
+                    "code": "video_job_capacity_exceeded", "message": message
+                }})),
+            )
+                .into_response();
+        }
+    };
+    // No await separates reservation and detachment. Dropping this HTTP response cannot abort the job.
+    tokio::spawn(async move {
+        let result = async {
+            let mut stream = state
+                .engine()
+                .submit_media(submission)
+                .await
+                .map_err(|error| VideoFailure {
+                    code: "submission_failed",
+                    message: error.to_string(),
+                })?;
+            let mut artifact = None;
+            let mut cancelled = false;
+            loop {
+                let event = tokio::select! {
+                    event = stream.next() => event,
+                    _ = cancellation.cancelled(), if !cancelled => {
+                        stream.cancel();
+                        cancelled = true;
+                        continue;
+                    }
+                };
+                match event {
+                    Some(Event::Scheduled { .. }) => state.videos.progress(&id, "encoding", 0),
+                    Some(Event::MediaProgress {
+                        phase,
+                        completed_steps,
+                    }) => state.videos.progress(&id, &phase, completed_steps),
+                    Some(Event::Artifact(value)) => {
+                        artifact =
+                            Some(Arc::new(SharedMedia::open(&value).map_err(|message| {
+                                VideoFailure {
+                                    code: "artifact_unavailable",
+                                    message,
+                                }
+                            })?));
+                    }
+                    Some(Event::Finished {
+                        reason: FinishReason::Completed,
+                        ..
+                    }) => {
+                        return artifact.ok_or(VideoFailure {
+                            code: "missing_artifact",
+                            message: "generation completed without an artifact".to_owned(),
+                        });
+                    }
+                    Some(Event::Finished { reason, .. }) => {
+                        return Err(VideoFailure {
+                            code: "generation_terminated",
+                            message: format!("generation ended: {reason:?}"),
+                        });
+                    }
+                    Some(Event::Rejected { message } | Event::Error { message }) => {
+                        return Err(VideoFailure {
+                            code: "generation_failed",
+                            message,
+                        });
+                    }
+                    None => {
+                        return Err(VideoFailure {
+                            code: "generation_stopped",
+                            message: "video runtime closed before completion".to_owned(),
+                        });
+                    }
+                    _ => {
+                        return Err(VideoFailure {
+                            code: "invalid_runtime_event",
+                            message: "video runtime emitted an incompatible event".to_owned(),
+                        });
+                    }
+                }
+            }
+        }
+        .await;
+        state.videos.finish(&id, result);
+    });
+    (StatusCode::OK, axum::Json(record)).into_response()
+}
+
+fn missing_video() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        axum::Json(serde_json::json!({"error": {
+            "code": "video_not_found", "message": "video does not exist or has expired"
+        }})),
+    )
+        .into_response()
+}
+
+pub(crate) async fn videos_list(State(state): State<Arc<AppState>>) -> Response {
+    axum::Json(
+        serde_json::json!({"object": "list", "data": state.videos.list(), "has_more": false}),
+    )
+    .into_response()
+}
+
+pub(crate) async fn videos_get(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    state
+        .videos
+        .get(&id)
+        .map(|record| axum::Json(record).into_response())
+        .unwrap_or_else(missing_video)
+}
+
+pub(crate) async fn videos_delete(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    if state.videos.delete(&id) {
+        axum::Json(serde_json::json!({"id": id, "object": "video.deleted", "deleted": true}))
+            .into_response()
+    } else {
+        missing_video()
+    }
+}
+
+pub(crate) async fn videos_content(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let Some(media) = state.videos.content(&id) else {
+        return if state.videos.get(&id).is_some() {
+            ApiError::conflict("video has no completed content").into_response()
+        } else {
+            missing_video()
+        };
+    };
+    let length = media.bytes;
+    let chunks = futures::stream::try_unfold((media, 0), |(media, offset)| async move {
+        if offset == media.bytes {
+            Ok::<_, std::convert::Infallible>(None)
+        } else {
+            let count = (media.bytes - offset).min(64 * 1024);
+            Ok(Some((media.chunk(offset, count), (media, offset + count))))
+        }
+    });
+    (
+        [
+            (header::CONTENT_TYPE, "video/mp4".to_owned()),
+            (header::CONTENT_LENGTH, length.to_string()),
+        ],
+        Body::from_stream(chunks),
+    )
+        .into_response()
+}
+
+pub(crate) async fn capabilities(State(state): State<Arc<AppState>>) -> Response {
+    let mut value = state
+        .model_contract
+        .clone()
+        .unwrap_or_else(|| serde_json::json!({}));
+    value["model"] = serde_json::json!(state.served_model_name());
+    value["video"] = state.runtime().model().video_capabilities();
+    value["video_jobs"] = serde_json::json!({
+        "max_jobs": crate::video_jobs::MAX_VIDEO_JOBS,
+        "max_retained_bytes": crate::video_jobs::MAX_VIDEO_BYTES,
+        "retention_seconds": crate::video_jobs::VIDEO_RETENTION.as_secs(),
+        "restart_behavior": "jobs and retained content are removed",
+    });
+    axum::Json(value).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::extract::FromRequest;
+
+    #[tokio::test]
+    async fn json_and_multipart_normalize_to_the_same_request() {
+        let json = axum::extract::Request::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"model":"FastH3","prompt":"A river","seconds":5.5,"seed":42}"#,
+            ))
+            .unwrap();
+        let multipart = axum::extract::Request::builder().header(header::CONTENT_TYPE, "multipart/form-data; boundary=clip")
+            .body(Body::from("--clip\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nFastH3\r\n--clip\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nA river\r\n--clip\r\nContent-Disposition: form-data; name=\"seconds\"\r\n\r\n5.5\r\n--clip\r\nContent-Disposition: form-data; name=\"seed\"\r\n\r\n42\r\n--clip--\r\n")).unwrap();
+        let left = VideoBody::from_request(json, &()).await.unwrap().0;
+        let right = VideoBody::from_request(multipart, &()).await.unwrap().0;
+        assert_eq!(left, right);
+        assert_eq!(left.seconds, 5.5);
+        assert_eq!(left.seed, 42);
+    }
+
+    #[tokio::test]
+    async fn unsupported_conditioning_is_rejected_in_both_formats() {
+        let json = axum::extract::Request::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"model":"FastH3","prompt":"A river","input_reference":"image.png"}"#,
+            ))
+            .unwrap();
+        let multipart = axum::extract::Request::builder().header(header::CONTENT_TYPE, "multipart/form-data; boundary=clip")
+            .body(Body::from("--clip\r\nContent-Disposition: form-data; name=\"input_reference\"; filename=\"image.png\"\r\n\r\nimage\r\n--clip--\r\n")).unwrap();
+        for request in [json, multipart] {
+            let response = match VideoBody::from_request(request, &()).await {
+                Ok(_) => panic!("conditioning was accepted"),
+                Err(response) => response,
+            };
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+    }
 }

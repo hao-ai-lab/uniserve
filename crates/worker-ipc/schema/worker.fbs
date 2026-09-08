@@ -150,6 +150,18 @@ table EntryInfo {
   outputs:[TensorSpec];
 }
 
+enum MediaPlanRepeat:ubyte { Once, Fixed, VideoUnits }
+table MediaPlanStage {
+  name:string;
+  operation:OpCode;
+  entry:string;
+  dependencies:[string];
+  input_from:string;
+  repeat:MediaPlanRepeat;
+  count:uint = 1;
+}
+table MediaExecutionPlan { stages:[MediaPlanStage]; }
+
 table WorkerInfo {
   model_name:string;
   weight_version:ulong;
@@ -169,6 +181,7 @@ table WorkerInfo {
   latent_pages:uint;
   buffer_pool_bytes:ulong;
   max_unresolved_ops:uint = 1;
+  media_plan:MediaExecutionPlan;
 }
 
 // Request identities and operation records.

@@ -322,6 +322,14 @@ impl ExecutorInfo {
 
         let seed_index = kv_indices.first().copied().unwrap_or(0);
         let mut merged = self.workers[seed_index].1.clone();
+        merged.media_plan = routed(OpCode::DiffusionStep).and_then(|info| info.media_plan.clone());
+        anyhow::ensure!(
+            self.workers.iter().all(|(_, info)| !info
+                .supported_ops
+                .contains(&OpCode::DiffusionStep)
+                || info.media_plan == merged.media_plan),
+            "workers disagree on the numerical media plan"
+        );
         let identity = (
             &self.workers[0].1.model_name,
             self.workers[0].1.weight_version,

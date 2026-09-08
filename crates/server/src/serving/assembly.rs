@@ -1004,7 +1004,7 @@ pub(super) async fn assemble_event_stream(
                 .await;
                 return Ok(());
             }
-            Event::Artifact(_) => {
+            Event::Artifact(_) | Event::MediaProgress { .. } => {
                 return Err(malformed_output(
                     request_id,
                     "generation request received a media lifecycle event",

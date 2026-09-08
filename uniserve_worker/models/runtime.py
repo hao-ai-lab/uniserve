@@ -18,6 +18,7 @@ from ..execution.bounded_storage import BoundedTensorStorage, TensorSchema
 from ..execution.forward_batch import AttentionSelection, ForwardBatch, ForwardOutput
 from ..foundation.errors import invalid_descriptor
 from ..nn.diffusion.schedule import DiffusionSchedule
+from ..nn.mesh import Communicator
 from ..nn.parallel_attention import AttentionContextGeometry, AttentionContextWorkspace
 from ..transfer.layout import TensorRegion
 
@@ -29,6 +30,23 @@ if TYPE_CHECKING:
 
 _FLOAT_DTYPES = frozenset({"float16", "bfloat16", "float32"})
 _KV_DTYPES = frozenset({*_FLOAT_DTYPES, "float8_e4m3fn"})
+
+
+@dataclass(frozen=True, slots=True)
+class ModuleExecution:
+    """Exact numerical signature and caller-owned storage for one capturable call.
+
+    Calls sharing a residency key are serialized and replace its shape together.
+    Mutated tensors are restored after compilation warmup before the first replay.
+    Coordination groups span every rank participating in this numerical call.
+    """
+
+    signature: Hashable
+    residency: Hashable
+    variant: Hashable
+    operation: Callable[[], torch.Tensor | tuple[torch.Tensor, ...]]
+    mutated: tuple[torch.Tensor, ...] = ()
+    groups: tuple[Communicator, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,6 +161,13 @@ class ExecutionModel(nn.Module):
     # Loaded submodules with fixed tensor arguments. The public runner owns
     # their input storage, capture streams, executables, and output lifetime.
     capture_inputs: Mapping[str, tuple[TensorSchema, ...]] = MappingProxyType({})
+    capture_entries: frozenset[str] = frozenset()
+
+    def module_execution(self, name: str, inputs: tuple[object, ...]) -> ModuleExecution | None:
+        """Bind a declared numerical call to stable storage and its exact signature."""
+
+        return None
+
     # Result declarations contain numerical geometry only. Request identities,
     # allocation, physical locations and reader lifetimes belong to the runtime.
     entry_outputs: Mapping[str, tuple[TensorSpec, ...]] = MappingProxyType({})

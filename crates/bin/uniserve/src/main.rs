@@ -102,8 +102,121 @@ fn main() -> Result<()> {
 /// Runs the UniServe command-line process.
 async fn async_main(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Serve(args) => {
+        Command::Serve(mut args) => {
+            let mut checkpoint_source = None;
+            if !args.runtime.sim && !args.runtime.worker_process.worker_stub {
+                let inspected = inspect_checkpoint(
+                    &args.runtime.worker_python,
+                    &args.runtime.model,
+                    args.runtime.revision.as_deref(),
+                    args.runtime.worker_ranks,
+                    None,
+                )
+                .await?;
+                let description = inspected["description"]
+                    .as_str()
+                    .context("checkpoint inspector omitted model description")?
+                    .parse()?;
+                if args
+                    .runtime
+                    .model_description
+                    .is_some_and(|value| value != description)
+                {
+                    anyhow::bail!("--model-description contradicts the checkpoint architecture");
+                }
+                if args.runtime.revision.is_some() && inspected["contract"].is_null() {
+                    anyhow::bail!("--revision requires the supported H3 checkpoint contract");
+                }
+                if inspected["repository"].is_string() && !inspected["contract"].is_null() {
+                    checkpoint_source = Some(args.runtime.model.clone());
+                }
+                args.runtime.model_description = Some(description);
+                args.runtime.model_contract = inspected
+                    .get("contract")
+                    .filter(|value| !value.is_null())
+                    .cloned();
+                args.runtime
+                    .served_model_name
+                    .get_or_insert_with(|| args.runtime.model.clone());
+                args.runtime.model = inspected["model_path"]
+                    .as_str()
+                    .context("checkpoint inspector omitted model path")?
+                    .to_owned();
+            } else if args.runtime.model_description.is_none() {
+                anyhow::bail!("simulation and stub workers require --model-description");
+            }
+            let settings = args.runtime.engine_settings();
+            info!(model = %args.runtime.model, contract = ?args.runtime.model_contract,
+                workers = ?settings.workers, resident_requests = settings.max_num_seqs,
+                python = %args.runtime.worker_python.display(), "resolved deployment");
+            if let Some(source) = checkpoint_source {
+                let downloaded = inspect_checkpoint(
+                    &args.runtime.worker_python,
+                    &source,
+                    args.runtime.revision.as_deref(),
+                    args.runtime.worker_ranks,
+                    Some("--download"),
+                )
+                .await?;
+                args.runtime.model = downloaded["model_path"]
+                    .as_str()
+                    .context("checkpoint download omitted its local path")?
+                    .to_owned();
+            }
             uniserve_server::serve(args.to_uniserve_config(), shutdown_signal()).await
         }
+        Command::Doctor(args) => {
+            let result = inspect_checkpoint(
+                &args.worker_python,
+                &args.model,
+                args.revision.as_deref(),
+                args.worker_ranks,
+                Some("--doctor"),
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            Ok(())
+        }
     }
+}
+
+/// Run the installed worker's catalog/provider validation before allocating model weights.
+async fn inspect_checkpoint(
+    python: &std::path::Path,
+    model: &str,
+    revision: Option<&str>,
+    ranks: usize,
+    action: Option<&str>,
+) -> Result<serde_json::Value> {
+    let mut command = tokio::process::Command::new(python);
+    command.args([
+        "-m",
+        "uniserve_worker.bootstrap.inspect_model",
+        "--model",
+        model,
+        "--worker-ranks",
+        &ranks.to_string(),
+    ]);
+    if let Some(action) = action {
+        command.arg(action);
+    }
+    if let Some(revision) = revision {
+        command.args(["--revision", revision]);
+    }
+    let output = command
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .await
+        .with_context(|| {
+            format!(
+                "could not run installed worker interpreter {}",
+                python.display()
+            )
+        })?;
+    anyhow::ensure!(
+        output.status.success(),
+        "checkpoint preflight failed ({})",
+        output.status
+    );
+    serde_json::from_slice(&output.stdout).context("invalid checkpoint inspector response")
 }

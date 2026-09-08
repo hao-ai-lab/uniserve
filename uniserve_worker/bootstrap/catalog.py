@@ -12,12 +12,14 @@ from ..foundation.errors import invalid_descriptor, unsupported_setup
 from ..loader.source import WeightSourceConfig
 from ..models.bagel import BagelForConditionalGeneration
 from ..models.minimax_h3 import MiniMaxH3Model
-from ..models.minimax_h3.precision import (
+from ..models.minimax_h3.config import (
+    FASTH3_LADDER,
+    FASTH3_SHIFTS,
+    FASTH3_TIME_SCALE,
     PRECISION_PRESETS,
     PRECISION_SHORTHANDS,
     SUPPORTED_PRECISIONS,
 )
-from ..models.minimax_h3.schedule import FASTH3_LADDER, FASTH3_SHIFTS, FASTH3_TIME_SCALE
 from ..models.qwen3 import Qwen3ForCausalLM
 from ..models.runtime import ExecutionModel
 from ..models.sensenova.model import NEOChatModel
@@ -112,6 +114,7 @@ MINIMAX_H3_ENTRY = CatalogEntry(
     ),
     sidecars=(
         "modular_model_index.json",
+        "fastvideo_inference.json",
         "transformer/config.json",
         "text_encoder/config.json",
         "vae/config.json",

@@ -3185,9 +3185,11 @@ gpu = [
     { name = "uniserve-kernel", extra = ["peer-memory"] },
 ]
 h3 = [
+    { name = "diffusers" },
+    { name = "flashinfer-python" },
     { name = "nvidia-cudnn-frontend", extra = ["cutedsl"] },
     { name = "nvidia-cutlass-dsl", extra = ["cu13"] },
-    { name = "uniserve-kernel", extra = ["sparse-attention"] },
+    { name = "uniserve-kernel", extra = ["peer-memory", "sparse-attention"] },
 ]
 test = [
     { name = "coverage", extra = ["toml"] },
@@ -3208,8 +3210,10 @@ requires-dist = [
     { name = "datasets", marker = "extra == 'bench'", specifier = ">=2.0" },
     { name = "datasets", marker = "extra == 'eval-datasets'", specifier = ">=3" },
     { name = "diffusers", specifier = ">=0.36" },
+    { name = "diffusers", marker = "extra == 'h3'", specifier = ">=0.40" },
     { name = "einops" },
     { name = "flashinfer-python", marker = "extra == 'gpu'" },
+    { name = "flashinfer-python", marker = "extra == 'h3'" },
     { name = "httpx", marker = "extra == 'bench'", specifier = ">=0.27" },
     { name = "huggingface-hub" },
     { name = "jsonschema", marker = "extra == 'test'", specifier = ">=4.22" },
@@ -3236,7 +3240,7 @@ requires-dist = [
     { name = "tqdm" },
     { name = "transformers", specifier = ">=4.57.1" },
     { name = "uniserve-kernel", extras = ["peer-memory"], marker = "extra == 'gpu'", editable = "uniserve_kernel" },
-    { name = "uniserve-kernel", extras = ["sparse-attention"], marker = "extra == 'h3'", editable = "uniserve_kernel" },
+    { name = "uniserve-kernel", extras = ["peer-memory", "sparse-attention"], marker = "extra == 'h3'", editable = "uniserve_kernel" },
 ]
 provides-extras = ["eval-datasets", "test", "dev", "bench", "gpu", "h3"]
 

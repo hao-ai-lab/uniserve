@@ -7,6 +7,8 @@ from typing import Any
 import torch
 from torch import nn
 
+from .layout import PROFILE_AUDIO_RATE, PROFILE_FPS, H3ComputeInputs
+
 __all__ = ["MiniMaxH3AudioVAE"]
 
 
@@ -71,3 +73,38 @@ class MiniMaxH3AudioVAE(nn.Module):
         if normalized_latents.ndim != 3 or normalized_latents.shape[:2] != (2, 32):
             raise ValueError("the H3 audio latent must have shape [2, 32, time]")
         return self._decode(normalized_latents)
+
+    def prepare_input(
+        self,
+        execution: H3ComputeInputs,
+        latents: torch.Tensor,
+        cursor: int,
+        max_units: int,
+    ) -> torch.Tensor:
+        """Pack complete channel-major audio rows into decoder layout."""
+
+        layout, scratch = execution.layout, execution.media
+        if (
+            cursor != 0
+            or max_units != 1
+            or tuple(latents.shape) != (int(layout.packed.audio_indices.numel()), 32)
+        ):
+            raise ValueError("audio decoder requires one complete stereo latent")
+        scratch.audio_latents.copy_(
+            latents.view(2, layout.packed.audio_frames, 32).permute(0, 2, 1)
+        )
+        return scratch.audio_latents
+
+    @staticmethod
+    def logical_output(execution: H3ComputeInputs, value: torch.Tensor) -> torch.Tensor:
+        """Trim decoded PCM to the exact requested video duration."""
+
+        samples = round(execution.layout.frame_count * PROFILE_AUDIO_RATE / PROFILE_FPS)
+        if value.shape[0] < samples:
+            raise RuntimeError("audio decoder returned less than the video duration")
+        return value[:samples]
+
+    def warmup_input(self, audio_frames: int) -> torch.Tensor:
+        """Create one representative latent input on the decoder device."""
+
+        return torch.zeros((2, 32, audio_frames), dtype=torch.float32, device=self.device)

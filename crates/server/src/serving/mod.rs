@@ -392,6 +392,15 @@ impl ServingRuntime {
 
     /// Submits a terminal video request to the engine.
     pub async fn generate_video(&self, request: VideoGenerationInput) -> Result<EventRx> {
+        let submission = self.prepare_video(request)?;
+        self.engine
+            .submit_media(submission)
+            .await
+            .map_err(ServeError::Engine)
+    }
+
+    /// Validate and tokenize a video before transferring submission ownership.
+    pub fn prepare_video(&self, request: VideoGenerationInput) -> Result<MediaSubmission> {
         if !self
             .model
             .support()
@@ -420,10 +429,7 @@ impl ServingRuntime {
             request.seed,
             geometry,
         );
-        self.engine
-            .submit_media(submission)
-            .await
-            .map_err(ServeError::Engine)
+        Ok(submission)
     }
 
     /// Returns the process-local identity of this runtime instance.

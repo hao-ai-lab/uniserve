@@ -16,6 +16,7 @@ pub mod profile;
 /// Model-aware request admission and output streaming.
 pub mod serving;
 mod state;
+mod video_jobs;
 
 use std::sync::Arc;
 
@@ -160,6 +161,17 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     .context("failed to start the UniServe engine")?;
 
     let engine = Arc::new(client);
+    if let Some(steps) = config
+        .model_contract
+        .as_ref()
+        .and_then(|contract| contract.get("denoise_steps"))
+        .and_then(serde_json::Value::as_u64)
+    {
+        anyhow::ensure!(
+            u64::from(engine.denoise_steps()) == steps,
+            "loaded worker numerical plan contradicts the resolved checkpoint"
+        );
+    }
     let snapshot = engine.snapshot();
     let route_max_model_len = effective_max_model_len.min(snapshot.max_model_len);
     let model = ResolvedModel::resolve(
@@ -174,6 +186,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
 
     Ok(Arc::new(
         AppState::new(runtime)
+            .with_model_contract(config.model_contract.clone())
             .with_log_requests(config.enable_log_requests)
             .with_request_id_headers(config.enable_request_id_headers)
             .with_api_key(config.api_key.clone())

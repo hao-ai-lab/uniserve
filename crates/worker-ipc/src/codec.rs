@@ -11,12 +11,13 @@ use crate::{
     CachePageAllocation, Checkpoint, CheckpointPoint, CloseReason, DType, DecodeRange,
     DiffusionRequestParams, DiffusionResult, DimBound, Disposition, DrawLayout, ErrorCode,
     ErrorOperationIdentity, FinishFlags, InlineValue, KvCacheConfig, LatentParams, Locator,
-    LogicalLengths, MediaGeometry, MediaOutput, MediaTrack, ModelOutput, NewRequest, OpCode, OpId,
-    OpPayload, OpStatus, Operation, PointRange, ProductKind, ProductPayload, ProductRef,
-    RegistrationAck, RequestKey, RequestKind, ResponseKind, ResultData, ResultPayload, Rng,
-    RowGeometry, Run, RunResult, ShapeBound, StorageClass, TensorTransfer, TimingCounters,
-    TokenSpan, TransferHandle, TransferTransport, UmmRequestParams, WorkerEndpoint,
-    WorkerForwardStats, WorkerInfo, WorkerRequest, WorkerResponse, WorkerResponseError,
+    LogicalLengths, MediaExecutionPlan, MediaGeometry, MediaOutput, MediaPlanRepeat,
+    MediaPlanStage, MediaTrack, ModelOutput, NewRequest, OpCode, OpId, OpPayload, OpStatus,
+    Operation, PointRange, ProductKind, ProductPayload, ProductRef, RegistrationAck, RequestKey,
+    RequestKind, ResponseKind, ResultData, ResultPayload, Rng, RowGeometry, Run, RunResult,
+    ShapeBound, StorageClass, TensorTransfer, TimingCounters, TokenSpan, TransferHandle,
+    TransferTransport, UmmRequestParams, WorkerEndpoint, WorkerForwardStats, WorkerInfo,
+    WorkerRequest, WorkerResponse, WorkerResponseError,
 };
 
 /// Result type returned by FlatBuffers codec operations.
@@ -1339,6 +1340,40 @@ fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
         latent_pages: info.latent_pages(),
         buffer_pool_bytes: info.buffer_pool_bytes(),
         max_unresolved_ops: info.max_unresolved_ops(),
+        media_plan: info
+            .media_plan()
+            .map(|plan| -> CodecResult<MediaExecutionPlan> {
+                Ok(MediaExecutionPlan {
+                    stages: plan
+                        .stages()
+                        .context("media plan has no stages")?
+                        .iter()
+                        .map(|stage| {
+                            Ok(MediaPlanStage {
+                                name: required_str(stage.name(), "media stage.name")?,
+                                operation: op_code_from_fb(stage.operation())?,
+                                entry: required_str(stage.entry(), "media stage.entry")?,
+                                dependencies: stage
+                                    .dependencies()
+                                    .map(|items| items.iter().map(str::to_owned).collect())
+                                    .unwrap_or_default(),
+                                input_from: stage
+                                    .input_from()
+                                    .filter(|value| !value.is_empty())
+                                    .map(str::to_owned),
+                                repeat: match stage.repeat() {
+                                    fbs::MediaPlanRepeat::Once => MediaPlanRepeat::Once,
+                                    fbs::MediaPlanRepeat::Fixed => MediaPlanRepeat::Fixed,
+                                    fbs::MediaPlanRepeat::VideoUnits => MediaPlanRepeat::VideoUnits,
+                                    _ => codec_bail!("media stage has an unknown repeat rule"),
+                                },
+                                count: stage.count(),
+                            })
+                        })
+                        .collect::<CodecResult<Vec<_>>>()?,
+                })
+            })
+            .transpose()?,
     };
     info.validate()?;
     Ok(info)
@@ -2518,6 +2553,28 @@ fn info_to_fb(info: &WorkerInfo) -> CodecResult<fbs::WorkerInfoT> {
         latent_pages: info.latent_pages,
         buffer_pool_bytes: info.buffer_pool_bytes,
         max_unresolved_ops: info.max_unresolved_ops,
+        media_plan: info.media_plan.as_ref().map(|plan| {
+            Box::new(fbs::MediaExecutionPlanT {
+                stages: Some(
+                    plan.stages
+                        .iter()
+                        .map(|stage| fbs::MediaPlanStageT {
+                            name: Some(stage.name.clone()),
+                            operation: op_code_to_fb(stage.operation),
+                            entry: Some(stage.entry.clone()),
+                            dependencies: Some(stage.dependencies.clone()),
+                            input_from: Some(stage.input_from.clone().unwrap_or_default()),
+                            repeat: match stage.repeat {
+                                MediaPlanRepeat::Once => fbs::MediaPlanRepeat::Once,
+                                MediaPlanRepeat::Fixed => fbs::MediaPlanRepeat::Fixed,
+                                MediaPlanRepeat::VideoUnits => fbs::MediaPlanRepeat::VideoUnits,
+                            },
+                            count: stage.count,
+                        })
+                        .collect(),
+                ),
+            })
+        }),
     })
 }
 

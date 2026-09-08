@@ -5,7 +5,6 @@ from __future__ import annotations
 import math
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
@@ -18,9 +17,7 @@ from ...backends.attention.video_sparse import (
     build_video_sparse_metadata,
 )
 from ...nn.attention import RadixAttention
-from ...nn.diffusion.integrator import clean_sample_euler_step_
 from ...nn.diffusion.modulation import ModulationPlan
-from ...nn.diffusion.schedule import DiffusionSchedule
 from ...nn.layer import LayerConfig
 from ...nn.linear import (
     InterleavedMergedColumnParallelLinear,
@@ -43,42 +40,16 @@ from ...ops import (
     modulated_rms_norm,
     qk_norm_rope,
 )
-from ...profiling import profile_range
+from .config import H3TransformerConfig
+from .layout import H3Layout, H3Scratch, H3Tensors
 from .packing import AUDIO_TAG
-from .state import H3Layout, H3Scratch, H3Tensors
 
 __all__ = [
-    "H3TransformerConfig",
     "H3TransformerMetadata",
     "MiniMaxH3Transformer",
 ]
 
 MODALITIES = 3
-
-if TYPE_CHECKING:
-    from .model import H3ComputeInputs
-
-
-@dataclass(frozen=True, slots=True)
-class H3TransformerConfig:
-    """Defines H3 multimodal width, layer, attention, expert, modulation, and sparse-video geometry."""
-
-    hidden_size: int = 5376
-    heads: int = 56
-    head_dim: int = 128
-    layers: int = 50
-    refiner_layers: int = 2
-    ffn_dim: int = 14336
-    video_channels: int = 24
-    audio_channels: int = 32
-    text_dim: int = 5120
-    frequency_dim: int = 256
-    time_hidden_dim: int = 5376
-    time_dim: int = 2688
-    rope_frequency_dim: int = 16
-    rope_theta: float = 10000.0
-    norm_eps: float = 1e-5
-    qk_norm_eps: float = 1e-5
 
 
 @dataclass(frozen=True, slots=True)
@@ -741,48 +712,18 @@ class MiniMaxH3Transformer(nn.Module):
     def forward(
         self,
         slot: H3Tensors,
-        execution: H3ComputeInputs,
-        start_step: int,
-        step_count: int,
-        schedule: DiffusionSchedule,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Advance explicit media Tensor views through one scheduled solver step."""
-
-        if int(step_count) != 1:
-            raise ValueError("H3 denoise calls evaluate exactly one scheduled step")
-        if not 0 <= start_step < 4:
-            raise ValueError("H3 denoise step is outside the four-evaluation ladder")
-        scratch = execution.scratch
-        assert scratch is not None and execution.transformer_metadata is not None
-        self.select_adaln_step(scratch, start_step)
-        with profile_range("uniserve.h3.denoise"):
-            self._forward_layers(slot, scratch, execution.transformer_metadata)
-            if self.pipeline.last:
-                clean_sample_euler_step_(
-                    slot.video_rows,
-                    scratch.video_velocity,
-                    schedule.timesteps[0][start_step],
-                    schedule.sigmas[0][start_step],
-                    schedule.sigmas[0][start_step + 1],
-                )
-                clean_sample_euler_step_(
-                    slot.audio_rows,
-                    scratch.audio_velocity,
-                    schedule.timesteps[1][start_step],
-                    schedule.sigmas[1][start_step],
-                    schedule.sigmas[1][start_step + 1],
-                )
-            self.pipeline.feedback((slot.video_rows, slot.audio_rows))
-        return slot.video_rows, slot.audio_rows
-
-    def _forward_layers(
-        self,
-        slot: H3Tensors,
         scratch: H3Scratch,
         metadata: H3TransformerMetadata,
+        step: int,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """Run assigned layers and publish media predictions on the final stage."""
+        """Return rank-local video/audio predictions on the final pipeline stage.
 
+        Inputs and scratch are caller-owned. Predictions borrow the velocity
+        buffers until the next forward; request latents are read-only here.
+        The caller selects a trained modulation step and owns solver progression.
+        """
+
+        self.select_adaln_step(scratch, step)
         hidden = scratch.packed_hidden
         if self.pipeline.first:
             assert self.proj_in is not None and self.audio_proj_in is not None

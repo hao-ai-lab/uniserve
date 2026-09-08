@@ -4,22 +4,40 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field, fields
+from typing import TYPE_CHECKING
 
 import torch
 
 from uniserve_worker.nn.mesh import EntryBindings
 
 from ...backends.attention.video_sparse import video_sparse_selected_tiles
+from ...execution.batch import (
+    DecodeRange,
+    DeviceDim,
+    DType,
+    MediaGeometry,
+    MediaTrack,
+    ShapeBound,
+    StaticDim,
+    TensorSpec,
+)
 from ...execution.bounded_storage import BoundedTensorStorage, TensorSchema
 from ...nn.mesh import DeviceMesh
 from ...nn.parallel_attention import AttentionContextWorkspace
-from .packing import H3PackedLayout, build_packed_layout
+from ...transfer.layout import TensorRegion
+from ..runtime import TensorOutputLayout
+from .encoder import H3TextEncoderConfig
+from .packing import H3PackedLayout, build_packed_layout, patchify_video
 
 __all__ = [
     "H3Layout",
     "H3Scratch",
     "H3Tensors",
     "bind_request_tensors",
+    "capture_input_schema",
+    "entry_output_schema",
+    "tensor_output_layout",
+    "warmup_geometries",
     "MIN_H3_FRAMES",
 ]
 
@@ -27,8 +45,75 @@ PROFILE_HEIGHT = 768
 PROFILE_WIDTH = 1344
 PROFILE_FPS = 24
 PROFILE_AUDIO_RATE = 32_000
-FASTH3_STEPS = 4
 MIN_H3_FRAMES = 22
+
+
+def entry_output_schema(layout: H3Layout) -> dict[str, tuple[TensorSpec, ...]]:
+    """Declare bounded products for every H3 computation entry."""
+
+    return {
+        "text_encoder": (
+            TensorSpec(
+                "conditioning",
+                DType.BF16,
+                ShapeBound(
+                    (
+                        StaticDim(1),
+                        DeviceDim(int(layout.packed.text_indices.numel())),
+                        StaticDim(H3TextEncoderConfig().hidden_size),
+                    )
+                ),
+            ),
+        ),
+        "denoiser": (
+            TensorSpec(
+                "video_latents",
+                DType.F32,
+                ShapeBound((DeviceDim(int(layout.packed.video_indices.numel())), StaticDim(96))),
+            ),
+            TensorSpec(
+                "audio_latents",
+                DType.F32,
+                ShapeBound((DeviceDim(int(layout.packed.audio_indices.numel())), StaticDim(32))),
+            ),
+        ),
+        "video_decoder": (
+            TensorSpec(
+                "video_segments",
+                DType.F16,
+                ShapeBound(
+                    (
+                        DeviceDim(layout.video_reconstruction_units),
+                        StaticDim(1),
+                        StaticDim(3),
+                        StaticDim(25),
+                        StaticDim(PROFILE_HEIGHT),
+                        StaticDim(PROFILE_WIDTH),
+                    )
+                ),
+            ),
+        ),
+        "audio_decoder": (
+            TensorSpec(
+                "audio_samples",
+                DType.I16,
+                ShapeBound(
+                    (
+                        DeviceDim(round(layout.frame_count * PROFILE_AUDIO_RATE / PROFILE_FPS)),
+                        StaticDim(2),
+                    )
+                ),
+            ),
+        ),
+    }
+
+
+def capture_input_schema(bindings: EntryBindings) -> dict[str, tuple[TensorSchema, ...]]:
+    """Declare fixed component inputs captured independently of request storage."""
+
+    if not bindings.owns("video_decoder"):
+        return {}
+    return {"video_decoder": (TensorSchema((1, 24, 7, 48, 84), torch.float32),)}
 
 
 def reconstruction_unit_frames(frames: int) -> tuple[int, ...]:
@@ -509,3 +594,253 @@ def bind_compute_tensors(
         context_workspace=context,
     )
     return scratch, media
+
+
+if TYPE_CHECKING:
+    from .transformer import H3TransformerMetadata, MiniMaxH3Transformer
+
+
+@dataclass(frozen=True, slots=True)
+class H3ComputeInputs:
+    """Binds an H3 layout to scratch storage, transformer indices, and sparse-attention page metadata."""
+
+    layout: H3Layout
+    scratch: H3Scratch | None
+    media: H3MediaScratch
+    transformer_metadata: H3TransformerMetadata | None
+    base_tile_valid_sizes: torch.Tensor
+    prompt_prefix_indices: torch.Tensor
+    prompt_dense_indices: torch.Tensor
+    prompt_prefix_counts: torch.Tensor
+
+    @classmethod
+    def bind(
+        cls,
+        bindings: EntryBindings,
+        layout: H3Layout,
+        storage: BoundedTensorStorage,
+        context: AttentionContextWorkspace | None,
+        transformer_metadata: H3TransformerMetadata | None,
+        device: torch.device,
+    ) -> H3ComputeInputs:
+        """Bind one layout's sparse metadata and borrowed numerical scratch."""
+
+        text_tiles = int(layout.packed.text_indices.numel()) // 64
+        if text_tiles < 1:
+            raise ValueError("H3 page execution requires at least one text page")
+        prefix = torch.arange(layout.packed.prefix_tiles, dtype=torch.int32, device=device)
+        dense = torch.arange(
+            layout.packed.prefix_tiles + layout.packed.video_tiles,
+            dtype=torch.int32,
+            device=device,
+        )
+        scratch, media = bind_compute_tensors(
+            storage, layout, bindings.meshes.get("denoiser"), context
+        )
+        return cls(
+            layout=layout,
+            scratch=scratch,
+            media=media,
+            transformer_metadata=transformer_metadata,
+            base_tile_valid_sizes=layout.packed.tile_valid_sizes.to(device),
+            prompt_prefix_indices=prefix,
+            prompt_dense_indices=dense,
+            prompt_prefix_counts=torch.tensor(
+                layout.packed.prefix_tiles,
+                dtype=torch.int32,
+                device=device,
+            ),
+        )
+
+    def _prepare_tile_metadata(self, slot: H3Tensors, text_rows: int) -> None:
+        """Write request text validity over immutable packed tile metadata."""
+
+        packed = self.layout.packed
+        valid = slot.tile_valid_sizes
+        text_tiles = int(packed.text_indices.numel()) // 64
+        full_tiles, remaining = divmod(int(text_rows), 64)
+        valid.copy_(self.base_tile_valid_sizes)
+        valid[:text_tiles].zero_()
+        if full_tiles:
+            valid[:full_tiles].fill_(64)
+        if remaining:
+            valid[full_tiles].fill_(remaining)
+        slot.prefix_key_indices.copy_(self.prompt_prefix_indices)
+        slot.dense_key_indices.copy_(self.prompt_dense_indices)
+        slot.prefix_count.copy_(self.prompt_prefix_counts)
+
+    def _prepare_rotary(
+        self,
+        slot: H3Tensors,
+        text_rows: int,
+        transformer: MiniMaxH3Transformer,
+    ) -> None:
+        """Write prompt-relative multimodal rotary coordinates into request views."""
+
+        assert self.scratch is not None and self.transformer_metadata is not None
+        positions = self.scratch.rotary_positions
+        positions.copy_(self.transformer_metadata.positions)
+        non_text_start = int(self.layout.packed.text_indices.numel())
+        positions[non_text_start:, 0].add_(
+            int(text_rows) - int(self.layout.packed.text_indices.numel())
+        )
+        transformer.rope.forward_into(
+            positions,
+            slot.rotary_cosine,
+            slot.rotary_sine,
+            self.scratch.rotary_frequencies,
+        )
+
+    @torch.inference_mode()
+    def prepare_tensors(
+        self,
+        slot: H3Tensors,
+        encoded: torch.Tensor | None,
+        text_rows: int,
+        transformer: MiniMaxH3Transformer | None,
+    ) -> None:
+        """Install conditioning and shape metadata into one request tensor slot."""
+
+        if transformer is not None:
+            if transformer.pipeline.first:
+                if encoded is None:
+                    raise RuntimeError("denoiser input owner did not receive text conditioning")
+                slot.text_condition.zero_()
+                slot.text_condition[:, : encoded.shape[1]].copy_(encoded)
+            self._prepare_tile_metadata(slot, text_rows)
+            self._prepare_rotary(slot, text_rows, transformer)
+        slot.video_overlap.zero_()
+
+    def prepare_warmup_slots(
+        self,
+        storage: tuple[BoundedTensorStorage, ...],
+        transformer: MiniMaxH3Transformer,
+    ) -> tuple[H3Tensors, ...]:
+        """Bind and initialize every resident slot for one warmup geometry."""
+
+        page_rows = int(self.layout.packed.text_indices.numel())
+        views = tuple(bind_request_tensors(tensors, self.layout) for tensors in storage)
+        for slot in views:
+            slot.text_condition.zero_()
+            slot.video_rows.zero_()
+            slot.audio_rows.zero_()
+            self.prepare_tensors(
+                slot,
+                slot.text_condition if transformer.pipeline.first else None,
+                page_rows,
+                transformer,
+            )
+        return views
+
+    @staticmethod
+    @torch.inference_mode()
+    def initialize_tensors(
+        slot: H3Tensors, seed: int
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+        """Initialize locally owned rows with physical-layout-independent noise."""
+
+        if not slot.layout.denoiser_participant:
+            return ()
+        layout = slot.layout
+        generator = torch.Generator(device="cpu").manual_seed(int(seed))
+        slot.video_noise.normal_(generator=generator)
+        raster_rows = patchify_video(slot.video_noise)[0]
+        tiled_rows = raster_rows.index_select(0, layout.packed.video_raster_indices)
+        video_owned = (layout.packed.video_indices >= layout.local_start) & (
+            layout.packed.video_indices < layout.local_end
+        )
+        torch.index_select(
+            tiled_rows,
+            0,
+            video_owned.nonzero(as_tuple=False).flatten(),
+            out=slot.video_source,
+        )
+        slot.audio_noise.normal_(generator=generator)
+        audio_owned = (layout.packed.audio_indices >= layout.local_start) & (
+            layout.packed.audio_indices < layout.local_end
+        )
+        torch.index_select(
+            slot.audio_noise,
+            0,
+            audio_owned.nonzero(as_tuple=False).flatten(),
+            out=slot.audio_source,
+        )
+        return ((slot.video_rows, slot.video_source), (slot.audio_rows, slot.audio_source))
+
+
+def tensor_output_layout(
+    bindings: EntryBindings,
+    entry: str,
+    output_index: int,
+    decode: DecodeRange | None,
+    *,
+    frames: int,
+    text_rows: int,
+    prompt_tokens: int,
+    audio_frames: int,
+) -> TensorOutputLayout | None:
+    """Describe one entry's logical H3 tensor and this rank's produced region."""
+
+    if bindings.process_group.rank not in bindings.output_ranks(entry):
+        return None
+    if entry == "text_encoder":
+        return TensorOutputLayout((1, prompt_tokens, H3TextEncoderConfig().hidden_size))
+    if entry == "denoiser":
+        layout = H3Layout.build(
+            bindings,
+            frames=frames,
+            text_rows=text_rows,
+            audio_frames=audio_frames,
+        )
+        indices = layout.packed.video_indices if output_index == 0 else layout.packed.audio_indices
+        count = layout.local_video_rows if output_index == 0 else layout.local_audio_rows
+        if count == 0:
+            return None
+        width = 96 if output_index == 0 else 32
+        start = int(torch.searchsorted(indices, layout.local_start))
+        return TensorOutputLayout(
+            (int(indices.numel()), width),
+            TensorRegion((start, 0), (count, width)),
+        )
+    if entry == "video_decoder":
+        if decode is None or decode.track is not MediaTrack.VIDEO:
+            raise ValueError("video reconstruction requires a temporal range")
+        rank = bindings.entries[entry].ranks.index(bindings.process_group.rank)
+        if rank >= decode.max_units:
+            return None
+        shape = (decode.max_units, 1, 3, 25, PROFILE_HEIGHT, PROFILE_WIDTH)
+        return TensorOutputLayout(
+            shape,
+            TensorRegion((rank, 0, 0, 0, 0, 0), (1, *shape[1:])),
+        )
+    if entry == "audio_decoder":
+        return TensorOutputLayout((round(frames * PROFILE_AUDIO_RATE / PROFILE_FPS), 2))
+    raise ValueError(f"H3 entry {entry!r} has no Tensor result")
+
+
+def warmup_geometries(capacity: H3Layout, denoise_steps: int) -> tuple[MediaGeometry, ...]:
+    """Return unique representative request shapes within the configured capacity."""
+
+    max_rows = int(capacity.packed.text_indices.numel())
+    shapes = (
+        (capacity.frame_count, 65),
+        (MIN_H3_FRAMES, 1),
+        *((capacity.frame_count, count) for count in (129, 193, 257)),
+        (capacity.frame_count, max_rows),
+    )
+    result: list[MediaGeometry] = []
+    keys: set[tuple[int, int]] = set()
+    for frames, token_count in shapes:
+        key = (frames, ((token_count + 63) // 64) * 64)
+        if key in keys:
+            continue
+        keys.add(key)
+        result.append(
+            MediaGeometry(
+                frame_count=frames,
+                video_units=len(reconstruction_unit_frames(frames)),
+                prompt_tokens=token_count,
+                denoise_steps=denoise_steps,
+            )
+        )
+    return tuple(result)

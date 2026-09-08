@@ -171,6 +171,7 @@ impl Default for WorkerProcessArgs {
             distributed_backend: None,
             lanes: Vec::new(),
             cuda_graph: true,
+            graph_policy: "auto".into(),
             decode_graph_batch_sizes: None,
             prefill_cuda_graph: false,
             prefill_graph_token_sizes: None,
@@ -225,6 +226,7 @@ impl WorkerProcessArgs {
         for lane in &self.lanes {
             cmd.arg("--lane").arg(lane.worker_arg());
         }
+        cmd.args(["--graph-policy", &self.graph_policy]);
         if !self.cuda_graph {
             cmd.arg("--no-cuda-graph");
         }

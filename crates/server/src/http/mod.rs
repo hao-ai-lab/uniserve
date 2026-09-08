@@ -82,3 +82,5 @@ pub async fn serve(config: Config, shutdown: CancellationToken) -> Result<()> {
         .unwrap_or_else(|| Instant::now() + config.shutdown_timeout);
     state.shutdown(shutdown_deadline).await
 }
+
+pub(crate) mod media;

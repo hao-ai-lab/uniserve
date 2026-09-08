@@ -32,7 +32,7 @@ sha2 = "0.10"
 anyhow = "1.0.100"
 arc-swap = "1.9.0"
 asynk-strim-attr = "0.1.0"
-axum = "0.8.8"
+axum = { version = "0.8.8", features = ["multipart"] }
 base64 = "0.22.1"
 bitflags = { version = "2.10.0", features = ["serde"] }
 bytes = "1.11.1"
@@ -77,6 +77,7 @@ thiserror-ext = "0.3.0"
 time = { version = "0.3.47", features = ["formatting", "local-offset", "macros"] }
 tokenizers = "0.22.0"
 tokio = { version = "1.47.1", features = [
+    "process",
     "macros",
     "net",
     "rt-multi-thread",

@@ -634,10 +634,12 @@ def warmup(self: WarmupContext) -> None:
     )
     self.worker.device_products.warmup_scattered_publication(product_devices)
     if torch.device(self.worker.worker_config.device).type == "cuda":
-        _warmup_sequence(self)
-        logger.info("completed token CUDA graph warmup")
-        _warmup_flow(self)
-        logger.info("completed flow CUDA graph warmup")
+        if OpCode.AR_EXTEND in self.worker._effective_work_variants:
+            _warmup_sequence(self)
+            logger.info("completed token numerical warmup and configured captures")
+        if isinstance(self.worker.model.generation, GenerationPipeline):
+            _warmup_flow(self)
+            logger.info("completed flow numerical warmup and configured captures")
     elif self.worker.runner.mixed_captures:
         _warmup_flow(self)
         logger.info("completed mixed execution warmup")

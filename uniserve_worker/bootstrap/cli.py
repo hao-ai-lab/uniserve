@@ -115,6 +115,7 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    parser.add_argument("--graph-policy", choices=("off", "auto", "full"), default="auto")
     parser.add_argument("--decode-graph-batch-sizes", default=None)
     parser.add_argument(
         "--prefill-cuda-graph",

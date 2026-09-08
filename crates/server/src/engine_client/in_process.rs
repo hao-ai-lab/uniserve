@@ -142,6 +142,11 @@ impl EngineClient {
         self.core.generation_limits()
     }
 
+    /// Fixed media prediction count advertised by the loaded model.
+    pub fn denoise_steps(&self) -> u32 {
+        self.core.info().denoise_steps()
+    }
+
     /// Returns whether the worker supports token sampling operations.
     pub fn supports_token_sampling(&self) -> bool {
         self.core.supports_token_sampling()

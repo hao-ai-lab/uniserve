@@ -211,6 +211,8 @@ pub enum ResolvedAssets {
         tokenizer: DynTokenizer,
         /// Maximum generated video duration in seconds.
         max_video_seconds: f64,
+        /// Number of scheduled predictions in the validated checkpoint contract.
+        denoise_steps: u32,
     },
 }
 
@@ -225,6 +227,9 @@ pub enum OmniPreprocessing {
 #[derive(Debug, Error)]
 /// Failure while resolving a configured model and its assets.
 pub enum ModelResolutionError {
+    /// Required numerical checkpoint metadata is missing or contradictory.
+    #[error("invalid media checkpoint contract: {0}")]
+    MediaContract(String),
     /// Model files or profile metadata cannot be resolved.
     #[error(transparent)]
     Assets(#[from] crate::profile::assets::Error),
@@ -272,10 +277,21 @@ impl ResolvedAssets {
             let ModelProfile::MiniMaxH3(profile) = profile else {
                 unreachable!("MiniMax H3 construction returns its matching closed variant")
             };
+            let denoise_steps = config
+                .model_contract
+                .as_ref()
+                .and_then(|contract| contract.get("denoise_steps"))
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|steps| u32::try_from(steps).ok())
+                .filter(|steps| *steps > 0)
+                .ok_or_else(|| ModelResolutionError::MediaContract(
+                    "resolve the checkpoint with the installed worker before building the server".to_owned()
+                ))?;
             return Ok(Self::Media {
                 profile,
                 tokenizer,
                 max_video_seconds: config.engine.max_video_seconds,
+                denoise_steps,
             });
         }
 
@@ -370,6 +386,7 @@ impl ResolvedAssets {
                 profile,
                 tokenizer,
                 max_video_seconds: 15.0,
+                denoise_steps: 4,
             },
         })
     }
@@ -485,6 +502,7 @@ pub struct MiniMaxH3Desc {
     tokenizer: DynTokenizer,
     max_prompt_tokens: u32,
     max_video_seconds: f64,
+    denoise_steps: u32,
 }
 
 impl ResolvedModel {
@@ -581,11 +599,13 @@ impl ResolvedModel {
                 profile,
                 tokenizer,
                 max_video_seconds,
+                denoise_steps,
             } => Ok(Self::Media(MiniMaxH3Desc {
                 identity: profile.identity,
                 tokenizer,
                 max_prompt_tokens: max_model_tokens,
                 max_video_seconds,
+                denoise_steps,
             })),
         }
     }
@@ -603,6 +623,29 @@ impl ResolvedModel {
     /// Returns the public served-model name.
     pub fn served_model_name(&self) -> &str {
         &self.served_identity().served_name
+    }
+
+    /// Public duration, geometry and prompt limits from the serving description.
+    pub fn video_capabilities(&self) -> serde_json::Value {
+        match self {
+            Self::Media(description) => {
+                let default_seconds = description.max_video_seconds.min(5.0);
+                let mut suggested_seconds = vec![default_seconds];
+                if description.max_video_seconds > default_seconds {
+                    suggested_seconds.push(description.max_video_seconds);
+                }
+                serde_json::json!({
+                    "tasks": ["t2va"],
+                    "default_seconds": default_seconds,
+                    "max_seconds": description.max_video_seconds,
+                    "suggested_seconds": suggested_seconds,
+                    "min_frames": 22, "fps": 24, "width": 1344, "height": 768,
+                    "max_prompt_tokens": description.max_prompt_tokens,
+                    "request_fields": ["model", "prompt", "seconds", "seed"],
+                })
+            }
+            _ => serde_json::Value::Null,
+        }
     }
 
     /// Resolves and validates requested video dimensions and frame count.
@@ -686,7 +729,7 @@ impl ResolvedModel {
                 frame_count,
                 video_units,
                 prompt_tokens,
-                denoise_steps: 4,
+                denoise_steps: description.denoise_steps,
             },
             prompt_token_ids,
         ))

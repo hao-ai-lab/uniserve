@@ -23,16 +23,16 @@ from uniserve_worker.execution.bounded_storage import BoundedTensorStorage
 from uniserve_worker.execution.model_runner import ModelRunner
 from uniserve_worker.execution.trace import ExecutionTrace
 from uniserve_worker.loader import LoadRequest, load_model
+from uniserve_worker.models.minimax_h3.config import (
+    PRECISION_PRESETS,
+    PRECISION_SHORTHANDS,
+    SUPPORTED_PRECISIONS,
+)
 from uniserve_worker.models.minimax_h3.packing import (
     audio_latent_frames,
     build_packed_layout,
     unpatchify_video,
     video_latent_frames,
-)
-from uniserve_worker.models.minimax_h3.precision import (
-    PRECISION_PRESETS,
-    PRECISION_SHORTHANDS,
-    SUPPORTED_PRECISIONS,
 )
 from uniserve_worker.nn.mesh import EntryBindings
 from uniserve_worker.nn.parallel import EntryConfig, ParallelConfig, SequenceParallel
@@ -154,6 +154,7 @@ def _generate(
     )
     with torch.inference_mode():
         for index, (frames, token_ids) in enumerate(requests):
+            print(f"{kind} rank {rank} case {index}: encoding", flush=True)
             media = MediaGeometry(
                 frame_count=frames,
                 video_units=(frames - 5) // 17,
@@ -194,13 +195,25 @@ def _generate(
                 (result,) = execution.run_module(name, value).values
                 return result
 
-            with execution.preparing_inputs(runner.initialize_tensors(slot, 1000)):
-                runner.prepare(slot, metadata, encoded, len(token_ids), execute)
+            with execution.preparing_inputs(runner.initialize_tensors(slot, 1000 + index)):
+                if runner.conditioner is not None:
+                    assert encoded is not None
+                    encoded = execute("conditioner", encoded)
+                runner.prepare_tensors(slot, metadata, encoded, len(token_ids))
             for ticket in tickets:
                 ticket.close()
-            for step in range(4):
-                if bindings.owns("denoiser"):
+            if bindings.owns("denoiser"):
+                for step in range(4):
+                    samples = (slot.video_rows, slot.audio_rows)
+                    initial = tuple(value.clone() for value in samples)
+                    runner.bind_denoising_step(slot, metadata, step, schedule)()
+                    eager = tuple(value.clone() for value in samples)
+                    for destination, saved in zip(samples, initial, strict=True):
+                        destination.copy_(saved)
                     execution.run_module("denoiser", slot, metadata, step, 1, schedule)
+                    for observed, expected in zip(samples, eager, strict=True):
+                        torch.testing.assert_close(observed, expected, rtol=0, atol=0)
+                    print(f"{kind} rank {rank} case {index} step {step}: exact parity", flush=True)
             torch.cuda.synchronize(runner.device)
             if rank in bindings.output_ranks("denoiser"):
                 owner = bindings.output_ranks("denoiser").index(rank)
@@ -267,7 +280,9 @@ def _collect(checkpoint, requests, kind, directory, *, encoder_tp=1, component_p
 def generation_requests():
     checkpoint = os.environ.get("UNISERVE_H3_MODEL", "")
     if not checkpoint or not Path(checkpoint).is_dir():
-        pytest.fail("UNISERVE_H3_MODEL must name the FastH3 Preview v0.2 checkpoint directory")
+        pytest.fail(
+            "UNISERVE_H3_MODEL must name the supported full FastH3 VSA checkpoint directory"
+        )
     tokenizer = AutoTokenizer.from_pretrained(Path(checkpoint) / "tokenizer")
     point = load_config().benchmarks["minimax-h3-5s-1k"]
     requests = []
@@ -279,6 +294,11 @@ def generation_requests():
         )
         example = MiniMaxH3Dataset(case).load(tokenizer)[0]
         requests.append((frames, tuple(tokenizer.encode(example.prompt, add_special_tokens=False))))
+    tokens = requests[0][1]
+    # Exact tile boundaries and a different prompt with the same signature expose
+    # stale conditioning, while the minimum frame count exercises decoder geometry.
+    requests.extend((22, tokens[:length]) for length in (63, 64, 65))
+    requests.append((22, tokens[1:65]))
     return checkpoint, requests
 
 

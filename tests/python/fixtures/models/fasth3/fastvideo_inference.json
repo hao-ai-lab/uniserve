@@ -1,0 +1,22 @@
+{
+  "schema_version": "fasth3-inference-contract-v1",
+  "model_id": "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree",
+  "training_parent_run_id": "20260823T132231Z-v10p5-datafree-sp4",
+  "checkpoint_step": 1300,
+  "checkpoint_content_sha256": "b36987515e4c75fa4c7aaa632a7842c829ea141b235358a54d782b51230497b3",
+  "checkpoint_metadata_sha256": "dcad0fbee2a7c7e75e53435f4fd98fccf3138844883874edf057962ab48fa428",
+  "fastvideo_commit": "48a047c05ff4138f20cfa33351499c6ec5945f5d",
+  "task": "t2av",
+  "transformer_forwards": 4,
+  "num_inference_steps": 5,
+  "dmd_denoising_steps": [999, 749, 500, 250],
+  "guidance_scale": 1.0,
+  "attention_backend": "VIDEO_SPARSE_ATTN_H3",
+  "vsa_tile_size": 64,
+  "vsa_sparsity": 0.9,
+  "vsa_kernel": "sm100a",
+  "num_gpus": 4,
+  "sequence_parallel_size": 4,
+  "use_fsdp_inference": true,
+  "torch_compile": false
+}

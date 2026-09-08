@@ -1053,7 +1053,15 @@ fn worker_info_round_trips() {
 #[test]
 fn kv_free_worker_info_round_trips() {
     let info = WorkerInfo {
-        supported_ops: vec![OpCode::DiffusionPrepare, OpCode::DiffusionStep],
+        media_plan: Some(terminal_media_plan()),
+        supported_ops: vec![
+            OpCode::EncoderText,
+            OpCode::DiffusionPrepare,
+            OpCode::DiffusionStep,
+            OpCode::DiffusionDecode,
+            OpCode::DiffusionFinalize,
+            OpCode::MediaAppend,
+        ],
         kv_cache: None,
         latent_page_units: 64,
         latent_pages: 3,
@@ -1065,6 +1073,7 @@ fn kv_free_worker_info_round_trips() {
         panic!("decoded response must preserve its info variant");
     };
     assert_eq!(decoded, info);
+    assert_eq!(decoded.denoise_steps(), 4);
 }
 
 #[test]
@@ -1303,6 +1312,7 @@ fn request_fixtures() -> Vec<WorkerRequest> {
 
 fn full_caps() -> WorkerInfo {
     WorkerInfo {
+        media_plan: Some(terminal_media_plan()),
         supported_ops: OpCode::ALL.to_vec(),
         kv_cache: Some(KvCacheConfig {
             groups: vec![
@@ -1335,6 +1345,100 @@ fn full_caps() -> WorkerInfo {
         model_name: "test-model".into(),
         weight_version: 7,
         ..WorkerInfo::default()
+    }
+}
+
+fn terminal_media_plan() -> MediaExecutionPlan {
+    let stage = |name: &str,
+                 operation: OpCode,
+                 entry: &str,
+                 dependencies: &[&str],
+                 input_from: Option<&str>,
+                 repeat: MediaPlanRepeat,
+                 count: u32| MediaPlanStage {
+        name: name.into(),
+        operation,
+        entry: entry.into(),
+        dependencies: dependencies.iter().map(|value| (*value).into()).collect(),
+        input_from: input_from.map(str::to_owned),
+        repeat,
+        count,
+    };
+    MediaExecutionPlan {
+        stages: vec![
+            stage(
+                "encode",
+                OpCode::EncoderText,
+                "text_encoder",
+                &[],
+                None,
+                MediaPlanRepeat::Once,
+                1,
+            ),
+            stage(
+                "prepare",
+                OpCode::DiffusionPrepare,
+                "denoiser",
+                &["encode"],
+                Some("encode"),
+                MediaPlanRepeat::Once,
+                1,
+            ),
+            stage(
+                "denoise",
+                OpCode::DiffusionStep,
+                "denoiser",
+                &["prepare"],
+                None,
+                MediaPlanRepeat::Fixed,
+                4,
+            ),
+            stage(
+                "video_decode",
+                OpCode::DiffusionDecode,
+                "video_decoder",
+                &["denoise"],
+                Some("denoise"),
+                MediaPlanRepeat::VideoUnits,
+                1,
+            ),
+            stage(
+                "audio_decode",
+                OpCode::DiffusionDecode,
+                "audio_decoder",
+                &["denoise"],
+                Some("denoise"),
+                MediaPlanRepeat::Once,
+                1,
+            ),
+            stage(
+                "video_append",
+                OpCode::MediaAppend,
+                "output",
+                &["denoise"],
+                Some("video_decode"),
+                MediaPlanRepeat::VideoUnits,
+                1,
+            ),
+            stage(
+                "audio_append",
+                OpCode::MediaAppend,
+                "output",
+                &["denoise"],
+                Some("audio_decode"),
+                MediaPlanRepeat::Once,
+                1,
+            ),
+            stage(
+                "finalize",
+                OpCode::DiffusionFinalize,
+                "output",
+                &["video_append", "audio_append"],
+                None,
+                MediaPlanRepeat::Once,
+                1,
+            ),
+        ],
     }
 }
 

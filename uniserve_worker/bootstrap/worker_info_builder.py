@@ -347,6 +347,7 @@ def build_worker_layout(
         latent_pages=num_latent_pages,
         buffer_pool_bytes=buffer_pool_bytes,
         max_unresolved_ops=unresolved_window,
+        media_plan=getattr(model, "media_plan", None),
     )
     arena = model_arena_capacity(
         model,
@@ -419,6 +420,7 @@ def _request_tensor_worker_layout(
         latent_pages=0,
         buffer_pool_bytes=slots * model.product_storage_bytes,
         max_unresolved_ops=unresolved_window,
+        media_plan=getattr(model, "media_plan", None),
     )
     return WorkerLayout(
         info=info,

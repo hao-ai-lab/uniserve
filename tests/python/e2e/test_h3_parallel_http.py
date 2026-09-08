@@ -270,3 +270,141 @@ def test_component_bindings_release_cancelled_requests(
             )
             assert media.frame_count == 124
             assert (media.audio_channels, media.audio_sample_rate) == (2, 32000)
+
+
+def test_video_jobs_retain_content_and_cancel_active_work(tmp_path: Path) -> None:
+    """Exercise async ownership and reuse through the HTTP contract on one deployment."""
+    import sys
+    import time
+
+    model = os.environ.get("UNISERVE_H3_MODEL")
+    if not model or not Path(model).is_dir():
+        pytest.fail("UNISERVE_H3_MODEL must name the supported full FastH3 VSA checkpoint")
+    port = find_free_port()
+    base = f"http://127.0.0.1:{port}"
+    command = [
+        str(require_uniserve_binary()),
+        "serve",
+        model,
+        "--worker-ranks",
+        "4",
+        "--worker-python",
+        sys.executable,
+        "--served-model-name",
+        "FastH3",
+        "--port",
+        str(port),
+        "--graph-policy",
+        "full",
+    ]
+
+    def completed(client, job_id):
+        deadline = time.monotonic() + 600
+        while time.monotonic() < deadline:
+            response = client.get(f"/v1/videos/{job_id}")
+            response.raise_for_status()
+            job = response.json()
+            assert job["status"] != "failed", job
+            if job["status"] == "completed":
+                return job
+            time.sleep(0.1)
+        pytest.fail("video did not complete within the request deadline")
+
+    with (
+        server_process(command, base, tmp_path / "video-jobs.log", timeout_s=900),
+        httpx.Client(base_url=base, timeout=600) as client,
+    ):
+        caps = client.get("/v1/capabilities").json()
+        assert caps["tasks"] == ["t2va"]
+        assert caps["model"] == "FastH3"
+        for payload in (
+            {"input_reference": "image.png"},
+            {"num_inference_steps": 8},
+            {"seconds": 16},
+        ):
+            response = client.post(
+                "/v1/videos", json={"model": "FastH3", "prompt": "A river", **payload}
+            )
+            assert response.status_code == 400
+        payload = {
+            "model": "FastH3",
+            "prompt": "A river flows through a forest, with birds singing.",
+            "seconds": 5,
+            "seed": 1001,
+        }
+        response = client.post(
+            "/v1/videos", files={name: (None, str(value)) for name, value in payload.items()}
+        )
+        response.raise_for_status()
+        job_id = response.json()["id"]
+        job = completed(client, job_id)
+        assert job["seconds"] == 5 and job["actual_seconds"] == 124 / 24
+        assert job["completed_steps"] == job["total_steps"] == 4
+        assert job["expires_at"] > job["completed_at"]
+        assert job_id in {item["id"] for item in client.get("/v1/videos").json()["data"]}
+        first = client.get(f"/v1/videos/{job_id}/content")
+        second = client.get(f"/v1/videos/{job_id}/content")
+        assert first.content == second.content
+        media = inspect_video_bytes(first.content, declared_mime=first.headers["content-type"])
+        assert media.frame_count == 124 and media.audio_channels == 2
+        assert client.delete(f"/v1/videos/{job_id}").json()["deleted"]
+        assert client.get(f"/v1/videos/{job_id}/content").status_code == 404
+
+        # Concurrent request storage must preserve each prompt and seed. Compare
+        # both artifacts with isolated executions through the same public route.
+        concurrent = [
+            {**payload, "seed": 1010},
+            {
+                **payload,
+                "prompt": "A train crosses a bridge at sunrise, with birds singing.",
+                "seed": 1011,
+            },
+        ]
+        ids = [client.post("/v1/videos", json=item).json()["id"] for item in concurrent]
+        for item, concurrent_id in zip(concurrent, ids, strict=True):
+            completed(client, concurrent_id)
+            content = client.get(f"/v1/videos/{concurrent_id}/content")
+            isolated = client.post("/v1/videos/sync", json=item)
+            isolated.raise_for_status()
+            assert content.content == isolated.content
+
+        # Cancel more requests than the two resident slots, including a genuinely active job.
+        for seed in range(3):
+            active = client.post(
+                "/v1/videos", json={**payload, "seconds": 15, "seed": seed}
+            ).json()["id"]
+            deadline = time.monotonic() + 600
+            while time.monotonic() < deadline:
+                state = client.get(f"/v1/videos/{active}").json()
+                if state["status"] == "in_progress":
+                    break
+                assert state["status"] != "failed", state
+                time.sleep(0.05)
+            else:
+                pytest.fail("job never reached execution")
+            queued = client.post("/v1/videos", json={**payload, "seed": seed + 100}).json()["id"]
+            assert client.delete(f"/v1/videos/{active}").status_code == 200
+            assert client.delete(f"/v1/videos/{queued}").status_code == 200
+            assert client.get(f"/v1/videos/{active}").status_code == 404
+        reused = client.post("/v1/videos", json={**payload, "seed": 1002}).json()["id"]
+        completed(client, reused)
+        assert client.get(f"/v1/videos/{reused}/content").status_code == 200
+        sync = client.post("/v1/videos/sync", json={**payload, "seed": 1003})
+        sync.raise_for_status()
+        assert (
+            inspect_video_bytes(
+                sync.content, declared_mime=sync.headers["content-type"]
+            ).frame_count
+            == 124
+        )
+
+    # The eager policy covers decoding as well as the learned denoising steps.
+    # Keep the exact checkpoint, capacity, prompt and seed from the full run.
+    command[-1] = "off"
+    with (
+        server_process(command, base, tmp_path / "video-eager.log", timeout_s=900),
+        httpx.Client(base_url=base, timeout=600) as client,
+    ):
+        eager = client.post("/v1/videos/sync", json=payload)
+        eager.raise_for_status()
+        assert eager.content == first.content

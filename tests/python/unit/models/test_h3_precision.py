@@ -2,7 +2,7 @@
 
 import pytest
 
-from uniserve_worker.models.minimax_h3.precision import (
+from uniserve_worker.models.minimax_h3.config import (
     PRECISION_PRESETS,
     PRECISION_SHORTHANDS,
     SUPPORTED_PRECISIONS,

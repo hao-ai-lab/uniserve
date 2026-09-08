@@ -12,6 +12,8 @@ const SHUTDOWN_REFCOUNT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Shared router state for one configured model and one generate funnel.
 pub struct AppState {
     runtime: ServingRuntime,
+    pub(crate) videos: Arc<crate::video_jobs::VideoJobs>,
+    pub(crate) model_contract: Option<serde_json::Value>,
     enable_log_requests: bool,
     enable_request_id_headers: bool,
     api_key: Option<String>,
@@ -25,6 +27,8 @@ impl AppState {
     pub fn new(runtime: ServingRuntime) -> Self {
         Self {
             runtime,
+            videos: Arc::default(),
+            model_contract: None,
             enable_log_requests: false,
             enable_request_id_headers: false,
             api_key: None,
@@ -32,6 +36,11 @@ impl AppState {
             max_concurrent_requests: None,
             server_load: AtomicU64::new(0),
         }
+    }
+
+    pub(crate) fn with_model_contract(mut self, contract: Option<serde_json::Value>) -> Self {
+        self.model_contract = contract;
+        self
     }
 
     /// Configures request lifecycle logging.
@@ -122,6 +131,7 @@ impl AppState {
     /// Waits until request-owned references are dropped, then shut down the
     /// serving runtime and its engine client.
     pub async fn shutdown(mut self: Arc<Self>, deadline: Instant) -> anyhow::Result<()> {
+        self.videos.cancel_all();
         loop {
             match Arc::try_unwrap(self) {
                 Ok(state) => {

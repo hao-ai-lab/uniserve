@@ -54,6 +54,21 @@ pub(crate) enum Command {
     /// Run the UniServe OpenAI server: the Rust engine and scheduler run
     /// in-process, driving a forward-only worker.
     Serve(Box<ServeArgs>),
+    /// Inspect checkpoint access and the installed GPU serving prerequisites.
+    Doctor(DoctorArgs),
+}
+
+/// Read-only serving prerequisite inspection.
+#[derive(Debug, Args)]
+pub(crate) struct DoctorArgs {
+    #[arg(long)]
+    pub model: String,
+    #[arg(long, default_value_t = 1)]
+    pub worker_ranks: usize,
+    #[arg(long, default_value_os_t = default_worker_python())]
+    pub worker_python: std::path::PathBuf,
+    #[arg(long)]
+    pub revision: Option<String>,
 }
 
 /// Scheduler ordering policy accepted by the command line.
@@ -121,7 +136,12 @@ pub(crate) struct SharedRuntimeArgs {
 
     /// Closed model description that owns configured preprocessing and output behavior.
     #[arg(long)]
-    pub model_description: ModelDescription,
+    pub model_description: Option<ModelDescription>,
+    #[arg(skip)]
+    pub model_contract: Option<Value>,
+    /// Immutable H3 checkpoint revision; the known FastH3 release is pinned by default.
+    #[arg(long)]
+    pub revision: Option<String>,
 
     /// Override the maximum model context length. When unset, the model's real
     /// context length (`max_position_embeddings`) is used.
@@ -166,20 +186,20 @@ pub(crate) struct SharedRuntimeArgs {
     #[command(flatten)]
     pub worker_process: WorkerProcessOptions,
     /// How many op-batches the scheduler keeps in flight against the worker.
-    #[arg(long, default_value_t = 2, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..), hide = true)]
-    pub pipeline_depth: usize,
+    #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..), hide = true)]
+    pub pipeline_depth: Option<usize>,
     /// Maximum number of ops assembled into one forward batch.
-    #[arg(long, default_value_t = DEFAULT_MAX_BATCH, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..), hide = true)]
-    pub max_batch: usize,
+    #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..), hide = true)]
+    pub max_batch: Option<usize>,
     /// Maximum transformer-token work admitted in one scheduling step.
-    #[arg(long, default_value_t = DEFAULT_MAX_NUM_BATCHED_TOKENS, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
-    pub max_num_batched_tokens: usize,
+    #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    pub max_num_batched_tokens: Option<usize>,
     /// Maximum number of concurrently resident requests.
-    #[arg(long = "max-running-requests", default_value_t = DEFAULT_MAX_NUM_SEQS, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
-    pub max_num_seqs: usize,
+    #[arg(long = "max-running-requests", value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    pub max_num_seqs: Option<usize>,
     /// Maximum number of prompt tokens processed per request in one prefill step.
-    #[arg(long = "chunked-prefill-size", default_value_t = DEFAULT_LONG_PREFILL_THRESHOLD, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
-    pub long_prefill_threshold: usize,
+    #[arg(long = "chunked-prefill-size", value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    pub long_prefill_threshold: Option<usize>,
     /// Per-step budget of text prefill tokens allowed to join a decode batch
     /// as one mixed extend+decode forward (0 disables mixing).
     #[arg(long, default_value_t = DEFAULT_MIXED_PREFILL_TOKENS, hide = true)]
@@ -255,11 +275,12 @@ impl SharedRuntimeArgs {
 
     /// Builds the UniServe Rust-engine settings from these CLI arguments.
     pub(crate) fn engine_settings(&self) -> EngineSettings {
-        let is_media = self.model_description == ModelDescription::MiniMaxH3;
+        let is_media = self.model_description == Some(ModelDescription::MiniMaxH3);
         let mut worker_process = self.worker_process.to_args();
         worker_process.python = self.worker_python.clone();
         worker_process.model = self.model.clone();
-        worker_process.pipeline_depth = self.pipeline_depth;
+        let pipeline_depth = self.pipeline_depth.unwrap_or(if is_media { 6 } else { 2 });
+        worker_process.pipeline_depth = pipeline_depth;
         worker_process.resp_slot_cap = if is_media {
             EngineSettings::MEDIA_IPC_SLOT_CAP
         } else {
@@ -274,10 +295,24 @@ impl SharedRuntimeArgs {
             } else {
                 EngineBackendKind::Worker
             },
-            max_batch: self.max_batch,
-            max_num_batched_tokens: self.max_num_batched_tokens,
-            max_num_seqs: self.max_num_seqs,
-            long_prefill_threshold: self.long_prefill_threshold,
+            max_batch: self
+                .max_batch
+                .unwrap_or(if is_media { 2 } else { DEFAULT_MAX_BATCH }),
+            max_num_batched_tokens: self.max_num_batched_tokens.unwrap_or(if is_media {
+                2
+            } else {
+                DEFAULT_MAX_NUM_BATCHED_TOKENS
+            }),
+            max_num_seqs: self.max_num_seqs.unwrap_or(if is_media {
+                2
+            } else {
+                DEFAULT_MAX_NUM_SEQS
+            }),
+            long_prefill_threshold: self.long_prefill_threshold.unwrap_or(if is_media {
+                1
+            } else {
+                DEFAULT_LONG_PREFILL_THRESHOLD
+            }),
             mixed_prefill_tokens: self.mixed_prefill_tokens,
             scheduler_policy: self.scheduler_policy.into(),
             // `None` lets `build_state` derive the model's real context length;
@@ -286,9 +321,9 @@ impl SharedRuntimeArgs {
             max_video_seconds: self.max_video_seconds,
             workers: self.workers.clone().map(Vec::from).unwrap_or_else(|| {
                 vec![if is_media {
-                    WorkerConfig::h3(&self.device, self.worker_ranks, self.pipeline_depth)
+                    WorkerConfig::h3(&self.device, self.worker_ranks, pipeline_depth)
                 } else {
-                    WorkerConfig::model(&self.device, self.worker_ranks, self.pipeline_depth)
+                    WorkerConfig::model(&self.device, self.worker_ranks, pipeline_depth)
                 }]
             }),
             transfer: self.transfer.clone().unwrap_or_default(),
@@ -305,7 +340,10 @@ impl SharedRuntimeArgs {
         Config {
             engine,
             model,
-            model_description: self.model_description,
+            model_description: self
+                .model_description
+                .expect("model description resolved before configuration"),
+            model_contract: self.model_contract,
             served_model_name: self.served_model_name,
             listener_mode,
             chat_template: self.chat_template,
@@ -367,6 +405,9 @@ pub(crate) struct WorkerProcessOptions {
     pub lanes: Vec<LaneConfig>,
     #[arg(long, action = ArgAction::Set, default_value_t = true, hide = true)]
     pub cuda_graph: bool,
+    /// GPU computation capture policy. Full rejects unavailable capture; off disables all graphs.
+    #[arg(long, default_value = "auto", value_parser = ["off", "auto", "full"])]
+    pub graph_policy: String,
     #[arg(long, hide = true)]
     pub decode_graph_batch_sizes: Option<String>,
     #[arg(long, action = ArgAction::Set, default_value_t = false, hide = true)]
@@ -411,7 +452,8 @@ impl WorkerProcessOptions {
             mesh: self.worker_mesh.clone(),
             distributed_backend: self.distributed_backend.clone(),
             lanes: self.lanes.clone(),
-            cuda_graph: self.cuda_graph,
+            cuda_graph: self.cuda_graph && self.graph_policy != "off",
+            graph_policy: self.graph_policy.clone(),
             decode_graph_batch_sizes: self.decode_graph_batch_sizes.clone(),
             prefill_cuda_graph: self.prefill_cuda_graph,
             prefill_graph_token_sizes: self.prefill_graph_token_sizes.clone(),
@@ -478,9 +520,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn serve_requires_model_description() {
+    fn serve_accepts_automatic_model_detection() {
         let result = <Cli as clap::Parser>::try_parse_from(["uniserve", "serve", "model"]);
-        assert!(result.is_err());
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -564,9 +606,7 @@ mod tests {
             "--lane",
             r#"{"lane_id":"decode","sm_budget":64,"domains":["decode"]}"#,
             "--workers",
-            r#"[{"id":"prefill","ranks":[{"node":"localhost","device":"cpu"},{"node":"localhost","device":"cpu"}],"entries":{"model":{"ranks":[0,1],"parallel_config":{"tensor_parallel_size":2}}},"queue_depth":1},{"id":"decode","ranks":[{"node":"localhost","device":"cpu"},{"node":"localhost","device":"cpu"}],"entries":{"model":{"ranks":[0,1],"parallel_config":{"tensor_parallel_size":2}}},"queue_depth":1}]"#,
-            "--transfer",
-            "prefill->decode=shm",
+            r#"[{"id":"text","ranks":[{"node":"localhost","device":"cpu"},{"node":"localhost","device":"cpu"}],"entries":{"model":{"ranks":[0,1],"parallel_config":{"tensor_parallel_size":2}}},"queue_depth":1}]"#,
         ])
         .expect("configured serve invocation");
         assert!(matches!(parsed.command, Command::Serve(_)));
@@ -584,7 +624,9 @@ mod tests {
             r#"{"mode":"performance","components":{"transformer.attention":"fp8","transformer.mlp":"nvfp4","text_encoder":"bf16","video_vae":"bf16"}}"#,
         ])
         .expect("MiniMax H3 quantization config");
-        let Command::Serve(args) = parsed.command;
+        let Command::Serve(args) = parsed.command else {
+            panic!("expected serve command");
+        };
         let worker = args.runtime.worker_process.to_args();
         assert_eq!(worker.quantization_config["mode"], "performance");
         assert_eq!(
@@ -603,7 +645,9 @@ mod tests {
             "minimax-h3",
         ])
         .expect("MiniMax H3 default precision policy");
-        let Command::Serve(args) = parsed.command;
+        let Command::Serve(args) = parsed.command else {
+            panic!("expected serve command");
+        };
         let worker = args.runtime.worker_process.to_args();
         assert_eq!(worker.quantization_config, serde_json::json!({}));
     }

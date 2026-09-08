@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Hashable, Iterator
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -42,7 +43,7 @@ from uniserve_worker.foundation.errors import (
     classify,
     invalid_descriptor,
 )
-from uniserve_worker.models.runtime import ExecutionModel
+from uniserve_worker.models.runtime import ExecutionModel, ModuleExecution
 from uniserve_worker.nn.diffusion.schedule import DiffusionSchedule
 from uniserve_worker.runtime.device import HostStagingRing, canonical_device, fill_cpu_ints
 from uniserve_worker.runtime.device_products import device_product_storage
@@ -185,7 +186,15 @@ class ModelRunner:
         self._startup_complete = False
         self._execution_lanes: dict[tuple[str, Domain], ExecutionLaneRuntime] = {}
         self._owned_lanes: list[ExecutionLaneRuntime] = []
-        self._geometry_cache: dict[Hashable, object] = {}
+        self._geometry_cache: OrderedDict[Hashable, object] = OrderedDict()
+        self._dynamic_graphs: OrderedDict[
+            tuple[str, Hashable],
+            tuple[Hashable, dict[Hashable, tuple[ModuleExecution, GraphEntry]]],
+        ] = OrderedDict()
+        self._warming_modules = False
+        self._denoising_pool = None
+        if worker_config.graph_policy == "full" and not worker_config.cuda_graph:
+            raise GraphExecutionError("full graph policy conflicts with disabled CUDA graphs")
         self._module_graphs: dict[str, GraphEntry[torch.Tensor]] = {}
         self._capture_stream: torch.cuda.Stream | None = None
         self._text_staging: HostStagingRing | None = None
@@ -222,7 +231,11 @@ class ModelRunner:
         """Own immutable model metadata until every dependent execution is retired."""
 
         if key not in self._geometry_cache:
+            if len(self._geometry_cache) >= max(2, self.worker_config.max_request_pool_size):
+                torch.cuda.current_stream(self.worker_config.device).synchronize()
+                self._geometry_cache.popitem(last=False)
             self._geometry_cache[key] = build()
+        self._geometry_cache.move_to_end(key)
         return cast(GeometryT, self._geometry_cache[key])
 
     def warmup_modules(self, storage: tuple[BoundedTensorStorage, ...]) -> None:
@@ -231,14 +244,25 @@ class ModelRunner:
         inputs = self.model.warmup_inputs
         if inputs is None:
             return
+        logger.info("warming numerical modules and their provider shapes")
         for workload in inputs(storage, self.scratch, self.context_workspace, self.schedule):
             if workload.geometry is not None:
                 key, metadata = workload.geometry
                 if key in self._geometry_cache and self._geometry_cache[key] is not metadata:
                     raise ValueError("warmup geometry key already owns different metadata")
-                self._geometry_cache[key] = metadata
-            self.run_module(workload.name, *workload.inputs)
+                self.prepare_geometry(key, lambda: metadata)
+            self._warming_modules = True
+            try:
+                self.run_module(workload.name, *workload.inputs)
+            finally:
+                self._warming_modules = False
         self.synchronize()
+        logger.info(
+            "numerical module warmup complete; CUDA graphs captured=%s; dynamic capture entries=%s policy=%s",
+            sorted(self._module_graphs),
+            sorted(self.model.capture_entries),
+            self.worker_config.graph_policy if self.worker_config.cuda_graph else "off",
+        )
 
     def stage_text_tokens(self, tokens: tuple[int, ...]) -> torch.Tensor:
         """Stage one text encoder input on the caller's stream without a world broadcast.
@@ -318,14 +342,34 @@ class ModelRunner:
         except AttributeError as error:
             raise InputError(f"rank does not own computation entry {name!r}") from error
         started = time.perf_counter_ns()
-        path = RunPath.GRAPH_REPLAY if name in self.model.capture_inputs else RunPath.EAGER
+        path = RunPath.GRAPH_REPLAY if name in self._module_graphs else RunPath.EAGER
         try:
-            if path is RunPath.GRAPH_REPLAY:
+            binding = self.model.module_execution(name, inputs)
+            if binding is not None and self.worker_config.cuda_graph and not self._warming_modules:
+                output, path = self._run_signature(name, inputs, binding)
+            elif path is RunPath.GRAPH_REPLAY:
                 if any(not isinstance(value, torch.Tensor) for value in inputs):
                     raise InputError("captured module arguments must be Tensors")
                 output = self.run_captured(name, *cast(tuple[torch.Tensor, ...], inputs))
             else:
-                output = module(*inputs)
+                if (
+                    self.worker_config.graph_policy == "full"
+                    and not self._warming_modules
+                    and binding is None
+                    and name not in self.model.capture_inputs
+                ):
+                    raise GraphExecutionError(
+                        f"full graph policy has no capture signature for {name}"
+                    )
+                from ..models.video import VideoModel
+
+                if name == "denoiser" and isinstance(self.model, VideoModel):
+                    tensors, metadata, step, count, schedule = inputs
+                    if count != 1:
+                        raise InputError("denoising calls evaluate exactly one scheduled step")
+                    output = self.model.bind_denoising_step(tensors, metadata, step, schedule)()
+                else:
+                    output = module(*inputs)
             values = (output,) if isinstance(output, torch.Tensor) else output
             if not isinstance(values, tuple) or any(
                 not isinstance(value, torch.Tensor) for value in values
@@ -356,6 +400,108 @@ class ModelRunner:
                 execution_path=path.value,
             )
             raise
+
+    @torch.inference_mode()
+    def _run_signature(
+        self, name: str, inputs: tuple[object, ...], binding: ModuleExecution
+    ) -> tuple[torch.Tensor | tuple[torch.Tensor, ...], RunPath]:
+        """Capture one complete numerical call, with bounded shape/slot residency.
+
+        The owner serializes computation on one stream. Tensor-only calls copy
+        inputs into graph-owned buffers; solver calls retain request storage.
+        Exact signatures preserve every admitted shape without semantic padding.
+        """
+
+        key = (name, binding.residency)
+        existing = self._dynamic_graphs.get(key)
+        missing = (
+            existing is None
+            or existing[0] != binding.signature
+            or binding.variant not in existing[1]
+        )
+        # Slot assignment can differ between ranks. Agree on first-use work before
+        # any rank warms collectives while another rank replays a graph.
+        if binding.groups:
+            decision = torch.tensor(
+                int(missing), dtype=torch.int32, device=self.worker_config.device
+            )
+            for group in binding.groups:
+                group.all_reduce_max(decision)
+            missing = bool(decision.item())
+        if missing:
+            current = torch.cuda.current_stream(self.worker_config.device)
+            current.synchronize()
+            if existing is not None and existing[0] != binding.signature:
+                for _, entry in existing[1].values():
+                    entry.close()
+                del self._dynamic_graphs[key]
+                existing = None
+            if existing is None:
+                # Request slots bound denoiser signatures. Tensor-only components
+                # retain one exact shape because outputs are consumed before reuse.
+                limit = max(2, self.worker_config.max_request_pool_size)
+                peers = [item for item in self._dynamic_graphs if item[0] == name]
+                if len(peers) >= limit:
+                    _, retired = self._dynamic_graphs.pop(peers[0])
+                    for _, entry in retired.values():
+                        entry.close()
+                existing = (binding.signature, {})
+                self._dynamic_graphs[key] = existing
+            previous = existing[1].pop(binding.variant, None)
+            if previous is not None:
+                previous[1].close()
+            tensor_inputs = all(isinstance(value, torch.Tensor) for value in inputs)
+            stable = tuple(value.clone() for value in inputs) if tensor_inputs else ()
+            if tensor_inputs:
+                binding = self.model.module_execution(name, stable)
+                assert binding is not None
+            snapshots = tuple(value.clone() for value in binding.mutated)
+            # Warm the exact provider shape and collective route, then restore the
+            # request's original state. Compilation must never consume a solver step.
+            binding.operation()
+            current.synchronize()
+            for value, saved in zip(binding.mutated, snapshots, strict=True):
+                value.copy_(saved)
+            if self._capture_stream is None:
+                self._capture_stream = torch.cuda.Stream(device=self.worker_config.device)
+            stream = self._capture_stream
+            stream.wait_stream(current)
+            if binding.mutated and self._denoising_pool is None:
+                self._denoising_pool = torch.cuda.graph_pool_handle()
+            before = torch.cuda.memory_allocated(self.worker_config.device)
+            entry = GraphEntry.capture(
+                binding.operation,
+                inputs=stable,
+                stream=stream,
+                pool=self._denoising_pool if binding.mutated else None,
+            )
+            current.wait_stream(stream)
+            existing[1][binding.variant] = (binding, entry)
+            logger.info(
+                "captured full numerical entry=%s signature=%s step=%s graphs=%d tensor_memory_bytes=%d",
+                name,
+                binding.signature,
+                binding.variant,
+                sum(
+                    len(value[1]) for item, value in self._dynamic_graphs.items() if item[0] == name
+                ),
+                torch.cuda.memory_allocated(self.worker_config.device) - before,
+            )
+        self._dynamic_graphs.move_to_end(key)
+        assert existing is not None
+        _, entry = existing[1][binding.variant]
+        output = (
+            entry.replay(*cast(tuple[torch.Tensor, ...], inputs))
+            if entry.inputs
+            else entry.replay()
+        )
+        return output, RunPath.GRAPH_CAPTURE if missing else RunPath.GRAPH_REPLAY
+
+    def _clear_dynamic_graphs(self) -> None:
+        for _, entries in self._dynamic_graphs.values():
+            for _, entry in entries.values():
+                entry.close()
+        self._dynamic_graphs.clear()
 
     @property
     def mixed_captures(self) -> tuple[MixedCapture, ...]:
@@ -481,7 +627,7 @@ class ModelRunner:
         replay runs on the caller's stream and borrows its output until reuse.
         """
 
-        if not self.model.capture_inputs:
+        if not self.worker_config.cuda_graph or not self.model.capture_inputs:
             return
         if self._startup_complete or self._module_graphs:
             raise GraphExecutionError("module capture requires an uncaptured startup binding")
@@ -489,6 +635,9 @@ class ModelRunner:
         current = torch.cuda.current_stream(device)
         stream = torch.cuda.Stream(device=device)
         self._capture_stream = stream
+        logger.info(
+            "warming providers and capturing fixed entries: %s", sorted(self.model.capture_inputs)
+        )
         for name, schemas in self.model.capture_inputs.items():
             module = self.model.get_submodule(name)
             if any(schema.memory != "device" for schema in schemas):
@@ -511,8 +660,15 @@ class ModelRunner:
 
             invoke()
             stream.wait_stream(current)
+            before = torch.cuda.memory_allocated(device)
             entry = GraphEntry.capture(invoke, inputs=inputs, stream=stream)
             self._module_graphs[name] = entry
+            logger.info(
+                "captured numerical entry=%s signature=%s graphs=1 tensor_memory_bytes=%d",
+                name,
+                tuple(tuple(value.shape) for value in inputs),
+                torch.cuda.memory_allocated(device) - before,
+            )
             with torch.cuda.stream(stream):
                 entry.replay()
             current.wait_stream(stream)
@@ -570,6 +726,7 @@ class ModelRunner:
     def invalidate_graphs(self, weight_version: int) -> None:
         """Drop captures whose embedded parameters predate the supplied weight version."""
 
+        self._clear_dynamic_graphs()
         for entry in self._module_graphs.values():
             entry.close()
         self._module_graphs.clear()
@@ -579,6 +736,7 @@ class ModelRunner:
     def close(self) -> None:
         """Release lane streams, graph bindings, and runner-owned staging state."""
 
+        self._clear_dynamic_graphs()
         for entry in self._module_graphs.values():
             entry.close()
         self._module_graphs.clear()

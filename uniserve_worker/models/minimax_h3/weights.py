@@ -25,20 +25,19 @@ from ...loader.weight_loaders import attach_parameter_loaders, load_parameter_we
 from ...nn.diffusion.schedule import DiffusionSchedule
 from ...nn.layer import LayerConfig
 from ...nn.linear import LinearBase
-from ...nn.mesh import Communicator
+from ...nn.mesh import Communicator, EntryBindings
 from ...nn.quant.config import QuantizationConfig
 from .audio_vae import MiniMaxH3AudioVAE
+from .config import H3TransformerConfig, resolve_h3_contract
 from .encoder import H3TextEncoderConfig, MiniMaxH3TextEncoder
+from .layout import MIN_H3_FRAMES, H3Layout
 from .packing import audio_latent_frames
-from .state import MIN_H3_FRAMES, H3Layout
 from .transformer import (
     H3TimestepEmbedding,
-    H3TransformerConfig,
     MiniMaxH3Transformer,
     build_conditioner,
 )
-from .video_vae import MiniMaxH3VideoVAE
-from .video_vae_decoder import MiniMaxH3VideoDecoder
+from .video_vae import MiniMaxH3VideoDecoder, MiniMaxH3VideoVAE
 
 
 @dataclass(slots=True)
@@ -52,9 +51,54 @@ class H3Components:
     audio_vae: MiniMaxH3AudioVAE | None
 
 
-def _require_checkpoint_geometry(root: Path) -> None:
+def validate_h3_entries(bindings: EntryBindings) -> None:
+    """Validate component placement before constructing checkpoint modules."""
+
+    expected = {"denoiser", "text_encoder", "video_decoder", "audio_decoder", "output"}
+    if not bindings.entries or not set(bindings.entries) <= expected:
+        raise ValueError(f"H3 entries must belong to {sorted(expected)}")
+    for name, component in bindings.entries.items():
+        config = component.parallel_config
+        if name == "video_decoder":
+            if component.distribution != "temporal_units" or component.units_per_rank != 1:
+                raise ValueError("H3 video decoder requires temporal_units with native batch one")
+            continue
+        if component.distribution is not None:
+            raise ValueError(f"H3 {name} requires model-parallel membership")
+        if name in {"audio_decoder", "output"}:
+            if len(component.ranks) != 1 or config.world_size != 1:
+                raise ValueError(f"H3 {name} requires one local owner")
+        elif name == "text_encoder":
+            if config.pipeline_parallel_size != 1 or config.sequence_parallel_size != 1:
+                raise ValueError("H3 text encoder supports direct tensor parallelism")
+            if any(width % config.tensor_parallel_size for width in (64, 8, 25600)):
+                raise ValueError("H3 encoder TP must divide query heads, KV heads, and MLP width")
+        elif name == "denoiser":
+            if config.pipeline_parallel_size > 50:
+                raise ValueError("H3 pipeline stages cannot exceed its 50 transformer layers")
+            if config.sequence_parallel.kind not in {
+                "local",
+                "ulysses",
+                "allgather",
+                "ring",
+                "hybrid",
+                "attention2d",
+            }:
+                raise ValueError("H3 sequence attention requires global sparse selection")
+            tensor = config.tensor_parallel_size
+            ulysses = dict(config.dimensions)["ulysses"]
+            if 56 % (tensor * ulysses) or 5376 % tensor or 14336 % tensor:
+                raise ValueError(
+                    "H3 TP × Ulysses must divide heads; TP must divide hidden and MLP widths"
+                )
+            if tensor not in (1, 2, 4) or config.sequence_parallel_size not in (1, 2, 4):
+                raise ValueError("H3 requires TP and sequence degrees in 1, 2, or 4")
+
+
+def require_h3_checkpoint(root: Path) -> None:
     """Validate checkpoint component files and tensor dimensions against the H3 architecture."""
 
+    resolve_h3_contract(root)
     transformer = json.loads((root / "transformer" / "config.json").read_text(encoding="utf-8"))
     transformer_config = H3TransformerConfig()
     expected_transformer = {
@@ -228,14 +272,14 @@ def _map_video_decoder(model: MiniMaxH3VideoDecoder, handles: Iterable[WeightHan
 def build_h3_checkpoint(config: dict[str, Any], context: ModelBuildContext) -> ModelConstruction:
     """Declare resident H3 components; the shared loader owns their materialization."""
 
-    from .model import MiniMaxH3Model, validate_h3_entries
+    from .model import MiniMaxH3Model
 
     request = context.request
     bindings, schedule = request.bindings, context.schedule
     if schedule is None:
         raise ValueError("H3 construction requires its diffusion schedule")
     validate_h3_entries(bindings)
-    _require_checkpoint_geometry(context.root)
+    require_h3_checkpoint(context.root)
     device = bindings.process_group.device
     precisions = context.component_precisions
     text_capacity = ((int(request.max_text_rows) + 63) // 64) * 64

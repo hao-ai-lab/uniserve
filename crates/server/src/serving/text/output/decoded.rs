@@ -490,7 +490,8 @@ pub async fn decoded_text_event_stream(
             | Event::ImageStep { .. }
             | Event::ImageCommit { .. }
             | Event::ImageDone { .. }
-            | Event::Artifact(_) => {
+            | Event::Artifact(_)
+            | Event::MediaProgress { .. } => {
                 return Err(Error::MalformedOutput {
                     request_id: request_id.clone(),
                     message: "text-only request received a non-text lifecycle event".to_string(),
