@@ -9,10 +9,49 @@ from uniserve_worker.nn.layer import LayerConfig
 from uniserve_worker.nn.linear import LinearBase, MergedColumnParallelLinear, RowParallelLinear
 from uniserve_worker.nn.mesh import Communicator
 from uniserve_worker.nn.mlp import GatedMLP
-from uniserve_worker.nn.quant.base import PreparedLinearInput
+from uniserve_worker.nn.quant.base import PreparedLinearInput, UnquantizedLinearMethod
 from uniserve_worker.nn.quant.fp8 import DynamicW8A8Fp8LinearMethod
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("shape,bias", [((2, 3, 256), True), ((1, 193, 14336), False)])
+def test_dense_fp32_accumulation_preserves_rounding_and_graph_inputs(dtype, shape, bias):
+    torch.manual_seed(53)
+    linear = LinearBase(
+        shape[-1],
+        128,
+        layer_config=LayerConfig(Communicator(), None),
+        quant_method=UnquantizedLinearMethod(accumulation_dtype=torch.float32),
+        bias=bias,
+    ).to(device="cuda", dtype=dtype)
+    # Bounded dyadic operands have exactly representable FP32 dot products.
+    # Round only after the complete reduction and optional bias addition.
+    with torch.inference_mode():
+        linear.weight.copy_(torch.randint(-8, 9, linear.weight.shape, device="cuda") / 16)
+        if linear.bias is not None:
+            linear.bias.copy_(torch.arange(128, device="cuda") / 16)
+        linear.finalize_weights()
+        inputs = (torch.randint(-8, 9, shape, device="cuda") / 16).to(dtype)
+
+        def reference():
+            return F.linear(
+                inputs.float(),
+                linear.weight.float(),
+                None if linear.bias is None else linear.bias.float(),
+            ).to(dtype)
+
+        torch.testing.assert_close(linear(inputs), reference(), rtol=0, atol=0)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = linear(inputs)
+        inputs.add_(1 / 16)
+        graph.replay()
+        torch.testing.assert_close(actual, reference(), rtol=0, atol=0)
+        graph.reset()
 
 
 @pytest.mark.parametrize("tensorwise", [False, True])

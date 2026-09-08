@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 import torch
@@ -61,6 +62,45 @@ class AttentionContextWorkspace:
     valid_sizes: torch.Tensor
     sync_input: torch.Tensor
     sync_output: torch.Tensor
+
+
+@dataclass(frozen=True)
+class AttentionRowExchange:
+    """Borrowed head shards awaiting their sequence-owner exchange.
+
+    A row-local consumer can process completed intervals while later transfers
+    remain in flight. Consumers with tensor-wide numerical domains materialize
+    all rows together. Both modes consume the caller-owned scratch buffers.
+    """
+
+    parallel: ParallelAttention
+    tensor: torch.Tensor
+    workspace: torch.Tensor
+
+    def materialize(self) -> torch.Tensor:
+        """Return all sequence-local rows with their complete head vectors."""
+
+        return self.parallel.restore_rows(self.tensor, workspace=self.workspace)
+
+    def chunks(self, receive_workspace: torch.Tensor) -> Iterator[tuple[slice, torch.Tensor]]:
+        """Restore head vectors using disjoint caller-owned receive byte capacity.
+
+        Receive storage must accommodate the complete head-shard payload on
+        the same device. Registered buffers enable copy-engine transport.
+        The iterator must finish before any of its three buffers is reused.
+        """
+
+        group = self.parallel.ulysses_group
+        rows = self.tensor.shape[0] // group.world_size
+        payload = self.tensor[0].numel() * self.tensor.element_size()
+        chunk_rows = max(128, (64 * 1024 * 1024 // payload // 128) * 128)
+        outgoing = self.tensor.view(group.world_size, rows, *self.tensor.shape[1:])
+        byte_count = self.tensor.numel() * self.tensor.element_size()
+        incoming = receive_workspace.view(torch.uint8).view(-1)[:byte_count].view(self.tensor.dtype)
+        for interval, sources in group.exchange_row_chunks(
+            outgoing, self.workspace, incoming, chunk_rows
+        ):
+            yield interval, torch.cat(sources, dim=1)
 
 
 class ParallelAttention:

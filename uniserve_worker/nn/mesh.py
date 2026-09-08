@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from itertools import product
 from math import prod
@@ -391,6 +392,65 @@ class Communicator:
         targets = output.split(tuple(output_splits), dim=0)
         for index, chunk in zip(order, received.split(backend_output_splits, dim=0)):
             targets[index].copy_(chunk)
+
+    def exchange_row_chunks(
+        self,
+        input: torch.Tensor,
+        workspace: torch.Tensor,
+        output: torch.Tensor,
+        chunk_rows: int,
+    ) -> Iterator[tuple[slice, tuple[torch.Tensor, ...]]]:
+        """Yield equal-count AlltoAll row intervals as their peer writes complete.
+
+        Input axes are logical destination, row, and payload features. Both
+        workspace buffers are consumed as scratch. Input storage stays live
+        independently of peer writes throughout staging and exchange. Each
+        yielded tuple orders source shards by logical membership. Consumers
+        must exhaust the iterator before either allocation is reused.
+        """
+
+        if input.ndim < 3 or input.shape[0] != self.world_size or chunk_rows < 1:
+            raise ValueError("chunked exchange requires a member axis and positive row chunks")
+        if (
+            not input.is_contiguous()
+            or not workspace.is_contiguous()
+            or workspace.numel() != input.numel()
+            or workspace.device != input.device
+            or workspace.dtype != input.dtype
+            or not output.is_contiguous()
+            or output.numel() != input.numel()
+            or output.device != input.device
+            or output.dtype != input.dtype
+            or len({input.data_ptr(), workspace.data_ptr(), output.data_ptr()}) != 3
+        ):
+            raise ValueError("chunked exchange requires distinct matching contiguous buffers")
+        rows = input.shape[1]
+        if self.world_size == 1:
+            yield slice(0, rows), (input[0],)
+            return
+        group = self._require()
+        order = self._backend_order
+        row_elements = prod(input.shape[2:])
+        source_flat, target_flat = workspace.view(-1), output.view(-1)
+        segments = []
+        for start in range(0, rows, chunk_rows):
+            count = min(chunk_rows, rows - start)
+            offset = start * self.world_size * row_elements
+            elements = count * self.world_size * row_elements
+            shape = (self.world_size, count, *input.shape[2:])
+            source = source_flat.narrow(0, offset, elements).view(shape)
+            target = target_flat.narrow(0, offset, elements).view(shape)
+            for backend_rank, logical_rank in enumerate(order):
+                source[backend_rank].copy_(input[logical_rank, start : start + count])
+            segments.append((slice(start, start + count), source, target))
+
+        pending = [
+            dist.all_to_all_single(target, source, group=group, async_op=True)
+            for _, source, target in segments
+        ]
+        for (interval, _, target), work in zip(segments, pending, strict=True):
+            _finish(work, input)
+            yield interval, tuple(target[order.index(rank)] for rank in range(self.world_size))
 
     def gather_into_tensor(
         self, output: torch.Tensor | None, input: torch.Tensor, *, dst: int

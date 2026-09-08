@@ -120,6 +120,11 @@ class LinearMethod(abc.ABC):
 class UnquantizedLinearMethod(LinearMethod):
     """Implements dense linear execution with loader-managed unquantized weights."""
 
+    def __init__(self, *, accumulation_dtype: torch.dtype | None = None) -> None:
+        if accumulation_dtype not in (None, torch.float32):
+            raise ValueError("dense accumulation dtype must be FP32 or provider-selected")
+        self.accumulation_dtype = accumulation_dtype
+
     def create_weights(
         self,
         module: LinearBase,
@@ -148,11 +153,28 @@ class UnquantizedLinearMethod(LinearMethod):
             attach_weight_loader(bias_parameter, default_weight_loader)
 
     def process_weights_after_loading(self, module: LinearBase) -> None:
-        """Dense checkpoint storage is already the execution representation."""
+        """Keep dense storage and resolve the requested accumulation provider."""
+
+        if (
+            self.accumulation_dtype is torch.float32
+            and module.weight.is_cuda
+            and module.weight.dtype in (torch.float16, torch.bfloat16)
+        ):
+            from uniserve_kernel.dense_linear import initialize
+
+            initialize()
 
     def apply(self, module: LinearBase, x: torch.Tensor) -> torch.Tensor:
         """Project activations with the module's dense weight and optional bias."""
 
+        if (
+            self.accumulation_dtype is torch.float32
+            and x.is_cuda
+            and x.dtype in (torch.float16, torch.bfloat16)
+        ):
+            from ...ops.linear import linear_fp32_accum
+
+            return linear_fp32_accum(x, module.weight, module.execution_bias)
         return F.linear(x, module.weight, module.execution_bias)
 
     def input_scale(
@@ -180,6 +202,14 @@ class UnquantizedLinearMethod(LinearMethod):
         values = prepared.values
         bias = module.execution_bias if include_bias else None
         if output_dtype == values.dtype:
+            if (
+                self.accumulation_dtype is torch.float32
+                and values.is_cuda
+                and values.dtype in (torch.float16, torch.bfloat16)
+            ):
+                from ...ops.linear import linear_fp32_accum
+
+                return linear_fp32_accum(values, module.weight, bias)
             return F.linear(values, module.weight, bias)
         if output_dtype != torch.float32 or values.dtype not in (torch.float16, torch.bfloat16):
             raise ValueError("dense prepared GEMM supports input dtype or FP32 output")

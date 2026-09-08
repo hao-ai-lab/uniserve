@@ -11,6 +11,7 @@ import torch
 from ...nn.parallel_attention import (
     AttentionContextWorkspace,
     AttentionOutputTargets,
+    AttentionRowExchange,
     ParallelAttention,
 )
 from ...ops import video_sparse as video_sparse_ops
@@ -265,7 +266,7 @@ class VideoSparseAttentionBackend:
         sync_input: torch.Tensor,
         sync_output: torch.Tensor,
         context_workspace: AttentionContextWorkspace | None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | AttentionRowExchange:
         """Compose global sparse selection with shared head and context exchanges."""
 
         context = parallel.context_group
@@ -359,7 +360,7 @@ class VideoSparseAttentionBackend:
         if local_output is not None:
             # The epilogue has consumed the sparse provider's output; its
             # registered buffer can now receive the head-to-row exchange.
-            return parallel.restore_rows(local_output, workspace=workspace.attention_output)
+            return AttentionRowExchange(parallel, local_output, workspace.attention_output)
         return parallel.finish_output(outputs, sync_input, sync_output)
 
     def forward_local(

@@ -31,10 +31,11 @@ from ...nn.mlp import GatedMLP
 from ...nn.norm import RMSNorm
 from ...nn.parallel_attention import (
     AttentionContextWorkspace,
+    AttentionRowExchange,
     ParallelAttention,
 )
 from ...nn.parallel_pipeline import LayerPipeline
-from ...nn.quant.base import PreparedLinearInput
+from ...nn.quant.base import PreparedLinearInput, UnquantizedLinearMethod
 from ...nn.quant.config import LinearPrecision, create_linear_method
 from ...ops import (
     gated_residual,
@@ -410,8 +411,8 @@ class _H3Attention(nn.Module):
         compressed_tiles: torch.Tensor,
         topk_indices_i32: torch.Tensor,
         backend: VideoSparseAttentionBackend,
-    ) -> torch.Tensor:
-        """Exchange sequence shards, run sparse global attention, and project local rows."""
+    ) -> torch.Tensor | AttentionRowExchange:
+        """Compute sparse global attention and publish its row-exchange dependency."""
 
         local = hidden[0]
         head_dim = self.config.head_dim
@@ -456,8 +457,7 @@ class _H3Attention(nn.Module):
             topk_indices_i32=topk_indices_i32,
         )
 
-        # VSA returns local sequence rows with globally composed head shards.
-        local_output = backend.forward_parallel(
+        return backend.forward_parallel(
             self.parallel_attention,
             query,
             key,
@@ -473,7 +473,6 @@ class _H3Attention(nn.Module):
             sync_output=projection_sync_output,
             context_workspace=context_workspace,
         )
-        return self.to_out(local_output.reshape(1, local_output.shape[0], -1))
 
 
 class _TransformerBlock(nn.Module):
@@ -510,12 +509,23 @@ class _TransformerBlock(nn.Module):
                 config.hidden_size,
                 config.ffn_dim,
                 logical_input_row_partitions=4 // mesh.size("sp"),
-                quant_method=create_linear_method(mlp_linear_precision),
+                # Preserve complete FP32 dot products across physical row intervals.
+                quant_method=(
+                    UnquantizedLinearMethod(accumulation_dtype=torch.float32)
+                    if mlp_linear_precision == "bf16"
+                    else create_linear_method(mlp_linear_precision)
+                ),
                 layer_config=layer_config.child("ff"),
                 order="value_gate",
                 activation_dtype=torch.bfloat16,
             )
         self.hidden_size = config.hidden_size
+        # Projected-head execution provides three registered transport buffers;
+        # dense projections keep each row independent of tensor-wide scales.
+        self.overlap_output_exchange = self.attn.projected_head and all(
+            not projection.quant_method.is_quantized
+            for projection in (self.attn.to_out[0], self.ff.gate_up_proj, self.ff.down_proj)
+        )
 
     def forward(
         self,
@@ -582,6 +592,42 @@ class _TransformerBlock(nn.Module):
             topk_indices_i32,
             backend,
         )
+        del normalized
+
+        if isinstance(attention, AttentionRowExchange):
+            if self.overlap_output_exchange:
+                output = torch.empty_like(hidden)
+                # QKVG projection has consumed this registered gather buffer.
+                # Reuse it for receives while keeping composed input read-only.
+                for interval, rows in attention.chunks(attention_workspace):
+                    projected = self.attn.to_out(rows.reshape(1, rows.shape[0], -1))
+                    output[:, interval] = self._finish_attention(
+                        hidden[:, interval],
+                        projected,
+                        gate_attn,
+                        shift_ffn,
+                        scale_ffn,
+                        gate_ffn,
+                        adaln_indices[interval],
+                    )
+                return output
+            attention = attention.materialize()
+        projected = self.attn.to_out(attention.reshape(1, attention.shape[0], -1))
+        return self._finish_attention(
+            hidden, projected, gate_attn, shift_ffn, scale_ffn, gate_ffn, adaln_indices
+        )
+
+    def _finish_attention(
+        self,
+        hidden: torch.Tensor,
+        attention: torch.Tensor,
+        gate_attn: torch.Tensor,
+        shift_ffn: torch.Tensor,
+        scale_ffn: torch.Tensor,
+        gate_ffn: torch.Tensor,
+        adaln_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Consume complete head vectors through the residual and feed-forward edges."""
 
         # Dynamic FP8 keeps the normalized feed-forward input quantized across
         # the expansion boundary; other precision modes consume the BF16 view.

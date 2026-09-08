@@ -3217,7 +3217,7 @@ gpu = [
 h3 = [
     { name = "nvidia-cudnn-frontend", extra = ["cutedsl"] },
     { name = "nvidia-cutlass-dsl", extra = ["cu13"] },
-    { name = "uniserve-kernel", extra = ["sparse-attention"] },
+    { name = "uniserve-kernel", extra = ["dense-linear", "sparse-attention"] },
 ]
 test = [
     { name = "coverage", extra = ["toml"] },
@@ -3268,7 +3268,7 @@ requires-dist = [
     { name = "tqdm" },
     { name = "transformers", specifier = ">=4.57.1" },
     { name = "uniserve-kernel", extras = ["peer-memory"], marker = "extra == 'gpu'", editable = "uniserve_kernel" },
-    { name = "uniserve-kernel", extras = ["sparse-attention"], marker = "extra == 'h3'", editable = "uniserve_kernel" },
+    { name = "uniserve-kernel", extras = ["sparse-attention", "dense-linear"], marker = "extra == 'h3'", editable = "uniserve_kernel" },
 ]
 provides-extras = ["eval-datasets", "test", "dev", "bench", "gpu", "h3"]
 
@@ -3281,6 +3281,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+dense-linear = [
+    { name = "ninja" },
+]
 peer-memory = [
     { name = "ninja" },
 ]
@@ -3291,12 +3294,13 @@ sparse-attention = [
 [package.metadata]
 requires-dist = [
     { name = "flash-attn-4", extras = ["cu13"], marker = "extra == 'flash-attn-jagged'", specifier = "==4.0.0b24" },
+    { name = "ninja", marker = "extra == 'dense-linear'", specifier = ">=1.13" },
     { name = "ninja", marker = "extra == 'peer-memory'", specifier = ">=1.13" },
     { name = "ninja", marker = "extra == 'sparse-attention'", specifier = ">=1.13" },
     { name = "nvidia-cutlass-dsl", extras = ["cu13"], marker = "extra == 'flash-attn-jagged'", specifier = "==4.6.0.dev0" },
     { name = "torch", specifier = ">=2.13,<2.14" },
 ]
-provides-extras = ["peer-memory", "sparse-attention", "flash-attn-jagged"]
+provides-extras = ["peer-memory", "sparse-attention", "dense-linear", "flash-attn-jagged"]
 
 [[package]]
 name = "urllib3"

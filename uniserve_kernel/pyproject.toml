@@ -17,6 +17,9 @@ peer_memory = [
   "ninja>=1.13",
 ]
 sparse_attention = [
+    "ninja>=1.13",
+]
+dense_linear = [
   "ninja>=1.13",
 ]
 flash_attn_jagged = [
@@ -32,4 +35,4 @@ where = ["src"]
 include = ["uniserve_kernel*"]
 
 [tool.setuptools.package-data]
-uniserve_kernel = ["py.typed", "flash_attn_jagged/cute/*.py", "sparse_attention/csrc/*.cu", "sparse_attention/csrc/*.cuh", "sparse_attention/LICENSE", "peer_memory/csrc/*.cpp"]
+uniserve_kernel = ["py.typed", "flash_attn_jagged/cute/*.py", "sparse_attention/csrc/*.cu", "sparse_attention/csrc/*.cuh", "sparse_attention/LICENSE", "peer_memory/csrc/*.cpp", "dense_linear/csrc/*.cpp"]
