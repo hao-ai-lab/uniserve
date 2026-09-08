@@ -538,10 +538,18 @@ class Worker:
             capacity=int(arena.cpu_tasks),
             workers=min(4, int(arena.cpu_tasks)),
         )
+        transfer_byte_capacity = int(arena.transfer_bytes)
+        if model.resource_geometry.request_tensors:
+            # Each live request tensor reserves one credit per publication
+            # representation and one read credit on every possible remote rank.
+            # These credits bound ownership lifetimes; they allocate no storage.
+            transfer_byte_capacity *= len(publication_backends) + max(
+                0, int(worker_config.world_size) - 1
+            )
         self.transports = make_transports(
             transfer_backends,
             source=endpoint,
-            byte_capacity=arena.transfer_bytes,
+            byte_capacity=transfer_byte_capacity,
             ticket_capacity=arena.transfer_tickets,
             event_pool=self.device_events,
         )
