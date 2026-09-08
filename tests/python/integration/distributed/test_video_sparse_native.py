@@ -1,17 +1,40 @@
-"""Native sparse head extents and fused head-to-row output composition on SM100."""
+"""Sparse head extents and fused head-to-row output composition on CUDA."""
 
 import pytest
 import torch
 import torch.nn.functional as F
 
-from uniserve_worker.backends.attention.video_sparse_cute import block_sparse_attention
+from uniserve_worker.backends.attention import (
+    video_sparse_cute,
+    video_sparse_triton,
+)
 from uniserve_worker.ops.video_sparse import compose_to_head_shards
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
 
+def _available_sparse_attention(
+    query,
+    key,
+    value,
+    output,
+    indices,
+    counts,
+    valid_sizes,
+):
+    """Call the architecture's production sparse-attention provider."""
+
+    if video_sparse_cute.available(query.device):
+        return video_sparse_cute.block_sparse_attention(
+            query, key, value, output, indices, counts, valid_sizes
+        )
+    return video_sparse_triton.block_sparse_attention(
+        query, key, value, output, indices, counts, valid_sizes
+    )
+
+
 @pytest.mark.parametrize("heads", [14, 28, 56, 7])
-def test_sparse_attention_native_heads_preserves_block_mask_and_partial_tiles(heads):
+def test_sparse_attention_heads_preserve_block_mask_and_partial_tiles(heads):
     torch.manual_seed(123)
     rows, width, tile = 256, 128, 64
     # Interleaved projections exercise the actual Q/K/V ingress strides.
@@ -23,7 +46,9 @@ def test_sparse_attention_native_heads_preserves_block_mask_and_partial_tiles(he
         indices[head, :, 1] = 2 if head % 2 == 0 else 1
     counts = torch.full((heads, 4), 2, device="cuda", dtype=torch.int32)
     output = torch.empty((rows, heads, width), device="cuda", dtype=torch.bfloat16)
-    actual = block_sparse_attention(query, key, value, output, indices, counts, valid_sizes)
+    actual = _available_sparse_attention(
+        query, key, value, output, indices, counts, valid_sizes
+    )
     mask = torch.zeros((heads, rows, rows), device="cuda", dtype=torch.bool)
     for head in range(heads):
         mask[head, :, :64] = True
@@ -132,6 +157,7 @@ def test_fused_composition_restores_each_rows_head_interval(members):
 
 
 def test_distinct_query_key_extents_and_empty_partition_merge():
+    from uniserve_worker.backends.attention.video_sparse_cute import block_sparse_attention
     from uniserve_worker.backends.attention.base import merge_attention_states
 
     torch.manual_seed(891)
@@ -194,6 +220,7 @@ def test_distinct_query_key_extents_and_empty_partition_merge():
 
 
 def test_partial_attention_preserves_cancellation_until_all_keys_are_merged():
+    from uniserve_worker.backends.attention.video_sparse_cute import block_sparse_attention
     from uniserve_worker.backends.attention.base import merge_attention_states
 
     query = torch.zeros(128, 7, 128, device="cuda", dtype=torch.bfloat16)
@@ -228,6 +255,8 @@ def test_partial_attention_preserves_cancellation_until_all_keys_are_merged():
 
 @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
 def test_sparse_softmax_underflow_and_empty_key_partitions(output_dtype):
+    from uniserve_worker.backends.attention.video_sparse_cute import block_sparse_attention
+
     torch.manual_seed(772)
     rows, heads, width = 4096, 7, 128
     # Alternating zero and large logits require zero and nonzero softmax

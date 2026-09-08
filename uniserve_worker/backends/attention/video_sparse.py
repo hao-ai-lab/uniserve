@@ -14,7 +14,7 @@ from ...nn.parallel_attention import (
     ParallelAttention,
 )
 from ...ops import video_sparse as video_sparse_ops
-from . import video_sparse_sm100
+from . import video_sparse_sm100, video_sparse_triton
 
 __all__ = [
     "VideoSparseAttentionBackend",
@@ -96,20 +96,22 @@ def build_video_sparse_metadata(
 
 
 def _resolve_kernel() -> Callable[..., torch.Tensor]:
-    """Resolve the FastH3 SM100a operation once at startup."""
+    """Resolve the strongest available FastH3 sparse-attention provider."""
 
-    if not video_sparse_sm100.available():
-        raise RuntimeError(
-            "FastH3 requires the SM100a H3 VSA kernel"
-        ) from video_sparse_sm100.import_error()
-    return video_sparse_sm100.block_sparse_attention
+    if video_sparse_sm100.available():
+        return video_sparse_sm100.block_sparse_attention
+    if video_sparse_triton.available():
+        return video_sparse_triton.execute_sparse_attention
+    raise RuntimeError("FastH3 requires a CUDA sparse-attention provider") from (
+        video_sparse_sm100.import_error() or video_sparse_triton.import_error()
+    )
 
 
 class VideoSparseAttentionBackend:
     """Checkpoint VSA: sparse top-k attention plus trained dense compression."""
 
     def __init__(self, metadata: VideoSparseAttentionMetadata) -> None:
-        """Bind immutable tile metadata and resolve the required SM100 sparse kernel."""
+        """Bind immutable tile metadata and resolve the sparse attention kernel."""
 
         self.metadata = metadata
         self.kernel = _resolve_kernel()

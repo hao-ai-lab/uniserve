@@ -90,7 +90,7 @@ MINIMAX_H3_ENTRY = CatalogEntry(
     architecture="MiniMaxH3Transformer3DModel",
     model_class=MiniMaxH3Model,
     components=("text_encoder", "denoiser", "video_decoder", "audio_decoder", "output"),
-    minimum_cuda_capability=(10, 0),
+    minimum_cuda_capability=(9, 0),
     component_precisions=partial(
         resolve_component_precisions,
         supported=SUPPORTED_PRECISIONS,
