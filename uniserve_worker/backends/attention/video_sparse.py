@@ -14,7 +14,7 @@ from ...nn.parallel_attention import (
     ParallelAttention,
 )
 from ...ops import video_sparse as video_sparse_ops
-from . import video_sparse_sm100, video_sparse_triton
+from . import video_sparse_flashinfer, video_sparse_sm100, video_sparse_triton
 
 __all__ = [
     "VideoSparseAttentionBackend",
@@ -100,6 +100,8 @@ def _resolve_kernel() -> Callable[..., torch.Tensor]:
 
     if video_sparse_sm100.available():
         return video_sparse_sm100.block_sparse_attention
+    if video_sparse_flashinfer.available():
+        return video_sparse_flashinfer.execute_sparse_attention
     if video_sparse_triton.available():
         return video_sparse_triton.execute_sparse_attention
     raise RuntimeError("FastH3 requires a CUDA sparse-attention provider") from (

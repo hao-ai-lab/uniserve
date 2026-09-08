@@ -6,8 +6,10 @@ import torch.nn.functional as F
 
 from uniserve_worker.backends.attention import (
     video_sparse_cute,
+    video_sparse_flashinfer,
     video_sparse_triton,
 )
+from uniserve_worker.nn.parallel_attention import AttentionOutputTargets
 from uniserve_worker.ops.video_sparse import compose_to_head_shards
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
@@ -68,6 +70,91 @@ def test_sparse_attention_heads_preserve_block_mask_and_partial_tiles(heads):
     torch.testing.assert_close(
         actual[0, :, valid_queries], reference[:, valid_queries], rtol=2e-2, atol=2e-2
     )
+
+
+@pytest.mark.parametrize("members", [1, 2])
+def test_flashinfer_sparse_attention_replays_dynamic_maps_across_output_shards(members):
+    if not video_sparse_flashinfer.available(torch.device("cuda")):
+        pytest.skip("FlashInfer sparse attention is unavailable")
+
+    torch.manual_seed(518)
+    rows, heads, width, tile = 256, 28, 128, 64
+    projected = torch.randn(rows, heads, 4, width, device="cuda", dtype=torch.bfloat16)
+    query, key, value, gate = projected.unbind(2)
+    valid_sizes = torch.tensor([64, 17, 64, 0], device="cuda", dtype=torch.int32)
+    indices = torch.zeros((heads, 4, 3), device="cuda", dtype=torch.int32)
+    indices[:, 0] = torch.tensor([0, 1, 2], device="cuda", dtype=torch.int32)
+    indices[:, 1:3, 1] = 1
+    counts = torch.tensor([3, 2, 2, 1], device="cuda", dtype=torch.int32)
+    counts = counts.view(1, -1).expand(heads, -1).contiguous()
+    compressed = torch.randn((heads, 4, width), device="cuda")
+    attention_output = torch.empty_like(query)
+    outputs = tuple(
+        torch.zeros((rows // members, heads * members, width), device="cuda", dtype=torch.bfloat16)
+        for _ in range(members)
+    )
+
+    def invoke() -> None:
+        video_sparse_flashinfer.execute_sparse_attention(
+            query,
+            key,
+            value,
+            mask_block_count=counts,
+            mask_block_indices=indices,
+            valid_sizes=valid_sizes,
+            tile_size=tile,
+            prefix_tiles=1,
+            gate=gate,
+            compressed=compressed,
+            attention_output=attention_output,
+            targets=AttentionOutputTargets(outputs, 0),
+        )
+
+    def reference(selected_video_tile: int) -> torch.Tensor:
+        mask = torch.zeros((heads, rows, rows), device="cuda", dtype=torch.bool)
+        mask[:, :tile, : 3 * tile] = True
+        mask[:, tile : 3 * tile, :tile] = True
+        mask[:, tile : 3 * tile, selected_video_tile * tile : (selected_video_tile + 1) * tile] = True
+        mask[:, 3 * tile :, :tile] = True
+        key_valid = torch.arange(rows, device="cuda") % tile < valid_sizes.repeat_interleave(tile)
+        mask &= key_valid.view(1, 1, -1)
+        attended = F.scaled_dot_product_attention(
+            query.transpose(0, 1).double(),
+            key.transpose(0, 1).double(),
+            value.transpose(0, 1).double(),
+            attn_mask=mask,
+        )
+        return (
+            attended
+            + gate.transpose(0, 1).double() * compressed.double().repeat_interleave(tile, dim=1)
+        ).to(torch.bfloat16)
+
+    def assert_matches(expected: torch.Tensor) -> None:
+        valid_queries = (
+            torch.arange(rows, device="cuda") % tile < valid_sizes.repeat_interleave(tile)
+        )
+        for destination, shard in enumerate(outputs):
+            begin = destination * (rows // members)
+            end = begin + rows // members
+            live = valid_queries[begin:end]
+            torch.testing.assert_close(
+                shard[live, :heads],
+                expected[:, begin:end].transpose(0, 1)[live],
+                rtol=2e-2,
+                atol=2e-2,
+            )
+
+    invoke()
+    torch.cuda.synchronize()
+    assert_matches(reference(1))
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        invoke()
+    indices[:, 1:3, 1] = 2
+    graph.replay()
+    assert_matches(reference(2))
+    graph.reset()
 
 
 @pytest.mark.parametrize("heads", [7, 14, 28, 56])
