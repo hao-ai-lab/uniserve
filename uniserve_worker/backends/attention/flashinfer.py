@@ -25,7 +25,6 @@ from .flashinfer_plan import (
     _cpu_last_page_len,
     _cpu_paged_indptr,
     _decode_plan_key,
-    _decode_plan_key_from_shape,
     _DecodePlanTensors,
     _indptr_last,
     _PlanCache,
@@ -92,7 +91,6 @@ class _DecodeGraphPlanInputs(NamedTuple):
     """Holds live decode metadata and wrapper identity used to refresh a captured graph plan."""
 
     block_table: torch.Tensor
-    cache_seqlens: torch.Tensor
     effective_seqlens: torch.Tensor
     cpu_indptr: torch.Tensor
     cpu_last_page_len: torch.Tensor
@@ -203,7 +201,21 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         if int(q_bhd.shape[0]) != int(effective_seqlens.shape[0]):
             raise ValueError("cache lengths must have one entry per decode row")
 
-        wrapper_key, wrapper = self._decode_wrapper_for(q_bhd, k_cache, binding)
+        graph_wrapper = self._decode_graph_wrapper_for_binding(binding)
+        if graph_wrapper is not None:
+            # Replay preparation owns the mutable page plan. Capturing another
+            # planner upload here would overwrite it with capture-time metadata.
+            _wrapper_key, wrapper = graph_wrapper
+            wrapper._sm_scale = float(scale)
+            out = wrapper.run(q_bhd.contiguous(), (k_cache, v_cache))
+            return inputs.restore.apply(out)
+
+        wrapper_key, wrapper = self._decode_wrapper(
+            q_bhd.device,
+            int(q_bhd.shape[1]),
+            int(k_cache.shape[2]),
+            k_cache.dtype,
+        )
         plan_key = _decode_plan_key(
             binding,
             inputs.block_table,
@@ -290,24 +302,6 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
             raise ValueError("current K/V head geometry does not match paged cache")
         _write_decode_token(k_cache, v_cache, block_table, cache_seqlens, k_bhd, v_bhd, plan)
         return 1
-
-    def _decode_wrapper_for(
-        self,
-        q_bhd: torch.Tensor,
-        k_cache: torch.Tensor,
-        binding: Any,
-    ) -> tuple[WrapperKey, Any]:
-        """Resolve an eager or graph-bound decode wrapper for the query and cache geometry."""
-
-        graph_wrapper = self._decode_graph_wrapper_for_binding(binding)
-        if graph_wrapper is not None:
-            return graph_wrapper
-        return self._decode_wrapper(
-            q_bhd.device,
-            int(q_bhd.shape[1]),
-            int(k_cache.shape[2]),
-            k_cache.dtype,
-        )
 
     def _build_decode_plan(
         self,
@@ -810,20 +804,6 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
             batch_size=int(batch_size),
             cpu_indptr=inputs.cpu_indptr,
         )
-        plan_key = self._decode_graph_plan_key(
-            binding,
-            inputs.block_table,
-            inputs.cache_seqlens,
-            batch_size=int(batch_size),
-            num_q_heads=int(num_q_heads),
-            num_kv_heads=int(num_kv_heads),
-            head_dim=int(head_dim),
-            page_size=int(page_size),
-            q_dtype=q_dtype,
-            kv_dtype=kv_dtype,
-            scale=scale,
-            wrapper_key=inputs.wrapper_key,
-        )
         self._plan_decode_graph(
             inputs.wrapper_key,
             inputs.wrapper,
@@ -842,7 +822,6 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
             cpu_indptr=inputs.cpu_indptr,
             cpu_last_page_len=inputs.cpu_last_page_len,
         )
-        self._decode_plan_cache.remember(inputs.wrapper_key, plan_key, binding)
         binding_key = _binding_identity(binding)
         if binding_key is None:
             raise RuntimeError("paged decode graph preparation requires a binding token")
@@ -953,7 +932,6 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         ).contiguous()
         return _DecodeGraphPlanInputs(
             block_table=block_table,
-            cache_seqlens=cache_seqlens,
             effective_seqlens=effective_seqlens,
             cpu_indptr=cpu_indptr,
             cpu_last_page_len=cpu_last_page_len,
@@ -981,40 +959,6 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
             index_count=_indptr_last(cpu_indptr),
         )
         return plan
-
-    def _decode_graph_plan_key(
-        self,
-        binding: Any,
-        block_table: torch.Tensor,
-        cache_seqlens: torch.Tensor,
-        *,
-        batch_size: int,
-        num_q_heads: int,
-        num_kv_heads: int,
-        head_dim: int,
-        page_size: int,
-        q_dtype: torch.dtype,
-        kv_dtype: torch.dtype,
-        scale: float | None,
-        wrapper_key: WrapperKey,
-    ) -> tuple[Any, ...]:
-        """Build the identity that distinguishes one reusable decode graph plan."""
-
-        return _decode_plan_key_from_shape(
-            binding,
-            block_table,
-            cache_seqlens,
-            batch_size=int(batch_size),
-            num_q_heads=int(num_q_heads),
-            num_kv_heads=int(num_kv_heads),
-            head_dim=int(head_dim),
-            page_size=int(page_size),
-            q_dtype=q_dtype,
-            kv_dtype=kv_dtype,
-            scale=scale,
-            current_tokens=1,
-            wrapper_key=wrapper_key,
-        )
 
     def _plan_decode_graph(
         self,

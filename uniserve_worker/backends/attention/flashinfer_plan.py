@@ -237,41 +237,6 @@ def _decode_plan_key(
 ) -> tuple[Any, ...]:
     """Build a decode-plan cache key from binding identity, tensor geometry, and scale."""
 
-    return _decode_plan_key_from_shape(
-        binding,
-        block_table,
-        cache_seqlens,
-        batch_size=int(q.shape[0]),
-        num_q_heads=int(q.shape[1]),
-        num_kv_heads=int(k_cache.shape[2]),
-        head_dim=int(q.shape[2]),
-        page_size=int(k_cache.shape[1]),
-        q_dtype=q.dtype,
-        kv_dtype=k_cache.dtype,
-        scale=scale,
-        current_tokens=current_tokens,
-        wrapper_key=wrapper_key,
-    )
-
-
-def _decode_plan_key_from_shape(
-    binding: Any,
-    block_table: torch.Tensor,
-    cache_seqlens: torch.Tensor,
-    *,
-    batch_size: int,
-    num_q_heads: int,
-    num_kv_heads: int,
-    head_dim: int,
-    page_size: int,
-    q_dtype: torch.dtype,
-    kv_dtype: torch.dtype,
-    scale: float | None,
-    current_tokens: int,
-    wrapper_key: "WrapperKey",
-) -> tuple[Any, ...]:
-    """Build a decode-plan cache key from explicit graph-capture geometry."""
-
     return (
         wrapper_key,
         _binding_identity(binding),
@@ -279,13 +244,13 @@ def _decode_plan_key_from_shape(
         int(cache_seqlens.data_ptr()),
         tuple(int(dim) for dim in block_table.shape),
         tuple(int(dim) for dim in cache_seqlens.shape),
-        int(batch_size),
-        int(num_q_heads),
-        int(num_kv_heads),
-        int(head_dim),
-        int(page_size),
-        str(q_dtype),
-        str(kv_dtype),
+        int(q.shape[0]),
+        int(q.shape[1]),
+        int(k_cache.shape[2]),
+        int(q.shape[2]),
+        int(k_cache.shape[1]),
+        str(q.dtype),
+        str(k_cache.dtype),
         None if scale is None else float(scale),
         int(current_tokens),
     )
