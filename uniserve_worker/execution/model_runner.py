@@ -43,6 +43,7 @@ from uniserve_worker.foundation.errors import (
     invalid_descriptor,
 )
 from uniserve_worker.models.runtime import ExecutionModel
+from uniserve_worker.nn.collective import collective_scope
 from uniserve_worker.nn.diffusion.schedule import DiffusionSchedule
 from uniserve_worker.runtime.device import HostStagingRing, canonical_device, fill_cpu_ints
 from uniserve_worker.runtime.device_products import device_product_storage
@@ -204,6 +205,13 @@ class ModelRunner:
             torch.cuda.Stream(device=worker_config.device)
             if bool(model.resource_geometry.request_tensors)
             else None
+        )
+        self._sum_reductions = (
+            environment.sum_reductions()
+            # The native launch geometry uses the physical device's SM count.
+            # Green Context lanes require an SM-partition-aware provider.
+            if environment is not None and model.resource_geometry.kv and not worker_config.lanes
+            else {}
         )
 
         self.scratch: BoundedTensorStorage | None = None
@@ -589,6 +597,9 @@ class ModelRunner:
         self._text_tokens = None
         for lane_runtime in reversed(self._owned_lanes):
             lane_runtime.close()
+        for reduction in reversed(tuple(self._sum_reductions.values())):
+            reduction.close()
+        self._sum_reductions.clear()
         self._geometry_cache.clear()
         self.context_workspace = None
         self.scratch = None
@@ -810,7 +821,8 @@ class ModelRunner:
             calls += 1
             ids = buffers.input_ids[:0] if value.input_ids is None else value.input_ids
             positions = buffers.positions[0, :0] if value.positions is None else value.positions
-            result = _invoke(self.model, ids, positions, value)
+            with collective_scope(self._sum_reductions):
+                result = _invoke(self.model, ids, positions, value)
             return result
 
         output_event = None

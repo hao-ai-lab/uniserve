@@ -6,6 +6,7 @@ import weakref
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
+from itertools import accumulate
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -56,6 +57,51 @@ class _PrefillPlanTensors:
     indices: torch.Tensor
     last_page_len: torch.Tensor
     index_count: int
+
+
+@dataclass(frozen=True)
+class _PrefillHostPlan:
+    """Pinned CPU planning inputs derived from the current row lengths.
+
+    PyTorch's pinned allocator tracks asynchronous copies from these tensors,
+    retaining their storage until the device has consumed it. The views share
+    one allocation and need no stream-blocking reuse fence.
+    """
+
+    qo_indptr: torch.Tensor
+    kv_indptr: torch.Tensor
+    last_page_len: torch.Tensor
+    kv_lens: torch.Tensor
+    index_count: int
+    max_query_rows: int
+    max_kv_rows: int
+
+
+def _prefill_host_plan(plan: Any, batch_size: int, page_size: int) -> _PrefillHostPlan | None:
+    """Use host-known lengths when supplied; device-only callers keep device planning."""
+
+    query_lens = tuple(getattr(plan, "query_lens_cpu", ()) or ())
+    kv_lens = tuple(getattr(plan, "kv_lens_cpu", ()) or ())
+    if not query_lens or not kv_lens:
+        return None
+    if (
+        len(query_lens) != batch_size
+        or len(kv_lens) != batch_size
+        or page_size < 1
+        or any(length < 0 for length in (*query_lens, *kv_lens))
+    ):
+        raise ValueError("prefill host lengths must describe every query and KV row")
+    qo_indptr = tuple(accumulate(query_lens, initial=0))
+    kv_indptr = tuple(accumulate((ceil_div(length, page_size) for length in kv_lens), initial=0))
+    last_page_len = tuple((length - 1) % page_size + 1 for length in kv_lens)
+    storage = torch.tensor(
+        (*qo_indptr, *kv_indptr, *last_page_len, *kv_lens),
+        dtype=torch.int32,
+        device="cpu",
+        pin_memory=True,
+    )
+    tensors = storage.split((batch_size + 1, batch_size + 1, batch_size, batch_size))
+    return _PrefillHostPlan(*tensors, kv_indptr[-1], max(query_lens), max(kv_lens))
 
 
 @dataclass(frozen=True)

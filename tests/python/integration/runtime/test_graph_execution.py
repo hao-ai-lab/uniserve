@@ -9,6 +9,7 @@ from uniserve_worker.config import WorkerConfig
 from uniserve_worker.execution.batch import DType, ShapeBound, StaticDim, TensorSpec
 from uniserve_worker.execution.bounded_storage import TensorSchema
 from uniserve_worker.execution.cuda_graph import GraphEntry, GraphExecutionError
+from uniserve_worker.execution.forward_batch import ForwardOutput
 from uniserve_worker.execution.model_runner import ModelRunner
 from uniserve_worker.execution.trace import ExecutionTrace
 from uniserve_worker.models.runtime import ExecutionModel, ResourceGeometry
@@ -73,7 +74,7 @@ def test_graph_outputs_survive_independent_and_ordered_replays(shared_pool):
     )
     # Shared storage requires publication before a different executable runs.
     # Independent entries retain their outputs across the other stream's work.
-    published = torch.empty_like(first_input)
+    retained = []
     source = torch.arange(first_input.numel(), device=device, dtype=first_input.dtype)
     first_stream.wait_stream(current)
     second_stream.wait_stream(current)
@@ -81,7 +82,8 @@ def test_graph_outputs_survive_independent_and_ordered_replays(shared_pool):
         with torch.cuda.stream(first_stream):
             first_value = first.replay(source)
             if shared_pool:
-                published.copy_(first_value)
+                published = ForwardOutput((first_value,)).clone().values[0]
+                retained.append((published, source * 2))
         with torch.cuda.stream(second_stream):
             second_value = second.replay(source)
         current.wait_stream(first_stream)
@@ -92,6 +94,8 @@ def test_graph_outputs_survive_independent_and_ordered_replays(shared_pool):
         first_stream.wait_stream(current)
         second_stream.wait_stream(current)
     current.synchronize()
+    for published, expected in retained:
+        torch.testing.assert_close(published, expected, rtol=0, atol=0)
     first.close()
     second.close()
     with pytest.raises(GraphExecutionError, match="retired"):

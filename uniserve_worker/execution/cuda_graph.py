@@ -304,11 +304,9 @@ class _GraphState:
     batch: ForwardBatch
     output: ForwardOutput
     greedy: GraphGreedyOutput | None
-    published: tuple[ForwardOutput, ...]
     releases: tuple[Callable[[], None], ...]
     startup_resident: bool
     signature: tuple[object, ...]
-    publish_cursor: int = 0
     batch_leaves: tuple[torch.Tensor, ...] = ()
     plan_leaves: tuple[torch.Tensor, ...] = ()
 
@@ -358,11 +356,10 @@ class CudaGraphRunner:
         stream: torch.cuda.Stream | None = None,
         expected_context: int | None = None,
         required_resident_families: Mapping[str, int] | None = None,
-        output_slot_count: int = 2,
     ) -> None:
         """Configure one lane's bounded graph catalog, workspaces, and capture identity."""
 
-        if weight_version < 0 or block_size < 1 or memory_budget_bytes < 0 or output_slot_count < 1:
+        if weight_version < 0 or block_size < 1 or memory_budget_bytes < 0:
             raise ValueError("graph-store identity and geometry are invalid")
         if decode_predicates is not None and (
             decode_predicates.ndim != 1 or decode_predicates.dtype is not torch.bool
@@ -403,7 +400,6 @@ class CudaGraphRunner:
             str(family): max(0, int(count))
             for family, count in (required_resident_families or {}).items()
         }
-        self._output_slot_count = int(output_slot_count)
 
     @property
     def resident_bytes(self) -> int:
@@ -732,18 +728,11 @@ class CudaGraphRunner:
                 expected_context=self._expected_context,
             )
             output, greedy = entry.output
-            context = nullcontext() if self._stream is None else torch.cuda.stream(self._stream)
-            with context:
-                published = tuple(
-                    ForwardOutput(tuple(torch.empty_like(value) for value in output.values))
-                    for _ in range(self._output_slot_count)
-                )
             return _GraphState(
                 entry,
                 static,
                 output,
                 greedy,
-                published,
                 releases,
                 startup_resident,
                 signature,
@@ -785,24 +774,25 @@ class CudaGraphRunner:
             state.entry.replay()
 
     def _publish_output(self, state: _GraphState, rows: int) -> ForwardOutput:
-        """Expose graph-owned outputs trimmed to the live row count."""
+        """Publish caller-owned live rows before another graph reuses capture storage."""
 
-        published = state.published[state.publish_cursor]
-        state.publish_cursor = (state.publish_cursor + 1) % len(state.published)
+        consumer = None if self._stream is None else torch.cuda.current_stream(self._stream.device)
         context = nullcontext() if self._stream is None else torch.cuda.stream(self._stream)
         with context:
-            for destination, source in zip(
-                published.values[:rows], state.output.values[:rows], strict=True
-            ):
-                destination.copy_(source)
-        return ForwardOutput(published.values[:rows])
+            published = _trim_output(state.output, rows).clone()
+        if consumer is not None and consumer != self._stream:
+            # The caller orders consumption behind the lane's output event.
+            # Keep its allocation live until that consumer stream retires.
+            for value in published.values:
+                value.record_stream(consumer)
+        return published
 
     def _snapshot_output(self, output: ForwardOutput) -> ForwardOutput:
         """Clone a forward output for later direct-versus-graph comparison."""
 
         context = nullcontext() if self._stream is None else torch.cuda.stream(self._stream)
         with context:
-            return _clone_output(output)
+            return output.clone()
 
     def _queue_equivalence_check(
         self,
@@ -1626,14 +1616,6 @@ def _trim_greedy(
         continuation=output.continuation[:rows],
         tagged_tokens=output.tagged_tokens[:rows],
         completion=completion,
-    )
-
-
-def _clone_output(output: ForwardOutput) -> ForwardOutput:
-    """Clone all tensors in a forward output without sharing storage."""
-
-    return ForwardOutput(
-        tuple(value.detach().clone(memory_format=torch.preserve_format) for value in output.values)
     )
 
 

@@ -64,6 +64,8 @@ Each packed current token has one `out_cache_loc`. Zero means its K/V is availab
 
 `ForwardRow` is the CPU packing record for one model row. It carries the request-pool index, historical sequence length, query length, and persistence choice. Multiple rows may reference the same request slot, including CFG branches that share conversational conditioning.
 
+FlashInfer prefill planning derives query/page offsets, last-page lengths and KV lengths from the current host row metadata. These planning tables occupy one pinned CPU allocation whose asynchronous H2D lifetime is tracked by PyTorch. Graph replay retains device buffer addresses while refreshing lengths and physical page indices, including declared padding rows. Backends that consume sequence-length tensors on the GPU retain those inputs; direct device-only attention callers retain their device-metadata contract.
+
 Sequence length has one owner for each meaning:
 
 | Meaning | Source |
@@ -112,3 +114,5 @@ Restore receives fresh scheduler-issued block tables, installs them into `ReqToT
 ## CUDA graph execution
 
 Captured forwards use fixed tensor bases and stage request-variable indices, sequence lengths, query lengths, output locations, and padded table tails before replay. Padding references page `0`. One qualified graph shape can therefore execute different scheduler bindings without embedding request ownership into the capture.
+
+Graph output publication copies only live rows into caller-owned storage before another replay can reuse the capture pool. Rows with a common device and dtype share a packed allocation; retained result tensors keep that allocation alive. Cross-lane consumers register their stream with the allocator and wait for the lane's output event. Graph buckets retain captured outputs and metadata, while publication storage follows actual in-flight results. Decode consumers that finish using borrowed logits before the next replay retain the direct graph-output path.

@@ -14,6 +14,7 @@ import torch
 import torch.distributed as dist
 
 from ..profiling import profile_range
+from .collective import try_sum_reduction
 from .parallel import EntryConfig, ParallelConfig
 
 RowChunkProducer = Callable[[slice, tuple[torch.Tensor, ...]], None]
@@ -417,7 +418,9 @@ class Communicator:
 
     def all_reduce(self, value: torch.Tensor) -> torch.Tensor:
         if self.world_size > 1:
-            dist.all_reduce(value, group=self._require())
+            group = self._require()
+            if not try_sum_reduction(group, value):
+                dist.all_reduce(value, group=group)
         return value
 
     def all_reduce_max(self, value: torch.Tensor) -> torch.Tensor:

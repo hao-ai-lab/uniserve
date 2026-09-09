@@ -855,9 +855,6 @@ class Worker:
                     required_resident_families["paged_prefill_bucket"] = len(
                         lane_prefill_catalog
                     )
-            output_slots = int(
-                (pipeline_depth if lane is None else lane.max_inflight or pipeline_depth) + 1
-            )
             return CudaGraphRunner(
                 enabled=worker_config.cuda_graph,
                 prefill_enabled=worker_config.prefill_cuda_graph,
@@ -880,7 +877,6 @@ class Worker:
                 stream=stream,
                 expected_context=expected_context,
                 required_resident_families=required_resident_families,
-                output_slot_count=output_slots,
             )
 
         if owns_kv:

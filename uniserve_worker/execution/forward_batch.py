@@ -8,6 +8,7 @@ runtime objects are deliberately absent.
 
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -250,6 +251,30 @@ class ForwardOutput:
     """Ordered raw tensors aligned with a :class:`ForwardBatch`."""
 
     values: tuple[torch.Tensor, ...]
+
+    def clone(self) -> ForwardOutput:
+        """Own detached copies that survive reuse of the producer's storage.
+
+        Outputs on one device with one dtype share a packed allocation. Shapes
+        and logical tensor values are preserved independently of source strides;
+        storage remains live for as long as any returned tensor is retained.
+        """
+
+        groups: dict[tuple[torch.device, torch.dtype], list[int]] = defaultdict(list)
+        for index, value in enumerate(self.values):
+            groups[(value.device, value.dtype)].append(index)
+        copied = list(self.values)
+        for indexes in groups.values():
+            if len(indexes) == 1:
+                index = indexes[0]
+                copied[index] = self.values[index].detach().clone()
+                continue
+            sources = [self.values[index] for index in indexes]
+            packed = torch.cat(tuple(value.detach().reshape(-1) for value in sources))
+            views = packed.split(tuple(value.numel() for value in sources))
+            for index, view in zip(indexes, views, strict=True):
+                copied[index] = view.reshape(self.values[index].shape)
+        return ForwardOutput(tuple(copied))
 
     def validate_for(self, batch: ForwardBatch) -> None:
         """Require one tensor result for every row in the originating batch."""

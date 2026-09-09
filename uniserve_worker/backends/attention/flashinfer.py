@@ -29,6 +29,8 @@ from .flashinfer_plan import (
     _DecodePlanTensors,
     _indptr_last,
     _PlanCache,
+    _PrefillHostPlan,
+    _prefill_host_plan,
     _prefill_plan_key,
     _PrefillPlanTensors,
     _weakref_or_none,
@@ -596,20 +598,24 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         ):
             query_lens = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
         query_lens = query_lens.to(device=cu_seqlens_q.device, dtype=torch.int32).contiguous()
+        host_plan = _prefill_host_plan(plan, int(kv_seqlens.shape[0]), int(k.shape[1]))
         plan_tensors = self._prefill_plan_tensors(
             wrapper_key,
             block_table,
             cu_seqlens_q,
             kv_seqlens,
             int(k.shape[1]),
-            index_count=_indptr_last(
-                _cpu_paged_indptr(plan, int(kv_seqlens.shape[0]), int(k.shape[1]))
+            index_count=(
+                _indptr_last(_cpu_paged_indptr(plan, int(kv_seqlens.shape[0]), int(k.shape[1])))
+                if host_plan is None
+                else host_plan.index_count
             ),
         )
         self._plan_prefill_wrapper(
             wrapper_key,
             wrapper,
             plan_tensors,
+            host_plan=host_plan,
             block_table=block_table,
             kv_seqlens=kv_seqlens,
             query_lens=query_lens,
@@ -630,6 +636,7 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         wrapper: Any,
         plan: _PrefillPlanTensors,
         *,
+        host_plan: _PrefillHostPlan | None,
         block_table: torch.Tensor,
         kv_seqlens: torch.Tensor,
         query_lens: torch.Tensor,
@@ -662,11 +669,15 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
             workspace=self._workspace(block_table.device),
             wrapper=wrapper,
         )
+        # The planner needs CPU lengths even when its kernels consume GPU
+        # metadata. Passing the existing host values avoids draining the
+        # execution stream for small D2H copies before every Graph replay.
+        device_lengths = self._tuning.prefill_backend == "cudnn"
         wrapper.plan(
-            plan.qo_indptr,
-            plan.kv_indptr,
+            plan.qo_indptr if host_plan is None else host_plan.qo_indptr,
+            plan.kv_indptr if host_plan is None else host_plan.kv_indptr,
             plan.indices,
-            plan.last_page_len,
+            plan.last_page_len if host_plan is None else host_plan.last_page_len,
             int(num_q_heads),
             int(num_kv_heads),
             int(head_dim),
@@ -677,8 +688,12 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
             o_data_type=q_dtype,
             sm_scale=scale_value,
             non_blocking=True,
-            seq_lens=kv_seqlens,
+            seq_lens=kv_seqlens if host_plan is None or device_lengths else host_plan.kv_lens,
             seq_lens_q=query_lens,
+            max_token_per_sequence=None if host_plan is None else host_plan.max_query_rows,
+            max_sequence_kv=(
+                host_plan.max_kv_rows if host_plan is not None and device_lengths else None
+            ),
             block_tables=block_table,
             fixed_split_size=self._tuning.prefill_split_tile_size,
             disable_split_kv=self._tuning.disable_split_kv,
@@ -728,18 +743,24 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         if not isinstance(query_lens, torch.Tensor) or tuple(query_lens.shape) != (batch_size,):
             query_lens = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
         query_lens = query_lens.to(device=cu_seqlens_q.device, dtype=torch.int32).contiguous()
+        host_plan = _prefill_host_plan(plan, batch_size, int(page_size))
         plan_tensors = self._prefill_plan_tensors(
             wrapper_key,
             block_table,
             cu_seqlens_q,
             kv_seqlens,
             int(page_size),
-            index_count=_indptr_last(_cpu_paged_indptr(plan, batch_size, int(page_size))),
+            index_count=(
+                _indptr_last(_cpu_paged_indptr(plan, batch_size, int(page_size)))
+                if host_plan is None
+                else host_plan.index_count
+            ),
         )
         self._plan_prefill_wrapper(
             wrapper_key,
             wrapper,
             plan_tensors,
+            host_plan=host_plan,
             block_table=block_table,
             kv_seqlens=kv_seqlens,
             query_lens=query_lens,

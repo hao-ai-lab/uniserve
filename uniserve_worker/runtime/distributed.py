@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import os
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
 import torch
 import torch.distributed as dist
@@ -14,6 +14,9 @@ from ..foundation.errors import distributed_setup_error
 from ..nn.mesh import Communicator, DeviceMesh, PeerTensorWorkspace, SymmetricMemoryWorkspace
 from ..nn.parallel import ParallelConfig
 from ..nn.parallel_attention import AttentionContextGeometry, AttentionContextWorkspace
+
+if TYPE_CHECKING:
+    from .collectives import PeerSumReduction
 
 
 @dataclass
@@ -25,6 +28,7 @@ class DistributedEnvironment:
     local_device: torch.device
     backend: str
     _groups: list[Any] = field(default_factory=list, repr=False)
+    _sum_groups: dict[Any, Communicator] = field(default_factory=dict, repr=False)
     _workspaces: dict[tuple[object, ...], SymmetricMemoryWorkspace] = field(
         default_factory=dict, repr=False
     )
@@ -156,6 +160,26 @@ class DistributedEnvironment:
             torch.empty(group.world_size, dtype=torch.int32, device=group.device),
         )
 
+    def sum_reductions(self) -> dict[Any, PeerSumReduction]:
+        """Allocate collective scratch for one serialized full-device execution scope.
+
+        The runner invokes this before variable memory pools are sized and owns
+        the returned workspaces until all of its graph executables retire.
+        """
+
+        from .collectives import PeerSumReduction, supports_peer_reduction
+
+        bindings: dict[Any, PeerSumReduction] = {}
+        try:
+            for process_group, group in self._sum_groups.items():
+                if supports_peer_reduction(group):
+                    bindings[process_group] = PeerSumReduction(group)
+            return bindings
+        except Exception:
+            for reduction in reversed(tuple(bindings.values())):
+                reduction.close()
+            raise
+
     def close(self) -> None:
         """Release peer allocations and groups after the caller retires runners."""
 
@@ -163,6 +187,7 @@ class DistributedEnvironment:
             torch.cuda.synchronize(self.local_device)
         self._peer_tensors.clear()
         self._workspaces.clear()
+        self._sum_groups.clear()
         for group in reversed(self._groups):
             dist.destroy_process_group(group)
         self._groups.clear()
@@ -285,6 +310,8 @@ def initialize_model_parallel(
                         environment.local_device,
                         process_groups.get(backend_members),
                     )
+                    if name == "tp" and len(members) > 1:
+                        environment._sum_groups[process_groups[backend_members]] = groups[name]
         if environment.rank in layout.ranks:
             meshes[component] = DeviceMesh(
                 layout.ranks,
