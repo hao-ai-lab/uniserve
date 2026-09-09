@@ -31,6 +31,8 @@ Page `0` is reserved as the padding sentinel. Positive page IDs belong to declar
 
 `CachePool` provides page-level reset, copy, read, write, export, and restore operations. It owns tensor storage and storage-dtype metadata; it does not own request slots, request page tables, logical sequence positions, or allocation policy.
 
+Automatic KV sizing uses the device's static memory grant after accounting for loaded parameters, co-resident runtime storage, and the graph reservation. Resident image and tensor products consume scheduler-managed persistent-buffer storage. Their `DeviceProducts` bindings borrow that storage; the separate product grant covers scalar backing and request relays. Each physical allocation therefore contributes once to the capacity calculation, independent of how many registries retain its ownership metadata.
+
 ## Scheduler tables and worker installation
 
 A scheduler `BlockTable` maps one cached sequence's logical blocks to physical pages and records its allocated token capacity. Scheduler request state owns the conversational tables. A distinct alternative CFG prefix owns ordinary tables for the lifetime of the flow operation. Reference-counted page handles keep shared prefixes live until their last owning table is released.

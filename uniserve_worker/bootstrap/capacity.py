@@ -276,7 +276,6 @@ def model_arena_capacity(
         raise ValueError("model generation behavior has an invalid type")
     latent_pool_bytes = 0
     latent_transfer_bytes = 0
-    artifact_bytes = 0
     if flow is not None:
         dtype_bytes = {
             "float16": 2,
@@ -297,20 +296,12 @@ def model_arena_capacity(
             int(latent_width),
             dtype_bytes,
         )
-        raw_image_bytes = int(flow.max_vae_grid_tokens) * int(flow.latent_downsample) ** 2 * 3
-        # Device feedback is the decoded BF16 image. Encoded PNG/base64 bytes
-        # belong to the pinned CPU output owner and consume no device arena.
-        artifact_bytes = raw_image_bytes * 2
     max_transfer_bytes = max(
         int(num_blocks) * block_size * int(bytes_per_token),
         latent_transfer_bytes,
         int(max_latent_feature_bytes),
         int(max_vision_feature_bytes),
         1,
-    )
-    max_product_bytes = max(
-        1,
-        artifact_bytes,
     )
     device_product_slots = slots + _DEVICE_PRODUCT_RETIREMENT_BATCHES * max_operations
     device_products = _DEVICE_PRODUCTS_PER_OPERATION * device_product_slots
@@ -320,11 +311,14 @@ def model_arena_capacity(
             str(worker_config.generation_device or worker_config.device),
         }
     )
+    # Resident images and tensor products borrow scheduler-assigned storage
+    # from PersistentBuffers, whose complete grant is counted by the layout
+    # owner. DeviceProducts owns scalar backing and request relays separately.
     device_product_bytes = device_product_capacity_bytes(
         device_products,
         device_count,
         selected_points_per_operation=1,
-        max_value_bytes=max_product_bytes,
+        max_value_bytes=1,
     )
     device_product_bytes += (
         (int(request_pool_size) + 1)

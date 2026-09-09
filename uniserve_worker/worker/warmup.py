@@ -400,7 +400,13 @@ def _build_warmup_batch(
                 if candidate not in occupied_blocks
             )[:missing]
             if len(allocated) != missing:
-                raise invalid_descriptor("warmup KV allocation exceeds resident capacity")
+                raise invalid_descriptor(
+                    "warmup KV allocation exceeds resident capacity: "
+                    f"request={operation.request_key.request_id}, group={group_id}, "
+                    f"required_pages={missing}, available_pages={len(allocated)}, "
+                    f"resident_pages={len(self.worker.cache_pool.page_ids(group_id))}, "
+                    f"leased_pages={len(occupied_blocks)}"
+                )
             block_table.extend(allocated)
             occupied_blocks.update(allocated)
             tables.append(

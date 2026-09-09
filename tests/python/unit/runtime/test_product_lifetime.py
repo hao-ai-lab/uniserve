@@ -314,7 +314,7 @@ def test_free_retains_an_acquired_consumer_until_it_records_completion(kind: Pro
         )
         if kind is ProductKind.VISION_FEATURE
         else DeviceProducts(
-            capacity=1, byte_capacity=16, persistent_buffers=buffers, event_pool=events
+            capacity=1, byte_capacity=1, persistent_buffers=buffers, event_pool=events
         )
     )
     product = ProductRef(
