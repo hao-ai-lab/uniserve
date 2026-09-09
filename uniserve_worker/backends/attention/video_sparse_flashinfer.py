@@ -198,6 +198,10 @@ if triton is not None:
         gate,
         compressed,
         output,
+        attended_stride_head: tl.constexpr,
+        attended_stride_row: tl.constexpr,
+        lse_stride_head: tl.constexpr,
+        lse_stride_row: tl.constexpr,
         gate_stride_row: tl.constexpr,
         gate_stride_head: tl.constexpr,
         rows: tl.constexpr,
@@ -211,16 +215,22 @@ if triton is not None:
         head = tl.program_id(1)
         columns = tl.arange(0, width)
         mask = row_offsets[:, None] < rows
-        flat_rows = head * rows + row_offsets
         invalid = tl.load(
             invalid_counts + head * (rows // tile_rows) + row_offsets // tile_rows,
             mask=row_offsets < rows,
             other=0,
         ).to(tl.float32)
-        logsumexp = tl.load(lse + flat_rows, mask=row_offsets < rows, other=0.0)
+        logsumexp = tl.load(
+            lse + head * lse_stride_head + row_offsets * lse_stride_row,
+            mask=row_offsets < rows,
+            other=0.0,
+        )
         retained_mass = 1.0 - invalid * tl.exp2(-logsumexp)
         attended_values = tl.load(
-            attended + flat_rows[:, None] * width + columns[None, :],
+            attended
+            + head * attended_stride_head
+            + row_offsets[:, None] * attended_stride_row
+            + columns[None, :],
             mask=mask,
             other=0.0,
         ).to(tl.float32)
@@ -252,6 +262,10 @@ if triton is not None:
         gate,
         compressed,
         outputs,
+        attended_stride_head: tl.constexpr,
+        attended_stride_row: tl.constexpr,
+        lse_stride_head: tl.constexpr,
+        lse_stride_row: tl.constexpr,
         gate_stride_row: tl.constexpr,
         gate_stride_head: tl.constexpr,
         rows: tl.constexpr,
@@ -274,16 +288,22 @@ if triton is not None:
         head = tl.program_id(1)
         columns = tl.arange(0, width)
         mask = row_offsets[:, None] < rows
-        flat_rows = head * rows + row_offsets
         invalid = tl.load(
             invalid_counts + head * (rows // tile_rows) + row_offsets // tile_rows,
             mask=row_offsets < rows,
             other=0,
         ).to(tl.float32)
-        logsumexp = tl.load(lse + flat_rows, mask=row_offsets < rows, other=0.0)
+        logsumexp = tl.load(
+            lse + head * lse_stride_head + row_offsets * lse_stride_row,
+            mask=row_offsets < rows,
+            other=0.0,
+        )
         retained_mass = 1.0 - invalid * tl.exp2(-logsumexp)
         attended_values = tl.load(
-            attended + flat_rows[:, None] * width + columns[None, :],
+            attended
+            + head * attended_stride_head
+            + row_offsets[:, None] * attended_stride_row
+            + columns[None, :],
             mask=mask,
             other=0.0,
         ).to(tl.float32)
@@ -570,6 +590,7 @@ def _compose_corrected(
 
     assert triton is not None
     heads, rows, width = (int(size) for size in attended.shape[1:])
+    lse = lse.view(heads, rows)
     block_rows = 8
     grid = (triton.cdiv(rows, block_rows), heads)
     if len(outputs) == 1 and owner_rows is None:
@@ -580,6 +601,10 @@ def _compose_corrected(
             gate,
             compressed,
             outputs[0],
+            int(attended.stride(1)),
+            int(attended.stride(2)),
+            int(lse.stride(0)),
+            int(lse.stride(1)),
             int(gate.stride(0)),
             int(gate.stride(1)),
             rows,
@@ -597,6 +622,10 @@ def _compose_corrected(
         gate,
         compressed,
         tuple(outputs),
+        int(attended.stride(1)),
+        int(attended.stride(2)),
+        int(lse.stride(0)),
+        int(lse.stride(1)),
         int(gate.stride(0)),
         int(gate.stride(1)),
         rows,
@@ -784,9 +813,9 @@ def prepare_sparse_attention_rows(
     """Prepare full K/V once and produce paired owner query intervals on demand.
 
     All owners share one selected key domain. Queries are packed in transport
-    interval order, preserving contiguous head-major inputs for each FlashInfer
-    invocation. The producer writes complete local-head vectors into the
-    supplied contiguous row-owner views; communication remains caller-owned.
+    interval order. Globally visible prefixes use dense prefill; video queries
+    retain their selected block maps. The producer writes complete local-head
+    vectors into contiguous row-owner views; communication remains caller-owned.
     """
 
     if (
@@ -817,6 +846,59 @@ def prepare_sparse_attention_rows(
         raise ValueError("prepared sparse inputs must match the complete query geometry")
     packed_key = packed[1].view(heads * rows, 1, width)
     packed_value = packed[2].view(heads * rows, 1, width)
+    prefix_rows = prefix_tiles * _TILE
+    valid_tiles = int(mask_block_indices.shape[2])
+    dense_invalid = valid_tiles * _TILE - valid_sizes[:valid_tiles].sum(dtype=torch.int32)
+
+    def produce_sparse(
+        packed_query: torch.Tensor,
+        outputs: tuple[torch.Tensor, ...],
+        start: int,
+        count: int,
+        members: int,
+    ) -> None:
+        plan = _plan_for(
+            query,
+            key,
+            prefix_tiles=prefix_tiles,
+            valid_tiles=valid_tiles,
+            owners=members,
+            row_start=start,
+            row_count=count,
+        )
+        invalid_counts = torch.empty(
+            (heads, members * count // _TILE), dtype=torch.int32, device=query.device
+        )
+        _fill_flattened_bsr(
+            plan,
+            mask_block_indices,
+            valid_sizes,
+            invalid_counts,
+            prefix_tiles=prefix_tiles,
+            valid_tiles=valid_tiles,
+        )
+        elements = heads * members * count * width
+        output = attention_output.view(-1)[:elements].view(heads * members * count, 1, width)
+        lse = torch.empty((heads * members * count, 1), dtype=torch.float32, device=query.device)
+        plan.wrapper.run(
+            packed_query.reshape(heads * members * count, 1, width),
+            packed_key,
+            packed_value,
+            out=output,
+            lse=lse,
+            return_lse=True,
+        )
+        _compose_corrected(
+            output.view(1, heads, members * count, width),
+            lse,
+            invalid_counts,
+            gate,
+            compressed,
+            list(outputs),
+            0,
+            owner_rows=rows // members,
+            start_row=start,
+        )
 
     def produce(interval: slice, outputs: tuple[torch.Tensor, ...]) -> None:
         start, end = interval.start, interval.stop
@@ -834,49 +916,49 @@ def prepare_sparse_attention_rows(
             )
         ):
             raise ValueError("sparse row destinations must match the prepared owner interval")
-        plan = _plan_for(
-            query,
-            key,
-            prefix_tiles=prefix_tiles,
-            valid_tiles=mask_block_indices.shape[2],
-            owners=owners,
-            row_start=start,
-            row_count=count,
-        )
-        invalid_counts = torch.empty(
-            (heads, owners * count // _TILE), dtype=torch.int32, device=query.device
-        )
-        _fill_flattened_bsr(
-            plan,
-            mask_block_indices,
-            valid_sizes,
-            invalid_counts,
-            prefix_tiles=prefix_tiles,
-            valid_tiles=mask_block_indices.shape[2],
-        )
         elements = heads * owners * count * width
         packed_query = packed[0].view(-1).narrow(0, start * owners * heads * width, elements)
-        output = attention_output.view(-1)[:elements].view(heads * owners * count, 1, width)
-        lse = torch.empty((heads * owners * count, 1), dtype=torch.float32, device=query.device)
-        plan.wrapper.run(
-            packed_query.view(heads * owners * count, 1, width),
-            packed_key,
-            packed_value,
-            out=output,
-            lse=lse,
-            return_lse=True,
-        )
-        _compose_corrected(
-            output.view(1, heads, owners * count, width),
-            lse,
-            invalid_counts,
-            gate,
-            compressed,
-            list(outputs),
-            0,
-            owner_rows=owner_rows,
-            start_row=start,
-        )
+        packed_query = packed_query.view(heads, owners * count, width)
+        if start >= prefix_rows:
+            produce_sparse(packed_query, outputs, start, count, owners)
+            return
+
+        # Prefix queries see the complete valid key domain. Their dense kernel
+        # avoids one-head page traversal; video queries retain the selected BSR
+        # domain. The communication interval and caller-owned destinations stay
+        # unchanged, including an interval spanning the prefix/video boundary.
+        for owner, destination in enumerate(outputs):
+            global_start = owner * owner_rows + start
+            dense_rows = max(0, min(count, prefix_rows - global_start))
+            owner_query = packed_query[:, owner * count : (owner + 1) * count]
+            if dense_rows:
+                attended, lse = _flashinfer.single_prefill_with_kv_cache(
+                    owner_query[:, :dense_rows].transpose(0, 1),
+                    packed[1, :, : valid_tiles * _TILE],
+                    packed[2, :, : valid_tiles * _TILE],
+                    kv_layout="HND",
+                    backend="fa2",
+                    return_lse=True,
+                )
+                _compose_corrected(
+                    attended.transpose(0, 1).unsqueeze(0),
+                    lse.transpose(0, 1),
+                    dense_invalid.expand(heads, dense_rows // _TILE).contiguous(),
+                    gate,
+                    compressed,
+                    [destination[:dense_rows]],
+                    0,
+                    owner_rows=rows,
+                    start_row=global_start,
+                )
+            if dense_rows < count:
+                produce_sparse(
+                    owner_query[:, dense_rows:],
+                    (destination[dense_rows:],),
+                    global_start + dense_rows,
+                    count - dense_rows,
+                    1,
+                )
 
     return produce
 

@@ -71,9 +71,13 @@ def test_sparse_attention_heads_preserve_block_mask_and_partial_tiles(heads):
     )
 
 
-@pytest.mark.parametrize("members", [1, 2])
-@pytest.mark.parametrize("chunk_rows", [None, 64, 192])
-def test_flashinfer_sparse_attention_replays_dynamic_maps_across_output_shards(members, chunk_rows):
+@pytest.mark.parametrize(
+    ("members", "chunk_rows", "prefix_tiles"),
+    [(1, None, 1), (2, None, 1), (1, 64, 1), (2, 64, 1), (1, 192, 1), (2, 192, 1), (2, 64, 3)],
+)
+def test_flashinfer_sparse_attention_replays_dynamic_maps_across_output_shards(
+    members, chunk_rows, prefix_tiles
+):
     if not video_sparse_flashinfer.available(torch.device("cuda")):
         pytest.skip("FlashInfer sparse attention is unavailable")
 
@@ -83,9 +87,14 @@ def test_flashinfer_sparse_attention_replays_dynamic_maps_across_output_shards(m
     query, key, value, gate = projected.unbind(2)
     valid_sizes = torch.tensor([64, 17, 64, 0], device="cuda", dtype=torch.int32)
     indices = torch.zeros((heads, 4, 3), device="cuda", dtype=torch.int32)
-    indices[:, 0] = torch.tensor([0, 1, 2], device="cuda", dtype=torch.int32)
-    indices[:, 1:3, 1] = 1
-    counts = torch.tensor([3, 2, 2, 1], device="cuda", dtype=torch.int32)
+    indices[:, :prefix_tiles] = torch.tensor([0, 1, 2], device="cuda", dtype=torch.int32)
+    if prefix_tiles < 3:
+        indices[:, prefix_tiles:3, prefix_tiles] = 1
+    counts = torch.tensor(
+        [3] * prefix_tiles + [prefix_tiles + 1] * (3 - prefix_tiles) + [1],
+        device="cuda",
+        dtype=torch.int32,
+    )
     counts = counts.view(1, -1).expand(heads, -1).contiguous()
     compressed = torch.randn((heads, 4, width), device="cuda")
     attention_output = torch.empty_like(query)
@@ -118,7 +127,7 @@ def test_flashinfer_sparse_attention_replays_dynamic_maps_across_output_shards(m
                 value,
                 mask_block_indices=indices,
                 valid_sizes=valid_sizes,
-                prefix_tiles=1,
+                prefix_tiles=prefix_tiles,
                 gate=gate,
                 compressed=compressed,
                 attention_output=attention_output,
@@ -138,7 +147,7 @@ def test_flashinfer_sparse_attention_replays_dynamic_maps_across_output_shards(m
             mask_block_indices=indices,
             valid_sizes=valid_sizes,
             tile_size=tile,
-            prefix_tiles=1,
+            prefix_tiles=prefix_tiles,
             gate=gate,
             compressed=compressed,
             attention_output=attention_output,
@@ -147,11 +156,13 @@ def test_flashinfer_sparse_attention_replays_dynamic_maps_across_output_shards(m
 
     def reference(selected_video_tile: int) -> torch.Tensor:
         mask = torch.zeros((heads, rows, rows), device="cuda", dtype=torch.bool)
-        mask[:, :tile, : 3 * tile] = True
-        mask[:, tile : 3 * tile, :tile] = True
-        mask[:, tile : 3 * tile, selected_video_tile * tile : (selected_video_tile + 1) * tile] = (
-            True
-        )
+        mask[:, : prefix_tiles * tile, : 3 * tile] = True
+        mask[:, prefix_tiles * tile : 3 * tile, : prefix_tiles * tile] = True
+        mask[
+            :,
+            prefix_tiles * tile : 3 * tile,
+            selected_video_tile * tile : (selected_video_tile + 1) * tile,
+        ] = True
         mask[:, 3 * tile :, :tile] = True
         key_valid = torch.arange(rows, device="cuda") % tile < valid_sizes.repeat_interleave(tile)
         mask &= key_valid.view(1, 1, -1)
@@ -188,7 +199,10 @@ def test_flashinfer_sparse_attention_replays_dynamic_maps_across_output_shards(m
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         invoke()
-    indices[:, 1:3, 1] = 2
+    if prefix_tiles < 3:
+        indices[:, prefix_tiles:3, prefix_tiles] = 2
+    else:
+        valid_sizes[1] = 31
     graph.replay()
     assert_matches(reference(2))
     graph.reset()
