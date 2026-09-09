@@ -68,6 +68,8 @@ Each packed current token has one `out_cache_loc`. Zero means its K/V is availab
 
 FlashInfer prefill planning derives query/page offsets, last-page lengths and KV lengths from the current host row metadata. These planning tables occupy one pinned CPU allocation whose asynchronous H2D lifetime is tracked by PyTorch. Graph replay retains device buffer addresses while refreshing lengths and physical page indices, including declared padding rows. Backends that consume sequence-length tensors on the GPU retain those inputs; direct device-only attention callers retain their device-metadata contract.
 
+Native FlashInfer planners also construct scheduling data in a pinned host workspace and upload it outside PyTorch's copy operator. Each plan owns an immutable upload generation, and the native memory interface registers its consuming CUDA stream with the pinned allocator. Physical host storage becomes reusable after the upload completes, including when its wrapper is retired. CPU planning remains asynchronous across successive eager calls and Graph replays; device workspace addresses remain stable.
+
 Sequence length has one owner for each meaning:
 
 | Meaning | Source |

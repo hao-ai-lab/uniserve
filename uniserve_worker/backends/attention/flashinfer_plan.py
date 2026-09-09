@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import weakref
-from collections.abc import Callable
-from contextlib import nullcontext
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from itertools import accumulate
 from typing import TYPE_CHECKING, Any
@@ -15,6 +15,26 @@ from ...foundation.math import ceil_div
 
 if TYPE_CHECKING:
     from .flashinfer_pool import WrapperKey
+
+
+@contextmanager
+def _plan_workspace(wrapper: Any) -> Iterator[None]:
+    """Give a native plan an immutable pinned upload generation.
+
+    FlashInfer writes this host workspace and enqueues its DMA directly. Its
+    next plan may run before the previous upload has reached the device. A fresh
+    allocation plus allocator stream tracking protects both reuse and teardown
+    while allowing CPU planning to continue asynchronously.
+    """
+
+    from uniserve_kernel.peer_memory import record_host_usage
+
+    source = torch.empty_like(wrapper._pin_memory_int_workspace_buffer, pin_memory=True)
+    wrapper._pin_memory_int_workspace_buffer = source
+    try:
+        yield
+    finally:
+        record_host_usage(source, torch.cuda.current_stream(wrapper.device))
 
 
 @dataclass
@@ -616,7 +636,9 @@ def _prepare_fast_decode_plan_buffers(
             )
         indices_buffer = getattr(wrapper, "_paged_kv_indices_buf", None)
         if indices_buffer is not None and len(indices) > len(indices_buffer):
-            raise ValueError("The size of indices should be less than or equal to the allocated buffer")
+            raise ValueError(
+                "The size of indices should be less than or equal to the allocated buffer"
+            )
         return
     wrapper._paged_kv_indptr_buf = indptr
     wrapper._paged_kv_indices_buf = indices

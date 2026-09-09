@@ -32,6 +32,7 @@ from .flashinfer_plan import (
     _PrefillHostPlan,
     _prefill_host_plan,
     _prefill_plan_key,
+    _plan_workspace,
     _PrefillPlanTensors,
     _weakref_or_none,
 )
@@ -459,9 +460,7 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         plan = context
         query_lens = tuple(int(value) for value in getattr(plan, "query_lens_cpu", ()) or ())
         causal_rows = tuple(bool(value) for value in getattr(plan, "causal_rows_cpu", ()) or ())
-        prefix_lens_cpu = tuple(
-            int(value) for value in getattr(plan, "seq_lens_cpu", ()) or ()
-        )
+        prefix_lens_cpu = tuple(int(value) for value in getattr(plan, "seq_lens_cpu", ()) or ())
         if (
             not query_lens
             or len(query_lens) != len(prefix_lens_cpu)
@@ -474,9 +473,7 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
             offsets.append(offsets[-1] + length)
         current_outputs: list[torch.Tensor] = []
         current_lses: list[torch.Tensor] = []
-        for row, (begin, end) in enumerate(
-            zip(offsets[:-1], offsets[1:], strict=True)
-        ):
+        for row, (begin, end) in enumerate(zip(offsets[:-1], offsets[1:], strict=True)):
             row_query = q[begin:end].contiguous()
             row_key = current_k[begin:end].contiguous()
             row_value = current_v[begin:end].contiguous()
@@ -673,31 +670,32 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         # metadata. Passing the existing host values avoids draining the
         # execution stream for small D2H copies before every Graph replay.
         device_lengths = self._tuning.prefill_backend == "cudnn"
-        wrapper.plan(
-            plan.qo_indptr if host_plan is None else host_plan.qo_indptr,
-            plan.kv_indptr if host_plan is None else host_plan.kv_indptr,
-            plan.indices,
-            plan.last_page_len if host_plan is None else host_plan.last_page_len,
-            int(num_q_heads),
-            int(num_kv_heads),
-            int(head_dim),
-            int(page_size),
-            causal=causal,
-            q_data_type=q_dtype,
-            kv_data_type=kv_dtype,
-            o_data_type=q_dtype,
-            sm_scale=scale_value,
-            non_blocking=True,
-            seq_lens=kv_seqlens if host_plan is None or device_lengths else host_plan.kv_lens,
-            seq_lens_q=query_lens,
-            max_token_per_sequence=None if host_plan is None else host_plan.max_query_rows,
-            max_sequence_kv=(
-                host_plan.max_kv_rows if host_plan is not None and device_lengths else None
-            ),
-            block_tables=block_table,
-            fixed_split_size=self._tuning.prefill_split_tile_size,
-            disable_split_kv=self._tuning.disable_split_kv,
-        )
+        with _plan_workspace(wrapper):
+            wrapper.plan(
+                plan.qo_indptr if host_plan is None else host_plan.qo_indptr,
+                plan.kv_indptr if host_plan is None else host_plan.kv_indptr,
+                plan.indices,
+                plan.last_page_len if host_plan is None else host_plan.last_page_len,
+                int(num_q_heads),
+                int(num_kv_heads),
+                int(head_dim),
+                int(page_size),
+                causal=causal,
+                q_data_type=q_dtype,
+                kv_data_type=kv_dtype,
+                o_data_type=q_dtype,
+                sm_scale=scale_value,
+                non_blocking=True,
+                seq_lens=kv_seqlens if host_plan is None or device_lengths else host_plan.kv_lens,
+                seq_lens_q=query_lens,
+                max_token_per_sequence=None if host_plan is None else host_plan.max_query_rows,
+                max_sequence_kv=(
+                    host_plan.max_kv_rows if host_plan is not None and device_lengths else None
+                ),
+                block_tables=block_table,
+                fixed_split_size=self._tuning.prefill_split_tile_size,
+                disable_split_kv=self._tuning.disable_split_kv,
+            )
 
     def prepare_paged_prefill_cuda_graph(
         self,

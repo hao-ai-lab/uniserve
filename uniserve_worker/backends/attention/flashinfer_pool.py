@@ -14,6 +14,7 @@ from .flashinfer_plan import (
     _decode_fast_plan_signature,
     _DecodePlanWorkspace,
     _fast_decode_plan_with_cpu_metadata,
+    _plan_workspace,
     _PrefillPlanWorkspace,
 )
 from .paged_attention_plan_pool import PagedAttentionPlanPool
@@ -338,47 +339,48 @@ class _WrapperPool(PagedAttentionPlanPool):
             workspace=self._workspace(indptr.device),
             wrapper=wrapper,
         )
-        if self._maybe_plan_decode_fast(
-            wrapper_key,
-            wrapper,
-            indptr,
-            indices,
-            last_page_len,
-            num_q_heads,
-            num_kv_heads,
-            head_dim,
-            page_size,
-            pos_encoding_mode=pos_encoding_mode,
-            q_data_type=q_data_type,
-            kv_data_type=kv_data_type,
-            data_type=data_type,
-            sm_scale=sm_scale,
-            options=options,
-            global_override_indptr_cpu=global_override_indptr_cpu,
-            global_override_last_page_len_cpu=global_override_last_page_len_cpu,
-            allow_fast=allow_fast,
-        ):
-            return
+        with _plan_workspace(wrapper):
+            if self._maybe_plan_decode_fast(
+                wrapper_key,
+                wrapper,
+                indptr,
+                indices,
+                last_page_len,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                page_size,
+                pos_encoding_mode=pos_encoding_mode,
+                q_data_type=q_data_type,
+                kv_data_type=kv_data_type,
+                data_type=data_type,
+                sm_scale=sm_scale,
+                options=options,
+                global_override_indptr_cpu=global_override_indptr_cpu,
+                global_override_last_page_len_cpu=global_override_last_page_len_cpu,
+                allow_fast=allow_fast,
+            ):
+                return
 
-        self._fallback_decode_plan(
-            wrapper,
-            indptr,
-            indices,
-            last_page_len,
-            num_q_heads,
-            num_kv_heads,
-            head_dim,
-            page_size,
-            pos_encoding_mode=pos_encoding_mode,
-            q_data_type=q_data_type,
-            kv_data_type=kv_data_type,
-            data_type=data_type,
-            sm_scale=sm_scale,
-            block_tables=block_tables,
-            seq_lens=seq_lens,
-            options=options,
-        )
-        self._remember_decode_fast_signature(wrapper_key, options.signature)
+            self._fallback_decode_plan(
+                wrapper,
+                indptr,
+                indices,
+                last_page_len,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                page_size,
+                pos_encoding_mode=pos_encoding_mode,
+                q_data_type=q_data_type,
+                kv_data_type=kv_data_type,
+                data_type=data_type,
+                sm_scale=sm_scale,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
+                options=options,
+            )
+            self._remember_decode_fast_signature(wrapper_key, options.signature)
 
     def _remember_decode_fast_signature(
         self,

@@ -21,12 +21,12 @@ def test_paged_prefill_replay_tracks_lengths_and_page_remapping(causal):
     device = torch.device("cuda", 0)
     dtype = torch.bfloat16
     page_size, query_heads, kv_heads, width = 64, 4, 2, 128
-    query = torch.randn((5, query_heads, width), dtype=dtype, device=device)
-    keys = torch.randn((6, page_size, kv_heads, width), dtype=dtype, device=device)
+    query = torch.randn((259, query_heads, width), dtype=dtype, device=device)
+    keys = torch.randn((16, page_size, kv_heads, width), dtype=dtype, device=device)
     values = torch.randn_like(keys)
     context = SimpleNamespace(
         binding=None,
-        block_table=torch.empty((3, 2), dtype=torch.int32, device=device),
+        block_table=torch.empty((3, 6), dtype=torch.int32, device=device),
         cu_seqlens_q=torch.empty(4, dtype=torch.int32, device=device),
         cu_seqlens_k=torch.empty(4, dtype=torch.int32, device=device),
         query_lens=torch.empty(3, dtype=torch.int32, device=device),
@@ -37,9 +37,13 @@ def test_paged_prefill_replay_tracks_lengths_and_page_remapping(causal):
     )
     # The final row represents the one-token padding row used by Graph buckets.
     layouts = (
-        ((1, 3, 1), (65, 7, 1), ((2, 4), (1, 3), (0, 0))),
-        ((2, 2, 1), (63, 70, 1), ((5, 0), (4, 2), (1, 0))),
-        ((1, 3, 1), (1, 68, 1), ((3, 0), (0, 5), (2, 0))),
+        ((1, 257, 1), (65, 321, 1), ((2, 4, 0, 0, 0, 0), (1, 3, 5, 7, 9, 11), (0, 0, 0, 0, 0, 0))),
+        (
+            (129, 129, 1),
+            (191, 198, 1),
+            ((5, 0, 6, 0, 0, 0), (4, 2, 8, 10, 0, 0), (1, 0, 0, 0, 0, 0)),
+        ),
+        ((257, 1, 1), (321, 68, 1), ((3, 1, 6, 7, 8, 9), (0, 5, 0, 0, 0, 0), (2, 0, 0, 0, 0, 0))),
     )
 
     def stage(query_lens, kv_lens, pages):
@@ -53,7 +57,7 @@ def test_paged_prefill_replay_tracks_lengths_and_page_remapping(causal):
             ("block_table", pages),
         ):
             target = getattr(context, name)
-            target.copy_(torch.tensor(data, dtype=torch.int32, device=device))
+            target.copy_(torch.tensor(data, dtype=torch.int32, pin_memory=True), non_blocking=True)
 
     def execute():
         return backend.forward_varlen(
@@ -114,12 +118,25 @@ def test_paged_prefill_replay_tracks_lengths_and_page_remapping(causal):
         torch.cuda.synchronize(device)
         with torch.cuda.graph(graph):
             output = execute()
+        original_query = query.clone()
+        expected = []
+        for layout in layouts:
+            query.add_(0.125)
+            expected.append(reference(*layout))
+        query.copy_(original_query)
+        torch.cuda.synchronize(device)
+        # Keep the upload stream occupied while successive CPU plans are built.
+        # Each replay must consume the plan submitted for that generation.
+        torch.cuda._sleep(1_000_000_000)
+        actual = []
         for layout in layouts:
             stage(*layout)
             query.add_(0.125)
             prepare()
             graph.replay()
-            torch.testing.assert_close(output, reference(*layout), rtol=2e-2, atol=2e-2)
+            actual.append(output.clone())
+        for result, reference_output in zip(actual, expected, strict=True):
+            torch.testing.assert_close(result, reference_output, rtol=2e-2, atol=2e-2)
     finally:
         torch.cuda.synchronize(device)
         graph.reset()
