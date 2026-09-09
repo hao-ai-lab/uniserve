@@ -9,6 +9,7 @@ from uniserve_worker.backends.attention import (
     video_sparse_flashinfer,
     video_sparse_triton,
 )
+from uniserve_worker.backends.attention.video_sparse import PreparedVideoSparseInputs
 from uniserve_worker.nn.parallel_attention import AttentionOutputTargets
 from uniserve_worker.ops.video_sparse import compose_to_head_shards
 
@@ -99,6 +100,18 @@ def test_flashinfer_sparse_attention_replays_dynamic_maps_across_output_shards(m
 
     def invoke() -> None:
         if chunk_rows is not None:
+            prepared = None
+            if chunk_rows == 64:
+                pooled = [
+                    torch.empty((rows // tile, heads, width), device="cuda") for _ in range(3)
+                ]
+                prepared = PreparedVideoSparseInputs(
+                    (rows, heads, width), query.dtype, valid_sizes, members, chunk_rows, *pooled
+                )
+                for start, end in ((128, 256), (0, 64), (64, 128)):
+                    prepared.append(
+                        slice(start, end), query[start:end], key[start:end], value[start:end]
+                    )
             produce = video_sparse_flashinfer.prepare_sparse_attention_rows(
                 query,
                 key,
@@ -111,6 +124,7 @@ def test_flashinfer_sparse_attention_replays_dynamic_maps_across_output_shards(m
                 attention_output=attention_output,
                 owners=members,
                 chunk_rows=chunk_rows,
+                packed=None if prepared is None else prepared.packed,
             )
             for start in range(0, rows // members, chunk_rows):
                 interval = slice(start, min(start + chunk_rows, rows // members))

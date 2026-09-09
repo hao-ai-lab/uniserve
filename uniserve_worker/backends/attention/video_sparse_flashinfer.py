@@ -69,6 +69,8 @@ if triton is not None:
         value_stride_row: tl.constexpr,
         value_stride_head: tl.constexpr,
         rows: tl.constexpr,
+        input_rows: tl.constexpr,
+        row_start: tl.constexpr,
         heads: tl.constexpr,
         width: tl.constexpr,
         tile_rows: tl.constexpr,
@@ -78,32 +80,36 @@ if triton is not None:
     ):
         """Pack interval/head-major queries and full head-major masked K/V."""
 
-        row_offsets = (tl.program_id(0) * block_rows + tl.arange(0, block_rows)).to(tl.int64)
+        input_offsets = (tl.program_id(0) * block_rows + tl.arange(0, block_rows)).to(tl.int64)
+        row_offsets = row_start + input_offsets
         head = tl.program_id(1)
         columns = tl.arange(0, width)
-        row_mask = row_offsets[:, None] < rows
+        row_mask = input_offsets[:, None] < input_rows
         valid_rows = tl.load(
-            valid_sizes + row_offsets // tile_rows, mask=row_offsets < rows, other=0
+            valid_sizes + row_offsets // tile_rows, mask=input_offsets < input_rows, other=0
         )
         key_mask = row_mask & ((row_offsets % tile_rows)[:, None] < valid_rows[:, None])
         destination = head * rows * width + row_offsets[:, None] * width + columns[None, :]
 
         query_values = tl.load(
             query
-            + row_offsets[:, None] * query_stride_row
+            + input_offsets[:, None] * query_stride_row
             + head * query_stride_head
             + columns[None, :],
             mask=row_mask,
             other=0.0,
         )
         key_values = tl.load(
-            key + row_offsets[:, None] * key_stride_row + head * key_stride_head + columns[None, :],
+            key
+            + input_offsets[:, None] * key_stride_row
+            + head * key_stride_head
+            + columns[None, :],
             mask=key_mask,
             other=0.0,
         )
         value_values = tl.load(
             value
-            + row_offsets[:, None] * value_stride_row
+            + input_offsets[:, None] * value_stride_row
             + head * value_stride_head
             + columns[None, :],
             mask=key_mask,
@@ -441,7 +447,7 @@ def _plan_for(
     return plan
 
 
-def _pack_masked_qkv(
+def pack_sparse_input_rows(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -449,14 +455,37 @@ def _pack_masked_qkv(
     *,
     owners: int = 1,
     chunk_rows: int | None = None,
+    packed: torch.Tensor | None = None,
+    row_start: int = 0,
 ) -> torch.Tensor:
-    """Pack queries by owner interval and full K/V with padded rows zeroed."""
+    """Publish a Q/K/V row interval into the provider's complete input layout.
+
+    Caller-owned storage supports out-of-order disjoint intervals produced by
+    a distributed projection. Every row must be published before attention
+    consumes the buffer. Validity and destination offsets use global rows.
+    """
 
     assert triton is not None
-    rows, heads, width = (int(size) for size in query.shape)
-    packed = torch.empty((3, heads, rows, width), dtype=query.dtype, device=query.device)
+    input_rows, heads, width = (int(size) for size in query.shape)
+    if packed is None:
+        packed = torch.empty((3, heads, input_rows, width), dtype=query.dtype, device=query.device)
+    rows = packed.shape[2]
+    if (
+        query.shape != key.shape
+        or query.shape != value.shape
+        or packed.shape != (3, heads, rows, width)
+        or packed.dtype != query.dtype
+        or packed.device != query.device
+        or not packed.is_contiguous()
+        or row_start < 0
+        or row_start + input_rows > rows
+        or owners < 1
+        or rows % owners
+        or (chunk_rows is not None and chunk_rows < 1)
+    ):
+        raise ValueError("sparse input rows must fit matching packed owner storage")
     block_rows = 8
-    _pack_masked_qkv_kernel[(triton.cdiv(rows, block_rows), heads)](
+    _pack_masked_qkv_kernel[(triton.cdiv(input_rows, block_rows), heads)](
         query,
         key,
         value,
@@ -469,6 +498,8 @@ def _pack_masked_qkv(
         int(value.stride(0)),
         int(value.stride(1)),
         rows,
+        input_rows,
+        row_start,
         heads,
         width,
         _TILE,
@@ -624,7 +655,7 @@ def _block_sparse_custom(
         prefix_tiles=prefix_tiles,
         valid_tiles=valid_tiles,
     )
-    packed = _pack_masked_qkv(query, key, value, valid_sizes)
+    packed = pack_sparse_input_rows(query, key, value, valid_sizes)
     output = attention_output.view(heads * rows, 1, width)
     lse = torch.empty((heads * rows, 1), dtype=torch.float32, device=query.device)
     plan.wrapper.run(
@@ -748,6 +779,7 @@ def prepare_sparse_attention_rows(
     attention_output: torch.Tensor,
     owners: int,
     chunk_rows: int,
+    packed: torch.Tensor | None = None,
 ) -> RowChunkProducer:
     """Prepare full K/V once and produce paired owner query intervals on demand.
 
@@ -772,7 +804,17 @@ def prepare_sparse_attention_rows(
         )
     rows, heads, width = query.shape
     owner_rows = rows // owners
-    packed = _pack_masked_qkv(query, key, value, valid_sizes, owners=owners, chunk_rows=chunk_rows)
+    if packed is None:
+        packed = pack_sparse_input_rows(
+            query, key, value, valid_sizes, owners=owners, chunk_rows=chunk_rows
+        )
+    elif (
+        packed.shape != (3, heads, rows, width)
+        or packed.dtype != query.dtype
+        or packed.device != query.device
+        or not packed.is_contiguous()
+    ):
+        raise ValueError("prepared sparse inputs must match the complete query geometry")
     packed_key = packed[1].view(heads * rows, 1, width)
     packed_value = packed[2].view(heads * rows, 1, width)
 

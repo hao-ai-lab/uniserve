@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
 import torch
@@ -21,6 +21,7 @@ __all__ = [
     "VideoSparseAttentionBackend",
     "VideoSparseAttentionMetadata",
     "VideoSparseAttentionWorkspace",
+    "PreparedVideoSparseInputs",
     "build_video_sparse_metadata",
     "video_sparse_selected_tiles",
 ]
@@ -59,6 +60,68 @@ class VideoSparseAttentionWorkspace:
     pooled_value: torch.Tensor
     compressed_tiles: torch.Tensor
     topk_indices_i32: torch.Tensor
+
+
+@dataclass(slots=True)
+class PreparedVideoSparseInputs:
+    """Input layout and pooled tiles populated by disjoint projected row intervals.
+
+    Producers publish every global row once on the attention consumer stream.
+    Pooled storage is borrowed and must remain live through sparse selection;
+    the packed input allocation remains owned through fine-query production.
+    """
+
+    shape: tuple[int, int, int]
+    dtype: torch.dtype
+    valid_sizes: torch.Tensor
+    owners: int
+    chunk_rows: int
+    pooled_query: torch.Tensor
+    pooled_key: torch.Tensor
+    pooled_value: torch.Tensor
+    packed: torch.Tensor | None = field(default=None, init=False)
+
+    def append(
+        self, interval: slice, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+    ) -> None:
+        """Pool normalized tile-aligned rows and write their provider input layout."""
+
+        start, end = interval.start, interval.stop
+        if (
+            start < 0
+            or start % TILE
+            or end % TILE
+            or end - start != query.shape[0]
+            or end > self.shape[0]
+        ):
+            raise ValueError("prepared sparse rows require complete in-range tiles")
+        if self.packed is None:
+            rows, heads, width = self.shape
+            self.packed = torch.empty(
+                (3, heads, rows, width), dtype=self.dtype, device=query.device
+            )
+        tiles = slice(start // TILE, end // TILE)
+        video_sparse_ops.pool_qkv_means(
+            query,
+            key,
+            value,
+            self.valid_sizes,
+            self.pooled_query[tiles],
+            self.pooled_key[tiles],
+            self.pooled_value[tiles],
+            query_tile_offset=start // TILE,
+            key_tile_offset=start // TILE,
+        )
+        video_sparse_flashinfer.pack_sparse_input_rows(
+            query,
+            key,
+            value,
+            self.valid_sizes,
+            owners=self.owners,
+            chunk_rows=self.chunk_rows,
+            packed=self.packed,
+            row_start=start,
+        )
 
 
 def build_video_sparse_metadata(
@@ -124,6 +187,41 @@ class VideoSparseAttentionBackend:
         """Declare whether fine attention releases its compute scratch before row consumers."""
 
         return self.kernel is video_sparse_flashinfer.execute_sparse_attention
+
+    def prepare_input_rows(
+        self,
+        shape: tuple[int, int, int],
+        valid_sizes: torch.Tensor,
+        *,
+        dtype: torch.dtype,
+        owners: int,
+        chunk_rows: int,
+        pooled_query: torch.Tensor,
+        pooled_key: torch.Tensor,
+        pooled_value: torch.Tensor,
+    ) -> PreparedVideoSparseInputs:
+        """Bind an input layout whose storage is allocated at first row publication."""
+
+        rows, heads, width = shape
+        if (
+            not self.supports_row_production
+            or rows != valid_sizes.numel() * TILE
+            or owners < 1
+            or rows % (owners * TILE)
+            or chunk_rows < TILE
+            or chunk_rows % TILE
+        ):
+            raise ValueError("prepared sparse inputs require a tile-aligned row-production backend")
+        return PreparedVideoSparseInputs(
+            shape,
+            dtype,
+            valid_sizes,
+            owners,
+            chunk_rows,
+            pooled_query,
+            pooled_key,
+            pooled_value,
+        )
 
     def _compressed_tiles(
         self,
@@ -273,6 +371,7 @@ class VideoSparseAttentionBackend:
         sync_output: torch.Tensor,
         context_workspace: AttentionContextWorkspace | None,
         consume_row_intervals: bool = False,
+        prepared_inputs: PreparedVideoSparseInputs | None = None,
     ) -> torch.Tensor | AttentionRowExchange:
         """Compose global sparse selection with shared head and context exchanges."""
 
@@ -348,16 +447,27 @@ class VideoSparseAttentionBackend:
             else None
         )
         if local_output is not None and consume_row_intervals and self.supports_row_production:
-            self.prepare_local(
-                query,
-                key,
-                value,
-                valid_sizes,
-                prefix_key_indices,
-                dense_key_indices,
-                prefix_count,
-                workspace,
-            )
+            if prepared_inputs is None:
+                self.prepare_local(
+                    query,
+                    key,
+                    value,
+                    valid_sizes,
+                    prefix_key_indices,
+                    dense_key_indices,
+                    prefix_count,
+                    workspace,
+                )
+            else:
+                if prepared_inputs.packed is None:
+                    raise ValueError("prepared sparse inputs have no published rows")
+                self.select_from_pooled(
+                    valid_sizes,
+                    prefix_key_indices,
+                    dense_key_indices,
+                    prefix_count,
+                    workspace,
+                )
             producer = video_sparse_flashinfer.prepare_sparse_attention_rows(
                 query,
                 key,
@@ -370,6 +480,7 @@ class VideoSparseAttentionBackend:
                 attention_output=workspace.attention_output,
                 owners=group.world_size,
                 chunk_rows=AttentionRowExchange.chunk_rows(local_output),
+                packed=None if prepared_inputs is None else prepared_inputs.packed,
             )
             return AttentionRowExchange(
                 parallel, local_output, workspace.attention_output, producer

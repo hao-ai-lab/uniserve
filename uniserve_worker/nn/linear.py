@@ -222,18 +222,27 @@ class LinearBase(nn.Module):
             include_bias=include_bias,
         )
 
-    def stream_sequence_parallel(self, rows: int, workspace: torch.Tensor) -> GatheredLinear:
+    def stream_sequence_parallel(
+        self,
+        rows: int,
+        workspace: torch.Tensor,
+        *,
+        row_consumer: Callable[[slice, torch.Tensor], None] | None = None,
+    ) -> GatheredLinear:
         """Accept ordered dense row production before the complete input is ready.
 
         Tensor-wide quantization scales require their complete input domain and
         use ``forward_sequence_parallel``. The returned projection owns stream
         dependencies; the caller supplies registered scratch through completion.
+        An optional consumer receives each projected logical row interval on
+        the current stream, before later peer intervals have completed. It may
+        transform those output rows in place and publish independent outputs.
         """
 
         if self.sequence_group is None or self.quant_method.is_quantized:
             raise ValueError("streamed sequence projection requires a dense sequence-bound layer")
         return GatheredLinear(
-            self.sequence_group, rows, self.weight, self.execution_bias, workspace
+            self.sequence_group, rows, self.weight, self.execution_bias, workspace, row_consumer
         )
 
     def forward_sequence_parallel(

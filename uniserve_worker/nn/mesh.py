@@ -37,6 +37,7 @@ class GatheredLinear:
         weight: torch.Tensor,
         bias: torch.Tensor | None,
         workspace: torch.Tensor,
+        row_consumer: Callable[[slice, torch.Tensor], None] | None = None,
     ) -> None:
         if rows < 1 or weight.ndim != 2 or not workspace.is_contiguous():
             raise ValueError("streamed projection requires positive rows and contiguous scratch")
@@ -46,6 +47,7 @@ class GatheredLinear:
         self.rows = rows
         self.weight = weight
         self.bias = bias
+        self.row_consumer = row_consumer
         members, width = group.world_size, weight.shape[1]
         elements = workspace.numel() * workspace.element_size() // weight.element_size()
         capacity_rows = elements // (2 * members * width)
@@ -63,11 +65,13 @@ class GatheredLinear:
         self.published_rows = 0
         self.next_slot = 0
 
-    def _project(self, source: torch.Tensor, target: torch.Tensor) -> None:
+    def _project(self, source: torch.Tensor, target: torch.Tensor, start: int) -> None:
         if self.bias is None:
             torch.mm(source, self.weight.t(), out=target)
         else:
             torch.addmm(self.bias, source, self.weight.t(), out=target)
+        if self.row_consumer is not None:
+            self.row_consumer(slice(start, start + source.shape[0]), target)
 
     def _consume(self) -> None:
         start, count, gathered, work = self.pending.popleft()
@@ -77,7 +81,11 @@ class GatheredLinear:
         targets = self.output.view(self.group.world_size, self.rows, self.weight.shape[0])
         for backend_rank, logical_rank in enumerate(self.group._backend_order):
             if logical_rank != self.group.rank_in_group:
-                self._project(gathered[backend_rank], targets[logical_rank, start : start + count])
+                self._project(
+                    gathered[backend_rank],
+                    targets[logical_rank, start : start + count],
+                    logical_rank * self.rows + start,
+                )
 
     def append(self, start: int, input: torch.Tensor) -> None:
         """Publish the next local interval; inputs stay caller-owned and read-only."""
@@ -118,7 +126,11 @@ class GatheredLinear:
             else:
                 work = None
             begin = start + offset
-            self._project(local, targets[self.group.rank_in_group, begin : begin + count])
+            self._project(
+                local,
+                targets[self.group.rank_in_group, begin : begin + count],
+                self.group.rank_in_group * self.rows + begin,
+            )
             self.pending.append((begin, count, gathered, work))
             self.next_slot = (self.next_slot + 1) % 2
         self.published_rows += input.shape[0]
@@ -131,6 +143,7 @@ class GatheredLinear:
         while self.pending:
             self._consume()
         output, self.output = self.output, None
+        self.row_consumer = None
         return output
 
 

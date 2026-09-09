@@ -125,8 +125,12 @@ def _run_gather(rank: int, rendezvous: str) -> None:
                     )
 
                     def produce():
+                        def consume(interval, projected):
+                            positions = torch.arange(interval.start, interval.stop, device=device)
+                            projected.add_(positions.remainder(3).to(projected.dtype)[:, None])
+
                         projection = layer.stream_sequence_parallel(
-                            local_rows, storage.capacity["rows"]
+                            local_rows, storage.capacity["rows"], row_consumer=consume
                         )
                         interval_rows = 3072 if local_rows > 128 else 48
                         for start in range(0, local_rows, interval_rows):
@@ -134,7 +138,9 @@ def _run_gather(rank: int, rendezvous: str) -> None:
                         return projection.finish()
 
                     actual = produce()
-                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                    positions = torch.arange(local_rows * 2, device=device)
+                    row_bias = positions.remainder(3).to(expected.dtype)[:, None]
+                    torch.testing.assert_close(actual, expected + row_bias, rtol=0, atol=0)
                     torch.cuda.synchronize(device)
                     with torch.cuda.graph(graph):
                         actual = produce()
@@ -142,7 +148,7 @@ def _run_gather(rank: int, rendezvous: str) -> None:
                     expected_rows.add_(1)
                     graph.replay()
                     expected = torch.nn.functional.linear(expected_rows, layer.weight, layer.bias)
-                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                    torch.testing.assert_close(actual, expected + row_bias, rtol=0, atol=0)
                     graph.reset()
                 del storage
     finally:

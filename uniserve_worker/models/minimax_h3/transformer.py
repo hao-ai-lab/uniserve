@@ -14,6 +14,7 @@ from torch.nn import functional as F
 
 from ...backends.attention.torch_sdpa import TorchSDPAAttentionBackend
 from ...backends.attention.video_sparse import (
+    PreparedVideoSparseInputs,
     VideoSparseAttentionBackend,
     VideoSparseAttentionWorkspace,
     build_video_sparse_metadata,
@@ -329,6 +330,23 @@ class _TokenRefiner(nn.Module):
         return self.final_norm(hidden)
 
 
+@dataclass(slots=True)
+class _PreparedAttentionProjection:
+    """Own a streamed projection and its incrementally prepared attention inputs."""
+
+    projection: GatheredLinear
+    inputs: PreparedVideoSparseInputs | None
+
+    def finish(self) -> tuple[torch.Tensor, PreparedVideoSparseInputs]:
+        """Transfer completed projection and input ownership to fine attention."""
+
+        if self.inputs is None:
+            raise RuntimeError("prepared attention projection was already consumed")
+        projected = self.projection.finish()
+        inputs, self.inputs = self.inputs, None
+        return projected, inputs
+
+
 class _H3Attention(nn.Module):
     """Routes packed multimodal Q/K/V through dense or sparse attention and output projection."""
 
@@ -393,6 +411,54 @@ class _H3Attention(nn.Module):
             config.head_dim, config.qk_norm_eps, affine_in_fp32=True, device=device
         )
 
+    def stream_projection(
+        self,
+        rows: int,
+        workspace: torch.Tensor,
+        *,
+        rotary: tuple[torch.Tensor, torch.Tensor],
+        valid_sizes: torch.Tensor,
+        scratch: H3Scratch,
+        backend: VideoSparseAttentionBackend,
+    ) -> _PreparedAttentionProjection:
+        """Prepare each completed QKVG interval while later peer inputs arrive."""
+
+        global_rows = rows * self.sequence_size
+        inputs = backend.prepare_input_rows(
+            (global_rows, self.local_heads, self.config.head_dim),
+            valid_sizes,
+            dtype=self.to_qkvg.weight.dtype,
+            owners=self.sequence_size,
+            chunk_rows=AttentionRowExchange.chunk_rows(
+                scratch.projection_peers[self.parallel_attention.ulysses_group.rank_in_group].view(
+                    global_rows, self.local_heads, self.config.head_dim
+                )
+            ),
+            pooled_query=scratch.pooled_query,
+            pooled_key=scratch.pooled_key,
+            pooled_value=scratch.pooled_value,
+        )
+        cosine, sine = rotary
+
+        def consume(interval: slice, projected: torch.Tensor) -> None:
+            query, key, value, _ = projected.view(
+                -1, self.local_heads, 4, self.config.head_dim
+            ).unbind(2)
+            qk_norm_rope(
+                query,
+                key,
+                self.norm_q.weight,
+                self.norm_k.weight,
+                cosine[interval],
+                sine[interval],
+                self.config.qk_norm_eps,
+                in_place=True,
+            )
+            inputs.append(interval, query, key, value)
+
+        projection = self.to_qkvg.stream_sequence_parallel(rows, workspace, row_consumer=consume)
+        return _PreparedAttentionProjection(projection, inputs)
+
     def forward(
         self,
         hidden: torch.Tensor,
@@ -417,7 +483,7 @@ class _H3Attention(nn.Module):
         topk_indices_i32: torch.Tensor,
         backend: VideoSparseAttentionBackend,
         consume_row_intervals: bool = False,
-        prepared_projection: GatheredLinear | None = None,
+        prepared_projection: _PreparedAttentionProjection | None = None,
     ) -> torch.Tensor | AttentionRowExchange:
         """Compute sparse global attention and publish its row-exchange dependency."""
 
@@ -425,10 +491,10 @@ class _H3Attention(nn.Module):
         head_dim = self.config.head_dim
         local_rows = local.shape[0]
         global_rows = local_rows * self.sequence_size
+        prepared_inputs = None
         if prepared_projection is not None:
-            exchanged = prepared_projection.finish().view(
-                global_rows, self.local_heads, 4, head_dim
-            )
+            projected, prepared_inputs = prepared_projection.finish()
+            exchanged = projected.view(global_rows, self.local_heads, 4, head_dim)
         elif self.projected_head:
             exchanged = self.to_qkvg.forward_sequence_parallel(local, attention_workspace).view(
                 global_rows,
@@ -446,16 +512,17 @@ class _H3Attention(nn.Module):
 
         # Query/key normalization and rotary application mutate their views of
         # the shared projection buffer before sparse block selection.
-        qk_norm_rope(
-            query,
-            key,
-            self.norm_q.weight,
-            self.norm_k.weight,
-            cosine,
-            sine,
-            self.config.qk_norm_eps,
-            in_place=True,
-        )
+        if prepared_projection is None:
+            qk_norm_rope(
+                query,
+                key,
+                self.norm_q.weight,
+                self.norm_k.weight,
+                cosine,
+                sine,
+                self.config.qk_norm_eps,
+                in_place=True,
+            )
         workspace = VideoSparseAttentionWorkspace(
             attention_output=attention_output,
             tile_scores=tile_scores,
@@ -484,6 +551,7 @@ class _H3Attention(nn.Module):
             sync_output=projection_sync_output,
             context_workspace=context_workspace,
             consume_row_intervals=consume_row_intervals,
+            prepared_inputs=prepared_inputs,
         )
 
 
@@ -564,7 +632,7 @@ class _TransformerBlock(nn.Module):
         compressed_tiles: torch.Tensor,
         topk_indices_i32: torch.Tensor,
         backend: VideoSparseAttentionBackend,
-        prepared_projection: GatheredLinear | None = None,
+        prepared_projection: _PreparedAttentionProjection | None = None,
         row_consumer: Callable[[slice, torch.Tensor], None] | None = None,
     ) -> torch.Tensor:
         """Apply one time-modulated sparse-attention and feed-forward residual block."""
@@ -906,8 +974,13 @@ class MiniMaxH3Transformer(nn.Module):
                 # Query production releases attention compute scratch before
                 # any row consumer runs. Its registered allocation can then
                 # carry the next layer's two-slot input gather pipeline.
-                next_projection = next_block.attn.to_qkvg.stream_sequence_parallel(
-                    hidden.shape[1], scratch.attention_output
+                next_projection = next_block.attn.stream_projection(
+                    hidden.shape[1],
+                    scratch.attention_output,
+                    rotary=rotary,
+                    valid_sizes=slot.tile_valid_sizes,
+                    scratch=scratch,
+                    backend=metadata.vsa,
                 )
                 shift, scale = (
                     scratch.block_adaln_params[layer + 1]
@@ -924,7 +997,7 @@ class MiniMaxH3Transformer(nn.Module):
                         metadata.adaln_indices[interval],
                         eps=next_block.norm1.eps,
                     )
-                    next_projection.append(interval.start, normalized[0])
+                    next_projection.projection.append(interval.start, normalized[0])
 
                 row_consumer = consume
             hidden = block(
