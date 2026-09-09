@@ -190,7 +190,7 @@ def test_qwen_decode_projection_preserves_row_alignment():
     hidden = torch.arange(32, dtype=torch.float32).view(4, 8)
     batch = _text_batch((1, 1, 1, 1), forward_mode=AttentionMode.PAGED_DECODE)
 
-    output = model.project(hidden, batch)
+    output = model.project(hidden, batch).materialize()
 
     assert len(output.values) == 4
     assert torch.equal(torch.cat(output.values), hidden @ weight.T)

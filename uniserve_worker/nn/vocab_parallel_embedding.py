@@ -8,6 +8,7 @@ zero synthetic rows so padded token ids cannot affect model results.
 from __future__ import annotations
 
 import math
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -15,6 +16,9 @@ import torch.nn.functional as F
 
 from .layer import LayerConfig
 from .linear import ColumnParallelLinear
+
+if TYPE_CHECKING:
+    from ..execution.forward_batch import VocabularyPartition
 
 __all__ = [
     "pad_vocab_size",
@@ -201,8 +205,27 @@ class ParallelLMHead(ColumnParallelLinear):
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
         """Project local vocabulary logits and optionally gather the unpadded vocabulary."""
 
-        local_logits = super().forward(x)
+        local_logits = self.forward_local(x)
         if not self.gather_output:
             return local_logits
         logits = self.tp_group.all_gather(local_logits, -1)
         return logits[..., : self.vocab_size]
+
+    def forward_local(self, x: torch.Tensor) -> torch.Tensor:
+        """Project this rank's padded vocabulary columns without communication."""
+
+        return super().forward(x)
+
+    def vocabulary_partition(self) -> VocabularyPartition:
+        """Describe local logits without transferring communicator ownership."""
+
+        from ..execution.forward_batch import VocabularyPartition
+
+        group = self.tp_group
+        return VocabularyPartition(
+            vocab_size=self.vocab_size,
+            width=self.output_size,
+            rank=group.rank_in_group,
+            backend_order=tuple(group.ranks.index(rank) for rank in sorted(group.ranks)),
+            group_name=group.backend_name,
+        )

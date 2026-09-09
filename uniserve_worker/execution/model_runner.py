@@ -85,12 +85,26 @@ class RunObservation:
 class ForwardResult:
     """Pairs a model output with the route and execution-path observation that produced it."""
 
-    values: tuple[torch.Tensor, ...]
+    output: ForwardOutput
     request_pool_indices: torch.Tensor
     path: RunPath
     output_event: torch.cuda.Event | None
     observation: RunObservation
     greedy: GraphGreedyOutput | None
+
+    def materialize_values(self) -> tuple[torch.Tensor, ...]:
+        """Order the consumer stream and collectively materialize raw outputs.
+
+        A consumer using ``greedy`` directly can retain vocabulary sharding.
+        Other consumers receive the complete unpadded logits through this
+        boundary. Every TP member must make the same consumption decision.
+        """
+
+        if self.output_event is not None:
+            torch.cuda.current_stream(self.request_pool_indices.device).wait_event(
+                self.output_event
+            )
+        return self.output.materialize().values
 
 
 @dataclass(frozen=True, slots=True)
@@ -890,7 +904,7 @@ class ModelRunner:
                 execution_path=path.value,
             )
             return ForwardResult(
-                values=output.values,
+                output=output,
                 request_pool_indices=request_pool_indices,
                 path=path,
                 output_event=output_event,

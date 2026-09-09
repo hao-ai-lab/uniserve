@@ -3159,7 +3159,7 @@ def _run_laneed_wave(
             output_event = None
         else:
             forward_result = _run_forward_group(runtime, group_tasks, group_scopes[0])
-            output = forward_result.values
+            output = forward_result.materialize_values()
             observation = forward_result.observation
             output_event = forward_result.output_event
         group_scopes[0].observations.append(observation)
@@ -3199,7 +3199,7 @@ def _run_startup_forward(
             end.record(stream)
             end.synchronize()
             elapsed_us = max(1, round(float(start.elapsed_time(end)) * 1000.0))
-        return result.values, result.observation, elapsed_us
+        return result.materialize_values(), result.observation, elapsed_us
 
 
 def _assert_mixed_equivalence(

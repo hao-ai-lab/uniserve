@@ -544,7 +544,6 @@ def decode_batch(
     runtime.record_component(scope, "text_build_batch", build_started)
     forward_started = time.perf_counter_ns()
     forward_result = runtime.run_observed_forward_group(tasks, scope)
-    outputs = forward_result.values
     graph_greedy = forward_result.greedy
     if forward_result.output_event is not None:
         torch.cuda.current_stream(runtime.phase_device(tasks[0].phase)).wait_event(
@@ -568,7 +567,7 @@ def decode_batch(
     if graph_outcomes is not None:
         runtime.record_component(scope, "text_sample", sample_started)
         return graph_outcomes
-    logits = tuple(token_logits(output)[-1] for output in outputs)
+    logits = tuple(token_logits(output)[-1] for output in forward_result.materialize_values())
     sample_tasks = tuple(
         build_sample_work(
             runtime,

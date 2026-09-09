@@ -2,13 +2,76 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 import torch.nn as nn
+
+if TYPE_CHECKING:
+    from ..execution.forward_batch import VocabularyPartition
 
 __all__ = [
     "LogitsProcessor",
     "forced_eos_logits",
+    "gather_vocabulary",
+    "greedy_vocabulary",
 ]
+
+
+def _gather_partitions(
+    value: torch.Tensor, partition: VocabularyPartition
+) -> tuple[torch.Tensor, ...]:
+    """Gather matrix rows and expose shards in logical vocabulary order."""
+
+    from .mesh import _all_gather_into_tensor
+
+    size = len(partition.backend_order)
+    if size == 1:
+        return (value,)
+    gathered = value.new_empty((size * value.shape[0], value.shape[1]))
+    assert partition.group_name is not None
+    _all_gather_into_tensor(gathered, value.contiguous(), partition.group_name)
+    physical = gathered.view(size, *value.shape)
+    return tuple(physical[partition.backend_order.index(rank)] for rank in range(size))
+
+
+def gather_vocabulary(logits: torch.Tensor, partition: VocabularyPartition) -> torch.Tensor:
+    """Materialize unpadded global logits from local vocabulary columns."""
+
+    shards = _gather_partitions(logits, partition)
+    return (shards[0] if len(shards) == 1 else torch.cat(shards, dim=-1))[
+        ..., : partition.vocab_size
+    ]
+
+
+def greedy_vocabulary(
+    logits: torch.Tensor, partition: VocabularyPartition | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select global maxima and token IDs with the dense ``torch.max`` contract.
+
+    Each rank exchanges one value/index pair per row. FP64 transports both the
+    original floating score and vocabulary IDs exactly, including FP32 scores
+    and IDs beyond the FP32 integer range. Logical rank ordering preserves the
+    lowest-token tie rule and the first-NaN rule of dense selection.
+    """
+
+    if partition is None:
+        return torch.max(logits, dim=-1)
+    begin = partition.rank * partition.width
+    valid_columns = max(0, min(partition.width, partition.vocab_size - begin))
+    if valid_columns:
+        values, tokens = torch.max(logits[:, :valid_columns], dim=-1)
+        tokens = tokens + begin
+    else:
+        values = logits.new_full((logits.shape[0],), float("-inf"))
+        tokens = torch.full_like(values, partition.vocab_size, dtype=torch.long)
+    if len(partition.backend_order) == 1:
+        return values, tokens
+    candidates = torch.stack((values.to(torch.float64), tokens.to(torch.float64)), dim=-1)
+    gathered = torch.stack(_gather_partitions(candidates, partition))
+    maxima, owners = torch.max(gathered[..., 0], dim=0)
+    selected = gathered[..., 1].gather(0, owners.unsqueeze(0)).squeeze(0)
+    return maxima.to(logits.dtype), selected.to(torch.long)
 
 
 def forced_eos_logits(

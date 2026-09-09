@@ -313,6 +313,15 @@ class Qwen3ForCausalLM(ExecutionModel):
 
         selections = forward_batch.token_selections
         query_lens = forward_batch.query_lens_cpu
+        if (
+            forward_batch.forward_mode is AttentionMode.PAGED_DECODE
+            and all(selection is TokenSelection.LAST_LOGITS for selection in selections)
+        ):
+            projected = self.lm_head.forward_local(hidden)
+            return ForwardOutput(
+                tuple(projected[index : index + 1] for index in range(len(selections))),
+                self.lm_head.vocabulary_partition(),
+            )
         dynamic_last = (
             forward_batch.output_indices
             if forward_batch.forward_mode is AttentionMode.PAGED_VARLEN

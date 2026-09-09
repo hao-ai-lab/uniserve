@@ -1523,7 +1523,7 @@ def _private_pool_bytes(device: torch.device | None) -> int:
 def _trim_output(output: ForwardOutput, rows: int) -> ForwardOutput:
     """Slice every forward-output row tensor to the live batch extent."""
 
-    return ForwardOutput(tuple(output.values[:rows]))
+    return ForwardOutput(tuple(output.values[:rows]), output.vocabulary)
 
 
 def _greedy_decode(
@@ -1564,7 +1564,9 @@ def _greedy_decode_values(
     if logits is None:
         raise _GraphMiss("decode logits are not one contiguous graph output")
     logits = logits.reshape(batch.row_count, -1)
-    max_values, tokens = torch.max(logits, dim=-1)
+    from ..nn.logits import greedy_vocabulary
+
+    max_values, tokens = greedy_vocabulary(logits, output.vocabulary)
     valid = torch.isfinite(max_values)
     active = predicate_state.index_select(0, batch.request_pool_indices.reshape(-1))
     finish = force_finish.reshape(-1) & valid & active
