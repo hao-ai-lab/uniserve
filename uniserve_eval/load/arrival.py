@@ -106,6 +106,8 @@ async def run_load(
             tasks.append(asyncio.create_task(limited(row, time.perf_counter())))
         outputs = await asyncio.gather(*tasks)
     finally:
+        # Profiler report draining is outside the request completion window.
+        benchmark_end_time = time.perf_counter()
         if measurement is not None:
             measurement.stop()
 
@@ -114,5 +116,5 @@ async def run_load(
     return LoadResult(
         tuple(warmup_outputs),
         tuple(outputs),
-        time.perf_counter() - benchmark_start_time,
+        benchmark_end_time - benchmark_start_time,
     )
