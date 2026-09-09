@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cache
 from typing import Any
 
 import torch
@@ -53,6 +54,25 @@ class _SparsePlan:
 _PLAN_CACHE: dict[tuple[Any, ...], _SparsePlan] = {}
 
 
+@dataclass(frozen=True, slots=True)
+class _NativeSparsePlan:
+    """Select owner-local query maps into stable native-provider metadata."""
+
+    query_tiles: torch.Tensor
+    indices: torch.Tensor
+    counts: torch.Tensor
+
+
+_NATIVE_PLAN_CACHE: dict[tuple[Any, ...], _NativeSparsePlan] = {}
+
+
+@cache
+def uses_row_major_inputs(device: torch.device) -> bool:
+    """Select the SM120/SM121 block-64 provider's contiguous sequence-head layout."""
+
+    return torch.cuda.get_device_capability(device) in ((12, 0), (12, 1))
+
+
 if triton is not None:
 
     @triton.jit
@@ -77,8 +97,9 @@ if triton is not None:
         block_rows: tl.constexpr,
         owners: tl.constexpr,
         chunk_rows: tl.constexpr,
+        row_major: tl.constexpr,
     ):
-        """Pack interval/head-major queries and full head-major masked K/V."""
+        """Pack interval queries and full masked K/V in the provider's physical layout."""
 
         input_offsets = (tl.program_id(0) * block_rows + tl.arange(0, block_rows)).to(tl.int64)
         row_offsets = row_start + input_offsets
@@ -89,7 +110,10 @@ if triton is not None:
             valid_sizes + row_offsets // tile_rows, mask=input_offsets < input_rows, other=0
         )
         key_mask = row_mask & ((row_offsets % tile_rows)[:, None] < valid_rows[:, None])
-        destination = head * rows * width + row_offsets[:, None] * width + columns[None, :]
+        if row_major:
+            destination = row_offsets[:, None] * heads * width + head * width + columns[None, :]
+        else:
+            destination = head * rows * width + row_offsets[:, None] * width + columns[None, :]
 
         query_values = tl.load(
             query
@@ -121,11 +145,14 @@ if triton is not None:
         local_row = row_offsets % owner_rows
         segment = local_row // chunk_rows
         count = tl.minimum(chunk_rows, owner_rows - segment * chunk_rows)
-        query_destination = (
-            segment * chunk_rows * owners * heads * width
-            + head * owners * count * width
-            + (owner * count + local_row % chunk_rows) * width
-        )
+        interval_offset = segment * chunk_rows * owners * heads * width
+        interval_row = owner * count + local_row % chunk_rows
+        if row_major:
+            query_destination = interval_offset + interval_row * heads * width + head * width
+        else:
+            query_destination = (
+                interval_offset + head * owners * count * width + interval_row * width
+            )
         tl.store(packed + query_destination[:, None] + columns, query_values, mask=row_mask)
         tl.store(packed + component_size + destination, key_values, mask=row_mask)
         tl.store(packed + 2 * component_size + destination, value_values, mask=row_mask)
@@ -208,6 +235,7 @@ if triton is not None:
         width: tl.constexpr,
         tile_rows: tl.constexpr,
         block_rows: tl.constexpr,
+        correct_padding: tl.constexpr,
     ):
         """Remove padded-key softmax mass and fuse trained compression."""
 
@@ -215,17 +243,20 @@ if triton is not None:
         head = tl.program_id(1)
         columns = tl.arange(0, width)
         mask = row_offsets[:, None] < rows
-        invalid = tl.load(
-            invalid_counts + head * (rows // tile_rows) + row_offsets // tile_rows,
-            mask=row_offsets < rows,
-            other=0,
-        ).to(tl.float32)
-        logsumexp = tl.load(
-            lse + head * lse_stride_head + row_offsets * lse_stride_row,
-            mask=row_offsets < rows,
-            other=0.0,
-        )
-        retained_mass = 1.0 - invalid * tl.exp2(-logsumexp)
+        if correct_padding:
+            invalid = tl.load(
+                invalid_counts + head * (rows // tile_rows) + row_offsets // tile_rows,
+                mask=row_offsets < rows,
+                other=0,
+            ).to(tl.float32)
+            logsumexp = tl.load(
+                lse + head * lse_stride_head + row_offsets * lse_stride_row,
+                mask=row_offsets < rows,
+                other=0.0,
+            )
+            retained_mass = 1.0 - invalid * tl.exp2(-logsumexp)
+        else:
+            retained_mass = tl.full((block_rows,), 1.0, tl.float32)
         attended_values = tl.load(
             attended
             + head * attended_stride_head
@@ -279,6 +310,7 @@ if triton is not None:
         owner_rows: tl.constexpr,
         start_row: tl.constexpr,
         global_rows: tl.constexpr,
+        correct_padding: tl.constexpr,
     ):
         """Correct sparse outputs and route rank-local heads into row-owner shards."""
 
@@ -288,17 +320,20 @@ if triton is not None:
         head = tl.program_id(1)
         columns = tl.arange(0, width)
         mask = row_offsets[:, None] < rows
-        invalid = tl.load(
-            invalid_counts + head * (rows // tile_rows) + row_offsets // tile_rows,
-            mask=row_offsets < rows,
-            other=0,
-        ).to(tl.float32)
-        logsumexp = tl.load(
-            lse + head * lse_stride_head + row_offsets * lse_stride_row,
-            mask=row_offsets < rows,
-            other=0.0,
-        )
-        retained_mass = 1.0 - invalid * tl.exp2(-logsumexp)
+        if correct_padding:
+            invalid = tl.load(
+                invalid_counts + head * (rows // tile_rows) + row_offsets // tile_rows,
+                mask=row_offsets < rows,
+                other=0,
+            ).to(tl.float32)
+            logsumexp = tl.load(
+                lse + head * lse_stride_head + row_offsets * lse_stride_row,
+                mask=row_offsets < rows,
+                other=0.0,
+            )
+            retained_mass = 1.0 - invalid * tl.exp2(-logsumexp)
+        else:
+            retained_mass = tl.full((block_rows,), 1.0, tl.float32)
         attended_values = tl.load(
             attended
             + head * attended_stride_head
@@ -467,6 +502,60 @@ def _plan_for(
     return plan
 
 
+def _native_plan_for(
+    source_indices: torch.Tensor,
+    *,
+    prefix_tiles: int,
+    owners: int,
+    row_start: int,
+    row_count: int,
+) -> _NativeSparsePlan:
+    """Cache immutable query mapping and counts; selected keys remain device mutable."""
+
+    heads, total_tiles, valid_tiles = source_indices.shape
+    cache_key = (
+        source_indices.device,
+        heads,
+        total_tiles,
+        valid_tiles,
+        prefix_tiles,
+        owners,
+        row_start,
+        row_count,
+    )
+    cached = _NATIVE_PLAN_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    owner_tiles = total_tiles // owners
+    interval_tiles = row_count // _TILE
+    local_tiles = torch.arange(owners * interval_tiles)
+    query_tiles = (
+        local_tiles // interval_tiles * owner_tiles
+        + row_start // _TILE
+        + local_tiles % interval_tiles
+    )
+    counts = _planned_counts(
+        query_tiles=owners * interval_tiles,
+        prefix_tiles=prefix_tiles,
+        valid_tiles=valid_tiles,
+        owner_tiles=owner_tiles,
+        interval_tiles=interval_tiles,
+        start_tile=row_start // _TILE,
+    )
+    selected_tiles = int(counts.max())
+    plan = _NativeSparsePlan(
+        query_tiles.to(source_indices.device),
+        torch.empty(
+            (1, heads, owners * interval_tiles, selected_tiles),
+            dtype=torch.int32,
+            device=source_indices.device,
+        ),
+        counts.repeat(heads).view(1, heads, -1).to(source_indices.device),
+    )
+    _NATIVE_PLAN_CACHE[cache_key] = plan
+    return plan
+
+
 def pack_sparse_input_rows(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -477,23 +566,29 @@ def pack_sparse_input_rows(
     chunk_rows: int | None = None,
     packed: torch.Tensor | None = None,
     row_start: int = 0,
+    row_major: bool = False,
 ) -> torch.Tensor:
     """Publish a Q/K/V row interval into the provider's complete input layout.
 
     Caller-owned storage supports out-of-order disjoint intervals produced by
     a distributed projection. Every row must be published before attention
     consumes the buffer. Validity and destination offsets use global rows.
+    Storage is (3, rows, heads, width) for the native provider and
+    (3, heads, rows, width) for flattened BSR. Queries use owner-interval
+    order within their component; K/V retain global row order.
     """
 
     assert triton is not None
     input_rows, heads, width = (int(size) for size in query.shape)
     if packed is None:
-        packed = torch.empty((3, heads, input_rows, width), dtype=query.dtype, device=query.device)
-    rows = packed.shape[2]
+        shape = (3, input_rows, heads, width) if row_major else (3, heads, input_rows, width)
+        packed = torch.empty(shape, dtype=query.dtype, device=query.device)
+    rows = packed.shape[1 if row_major else 2]
+    expected_shape = (3, rows, heads, width) if row_major else (3, heads, rows, width)
     if (
         query.shape != key.shape
         or query.shape != value.shape
-        or packed.shape != (3, heads, rows, width)
+        or packed.shape != expected_shape
         or packed.dtype != query.dtype
         or packed.device != query.device
         or not packed.is_contiguous()
@@ -526,6 +621,7 @@ def pack_sparse_input_rows(
         block_rows,
         owners,
         rows if chunk_rows is None else chunk_rows,
+        row_major,
         num_warps=4,
         num_stages=1,
     )
@@ -574,10 +670,10 @@ def _fill_flattened_bsr(
     )
 
 
-def _compose_corrected(
+def _compose_attention(
     attended: torch.Tensor,
-    lse: torch.Tensor,
-    invalid_counts: torch.Tensor,
+    lse: torch.Tensor | None,
+    invalid_counts: torch.Tensor | None,
     gate: torch.Tensor,
     compressed: torch.Tensor,
     outputs: list[torch.Tensor],
@@ -586,11 +682,20 @@ def _compose_corrected(
     owner_rows: int | None = None,
     start_row: int = 0,
 ) -> None:
-    """Correct padded softmax mass and compose into caller-owned destinations."""
+    """Fuse trained compression, correcting padding only for unmasked providers.
+
+    A provider that masks invalid key rows supplies no correction metadata.
+    Otherwise, LSE is base-2 and invalid_counts describes its zero-padded keys.
+    Composition accumulates in FP32 before writing the destination dtype.
+    """
 
     assert triton is not None
     heads, rows, width = (int(size) for size in attended.shape[1:])
-    lse = lse.view(heads, rows)
+    correct_padding = lse is not None
+    if lse is not None:
+        lse = lse.view(heads, rows)
+    lse_stride_head = 0 if lse is None else int(lse.stride(0))
+    lse_stride_row = 0 if lse is None else int(lse.stride(1))
     block_rows = 8
     grid = (triton.cdiv(rows, block_rows), heads)
     if len(outputs) == 1 and owner_rows is None:
@@ -603,14 +708,15 @@ def _compose_corrected(
             outputs[0],
             int(attended.stride(1)),
             int(attended.stride(2)),
-            int(lse.stride(0)),
-            int(lse.stride(1)),
+            lse_stride_head,
+            lse_stride_row,
             int(gate.stride(0)),
             int(gate.stride(1)),
             rows,
             width,
             _TILE,
             block_rows,
+            correct_padding,
             num_warps=4,
             num_stages=1,
         )
@@ -624,8 +730,8 @@ def _compose_corrected(
         tuple(outputs),
         int(attended.stride(1)),
         int(attended.stride(2)),
-        int(lse.stride(0)),
-        int(lse.stride(1)),
+        lse_stride_head,
+        lse_stride_row,
         int(gate.stride(0)),
         int(gate.stride(1)),
         rows,
@@ -639,6 +745,7 @@ def _compose_corrected(
         rows // len(outputs) if owner_rows is None else owner_rows,
         start_row,
         int(gate.shape[0]),
+        correct_padding,
         num_warps=4,
         num_stages=1,
     )
@@ -696,7 +803,7 @@ def _block_sparse_custom(
         return_lse=True,
     )
     attended = output.view(1, heads, rows, width)
-    _compose_corrected(attended, lse, invalid_counts, gate, compressed, outputs, source_rank)
+    _compose_attention(attended, lse, invalid_counts, gate, compressed, outputs, source_rank)
 
 
 @_block_sparse_custom.register_fake
@@ -833,19 +940,30 @@ def prepare_sparse_attention_rows(
         )
     rows, heads, width = query.shape
     owner_rows = rows // owners
+    native_rows = uses_row_major_inputs(query.device)
+    if native_rows:
+        from flashinfer.cute_dsl.sparse.bsa_attn_sm120 import bsa_attn_sm120_blk64_fwd
+
+    packed_shape = (3, rows, heads, width) if native_rows else (3, heads, rows, width)
     if packed is None:
         packed = pack_sparse_input_rows(
-            query, key, value, valid_sizes, owners=owners, chunk_rows=chunk_rows
+            query,
+            key,
+            value,
+            valid_sizes,
+            owners=owners,
+            chunk_rows=chunk_rows,
+            row_major=native_rows,
         )
     elif (
-        packed.shape != (3, heads, rows, width)
+        packed.shape != packed_shape
         or packed.dtype != query.dtype
         or packed.device != query.device
         or not packed.is_contiguous()
     ):
         raise ValueError("prepared sparse inputs must match the complete query geometry")
-    packed_key = packed[1].view(heads * rows, 1, width)
-    packed_value = packed[2].view(heads * rows, 1, width)
+    packed_key = packed[1].transpose(0, 1) if native_rows else packed[1]
+    packed_value = packed[2].transpose(0, 1) if native_rows else packed[2]
     prefix_rows = prefix_tiles * _TILE
     valid_tiles = int(mask_block_indices.shape[2])
     dense_invalid = valid_tiles * _TILE - valid_sizes[:valid_tiles].sum(dtype=torch.int32)
@@ -857,6 +975,45 @@ def prepare_sparse_attention_rows(
         count: int,
         members: int,
     ) -> None:
+        elements = heads * members * count * width
+        if native_rows:
+            plan = _native_plan_for(
+                mask_block_indices,
+                prefix_tiles=prefix_tiles,
+                owners=members,
+                row_start=start,
+                row_count=count,
+            )
+            selected_tiles = plan.indices.shape[3]
+            torch.index_select(
+                mask_block_indices[:, :, :selected_tiles],
+                1,
+                plan.query_tiles,
+                out=plan.indices[0],
+            )
+            output = attention_output.view(-1)[:elements].view(1, members * count, heads, width)
+            bsa_attn_sm120_blk64_fwd(
+                packed_query.transpose(0, 1).unsqueeze(0),
+                packed[1].unsqueeze(0),
+                packed[2].unsqueeze(0),
+                plan.indices,
+                selected_tiles,
+                block_sizes=valid_sizes,
+                q2k_block_nums=plan.counts,
+                out=output,
+            )
+            _compose_attention(
+                output.transpose(1, 2),
+                None,
+                None,
+                gate,
+                compressed,
+                list(outputs),
+                0,
+                owner_rows=rows // members,
+                start_row=start,
+            )
+            return
         plan = _plan_for(
             query,
             key,
@@ -877,18 +1034,17 @@ def prepare_sparse_attention_rows(
             prefix_tiles=prefix_tiles,
             valid_tiles=valid_tiles,
         )
-        elements = heads * members * count * width
         output = attention_output.view(-1)[:elements].view(heads * members * count, 1, width)
         lse = torch.empty((heads * members * count, 1), dtype=torch.float32, device=query.device)
         plan.wrapper.run(
             packed_query.reshape(heads * members * count, 1, width),
-            packed_key,
-            packed_value,
+            packed_key.view(heads * rows, 1, width),
+            packed_value.view(heads * rows, 1, width),
             out=output,
             lse=lse,
             return_lse=True,
         )
-        _compose_corrected(
+        _compose_attention(
             output.view(1, heads, members * count, width),
             lse,
             invalid_counts,
@@ -918,13 +1074,17 @@ def prepare_sparse_attention_rows(
             raise ValueError("sparse row destinations must match the prepared owner interval")
         elements = heads * owners * count * width
         packed_query = packed[0].view(-1).narrow(0, start * owners * heads * width, elements)
-        packed_query = packed_query.view(heads, owners * count, width)
+        packed_query = (
+            packed_query.view(owners * count, heads, width).transpose(0, 1)
+            if native_rows
+            else packed_query.view(heads, owners * count, width)
+        )
         if start >= prefix_rows:
             produce_sparse(packed_query, outputs, start, count, owners)
             return
 
         # Prefix queries see the complete valid key domain. Their dense kernel
-        # avoids one-head page traversal; video queries retain the selected BSR
+        # avoids one-head page traversal; video queries retain their selected key
         # domain. The communication interval and caller-owned destinations stay
         # unchanged, including an interval spanning the prefix/video boundary.
         for owner, destination in enumerate(outputs):
@@ -934,13 +1094,13 @@ def prepare_sparse_attention_rows(
             if dense_rows:
                 attended, lse = _flashinfer.single_prefill_with_kv_cache(
                     owner_query[:, :dense_rows].transpose(0, 1),
-                    packed[1, :, : valid_tiles * _TILE],
-                    packed[2, :, : valid_tiles * _TILE],
+                    packed_key[:, : valid_tiles * _TILE],
+                    packed_value[:, : valid_tiles * _TILE],
                     kv_layout="HND",
                     backend="fa2",
                     return_lse=True,
                 )
-                _compose_corrected(
+                _compose_attention(
                     attended.transpose(0, 1).unsqueeze(0),
                     lse.transpose(0, 1),
                     dense_invalid.expand(heads, dense_rows // _TILE).contiguous(),

@@ -97,9 +97,12 @@ class PreparedVideoSparseInputs:
             raise ValueError("prepared sparse rows require complete in-range tiles")
         if self.packed is None:
             rows, heads, width = self.shape
-            self.packed = torch.empty(
-                (3, heads, rows, width), dtype=self.dtype, device=query.device
+            packed_shape = (
+                (3, rows, heads, width)
+                if video_sparse_flashinfer.uses_row_major_inputs(query.device)
+                else (3, heads, rows, width)
             )
+            self.packed = torch.empty(packed_shape, dtype=self.dtype, device=query.device)
         tiles = slice(start // TILE, end // TILE)
         video_sparse_ops.pool_qkv_means(
             query,
@@ -121,6 +124,7 @@ class PreparedVideoSparseInputs:
             chunk_rows=self.chunk_rows,
             packed=self.packed,
             row_start=start,
+            row_major=video_sparse_flashinfer.uses_row_major_inputs(query.device),
         )
 
 

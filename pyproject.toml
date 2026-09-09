@@ -59,7 +59,7 @@ bench = [
 # `uniserve-kernel` pack. H3 uses its SM100a sparse-attention
 # extensions plus cuDNN Frontend CuTe DSL; native builds require a CUDA 13 toolkit.
 gpu = [
-    "flashinfer-python",
+    "flashinfer-python==0.6.18",
     "ninja>=1.11",
     "requests[socks]>=2",
     "uniserve-kernel[peer_memory]",
@@ -67,7 +67,7 @@ gpu = [
 h3 = [
     "uniserve-kernel[sparse_attention,dense_linear]",
     "nvidia-cudnn-frontend[cutedsl]==1.27.0",
-    "nvidia-cutlass-dsl[cu13]==4.6.1",
+    "nvidia-cutlass-dsl[cu13]==4.6.2",
 ]
 
 [tool.uv.sources]
