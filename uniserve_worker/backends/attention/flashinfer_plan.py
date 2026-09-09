@@ -642,7 +642,8 @@ def _fast_decode_plan_args(
         int(window_left),
     ]
     if getattr(wrapper, "_backend", None) == "fa2":
-        args.extend((fixed_split_size, bool(disable_split_kv), 0))
+        # Single-query decode uses the planner's general query-length mode.
+        args.extend((fixed_split_size, bool(disable_split_kv), 0, 0))
     return args
 
 
