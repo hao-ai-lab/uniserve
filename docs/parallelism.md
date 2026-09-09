@@ -38,6 +38,8 @@ Qwen paged decode retains vocabulary-sharded logits through the shared forward-o
 
 Install the H3 dependencies with `uv sync --extra h3`. H3 requires CUDA compute capability 9.0 or later. Sparse attention selects the SM100 native provider on supported SM100 devices and the FlashInfer or Triton providers according to their device capabilities. Native providers require the CUDA 13 toolkit (including `nvcc`) and a C++20 compiler. Set `CUDA_HOME` when the toolkit is outside the standard CUDA installation path. Worker initialization builds and caches these providers before dependent CUDA graph capture; compiler failures are startup errors. The kernel package includes the native sources and their Apache-2.0 licensing.
 
+The four-step checkpoint is `FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree`, revision `5ea076f35b84da4c3c82217112fa733d8eea2ae1`. Preserve its component configuration files and `fastvideo_inference.json` alongside the weights.
+
 Checkpoints with `fastvideo_inference.json` supply their trained DMD jump points through that inference contract. The four-step VSA DataFree checkpoint declares `[999, 749, 500, 250]`; the loader applies video/audio shifts of 12 and 3 with the checkpoint scheduler's FP32 arithmetic before preparing timestep modulation. Checkpoints without the sidecar use the uniform `[1000, 750, 500, 250]` grid. The contract's task, guidance and sparse-attention geometry must match the supported H3 computation.
 
 For source checkouts, build the Rust executable and native Python extension against the same IPC schema and worker interpreter. For example, `PYO3_PYTHON=.venv/bin/python cargo build --release -p uniserve -p uniserve-ipc-py --features pyo3/extension-module` builds both artifacts; `uv pip install --python .venv/bin/python --no-build-isolation -e .` installs the checkout and its extension into the worker environment. Rebuild both after protocol changes. An extension linked against another Python ABI cannot be loaded by the worker interpreter.
@@ -49,7 +51,7 @@ H3 declares five components: `denoiser`, `text_encoder`, `video_decoder`, `audio
 This four-device example places two-stage pipeline denoising on ranks 3 and 1, encoding on rank 0, temporal decoding on ranks 2 and 0, audio decoding on rank 1, and output assembly on rank 2:
 
 ```bash
-uniserve serve /models/FastVideo-Minimax-FastH3-Preview-v0.2 \
+uniserve serve /models/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree \
   --model-description minimax-h3 \
   --served-model-name MiniMax-H3 \
   --workers '[{"id":"model","ranks":[{"node":"localhost","device":"cuda:0"},{"node":"localhost","device":"cuda:1"},{"node":"localhost","device":"cuda:2"},{"node":"localhost","device":"cuda:3"}],"entries":{"denoiser":{"ranks":[3,1],"parallel_config":{"pipeline_parallel_size":2}},"text_encoder":{"ranks":[0]},"video_decoder":{"ranks":[2,0],"distribution":"temporal_units","units_per_rank":1},"audio_decoder":{"ranks":[1]},"output":{"ranks":[2]}},"queue_depth":6}]' \
@@ -59,9 +61,11 @@ uniserve serve /models/FastVideo-Minimax-FastH3-Preview-v0.2 \
   --max-model-len 16384 --max-video-seconds 15
 ```
 
-On four GB200s, this binding has completed 5-second/1K-token and 15-second/16,384-token requests, including subsequent requests after three client cancellations. The stated precision resolves to BF16 denoiser attention, BF16 denoiser MLP, BF16 text encoder, and FP16 video VAE. Performance remains unranked.
+On four GB200s, this placement with the v0.2 checkpoint has completed 5-second/1K-token and 15-second/16,384-token requests, including subsequent requests after three client cancellations. That evidence covers component placement and cancellation reuse; the four-step v1 checkpoint has separate two-rank evaluation results. The stated precision resolves to BF16 denoiser attention, BF16 denoiser MLP, BF16 text encoder, and FP16 video VAE. Performance remains unranked.
 
 Omitting configuration for H3 assigns all workers to projected-head Ulysses denoising, direct encoder TP, and temporal video decoding, with audio/output on rank zero. Four ranks therefore select U4, encoder TP4, and four temporal decoders.
+
+Two ranks select U2 denoising, encoder TP2, and two temporal video decoders. The [`fast_h3` evaluation suite](benchmarking.md#two-gpu-evaluation) provides four fixed duration/conditioning points for this layout. CUDA Graph coverage is component-specific; the [execution and memory contract](cuda-graphs.md) describes the current boundaries.
 
 ## KV head delivery
 

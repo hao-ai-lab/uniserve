@@ -1,6 +1,6 @@
 # Serving evaluation
 
-`uniserve-eval` plans explicit TOML points and runs them serially. Offline comparison of matched result bundles is [`scripts/compare_eval.py`](../scripts/compare_eval.py). Commands and measurement semantics are documented in [`benchmarking.md`](benchmarking.md). Evaluator implementation details are documented in [`specs/eval.md`](../specs/eval.md).
+`uniserve-eval` plans explicit TOML points and runs them serially. Offline comparison of matched result bundles is [`scripts/compare_eval.py`](../scripts/compare_eval.py). Commands and measurement semantics are documented in [`benchmarking.md`](benchmarking.md). The [point execution pipeline](../uniserve_eval/pipeline/run.py) owns workload execution and result publication.
 
 ## Inspect available work
 
@@ -25,6 +25,6 @@ The evaluator refuses to overwrite a non-empty point directory. Comparison reads
 
 Add a server command and one explicit benchmark table to [`uniserve_eval/profiles.toml`](../uniserve_eval/profiles.toml). A benchmark selects a task class and a dataset class. The task class owns public request construction, config legality, and observable output validation. Shared transport and metric code do not contain model-specific output rules.
 
-Registered tasks are `text`, `t2i`, `i2i`, `i2t`, and `interleave`. Registered datasets are `sharegpt`, `mjhq`, `beans`, `ueval`, `pie-bench`, and `jsonl`.
+Registered tasks are `text`, `t2i`, `i2i`, `i2t`, `interleave`, and `video`. Registered datasets are `sharegpt`, `mjhq`, `beans`, `ueval`, `pie-bench`, `jsonl`, and `minimax-h3`. The `fast_h3` suite runs the four declared video duration/conditioning points; [two-GPU configuration](benchmarking.md#two-gpu-evaluation) specifies the model snapshots and runtime overrides.
 
 Protected metrics are a TOML mapping from summary paths to `higher` or `lower`. A suite is an ordered list of benchmark names. Comparison reports raw parent and candidate values unless the caller passes `--max-regression` to `scripts/compare_eval.py`.
