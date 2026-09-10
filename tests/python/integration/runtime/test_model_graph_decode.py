@@ -7,7 +7,6 @@ import torch
 
 from uniserve_worker.backends.attention.flashinfer import FlashInferAttentionBackend
 from uniserve_worker.backends.attention.tuning import FlashInferTuningConfig
-from uniserve_worker.execution.cuda_graph import CudaGraphRunner
 from uniserve_worker.execution.forward_batch import (
     AttentionMode,
     AttentionSelection,
@@ -15,6 +14,8 @@ from uniserve_worker.execution.forward_batch import (
     ModelPhase,
     TokenSelection,
 )
+from uniserve_worker.execution.graph.full import FullCudaGraphBackend
+from uniserve_worker.execution.runners.packed import PackedRunner
 from uniserve_worker.models.sensenova.config import NeoChatConfig
 from uniserve_worker.models.sensenova.model import NEOChatModel
 from uniserve_worker.nn.layer import LayerConfig
@@ -24,10 +25,9 @@ from uniserve_worker.runtime.cache_pool import CachePool
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("selection_kind", [TokenSelection.LAST_LOGITS, TokenSelection.HIDDEN])
+@pytest.fixture
 @torch.inference_mode()
-def test_model_decode_replay_consumes_live_strided_page_metadata(selection_kind):
+def numerical_model(request):
     torch.manual_seed(619)
     device = torch.device("cuda", 0)
     config = NeoChatConfig(
@@ -62,14 +62,30 @@ def test_model_decode_replay_consumes_live_strided_page_metadata(selection_kind)
         max_image_seq_len=16,
         fm_head_layers=2,
     )
-    model = NEOChatModel(config, layer_config=LayerConfig(Communicator(), None))
+    if getattr(request, "param", "sensenova") == "qwen":
+        from uniserve_worker.models.qwen3 import Qwen3ForCausalLM
+
+        model = Qwen3ForCausalLM(
+            dict(
+                vocab_size=64,
+                hidden_size=512,
+                intermediate_size=1024,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                head_dim=128,
+                max_position_embeddings=256,
+            ),
+            layer_config=LayerConfig(Communicator(), None),
+        )
+    else:
+        model = NEOChatModel(config, layer_config=LayerConfig(Communicator(), None))
     model.to(device=device, dtype=torch.bfloat16)
     for parameter in model.parameters():
         if parameter.ndim == 1:
             parameter.fill_(1)
         else:
             parameter.normal_(std=0.05)
-    cache = model.cache_geometry
     pool = CachePool(
         num_layers=2,
         num_pages=16,
@@ -81,11 +97,20 @@ def test_model_decode_replay_consumes_live_strided_page_metadata(selection_kind)
     )
     pool.k.normal_(std=0.1)
     pool.v.normal_(std=0.1)
-    backend = FlashInferAttentionBackend(
-        tuning=FlashInferTuningConfig(workspace_size=64 << 20)
-    )
+    backend = FlashInferAttentionBackend(tuning=FlashInferTuningConfig(workspace_size=64 << 20))
     selection = AttentionSelection("flashinfer", (backend,))
     model.bind_cache_pool(pool, selection)
+    yield model, pool, selection, device
+    torch.cuda.synchronize(device)
+    pool.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("selection_kind", [TokenSelection.LAST_LOGITS, TokenSelection.HIDDEN])
+@torch.inference_mode()
+def test_model_decode_replay_consumes_live_strided_page_metadata(selection_kind, numerical_model):
+    model, pool, selection, device = numerical_model
+    cache = model.cache_geometry
     rows = 3
     # A context-bounded view retains the wider staging allocation's row stride.
     # Only the first four physical pages per request contain live KV tokens.
@@ -111,14 +136,18 @@ def test_model_decode_replay_consumes_live_strided_page_metadata(selection_kind)
         token_selections=(selection_kind,) * rows,
         decode_force_finish=torch.zeros(rows, dtype=torch.bool, device=device),
     )
-    runner = CudaGraphRunner(
+    runner = PackedRunner(
+        backend=FullCudaGraphBackend(
+            device=device,
+            stream=torch.cuda.Stream(device=device),
+            pool=torch.cuda.graph_pool_handle(),
+        ),
         enabled=True,
         prefill_enabled=True,
         cache=cache,
         cache_pool=pool,
         attention=selection,
         block_size=64,
-        weight_version=0,
         memory_budget_bytes=512 << 20,
         decode_batch_sizes=(rows,),
         decode_context_blocks=1319,
@@ -129,10 +158,11 @@ def test_model_decode_replay_consumes_live_strided_page_metadata(selection_kind)
         return model.project(model(value.input_ids, value.positions, value), value)
 
     try:
-        runner.execute("text", batch, forward, eligible=True)
-        runner.execute("text", batch, forward, eligible=True)
+        runner.capture(batch, forward)
         runner.complete_startup()
-        for lengths, tokens in (((198, 211, 200), (9, 11, 13)), ((199, 212, 201), (4, 2, 19))):
+        for index, (lengths, tokens) in enumerate(
+            (((198, 211, 200), (9, 11, 13)), ((199, 212, 201), (4, 2, 19)))
+        ):
             batch.input_ids.copy_(torch.tensor(tokens, device=device))
             batch.kv_lens.copy_(torch.tensor(lengths, dtype=torch.int32, device=device))
             batch.seq_lens.copy_(batch.kv_lens - 1)
@@ -148,7 +178,7 @@ def test_model_decode_replay_consumes_live_strided_page_metadata(selection_kind)
                 kv_lens_cpu=lengths,
                 seq_lens_cpu=tuple(n - 1 for n in lengths),
             )
-            execution = runner.execute("text", batch, forward, eligible=True)
+            execution = runner.run(batch, forward, eligible=True)
             actual = execution.output
             expected = forward(batch)
             for result, reference in zip(actual.values, expected.values, strict=True):
@@ -162,3 +192,59 @@ def test_model_decode_replay_consumes_live_strided_page_metadata(selection_kind)
     finally:
         torch.cuda.synchronize(device)
         runner.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("numerical_model", ["qwen"], indirect=True)
+@torch.inference_mode()
+def test_model_prefill_padding_preserves_live_outputs(numerical_model):
+    from uniserve_worker.execution.input_buffers import InputBuffers, InputGeometry
+    from uniserve_worker.execution.runners.packed import select_prefill_captures
+    from uniserve_worker.execution.runners.prefill import prepare_prefill, stage_text
+
+    model, pool, selection, device = numerical_model
+    buffers = InputBuffers(geometry=InputGeometry(8, 16, 16, 4, 512), device=device)
+    shapes = select_prefill_captures((8, 16), (4,), max_rows=3, max_tokens=16)
+    runner = PackedRunner(
+        backend=FullCudaGraphBackend(
+            device=device,
+            stream=torch.cuda.Stream(device=device),
+            pool=torch.cuda.graph_pool_handle(),
+        ),
+        enabled=True,
+        prefill_enabled=True,
+        cache=model.cache_geometry,
+        cache_pool=pool,
+        attention=selection,
+        block_size=64,
+        memory_budget_bytes=512 << 20,
+        prefill_token_sizes=(8, 16),
+        prefill_row_sizes=(4,),
+        decode_context_blocks=4,
+        prefill_shapes=shapes,
+    )
+
+    def forward(batch):
+        return model.project(model(batch.input_ids, batch.positions, batch), batch)
+
+    try:
+        prepare_prefill(runner, buffers, forward, shapes, packed=False)
+        runner.complete_startup()
+        with pool.startup_pages(3) as pages:
+            for lengths in ((3,), (3, 2), (4, 5), (1, 5, 4)):
+                tokens = tuple(tuple(range(1, length + 1)) for length in lengths)
+                batch = stage_text(
+                    buffers,
+                    pool,
+                    tokens,
+                    tuple((page,) for page in pages[: len(lengths)]),
+                    packed=False,
+                )
+                expected = forward(batch).clone()
+                actual = runner.run(batch, forward, eligible=True).output
+                for result, reference in zip(actual.values, expected.values, strict=True):
+                    torch.testing.assert_close(result, reference, rtol=2e-2, atol=2e-2)
+    finally:
+        torch.cuda.synchronize(device)
+        runner.close()
+        buffers.close()

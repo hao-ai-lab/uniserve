@@ -34,12 +34,10 @@ from uniserve_worker.execution.batch import (
 )
 from uniserve_worker.execution.model_runner import ModelRunner
 from uniserve_worker.execution.output import finalize_run_result
-from uniserve_worker.execution.trace import ExecutionTrace
 from uniserve_worker.foundation.errors import ComputeError, InputError
 from uniserve_worker.models.runtime import ExecutionModel, ResourceGeometry
 from uniserve_worker.models.stub import StubModel
 from uniserve_worker.nn.parallel import EntryConfig
-from uniserve_worker.process import dispatch
 from uniserve_worker.transfer.layout import fetch_tensor
 
 pytestmark = pytest.mark.integration
@@ -64,6 +62,7 @@ def test_text_encoder_operation_publishes_consumable_conditioning(separate_start
         model,
         components=(("text_encoder", EntryConfig((0,))), ("output", EntryConfig((0,)))),
     )
+    worker.runner.bind_module("text_encoder", model.text_encoder)
     key = RequestKey(1, 1, 1)
     prompt = (3, 8, 1)
     reference = ProductRef(
@@ -203,7 +202,8 @@ def test_text_entry_stages_successive_bounded_inputs(device):
     }
     with torch.no_grad():
         model.text_encoder.weight.copy_(torch.arange(128, device=device).reshape(32, 4))
-    runner = ModelRunner(model, WorkerConfig(device=device), ExecutionTrace("text_entry"))
+    runner = ModelRunner(model, WorkerConfig(device=device))
+    runner.bind_module("text_encoder", model.text_encoder)
     try:
         outputs = []
         prompts = ((3, 8, 1), (31,), (0, 5, 19, 7), (1, 2))
@@ -234,7 +234,8 @@ def test_entry_rejects_outputs_outside_the_loaded_contract(shape, dtype, message
     model.entry_outputs = {
         "projection": (TensorSpec("values", DType.F32, ShapeBound((DeviceDim(2), StaticDim(4)))),),
     }
-    runner = ModelRunner(model, WorkerConfig(), ExecutionTrace("projection"))
+    runner = ModelRunner(model, WorkerConfig())
+    runner.bind_module("projection", model.projection)
     try:
         with pytest.raises(ComputeError, match=message):
             runner.run_entry("projection", torch.zeros(shape, dtype=dtype))
@@ -254,7 +255,7 @@ def test_worker_reports_entry_result_bounds_with_its_static_membership():
     }
     worker = execution_worker(model, components=(("projection", EntryConfig((0,))),))
     try:
-        info = dispatch(worker, {"kind": "info"})["info"]
+        info = worker.info.to_mapping()
         (entry,) = WorkerInfo.from_mapping(info).components
         assert entry.name == "projection"
         assert entry.config.ranks == (0,)
@@ -279,27 +280,38 @@ def test_worker_binds_dense_attention_without_requesting_kv_storage():
     model.architecture = "DenseAttention"
     model.resource_geometry = ResourceGeometry(kv=False)
     model.supported_work = frozenset({OpCode.DIFFUSION_DECODE})
-    model.supports_weight_updates = False
     model.decoder = DenseEntry()
     model.entry_outputs = {
-        "decoder": (TensorSpec(
-            "values", DType.F32,
-            ShapeBound((StaticDim(1), StaticDim(2), DeviceDim(16), StaticDim(8))),
-        ),),
+        "decoder": (
+            TensorSpec(
+                "values",
+                DType.F32,
+                ShapeBound((StaticDim(1), StaticDim(2), DeviceDim(16), StaticDim(8))),
+            ),
+        ),
     }
     worker = Worker(
-        model, sampling_group=None,
+        model,
+        sampling_group=None,
         worker_config=WorkerConfig(
-            device="cpu", cuda_graph=False, max_batch_operations=2,
-            max_batch_tokens=2, max_request_pool_size=2,
+            device="cpu",
+            graph_policy="off",
+            max_batch_operations=2,
+            max_batch_tokens=2,
+            max_request_pool_size=2,
         ),
-        attention=None, tokenizer=None, allowed_work_variants=model.supported_work,
-        transfer_backends=("local",), publication_backends=("local",), worker_id="decoder",
-        pipeline_depth=3, completion_payload_bytes=1 << 16,
+        attention=None,
+        tokenizer=None,
+        allowed_work_variants=model.supported_work,
+        transfer_backends=("local",),
+        publication_backends=("local",),
+        worker_id="decoder",
+        pipeline_depth=3,
+        completion_payload_bytes=1 << 16,
         components=(("decoder", EntryConfig((0,))),),
     )
     try:
-        info = WorkerInfo.from_mapping(dispatch(worker, {"kind": "info"})["info"])
+        info = WorkerInfo.from_mapping(worker.info.to_mapping())
         assert info.uses_kv is False
         assert info.kv_cache is None
         values = torch.arange(64, dtype=torch.float32).reshape(1, 2, 4, 8) / 64

@@ -286,7 +286,6 @@ pub struct WorkerInfo {
     #[serde(default)]
     pub media_plan: Option<MediaExecutionPlan>,
     /// Model-weight revision used to reject cross-version products.
-    pub weight_version: u64,
     /// Identity of the loaded rank and its host address space.
     pub endpoint: WorkerEndpoint,
     /// Rank-local primary compute device used to bind physical transfer edges.
@@ -482,7 +481,6 @@ impl Default for WorkerInfo {
         Self {
             model_name: "model".to_owned(),
             media_plan: None,
-            weight_version: 0,
             endpoint: WorkerEndpoint {
                 worker_id: "worker".into(),
                 rank: 0,

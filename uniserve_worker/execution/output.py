@@ -35,6 +35,7 @@ from ..execution.batch import (
     TransferResult,
 )
 from ..foundation.errors import WorkerError, WorkerErrorCode, invalid_descriptor, resource_error
+from ..foundation.resources import close_resources
 from ..media.codec import uint8_image_to_png_base64_bytes
 from ..profiling import profile_range, timing_events_enabled
 from ..runtime.cpu import CpuTaskReservation
@@ -150,7 +151,6 @@ class OutputBuffer:
         "_ready_ns",
         "_timing",
         "_timing_events",
-        "_retained_until_ready",
         "_completion_future",
         "_completion_registered",
         "_release_to_pool",
@@ -209,7 +209,6 @@ class OutputBuffer:
         self._ready_ns = 0
         self._timing: tuple[int, int, int, int] | None = None
         self._timing_events = timing_events_enabled()
-        self._retained_until_ready: list[object] = []
         self._completion_future: concurrent.futures.Future[None] | None = None
         self._completion_registered = False
         self._release_to_pool = release_to_pool
@@ -272,7 +271,6 @@ class OutputBuffer:
         self._ready_ns = 0
         self._timing = None
         self._timing_events = timing_events_enabled()
-        self._retained_until_ready.clear()
         self._completion_future = None
         self._completion_registered = False
         self._released_to_pool = False
@@ -468,7 +466,6 @@ class OutputBuffer:
         if any(not bool(event.query()) for event in self._events.values()):
             return False
         self._ready_ns = time.perf_counter_ns()
-        self._retained_until_ready.clear()
         self._complete_dependents()
         return True
 
@@ -515,13 +512,6 @@ class OutputBuffer:
         future = self._completion_future
         if future is not None:
             self._resolve_completion(future)
-
-    def retain_until_ready(self, owner: object) -> None:
-        """Keep an external resource alive until every registered copy completes."""
-
-        if self.ready():
-            return
-        self._retained_until_ready.append(owner)
 
     def read_tokens(self, capture: TokenCapture) -> tuple[int, ...]:
         """Read and cache a validated token capture after its copy completes."""
@@ -1035,7 +1025,7 @@ class CpuJob:
         dependencies: tuple[concurrent.futures.Future[object], ...] = (),
         profile_name: str,
         release: Callable[[], None] | None = None,
-        defer_release: Callable[[ByteCapture], None] | None = None,
+        defer_release: Callable[[concurrent.futures.Future[None]], None] | None = None,
     ) -> None:
         """Retain a bounded CPU reservation and lazily submitted host operation."""
 
@@ -1067,7 +1057,7 @@ class CpuJob:
             return
         self._resource_released = True
         if self.capture is not None and self._defer_release is not None:
-            self._defer_release(self.capture)
+            self._defer_release(self.capture.buffer.completion_future())
         else:
             self._release()
 
@@ -1128,10 +1118,14 @@ class CpuJob:
             raise RuntimeError("output CPU job lost its submitted future")
         return self._future.result(timeout=0)
 
-    def __del__(self) -> None:
-        """Release an unsubmitted CPU reservation during finalization."""
+    def abandon(self) -> None:
+        """Release an unsubmitted job; submitted work retains storage until its completion."""
 
+        if self._future is not None:
+            return
         self.reservation.abandon()
+        self._submission_error = concurrent.futures.CancelledError("output job was abandoned")
+        self.promise.cancel()
         if self.capture is None or self.capture.ready():
             self._release_now()
         else:
@@ -1277,8 +1271,8 @@ class ImagePayload:
 
         return self.finalize()
 
-    def __del__(self) -> None:
-        """Release an unconsumed encoded image payload during finalization."""
+    def abandon(self) -> None:
+        """Release encoding admission when its completion will not be consumed."""
 
         self.reservation.abandon()
 
@@ -1564,12 +1558,16 @@ class PendingOutput:
         memo[id(self)] = self
         return self
 
-    def __del__(self) -> None:
-        """Abandon unresolved completion ownership during finalization."""
+    def abandon(self) -> None:
+        """Release unobserved host work and retire the result through its device fence."""
 
-        buffer = self._buffer
+        tasks, self._completion_tasks = self._completion_tasks, ()
+        actions = [task.abandon for task in tasks if isinstance(task, (CpuJob, ImagePayload))]
+        buffer, self._buffer = self._buffer, None
         if buffer is not None and not self._observed:
-            buffer.discard(self._row, self._generation)
+            self._observed = True
+            actions.append(partial(buffer.discard, self._row, self._generation))
+        close_resources(*actions)
 
 
 def _record_ready(record: ModelOutput | CompletionState) -> bool:

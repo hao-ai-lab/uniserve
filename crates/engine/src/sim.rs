@@ -395,7 +395,6 @@ impl SimEngine {
             max_batch_ops: 1024,
             max_unresolved_ops: 2,
             model_name: "sim".to_owned(),
-            weight_version: 0,
             ..WorkerInfo::default()
         };
         Self {

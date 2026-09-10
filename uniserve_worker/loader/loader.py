@@ -28,7 +28,6 @@ from .handles import TensorWeightHandle, WeightHandle, weight_handle_materializa
 from .io import iter_weight_handles
 from .mapping import LoadReport, stacked_weight_name
 from .source import (
-    WeightSourceConfig,
     WeightSourceSet,
     read_model_config,
     resolve_model_root,
@@ -41,7 +40,6 @@ from .weight_loaders import (
     defer_parameter_weights,
     load_parameter_weight,
 )
-from .weight_set import WeightSet
 
 logger = logging.getLogger(__name__)
 
@@ -53,16 +51,13 @@ __all__ = ["ModelLoader", "LoadedModel", "get_model_loader", "load_model"]
 
 @dataclass(frozen=True, slots=True)
 class LoadedModel:
-    """Materialized module, tokenizer, live weights, sources, and architecture metadata."""
+    """Materialized model, tokenizer, sources, and resolved execution metadata."""
 
     model: ExecutionModel
     tokenizer: Any | None
     worker_config: WorkerConfig
-    weights: WeightSet
     sources: tuple[WeightSourceSet, ...]
     architecture_config: dict[str, Any]
-    weight_sidecars: tuple[str, ...]
-    weight_sources: tuple[WeightSourceConfig, ...]
     schedule: DiffusionSchedule | None = None
 
 
@@ -176,11 +171,8 @@ class ModelLoader:
             model=model,
             tokenizer=construction.tokenizer,
             worker_config=request.execution,
-            weights=WeightSet.from_module(model),
             sources=sources,
             architecture_config=_canonical_architecture_config(construction.config),
-            weight_sidecars=entry.sidecars,
-            weight_sources=entry.sources,
             schedule=schedule,
         )
 
@@ -199,9 +191,8 @@ def load_model(request: LoadRequest) -> LoadedModel:
     loaded = replace(loaded, worker_config=_loaded_worker_config(loaded.model, request))
     _resolve_input_tokens(loaded.model, loaded.tokenizer)
     logger.info(
-        "loaded model architecture=%s weight_version=%d",
+        "loaded model architecture=%s",
         loaded.model.architecture,
-        loaded.weights.version,
     )
     return loaded
 
@@ -280,9 +271,7 @@ def component_parameter_names(component: CheckpointComponent) -> set[str]:
     )
 
 
-def audit_component(
-    component: CheckpointComponent, report: LoadReport, *, packed: bool = True
-) -> None:
+def audit_component(component: CheckpointComponent, report: LoadReport) -> None:
     """Require all resident parameters and declared persistent buffers to be loaded."""
 
     included = component_parameter_names(component)
@@ -294,7 +283,6 @@ def audit_component(
         included=included,
         optional=component.optional,
         label=f"{component.source} checkpoint",
-        require_packed_shards=packed,
     )
 
 
@@ -320,7 +308,6 @@ def load_component(
             handles,
             device=request.execution.device,
             layered=request.load.load_format is LoadFormat.LAYERED,
-            installed=request.load.load_format is LoadFormat.SHARDED_STATE,
         )
         if component.post_load is not None:
             assert retained is not None
@@ -339,13 +326,12 @@ def assign_component(
     *,
     device: str,
     layered: bool = False,
-    installed: bool = False,
 ) -> LoadReport:
     """Map and audit checkpoint values; layered mode materializes one owner at a time."""
 
     def assign() -> LoadReport:
-        if installed or component.map_weights is None:
-            return _load_declared_weights(component, handles, device, packed=not installed)
+        if component.map_weights is None:
+            return _load_declared_weights(component, handles, device)
         return component.map_weights(handles)
 
     if layered:
@@ -355,7 +341,7 @@ def assign_component(
     else:
         with torch.no_grad(), weight_handle_materialization():
             report = assign()
-    audit_component(component, report, packed=not installed)
+    audit_component(component, report)
     return report
 
 
@@ -370,28 +356,19 @@ def _load_declared_weights(
     component: CheckpointComponent,
     handles: Iterable[WeightHandle],
     device: str,
-    *,
-    packed: bool,
 ) -> LoadReport:
     parameters = dict(component.module.named_parameters())
     included = component_parameter_names(component)
     buffers = _persistent_buffers(component.module) if component.persistent_buffers else {}
     report = LoadReport()
     for handle in handles:
-        name, shard = (
-            stacked_weight_name(handle.name, component.weight_name_map)
-            if packed
-            else (handle.name, None)
-        )
+        name, shard = stacked_weight_name(handle.name, component.weight_name_map)
         if name not in parameters and handle.name in parameters:
             name, shard = handle.name, None
         if name in parameters:
             if name not in included:
                 continue
-            if packed:
-                load_parameter_weight(parameters[name], handle, shard)
-            else:
-                default_weight_loader(parameters[name], handle)
+            load_parameter_weight(parameters[name], handle, shard)
         elif name in buffers:
             target = buffers[name]
             if target.shape != torch.Size(handle.shape):

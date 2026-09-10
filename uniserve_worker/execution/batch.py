@@ -39,6 +39,11 @@ class CompletionState(Protocol):
 
         ...
 
+    def abandon(self) -> None:
+        """Retire an unobserved row without reusing storage before device completion."""
+
+        ...
+
 
 class LanePublication(Protocol):
     """One-shot request-state publication owned by a lane result."""

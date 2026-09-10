@@ -88,7 +88,6 @@ fn main() -> anyhow::Result<()> {
     let worker_config = WorkerProcessArgs {
         worker_id: "local".into(),
         stub: true,
-        cuda_graph: false,
         ..WorkerProcessArgs::default()
     };
     let engine = Worker::spawn(uniserve_engine::WorkerProcessArgs {

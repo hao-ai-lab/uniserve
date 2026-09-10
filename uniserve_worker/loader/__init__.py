@@ -2,7 +2,6 @@
 
 from .config import LoadConfig, LoadFormat, LoadRequest
 from .loader import LoadedModel, ModelLoader, get_model_loader, load_model
-from .weight_set import WeightSet
 
 __all__ = [
     "ModelLoader",
@@ -10,7 +9,6 @@ __all__ = [
     "LoadFormat",
     "LoadRequest",
     "LoadedModel",
-    "WeightSet",
     "get_model_loader",
     "load_model",
 ]

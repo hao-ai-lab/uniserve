@@ -330,17 +330,6 @@ impl ExecutorInfo {
                 || info.media_plan == merged.media_plan),
             "workers disagree on the numerical media plan"
         );
-        let identity = (
-            &self.workers[0].1.model_name,
-            self.workers[0].1.weight_version,
-        );
-        anyhow::ensure!(
-            self.workers.iter().all(|(_, info)| {
-                info.model_name == *identity.0 && info.weight_version == identity.1
-            }),
-            "executor pools expose different model names or weight versions"
-        );
-
         // Every KV stage must agree on layout. Capacity is the narrowest pool
         // because a lineage may traverse all routed KV stages.
         if let Some(first_index) = kv_indices.first().copied() {

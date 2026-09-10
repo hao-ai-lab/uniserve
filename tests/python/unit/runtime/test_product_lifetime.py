@@ -1,5 +1,6 @@
 """Physical product ownership from read acquisition through consumer completion."""
 
+from concurrent.futures import CancelledError
 from dataclasses import replace
 from threading import Event
 
@@ -18,9 +19,10 @@ from uniserve_worker.execution.batch import (
     StaticDim,
     StorageClass,
 )
-from uniserve_worker.execution.output import OutputPool
+from uniserve_worker.execution.output import CpuJob, OutputPool
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.runtime.cache_pool import CachePool
+from uniserve_worker.runtime.cpu import CpuPool
 from uniserve_worker.runtime.device_events import DeviceEventPool
 from uniserve_worker.runtime.device_products import DeviceProducts
 from uniserve_worker.runtime.encoder_cache import EncoderCache, EncoderMetadata
@@ -28,6 +30,28 @@ from uniserve_worker.runtime.latent_pool import LatentPool
 from uniserve_worker.runtime.persistent_buffers import PersistentBuffers
 from uniserve_worker.transfer.layout import TensorRegion
 from uniserve_worker.transfer.tickets import make_transport
+
+
+def test_abandoned_output_job_releases_capacity_and_terminates_dependent_work() -> None:
+    pool = CpuPool(capacity=2, workers=1)
+    predecessor = CpuJob(pool.reserve(), lambda: 1, profile_name="output.predecessor")
+    successor = CpuJob(
+        pool.reserve(),
+        lambda: 2,
+        dependencies=(predecessor.promise,),
+        profile_name="output.successor",
+    )
+    try:
+        successor.start()
+        predecessor.abandon()
+        with pytest.raises(CancelledError):
+            successor.promise.result(timeout=5)
+        assert predecessor.promise.cancelled()
+    finally:
+        predecessor.abandon()
+        successor.abandon()
+        pool.close()
+    assert pool.reserved == 0
 
 
 def test_compact_persistent_buffers_remap_live_logical_allocations() -> None:
@@ -725,3 +749,39 @@ def test_failed_latent_publication_retains_its_pages_without_poisoning_other_req
             segment = shared_memory.SharedMemory(name=locator.transport.name)
             segment.close()
             segment.unlink()
+
+
+@pytest.mark.gpu
+def test_media_capture_releases_capacity_after_its_completion_fence():
+    from uniserve_worker.execution.video import VideoOutputRing
+    from uniserve_worker.models.video import VideoOutputGeometry
+
+    events = DeviceEventPool()
+    outputs = OutputPool(capacity=1, max_words=8, event_pool=events)
+    ring = VideoOutputRing(
+        state_slots=1,
+        unresolved_window=1,
+        max_video_frames_per_round=1,
+        max_geometry=VideoOutputGeometry(1, (1,), 2, 2, 1, 8),
+    )
+    lease = ring.reserve("video")
+    try:
+        output = outputs.acquire(1, token_capacity=8, devices=("cuda:0",))
+        value = torch.arange(12, dtype=torch.uint8, device="cuda:0")
+        capture = output.capture_bytes_into(value, lease.storage)
+        lease.defer_until_ready(capture.buffer.completion_future())
+        with pytest.raises(WorkerError, match="output ring is exhausted"):
+            ring.reserve("video")
+        # Closing the output owner completes its copy and retires the borrowed
+        # ring capacity even while both the lease and capture remain referenced.
+        outputs.close()
+        replacement = ring.reserve("video")
+        try:
+            torch.testing.assert_close(
+                replacement.storage, torch.arange(12, dtype=torch.uint8), rtol=0, atol=0
+            )
+        finally:
+            replacement.release()
+    finally:
+        outputs.close()
+        events.close()

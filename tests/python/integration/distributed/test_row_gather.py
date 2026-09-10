@@ -2,7 +2,6 @@
 
 import pytest
 import torch
-import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from uniserve_worker.execution.bounded_storage import BoundedTensorStorage, TensorSchema
@@ -205,7 +204,6 @@ def _run_gather(rank: int, rendezvous: str) -> None:
             graph.reset()
     finally:
         environment.close()
-        dist.destroy_process_group()
 
 
 def test_row_gather_and_projection_replay_updated_values_in_logical_rank_order(tmp_path):
@@ -282,7 +280,6 @@ def _run_quantized_gather(rank: int, rendezvous: str) -> None:
             graph.reset()
     finally:
         environment.close()
-        dist.destroy_process_group()
 
 
 def test_row_and_block_quantized_projection_preserves_scale_domains_under_replay(tmp_path):
@@ -407,7 +404,6 @@ def _run_routed_scales(rank: int, rendezvous: str) -> None:
         if graph is not None:
             graph.reset()
         environment.close()
-        dist.destroy_process_group()
 
 
 def test_quantized_routes_share_complete_scale_domains_with_empty_sequence_shards(tmp_path):

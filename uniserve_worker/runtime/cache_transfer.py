@@ -102,7 +102,7 @@ class CacheTransfers:
         self._closed = False
         self._wake: Callable[[], None] | None = None
 
-    def set_completion_wake(self, wake: Callable[[], None]) -> None:
+    def set_completion_wake(self, wake: Callable[[], None] | None) -> None:
         """Wake the owner after import jobs or destination retirements finish."""
 
         self._wake = wake

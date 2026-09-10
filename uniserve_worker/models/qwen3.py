@@ -191,7 +191,7 @@ class Qwen3ForCausalLM(ExecutionModel):
         return ModelConstruction(model.checkpoint_components(), lambda: model, config)
 
     def checkpoint_components(self) -> tuple[CheckpointComponent, ...]:
-        """Declare the complete language graph for loading and weight updates."""
+        """Declare the complete language graph populated by checkpoint loading."""
 
         from ..loader.component import CheckpointComponent
 

@@ -1,4 +1,4 @@
-"""Packed-forward graph catalog and startup workload construction."""
+"""Bounded request, sampling, and product startup scenarios."""
 
 from __future__ import annotations
 
@@ -37,15 +37,12 @@ from ..execution.batch import (
     Start,
     StorageClass,
 )
-from ..execution.cuda_graph import FlowCapture, PrefillCapture, select_prefill_captures
 from ..execution.model_runner import capture_image_parameters
 from ..execution.output import (
     finalize_run_result,
     run_result_ready,
 )
-from ..execution.step import (
-    execute_startup,
-)
+from ..execution.runners.packed import FlowCapture
 from ..foundation.errors import invalid_descriptor
 from ..foundation.math import ceil_div
 from ..models.generation import GenerationPipeline
@@ -57,22 +54,22 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class WarmupContext:
-    """Startup-only execution resources and scratch state."""
+class _WarmupRequests:
+    """Track synthetic request allocations while borrowing Worker execution resources."""
 
     def __init__(self, worker: Worker) -> None:
         """Borrow startup-owned worker resources needed to exercise every execution shape."""
 
         self.worker = worker
-        self._warmup_kv_pages: dict[tuple[RequestKey, int], list[int]] = {}
-        self._warmup_prefix_pages: dict[RequestKey, list[int]] = {}
-        self._warmup_prefix_slots: dict[RequestKey, int] = {}
-        self._warmup_latent_pages: dict[RequestKey, list[int]] = {}
-        self._warmup_buffers: dict[BufferId, BufferAllocation] = {}
-        self._warmup_buffer_free: list[tuple[int, int]] = [
-            (0, int(self.worker._info.buffer_pool_bytes))
+        self._kv_pages: dict[tuple[RequestKey, int], list[int]] = {}
+        self._prefix_pages: dict[RequestKey, list[int]] = {}
+        self._prefix_slots: dict[RequestKey, int] = {}
+        self._latent_pages: dict[RequestKey, list[int]] = {}
+        self._buffers: dict[BufferId, BufferAllocation] = {}
+        self._free_buffer_ranges: list[tuple[int, int]] = [
+            (0, int(self.worker.info.buffer_pool_bytes))
         ]
-        self._warmup_run_id = 0
+        self._run_id = 0
 
     def drop_request(self, request_id: int) -> None:
         """Release warmup request, runtime, cache, latent, and product state for one identifier."""
@@ -87,13 +84,13 @@ class WarmupContext:
         for group_id in range(
             0 if self.worker.cache_pool is None else self.worker.cache_pool.group_count
         ):
-            self._warmup_kv_pages.pop((request.request_key, group_id), None)
-        self._warmup_prefix_pages.pop(request.request_key, None)
-        self._warmup_prefix_slots.pop(request.request_key, None)
-        self._warmup_latent_pages.pop(request.request_key, None)
+            self._kv_pages.pop((request.request_key, group_id), None)
+        self._prefix_pages.pop(request.request_key, None)
+        self._prefix_slots.pop(request.request_key, None)
+        self._latent_pages.pop(request.request_key, None)
         released = tuple(
             buffer
-            for buffer, allocation in self._warmup_buffers.items()
+            for buffer, allocation in self._buffers.items()
             if int(allocation.buffer.owner.request_id) == int(request_id)
         )
         self._release_buffer_allocations(released)
@@ -109,12 +106,12 @@ class WarmupContext:
     def _execute_controls(self, commands: tuple[BatchCommand, ...]) -> None:
         """Wait for the same physical retirement acknowledgement used by serving."""
 
-        self._warmup_run_id += 1
+        self._run_id += 1
         _execute_warmup(
             self,
             Run(
-                batch_id=self._warmup_run_id,
-                run_id=self._warmup_run_id,
+                batch_id=self._run_id,
+                run_id=self._run_id,
                 commands=commands,
             ),
             retain_device_outputs=True,
@@ -124,29 +121,29 @@ class WarmupContext:
         """Release persistent warmup allocations by exact buffer identity."""
 
         for buffer in buffers:
-            allocation = self._warmup_buffers.pop(buffer, None)
+            allocation = self._buffers.pop(buffer, None)
             if allocation is not None:
-                self._warmup_buffer_free.append((allocation.offset, allocation.bytes))
-        if not self._warmup_buffer_free:
+                self._free_buffer_ranges.append((allocation.offset, allocation.bytes))
+        if not self._free_buffer_ranges:
             return
         merged: list[tuple[int, int]] = []
-        for offset, extent in sorted(self._warmup_buffer_free):
+        for offset, extent in sorted(self._free_buffer_ranges):
             if merged and merged[-1][0] + merged[-1][1] == offset:
                 previous, size = merged[-1]
                 merged[-1] = (previous, size + extent)
             else:
                 merged.append((offset, extent))
-        self._warmup_buffer_free = merged
+        self._free_buffer_ranges = merged
 
     def buffer_allocation(self, product: ProductRef) -> BufferAllocation:
         """Allocate a deterministic aligned slice of warmup persistent storage for a product."""
 
-        existing = self._warmup_buffers.get(product.buffer_id)
+        existing = self._buffers.get(product.buffer_id)
         if existing is not None:
             return existing
         alignment = 256
         required = int(product.max_bytes)
-        for index, (offset, extent) in enumerate(self._warmup_buffer_free):
+        for index, (offset, extent) in enumerate(self._free_buffer_ranges):
             aligned = (offset + alignment - 1) & ~(alignment - 1)
             end = aligned + required
             if end > offset + extent:
@@ -156,9 +153,9 @@ class WarmupContext:
                 replacement.append((offset, aligned - offset))
             if end < offset + extent:
                 replacement.append((end, offset + extent - end))
-            self._warmup_buffer_free[index : index + 1] = replacement
+            self._free_buffer_ranges[index : index + 1] = replacement
             allocation = BufferAllocation(product.buffer_id, aligned, required)
-            self._warmup_buffers[product.buffer_id] = allocation
+            self._buffers[product.buffer_id] = allocation
             return allocation
         raise invalid_descriptor("warmup persistent buffer allocation exceeds resident capacity")
 
@@ -293,15 +290,14 @@ def _warmup_token_outputs(
 
 
 def _execute_warmup(
-    self: WarmupContext,
+    requests: _WarmupRequests,
     batch: Run,
     *,
     retain_device_outputs: bool = False,
-    catalog_graphs: bool = True,
 ) -> RunResult:
-    """Execute a synthetic run and optionally retain outputs or catalog captured graphs."""
+    """Execute a runtime scenario and optionally retain its published outputs."""
 
-    report = execute_startup(self.worker, batch, catalog_graphs=catalog_graphs)
+    report = requests.worker._execute_batch(batch, propagate_errors=True)
     while not run_result_ready(report):
         time.sleep(0.00005)
     finalized = finalize_run_result(report)
@@ -317,8 +313,6 @@ def _execute_warmup(
             raise RuntimeError("finalized warmup result retains unresolved device output")
         if completion.status is OpStatus.ERROR:
             failures.append(completion)
-    if failures or not retain_device_outputs:
-        self.free_products(device_buffers)
     if failures:
         details = ", ".join(
             f"request={completion.request_key.request_id} op={completion.op_id} "
@@ -326,11 +320,13 @@ def _execute_warmup(
             for completion in failures
         )
         raise RuntimeError(f"startup warmup execution failed: {details}")
+    if not retain_device_outputs:
+        requests.free_products(device_buffers)
     return finalized
 
 
 def _build_warmup_batch(
-    self: WarmupContext,
+    requests: _WarmupRequests,
     *,
     admissions: tuple[NewRequest, ...],
     operations: tuple[Operation, ...],
@@ -340,9 +336,9 @@ def _build_warmup_batch(
 ) -> Run:
     """Derive cache, latent, buffer, and row allocations for a warmup submission."""
 
-    self._warmup_run_id += 1
+    requests._run_id += 1
     admissions_by_key = {admission.request_key: admission for admission in admissions}
-    occupied_blocks = {page for pages in self._warmup_kv_pages.values() for page in pages}
+    occupied_blocks = {page for pages in requests._kv_pages.values() for page in pages}
     request_pool_indices: dict[RequestKey, int] = {}
     block_tables: dict[tuple[RequestKey, int], tuple[BlockTable, ...]] = {}
     new_cache_pages: dict[tuple[RequestKey, int], tuple[CachePageAllocation, ...]] = {}
@@ -358,11 +354,11 @@ def _build_warmup_batch(
         ):
             if not product.uses_persistent_buffer():
                 continue
-            allocation = self.buffer_allocation(product)
+            allocation = requests.buffer_allocation(product)
             buffer_allocations[allocation.buffer] = allocation
     # Bind request slots and grow reusable KV leases to each operation's maximum shape.
     for operation in operations:
-        request = self.worker.requests.peek(int(operation.request_key.request_id))
+        request = requests.worker.requests.peek(int(operation.request_key.request_id))
         admission = admissions_by_key.get(operation.request_key)
         if request is None and admission is None:
             raise invalid_descriptor("warmup operation has no request-pool binding")
@@ -404,21 +400,21 @@ def _build_warmup_batch(
         )
         tables: list[BlockTable] = []
         allocations: list[CachePageAllocation] = []
-        if self.worker.cache_pool is None:
+        if requests.worker.cache_pool is None:
             raise invalid_descriptor("warmup KV operation requires cache storage")
-        for group_id in range(self.worker.cache_pool.group_count):
+        for group_id in range(requests.worker.cache_pool.group_count):
             lease_key = (operation.request_key, group_id)
-            block_table = self._warmup_kv_pages.setdefault(lease_key, [])
+            block_table = requests._kv_pages.setdefault(lease_key, [])
             target_pages = ceil_div(
                 visible + input_length,
-                int(self.worker.cache_pool.block_size),
+                int(requests.worker.cache_pool.block_size),
             )
             missing = target_pages - len(block_table)
             if missing < 0:
                 raise invalid_descriptor("warmup operation regresses its KV capacity")
             allocated = tuple(
                 candidate
-                for candidate in self.worker.cache_pool.page_ids(group_id)
+                for candidate in requests.worker.cache_pool.page_ids(group_id)
                 if candidate not in occupied_blocks
             )[:missing]
             if len(allocated) != missing:
@@ -426,7 +422,7 @@ def _build_warmup_batch(
                     "warmup KV allocation exceeds resident capacity: "
                     f"request={operation.request_key.request_id}, group={group_id}, "
                     f"required_pages={missing}, available_pages={len(allocated)}, "
-                    f"resident_pages={len(self.worker.cache_pool.page_ids(group_id))}, "
+                    f"resident_pages={len(requests.worker.cache_pool.page_ids(group_id))}, "
                     f"leased_pages={len(occupied_blocks)}"
                 )
             block_table.extend(allocated)
@@ -436,7 +432,7 @@ def _build_warmup_batch(
                     request_pool_idx=request_pool_indices[operation.request_key],
                     group_id=group_id,
                     page_ids=tuple(block_table),
-                    allocated_tokens=len(block_table) * self.worker.cache_pool.block_size,
+                    allocated_tokens=len(block_table) * requests.worker.cache_pool.block_size,
                 )
             )
             if allocated:
@@ -460,35 +456,35 @@ def _build_warmup_batch(
                     write_kv=True,
                 ),
             )
-    height, width = image_geometry or _warmup_image_geometry(self)
+    height, width = image_geometry or _warmup_image_geometry(requests)
     latent_units = max(
         1,
-        (height // max(1, int(self.worker._layout.latent_downsample)))
-        * (width // max(1, int(self.worker._layout.latent_downsample))),
+        (height // max(1, int(requests.worker._layout.latent_downsample)))
+        * (width // max(1, int(requests.worker._layout.latent_downsample))),
     )
-    page_units = int(self.worker._info.latent_page_units)
+    page_units = int(requests.worker.info.latent_page_units)
     latent_page_count = (latent_units + page_units - 1) // page_units if page_units > 0 else 0
-    occupied_latent_pages = {page for pages in self._warmup_latent_pages.values() for page in pages}
+    occupied_latent_pages = {page for pages in requests._latent_pages.values() for page in pages}
     for operation in operations:
         if operation.kind not in {
             OpCode.DIFFUSION_PREPARE,
             OpCode.DIFFUSION_STEP,
         } and not any(product.kind is ProductKind.LATENT for product in operation.inputs):
             continue
-        page_table = self._warmup_latent_pages.setdefault(operation.request_key, [])
+        page_table = requests._latent_pages.setdefault(operation.request_key, [])
         missing = latent_page_count - len(page_table)
         if missing < 0:
             raise invalid_descriptor("warmup latent allocation regresses its physical extent")
         allocated = tuple(
             page
-            for page in range(1, int(self.worker._info.latent_pages))
+            for page in range(1, int(requests.worker.info.latent_pages))
             if page not in occupied_latent_pages
         )[:missing]
         if len(allocated) != missing:
             raise invalid_descriptor("warmup latent allocation exceeds resident capacity")
         page_table.extend(allocated)
         occupied_latent_pages.update(allocated)
-        request = self.worker.requests.peek(int(operation.request_key.request_id))
+        request = requests.worker.requests.peek(int(operation.request_key.request_id))
         start_step = 0 if request is None else int(request.flow_step)
         latent_params[(operation.request_key, operation.op_id)] = LatentParams(
             request_key=operation.request_key,
@@ -504,7 +500,7 @@ def _build_warmup_batch(
         )
         if operation.kind is OpCode.DIFFUSION_STEP:
             extra_tables, extra_allocations, flow_rows = _warmup_flow_tables(
-                self,
+                requests,
                 operation,
                 request_pool_indices[operation.request_key],
                 height,
@@ -518,7 +514,7 @@ def _build_warmup_batch(
             )
             forward_rows[identity] = flow_rows
     return _warmup_batch(
-        run_id=self._warmup_run_id,
+        run_id=requests._run_id,
         admissions=admissions,
         operations=operations,
         block_tables=block_tables,
@@ -532,7 +528,7 @@ def _build_warmup_batch(
 
 
 def _warmup_flow_tables(
-    self: WarmupContext,
+    requests: _WarmupRequests,
     operation: Operation,
     main_slot: int,
     height: int,
@@ -544,9 +540,9 @@ def _warmup_flow_tables(
 ]:
     """Build alternative-prefix KV tables and forward rows for all active CFG branches."""
 
-    request = self.worker.requests.get(operation.request_key.request_id)
+    request = requests.worker.requests.get(operation.request_key.request_id)
     image = request.image
-    generation = self.worker.model.generation
+    generation = requests.worker.model.generation
     if image is None or generation is None:
         raise invalid_descriptor("generation warmup has no admitted image runtime")
     guide = build_flow_cfg_plan(
@@ -568,7 +564,7 @@ def _warmup_flow_tables(
             image_prompt=image_prompt,
             negative_prompt=image.negative_prompt,
             negative_token_ids=request.negative_token_ids,
-            tokenizer=self.worker.tokenizer,
+            tokenizer=requests.worker.tokenizer,
         )
         branch_prefixes.append((prefix, copy_conditioning))
     alternatives = {
@@ -577,22 +573,22 @@ def _warmup_flow_tables(
     if len(alternatives) > 1:
         raise invalid_descriptor("warmup flow has multiple distinct alternative prefixes")
     alternative = next(iter(alternatives), ())
-    if self.worker.cache_pool is None:
+    if requests.worker.cache_pool is None:
         raise invalid_descriptor("warmup flow requires KV cache storage")
-    required = ceil_div(len(alternative), self.worker.cache_pool.block_size)
-    lease = self._warmup_prefix_pages.setdefault(operation.request_key, [])
+    required = ceil_div(len(alternative), requests.worker.cache_pool.block_size)
+    lease = requests._prefix_pages.setdefault(operation.request_key, [])
     missing = required - len(lease)
     occupied = {
         page
-        for request_key, pages in self._warmup_prefix_pages.items()
+        for request_key, pages in requests._prefix_pages.items()
         if request_key != operation.request_key
         for page in pages
     }
-    occupied.update(page for pages in self._warmup_kv_pages.values() for page in pages)
+    occupied.update(page for pages in requests._kv_pages.values() for page in pages)
     # Prefix pages persist across warmup shapes so graph capture observes stable tables.
-    allocated = tuple(page for page in self.worker.cache_pool.page_ids(0) if page not in occupied)[
-        :missing
-    ]
+    allocated = tuple(
+        page for page in requests.worker.cache_pool.page_ids(0) if page not in occupied
+    )[:missing]
     if len(allocated) != missing:
         raise invalid_descriptor("warmup alternative prefix exceeds KV capacity")
     lease.extend(allocated)
@@ -601,9 +597,9 @@ def _warmup_flow_tables(
     alternative_slot = main_slot
     rows: list[RowGeometry] = []
     if alternative:
-        alternative_slot = self._warmup_prefix_slots.setdefault(
+        alternative_slot = requests._prefix_slots.setdefault(
             operation.request_key,
-            int(self.worker._info.request_slots) - len(self._warmup_prefix_slots),
+            int(requests.worker.info.request_slots) - len(requests._prefix_slots),
         )
         if alternative_slot == main_slot or alternative_slot < 1:
             raise invalid_descriptor("warmup has no request slot for an alternative prefix")
@@ -612,7 +608,7 @@ def _warmup_flow_tables(
                 request_pool_idx=alternative_slot,
                 group_id=0,
                 page_ids=tuple(lease),
-                allocated_tokens=len(lease) * self.worker.cache_pool.block_size,
+                allocated_tokens=len(lease) * requests.worker.cache_pool.block_size,
             ),
         )
         if allocated:
@@ -646,61 +642,51 @@ def _warmup_flow_tables(
     return tables, allocations, tuple(rows)
 
 
-def warmup(self: WarmupContext) -> None:
-    """Complete capability-selected pre-admission kernel work.
+def warmup_requests(worker: Worker) -> None:
+    """Exercise synthetic requests through the configured execution paths.
 
-    The ``fa4_cute`` attention backend JIT-compiles its CUTLASS kernels the
-    first time each variant runs, costing tens of seconds on the first real
-    request. Representative operations run through the real execution path;
-    startup succeeds only after every configured warmup completes and its
-    private collective identities are retired.
+    Successful scenarios retire their requests before returning. If execution
+    fails, leave resource release to the enclosing Worker scope instead of
+    issuing more execution commands that could replace the startup error.
     """
 
+    requests = _WarmupRequests(worker)
     product_devices = (
-        self.worker.worker_config.device,
-        self.worker.worker_config.generation_device or self.worker.worker_config.device,
+        worker.worker_config.device,
+        worker.worker_config.generation_device or worker.worker_config.device,
     )
-    self.worker.device_products.warmup_scattered_publication(product_devices)
-    if torch.device(self.worker.worker_config.device).type == "cuda":
-        if OpCode.AR_EXTEND in self.worker._effective_work_variants:
-            _warmup_sequence(self)
-            logger.info("completed token numerical warmup and configured captures")
-        if isinstance(self.worker.model.generation, GenerationPipeline):
-            _warmup_flow(self)
-            logger.info("completed flow numerical warmup and configured captures")
-    elif self.worker.runner.mixed_captures:
-        _warmup_flow(self)
+    worker.device_products.warmup_scattered_publication(product_devices)
+    if torch.device(worker.worker_config.device).type == "cuda":
+        if OpCode.AR_EXTEND in worker.info.supported_ops:
+            _warmup_tokens(requests)
+            logger.info("completed token runtime warmup")
+        if isinstance(worker.model.generation, GenerationPipeline):
+            _warmup_flow(requests)
+            logger.info("completed flow runtime warmup")
+    elif worker.runner.mixed_captures:
+        _warmup_flow(requests)
         logger.info("completed mixed execution warmup")
 
 
-def _warmup_image_geometry(self: WarmupContext) -> tuple[int, int]:
+def _warmup_image_geometry(requests: _WarmupRequests) -> tuple[int, int]:
     """Derive the largest square image whose latent grid fits the declared capacity."""
 
-    import math
-
-    downsample = max(1, int(self.worker._layout.latent_downsample))
-    capacity = int(self.worker._info.latent_capacity_units)
-    if int(self.worker._layout.max_vae_grid_tokens) > 0:
-        capacity = min(capacity, int(self.worker._layout.max_vae_grid_tokens))
+    downsample = max(1, int(requests.worker._layout.latent_downsample))
+    capacity = int(requests.worker.info.latent_capacity_units)
+    if int(requests.worker._layout.max_vae_grid_tokens) > 0:
+        capacity = min(capacity, int(requests.worker._layout.max_vae_grid_tokens))
     side = max(1, math.isqrt(max(1, capacity)))
     return side * downsample, side * downsample
 
 
-def _warmup_sequence(self: WarmupContext) -> None:
-    """Warm the real token forward paths and capture the configured graphs.
-
-    One prompt extend across the largest configured decode batch pays the
-    first-use kernel JIT; the paged-prefill CUDA graph is captured for
-    every configured token bucket; the decode CUDA graph is captured for
-    every configured batch size (two rounds each: capture, then replay).
-    """
+def _warmup_tokens(requests: _WarmupRequests) -> None:
+    """Exercise extend-to-decode token handoff and release its synthetic request."""
 
     from ..execution.batch import (
         ArRequestParams,
         Bounds,
         Checkpoint,
         DeviceSelected,
-        Domain,
         DType,
         FixedCheckpoint,
         NewRequest,
@@ -717,39 +703,15 @@ def _warmup_sequence(self: WarmupContext) -> None:
         encode_token_product_bytes,
     )
 
-    variants = self.worker._effective_work_variants
+    variants = requests.worker.info.supported_ops
     if OpCode.AR_EXTEND not in variants:
         return
-    pool = self.worker.cache_pool
+    pool = requests.worker.cache_pool
     if pool is None:
         raise invalid_descriptor("autoregressive warmup requires KV cache storage")
-    if self.worker.requests.request_ids():
+    if requests.worker.requests.request_ids():
         return
-    if self.worker.worker_config.cuda_graph and self.worker.worker_config.prefill_cuda_graph:
-        _warmup_prefill_graphs(self)
-    configured = (
-        tuple(
-            sorted(
-                {
-                    batch_size
-                    for lane_runtime in self.worker.runner.execution_lanes
-                    if Domain.DECODE in lane_runtime.domains
-                    for batch_size in lane_runtime.graphs.decode_batch_sizes
-                }
-            )
-        )
-        if (self.worker.worker_config.cuda_graph and OpCode.AR_DECODE in variants)
-        else (1,)
-    )
-    batch_sizes = tuple(
-        sorted(
-            {int(value) for value in configured if 0 < int(value) < int(pool.num_pages)},
-            reverse=True,
-        )
-    )
-    if not batch_sizes:
-        return
-    logger.info("warming %d decode CUDA graph executables", len(batch_sizes))
+    batch_sizes = (1,)
     request_ids = tuple(range(1, max(batch_sizes) + 1))
     keys = {sid: RequestKey(0, sid, 1) for sid in request_ids}
     admissions = {
@@ -825,198 +787,60 @@ def _warmup_sequence(self: WarmupContext) -> None:
 
     op_ids = {sid: 0 for sid in request_ids}
     predecessors: dict[int, Operation] = {}
-    try:
-        operations = []
-        payloads = []
-        for sid in request_ids:
-            root = Checkpoint(0, FixedCheckpoint(0))
-            op_ids[sid] += 1
-            operation, payload = prompt_op(sid, op_ids[sid], root, (0,))
-            operations.append(operation)
-            payloads.append(payload)
-        _execute_warmup(
-            self,
-            _build_warmup_batch(
-                self,
-                admissions=tuple(admissions[sid] for sid in request_ids),
-                operations=tuple(operations),
-                input_products=tuple(payloads),
-            ),
-            retain_device_outputs=OpCode.AR_DECODE in variants,
-        )
-        predecessors.update(zip(request_ids, operations, strict=True))
-        if OpCode.AR_DECODE not in variants:
-            return
-        repeats = 2 if self.worker.worker_config.cuda_graph else 1
-        for _ in range(repeats):
-            for batch_size in batch_sizes:
-                selected = request_ids[:batch_size]
-                operations = []
-                for sid in selected:
-                    op_ids[sid] += 1
-                    operations.append(decode_op(sid, op_ids[sid], predecessors[sid]))
-                _execute_warmup(
-                    self,
-                    _build_warmup_batch(
-                        self,
-                        admissions=(),
-                        operations=tuple(operations),
-                    ),
-                    retain_device_outputs=True,
-                )
-                self.free_products(
-                    tuple(
-                        output.buffer_id
-                        for sid in selected
-                        for output in predecessors[sid].outputs
-                        if output.storage_class
-                        in {StorageClass.DEVICE_TENSOR, StorageClass.REQUEST_RELAY}
-                    )
-                )
-                predecessors.update(zip(selected, operations, strict=True))
-    finally:
-        device = torch.device(self.worker.worker_config.device)
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-        for sid in request_ids:
-            self.drop_request(sid)
-
-
-def _warmup_prefill_graphs(self: WarmupContext) -> None:
-    """Capture the paged-prefill CUDA graph for every configured token bucket."""
-
-    from ..execution.batch import (
-        ArRequestParams,
-        Bounds,
-        Checkpoint,
-        DType,
-        FixedCheckpoint,
-        NewRequest,
-        Operation,
-        PointRange,
-        ProductKind,
-        ProductPayload,
-        ProductRef,
-        RequestKey,
-        SamplingParams,
-        ShapeBound,
-        StaticDim,
-        StorageClass,
-        encode_token_product_bytes,
+    operations = []
+    payloads = []
+    for sid in request_ids:
+        root = Checkpoint(0, FixedCheckpoint(0))
+        op_ids[sid] += 1
+        operation, payload = prompt_op(sid, op_ids[sid], root, (0,))
+        operations.append(operation)
+        payloads.append(payload)
+    _execute_warmup(
+        requests,
+        _build_warmup_batch(
+            requests,
+            admissions=tuple(admissions[sid] for sid in request_ids),
+            operations=tuple(operations),
+            input_products=tuple(payloads),
+        ),
+        retain_device_outputs=OpCode.AR_DECODE in variants,
     )
-
-    pool = self.worker.cache_pool
-    if pool is None:
-        raise invalid_descriptor("prefill warmup requires KV cache storage")
-    if self.worker.requests.request_ids():
-        return
-    max_route_tokens = int(self.worker.model.text_max_tokens)
-    capacity = min(
-        max_route_tokens,
-        max(0, int(pool.num_pages) - 1) * int(pool.block_size),
-    )
-    token_buckets = tuple(
-        sorted(
-            {
-                int(value)
-                for value in self.worker.runner.prefill_tokens
-                if 0 < int(value) <= capacity
-            },
-            reverse=True,
-        )
-    )
-    if not token_buckets:
-        return
-    catalog = (
-        tuple(PrefillCapture(value, 1, 1) for value in token_buckets)
-        if self.worker.model.tensorized_mixed
-        else select_prefill_captures(
-            token_buckets,
-            self.worker.runner.prefill_rows,
-            max_rows=int(self.worker._info.request_slots),
-            max_tokens=capacity,
-        )
-    )
-    catalog = tuple(
-        sorted(
-            catalog,
-            key=lambda value: (value.token_bucket * value.row_bucket, value.token_bucket),
-            reverse=True,
-        )
-    )
-    logger.info("warming %d paged-prefill CUDA graph executables", len(catalog))
-    request_id = 0
-    # First warm every configured physical call in descending footprint,
-    # then capture every bucket in the same order.
-    for _ in range(2):
-        for bucket in catalog:
-            live_rows = bucket.live_rows
-            token_counts = (
-                bucket.token_bucket - live_rows + 1,
-                *(1 for _ in range(live_rows - 1)),
+    predecessors.update(zip(request_ids, operations, strict=True))
+    if OpCode.AR_DECODE in variants:
+        for batch_size in batch_sizes:
+            selected = request_ids[:batch_size]
+            operations = []
+            for sid in selected:
+                op_ids[sid] += 1
+                operations.append(decode_op(sid, op_ids[sid], predecessors[sid]))
+            _execute_warmup(
+                requests,
+                _build_warmup_batch(
+                    requests,
+                    admissions=(),
+                    operations=tuple(operations),
+                ),
+                retain_device_outputs=True,
             )
-            admissions: list[NewRequest] = []
-            operations: list[Operation] = []
-            input_products: list[ProductPayload] = []
-            active_requests: list[int] = []
-            for row, token_count in enumerate(token_counts):
-                tokens = (0,) * token_count
-                request_id += 1
-                active_requests.append(request_id)
-                rk = RequestKey(0, request_id, 1)
-                admission = NewRequest.create(
-                    rk,
-                    request_pool_idx=row + 1,
-                    ar=ArRequestParams(
-                        sampling=SamplingParams(temperature=0.0, ignore_eos=True),
-                        initial_position=0,
-                    ),
+            requests.free_products(
+                tuple(
+                    output.buffer_id
+                    for sid in selected
+                    for output in predecessors[sid].outputs
+                    if output.storage_class
+                    in {StorageClass.DEVICE_TENSOR, StorageClass.REQUEST_RELAY}
                 )
-                token_ref = ProductRef(
-                    request_key=rk,
-                    producer_op_id=1,
-                    output_index=(1 << 16) - 1,
-                    generation=1,
-                    kind=ProductKind.TOKEN,
-                    storage_class=StorageClass.HOST_STAGING,
-                    dtype=DType.U32,
-                    shape_bound=ShapeBound((StaticDim(token_count),)),
-                    point_range=PointRange(),
-                )
-                operations.append(
-                    Operation.registered(
-                        request_key=rk,
-                        op_id=1,
-                        parent=Checkpoint(0, FixedCheckpoint(0)),
-                        kind=OpCode.AR_EXTEND,
-                        bounds=Bounds(max_points=1, max_tokens=token_count),
-                        inputs=(token_ref,),
-                        outputs=_warmup_token_outputs(rk, 1, 2),
-                    )
-                )
-                admissions.append(admission)
-                input_products.append(
-                    ProductPayload(
-                        product=token_ref,
-                        payload=encode_token_product_bytes(tokens),
-                    )
-                )
-            try:
-                _execute_warmup(
-                    self,
-                    _build_warmup_batch(
-                        self,
-                        admissions=tuple(admissions),
-                        operations=tuple(operations),
-                        input_products=tuple(input_products),
-                    ),
-                )
-            finally:
-                for active_request in active_requests:
-                    self.drop_request(active_request)
+            )
+            predecessors.update(zip(selected, operations, strict=True))
+
+    device = torch.device(requests.worker.worker_config.device)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    for sid in request_ids:
+        requests.drop_request(sid)
 
 
-def _warmup_flow(self: WarmupContext) -> None:
+def _warmup_flow(requests: _WarmupRequests) -> None:
     """Drive one denoise quantum through the real flow forward path."""
 
     from ..execution.batch import (
@@ -1044,38 +868,29 @@ def _warmup_flow(self: WarmupContext) -> None:
         encode_token_product_bytes,
     )
 
-    generation = self.worker.model.generation
+    generation = requests.worker.model.generation
     if not {
         OpCode.DIFFUSION_PREPARE,
         OpCode.DIFFUSION_STEP,
-    }.issubset(self.worker._effective_work_variants) or not isinstance(
+    }.issubset(requests.worker.info.supported_ops) or not isinstance(
         generation, GenerationPipeline
     ):
         return
-    if self.worker.requests.request_ids():
+    if requests.worker.requests.request_ids():
         return
-    # Largest buckets run first so resident graph memory pressure is resolved early.
+    # One scenario per CFG execution branch; numerical shape catalogs belong
+    # to the execution owners and are already resident before these requests.
     configured = tuple(
-        sorted(
-            self.worker.runner.flow_captures,
-            key=lambda value: (
-                value.rows * value.height * value.width * value.cfg_branches,
-                value.rows,
-                value.height,
-                value.width,
-                value.cfg_branches,
+        next(
+            (
+                shape
+                for shape in reversed(requests.worker.runner.flow_captures)
+                if shape.cfg_branches == branches
             ),
-            reverse=True,
+            FlowCapture(1, *_warmup_image_geometry(requests), branches),
         )
+        for branches in requests.worker.runner.flow_cfg_branches
     )
-    if not configured:
-        if self.worker.worker_config.cuda_graph:
-            return
-        height, width = _warmup_image_geometry(self)
-        configured = tuple(
-            FlowCapture(1, height, width, cfg_branches)
-            for cfg_branches in self.worker._flow_cfg_branches
-        )
     # Warmup identities and generations are private to this bounded startup sequence.
     next_request_id = 1
     next_generation = 1
@@ -1084,22 +899,19 @@ def _warmup_flow(self: WarmupContext) -> None:
         height = bucket.height
         width = bucket.width
         cfg_branches = bucket.cfg_branches
-        if batch_size > int(self.worker._info.request_slots):
+        if batch_size > int(requests.worker.info.request_slots):
             continue
         mixed_text_sizes = tuple(
-            mixed.decode_rows
-            for mixed in self.worker.runner.mixed_captures
-            if mixed.flow_rows == batch_size
-            and mixed.height == height
-            and mixed.width == width
-            and mixed.cfg_branches == cfg_branches
-            and mixed.decode_rows + batch_size <= int(self.worker._info.request_slots)
-        )
-        mixed_rounds = (
-            3
-            if self.worker.worker_config.cuda_graph and self.worker.worker_config.prefill_cuda_graph
-            else 1
-        )
+            dict.fromkeys(
+                mixed.decode_rows
+                for mixed in requests.worker.runner.mixed_captures
+                if mixed.flow_rows == batch_size
+                and mixed.height == height
+                and mixed.width == width
+                and mixed.cfg_branches == cfg_branches
+            )
+        )[:1]
+        mixed_rounds = 1
         request_ids = tuple(range(next_request_id, next_request_id + batch_size))
         next_request_id += batch_size
         keys = tuple(RequestKey(0, request_id, 1) for request_id in request_ids)
@@ -1163,81 +975,141 @@ def _warmup_flow(self: WarmupContext) -> None:
                     outputs=(conditioning,),
                 )
             )
-        try:
+        _execute_warmup(
+            requests,
+            _build_warmup_batch(
+                requests,
+                admissions=admissions,
+                operations=tuple(publications),
+                image_geometry=(height, width),
+            ),
+        )
+        text_predecessors: dict[int, Operation] = {}
+        text_op_ids = {request_id: 1 for request_id in text_request_ids}
+        if text_request_ids:
+            prompt_operations: list[Operation] = []
+            prompt_payloads: list[ProductPayload] = []
+            for request_id in text_request_ids:
+                key = text_keys[request_id]
+                token_ref = ProductRef(
+                    request_key=key,
+                    producer_op_id=1,
+                    output_index=(1 << 16) - 1,
+                    generation=next_generation,
+                    kind=ProductKind.TOKEN,
+                    storage_class=StorageClass.HOST_STAGING,
+                    dtype=DType.U32,
+                    shape_bound=ShapeBound((StaticDim(1),)),
+                    point_range=PointRange(),
+                )
+                next_generation += 1
+                prompt_outputs = _warmup_token_outputs(key, 1, next_generation)
+                next_generation += len(prompt_outputs)
+                operation = Operation.registered(
+                    request_key=key,
+                    op_id=1,
+                    parent=Checkpoint(
+                        0,
+                        FixedCheckpoint(0),
+                    ),
+                    kind=OpCode.AR_EXTEND,
+                    bounds=Bounds(max_points=1, max_tokens=1),
+                    inputs=(token_ref,),
+                    outputs=prompt_outputs,
+                )
+                prompt_operations.append(operation)
+                prompt_payloads.append(
+                    ProductPayload(
+                        product=token_ref,
+                        payload=encode_token_product_bytes((0,)),
+                    )
+                )
             _execute_warmup(
-                self,
+                requests,
                 _build_warmup_batch(
-                    self,
-                    admissions=admissions,
-                    operations=tuple(publications),
+                    requests,
+                    admissions=tuple(
+                        text_admissions[request_id] for request_id in text_request_ids
+                    ),
+                    operations=tuple(prompt_operations),
+                    input_products=tuple(prompt_payloads),
                     image_geometry=(height, width),
                 ),
+                retain_device_outputs=True,
             )
-            text_predecessors: dict[int, Operation] = {}
-            text_op_ids = {request_id: 1 for request_id in text_request_ids}
-            if text_request_ids:
-                prompt_operations: list[Operation] = []
-                prompt_payloads: list[ProductPayload] = []
-                for request_id in text_request_ids:
-                    key = text_keys[request_id]
-                    token_ref = ProductRef(
-                        request_key=key,
-                        producer_op_id=1,
-                        output_index=(1 << 16) - 1,
-                        generation=next_generation,
-                        kind=ProductKind.TOKEN,
-                        storage_class=StorageClass.HOST_STAGING,
-                        dtype=DType.U32,
-                        shape_bound=ShapeBound((StaticDim(1),)),
-                        point_range=PointRange(),
-                    )
-                    next_generation += 1
-                    prompt_outputs = _warmup_token_outputs(key, 1, next_generation)
-                    next_generation += len(prompt_outputs)
-                    operation = Operation.registered(
-                        request_key=key,
-                        op_id=1,
-                        parent=Checkpoint(
-                            0,
-                            FixedCheckpoint(0),
-                        ),
-                        kind=OpCode.AR_EXTEND,
-                        bounds=Bounds(max_points=1, max_tokens=1),
-                        inputs=(token_ref,),
-                        outputs=prompt_outputs,
-                    )
-                    prompt_operations.append(operation)
-                    prompt_payloads.append(
-                        ProductPayload(
-                            product=token_ref,
-                            payload=encode_token_product_bytes((0,)),
-                        )
-                    )
-                _execute_warmup(
-                    self,
-                    _build_warmup_batch(
-                        self,
-                        admissions=tuple(
-                            text_admissions[request_id] for request_id in text_request_ids
-                        ),
-                        operations=tuple(prompt_operations),
-                        input_products=tuple(prompt_payloads),
-                        image_geometry=(height, width),
-                    ),
-                    retain_device_outputs=True,
-                    catalog_graphs=False,
-                )
-                text_predecessors.update(zip(text_request_ids, prompt_operations, strict=True))
-            max_latent_elements = max(
-                1,
-                math.prod(generation.latent_shape(height, width)),
+            text_predecessors.update(zip(text_request_ids, prompt_operations, strict=True))
+        max_latent_elements = max(
+            1,
+            math.prod(generation.latent_shape(height, width)),
+        )
+        initial_latents: list[ProductRef] = []
+        transitions: list[Operation] = []
+        for key, root, conditioning in zip(keys, roots, conditionings, strict=True):
+            initial_latent = ProductRef(
+                request_key=key,
+                producer_op_id=2,
+                output_index=0,
+                generation=next_generation,
+                kind=ProductKind.LATENT,
+                storage_class=StorageClass.LATENT_ARENA,
+                dtype=DType.BF16,
+                shape_bound=ShapeBound((DeviceDim(max_latent_elements),)),
+                point_range=PointRange(),
             )
-            initial_latents: list[ProductRef] = []
-            transitions: list[Operation] = []
-            for key, root, conditioning in zip(keys, roots, conditionings, strict=True):
-                initial_latent = ProductRef(
+            next_generation += 1
+            ready = ProductRef(
+                request_key=key,
+                producer_op_id=2,
+                output_index=1,
+                generation=next_generation,
+                kind=ProductKind.COMPLETION,
+                storage_class=StorageClass.REQUEST_RELAY,
+                dtype=DType.U32,
+                shape_bound=ShapeBound((StaticDim(1),)),
+                point_range=PointRange(),
+            )
+            next_generation += 1
+            initial_latents.append(initial_latent)
+            transitions.append(
+                Operation.registered(
                     request_key=key,
-                    producer_op_id=2,
+                    op_id=2,
+                    parent=root,
+                    kind=OpCode.DIFFUSION_PREPARE,
+                    bounds=Bounds(
+                        max_points=1,
+                        max_tokens=1,
+                        max_latent_bytes=max_latent_elements * 2,
+                    ),
+                    inputs=(conditioning,),
+                    outputs=(initial_latent, ready),
+                    rng=Rng(
+                        seed=0,
+                        semantic_index_base=1,
+                        draw_layout=DrawLayout.FLOW_NOISE,
+                    ),
+                )
+            )
+        _execute_warmup(
+            requests,
+            _build_warmup_batch(
+                requests,
+                admissions=(),
+                operations=tuple(transitions),
+                image_geometry=(height, width),
+            ),
+        )
+        current_latents = tuple(initial_latents)
+        flow_predecessors = dict(zip(request_ids, transitions, strict=True))
+        for op_id in (3, 4):
+            outputs: list[ProductRef] = []
+            flows: list[Operation] = []
+            for request_id, key, conditioning, current in zip(
+                request_ids, keys, conditionings, current_latents, strict=True
+            ):
+                output = ProductRef(
+                    request_key=key,
+                    producer_op_id=op_id,
                     output_index=0,
                     generation=next_generation,
                     kind=ProductKind.LATENT,
@@ -1247,59 +1119,80 @@ def _warmup_flow(self: WarmupContext) -> None:
                     point_range=PointRange(),
                 )
                 next_generation += 1
-                ready = ProductRef(
-                    request_key=key,
-                    producer_op_id=2,
-                    output_index=1,
-                    generation=next_generation,
-                    kind=ProductKind.COMPLETION,
-                    storage_class=StorageClass.REQUEST_RELAY,
-                    dtype=DType.U32,
-                    shape_bound=ShapeBound((StaticDim(1),)),
-                    point_range=PointRange(),
-                )
-                next_generation += 1
-                initial_latents.append(initial_latent)
-                transitions.append(
+                outputs.append(output)
+                flows.append(
                     Operation.registered(
                         request_key=key,
-                        op_id=2,
-                        parent=root,
-                        kind=OpCode.DIFFUSION_PREPARE,
+                        op_id=op_id,
+                        parent=Checkpoint(
+                            flow_predecessors[request_id].op_id,
+                            DeviceSelected(),
+                        ),
+                        kind=OpCode.DIFFUSION_STEP,
                         bounds=Bounds(
                             max_points=1,
                             max_tokens=1,
                             max_latent_bytes=max_latent_elements * 2,
                         ),
-                        inputs=(conditioning,),
-                        outputs=(initial_latent, ready),
-                        rng=Rng(
-                            seed=0,
-                            semantic_index_base=1,
-                            draw_layout=DrawLayout.FLOW_NOISE,
-                        ),
+                        inputs=(conditioning, current),
+                        outputs=(output,),
                     )
                 )
             _execute_warmup(
-                self,
+                requests,
                 _build_warmup_batch(
-                    self,
+                    requests,
                     admissions=(),
-                    operations=tuple(transitions),
+                    operations=tuple(flows),
                     image_geometry=(height, width),
                 ),
             )
-            current_latents = tuple(initial_latents)
-            flow_predecessors = dict(zip(request_ids, transitions, strict=True))
-            for op_id in (3, 4):
-                outputs: list[ProductRef] = []
-                flows: list[Operation] = []
+            requests.free_products(tuple(product.buffer_id for product in current_latents))
+            current_latents = tuple(outputs)
+            flow_predecessors.update(zip(request_ids, flows, strict=True))
+        flow_op_id = 5
+        for text_batch_size in mixed_text_sizes:
+            selected_text = text_request_ids[:text_batch_size]
+            for _ in range(mixed_rounds):
+                text_operations: list[Operation] = []
+                for request_id in selected_text:
+                    predecessor = text_predecessors[request_id]
+                    token_output = next(
+                        output for output in predecessor.outputs if output.kind is ProductKind.TOKEN
+                    )
+                    text_op_ids[request_id] += 1
+                    op_id = text_op_ids[request_id]
+                    token_outputs = _warmup_token_outputs(
+                        text_keys[request_id], op_id, next_generation
+                    )
+                    next_generation += len(token_outputs)
+                    text_operations.append(
+                        Operation.registered(
+                            request_key=text_keys[request_id],
+                            op_id=op_id,
+                            parent=Checkpoint(
+                                predecessor.op_id,
+                                DeviceSelected(),
+                            ),
+                            kind=OpCode.AR_DECODE,
+                            bounds=Bounds(max_points=1, max_tokens=1),
+                            outputs=token_outputs,
+                            predicate=token_output,
+                        )
+                    )
+
+                flow_outputs: list[ProductRef] = []
+                flow_operations: list[Operation] = []
                 for request_id, key, conditioning, current in zip(
-                    request_ids, keys, conditionings, current_latents, strict=True
+                    request_ids,
+                    keys,
+                    conditionings,
+                    current_latents,
+                    strict=True,
                 ):
                     output = ProductRef(
                         request_key=key,
-                        producer_op_id=op_id,
+                        producer_op_id=flow_op_id,
                         output_index=0,
                         generation=next_generation,
                         kind=ProductKind.LATENT,
@@ -1309,11 +1202,11 @@ def _warmup_flow(self: WarmupContext) -> None:
                         point_range=PointRange(),
                     )
                     next_generation += 1
-                    outputs.append(output)
-                    flows.append(
+                    flow_outputs.append(output)
+                    flow_operations.append(
                         Operation.registered(
                             request_key=key,
-                            op_id=op_id,
+                            op_id=flow_op_id,
                             parent=Checkpoint(
                                 flow_predecessors[request_id].op_id,
                                 DeviceSelected(),
@@ -1328,116 +1221,31 @@ def _warmup_flow(self: WarmupContext) -> None:
                             outputs=(output,),
                         )
                     )
+                flow_op_id += 1
                 _execute_warmup(
-                    self,
+                    requests,
                     _build_warmup_batch(
-                        self,
+                        requests,
                         admissions=(),
-                        operations=tuple(flows),
+                        operations=(*text_operations, *flow_operations),
+                        tensorized_mixed=True,
                         image_geometry=(height, width),
                     ),
+                    retain_device_outputs=True,
                 )
-                self.free_products(tuple(product.buffer_id for product in current_latents))
-                current_latents = tuple(outputs)
-                flow_predecessors.update(zip(request_ids, flows, strict=True))
-            flow_op_id = 5
-            for text_batch_size in mixed_text_sizes:
-                selected_text = text_request_ids[:text_batch_size]
-                for _ in range(mixed_rounds):
-                    text_operations: list[Operation] = []
-                    for request_id in selected_text:
-                        predecessor = text_predecessors[request_id]
-                        token_output = next(
-                            output
-                            for output in predecessor.outputs
-                            if output.kind is ProductKind.TOKEN
-                        )
-                        text_op_ids[request_id] += 1
-                        op_id = text_op_ids[request_id]
-                        token_outputs = _warmup_token_outputs(
-                            text_keys[request_id], op_id, next_generation
-                        )
-                        next_generation += len(token_outputs)
-                        text_operations.append(
-                            Operation.registered(
-                                request_key=text_keys[request_id],
-                                op_id=op_id,
-                                parent=Checkpoint(
-                                    predecessor.op_id,
-                                    DeviceSelected(),
-                                ),
-                                kind=OpCode.AR_DECODE,
-                                bounds=Bounds(max_points=1, max_tokens=1),
-                                outputs=token_outputs,
-                                predicate=token_output,
-                            )
-                        )
+                requests.free_products(
+                    tuple(
+                        output.buffer_id
+                        for request_id in selected_text
+                        for output in text_predecessors[request_id].outputs
+                        if output.storage_class
+                        in {StorageClass.DEVICE_TENSOR, StorageClass.REQUEST_RELAY}
+                    )
+                )
+                text_predecessors.update(zip(selected_text, text_operations, strict=True))
+                requests.free_products(tuple(product.buffer_id for product in current_latents))
+                current_latents = tuple(flow_outputs)
+                flow_predecessors.update(zip(request_ids, flow_operations, strict=True))
 
-                    flow_outputs: list[ProductRef] = []
-                    flow_operations: list[Operation] = []
-                    for request_id, key, conditioning, current in zip(
-                        request_ids,
-                        keys,
-                        conditionings,
-                        current_latents,
-                        strict=True,
-                    ):
-                        output = ProductRef(
-                            request_key=key,
-                            producer_op_id=flow_op_id,
-                            output_index=0,
-                            generation=next_generation,
-                            kind=ProductKind.LATENT,
-                            storage_class=StorageClass.LATENT_ARENA,
-                            dtype=DType.BF16,
-                            shape_bound=ShapeBound((DeviceDim(max_latent_elements),)),
-                            point_range=PointRange(),
-                        )
-                        next_generation += 1
-                        flow_outputs.append(output)
-                        flow_operations.append(
-                            Operation.registered(
-                                request_key=key,
-                                op_id=flow_op_id,
-                                parent=Checkpoint(
-                                    flow_predecessors[request_id].op_id,
-                                    DeviceSelected(),
-                                ),
-                                kind=OpCode.DIFFUSION_STEP,
-                                bounds=Bounds(
-                                    max_points=1,
-                                    max_tokens=1,
-                                    max_latent_bytes=max_latent_elements * 2,
-                                ),
-                                inputs=(conditioning, current),
-                                outputs=(output,),
-                            )
-                        )
-                    flow_op_id += 1
-                    _execute_warmup(
-                        self,
-                        _build_warmup_batch(
-                            self,
-                            admissions=(),
-                            operations=(*text_operations, *flow_operations),
-                            tensorized_mixed=True,
-                            image_geometry=(height, width),
-                        ),
-                        retain_device_outputs=True,
-                    )
-                    self.free_products(
-                        tuple(
-                            output.buffer_id
-                            for request_id in selected_text
-                            for output in text_predecessors[request_id].outputs
-                            if output.storage_class
-                            in {StorageClass.DEVICE_TENSOR, StorageClass.REQUEST_RELAY}
-                        )
-                    )
-                    text_predecessors.update(zip(selected_text, text_operations, strict=True))
-                    self.free_products(tuple(product.buffer_id for product in current_latents))
-                    current_latents = tuple(flow_outputs)
-                    flow_predecessors.update(zip(request_ids, flow_operations, strict=True))
-        finally:
-            for request_id in (*request_ids, *text_request_ids):
-                self.drop_request(request_id)
+        for request_id in (*request_ids, *text_request_ids):
+            requests.drop_request(request_id)

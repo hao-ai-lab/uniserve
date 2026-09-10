@@ -68,3 +68,20 @@ The physical verification matrix covers GB200 with two and four participating de
 Floating-point equivalence is evaluated with dtype-appropriate error bounds and model quality. Implementations may fuse operations and choose different reduction orders; no model requires bitwise reproduction of a particular provider or GPU topology. Data transport and integer control metadata retain their exact contracts.
 
 Mixed-batch startup measures service time to select useful execution geometries. It does not require identical greedy tokens or compare full-model outputs using a single operator's dtype tolerance. Numerical conformance is verified separately against independent references; small score changes near a tie may change greedy selection.
+
+## Worker computation resources
+
+A worker's logical domains (`decode`, `prefill`, and `flow`) resolve to physical computation bindings during construction. Without `--lane`, they use the existing full-device execution stream. An explicit Lane reserves a Green Context and SM quota; domains assigned to the same Lane share one PackedRunner, its staging, and its graph backend. Separate Lanes have independent mutable computation storage and NCCL communicators. The explicit-stream NCCL provider keeps communication kernels inside the assigned Green Context during eager execution and capture. ModelRunner owns grouping and synchronization within the scheduler's submitted logical launch constraints.
+
+The following server options configure a shared 152-SM binding or independent 64/88-SM bindings on a device supporting those quotas:
+
+```bash
+--lane '{"lane_id":"compute","sm_budget":152,"domains":["decode","prefill","flow"]}'
+
+--lane '{"lane_id":"decode","sm_budget":64,"domains":["decode"]}' \
+--lane '{"lane_id":"compute","sm_budget":88,"domains":["prefill","flow"]}'
+```
+
+The quotas are explicit configuration, validated against the target device at startup. Unsupported domains, overlapping assignments, or invalid quotas fail construction. Lane resources remain fixed until the worker closes. Warmup, capture, replay, and eager execution all use the configured bindings; graph policy does not change SM allocation. Use `--graph-policy full --prefill-cuda-graph true` for required capture, or `--graph-policy off --prefill-cuda-graph false` for eager execution. A required graph cannot silently fall back to eager execution.
+
+The [Worker lifecycle](worker-lifecycle.md) describes endpoint ownership, optional direct-execution warmup, and the scope that releases graphs and staging before physical Lane resources.

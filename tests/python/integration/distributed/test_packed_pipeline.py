@@ -5,7 +5,6 @@ from pathlib import Path
 
 import pytest
 import torch
-import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from uniserve_worker.backends.attention.fa4_cute import Fa4CuteAttentionBackend
@@ -448,7 +447,6 @@ def _run_pipeline(
             graph.reset()
         torch.cuda.synchronize(device)
         environment.close()
-        dist.destroy_process_group()
 
 
 def _compare_long_packed_rows(model, reference, architecture, device):

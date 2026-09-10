@@ -3,22 +3,24 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 import torch
 
-from uniserve_worker.config import WorkerConfig
-
+from ..config import WorkerConfig
 from ..execution.batch import DeviceDim, TensorSpec
 from ..execution.bounded_storage import TensorSchema
 from ..execution.input_buffers import InputGeometry
+from ..foundation.errors import unsupported_setup
 from ..foundation.math import ceil_div
 from ..models.generation import GenerationPipeline
 from ..models.inputs import FeatureLayout
 from ..models.runtime import ExecutionModel
 from ..nn.mesh import Communicator, EntryBindings
-from ..runtime.device_products import device_product_capacity_bytes
+from ..runtime.cache_pool import CachePool
+from ..runtime.device import canonical_device, device_memory_budget
+from ..runtime.device_products import DeviceProducts, device_product_capacity_bytes
 
 if TYPE_CHECKING:
     from ..models.video import MediaExecutionPlan
@@ -498,3 +500,105 @@ __all__ = [
     "model_arena_capacity",
     "operation_window",
 ]
+
+
+def resolve_request_capacity(
+    model: ExecutionModel,
+    worker_config: WorkerConfig,
+    *,
+    pipeline_depth: int,
+    capacity_group: Communicator | None,
+) -> WorkerConfig:
+    """Fit request tensors and their product arenas within the rank's fixed memory grant."""
+
+    if canonical_device(worker_config.device).type == "cuda":
+        available, _free = device_memory_budget(
+            worker_config.device, worker_config.kv_memory_fraction
+        )
+        worker_config = replace(worker_config, pool_memory_bytes=available)
+        schema = model.resource_geometry.request_tensors
+        if schema:
+            if capacity_group is None:
+                raise unsupported_setup("request tensor sizing requires its rank group")
+
+            def auxiliary_bytes(count: int) -> int:
+                capacity_config = replace(
+                    worker_config,
+                    max_request_pool_size=count,
+                    max_batch_operations=min(count, worker_config.max_batch_operations),
+                    max_batch_tokens=min(count, worker_config.max_batch_tokens),
+                )
+                product_bytes = local_product_storage_bytes(
+                    model.entry_outputs,
+                    bindings=model.bindings,
+                    plan=model.media_plan,
+                    max_unresolved_ops=request_tensor_window(pipeline_depth, count),
+                )
+                arena = request_tensor_arena_capacity(
+                    capacity_config,
+                    pipeline_depth=pipeline_depth,
+                    product_bytes_per_request=product_bytes,
+                )
+                return count * product_bytes + arena.device_product_bytes
+
+            slots = tensor_slot_capacity(
+                schema,
+                capacity_group,
+                maximum=min(worker_config.max_request_pool_size, pipeline_depth // 3),
+                minimum=worker_config.min_request_pool_size,
+                available_bytes=available,
+                auxiliary_bytes=auxiliary_bytes,
+            )
+            worker_config = replace(
+                worker_config,
+                max_request_pool_size=slots,
+                max_batch_operations=min(slots, worker_config.max_batch_operations),
+                max_batch_tokens=min(slots, worker_config.max_batch_tokens),
+            )
+    return worker_config
+
+
+def decode_context_blocks(
+    model: ExecutionModel, worker_config: WorkerConfig, pool: CachePool | None
+) -> int:
+    """Return the maximum paged-decode context blocks supported by this worker."""
+
+    if not model.resource_geometry.kv:
+        return 0
+    max_tokens = int(model.text_max_tokens)
+    if max_tokens < 1:
+        return 0
+    blocks = (max_tokens + int(worker_config.block_size) - 1) // int(worker_config.block_size)
+    if pool is None:
+        return 0
+    return min(blocks, max(0, int(pool.num_pages) - 1))
+
+
+def check_startup_memory(
+    worker_config: WorkerConfig, product_capacity_bytes: int, device_products: DeviceProducts
+) -> None:
+    """Check resident startup allocations and reserved products against device grants."""
+
+    # Warmup may retain backend plans and graph pools in addition to the
+    # explicit arenas. Readiness requires that these resident allocations
+    # leave room for every still-lazy public product within the same grant.
+    devices = tuple(
+        dict.fromkeys(
+            (
+                worker_config.device,
+                worker_config.generation_device or worker_config.device,
+            )
+        )
+    )
+    product_bytes = product_capacity_bytes // len(devices)
+    for device in devices:
+        if canonical_device(device).type != "cuda":
+            continue
+        available, free = device_memory_budget(device, worker_config.kv_memory_fraction)
+        total = device_total_bytes(device)
+        remaining = max(0, product_bytes - device_products.resident_bytes(device))
+        if remaining > available or total - free > int(total * worker_config.kv_memory_fraction):
+            raise unsupported_setup(
+                f"initialized runtime on {device} exceeds its static memory grant: "
+                f"{total - free} resident bytes and {remaining} reserved product bytes"
+            )

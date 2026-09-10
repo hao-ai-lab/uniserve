@@ -4,7 +4,6 @@ from pathlib import Path
 
 import pytest
 import torch
-import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 
@@ -18,16 +17,14 @@ from uniserve_worker.nn.linear import (
     RowParallelLinear,
 )
 from uniserve_worker.nn.mesh import DeviceMesh
-from uniserve_worker.nn.parallel import ParallelConfig, SequenceParallel
+from uniserve_worker.nn.parallel import EntryConfig, ParallelConfig, SequenceParallel
 from uniserve_worker.nn.vocab_parallel_embedding import VocabParallelEmbedding
-from uniserve_worker.runtime.distributed import (
-    init_distributed_environment,
-    initialize_model_parallel,
-)
+from uniserve_worker.runtime.distributed import init_distributed_environment
 
 pytestmark = pytest.mark.integration
 
 
+@torch.inference_mode()
 def _run_groups(rank: int, rendezvous: str, backend: str):
     device = f"cuda:{rank}" if backend == "nccl" else "cpu"
     environment = init_distributed_environment(
@@ -38,17 +35,26 @@ def _run_groups(rank: int, rendezvous: str, backend: str):
         backend=backend,
         init_method=rendezvous,
     )
-    meshes = initialize_model_parallel(
-        environment,
+    bindings = environment.initialize_entries(
         {
-            "denoiser": (
+            "denoiser": EntryConfig(
                 (0, 1, 2, 3),
                 ParallelConfig(2, sequence_parallel=SequenceParallel("ulysses", (2,))),
             ),
-            "encoder": ((3, 1), ParallelConfig(2)),
-            "output": ((2,), ParallelConfig()),
+            "encoder": EntryConfig((3, 1), ParallelConfig(2)),
+            "output": EntryConfig((2,)),
+            "decoder": EntryConfig((3, 1), distribution="temporal_units", units_per_rank=2),
         },
     )
+    meshes = bindings.meshes
+    assert bindings.input_ranks("decoder") == (3, 1)
+    assert bindings.output_ranks("decoder") == (3, 1)
+    assert bindings.owns("decoder") == (rank in (3, 1))
+    if bindings.owns("decoder"):
+        value = torch.tensor([rank + 1.0], device=device)
+        result = meshes["decoder"].get_group("tp").all_reduce(value.clone())
+        torch.testing.assert_close(result, value, rtol=0, atol=0)
+
     for mesh in meshes.values():
         for dimension in ("tp", "ulysses", "sp", "pp"):
             group = mesh.get_group(dimension)
@@ -232,7 +238,6 @@ def _run_groups(rank: int, rendezvous: str, backend: str):
     global_x = torch.cat([x + member for member in sequence.ranks])
     torch.testing.assert_close(result, F.linear(global_x, weight), rtol=1e-6, atol=1e-6)
     environment.close()
-    dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("backend", ["gloo", pytest.param("nccl", marks=pytest.mark.gpu)])

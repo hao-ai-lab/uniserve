@@ -4,14 +4,13 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from ..loader import LoadedModel, LoadRequest, WeightSet, load_model
-from ..loader.source import WeightSourceConfig
+from ..loader import LoadedModel, LoadRequest, load_model
 from ..nn.mesh import EntryBindings
 from .config import WorkerProcessArgs
 
 
-def materialize_worker_model(config: WorkerProcessArgs, bindings: EntryBindings) -> LoadedModel:
-    """Materialize the checkpoint or the explicitly enabled deterministic stub."""
+def load_worker_model(config: WorkerProcessArgs, bindings: EntryBindings) -> LoadedModel:
+    """Load the checkpoint or the explicitly enabled deterministic stub."""
 
     if config.use_stub_model:
         from ..models.stub import StubModel
@@ -21,11 +20,8 @@ def materialize_worker_model(config: WorkerProcessArgs, bindings: EntryBindings)
             model=model,
             tokenizer=None,
             worker_config=replace(config.execution, attention_backend="torch_sdpa"),
-            weights=WeightSet.from_module(model),
             sources=(),
             architecture_config={},
-            weight_sidecars=("config.json",),
-            weight_sources=(WeightSourceConfig(),),
         )
     launch = config.model
     if launch is None:

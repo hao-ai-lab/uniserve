@@ -39,7 +39,6 @@ def audit_load_report(
     included: Iterable[str] | None = None,
     optional: Iterable[str] = (),
     label: str = "checkpoint",
-    require_packed_shards: bool = True,
 ) -> None:
     """Reject an incomplete or inconsistent load report for the selected model scope.
 
@@ -54,7 +53,7 @@ def audit_load_report(
         if name not in report.loaded:
             continue
         plan = get_shard_plan(parameter)
-        if not require_packed_shards or plan is None or not plan.slots:
+        if plan is None or not plan.slots:
             continue
         loaded_shards = set(getattr(parameter, "_uniserve_checkpoint_shards", set()))
         required_shards = set(plan.slots)

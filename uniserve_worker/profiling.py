@@ -2,6 +2,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .execution.batch import WorkerForwardStats
+    from .execution.model_runner import RunObservation
+    from .execution.rows import LaneState
+
+
 import inspect
 import logging
 import os
@@ -12,6 +21,7 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping
 
 from .foundation.env import flag_from_value, int_from_value
+from .foundation.errors import WorkerError, should_capture_trace
 
 torch: Any | None
 try:  # torch is an optional import for CPU-only control-plane tests.
@@ -28,13 +38,11 @@ __all__ = [
     "timing_events_enabled",
 ]
 
-_PROFILE_NVTX_ENV = "UNISERVE_PROFILE_NVTX"
 _NVTX_ENV = "UNISERVE_NVTX"
 _NULL_CONTEXT = nullcontext()
 
 logger = logging.getLogger(__name__)
 
-_PROFILE_DIR_ENV = "UNISERVE_PROFILE_DIR"
 _TORCH_PROFILE_DIR_ENV = "UNISERVE_TORCH_PROFILER_DIR"
 _PROFILE_ACTIVITIES_ENV = "UNISERVE_PROFILE_ACTIVITIES"
 _PROFILE_START_STEP_ENV = "UNISERVE_PROFILE_START_STEP"
@@ -78,14 +86,11 @@ class WorkerProfiler:
         """Build a bounded step profiler from the worker profiling environment."""
 
         env = os.environ if env is None else env
-        output_dir = env.get(_TORCH_PROFILE_DIR_ENV) or env.get(_PROFILE_DIR_ENV)
+        output_dir = env.get(_TORCH_PROFILE_DIR_ENV)
         if not output_dir:
             return cls(None)
         activities = _parse_activities(env.get(_PROFILE_ACTIVITIES_ENV, "CPU,GPU"))
-        cuda_profiler = "CUDA_PROFILER" in activities or flag_from_value(
-            env.get(_CUDA_PROFILER_ENV)
-        )
-        activities = tuple(activity for activity in activities if activity != "CUDA_PROFILER")
+        cuda_profiler = flag_from_value(env.get(_CUDA_PROFILER_ENV))
         config = WorkerProfileConfig(
             output_dir=Path(output_dir),
             prefix=env.get(_PROFILE_PREFIX_ENV, "uniserve-worker") or "uniserve-worker",
@@ -216,10 +221,8 @@ def timing_events_enabled() -> bool:
     """Return whether optional CUDA interval timing is configured."""
 
     env = os.environ
-    return bool(env.get(_TORCH_PROFILE_DIR_ENV) or env.get(_PROFILE_DIR_ENV)) or bool(
-        flag_from_value(env.get(_PROFILE_NVTX_ENV))
-        or flag_from_value(env.get(_NVTX_ENV))
-        or flag_from_value(env.get(_CUDA_PROFILER_ENV))
+    return bool(env.get(_TORCH_PROFILE_DIR_ENV)) or bool(
+        flag_from_value(env.get(_NVTX_ENV)) or flag_from_value(env.get(_CUDA_PROFILER_ENV))
     )
 
 
@@ -252,11 +255,7 @@ def _nvtx_ranges_enabled() -> bool:
         return False
     if not torch.cuda.is_available():
         return False
-    env = os.environ
-    if flag_from_value(env.get(_PROFILE_NVTX_ENV)) or flag_from_value(env.get(_NVTX_ENV)):
-        return True
-    activities = _parse_activities(env.get(_PROFILE_ACTIVITIES_ENV, ""))
-    return "CUDA_PROFILER" in activities or flag_from_value(env.get(_CUDA_PROFILER_ENV))
+    return flag_from_value(os.environ.get(_NVTX_ENV))
 
 
 def _parse_activities(raw: str | None) -> tuple[str, ...]:
@@ -265,9 +264,9 @@ def _parse_activities(raw: str | None) -> tuple[str, ...]:
     values = []
     for piece in (raw or "").replace(",", " ").split():
         value = piece.strip().upper()
-        if value == "CUDA":
-            value = "GPU"
-        if value in {"CPU", "GPU", "CUDA_PROFILER"} and value not in values:
+        if value not in {"CPU", "GPU"}:
+            raise ValueError(f"unknown profiler activity {value!r}; expected CPU or GPU")
+        if value not in values:
             values.append(value)
     return tuple(values)
 
@@ -339,3 +338,84 @@ def _profiler_table(profiler, *, prefer_cuda: bool) -> str:
         except Exception:
             continue
     return profiler.key_averages().table(row_limit=120)
+
+
+def record_component(scope: LaneState, name: str, started_ns: int) -> None:
+    """Accumulate elapsed microseconds under a lane-scoped execution component."""
+
+    elapsed_us = max(0, (time.perf_counter_ns() - int(started_ns)) // 1000)
+    scope.component_us[name] = scope.component_us.get(name, 0) + elapsed_us
+
+
+def _forward_stats(
+    observations: Sequence[RunObservation],
+    component_us: Mapping[str, int] | None = None,
+) -> WorkerForwardStats:
+    """Aggregate forward observations into stable per-component and total timing statistics."""
+
+    from .execution.batch import WorkerForwardStats
+    from .execution.model_runner import RunPath
+
+    route_counts: dict[str, int] = {}
+    route_rows: dict[str, int] = {}
+    route_us: dict[str, int] = {}
+    path_counts: dict[str, int] = {}
+    captures = 0
+    replays = 0
+    fallbacks = 0
+    graph_unpadded_tokens = 0
+    graph_padded_tokens = 0
+    for observation in observations:
+        route_counts[observation.route] = route_counts.get(observation.route, 0) + 1
+        route_rows[observation.route] = route_rows.get(observation.route, 0) + int(
+            observation.row_count
+        )
+        route_us[observation.route] = route_us.get(observation.route, 0) + int(
+            observation.duration_us
+        )
+        path_counts[observation.path.value] = path_counts.get(observation.path.value, 0) + 1
+        captures += observation.path is RunPath.GRAPH_CAPTURE
+        replays += observation.path is RunPath.GRAPH_REPLAY
+        fallbacks += observation.path is RunPath.GRAPH_FALLBACK
+        graph_unpadded_tokens += int(observation.graph_unpadded_tokens)
+        graph_padded_tokens += int(observation.graph_padded_tokens)
+    components: dict[str, int] = {}
+    if observations:
+        components["forward"] = sum(route_us.values())
+    for name, value in (component_us or {}).items():
+        components[str(name)] = components.get(str(name), 0) + max(0, int(value))
+    return WorkerForwardStats(
+        mode_counts=route_counts,
+        mode_tokens=route_rows,
+        mode_us=route_us,
+        component_us=components,
+        cuda_graph_captures=int(captures),
+        cuda_graph_replays=int(replays),
+        cuda_graph_misses=int(fallbacks),
+        cuda_graph_fallbacks=int(fallbacks),
+        cuda_graph_unpadded_tokens=graph_unpadded_tokens,
+        cuda_graph_padded_tokens=graph_padded_tokens,
+        cuda_graph_runtime_mode_counts=path_counts,
+    )
+
+
+def record_failure(raw_kind: object, error: WorkerError, *, unexpected: bool = False) -> None:
+    """Log a classified request failure at the severity required by its error code."""
+
+    log = logger.exception if unexpected or should_capture_trace(error.code) else logger.warning
+    log(
+        "worker request %r failed: %s [code=%s request_id=%s op_id=%s operation=%s]",
+        raw_kind,
+        error.message,
+        error.code,
+        error.req_id,
+        error.op_id,
+        error.op_kind,
+    )
+
+
+def worker_range_name(boundary: str, *, rank: int, run_id: int | None = None) -> str:
+    """Build a rank- and run-qualified profiler range name."""
+
+    name = f"uniserve.worker.{boundary} rank={int(rank)}"
+    return f"{name} run={run_id}" if run_id is not None and run_id >= 0 else name

@@ -1,6 +1,8 @@
-"""Worker-server idempotence over concrete execution and completion resources."""
+"""Worker protocol and ownership over concrete execution and completion resources."""
 
 from __future__ import annotations
+
+from dataclasses import replace
 
 import pytest
 
@@ -16,10 +18,11 @@ from uniserve_worker.execution.batch import (
     NewRequest,
     Operation,
     ProductPayload,
+    RequestKey,
+    Retire,
     Run,
     TokenMode,
 )
-from uniserve_worker.process import WorkerProcess
 
 pytestmark = pytest.mark.integration
 
@@ -64,23 +67,26 @@ def _by_call(endpoint: QueuedWorkerIpc) -> dict[int, dict[str, object]]:
     }
 
 
-def test_info_request_is_served_by_the_process_queue() -> None:
+def test_info_request_is_served_before_close() -> None:
     endpoint = QueuedWorkerIpc(
         (
             {"kind": "info", "call_id": 1},
             {"kind": "close", "call_id": 2},
         )
     )
-    server = WorkerProcess(execution_worker(pipeline_depth=1), endpoint)
-
-    server.serve()
+    with execution_worker(pipeline_depth=1) as worker:
+        worker.bind(endpoint)
+        worker.run()
 
     responses = _by_call(endpoint)
     assert responses[1]["kind"] == "info"
-    assert responses[1]["info"] == server.worker.info.to_mapping()
+    assert responses[1]["info"] == worker.info.to_mapping()
+    assert [response["call_id"] for response in endpoint.responses] == [1, 2]
+    assert responses[2]["kind"] == "ok"
 
 
-def test_inflight_and_terminal_duplicates_return_one_terminal_report() -> None:
+@pytest.mark.parametrize("pipeline_depth", (1, 3))
+def test_duplicate_submissions_are_rejected_while_the_original_completes(pipeline_depth) -> None:
     _admission, _operation, _payload, run = _token_run(
         request_id=11,
         op_id=21,
@@ -95,14 +101,36 @@ def test_inflight_and_terminal_duplicates_return_one_terminal_report() -> None:
             {"kind": "close", "call_id": 4},
         )
     )
-    server = WorkerProcess(execution_worker(pipeline_depth=2), endpoint)
-
-    server.serve()
+    with execution_worker(pipeline_depth=pipeline_depth) as worker:
+        worker.bind(endpoint)
+        worker.run()
 
     responses = _by_call(endpoint)
-    first = responses[1]["result"]
-    assert responses[2]["result"] == first
-    assert responses[3]["result"] == first
+    assert responses[1]["kind"] == "result"
+    assert responses[1]["result"]["done"]
+    for call_id in (2, 3):
+        assert responses[call_id]["kind"] == "error"
+        assert responses[call_id]["code"] == "InvalidDescriptor"
+    assert responses[4]["kind"] == "ok"
+
+
+def test_failed_submissions_cannot_be_reused_and_allow_shutdown() -> None:
+    with execution_worker(pipeline_depth=2) as worker:
+        admission = replace(ar_params(91), request_pool_idx=worker.info.request_slots + 1)
+        run = execution_run(run_id=1, admissions=(admission,))
+        endpoint = QueuedWorkerIpc(
+            (_request(1, run), _request(2, run), {"kind": "close", "call_id": 3})
+        )
+        worker.bind(endpoint).run()
+
+    responses = _by_call(endpoint)
+    for call_id in (1, 2):
+        response = responses[call_id]
+        assert response["kind"] == "error"
+        assert response["code"] == "InvalidDescriptor"
+        assert response["fatal"] is False
+    assert [response["call_id"] for response in endpoint.responses] == [1, 2, 3]
+    assert responses[3]["kind"] == "ok"
 
 
 def test_conflicting_run_identity_fails_before_new_admission() -> None:
@@ -124,7 +152,7 @@ def test_conflicting_run_identity_fails_before_new_admission() -> None:
         operations=(conflicting,),
         input_products=(conflicting_payload,),
     )
-    next_admission, next_operation, next_payload, _next_run = _token_run(
+    next_admission, next_operation, next_payload, next_run = _token_run(
         request_id=13,
         op_id=32,
         run_id=8,
@@ -141,12 +169,13 @@ def test_conflicting_run_identity_fails_before_new_admission() -> None:
             _request(1, run),
             _request(2, conflicting_run),
             _request(3, mixed_run),
-            {"kind": "close", "call_id": 4},
+            _request(4, replace(next_run, run_id=9, batch_id=2)),
+            {"kind": "close", "call_id": 5},
         )
     )
-    server = WorkerProcess(execution_worker(pipeline_depth=3), endpoint)
-
-    server.serve()
+    with execution_worker(pipeline_depth=3) as worker:
+        worker.bind(endpoint)
+        worker.run()
 
     responses = _by_call(endpoint)
     assert responses[1]["kind"] == "result"
@@ -154,43 +183,269 @@ def test_conflicting_run_identity_fails_before_new_admission() -> None:
     assert responses[2]["code"] == "InvalidDescriptor"
     assert responses[3]["kind"] == "error"
     assert responses[3]["code"] == "InvalidDescriptor"
+    # Rejected work must not admit its request. Logical batch IDs need not
+    # increase when the scheduler dispatches independent work around dependencies.
+    result = responses[4]["result"]
+    assert result["batch_id"] == 2
+    assert result["run_id"] == 9
+    assert result["completions"][0]["op_id"] == 32
+    assert result["completions"][0]["status"] == "ok"
+    assert responses[5]["kind"] == "ok"
 
 
-def test_completed_report_remains_retained_after_later_execution() -> None:
-    _first_admission, first_operation, _first_payload, first_run = _token_run(
-        request_id=5,
-        op_id=41,
-        run_id=11,
-        tokens=(1, 2),
-    )
-    _second_admission, _second_operation, _second_payload, second_run = _token_run(
-        request_id=6,
-        op_id=42,
-        run_id=12,
-        tokens=(3, 4),
-    )
-    endpoint = QueuedWorkerIpc(
-        (
-            _request(1, first_run),
-            _request(2, second_run),
-            _request(3, first_run),
-            {"kind": "close", "call_id": 4},
-        )
-    )
-    server = WorkerProcess(
-        execution_worker(
-            pipeline_depth=1,
-            max_batch_operations=1,
-            max_request_pool_size=8,
-        ),
-        endpoint,
-        replay_capacity=4,
-    )
+def test_rebinding_rejects_both_same_and_different_endpoints() -> None:
+    endpoint = QueuedWorkerIpc(({"kind": "close", "call_id": 1},))
+    other = QueuedWorkerIpc(({"kind": "info", "call_id": 2},))
+    worker = execution_worker()
+    try:
+        assert worker.bind(endpoint) is worker
+        for candidate in (endpoint, other):
+            with pytest.raises(RuntimeError, match="already.*bound"):
+                worker.bind(candidate)
+        worker.run()
+        assert endpoint.responses[0]["call_id"] == 1
+        assert other.try_recv() == {"kind": "info", "call_id": 2}
+        assert not endpoint.closed
+        assert not other.closed
+    finally:
+        worker.close()
 
-    server.serve()
 
-    responses = _by_call(endpoint)
-    first = responses[1]["result"]
-    retained = responses[3]["result"]
-    assert responses[2]["kind"] == "result"
-    assert retained == first
+def test_unbound_run_failure_closes_worker_at_scope_exit() -> None:
+    worker = execution_worker()
+    with pytest.raises(RuntimeError, match="no bound IPC endpoint"):
+        with worker:
+            worker.run()
+    with pytest.raises(RuntimeError, match="closed"):
+        worker.bind(QueuedWorkerIpc())
+    with pytest.raises(RuntimeError, match="closed"):
+        worker.execute(execution_run(run_id=1, commands=(Retire(RequestKey(1, 1, 1)),)))
+    worker.close()
+
+
+def test_closed_endpoint_is_rejected_without_consuming_worker() -> None:
+    endpoint = QueuedWorkerIpc()
+    endpoint.close()
+    worker = execution_worker()
+    try:
+        with pytest.raises(ValueError, match="open IPC endpoint"):
+            worker.bind(endpoint)
+        worker.bind(QueuedWorkerIpc(({"kind": "close"},))).run()
+    finally:
+        worker.close()
+
+
+def test_service_is_single_use_and_scope_exit_prevents_reuse() -> None:
+    worker = execution_worker().bind(QueuedWorkerIpc(({"kind": "close"},)))
+    with worker:
+        worker.run()
+        with pytest.raises(RuntimeError, match="only run once"):
+            worker.run()
+    for action in (worker.run, worker.warmup):
+        with pytest.raises(RuntimeError, match="closed"):
+            action()
+    with pytest.raises(RuntimeError, match="closed"):
+        worker.execute(execution_run(run_id=1, commands=(Retire(RequestKey(1, 1, 1)),)))
+    worker.close()
+
+
+def test_close_releases_borrowed_endpoint_references() -> None:
+    import weakref
+
+    endpoint = QueuedWorkerIpc()
+    reference = weakref.ref(endpoint)
+    worker = execution_worker().bind(endpoint)
+    worker.close()
+    assert not endpoint.closed
+    del endpoint
+    assert reference() is None
+
+
+@pytest.mark.parametrize("cleanup_failure", (False, True))
+@pytest.mark.parametrize("entrypoint", ("run", "warmup"))
+def test_warmup_failure_preserves_error_and_leaves_requests_unconsumed(
+    monkeypatch, cleanup_failure: bool, entrypoint: str
+) -> None:
+    import concurrent.futures
+
+    import torch
+
+    from uniserve_worker.bootstrap.cli import parse_worker_args
+    from uniserve_worker.worker import Worker
+
+    config = parse_worker_args(
+        [
+            "--service-name",
+            "startup-failure",
+            "--ipc-payload-cap",
+            "65536",
+            "--max-batch-tokens",
+            "256",
+            "--max-batch-operations",
+            "2",
+            "--device",
+            "cpu",
+            "--no-model",
+            "--allow-stub",
+            "--kv-token-capacity",
+            "4096",
+        ]
+    )
+    request = {"kind": "info", "call_id": 1}
+    endpoint = QueuedWorkerIpc((request,))
+    failure = RuntimeError("numerical backend unavailable")
+
+    def unavailable(*args, **kwargs):
+        raise failure
+
+    # PyTorch is the external numerical backend. Construction and binding must
+    # succeed even when entering numerical warmup cannot succeed.
+    monkeypatch.setattr(torch, "inference_mode", unavailable)
+    worker = Worker.from_config(config)
+    if cleanup_failure:
+        shutdown = concurrent.futures.ThreadPoolExecutor.shutdown
+
+        def failed_shutdown(executor, *args, **kwargs):
+            shutdown(executor, *args, **kwargs)
+            raise OSError("executor shutdown failed")
+
+        monkeypatch.setattr(concurrent.futures.ThreadPoolExecutor, "shutdown", failed_shutdown)
+    with pytest.raises(RuntimeError) as caught:
+        with worker:
+            if entrypoint == "run":
+                worker.bind(endpoint)
+            getattr(worker, entrypoint)()
+    assert caught.value is failure
+    assert endpoint.try_recv() == request
+    assert endpoint.responses == []
+    assert not endpoint.closed
+    with pytest.raises(RuntimeError, match="closed"):
+        worker.execute(execution_run(run_id=1, commands=(Retire(RequestKey(1, 1, 1)),)))
+    if cleanup_failure:
+        assert any("executor shutdown failed" in note for note in failure.__notes__)
+
+
+@pytest.mark.parametrize("gc_enabled", (False, True))
+def test_transport_failure_releases_worker_and_restores_gc(gc_enabled: bool) -> None:
+    import gc
+
+    failure = OSError("IPC connection lost")
+
+    class DisconnectedEndpoint(QueuedWorkerIpc):
+        def try_recv(self):
+            raise failure
+
+    was_enabled = gc.isenabled()
+    endpoint = DisconnectedEndpoint()
+    worker = execution_worker().bind(endpoint)
+    try:
+        (gc.enable if gc_enabled else gc.disable)()
+        with pytest.raises(OSError) as caught:
+            with worker:
+                worker.run()
+        assert caught.value is failure
+        assert gc.isenabled() == gc_enabled
+        assert not endpoint.closed
+        with pytest.raises(RuntimeError, match="closed"):
+            worker.execute(execution_run(run_id=1, commands=(Retire(RequestKey(1, 1, 1)),)))
+    finally:
+        (gc.enable if was_enabled else gc.disable)()
+        worker.close()
+
+
+def test_successful_manual_warmup_is_retained_by_run(monkeypatch) -> None:
+    import torch
+
+    worker = execution_worker()
+    try:
+        worker.warmup()
+
+        def unavailable(*args, **kwargs):
+            raise RuntimeError("numerical startup is unavailable")
+
+        # Administrative serving needs no further numerical startup once the
+        # execution-only caller has successfully warmed up the worker.
+        monkeypatch.setattr(torch, "inference_mode", unavailable)
+        endpoint = QueuedWorkerIpc(({"kind": "info", "call_id": 1}, {"kind": "close"}))
+        worker.bind(endpoint).run()
+        assert endpoint.responses[0]["kind"] == "info"
+        assert endpoint.responses[-1]["kind"] == "ok"
+    finally:
+        worker.close()
+
+
+def test_startup_failure_keeps_resources_until_scope_exit(monkeypatch) -> None:
+    import weakref
+
+    import torch
+
+    worker = execution_worker()
+    model = weakref.ref(worker.model)
+    endpoint = QueuedWorkerIpc()
+
+    def unavailable(*args, **kwargs):
+        raise ValueError("startup unavailable")
+
+    monkeypatch.setattr(torch, "inference_mode", unavailable)
+    with worker:
+        with pytest.raises(ValueError):
+            worker.warmup()
+        assert model() is not None
+
+    assert model() is None
+    assert not endpoint.closed
+
+
+@pytest.mark.parametrize("gc_enabled", (False, True))
+def test_normal_shutdown_reports_cleanup_failure_and_restores_gc(monkeypatch, gc_enabled) -> None:
+    import concurrent.futures
+    import gc
+
+    endpoint = QueuedWorkerIpc(({"kind": "close", "call_id": 1},))
+    worker = execution_worker().bind(endpoint)
+    shutdown = concurrent.futures.ThreadPoolExecutor.shutdown
+    failure = OSError("executor shutdown failed")
+
+    def failed_shutdown(executor, *args, **kwargs):
+        shutdown(executor, *args, **kwargs)
+        raise failure
+
+    monkeypatch.setattr(concurrent.futures.ThreadPoolExecutor, "shutdown", failed_shutdown)
+    was_enabled = gc.isenabled()
+    try:
+        (gc.enable if gc_enabled else gc.disable)()
+        with pytest.raises(OSError) as caught:
+            with worker:
+                worker.run()
+        assert caught.value is failure
+        assert gc.isenabled() == gc_enabled
+        assert endpoint.responses[0]["kind"] == "ok"
+        assert endpoint.responses[0]["call_id"] == 1
+        assert not endpoint.closed
+        with pytest.raises(RuntimeError, match="closed"):
+            worker.run()
+    finally:
+        (gc.enable if was_enabled else gc.disable)()
+        worker.close()
+
+
+def test_scope_retains_model_after_run_and_releases_it_on_exit() -> None:
+    import gc
+    import weakref
+
+    from uniserve_worker.models.stub import StubModel
+
+    model = StubModel()
+    reference = weakref.ref(model)
+    worker = execution_worker(model).bind(QueuedWorkerIpc(({"kind": "close"},)))
+    del model
+    with worker as owned:
+        assert owned is worker
+        worker.run()
+        gc.collect()
+        assert reference() is not None
+    gc.collect()
+    assert reference() is None
+    with pytest.raises(RuntimeError, match="closed"):
+        with worker:
+            pytest.fail("closed workers cannot enter another resource scope")

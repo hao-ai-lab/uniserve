@@ -1,4 +1,4 @@
-//! Multiprocess framing, replay idempotency, and physical-rank recovery.
+//! Multiprocess framing, single-submit delivery, and physical-rank recovery.
 
 #![cfg(target_os = "linux")]
 
@@ -139,6 +139,174 @@ fn independent_entries_complete_on_their_assigned_ranks() -> anyhow::Result<()> 
     assert!(report.done);
     assert!(report.completions.is_empty());
     worker.close()?;
+    Ok(())
+}
+
+#[test]
+fn native_close_drains_results_and_releases_service() -> anyhow::Result<()> {
+    use uniserve_worker_ipc::{ClientEndpoint, WorkerRequest, WorkerResponse};
+
+    let service = uniserve_worker_ipc::service_name(&format!(
+        "close_{}_{}",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+    ));
+    // Reopen the identical transport resource after each graceful process exit.
+    for _ in 0..2 {
+        let mut child = std::process::Command::new(worker_python())
+            .args(["-m", "uniserve_worker.main", "--service-name", &service])
+            .args([
+                "--device",
+                "cpu",
+                "--no-model",
+                "--allow-stub",
+                "--no-prefill-cuda-graph",
+                "--graph-policy",
+                "off",
+                "--ipc-payload-cap",
+                "1048576",
+                "--ipc-max-inflight",
+                "8",
+                "--pipeline-depth",
+                "2",
+                "--max-batch-tokens",
+                "256",
+                "--max-batch-operations",
+                "8",
+                "--kv-token-capacity",
+                "4096",
+            ])
+            .spawn()?;
+        let result = (|| -> anyhow::Result<()> {
+            let client = ClientEndpoint::connect(&service, 1 << 20, 8)?;
+            let admission = text_admission(51, 1, 1)?;
+            let run = token_batch(
+                1,
+                1,
+                admission.request_key,
+                Some(admission),
+                OpId(1),
+                Checkpoint::admission_root(OpId(0)),
+                OpCode::ArExtend,
+                &[7, 8],
+                0,
+                BlockId(1),
+                0,
+            );
+            let request = |mut request: WorkerRequest, call_id| {
+                request.set_call_id(Some(call_id));
+                request
+            };
+            let initial = client.send_request(&request(WorkerRequest::submit(run.clone()), 1))?;
+            let first = client
+                .recv_response_timeout(&initial, Duration::from_secs(30))?
+                .context("initial submission did not complete")?
+                .decode_response()?;
+            let WorkerResponse::Result { result: first, .. } = first else {
+                anyhow::bail!("initial submission failed: {first:?}");
+            };
+            anyhow::ensure!(first.done, "initial result is not terminal");
+            anyhow::ensure!(
+                first.completions.len() == 1,
+                "initial completion count changed"
+            );
+            anyhow::ensure!(
+                first.completions[0].status == OpStatus::Ok,
+                "initial operation failed"
+            );
+            anyhow::ensure!(
+                first.completions[0].committed_tokens().len() == 1,
+                "initial token missing"
+            );
+            drop(initial);
+
+            let other = text_admission(52, 1, 2)?;
+            let other_run = token_batch(
+                2,
+                2,
+                other.request_key,
+                Some(other),
+                OpId(2),
+                Checkpoint::admission_root(OpId(0)),
+                OpCode::ArExtend,
+                &[9, 10],
+                0,
+                BlockId(2),
+                0,
+            );
+            let accepted = client.send_request(&request(WorkerRequest::submit(other_run), 2))?;
+            let rejected = client.send_request(&request(WorkerRequest::submit(run.clone()), 3))?;
+            let duplicate = client.send_request(&request(WorkerRequest::submit(run), 4))?;
+            // A terminal run has no continuation: repeated Poll preserves that wire error.
+            let poll = client.send_request(&request(WorkerRequest::poll(1), 5))?;
+            let repeated_poll = client.send_request(&request(WorkerRequest::poll(1), 6))?;
+            let close = client.send_request(&request(WorkerRequest::close(), 7))?;
+            let closed = client
+                .recv_response_timeout(&close, Duration::from_secs(30))?
+                .context("Close did not drain accepted work")?
+                .decode_response()?;
+            anyhow::ensure!(
+                closed == WorkerResponse::Ok { call_id: Some(7) },
+                "Close failed: {closed:?}"
+            );
+
+            // Receiving Close first must still leave every accepted response available.
+            let receive = |pending| -> anyhow::Result<WorkerResponse> {
+                Ok(client
+                    .try_recv_response(pending)?
+                    .context("Close acknowledged before accepted response delivery")?
+                    .decode_response()?)
+            };
+            let WorkerResponse::Result { result: other, .. } = receive(&accepted)? else {
+                anyhow::bail!("independent submission did not return a result");
+            };
+            anyhow::ensure!(
+                other.done && other.completions.len() == 1,
+                "independent run did not complete"
+            );
+            anyhow::ensure!(
+                other.completions[0].op_id == OpId(2),
+                "independent operation identity changed"
+            );
+            for pending in [&rejected, &duplicate] {
+                let WorkerResponse::Error { error, .. } = receive(pending)? else {
+                    anyhow::bail!("duplicate submission was accepted");
+                };
+                anyhow::ensure!(
+                    error.code.as_deref() == Some("InvalidDescriptor"),
+                    "duplicate must be a protocol error"
+                );
+            }
+            for pending in [&poll, &repeated_poll] {
+                let WorkerResponse::Error { error, .. } = receive(pending)? else {
+                    anyhow::bail!("terminal Poll must reject the absent continuation");
+                };
+                anyhow::ensure!(
+                    error.code.as_deref() == Some("InvalidDescriptor"),
+                    "terminal Poll changed its error: {error:?}"
+                );
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(status) = child.try_wait()? {
+                    anyhow::ensure!(status.success(), "worker shutdown failed: {status}");
+                    break;
+                }
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "worker did not exit after Close"
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+            Ok(())
+        })();
+        // Clean up the external process even when an assertion or transport operation fails.
+        if result.is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        result?;
+    }
     Ok(())
 }
 
@@ -659,8 +827,7 @@ fn check_rank_ipc() -> anyhow::Result<()> {
     assert_eq!(first_record.status, OpStatus::Ok);
     assert_eq!(first_record.committed_tokens().len(), 1);
 
-    let replayed = execute(&mut executor, initial.clone())?;
-    assert_eq!(replayed, first);
+    assert!(executor.submit_run(initial).is_err());
 
     let conflicting = token_batch(
         1,
@@ -675,7 +842,7 @@ fn check_rank_ipc() -> anyhow::Result<()> {
         BlockId(1),
         0,
     );
-    assert_execution_error(&mut executor, conflicting, "submitted run")?;
+    assert!(executor.submit_run(conflicting).is_err());
 
     let selected = fixed_completion(first_record);
     let commit = BatchCommand::Commit {
@@ -692,7 +859,10 @@ fn check_rank_ipc() -> anyhow::Result<()> {
             .completions
             .is_empty()
     );
-    assert!(execute(&mut executor, commit_batch)?.completions.is_empty());
+    assert!(matches!(
+        executor.submit_run(commit_batch),
+        Err(uniserve_engine::RunSubmitError::Failed(_))
+    ));
 
     let gap = BatchCommand::Finish {
         request_key: admission.request_key,
@@ -757,20 +927,22 @@ fn check_rank_ipc() -> anyhow::Result<()> {
         0,
     );
     close_batch.commands.push(close.clone());
-    for _ in 0..2 {
-        executor.submit_run(close_batch.clone())?;
-        let result = executor
-            .poll_run(Duration::from_secs(30))?
-            .ok_or_else(|| anyhow::anyhow!("independent operation did not complete"))?;
-        assert!(!result.done);
-        assert_eq!(result.completions.len(), 1);
-        assert_eq!(result.completions[0].status, OpStatus::Ok);
-        let acknowledgement = executor
-            .poll_run(Duration::from_secs(30))?
-            .ok_or_else(|| anyhow::anyhow!("Finish acknowledgement did not arrive"))?;
-        assert!(acknowledgement.done);
-        assert!(acknowledgement.completions.is_empty());
-    }
+    executor.submit_run(close_batch.clone())?;
+    let result = executor
+        .poll_run(Duration::from_secs(30))?
+        .ok_or_else(|| anyhow::anyhow!("independent operation did not complete"))?;
+    assert!(!result.done);
+    assert_eq!(result.completions.len(), 1);
+    assert_eq!(result.completions[0].status, OpStatus::Ok);
+    let acknowledgement = executor
+        .poll_run(Duration::from_secs(30))?
+        .ok_or_else(|| anyhow::anyhow!("Finish acknowledgement did not arrive"))?;
+    assert!(acknowledgement.done);
+    assert!(acknowledgement.completions.is_empty());
+    assert!(matches!(
+        executor.submit_run(close_batch),
+        Err(uniserve_engine::RunSubmitError::Failed(_))
+    ));
     let conflicting_close = BatchCommand::Finish {
         request_key: admission.request_key,
         control_seq: 2,
@@ -902,26 +1074,35 @@ fn qualify_kv_rank_locations(executor: &mut Worker) -> anyhow::Result<()> {
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(ranks, (0..WORLD_SIZE as u32).collect());
     }
-    assert_eq!(execute(executor, publish)?, report);
+    assert!(execute(executor, publish).is_err());
     Ok(())
 }
 
 fn qualify_peer_replacement() -> anyhow::Result<()> {
-    // Cargo may execute the media test in this binary concurrently. Serialize
-    // child launch while the replacement fault is injected so unrelated
-    // workers cannot inherit the process-wide test environment.
+    // Identify only this test's rank children while the shared launch lock is held.
     let launch_guard = CHILD_LAUNCH_ENV_LOCK
         .lock()
-        .map_err(|_| anyhow::anyhow!("child-launch environment lock is poisoned"))?;
-    unsafe {
-        std::env::set_var("UNISERVE_STUB_DIE_AFTER", "2");
-        std::env::set_var("UNISERVE_STUB_DIE_RANK", "1");
-    }
+        .map_err(|_| anyhow::anyhow!("child launch lock poisoned"))?;
+    let child_ids = || -> anyhow::Result<Vec<u32>> {
+        Ok(std::fs::read_to_string("/proc/thread-self/children")?
+            .split_whitespace()
+            .map(str::parse)
+            .collect::<Result<_, _>>()?)
+    };
+    let before = child_ids()?;
     let mut executor = spawn_rank_group()?;
-    unsafe {
-        std::env::remove_var("UNISERVE_STUB_DIE_AFTER");
-        std::env::remove_var("UNISERVE_STUB_DIE_RANK");
-    }
+    let victim = child_ids()?
+        .into_iter()
+        .find(|pid| {
+            if before.contains(pid) {
+                return false;
+            }
+            let args = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+            let args = args.split(|byte| *byte == 0).collect::<Vec<_>>();
+            args.windows(2)
+                .any(|pair| pair == [b"--rank".as_slice(), b"1".as_slice()])
+        })
+        .context("rank child was not found")?;
     drop(launch_guard);
 
     let initial_endpoint = executor.info().endpoint.clone();
@@ -981,6 +1162,8 @@ fn qualify_peer_replacement() -> anyhow::Result<()> {
 
     let lost_admission = text_admission(22, 1, 2)?;
     let lost_root = Checkpoint::admission_root(OpId(0));
+    // Keep this rank from completing the run before the test terminates it.
+    let paused = PausedProcess::new(victim.try_into()?)?;
     executor.submit_run(token_batch(
         3,
         3,
@@ -994,6 +1177,7 @@ fn qualify_peer_replacement() -> anyhow::Result<()> {
         BlockId(2),
         0,
     ))?;
+    paused.terminate()?;
     let loss = executor
         .poll_run(Duration::from_secs(30))
         .expect_err("rank loss must be reported");
@@ -1074,7 +1258,6 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
     let worker = worker_python();
     let config = WorkerProcessArgs {
         stub: true,
-        cuda_graph: false,
         prefill_cuda_graph: false,
         ..WorkerProcessArgs::default()
     };
@@ -1145,7 +1328,11 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
         0,
     );
 
-    executor.submit_run(slow)?;
+    executor.submit_run(slow.clone())?;
+    assert!(matches!(
+        executor.submit_run(slow),
+        Err(uniserve_engine::RunSubmitError::Failed(_))
+    ));
     executor.submit_run(fast)?;
     let first = executor
         .poll_run(Duration::from_secs(30))?
@@ -1154,6 +1341,9 @@ fn qualify_slow_transfer() -> anyhow::Result<()> {
     assert!(!publication.published.load(Ordering::Acquire));
     assert_eq!(first.completions[0].status, OpStatus::Ok);
 
+    // Waiting does not submit the slow run again. Its original result remains
+    // available after the external publisher makes the dependency readable.
+    assert!(executor.poll_run(Duration::from_millis(50))?.is_none());
     publication.publish()?;
     let second = executor
         .poll_run(Duration::from_secs(30))?
@@ -1336,7 +1526,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
     assert_eq!(resumed.batch_id, 2);
     assert_eq!(resumed.results[0].output.status, OpStatus::Ok);
     // Request-relay products have no arena params, but their release must
-    // still reach the rank holding the published generation and support replay.
+    // still reach the rank holding the published generation.
     let release = LogicalBatch::new(
         4,
         Vec::new(),
@@ -1345,14 +1535,10 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         }],
         Vec::new(),
     );
-    executor.submit(release.clone())?;
+    executor.submit(release)?;
     let retired = poll_logical(&mut executor)?.context("product release did not complete")?;
     assert_eq!(retired.batch_id, 4);
     assert!(retired.results.is_empty());
-    executor.submit(release)?;
-    let replay = poll_logical(&mut executor)?.context("product release replay did not complete")?;
-    assert_eq!(replay.batch_id, retired.batch_id);
-    assert!(replay.results.is_empty());
 
     // The second instance holds a transported product and an admission root,
     // while the first instance owns the request's semantic Finish checkpoint.
@@ -1498,12 +1684,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         reason: CloseReason::Completed,
         retained_buffers: vec![feature.buffer_id()],
     };
-    executor.submit(LogicalBatch::new(
-        8,
-        Vec::new(),
-        vec![finish.clone()],
-        Vec::new(),
-    ))?;
+    executor.submit(LogicalBatch::new(8, Vec::new(), vec![finish], Vec::new()))?;
     let closed = poll_logical(&mut executor)?.context("shared request did not retire")?;
     assert!(closed.done);
     let mut last_cutoff = None;
@@ -1514,9 +1695,6 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
         assert_eq!(reused.results[0].output.status, OpStatus::Ok);
         last_cutoff = Some(fixed_completion(&reused.results[0].output));
     }
-    executor.submit(LogicalBatch::new(11, Vec::new(), vec![finish], Vec::new()))?;
-    let replay = poll_logical(&mut executor)?.context("Finish replay did not complete")?;
-    assert!(replay.done);
 
     // A rejected close has no physical retirement acknowledgement. The other
     // instance's operation in the same logical batch still completes normally.
@@ -1600,8 +1778,7 @@ fn independent_workers_preserve_capacity_retirement_and_failed_work() -> anyhow:
     let reused = poll_logical(&mut executor)?.context("failed request slot was not reusable")?;
     assert_eq!(reused.results[0].output.status, OpStatus::Ok);
 
-    // The retained product's separate lifetime survives both request slot reuse
-    // and replay of the producer's Finish command.
+    // The retained product's separate lifetime survives request slot reuse.
     let next = text_admission(59, 1, 5)?;
     let retained = Operation {
         request_key: next.request_key,
@@ -1685,6 +1862,17 @@ impl PausedProcess {
             );
             self.0 = None;
         }
+        Ok(())
+    }
+
+    fn terminate(mut self) -> anyhow::Result<()> {
+        let pid = self.0.context("selected worker is no longer paused")?;
+        anyhow::ensure!(
+            unsafe { libc::kill(pid, libc::SIGKILL) } == 0,
+            "failed to terminate the selected worker: {}",
+            std::io::Error::last_os_error()
+        );
+        self.0 = None;
         Ok(())
     }
 }
@@ -1820,7 +2008,6 @@ fn rank_group_args(
     let worker = worker_python();
     let config = WorkerProcessArgs {
         stub: true,
-        cuda_graph: false,
         prefill_cuda_graph: false,
         ..WorkerProcessArgs::default()
     };

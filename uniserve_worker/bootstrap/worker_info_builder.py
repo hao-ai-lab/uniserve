@@ -16,7 +16,7 @@ from uniserve_worker.nn.parallel import EntryConfig
 from ..config import graph_memory_budget_bytes, graph_padding_block_count
 from ..execution.batch import OpCode, WorkerEndpoint
 from ..execution.input_buffers import InputGeometry
-from ..foundation.errors import invalid_descriptor
+from ..foundation.errors import invalid_descriptor, unsupported_setup
 from ..foundation.math import ceil_div
 from ..models.generation import GenerationPipeline, LatentLayout
 from ..models.runtime import ExecutionModel, active_latent_capacity_tokens
@@ -37,6 +37,7 @@ from .capacity import (
     request_tensor_window,
 )
 from .worker_info import (
+    EntryInfo,
     KvCacheConfig,
     KvGroup,
     KvGroupKind,
@@ -79,9 +80,9 @@ def configuration_identity(
 ) -> str:
     """Identify resolved params, numerical storage, operators, and shape bounds.
 
-    Weight contents have their separate version. This identity describes the
-    initialized worker configuration; graph and arena objects retain their own
-    lifetimes and cannot be reused by a differently initialized worker.
+    This describes resolved execution geometry and numerical policy, not a hash
+    of weight contents. Graph and arena objects retain their own lifetimes and
+    cannot be reused by a differently initialized worker.
     """
 
     numerical = {}
@@ -97,12 +98,16 @@ def configuration_identity(
                     module.weight_shard_axis if isinstance(module, LinearBase) else None
                 ),
             }
+
     layout_description = asdict(layout)
     layout_description["info"].pop("endpoint")
-    execution_config = asdict(worker_config)
+    layout_description["info"].pop("configuration_id")
+
     # The observed grant changes with transient allocations and other processes.
     # Resolved capacities live in layout; free bytes are not an execution identity.
+    execution_config = asdict(worker_config)
     execution_config.pop("pool_memory_bytes")
+
     encoded = json.dumps(
         {
             "worker_config": execution_config,
@@ -127,6 +132,7 @@ def configuration_identity(
         sort_keys=True,
         separators=(",", ":"),
     )
+
     return hashlib.sha256(encoded.encode()).hexdigest()
 
 
@@ -135,7 +141,6 @@ def build_worker_info(
     worker_config: WorkerConfig,
     *,
     model_name: str | None = None,
-    weight_version: int = 0,
     queue_depth: int = 1,
     completion_payload_bytes: int = 1 << 20,
     endpoint: WorkerEndpoint | None = None,
@@ -146,7 +151,6 @@ def build_worker_info(
         model,
         worker_config,
         model_name=model_name,
-        weight_version=weight_version,
         queue_depth=queue_depth,
         completion_payload_bytes=completion_payload_bytes,
         endpoint=endpoint,
@@ -158,27 +162,97 @@ def build_worker_layout(
     worker_config: WorkerConfig,
     *,
     model_name: str | None = None,
-    weight_version: int = 0,
     queue_depth: int = 1,
     completion_payload_bytes: int = 1 << 20,
     endpoint: WorkerEndpoint | None = None,
     capacity_group: Communicator | None = None,
+    allowed_work_variants: frozenset[OpCode] | None = None,
+    transfer_backends: tuple[str, ...] = ("local",),
+    components: tuple[tuple[str, EntryConfig], ...] = (),
+    attention_identity: str | None = None,
 ) -> WorkerLayout:
-    """Build worker-local model geometry and its public capacity projection."""
+    """Resolve resource geometry and the exact capacity report used by the worker.
+
+    Model geometry determines storage reservations. Admission additionally obeys
+    the configured operation set and every lane's bounds; these restrictions do
+    not shrink the storage needed by warmup and graph capture.
+    """
+
+    if queue_depth <= 0:
+        raise unsupported_setup("worker pipeline depth must be positive")
+
+    if completion_payload_bytes <= 0:
+        raise ValueError("completion payload capacity must be positive")
+
+    supported_ops = model.supported_work
+    if allowed_work_variants is not None:
+        supported_ops = supported_ops & allowed_work_variants
+
+    if not supported_ops:
+        raise unsupported_setup("worker model implements none of the requested work variants")
 
     model_name = model.architecture if model_name is None else model_name
     endpoint = endpoint or WorkerEndpoint.local(rank=int(worker_config.rank))
 
-    if bool(model.resource_geometry.request_tensors):
-        return _request_tensor_worker_layout(
+    if model.resource_geometry.request_tensors:
+        layout = _request_tensor_worker_layout(
             model,
             worker_config,
             model_name=model_name,
-            weight_version=weight_version,
             queue_depth=queue_depth,
             completion_payload_bytes=completion_payload_bytes,
             endpoint=endpoint,
         )
+    else:
+        layout = _token_worker_layout(
+            model,
+            worker_config,
+            model_name=model_name,
+            queue_depth=queue_depth,
+            completion_payload_bytes=completion_payload_bytes,
+            endpoint=endpoint,
+            capacity_group=capacity_group,
+        )
+
+    # A shared admission limit must be safe on every eligible lane. Keep it in
+    # the layout so runtime allocation and the IPC handshake read the same value.
+    max_operations = layout.info.max_batch_ops
+    max_tokens = layout.info.max_batch_tokens
+
+    for lane in worker_config.lanes:
+        max_operations = min(max_operations, lane.max_batch_operations or max_operations)
+        max_tokens = min(max_tokens, lane.max_batch_tokens or max_tokens)
+
+    info = replace(
+        layout.info,
+        supported_ops=tuple(code for code in OpCode if code in supported_ops),
+        transfer_backends=transfer_backends,
+        max_batch_ops=max_operations,
+        max_batch_tokens=max_tokens,
+        components=tuple(
+            EntryInfo(name, entry, model.entry_outputs.get(name, ())) for name, entry in components
+        ),
+    )
+    layout = replace(layout, info=info)
+
+    # Hash the final advertised limits and component bindings, excluding the
+    # process incarnation and the identity field itself.
+    identity = configuration_identity(model, worker_config, layout, components, attention_identity)
+
+    return replace(layout, info=replace(info, configuration_id=identity))
+
+
+def _token_worker_layout(
+    model: ExecutionModel,
+    worker_config: WorkerConfig,
+    *,
+    model_name: str,
+    queue_depth: int,
+    completion_payload_bytes: int,
+    endpoint: WorkerEndpoint,
+    capacity_group: Communicator | None,
+) -> WorkerLayout:
+    """Size token inputs, paged KV, and latent storage before admission limits."""
 
     resources = model.resource_geometry
     owns_kv = bool(resources.kv)
@@ -307,12 +381,9 @@ def build_worker_layout(
             capacity = replace(
                 capacity, num_blocks=blocks, token_capacity=blocks * capacity.block_size
             )
-    if int(completion_payload_bytes) < 1:
-        raise ValueError("completion payload capacity must be positive")
     supported_ops = tuple(code for code in OpCode if code in model.supported_work)
     info = WorkerInfo(
         model_name=model_name,
-        weight_version=weight_version,
         endpoint=endpoint,
         device=str(worker_config.device),
         world_size=int(worker_config.world_size),
@@ -389,15 +460,12 @@ def _request_tensor_worker_layout(
     worker_config: WorkerConfig,
     *,
     model_name: str,
-    weight_version: int,
     queue_depth: int,
     completion_payload_bytes: int,
     endpoint: WorkerEndpoint,
 ) -> WorkerLayout:
     """Describe request tensors, products, and persistent capacity."""
 
-    if int(completion_payload_bytes) < 1:
-        raise ValueError("completion payload capacity must be positive")
     if not model.resource_geometry.request_tensors:
         raise RuntimeError("request tensor worker info requires declared tensor storage")
     slots = int(worker_config.max_request_pool_size)
@@ -406,7 +474,6 @@ def _request_tensor_worker_layout(
     max_operations = min(slots, int(worker_config.max_batch_operations))
     info = WorkerInfo(
         model_name=model_name,
-        weight_version=weight_version,
         endpoint=endpoint,
         device=str(worker_config.device),
         world_size=int(worker_config.world_size),

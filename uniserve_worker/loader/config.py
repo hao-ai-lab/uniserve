@@ -20,7 +20,6 @@ class LoadFormat(StrEnum):
     SAFETENSORS = "safetensors"
     PT = "pt"
     DUMMY = "dummy"
-    SHARDED_STATE = "sharded_state"
     LAYERED = "layered"
 
 

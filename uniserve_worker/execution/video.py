@@ -27,7 +27,6 @@ from uniserve_worker.execution.batch import (
     TokenSpan,
 )
 from uniserve_worker.execution.output import ByteCapture, CpuJob
-from uniserve_worker.execution.trace import OperationTrace
 from uniserve_worker.foundation.errors import (
     invalid_descriptor,
     resource_error,
@@ -39,10 +38,19 @@ from uniserve_worker.profiling import profile_range
 from uniserve_worker.runtime.cpu import CpuTaskReservation
 from uniserve_worker.runtime.device import allocate_shared_memory
 
+from . import operations as operation_geometry
 from .rows import OperationState, Outcome
 
 if TYPE_CHECKING:
-    from ..worker.worker import Worker
+    from collections.abc import Mapping
+
+    from ..models.runtime import ExecutionModel
+    from ..runtime.device_products import DeviceProducts
+    from ..runtime.encoder_cache import EncoderCache
+    from ..runtime.request import RequestPool
+    from ..transfer.tickets import Transport
+    from .model_runner import ModelRunner
+    from .video import VideoMuxCoordinator
 
 
 def _publish_media_bytes(payload: bytes) -> str:
@@ -208,39 +216,17 @@ class VideoOutputRingLease:
         self._released = True
         self._ring._release(self.kind, self.index)
 
-    def defer_until_capture_ready(self, capture: ByteCapture) -> None:
-        """Keep this output slot leased until its asynchronous byte capture completes."""
+    def defer_until_ready(self, completion: concurrent.futures.Future[None]) -> None:
+        """Keep this output slot leased until its existing device fence completes."""
 
         if self._released:
             return
-        if capture.ready():
+        if completion.done():
             self.release()
             return
         self._released = True
-        capture.buffer.retain_until_ready(_DeferredRingRelease(self._ring, self.kind, self.index))
-
-    def __del__(self) -> None:
-        """Release an unclosed output-ring lease during finalization."""
-
-        self.release()
-
-
-class _DeferredRingRelease:
-    """Retains a video-ring lease until capture completion permits safe reclamation."""
-
-    __slots__ = ("_ring", "_kind", "_index")
-
-    def __init__(self, ring: VideoOutputRing, kind: str, index: int) -> None:
-        """Retain a ring slot until an asynchronous consumer releases it."""
-
-        self._ring = ring
-        self._kind = kind
-        self._index = int(index)
-
-    def __del__(self) -> None:
-        """Complete a deferred ring release during finalization."""
-
-        self._ring._release(self._kind, self._index)
+        ring, kind, index = self._ring, self.kind, self.index
+        completion.add_done_callback(lambda _future: ring._release(kind, index))
 
 
 class VideoMuxCoordinator:
@@ -294,7 +280,7 @@ class VideoMuxCoordinator:
             capture=capture,
             dependencies=dependencies,
             release=None if ring_lease is None else ring_lease.release,
-            defer_release=(None if ring_lease is None else ring_lease.defer_until_capture_ready),
+            defer_release=(None if ring_lease is None else ring_lease.defer_until_ready),
             profile_name=profile_name,
         )
 
@@ -446,10 +432,10 @@ def decode_range(lane: RunLane, operation: Operation) -> DecodeRange:
     return selected[0]
 
 
-def validate_batch(runtime: Worker, batch: Run) -> None:
+def validate_batch(batch: Run, *, execution_model: ExecutionModel) -> None:
     """Validate video admission requirements before staging state."""
 
-    if not isinstance(runtime.model, VideoModel):
+    if not isinstance(execution_model, VideoModel):
         return
     for operation in batch.operations:
         if operation.kind is not OpCode.DIFFUSION_PREPARE:
@@ -460,10 +446,20 @@ def validate_batch(runtime: Worker, batch: Run) -> None:
             raise invalid_descriptor("video preparation does not name its request root")
 
 
-def run_action(runtime: Worker, state: OperationState) -> bool:
+def run_action(
+    state: OperationState,
+    *,
+    device_products: DeviceProducts,
+    encoder_cache: EncoderCache,
+    media_mux: VideoMuxCoordinator | None,
+    execution_model: ExecutionModel,
+    publication_transports: Mapping[str, Transport],
+    request_pool: RequestPool,
+    model_runner: ModelRunner,
+) -> bool:
     """Land one ready video action without constructing a packed forward row."""
 
-    if state.phase != "initial" or not isinstance(runtime.model, VideoModel):
+    if state.phase != "initial" or not isinstance(execution_model, VideoModel):
         return False
     operation = state.operation
     if operation.kind not in {
@@ -475,26 +471,26 @@ def run_action(runtime: Worker, state: OperationState) -> bool:
     }:
         return False
     scope = state.lane
-    model = runtime.model
-    request = runtime.request_row(scope, operation.request_key.request_id)
+    model = execution_model
+    request = operation_geometry.request_row(scope, operation.request_key.request_id)
     media = request.request.admission.diffusion
     if media is None:
         raise invalid_descriptor("video operation has no admitted media geometry")
-    scratch = runtime.runner.scratch
+    scratch = model_runner.scratch
     if scratch is None:
         raise RuntimeError("video execution has no allocated scratch storage")
     media_geometry = media.geometry
-    metadata = runtime.runner.prepare_geometry(
+    metadata = model_runner.prepare_geometry(
         model.execution_key(media_geometry),
-        lambda: model.build_execution(media_geometry, scratch, runtime.runner.context_workspace),
+        lambda: model.build_execution(media_geometry, scratch, model_runner.context_workspace),
     )
     slot = model.request_tensors(
-        runtime.requests.tensors(request.request.request_pool_idx), media.geometry, metadata
+        request_pool.tensors(request.request.request_pool_idx), media.geometry, metadata
     )
-    mux = runtime.media_mux
+    mux = media_mux
     if operation.kind in {OpCode.MEDIA_APPEND, OpCode.DIFFUSION_FINALIZE} and mux is None:
         raise unsupported_setup("output owner has no video mux resources")
-    identity = runtime.operation_identity(operation)
+    identity = operation_geometry.operation_identity(operation)
     from . import transfer
 
     tasks: tuple[CpuJob, ...] = ()
@@ -511,27 +507,22 @@ def run_action(runtime: Worker, state: OperationState) -> bool:
         )
         if len(inputs) != 1:
             raise invalid_descriptor("video preparation requires one conditioning Tensor")
-        conditioning = runtime.device_products.consume(
-            inputs[0], consumer_op_id=operation.op_id, device=runtime.operation_device(operation)
+        conditioning = device_products.consume(
+            inputs[0],
+            consumer_op_id=operation.op_id,
+            device=model_runner.operation_device(operation),
         )
         scope.device_reads.append(conditioning)
         if conditioning.region is not None:
             raise invalid_descriptor("video preparation requires complete conditioning coverage")
         encoded = conditioning.tensor
-        key = operation.request_key
-
-        with runtime.runner.preparing_inputs(model.initialize_tensors(slot, media.seed)):
+        with model_runner.preparing_inputs(model.initialize_tensors(slot, media.seed)):
             if model.conditioner is not None:
                 if encoded is None:
                     raise invalid_descriptor("conditioning module has no input Tensor")
-                result = runtime.runner.run_module(
+                result = model_runner.run_module(
                     "conditioner",
                     encoded,
-                    operations=(
-                        OperationTrace(
-                            key.authority_id, key.request_id, key.epoch, operation.op_id, 0
-                        ),
-                    ),
                 )
                 scope.observations.append(result.observation)
                 if len(result.values) != 1:
@@ -543,27 +534,31 @@ def run_action(runtime: Worker, state: OperationState) -> bool:
         start_step, step_count = int(params.start_step), int(params.step_count)
         if start_step != request.flow_step:
             raise invalid_descriptor("denoising does not begin at the selected request step")
-        schedule = runtime.runner.schedule
+        schedule = model_runner.schedule
         if schedule is None:
             raise RuntimeError("video execution lost its bound diffusion schedule")
-        key = operation.request_key
-        result = runtime.runner.run_module(
-            operation.entry,
+        result = model_runner.run_denoising(
             slot,
             metadata,
             start_step,
             step_count,
             schedule,
-            operations=(
-                OperationTrace(key.authority_id, key.request_id, key.epoch, operation.op_id, 0),
-            ),
+            slot=request.request.request_pool_idx,
+            geometry=model.execution_key(media_geometry),
         )
         scope.observations.append(result.observation)
         request.flow_step = start_step + step_count
         if any(output.kind is ProductKind.TENSOR for output in operation.outputs):
             if request.flow_step != media.geometry.denoise_steps:
                 raise invalid_descriptor("final latent products require completed denoising")
-            products = transfer.publish_tensors(runtime, operation, result.values, scope)
+            products = transfer.publish_tensors(
+                operation,
+                result.values,
+                scope,
+                device_products=device_products,
+                encoder_cache=encoder_cache,
+                publication_transports=publication_transports,
+            )
     elif operation.kind in {OpCode.DIFFUSION_DECODE, OpCode.MEDIA_APPEND}:
         params = decode_range(scope.lane, operation)
         inputs = tuple(
@@ -571,8 +566,10 @@ def run_action(runtime: Worker, state: OperationState) -> bool:
         )
         if len(inputs) != 1:
             raise invalid_descriptor("media reconstruction requires one Tensor input")
-        read = runtime.device_products.consume(
-            inputs[0], consumer_op_id=operation.op_id, device=runtime.operation_device(operation)
+        read = device_products.consume(
+            inputs[0],
+            consumer_op_id=operation.op_id,
+            device=model_runner.operation_device(operation),
         )
         scope.device_reads.append(read)
         if read.region is not None:
@@ -581,19 +578,22 @@ def run_action(runtime: Worker, state: OperationState) -> bool:
         next_cursor = cursor + count
         if operation.kind is OpCode.DIFFUSION_DECODE:
             value = model.decoder_input(metadata, read.tensor, track, cursor, count)
-            key = operation.request_key
-            result = runtime.runner.run_module(
+            result = model_runner.run_module(
                 operation.entry,
                 value,
-                operations=(
-                    OperationTrace(key.authority_id, key.request_id, key.epoch, operation.op_id, 0),
-                ),
             )
             scope.observations.append(result.observation)
             if len(result.values) != 1:
                 raise invalid_descriptor("media decoder must return one numerical tensor")
             decoded = model.decoder_output(metadata, result.values[0], track)
-            products = transfer.publish_tensors(runtime, operation, (decoded,), scope)
+            products = transfer.publish_tensors(
+                operation,
+                (decoded,),
+                scope,
+                device_products=device_products,
+                encoder_cache=encoder_cache,
+                publication_transports=publication_transports,
+            )
         else:
             owner = request.request
             if owner.media_finalized:
@@ -641,7 +641,7 @@ def run_action(runtime: Worker, state: OperationState) -> bool:
                     )
                     owner.media_audio_written = True
             except BaseException:
-                ring_lease.defer_until_capture_ready(capture)
+                ring_lease.defer_until_ready(capture.buffer.completion_future())
                 raise
     else:
         owner = request.request
@@ -656,10 +656,11 @@ def run_action(runtime: Worker, state: OperationState) -> bool:
             raise RuntimeError("media finalization has no reserved CPU task")
         tasks = (mux.finalize_artifact(operation.request_key, reservation, operation.op_id),)
         owner.media_finalized = True
+    scope.completion_jobs.extend(tasks)
     state.outcome = Outcome(
         status=OpStatus.OK,
         selected_point=1 if operation.advances_state else 0,
-        logical_lengths=runtime.logical_lengths(
+        logical_lengths=operation_geometry.logical_lengths(
             operation,
             request,
             None,
@@ -667,7 +668,7 @@ def run_action(runtime: Worker, state: OperationState) -> bool:
         ),
         token_span=TokenSpan(base=int(request.logical_position), len=0),
         finish_flags=FinishFlags(),
-        product_generations=runtime.output_generations(operation),
+        product_generations=operation_geometry.output_generations(operation),
         completion_tasks=tasks,
         products=products,
         next_cursor=next_cursor,
@@ -694,3 +695,11 @@ __all__ = [
     "trajectory_params",
     "validate_batch",
 ]
+
+
+def require_media_output_ring(ring: VideoOutputRing | None) -> VideoOutputRing:
+    """Require bounded media storage on the configured output rank."""
+
+    if ring is None:
+        raise unsupported_setup("operation requires the media output owner's ring")
+    return ring

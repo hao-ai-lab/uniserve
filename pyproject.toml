@@ -25,6 +25,7 @@ dependencies = [
     "huggingface_hub",
     "diffusers>=0.36",
     "av>=14",
+    "nccl4py==0.3.1; sys_platform == 'linux'",
 ]
 
 [project.optional-dependencies]

@@ -17,7 +17,6 @@ from uniserve_worker.config import WorkerConfig
 from uniserve_worker.loader import LoadConfig, LoadFormat, LoadRequest, get_model_loader
 from uniserve_worker.loader.component import CheckpointComponent, ModelConstruction
 from uniserve_worker.loader.source import WeightSourceConfig
-from uniserve_worker.loader.update import WeightUpdater
 from uniserve_worker.models.runtime import ExecutionModel
 from uniserve_worker.nn.mesh import Communicator
 
@@ -135,7 +134,6 @@ def test_component_directories_preserve_namespaces_and_persistent_buffers(
     torch.testing.assert_close(
         loaded.model(torch.tensor([[1.0, 2.0]])), torch.tensor([[5.0, 66.0]])
     )
-    assert loaded.weights.version == 0
 
 
 def test_checksum_covers_each_component_source(component_checkpoint):
@@ -151,7 +149,7 @@ def test_checksum_covers_each_component_source(component_checkpoint):
 @pytest.mark.gpu
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="two CUDA devices are required")
 @pytest.mark.parametrize("load_format", [LoadFormat.AUTO, LoadFormat.LAYERED])
-def test_components_execute_and_reload_on_their_declared_devices(component_checkpoint, load_format):
+def test_components_execute_on_their_declared_devices(component_checkpoint, load_format):
     entry, request, root = component_checkpoint
     request = replace(request, load=LoadConfig(load_format=load_format))
     loaded = get_model_loader(load_format).load(
@@ -170,14 +168,6 @@ def test_components_execute_and_reload_on_their_declared_devices(component_check
     torch.testing.assert_close(
         loaded.model.decoder(inputs.cuda(1)), torch.tensor([[1.0, 12.0]], device="cuda:1")
     )
-    updater = WeightUpdater(loaded.model, sources=entry.sources, weights=loaded.weights)
-    save_file({"weight": torch.eye(2)}, root / "encoder" / "diffusion_pytorch_model.safetensors")
-    save_file(
-        {"weight": torch.eye(2), "scale": torch.tensor([4.0, 5.0])},
-        root / "decoder" / "diffusion_pytorch_model.safetensors",
-    )
-    assert updater.update_disk(request, root=root).version == 1
-    torch.testing.assert_close(loaded.model(inputs), torch.tensor([[4.0, 10.0]]), rtol=0, atol=0)
 
 
 def test_missing_serialized_buffer_rejects_incomplete_component(component_checkpoint):
@@ -215,74 +205,6 @@ def test_component_resolution_requires_only_resident_sources(component_checkpoin
     assert len(sources) == 1
     assert sources[0].source_name == "encode"
     assert sources[0].preview_shape("weight") == (2, 2)
-
-
-def test_installed_checkpoint_rank_is_relative_to_its_computation_entry(component_checkpoint):
-    from uniserve_worker.nn.mesh import DeviceMesh, EntryBindings
-    from uniserve_worker.nn.parallel import EntryConfig, ParallelConfig
-
-    entry, request, root = component_checkpoint
-    encoder = EntryConfig((2, 0), ParallelConfig(tensor_parallel_size=2))
-    decoder = EntryConfig((0,))
-    bindings = EntryBindings(
-        {"encode": encoder, "decode": decoder},
-        {
-            "encode": DeviceMesh(encoder.ranks, 0, encoder.parallel_config),
-            "decode": DeviceMesh.trivial(),
-        },
-        Communicator(ranks=(0, 1, 2), rank=0),
-    )
-    save_file({"weight": torch.zeros(2, 2)}, root / "encoder" / "rank-00000-of-00002.safetensors")
-    save_file(
-        {"weight": torch.tensor([[1.0, 2.0], [3.0, 4.0]])},
-        root / "encoder" / "rank-00001-of-00002.safetensors",
-    )
-    save_file(
-        {"weight": torch.diag(torch.tensor([2.0, 3.0])), "scale": torch.tensor([0.5, 2.0])},
-        root / "decoder" / "rank-00000-of-00001.safetensors",
-    )
-    entry = replace(
-        entry,
-        components=("encode", "decode"),
-        sources=tuple(replace(source, entry=source.name) for source in entry.sources),
-    )
-    request = replace(
-        request, bindings=bindings, load=LoadConfig(load_format=LoadFormat.SHARDED_STATE)
-    )
-    loaded = get_model_loader(request.load.load_format).load(
-        entry, {}, request, root=root, repository_id=None
-    )
-    torch.testing.assert_close(
-        loaded.model(torch.tensor([[1.0, 2.0]])), torch.tensor([[5.0, 66.0]]), rtol=0, atol=0
-    )
-
-
-def test_component_update_failure_restores_parameters_and_persistent_buffers(component_checkpoint):
-    entry, request, root = component_checkpoint
-    loaded = get_model_loader(request.load.load_format).load(
-        entry, {}, request, root=root, repository_id=None
-    )
-    updater = WeightUpdater(loaded.model, sources=entry.sources, weights=loaded.weights)
-    inputs = torch.tensor([[1.0, 2.0]])
-    original = loaded.model(inputs).detach().clone()
-    save_file({"weight": torch.eye(2)}, root / "encoder" / "diffusion_pytorch_model.safetensors")
-    # A serialized buffer arrives before the wrong-shaped projection in source order.
-    save_file(
-        {"weight": torch.eye(3), "scale": torch.tensor([4.0, 5.0])},
-        root / "decoder" / "diffusion_pytorch_model.safetensors",
-    )
-    request = replace(request, load=LoadConfig())
-    with pytest.raises(ValueError, match="shape"):
-        updater.update_disk(request, root=root)
-    torch.testing.assert_close(loaded.model(inputs), original)
-    assert updater.weights.version == 0
-
-    save_file(
-        {"weight": torch.eye(2), "scale": torch.tensor([4.0, 5.0])},
-        root / "decoder" / "diffusion_pytorch_model.safetensors",
-    )
-    assert updater.update_disk(request, root=root).version == 1
-    torch.testing.assert_close(loaded.model(inputs), torch.tensor([[4.0, 10.0]]))
 
 
 class PackedProjection(ExecutionModel):

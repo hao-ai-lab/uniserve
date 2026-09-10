@@ -2,7 +2,6 @@
 
 import pytest
 import torch
-import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 
@@ -92,7 +91,6 @@ def _run_attention(rank: int, rendezvous: str) -> None:
                     torch.testing.assert_close(actual, reference[begin : begin + local_rows])
     finally:
         environment.close()
-        dist.destroy_process_group()
 
 
 def test_sequence_communication_preserves_dense_and_gqa_attention(tmp_path):

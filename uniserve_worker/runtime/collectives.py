@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import socket
-from ctypes import c_void_p
+from ctypes import addressof, c_void_p
 from typing import Any
 
 import torch
@@ -129,3 +129,192 @@ class PeerSumReduction:
         trtllm_destroy_ipc_workspace_for_all_reduce_fusion(workspace.ipc_handles)
         cudart.cudaFree(c_void_p(workspace.metadata["control_flag_ptr"]))
         workspace.destroy()
+
+
+class NcclStreamCollectives:
+    """Own a NCCL communicator whose kernels execute on one borrowed stream.
+
+    PyTorch process groups retain their own communication streams. Explicit
+    Green Context computation requires direct NCCL enqueueing on the bound
+    stream, including graph capture. Rank ordering matches the process group;
+    the model Communicator continues to handle logical membership ordering.
+    """
+
+    def __init__(self, group, stream: torch.cuda.Stream) -> None:
+        import nccl.bindings.nccl as nccl
+
+        self._nccl = nccl
+        self._stream = stream
+        self._comm = c_void_p()
+        self._rank = dist.get_rank(group)
+        self._size = dist.get_world_size(group)
+        self._ranks = tuple(dist.get_process_group_ranks(group))
+        identity = [bytes(nccl.get_unique_id()) if self._rank == 0 else None]
+        dist.broadcast_object_list(identity, src=self._ranks[0], group=group)
+        unique_id = identity[0]
+        if not isinstance(unique_id, bytes):
+            raise RuntimeError("NCCL initialization did not receive a unique identifier")
+        try:
+            with torch.cuda.device(stream.device):
+                nccl.comm_init_rank(
+                    addressof(self._comm), self._size, bytearray(unique_id), self._rank
+                )
+        except BaseException as error:
+            if self._comm.value:
+                try:
+                    nccl.comm_abort(self._comm.value)
+                except BaseException as cleanup_error:
+                    error.add_note(f"NCCL initialization cleanup failed: {cleanup_error!r}")
+                self._comm = c_void_p()
+            raise
+
+    def _arguments(
+        self, value: torch.Tensor, output: torch.Tensor | None = None
+    ) -> tuple[int, int]:
+        if not self._comm.value:
+            raise RuntimeError("computation collective is closed")
+        if value.device != self._stream.device or not value.is_contiguous():
+            raise ValueError("computation collectives require contiguous tensors on their device")
+        if output is not None and (
+            output.device != value.device
+            or output.dtype != value.dtype
+            or not output.is_contiguous()
+        ):
+            raise ValueError("collective output must match input dtype, device, and layout")
+        return self._comm.value, self._stream.cuda_stream
+
+    def _dtype(self, value: torch.Tensor) -> int:
+        types = self._nccl.DataType
+        return {
+            torch.bool: types.Uint8,
+            torch.uint8: types.Uint8,
+            torch.int8: types.Int8,
+            torch.int32: types.Int32,
+            torch.int64: types.Int64,
+            torch.float16: types.Float16,
+            torch.bfloat16: types.Bfloat16,
+            torch.float32: types.Float32,
+            torch.float64: types.Float64,
+        }[value.dtype]
+
+    def all_reduce(self, value: torch.Tensor, op: str = "sum") -> None:
+        reduction = {
+            "sum": self._nccl.RedOp.Sum,
+            "max": self._nccl.RedOp.Max,
+            "min": self._nccl.RedOp.Min,
+        }[op]
+        self._nccl.all_reduce(
+            value.data_ptr(),
+            value.data_ptr(),
+            value.numel(),
+            self._dtype(value),
+            reduction,
+            *self._arguments(value),
+        )
+
+    def all_gather(self, output: torch.Tensor, value: torch.Tensor) -> None:
+        if output.numel() != value.numel() * self._size:
+            raise ValueError("collective gather output must hold every rank's contribution")
+        self._nccl.all_gather(
+            value.data_ptr(),
+            output.data_ptr(),
+            value.numel(),
+            self._dtype(value),
+            *self._arguments(value, output),
+        )
+
+    def all_to_all(
+        self,
+        output: torch.Tensor,
+        value: torch.Tensor,
+        output_splits: list[int],
+        input_splits: list[int],
+    ) -> None:
+        self._arguments(value, output)
+        if len(input_splits) != self._size or len(output_splits) != self._size:
+            raise ValueError("collective exchange requires one split per rank")
+        send_rows, receive_rows = value.split(input_splits), output.split(output_splits)
+        self._nccl.group_start()
+        try:
+            for peer, (send, receive) in enumerate(zip(send_rows, receive_rows, strict=True)):
+                if send.numel():
+                    self.send(send, self._ranks[peer])
+                if receive.numel():
+                    self.recv(receive, self._ranks[peer])
+        finally:
+            self._nccl.group_end()
+
+    def gather(self, outputs: list[torch.Tensor] | None, value: torch.Tensor, root: int) -> None:
+        self._arguments(value)
+        self._ranks.index(root)
+        if self._ranks[self._rank] == root:
+            if outputs is None or len(outputs) != self._size:
+                raise ValueError("collective gather requires one destination per rank")
+            for output in outputs:
+                self._arguments(value, output)
+                if output.numel() != value.numel():
+                    raise ValueError("gather destination must match the contribution size")
+        self._nccl.group_start()
+        try:
+            self.send(value, root)
+            if self._ranks[self._rank] == root:
+                assert outputs is not None
+                for peer, output in zip(self._ranks, outputs, strict=True):
+                    self.recv(output, peer)
+        finally:
+            self._nccl.group_end()
+
+    def broadcast(self, value: torch.Tensor, root: int) -> None:
+        self._nccl.broadcast(
+            value.data_ptr(),
+            value.data_ptr(),
+            value.numel(),
+            self._dtype(value),
+            self._ranks.index(root),
+            *self._arguments(value),
+        )
+
+    def reduce_scatter(self, output: torch.Tensor, value: torch.Tensor) -> None:
+        if value.numel() != output.numel() * self._size:
+            raise ValueError("collective reduction requires one output-sized partition per rank")
+        self._nccl.reduce_scatter(
+            value.data_ptr(),
+            output.data_ptr(),
+            output.numel(),
+            self._dtype(value),
+            self._nccl.RedOp.Sum,
+            *self._arguments(value, output),
+        )
+
+    def send(self, value: torch.Tensor, peer: int) -> None:
+        self._nccl.send(
+            value.data_ptr(),
+            value.numel(),
+            self._dtype(value),
+            self._ranks.index(peer),
+            *self._arguments(value),
+        )
+
+    def recv(self, value: torch.Tensor, peer: int) -> None:
+        self._nccl.recv(
+            value.data_ptr(),
+            value.numel(),
+            self._dtype(value),
+            self._ranks.index(peer),
+            *self._arguments(value),
+        )
+
+    def send_recv(self, output: torch.Tensor, value: torch.Tensor, dst: int, src: int) -> None:
+        self._nccl.group_start()
+        try:
+            self.send(value.reshape(-1).view(torch.uint8), dst)
+            self.recv(output.reshape(-1).view(torch.uint8), src)
+        finally:
+            self._nccl.group_end()
+
+    def close(self) -> None:
+        """Destroy the communicator after its runner has retired all graph use."""
+
+        if self._comm.value:
+            communicator, self._comm = self._comm.value, c_void_p()
+            self._nccl.comm_destroy(communicator)

@@ -15,7 +15,7 @@ import torch
 import torch.distributed as dist
 
 from ..profiling import profile_range
-from .collective import try_sum_reduction
+from .collective import stream_collectives, try_sum_reduction
 from .parallel import EntryConfig, ParallelConfig
 
 RowChunkProducer = Callable[[slice, tuple[torch.Tensor, ...]], None]
@@ -97,11 +97,8 @@ class RowGather:
             local = input[offset : offset + count]
             gathered[backend_rank].copy_(local)
             if self.group.world_size > 1:
-                work = dist.all_gather_into_tensor(
-                    gathered.flatten(0, 1),
-                    gathered[backend_rank],
-                    group=self.group._require(),
-                    async_op=True,
+                work = _start_all_gather(
+                    gathered.flatten(0, 1), gathered[backend_rank], self.group._require()
                 )
             else:
                 work = None
@@ -138,10 +135,22 @@ def _process_group(name: str):
 
 
 def _finish(work: Any, tensor: torch.Tensor) -> None:
+    if work is None:
+        return
     if tensor.device.type == "cuda":
         work.block_current_stream()
     else:
         work.wait()
+
+
+def _start_all_gather(output: torch.Tensor, input: torch.Tensor, group):
+    """Enqueue a gather using the computation stream or the default group stream."""
+
+    bound = stream_collectives(group.group_name)
+    if bound is not None:
+        bound.all_gather(output, input)
+        return None
+    return dist.all_gather_into_tensor(output, input, group=group, async_op=True)
 
 
 @torch.library.custom_op("uniserve_worker::all_gather_into_tensor", mutates_args=("output",))
@@ -155,7 +164,7 @@ def _all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor, group_nam
         local = output.view(-1).narrow(0, group.rank() * input.numel(), input.numel())
         local = local.view_as(input)
         local.copy_(input)
-        work = dist.all_gather_into_tensor(output, local, group=group, async_op=True)
+        work = _start_all_gather(output, local, group)
         _finish(work, input)
 
 
@@ -175,6 +184,10 @@ def _all_to_all_single_into(
     with profile_range(
         f"uniserve.collective kind=all_to_all group={group_name} rank={dist.get_rank()}"
     ):
+        bound = stream_collectives(group_name)
+        if bound is not None:
+            bound.all_to_all(output, input, output_splits, input_splits)
+            return
         # Empty split lists select the native equal-count collective. Explicit
         # lists select variable-count send/recv, including when counts match.
         equal_counts = (
@@ -201,6 +214,10 @@ def _all_reduce_max(value: torch.Tensor, group_name: str) -> None:
     with profile_range(
         f"uniserve.collective kind=all_reduce_max group={group_name} rank={dist.get_rank()}"
     ):
+        bound = stream_collectives(group_name)
+        if bound is not None:
+            bound.all_reduce(value, "max")
+            return
         work = dist.all_reduce(
             value, op=dist.ReduceOp.MAX, group=_process_group(group_name), async_op=True
         )
@@ -224,6 +241,10 @@ def _send_recv(
     with profile_range(
         f"uniserve.collective kind=send_recv group={group_name} rank={dist.get_rank()}"
     ):
+        bound = stream_collectives(group_name)
+        if bound is not None:
+            bound.send_recv(output, value, dst, src)
+            return
         operations = [
             dist.P2POp(dist.isend, value.reshape(-1).view(torch.uint8), dst, group),
             dist.P2POp(dist.irecv, output.reshape(-1).view(torch.uint8), src, group),
@@ -341,7 +362,10 @@ class Communicator:
     def all_reduce(self, value: torch.Tensor) -> torch.Tensor:
         if self.world_size > 1:
             group = self._require()
-            if not try_sum_reduction(group, value):
+            bound = stream_collectives(group.group_name)
+            if bound is not None:
+                bound.all_reduce(value)
+            elif not try_sum_reduction(group, value):
                 dist.all_reduce(value, group=group)
         return value
 
@@ -354,14 +378,28 @@ class Communicator:
         """Resolve a capacity or bound shared by all members."""
 
         if self.world_size > 1:
-            dist.all_reduce(value, op=dist.ReduceOp.MIN, group=self._require())
+            group = self._require()
+            bound = stream_collectives(group.group_name)
+            if bound is not None:
+                bound.all_reduce(value, "min")
+            else:
+                dist.all_reduce(value, op=dist.ReduceOp.MIN, group=group)
         return value
 
     def all_gather(self, value: torch.Tensor, dim: int = 0) -> torch.Tensor:
         if self.world_size == 1:
             return value
-        chunks = [torch.empty_like(value) for _ in self.ranks]
-        dist.all_gather(chunks, value.contiguous(), group=self._require())
+        group = self._require()
+        bound = stream_collectives(group.group_name)
+        if bound is not None:
+            gathered = torch.empty(
+                (self.world_size, *value.shape), dtype=value.dtype, device=value.device
+            )
+            bound.all_gather(gathered, value.contiguous())
+            chunks = list(gathered.unbind(0))
+        else:
+            chunks = [torch.empty_like(value) for _ in self.ranks]
+            dist.all_gather(chunks, value.contiguous(), group=group)
         backend_ranks = sorted(self.ranks)
         return torch.cat([chunks[backend_ranks.index(rank)] for rank in self.ranks], dim=dim)
 
@@ -416,9 +454,7 @@ class Communicator:
             sources[local_rank].copy_(input[start : start + count])
             segments.append((start, count, sources))
         pending = [
-            dist.all_gather_into_tensor(
-                sources.flatten(0, 1), sources[local_rank], group=self._require(), async_op=True
-            )
+            _start_all_gather(sources.flatten(0, 1), sources[local_rank], self._require())
             for _, _, sources in segments
         ]
         begin = self.rank_in_group * rows
@@ -496,7 +532,13 @@ class Communicator:
             destination.copy_(source)
             work = None
         else:
-            work = dist.all_to_all_single(destination, source, group=self._require(), async_op=True)
+            group = self._require()
+            bound = stream_collectives(group.group_name)
+            if bound is not None:
+                bound.all_to_all(destination, source, [1] * self.world_size, [1] * self.world_size)
+                work = None
+            else:
+                work = dist.all_to_all_single(destination, source, group=group, async_op=True)
 
         def complete() -> tuple[torch.Tensor, ...]:
             if work is not None:
@@ -613,15 +655,25 @@ class Communicator:
             assert output is not None
             output[0].copy_(input)
             return
+        group = self._require()
+        bound = stream_collectives(group.group_name)
+        if bound is not None:
+            bound.gather(gather_list, input, global_dst)
+            return
         work = dist.gather(
-            input, gather_list=gather_list, dst=global_dst, group=self._require(), async_op=True
+            input, gather_list=gather_list, dst=global_dst, group=group, async_op=True
         )
         _finish(work, input)
 
     def broadcast(self, value: torch.Tensor, *, src: int = 0) -> torch.Tensor:
         global_src = self._peer(src)
         if self.world_size > 1:
-            dist.broadcast(value, src=global_src, group=self._require())
+            group = self._require()
+            bound = stream_collectives(group.group_name)
+            if bound is not None:
+                bound.broadcast(value, global_src)
+            else:
+                dist.broadcast(value, src=global_src, group=group)
         return value
 
     def reduce_scatter(self, value: torch.Tensor, dim: int = 0) -> torch.Tensor:
@@ -633,20 +685,35 @@ class Communicator:
         chunks = value.chunk(self.world_size, dim=dim)
         packed = torch.cat([chunks[index].movedim(dim, 0) for index in self._backend_order], dim=0)
         output = torch.empty_like(chunks[0].movedim(dim, 0), memory_format=torch.contiguous_format)
-        dist.reduce_scatter_tensor(output, packed.contiguous(), group=self._require())
+        group = self._require()
+        bound = stream_collectives(group.group_name)
+        if bound is not None:
+            bound.reduce_scatter(output, packed.contiguous())
+        else:
+            dist.reduce_scatter_tensor(output, packed.contiguous(), group=group)
         return output.movedim(0, dim)
 
     def send(self, value: torch.Tensor, *, dst: int) -> None:
         """Send a tensor's logical bytes, including dtypes unsupported by NCCL."""
 
         payload = value.contiguous().reshape(-1).view(torch.uint8)
-        dist.send(payload, dst=self._peer(dst), group=self._require())
+        group = self._require()
+        bound = stream_collectives(group.group_name)
+        if bound is not None:
+            bound.send(payload, self._peer(dst))
+        else:
+            dist.send(payload, dst=self._peer(dst), group=group)
 
     def recv(self, value: torch.Tensor, *, src: int) -> torch.Tensor:
         """Receive bytes into caller-owned storage with the agreed shape and dtype."""
 
         storage = value if value.is_contiguous() else torch.empty_like(value).contiguous()
-        dist.recv(storage.reshape(-1).view(torch.uint8), src=self._peer(src), group=self._require())
+        group = self._require()
+        bound = stream_collectives(group.group_name)
+        if bound is not None:
+            bound.recv(storage.reshape(-1).view(torch.uint8), self._peer(src))
+        else:
+            dist.recv(storage.reshape(-1).view(torch.uint8), src=self._peer(src), group=group)
         if storage is not value:
             value.copy_(storage)
         return value

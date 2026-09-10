@@ -1,19 +1,31 @@
-"""Execution-run ownership and partial-result readers."""
+"""In-flight execution ownership and incremental result delivery."""
 
 from __future__ import annotations
 
-from collections import OrderedDict
 from collections.abc import Callable
 
-from ..foundation.errors import WorkerError, classify, invalid_descriptor
-from .batch import Finish, Free, LaneResult, ModelOutput, Retire, Run, RunResult, TransferHandle
-from .output import _completion_payload_ready, _record_ready, finalize_run_result
-from .rows import PreparedExecution
+from uniserve_worker.execution.batch import (
+    Finish,
+    Free,
+    LaneResult,
+    ModelOutput,
+    Retire,
+    Run,
+    RunResult,
+    TransferHandle,
+)
+from uniserve_worker.execution.output import (
+    _completion_payload_ready,
+    _record_ready,
+    finalize_run_result,
+)
+from uniserve_worker.execution.rows import PreparedExecution
+from uniserve_worker.foundation.errors import WorkerError, classify, invalid_descriptor
+from uniserve_worker.foundation.resources import close_resources
 
 _OperationKey = tuple[int, int, int]
-_EpochKey = tuple[int, int]
 
-__all__ = ["LaneRun", "RunReader", "WorkerRun", "ReplayWindow"]
+__all__ = ["LaneRun", "WorkerRun"]
 
 
 def _operation_key(operation: object) -> _OperationKey:
@@ -23,16 +35,15 @@ def _operation_key(operation: object) -> _OperationKey:
     return (int(request.request_id), int(request.epoch), int(getattr(operation, "op_id")))
 
 
-def _run_lineage(batch: Run) -> tuple[frozenset[int], frozenset[_EpochKey]]:
-    """Map every operation identity to its parent operation within a run."""
-
-    request_keys = (
-        *(admission.request_key for admission in batch.admissions),
-        *(operation.request_key for operation in batch.operations),
-        *(command.request_key for command in batch.commands),
+def _request_ids(batch: Run) -> frozenset[int]:
+    return frozenset(
+        key.request_id
+        for key in (
+            *(admission.request_key for admission in batch.admissions),
+            *(operation.request_key for operation in batch.operations),
+            *(command.request_key for command in batch.commands),
+        )
     )
-    epochs = frozenset((int(key.request_id), int(key.epoch)) for key in request_keys)
-    return frozenset(request for request, _epoch in epochs), epochs
 
 
 def _validate_report(run: WorkerRun, report: RunResult) -> None:
@@ -68,7 +79,7 @@ def _validate_report(run: WorkerRun, report: RunResult) -> None:
 
 
 class LaneRun:
-    """One lane from device launch through immutable host publication."""
+    """Pending outputs for one logical result lane, materialized when ready."""
 
     __slots__ = (
         "lane_id",
@@ -80,8 +91,6 @@ class LaneRun:
     )
 
     def __init__(self, lane_id: int) -> None:
-        """Initialize one physical lane in the prepared state."""
-
         self.lane_id = int(lane_id)
         self.state = "PREPARED"
         self.result: LaneResult | None = None
@@ -163,37 +172,44 @@ class LaneRun:
         if self.result is None:
             raw = self._raw
             publication = None if raw is None else raw.publication
+            actions = []
             if publication is not None:
-                publication.cancel()
+                actions.append(publication.cancel)
+            if raw is not None:
+                actions.extend(
+                    record.abandon
+                    for record in raw.completions
+                    if not isinstance(record, ModelOutput)
+                )
             self._raw = None
             self.state = "ABORTED"
+            close_resources(*actions)
 
 
 class WorkerRun:
-    """One exact-once physical run retained through replay eviction."""
+    """Own one execution and its undelivered Submit/Poll results until retirement."""
 
     __slots__ = (
         "batch_id",
         "run_id",
         "run",
         "request_ids",
-        "epochs",
         "lane_order",
         "lane_operation_keys",
         "lanes",
-        "weight",
         "state",
         "error",
         "report",
-        "active_readers",
         "requires_command_ack",
         "_retirement",
         "_source",
         "_on_successors_ready",
         "_on_ready",
-        "_on_terminal",
         "_successors_notified",
         "_terminal_notified",
+        "_sent",
+        "_terminal_sent",
+        "awaiting_poll",
     )
 
     def __init__(
@@ -202,36 +218,34 @@ class WorkerRun:
         *,
         on_successors_ready: Callable[[WorkerRun], None],
         on_ready: Callable[[WorkerRun], None],
-        on_terminal: Callable[[WorkerRun], None],
     ) -> None:
-        """Track one scheduler run from staged source through terminal lane reports."""
-
-        requests, epochs = _run_lineage(run)
         self.batch_id = int(run.batch_id)
         self.run_id = int(run.run_id)
         self.run = run
-        self.request_ids = requests
-        self.epochs = epochs
+        self.request_ids = _request_ids(run)
         self.lane_order = tuple(int(lane.lane_id) for lane in run.lanes)
         self.lane_operation_keys = tuple(
             tuple(_operation_key(operation) for operation in lane.operations) for lane in run.lanes
         )
         self.lanes = tuple(LaneRun(value) for value in self.lane_order)
-        self.weight = max(1, len(run.operations))
+
         self.state = "QUEUED"
         self.error: WorkerError | None = None
         self.report: RunResult | None = None
-        self.active_readers = 0
         self.requires_command_ack = any(
             isinstance(command, (Free, Finish, Retire)) for command in run.commands
         )
         self._retirement: Callable[[], bool] | None = None
         self._source: RunResult | PreparedExecution | None = None
+
         self._on_successors_ready = on_successors_ready
         self._on_ready = on_ready
-        self._on_terminal = on_terminal
         self._successors_notified = False
         self._terminal_notified = False
+
+        self._sent: set[int] = set()
+        self._terminal_sent = False
+        self.awaiting_poll = False
 
     @property
     def complete(self) -> bool:
@@ -254,7 +268,7 @@ class WorkerRun:
         self.state = "RUNNING"
 
     def fail(self, error: BaseException, *, context: str = "execute") -> None:
-        """Classify a run failure, abort active lanes, and preserve the error for readers."""
+        """Classify a run failure, abort active lanes, and deliver its error once."""
 
         if self.complete:
             return
@@ -266,11 +280,30 @@ class WorkerRun:
             if isinstance(source, PreparedExecution)
             else classify(error, context=context)
         )
-        for lane in self.lanes:
-            lane.abort()
-        self._source = None
+        try:
+            self.close()
+        except BaseException as cleanup_error:
+            self.error.add_note(f"run cleanup failed: {cleanup_error!r}")
         self.state = "TERMINAL"
         self._notify_terminal()
+
+    def close(self) -> None:
+        """Abandon owned preparation and result leases before releasing run references."""
+
+        source, self._source = self._source, None
+        actions = [lane.abort for lane in self.lanes]
+        if isinstance(source, PreparedExecution):
+            actions.insert(0, source.abandon)
+        elif isinstance(source, RunResult):
+            for lane in source.lanes:
+                if lane.publication is not None:
+                    actions.append(lane.publication.cancel)
+                actions.extend(
+                    record.abandon
+                    for record in lane.completions
+                    if not isinstance(record, ModelOutput)
+                )
+        close_resources(*actions)
 
     def advance_execution(self) -> bool:
         """Launch a prepared batch once its input transfers and predicates are ready."""
@@ -303,7 +336,10 @@ class WorkerRun:
     def advance(self) -> None:
         """Advance execution and finalize every lane whose device results are ready."""
 
-        if self.complete or not self.advance_execution() or self.complete:
+        if not self.advance_execution():
+            return
+        # Advancing may have completed the run with an execution error.
+        if self.complete:
             return
         try:
             published = len(self.published_lanes())
@@ -313,10 +349,13 @@ class WorkerRun:
                 self._on_ready(self)
             if any(lane.result is None for lane in self.lanes):
                 return
+
+            # Free/Finish/Retire acknowledge only after outstanding readers release storage.
             if self._retirement is not None:
                 if not self._retirement():
                     return
                 self._retirement = None
+
             report = RunResult(
                 batch_id=self.batch_id,
                 run_id=self.run_id,
@@ -343,7 +382,8 @@ class WorkerRun:
         if self._terminal_notified:
             return
         self._terminal_notified = True
-        self._on_terminal(self)
+        self._notify_successors_ready()
+        self._on_ready(self)
 
     def _notify_successors_ready(self) -> None:
         """Notify dependents once the run's produced values become readable."""
@@ -353,166 +393,59 @@ class WorkerRun:
         self._successors_notified = True
         self._on_successors_ready(self)
 
-
-class RunReader:
-    """Independent wire cursor over the immutable results of one physical run."""
-
-    __slots__ = ("run", "_sent", "_terminal_sent", "_error_sent", "_closed", "_on_close")
-
-    def __init__(self, run: WorkerRun, on_close: Callable[[RunReader], None]) -> None:
-        """Create a cursor that emits each published lane or terminal error once."""
-
-        self.run = run
-        self._sent: set[int] = set()
-        self._terminal_sent = False
-        self._error_sent = False
-        self._closed = False
-        self._on_close = on_close
-
-    @property
-    def run_id(self) -> int:
-        """Expose the scheduler-assigned identity of the observed worker run."""
-
-        return self.run.run_id
-
-    @property
-    def request_ids(self) -> frozenset[int]:
-        """Expose request ids whose state is read or mutated by the observed run."""
-
-        return self.run.request_ids
-
-    @property
-    def error(self) -> WorkerError | None:
-        """Expose the terminal classified run failure, if one has occurred."""
-
-        return self.run.error
-
-    @property
-    def complete(self) -> bool:
-        """Indicate whether the observed run has reached its terminal state."""
-
-        return self.run.complete
-
     def ready(self) -> bool:
-        """Return whether the requested run cursor can yield a report or terminal error."""
+        """Return whether the requested run delivery position can yield a report or terminal error."""
 
-        self.run.advance()
-        if self.run.error is not None:
-            return not self._error_sent
-        if any(int(lane.lane_id) not in self._sent for lane in self.run.published_lanes()):
+        self.advance()
+        if self.error is not None:
+            return not self._terminal_sent
+        if any(int(lane.lane_id) not in self._sent for lane in self.published_lanes()):
             return True
-        return self.run.complete and not self._terminal_sent
+        return self.complete and not self._terminal_sent
 
     def take_ready(self) -> RunResult:
-        """Return the next report at the cursor and advance past completed lanes."""
+        """Return the next report at the delivery position and advance past completed lanes."""
 
-        self.run.advance()
-        if self.run.error is not None:
+        self.advance()
+        if self.error is not None:
             raise RuntimeError("terminal error must be consumed through take_error")
         lanes = tuple(
-            lane for lane in self.run.published_lanes() if int(lane.lane_id) not in self._sent
+            lane for lane in self.published_lanes() if int(lane.lane_id) not in self._sent
         )
         if lanes:
             # A fragment's aggregate counters belong to one computation entry.
             # Entry participants can differ even within the same physical run.
-            entries = {int(lane.lane_id): lane.operations[0].entry for lane in self.run.run.lanes}
+            entries = {int(lane.lane_id): lane.operations[0].entry for lane in self.run.lanes}
             entry = entries[int(lanes[0].lane_id)]
             lanes = tuple(lane for lane in lanes if entries[int(lane.lane_id)] == entry)
             self._sent.update(int(lane.lane_id) for lane in lanes)
             done = (
-                self.run.complete
-                and len(self._sent) == len(self.run.lane_order)
-                and not self.run.requires_command_ack
+                self.complete
+                and len(self._sent) == len(self.lane_order)
+                and not self.requires_command_ack
             )
             self._terminal_sent = done
             return RunResult(
-                batch_id=self.run.batch_id,
-                run_id=self.run.run_id,
+                batch_id=self.batch_id,
+                run_id=self.run_id,
                 lanes=lanes,
                 done=done,
             )
-        if self.run.complete and not self._terminal_sent:
+        if self.complete and not self._terminal_sent:
             self._terminal_sent = True
-            return RunResult(
-                batch_id=self.run.batch_id, run_id=self.run.run_id, lanes=(), done=True
-            )
-        raise RuntimeError("run reader has no query-ready lane")
+            return RunResult(batch_id=self.batch_id, run_id=self.run_id, lanes=(), done=True)
+        raise RuntimeError("run has no query-ready lane")
 
     def take_error(self) -> WorkerError:
-        """Return the run’s terminal error after consuming this reader."""
+        """Return the run’s terminal error after consuming this run."""
 
-        error = self.run.error
-        if error is None or self._error_sent:
-            raise RuntimeError("run reader has no unread terminal error")
-        self._error_sent = True
+        error = self.error
+        if error is None or self._terminal_sent:
+            raise RuntimeError("run has no unread terminal error")
+        self._terminal_sent = True
         return error
 
     def pending(self) -> bool:
-        """Indicate whether the cursor still owes a result or terminal acknowledgement."""
+        """Indicate whether the delivery position still owes a result or terminal acknowledgement."""
 
-        if self.run.error is not None:
-            return not self._error_sent
         return not self._terminal_sent
-
-    def close(self) -> None:
-        """Release this reader’s reference to the underlying worker run."""
-
-        if self._closed:
-            return
-        self._closed = True
-        self._on_close(self)
-
-    def __del__(self) -> None:
-        """Release an unclosed run reader during finalization."""
-
-        try:
-            self.close()
-        except Exception:
-            pass
-
-
-class ReplayWindow:
-    """Weighted LRU ownership for terminal batch runs."""
-
-    def __init__(self, capacity: int) -> None:
-        """Create a count-bounded least-recently-used store for replayable runs."""
-
-        self.capacity = int(capacity)
-        if self.capacity < 1:
-            raise ValueError("replay window capacity must be positive")
-        self._runs: OrderedDict[int, WorkerRun] = OrderedDict()
-        self._weight = 0
-
-    def take(self, run_id: int) -> WorkerRun | None:
-        """Return the retained run with the requested identifier, if present."""
-
-        run = self._runs.pop(int(run_id), None)
-        if run is not None:
-            self._weight -= run.weight
-        return run
-
-    def touch(self, run_id: int) -> None:
-        """Mark a retained run as most recently observed for replay eviction."""
-
-        if int(run_id) in self._runs:
-            self._runs.move_to_end(int(run_id))
-
-    def put(self, run: WorkerRun) -> tuple[WorkerRun, ...]:
-        """Retain a completed or active run while enforcing replay count and byte bounds."""
-
-        prior = self._runs.pop(run.run_id, None)
-        if prior is not None:
-            self._weight -= prior.weight
-        self._runs[run.run_id] = run
-        self._weight += run.weight
-        evicted: list[WorkerRun] = []
-        while self._weight > self.capacity:
-            _run_id, victim = self._runs.popitem(last=False)
-            self._weight -= victim.weight
-            evicted.append(victim)
-        return tuple(evicted)
-
-    def remove(self, run_id: int) -> WorkerRun | None:
-        """Remove and return a retained run without requiring it to be terminal."""
-
-        return self.take(run_id)

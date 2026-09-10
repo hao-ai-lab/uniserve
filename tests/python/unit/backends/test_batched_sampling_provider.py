@@ -5,7 +5,6 @@ from __future__ import annotations
 import pytest
 import torch
 
-from uniserve_worker.backends.triton import configure_triton_toolchain
 from uniserve_worker.execution.top_k_sampling import SamplingParameters, sample_top_k
 
 pytestmark = pytest.mark.unit
@@ -105,7 +104,6 @@ def test_top_k_provider_matches_the_full_expression() -> None:
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_top_k_provider_is_capture_eligible_and_matches_eager_tokens() -> None:
-    assert configure_triton_toolchain()
     inputs = _inputs(torch.device("cuda"))
     expected = _reference(*inputs, 4)
     logits, draws, penalty_token_ids, penalty_counts, parameters = inputs
@@ -115,9 +113,7 @@ def test_top_k_provider_is_capture_eligible_and_matches_eager_tokens() -> None:
     graph = torch.cuda.CUDAGraph()
 
     with torch.cuda.graph(graph):
-        captured, valid = sample_top_k(
-            logits, draws, penalty_token_ids, penalty_counts, packed, 4
-        )
+        captured, valid = sample_top_k(logits, draws, penalty_token_ids, penalty_counts, packed, 4)
     graph.replay()
     torch.cuda.synchronize()
 
@@ -128,7 +124,6 @@ def test_top_k_provider_is_capture_eligible_and_matches_eager_tokens() -> None:
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_top_k_provider_accepts_every_serving_wave_row_count() -> None:
-    assert configure_triton_toolchain()
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(42)
 

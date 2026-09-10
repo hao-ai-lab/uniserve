@@ -68,7 +68,7 @@ class DeviceEventPool:
         self._lock = RLock()
         self._closed = False
 
-    def set_completion_wake(self, wake_on_stream: Callable[[int], None]) -> None:
+    def set_completion_wake(self, wake_on_stream: Callable[[int], None] | None) -> None:
         """Install the callback used to wake a device-specific completion stream."""
 
         self._wake_on_stream = wake_on_stream

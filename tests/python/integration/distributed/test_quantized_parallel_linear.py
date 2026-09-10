@@ -4,7 +4,6 @@ from pathlib import Path
 
 import pytest
 import torch
-import torch.distributed as dist
 import torch.multiprocessing as mp
 from safetensors.torch import save_file
 
@@ -192,7 +191,6 @@ def _run(rank, rendezvous, checkpoint):
                 msg=f"{name}/{format}: prepared value/scale sequence transport",
             )
     environment.close()
-    dist.destroy_process_group()
 
 
 def test_checkpoint_quantization_preserves_logical_domains_across_tp(tmp_path):
@@ -282,7 +280,6 @@ def _run_sequence_scale(rank, rendezvous):
         if graph is not None:
             graph.reset()
         environment.close()
-        dist.destroy_process_group()
 
 
 def test_tensor_scale_preserves_values_across_sequence_partitions(tmp_path):

@@ -6,7 +6,6 @@ from abc import ABC, abstractmethod
 from collections.abc import Hashable
 from dataclasses import dataclass
 from enum import StrEnum
-from functools import partial
 from typing import Generic, TypeVar
 
 import torch
@@ -16,7 +15,7 @@ from ..execution.bounded_storage import BoundedTensorStorage
 from ..execution.denoising import DenoisingStep
 from ..nn.diffusion.schedule import DiffusionSchedule
 from ..nn.parallel_attention import AttentionContextWorkspace
-from .runtime import ExecutionModel, ModuleExecution
+from .runtime import ExecutionModel
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,8 +124,6 @@ class VideoModel(ExecutionModel, Generic[MetadataT, TensorViewsT], ABC):
     denoiser: torch.nn.Module | None
     conditioner: torch.nn.Sequential | None
     media_plan: MediaExecutionPlan
-    capture_mesh_entries: dict[str, str] = {}
-    capture_excluded_axes: dict[str, tuple[str, ...]] = {}
 
     @property
     def denoise_steps(self) -> int:
@@ -139,38 +136,6 @@ class VideoModel(ExecutionModel, Generic[MetadataT, TensorViewsT], ABC):
         """Identify a complete denoising call's dynamic numerical shape."""
 
         raise NotImplementedError
-
-    def module_execution(self, name: str, inputs: tuple[object, ...]) -> ModuleExecution | None:
-        """Bind model-declared media calls to the shared capture lifecycle."""
-
-        if name not in self.capture_entries:
-            return None
-        if name == "denoiser":
-            tensors, metadata, step, count, schedule = inputs
-            if count != 1:
-                raise ValueError("media denoise calls evaluate exactly one scheduled step")
-            operation = self.bind_denoising_step(tensors, metadata, step, schedule)
-            signature = self.denoising_signature(tensors, metadata)
-            residency = operation.samples[0].data_ptr()
-            mutated = operation.samples
-            variant = step
-        else:
-            signature = tuple((tuple(value.shape), value.dtype) for value in inputs)
-            residency, variant, mutated = name, 0, ()
-            operation = partial(self.get_submodule(name), *inputs)
-        mesh_name = self.capture_mesh_entries.get(name, name)
-        mesh = self.bindings.meshes.get(mesh_name)
-        excluded = self.capture_excluded_axes.get(name, ())
-        groups = (
-            ()
-            if mesh is None
-            else tuple(
-                mesh.get_group(axis)
-                for axis in ("tp", "sp", "pp")
-                if mesh.size(axis) > 1 and axis not in excluded
-            )
-        )
-        return ModuleExecution(signature, residency, variant, operation, mutated, groups)
 
     @abstractmethod
     def bind_denoising_step(

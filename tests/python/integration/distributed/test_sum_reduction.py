@@ -4,7 +4,6 @@ from pathlib import Path
 
 import pytest
 import torch
-import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from uniserve_worker.nn.collective import collective_scope
@@ -94,7 +93,6 @@ def _run_sum_reduction(rank: int, rendezvous: str, world_size: int) -> None:
         for reduction in reductions.values():
             reduction.close()
         environment.close()
-        dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("world_size", [2, 4])

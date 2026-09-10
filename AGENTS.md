@@ -29,9 +29,9 @@ The authorized objective governs all work. Measure progress by delivered behavio
 ## Code Readability
 
 - Follow the language's established formatting conventions, repository formatter configuration, and surrounding code style. Use consistent indentation, conventional spacing around operators and after separators, and readable line breaks for long expressions and argument lists.
-- Separate logical stages with blank lines and keep related statements together. Avoid compressed statements, dense one-liners, and excessive vertical whitespace that obscure control flow or data flow.
+- All code additions and edits must use appropriate blank lines to separate logical stages and keep related statements together. Avoid compressed statements, dense one-liners, and excessive vertical whitespace that obscure control flow or data flow.
 - Use precise, domain-based names and straightforward structure so the code communicates its purpose without requiring explanatory narration for every statement.
-- Add comments where readers need the intent, rationale, invariants, algorithmic explanation, or non-obvious assumptions. Explain units, data layouts, numerical constraints, ownership, and synchronization where they affect correctness.
+- All code additions and edits must include helpful comments where intent, rationale, invariants, or non-obvious assumptions are not clear from the code. Explain units, data layouts, numerical constraints, ownership, and synchronization where they affect correctness. Comment placement and detail must serve comprehension; do not add obvious narration or satisfy a comment-count quota.
 - Document public interfaces and complex routines when their contracts are not evident from their signatures: describe inputs, outputs, side effects, error behavior, and caller obligations as applicable.
 - Keep comments accurate and adjacent to the relevant code. Update or remove them when behavior changes. Explain the current design and meaningful tradeoffs; avoid restating obvious operations, preserving commented-out code, or recounting implementation history.
 

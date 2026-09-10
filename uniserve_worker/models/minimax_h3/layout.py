@@ -34,7 +34,6 @@ __all__ = [
     "H3Scratch",
     "H3Tensors",
     "bind_request_tensors",
-    "capture_input_schema",
     "entry_output_schema",
     "tensor_output_layout",
     "warmup_geometries",
@@ -106,14 +105,6 @@ def entry_output_schema(layout: H3Layout) -> dict[str, tuple[TensorSpec, ...]]:
             ),
         ),
     }
-
-
-def capture_input_schema(bindings: EntryBindings) -> dict[str, tuple[TensorSchema, ...]]:
-    """Declare fixed component inputs captured independently of request storage."""
-
-    if not bindings.owns("video_decoder"):
-        return {}
-    return {"video_decoder": (TensorSchema((1, 24, 7, 48, 84), torch.float32),)}
 
 
 def reconstruction_unit_frames(frames: int) -> tuple[int, ...]:

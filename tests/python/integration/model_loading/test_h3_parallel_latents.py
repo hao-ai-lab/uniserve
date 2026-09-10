@@ -21,7 +21,6 @@ from uniserve_worker.execution.batch import (
 )
 from uniserve_worker.execution.bounded_storage import BoundedTensorStorage
 from uniserve_worker.execution.model_runner import ModelRunner
-from uniserve_worker.execution.trace import ExecutionTrace
 from uniserve_worker.loader import LoadRequest, load_model
 from uniserve_worker.models.minimax_h3.config import (
     PRECISION_PRESETS,
@@ -137,7 +136,6 @@ def _generate(
     execution = ModelRunner(
         runner,
         loaded.worker_config,
-        ExecutionTrace(runner.architecture),
         environment=environment,
         schedule=schedule,
     )
@@ -210,10 +208,20 @@ def _generate(
                     eager = tuple(value.clone() for value in samples)
                     for destination, saved in zip(samples, initial, strict=True):
                         destination.copy_(saved)
-                    execution.run_module("denoiser", slot, metadata, step, 1, schedule)
+                    execution.run_denoising(
+                        slot,
+                        metadata,
+                        step,
+                        1,
+                        schedule,
+                        slot=1,
+                        geometry=runner.execution_key(media),
+                    )
                     for observed, expected in zip(samples, eager, strict=True):
                         torch.testing.assert_close(observed, expected, rtol=2e-2, atol=2e-2)
-                    print(f"{kind} rank {rank} case {index} step {step}: numerical parity", flush=True)
+                    print(
+                        f"{kind} rank {rank} case {index} step {step}: numerical parity", flush=True
+                    )
             torch.cuda.synchronize(runner.device)
             if rank in bindings.output_ranks("denoiser"):
                 owner = bindings.output_ranks("denoiser").index(rank)
@@ -230,7 +238,6 @@ def _generate(
     execution.synchronize()
     execution.close()
     environment.close()
-    dist.destroy_process_group()
 
 
 def _collect(checkpoint, requests, kind, directory, *, encoder_tp=1, component_precisions):

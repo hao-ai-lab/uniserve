@@ -4,14 +4,10 @@ import pytest
 import torch
 
 from uniserve_worker.backends import paged_kv_math
-from uniserve_worker.backends.triton import triton_available
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_fused_paged_kv_write_replays_dynamic_rows_in_cuda_graph():
-    if paged_kv_math.triton is None or not triton_available(torch.device("cuda")):
-        pytest.skip("Triton fused layers are not supported on this CUDA device")
-
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(71)
     pages, page_size, heads, head_dim = 5, 4, 8, 128
@@ -59,14 +55,6 @@ def test_fused_paged_kv_write_replays_dynamic_rows_in_cuda_graph():
     offsets = torch.tensor([0, 3, 0], dtype=torch.int32, device=device)
 
     with torch.inference_mode():
-        assert paged_kv_math._triton_paged_kv_write_eligible(
-            k_cache,
-            v_cache,
-            page_ids,
-            offsets,
-            k_current,
-            v_current,
-        )
         paged_kv_math.paged_kv_write(
             k_cache,
             v_cache,

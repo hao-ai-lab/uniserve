@@ -71,7 +71,7 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--load-format",
         default="auto",
-        choices=("auto", "safetensors", "pt", "dummy", "sharded_state", "layered"),
+        choices=("auto", "safetensors", "pt", "dummy", "layered"),
     )
     parser.add_argument("--download-dir", default=None)
     parser.add_argument("--load-threads", type=int, default=None)
@@ -109,11 +109,6 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         help="repeatable JSON lane descriptor with lane_id, sm_budget, and domains",
-    )
-    parser.add_argument(
-        "--cuda-graph",
-        action=argparse.BooleanOptionalAction,
-        default=True,
     )
     parser.add_argument("--graph-policy", choices=("off", "auto", "full"), default="auto")
     parser.add_argument("--decode-graph-batch-sizes", default=None)

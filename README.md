@@ -148,6 +148,8 @@ For text-to-video-and-audio generation with `FastVideo/FastVideo-FastH3-4-step-P
 
 ## Development and verification
 
+The [Worker lifecycle](docs/worker-lifecycle.md) documents Python startup, IPC ownership, synchronous serving, and direct execution.
+
 The `justfile` exposes the canonical repository checks:
 
 ```bash

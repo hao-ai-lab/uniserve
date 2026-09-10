@@ -272,6 +272,21 @@ class StubModel(ExecutionModel):
         )
         flow_rows = set(forward_batch.flow_row_indices)
 
+        # Token rows share one projection allocation, matching the packed
+        # vocabulary contract used by graph-captured greedy selection.
+        logit_rows = sum(
+            1 if selection is TokenSelection.LAST_LOGITS else row_lengths[index]
+            for index, selection in selections.items()
+            if selection is not TokenSelection.HIDDEN
+        )
+        logits_storage = torch.full(
+            (logit_rows, _STUB_VOCAB_SIZE),
+            -16.0,
+            dtype=torch.bfloat16,
+            device=hidden.device,
+        )
+        logit_offset = 0
+
         # Preserve heterogeneous output order across token and diffusion rows.
         outputs: list[torch.Tensor] = []
         for row_index, row_hidden in enumerate(rows):
@@ -283,12 +298,9 @@ class StubModel(ExecutionModel):
                 targets = _next_tokens(ids)
                 if selection is TokenSelection.LAST_LOGITS:
                     targets = targets[-1:]
-                logits = torch.full(
-                    (int(targets.numel()), _STUB_VOCAB_SIZE),
-                    -16.0,
-                    dtype=torch.bfloat16,
-                    device=ids.device,
-                )
+                count = int(targets.numel())
+                logits = logits_storage[logit_offset : logit_offset + count]
+                logit_offset += count
                 logits.scatter_(1, targets.reshape(-1, 1), 16.0)
                 outputs.append(logits)
             elif row_index in flow_rows:

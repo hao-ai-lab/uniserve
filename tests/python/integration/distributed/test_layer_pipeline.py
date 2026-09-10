@@ -4,7 +4,6 @@ from pathlib import Path
 
 import pytest
 import torch
-import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from uniserve_worker.nn.parallel import ParallelConfig, SequenceParallel
@@ -71,7 +70,6 @@ def _run_pipeline(rank: int, rendezvous: str, stages: int) -> None:
             states, reference[:, offset : offset + local_rows], rtol=0, atol=0
         )
     environment.close()
-    dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("stages", [2, 4])

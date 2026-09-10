@@ -19,6 +19,7 @@ from tests.python.fixtures.depth_one import (
     visual_state_operation,
 )
 from tests.python.fixtures.execution_worker import execution_worker
+from tests.python.fixtures.worker_ipc import QueuedWorkerIpc
 from uniserve_worker.execution.batch import (
     CloseReason,
     ErrorCode,
@@ -31,20 +32,22 @@ from uniserve_worker.execution.batch import (
     TokenMode,
 )
 from uniserve_worker.execution.output import run_result_ready
-from uniserve_worker.execution.run import RunReader, WorkerRun
-from uniserve_worker.execution.step import execute_startup
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.models.stub import _next_token
 
 pytestmark = pytest.mark.integration
 
 
-def test_independent_product_work_preserves_the_committed_request_state() -> None:
+@pytest.mark.parametrize(
+    ("device", "warm_start"),
+    (("cpu", False), ("cpu", True), pytest.param("cuda:0", True, marks=pytest.mark.gpu)),
+)
+def test_independent_product_work_preserves_the_committed_request_state(device, warm_start) -> None:
     from dataclasses import replace
 
     from uniserve_worker.execution.batch import Bounds, OpCode, Operation
 
-    worker = execution_worker()
+    worker = execution_worker(device=device)
     admission = ar_params(79, block_ids=(0,))
     first, tokens = token_operation(
         admission.request_key,
@@ -53,7 +56,9 @@ def test_independent_product_work_preserves_the_committed_request_state() -> Non
         mode=TokenMode.EXTEND,
         tokens=(7,),
     )
-    try:
+    with worker:
+        if warm_start:
+            worker.warmup()
         produced = finalized_report(
             worker.execute(
                 execution_run(
@@ -107,8 +112,6 @@ def test_independent_product_work_preserves_the_committed_request_state() -> Non
         assert continued.completions[0].status is OpStatus.OK
         assert continued.completions[0].committed_tokens == (1001,)
         assert continued.completions[0].logical_lengths.token_len == 2
-    finally:
-        worker.close()
 
 
 @pytest.mark.parametrize(
@@ -220,12 +223,11 @@ def test_retained_encoder_product_outlives_its_producer_request(
 
 
 @pytest.mark.parametrize("retirement", ("free", "finish", "retire"))
-@pytest.mark.parametrize("startup", (False, True))
 def test_command_acknowledgement_waits_for_readers_without_delaying_other_results(
     retirement: str,
-    startup: bool,
 ) -> None:
     worker = execution_worker(pipeline_depth=2)
+    worker.warmup()
     admission = ar_params(87, block_ids=(0,))
     operation, payload = token_operation(
         admission.request_key,
@@ -278,32 +280,50 @@ def test_command_acknowledgement_waits_for_readers_without_delaying_other_result
                 commands=(command,),
             )
         )
-        run = WorkerRun(
-            batch,
-            on_successors_ready=lambda _: None,
-            on_ready=lambda _: None,
-            on_terminal=lambda _: None,
-        )
-        run.attach(execute_startup(worker, batch) if startup else worker.execute(batch))
-        reader = RunReader(run, lambda _: None)
-        replay = RunReader(run, lambda _: None)
-        assert reader.ready()
-        partial = reader.take_ready()
-        assert not partial.done
-        assert partial.completions[0].request_key == independent.request_key
-        assert partial.completions[0].status is OpStatus.OK
-        assert reader.pending()
-        assert not reader.ready()
-        assert replay.take_ready().to_mapping() == partial.to_mapping()
 
-        worker.device_products.record_readers((read,))
-        assert reader.ready()
-        terminal = reader.take_ready()
-        assert terminal.done
-        assert not terminal.completions
-        assert not reader.pending()
-        assert replay.take_ready().to_mapping() == terminal.to_mapping()
-        assert not replay.pending()
+        later = ar_params(89, block_ids=(2,))
+        later_operation, later_payload = token_operation(
+            later.request_key,
+            op_id=1,
+            parent=root_parent(later),
+            mode=TokenMode.EXTEND,
+            tokens=(9,),
+        )
+        later_run = execution_run(
+            run_id=4,
+            admissions=(later,),
+            operations=(later_operation,),
+            input_products=(later_payload,),
+        )
+
+        class Endpoint(QueuedWorkerIpc):
+            def respond(self, response):
+                super().respond(response)
+                if response.get("call_id") == 1:
+                    partial = response["result"]
+                    assert not partial["done"]
+                    assert len(partial["completions"]) == 1
+                    self.submit({"kind": "submit", "run": batch, "call_id": 2})
+                elif response.get("call_id") == 2:
+                    assert response["kind"] == "error"
+                    assert response["code"] == "InvalidDescriptor"
+                    self.submit({"kind": "poll", "run_id": 3, "call_id": 4})
+                    self.submit({"kind": "submit", "run": later_run, "call_id": 3})
+                elif response.get("call_id") == 3:
+                    result = response["result"]
+                    assert result["done"]
+                    assert len(result["completions"]) == 1
+                    worker.device_products.record_readers((read,))
+                elif response.get("call_id") == 4:
+                    terminal = response["result"]
+                    assert terminal["done"]
+                    assert not terminal["completions"]
+                    self.submit({"kind": "close", "call_id": 5})
+
+        endpoint = Endpoint(({"kind": "submit", "run": batch, "call_id": 1},))
+        worker.bind(endpoint).run()
+        assert [response["call_id"] for response in endpoint.responses] == [1, 2, 3, 4, 5]
+        assert endpoint.responses[-1]["kind"] == "ok"
     finally:
         worker.close()
 

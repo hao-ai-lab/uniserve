@@ -71,7 +71,6 @@ def test_worker_info_projects_model_behavior_and_resource_geometry():
         TEST_MODEL,
         TEST_WORKER_CONFIG,
         model_name="test-model",
-        weight_version=7,
     )
     info = layout.info
 
@@ -83,7 +82,6 @@ def test_worker_info_projects_model_behavior_and_resource_geometry():
     assert info.kv_cache is not None
     assert info.kv_cache.num_layers == TEST_MODEL.cache_geometry.num_layers
     assert info.model_name == "test-model"
-    assert info.weight_version == 7
 
 
 def test_latent_capacity_rounds_to_complete_scheduler_pages() -> None:

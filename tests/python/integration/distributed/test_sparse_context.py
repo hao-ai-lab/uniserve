@@ -4,7 +4,6 @@ from pathlib import Path
 
 import pytest
 import torch
-import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from uniserve_worker.backends.attention.video_sparse import (
@@ -15,8 +14,8 @@ from uniserve_worker.backends.attention.video_sparse import (
 )
 from uniserve_worker.nn.parallel import ParallelConfig, SequenceParallel
 from uniserve_worker.nn.parallel_attention import (
-    AttentionRowExchange,
     AttentionContextGeometry,
+    AttentionRowExchange,
     ParallelAttention,
 )
 from uniserve_worker.runtime.distributed import (
@@ -203,7 +202,6 @@ def _run_context(rank: int, rendezvous: str, world_size: int, kind: str) -> None
         )
         graph.reset()
     environment.close()
-    dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("world_size", [2, 4])

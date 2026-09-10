@@ -23,7 +23,6 @@ from uniserve_worker.loader import (
     LoadConfig,
     LoadFormat,
     LoadRequest,
-    WeightSet,
     get_model_loader,
     load_model,
 )
@@ -32,7 +31,6 @@ from uniserve_worker.loader.source import (
     resolve_model_root,
     resolve_weight_sources,
 )
-from uniserve_worker.loader.update import BucketTensor, WeightUpdater
 from uniserve_worker.loader.weight_loaders import attach_parameter_loaders
 from uniserve_worker.models.qwen3 import Qwen3ForCausalLM
 from uniserve_worker.nn.layer import LayerConfig
@@ -47,7 +45,7 @@ pytestmark = pytest.mark.integration
 
 
 def _execution(dtype: str = "float32") -> WorkerConfig:
-    return WorkerConfig(model_dtype=dtype, cuda_graph=False, prefill_cuda_graph=False)
+    return WorkerConfig(model_dtype=dtype, graph_policy="off", prefill_cuda_graph=False)
 
 
 def _qwen_config() -> dict[str, object]:
@@ -208,7 +206,6 @@ def test_indexed_qwen_checkpoint_installs_packed_weights_on_the_requested_device
     loaded = load_model(_qwen_request(str(tmp_path)))
 
     assert loaded.model.architecture == "Qwen3ForCausalLM"
-    assert loaded.weights.version == 0
     assert {parameter.device.type for parameter in loaded.model.parameters()} == {"cpu"}
     for name, parameter in loaded.model.state_dict().items():
         torch.testing.assert_close(parameter, reference.state_dict()[name].to(torch.bfloat16))
@@ -435,22 +432,6 @@ def test_dummy_load_is_deterministic_and_does_not_read_weight_bytes(tmp_path):
         torch.testing.assert_close(value, second.model.state_dict()[name])
 
 
-def test_sharded_state_loads_installed_names_without_hugging_face_remapping(tmp_path):
-    config = _qwen_config()
-    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
-    reference = _qwen_reference(config)
-    save_file(
-        {name: parameter.detach().contiguous() for name, parameter in reference.named_parameters()},
-        tmp_path / "rank-00000-of-00001.safetensors",
-    )
-    load = LoadConfig(load_format=LoadFormat.SHARDED_STATE)
-
-    loaded = load_model(_qwen_request(str(tmp_path), load=load))
-
-    for name, value in loaded.model.state_dict().items():
-        torch.testing.assert_close(value, reference.state_dict()[name].to(torch.bfloat16))
-
-
 def test_layered_load_materializes_the_complete_graph_from_file_backed_handles(tmp_path):
     reference = _write_qwen_checkpoint(tmp_path, indexed=True)
     load = LoadConfig(load_format=LoadFormat.LAYERED)
@@ -616,89 +597,6 @@ def test_sensenova_checkpoint_layer_exclusions_preserve_projection_weights(
     )
     expected = state["language_model.model.norm_mot_gen.weight"].bfloat16().expand(2, 8)
     torch.testing.assert_close(normalized.cpu(), expected, rtol=0, atol=0)
-
-
-def test_weight_update_publishes_version_and_rolls_back_partial_failure():
-    model = _qwen_reference(_qwen_config())
-    attach_parameter_loaders(model, device="cpu", dtype=torch.float32)
-    initial = WeightSet.from_module(model)
-    updater = WeightUpdater(
-        model,
-        weights=initial,
-    )
-    replacement = torch.full_like(model.model.norm.weight, 3)
-
-    current = updater.update_named(
-        {"model.norm.weight": replacement},
-        expected_parameters={"model.norm.weight"},
-    )
-
-    assert current.version == 1
-    assert current.tensors["model.norm.weight"].data_ptr() == model.model.norm.weight.data_ptr()
-    torch.testing.assert_close(model.model.norm.weight, replacement)
-
-    with pytest.raises(RuntimeError, match="missing=1"):
-        updater.update_named(
-            {"model.norm.weight": torch.full_like(replacement, 9)},
-            expected_parameters={"model.norm.weight", "lm_head.weight"},
-        )
-    assert updater.weights is current
-    torch.testing.assert_close(model.model.norm.weight, replacement)
-
-    flattened = torch.arange(replacement.numel(), dtype=replacement.dtype)
-    installed = updater.update_flattened(
-        flattened,
-        (
-            BucketTensor(
-                name="model.norm.weight",
-                shape=tuple(replacement.shape),
-                offset=0,
-                length=replacement.numel(),
-            ),
-        ),
-        expected_parameters={"model.norm.weight"},
-    )
-    assert installed.version == 2
-    torch.testing.assert_close(model.model.norm.weight, flattened.view_as(replacement))
-
-    with pytest.raises(ValueError, match="repeats tensor"):
-        updater.update_distributed(
-            (
-                ("model.norm.weight", replacement),
-                ("model.norm.weight", replacement),
-            ),
-            expected_parameters={"model.norm.weight"},
-        )
-
-
-def test_online_fp8_weights_remain_replaceable_after_post_load_finalize(tmp_path):
-    config = _qwen_config()
-    config["quantization_config"] = {"quant_method": "fp8"}
-    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
-    reference = _qwen_reference(config)
-    save_file(_qwen_hugging_face_weights(reference), tmp_path / "model.safetensors")
-    loaded = load_model(
-        _qwen_request(str(tmp_path), load=LoadConfig(load_format=LoadFormat.LAYERED))
-    )
-    updater = WeightUpdater(
-        loaded.model,
-        weights=loaded.weights,
-    )
-    name = "model.layers.0.self_attn.o_proj.weight"
-    shape = tuple(dict(loaded.model.named_parameters())[name].shape)
-
-    first = updater.update_named(
-        {name: torch.full(shape, 0.25, dtype=torch.bfloat16)},
-        expected_parameters={name},
-    )
-    second = updater.update_named(
-        {name: torch.full(shape, 0.5, dtype=torch.bfloat16)},
-        expected_parameters={name},
-    )
-
-    assert first.version == 1
-    assert second.version == 2
-    assert dict(loaded.model.named_parameters())[name].dtype == torch.float8_e4m3fn
 
 
 @pytest.mark.parametrize("load_format", [LoadFormat.AUTO, LoadFormat.LAYERED])

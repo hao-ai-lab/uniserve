@@ -13,20 +13,29 @@ from uniserve_worker.execution.forward_batch import AttentionMode, ExpertRoute, 
 from uniserve_worker.foundation.errors import invalid_descriptor
 from uniserve_worker.foundation.math import bucketed_length
 
+from ..models.runtime import CacheGeometry
+from .forward_batch import AttentionSelection
 from .rows import ForwardRow
 
 if TYPE_CHECKING:
-    from ..worker.worker import Worker
+    from ..runtime.cache_pool import CachePool
+    from ..runtime.req_to_token_pool import ReqToTokenPool
+    from ..runtime.runtime_states import RuntimeStates
     from .input_buffers import AttentionColumns, AttentionInputs
 
 
-def columns(runtime: Worker, tasks: tuple[ForwardRow, ...]) -> AttentionInputs:
+def columns(
+    tasks: tuple[ForwardRow, ...],
+    *,
+    tables: ReqToTokenPool | None,
+    cache: CachePool | None,
+    states: RuntimeStates | None,
+    packed: bool,
+) -> AttentionInputs:
     """Build packed attention mode, sequence, cache, position, and route tensors for forward rows."""
 
     if not tasks:
         raise invalid_descriptor("attention metadata requires forward rows")
-    tables = runtime.req_to_token_pool
-    cache = runtime.cache_pool
     if tables is None or cache is None:
         raise invalid_descriptor("paged attention requires resident KV storage and request tables")
     groups = {int(task.group_id) for task in tasks}
@@ -63,7 +72,6 @@ def columns(runtime: Worker, tasks: tuple[ForwardRow, ...]) -> AttentionInputs:
         tables.max_blocks_per_request,
     )
     if pure_decode and all(task.request_indexed_decode for task in tasks):
-        states = runtime.runtime_states
         if (
             states is not None
             and states.device.type == "cuda"
@@ -85,7 +93,49 @@ def columns(runtime: Worker, tasks: tuple[ForwardRow, ...]) -> AttentionInputs:
                 "table_width": width,
                 "page_size": cache.block_size,
             }
-    block_table = torch.zeros((len(tasks), width), dtype=torch.int32)
+    return physical_columns(
+        pages=pages,
+        seq_lens=seq_lens,
+        query_lens=query_lens,
+        causal_rows=causal_rows,
+        write_rows=tuple(task.write_kv for task in tasks),
+        positions=tuple(
+            task.attention_indexes
+            if task.attention_indexes is not None
+            else _three_axis_positions(task.positions, task.query_tokens)
+            for task in tasks
+        ),
+        token_rows=tuple(task.token_ids is not None for task in tasks),
+        text_local_indices=tuple(task.text_local_indices for task in tasks),
+        width=width,
+        block_size=cache.block_size,
+        group_id=group_id,
+        binding=binding,
+        packed=packed,
+        decode=pure_decode,
+    )
+
+
+def physical_columns(
+    *,
+    pages: Sequence[Sequence[int]],
+    seq_lens: tuple[int, ...],
+    query_lens: tuple[int, ...],
+    causal_rows: tuple[bool, ...],
+    write_rows: tuple[bool, ...],
+    positions: tuple[torch.Tensor, ...],
+    token_rows: tuple[bool, ...],
+    text_local_indices: tuple[tuple[int, ...], ...],
+    width: int,
+    block_size: int,
+    group_id: int = 0,
+    binding: int = 0,
+    packed: bool = False,
+    decode: bool = False,
+) -> AttentionColumns:
+    """Build numerical attention metadata for serving and startup inputs alike."""
+
+    block_table = torch.zeros((len(query_lens), width), dtype=torch.int32)
     for row, row_pages in enumerate(pages):
         if row_pages:
             block_table[row, : len(row_pages)] = torch.tensor(row_pages, dtype=torch.int32)
@@ -93,15 +143,15 @@ def columns(runtime: Worker, tasks: tuple[ForwardRow, ...]) -> AttentionInputs:
         pages,
         seq_lens,
         query_lens,
-        tuple(bool(task.write_kv) for task in tasks),
-        cache.block_size,
+        write_rows,
+        block_size,
     )
     common: AttentionColumns = {
         "forward_mode": AttentionMode.PAGED_VARLEN,
         "seq_lens": torch.tensor(seq_lens, dtype=torch.int32),
         "query_lens": torch.tensor(query_lens, dtype=torch.int32),
         "out_cache_loc": out_cache_loc,
-        "has_cache_writes": any(bool(task.write_kv) for task in tasks),
+        "has_cache_writes": any(write_rows),
         "block_table": block_table,
         "seq_lens_cpu": seq_lens,
         "query_lens_cpu": query_lens,
@@ -110,13 +160,23 @@ def columns(runtime: Worker, tasks: tuple[ForwardRow, ...]) -> AttentionInputs:
         "group_id": group_id,
         "binding": binding,
     }
-    if runtime.model.tensorized_mixed and not pure_decode:
-        return _packed_columns(common, tasks, query_lens, seq_lens, width, cache.block_size)
+    if packed and not decode:
+        return _packed_columns(
+            common,
+            positions,
+            token_rows,
+            text_local_indices,
+            query_lens,
+            seq_lens,
+            width,
+            block_size,
+            causal_rows,
+        )
     kv_lens = tuple(prefix + query for prefix, query in zip(seq_lens, query_lens, strict=True))
     common["kv_lens"] = torch.tensor(kv_lens, dtype=torch.int32)
     common["kv_lens_cpu"] = kv_lens
-    common["max_seqlen_k"] = width * cache.block_size
-    if pure_decode:
+    common["max_seqlen_k"] = width * block_size
+    if decode:
         common["forward_mode"] = AttentionMode.PAGED_DECODE
         return common
     common.update(
@@ -153,16 +213,19 @@ def dense_columns(row_count: int, query_lens: Sequence[int]) -> AttentionColumns
 
 def _packed_columns(
     common: AttentionColumns,
-    tasks: tuple[ForwardRow, ...],
+    positions: tuple[torch.Tensor, ...],
+    token_rows: tuple[bool, ...],
+    text_local_indices: tuple[tuple[int, ...], ...],
     query_lens: tuple[int, ...],
     seq_lens: tuple[int, ...],
     width: int,
     block_size: int,
+    causal_rows: tuple[bool, ...],
 ) -> AttentionColumns:
     """Build packed attention boundaries, cache tables, write locations, and route spans."""
 
     max_query = bucketed_length(max(query_lens))
-    visible = torch.zeros((len(tasks), max_query), dtype=torch.int32)
+    visible = torch.zeros((len(query_lens), max_query), dtype=torch.int32)
     indexes: list[torch.Tensor] = []
     spans: list[RouteSpan] = []
     offset = 0
@@ -180,20 +243,18 @@ def _packed_columns(
             spans.append(RouteSpan(route, offset, count))
         offset += count
 
-    for row, (task, query) in enumerate(zip(tasks, query_lens, strict=True)):
+    for row, query in enumerate(query_lens):
         visible[row, :query] = (
-            torch.arange(1, query + 1, dtype=torch.int32) if task.causal else query
+            torch.arange(1, query + 1, dtype=torch.int32) if causal_rows[row] else query
         )
-        position = task.attention_indexes
-        if position is None:
-            position = _three_axis_positions(task.positions, query)
+        position = positions[row]
         if tuple(position.shape) != (3, query):
             raise invalid_descriptor("packed attention indexes must have shape [3, query]")
         indexes.append(position.to(device="cpu", dtype=torch.long))
-        if task.token_ids is not None:
+        if token_rows[row]:
             append_span(ExpertRoute.TEXT, query)
             continue
-        local_text = tuple(int(value) for value in task.text_local_indices)
+        local_text = tuple(int(value) for value in text_local_indices[row])
         if local_text != tuple(sorted(set(local_text))) or any(
             value < 0 or value >= query for value in local_text
         ):
@@ -220,7 +281,7 @@ def _packed_columns(
             "cu_seqlens_q": _cumulative(query_lens),
             "max_seqlen_q": max_query,
             "max_seqlen_k": width * block_size,
-            "fully_visible": all(not task.causal for task in tasks),
+            "fully_visible": not any(causal_rows),
             "kv_lens_cpu": seq_lens,
         }
     )
@@ -285,3 +346,25 @@ def _binding_identity(tasks: Sequence[ForwardRow]) -> int:
 
 
 __all__ = ["columns", "dense_columns"]
+
+
+def supports_flow_attention(
+    selection: AttentionSelection,
+    geometry: CacheGeometry,
+    pool: CachePool,
+    device: torch.device,
+) -> bool:
+    """Return whether the selected backend can execute the model's flow-attention geometry."""
+
+    if not pool.supports_paged_attention_storage:
+        return False
+    head_dim = int(geometry.head_dim)
+    for provider in selection.providers:
+        if provider.can_bind(
+            AttentionMode.PACKED,
+            head_dim=head_dim,
+            block_size=pool.block_size,
+            device=device,
+        ):
+            return True
+    return False

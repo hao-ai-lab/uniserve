@@ -31,9 +31,14 @@ use uniserve_worker_ipc::{ServerEndpoint, WakeSender};
 /// Python-facing owner of one worker-side IPC endpoint.
 struct PyServer {
     /// Endpoint held outside the mutex while a blocking operation releases the GIL.
-    inner: Mutex<Option<ServerEndpoint>>,
+    inner: Mutex<ServerState>,
+}
+
+/// The endpoint may be borrowed by an operation; both fields are empty after close.
+struct ServerState {
+    endpoint: Option<ServerEndpoint>,
     /// Wake source used by CPU, transfer, and device completion callbacks.
-    completion_wake: WakeSender,
+    completion_wake: Option<WakeSender>,
 }
 
 /// Shared eventfd state retained until the last scheduled callback completes.
@@ -244,9 +249,68 @@ impl PyServer {
             .map_err(|err| py_runtime(format!("failed to bind IPC service: {err:#}")))?;
         let completion_wake = inner.completion_wake();
         Ok(Self {
-            inner: Mutex::new(Some(inner)),
-            completion_wake,
+            inner: Mutex::new(ServerState {
+                endpoint: Some(inner),
+                completion_wake: Some(completion_wake),
+            }),
         })
+    }
+
+    /// Borrows this open endpoint for a scope that owns its eventual closure.
+    fn __enter__(slf: PyRef<'_, Self>) -> PyResult<PyRef<'_, Self>> {
+        if slf.closed()? {
+            return Err(py_runtime("IPC server endpoint is closed"));
+        }
+        Ok(slf)
+    }
+
+    /// Closes the endpoint without replacing an exception raised inside the scope.
+    fn __exit__(
+        &self,
+        _exc_type: &Bound<'_, PyAny>,
+        exc_value: &Bound<'_, PyAny>,
+        _traceback: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        if let Err(error) = self.close() {
+            if exc_value.is_none() {
+                return Err(error);
+            }
+            // Exception notes are diagnostic: even a user-defined add_note()
+            // failure must not replace the original exception.
+            let _ = exc_value.call_method1(
+                "add_note",
+                (format!("IPC endpoint cleanup also failed: {error}"),),
+            );
+        }
+        Ok(())
+    }
+
+    /// Releases the service after its caller has stopped all endpoint operations.
+    /// Repeated close is harmless; closing during a blocking operation is rejected.
+    fn close(&self) -> PyResult<()> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| py_runtime("IPC server mutex poisoned"))?;
+        if state.completion_wake.is_none() {
+            return Ok(());
+        }
+        if state.endpoint.is_none() {
+            return Err(py_runtime("IPC server endpoint is already in use"));
+        }
+        state.endpoint.take();
+        state.completion_wake.take();
+        Ok(())
+    }
+
+    #[getter]
+    /// Reports whether the endpoint owner has released this service.
+    fn closed(&self) -> PyResult<bool> {
+        let state = self
+            .inner
+            .lock()
+            .map_err(|_| py_runtime("IPC server mutex poisoned"))?;
+        Ok(state.completion_wake.is_none())
     }
 
     /// Waits for one request and converts it into its Python representation.
@@ -306,13 +370,14 @@ impl PyServer {
     }
 
     /// Signals that asynchronous worker progress is ready to consume.
-    fn wake(&self) {
-        self.completion_wake.wake();
+    fn wake(&self) -> PyResult<()> {
+        self.completion_wake()?.wake();
+        Ok(())
     }
 
     /// Schedules the worker completion wake on a CUDA stream.
     fn wake_on_stream(&self, stream: usize) -> PyResult<()> {
-        let wake = self.completion_wake.clone();
+        let wake = self.completion_wake()?;
         schedule_completion_wake(stream, wake).map_err(py_runtime)
     }
 
@@ -357,9 +422,13 @@ impl PyServer {
             .inner
             .lock()
             .map_err(|_| py_runtime("IPC server mutex poisoned"))?;
-        guard
-            .take()
-            .ok_or_else(|| py_runtime("IPC server endpoint is already in use"))
+        guard.endpoint.take().ok_or_else(|| {
+            py_runtime(if guard.completion_wake.is_none() {
+                "IPC server endpoint is closed"
+            } else {
+                "IPC server endpoint is already in use"
+            })
+        })
     }
 
     /// Restores endpoint ownership after a GIL-free operation.
@@ -368,8 +437,20 @@ impl PyServer {
             .inner
             .lock()
             .map_err(|_| py_runtime("IPC server mutex poisoned"))?;
-        *guard = Some(endpoint);
+        guard.endpoint = Some(endpoint);
         Ok(())
+    }
+
+    /// Borrows a wake source independently of a pending receive operation.
+    fn completion_wake(&self) -> PyResult<WakeSender> {
+        let state = self
+            .inner
+            .lock()
+            .map_err(|_| py_runtime("IPC server mutex poisoned"))?;
+        state
+            .completion_wake
+            .clone()
+            .ok_or_else(|| py_runtime("IPC server endpoint is closed"))
     }
 }
 

@@ -4,12 +4,11 @@ from pathlib import Path
 
 import pytest
 import torch
-import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 
-from uniserve_worker.execution.cuda_graph import GraphEntry
 from uniserve_worker.execution.forward_batch import ForwardOutput
+from uniserve_worker.execution.graph.full import FullCudaGraphBackend
 from uniserve_worker.loader.handles import TensorWeightHandle
 from uniserve_worker.loader.weight_loaders import load_parameter_weight
 from uniserve_worker.nn.layer import LayerConfig
@@ -93,10 +92,9 @@ def _run_vocabulary_selection(rank: int, rendezvous: str) -> None:
                         greedy_vocabulary(local, partition)
                     current.wait_stream(stream)
                     current.synchronize()
-                    entry = GraphEntry.capture(
-                        lambda: greedy_vocabulary(local, partition),
-                        inputs=(local,),
-                        stream=stream,
+                    entry = FullCudaGraphBackend(device=device, stream=stream)
+                    entry.capture_one(
+                        "greedy", lambda: greedy_vocabulary(local, partition), keepalive=(local,)
                     )
                     retained = projected.clone()
                     retained_expected = full[:, :65].clone()
@@ -108,7 +106,8 @@ def _run_vocabulary_selection(rank: int, rendezvous: str) -> None:
                             full[4, 10] = float("nan")
                         stream.wait_stream(current)
                         with torch.cuda.stream(stream):
-                            values, tokens = entry.replay(full[:, begin : begin + partition.width])
+                            local.copy_(full[:, begin : begin + partition.width])
+                            values, tokens = entry.replay("greedy")
                         current.wait_stream(stream)
                         reference_values, reference_tokens = full[:, :65].max(dim=-1)
                         torch.testing.assert_close(
@@ -136,7 +135,6 @@ def _run_vocabulary_selection(rank: int, rendezvous: str) -> None:
         if entry is not None:
             entry.close()
         environment.close()
-        dist.destroy_process_group()
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="two CUDA devices are required")

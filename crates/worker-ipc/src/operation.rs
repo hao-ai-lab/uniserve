@@ -1449,7 +1449,8 @@ impl BufferAllocation {
 pub struct Run {
     /// Submission batch identity assigned by the executor.
     pub batch_id: u64,
-    /// Physical invocation identity used to correlate result fragments.
+    /// Physical invocation identity, strictly increasing in each worker's Submit order.
+    /// Logical batch allocation and result completion may occur in a different order.
     pub run_id: u64,
     /// Monotonic sequence shared by collective participants.
     pub collective_seq: u64,

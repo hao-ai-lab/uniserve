@@ -6,8 +6,10 @@ from collections.abc import Sequence
 
 import torch
 
+from ..execution.batch import RequestKey
 from ..execution.bounded_storage import BoundedTensorStorage, TensorSchema
 from ..foundation.errors import invalid_descriptor
+from ..foundation.resources import close_resources
 from .device import HostStagingRing, fill_cpu_ints
 
 __all__ = ["ReqToTokenPool"]
@@ -35,6 +37,7 @@ class ReqToTokenPool:
 
         # Slot zero is included in every device row allocation but remains
         # reserved for padding and graph replay rather than scheduler requests.
+        self._prefix_slots: dict[RequestKey, set[int]] = {}
         self.group_count = int(group_count)
         self.request_pool_size = int(request_pool_size)
         self.max_blocks_per_request = int(max_blocks_per_request)
@@ -252,6 +255,34 @@ class ReqToTokenPool:
         elif not bool(bounds):
             raise invalid_descriptor("verified length exceeds allocated KV capacity")
         self.verified_lens.index_copy_(0, slots, lengths)
+
+    def close(self) -> None:
+        """Retire pinned page-table sources before their borrowed streams are destroyed."""
+
+        close_resources(
+            self._page_host.close,
+            self._slot_host.close,
+            self._group_host.close,
+            self._allocated_host.close,
+        )
+        self._prefix_slots.clear()
+        self._host_tables.clear()
+        self._host_alloced_lens.clear()
+
+    def retain_prefix(self, request_key: RequestKey, slot: int) -> None:
+        """Associate an alternative CFG prefix row with its exact request epoch."""
+
+        self._prefix_slots.setdefault(request_key, set()).add(int(slot))
+
+    def release_prefixes(self, request_key: RequestKey, slots: Sequence[int] | None = None) -> None:
+        """Release selected alternative rows, or every row owned by a retiring epoch."""
+
+        tracked = self._prefix_slots.get(request_key, set())
+        selected = tuple(tracked) if slots is None else tuple(slots)
+        self.release(selected)
+        tracked.difference_update(selected)
+        if not tracked:
+            self._prefix_slots.pop(request_key, None)
 
     def release(self, slots: Sequence[int]) -> None:
         """Clear selected request slots and return them to the scheduler-owned free state."""

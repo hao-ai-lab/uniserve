@@ -10,7 +10,7 @@ from typing import Any, TypeVar, cast
 from uniserve_worker.nn.parallel import EntryConfig
 
 from ..execution.batch import OpCode, TensorSpec, WorkerEndpoint
-from ..foundation.errors import invalid_descriptor
+from ..foundation.errors import invalid_descriptor, unsupported_setup
 from ..models.video import MediaExecutionPlan, MediaPlanRepeat, MediaPlanStage
 
 
@@ -199,7 +199,6 @@ class WorkerInfo:
     """Describes a worker’s public capabilities, topology, and resource bounds."""
 
     model_name: str
-    weight_version: int
     endpoint: WorkerEndpoint
     world_size: int
     supported_ops: tuple[OpCode, ...]
@@ -217,6 +216,21 @@ class WorkerInfo:
     device: str = "cpu"
     transfer_backends: tuple[str, ...] = ("local",)
     media_plan: MediaExecutionPlan | None = None
+
+    def output_rank(self, entry: str) -> int:
+        """Resolve the host publication owner from the operation's ordered entry.
+
+        Cooperative numerical outputs may reside on different stages. Host
+        products belong to the entry's first member, matching the rank-report
+        join contract. An unconfigured local worker has one possible owner.
+        """
+
+        for component in self.components:
+            if component.name == entry:
+                return component.config.ranks[0]
+        if self.world_size == 1:
+            return 0
+        raise unsupported_setup(f"computation entry {entry!r} has no publication owner")
 
     @property
     def denoise_steps(self) -> int:
@@ -282,8 +296,8 @@ class WorkerInfo:
         if has_latent_geometry:
             if self.latent_page_units < 1 or self.latent_pages < 2:
                 raise invalid_descriptor("worker info declares incomplete latent pool capacity")
-        if not self.model_name or self.weight_version < 0:
-            raise invalid_descriptor("worker model name and weight version are invalid")
+        if not self.model_name:
+            raise invalid_descriptor("worker model name is empty")
 
     @classmethod
     def from_mapping(cls, value: object, where: str = "info") -> WorkerInfo:
@@ -300,7 +314,6 @@ class WorkerInfo:
                 )
             ),
             model_name=_str(data.get("model_name", ""), f"{where}.model_name"),
-            weight_version=_uint(data.get("weight_version", 0), f"{where}.weight_version"),
             endpoint=WorkerEndpoint.from_mapping(data.get("endpoint"), f"{where}.endpoint"),
             device=_str(data.get("device"), f"{where}.device"),
             transfer_backends=tuple(
@@ -335,7 +348,6 @@ class WorkerInfo:
         return {
             "media_plan": None if self.media_plan is None else self.media_plan.to_mapping(),
             "model_name": self.model_name,
-            "weight_version": self.weight_version,
             "endpoint": self.endpoint.to_mapping(),
             "device": self.device,
             "transfer_backends": list(self.transfer_backends),

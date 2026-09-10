@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from concurrent.futures import Future
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import torch
@@ -12,7 +13,7 @@ import torch
 from ..execution.batch import BufferId, ProductRef, RequestKey
 from ..foundation.errors import invalid_descriptor, resource_error
 from ..transfer.tickets import TransferTicket
-from .device import fill_cpu_ints
+from .device import HostStagingRing, fill_cpu_ints
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,11 +175,8 @@ class LatentPool:
 
         # Retain a pinned source for nonblocking page-index copies into the
         # fixed gather buffer used by one latent step at a time.
-        self._page_table_host = torch.empty(
-            self.num_pages - 1,
-            dtype=torch.int64,
-            device="cpu",
-            pin_memory=self.device.type == "cuda",
+        self._page_table_staging = HostStagingRing(
+            self.num_pages - 1, dtype=torch.int64, depth=1, device=self.device
         )
 
     @property
@@ -204,6 +202,21 @@ class LatentPool:
 
         return int(self._units.sum().item()) * self.latent_width * self.storage.element_size()
 
+    @contextmanager
+    def startup_values(self, rows: int, units: int):
+        """Borrow the existing step buffer for numerical startup before admission."""
+
+        if any(self._slot_pages) or self._imports or self._sources:
+            raise RuntimeError("startup scratch requires an idle latent pool")
+        count = (units + self.page_units - 1) // self.page_units
+        pages = tuple(tuple(range(1 + row * count, 1 + (row + 1) * count)) for row in range(rows))
+        views = tuple(item.value[:units] for item in self.stage(pages, (units,) * rows))
+        try:
+            yield views
+        finally:
+            if self.device.type == "cuda":
+                torch.cuda.current_stream(self.device).synchronize()
+
     def stage(
         self,
         page_tables: Sequence[Sequence[int]],
@@ -224,11 +237,7 @@ class LatentPool:
         flattened = tuple(page for pages in canonical for page in pages)
         if len(set(flattened)) != len(flattened):
             raise invalid_descriptor("latent staging page tables overlap")
-        fill_cpu_ints(self._page_table_host, flattened)
-        self.page_table_buffer[:total_pages].copy_(
-            self._page_table_host[:total_pages],
-            non_blocking=self.device.type == "cuda",
-        )
+        self._device_pages(flattened)
         result: list[LatentStaging] = []
         page_offset = 0
         unit_offset = 0
@@ -774,6 +783,7 @@ class LatentPool:
     def close(self) -> None:
         """Release storage after the owning transport has drained its physical reads."""
 
+        self._page_table_staging.close()
         self.release_buffers(tuple(self._sources))
         self.release_slots(
             tuple(
@@ -954,9 +964,11 @@ class LatentPool:
     def _device_pages(self, pages: Sequence[int]) -> torch.Tensor:
         """Copy host page identifiers into reusable device index storage."""
 
-        fill_cpu_ints(self._page_table_host, pages)
+        slot, host = self._page_table_staging.acquire()
+        fill_cpu_ints(host, pages)
         target = self.page_table_buffer[: len(pages)]
-        target.copy_(self._page_table_host[: len(pages)], non_blocking=self.device.type == "cuda")
+        target.copy_(host[: len(pages)], non_blocking=self.device.type == "cuda")
+        self._page_table_staging.release(slot)
         return target
 
 
@@ -968,3 +980,13 @@ __all__ = [
     "LatentStaging",
     "LatentWrite",
 ]
+
+
+def require_latent_pool(pool: LatentPool | None) -> LatentPool:
+    """Require physical trajectory storage for an operation that consumes latents."""
+
+    if pool is None:
+        from ..foundation.errors import unsupported_setup
+
+        raise unsupported_setup("operation requires a physical latent pool")
+    return pool

@@ -35,7 +35,7 @@ class CpuPool:
         )
         self._completion_wake: Callable[[], None] | None = None
 
-    def set_completion_wake(self, wake: Callable[[], None]) -> None:
+    def set_completion_wake(self, wake: Callable[[], None] | None) -> None:
         """Install the event-loop callback invoked when a submitted CPU task finishes."""
 
         self._completion_wake = wake

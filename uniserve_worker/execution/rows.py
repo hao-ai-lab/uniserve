@@ -41,7 +41,7 @@ from uniserve_worker.execution.output import (
     TokenCapture,
 )
 from uniserve_worker.foundation.errors import WorkerError, classify, invalid_descriptor
-from uniserve_worker.loader.weight_set import WeightSet
+from uniserve_worker.foundation.resources import close_resources
 from uniserve_worker.runtime.cache_transfer import CacheWrite
 from uniserve_worker.runtime.cpu import CpuTaskReservation
 from uniserve_worker.runtime.device_products import (
@@ -72,7 +72,6 @@ class ForwardRow:
 
     operation: Operation
     request: RequestDraft
-    weights: WeightSet
     phase: ModelPhase
     token_ids: torch.Tensor | None = None
     token_embeddings: torch.Tensor | None = None
@@ -383,14 +382,6 @@ class PreparedPredicateBatch:
         if self._values is None:
             self.buffer.abandon()
 
-    def __del__(self) -> None:
-        """Abandon predicate completion storage that was never closed explicitly."""
-
-        try:
-            self.abandon()
-        except Exception:
-            pass
-
 
 @dataclass(slots=True)
 class PreparedExecution:
@@ -407,7 +398,6 @@ class PreparedExecution:
         default=None,
         repr=False,
     )
-    _release: Callable[[], None] | None = field(default=None, repr=False)
     _finished: bool = field(default=False, init=False, repr=False)
 
     def ready(self) -> bool:
@@ -489,14 +479,12 @@ class PreparedExecution:
     def bind(
         self,
         execute: Callable[[PreparedExecution], RunResult],
-        release: Callable[[], None],
     ) -> PreparedExecution:
-        """Install the single-use execution and release callbacks for this prepared batch."""
+        """Install the single-use execution callback for this prepared batch."""
 
-        if self._execute is not None or self._release is not None:
+        if self._execute is not None:
             raise RuntimeError("prepared execution is already bound")
         self._execute = execute
-        self._release = release
         return self
 
     def resolve(self) -> RunResult:
@@ -512,14 +500,24 @@ class PreparedExecution:
         try:
             for dependency in self.storage_dependencies:
                 dependency.result()
-            return execute(self)
-        finally:
+            result = execute(self)
+        except BaseException as error:
+            try:
+                self.abandon()
+            except BaseException as cleanup_error:
+                error.add_note(f"prepared execution cleanup failed: {cleanup_error}")
+            raise
+        else:
             self._finish()
+            return result
 
     def record_failure(self, error: BaseException) -> WorkerError:
         """Abandon prepared resources and classify the execution failure for the wire response."""
 
-        self.abandon()
+        try:
+            self.abandon()
+        except BaseException as cleanup_error:
+            error.add_note(f"prepared execution cleanup failed: {cleanup_error}")
         return classify(error, context="execute")
 
     def abandon(self) -> None:
@@ -527,11 +525,10 @@ class PreparedExecution:
 
         if self._finished:
             return
-        for transfer in self.transfers:
-            transfer.discard_destination()
+        actions = [transfer.discard_destination for transfer in self.transfers]
         if self.predicates is not None:
-            self.predicates.abandon()
-        self._finish()
+            actions.append(self.predicates.abandon)
+        close_resources(*actions, self._finish)
 
     def _finish(self) -> None:
         """Close predicate and transfer preparation resources exactly once."""
@@ -539,31 +536,10 @@ class PreparedExecution:
         if self._finished:
             return
         self._finished = True
-        release = self._release
-        self._release = None
         self._execute = None
         self._prepare_inputs = None
-        error: BaseException | None = None
-        try:
-            for transfer in self.transfers:
-                try:
-                    transfer.close()
-                except BaseException as failure:
-                    if error is None:
-                        error = failure
-        finally:
-            if release is not None:
-                release()
-        if error is not None:
-            raise error
-
-    def __del__(self) -> None:
-        """Release unfinished preparation resources during finalization."""
-
-        try:
-            self.abandon()
-        except Exception:
-            pass
+        actions = [transfer.close for transfer in self.transfers]
+        close_resources(*actions)
 
 
 @dataclass(frozen=True, slots=True)
@@ -573,7 +549,6 @@ class LaneLayout:
     operations: tuple[Operation, ...]
     requests: tuple[RequestDraft, ...]
     seq_lens: tuple[int, ...]
-    weights: tuple[WeightSet, ...]
     identities: tuple[OperationIdentity, ...]
 
     def __post_init__(self) -> None:
@@ -585,7 +560,6 @@ class LaneLayout:
             for values in (
                 self.requests,
                 self.seq_lens,
-                self.weights,
                 self.identities,
             )
         ):
@@ -648,6 +622,7 @@ class LaneState:
     runtime_cache_lengths: dict[int, int | torch.Tensor] = field(default_factory=dict)
     registration_visible: bool = False
     cpu_tasks: dict[OperationIdentity, CpuTaskReservation] = field(default_factory=dict)
+    completion_jobs: list[CpuJob] = field(default_factory=list)
     media_output_leases: dict[OperationIdentity, VideoOutputRingLease] = field(default_factory=dict)
     latent_rows: dict[OperationIdentity, LatentExecution] = field(default_factory=dict)
     latent_publications: list[LatentPublication] = field(default_factory=list)

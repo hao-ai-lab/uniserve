@@ -1349,7 +1349,6 @@ fn full_caps() -> WorkerInfo {
         latent_page_units: 64,
         latent_pages: 17,
         model_name: "test-model".into(),
-        weight_version: 7,
         ..WorkerInfo::default()
     }
 }

@@ -2,7 +2,6 @@
 
 import pytest
 import torch
-import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from uniserve_worker.execution.bounded_storage import BoundedTensorStorage, TensorSchema
@@ -111,7 +110,6 @@ def _run_exchange(rank: int, rendezvous: str) -> None:
             del execute, actual, outgoing, incoming, staging, storage
     finally:
         environment.close()
-        dist.destroy_process_group()
 
 
 def test_attention_row_exchange_replays_updated_values_in_logical_rank_order(tmp_path):
@@ -213,7 +211,6 @@ def _run_head_rows(rank, rendezvous):
                     del execute, storage, independent_storage, actual, independent, value, wanted
     finally:
         environment.close()
-        dist.destroy_process_group()
 
 
 def test_projected_head_rows_preserve_global_order_and_gqa_under_replay(tmp_path):

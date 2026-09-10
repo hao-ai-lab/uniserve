@@ -166,7 +166,6 @@ table MediaExecutionPlan { stages:[MediaPlanStage]; }
 
 table WorkerInfo {
   model_name:string;
-  weight_version:ulong;
   endpoint:WorkerEndpoint;
   device:string;
   transfer_backends:[string];
@@ -549,6 +548,7 @@ table NewRequest {
 
 table Run {
   batch_id:ulong;
+  // Strictly increasing in Submit order for this worker, independent of batch_id.
   run_id:ulong;
   collective_seq:ulong;
   operations:[Operation];

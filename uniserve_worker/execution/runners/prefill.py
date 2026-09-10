@@ -1,0 +1,94 @@
+"""Numerical token inputs for bounded packed startup preparation."""
+
+from collections.abc import Callable, Sequence
+
+import torch
+
+from ...foundation.math import bucketed_length, ceil_div
+from ...runtime.cache_pool import CachePool
+from ..attention import physical_columns
+from ..forward_batch import ForwardBatch, ForwardOutput, ModelPhase, TokenSelection
+from ..input_buffers import InputBuffers
+from .packed import PackedRunner, PrefillCapture
+
+
+def stage_text(
+    buffers: InputBuffers,
+    cache: CachePool,
+    tokens: tuple[tuple[int, ...], ...],
+    pages: Sequence[Sequence[int]],
+    *,
+    packed: bool,
+    prefixes: tuple[int, ...] | None = None,
+    decode: bool = False,
+    selection: TokenSelection = TokenSelection.LAST_LOGITS,
+    slots: tuple[int, ...] | None = None,
+) -> ForwardBatch:
+    """Use serving's staging and attention preparation with numerical inputs."""
+
+    rows = len(tokens)
+    lengths = tuple(len(value) for value in tokens)
+    prefixes = (0,) * rows if prefixes is None else prefixes
+    positions = tuple(
+        torch.arange(prefix, prefix + length, dtype=torch.int64)
+        for prefix, length in zip(prefixes, lengths, strict=True)
+    )
+    indexes = tuple(
+        torch.stack((value, torch.zeros_like(value), torch.zeros_like(value)))
+        for value in positions
+    )
+    attention = physical_columns(
+        pages=pages,
+        seq_lens=prefixes,
+        query_lens=lengths,
+        causal_rows=(True,) * rows,
+        write_rows=(True,) * rows,
+        positions=indexes,
+        token_rows=(True,) * rows,
+        text_local_indices=((),) * rows,
+        width=min(buffers.max_blocks_per_row, bucketed_length(max(1, max(map(len, pages))))),
+        block_size=cache.block_size,
+        packed=packed,
+        decode=decode,
+    )
+    return buffers.stage(
+        phase=ModelPhase.TEXT,
+        row_count=rows,
+        request_pool_indices=slots or tuple(range(1, rows + 1)),
+        decode_force_finish=(False,) * rows if decode else (),
+        token_row_indices=tuple(range(rows)),
+        token_ids=tuple(torch.tensor(value, dtype=torch.int64) for value in tokens),
+        token_embeddings=(None,) * rows,
+        token_embedding_masks=(None,) * rows,
+        token_positions=positions,
+        token_selections=(selection,) * rows,
+        attention=attention,
+    )
+
+
+def prepare_prefill(
+    runner: PackedRunner,
+    buffers: InputBuffers,
+    forward: Callable[[ForwardBatch], ForwardOutput],
+    shapes: tuple[PrefillCapture, ...],
+    *,
+    packed: bool,
+) -> None:
+    """Capture each selected physical token/row bucket in footprint order."""
+
+    for shape in sorted(
+        shapes,
+        key=lambda item: (item.token_bucket * item.row_bucket, item.token_bucket),
+        reverse=True,
+    ):
+        lengths = (shape.token_bucket - shape.live_rows + 1, *(1,) * (shape.live_rows - 1))
+        counts = tuple(ceil_div(length, runner.block_size) for length in lengths)
+        with runner.cache_pool.startup_pages(sum(counts)) as scratch:
+            pages = tuple(
+                scratch[sum(counts[:index]) : sum(counts[: index + 1])]
+                for index in range(len(counts))
+            )
+            batch = stage_text(
+                buffers, runner.cache_pool, tuple((0,) * n for n in lengths), pages, packed=packed
+            )
+            runner.capture(batch, forward)

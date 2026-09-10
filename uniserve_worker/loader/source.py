@@ -207,22 +207,6 @@ def resolve_weight_sources(
                     f"checkpoint from {source.filenames!r} under {root / source.directory}"
                 )
             names = (selected,)
-        elif request.load.load_format is LoadFormat.SHARDED_STATE:
-            candidates = tuple(
-                PurePosixPath(name).name
-                for name in available
-                if PurePosixPath(name).parent == directory
-            )
-            entry = source.entry
-            if entry is None:
-                if len(request.bindings.entries) != 1:
-                    raise ValueError("rank checkpoint source must declare its computation entry")
-                entry = next(iter(request.bindings.entries))
-            members = request.bindings.entries[entry].ranks
-            name = _rank_file(
-                candidates, members.index(request.bindings.process_group.rank), len(members)
-            )
-            names = ((directory / name).as_posix(),)
         else:
             names = _select_primary(
                 model_path=request.model_path,
@@ -345,22 +329,6 @@ def _index_weight_files(
     return names
 
 
-def _rank_file(available: tuple[str, ...], rank: int, size: int) -> str:
-    """Select the recognized installed-state filename for one parallel rank."""
-
-    candidates = (
-        f"rank-{rank:05d}-of-{size:05d}.safetensors",
-        f"rank-{rank}.safetensors",
-        f"tp_rank_{rank}.safetensors",
-    )
-    matches = tuple(name for name in candidates if name in available)
-    if not matches:
-        raise FileNotFoundError(
-            f"sharded-state checkpoint has no safetensors file for rank {rank} of {size}"
-        )
-    return matches[0]
-
-
 def _fetch_sidecars(
     patterns: tuple[str, ...],
     *,
@@ -412,7 +380,7 @@ def _accepts_suffix(name: str, load_format: LoadFormat) -> bool:
     suffix = Path(name).suffix
     if load_format in {LoadFormat.AUTO, LoadFormat.LAYERED}:
         return suffix in {".safetensors", ".bin", ".pt"}
-    if load_format in {LoadFormat.SAFETENSORS, LoadFormat.SHARDED_STATE}:
+    if load_format is LoadFormat.SAFETENSORS:
         return suffix == ".safetensors"
     if load_format is LoadFormat.PT:
         return suffix in {".bin", ".pt"}

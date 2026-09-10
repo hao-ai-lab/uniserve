@@ -51,7 +51,6 @@ from uniserve_worker.execution.batch import (
     TokenMode,
     TransferHandle,
 )
-from uniserve_worker.process import WorkerProcess
 
 
 def _read_request(locator: Locator) -> bytes:
@@ -66,186 +65,188 @@ def _read_request(locator: Locator) -> bytes:
 
 
 def test_kv_install_waits_for_storage_and_input_without_blocking_independent_work() -> None:
-    producer = execution_worker(transfer_backends=("shm",))
-    worker = execution_worker(transfer_backends=("shm",), pipeline_depth=3)
-    incoming = ar_params(45, block_ids=(0,))
-    admission = ar_params(44, block_ids=(0,))
-    server_started = False
-    grant = Event()
-    accepted = Event()
-    endpoint = f"uniserve-test-kv-{uuid.uuid4().hex}"
-    try:
-        publications = []
-        commits = []
-        for owner, request, tokens in (
-            (producer, incoming, (8, 9)),
-            (worker, admission, (3, 4)),
-        ):
-            extend, input_product = token_operation(
-                request.request_key,
-                op_id=1,
-                parent=root_parent(request),
-                mode=TokenMode.EXTEND,
-                tokens=tokens,
-            )
-            extended = finalized_report(
-                owner.execute(
-                    execution_run(
-                        run_id=1,
-                        admissions=(request,),
-                        operations=(extend,),
-                        input_products=(input_product,),
+    with (
+        execution_worker(transfer_backends=("shm",)) as producer,
+        execution_worker(transfer_backends=("shm",), pipeline_depth=3) as worker,
+    ):
+        incoming = ar_params(45, block_ids=(0,))
+        admission = ar_params(44, block_ids=(0,))
+        worker.warmup()
+        grant = Event()
+        accepted = Event()
+        endpoint = f"uniserve-test-kv-{uuid.uuid4().hex}"
+        try:
+            publications = []
+            commits = []
+            for owner, request, tokens in (
+                (producer, incoming, (8, 9)),
+                (worker, admission, (3, 4)),
+            ):
+                extend, input_product = token_operation(
+                    request.request_key,
+                    op_id=1,
+                    parent=root_parent(request),
+                    mode=TokenMode.EXTEND,
+                    tokens=tokens,
+                )
+                extended = finalized_report(
+                    owner.execute(
+                        execution_run(
+                            run_id=1,
+                            admissions=(request,),
+                            operations=(extend,),
+                            input_products=(input_product,),
+                        )
                     )
                 )
-            )
-            commit = commit_for_completion(extend, extended)
-            publication, _product = _publication_operation(
-                request.request_key,
-                op_id=2,
-                parent=commit.selected,
-                control_seq=commit.control_seq,
-            )
-            published = finalized_report(
-                owner.execute(
-                    execution_run(run_id=2, operations=(publication,), commands=(commit,))
+                commit = commit_for_completion(extend, extended)
+                publication, _product = _publication_operation(
+                    request.request_key,
+                    op_id=2,
+                    parent=commit.selected,
+                    control_seq=commit.control_seq,
                 )
-            )
-            publications.append(published.products[0])
-            commits.append(commit)
+                published = finalized_report(
+                    owner.execute(
+                        execution_run(run_id=2, operations=(publication,), commands=(commit,))
+                    )
+                )
+                publications.append(published.products[0])
+                commits.append(commit)
 
-        source, resident = publications
-        assert isinstance(source.payload, TransferHandle)
-        assert isinstance(source.payload.value, KvTransferValue)
-        assert isinstance(resident.payload, TransferHandle)
-        assert isinstance(resident.payload.value, KvTransferValue)
-        old_locator = resident.payload.value.tensors[0].locations[0]
-        assert isinstance(old_locator.transport, PosixShmTransfer)
+            source, resident = publications
+            assert isinstance(source.payload, TransferHandle)
+            assert isinstance(source.payload.value, KvTransferValue)
+            assert isinstance(resident.payload, TransferHandle)
+            assert isinstance(resident.payload.value, KvTransferValue)
+            old_locator = resident.payload.value.tensors[0].locations[0]
+            assert isinstance(old_locator.transport, PosixShmTransfer)
 
-        # The external publisher owns real SHM bytes, but gates permission to
-        # read them so storage retirement and input completion remain distinct.
-        tensors = tuple(
-            replace(
-                tensor,
-                locations=tuple(
-                    replace(locator, transport=replace(locator.transport, endpoint=endpoint))
-                    for locator in tensor.locations
-                ),
+            # The external publisher owns real SHM bytes, but gates permission to
+            # read them so storage retirement and input completion remain distinct.
+            tensors = tuple(
+                replace(
+                    tensor,
+                    locations=tuple(
+                        replace(locator, transport=replace(locator.transport, endpoint=endpoint))
+                        for locator in tensor.locations
+                    ),
+                )
+                for tensor in source.payload.value.tensors
             )
-            for tensor in source.payload.value.tensors
-        )
-        incoming_payload = replace(
-            source, payload=TransferHandle(replace(source.payload.value, tensors=tensors))
-        )
-        requests = {_read_request(locator) for tensor in tensors for locator in tensor.locations}
-        with (
-            socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as listener,
-            socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as reader,
-            ThreadPoolExecutor(max_workers=2) as executor,
-        ):
-            listener.bind("\0" + endpoint)
-            listener.listen(len(requests))
-            listener.settimeout(10)
+            incoming_payload = replace(
+                source, payload=TransferHandle(replace(source.payload.value, tensors=tensors))
+            )
+            requests = {
+                _read_request(locator) for tensor in tensors for locator in tensor.locations
+            }
+            with (
+                socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as listener,
+                socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as reader,
+                ThreadPoolExecutor(max_workers=2) as executor,
+            ):
+                listener.bind("\0" + endpoint)
+                listener.listen(len(requests))
+                listener.settimeout(10)
 
-            def serve() -> None:
-                pending = set(requests)
-                while pending:
-                    connection, _address = listener.accept()
-                    with connection:
-                        connection.settimeout(10)
-                        pending.remove(connection.recv(128))
-                        accepted.set()
-                        assert grant.wait(10), "publisher was never permitted to expose its bytes"
-                        connection.sendall(b"G")
-                        assert connection.recv(1) == b"A"
-                        connection.sendall(b"D")
+                def serve() -> None:
+                    pending = set(requests)
+                    while pending:
+                        connection, _address = listener.accept()
+                        with connection:
+                            connection.settimeout(10)
+                            pending.remove(connection.recv(128))
+                            accepted.set()
+                            assert grant.wait(10), (
+                                "publisher was never permitted to expose its bytes"
+                            )
+                            connection.sendall(b"G")
+                            assert connection.recv(1) == b"A"
+                            connection.sendall(b"D")
 
-            reader.settimeout(10)
-            reader.connect("\0" + old_locator.transport.endpoint)
-            reader.sendall(_read_request(old_locator))
-            assert reader.recv(1) == b"G"
-            commit = commits[1]
-            finish = Finish(
-                admission.request_key,
-                commit.control_seq + 1,
-                commit.selected,
-                CloseReason.COMPLETED,
-            )
-            installation, installed = _installation_operation(
-                incoming, op_id=3, parent=root_parent(incoming), source=source.product
-            )
-            independent = ar_params(46, block_ids=(1,))
-            operation, independent_input = token_operation(
-                independent.request_key,
-                op_id=1,
-                parent=root_parent(independent),
-                mode=TokenMode.EXTEND,
-                tokens=(6, 7),
-            )
-            runs = (
-                execution_run(run_id=3, commands=(finish,)),
-                execution_run(
-                    run_id=5,
-                    admissions=(incoming,),
-                    operations=(installation,),
-                    input_products=(incoming_payload,),
-                    **_installation_allocation(installation, 2),
-                ),
-                execution_run(
-                    run_id=4,
-                    admissions=(independent,),
-                    operations=(operation,),
-                    input_products=(independent_input,),
-                ),
-            )
-            ipc = QueuedWorkerIpc(
-                tuple({"kind": "submit", "call_id": run.run_id, "run": run} for run in runs)
-            )
-            server = WorkerProcess(worker, ipc)
-            serving = executor.submit(serve)
-            processing = executor.submit(server.serve)
-            server_started = True
-            reader_held = True
-            try:
-                response = ipc.receive()
-                assert response["call_id"] == 4, response
-                completed = RunResult.from_mapping(response["result"])
-                assert completed.completions[0].status is OpStatus.OK
+                reader.settimeout(10)
+                reader.connect("\0" + old_locator.transport.endpoint)
+                reader.sendall(_read_request(old_locator))
+                assert reader.recv(1) == b"G"
+                commit = commits[1]
+                finish = Finish(
+                    admission.request_key,
+                    commit.control_seq + 1,
+                    commit.selected,
+                    CloseReason.COMPLETED,
+                )
+                installation, installed = _installation_operation(
+                    incoming, op_id=3, parent=root_parent(incoming), source=source.product
+                )
+                independent = ar_params(46, block_ids=(1,))
+                operation, independent_input = token_operation(
+                    independent.request_key,
+                    op_id=1,
+                    parent=root_parent(independent),
+                    mode=TokenMode.EXTEND,
+                    tokens=(6, 7),
+                )
+                runs = (
+                    execution_run(run_id=3, commands=(finish,)),
+                    execution_run(
+                        run_id=5,
+                        admissions=(incoming,),
+                        operations=(installation,),
+                        input_products=(incoming_payload,),
+                        **_installation_allocation(installation, 2),
+                    ),
+                    execution_run(
+                        run_id=4,
+                        admissions=(independent,),
+                        operations=(operation,),
+                        input_products=(independent_input,),
+                    ),
+                )
+                ipc = QueuedWorkerIpc(
+                    tuple({"kind": "submit", "call_id": run.run_id, "run": run} for run in runs)
+                )
+                worker.bind(ipc)
+                serving = executor.submit(serve)
+                processing = executor.submit(worker.run)
+                reader_held = True
+                try:
+                    response = ipc.receive()
+                    assert response["call_id"] == 4, response
+                    completed = RunResult.from_mapping(response["result"])
+                    assert completed.completions[0].status is OpStatus.OK
 
-                reader.sendall(b"A")
-                assert reader.recv(1) == b"D"
-                reader_held = False
-                response = ipc.receive()
-                assert response["call_id"] == 3, response
-                assert RunResult.from_mapping(response["result"]).done
-                assert accepted.wait(5), "retiring storage did not start the dependent read"
-                grant.set()
-
-                # No new IPC request drives this transition: the completed
-                # physical import must wake the sleeping process itself.
-                response = ipc.receive()
-                assert response["call_id"] == 5, response
-                report = RunResult.from_mapping(response["result"])
-                assert report.completions[0].status is OpStatus.OK
-                assert report.completions[0].logical_lengths.kv_visible_len == 2
-                assert report.products[0].product == installed
-                serving.result(timeout=5)
-                for layer in range(worker.cache_pool.num_layers):
-                    expected = producer.cache_pool.read(layer, (1,), start=0, length=2)
-                    actual = worker.cache_pool.read(layer, (1,), start=0, length=2)
-                    for left, right in zip(actual, expected, strict=True):
-                        torch.testing.assert_close(left, right, rtol=0, atol=0)
-            finally:
-                grant.set()
-                if reader_held:
                     reader.sendall(b"A")
                     assert reader.recv(1) == b"D"
-                ipc.submit({"kind": "close", "call_id": 6})
-                processing.result(timeout=10)
-    finally:
-        grant.set()
-        if not server_started:
-            worker.close()
-        producer.close()
+                    reader_held = False
+                    response = ipc.receive()
+                    assert response["call_id"] == 3, response
+                    assert RunResult.from_mapping(response["result"]).done
+                    assert accepted.wait(5), "retiring storage did not start the dependent read"
+                    grant.set()
+
+                    # No new IPC request drives this transition: the completed
+                    # physical import must wake the sleeping process itself.
+                    response = ipc.receive()
+                    assert response["call_id"] == 5, response
+                    report = RunResult.from_mapping(response["result"])
+                    assert report.completions[0].status is OpStatus.OK
+                    assert report.completions[0].logical_lengths.kv_visible_len == 2
+                    assert report.products[0].product == installed
+                    serving.result(timeout=5)
+                    for layer in range(worker.cache_pool.num_layers):
+                        expected = producer.cache_pool.read(layer, (1,), start=0, length=2)
+                        actual = worker.cache_pool.read(layer, (1,), start=0, length=2)
+                        for left, right in zip(actual, expected, strict=True):
+                            torch.testing.assert_close(left, right, rtol=0, atol=0)
+                finally:
+                    grant.set()
+                    if reader_held:
+                        reader.sendall(b"A")
+                        assert reader.recv(1) == b"D"
+                    ipc.submit({"kind": "close", "call_id": 6})
+                    processing.result(timeout=10)
+        finally:
+            grant.set()
 
 
 def _installation_operation(

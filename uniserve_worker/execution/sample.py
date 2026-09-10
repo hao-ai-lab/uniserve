@@ -27,7 +27,7 @@ from uniserve_worker.runtime.device_products import (
     DeviceProductWrite,
 )
 
-from .cuda_graph import GraphGreedyOutput
+from ..nn.mesh import Communicator
 from .rows import (
     ForwardRow,
     SampleBatchVectors,
@@ -35,6 +35,7 @@ from .rows import (
     SampleRow,
     SampleWork,
 )
+from .runners.packed import GraphGreedyOutput
 from .top_k_sampling import SamplingParameters, sample_top_k
 
 SAMPLING_COMPLETION_FIELDS = 4
@@ -651,10 +652,10 @@ def _run_fused_top_k_sampling(
     parameters: torch.Tensor,
     top_k: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run the compiled fixed-top-k sampler after validating CUDA toolchain availability."""
+    """Run the compiled fixed-top-k sampler on a CUDA device."""
 
     if not triton_available(logits.device):
-        raise unsupported_setup("fused top-k sampling requires a supported CUDA compile toolchain")
+        raise unsupported_setup("fused top-k sampling requires a CUDA device")
     return sample_top_k(
         logits,
         draws,
@@ -1625,3 +1626,9 @@ def logprob_details(
             max_requested,
         )
     return {result_index: LogprobOutputRow(batch, result_index) for result_index in requested_rows}
+
+
+def broadcast_selection(group: Communicator | None, value: torch.Tensor) -> torch.Tensor:
+    """Publish selected tokens through the bound tensor-parallel communicator."""
+
+    return value if group is None else group.broadcast(value, src=0)

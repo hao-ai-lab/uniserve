@@ -65,6 +65,7 @@ pub struct Worker {
     info: WorkerInfo,
     depth: usize,
     inflight: usize,
+    last_run_id: Option<u64>,
     progress_fds: Vec<i32>,
     last_progress: Instant,
     pending_batches: BTreeMap<u64, PhysicalRun>,
@@ -256,6 +257,7 @@ impl Worker {
             info,
             depth,
             inflight: 0,
+            last_run_id: None,
             progress_fds,
             last_progress: Instant::now(),
             pending_batches: BTreeMap::new(),
@@ -1189,6 +1191,11 @@ impl Worker {
         if self.closed {
             return Err(RunSubmitError::Failed(anyhow::anyhow!("Worker is closed")));
         }
+        if self.last_run_id.is_some_and(|last| batch.run_id <= last) {
+            return Err(RunSubmitError::Failed(anyhow::anyhow!(
+                "physical run IDs must increase in submission order"
+            )));
+        }
         if !self.is_ready() || self.inflight >= self.depth {
             return Err(RunSubmitError::WouldBlock(batch));
         }
@@ -1196,12 +1203,6 @@ impl Worker {
             .validate()
             .map_err(anyhow::Error::from)
             .map_err(RunSubmitError::Failed)?;
-        if self.pending_batches.contains_key(&batch.run_id) {
-            return Err(RunSubmitError::Failed(anyhow::anyhow!(
-                "step {} is already in flight",
-                batch.run_id
-            )));
-        }
         let rank_batches = split_rank_runs(
             &batch,
             &self.process_args.entries,
@@ -1225,6 +1226,7 @@ impl Worker {
             .operations()
             .map(|operation| operation.request_key)
             .collect::<Vec<_>>();
+        self.last_run_id = Some(run_id);
         self.pending_batches.insert(run_id, batch.clone());
         self.pending_operations.insert(
             run_id,

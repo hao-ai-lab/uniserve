@@ -1269,7 +1269,6 @@ fn error_operation_from_table(
 fn info_from_table(info: fbs::WorkerInfo<'_>) -> CodecResult<WorkerInfo> {
     let info = WorkerInfo {
         model_name: required_str(info.model_name(), "info.model_name")?,
-        weight_version: info.weight_version(),
         endpoint: endpoint_from_table(info.endpoint().context("info has no endpoint")?)?,
         device: required_str(info.device(), "info.device")?,
         transfer_backends: info
@@ -2491,7 +2490,6 @@ fn info_to_fb(info: &WorkerInfo) -> CodecResult<fbs::WorkerInfoT> {
     info.validate()?;
     Ok(fbs::WorkerInfoT {
         model_name: Some(info.model_name.clone()),
-        weight_version: info.weight_version,
         endpoint: Some(Box::new(endpoint_to_fb(&info.endpoint))),
         device: Some(info.device.clone()),
         transfer_backends: Some(info.transfer_backends.clone()),

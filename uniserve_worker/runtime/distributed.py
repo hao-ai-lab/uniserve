@@ -4,15 +4,25 @@ from __future__ import annotations
 
 import math
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Mapping
+from functools import partial
+from types import TracebackType
+from typing import TYPE_CHECKING, Any, Mapping, Self
 
 import torch
 import torch.distributed as dist
 
 from ..foundation.errors import distributed_setup_error
-from ..nn.mesh import Communicator, DeviceMesh, PeerTensorWorkspace, SymmetricMemoryWorkspace
-from ..nn.parallel import ParallelConfig
+from ..foundation.resources import close_resources
+from ..nn.mesh import (
+    Communicator,
+    DeviceMesh,
+    EntryBindings,
+    PeerTensorWorkspace,
+    SymmetricMemoryWorkspace,
+)
+from ..nn.parallel import EntryConfig, ParallelConfig
 from ..nn.parallel_attention import AttentionContextGeometry, AttentionContextWorkspace
 
 if TYPE_CHECKING:
@@ -21,7 +31,11 @@ if TYPE_CHECKING:
 
 @dataclass
 class DistributedEnvironment:
-    """Own group resources until dependent runners and captured graphs retire."""
+    """Own collective resources until dependent runners and captured graphs retire.
+
+    This includes a default process group created during initialization. A
+    pre-existing default group belongs to the caller and is never destroyed here.
+    """
 
     rank: int
     world_size: int
@@ -36,6 +50,24 @@ class DistributedEnvironment:
         default_factory=dict, repr=False
     )
 
+    def __enter__(self) -> Self:
+        """Enter a scope owning the groups and distributed storage created here."""
+
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        try:
+            self.close()
+        except BaseException as cleanup_error:
+            if exc_value is None:
+                raise
+            exc_value.add_note(f"Resource cleanup also failed: {cleanup_error!r}")
+
     @property
     def process_group(self) -> Communicator:
         """Bind component transfers to the instance's ordered physical ranks."""
@@ -47,6 +79,28 @@ class DistributedEnvironment:
             self.local_device,
             dist.group.WORLD if dist.is_initialized() else None,
         )
+
+    def initialize_entries(self, entries: Mapping[str, EntryConfig]) -> EntryBindings:
+        """Bind declared entries to their local meshes and shared process world."""
+
+        meshes = initialize_model_parallel(
+            self,
+            {
+                name: (entry.ranks, entry.parallel_config)
+                for name, entry in entries.items()
+                if entry.distribution is None
+            },
+        )
+
+        # Temporal distribution partitions work across independent local models;
+        # its width is an entry parameter, not a model-parallel mesh dimension.
+        for name, entry in entries.items():
+            if entry.distribution is not None and self.rank in entry.ranks:
+                meshes[name] = DeviceMesh(
+                    (self.rank,), self.rank, entry.parallel_config, self.local_device
+                )
+
+        return EntryBindings(dict(entries), meshes, self.process_group)
 
     def symmetric_memory(
         self,
@@ -160,6 +214,25 @@ class DistributedEnvironment:
             torch.empty(group.world_size, dtype=torch.int32, device=group.device),
         )
 
+    def stream_collectives(self, stream: torch.cuda.Stream):
+        """Allocate independent communication resources for one computation stream."""
+
+        from .collectives import NcclStreamCollectives
+
+        bindings = {}
+        try:
+            for group in self._groups:
+                if dist.get_backend(group) == "nccl":
+                    bindings[group.group_name] = NcclStreamCollectives(group, stream)
+        except BaseException as error:
+            for binding in reversed(tuple(bindings.values())):
+                try:
+                    binding.close()
+                except BaseException as cleanup_error:
+                    error.add_note(f"collective binding cleanup failed: {cleanup_error!r}")
+            raise
+        return bindings
+
     def sum_reductions(self) -> dict[Any, PeerSumReduction]:
         """Allocate collective scratch for one serialized full-device execution scope.
 
@@ -181,16 +254,21 @@ class DistributedEnvironment:
             raise
 
     def close(self) -> None:
-        """Release peer allocations and groups after the caller retires runners."""
+        """Release all owned resources after the caller retires runners.
 
+        Attempt every release even if device synchronization or a group teardown
+        fails. Component groups retire before the default world they depend on.
+        """
+
+        actions: list[Callable[[], object]] = []
         if self.local_device.type == "cuda":
-            torch.cuda.synchronize(self.local_device)
-        self._peer_tensors.clear()
-        self._workspaces.clear()
-        self._sum_groups.clear()
-        for group in reversed(self._groups):
-            dist.destroy_process_group(group)
+            actions.append(partial(torch.cuda.synchronize, self.local_device))
+        actions.extend((self._peer_tensors.clear, self._workspaces.clear, self._sum_groups.clear))
+        actions.extend(
+            partial(dist.destroy_process_group, group) for group in reversed(self._groups)
+        )
         self._groups.clear()
+        close_resources(*actions)
 
 
 def init_distributed_environment(
@@ -202,7 +280,13 @@ def init_distributed_environment(
     backend: str | None = None,
     init_method: str | None = None,
 ) -> DistributedEnvironment:
-    """Initialize physical launch information without assigning model-parallel degrees."""
+    """Select the rank's device and join or create its physical process world.
+
+    The returned environment owns any process group it creates; callers must
+    close it after all dependent execution resources have retired. Used with
+    `with`, it releases resources on construction failure and retains them on
+    success for the constructed owner's lifetime.
+    """
 
     if world_size < 1 or not 0 <= rank < world_size or local_rank < 0:
         raise distributed_setup_error("launch rank must satisfy 0 <= rank < positive world_size")
@@ -242,6 +326,7 @@ def init_distributed_environment(
             pg_options=_group_options(backend),
             device_id=local_device if backend == "nccl" else None,
         )
+        environment._groups.append(dist.group.WORLD)
     return environment
 
 

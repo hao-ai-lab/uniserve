@@ -4,7 +4,6 @@ from pathlib import Path
 
 import pytest
 import torch
-import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from uniserve_worker.nn.parallel import ParallelConfig, SequenceParallel
@@ -70,7 +69,6 @@ def _run_peer_tensor(rank: int, rendezvous: str, world_size: int) -> None:
         graph.reset()
     torch.cuda.synchronize()
     environment.close()
-    dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("world_size", [2, 4])

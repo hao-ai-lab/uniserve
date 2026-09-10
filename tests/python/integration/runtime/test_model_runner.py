@@ -401,8 +401,7 @@ class _CloseScoreModel(StubModel):
         return output
 
 
-def test_startup_accepts_numerically_close_mixed_token_ties():
-    from uniserve_worker.execution.step import execute_startup
+def test_mixed_token_ties_preserve_numerically_close_outputs():
 
     worker = execution_worker(_CloseScoreModel())
     sequence_admission = ar_params(1, block_ids=(0,))
@@ -437,128 +436,170 @@ def test_startup_accepts_numerically_close_mixed_token_ties():
             input_products=(sequence_input,),
         )
     )
-    result = finalized_report(execute_startup(worker, batch))
+    result = finalized_report(
+        worker.execute(
+            batch,
+        )
+    )
     assert all(item.status is OpStatus.OK for item in result.completions)
     assert result.completions[0].committed_tokens == (1,)
 
 
-def test_mixed_token_and_flow_match_homogeneous_results():
-    mixed = execution_worker()
-    sequence_admission = ar_params(1, block_ids=(0,))
-    flow_admission = umm_params(2, ImageParams(steps=1, height=16, width=16, seed=29))
-    mixed_conditioning = _publish_conditioning(mixed, flow_admission, op_id=10, run_id=1)
-    mixed_latent, mixed_preparation_commit = _prepare_media(
-        mixed,
-        flow_admission,
-        mixed_conditioning,
-        op_id=11,
-        parent=root_parent(flow_admission),
-        run_id=2,
+@pytest.mark.parametrize(
+    ("device", "binding", "graphs"),
+    [
+        ("cpu", "default", False),
+        pytest.param("cuda:0", "default", True, marks=pytest.mark.gpu),
+        pytest.param("cuda:0", "shared", True, marks=pytest.mark.gpu),
+        pytest.param("cuda:0", "split", True, marks=pytest.mark.gpu),
+        pytest.param("cuda:0", "split", False, marks=pytest.mark.gpu),
+    ],
+)
+def test_mixed_token_and_flow_match_homogeneous_results(device, binding, graphs):
+    lanes = {
+        "default": (),
+        "shared": (LaneConfig("compute", 152, tuple(Domain)),),
+        "split": (
+            LaneConfig("decode", 64, (Domain.DECODE,)),
+            LaneConfig("compute", 88, (Domain.PREFILL, Domain.FLOW)),
+        ),
+    }[binding]
+    policy = WorkerConfig(
+        prefill_cuda_graph=graphs,
+        graph_policy="full" if graphs else "off",
+        decode_graph_batch_sizes=(1, 2),
+        prefill_graph_token_sizes=(16, 32),
+        flow_graph_batch_sizes=(1,),
+        flow_graph_shapes=((16, 16),),
+        lanes=lanes,
     )
-    flow, mixed_output_latent = diffusion_step_operation(
-        flow_admission.request_key,
-        op_id=12,
-        parent=mixed_preparation_commit.selected,
-        conditioning=mixed_conditioning,
-        latent=mixed_latent,
-        steps=1,
-        control_seq=mixed_preparation_commit.control_seq,
-    )
-    sequence, sequence_input, sequence_control = _prepare_decode(
-        mixed,
-        sequence_admission,
-        op_id=10,
-        run_id=3,
-        tokens=(3, 4),
-    )
+    with (
+        execution_worker(device=device, execution=policy) as mixed,
+        execution_worker(device=device) as split,
+    ):
+        # Direct execution permits cold capture of configured mixed geometry;
+        # service warmup separately qualifies which mixed launches it advertises.
+        sequence_admission = ar_params(1, block_ids=(0,))
+        flow_admission = umm_params(2, ImageParams(steps=1, height=16, width=16, seed=29))
+        mixed_conditioning = _publish_conditioning(mixed, flow_admission, op_id=10, run_id=1)
+        mixed_latent, mixed_preparation_commit = _prepare_media(
+            mixed,
+            flow_admission,
+            mixed_conditioning,
+            op_id=11,
+            parent=root_parent(flow_admission),
+            run_id=2,
+        )
+        flow, mixed_output_latent = diffusion_step_operation(
+            flow_admission.request_key,
+            op_id=12,
+            parent=mixed_preparation_commit.selected,
+            conditioning=mixed_conditioning,
+            latent=mixed_latent,
+            steps=1,
+            control_seq=mixed_preparation_commit.control_seq,
+        )
+        sequence, sequence_input, sequence_control = _prepare_decode(
+            mixed,
+            sequence_admission,
+            op_id=10,
+            run_id=3,
+            tokens=(3, 4),
+        )
 
-    mixed_result = finalized_report(
-        mixed.execute(
-            execution_run(
-                run_id=4,
-                admissions=(),
-                operations=(sequence, flow),
-                commands=(mixed_preparation_commit, sequence_control),
-                input_products=(sequence_input,),
+        combined = execution_run(
+            run_id=4,
+            admissions=(),
+            operations=(sequence, flow),
+            commands=(mixed_preparation_commit, sequence_control),
+            input_products=(sequence_input,),
+        )
+        if binding == "split":
+            # Separate physical bindings accept independent logical launches;
+            # a mixed launch requires a shared, qualified computation binding.
+            combined = replace(
+                combined,
+                lanes=tuple(replace(lane, launch_id=lane.lane_id) for lane in combined.lanes),
+            )
+        mixed_result = finalized_report(mixed.execute(combined))
+
+        split_conditioning = _publish_conditioning(split, flow_admission, op_id=10, run_id=1)
+        split_latent, split_preparation_commit = _prepare_media(
+            split,
+            flow_admission,
+            split_conditioning,
+            op_id=11,
+            parent=root_parent(flow_admission),
+            run_id=2,
+        )
+        split_flow, split_output_latent = diffusion_step_operation(
+            flow_admission.request_key,
+            op_id=12,
+            parent=split_preparation_commit.selected,
+            conditioning=split_conditioning,
+            latent=split_latent,
+            steps=1,
+            control_seq=split_preparation_commit.control_seq,
+        )
+        split_sequence, split_sequence_input, split_sequence_control = _prepare_decode(
+            split,
+            sequence_admission,
+            op_id=10,
+            run_id=3,
+            tokens=(3, 4),
+        )
+        sequence_result = finalized_report(
+            split.execute(
+                execution_run(
+                    run_id=4,
+                    admissions=(),
+                    operations=(split_sequence,),
+                    commands=(split_sequence_control,),
+                    input_products=(split_sequence_input,),
+                )
             )
         )
-    )
-
-    split = execution_worker()
-    split_conditioning = _publish_conditioning(split, flow_admission, op_id=10, run_id=1)
-    split_latent, split_preparation_commit = _prepare_media(
-        split,
-        flow_admission,
-        split_conditioning,
-        op_id=11,
-        parent=root_parent(flow_admission),
-        run_id=2,
-    )
-    split_flow, split_output_latent = diffusion_step_operation(
-        flow_admission.request_key,
-        op_id=12,
-        parent=split_preparation_commit.selected,
-        conditioning=split_conditioning,
-        latent=split_latent,
-        steps=1,
-        control_seq=split_preparation_commit.control_seq,
-    )
-    split_sequence, split_sequence_input, split_sequence_control = _prepare_decode(
-        split,
-        sequence_admission,
-        op_id=10,
-        run_id=3,
-        tokens=(3, 4),
-    )
-    sequence_result = finalized_report(
-        split.execute(
-            execution_run(
-                run_id=4,
-                admissions=(),
-                operations=(split_sequence,),
-                commands=(split_sequence_control,),
-                input_products=(split_sequence_input,),
+        flow_result = finalized_report(
+            split.execute(
+                execution_run(
+                    run_id=5,
+                    admissions=(),
+                    operations=(split_flow,),
+                    commands=(split_preparation_commit,),
+                    input_products=(),
+                )
             )
         )
-    )
-    flow_result = finalized_report(
-        split.execute(
-            execution_run(
-                run_id=5,
-                admissions=(),
-                operations=(split_flow,),
-                commands=(split_preparation_commit,),
-                input_products=(),
-            )
-        )
-    )
 
-    assert (
-        mixed_result.completions[0].committed_tokens
-        == sequence_result.completions[0].committed_tokens
-    )
-    assert (
-        mixed_result.completions[0].logical_lengths
-        == sequence_result.completions[0].logical_lengths
-    )
-    assert mixed_result.completions[1].logical_lengths == flow_result.completions[0].logical_lengths
-    mixed_flow_commit = commit_for_completion(flow, mixed_result)
-    split_flow_commit = commit_for_completion(split_flow, flow_result)
-    assert _finalized_artifact(
-        mixed,
-        flow_admission,
-        mixed_output_latent,
-        mixed_flow_commit,
-        op_id=13,
-        run_id=5,
-    ) == _finalized_artifact(
-        split,
-        flow_admission,
-        split_output_latent,
-        split_flow_commit,
-        op_id=13,
-        run_id=6,
-    )
+        assert (
+            mixed_result.completions[0].committed_tokens
+            == sequence_result.completions[0].committed_tokens
+        )
+        assert (
+            mixed_result.completions[0].logical_lengths
+            == sequence_result.completions[0].logical_lengths
+        )
+        assert (
+            mixed_result.completions[1].logical_lengths
+            == flow_result.completions[0].logical_lengths
+        )
+        mixed_flow_commit = commit_for_completion(flow, mixed_result)
+        split_flow_commit = commit_for_completion(split_flow, flow_result)
+        assert _finalized_artifact(
+            mixed,
+            flow_admission,
+            mixed_output_latent,
+            mixed_flow_commit,
+            op_id=13,
+            run_id=5,
+        ) == _finalized_artifact(
+            split,
+            flow_admission,
+            split_output_latent,
+            split_flow_commit,
+            op_id=13,
+            run_id=6,
+        )
 
 
 @pytest.mark.parametrize("device_parent", [False, True])
@@ -748,7 +789,7 @@ def test_failed_lane_keeps_kv_pages_until_submitted_device_work_finishes() -> No
         model,
         device="cuda:0",
         execution=WorkerConfig(
-            cuda_graph=False,
+            graph_policy="off",
             prefill_cuda_graph=False,
             lanes=(LaneConfig("compute", 64, tuple(Domain)),),
         ),
@@ -2360,15 +2401,24 @@ def test_generated_feedback_commits_absolute_visual_token_state():
         assert image.size == (16, 16)
 
 
-def test_latent_bank_reuse_waits_for_a_reader_after_free_without_blocking_independent_work() -> (
-    None
-):
+@pytest.mark.parametrize("device", ("cpu", pytest.param("cuda:0", marks=pytest.mark.gpu)))
+def test_latent_bank_reuse_waits_for_a_reader_after_free_without_blocking_independent_work(device):
     import hashlib
     import json
     import socket
     from threading import Event
 
-    worker = execution_worker(transfer_backends=("shm",))
+    policy = WorkerConfig(
+        prefill_cuda_graph=False,
+        graph_policy="off",
+        lanes=(
+            LaneConfig("decode", 64, (Domain.DECODE,)),
+            LaneConfig("compute", 88, (Domain.PREFILL, Domain.FLOW)),
+        )
+        if device.startswith("cuda")
+        else (),
+    )
+    worker = execution_worker(transfer_backends=("shm",), device=device, execution=policy)
     admission = umm_params(76, ImageParams(steps=3, height=16, width=16, seed=29))
     conditioning = _publish_conditioning(worker, admission, op_id=1, run_id=1)
     initial, commit = _prepare_media(
@@ -2493,68 +2543,145 @@ def test_later_product_release_unblocks_an_earlier_bank_writer() -> None:
 
     from tests.python.fixtures.worker_ipc import QueuedWorkerIpc
     from uniserve_worker.execution.batch import RunResult
-    from uniserve_worker.process import WorkerProcess
 
-    worker = execution_worker(transfer_backends=("shm",), pipeline_depth=2)
-    admission = umm_params(76, ImageParams(steps=3, height=16, width=16, seed=29))
-    conditioning = _publish_conditioning(worker, admission, op_id=1, run_id=1)
-    latent, commit = _prepare_media(
-        worker, admission, conditioning, op_id=2, parent=root_parent(admission), run_id=2
-    )
-    retained = latent
-    for op_id in (3, 4):
-        operation, successor = diffusion_step_operation(
+    with execution_worker(transfer_backends=("shm",), pipeline_depth=2) as worker:
+        worker.warmup()
+        admission = umm_params(76, ImageParams(steps=3, height=16, width=16, seed=29))
+        conditioning = _publish_conditioning(worker, admission, op_id=1, run_id=1)
+        latent, commit = _prepare_media(
+            worker, admission, conditioning, op_id=2, parent=root_parent(admission), run_id=2
+        )
+        retained = latent
+        for op_id in (3, 4):
+            operation, successor = diffusion_step_operation(
+                admission.request_key,
+                op_id=op_id,
+                parent=commit.selected,
+                conditioning=conditioning,
+                latent=latent,
+                steps=1,
+                control_seq=commit.control_seq,
+            )
+            report = finalized_report(
+                worker.execute(
+                    execution_run(
+                        run_id=op_id,
+                        operations=(operation,),
+                        commands=(commit,) if op_id == 3 else (commit, Free(retained.buffer_id)),
+                    )
+                )
+            )
+            assert report.completions[0].status is OpStatus.OK
+            retained, latent = latent, successor
+            commit = commit_for_completion(operation, report)
+
+        third, _final_latent = diffusion_step_operation(
             admission.request_key,
-            op_id=op_id,
+            op_id=5,
             parent=commit.selected,
             conditioning=conditioning,
             latent=latent,
             steps=1,
             control_seq=commit.control_seq,
         )
-        report = finalized_report(
+        waiting = execution_run(run_id=5, operations=(third,), commands=(commit,))
+        release = execution_run(run_id=6, commands=(Free(retained.buffer_id),))
+        endpoint = QueuedWorkerIpc(
+            tuple(
+                {"kind": "submit", "call_id": run.run_id, "run": run} for run in (waiting, release)
+            )
+        )
+        worker.bind(endpoint)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            serving = executor.submit(worker.run)
+            try:
+                responses = {
+                    int(value["call_id"]): value
+                    for value in (endpoint.receive(), endpoint.receive())
+                }
+                assert responses[5]["kind"] == "result", responses[5]
+                result = RunResult.from_mapping(responses[5]["result"])
+                assert result.completions[0].status is OpStatus.OK
+                assert result.completions[0].logical_lengths.latent_len == 3
+                assert responses[6]["kind"] == "result", responses[6]
+                assert RunResult.from_mapping(responses[6]["result"]).done
+            finally:
+                # Failure cleanup supplies the same valid release directly, allowing
+                # the serving thread to leave its storage wait before it is joined.
+                worker.execute(execution_run(run_id=99, commands=(Free(retained.buffer_id),)))
+                endpoint.submit({"kind": "close", "call_id": 7})
+                serving.result(timeout=10)
+
+
+@pytest.mark.gpu
+def test_direct_full_binding_captures_without_explicit_warmup():
+    policy = WorkerConfig(
+        graph_policy="full",
+        prefill_cuda_graph=True,
+        decode_graph_batch_sizes=(1, 2),
+        prefill_graph_token_sizes=(16, 32),
+        flow_graph_batch_sizes=(1,),
+        flow_graph_shapes=((16, 16),),
+        lanes=(LaneConfig("compute", 152, tuple(Domain)),),
+    )
+    with execution_worker(device="cuda:0", execution=policy) as worker:
+        admission = ar_params(1, block_ids=(0,))
+        decode, payload, commit = _prepare_decode(
+            worker, admission, op_id=1, run_id=1, tokens=(3, 4)
+        )
+        result = finalized_report(
             worker.execute(
                 execution_run(
-                    run_id=op_id,
-                    operations=(operation,),
-                    commands=(commit,) if op_id == 3 else (commit, Free(retained.buffer_id)),
+                    run_id=2,
+                    operations=(decode,),
+                    commands=(commit,),
+                    input_products=(payload,),
                 )
             )
         )
-        assert report.completions[0].status is OpStatus.OK
-        retained, latent = latent, successor
-        commit = commit_for_completion(operation, report)
+        assert result.completions[0].status is OpStatus.OK
+        assert result.completions[0].committed_tokens == (_next_token(_next_token(4)),)
 
-    third, _final_latent = diffusion_step_operation(
-        admission.request_key,
-        op_id=5,
-        parent=commit.selected,
-        conditioning=conditioning,
-        latent=latent,
-        steps=1,
-        control_seq=commit.control_seq,
+
+@pytest.mark.gpu
+def test_failed_capture_preserves_error_through_worker_scope_and_reconstruction(monkeypatch):
+    policy = WorkerConfig(
+        graph_policy="full",
+        prefill_cuda_graph=True,
+        decode_graph_batch_sizes=(1, 2),
+        prefill_graph_token_sizes=(16, 32),
+        flow_graph_batch_sizes=(1,),
+        flow_graph_shapes=((16, 16),),
+        lanes=(LaneConfig("compute", 152, tuple(Domain)),),
     )
-    waiting = execution_run(run_id=5, operations=(third,), commands=(commit,))
-    release = execution_run(run_id=6, commands=(Free(retained.buffer_id),))
-    endpoint = QueuedWorkerIpc(
-        tuple({"kind": "submit", "call_id": run.run_id, "run": run} for run in (waiting, release))
-    )
-    server = WorkerProcess(worker, endpoint)
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        serving = executor.submit(server.serve)
-        try:
-            responses = {
-                int(value["call_id"]): value for value in (endpoint.receive(), endpoint.receive())
-            }
-            assert responses[5]["kind"] == "result", responses[5]
-            result = RunResult.from_mapping(responses[5]["result"])
-            assert result.completions[0].status is OpStatus.OK
-            assert result.completions[0].logical_lengths.latent_len == 3
-            assert responses[6]["kind"] == "result", responses[6]
-            assert RunResult.from_mapping(responses[6]["result"]).done
-        finally:
-            # Failure cleanup supplies the same valid release directly, allowing
-            # the serving thread to leave its storage wait before it is joined.
-            worker.execute(execution_run(run_id=99, commands=(Free(retained.buffer_id),)))
-            endpoint.submit({"kind": "close", "call_id": 7})
-            serving.result(timeout=10)
+    capture_end = torch.cuda.CUDAGraph.capture_end
+    failure = RuntimeError("CUDA capture completion failed")
+
+    def failed_capture(graph):
+        capture_end(graph)
+        raise failure
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.cuda.CUDAGraph, "capture_end", failed_capture)
+        with pytest.raises(RuntimeError) as raised:
+            with execution_worker(device="cuda:0", execution=policy) as worker:
+                worker.warmup()
+        assert raised.value is failure
+    with execution_worker(device="cuda:0", execution=policy) as worker:
+        worker.warmup()
+        admission = ar_params(1, block_ids=(0,))
+        decode, payload, commit = _prepare_decode(
+            worker, admission, op_id=1, run_id=1, tokens=(3, 4)
+        )
+        result = finalized_report(
+            worker.execute(
+                execution_run(
+                    run_id=2,
+                    operations=(decode,),
+                    commands=(commit,),
+                    input_products=(payload,),
+                )
+            )
+        )
+        assert result.completions[0].status is OpStatus.OK
+        assert result.completions[0].committed_tokens == (_next_token(_next_token(4)),)

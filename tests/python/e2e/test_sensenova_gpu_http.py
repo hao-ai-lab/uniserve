@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -52,7 +53,9 @@ def image_start_token_id(model: Path) -> int:
 
 
 @contextmanager
-def production_server(tmp_path: Path, model: Path) -> Iterator[str]:
+def production_server(
+    tmp_path: Path, model: Path, binding: str, graph_policy: str
+) -> Iterator[str]:
     try:
         binary = require_uniserve_binary()
     except FileNotFoundError as error:
@@ -80,16 +83,30 @@ def production_server(tmp_path: Path, model: Path) -> Iterator[str]:
         "--max-num-batched-tokens",
         "4096",
         "--prefill-cuda-graph",
-        "true",
+        "true" if graph_policy == "full" else "false",
+        "--graph-policy",
+        graph_policy,
         "--worker-ranks",
         "2",
-        "--lane",
-        '{"lane_id":"decode","sm_budget":64,"domains":["decode"]}',
-        "--lane",
-        '{"lane_id":"compute","sm_budget":88,"domains":["prefill","flow"]}',
         "--log-stats",
         "false",
     ]
+    if binding == "shared":
+        args.extend(
+            [
+                "--lane",
+                '{"lane_id":"compute","sm_budget":152,"domains":["decode","prefill","flow"]}',
+            ]
+        )
+    elif binding == "split":
+        args.extend(
+            [
+                "--lane",
+                '{"lane_id":"decode","sm_budget":64,"domains":["decode"]}',
+                "--lane",
+                '{"lane_id":"compute","sm_budget":88,"domains":["prefill","flow"]}',
+            ]
+        )
     environment = {"CUDA_VISIBLE_DEVICES": "0,1"}
     with server_process(
         args,
@@ -142,100 +159,110 @@ def visible_stream_delta(event: dict[str, Any]) -> dict[str, Any] | None:
 
 
 @pytest.mark.timeout(600)
-def test_sensenova_public_production_lineage(tmp_path: Path):
+@pytest.mark.parametrize(
+    ("binding", "graph_policy"),
+    [("default", "full"), ("shared", "full"), ("split", "full"), ("split", "off")],
+)
+def test_sensenova_public_production_lineage(tmp_path: Path, binding: str, graph_policy: str):
     model = active_model()
     input_image_url = f"data:image/png;base64,{tiny_input_png_b64()}"
-    with production_server(tmp_path, model) as base_url:
-        text = post_chat(
-            base_url,
-            {
-                "messages": [{"role": "user", "content": "Reply with one word."}],
-                "modalities": ["text"],
-                "max_completion_tokens": 2,
-            },
-        )
-        assert_bounded_text_completion(text)
+    with production_server(tmp_path, model, binding, graph_policy) as base_url:
+        delivered = []
+        snapshots = []
+        for _round in range(2):
+            text = post_chat(
+                base_url,
+                {
+                    "messages": [{"role": "user", "content": "Reply with one word."}],
+                    "modalities": ["text"],
+                    "max_completion_tokens": 2,
+                },
+            )
+            assert_bounded_text_completion(text)
 
-        image_to_text = post_chat(
-            base_url,
-            {
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": "Describe the dominant color."},
-                            {"type": "image_url", "image_url": {"url": input_image_url}},
-                        ],
-                    }
-                ],
-                "modalities": ["text"],
-                "max_completion_tokens": 2,
-            },
-        )
-        assert_bounded_text_completion(image_to_text)
+            image_to_text = post_chat(
+                base_url,
+                {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "Describe the dominant color."},
+                                {"type": "image_url", "image_url": {"url": input_image_url}},
+                            ],
+                        }
+                    ],
+                    "modalities": ["text"],
+                    "max_completion_tokens": 2,
+                },
+            )
+            assert_bounded_text_completion(image_to_text)
 
-        image_response = httpx.post(
-            f"{base_url}/v1/images/generations",
-            json={
-                "model": SERVED_MODEL,
-                "prompt": "A blue square.",
-                "n": 1,
-                "steps": 1,
-                "seed": 7,
-            },
-            timeout=600,
-        )
-        image_response.raise_for_status()
-        generated_images = image_response.json()["data"]
-        assert len(generated_images) == 1
-        assert_generated_image(generated_images[0])
+            image_response = httpx.post(
+                f"{base_url}/v1/images/generations",
+                json={
+                    "model": SERVED_MODEL,
+                    "prompt": "A blue square.",
+                    "n": 1,
+                    "steps": 1,
+                    "seed": 7,
+                },
+                timeout=600,
+            )
+            image_response.raise_for_status()
+            generated_images = image_response.json()["data"]
+            assert len(generated_images) == 1
+            assert_generated_image(generated_images[0])
 
-        interleaved = post_sse(
-            base_url,
-            "/v1/chat/completions",
-            {
-                "model": SERVED_MODEL,
-                "stream": True,
-                "stream_options": {"include_usage": True},
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": "Use this color in two generated images."},
-                            {"type": "image_url", "image_url": {"url": input_image_url}},
-                        ],
-                    }
-                ],
-                "modalities": ["text", "image"],
-                "max_completion_tokens": 4,
-                "temperature": 0.0,
-                "logit_bias": {str(image_start_token_id(model)): 100.0},
-                "image_config": {"num_images": 2, "steps": 2, "seed": 7},
-            },
-            timeout_s=600,
-        )
-        assert interleaved[-1]["type"] == "sse_done"
-        finish_reasons = [
-            choice["finish_reason"]
-            for event in interleaved
-            for choice in event.get("choices", [])
-            if choice.get("finish_reason") is not None
-        ]
-        assert finish_reasons == ["length"]
-        usage = next(event["usage"] for event in interleaved if event.get("usage"))
-        assert usage["completion_tokens"] == 4
-        assert usage["image_count"] == 2
-        assert usage["image_steps"] == 4
-        assert usage["image_steps_per_image"] == [2, 2]
-        visible_events = [
-            (event, delta)
-            for event in interleaved
-            if (delta := visible_stream_delta(event)) is not None
-        ]
-        assert visible_events
-        images = [image for _, delta in visible_events for image in delta.get("images", [])]
-        assert len(images) == 2
-        for image in images:
-            image_url = image["image_url"]["url"]
-            assert image_url.startswith("data:image/png;base64,")
-            assert png_size_from_b64(image_url.split(",", 1)[1]) == IMAGE_SIZE
+            interleaved = post_sse(
+                base_url,
+                "/v1/chat/completions",
+                {
+                    "model": SERVED_MODEL,
+                    "stream": True,
+                    "stream_options": {"include_usage": True},
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "Use this color in two generated images."},
+                                {"type": "image_url", "image_url": {"url": input_image_url}},
+                            ],
+                        }
+                    ],
+                    "modalities": ["text", "image"],
+                    "max_completion_tokens": 4,
+                    "temperature": 0.0,
+                    "logit_bias": {str(image_start_token_id(model)): 100.0},
+                    "image_config": {"num_images": 2, "steps": 2, "seed": 7},
+                },
+                timeout_s=600,
+            )
+            assert interleaved[-1]["type"] == "sse_done"
+            finish_reasons = [
+                choice["finish_reason"]
+                for event in interleaved
+                for choice in event.get("choices", [])
+                if choice.get("finish_reason") is not None
+            ]
+            assert finish_reasons == ["length"]
+            usage = next(event["usage"] for event in interleaved if event.get("usage"))
+            assert usage["completion_tokens"] == 4
+            assert usage["image_count"] == 2
+            assert usage["image_steps"] == 4
+            assert usage["image_steps_per_image"] == [2, 2]
+            visible_events = [
+                (event, delta)
+                for event in interleaved
+                if (delta := visible_stream_delta(event)) is not None
+            ]
+            assert visible_events
+            images = [image for _, delta in visible_events for image in delta.get("images", [])]
+            assert len(images) == 2
+            for image in images:
+                image_url = image["image_url"]["url"]
+                assert image_url.startswith("data:image/png;base64,")
+                assert png_size_from_b64(image_url.split(",", 1)[1]) == IMAGE_SIZE
+            delivered.append((text, image_to_text, generated_images, interleaved))
+            snapshots.append(copy.deepcopy(delivered[-1]))
+            assert delivered == snapshots

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import gc
+from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import Any
 
@@ -10,6 +10,7 @@ import torch
 
 from uniserve_worker.config import LaneConfig
 from uniserve_worker.execution.batch import Domain
+from uniserve_worker.foundation.resources import close_resources
 
 
 class ExecutionLaneError(RuntimeError):
@@ -29,9 +30,18 @@ class _GreenContext:
     stream: torch.cuda.ExternalStream
     component_path: tuple[int, ...]
 
+    def close(self) -> None:
+        """Release the origin stream before destroying its owning context."""
+
+        cu = _driver()
+        close_resources(
+            lambda: _cuda_status(cu.cuStreamDestroy(self.raw_stream), "destroy lane stream"),
+            lambda: _cuda_status(cu.cuGreenCtxDestroy(self.green), "destroy Green Context"),
+        )
+
 
 class ExecutionLaneRuntime:
-    """Own streams, buffers, graphs, and events for one physical lane."""
+    """Own a physical execution context, stream, SM partition, and dependency events."""
 
     def __init__(
         self,
@@ -40,12 +50,10 @@ class ExecutionLaneRuntime:
         device: torch.device,
         stream: torch.cuda.Stream | None,
         sm_count: int,
-        buffer: Any,
-        graphs: Any,
         green: _GreenContext | None = None,
         event_slots: int = 2,
     ) -> None:
-        """Own one lane's stream, context, staging buffers, graph catalog, and output events."""
+        """Own one lane's stream, context, SM partition, and dependency events."""
 
         if int(event_slots) < 1:
             raise ValueError("execution lane requires a positive event bound")
@@ -53,8 +61,6 @@ class ExecutionLaneRuntime:
         self.device = device
         self.stream = stream
         self.sm_count = int(sm_count)
-        self.buffer = buffer
-        self.graphs = graphs
         self._green = green
         self._closed = False
         self._event_cursor = 0
@@ -133,21 +139,18 @@ class ExecutionLaneRuntime:
         if self._closed:
             return
         self._closed = True
+        actions = []
         if self.stream is not None:
-            self.stream.synchronize()
-        self.graphs.close()
-        self.buffer.close()
-        self.buffer = None
-        self.graphs = None
-        self._ingress_events = ()
-        self._output_events = ()
-        gc.collect()
-        if self._green is None:
-            return
-        cu = _driver()
-        _cuda_status(cu.cuStreamDestroy(self._green.raw_stream), "destroy lane stream")
-        _cuda_status(cu.cuGreenCtxDestroy(self._green.green), "destroy Green Context")
-        self.stream = None
+            actions.append(self.stream.synchronize)
+        if self._green is not None:
+            actions.append(self._green.close)
+        try:
+            close_resources(*actions)
+        finally:
+            self._ingress_events = ()
+            self._output_events = ()
+            self.stream = None
+            self._green = None
 
 
 def create_green_contexts(
@@ -186,12 +189,16 @@ def create_green_contexts(
             f"lane SM budgets require {requested} SMs but the device exposes {available}"
         )
 
-    aggregate, _unassigned = _split_one(cu, full, requested)
-    aggregate_green = _green_from_resources(cu, cuda_device, (aggregate,))
-    intermediate = [aggregate_green]
-    current_resource = _green_resource(cu, aggregate_green)
+    acquisition = ExitStack()
+    partitions = ExitStack()
     realized: list[_GreenContext] = []
     try:
+        aggregate, _unassigned = _split_one(cu, full, requested)
+        aggregate_green = _green_from_resources(cu, cuda_device, (aggregate,))
+        partitions.callback(
+            lambda: _cuda_status(cu.cuGreenCtxDestroy(aggregate_green), "destroy split context")
+        )
+        current_resource = _green_resource(cu, aggregate_green)
         for ordinal, lane in enumerate(lanes):
             if ordinal + 1 == len(lanes):
                 lane_resource = current_resource
@@ -199,58 +206,64 @@ def create_green_contexts(
             else:
                 lane_resource, remainder = _split_one(cu, current_resource, int(lane.sm_budget))
             lane_green = _green_from_resources(cu, cuda_device, (lane_resource,))
-            try:
-                context = _cuda_value(cu.cuCtxFromGreenCtx(lane_green), "resolve lane context")
-                raw_stream = _cuda_value(
-                    cu.cuGreenCtxStreamCreate(
-                        lane_green,
-                        int(cu.CUstream_flags.CU_STREAM_NON_BLOCKING),
-                        0,
-                    ),
-                    "create lane origin stream",
+            acquisition.callback(
+                lambda green=lane_green: _cuda_status(
+                    cu.cuGreenCtxDestroy(green), "destroy lane context"
                 )
-                resolved = _green_resource(cu, lane_green)
-                sm_count = int(resolved.sm.smCount)
-                if sm_count != int(lane.sm_budget):
-                    raise ExecutionLaneError(
-                        f"lane {lane.lane_id!r} resolved {sm_count} SMs, expected {lane.sm_budget}"
-                    )
-                associated = _cuda_value(
-                    cu.cuStreamGetGreenCtx(raw_stream),
-                    "query lane origin stream",
+            )
+            context = _cuda_value(cu.cuCtxFromGreenCtx(lane_green), "resolve lane context")
+            raw_stream = _cuda_value(
+                cu.cuGreenCtxStreamCreate(
+                    lane_green, int(cu.CUstream_flags.CU_STREAM_NON_BLOCKING), 0
+                ),
+                "create lane origin stream",
+            )
+            acquisition.callback(
+                lambda stream=raw_stream: _cuda_status(
+                    cu.cuStreamDestroy(stream), "destroy lane stream"
                 )
-                if int(associated) != int(lane_green):
-                    raise ExecutionLaneError("lane origin stream has the wrong Green Context")
-                realized.append(
-                    _GreenContext(
-                        lane=lane,
-                        device=device,
-                        sm_count=sm_count,
-                        green=lane_green,
-                        context=context,
-                        raw_stream=raw_stream,
-                        stream=torch.cuda.ExternalStream(int(raw_stream), device=device),
-                        component_path=tuple(range(ordinal + 1)),
-                    )
+            )
+            resolved = _green_resource(cu, lane_green)
+            sm_count = int(resolved.sm.smCount)
+            if sm_count != int(lane.sm_budget):
+                raise ExecutionLaneError(
+                    f"lane {lane.lane_id!r} resolved {sm_count} SMs, expected {lane.sm_budget}"
                 )
-            except Exception:
-                _cuda_status(cu.cuGreenCtxDestroy(lane_green), "destroy rejected lane context")
-                raise
+            associated = _cuda_value(cu.cuStreamGetGreenCtx(raw_stream), "query lane origin stream")
+            if int(associated) != int(lane_green):
+                raise ExecutionLaneError("lane origin stream has the wrong Green Context")
+            realized.append(
+                _GreenContext(
+                    lane=lane,
+                    device=device,
+                    sm_count=sm_count,
+                    green=lane_green,
+                    context=context,
+                    raw_stream=raw_stream,
+                    stream=torch.cuda.ExternalStream(int(raw_stream), device=device),
+                    component_path=tuple(range(ordinal + 1)),
+                )
+            )
             if remainder is not None:
                 remainder_green = _green_from_resources(cu, cuda_device, (remainder,))
-                intermediate.append(remainder_green)
+                partitions.callback(
+                    lambda green=remainder_green: _cuda_status(
+                        cu.cuGreenCtxDestroy(green), "destroy split context"
+                    )
+                )
                 current_resource = _green_resource(cu, remainder_green)
         if sum(item.sm_count for item in realized) != requested:
             raise ExecutionLaneError("lane SM resources do not form the configured disjoint total")
-        return tuple(realized)
-    except Exception:
-        for item in reversed(realized):
-            _cuda_status(cu.cuStreamDestroy(item.raw_stream), "destroy rejected lane stream")
-            _cuda_status(cu.cuGreenCtxDestroy(item.green), "destroy rejected lane context")
+        partitions.close()
+    except BaseException as error:
+        try:
+            close_resources(acquisition.close, partitions.close)
+        except BaseException as cleanup_error:
+            error.add_note(f"Resource cleanup also failed: {cleanup_error!r}")
         raise
-    finally:
-        for parent in reversed(intermediate):
-            _cuda_status(cu.cuGreenCtxDestroy(parent), "destroy lane split context")
+    # Each returned context now owns its stream and exact SM partition.
+    acquisition.pop_all()
+    return tuple(realized)
 
 
 def verify_graph_context(graph: torch.cuda.CUDAGraph, expected_context: int | None) -> int:
@@ -271,7 +284,16 @@ def verify_graph_context(graph: torch.cuda.CUDAGraph, expected_context: int | No
             continue
         params = _cuda_value(cu.cuGraphKernelNodeGetParams(node), "query kernel node context")
         if int(params.ctx) != int(expected_context):
-            raise ExecutionLaneError("captured compute node escaped its owning context")
+            name_result = (
+                cu.cuFuncGetName(params.func)
+                if int(params.func)
+                else cu.cuKernelGetName(params.kern)
+            )
+            name = name_result[1] if name_result[0] == cu.CUresult.CUDA_SUCCESS else "unknown"
+            raise ExecutionLaneError(
+                f"captured compute node {name!r} escaped its owning context: "
+                f"actual={int(params.ctx):#x}, expected={int(expected_context):#x}"
+            )
         kernels += 1
     if kernels == 0:
         raise ExecutionLaneError("captured CUDA graph contains no compute node")

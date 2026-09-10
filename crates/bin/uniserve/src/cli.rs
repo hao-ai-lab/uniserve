@@ -368,7 +368,7 @@ pub(crate) struct WorkerProcessOptions {
     #[arg(long, hide = true)]
     pub worker_stub: bool,
     /// Checkpoint loader format used by every model worker.
-    #[arg(long, default_value = "auto", value_parser = ["auto", "safetensors", "pt", "dummy", "sharded_state", "layered"])]
+    #[arg(long, default_value = "auto", value_parser = ["auto", "safetensors", "pt", "dummy", "layered"])]
     pub load_format: String,
     /// Hugging Face cache root for repository model paths.
     #[arg(long)]
@@ -403,8 +403,6 @@ pub(crate) struct WorkerProcessOptions {
     /// Repeatable JSON descriptor for a configuration-static execution lane.
     #[arg(long = "lane")]
     pub lanes: Vec<LaneConfig>,
-    #[arg(long, action = ArgAction::Set, default_value_t = true, hide = true)]
-    pub cuda_graph: bool,
     /// GPU computation capture policy. Full rejects unavailable capture; off disables all graphs.
     #[arg(long, default_value = "auto", value_parser = ["off", "auto", "full"])]
     pub graph_policy: String,
@@ -452,7 +450,6 @@ impl WorkerProcessOptions {
             mesh: self.worker_mesh.clone(),
             distributed_backend: self.distributed_backend.clone(),
             lanes: self.lanes.clone(),
-            cuda_graph: self.cuda_graph && self.graph_policy != "off",
             graph_policy: self.graph_policy.clone(),
             decode_graph_batch_sizes: self.decode_graph_batch_sizes.clone(),
             prefill_cuda_graph: self.prefill_cuda_graph,
@@ -595,8 +592,8 @@ mod tests {
             "4",
             "--checksum-manifest",
             "/models/checksums.json",
-            "--cuda-graph",
-            "false",
+            "--graph-policy",
+            "off",
             "--prefill-cuda-graph",
             "true",
             "--flashinfer-fast-decode-plan",

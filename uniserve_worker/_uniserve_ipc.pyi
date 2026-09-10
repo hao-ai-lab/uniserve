@@ -1,6 +1,7 @@
 """Native asynchronous request server exposed to the Python worker."""
 
-from typing import Any
+from types import TracebackType
+from typing import Any, Self
 
 class Server:
     """Receives bounded IPC requests and publishes their responses."""
@@ -12,6 +13,28 @@ class Server:
         max_inflight: int = 1,
     ) -> None:
         """Bind a named service with bounded payload size and in-flight request capacity."""
+
+        ...
+    def __enter__(self) -> Self:
+        """Return this open endpoint and close it when the scope exits."""
+
+        ...
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        """Close the endpoint while preserving an exception raised inside the scope."""
+
+        ...
+    @property
+    def closed(self) -> bool:
+        """Report whether the endpoint owner has released this service."""
+
+        ...
+    def close(self) -> None:
+        """Idempotently release the service after all endpoint operations have stopped."""
 
         ...
     def recv(self) -> Any:

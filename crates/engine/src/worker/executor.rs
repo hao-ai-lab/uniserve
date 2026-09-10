@@ -19,6 +19,7 @@ use uniserve_worker_ipc::{
 };
 
 struct PendingStep {
+    worker_runs: HashMap<usize, u64>,
     expected_workers: u64,
     operations: HashMap<(RequestKey, uniserve_worker_ipc::OpId), usize>,
     returned_operations: HashSet<(RequestKey, uniserve_worker_ipc::OpId)>,
@@ -219,7 +220,6 @@ impl WorkerExecutor {
     /// Refreshes physical discovery after replacement; other instance counters remain intact.
     fn refresh_worker(&mut self, index: usize) {
         self.executor_info.workers[index].1 = self.workers[index].1.info().clone();
-        self.worker_collective_seqs[index] = 0;
         self.refresh_progress_fds();
     }
 
@@ -246,7 +246,12 @@ impl WorkerExecutor {
         }
         let failed_run = (!lost)
             .then(|| loss.execution.as_ref().and_then(|error| error.run_id))
-            .flatten();
+            .flatten()
+            .and_then(|run_id| {
+                self.pending.iter().find_map(|(&batch_id, step)| {
+                    (step.worker_runs.get(&index) == Some(&run_id)).then_some(batch_id)
+                })
+            });
         let mut retired = loss.retired.iter().copied().collect::<HashSet<_>>();
         let failed_operations = retired
             .iter()
@@ -360,6 +365,7 @@ impl WorkerExecutor {
         }
         for (batch_id, step) in &mut self.pending {
             if lost || failed_run == Some(*batch_id) {
+                step.worker_runs.remove(&index);
                 step.expected_workers &= !Self::worker_bit(index);
             }
             retired.extend(step.operations.iter().filter_map(|(identity, worker)| {
@@ -507,13 +513,6 @@ impl WorkerExecutor {
                 .copied()
                 .into_iter()
                 .collect(),
-            // Independent retained products do not reopen an already retired
-            // request's semantic lineage when Finish is replayed.
-            BatchCommand::Finish { request_key, .. }
-                if !self.admissions.contains_key(request_key) =>
-            {
-                Vec::new()
-            }
             BatchCommand::Finish { request_key, .. } | BatchCommand::Retire { request_key, .. } => {
                 self.request_workers(*request_key)
             }
@@ -597,10 +596,12 @@ impl WorkerExecutor {
             })?;
             inputs.push(payload.clone());
         }
-        let collective_seq = self.worker_collective_seqs[worker_index] + 1;
+        let collective_seq = self.worker_collective_seqs[worker_index]
+            .checked_add(1)
+            .context("physical run ID space exhausted")?;
         let mut run = physical_run(
             batch.id,
-            batch.id,
+            collective_seq,
             collective_seq,
             batch.ops.clone(),
             commands,
@@ -659,6 +660,11 @@ impl WorkerExecutor {
             Err(RunSubmitError::Failed(error)) => return Err(error),
         }
         self.worker_collective_seqs[worker_index] = collective_seq;
+        self.pending
+            .get_mut(&batch.id)
+            .context("submitted batch is not pending")?
+            .worker_runs
+            .insert(worker_index, collective_seq);
         self.admitted_workers
             .extend(request_keys.into_iter().map(|key| (worker_index, key)));
         Ok(true)
@@ -757,7 +763,16 @@ impl WorkerExecutor {
             })
             .cloned()
             .collect();
-        let run_id = report.run_id;
+        let run_id = report.batch_id;
+        anyhow::ensure!(
+            self.pending
+                .get(&run_id)
+                .and_then(|step| step.worker_runs.get(&worker_index))
+                == Some(&report.run_id),
+            "worker returned a run that does not belong to its logical batch"
+        );
+        // The engine consumes logical batch results; physical IDs stop here.
+        report.run_id = run_id;
         let worker_bit = Self::worker_bit(worker_index);
         {
             let step = self
@@ -1207,6 +1222,7 @@ impl Executor for WorkerExecutor {
             self.pending.insert(
                 batch_id,
                 PendingStep {
+                    worker_runs: HashMap::new(),
                     expected_workers,
                     operations: operation_routes,
                     returned_operations: HashSet::new(),

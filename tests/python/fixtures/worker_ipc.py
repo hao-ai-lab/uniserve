@@ -1,4 +1,4 @@
-"""Queued CPU IPC boundary for concrete WorkerProcess integration tests."""
+"""Queued CPU IPC boundary for worker service integration tests."""
 
 from __future__ import annotations
 
@@ -9,12 +9,16 @@ class QueuedWorkerIpc:
     """Deliver requests, responses and latched wake signals between test threads."""
 
     def __init__(self, requests: tuple[dict[str, object], ...] = ()) -> None:
+        self.closed = False
         self._requests: Queue[dict[str, object]] = Queue()
         self._responses: Queue[dict[str, object]] = Queue()
         self._wake: Queue[None] = Queue(maxsize=1)
         self.responses: list[dict[str, object]] = []
         for request in requests:
             self.submit(request)
+
+    def close(self) -> None:
+        self.closed = True
 
     def submit(self, request: dict[str, object]) -> None:
         self._requests.put(request)

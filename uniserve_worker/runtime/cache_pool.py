@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from concurrent.futures import Future
+from contextlib import contextmanager
 from dataclasses import dataclass
 from threading import RLock
 
@@ -142,6 +143,29 @@ class CachePool:
         self._execution_pages: dict[int, set[CacheExecution]] = {}
         self._execution_lock = RLock()
         self.imports = CacheTransfers(self, capacity=import_capacity)
+
+    @contextmanager
+    def startup_pages(self, count: int, *, group: int = 0):
+        """Borrow bounded scratch pages before scheduler admission.
+
+        The startup caller serializes this lease with other preparation and
+        returns only after its stream finishes. Serving allocation authority
+        remains with the scheduler; no request or publication is introduced.
+        """
+
+        if self.has_pending_accesses:
+            raise RuntimeError("startup scratch requires an idle KV pool")
+        available = self.page_ids(group)
+        if not 0 <= count <= len(available):
+            raise ValueError("startup scratch exceeds KV capacity")
+        pages = tuple(available[:count])
+        self.zero_pages(group, pages)
+        try:
+            yield pages
+        finally:
+            if self.k.is_cuda:
+                torch.cuda.current_stream(self.k.device).synchronize()
+            self.zero_pages(group, pages)
 
     @property
     def has_pending_accesses(self) -> bool:

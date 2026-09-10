@@ -43,7 +43,7 @@ def execution_worker(
         )
     policy = (
         WorkerConfig(
-            cuda_graph=False,
+            graph_policy="off",
             prefill_cuda_graph=False,
             flow_graph_batch_sizes=(1,),
             flow_graph_shapes=((16, 16),),

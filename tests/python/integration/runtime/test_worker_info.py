@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from tests.python.fixtures.execution_worker import execution_worker
-from uniserve_worker.bootstrap.capacity import operation_window
 from uniserve_worker.bootstrap.worker_info_builder import build_worker_info
-from uniserve_worker.config import WorkerConfig
-from uniserve_worker.execution.batch import OpCode
+from uniserve_worker.config import LaneConfig, WorkerConfig
+from uniserve_worker.execution.batch import Domain, OpCode
 from uniserve_worker.models.runtime import ExecutionModel, ResourceGeometry
-from uniserve_worker.process import dispatch
+from uniserve_worker.models.stub import StubModel, stub_worker_config
+from uniserve_worker.worker import Worker
 
 pytestmark = pytest.mark.integration
 
@@ -19,7 +21,7 @@ pytestmark = pytest.mark.integration
 def test_worker_info_reports_schedulable_work_and_bounds(backends: tuple[str, ...]) -> None:
     worker = execution_worker(transfer_backends=backends)
     try:
-        info = dispatch(worker, {"kind": "info"})["info"]
+        info = worker.info.to_mapping()
     finally:
         worker.close()
 
@@ -29,9 +31,7 @@ def test_worker_info_reports_schedulable_work_and_bounds(backends: tuple[str, ..
     assert info["kv_cache"]["num_kv_heads"] > 0
     assert info["kv_cache"]["head_dim"] > 0
     assert info["max_batch_ops"] > 0
-    assert info["max_unresolved_ops"] == operation_window(
-        info["queue_depth"], info["max_batch_ops"]
-    )
+    assert info["max_unresolved_ops"] > 0
     assert info["request_slots"] > 0
     assert info["model_name"]
     assert len(info["configuration_id"]) == 64
@@ -74,7 +74,7 @@ def test_loaded_worker_identity_distinguishes_incarnations_in_one_process() -> N
         worker = execution_worker(
             worker_id="encoder-0",
             execution=WorkerConfig(
-                cuda_graph=False,
+                graph_policy="off",
                 prefill_cuda_graph=False,
                 flow_graph_batch_sizes=(1,),
                 flow_graph_shapes=((16, 16),),
@@ -82,7 +82,7 @@ def test_loaded_worker_identity_distinguishes_incarnations_in_one_process() -> N
             ),
         )
         try:
-            snapshots.append(dispatch(worker, {"kind": "info"})["info"])
+            snapshots.append(worker.info.to_mapping())
         finally:
             worker.close()
     first, second = snapshots
@@ -93,3 +93,51 @@ def test_loaded_worker_identity_distinguishes_incarnations_in_one_process() -> N
     assert first["endpoint"]["address_space"] == second["endpoint"]["address_space"]
     assert first["endpoint"]["incarnation"] != second["endpoint"]["incarnation"]
     assert first["configuration_id"] == second["configuration_id"]
+
+
+@pytest.mark.parametrize("with_lane_limits", (False, True))
+def test_worker_info_reports_limits_safe_for_all_bound_lanes(with_lane_limits) -> None:
+    config = replace(
+        stub_worker_config(16, max_batch_tokens=256),
+        max_batch_operations=4,
+        lanes=(
+            LaneConfig("decode", 64, (Domain.DECODE,), max_batch_operations=2),
+            LaneConfig("compute", 64, (Domain.PREFILL, Domain.FLOW), max_batch_tokens=128),
+        )
+        if with_lane_limits
+        else (),
+    )
+
+    # The scheduler receives one shared bound even when lanes constrain different
+    # dimensions. Unspecified lane limits inherit the configured model capacity.
+    info = build_worker_info(StubModel(), config)
+
+    assert info.max_batch_ops == (2 if with_lane_limits else 4)
+    assert info.max_batch_tokens == (128 if with_lane_limits else 256)
+
+
+def test_worker_identity_and_capabilities_reflect_enabled_operations() -> None:
+    identities = []
+    config = replace(stub_worker_config(16, max_batch_tokens=256), graph_policy="off")
+    for allowed in (
+        frozenset({OpCode.AR_EXTEND}),
+        frozenset({OpCode.AR_EXTEND, OpCode.AR_DECODE}),
+    ):
+        with Worker(
+            StubModel(),
+            worker_config=config,
+            sampling_group=None,
+            tokenizer=None,
+            allowed_work_variants=allowed,
+            pipeline_depth=1,
+            completion_payload_bytes=65536,
+        ) as worker:
+            info = worker.info.to_mapping()
+            assert set(info["supported_ops"]) == {code.value for code in allowed}
+            assert worker.supports_run_kind(OpCode.AR_EXTEND)
+            assert worker.supports_run_kind(OpCode.AR_DECODE) == (OpCode.AR_DECODE in allowed)
+            identities.append(info["configuration_id"])
+
+    # Same model and geometry, but different executable work: callers must not
+    # mistake these workers for the same resolved configuration.
+    assert identities[0] != identities[1]
