@@ -47,3 +47,31 @@ def test_incompatible_checkpoint_is_rejected(checkpoint, field, value):
 def test_architecture_without_variant_metadata_is_rejected(tmp_path):
     with pytest.raises(ValueError, match="fastvideo_inference.json"):
         resolve_h3_contract(tmp_path)
+
+
+def test_parallel_placement_preserves_global_modality_rows_with_eight_sequence_owners():
+    import torch
+
+    from uniserve_worker.models.minimax_h3.layout import H3Layout
+    from uniserve_worker.models.minimax_h3.weights import validate_h3_entries
+    from uniserve_worker.nn.mesh import Communicator, DeviceMesh, EntryBindings
+    from uniserve_worker.nn.parallel import EntryConfig, ParallelConfig, SequenceParallel
+
+    ranks = tuple(range(7, -1, -1))
+    config = ParallelConfig(sequence_parallel=SequenceParallel("ulysses", (8,)))
+    entry = EntryConfig(ranks, config)
+    layouts = []
+    for rank in ranks:
+        bindings = EntryBindings(
+            {"denoiser": entry},
+            {"denoiser": DeviceMesh(ranks, rank, config)},
+            Communicator(ranks=ranks, rank=rank),
+        )
+        validate_h3_entries(bindings)
+        layouts.append(H3Layout.build(bindings, frames=22, text_rows=128, audio_frames=8))
+    for modality in ("text_indices", "video_indices", "audio_indices"):
+        original = getattr(layouts[0].packed, modality)
+        reconstructed = torch.cat(
+            [layout.local_indices(original) + layout.local_start for layout in layouts]
+        )
+        torch.testing.assert_close(reconstructed, original, rtol=0, atol=0)

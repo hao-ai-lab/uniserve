@@ -131,7 +131,7 @@ class NeoVitEncoder(nn.Module):
         # Conv2d acts independently per batch element, so when every image shares
         # the same (h, w) grid (the common batched-serving case) the per-image
         # Python loop is equivalent to a single batched conv over (N, C, h, w):
-        # it collapses N kernel launches into one and is bit-identical.
+        # it combines their independent image projections in one launch.
         h0, w0 = shapes[0]
         if all(h == h0 and w == w0 for h, w in shapes):
             n = len(shapes)

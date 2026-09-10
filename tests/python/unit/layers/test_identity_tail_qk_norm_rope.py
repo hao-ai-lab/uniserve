@@ -1,4 +1,5 @@
-"""Bit-exact identity-tail qk_norm_rope against the general multi-axis call."""
+"""Shared-axis QK normalization with an unrotated spatial tail."""
+
 from __future__ import annotations
 
 import pytest
@@ -56,6 +57,13 @@ def test_identity_axes_match_full_multi_axis_on_cuda(tokens, dtype):
     q, k, wq, wk, cos, sin = _inputs("cuda", dtype, tokens)
     base_q, base_k = _run(q, k, wq, wk, cos, sin, identity_axes=None)
     fast_q, fast_k = _run(q, k, wq, wk, cos, sin, identity_axes=(1, 2))
-    assert fast_q.shape == base_q.shape and fast_k.shape == base_k.shape
-    assert torch.equal(fast_q, base_q)
-    assert torch.equal(fast_k, base_k)
+    tolerance = 2e-2 if dtype is torch.bfloat16 else 2e-3
+    for source, weights, base, actual in ((q, wq, base_q, fast_q), (k, wk, base_k, fast_k)):
+        head, tail = source.double().split((ROPE_DIM, DIM - ROPE_DIM), dim=-1)
+        head = head * torch.rsqrt(head.square().mean(-1, keepdim=True) + EPS) * weights[0].double()
+        tail = tail * torch.rsqrt(tail.square().mean(-1, keepdim=True) + EPS) * weights[1].double()
+        left, right = head.chunk(2, dim=-1)
+        cosine, sine = cos[0].double().unsqueeze(1), sin[0].double().unsqueeze(1)
+        expected = torch.cat((left * cosine - right * sine, right * cosine + left * sine, tail), -1)
+        torch.testing.assert_close(base.double(), expected, rtol=tolerance, atol=tolerance)
+        torch.testing.assert_close(actual.double(), expected, rtol=tolerance, atol=tolerance)

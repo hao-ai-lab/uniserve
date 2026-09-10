@@ -231,7 +231,6 @@ class WorkerConfig:
     max_batch_tokens: int = 8192
     max_request_pool_size: int = 128
     generation_device: str | None = None
-    output_rank: int = 0
     min_request_pool_size: int = 1
     pool_memory_bytes: int | None = None
     model_dtype: str = "bfloat16"
@@ -260,8 +259,6 @@ class WorkerConfig:
             raise invalid_descriptor("worker device must be named")
         if self.world_size < 1 or not 0 <= self.rank < self.world_size:
             raise invalid_descriptor("worker configuration process rank is invalid")
-        if not 0 <= self.output_rank < self.world_size:
-            raise invalid_descriptor("worker configuration output owner is invalid")
         if not 1 <= self.min_request_pool_size <= self.max_request_pool_size:
             raise invalid_descriptor("worker request slot bounds are invalid")
         if self.pool_memory_bytes is not None and self.pool_memory_bytes < 0:

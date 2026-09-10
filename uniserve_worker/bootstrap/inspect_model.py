@@ -64,7 +64,7 @@ def doctor(model: dict, ranks: int) -> dict:
 
     import torch
 
-    from ..backends.attention import video_sparse_sm100
+    from ..backends.attention.video_sparse_provider import resolve_sparse_provider
     from ..media.mux import require_media_codecs
     from ..models.minimax_h3.config import PRECISION_PRESETS
 
@@ -86,13 +86,13 @@ def doctor(model: dict, ranks: int) -> dict:
         )
     devices = []
     for rank in range(ranks):
-        if torch.cuda.get_device_capability(rank) != (10, 0):
-            raise RuntimeError(f"GPU {rank} does not support the H3 sm_100a provider")
+        provider = resolve_sparse_provider(torch.device("cuda", rank))
         free, total = torch.cuda.mem_get_info(rank)
         devices.append(
             {
                 "rank": rank,
                 "name": torch.cuda.get_device_name(rank),
+                "sparse_attention": provider.name,
                 "free_bytes": free,
                 "total_bytes": total,
             }
@@ -100,10 +100,6 @@ def doctor(model: dict, ranks: int) -> dict:
         for peer in range(ranks):
             if peer != rank and not torch.cuda.can_device_access_peer(rank, peer):
                 raise RuntimeError(f"CUDA peer access unavailable: {rank} -> {peer}")
-    if not video_sparse_sm100.available():
-        raise RuntimeError(
-            "required SM100a sparse-attention provider is unavailable"
-        ) from video_sparse_sm100.import_error()
     require_media_codecs("libx264", "aac")
     root = Path(model["model_path"])
     component_bytes = {}

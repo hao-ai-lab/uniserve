@@ -77,17 +77,17 @@ def create_media_resources(
     model: VideoModel,
     *,
     rank: int,
-    output_rank: int,
+    owns_output: bool,
     state_slots: int,
     unresolved_window: int,
 ) -> tuple[VideoMuxCoordinator | None, VideoOutputRing | None]:
     """Provision public output resources from the declared media geometry."""
 
-    if not model.owns_media_output or rank != output_rank:
+    if not model.owns_media_output or not owns_output:
         return None, None
     require_video_codecs()
     return (
-        VideoMuxCoordinator(rank=output_rank),
+        VideoMuxCoordinator(rank=rank),
         VideoOutputRing(
             state_slots=state_slots,
             unresolved_window=unresolved_window,

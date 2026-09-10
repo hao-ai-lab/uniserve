@@ -11,6 +11,7 @@ from tests.python.fixtures.model_execution import TEST_MODEL, TEST_WORKER_CONFIG
 from uniserve_worker.bootstrap.capacity import (
     latent_trajectory_bytes,
     model_arena_capacity,
+    request_tensor_window,
     tensor_slot_capacity,
 )
 from uniserve_worker.bootstrap.worker_info_builder import build_worker_layout
@@ -35,7 +36,7 @@ def test_request_capacity_charges_only_device_storage_against_device_budget():
             maximum=8,
             minimum=2,
             available_bytes=2048,
-            product_bytes_per_request=512,
+            auxiliary_bytes=lambda slots: slots * 512,
         )
         == 2
     )
@@ -46,8 +47,23 @@ def test_request_capacity_charges_only_device_storage_against_device_budget():
             maximum=8,
             minimum=2,
             available_bytes=2047,
-            product_bytes_per_request=512,
+            auxiliary_bytes=lambda slots: slots * 512,
         )
+
+
+def test_request_capacity_accounts_for_the_candidate_output_horizon():
+    schema = {"state": TensorSchema((128,), torch.float32)}
+    # At depth 12, two, three, and four requests retain 10, 9, and 8
+    # output batches respectively. Smaller counts need more product storage.
+    count = tensor_slot_capacity(
+        schema,
+        Communicator(),
+        maximum=4,
+        minimum=2,
+        available_bytes=10_240,
+        auxiliary_bytes=lambda slots: slots * request_tensor_window(12, slots) * 1024,
+    )
+    assert count == 4
 
 
 def test_worker_info_projects_model_behavior_and_resource_geometry():
@@ -232,3 +248,66 @@ def test_cuda_capacity_query_failure_is_not_an_empty_budget(monkeypatch) -> None
     assert device_total_bytes("cpu") == 0
     with pytest.raises(RuntimeError, match="CUDA device is unavailable"):
         device_total_bytes("cuda:0")
+
+
+@pytest.mark.parametrize("rank", [0, 1, 2, 3])
+def test_product_capacity_accounts_for_remote_consumers_and_streamed_units(rank):
+    from uniserve_worker.bootstrap.capacity import local_product_storage_bytes
+    from uniserve_worker.execution.batch import DeviceDim, DType, ShapeBound, StaticDim, TensorSpec
+    from uniserve_worker.models.video import MediaExecutionPlan, MediaPlanRepeat, MediaPlanStage
+    from uniserve_worker.nn.mesh import DeviceMesh, EntryBindings
+    from uniserve_worker.nn.parallel import EntryConfig
+
+    entries = {
+        "encode": EntryConfig((2,)),
+        "predict": EntryConfig((1,)),
+        "decode": EntryConfig((1, 3), distribution="temporal_units", units_per_rank=2),
+        "assemble": EntryConfig((0,)),
+    }
+    bindings = EntryBindings(
+        entries,
+        {
+            name: DeviceMesh(config.ranks, rank, config.parallel_config, torch.device("cpu"))
+            for name, config in entries.items()
+            if config.distribution is None and rank in config.ranks
+        },
+        Communicator((0, 1, 2, 3), rank),
+    )
+    outputs = {
+        "encode": (TensorSpec("embedding", DType.F32, ShapeBound((StaticDim(128),))),),
+        "predict": (TensorSpec("latents", DType.F32, ShapeBound((StaticDim(256),))),),
+        "decode": (TensorSpec("frames", DType.F32, ShapeBound((DeviceDim(20), StaticDim(128)))),),
+    }
+    plan = MediaExecutionPlan(
+        (
+            MediaPlanStage("conditioning", OpCode.ENCODER_TEXT, "encode"),
+            MediaPlanStage("denoise", OpCode.DIFFUSION_STEP, "predict", input_from="conditioning"),
+            MediaPlanStage(
+                "decode",
+                OpCode.DIFFUSION_DECODE,
+                "decode",
+                input_from="denoise",
+                repeat=MediaPlanRepeat.VIDEO_UNITS,
+            ),
+            MediaPlanStage(
+                "write",
+                OpCode.MEDIA_APPEND,
+                "assemble",
+                input_from="decode",
+                repeat=MediaPlanRepeat.VIDEO_UNITS,
+            ),
+        )
+    )
+    # Two outstanding groups each contain four 512-byte units. The output
+    # assembler imports both groups although it executes neither producer.
+    expected = {0: 4096, 1: 512 + 1024 + 4096, 2: 512, 3: 1024 + 4096}
+    assert (
+        local_product_storage_bytes(outputs, bindings=bindings, plan=plan, max_unresolved_ops=2)
+        == expected[rank]
+    )
+    # A horizon beyond the complete trajectory never reserves extra units.
+    expected_full = {0: 10_240, 1: 512 + 1024 + 10_240, 2: 512, 3: 1024 + 10_240}
+    assert (
+        local_product_storage_bytes(outputs, bindings=bindings, plan=plan, max_unresolved_ops=8)
+        == expected_full[rank]
+    )

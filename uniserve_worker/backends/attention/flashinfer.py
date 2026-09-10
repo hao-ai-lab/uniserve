@@ -21,14 +21,17 @@ from .flashinfer_kernels import (
     _write_decode_token,
 )
 from .flashinfer_plan import (
+    _binding_identity,
     _cpu_last_page_len,
     _cpu_paged_indptr,
     _decode_plan_key,
-    _decode_plan_key_from_shape,
     _DecodePlanTensors,
     _indptr_last,
+    _plan_workspace,
     _PlanCache,
+    _prefill_host_plan,
     _prefill_plan_key,
+    _PrefillHostPlan,
     _PrefillPlanTensors,
     _weakref_or_none,
 )
@@ -88,7 +91,6 @@ class _DecodeGraphPlanInputs(NamedTuple):
     """Holds live decode metadata and wrapper identity used to refresh a captured graph plan."""
 
     block_table: torch.Tensor
-    cache_seqlens: torch.Tensor
     effective_seqlens: torch.Tensor
     cpu_indptr: torch.Tensor
     cpu_last_page_len: torch.Tensor
@@ -106,6 +108,7 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
     min_head_dim = 64
     single_ar_decode = True
     cuda_only = True
+    dense_dtypes = frozenset({torch.float16, torch.bfloat16})
     dense_ranks = frozenset({3})
 
     def supports(self, mode: AttentionMode, *, cuda_graph: bool = False) -> bool:
@@ -199,7 +202,21 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         if int(q_bhd.shape[0]) != int(effective_seqlens.shape[0]):
             raise ValueError("cache lengths must have one entry per decode row")
 
-        wrapper_key, wrapper = self._decode_wrapper_for(q_bhd, k_cache, binding)
+        graph_wrapper = self._decode_graph_wrapper_for_binding(binding)
+        if graph_wrapper is not None:
+            # Replay preparation owns the mutable page plan. Capturing another
+            # planner upload here would overwrite it with capture-time metadata.
+            _wrapper_key, wrapper = graph_wrapper
+            wrapper._sm_scale = float(scale)
+            out = wrapper.run(q_bhd.contiguous(), (k_cache, v_cache))
+            return inputs.restore.apply(out)
+
+        wrapper_key, wrapper = self._decode_wrapper(
+            q_bhd.device,
+            int(q_bhd.shape[1]),
+            int(k_cache.shape[2]),
+            k_cache.dtype,
+        )
         plan_key = _decode_plan_key(
             binding,
             inputs.block_table,
@@ -287,24 +304,6 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         _write_decode_token(k_cache, v_cache, block_table, cache_seqlens, k_bhd, v_bhd, plan)
         return 1
 
-    def _decode_wrapper_for(
-        self,
-        q_bhd: torch.Tensor,
-        k_cache: torch.Tensor,
-        binding: Any,
-    ) -> tuple[WrapperKey, Any]:
-        """Resolve an eager or graph-bound decode wrapper for the query and cache geometry."""
-
-        graph_wrapper = self._decode_graph_wrapper_for_binding(binding)
-        if graph_wrapper is not None:
-            return graph_wrapper
-        return self._decode_wrapper(
-            q_bhd.device,
-            int(q_bhd.shape[1]),
-            int(k_cache.shape[2]),
-            k_cache.dtype,
-        )
-
     def _build_decode_plan(
         self,
         wrapper_key: WrapperKey,
@@ -389,9 +388,9 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         # other forwards keep the shared prefill wrapper.
         graph_wrapper = self._prefill_graph_wrapper_for_binding(binding)
         if graph_wrapper is not None:
-            wrapper_key, wrapper = graph_wrapper
-        else:
-            wrapper_key, wrapper = self._prefill_wrapper(inputs.q.device)
+            _wrapper_key, wrapper = graph_wrapper
+            return wrapper.run(inputs.q, (k, v))
+        wrapper_key, wrapper = self._prefill_wrapper(inputs.q.device)
         plan_key = _prefill_plan_key(
             binding,
             inputs.block_table,
@@ -415,9 +414,10 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
                 inputs.block_table,
                 inputs.cu_seqlens_q,
                 inputs.cu_seqlens_k,
-                plan,
                 causal,
                 scale,
+                query_lens_cpu=tuple(getattr(plan, "query_lens_cpu", ()) or ()),
+                kv_lens_cpu=tuple(getattr(plan, "kv_lens_cpu", ()) or ()),
             )
 
         self._prefill_plan_cache.plan_or_reuse(
@@ -456,9 +456,7 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         plan = context
         query_lens = tuple(int(value) for value in getattr(plan, "query_lens_cpu", ()) or ())
         causal_rows = tuple(bool(value) for value in getattr(plan, "causal_rows_cpu", ()) or ())
-        prefix_lens_cpu = tuple(
-            int(value) for value in getattr(plan, "seq_lens_cpu", ()) or ()
-        )
+        prefix_lens_cpu = tuple(int(value) for value in getattr(plan, "seq_lens_cpu", ()) or ())
         if (
             not query_lens
             or len(query_lens) != len(prefix_lens_cpu)
@@ -471,9 +469,7 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
             offsets.append(offsets[-1] + length)
         current_outputs: list[torch.Tensor] = []
         current_lses: list[torch.Tensor] = []
-        for row, (begin, end) in enumerate(
-            zip(offsets[:-1], offsets[1:], strict=True)
-        ):
+        for row, (begin, end) in enumerate(zip(offsets[:-1], offsets[1:], strict=True)):
             row_query = q[begin:end].contiguous()
             row_key = current_k[begin:end].contiguous()
             row_value = current_v[begin:end].contiguous()
@@ -505,9 +501,10 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
             pages,
             cu_q,
             cu_prefix,
-            plan,
             False,
             scale,
+            query_lens_cpu=query_lens,
+            kv_lens_cpu=prefix_lens_cpu,
         )
         prefix_output, prefix_lse = wrapper.forward_return_lse(
             q.contiguous(),
@@ -577,38 +574,36 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         block_table: torch.Tensor,
         cu_seqlens_q: torch.Tensor,
         cu_seqlens_k: torch.Tensor,
-        plan: Any,
         causal: bool,
         scale: float,
+        *,
+        query_lens_cpu: tuple[int, ...],
+        kv_lens_cpu: tuple[int, ...],
     ) -> int:
         """Populate packed prefill page metadata and plan the selected wrapper."""
 
-        kv_seqlens = getattr(plan, "kv_lens", None)
-        if not isinstance(kv_seqlens, torch.Tensor) or tuple(kv_seqlens.shape) != (
-            int(cu_seqlens_k.numel()) - 1,
-        ):
-            kv_seqlens = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+        # The supplied boundaries define this attention domain. A segmented
+        # prefix excludes the live tokens carried by the enclosing batch.
+        kv_seqlens = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
         kv_seqlens = kv_seqlens.to(device=cu_seqlens_k.device, dtype=torch.int32).contiguous()
-        query_lens = getattr(plan, "query_lens", None)
-        if not isinstance(query_lens, torch.Tensor) or tuple(query_lens.shape) != (
-            int(cu_seqlens_q.numel()) - 1,
-        ):
-            query_lens = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+        query_lens = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
         query_lens = query_lens.to(device=cu_seqlens_q.device, dtype=torch.int32).contiguous()
+        host_plan = _prefill_host_plan(
+            query_lens_cpu, kv_lens_cpu, int(kv_seqlens.shape[0]), int(k.shape[1])
+        )
         plan_tensors = self._prefill_plan_tensors(
             wrapper_key,
             block_table,
             cu_seqlens_q,
             kv_seqlens,
             int(k.shape[1]),
-            index_count=_indptr_last(
-                _cpu_paged_indptr(plan, int(kv_seqlens.shape[0]), int(k.shape[1]))
-            ),
+            index_count=None if host_plan is None else host_plan.index_count,
         )
         self._plan_prefill_wrapper(
             wrapper_key,
             wrapper,
             plan_tensors,
+            host_plan=host_plan,
             block_table=block_table,
             kv_seqlens=kv_seqlens,
             query_lens=query_lens,
@@ -629,6 +624,7 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         wrapper: Any,
         plan: _PrefillPlanTensors,
         *,
+        host_plan: _PrefillHostPlan | None,
         block_table: torch.Tensor,
         kv_seqlens: torch.Tensor,
         query_lens: torch.Tensor,
@@ -661,27 +657,36 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
             workspace=self._workspace(block_table.device),
             wrapper=wrapper,
         )
-        wrapper.plan(
-            plan.qo_indptr,
-            plan.kv_indptr,
-            plan.indices,
-            plan.last_page_len,
-            int(num_q_heads),
-            int(num_kv_heads),
-            int(head_dim),
-            int(page_size),
-            causal=causal,
-            q_data_type=q_dtype,
-            kv_data_type=kv_dtype,
-            o_data_type=q_dtype,
-            sm_scale=scale_value,
-            non_blocking=True,
-            seq_lens=kv_seqlens,
-            seq_lens_q=query_lens,
-            block_tables=block_table,
-            fixed_split_size=self._tuning.prefill_split_tile_size,
-            disable_split_kv=self._tuning.disable_split_kv,
-        )
+        # The planner needs CPU lengths even when its kernels consume GPU
+        # metadata. Passing the existing host values avoids draining the
+        # execution stream for small D2H copies before every Graph replay.
+        device_lengths = self._tuning.prefill_backend == "cudnn"
+        with _plan_workspace(wrapper):
+            wrapper.plan(
+                plan.qo_indptr if host_plan is None else host_plan.qo_indptr,
+                plan.kv_indptr if host_plan is None else host_plan.kv_indptr,
+                plan.indices,
+                plan.last_page_len if host_plan is None else host_plan.last_page_len,
+                int(num_q_heads),
+                int(num_kv_heads),
+                int(head_dim),
+                int(page_size),
+                causal=causal,
+                q_data_type=q_dtype,
+                kv_data_type=kv_dtype,
+                o_data_type=q_dtype,
+                sm_scale=scale_value,
+                non_blocking=True,
+                seq_lens=kv_seqlens if host_plan is None or device_lengths else host_plan.kv_lens,
+                seq_lens_q=query_lens,
+                max_token_per_sequence=None if host_plan is None else host_plan.max_query_rows,
+                max_sequence_kv=(
+                    host_plan.max_kv_rows if host_plan is not None and device_lengths else None
+                ),
+                block_tables=block_table,
+                fixed_split_size=self._tuning.prefill_split_tile_size,
+                disable_split_kv=self._tuning.disable_split_kv,
+            )
 
     def prepare_paged_prefill_cuda_graph(
         self,
@@ -727,18 +732,29 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         if not isinstance(query_lens, torch.Tensor) or tuple(query_lens.shape) != (batch_size,):
             query_lens = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
         query_lens = query_lens.to(device=cu_seqlens_q.device, dtype=torch.int32).contiguous()
+        host_plan = _prefill_host_plan(
+            tuple(getattr(plan, "query_lens_cpu", ()) or ()),
+            tuple(getattr(plan, "kv_lens_cpu", ()) or ()),
+            batch_size,
+            int(page_size),
+        )
         plan_tensors = self._prefill_plan_tensors(
             wrapper_key,
             block_table,
             cu_seqlens_q,
             kv_seqlens,
             int(page_size),
-            index_count=_indptr_last(_cpu_paged_indptr(plan, batch_size, int(page_size))),
+            index_count=(
+                _indptr_last(_cpu_paged_indptr(plan, batch_size, int(page_size)))
+                if host_plan is None
+                else host_plan.index_count
+            ),
         )
         self._plan_prefill_wrapper(
             wrapper_key,
             wrapper,
             plan_tensors,
+            host_plan=host_plan,
             block_table=block_table,
             kv_seqlens=kv_seqlens,
             query_lens=query_lens,
@@ -790,20 +806,6 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
             batch_size=int(batch_size),
             cpu_indptr=inputs.cpu_indptr,
         )
-        plan_key = self._decode_graph_plan_key(
-            binding,
-            inputs.block_table,
-            inputs.cache_seqlens,
-            batch_size=int(batch_size),
-            num_q_heads=int(num_q_heads),
-            num_kv_heads=int(num_kv_heads),
-            head_dim=int(head_dim),
-            page_size=int(page_size),
-            q_dtype=q_dtype,
-            kv_dtype=kv_dtype,
-            scale=scale,
-            wrapper_key=inputs.wrapper_key,
-        )
         self._plan_decode_graph(
             inputs.wrapper_key,
             inputs.wrapper,
@@ -822,9 +824,14 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
             cpu_indptr=inputs.cpu_indptr,
             cpu_last_page_len=inputs.cpu_last_page_len,
         )
-        self._decode_plan_cache.remember(inputs.wrapper_key, plan_key, binding)
-        self._binding_graph_wrappers[id(binding)] = (inputs.wrapper_key, _weakref_or_none(binding))
-        self.bind_graph((id(binding), "decode"), inputs.wrapper_key)
+        binding_key = _binding_identity(binding)
+        if binding_key is None:
+            raise RuntimeError("paged decode graph preparation requires a binding token")
+        self._binding_graph_wrappers[binding_key] = (
+            inputs.wrapper_key,
+            _weakref_or_none(binding),
+        )
+        self.bind_graph((binding_key, "decode"), inputs.wrapper_key)
 
     def bind_paged_prefill_graph_wrapper(
         self,
@@ -867,13 +874,19 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
             batch_size=batch_size,
             max_indices=max(1, int(block_table.numel())),
         )
-        self._binding_prefill_graph_wrappers[id(binding)] = (key, _weakref_or_none(binding))
-        self.bind_graph((id(binding), "prefill"), key)
+        binding_key = _binding_identity(binding)
+        if binding_key is None:
+            raise RuntimeError("paged prefill graph binding requires a binding token")
+        self._binding_prefill_graph_wrappers[binding_key] = (key, _weakref_or_none(binding))
+        self.bind_graph((binding_key, "prefill"), key)
 
     def release_paged_prefill_graph_wrapper(self, binding: Any) -> None:
         """Drop the exclusive prefill wrapper (and its caches) bound to ``binding``."""
 
-        entry = self._binding_prefill_graph_wrappers.pop(id(binding), None)
+        binding_key = _binding_identity(binding)
+        if binding_key is None:
+            return
+        entry = self._binding_prefill_graph_wrappers.pop(binding_key, None)
         if entry is None:
             return
         wrapper_key, _binding_ref = entry
@@ -884,7 +897,9 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
     def release_paged_decode_graph_binding(self, binding: Any) -> None:
         """Release one binding while retaining shape-shared decode buffers."""
 
-        self._binding_graph_wrappers.pop(id(binding), None)
+        binding_key = _binding_identity(binding)
+        if binding_key is not None:
+            self._binding_graph_wrappers.pop(binding_key, None)
 
     def _decode_graph_plan_inputs(
         self,
@@ -924,7 +939,6 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
         ).contiguous()
         return _DecodeGraphPlanInputs(
             block_table=block_table,
-            cache_seqlens=cache_seqlens,
             effective_seqlens=effective_seqlens,
             cpu_indptr=cpu_indptr,
             cpu_last_page_len=cpu_last_page_len,
@@ -952,40 +966,6 @@ class FlashInferAttentionBackend(_WrapperPool, AttentionBackend):
             index_count=_indptr_last(cpu_indptr),
         )
         return plan
-
-    def _decode_graph_plan_key(
-        self,
-        binding: Any,
-        block_table: torch.Tensor,
-        cache_seqlens: torch.Tensor,
-        *,
-        batch_size: int,
-        num_q_heads: int,
-        num_kv_heads: int,
-        head_dim: int,
-        page_size: int,
-        q_dtype: torch.dtype,
-        kv_dtype: torch.dtype,
-        scale: float | None,
-        wrapper_key: WrapperKey,
-    ) -> tuple[Any, ...]:
-        """Build the identity that distinguishes one reusable decode graph plan."""
-
-        return _decode_plan_key_from_shape(
-            binding,
-            block_table,
-            cache_seqlens,
-            batch_size=int(batch_size),
-            num_q_heads=int(num_q_heads),
-            num_kv_heads=int(num_kv_heads),
-            head_dim=int(head_dim),
-            page_size=int(page_size),
-            q_dtype=q_dtype,
-            kv_dtype=kv_dtype,
-            scale=scale,
-            current_tokens=1,
-            wrapper_key=wrapper_key,
-        )
 
     def _plan_decode_graph(
         self,

@@ -388,6 +388,60 @@ def test_decode_reuses_the_published_request_page_table() -> None:
     assert report.completions[0].logical_lengths.kv_visible_len == 3
 
 
+class _CloseScoreModel(StubModel):
+    """Expose a token tie whose winner depends on small score variation."""
+
+    def project(self, hidden: torch.Tensor, batch: ForwardBatch) -> ForwardOutput:
+        output = super().project(hidden, batch)
+        for row in batch.token_row_indices:
+            scores = output.values[row]
+            scores.fill_(-1.0)
+            scores[..., 0] = 0.0
+            scores[..., 1] = 2e-6 if batch.flow_row_indices else -2e-6
+        return output
+
+
+def test_startup_accepts_numerically_close_mixed_token_ties():
+    from uniserve_worker.execution.step import execute_startup
+
+    worker = execution_worker(_CloseScoreModel())
+    sequence_admission = ar_params(1, block_ids=(0,))
+    flow_admission = umm_params(2, ImageParams(steps=1, height=16, width=16, seed=29))
+    conditioning = _publish_conditioning(worker, flow_admission, op_id=10, run_id=1)
+    latent, preparation = _prepare_media(
+        worker,
+        flow_admission,
+        conditioning,
+        op_id=11,
+        parent=root_parent(flow_admission),
+        run_id=2,
+    )
+    flow, _ = diffusion_step_operation(
+        flow_admission.request_key,
+        op_id=12,
+        parent=preparation.selected,
+        conditioning=conditioning,
+        latent=latent,
+        steps=1,
+        control_seq=preparation.control_seq,
+    )
+    sequence, sequence_input, sequence_control = _prepare_decode(
+        worker, sequence_admission, op_id=10, run_id=3, tokens=(3, 4)
+    )
+    batch = worker.plan_run(
+        execution_run(
+            run_id=4,
+            admissions=(),
+            operations=(sequence, flow),
+            commands=(preparation, sequence_control),
+            input_products=(sequence_input,),
+        )
+    )
+    result = finalized_report(execute_startup(worker, batch))
+    assert all(item.status is OpStatus.OK for item in result.completions)
+    assert result.completions[0].committed_tokens == (1,)
+
+
 def test_mixed_token_and_flow_match_homogeneous_results():
     mixed = execution_worker()
     sequence_admission = ar_params(1, block_ids=(0,))
@@ -1109,6 +1163,50 @@ def test_multi_step_quantum_matches_the_serial_model_artifact(
         return artifact
 
     assert run(4) == run(1)
+
+
+@pytest.mark.parametrize("device", ("cpu", pytest.param("cuda:0", marks=pytest.mark.gpu)))
+def test_non_power_of_two_context_capacity_accepts_prefill_and_decode(device: str) -> None:
+    model = StubModel()
+    model.text_max_tokens = 20
+    worker = execution_worker(model, block_size=4, device=device)
+    admission = ar_params(1, block_ids=(0, 1, 2, 3, 4))
+    parent = root_parent(admission)
+    commands = ()
+    tokens = tuple(range(1, 19))
+    selected = []
+    try:
+        for step in range(3):
+            operation, payload = token_operation(
+                admission.request_key,
+                op_id=step + 1,
+                parent=parent,
+                mode=TokenMode.EXTEND if step == 0 else TokenMode.DECODE,
+                tokens=tokens,
+                control_seq=step,
+            )
+            report = finalized_report(
+                worker.execute(
+                    execution_run(
+                        run_id=step + 1,
+                        admissions=(admission,) if step == 0 else (),
+                        commands=commands,
+                        operations=(operation,),
+                        input_products=(payload,),
+                    )
+                )
+            )
+            completion = report.completions[0]
+            assert completion.status is OpStatus.OK
+            assert completion.logical_lengths.kv_visible_len == 18 + step
+            selected.extend(completion.committed_tokens)
+            tokens = completion.committed_tokens
+            commit = commit_for_completion(operation, report)
+            parent = commit.selected
+            commands = (commit,)
+        assert selected == [1000, 1001, 151670]
+    finally:
+        worker.close()
 
 
 def test_decode_grows_logical_capacity_across_a_kv_page_boundary():
@@ -2386,3 +2484,77 @@ def test_latent_bank_reuse_waits_for_a_reader_after_free_without_blocking_indepe
         if prepared is not None:
             prepared.abandon()
         worker.close()
+
+
+def test_later_product_release_unblocks_an_earlier_bank_writer() -> None:
+    """A received Free must progress while computation waits for its storage."""
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    from tests.python.fixtures.worker_ipc import QueuedWorkerIpc
+    from uniserve_worker.execution.batch import RunResult
+    from uniserve_worker.process import WorkerProcess
+
+    worker = execution_worker(transfer_backends=("shm",), pipeline_depth=2)
+    admission = umm_params(76, ImageParams(steps=3, height=16, width=16, seed=29))
+    conditioning = _publish_conditioning(worker, admission, op_id=1, run_id=1)
+    latent, commit = _prepare_media(
+        worker, admission, conditioning, op_id=2, parent=root_parent(admission), run_id=2
+    )
+    retained = latent
+    for op_id in (3, 4):
+        operation, successor = diffusion_step_operation(
+            admission.request_key,
+            op_id=op_id,
+            parent=commit.selected,
+            conditioning=conditioning,
+            latent=latent,
+            steps=1,
+            control_seq=commit.control_seq,
+        )
+        report = finalized_report(
+            worker.execute(
+                execution_run(
+                    run_id=op_id,
+                    operations=(operation,),
+                    commands=(commit,) if op_id == 3 else (commit, Free(retained.buffer_id)),
+                )
+            )
+        )
+        assert report.completions[0].status is OpStatus.OK
+        retained, latent = latent, successor
+        commit = commit_for_completion(operation, report)
+
+    third, _final_latent = diffusion_step_operation(
+        admission.request_key,
+        op_id=5,
+        parent=commit.selected,
+        conditioning=conditioning,
+        latent=latent,
+        steps=1,
+        control_seq=commit.control_seq,
+    )
+    waiting = execution_run(run_id=5, operations=(third,), commands=(commit,))
+    release = execution_run(run_id=6, commands=(Free(retained.buffer_id),))
+    endpoint = QueuedWorkerIpc(
+        tuple({"kind": "submit", "call_id": run.run_id, "run": run} for run in (waiting, release))
+    )
+    server = WorkerProcess(worker, endpoint)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        serving = executor.submit(server.serve)
+        try:
+            responses = {
+                int(value["call_id"]): value for value in (endpoint.receive(), endpoint.receive())
+            }
+            assert responses[5]["kind"] == "result", responses[5]
+            result = RunResult.from_mapping(responses[5]["result"])
+            assert result.completions[0].status is OpStatus.OK
+            assert result.completions[0].logical_lengths.latent_len == 3
+            assert responses[6]["kind"] == "result", responses[6]
+            assert RunResult.from_mapping(responses[6]["result"]).done
+        finally:
+            # Failure cleanup supplies the same valid release directly, allowing
+            # the serving thread to leave its storage wait before it is joined.
+            worker.execute(execution_run(run_id=99, commands=(Free(retained.buffer_id),)))
+            endpoint.submit({"kind": "close", "call_id": 7})
+            serving.result(timeout=10)

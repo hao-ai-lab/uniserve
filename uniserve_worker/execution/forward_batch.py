@@ -8,6 +8,7 @@ runtime objects are deliberately absent.
 
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -246,10 +247,102 @@ class ForwardBatch:
 
 
 @dataclass(frozen=True, slots=True)
+class VocabularyPartition:
+    """Logical vocabulary layout and non-owning collective identity.
+
+    ``rank`` is the logical vocabulary partition. ``backend_order`` maps each
+    physical collective rank to its logical partition, including reordered TP
+    groups. Padding belongs to storage and lies outside ``vocab_size``.
+    """
+
+    vocab_size: int
+    width: int
+    rank: int
+    backend_order: tuple[int, ...]
+    group_name: str | None
+
+    def __post_init__(self) -> None:
+        size = len(self.backend_order)
+        if (
+            self.width < 1
+            or not 0 < self.vocab_size <= min(self.width * size, 2**53)
+            or not 0 <= self.rank < size
+            or sorted(self.backend_order) != list(range(size))
+            or (size > 1 and self.group_name is None)
+        ):
+            raise ValueError("vocabulary partition has invalid geometry or collective membership")
+
+
+@dataclass(frozen=True, slots=True)
 class ForwardOutput:
-    """Ordered raw tensors aligned with a :class:`ForwardBatch`."""
+    """Ordered raw tensors and optional vocabulary sharding aligned with a batch.
+
+    Each result has its own optional vocabulary partition. Hidden states and
+    continuous predictions have no vocabulary, including in mixed batches.
+    Consumers needing global logits call ``materialize`` collectively;
+    distributed selection can consume the local text rows directly.
+    """
 
     values: tuple[torch.Tensor, ...]
+    vocabularies: tuple[VocabularyPartition | None, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.vocabularies:
+            object.__setattr__(self, "vocabularies", (None,) * len(self.values))
+        if len(self.vocabularies) != len(self.values):
+            raise ValueError("vocabulary metadata must align with output rows")
+        for value, partition in zip(self.values, self.vocabularies, strict=True):
+            if partition is not None and (
+                value.ndim != 2 or value.shape[-1] != partition.width
+            ):
+                raise ValueError("vocabulary output rows disagree with their partition")
+
+    def materialize(self) -> ForwardOutput:
+        """Gather global vocabulary rows, preserving their caller-visible shapes."""
+
+        if not any(self.vocabularies):
+            return self
+        from ..nn.logits import gather_vocabulary
+
+        groups: dict[VocabularyPartition, list[int]] = defaultdict(list)
+        for index, partition in enumerate(self.vocabularies):
+            if partition is not None:
+                groups[partition].append(index)
+        values = list(self.values)
+        for partition, indexes in groups.items():
+            sources = tuple(self.values[index] for index in indexes)
+            rows = packed_tensor_views(sources)
+            if rows is None:
+                rows = torch.cat(sources, dim=0)
+            gathered = gather_vocabulary(rows.reshape(-1, partition.width), partition)
+            results = gathered.split(tuple(value.shape[0] for value in sources))
+            for index, value in zip(indexes, results, strict=True):
+                values[index] = value
+        return ForwardOutput(tuple(values))
+
+    def clone(self) -> ForwardOutput:
+        """Own detached copies that survive reuse of the producer's storage.
+
+        Outputs on one device with one dtype share a packed allocation. Shapes
+        and logical tensor values are preserved independently of source strides;
+        storage remains live for as long as any returned tensor is retained.
+        """
+
+        groups: dict[tuple[torch.device, torch.dtype], list[int]] = defaultdict(list)
+        for index, value in enumerate(self.values):
+            groups[(value.device, value.dtype)].append(index)
+        copied = list(self.values)
+        for indexes in groups.values():
+            if len(indexes) == 1:
+                index = indexes[0]
+                copied[index] = self.values[index].detach().clone()
+                continue
+            sources = [self.values[index] for index in indexes]
+            packed = torch.cat(tuple(value.detach().reshape(-1) for value in sources))
+            views = packed.split(tuple(value.numel() for value in sources))
+            for index, view in zip(indexes, views, strict=True):
+                copied[index] = view.reshape(self.values[index].shape)
+        return ForwardOutput(tuple(copied), self.vocabularies)
 
     def validate_for(self, batch: ForwardBatch) -> None:
         """Require one tensor result for every row in the originating batch."""
@@ -269,5 +362,6 @@ __all__ = [
     "RouteSpan",
     "ModelPhase",
     "TokenSelection",
+    "VocabularyPartition",
     "packed_tensor_views",
 ]

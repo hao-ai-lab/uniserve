@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 
 from .mesh import Communicator
 from .quant import LinearMethod, QuantizationConfig, UnquantizedLinearMethod
@@ -17,6 +17,8 @@ class LayerConfig:
     communicator: Communicator
     quantization: QuantizationConfig | None
     prefix: str = ""
+    pipeline: Communicator = field(default_factory=Communicator)
+    sequence: Communicator = field(default_factory=Communicator)
 
     def qualify(self, name: str) -> str:
         """Resolve a child name in this component's checkpoint namespace."""
@@ -26,7 +28,7 @@ class LayerConfig:
     def child(self, name: str) -> LayerConfig:
         """Keep geometry and precision policy while descending into a module."""
 
-        return LayerConfig(self.communicator, self.quantization, self.qualify(name))
+        return replace(self, prefix=self.qualify(name))
 
     def quant_method(self, prefix: str, *, packed_names: tuple[str, ...] = ()) -> LinearMethod:
         """Resolve a parameter prefix to its configured quantized linear implementation."""

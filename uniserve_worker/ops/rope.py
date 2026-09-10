@@ -3,8 +3,8 @@
 The module supports packed GPT-NeoX and interleaved rotary conventions,
 HF-shaped query/key tensors, and multi-axis video layouts whose adjacent axes
 may share one RMS normalization group. Specialized Triton strategies preserve
-those grouping and dtype-boundary contracts, with eager tensor execution as the
-general provider.
+those normalization groups and rotary coordinates. Eager tensor execution handles
+the general layout.
 """
 
 from __future__ import annotations
@@ -19,10 +19,9 @@ from .qk_plan import FusedStrategy, QKNormRopePlan
 from .requests import (
     MultiAxisQKNormRopeReq,
     PackedRopeReq,
-    QKNormReq,
     QKNormRopeRequest,
 )
-from .rms import EagerQKNorm, run_qk_rms_norm
+from .rms import eager_rms_norm, run_qk_rms_norm
 from .rope_kernels import (
     _EagerPackedRope,
     _TritonPackedRope,
@@ -713,10 +712,9 @@ class EagerQKNormRope(Operator):
     """Portable tensor provider for QK RMSNorm-plus-RoPE."""
 
     def __init__(self) -> None:
-        """Register the eager fused-QK provider and its normalization helper."""
+        """Register the eager fused-QK provider."""
 
         super().__init__("eager", "qk_norm_rope")
-        self._norm = EagerQKNorm()
 
     def can_run(self, req: QKNormRopeRequest) -> bool:
         """Accept all request layouts supported by the tensor implementation."""
@@ -730,9 +728,8 @@ class EagerQKNormRope(Operator):
         if isinstance(req, MultiAxisQKNormRopeReq):
             return self._run_multi_axis(req)
 
-        # Normalization precedes rotation and preserves the eager dtype boundary
-        # used by fused providers.
-        q, k = self._norm.run(QKNormReq(req.q, req.k, req.q_weight, req.k_weight, req.eps))
+        q = eager_rms_norm(req.q.float(), req.q_weight.float(), req.eps)
+        k = eager_rms_norm(req.k.float(), req.k_weight.float(), req.eps)
         if req.in_place:
             # In-place requests carry full-width duplicated factors for an even
             # rotary prefix; the remainder of each normalized head is retained.
@@ -767,7 +764,7 @@ class EagerQKNormRope(Operator):
             return req.q, req.k
 
         q, k = _apply_rope_axis(q, k, req.cos, req.sin, unsqueeze_dim=req.unsqueeze_dim)
-        return q, k
+        return q.to(req.q.dtype), k.to(req.k.dtype)
 
     def _run_multi_axis(self, req: MultiAxisQKNormRopeReq) -> tuple[torch.Tensor, torch.Tensor]:
         """Normalize shared groups, rotate each axis, and restore feature order."""
@@ -784,14 +781,11 @@ class EagerQKNormRope(Operator):
         for group in plan.groups:
             q_group = torch.cat(q_parts[group.start : group.end], dim=-1)
             k_group = torch.cat(k_parts[group.start : group.end], dim=-1)
-            q_normed_group, k_normed_group = self._norm.run(
-                QKNormReq(
-                    q_group,
-                    k_group,
-                    plan.q_weights[group.start],
-                    plan.k_weights[group.start],
-                    req.eps,
-                )
+            q_normed_group = eager_rms_norm(
+                q_group.float(), plan.q_weights[group.start].float(), req.eps
+            )
+            k_normed_group = eager_rms_norm(
+                k_group.float(), plan.k_weights[group.start].float(), req.eps
             )
             q_normed_parts = q_normed_group.split(plan.axis_dims[group.start : group.end], dim=-1)
             k_normed_parts = k_normed_group.split(plan.axis_dims[group.start : group.end], dim=-1)
@@ -809,7 +803,7 @@ class EagerQKNormRope(Operator):
                 out_q.append(q_rot)
                 out_k.append(k_rot)
 
-        return torch.cat(out_q, dim=-1), torch.cat(out_k, dim=-1)
+        return torch.cat(out_q, dim=-1).to(req.q.dtype), torch.cat(out_k, dim=-1).to(req.k.dtype)
 
 
 @lru_cache(maxsize=1)
@@ -848,8 +842,8 @@ def qk_rms_norm_partial_rope_(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Normalize Q/K heads and rotate their leading split-half coordinates in place.
 
-    Optional projection biases are rounded through the operand dtype before
-    normalization. When supplied, the value bias is also applied in place so the
+    Bias addition, normalization, and rotation accumulate in FP32 before the
+    output store. When supplied, the value bias is also applied in place so the
     three attention projections share one launch.
     """
 
@@ -889,20 +883,12 @@ def qk_rms_norm_partial_rope_(
         and head_dim <= 256
         and all(tensor is None or tensor.is_contiguous() for tensor in operands)
     ):
-        q = (
-            query
-            if query_bias is None
-            else (query.float() + query_bias.reshape(heads, head_dim).float()).to(query.dtype)
-        )
-        k = (
-            key
-            if key_bias is None
-            else (key.float() + key_bias.reshape(heads, head_dim).float()).to(key.dtype)
-        )
-        q = (q.float() * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + eps)).to(
-            query.dtype
-        )
-        k = (k.float() * torch.rsqrt(k.float().square().mean(-1, keepdim=True) + eps)).to(key.dtype)
+        q, k = query.float(), key.float()
+        if query_bias is not None and key_bias is not None:
+            q = q + query_bias.reshape(heads, head_dim).float()
+            k = k + key_bias.reshape(heads, head_dim).float()
+        q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + eps)
+        k = k * torch.rsqrt(k.square().mean(-1, keepdim=True) + eps)
         table_shape = (*query.shape[:-2], 1, rotary_dim)
         cos = cosine.reshape(table_shape).float()
         sin = sine.reshape(table_shape).float()

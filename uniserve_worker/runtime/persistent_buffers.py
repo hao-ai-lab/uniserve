@@ -43,12 +43,14 @@ class PersistentBuffers:
         *,
         byte_capacity: int,
         devices: tuple[torch.device | str, ...],
+        compact: bool = False,
     ) -> None:
-        """Allocate one byte-addressed persistent arena for each distinct device."""
+        """Allocate one persistent arena, optionally remapping logical allocations."""
 
         self.byte_capacity = int(byte_capacity)
         if self.byte_capacity < 0:
             raise ValueError("persistent buffer capacity must not be negative")
+        self.compact = bool(compact)
         normalized: list[torch.device] = []
         for raw in devices:
             device = canonical_device(raw)
@@ -64,6 +66,33 @@ class PersistentBuffers:
         self._active: dict[tuple[str, BufferId], PersistentBufferBinding] = {}
         self._next_binding_id = 1
         self._lock = RLock()
+
+    def _compact_offset_locked(self, device_name: str, extent: int) -> int:
+        """Return the first aligned gap that can hold one physical binding."""
+
+        cursor = 0
+        active_bindings = sorted(
+            (
+                binding
+                for binding in self._active.values()
+                if binding.device_name == device_name
+            ),
+            key=lambda binding: binding.offset,
+        )
+        for active in active_bindings:
+            start = ((cursor + 255) // 256) * 256
+            if start + extent <= active.offset:
+                return start
+            cursor = max(cursor, active.offset + active.bytes)
+        start = ((cursor + 255) // 256) * 256
+        if start + extent > self.byte_capacity:
+            spans = tuple((binding.offset, binding.bytes) for binding in active_bindings)
+            raise invalid_descriptor(
+                "physical buffer allocation exceeds the worker buffer pool: "
+                f"{extent} bytes requested from {self.byte_capacity} bytes with "
+                f"live spans {spans}"
+            )
+        return start
 
     def bind(
         self,
@@ -84,11 +113,8 @@ class PersistentBuffers:
         if allocation.buffer != reference.buffer_id:
             raise invalid_descriptor("buffer allocation does not name its output")
         required = int(math.prod(shape)) * int(torch.empty((), dtype=dtype).element_size())
-        end = int(allocation.offset) + int(allocation.bytes)
         if required < 1 or required > int(allocation.bytes):
             raise invalid_descriptor("buffer allocation is smaller than its output tensor")
-        if end > self.byte_capacity:
-            raise invalid_descriptor("buffer allocation exceeds the worker buffer pool")
         element_bytes = int(torch.empty((), dtype=dtype).element_size())
         if int(allocation.offset) % element_bytes != 0:
             raise invalid_descriptor("buffer allocation is not aligned for its output dtype")
@@ -96,7 +122,19 @@ class PersistentBuffers:
         with self._lock:
             if key in self._active:
                 raise invalid_descriptor("buffer allocation is already bound")
-            start = int(allocation.offset)
+            extent = (
+                ((required + 255) // 256) * 256
+                if self.compact
+                else int(allocation.bytes)
+            )
+            start = (
+                self._compact_offset_locked(device_name, extent)
+                if self.compact
+                else int(allocation.offset)
+            )
+            end = start + extent
+            if end > self.byte_capacity:
+                raise invalid_descriptor("buffer allocation exceeds the worker buffer pool")
             for active in self._active.values():
                 if active.device_name != device_name:
                     continue
@@ -106,7 +144,7 @@ class PersistentBuffers:
             binding = PersistentBufferBinding(
                 buffer=allocation.buffer,
                 offset=start,
-                bytes=int(allocation.bytes),
+                bytes=extent,
                 binding_id=self._next_binding_id,
                 device_name=device_name,
                 tensor=tensor,

@@ -6,7 +6,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 import torch
 from torch import nn
@@ -37,6 +37,7 @@ class CheckpointComponent:
     weight_name_map: WeightNameMap = ()
     included: frozenset[str] | None = None
     optional: frozenset[str] = frozenset()
+    nonresident: frozenset[str] = frozenset()
     dtype: torch.dtype | None = None
     parameter_dtypes: tuple[tuple[str, torch.dtype], ...] = ()
     module_devices: tuple[tuple[str, torch.device], ...] = ()
@@ -71,19 +72,19 @@ class ModelBuildContext:
     schedule: DiffusionSchedule | None
 
     def packed_decoder_layers(self, entry: str) -> LayerConfig:
-        """Bind the TP layers of a packed decoder to its configured computation entry.
-
-        Packed KV execution currently owns a complete local sequence and layer
-        stack. A component needing SP or PP must supply its corresponding
-        attention and layer-pipeline execution instead of this packed binding.
-        """
+        """Bind packed attention shards and resident layers to an execution entry."""
 
         mesh = self.request.bindings.meshes.get(entry)
         if mesh is None:
             raise ValueError(f"packed decoder entry {entry!r} is not assigned to this rank")
-        if mesh.size("sp") != 1 or mesh.size("pp") != 1:
-            raise ValueError("packed decoding requires local sequence and pipeline axes")
-        return LayerConfig(mesh.get_group("tp"), self.quantization)
+        if mesh.parallel_config.sequence_parallel.kind not in {"local", "ulysses"}:
+            raise ValueError("paged attention sequence execution requires Ulysses head exchange")
+        return LayerConfig(
+            mesh.get_group("tp"),
+            self.quantization,
+            pipeline=mesh.get_group("pp"),
+            sequence=mesh.get_group("ulysses"),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +95,26 @@ class ModelConstruction:
     assemble: Callable[[], nn.Module]
     config: Any
     tokenizer: Any | None = None
+
+
+_Module = TypeVar("_Module", bound=nn.Module)
+
+
+def construct_owned_module(
+    factory: Callable[[], _Module], *, resident: bool
+) -> tuple[_Module | None, frozenset[str]]:
+    """Construct owned weights or describe an off-stage checkpoint namespace.
+
+    Off-stage construction uses metadata tensors exclusively. Its parameter
+    names allow the loader to distinguish valid nonresident records from
+    misspelled or unknown checkpoint weights, without retaining their modules.
+    """
+
+    if resident:
+        return factory(), frozenset()
+    with torch.device("meta"):
+        module = factory()
+    return None, frozenset(name for name, _ in module.named_parameters())
 
 
 @contextmanager

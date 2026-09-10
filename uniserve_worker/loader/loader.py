@@ -210,8 +210,6 @@ def _loaded_worker_config(model: ExecutionModel, request: LoadRequest) -> Worker
     """Close requested execution bounds over the materialized computation geometry."""
 
     config = request.execution
-    if "output" in request.bindings.entries:
-        config = replace(config, output_rank=request.bindings.entries["output"].ranks[0])
     if model.resource_geometry.request_tensors:
         if request.pipeline_depth is None:
             raise unsupported_setup("request tensor storage requires its physical pipeline depth")
@@ -402,6 +400,9 @@ def _load_declared_weights(
             path, _, field = name.rpartition(".")
             owner = component.module.get_submodule(path)
             owner.register_buffer(field, value, persistent=True)
+        elif name in component.nonresident:
+            report.skipped.append(handle.name)
+            continue
         else:
             (report.unexpected if component.strict else report.skipped).append(name)
             continue

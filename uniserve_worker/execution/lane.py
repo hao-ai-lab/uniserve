@@ -70,6 +70,12 @@ class ExecutionLaneRuntime:
             self._output_events = ()
 
     @property
+    def full_device(self) -> bool:
+        """Whether kernels may address the device's complete physical SM domain."""
+
+        return self._green is None
+
+    @property
     def lane_id(self) -> str | None:
         """Expose the scheduler lane identifier, or ``None`` for the default stream."""
 

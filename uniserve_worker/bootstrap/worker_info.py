@@ -80,6 +80,8 @@ class KvCacheConfig:
     block_size: int
     num_blocks: int
     num_layers: int
+    total_layers: int
+    layer_offset: int
     num_kv_heads: int
     total_kv_heads: int
     kv_head_offset: int
@@ -107,6 +109,8 @@ class KvCacheConfig:
             raise invalid_descriptor("worker info declares incomplete KV geometry")
         if self.kv_head_offset < 0 or self.kv_head_offset + self.num_kv_heads > self.total_kv_heads:
             raise invalid_descriptor("worker KV head interval exceeds its logical geometry")
+        if self.layer_offset < 0 or self.layer_offset + self.num_layers > self.total_layers:
+            raise invalid_descriptor("worker KV layer interval exceeds its logical geometry")
         if any(group.num_blocks < 1 for group in self.groups):
             raise invalid_descriptor("worker info KV groups must be physical page partitions")
         if sum(group.num_blocks for group in self.groups) != self.num_blocks:
@@ -121,6 +125,8 @@ class KvCacheConfig:
             block_size=_uint(data.get("block_size"), f"{where}.block_size"),
             num_blocks=_uint(data.get("num_blocks"), f"{where}.num_blocks"),
             num_layers=_uint(data.get("num_layers"), f"{where}.num_layers"),
+            total_layers=_uint(data.get("total_layers"), f"{where}.total_layers"),
+            layer_offset=_uint(data.get("layer_offset"), f"{where}.layer_offset"),
             num_kv_heads=_uint(data.get("num_kv_heads"), f"{where}.num_kv_heads"),
             total_kv_heads=_uint(data.get("total_kv_heads"), f"{where}.total_kv_heads"),
             kv_head_offset=_uint(data.get("kv_head_offset"), f"{where}.kv_head_offset"),
@@ -140,6 +146,8 @@ class KvCacheConfig:
             "block_size": self.block_size,
             "num_blocks": self.num_blocks,
             "num_layers": self.num_layers,
+            "total_layers": self.total_layers,
+            "layer_offset": self.layer_offset,
             "num_kv_heads": self.num_kv_heads,
             "total_kv_heads": self.total_kv_heads,
             "kv_head_offset": self.kv_head_offset,

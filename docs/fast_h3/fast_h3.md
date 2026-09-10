@@ -29,7 +29,7 @@ uv sync --locked --python /usr/bin/python3.12 --extra h3
 source "$UV_PROJECT_ENVIRONMENT/bin/activate"
 ```
 
-The `h3` extra installs the locked H3 runtime, FlashInfer, peer-memory and sparse-attention kernels, Diffusers audio decoding, CuTe DSL, CUTLASS DSL, and PyAV. FastVideo itself is not a runtime dependency.
+The `h3` extra installs the locked H3 runtime, FlashInfer, FlashAttention-4, peer-memory and sparse-attention kernels, Diffusers audio decoding, CuTe DSL, CUTLASS DSL, and PyAV. FastVideo itself is not a runtime dependency.
 
 ## Download the model
 
@@ -154,7 +154,7 @@ Example:
 ## Fixed model contract
 
 - Four denoiser forwards with inference grid `[1, 0.75, 0.5, 0.25, 0]` and video/audio sigma shifts `12/3`.
-- VSA sparse attention with tile size 64, sparsity 0.9, and the SM100a kernel.
+- VSA sparse attention with tile size 64 and sparsity 0.9. The shared provider selects the installed implementation from the execution device; SM100 uses the native SM100a kernel and supports incremental row production. Dense attention selects a compatible provider from each request’s dtype, head layout and mask. GB200 has end-to-end validation; other hardware requires its own validation before performance claims.
 - Fixed 1344×768 output, 24 fps, and stereo 32-kHz audio.
 - Text-only conditioning. Image/video references, LoRA, variable resolution, guidance changes, and step-count changes are rejected.
 

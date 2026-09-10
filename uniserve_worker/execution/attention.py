@@ -55,7 +55,13 @@ def columns(runtime: Worker, tasks: tuple[ForwardRow, ...]) -> AttentionInputs:
             raise invalid_descriptor("forward row exceeds its scheduler block table")
         if task.write_kv:
             cache.require_writable(row_pages, group=group_id, start=prefix, length=query)
-    width = bucketed_length(max(1, max(map(len, pages))))
+    # The last shape bucket can end at a non-power-of-two context capacity.
+    # Both resident and staged tables own that exact bound; shape padding
+    # must not invent columns beyond their scheduler-visible page geometry.
+    width = min(
+        bucketed_length(max(1, max(map(len, pages)))),
+        tables.max_blocks_per_request,
+    )
     if pure_decode and all(task.request_indexed_decode for task in tasks):
         states = runtime.runtime_states
         if (

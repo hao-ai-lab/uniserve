@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from collections import deque
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
+from functools import partial
 from itertools import product
 from math import prod
 from types import MappingProxyType
@@ -12,7 +15,110 @@ import torch
 import torch.distributed as dist
 
 from ..profiling import profile_range
+from .collective import try_sum_reduction
 from .parallel import EntryConfig, ParallelConfig
+
+RowChunkProducer = Callable[[slice, tuple[torch.Tensor, ...]], None]
+
+
+class RowGather:
+    """Exchange ordered row publications through two caller-owned gather slots.
+
+    The consumer receives each logical interval on the current stream. It must
+    enqueue all reads before returning; the transport then owns slot reuse and
+    peer readiness. Local rows are immediately readable while remote rows are
+    delivered after their transfer. Numerical work belongs to the consumer.
+    """
+
+    def __init__(
+        self,
+        group: Communicator,
+        rows: int,
+        width: int,
+        dtype: torch.dtype,
+        workspace: torch.Tensor,
+        consumer: Callable[[slice, torch.Tensor], None],
+    ) -> None:
+        if min(rows, width) < 1 or not workspace.is_contiguous():
+            raise ValueError("row gathering requires positive geometry and contiguous scratch")
+        self.group = group
+        self.rows = rows
+        self.width = width
+        self.dtype = dtype
+        self.consumer = consumer
+        members = group.world_size
+        element_bytes = dtype.itemsize
+        elements = workspace.numel() * workspace.element_size() // element_bytes
+        capacity_rows = elements // (2 * members * width)
+        if capacity_rows < 1:
+            raise ValueError("row gathering scratch must hold two complete member rows")
+        capacity_rows = min(capacity_rows, (64 * 1024 * 1024) // (width * element_bytes))
+        self.chunk_rows = capacity_rows // 128 * 128 if capacity_rows >= 128 else capacity_rows
+        byte_count = 2 * members * self.chunk_rows * width * element_bytes
+        self.storage = workspace.view(torch.uint8).view(-1)[:byte_count].view(dtype)
+        self.storage = self.storage.view(2, members, self.chunk_rows, width)
+        self.pending: deque[tuple[int, int, torch.Tensor, Any]] = deque()
+        self.published_rows = 0
+        self.next_slot = 0
+
+    def _consume(self) -> None:
+        start, count, gathered, work = self.pending.popleft()
+        if work is not None:
+            _finish(work, gathered)
+        for backend_rank, logical_rank in enumerate(self.group._backend_order):
+            if logical_rank != self.group.rank_in_group:
+                begin = logical_rank * self.rows + start
+                self.consumer(slice(begin, begin + count), gathered[backend_rank])
+
+    def append(self, start: int, input: torch.Tensor) -> None:
+        """Publish the next contiguous local interval without mutating its values."""
+
+        if (
+            input.ndim != 2
+            or input.shape[1] != self.width
+            or input.dtype != self.dtype
+            or input.device != self.storage.device
+            or start != self.published_rows
+            or input.shape[0] < 1
+            or start + input.shape[0] > self.rows
+        ):
+            raise ValueError("row gathering requires ordered matching input intervals")
+        backend_rank = self.group._backend_order.index(self.group.rank_in_group)
+        for offset in range(0, input.shape[0], self.chunk_rows):
+            if len(self.pending) == 2:
+                self._consume()
+            count = min(self.chunk_rows, input.shape[0] - offset)
+            # Tail segments compact the member stride for equal-count gather.
+            gathered = (
+                self.storage[self.next_slot]
+                .view(-1)[: self.group.world_size * count * self.width]
+                .view(self.group.world_size, count, self.width)
+            )
+            local = input[offset : offset + count]
+            gathered[backend_rank].copy_(local)
+            if self.group.world_size > 1:
+                work = dist.all_gather_into_tensor(
+                    gathered.flatten(0, 1),
+                    gathered[backend_rank],
+                    group=self.group._require(),
+                    async_op=True,
+                )
+            else:
+                work = None
+            begin = start + offset
+            logical_begin = self.group.rank_in_group * self.rows + begin
+            self.consumer(slice(logical_begin, logical_begin + count), local)
+            self.pending.append((begin, count, gathered, work))
+            self.next_slot = (self.next_slot + 1) % 2
+        self.published_rows += input.shape[0]
+
+    def finish(self) -> None:
+        """Consume every published transfer before the caller reuses scratch."""
+
+        if self.published_rows != self.rows:
+            raise ValueError("row gathering must publish every row before completion")
+        while self.pending:
+            self._consume()
 
 
 def divide(numerator: int, denominator: int) -> int:
@@ -43,9 +149,13 @@ def _all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor, group_nam
     with profile_range(
         f"uniserve.collective kind=all_gather group={group_name} rank={dist.get_rank()}"
     ):
-        work = dist.all_gather_into_tensor(
-            output, input, group=_process_group(group_name), async_op=True
-        )
+        group = _process_group(group_name)
+        # In-place AllGather registers one stable allocation for both source
+        # and destination. Symmetric workspaces can then use NCCL copy engines.
+        local = output.view(-1).narrow(0, group.rank() * input.numel(), input.numel())
+        local = local.view_as(input)
+        local.copy_(input)
+        work = dist.all_gather_into_tensor(output, local, group=group, async_op=True)
         _finish(work, input)
 
 
@@ -65,11 +175,16 @@ def _all_to_all_single_into(
     with profile_range(
         f"uniserve.collective kind=all_to_all group={group_name} rank={dist.get_rank()}"
     ):
+        # Empty split lists select the native equal-count collective. Explicit
+        # lists select variable-count send/recv, including when counts match.
+        equal_counts = (
+            input.numel() == output.numel() and len(set(output_splits + input_splits)) == 1
+        )
         work = dist.all_to_all_single(
             output,
             input,
-            output_split_sizes=output_splits,
-            input_split_sizes=input_splits,
+            output_split_sizes=None if equal_counts else output_splits,
+            input_split_sizes=None if equal_counts else input_splits,
             group=_process_group(group_name),
             async_op=True,
         )
@@ -206,6 +321,12 @@ class Communicator:
             )
         return self._group
 
+    @property
+    def backend_name(self) -> str | None:
+        """Expose a non-owning collective identity for tensor-layout metadata."""
+
+        return None if self.world_size == 1 else self._require().group_name
+
     def _peer(self, peer: int) -> int:
         if not 0 <= peer < self.world_size:
             raise ValueError(
@@ -219,7 +340,9 @@ class Communicator:
 
     def all_reduce(self, value: torch.Tensor) -> torch.Tensor:
         if self.world_size > 1:
-            dist.all_reduce(value, group=self._require())
+            group = self._require()
+            if not try_sum_reduction(group, value):
+                dist.all_reduce(value, group=group)
         return value
 
     def all_reduce_max(self, value: torch.Tensor) -> torch.Tensor:
@@ -259,6 +382,54 @@ class Communicator:
             for backend_rank, logical_rank in enumerate(self._backend_order):
                 targets[logical_rank].copy_(sources[backend_rank])
 
+    def gather_row_chunks(
+        self, input: torch.Tensor, workspace: torch.Tensor
+    ) -> Iterator[tuple[slice, torch.Tensor]]:
+        """Expose complete local rows, then ready remote intervals in logical order.
+
+        All source staging precedes asynchronous gathers. Consumers may enqueue
+        numerical work between yields while subsequent transfers make progress.
+        Workspace is caller-owned and remains live until iterator exhaustion.
+        """
+
+        if input.ndim != 2 or min(input.shape) < 1:
+            raise ValueError("row gathering requires a nonempty matrix")
+        rows, width = input.shape
+        if self.world_size == 1:
+            yield slice(0, rows), input
+            return
+        byte_count = input.numel() * input.element_size() * self.world_size
+        if not workspace.is_contiguous() or workspace.device != input.device:
+            raise ValueError("row gathering requires contiguous scratch on the input device")
+        if workspace.numel() * workspace.element_size() < byte_count:
+            raise ValueError("row gathering scratch cannot hold all input rows")
+        storage = workspace.view(torch.uint8).view(-1)[:byte_count].view(input.dtype)
+        segment_rows = max(1, ((64 * 1024 * 1024) // (width * input.element_size()) // 128) * 128)
+        local_rank = self._backend_order.index(self.rank_in_group)
+        segments = []
+        for start in range(0, rows, segment_rows):
+            count = min(segment_rows, rows - start)
+            sources = storage.narrow(
+                0, start * self.world_size * width, count * self.world_size * width
+            )
+            sources = sources.view(self.world_size, count, width)
+            sources[local_rank].copy_(input[start : start + count])
+            segments.append((start, count, sources))
+        pending = [
+            dist.all_gather_into_tensor(
+                sources.flatten(0, 1), sources[local_rank], group=self._require(), async_op=True
+            )
+            for _, _, sources in segments
+        ]
+        begin = self.rank_in_group * rows
+        yield slice(begin, begin + rows), input
+        for (start, count, sources), work in zip(segments, pending, strict=True):
+            _finish(work, input)
+            for backend_rank, logical_rank in enumerate(self._backend_order):
+                if backend_rank != local_rank:
+                    begin = logical_rank * rows + start
+                    yield slice(begin, begin + count), sources[backend_rank]
+
     def all_to_all_single_into(
         self,
         output: torch.Tensor,
@@ -293,6 +464,134 @@ class Communicator:
         targets = output.split(tuple(output_splits), dim=0)
         for index, chunk in zip(order, received.split(backend_output_splits, dim=0)):
             targets[index].copy_(chunk)
+
+    def produce_exchange(
+        self,
+        source: torch.Tensor,
+        destination: torch.Tensor,
+        producer: Callable[[tuple[torch.Tensor, ...]], None],
+    ) -> Callable[[], tuple[torch.Tensor, ...]]:
+        """Publish equal peer payloads and return their deferred completion.
+
+        Physical buffers have a leading member axis. Producer and consumer
+        views use logical member order. Contiguous registered buffers permit
+        NCCL's zero-CTA AlltoAll; tensor layout and numerical work belong to
+        the caller. Both buffers must remain live until completion is consumed.
+        """
+
+        if (
+            source.ndim < 2
+            or source.shape[0] != self.world_size
+            or source.shape != destination.shape
+            or source.dtype != destination.dtype
+            or source.device != destination.device
+            or not source.is_contiguous()
+            or not destination.is_contiguous()
+            or source.data_ptr() == destination.data_ptr()
+        ):
+            raise ValueError("produced exchange requires distinct matching peer buffers")
+        order = self._backend_order
+        producer(tuple(source[order.index(rank)] for rank in range(self.world_size)))
+        if self.world_size == 1:
+            destination.copy_(source)
+            work = None
+        else:
+            work = dist.all_to_all_single(destination, source, group=self._require(), async_op=True)
+
+        def complete() -> tuple[torch.Tensor, ...]:
+            if work is not None:
+                _finish(work, source)
+            return tuple(destination[order.index(rank)] for rank in range(self.world_size))
+
+        return complete
+
+    def exchange_row_chunks(
+        self,
+        input: torch.Tensor,
+        workspace: torch.Tensor,
+        output: torch.Tensor,
+        chunk_rows: int,
+    ) -> Iterator[tuple[slice, tuple[torch.Tensor, ...]]]:
+        """Yield equal-count AlltoAll row intervals as their peer writes complete.
+
+        Input axes are logical destination, row, and payload features. Both
+        workspace buffers are consumed as scratch. Input storage stays live
+        independently of peer writes throughout staging and exchange. Each
+        yielded tuple orders source shards by logical membership. Consumers
+        must exhaust the iterator before either allocation is reused.
+        """
+
+        if input.ndim < 3 or input.shape[0] != self.world_size or chunk_rows < 1:
+            raise ValueError("chunked exchange requires a member axis and positive row chunks")
+        if (
+            not input.is_contiguous()
+            or not workspace.is_contiguous()
+            or workspace.numel() != input.numel()
+            or workspace.device != input.device
+            or workspace.dtype != input.dtype
+            or not output.is_contiguous()
+            or output.numel() != input.numel()
+            or output.device != input.device
+            or output.dtype != input.dtype
+            or len({input.data_ptr(), workspace.data_ptr(), output.data_ptr()}) != 3
+        ):
+            raise ValueError("chunked exchange requires distinct matching contiguous buffers")
+
+        def produce(interval: slice, destinations: tuple[torch.Tensor, ...]) -> None:
+            for rank, destination in enumerate(destinations):
+                destination.copy_(input[rank, interval])
+
+        return self.produce_row_chunks(input.shape, workspace, output, chunk_rows, produce)
+
+    def produce_row_chunks(
+        self,
+        shape: tuple[int, ...],
+        workspace: torch.Tensor,
+        output: torch.Tensor,
+        chunk_rows: int,
+        producer: RowChunkProducer,
+    ) -> Iterator[tuple[slice, tuple[torch.Tensor, ...]]]:
+        """Exchange row intervals as a stream-ordered producer publishes them.
+
+        Shape axes are logical destination, row, and payload. The producer
+        writes each supplied logical destination view on the current stream.
+        It must finish enqueuing its writes before returning. Transport owns
+        ordering and scratch layout, and starts each exchange immediately.
+        All production is enqueued before yielding to consumers, allowing its
+        temporary inputs to be released before consumer allocations begin.
+        Both distinct scratch buffers remain live until iterator exhaustion.
+        """
+
+        if len(shape) < 3 or shape[0] != self.world_size or min(shape) < 1 or chunk_rows < 1:
+            raise ValueError("row production requires a member axis and positive row chunks")
+        if (
+            not workspace.is_contiguous()
+            or not output.is_contiguous()
+            or workspace.numel() != prod(shape)
+            or output.numel() != prod(shape)
+            or workspace.device != output.device
+            or workspace.dtype != output.dtype
+            or workspace.data_ptr() == output.data_ptr()
+        ):
+            raise ValueError("row production requires distinct matching contiguous buffers")
+        rows = shape[1]
+        row_elements = prod(shape[2:])
+        source_flat, target_flat = workspace.view(-1), output.view(-1)
+        segments = []
+        for start in range(0, rows, chunk_rows):
+            count = min(chunk_rows, rows - start)
+            offset = start * self.world_size * row_elements
+            elements = count * self.world_size * row_elements
+            segment_shape = (self.world_size, count, *shape[2:])
+            source = source_flat.narrow(0, offset, elements).view(segment_shape)
+            target = target_flat.narrow(0, offset, elements).view(segment_shape)
+            interval = slice(start, start + count)
+            complete = self.produce_exchange(source, target, partial(producer, interval))
+            segments.append((interval, complete))
+
+        del producer
+        for interval, complete in segments:
+            yield interval, complete()
 
     def gather_into_tensor(
         self, output: torch.Tensor | None, input: torch.Tensor, *, dst: int

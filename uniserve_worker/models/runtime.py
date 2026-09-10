@@ -18,7 +18,7 @@ from ..execution.bounded_storage import BoundedTensorStorage, TensorSchema
 from ..execution.forward_batch import AttentionSelection, ForwardBatch, ForwardOutput
 from ..foundation.errors import invalid_descriptor
 from ..nn.diffusion.schedule import DiffusionSchedule
-from ..nn.mesh import Communicator
+from ..nn.mesh import Communicator, EntryBindings
 from ..nn.parallel_attention import AttentionContextGeometry, AttentionContextWorkspace
 from ..transfer.layout import TensorRegion
 
@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from ..runtime.cache_pool import CachePool
     from .generation import GenerationPipeline
     from .inputs import ImageProcessor
+    from .video import MediaExecutionPlan
 
 _FLOAT_DTYPES = frozenset({"float16", "bfloat16", "float32"})
 _KV_DTYPES = frozenset({*_FLOAT_DTYPES, "float8_e4m3fn"})
@@ -70,7 +71,7 @@ class PositionLayout(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class CacheGeometry:
-    """Defines local KV storage and its head interval in the logical model cache."""
+    """Defines local KV storage and its layer/head region in the logical cache."""
 
     num_layers: int
     num_attention_heads: int
@@ -80,6 +81,8 @@ class CacheGeometry:
     head_dim: int
     dtype: str
     store_dtype: str | None = None
+    total_layers: int | None = None
+    layer_offset: int = 0
 
     def __post_init__(self) -> None:
         """Validate physical dimensions, global head coverage, and numeric format."""
@@ -87,6 +90,10 @@ class CacheGeometry:
         for name in ("num_layers", "num_attention_heads", "num_kv_heads", "head_dim"):
             if int(getattr(self, name)) < 1:
                 raise invalid_descriptor(f"cache geometry {name} must be positive")
+        total_layers = self.num_layers if self.total_layers is None else self.total_layers
+        object.__setattr__(self, "total_layers", total_layers)
+        if self.layer_offset < 0 or self.layer_offset + self.num_layers > total_layers:
+            raise invalid_descriptor("cache layer interval exceeds logical model geometry")
         if self.kv_head_offset < 0 or self.kv_head_offset + self.num_kv_heads > self.total_kv_heads:
             raise invalid_descriptor("cache head interval exceeds logical model geometry")
         if self.dtype not in _FLOAT_DTYPES:
@@ -171,6 +178,8 @@ class ExecutionModel(nn.Module):
     # Result declarations contain numerical geometry only. Request identities,
     # allocation, physical locations and reader lifetimes belong to the runtime.
     entry_outputs: Mapping[str, tuple[TensorSpec, ...]] = MappingProxyType({})
+    bindings: EntryBindings | None = None
+    media_plan: MediaExecutionPlan | None = None
     supports_weight_updates: bool = True
     ordered_collective_execution: bool = False
     warmup_inputs: (

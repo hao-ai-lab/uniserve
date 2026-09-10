@@ -51,25 +51,27 @@ dev = [
 ]
 bench = [
     "datasets>=2.0",
-    "httpx>=0.27",
+    "httpx[socks]>=0.27",
     "pillow>=10.4",
 ]
 # Optional accelerator kernels. Model bindings require their declared native
 # capabilities at startup. UniServe kernels live in the independent
-# `uniserve-kernel` pack. H3 uses its SM100a sparse-attention
-# extensions plus cuDNN Frontend CuTe DSL; native builds require a CUDA 13 toolkit.
+# `uniserve-kernel` pack. Shared dense and sparse providers use CuTe DSL;
+# native builds require a CUDA 13 toolkit.
 gpu = [
-    "flashinfer-python",
-    "uniserve-kernel[peer_memory]",
+    "flashinfer-python==0.6.18",
+    "ninja>=1.13",
+    "requests[socks]>=2",
+    "uniserve-kernel[peer_memory,flash_attn_jagged]",
 ]
 h3 = [
     # H3 audio decoding and the default NVFP4/peer-transfer paths must work
     # when this extra is installed without the general GPU extra.
     "diffusers>=0.40",
-    "flashinfer-python",
-    "uniserve-kernel[peer_memory,sparse_attention]",
+    "flashinfer-python==0.6.18",
+    "uniserve-kernel[peer_memory,sparse_attention,flash_attn_jagged]",
     "nvidia-cudnn-frontend[cutedsl]==1.27.0",
-    "nvidia-cutlass-dsl[cu13]==4.6.1",
+    "nvidia-cutlass-dsl[cu13]==4.6.2",
 ]
 
 [tool.uv.sources]

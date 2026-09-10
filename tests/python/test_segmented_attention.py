@@ -27,12 +27,8 @@ def test_attention_state_merge_matches_reference_during_cuda_graph_replay() -> N
             first_output, first_lse, second_output, second_lse
         )
 
-    first_output.copy_(
-        torch.randn(shape, device=device, dtype=torch.float16, generator=generator)
-    )
-    second_output.copy_(
-        torch.randn(shape, device=device, dtype=torch.float16, generator=generator)
-    )
+    first_output.copy_(torch.randn(shape, device=device, dtype=torch.float16, generator=generator))
+    second_output.copy_(torch.randn(shape, device=device, dtype=torch.float16, generator=generator))
     first_lse.copy_(
         torch.randn(shape[:-1], device=device, dtype=torch.float32, generator=generator)
     )
@@ -130,21 +126,19 @@ def test_paged_prefix_dense_current_matches_concatenated_attention(causal: bool)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_flashinfer_segmented_attention_matches_concatenated_attention() -> None:
+@pytest.mark.parametrize("prefix_lens", [(2, 5), (0, 15)])
+def test_flashinfer_segmented_attention_matches_concatenated_attention(prefix_lens) -> None:
     flashinfer = pytest.importorskip("flashinfer")
     torch.manual_seed(11)
     device = torch.device("cuda")
     dtype = torch.float16
     page_size = 16
     query_lens = (1, 3)
-    prefix_lens = (2, 5)
     causal_rows = (True, False)
     query_heads = 4
     kv_heads = 2
     head_dim = 64
-    cache = torch.zeros(
-        (2, page_size, kv_heads, head_dim), device=device, dtype=dtype
-    )
+    cache = torch.zeros((2, page_size, kv_heads, head_dim), device=device, dtype=dtype)
     value_cache = torch.zeros_like(cache)
     dense_prefixes: list[tuple[torch.Tensor, torch.Tensor]] = []
     for row, prefix_len in enumerate(prefix_lens):
@@ -161,7 +155,14 @@ def test_flashinfer_segmented_attention_matches_concatenated_attention() -> None
     offsets = torch.tensor((0, query_lens[0], total_query), device=device, dtype=torch.int32)
     context = SimpleNamespace(
         query_lens_cpu=query_lens,
+        query_lens=torch.tensor(query_lens, device=device, dtype=torch.int32),
         seq_lens_cpu=prefix_lens,
+        kv_lens_cpu=tuple(prefix + current for prefix, current in zip(prefix_lens, query_lens)),
+        kv_lens=torch.tensor(
+            [prefix + current for prefix, current in zip(prefix_lens, query_lens)],
+            device=device,
+            dtype=torch.int32,
+        ),
         causal_rows_cpu=causal_rows,
         binding=17,
     )
@@ -177,16 +178,16 @@ def test_flashinfer_segmented_attention_matches_concatenated_attention() -> None
         page_table=torch.tensor(((0,), (1,)), device=device, dtype=torch.int32),
         prefix_lens=torch.tensor(prefix_lens, device=device, dtype=torch.int32),
         cu_seqlens_q=offsets,
-        visible_current_end=torch.tensor(
-            ((1, 0, 0), (3, 3, 3)), device=device, dtype=torch.int32
-        ),
+        visible_current_end=torch.tensor(((1, 0, 0), (3, 3, 3)), device=device, dtype=torch.int32),
         scale=head_dim**-0.5,
         fully_visible_current=False,
         context=context,
     )
 
     expected = []
-    for row, (begin, end) in enumerate(zip(offsets.tolist()[:-1], offsets.tolist()[1:], strict=True)):
+    for row, (begin, end) in enumerate(
+        zip(offsets.tolist()[:-1], offsets.tolist()[1:], strict=True)
+    ):
         prefix_key, prefix_value = dense_prefixes[row]
         expected.append(
             flashinfer.single_prefill_with_kv_cache(

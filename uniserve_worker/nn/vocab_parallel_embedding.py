@@ -8,6 +8,7 @@ zero synthetic rows so padded token ids cannot affect model results.
 from __future__ import annotations
 
 import math
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -15,16 +16,38 @@ import torch.nn.functional as F
 
 from .layer import LayerConfig
 from .linear import ColumnParallelLinear
+from .mesh import Communicator
+
+if TYPE_CHECKING:
+    from ..execution.forward_batch import VocabularyPartition
 
 __all__ = [
     "pad_vocab_size",
     "zero_vocab_padding",
     "VocabParallelEmbedding",
     "ParallelLMHead",
+    "vocabulary_partition",
 ]
 
 # Vocab is padded to a multiple of this for TP sharding / kernel alignment.
 _VOCAB_PAD_MULTIPLE = 64
+
+
+def vocabulary_partition(
+    vocab_size: int, group: Communicator, *, pad_to: int = _VOCAB_PAD_MULTIPLE
+) -> VocabularyPartition:
+    """Describe vocabulary ownership independently of the resident projection weights."""
+
+    from ..execution.forward_batch import VocabularyPartition
+
+    return VocabularyPartition(
+        vocab_size=vocab_size,
+        width=pad_vocab_size(vocab_size, pad_to=pad_to, tp_size=group.world_size)
+        // group.world_size,
+        rank=group.rank_in_group,
+        backend_order=tuple(group.ranks.index(rank) for rank in sorted(group.ranks)),
+        group_name=group.backend_name,
+    )
 
 
 def pad_vocab_size(vocab_size: int, *, pad_to: int = _VOCAB_PAD_MULTIPLE, tp_size: int = 1) -> int:
@@ -155,6 +178,7 @@ class ParallelLMHead(ColumnParallelLinear):
             tp_size=parallel.world_size,
         )
         self.gather_output = bool(gather_output)
+        self.pad_vocab_size_to = pad_vocab_size_to
         super().__init__(
             input_size,
             self.padded_vocab_size,
@@ -201,8 +225,18 @@ class ParallelLMHead(ColumnParallelLinear):
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
         """Project local vocabulary logits and optionally gather the unpadded vocabulary."""
 
-        local_logits = super().forward(x)
+        local_logits = self.forward_local(x)
         if not self.gather_output:
             return local_logits
         logits = self.tp_group.all_gather(local_logits, -1)
         return logits[..., : self.vocab_size]
+
+    def forward_local(self, x: torch.Tensor) -> torch.Tensor:
+        """Project this rank's padded vocabulary columns without communication."""
+
+        return super().forward(x)
+
+    def vocabulary_partition(self) -> VocabularyPartition:
+        """Describe local logits without transferring communicator ownership."""
+
+        return vocabulary_partition(self.vocab_size, self.tp_group, pad_to=self.pad_vocab_size_to)

@@ -71,8 +71,8 @@ def validate_h3_entries(bindings: EntryBindings) -> None:
         elif name == "text_encoder":
             if config.pipeline_parallel_size != 1 or config.sequence_parallel_size != 1:
                 raise ValueError("H3 text encoder supports direct tensor parallelism")
-            if any(width % config.tensor_parallel_size for width in (64, 8, 25600)):
-                raise ValueError("H3 encoder TP must divide query heads, KV heads, and MLP width")
+            if any(width % config.tensor_parallel_size for width in (64, 25600)):
+                raise ValueError("H3 encoder TP must divide query heads and MLP width")
         elif name == "denoiser":
             if config.pipeline_parallel_size > 50:
                 raise ValueError("H3 pipeline stages cannot exceed its 50 transformer layers")
@@ -91,8 +91,6 @@ def validate_h3_entries(bindings: EntryBindings) -> None:
                 raise ValueError(
                     "H3 TP × Ulysses must divide heads; TP must divide hidden and MLP widths"
                 )
-            if tensor not in (1, 2, 4) or config.sequence_parallel_size not in (1, 2, 4):
-                raise ValueError("H3 requires TP and sequence degrees in 1, 2, or 4")
 
 
 def require_h3_checkpoint(root: Path) -> None:

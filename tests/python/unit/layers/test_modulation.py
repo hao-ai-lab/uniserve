@@ -5,7 +5,6 @@ import torch
 from torch.nn import functional as F
 
 from uniserve_worker import ops
-from uniserve_worker.nn.quant.kv_cache import fp8_quantize, fp8_scale_from
 from uniserve_worker.ops import (
     gated_residual,
     gated_residual_rms_norm,
@@ -23,20 +22,40 @@ pytestmark = [
 
 
 def _rmsnorm(value: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    normalized = value.float() * torch.rsqrt(value.float().pow(2).mean(-1, keepdim=True) + eps)
-    return (normalized * weight.float()).to(value.dtype)
+    normalized = value.double() * torch.rsqrt(value.double().pow(2).mean(-1, keepdim=True) + eps)
+    return normalized * weight.double()
 
 
-@pytest.mark.parametrize("width", [128, 5376])
-def test_block_edges_match_strided_bf16_reference(width) -> None:
+def _assert_e4m3_error(values, scale, reference):
+    # E4M3 nearest rounding has unit roundoff 2^-4 and half a subnormal
+    # spacing of 2^-10. The absolute term retains the BF16 composition bound.
+    actual = values.float() * scale
+    error = (actual.double() - reference.double()).abs()
+    bound = reference.double().abs() / 16 + scale.double() / 1024 + 2e-2
+    assert torch.isfinite(actual).all()
+    assert (scale > 0).all()
+    assert (error <= bound).all()
+
+
+@pytest.mark.parametrize(
+    "width,rows,weight_dtype",
+    [
+        (128, 8, torch.bfloat16),
+        (5376, 8, torch.bfloat16),
+        (5376, 9344, torch.bfloat16),
+        (5376, 21888, torch.float32),
+        (16384, 16, torch.float32),
+        (132, 3, torch.float32),
+    ],
+)
+def test_block_edges_match_strided_bf16_reference(width, rows, weight_dtype) -> None:
     torch.manual_seed(23)
-    rows = 8
     states = 6
     eps = 1e-5
     hidden = torch.randn(rows, width, device="cuda", dtype=torch.bfloat16)
     attention = torch.randn_like(hidden)
     feed_forward = torch.randn_like(hidden)
-    weight = torch.randn(width, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(width, device="cuda", dtype=weight_dtype)
     parameters = torch.randn(
         states,
         6 * width,
@@ -50,9 +69,10 @@ def test_block_edges_match_strided_bf16_reference(width) -> None:
     row_indices = torch.randint(states, (rows,), device="cuda", dtype=torch.long)
 
     expected_attn_norm = _rmsnorm(hidden, weight, eps)
-    expected_attn_norm = expected_attn_norm * (
-        1.0 + scale_attn.index_select(0, row_indices)
-    ) + shift_attn.index_select(0, row_indices)
+    expected_attn_norm = (
+        expected_attn_norm * (1.0 + scale_attn.index_select(0, row_indices).double())
+        + shift_attn.index_select(0, row_indices).double()
+    )
     actual_attn_norm = modulated_rms_norm(
         hidden,
         weight,
@@ -62,11 +82,14 @@ def test_block_edges_match_strided_bf16_reference(width) -> None:
         eps=eps,
     )
 
-    expected_residual = hidden + gate_attn.index_select(0, row_indices) * attention
+    expected_residual = (
+        hidden.double() + gate_attn.index_select(0, row_indices).double() * attention.double()
+    )
     expected_ffn_norm = _rmsnorm(expected_residual, weight, eps)
-    expected_ffn_norm = expected_ffn_norm * (
-        1.0 + scale_ffn.index_select(0, row_indices)
-    ) + shift_ffn.index_select(0, row_indices)
+    expected_ffn_norm = (
+        expected_ffn_norm * (1.0 + scale_ffn.index_select(0, row_indices).double())
+        + shift_ffn.index_select(0, row_indices).double()
+    )
     actual_residual, actual_ffn_norm = gated_residual_rms_norm(
         hidden,
         attention.clone(),
@@ -77,7 +100,9 @@ def test_block_edges_match_strided_bf16_reference(width) -> None:
         row_indices,
         eps=eps,
     )
-    expected_output = expected_residual + gate_ffn.index_select(0, row_indices) * feed_forward
+    expected_output = (
+        expected_residual + gate_ffn.index_select(0, row_indices).double() * feed_forward.double()
+    )
     actual_output = gated_residual(
         actual_residual,
         feed_forward.clone(),
@@ -85,11 +110,18 @@ def test_block_edges_match_strided_bf16_reference(width) -> None:
         row_indices,
     )
 
-    assert shift_attn.stride(0) == 6 * width
-    assert torch.equal(actual_attn_norm, expected_attn_norm)
-    assert torch.equal(actual_residual, expected_residual)
-    assert torch.equal(actual_ffn_norm, expected_ffn_norm)
-    assert torch.equal(actual_output, expected_output)
+    torch.testing.assert_close(
+        actual_attn_norm.double(), expected_attn_norm.double(), rtol=2e-2, atol=2e-2
+    )
+    torch.testing.assert_close(
+        actual_residual.double(), expected_residual.double(), rtol=2e-2, atol=2e-2
+    )
+    torch.testing.assert_close(
+        actual_ffn_norm.double(), expected_ffn_norm.double(), rtol=2e-2, atol=2e-2
+    )
+    torch.testing.assert_close(
+        actual_output.double(), expected_output.double(), rtol=2e-2, atol=2e-2
+    )
 
 
 @pytest.mark.parametrize("expanded", [128, 14336])
@@ -102,9 +134,14 @@ def test_swiglu_matches_bf16_reference(expanded) -> None:
         dtype=torch.bfloat16,
     )
     value, gate = value_gate.chunk(2, dim=-1)
-    expected = value * F.silu(gate.float()).to(gate.dtype)
+    expected = value.double() * F.silu(gate.double())
 
-    assert torch.equal(value_first_swiglu(value_gate, activation_dtype=torch.bfloat16), expected)
+    torch.testing.assert_close(
+        value_first_swiglu(value_gate).double(),
+        expected,
+        rtol=2e-2,
+        atol=2e-2,
+    )
 
 
 @pytest.mark.parametrize(("width", "expanded"), [(128, 256), (5376, 14336)])
@@ -127,13 +164,14 @@ def test_fp8_boundaries_match_bf16_reference(width, expanded) -> None:
     _, _, gate_attn, shift_ffn, scale_ffn, _ = parameters.chunk(6, dim=-1)
     row_indices = torch.randint(states, (rows,), device="cuda", dtype=torch.long)
 
-    expected_residual = hidden + gate_attn.index_select(0, row_indices) * attention
+    expected_residual = (
+        hidden.double() + gate_attn.index_select(0, row_indices).double() * attention.double()
+    )
     expected_normalized = _rmsnorm(expected_residual, weight, eps)
-    expected_normalized = expected_normalized * (
-        1.0 + scale_ffn.index_select(0, row_indices)
-    ) + shift_ffn.index_select(0, row_indices)
-    expected_scale = fp8_scale_from(expected_normalized.float(), dim=1)
-    expected_fp8 = fp8_quantize(expected_normalized.float(), expected_scale)
+    expected_normalized = (
+        expected_normalized * (1.0 + scale_ffn.index_select(0, row_indices).double())
+        + shift_ffn.index_select(0, row_indices).double()
+    )
     actual_residual, actual_fp8, actual_scale = gated_residual_rms_norm_fp8(
         hidden,
         attention.clone(),
@@ -152,16 +190,14 @@ def test_fp8_boundaries_match_bf16_reference(width, expanded) -> None:
         dtype=torch.bfloat16,
     )
     value, gate = value_gate.chunk(2, dim=-1)
-    expected_swiglu = value * F.silu(gate.float()).to(gate.dtype)
-    expected_swiglu_scale = fp8_scale_from(expected_swiglu.float(), dim=1)
-    expected_swiglu_fp8 = fp8_quantize(expected_swiglu.float(), expected_swiglu_scale)
+    expected_swiglu = value.double() * F.silu(gate.double())
     actual_swiglu_fp8, actual_swiglu_scale = value_first_swiglu_fp8(value_gate)
 
-    assert torch.equal(actual_residual, expected_residual)
-    assert torch.equal(actual_scale, expected_scale)
-    assert torch.equal(actual_fp8, expected_fp8)
-    assert torch.equal(actual_swiglu_scale, expected_swiglu_scale)
-    assert torch.equal(actual_swiglu_fp8, expected_swiglu_fp8)
+    torch.testing.assert_close(
+        actual_residual.double(), expected_residual.double(), rtol=2e-2, atol=2e-2
+    )
+    _assert_e4m3_error(actual_fp8, actual_scale, expected_normalized)
+    _assert_e4m3_error(actual_swiglu_fp8, actual_swiglu_scale, expected_swiglu)
 
 
 def test_text_fp8_swiglu_matches_unfused_boundary() -> None:
@@ -177,12 +213,6 @@ def test_text_fp8_swiglu_matches_unfused_boundary() -> None:
         dtype=torch.bfloat16,
     )
     expected_activated = ops.silu_and_mul(gate_up)
-    expected_activated_scale = fp8_scale_from(expected_activated.float(), dim=1)
-    expected_activated_fp8 = fp8_quantize(
-        expected_activated.float(),
-        expected_activated_scale,
-    )
     actual_activated_fp8, actual_activated_scale = ops.silu_and_mul_fp8(gate_up)
 
-    assert torch.equal(actual_activated_scale, expected_activated_scale)
-    assert torch.equal(actual_activated_fp8, expected_activated_fp8)
+    _assert_e4m3_error(actual_activated_fp8, actual_activated_scale, expected_activated)

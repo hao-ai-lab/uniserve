@@ -17,8 +17,8 @@ from ...execution.forward_batch import (
     ForwardBatch,
     ForwardOutput,
     RouteSpan,
-    TokenSelection,
 )
+from ...loader.component import construct_owned_module
 from ...loader.mapping import WeightNameMap
 from ...nn.attention import RadixAttention
 from ...nn.diffusion import (
@@ -29,7 +29,7 @@ from ...nn.diffusion import (
     TimestepEmbedder,
 )
 from ...nn.diffusion.cfg import CfgRecipe
-from ...nn.expert_routing import RoutedTensor
+from ...nn.expert_routing import RoutedTensor, slice_route_spans
 from ...nn.layer import LayerConfig
 from ...nn.linear import (
     LinearBase,
@@ -39,12 +39,27 @@ from ...nn.linear import (
     local_kv_head_count,
     local_kv_head_offset,
 )
+from ...nn.logits import project_outputs
 from ...nn.mlp import GatedMLP
 from ...nn.norm import RMSNorm
+from ...nn.parallel_pipeline import LayerPipeline
+from ...nn.parallel_sequence import SequencePartition
 from ...nn.rope import HFRotaryEmbedding, RotaryEmbedding, get_rope, qk_norm_rope
+from ...nn.row_pipeline import (
+    RowStage,
+    RowTensors,
+    RowTensorSegments,
+    independent_linear_rows,
+    packed_row_stage,
+    run_row_pipeline,
+)
 from ...nn.shard import WeightMode
 from ...nn.vision import NeoVitConfig, NeoVitEncoder
-from ...nn.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
+from ...nn.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+    vocabulary_partition,
+)
 from ..generation import (
     BranchSource,
     FlowPrompt,
@@ -126,12 +141,38 @@ class _RoutedRope:
     text: _PackedRope | None
     flow: _PackedRope | None
 
+    def narrow(self, interval: slice, spans: tuple[RouteSpan, ...]) -> _RoutedRope:
+        """Retain the temporal/spatial factors for one packed numerical interval."""
 
-def _route_rope(rope: _PackedRope, spans: tuple[RouteSpan, ...]) -> _RoutedRope:
+        def select(attribute: str) -> tuple[RoutedTensor, ...]:
+            return tuple(
+                RoutedTensor(
+                    None if self.text is None else getattr(self.text, attribute)[axis],
+                    None if self.flow is None else getattr(self.flow, attribute)[axis],
+                ).narrow(interval, spans)
+                for axis in range(3)
+            )
+
+        cos, sin = select("cos"), select("sin")
+
+        def expert(route: str) -> _PackedRope:
+            cos_t, cos_h, cos_w = (getattr(item, route) for item in cos)
+            sin_t, sin_h, sin_w = (getattr(item, route) for item in sin)
+            return _PackedRope((cos_t, cos_h, cos_w), (sin_t, sin_h, sin_w))
+
+        return _RoutedRope(
+            None if self.text is None else expert("text"),
+            None if self.flow is None else expert("flow"),
+        )
+
+
+def _route_rope(
+    rope: _PackedRope, spans: tuple[RouteSpan, ...], routes: frozenset[ExpertRoute] = frozenset()
+) -> _RoutedRope:
     """Split packed rotary tables into independent text and flow route tables."""
 
-    cosine = tuple(RoutedTensor.from_packed(value, spans) for value in rope.cos)
-    sine = tuple(RoutedTensor.from_packed(value, spans) for value in rope.sin)
+    cosine = tuple(RoutedTensor.from_packed(value, spans, routes=routes) for value in rope.cos)
+    sine = tuple(RoutedTensor.from_packed(value, spans, routes=routes) for value in rope.sin)
     text = (
         None
         if cosine[0].text is None
@@ -249,6 +290,7 @@ class _SenseAttention(nn.Module):
             self.num_kv_heads,
             self.head_dim,
             layer_id=layer,
+            sequence=layer_config.sequence,
         )
         self.o_proj = RowParallelLinear(
             query_width, hidden_size, layer_config=layer_config, prefix="o_proj", bias=bias
@@ -352,16 +394,15 @@ class _SenseAttention(nn.Module):
             tensor_to_device(value, target),
         )
 
-    def forward(
+    def project_rows(
         self,
         hidden: RoutedTensor,
         *,
         context: ForwardBatch,
         spans: tuple[RouteSpan, ...],
         rope: _RoutedRope,
-        causal: bool,
-    ) -> RoutedTensor:
-        """Project routed Q/K/V, attend across declared spans, and restore branch shards."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Prepare routed normalized QKV without consuming global attention."""
 
         text_projection = (
             None
@@ -385,17 +426,7 @@ class _SenseAttention(nn.Module):
             None if text_projection is None else text_projection[2],
             None if flow_projection is None else flow_projection[2],
         ).packed(spans)
-        attended = self.attention(
-            query,
-            key,
-            value,
-            context,
-            causal=causal,
-            scale=self.scaling,
-        ).reshape(query.shape[0], -1)
-        return RoutedTensor.from_packed(attended, spans).apply(
-            text=self.o_proj, flow=self.o_proj_mot_gen, generation_device=self.generation_device
-        )
+        return query, key, value
 
 
 class _SenseLayer(nn.Module):
@@ -440,40 +471,70 @@ class _SenseLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(hidden, eps=epsilon)
         self.post_attention_layernorm_mot_gen = RMSNorm(hidden, eps=epsilon)
 
-    def forward(
+    def row_stage(
         self,
-        hidden: RoutedTensor,
         *,
         context: ForwardBatch,
         spans: tuple[RouteSpan, ...],
+        routes: frozenset[ExpertRoute],
         rope: _RoutedRope,
         causal: bool,
-    ) -> RoutedTensor:
-        """Advance text and flow branches through one normalized attention-plus-MLP layer."""
+        partition: SequencePartition,
+    ) -> RowStage[RowTensorSegments]:
+        """Declare routed input and output equations around shared row transport."""
 
-        normalized = hidden.apply(
-            text=self.input_layernorm,
-            flow=self.input_layernorm_mot_gen,
-            generation_device=self.generation_device,
+        independent_output = independent_linear_rows(
+            self.self_attn.o_proj, self.self_attn.o_proj_mot_gen, self.mlp, self.mlp_mot_gen
         )
-        hidden = hidden.add(
-            self.self_attn(
-                normalized,
-                context=context,
-                spans=spans,
-                rope=rope,
-                causal=causal,
+
+        def project(interval: slice, values: RowTensors) -> RowTensors:
+            local_spans = slice_route_spans(spans, interval)
+            hidden = RoutedTensor.from_packed(values[0], local_spans, routes=routes)
+            normalized = hidden.apply(
+                text=self.input_layernorm,
+                flow=self.input_layernorm_mot_gen,
+                generation_device=self.generation_device,
             )
+            projected = self.self_attn.project_rows(
+                normalized, context=context, spans=local_spans, rope=rope.narrow(interval, spans)
+            )
+            return (*projected, values[0])
+
+        def finish(interval: slice, attended: torch.Tensor, state: RowTensors) -> RowTensors:
+            local_spans = slice_route_spans(spans, interval)
+            hidden = RoutedTensor.from_packed(state[0], local_spans, routes=routes)
+            attended = attended.reshape(
+                attended.shape[0], self.self_attn.num_heads * self.self_attn.head_dim
+            )
+            projected = RoutedTensor.from_packed(attended, local_spans, routes=routes).apply(
+                text=self.self_attn.o_proj,
+                flow=self.self_attn.o_proj_mot_gen,
+                generation_device=self.generation_device,
+            )
+            hidden = hidden.add(projected)
+            normalized = hidden.apply(
+                text=self.post_attention_layernorm,
+                flow=self.post_attention_layernorm_mot_gen,
+                generation_device=self.generation_device,
+            )
+            feed_forward = normalized.apply(
+                text=self.mlp, flow=self.mlp_mot_gen, generation_device=self.generation_device
+            )
+            return (hidden.add(feed_forward).packed(local_spans),)
+
+        return packed_row_stage(
+            project,
+            self.self_attn.attention,
+            finish,
+            context=context,
+            partition=partition,
+            causal=causal,
+            scale=self.self_attn.scaling,
+            independent_input=independent_linear_rows(
+                self.self_attn.qkv_proj, self.self_attn.qkv_proj_mot_gen
+            ),
+            independent_output=independent_output,
         )
-        normalized = hidden.apply(
-            text=self.post_attention_layernorm,
-            flow=self.post_attention_layernorm_mot_gen,
-            generation_device=self.generation_device,
-        )
-        feed_forward = normalized.apply(
-            text=self.mlp, flow=self.mlp_mot_gen, generation_device=self.generation_device
-        )
-        return hidden.add(feed_forward)
 
 
 class _SenseDecoder(nn.Module):
@@ -491,38 +552,70 @@ class _SenseDecoder(nn.Module):
         super().__init__()
         self.generation_device = generation_device
         hidden = int(getattr(config, "hidden_size"))
-        self.embed_tokens = VocabParallelEmbedding(
-            int(getattr(config, "vocab_size")),
-            hidden,
-            int(getattr(config, "pad_token_id")),
-            layer_config=layer_config,
-            init_weights=False,
-        )
-        self.layers = nn.ModuleList(
-            _SenseLayer(
-                config,
-                index,
-                layer_config=layer_config.child(f"layers.{index}"),
-                generation_device=generation_device,
+        self.hidden_size = hidden
+        self.pipeline = LayerPipeline(layer_config.pipeline, int(config.num_hidden_layers))
+        self.sequence = layer_config.sequence
+        self.embed_tokens = (
+            VocabParallelEmbedding(
+                int(getattr(config, "vocab_size")),
+                hidden,
+                int(getattr(config, "pad_token_id")),
+                layer_config=layer_config,
+                init_weights=False,
             )
-            for index in range(int(getattr(config, "num_hidden_layers")))
+            if self.pipeline.first
+            else None
+        )
+        self.layers = nn.ModuleDict(
+            {
+                str(index): _SenseLayer(
+                    config,
+                    index - self.pipeline.layers.start,
+                    layer_config=layer_config.child(f"layers.{index}"),
+                    generation_device=generation_device,
+                )
+                for index in self.pipeline.layers
+            }
         )
         epsilon = float(getattr(config, "rms_norm_eps"))
-        self.norm = RMSNorm(hidden, eps=epsilon)
-        self.norm_mot_gen = RMSNorm(hidden, eps=epsilon)
+        self.norm = RMSNorm(hidden, eps=epsilon) if self.pipeline.last else None
+        self.norm_mot_gen = RMSNorm(hidden, eps=epsilon) if self.pipeline.last else None
+        parameters = tuple(dict(next(iter(self.layers.values())).named_parameters()))
+        nonresident = self.pipeline.nonresident_layer_names("layers", parameters)
+        if not self.pipeline.first:
+            nonresident |= {"embed_tokens.weight"}
+        if not self.pipeline.last:
+            nonresident |= {"norm.weight", "norm_mot_gen.weight"}
+        self.nonresident_parameters = nonresident
 
     def forward(
         self,
-        inputs: torch.Tensor,
+        inputs: torch.Tensor | None,
         context: ForwardBatch,
         *,
         positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Decode packed routed rows and return final-normalized states in input order."""
 
-        if inputs.ndim != 2:
-            raise ValueError("SenseNova decoder inputs must have shape [tokens, hidden]")
-        token_count = int(inputs.shape[0])
+        first = cast(_SenseLayer, next(iter(self.layers.values())))
+        if inputs is not None:
+            token_count = int(inputs.shape[0])
+        elif context.forward_mode is AttentionMode.PACKED and context.attention_indexes is not None:
+            token_count = int(context.attention_indexes.shape[1])
+        elif context.forward_mode is AttentionMode.PAGED_DECODE and positions is not None:
+            token_count = positions.numel()
+        else:
+            raise ValueError("pipeline input requires packed or decode row geometry")
+        partition = SequencePartition(token_count, self.sequence)
+        if inputs is None:
+            if self.pipeline.first:
+                raise ValueError("the first decoder stage requires input embeddings")
+            inputs = first.input_layernorm.weight.new_empty((partition.count, self.hidden_size))
+        else:
+            if inputs.ndim != 2:
+                raise ValueError("SenseNova decoder inputs must have shape [tokens, hidden]")
+            inputs = partition.local(inputs)
+        self.pipeline.receive_activation(inputs)
         spans: tuple[RouteSpan, ...]
         indexes: torch.Tensor
         causal: bool
@@ -549,24 +642,33 @@ class _SenseDecoder(nn.Module):
             causal = True
         else:
             raise ValueError("SenseNova decoder requires packed attention or paged decode")
-        if not self.layers:
-            raise ValueError("SenseNova decoder requires at least one layer")
-
-        first = cast(_SenseLayer, self.layers[0])
-        rope = _route_rope(first.self_attn.rope(indexes), spans)
-        hidden = RoutedTensor.from_packed(inputs, spans)
-        for layer_module in self.layers:
-            layer = cast(_SenseLayer, layer_module)
-            hidden = layer(
-                hidden,
-                context=context,
-                spans=spans,
-                rope=rope,
-                causal=causal,
-            )
-        return hidden.apply(
-            text=self.norm, flow=self.norm_mot_gen, generation_device=self.generation_device
-        ).packed(spans)
+        routes = frozenset(span.route for span in spans)
+        spans = partition.routes(spans)
+        rope = _route_rope(first.self_attn.rope(partition.local(indexes, axis=1)), spans, routes)
+        (packed,) = run_row_pipeline(
+            RowTensorSegments.complete((inputs,)),
+            tuple(
+                cast(_SenseLayer, layer).row_stage(
+                    context=context,
+                    spans=spans,
+                    routes=routes,
+                    rope=rope,
+                    causal=causal,
+                    partition=partition,
+                )
+                for layer in self.layers.values()
+            ),
+        ).materialize()
+        if not self.pipeline.last:
+            self.pipeline.send_activation(packed)
+            return packed
+        hidden = RoutedTensor.from_packed(packed, spans, routes=routes)
+        assert self.norm is not None and self.norm_mot_gen is not None
+        return partition.gather(
+            hidden.apply(
+                text=self.norm, flow=self.norm_mot_gen, generation_device=self.generation_device
+            ).packed(spans)
+        )
 
 
 class _LanguageModel(nn.Module):
@@ -586,13 +688,22 @@ class _LanguageModel(nn.Module):
         self.model = _SenseDecoder(
             config, layer_config=layer_config.child("model"), generation_device=generation_device
         )
-        self.lm_head = ParallelLMHead(
-            int(getattr(config, "hidden_size")),
-            int(getattr(config, "vocab_size")),
-            layer_config=layer_config,
-            prefix="lm_head",
-            bias=False,
+        self.lm_head = (
+            ParallelLMHead(
+                int(getattr(config, "hidden_size")),
+                int(getattr(config, "vocab_size")),
+                layer_config=layer_config,
+                prefix="lm_head",
+                bias=False,
+            )
+            if self.model.pipeline.last
+            else None
         )
+        self.nonresident_parameters = frozenset(
+            f"model.{name}" for name in self.model.nonresident_parameters
+        )
+        if not self.model.pipeline.last:
+            self.nonresident_parameters |= {"lm_head.weight"}
 
 
 class NEOChatModel(ExecutionModel):
@@ -638,6 +749,7 @@ class NEOChatModel(ExecutionModel):
             CheckpointComponent(
                 self,
                 weight_name_map=_STACKED_WEIGHTS,
+                nonresident=self.nonresident_parameters,
                 module_devices=(
                     ()
                     if self.generation_device is None
@@ -670,25 +782,42 @@ class NEOChatModel(ExecutionModel):
             layer_config=layer_config.child("language_model"),
             generation_device=generation_device,
         )
-        self.fm_modules = nn.ModuleDict(
-            {
-                "vision_model_mot_gen": _VisionModel(vision),
-                "timestep_embedder": TimestepEmbedder(hidden),
-                "fm_head": self._flow_head(
-                    config, hidden, layer_config.child("fm_modules.fm_head")
-                ),
-            }
+        self.nonresident_parameters = frozenset(
+            f"language_model.{name}" for name in self.language_model.nonresident_parameters
         )
         self._patch_size = int(vision.patch_size)
         self._downsample_ratio = float(config.downsample_ratio)
         self._use_deep_head = bool(getattr(config, "fm_head_layers", 2) > 2)
         self._use_pixel_head = bool(getattr(config, "use_pixel_head", False))
-        if self._use_pixel_head:
-            self.fm_modules["fm_head"] = ConvDecoder(hidden)
         self._add_noise_embedding = bool(getattr(config, "add_noise_scale_embedding", False))
         self._noise_scale_max = float(getattr(config, "noise_scale_max_value", 1.0))
+        pipeline = self.language_model.model.pipeline
+        declarations = [
+            ("vision_model_mot_gen", pipeline.first, lambda: _VisionModel(vision)),
+            ("timestep_embedder", pipeline.first, lambda: TimestepEmbedder(hidden)),
+            (
+                "fm_head",
+                pipeline.last,
+                lambda: (
+                    ConvDecoder(hidden)
+                    if self._use_pixel_head
+                    else self._flow_head(config, hidden, layer_config.child("fm_modules.fm_head"))
+                ),
+            ),
+        ]
         if self._add_noise_embedding:
-            self.fm_modules["noise_scale_embedder"] = TimestepEmbedder(hidden)
+            declarations.append(
+                ("noise_scale_embedder", pipeline.first, lambda: TimestepEmbedder(hidden))
+            )
+        modules = {}
+        for name, resident, factory in declarations:
+            module, nonresident = construct_owned_module(factory, resident=resident)
+            if module is not None:
+                modules[name] = module
+            self.nonresident_parameters |= {
+                f"fm_modules.{name}.{parameter}" for parameter in nonresident
+            }
+        self.fm_modules = nn.ModuleDict(modules)
         self._configure_runtime(config)
 
     @staticmethod
@@ -789,14 +918,24 @@ class NEOChatModel(ExecutionModel):
         # Attention pages store rank-local heads while token and latent bounds
         # remain global scheduler-visible quantities.
         self.cache_geometry = CacheGeometry(
-            num_layers=int(llm.num_hidden_layers),
+            num_layers=len(self.language_model.model.pipeline.layers),
+            total_layers=int(llm.num_hidden_layers),
+            layer_offset=self.language_model.model.pipeline.layers.start,
             num_attention_heads=local_attention_head_count(
-                int(llm.num_attention_heads), parallel=self._parallel
+                int(llm.num_attention_heads),
+                parallel=self._parallel,
+                sequence=self.language_model.model.sequence,
             ),
-            num_kv_heads=local_kv_head_count(int(llm.num_key_value_heads), parallel=self._parallel),
+            num_kv_heads=local_kv_head_count(
+                int(llm.num_key_value_heads),
+                parallel=self._parallel,
+                sequence=self.language_model.model.sequence,
+            ),
             total_kv_heads=int(llm.num_key_value_heads),
             kv_head_offset=local_kv_head_offset(
-                int(llm.num_key_value_heads), parallel=self._parallel
+                int(llm.num_key_value_heads),
+                parallel=self._parallel,
+                sequence=self.language_model.model.sequence,
             ),
             head_dim=int(llm.head_dim),
             dtype="bfloat16",
@@ -922,6 +1061,9 @@ class NEOChatModel(ExecutionModel):
             if batch.flow_row_indices:
                 raise TypeError("SenseNova paged decode accepts token rows only")
             decode_positions = positions
+        if not self.language_model.model.pipeline.first:
+            return self.language_model.model(None, batch, positions=decode_positions)
+        assert self.language_model.model.embed_tokens is not None
         token_embeds = self.language_model.model.embed_tokens(input_ids.reshape(-1))
         if batch.input_embeddings is not None:
             if batch.embedding_mask is None:
@@ -958,77 +1100,17 @@ class NEOChatModel(ExecutionModel):
         )
 
     def project(self, hidden: torch.Tensor, batch: ForwardBatch) -> ForwardOutput:
-        """Project packed text rows to requested logits and flow rows to latent velocity."""
+        """Project text through the shared head and preserve flow prediction math."""
 
-        # Reconstruct scheduler row boundaries from modality-specific length metadata.
-        row_lengths = [0] * batch.row_count
-        for row_index, count in zip(
-            batch.token_row_indices,
-            tuple(batch.query_lens_cpu[index] for index in batch.token_row_indices),
-            strict=True,
-        ):
-            row_lengths[row_index] = count
-        for row_index, count in zip(batch.flow_row_indices, batch.flow_image_tokens, strict=True):
-            row_lengths[row_index] = count
-        rows: list[torch.Tensor] = []
-        offset = 0
-        for count in row_lengths:
-            rows.append(hidden[offset : offset + count])
-            offset += count
-        row_hidden = tuple(rows)
-        selection_by_row = dict(zip(batch.token_row_indices, batch.token_selections, strict=True))
-        # Text rows share one vocabulary projection; flow rows bypass it entirely.
-        projected_rows = tuple(
-            index
-            for index, selection in selection_by_row.items()
-            if selection is not TokenSelection.HIDDEN
+        return project_outputs(
+            hidden,
+            batch,
+            self.language_model.lm_head,
+            project_flow=lambda rows, index: self._velocity(rows, index, batch),
+            pipeline=self.language_model.model.pipeline,
+            vocabulary=vocabulary_partition(self.vocab_size, self._parallel),
+            flow_dtype=torch.float32,
         )
-        projected: torch.Tensor | None = None
-        if projected_rows:
-            if (
-                len(projected_rows) == batch.row_count
-                and all(
-                    selection is TokenSelection.LAST_LOGITS
-                    for selection in selection_by_row.values()
-                )
-                and all(int(value.shape[0]) == 1 for value in row_hidden)
-            ):
-                selected = hidden
-            else:
-                selected_rows = tuple(
-                    row_hidden[index]
-                    if selection_by_row[index] is TokenSelection.ALL_LOGITS
-                    else row_hidden[index][-1:]
-                    for index in projected_rows
-                )
-                selected = (
-                    selected_rows[0] if len(selected_rows) == 1 else torch.cat(selected_rows, dim=0)
-                )
-            projected = self.language_model.lm_head(selected)
-
-        # Reassemble heterogeneous outputs in the scheduler's original row order.
-        outputs: list[torch.Tensor] = []
-        projected_offset = 0
-        flow_by_row = {row_index: index for index, row_index in enumerate(batch.flow_row_indices)}
-        for index in range(batch.row_count):
-            value_hidden = row_hidden[index]
-            selection = selection_by_row.get(index)
-            if selection is not None:
-                if selection is TokenSelection.HIDDEN:
-                    value = value_hidden
-                else:
-                    if projected is None:
-                        raise RuntimeError("SenseNova projected output buffer is missing")
-                    count = (
-                        int(value_hidden.shape[0]) if selection is TokenSelection.ALL_LOGITS else 1
-                    )
-                    value = projected[projected_offset : projected_offset + count]
-                    projected_offset += count
-                outputs.append(value)
-            else:
-                flow_index = flow_by_row[index]
-                outputs.append(self._velocity(value_hidden, flow_index, batch))
-        return ForwardOutput(tuple(outputs))
 
     def _velocity(
         self,

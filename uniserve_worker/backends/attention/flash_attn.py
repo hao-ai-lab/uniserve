@@ -39,6 +39,7 @@ class FlashAttentionBackend(AttentionBackend):
     paged_varlen = _flash_attn_varlen_func is not None
     page_size_multiple = 256
     cuda_only = True
+    dense_dtypes = frozenset({torch.float16, torch.bfloat16})
     dense_ranks = frozenset({4})
 
     def supports(self, mode: AttentionMode, *, cuda_graph: bool = False) -> bool:

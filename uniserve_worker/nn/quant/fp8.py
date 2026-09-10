@@ -55,19 +55,6 @@ if triton is not None:
     _FP8_SCALE_EPS_TL = tl.constexpr(1.0e-12)
 
     @triton.jit
-    def _divide_rn(dividend, divisor):
-        """Divide FP32 operands with explicit nearest-even PTX semantics."""
-
-        return tl.inline_asm_elementwise(
-            asm="div.rn.f32 $0, $1, $2;",
-            constraints="=f,f,f",
-            args=[dividend, divisor],
-            dtype=tl.float32,
-            is_pure=True,
-            pack=1,
-        )
-
-    @triton.jit
     def _rowwise_fp8_quant_kernel(
         input_ptr,
         output_ptr,
@@ -89,7 +76,7 @@ if triton is not None:
         maximum = tl.maximum(tl.max(tl.abs(values), axis=0), _FP8_SCALE_EPS_TL)
         scale = maximum / _FP8_MAX_TL
         quantized = tl.maximum(
-            tl.minimum(_divide_rn(values, scale), _FP8_MAX_TL),
+            tl.minimum(values / scale, _FP8_MAX_TL),
             -_FP8_MAX_TL,
         )
         tl.store(output_ptr + row * width + columns, quantized, mask=mask)

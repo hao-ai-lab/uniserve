@@ -3,23 +3,25 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import Callable
+from dataclasses import dataclass, field
 
 import torch
 
 from ...nn.parallel_attention import (
     AttentionContextWorkspace,
     AttentionOutputTargets,
+    AttentionRowExchange,
     ParallelAttention,
 )
 from ...ops import video_sparse as video_sparse_ops
-from . import video_sparse_sm100
+from ...ops.video_sparse_rows import SparseAttentionPattern, pack_sparse_input_rows
+from .video_sparse_provider import resolve_sparse_provider
 
 __all__ = [
     "VideoSparseAttentionBackend",
     "VideoSparseAttentionMetadata",
     "VideoSparseAttentionWorkspace",
+    "PreparedVideoSparseInputs",
     "build_video_sparse_metadata",
     "video_sparse_selected_tiles",
 ]
@@ -44,6 +46,24 @@ class VideoSparseAttentionMetadata:
     valid_tiles: int
     valid_sizes: torch.Tensor
 
+    def pattern(self, query_tiles: int, query_tile_offset: int = 0) -> SparseAttentionPattern:
+        """Declare checkpoint selection cardinalities independently of its provider."""
+
+        selected = video_sparse_selected_tiles(self.video_tiles)
+        counts = tuple(
+            self.valid_tiles
+            if tile < self.prefix_tiles
+            else self.prefix_tiles + selected
+            if tile < self.valid_tiles
+            else 1
+            for tile in range(query_tile_offset, query_tile_offset + query_tiles)
+        )
+        return SparseAttentionPattern(
+            (counts,),
+            dense_prefix_tiles=max(0, min(query_tiles, self.prefix_tiles - query_tile_offset)),
+            dense_key_tiles=self.valid_tiles,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class VideoSparseAttentionWorkspace:
@@ -60,6 +80,69 @@ class VideoSparseAttentionWorkspace:
     topk_indices_i32: torch.Tensor
 
 
+@dataclass(slots=True)
+class PreparedVideoSparseInputs:
+    """Input layout and pooled tiles populated by disjoint projected row intervals.
+
+    Producers publish every global row once on the attention consumer stream.
+    Pooled storage is borrowed and must remain live through sparse selection;
+    the packed input allocation remains owned through fine-query production.
+    """
+
+    shape: tuple[int, int, int]
+    dtype: torch.dtype
+    valid_sizes: torch.Tensor
+    owners: int
+    chunk_rows: int
+    pooled_query: torch.Tensor
+    pooled_key: torch.Tensor
+    pooled_value: torch.Tensor
+    row_major: bool
+    packed: torch.Tensor | None = field(default=None, init=False)
+
+    def append(
+        self, interval: slice, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+    ) -> None:
+        """Pool normalized tile-aligned rows and write their provider input layout."""
+
+        start, end = interval.start, interval.stop
+        if (
+            start < 0
+            or start % TILE
+            or end % TILE
+            or end - start != query.shape[0]
+            or end > self.shape[0]
+        ):
+            raise ValueError("prepared sparse rows require complete in-range tiles")
+        if self.packed is None:
+            rows, heads, width = self.shape
+            packed_shape = (3, rows, heads, width) if self.row_major else (3, heads, rows, width)
+            self.packed = torch.empty(packed_shape, dtype=self.dtype, device=query.device)
+        tiles = slice(start // TILE, end // TILE)
+        video_sparse_ops.pool_qkv_means(
+            query,
+            key,
+            value,
+            self.valid_sizes,
+            self.pooled_query[tiles],
+            self.pooled_key[tiles],
+            self.pooled_value[tiles],
+            query_tile_offset=start // TILE,
+            key_tile_offset=start // TILE,
+        )
+        pack_sparse_input_rows(
+            query,
+            key,
+            value,
+            self.valid_sizes,
+            owners=self.owners,
+            chunk_rows=self.chunk_rows,
+            packed=self.packed,
+            row_start=start,
+            row_major=self.row_major,
+        )
+
+
 def build_video_sparse_metadata(
     *,
     padded_rows: int,
@@ -71,12 +154,12 @@ def build_video_sparse_metadata(
     """Validate tile geometry and move per-tile valid-row counts onto the execution device."""
 
     if padded_rows % (TILE * 2):
-        raise ValueError("H3 VSA transport requires an even tile-64 count")
+        raise ValueError("video sparse attention transport requires an even tile-64 count")
     total_tiles = padded_rows // TILE
     if valid_sizes.shape != (total_tiles,):
-        raise ValueError("H3 VSA tile-valid metadata does not match padded rows")
+        raise ValueError("video sparse attention tile-valid metadata does not match padded rows")
     if prefix_tiles + video_tiles > total_tiles:
-        raise ValueError("H3 VSA segment tile counts exceed transport geometry")
+        raise ValueError("video sparse attention segment tile counts exceed transport geometry")
     valid = valid_sizes.to(device=device, dtype=torch.int32)
     expected = torch.cat(
         (
@@ -85,7 +168,9 @@ def build_video_sparse_metadata(
         )
     ).to(device)
     if not bool(torch.equal(valid > 0, expected)):
-        raise ValueError("H3 VSA valid sizes do not describe prefix/video/partner tiles")
+        raise ValueError(
+            "video sparse attention valid sizes do not describe prefix/video/partner tiles"
+        )
     return VideoSparseAttentionMetadata(
         padded_rows=padded_rows,
         prefix_tiles=prefix_tiles,
@@ -95,24 +180,60 @@ def build_video_sparse_metadata(
     )
 
 
-def _resolve_kernel() -> Callable[..., torch.Tensor]:
-    """Resolve the FastH3 SM100a operation once at startup."""
-
-    if not video_sparse_sm100.available():
-        raise RuntimeError(
-            "FastH3 requires the SM100a H3 VSA kernel"
-        ) from video_sparse_sm100.import_error()
-    return video_sparse_sm100.block_sparse_attention
-
-
 class VideoSparseAttentionBackend:
     """Checkpoint VSA: sparse top-k attention plus trained dense compression."""
 
     def __init__(self, metadata: VideoSparseAttentionMetadata) -> None:
-        """Bind immutable tile metadata and resolve the required SM100 sparse kernel."""
+        """Bind immutable tile metadata and resolve the sparse attention kernel."""
 
         self.metadata = metadata
-        self.kernel = _resolve_kernel()
+        self.provider = resolve_sparse_provider(metadata.valid_sizes.device)
+        self._patterns: dict[tuple[int, int], SparseAttentionPattern] = {}
+
+    def _pattern_for(self, query_tiles: int, query_tile_offset: int = 0) -> SparseAttentionPattern:
+        """Reuse immutable selection metadata across layers and graph captures."""
+
+        key = (query_tiles, query_tile_offset)
+        pattern = self._patterns.get(key)
+        if pattern is None:
+            pattern = self.metadata.pattern(query_tiles, query_tile_offset)
+            self._patterns[key] = pattern
+        return pattern
+
+    def prepare_input_rows(
+        self,
+        shape: tuple[int, int, int],
+        valid_sizes: torch.Tensor,
+        *,
+        dtype: torch.dtype,
+        owners: int,
+        chunk_rows: int,
+        pooled_query: torch.Tensor,
+        pooled_key: torch.Tensor,
+        pooled_value: torch.Tensor,
+    ) -> PreparedVideoSparseInputs:
+        """Bind an input layout whose storage is allocated at first row publication."""
+
+        rows, heads, width = shape
+        if (
+            rows != valid_sizes.numel() * TILE
+            or owners < 1
+            or rows % (owners * TILE)
+            or chunk_rows < TILE
+            or chunk_rows % TILE
+        ):
+            raise ValueError("prepared sparse inputs require a tile-aligned row-production backend")
+        return PreparedVideoSparseInputs(
+            shape,
+            dtype,
+            valid_sizes,
+            owners,
+            chunk_rows,
+            pooled_query,
+            pooled_key,
+            pooled_value,
+            self.provider.row_major,
+        )
 
     def _compressed_tiles(
         self,
@@ -261,7 +382,9 @@ class VideoSparseAttentionBackend:
         sync_input: torch.Tensor,
         sync_output: torch.Tensor,
         context_workspace: AttentionContextWorkspace | None,
-    ) -> torch.Tensor:
+        consume_row_intervals: bool = False,
+        prepared_inputs: PreparedVideoSparseInputs | None = None,
+    ) -> torch.Tensor | AttentionRowExchange:
         """Compose global sparse selection with shared head and context exchanges."""
 
         context = parallel.context_group
@@ -323,6 +446,7 @@ class VideoSparseAttentionBackend:
                 transport.valid_sizes,
                 workspace,
                 block_indices=physical_indices,
+                query_tile_offset=start,
                 targets=AttentionOutputTargets(outputs, group.rank_in_group),
             )
             parallel.finish_context(transport)
@@ -330,6 +454,51 @@ class VideoSparseAttentionBackend:
 
         query_tile_offset = context.rank_in_group * (query.shape[0] // TILE)
         key, value = parallel.distribute_key_value(key, value, context_workspace)
+        local_output = (
+            outputs[group.rank_in_group].view_as(query)
+            if context.world_size == 1 and group.world_size > 1
+            else None
+        )
+        if local_output is not None and consume_row_intervals:
+            if prepared_inputs is None:
+                self.prepare_local(
+                    query,
+                    key,
+                    value,
+                    valid_sizes,
+                    prefix_key_indices,
+                    dense_key_indices,
+                    prefix_count,
+                    workspace,
+                )
+            else:
+                if prepared_inputs.packed is None:
+                    raise ValueError("prepared sparse inputs have no published rows")
+                self.select_from_pooled(
+                    valid_sizes,
+                    prefix_key_indices,
+                    dense_key_indices,
+                    prefix_count,
+                    workspace,
+                )
+            producer = self.provider.prepare_rows(
+                query,
+                key,
+                value,
+                mask_block_indices=workspace.block_indices,
+                mask_block_count=workspace.block_counts,
+                valid_sizes=valid_sizes,
+                pattern=self._pattern_for(query.shape[0] // TILE),
+                gate=gate,
+                compressed=workspace.compressed_tiles,
+                attention_output=workspace.attention_output,
+                owners=group.world_size,
+                chunk_rows=AttentionRowExchange.chunk_rows(local_output),
+                packed=None if prepared_inputs is None else prepared_inputs.packed,
+            )
+            return AttentionRowExchange(
+                parallel, local_output, workspace.attention_output, producer
+            )
         self.forward_local(
             query,
             key,
@@ -340,9 +509,17 @@ class VideoSparseAttentionBackend:
             dense_key_indices,
             prefix_count,
             workspace,
-            targets=AttentionOutputTargets(outputs, group.rank_in_group),
+            targets=(
+                AttentionOutputTargets((local_output,), 0)
+                if local_output is not None
+                else AttentionOutputTargets(outputs, group.rank_in_group)
+            ),
             query_tile_offset=query_tile_offset,
         )
+        if local_output is not None:
+            # The epilogue has consumed the sparse provider's output; its
+            # registered buffer can now receive the head-to-row exchange.
+            return AttentionRowExchange(parallel, local_output, workspace.attention_output)
         return parallel.finish_output(outputs, sync_input, sync_output)
 
     def forward_local(
@@ -362,6 +539,44 @@ class VideoSparseAttentionBackend:
     ) -> torch.Tensor:
         """Evaluate the complete selected key set for this owner's query rows."""
 
+        self.prepare_local(
+            query,
+            key,
+            value,
+            valid_sizes,
+            prefix_key_indices,
+            dense_key_indices,
+            prefix_count,
+            workspace,
+            query_tile_offset=query_tile_offset,
+        )
+        return self.forward_selected(
+            query,
+            key,
+            value,
+            gate,
+            valid_sizes,
+            workspace,
+            block_indices=workspace.block_indices,
+            query_tile_offset=query_tile_offset,
+            targets=targets,
+        )
+
+    def prepare_local(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        valid_sizes: torch.Tensor,
+        prefix_key_indices: torch.Tensor,
+        dense_key_indices: torch.Tensor,
+        prefix_count: torch.Tensor,
+        workspace: VideoSparseAttentionWorkspace,
+        *,
+        query_tile_offset: int = 0,
+    ) -> None:
+        """Prepare one selected key domain shared by all fine-query intervals."""
+
         video_sparse_ops.pool_qkv_means(
             query,
             key,
@@ -380,16 +595,6 @@ class VideoSparseAttentionBackend:
             workspace,
             query_tile_offset=query_tile_offset,
         )
-        return self.forward_selected(
-            query,
-            key,
-            value,
-            gate,
-            valid_sizes,
-            workspace,
-            block_indices=workspace.block_indices,
-            targets=targets,
-        )
 
     def forward_selected(
         self,
@@ -402,6 +607,7 @@ class VideoSparseAttentionBackend:
         *,
         block_indices: torch.Tensor,
         targets: AttentionOutputTargets,
+        query_tile_offset: int = 0,
     ) -> torch.Tensor:
         """Evaluate one complete sparse loop and apply global compression once.
 
@@ -409,7 +615,7 @@ class VideoSparseAttentionBackend:
         metadata retains logical geometry independently of page padding.
         """
 
-        return self.kernel(
+        return self.provider.execute(
             query,
             key,
             value,
@@ -417,7 +623,7 @@ class VideoSparseAttentionBackend:
             mask_block_indices=block_indices,
             valid_sizes=valid_sizes,
             tile_size=TILE,
-            prefix_tiles=self.metadata.prefix_tiles,
+            pattern=self._pattern_for(query.shape[0] // TILE, query_tile_offset),
             gate=gate,
             compressed=workspace.compressed_tiles,
             attention_output=workspace.attention_output,

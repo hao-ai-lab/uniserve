@@ -148,9 +148,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     command.add_argument(
         "--nsys-cuda-trace",
-        choices=("cuda", "cuda-sw"),
+        choices=("cuda", "cuda-hw"),
         default="cuda",
-        help="select Nsight's default CUDA tracing or explicit software instrumentation",
+        help="select Nsight's software CUDA tracing or hardware tracing on supported devices",
     )
     command.set_defaults(function=run)
     return parser

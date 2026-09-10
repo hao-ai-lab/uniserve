@@ -32,6 +32,7 @@ from uniserve_worker.execution.batch import (
 )
 from uniserve_worker.execution.output import run_result_ready
 from uniserve_worker.execution.run import RunReader, WorkerRun
+from uniserve_worker.execution.step import execute_startup
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.models.stub import _next_token
 
@@ -219,8 +220,10 @@ def test_retained_encoder_product_outlives_its_producer_request(
 
 
 @pytest.mark.parametrize("retirement", ("free", "finish", "retire"))
+@pytest.mark.parametrize("startup", (False, True))
 def test_command_acknowledgement_waits_for_readers_without_delaying_other_results(
     retirement: str,
+    startup: bool,
 ) -> None:
     worker = execution_worker(pipeline_depth=2)
     admission = ar_params(87, block_ids=(0,))
@@ -281,7 +284,7 @@ def test_command_acknowledgement_waits_for_readers_without_delaying_other_result
             on_ready=lambda _: None,
             on_terminal=lambda _: None,
         )
-        run.attach(worker.execute(batch))
+        run.attach(execute_startup(worker, batch) if startup else worker.execute(batch))
         reader = RunReader(run, lambda _: None)
         replay = RunReader(run, lambda _: None)
         assert reader.ready()

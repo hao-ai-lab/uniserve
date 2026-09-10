@@ -15,6 +15,7 @@ from uniserve_worker.backends.attention.video_sparse import (
 )
 from uniserve_worker.nn.parallel import ParallelConfig, SequenceParallel
 from uniserve_worker.nn.parallel_attention import (
+    AttentionRowExchange,
     AttentionContextGeometry,
     ParallelAttention,
 )
@@ -136,7 +137,7 @@ def _run_context(rank: int, rendezvous: str, world_size: int, kind: str) -> None
         local_query, local_key, local_value, local_gate = attention.exchange_heads(
             projected[begin:end]
         ).unbind(2)
-        return backend.forward_parallel(
+        result = backend.forward_parallel(
             attention,
             local_query,
             local_key,
@@ -152,6 +153,7 @@ def _run_context(rank: int, rendezvous: str, world_size: int, kind: str) -> None
             sync_output=sync_output,
             context_workspace=context_workspace,
         )
+        return result.materialize() if isinstance(result, AttentionRowExchange) else result
 
     with torch.inference_mode():
         actual = execute()

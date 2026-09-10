@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import math
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
+from typing import cast
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
-from ...backends.attention.torch_sdpa import TorchSDPAAttentionBackend
 from ...backends.attention.video_sparse import (
+    PreparedVideoSparseInputs,
     VideoSparseAttentionBackend,
     VideoSparseAttentionWorkspace,
     build_video_sparse_metadata,
@@ -28,11 +31,19 @@ from ...nn.mlp import GatedMLP
 from ...nn.norm import RMSNorm
 from ...nn.parallel_attention import (
     AttentionContextWorkspace,
+    AttentionRowExchange,
     ParallelAttention,
 )
 from ...nn.parallel_pipeline import LayerPipeline
 from ...nn.quant.base import PreparedLinearInput
 from ...nn.quant.config import LinearPrecision, create_linear_method
+from ...nn.row_pipeline import (
+    ProjectedRows,
+    RowStage,
+    independent_linear_rows,
+    map_attention_rows,
+    run_row_pipeline,
+)
 from ...ops import (
     gated_residual,
     gated_residual_rms_norm,
@@ -198,19 +209,13 @@ class _DenseAttention(nn.Module):
         inner = config.heads * config.head_dim
         self.heads = config.heads
         self.head_dim = config.head_dim
-        self.attention = RadixAttention(
-            self.heads, self.heads, self.head_dim, dense_provider=TorchSDPAAttentionBackend()
-        )
+        self.attention = RadixAttention(self.heads, self.heads, self.head_dim)
         self.to_q = nn.Linear(config.hidden_size, inner, bias=False, device=device)
         self.to_k = nn.Linear(config.hidden_size, inner, bias=False, device=device)
         self.to_v = nn.Linear(config.hidden_size, inner, bias=False, device=device)
         self.to_out = nn.Sequential(nn.Linear(inner, config.hidden_size, bias=False, device=device))
-        self.norm_q = RMSNorm(
-            config.head_dim, config.qk_norm_eps, affine_in_fp32=True, device=device
-        )
-        self.norm_k = RMSNorm(
-            config.head_dim, config.qk_norm_eps, affine_in_fp32=True, device=device
-        )
+        self.norm_q = RMSNorm(config.head_dim, config.qk_norm_eps, device=device)
+        self.norm_k = RMSNorm(config.head_dim, config.qk_norm_eps, device=device)
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         """Attend over dense ``[batch, rows, hidden]`` refinement sequences."""
@@ -239,13 +244,9 @@ class _TokenRefinerBlock(nn.Module):
         """Assemble one normalized dense-attention and feed-forward refinement block."""
 
         super().__init__()
-        self.norm1 = RMSNorm(
-            config.hidden_size, config.norm_eps, affine_in_fp32=True, device=device
-        )
+        self.norm1 = RMSNorm(config.hidden_size, config.norm_eps, device=device)
         self.attn = _DenseAttention(config, device=device)
-        self.norm2 = RMSNorm(
-            config.hidden_size, config.norm_eps, affine_in_fp32=True, device=device
-        )
+        self.norm2 = RMSNorm(config.hidden_size, config.norm_eps, device=device)
         with torch.device(device):
             self.ff = GatedMLP(
                 config.hidden_size,
@@ -253,7 +254,6 @@ class _TokenRefinerBlock(nn.Module):
                 quant_method=create_linear_method(linear_precision),
                 layer_config=layer_config.child("ff"),
                 order="value_gate",
-                activation_dtype=torch.bfloat16,
             )
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
@@ -286,9 +286,7 @@ class _TokenRefiner(nn.Module):
             )
             for index in range(config.refiner_layers)
         )
-        self.final_norm = RMSNorm(
-            config.hidden_size, config.norm_eps, affine_in_fp32=True, device=device
-        )
+        self.final_norm = RMSNorm(config.hidden_size, config.norm_eps, device=device)
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         """Run every refinement block and normalize the resulting text condition."""
@@ -336,7 +334,6 @@ class _H3Attention(nn.Module):
                 prefix="to_qkvg",
                 sequence_group=mesh.get_group("sp"),
                 input_scale_group=mesh.get_group("sp"),
-                weight_scale_partition_size=14 * 4 * config.head_dim,
                 quant_method=create_linear_method(linear_precision, tensorwise=True),
                 bias=False,
             )
@@ -348,15 +345,58 @@ class _H3Attention(nn.Module):
                     prefix="to_out.0",
                     bias=False,
                     quant_method=create_linear_method(linear_precision),
-                    logical_input_row_partitions=4 // mesh.size("sp"),
                 )
             )
-        self.norm_q = RMSNorm(
-            config.head_dim, config.qk_norm_eps, affine_in_fp32=True, device=device
+        self.norm_q = RMSNorm(config.head_dim, config.qk_norm_eps, device=device)
+        self.norm_k = RMSNorm(config.head_dim, config.qk_norm_eps, device=device)
+
+    def stream_projection(
+        self,
+        rows: int,
+        workspace: torch.Tensor,
+        *,
+        rotary: tuple[torch.Tensor, torch.Tensor],
+        valid_sizes: torch.Tensor,
+        scratch: H3Scratch,
+        backend: VideoSparseAttentionBackend,
+    ) -> ProjectedRows[PreparedVideoSparseInputs]:
+        """Prepare each completed QKVG interval while later peer inputs arrive."""
+
+        global_rows = rows * self.sequence_size
+        inputs = backend.prepare_input_rows(
+            (global_rows, self.local_heads, self.config.head_dim),
+            valid_sizes,
+            dtype=torch.bfloat16,
+            owners=self.sequence_size,
+            chunk_rows=AttentionRowExchange.chunk_rows(
+                scratch.projection_peers[self.parallel_attention.ulysses_group.rank_in_group].view(
+                    global_rows, self.local_heads, self.config.head_dim
+                )
+            ),
+            pooled_query=scratch.pooled_query,
+            pooled_key=scratch.pooled_key,
+            pooled_value=scratch.pooled_value,
         )
-        self.norm_k = RMSNorm(
-            config.head_dim, config.qk_norm_eps, affine_in_fp32=True, device=device
-        )
+        cosine, sine = rotary
+
+        def consume(interval: slice, projected: torch.Tensor) -> None:
+            query, key, value, _ = projected.view(
+                -1, self.local_heads, 4, self.config.head_dim
+            ).unbind(2)
+            qk_norm_rope(
+                query,
+                key,
+                self.norm_q.weight,
+                self.norm_k.weight,
+                cosine[interval],
+                sine[interval],
+                self.config.qk_norm_eps,
+                in_place=True,
+            )
+            inputs.append(interval, query, key, value)
+
+        projection = self.to_qkvg.stream_sequence_parallel(rows, workspace, row_consumer=consume)
+        return ProjectedRows[PreparedVideoSparseInputs](projection, inputs)
 
     def forward(
         self,
@@ -381,14 +421,20 @@ class _H3Attention(nn.Module):
         compressed_tiles: torch.Tensor,
         topk_indices_i32: torch.Tensor,
         backend: VideoSparseAttentionBackend,
-    ) -> torch.Tensor:
-        """Exchange sequence shards, run sparse global attention, and project local rows."""
+        consume_row_intervals: bool = False,
+        prepared_projection: ProjectedRows[PreparedVideoSparseInputs] | None = None,
+    ) -> torch.Tensor | AttentionRowExchange:
+        """Compute sparse global attention and publish its row-exchange dependency."""
 
         local = hidden[0]
         head_dim = self.config.head_dim
         local_rows = local.shape[0]
         global_rows = local_rows * self.sequence_size
-        if self.projected_head:
+        prepared_inputs = None
+        if prepared_projection is not None:
+            projected, prepared_inputs = prepared_projection.finish()
+            exchanged = projected.view(global_rows, self.local_heads, 4, head_dim)
+        elif self.projected_head:
             exchanged = self.to_qkvg.forward_sequence_parallel(local, attention_workspace).view(
                 global_rows,
                 self.local_heads,
@@ -405,16 +451,17 @@ class _H3Attention(nn.Module):
 
         # Query/key normalization and rotary application mutate their views of
         # the shared projection buffer before sparse block selection.
-        qk_norm_rope(
-            query,
-            key,
-            self.norm_q.weight,
-            self.norm_k.weight,
-            cosine,
-            sine,
-            self.config.qk_norm_eps,
-            in_place=True,
-        )
+        if prepared_projection is None:
+            qk_norm_rope(
+                query,
+                key,
+                self.norm_q.weight,
+                self.norm_k.weight,
+                cosine,
+                sine,
+                self.config.qk_norm_eps,
+                in_place=True,
+            )
         workspace = VideoSparseAttentionWorkspace(
             attention_output=attention_output,
             tile_scores=tile_scores,
@@ -427,8 +474,7 @@ class _H3Attention(nn.Module):
             topk_indices_i32=topk_indices_i32,
         )
 
-        # VSA returns local sequence rows with globally composed head shards.
-        local_output = backend.forward_parallel(
+        return backend.forward_parallel(
             self.parallel_attention,
             query,
             key,
@@ -443,8 +489,9 @@ class _H3Attention(nn.Module):
             sync_input=projection_sync_input,
             sync_output=projection_sync_output,
             context_workspace=context_workspace,
+            consume_row_intervals=consume_row_intervals,
+            prepared_inputs=prepared_inputs,
         )
-        return self.to_out(local_output.reshape(1, local_output.shape[0], -1))
 
 
 class _TransformerBlock(nn.Module):
@@ -463,9 +510,7 @@ class _TransformerBlock(nn.Module):
         """Assemble one adaptive sparse-attention and gated feed-forward block."""
 
         super().__init__()
-        self.norm1 = RMSNorm(
-            config.hidden_size, config.norm_eps, affine_in_fp32=True, device=device
-        )
+        self.norm1 = RMSNorm(config.hidden_size, config.norm_eps, device=device)
         self.attn = _H3Attention(
             config,
             mesh,
@@ -473,20 +518,21 @@ class _TransformerBlock(nn.Module):
             layer_config=layer_config.child("attn"),
             device=device,
         )
-        self.norm2 = RMSNorm(
-            config.hidden_size, config.norm_eps, affine_in_fp32=True, device=device
-        )
+        self.norm2 = RMSNorm(config.hidden_size, config.norm_eps, device=device)
         with torch.device(device):
             self.ff = GatedMLP(
                 config.hidden_size,
                 config.ffn_dim,
-                logical_input_row_partitions=4 // mesh.size("sp"),
                 quant_method=create_linear_method(mlp_linear_precision),
                 layer_config=layer_config.child("ff"),
                 order="value_gate",
-                activation_dtype=torch.bfloat16,
             )
         self.hidden_size = config.hidden_size
+        # Projected-head execution provides three registered transport buffers;
+        # dense projections keep each row independent of tensor-wide scales.
+        self.overlap_output_exchange = self.attn.projected_head and independent_linear_rows(
+            self.attn.to_out, self.ff
+        )
 
     def forward(
         self,
@@ -513,6 +559,8 @@ class _TransformerBlock(nn.Module):
         compressed_tiles: torch.Tensor,
         topk_indices_i32: torch.Tensor,
         backend: VideoSparseAttentionBackend,
+        prepared_projection: ProjectedRows[PreparedVideoSparseInputs] | None = None,
+        row_consumer: Callable[[slice, torch.Tensor], None] | None = None,
     ) -> torch.Tensor:
         """Apply one time-modulated sparse-attention and feed-forward residual block."""
 
@@ -522,13 +570,17 @@ class _TransformerBlock(nn.Module):
             tensor.to(hidden.dtype)
             for tensor in adaln_values.reshape(-1, self.hidden_size * 6).chunk(6, dim=-1)
         )
-        normalized = modulated_rms_norm(
-            hidden,
-            self.norm1.weight,
-            shift_attn,
-            scale_attn,
-            adaln_indices,
-            eps=self.norm1.eps,
+        normalized = (
+            hidden
+            if prepared_projection is not None
+            else modulated_rms_norm(
+                hidden,
+                self.norm1.weight,
+                shift_attn,
+                scale_attn,
+                adaln_indices,
+                eps=self.norm1.eps,
+            )
         )
         attention = self.attn(
             normalized,
@@ -552,7 +604,44 @@ class _TransformerBlock(nn.Module):
             compressed_tiles,
             topk_indices_i32,
             backend,
+            consume_row_intervals=self.overlap_output_exchange,
+            prepared_projection=prepared_projection,
         )
+        del normalized
+
+        def finish(interval: slice, rows: torch.Tensor) -> torch.Tensor:
+            projected = self.attn.to_out(rows.reshape(1, rows.shape[0], -1))
+            return self._finish_attention(
+                hidden[:, interval],
+                projected,
+                gate_attn,
+                shift_ffn,
+                scale_ffn,
+                gate_ffn,
+                adaln_indices[interval],
+            )
+
+        return map_attention_rows(
+            attention,
+            hidden,
+            attention_workspace,
+            finish,
+            row_axis=1,
+            row_independent=self.overlap_output_exchange,
+            consumer=row_consumer,
+        )
+
+    def _finish_attention(
+        self,
+        hidden: torch.Tensor,
+        attention: torch.Tensor,
+        gate_attn: torch.Tensor,
+        shift_ffn: torch.Tensor,
+        scale_ffn: torch.Tensor,
+        gate_ffn: torch.Tensor,
+        adaln_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Consume complete head vectors through the residual and feed-forward edges."""
 
         # Dynamic FP8 keeps the normalized feed-forward input quantized across
         # the expansion boundary; other precision modes consume the BF16 view.
@@ -597,7 +686,7 @@ class _OutputNorm(nn.Module):
         """Build final adaptive normalization for latent-velocity prediction."""
 
         super().__init__()
-        self.norm = RMSNorm(config.hidden_size, config.norm_eps, affine_in_fp32=True, device=device)
+        self.norm = RMSNorm(config.hidden_size, config.norm_eps, device=device)
 
     def forward(
         self,
@@ -758,32 +847,92 @@ class MiniMaxH3Transformer(nn.Module):
 
         # Every block consumes the same layout metadata and caller-owned collective buffers.
         rotary = (slot.rotary_cosine, slot.rotary_sine)
-        for layer, block in enumerate(self.transformer_blocks.values()):
-            hidden = block(
-                hidden,
-                scratch.block_adaln_params[layer],
-                metadata.adaln_indices,
-                rotary,
-                slot.tile_valid_sizes,
-                slot.prefix_key_indices,
-                slot.dense_key_indices,
-                slot.prefix_count,
-                scratch.projection_peers,
-                scratch.projection_sync_input,
-                scratch.projection_sync_output,
-                scratch.attention_workspace,
-                scratch.attention_output,
-                scratch.context_workspace,
-                scratch.tile_scores,
-                scratch.block_counts,
-                scratch.block_indices,
-                scratch.pooled_query,
-                scratch.pooled_key,
-                scratch.pooled_value,
-                scratch.compressed_tiles,
-                scratch.topk_indices_i32,
-                metadata.vsa,
+
+        def bind_stage(layer: int, block: _TransformerBlock) -> RowStage:
+            adaln = scratch.block_adaln_params[layer]
+            operation = partial(
+                block,
+                adaln_values=adaln,
+                adaln_indices=metadata.adaln_indices,
+                rotary=rotary,
+                tile_valid_sizes=slot.tile_valid_sizes,
+                prefix_key_indices=slot.prefix_key_indices,
+                dense_key_indices=slot.dense_key_indices,
+                prefix_count=slot.prefix_count,
+                projection_peers=scratch.projection_peers,
+                projection_sync_input=scratch.projection_sync_input,
+                projection_sync_output=scratch.projection_sync_output,
+                attention_workspace=scratch.attention_workspace,
+                attention_output=scratch.attention_output,
+                context_workspace=scratch.context_workspace,
+                tile_scores=scratch.tile_scores,
+                block_counts=scratch.block_counts,
+                block_indices=scratch.block_indices,
+                pooled_query=scratch.pooled_query,
+                pooled_key=scratch.pooled_key,
+                pooled_value=scratch.pooled_value,
+                compressed_tiles=scratch.compressed_tiles,
+                topk_indices_i32=scratch.topk_indices_i32,
+                backend=metadata.vsa,
             )
+
+            def prepare(value: torch.Tensor) -> ProjectedRows[PreparedVideoSparseInputs]:
+                _, spare = AttentionRowExchange.partition_workspace(
+                    scratch.attention_workspace,
+                    scratch.projection_peers[
+                        block.attn.parallel_attention.ulysses_group.rank_in_group
+                    ],
+                )
+                # The current attention exchange owns only its receive prefix.
+                # Its suffix and the consumed provider output are both free for
+                # next-layer gathering; use the larger legal row capacity.
+                workspace = (
+                    spare
+                    if spare.nbytes > scratch.attention_output.nbytes
+                    else scratch.attention_output
+                )
+                projection = block.attn.stream_projection(
+                    value.shape[1],
+                    workspace,
+                    rotary=rotary,
+                    valid_sizes=slot.tile_valid_sizes,
+                    scratch=scratch,
+                    backend=metadata.vsa,
+                )
+                shift, scale = (
+                    tensor.to(value.dtype)
+                    for tensor in adaln.reshape(-1, block.hidden_size * 6).chunk(6, dim=-1)[:2]
+                )
+
+                def normalize(interval: slice, rows: torch.Tensor) -> torch.Tensor:
+                    return modulated_rms_norm(
+                        rows,
+                        block.norm1.weight,
+                        shift,
+                        scale,
+                        metadata.adaln_indices[interval],
+                        eps=block.norm1.eps,
+                    )[0]
+
+                projection.transform = normalize
+                return projection
+
+            accepts_rows = (
+                block.attn.projected_head
+                and block.attn.sequence_size > 1
+                and independent_linear_rows(block.attn.to_qkvg)
+            )
+            return RowStage(
+                operation, block.overlap_output_exchange, prepare if accepts_rows else None
+            )
+
+        hidden = run_row_pipeline(
+            hidden,
+            tuple(
+                bind_stage(layer, cast(_TransformerBlock, block))
+                for layer, block in enumerate(self.transformer_blocks.values())
+            ),
+        )
         self.pipeline.send_activation(hidden)
         if not self.pipeline.last:
             return None

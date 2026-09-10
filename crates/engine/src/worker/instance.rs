@@ -2,7 +2,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::fmt::Write as _;
-use std::net::TcpListener;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
@@ -24,16 +23,23 @@ impl WorkerProcessArgs {
     /// Launches and connects every rank in one physical worker group.
     fn launch(&self, cancel: Option<Arc<AtomicBool>>) -> anyhow::Result<Vec<RankProcess>> {
         let cancel = cancel.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-        let distributed_init_method = if self.ranks.len() > 1 {
-            Some(allocate_distributed_init_method()?)
-        } else {
-            None
-        };
         crate::WorkerConfig::validate_members(&self.ranks, &self.entries)?;
         anyhow::ensure!(
             self.ranks.iter().all(|rank| rank.node == "localhost"),
             "remote worker process launch is unavailable"
         );
+        // Local ranks share a unique filesystem rendezvous for their entire
+        // lifetime. Probing and releasing a TCP port cannot reserve it for the
+        // Python store that starts after process creation.
+        let rendezvous = if self.ranks.len() > 1 {
+            Some(Arc::new(
+                tempfile::Builder::new()
+                    .prefix("uniserve-rendezvous-")
+                    .tempdir()?,
+            ))
+        } else {
+            None
+        };
         let mut launched = Vec::with_capacity(self.ranks.len());
         for rank in 0..self.ranks.len() {
             let rank_device = &self.ranks[rank].device;
@@ -42,7 +48,7 @@ impl WorkerProcessArgs {
                 &rank_device,
                 rank as u32,
                 self.ranks.len() as u32,
-                distributed_init_method.as_deref(),
+                rendezvous.clone(),
                 &self.entries,
                 cancel.clone(),
             )?;
@@ -174,6 +180,9 @@ impl Worker {
             if let (Some(local), Some(reference)) = (&mut normalized.kv_cache, &canonical.kv_cache)
             {
                 local.kv_head_offset = reference.kv_head_offset;
+                local.layer_offset = reference.layer_offset;
+                local.num_layers = reference.num_layers;
+                local.bytes_per_token = reference.bytes_per_token;
             }
             // The resolved identity includes rank-local parameter and buffer
             // layouts. Component params may therefore give each physical
@@ -184,6 +193,55 @@ impl Worker {
                 normalized == canonical,
                 "physical rank {rank} worker info disagree with rank 0"
             );
+        }
+        if let Some(cache) = &mut info.kv_cache {
+            let regions: Vec<_> = workers
+                .iter()
+                .filter_map(|worker| worker.info().kv_cache.as_ref())
+                .collect();
+            let layer_bounds: BTreeSet<_> = regions
+                .iter()
+                .flat_map(|region| [region.layer_offset, region.layer_offset + region.num_layers])
+                .chain([0, cache.total_layers])
+                .collect();
+            let layer_bounds: Vec<_> = layer_bounds.into_iter().collect();
+            for layers in layer_bounds.windows(2) {
+                let mut heads: Vec<_> = regions
+                    .iter()
+                    .filter(|region| {
+                        region.layer_offset <= layers[0]
+                            && region.layer_offset + region.num_layers >= layers[1]
+                    })
+                    .map(|region| {
+                        (
+                            region.kv_head_offset,
+                            region.kv_head_offset + region.num_kv_heads,
+                        )
+                    })
+                    .collect();
+                heads.sort_unstable();
+                let mut covered = 0;
+                for (start, end) in heads {
+                    anyhow::ensure!(
+                        start <= covered,
+                        "worker KV regions leave a logical head gap"
+                    );
+                    covered = covered.max(end);
+                }
+                anyhow::ensure!(
+                    covered == cache.total_kv_heads,
+                    "worker KV regions do not cover layers {}..{}",
+                    layers[0],
+                    layers[1],
+                );
+            }
+            // The scheduler reserves pages shared by every stage. Its byte
+            // accounting must cover the largest rank-local layer partition.
+            cache.bytes_per_token = regions
+                .iter()
+                .map(|region| region.bytes_per_token)
+                .max()
+                .unwrap_or(cache.bytes_per_token);
         }
         info.configuration_id = process_world_configuration_id(&workers);
         for worker in &mut workers {
@@ -1074,13 +1132,6 @@ fn validate_replacement_info(
         "replacement rank {rank} worker info changed"
     );
     Ok(())
-}
-
-/// Allocates a process-world initialization endpoint.
-fn allocate_distributed_init_method() -> anyhow::Result<String> {
-    let listener = TcpListener::bind(("127.0.0.1", 0))?;
-    let addr = listener.local_addr()?;
-    Ok(format!("tcp://127.0.0.1:{}", addr.port()))
 }
 
 impl Worker {

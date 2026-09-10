@@ -16,7 +16,7 @@ from ...execution.forward_batch import (
     RouteSpan,
 )
 from ..attention import RadixAttention
-from ..expert_routing import RoutedTensor
+from ..expert_routing import RoutedTensor, slice_route_spans
 from ..layer import LayerConfig
 from ..linear import (
     QKVParallelLinear,
@@ -26,7 +26,17 @@ from ..linear import (
 )
 from ..mlp import GatedMLP
 from ..norm import RMSNorm
+from ..parallel_pipeline import LayerPipeline
+from ..parallel_sequence import SequencePartition
 from ..rope import apply_rotary_emb, get_rope
+from ..row_pipeline import (
+    RowStage,
+    RowTensors,
+    RowTensorSegments,
+    independent_linear_rows,
+    packed_row_stage,
+    run_row_pipeline,
+)
 from ..vocab_parallel_embedding import VocabParallelEmbedding
 
 __all__ = ["MoTConfig", "MoTDecoderLayer", "MoTModel"]
@@ -142,7 +152,9 @@ class MoTDecoderLayer(nn.Module):
             int(config.intermediate_size),
             layer_config=layer_config.child("mlp_moe_gen"),
         )
-        self.attention = RadixAttention(self.num_heads, self.num_kv_heads, head_dim)
+        self.attention = RadixAttention(
+            self.num_heads, self.num_kv_heads, head_dim, sequence=layer_config.sequence
+        )
 
         self._text = _Expert(
             input_norm=self.input_layernorm,
@@ -200,72 +212,95 @@ class MoTDecoderLayer(nn.Module):
             tensor_to_device(value.to(torch.bfloat16), target),
         )
 
-    def forward(
+    def row_stage(
         self,
         layer: int,
-        hidden: RoutedTensor,
         *,
         cos: RoutedTensor,
         sin: RoutedTensor,
         context: ForwardBatch,
         spans: tuple[RouteSpan, ...],
+        routes: frozenset[ExpertRoute],
         causal: bool,
-    ) -> RoutedTensor:
-        """Apply the selected experts and one shared attention operation."""
-
-        normalized = hidden.apply(
-            text=self._text.input_norm,
-            flow=self._flow.input_norm,
-            generation_device=self.generation_device,
-        )
-        text_projection = (
-            None
-            if normalized.text is None or cos.text is None or sin.text is None
-            else self._project(self._text, normalized.text, cos.text, sin.text, context)
-        )
-        flow_projection = (
-            None
-            if normalized.flow is None or cos.flow is None or sin.flow is None
-            else self._project(self._flow, normalized.flow, cos.flow, sin.flow, context)
-        )
-        query = RoutedTensor(
-            None if text_projection is None else text_projection[0],
-            None if flow_projection is None else flow_projection[0],
-        ).packed(spans)
-        key = RoutedTensor(
-            None if text_projection is None else text_projection[1],
-            None if flow_projection is None else flow_projection[1],
-        ).packed(spans)
-        value = RoutedTensor(
-            None if text_projection is None else text_projection[2],
-            None if flow_projection is None else flow_projection[2],
-        ).packed(spans)
+        partition: SequencePartition,
+    ) -> RowStage[RowTensorSegments]:
+        """Declare routed equations around the shared packed attention dependency."""
 
         self.attention.layer_id = int(layer)
-        attended = self.attention(
-            query,
-            key,
-            value,
-            context,
+        independent_output = independent_linear_rows(
+            self.o_proj, self.o_proj_moe_gen, self.mlp, self.mlp_moe_gen
+        )
+        complete_cos, complete_sin = cos, sin
+
+        def project(interval: slice, values: RowTensors) -> RowTensors:
+            local_spans = slice_route_spans(spans, interval)
+            hidden = RoutedTensor.from_packed(values[0], local_spans, routes=routes)
+            cos = complete_cos.narrow(interval, spans)
+            sin = complete_sin.narrow(interval, spans)
+            normalized = hidden.apply(
+                text=self._text.input_norm,
+                flow=self._flow.input_norm,
+                generation_device=self.generation_device,
+            )
+            text_projection = (
+                None
+                if normalized.text is None or cos.text is None or sin.text is None
+                else self._project(self._text, normalized.text, cos.text, sin.text, context)
+            )
+            flow_projection = (
+                None
+                if normalized.flow is None or cos.flow is None or sin.flow is None
+                else self._project(self._flow, normalized.flow, cos.flow, sin.flow, context)
+            )
+            query = RoutedTensor(
+                None if text_projection is None else text_projection[0],
+                None if flow_projection is None else flow_projection[0],
+            ).packed(local_spans)
+            key = RoutedTensor(
+                None if text_projection is None else text_projection[1],
+                None if flow_projection is None else flow_projection[1],
+            ).packed(local_spans)
+            value = RoutedTensor(
+                None if text_projection is None else text_projection[2],
+                None if flow_projection is None else flow_projection[2],
+            ).packed(local_spans)
+
+            return query, key, value, values[0]
+
+        def finish(interval: slice, attended: torch.Tensor, state: RowTensors) -> RowTensors:
+            local_spans = slice_route_spans(spans, interval)
+            hidden = RoutedTensor.from_packed(state[0], local_spans, routes=routes)
+            attended = attended.reshape(attended.shape[0], self.query_size)
+            projected = RoutedTensor.from_packed(attended, local_spans, routes=hidden.routes).apply(
+                text=self._text.output,
+                flow=self._flow.output,
+                generation_device=self.generation_device,
+            )
+            residual = hidden.add(projected)
+            normalized = residual.apply(
+                text=self._text.post_norm,
+                flow=self._flow.post_norm,
+                generation_device=self.generation_device,
+            ).map(
+                lambda item: item.to(torch.bfloat16),
+                lambda item: item.to(torch.bfloat16),
+            )
+            feed_forward = normalized.apply(
+                text=self._text.mlp, flow=self._flow.mlp, generation_device=self.generation_device
+            )
+            return (residual.add(feed_forward).packed(local_spans),)
+
+        return packed_row_stage(
+            project,
+            self.attention,
+            finish,
+            context=context,
+            partition=partition,
             causal=causal,
             scale=self.scale,
-        ).reshape(query.shape[0], self.query_size)
-        projected = RoutedTensor.from_packed(attended, spans).apply(
-            text=self._text.output, flow=self._flow.output, generation_device=self.generation_device
+            independent_input=independent_linear_rows(self.qkv_proj, self.qkv_proj_moe_gen),
+            independent_output=independent_output,
         )
-        residual = hidden.add(projected)
-        normalized = residual.apply(
-            text=self._text.post_norm,
-            flow=self._flow.post_norm,
-            generation_device=self.generation_device,
-        ).map(
-            lambda item: item.to(torch.bfloat16),
-            lambda item: item.to(torch.bfloat16),
-        )
-        feed_forward = normalized.apply(
-            text=self._text.mlp, flow=self._flow.mlp, generation_device=self.generation_device
-        )
-        return residual.add(feed_forward)
 
 
 class MoTModel(nn.Module):
@@ -282,35 +317,71 @@ class MoTModel(nn.Module):
 
         super().__init__()
         self.generation_device = generation_device
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            layer_config=layer_config,
-        )
-        self.layers = nn.ModuleList(
-            MoTDecoderLayer(
-                config,
-                layer_config=layer_config.child(f"layers.{index}"),
-                generation_device=generation_device,
+        self.pipeline = LayerPipeline(layer_config.pipeline, config.num_hidden_layers)
+        self.sequence = layer_config.sequence
+        self.hidden_size = config.hidden_size
+        self.embed_tokens = (
+            VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                layer_config=layer_config,
             )
-            for index in range(config.num_hidden_layers)
+            if self.pipeline.first
+            else None
         )
-        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.norm_moe_gen = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.layers = nn.ModuleDict(
+            {
+                str(index): MoTDecoderLayer(
+                    config,
+                    layer_config=layer_config.child(f"layers.{index}"),
+                    generation_device=generation_device,
+                )
+                for index in self.pipeline.layers
+            }
+        )
+        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps) if self.pipeline.last else None
+        self.norm_moe_gen = (
+            RMSNorm(config.hidden_size, config.rms_norm_eps) if self.pipeline.last else None
+        )
         self.rotary = get_rope(config.head_dim, theta=config.rope_theta)
+        parameters = tuple(dict(next(iter(self.layers.values())).named_parameters()))
+        nonresident = self.pipeline.nonresident_layer_names("layers", parameters)
+        if not self.pipeline.first:
+            nonresident |= {"embed_tokens.weight"}
+        if not self.pipeline.last:
+            nonresident |= {"norm.weight", "norm_moe_gen.weight"}
+        self.nonresident_parameters = nonresident
 
     def forward(
         self,
-        inputs_embeds: torch.Tensor,
+        inputs_embeds: torch.Tensor | None,
         context: ForwardBatch,
         *,
         positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run one decoder sweep described by the explicit attention plan."""
 
-        if inputs_embeds.ndim != 2:
-            raise ValueError("MoT inputs must have shape [tokens, hidden]")
-        token_count = int(inputs_embeds.shape[0])
+        if inputs_embeds is not None:
+            token_count = int(inputs_embeds.shape[0])
+        elif context.forward_mode is AttentionMode.PACKED and context.attention_indexes is not None:
+            token_count = int(context.attention_indexes.shape[1])
+        elif context.forward_mode is AttentionMode.PAGED_DECODE and positions is not None:
+            token_count = positions.numel()
+        else:
+            raise ValueError("pipeline input requires packed or decode row geometry")
+        partition = SequencePartition(token_count, self.sequence)
+        if inputs_embeds is None:
+            if self.pipeline.first:
+                raise ValueError("the first decoder stage requires input embeddings")
+            first = cast(MoTDecoderLayer, next(iter(self.layers.values())))
+            inputs_embeds = first.input_layernorm.weight.new_empty(
+                (partition.count, self.hidden_size)
+            )
+        else:
+            if inputs_embeds.ndim != 2:
+                raise ValueError("MoT inputs must have shape [tokens, hidden]")
+            inputs_embeds = partition.local(inputs_embeds)
+        self.pipeline.receive_activation(inputs_embeds)
         spans: tuple[RouteSpan, ...]
         temporal_positions: torch.Tensor
         causal: bool
@@ -330,21 +401,34 @@ class MoTModel(nn.Module):
         else:
             raise ValueError("MoT forward requires packed attention or paged decode")
 
-        cos, sin = self.rotary.cos_sin_1d(temporal_positions)
-        routed_cos = RoutedTensor.from_packed(cos, spans)
-        routed_sin = RoutedTensor.from_packed(sin, spans)
-        hidden = RoutedTensor.from_packed(inputs_embeds, spans)
-        for layer_index, layer_module in enumerate(self.layers):
-            layer = cast(MoTDecoderLayer, layer_module)
-            hidden = layer(
-                layer_index,
-                hidden,
-                cos=routed_cos,
-                sin=routed_sin,
-                context=context,
-                spans=spans,
-                causal=causal,
-            )
-        return hidden.apply(
-            text=self.norm, flow=self.norm_moe_gen, generation_device=self.generation_device
-        ).packed(spans)
+        routes = frozenset(span.route for span in spans)
+        spans = partition.routes(spans)
+        cos, sin = self.rotary.cos_sin_1d(partition.local(temporal_positions))
+        routed_cos = RoutedTensor.from_packed(cos, spans, routes=routes)
+        routed_sin = RoutedTensor.from_packed(sin, spans, routes=routes)
+        (packed,) = run_row_pipeline(
+            RowTensorSegments.complete((inputs_embeds,)),
+            tuple(
+                cast(MoTDecoderLayer, layer).row_stage(
+                    int(index) - self.pipeline.layers.start,
+                    cos=routed_cos,
+                    sin=routed_sin,
+                    context=context,
+                    spans=spans,
+                    routes=routes,
+                    causal=causal,
+                    partition=partition,
+                )
+                for index, layer in self.layers.items()
+            ),
+        ).materialize()
+        if not self.pipeline.last:
+            self.pipeline.send_activation(packed)
+            return packed
+        hidden = RoutedTensor.from_packed(packed, spans, routes=routes)
+        assert self.norm is not None and self.norm_moe_gen is not None
+        return partition.gather(
+            hidden.apply(
+                text=self.norm, flow=self.norm_moe_gen, generation_device=self.generation_device
+            ).packed(spans)
+        )

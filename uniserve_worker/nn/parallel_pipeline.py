@@ -39,17 +39,29 @@ class LayerPipeline:
     def last(self) -> bool:
         return self.group.rank_in_group == self.group.world_size - 1
 
-    def receive_activation(self, rows: torch.Tensor) -> None:
-        """Receive the preceding stage's row-sharded hidden activation in place."""
+    def receive_activation(self, *states: torch.Tensor) -> None:
+        """Receive numerical states separately, preserving their declared dtypes."""
 
         if not self.first:
-            self.group.recv(rows, src=self.group.rank_in_group - 1)
+            for state in states:
+                self.group.recv(state, src=self.group.rank_in_group - 1)
 
-    def send_activation(self, rows: torch.Tensor) -> None:
-        """Publish row-sharded hidden activation to the next layer stage."""
+    def send_activation(self, *states: torch.Tensor) -> None:
+        """Publish numerical states in the receiving stage's declared order."""
 
         if not self.last:
-            self.group.send(rows, dst=self.group.rank_in_group + 1)
+            for state in states:
+                self.group.send(state, dst=self.group.rank_in_group + 1)
+
+    def nonresident_layer_names(self, prefix: str, parameters: tuple[str, ...]) -> frozenset[str]:
+        """Enumerate valid off-stage parameter names from an architecture's layer schema."""
+
+        return frozenset(
+            f"{prefix}.{layer}.{parameter}"
+            for layer in range(self.layer_count)
+            if layer not in self.layers
+            for parameter in parameters
+        )
 
     def feedback(self, products: tuple[torch.Tensor, ...]) -> None:
         """Return final-stage solver products to the first stage in tuple order.

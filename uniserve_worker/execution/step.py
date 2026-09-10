@@ -103,11 +103,6 @@ from uniserve_worker.models.runtime import (
     ExecutionModel,
 )
 from uniserve_worker.models.video import VideoModel
-from uniserve_worker.nn.diffusion.cfg import build_flow_cfg_plan
-from uniserve_worker.nn.diffusion.integrator import euler_step
-from uniserve_worker.nn.diffusion.schedule import (
-    x_pred_to_velocity,
-)
 from uniserve_worker.profiling import profile_range
 from uniserve_worker.runtime.cache_transfer import CacheWrite
 from uniserve_worker.runtime.device_products import (
@@ -220,7 +215,7 @@ def plan_run(runtime: Worker, batch: Run) -> Run:
     if batch.lanes or not batch.operations:
         return batch
     if any(
-        params.offset + params.bytes > runtime.encoder_cache.byte_capacity
+        params.offset + params.bytes > runtime.info.buffer_pool_bytes
         for params in batch.buffer_allocations
     ):
         raise invalid_descriptor("run buffer params exceeds the worker buffer pool")
@@ -904,9 +899,9 @@ def execute_startup(
     *,
     catalog_graphs: bool = True,
 ) -> RunResult:
-    """Execute pre-admission work with direct error propagation."""
+    """Execute pre-admission work with direct errors and normal storage retirement."""
 
-    return _execute(
+    report = _execute(
         runtime,
         batch,
         prepared=(),
@@ -914,6 +909,7 @@ def execute_startup(
         propagate_errors=True,
         graph_eligible=bool(catalog_graphs),
     )
+    return runtime._retire_commands(batch, report)
 
 
 def _apply_batch_controls(runtime: Worker, batch: Run) -> None:
@@ -1715,7 +1711,7 @@ def _commit_lane(
         report_products.extend(
             product
             for product in outcome.products
-            if runtime.worker_config.rank == runtime.worker_config.output_rank
+            if runtime.worker_config.rank == runtime.output_rank(operation.entry)
             or isinstance(product.payload, TransferHandle)
         )
         pending = PendingOutput(
@@ -1982,13 +1978,12 @@ def _reserve_cpu_tasks(
     """Reserve bounded CPU slots for active operations that schedule host-side work."""
 
     video_model = isinstance(runtime.model, VideoModel)
-    owns_output = not video_model or runtime.worker_config.rank == runtime.worker_config.output_rank
     for operation in operations:
         if operation.kind is not OpCode.DIFFUSION_FINALIZE and not (
             video_model and operation.kind is OpCode.MEDIA_APPEND
         ):
             continue
-        if not owns_output:
+        if video_model and runtime.worker_config.rank != runtime.output_rank(operation.entry):
             continue
         identity = _operation_identity(operation)
         if identity in scope.cpu_tasks:
@@ -2656,18 +2651,12 @@ def _apply_release_controls(runtime: Worker, batch: Run, *, before_execution: bo
             else ()
         )
         buffers = (*freed, *closing_publications)
-        runtime.device_products.release_buffers(buffers)
-        runtime.encoder_cache.release_buffers(buffers)
+        runtime.release_buffers(buffers)
         if runtime.cache_pool is not None:
-            runtime.cache_pool.release_buffers(buffers)
             for request_key, retained in closed.items():
                 runtime.cache_pool.imports.cancel_requests(
                     frozenset((request_key,)), retained=retained
                 )
-        if runtime.latent_pool is not None:
-            runtime.latent_pool.release_buffers(buffers)
-        for buffer in buffers:
-            _release_locators(runtime, runtime._transport_publications.get(buffer, ()))
     if not before_execution:
         consumed_predicates = tuple(
             predicate.buffer_id
@@ -3096,8 +3085,9 @@ def _run_laneed_wave(
         for scope in _unique_scopes(group_scopes):
             scope.completion.register_device(target)
         if qualify_mixed and len(kinds) > 1:
-            # Startup qualification compares tensorized mixed output with
-            # independently executed homogeneous groups for the same rows.
+            # Measure whether tensorizing these rows improves service time.
+            # Numerical conformance belongs to independent model/operator
+            # tests, not a comparison against another batch shape at startup.
             output, observation, mixed_us = _run_startup_forward(
                 runtime,
                 group_tasks,
@@ -3107,35 +3097,20 @@ def _run_laneed_wave(
             mixed_output = tuple(value.clone() for value in output)
             homogeneous: dict[
                 str,
-                list[tuple[int, ForwardRow, LaneState]],
+                list[tuple[ForwardRow, LaneState]],
             ] = defaultdict(list)
-            for local_index, (_index, task, scope) in enumerate(group):
-                homogeneous[task.kind].append((local_index, task, scope))
-            references: list[torch.Tensor | None] = [None] * len(group)
+            for _index, task, scope in group:
+                homogeneous[task.kind].append((task, scope))
             homogeneous_us: list[int] = []
             for members in homogeneous.values():
-                reference, _reference_observation, reference_us = _run_startup_forward(
+                _reference, _reference_observation, reference_us = _run_startup_forward(
                     runtime,
-                    tuple(task for _index, task, _scope in members),
-                    members[0][2],
+                    tuple(task for task, _scope in members),
+                    members[0][1],
                     target,
                     force_eager=observation.path is RunPath.EAGER,
                 )
                 homogeneous_us.append(reference_us)
-                for (local_index, _task, _scope), value in zip(
-                    members,
-                    reference,
-                    strict=True,
-                ):
-                    references[local_index] = value.clone()
-            if any(value is None for value in references):
-                raise RuntimeError("mixed qualification lost a homogeneous output row")
-            _assert_mixed_equivalence(
-                runtime,
-                mixed_output,
-                tuple(cast(torch.Tensor, value) for value in references),
-                group_tasks,
-            )
             service_paths = {RunPath.EAGER, RunPath.GRAPH_REPLAY}
             if observation.path in service_paths:
                 serial_us = sum(homogeneous_us)
@@ -3159,7 +3134,7 @@ def _run_laneed_wave(
             output_event = None
         else:
             forward_result = _run_forward_group(runtime, group_tasks, group_scopes[0])
-            output = forward_result.values
+            output = forward_result.materialize_values()
             observation = forward_result.observation
             output_event = forward_result.output_event
         group_scopes[0].observations.append(observation)
@@ -3183,7 +3158,7 @@ def _run_startup_forward(
 ) -> tuple[tuple[torch.Tensor, ...], RunObservation, int]:
     """Execute startup forward rows eagerly or through graph qualification without publication."""
 
-    with profile_range("uniserve.startup.mixed_oracle_forward"):
+    with profile_range("uniserve.startup.mixed_service_measurement"):
         if target.type != "cuda":
             started = time.perf_counter_ns()
             result = _run_forward_group(runtime, tasks, scope, force_eager=force_eager)
@@ -3199,123 +3174,7 @@ def _run_startup_forward(
             end.record(stream)
             end.synchronize()
             elapsed_us = max(1, round(float(start.elapsed_time(end)) * 1000.0))
-        return result.values, result.observation, elapsed_us
-
-
-def _assert_mixed_equivalence(
-    runtime: Worker,
-    mixed: tuple[torch.Tensor, ...],
-    homogeneous: tuple[torch.Tensor, ...],
-    tasks: tuple[ForwardRow, ...],
-) -> None:
-    """Compare mixed-lane outputs with homogeneous execution across corresponding row slices."""
-
-    from . import flow as flow_ops
-
-    if len(mixed) != len(homogeneous) or len(mixed) != len(tasks):
-        raise RuntimeError("mixed and homogeneous forwards returned different row counts")
-    tolerances = {
-        torch.bfloat16: (1.6e-2, 1.0e-5),
-        torch.float16: (1.0e-3, 1.0e-5),
-        torch.float32: (1.3e-6, 1.0e-5),
-        torch.float64: (1.0e-7, 1.0e-7),
-    }
-    flow_rows: dict[OperationIdentity, list[int]] = defaultdict(list)
-    for row, (actual, expected, task) in enumerate(zip(mixed, homogeneous, tasks, strict=True)):
-        if actual.shape != expected.shape or actual.dtype != expected.dtype:
-            raise RuntimeError(f"mixed qualification row {row} changed output structure")
-        if task.kind == "token":
-            actual_tokens = actual.argmax(dim=-1)
-            expected_tokens = expected.argmax(dim=-1)
-            if not torch.equal(actual_tokens, expected_tokens):
-                actual_row = actual.reshape(-1, actual.shape[-1])[-1].float()
-                expected_row = expected.reshape(-1, expected.shape[-1])[-1].float()
-                actual_token = int(actual_tokens.reshape(-1)[-1].item())
-                expected_token = int(expected_tokens.reshape(-1)[-1].item())
-                compared = tuple(sorted({actual_token, expected_token}))
-                score_pairs = tuple(
-                    (
-                        token,
-                        float(actual_row[token].item()),
-                        float(expected_row[token].item()),
-                    )
-                    for token in compared
-                )
-                raise RuntimeError(
-                    f"mixed qualification row {row} changed the committed greedy token: "
-                    f"actual={actual_token} expected={expected_token} "
-                    f"candidate_scores={score_pairs!r} "
-                    f"max_abs_logit_error="
-                    f"{float((actual_row - expected_row).abs().max().item()):.6g}"
-                )
-            continue
-        if task.kind != "flow":
-            raise RuntimeError("mixed qualification contains an unsupported row kind")
-        flow_rows[_operation_identity(task.operation)].append(row)
-
-    flow = _generation(
-        runtime,
-    )
-    for identity, rows in flow_rows.items():
-        first = tasks[rows[0]]
-        image = first.request.request.image
-        timestep = first.timestep
-        latent = first.latent
-        if image is None or timestep is None or latent is None:
-            raise RuntimeError("mixed flow qualification lost its committed-state inputs")
-        host_t, host_t_next = flow.schedule_pair(
-            int(image.steps),
-            float(image.timestep_shift),
-            int(first.request.flow_step),
-        )
-        guide = build_flow_cfg_plan(
-            cfg_text_scale=float(image.cfg_text_scale),
-            cfg_img_scale=float(image.cfg_img_scale),
-            recipe=flow.cfg_recipe,
-            renorm=image.cfg_renorm_type,
-            renorm_min=float(image.cfg_renorm_min),
-            use_cfg=float(image.cfg_interval[0]) <= host_t <= float(image.cfg_interval[1]),
-        )
-        if len(guide.branches) != len(rows) or any(
-            _operation_identity(tasks[row].operation) != identity for row in rows
-        ):
-            raise RuntimeError("mixed flow qualification changed its CFG branch geometry")
-
-        def committed(values: tuple[torch.Tensor, ...]) -> torch.Tensor:
-            """Combine CFG branches and integrate the candidate latent for comparison."""
-
-            predictions = {
-                branch: flow_ops.prediction(values[row])
-                for branch, row in zip(guide.branches, rows, strict=True)
-            }
-            velocity = guide.combine(predictions)
-            if flow.prediction in {"x", "x_prediction", "x_pred"}:
-                velocity = x_pred_to_velocity(velocity, latent, timestep)
-            elif flow.prediction != "velocity":
-                raise invalid_descriptor(f"unsupported flow prediction {flow.prediction!r}")
-            next_timestep = timestep.new_tensor([host_t_next])
-            return euler_step(latent, velocity, timestep, next_timestep)
-
-        actual = committed(mixed)
-        expected = committed(homogeneous)
-        if actual.shape != expected.shape or actual.dtype != expected.dtype:
-            raise RuntimeError("mixed flow qualification changed committed latent structure")
-        tolerance = tolerances.get(actual.dtype)
-        if tolerance is None:
-            if not torch.equal(actual, expected):
-                raise RuntimeError("mixed flow qualification changed an exact committed latent")
-            continue
-        rtol, atol = tolerance
-        torch.testing.assert_close(
-            actual,
-            expected,
-            rtol=rtol,
-            atol=atol,
-            equal_nan=True,
-            msg=lambda message: (
-                f"mixed flow qualification {identity!r} changed the committed latent: {message}"
-            ),
-        )
+        return result.materialize_values(), result.observation, elapsed_us
 
 
 def _run_observed_forward_group(

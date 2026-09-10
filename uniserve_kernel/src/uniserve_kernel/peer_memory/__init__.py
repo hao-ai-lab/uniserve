@@ -1,4 +1,4 @@
-"""CUDA peer allocation and mapping primitives for public resource owners."""
+"""CUDA allocation, mapping, and asynchronous host-storage primitives."""
 
 from functools import lru_cache
 from pathlib import Path
@@ -83,3 +83,14 @@ def copy_host_device(
     if device != stream.device:
         raise ValueError("host/device copy stream belongs to another device")
     _extension().copy_host_device(destination, source, int(stream.cuda_stream))
+
+
+def record_host_usage(tensor: torch.Tensor, stream: torch.cuda.Stream) -> None:
+    """Retain pinned storage through a native asynchronous DMA submission.
+
+    Call after native code enqueues a host/device copy outside PyTorch's copy
+    operator. The pinned allocator delays storage reuse until this stream retires
+    the copy; the owner must leave the submitted contents immutable meanwhile.
+    """
+
+    _extension().record_host_usage(tensor, stream.device_index, int(stream.cuda_stream))

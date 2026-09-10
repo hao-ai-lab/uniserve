@@ -378,12 +378,17 @@ class CacheTransfers:
         ):
             if index < 2:
                 region = TensorRegion(
-                    (0, 0, self.pool.kv_head_offset, 0),
+                    (0, self.pool.layer_offset, self.pool.kv_head_offset, 0),
                     (suffix, self.pool.num_layers, self.pool.n_kv, self.pool.head_dim),
                 )
             else:
                 region = TensorRegion(
-                    (0, 0, 0, self.pool.kv_head_offset // publication.scale_head_size),
+                    (
+                        0,
+                        0,
+                        self.pool.layer_offset,
+                        self.pool.kv_head_offset // publication.scale_head_size,
+                    ),
                     (len(destination), 2, self.pool.num_layers, 1),
                 )
             tickets.extend(self._fetch(write, tensor, destination, transports, region=region))
@@ -412,7 +417,10 @@ class CacheTransfers:
                 workspace.raw[field, : elements * itemsize].view(dtype).reshape(count, *trailing)
                 for field in range(2)
             )
-            region = TensorRegion((logical, 0, self.pool.kv_head_offset, 0), (count, *trailing))
+            region = TensorRegion(
+                (logical, self.pool.layer_offset, self.pool.kv_head_offset, 0),
+                (count, *trailing),
+            )
             tickets = tuple(
                 ticket
                 for tensor, destination in zip(publication.tensors[:2], raw, strict=True)
@@ -436,7 +444,7 @@ class CacheTransfers:
                     workspace.scales[:scale_count, :, :, : head_end - head_start],
                     transports,
                     region=TensorRegion(
-                        (scale_start, 0, 0, head_start),
+                        (scale_start, 0, self.pool.layer_offset, head_start),
                         (scale_count, 2, self.pool.num_layers, head_end - head_start),
                     ),
                 )

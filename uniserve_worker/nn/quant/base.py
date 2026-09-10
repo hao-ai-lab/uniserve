@@ -79,6 +79,11 @@ class LinearMethod(abc.ABC):
 
         raise NotImplementedError
 
+    def apply_into(self, module: LinearBase, x: torch.Tensor, output: torch.Tensor) -> None:
+        """Project into caller-owned rows with the method's usual numerical contract."""
+
+        output.copy_(self.apply(module, x))
+
     @abc.abstractmethod
     def process_weights_after_loading(self, module: LinearBase) -> None:
         """Finalize loaded tensors into the representation consumed by execution."""
@@ -159,6 +164,12 @@ class UnquantizedLinearMethod(LinearMethod):
         self, x: torch.Tensor, *, absmax: torch.Tensor | None = None
     ) -> torch.Tensor | None:
         return None
+
+    def apply_into(self, module: LinearBase, x: torch.Tensor, output: torch.Tensor) -> None:
+        if module.execution_bias is None:
+            torch.mm(x, module.weight.t(), out=output)
+        else:
+            torch.addmm(module.execution_bias, x, module.weight.t(), out=output)
 
     def prepare_input(
         self,

@@ -1,9 +1,9 @@
 """Channel-scaled residuals and normalization with FP32 affine accumulation.
 
-Projection bias rounds through the update dtype before scaling. Residual sums,
-normalization statistics and learned affine transforms stay in FP32 until the
-output dtype boundary. RMS variants update the residual storage in place while
-normalizing the unrounded sum. Magnitude variants measure the rounded output.
+Projection bias, residual sums, normalization statistics and learned affine
+transforms stay in FP32 until the output dtype boundary. RMS variants update the
+residual storage in place while normalizing the unrounded sum. Magnitude variants
+measure the stored output.
 """
 
 from __future__ import annotations
@@ -122,7 +122,6 @@ if triton is not None:
             update += tl.load(update_bias_ptr + columns, mask=columns < WIDTH, other=0.0).to(
                 tl.float32
             )
-            update = update.to(update_ptr.dtype.element_ty).to(tl.float32)
         scale = tl.load(scale_ptr + columns, mask=columns < WIDTH, other=0.0).to(tl.float32)
         residual = hidden + update * scale
         inverse_rms = tl.rsqrt(tl.sum(residual * residual, axis=0) / WIDTH + eps)
@@ -155,7 +154,6 @@ if triton is not None:
             update += tl.load(update_bias_ptr + columns, mask=columns < WIDTH, other=0.0).to(
                 tl.float32
             )
-            update = update.to(update_ptr.dtype.element_ty).to(tl.float32)
         scale = tl.load(scale_ptr + columns, mask=columns < WIDTH, other=0.0).to(tl.float32)
         residual = hidden + update * scale
         inverse_rms = tl.rsqrt(tl.sum(residual * residual, axis=0) / WIDTH + eps)
@@ -188,7 +186,6 @@ if triton is not None:
         update = tl.load(update_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
         if HAS_UPDATE_BIAS:
             update += tl.load(update_bias_ptr + columns, mask=mask, other=0.0).to(tl.float32)
-            update = update.to(update_ptr.dtype.element_ty).to(tl.float32)
         scale = tl.load(scale_ptr + columns, mask=mask, other=0.0).to(tl.float32)
         tl.store(hidden_ptr + offsets, hidden + update * scale, mask=mask)
 
@@ -217,7 +214,6 @@ if triton is not None:
             update += tl.load(update_bias_ptr + columns, mask=columns < WIDTH, other=0.0).to(
                 tl.float32
             )
-            update = update.to(update_ptr.dtype.element_ty).to(tl.float32)
         scale = tl.load(scale_ptr + columns, mask=columns < WIDTH, other=0.0).to(tl.float32)
         residual = hidden + update * scale
         mean = tl.sum(residual, axis=0) / WIDTH
@@ -253,7 +249,6 @@ if triton is not None:
             update += tl.load(update_bias_ptr + columns, mask=columns < WIDTH, other=0.0).to(
                 tl.float32
             )
-            update = update.to(update_ptr.dtype.element_ty).to(tl.float32)
         scale = tl.load(scale_ptr + columns, mask=columns < WIDTH, other=0.0).to(tl.float32)
         residual = hidden + update * scale
         mean = tl.sum(residual, axis=0) / WIDTH
@@ -340,9 +335,10 @@ def scaled_residual_rms_norm_(
     if hidden.shape != update.shape or hidden.device != update.device:
         raise ValueError("scaled residual operands must have the same shape and device")
     if not _fused_rows(hidden, scale, weight, update_bias) or not update.is_contiguous():
+        biased_update = update.float()
         if update_bias is not None:
-            update = (update.float() + update_bias.float()).to(update.dtype)
-        residual = hidden.float() + update.float() * scale.float()
+            biased_update = biased_update + update_bias.float()
+        residual = hidden.float() + biased_update * scale.float()
         hidden.copy_(residual)
         normalized = residual * torch.rsqrt(residual.square().mean(-1, keepdim=True) + eps)
         return hidden, (normalized * weight.float()).to(_output_dtype(update))
@@ -426,9 +422,10 @@ def scaled_residual_(
     if hidden.shape != update.shape or hidden.device != update.device:
         raise ValueError("scaled residual operands must have the same shape and device")
     if not _fused_rows(hidden, scale, update_bias) or not update.is_contiguous():
+        biased_update = update.float()
         if update_bias is not None:
-            update = (update.float() + update_bias.float()).to(update.dtype)
-        hidden.add_(update.float() * scale.float())
+            biased_update = biased_update + update_bias.float()
+        hidden.add_(biased_update * scale.float())
         return hidden
 
     elements = hidden.numel()
@@ -461,9 +458,10 @@ def scaled_residual_layer_norm(
     if hidden.shape != update.shape or hidden.device != update.device:
         raise ValueError("scaled residual operands must have the same shape and device")
     if not _fused_rows(hidden, scale, weight, bias, update_bias) or not update.is_contiguous():
+        biased_update = update.float()
         if update_bias is not None:
-            update = (update.float() + update_bias.float()).to(update.dtype)
-        residual = hidden.float() + update.float() * scale.float()
+            biased_update = biased_update + update_bias.float()
+        residual = hidden.float() + biased_update * scale.float()
         normalized = F.layer_norm(
             residual, (int(hidden.shape[-1]),), weight.float(), bias.float(), eps
         )

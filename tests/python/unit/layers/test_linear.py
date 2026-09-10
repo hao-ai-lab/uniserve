@@ -6,7 +6,10 @@ from torch import nn
 from torch.nn import functional as F
 
 from uniserve_worker.nn.layer import LayerConfig
-from uniserve_worker.nn.linear import LinearBase, MergedColumnParallelLinear, RowParallelLinear
+from uniserve_worker.nn.linear import (
+    LinearBase,
+    MergedColumnParallelLinear,
+)
 from uniserve_worker.nn.mesh import Communicator
 from uniserve_worker.nn.mlp import GatedMLP
 from uniserve_worker.nn.quant.base import PreparedLinearInput
@@ -53,24 +56,6 @@ def test_prepared_fp8_values_preserve_shape_scale_and_deferred_bias(tensorwise):
     )
     with pytest.raises(ValueError, match="activation scale"):
         linear.forward_prepared(misplaced)
-
-
-@pytest.mark.parametrize("projection", [LinearBase, RowParallelLinear])
-def test_logical_input_partitions_are_independent_quantization_domains(projection):
-    linear = projection(
-        2,
-        2,
-        layer_config=LayerConfig(Communicator(), None),
-        quant_method=DynamicW8A8Fp8LinearMethod(tensorwise=True),
-        logical_input_row_partitions=2,
-        bias=False,
-    )
-    linear.weight = nn.Parameter(torch.tensor([[448.0, 0.0], [0.0, 448.0]]), requires_grad=False)
-    linear.finalize_weights()
-    inputs = torch.tensor([[0.5, 1.0], [224.0, 448.0]])
-    torch.testing.assert_close(linear(inputs), inputs * 448.0, rtol=0, atol=0)
-    with pytest.raises(ValueError, match="logical quantization partitions"):
-        linear(inputs[:1])
 
 
 def test_prepared_gated_mlp_preserves_row_scales_and_leading_dimensions():
@@ -216,3 +201,53 @@ def test_packed_projection_branches_preserve_logical_weights_and_bias(quantized,
     expected = F.linear(inputs, weights, bias)
     actual = torch.cat(projection.forward_branches(inputs), dim=-1)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("heads,kv_heads", [(4, 2), (4, 1), (8, 8)])
+def test_query_owners_load_their_corresponding_grouped_key_value_heads(heads, kv_heads):
+    from uniserve_worker.loader.handles import TensorWeightHandle
+    from uniserve_worker.loader.weight_loaders import (
+        attach_parameter_loaders,
+        load_parameter_weight,
+    )
+    from uniserve_worker.nn.linear import QKVParallelLinear
+
+    head_dim, width = 4, 8
+    weights = tuple(
+        torch.arange(count * head_dim * width, dtype=torch.float32).view(count * head_dim, width)
+        for count in (heads, kv_heads, kv_heads)
+    )
+    biases = tuple(
+        torch.arange(count * head_dim, dtype=torch.float32) for count in (heads, kv_heads, kv_heads)
+    )
+    values = torch.eye(width)[:3]
+    ranks = (3, 1, 0, 2)
+    for owner, physical in enumerate(ranks):
+        linear = QKVParallelLinear(
+            width,
+            head_dim,
+            heads,
+            kv_heads,
+            layer_config=LayerConfig(Communicator(ranks=ranks, rank=physical), None),
+            bias=True,
+        )
+        attach_parameter_loaders(linear, device="cpu", dtype=torch.float32)
+        for branch, weight, bias in zip(("q", "k", "v"), weights, biases, strict=True):
+            load_parameter_weight(linear.weight, TensorWeightHandle("weight", weight), branch)
+            load_parameter_weight(linear.bias, TensorWeightHandle("bias", bias), branch)
+        query_heads = range(owner * heads // 4, (owner + 1) * heads // 4)
+        key_heads = sorted({head // (heads // kv_heads) for head in query_heads})
+        expected = []
+        for selected, weight, bias in zip(
+            (list(query_heads), key_heads, key_heads), weights, biases, strict=True
+        ):
+            columns = [head * head_dim + dim for head in selected for dim in range(head_dim)]
+            expected.append(F.linear(values, weight, bias)[:, columns])
+        torch.testing.assert_close(linear(values), torch.cat(expected, dim=-1), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("shape", [(0, 7), (0, 0), ()])
+def test_empty_projection_keeps_the_declared_input_width(shape):
+    linear = LinearBase(8, 4, layer_config=LayerConfig(Communicator(), None))
+    with pytest.raises(ValueError, match="feature width"):
+        linear(torch.empty(shape))

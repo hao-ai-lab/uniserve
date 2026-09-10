@@ -98,4 +98,79 @@ def compute_prefix_bounds_varlen(
     ).contiguous()
 
 
-__all__ = ["compute_prefix_bounds", "compute_prefix_bounds_varlen"]
+def prefix_block_sparsity(
+    visible_end: torch.Tensor,
+    *,
+    query_lengths: torch.Tensor,
+    key_lengths: torch.Tensor,
+    max_key_length: int,
+    query_tile: int,
+    key_tile: int,
+    variable_length: bool,
+):
+    """Describe fully visible and masked KV tiles using the CuTe sparse ABI.
+
+    Prefix minima identify tiles requiring no element mask; maxima bound the
+    tiles that need the per-query mask. Storage is bounded by host geometry,
+    while lengths, counts and offsets remain live device values under replay.
+    Variable-length indices have each sequence's actual KV-tile row stride.
+    """
+
+    from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
+
+    batch, width = _validate_visible_end(visible_end)
+    query_tiles = (width + query_tile - 1) // query_tile
+    key_tiles = (max_key_length + key_tile - 1) // key_tile
+    if query_lengths.shape != (batch,) or key_lengths.shape != (batch,):
+        raise ValueError("prefix sparsity requires one query and key length per sequence")
+    bounds = compute_prefix_bounds_varlen(
+        visible_end, query_lengths, q_tile_size=query_tile, num_q_tiles=query_tiles
+    ).clamp_min(0)
+    bounds = torch.minimum(bounds, key_lengths[:, None, None])
+    full = bounds[..., 0] // key_tile
+    partial = (bounds[..., 1] + key_tile - 1) // key_tile - full
+    columns = torch.arange(key_tiles, device=visible_end.device, dtype=torch.int32)
+    if not variable_length:
+        return BlockSparseTensorsTorch(
+            partial[:, None].contiguous(),
+            (full[..., None] + columns)[:, None].contiguous(),
+            full[:, None].contiguous(),
+            columns.expand(batch, 1, query_tiles, key_tiles).contiguous(),
+            block_size=(query_tile, key_tile),
+        )
+
+    q_tiles = (query_lengths + query_tile - 1) // query_tile
+    k_tiles = (key_lengths + key_tile - 1) // key_tile
+    cumulative_tiles = torch.nn.functional.pad(q_tiles.cumsum(0, dtype=torch.int32), (1, 0))
+    cumulative_indices = torch.nn.functional.pad(
+        (q_tiles * k_tiles).cumsum(0, dtype=torch.int32), (1, 0)
+    )
+    positions = torch.arange(batch * query_tiles, device=visible_end.device, dtype=torch.int32)
+    owners = torch.searchsorted(cumulative_tiles[1:], positions, right=True).clamp_max(batch - 1)
+    local_tile = positions - cumulative_tiles[owners]
+    source = owners * query_tiles + local_tile.clamp(0, query_tiles - 1)
+    valid = positions < cumulative_tiles[-1]
+    full_counts = torch.where(valid, full.reshape(-1)[source], 0)
+    mask_counts = torch.where(valid, partial.reshape(-1)[source], 0)
+
+    positions = torch.arange(
+        batch * query_tiles * key_tiles, device=visible_end.device, dtype=torch.int32
+    )
+    owners = torch.searchsorted(cumulative_indices[1:], positions, right=True).clamp_max(batch - 1)
+    local_index = positions - cumulative_indices[owners]
+    stride = k_tiles[owners].clamp_min(1)
+    local_tile = torch.div(local_index, stride, rounding_mode="floor").clamp(0, query_tiles - 1)
+    columns = local_index.remainder(stride)
+    first_masked = full.reshape(-1)[owners * query_tiles + local_tile]
+    return BlockSparseTensorsTorch(
+        mask_counts[None].contiguous(),
+        (first_masked + columns)[None].contiguous(),
+        full_counts[None].contiguous(),
+        columns[None].contiguous(),
+        cu_total_m_blocks=cumulative_tiles,
+        cu_block_idx_offsets=cumulative_indices,
+        block_size=(query_tile, key_tile),
+    )
+
+
+__all__ = ["compute_prefix_bounds", "compute_prefix_bounds_varlen", "prefix_block_sparsity"]

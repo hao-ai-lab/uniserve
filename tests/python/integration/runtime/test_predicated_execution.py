@@ -23,6 +23,7 @@ from uniserve_worker.execution.batch import (
     DType,
     Finish,
     FixedCheckpoint,
+    Free,
     ImageParams,
     NewRequest,
     Operation,
@@ -88,12 +89,17 @@ def _with_transition_predicate(
 
 
 def _release_relay_outputs(worker, *operations: Operation) -> None:
-    worker.free_products(
-        tuple(
-            output.buffer_id
-            for operation in operations
-            for output in operation.outputs
-            if output.storage_class is StorageClass.REQUEST_RELAY
+    finalize_run_result(
+        worker.execute(
+            execution_run(
+                run_id=max(operation.op_id for operation in operations) + 1,
+                commands=tuple(
+                    Free(output.buffer_id)
+                    for operation in operations
+                    for output in operation.outputs
+                    if output.storage_class is StorageClass.REQUEST_RELAY
+                ),
+            )
         )
     )
 

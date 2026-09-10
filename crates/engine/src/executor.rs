@@ -360,7 +360,7 @@ impl ExecutorInfo {
                     "executor KV pools disagree on block size"
                 );
                 anyhow::ensure!(
-                    other_kv.num_layers == first_kv.num_layers
+                    other_kv.total_layers == first_kv.total_layers
                         && other_kv.total_kv_heads == first_kv.total_kv_heads
                         && other_kv.head_dim == first_kv.head_dim
                         && other_kv.dtype == first_kv.dtype

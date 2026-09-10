@@ -1844,9 +1844,13 @@ fn rank_group_args(
 }
 
 fn worker_python() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join(".venv/bin/python")
+    std::env::var_os("UNISERVE_WORKER_PYTHON")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .join(".venv/bin/python")
+        })
 }
 
 fn execute(executor: &mut Worker, batch: Batch) -> anyhow::Result<uniserve_worker_ipc::RunResult> {

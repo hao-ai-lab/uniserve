@@ -69,7 +69,6 @@ if triton is not None:
         value = tl.load(source_ptr + source_offsets, mask=mask, other=0.0).to(tl.float32)
         if HAS_BIAS:
             value += tl.load(bias_ptr + patch_channel, mask=mask, other=0.0).to(tl.float32)
-            value = value.to(output_ptr.dtype.element_ty).to(tl.float32)
         tl.store(output_ptr + offsets, value, mask=mask)
 
 
@@ -84,7 +83,7 @@ def unpatchify_video_tokens(
 
     Grid and patch dimensions follow time, height, width order. Each token stores
     channel-major patch elements. Trailing padded tokens are ignored. Bias is
-    added before reshaping and rounds through the source dtype.
+    accumulated in FP32 before storing the rearranged output in the source dtype.
     """
 
     if source.ndim != 3 or min(*grid_shape, *patch_shape) < 1:

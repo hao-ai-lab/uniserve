@@ -2,22 +2,26 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
 from uniserve_worker.config import WorkerConfig
 
+from ..execution.batch import DeviceDim, TensorSpec
 from ..execution.bounded_storage import TensorSchema
 from ..execution.input_buffers import InputGeometry
 from ..foundation.math import ceil_div
 from ..models.generation import GenerationPipeline
 from ..models.inputs import FeatureLayout
 from ..models.runtime import ExecutionModel
-from ..nn.mesh import Communicator
+from ..nn.mesh import Communicator, EntryBindings
 from ..runtime.device_products import device_product_capacity_bytes
+
+if TYPE_CHECKING:
+    from ..models.video import MediaExecutionPlan
 
 _DEVICE_PRODUCTS_PER_OPERATION = 6
 _DEVICE_PRODUCT_RETIREMENT_BATCHES = 1
@@ -91,23 +95,98 @@ def tensor_slot_capacity(
     maximum: int,
     minimum: int,
     available_bytes: int,
-    product_bytes_per_request: int = 0,
+    auxiliary_bytes: Callable[[int], int],
 ) -> int:
-    """Size identical request-slot counts within every participating device's grant."""
+    """Choose the largest slot count whose complete storage fits on every rank.
 
-    bytes_per_slot = (
-        sum(field.nbytes for field in schema.values() if field.memory != "pinned")
-        + product_bytes_per_request
-    )
+    ``auxiliary_bytes(slots)`` includes products and runtime arenas. Its cost
+    may increase when fewer slots allow more in-flight outputs per request,
+    so ranks agree on feasible counts rather than reducing local maxima.
+    """
+
+    bytes_per_slot = sum(field.nbytes for field in schema.values() if field.memory != "pinned")
     if bytes_per_slot < 1 or minimum < 1 or maximum < minimum:
         raise ValueError("request tensor capacity requires valid byte and slot bounds")
-    available = min(maximum, available_bytes // bytes_per_slot)
-    agreed = torch.tensor(available, dtype=torch.int64, device=group.device)
+    candidates = range(minimum, maximum + 1)
+    requirements = [count * bytes_per_slot + auxiliary_bytes(count) for count in candidates]
+    agreed = torch.tensor(
+        [required <= available_bytes for required in requirements],
+        dtype=torch.int32,
+        device=group.device,
+    )
     group.all_reduce_min(agreed)
-    count = int(agreed.item())
-    if count < minimum:
-        raise RuntimeError("insufficient device memory for the required request tensor slots")
-    return count
+    feasible = [count for count, fits in zip(candidates, agreed.cpu().tolist()) if fits]
+    if feasible:
+        return feasible[-1]
+    raise RuntimeError(
+        "insufficient device memory for a common request tensor slot count: "
+        f"candidate range {minimum}..{maximum}, local requirements {requirements}, "
+        f"{available_bytes} bytes available"
+    )
+
+
+def request_tensor_window(pipeline_depth: int, request_slots: int) -> int:
+    """Return the output horizon after reserving one pipeline slot per request."""
+
+    if request_slots < 1 or pipeline_depth < 3 * request_slots:
+        raise ValueError("request tensor pipeline requires two unresolved outputs per slot")
+    return pipeline_depth // request_slots - 1
+
+
+def local_product_storage_bytes(
+    entry_outputs: Mapping[str, tuple[TensorSpec, ...]],
+    *,
+    bindings: EntryBindings | None,
+    plan: MediaExecutionPlan | None,
+    max_unresolved_ops: int,
+) -> int:
+    """Size persistent products from placement, consumers and the output horizon.
+
+    Producers and remote consumers each need a complete logical allocation:
+    disjoint regions may subsequently be imported into that allocation. A
+    temporal-unit stage only retains its unresolved groups of leading-axis
+    units. Non-streaming results retain their declared capacity until their
+    consumers finish. Alignment follows PersistentBuffers' allocation contract.
+    """
+
+    from ..models.video import MediaPlanRepeat
+
+    if max_unresolved_ops < 1:
+        raise ValueError("product storage requires a positive output horizon")
+    consumers: dict[str, set[str]] = {}
+    streamed: set[str] = set()
+    if plan is not None:
+        stages = {stage.name: stage for stage in plan.stages}
+        for stage in stages.values():
+            if stage.input_from is not None:
+                source = stages[stage.input_from].entry
+                consumers.setdefault(source, set()).add(stage.entry)
+            if stage.repeat is MediaPlanRepeat.VIDEO_UNITS:
+                streamed.add(stage.entry)
+    total = 0
+    for entry, outputs in entry_outputs.items():
+        if bindings is not None:
+            residents = set(bindings.output_ranks(entry))
+            for consumer in consumers.get(entry, ()):
+                residents.update(bindings.entries[consumer].ranks)
+            if bindings.process_group.rank not in residents:
+                continue
+        units_per_operation = 1
+        if bindings is not None and entry in streamed:
+            config = bindings.entries[entry]
+            units_per_operation = len(config.ranks) * config.units_per_rank
+        for output in outputs:
+            size = output.max_bytes
+            if entry in streamed:
+                dims = output.shape_bound.dims
+                if not dims or not isinstance(dims[0], DeviceDim):
+                    raise ValueError("streamed products require a bounded leading unit axis")
+                max_units = dims[0].bound
+                group_bytes = size // max_units * min(max_units, units_per_operation)
+                live_groups = min(ceil_div(max_units, units_per_operation), max_unresolved_ops)
+                size = live_groups * ceil_div(group_bytes, 256) * 256
+            total += ceil_div(size, 256) * 256
+    return total
 
 
 @dataclass(frozen=True)
@@ -194,7 +273,7 @@ def request_tensor_arena_capacity(
     max_operations = int(worker_config.max_batch_operations)
     state_slots = int(worker_config.max_request_pool_size)
     slots = depth * max_operations
-    unresolved_window = depth // state_slots - 1
+    unresolved_window = request_tensor_window(depth, state_slots)
     device_products = _DEVICE_PRODUCTS_PER_OPERATION * (
         slots + _DEVICE_PRODUCT_RETIREMENT_BATCHES * max_operations
     )
@@ -246,7 +325,12 @@ def model_arena_capacity(
         return request_tensor_arena_capacity(
             worker_config,
             pipeline_depth=depth,
-            product_bytes_per_request=model.product_storage_bytes,
+            product_bytes_per_request=local_product_storage_bytes(
+                model.entry_outputs,
+                bindings=model.bindings,
+                plan=model.media_plan,
+                max_unresolved_ops=request_tensor_window(depth, request_pool_size),
+            ),
         )
     transfer_tickets = min(slots, _MAX_TRANSFER_ENTRIES)
     block_size = int(worker_config.block_size)
@@ -255,7 +339,6 @@ def model_arena_capacity(
         raise ValueError("model generation behavior has an invalid type")
     latent_pool_bytes = 0
     latent_transfer_bytes = 0
-    artifact_bytes = 0
     if flow is not None:
         dtype_bytes = {
             "float16": 2,
@@ -276,20 +359,12 @@ def model_arena_capacity(
             int(latent_width),
             dtype_bytes,
         )
-        raw_image_bytes = int(flow.max_vae_grid_tokens) * int(flow.latent_downsample) ** 2 * 3
-        # Device feedback is the decoded BF16 image. Encoded PNG/base64 bytes
-        # belong to the pinned CPU output owner and consume no device arena.
-        artifact_bytes = raw_image_bytes * 2
     max_transfer_bytes = max(
         int(num_blocks) * block_size * int(bytes_per_token),
         latent_transfer_bytes,
         int(max_latent_feature_bytes),
         int(max_vision_feature_bytes),
         1,
-    )
-    max_product_bytes = max(
-        1,
-        artifact_bytes,
     )
     device_product_slots = slots + _DEVICE_PRODUCT_RETIREMENT_BATCHES * max_operations
     device_products = _DEVICE_PRODUCTS_PER_OPERATION * device_product_slots
@@ -299,11 +374,14 @@ def model_arena_capacity(
             str(worker_config.generation_device or worker_config.device),
         }
     )
+    # Resident images and tensor products borrow scheduler-assigned storage
+    # from PersistentBuffers, whose complete grant is counted by the layout
+    # owner. DeviceProducts owns scalar backing and request relays separately.
     device_product_bytes = device_product_capacity_bytes(
         device_products,
         device_count,
         selected_points_per_operation=1,
-        max_value_bytes=max_product_bytes,
+        max_value_bytes=1,
     )
     device_product_bytes += (
         (int(request_pool_size) + 1)

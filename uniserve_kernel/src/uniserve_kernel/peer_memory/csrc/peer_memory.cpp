@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <torch/extension.h>
+#include <ATen/core/CachingHostAllocator.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAStream.h>
 #include <cuda.h>
 
 #include <cstring>
@@ -236,6 +238,18 @@ torch::Tensor import_ipc(torch::Tensor prototype, const pybind11::bytes& opaque,
       .make_tensor();
 }
 
+void record_host_usage(torch::Tensor tensor, int64_t device, uint64_t stream_handle) {
+  TORCH_CHECK(tensor.is_cpu() && tensor.is_pinned(),
+              "native DMA lifetime tracking requires pinned host storage");
+  const c10::cuda::CUDAGuard guard(static_cast<c10::DeviceIndex>(device));
+  const auto stream = c10::cuda::getStreamFromExternal(
+      reinterpret_cast<cudaStream_t>(stream_handle), static_cast<c10::DeviceIndex>(device));
+  const auto& allocation = tensor.storage().data_ptr();
+  TORCH_CHECK(at::getHostAllocator(at::kCUDA)->record_event(
+                  tensor.data_ptr(), allocation.get_context(), stream.unwrap()),
+              "native DMA source must belong to the PyTorch pinned allocator");
+}
+
 void copy_host_device(torch::Tensor destination, torch::Tensor source, uint64_t stream_handle) {
   TORCH_CHECK(source.is_cuda() != destination.is_cuda() &&
                   (source.is_cpu() || destination.is_cpu()),
@@ -345,6 +359,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, binding) {
   binding.def("export_ipc", &export_ipc);
   binding.def("import_ipc", &import_ipc);
   binding.def("copy_host_device", &copy_host_device);
+  binding.def("record_host_usage", &record_host_usage);
   pybind11::class_<PeerAllocation>(binding, "PeerAllocation")
       .def(pybind11::init<torch::Tensor, std::vector<int64_t>>())
       .def("export_fd", &PeerAllocation::export_fd)

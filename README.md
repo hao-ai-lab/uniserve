@@ -27,7 +27,7 @@ uv pip install -e .
 
 The installation builds the `uniserve` binary and the native worker IPC extension.
 
-CUDA IPC and peer-memory mappings use the native `uniserve-kernel` package included in the `gpu` extra. Install the source workspace with `uv sync --extra gpu`; building these mappings requires a CUDA toolkit compatible with PyTorch, a C++ compiler, and Ninja.
+The `gpu` extra includes FlashAttention-4 and the native `uniserve-kernel` package for CUDA IPC and peer-memory mappings. Install the source workspace with `uv sync --extra gpu`; building these mappings requires a CUDA toolkit compatible with PyTorch, a C++ compiler, and Ninja.
 
 ## Start a server
 
@@ -141,6 +141,8 @@ uniserve serve /models/Qwen3-32B \
   --served-model-name Qwen3-32B \
   --worker-ranks 4
 ```
+
+For sequence and pipeline parallelism, combined layouts, and shared execution capabilities, use the [parallel execution guide](docs/parallel-execution.md).
 
 For text-to-video-and-audio generation with `FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree`, use the [FastH3 cheat sheet](docs/fast_h3/fast_h3.md).
 

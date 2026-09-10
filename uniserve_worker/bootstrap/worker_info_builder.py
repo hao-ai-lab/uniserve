@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import asdict, dataclass, replace
+from typing import cast
 
 import torch
 
@@ -29,9 +30,11 @@ from .capacity import (
     derive_runtime_kv_capacity,
     device_total_bytes,
     latent_pool_capacity_bytes,
+    local_product_storage_bytes,
     model_arena_capacity,
     operation_window,
     packed_input_geometry,
+    request_tensor_window,
 )
 from .worker_info import (
     KvCacheConfig,
@@ -51,6 +54,7 @@ class WorkerLayout:
     arena: ArenaCapacity
     input_geometry: InputGeometry | None
     fixed_device_bytes: tuple[tuple[str, int], ...]
+    physical_buffer_pool_bytes: int
     latent_width: int
     latent_dtype: str
     latent_downsample: int
@@ -91,9 +95,6 @@ def configuration_identity(
                 "weight_scale_domain": method.weight_scale_domain,
                 "weight_shard_axis": (
                     module.weight_shard_axis if isinstance(module, LinearBase) else None
-                ),
-                "logical_input_row_partitions": (
-                    module.logical_input_row_partitions if isinstance(module, LinearBase) else 1
                 ),
             }
     layout_description = asdict(layout)
@@ -325,6 +326,8 @@ def build_worker_layout(
                 block_size=int(worker_config.block_size),
                 num_blocks=int(capacity.num_blocks),
                 num_layers=int(cache.num_layers),
+                total_layers=cast(int, cache.total_layers),
+                layer_offset=int(cache.layer_offset),
                 num_kv_heads=int(cache.num_kv_heads),
                 total_kv_heads=int(cache.total_kv_heads),
                 kv_head_offset=int(cache.kv_head_offset),
@@ -360,6 +363,7 @@ def build_worker_layout(
         arena=arena,
         input_geometry=input_geometry,
         fixed_device_bytes=tuple(fixed_bytes.items()),
+        physical_buffer_pool_bytes=buffer_pool_bytes,
         latent_width=latent_width,
         latent_dtype=worker_config.model_dtype if flow is not None else "",
         latent_downsample=int(flow.latent_downsample) if flow is not None else 1,
@@ -398,11 +402,7 @@ def _request_tensor_worker_layout(
         raise RuntimeError("request tensor worker info requires declared tensor storage")
     slots = int(worker_config.max_request_pool_size)
     depth = int(queue_depth)
-    unresolved_window = depth // slots - 1
-    if unresolved_window < 2 or depth < slots * (unresolved_window + 1):
-        raise invalid_descriptor(
-            "request tensor pipeline depth does not provide two unresolved outputs per state slot"
-        )
+    unresolved_window = request_tensor_window(depth, slots)
     max_operations = min(slots, int(worker_config.max_batch_operations))
     info = WorkerInfo(
         model_name=model_name,
@@ -440,6 +440,13 @@ def _request_tensor_worker_layout(
         ),
         input_geometry=None,
         fixed_device_bytes=(),
+        physical_buffer_pool_bytes=slots
+        * local_product_storage_bytes(
+            model.entry_outputs,
+            bindings=model.bindings,
+            plan=model.media_plan,
+            max_unresolved_ops=unresolved_window,
+        ),
         latent_width=1,
         latent_dtype="float32",
         latent_downsample=1,

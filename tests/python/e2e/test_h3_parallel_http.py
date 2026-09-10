@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
+import sys
 from dataclasses import replace
+from itertools import zip_longest
 from pathlib import Path
 
+import av
 import httpx
+import numpy as np
 import pytest
 from transformers import AutoTokenizer
 
@@ -21,6 +26,27 @@ from uniserve_eval.datasets.minimax_h3 import MiniMaxH3Dataset
 from uniserve_eval.transport.video import inspect_video_bytes
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("minimax_h3")]
+
+
+def _assert_media_values_close(actual: bytes, expected: bytes) -> None:
+    """Compare decoded media within the BF16 model-composition error budget."""
+
+    for kind in ("video", "audio"):
+        with av.open(io.BytesIO(actual)) as observed, av.open(io.BytesIO(expected)) as reference:
+            for frame, wanted in zip_longest(
+                observed.decode(**{kind: 0}), reference.decode(**{kind: 0})
+            ):
+                assert frame is not None and wanted is not None, f"{kind}: frame count mismatch"
+                assert frame.time == wanted.time, f"{kind}: presentation time mismatch"
+                if kind == "video":
+                    values = frame.to_ndarray(format="rgb24").astype(np.float32) / 255
+                    reference_values = wanted.to_ndarray(format="rgb24").astype(np.float32) / 255
+                else:
+                    values = frame.to_ndarray()
+                    reference_values = wanted.to_ndarray()
+                np.testing.assert_allclose(
+                    values, reference_values, rtol=2e-2, atol=2e-2, equal_nan=False
+                )
 
 
 @pytest.mark.parametrize(
@@ -195,7 +221,7 @@ def test_component_bindings_release_cancelled_requests(
         "--port",
         str(port),
         "--worker-python",
-        str(Path.cwd() / ".venv" / "bin" / "python"),
+        sys.executable,
         "--workers",
         json.dumps(workers),
         "--transfer",
@@ -274,7 +300,6 @@ def test_component_bindings_release_cancelled_requests(
 
 def test_video_jobs_retain_content_and_cancel_active_work(tmp_path: Path) -> None:
     """Exercise async ownership and reuse through the HTTP contract on one deployment."""
-    import sys
     import time
 
     model = os.environ.get("UNISERVE_H3_MODEL")
@@ -366,7 +391,7 @@ def test_video_jobs_retain_content_and_cancel_active_work(tmp_path: Path) -> Non
             content = client.get(f"/v1/videos/{concurrent_id}/content")
             isolated = client.post("/v1/videos/sync", json=item)
             isolated.raise_for_status()
-            assert content.content == isolated.content
+            _assert_media_values_close(content.content, isolated.content)
 
         # Cancel more requests than the two resident slots, including a genuinely active job.
         for seed in range(3):
@@ -407,4 +432,4 @@ def test_video_jobs_retain_content_and_cancel_active_work(tmp_path: Path) -> Non
     ):
         eager = client.post("/v1/videos/sync", json=payload)
         eager.raise_for_status()
-        assert eager.content == first.content
+        _assert_media_values_close(eager.content, first.content)

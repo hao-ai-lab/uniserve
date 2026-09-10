@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from ...execution.forward_batch import AttentionSelection
+from ...execution.forward_batch import AttentionMode, AttentionSelection
 from ...foundation.errors import unsupported_setup
 from .base import AttentionBackend
 from .tuning import FlashInferTuningConfig
@@ -69,7 +69,9 @@ def resolve_attention_selection(
             continue
         backend = construct()
         multiple = max(1, int(backend.page_size_multiple))
-        if backend.available and int(block_size) % multiple == 0:
+        if backend.available and (
+            int(block_size) % multiple == 0 or backend.supports(AttentionMode.DENSE)
+        ):
             available.append(backend)
     if not available:
         raise unsupported_setup(f"attention backend {requested!r} is unavailable")

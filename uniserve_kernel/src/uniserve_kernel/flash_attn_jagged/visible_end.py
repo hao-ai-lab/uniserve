@@ -22,11 +22,10 @@ def hybrid_multimodal_mask(
     kv_idx: cute.TensorSSA,
     seqlen_info,
     aux_tensors: list,
-    aux_scalars: list,
 ) -> cute.TensorSSA:
     """Keep key positions below the visible-end limit for each batch/query pair."""
 
-    del head, seqlen_info, aux_scalars
+    del head, seqlen_info
     visible_end = aux_tensors[0]
     limit = scalar_to_ssa(visible_end[batch[0], q_idx[0]], cutlass.Int32)
     return kv_idx < limit

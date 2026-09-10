@@ -20,8 +20,8 @@ from ..execution.forward_batch import (
     AttentionMode,
     ForwardBatch,
     ForwardOutput,
-    TokenSelection,
 )
+from ..loader.component import construct_owned_module
 from ..loader.handles import WeightHandle
 from ..loader.mapping import LoadReport, WeightNameMap, stacked_weight_name
 from ..loader.weight_loaders import load_parameter_weight
@@ -41,6 +41,7 @@ from ..nn.diffusion import (
     TimestepEmbedder,
 )
 from ..nn.diffusion.cfg import CfgRecipe
+from ..nn.logits import project_outputs
 from ..nn.vae import AutoEncoder, default_ae_params
 from ..nn.vision import (
     PositionEmbedding,
@@ -49,6 +50,7 @@ from ..nn.vision import (
     get_flattened_position_ids_extrapolate,
     patchify_batch,
 )
+from ..nn.vocab_parallel_embedding import vocabulary_partition
 from .generation import (
     BranchSource,
     GenerationPipeline,
@@ -206,6 +208,12 @@ class BagelConfig:
 class _BagelGraph(nn.Module):
     """Owns the MoT, VAE, ViT, and flow-matching projections as one neural graph."""
 
+    lm_head: ParallelLMHead | None
+    vae2llm: LinearBase | None
+    llm2vae: LinearBase | None
+    time_embedder: TimestepEmbedder | None
+    latent_pos_embed: PositionEmbedding | None
+
     def __init__(
         self,
         cfg: BagelConfig,
@@ -236,21 +244,47 @@ class _BagelGraph(nn.Module):
             layer_config=layer_config.child("language_model.model"),
             generation_device=generation_device,
         )
-        self.lm_head = ParallelLMHead(
-            hidden,
-            cfg.llm.vocab_size,
-            layer_config=layer_config,
-            prefix="language_model.lm_head",
-            bias=False,
+        self.nonresident_parameters = frozenset(
+            f"lm.{name}" for name in self.lm.nonresident_parameters
         )
-        self.vae2llm = LinearBase(
-            cfg.patch_latent_dim, hidden, layer_config=layer_config, prefix="vae2llm"
+        pipeline = self.lm.pipeline
+        declarations = (
+            (
+                "lm_head",
+                pipeline.last,
+                lambda: ParallelLMHead(
+                    hidden,
+                    cfg.llm.vocab_size,
+                    layer_config=layer_config,
+                    prefix="language_model.lm_head",
+                    bias=False,
+                ),
+            ),
+            (
+                "vae2llm",
+                pipeline.first,
+                lambda: LinearBase(
+                    cfg.patch_latent_dim, hidden, layer_config=layer_config, prefix="vae2llm"
+                ),
+            ),
+            (
+                "llm2vae",
+                pipeline.last,
+                lambda: LinearBase(
+                    hidden, cfg.patch_latent_dim, layer_config=layer_config, prefix="llm2vae"
+                ),
+            ),
+            ("time_embedder", pipeline.first, lambda: TimestepEmbedder(hidden)),
+            (
+                "latent_pos_embed",
+                pipeline.first,
+                lambda: PositionEmbedding(cfg.max_latent_size, hidden, init_sincos=False),
+            ),
         )
-        self.llm2vae = LinearBase(
-            hidden, cfg.patch_latent_dim, layer_config=layer_config, prefix="llm2vae"
-        )
-        self.time_embedder = TimestepEmbedder(hidden)
-        self.latent_pos_embed = PositionEmbedding(cfg.max_latent_size, hidden, init_sincos=False)
+        for name, resident, factory in declarations:
+            module, nonresident = construct_owned_module(factory, resident=resident)
+            setattr(self, name, module)
+            self.nonresident_parameters |= {f"{name}.{parameter}" for parameter in nonresident}
         self.vae = AutoEncoder(default_ae_params())
 
         # Vision patches retain their own encoder before projection into MoT width.
@@ -281,11 +315,13 @@ class _BagelGraph(nn.Module):
     def device(self) -> torch.device:
         """Return the device that owns route inputs and model outputs."""
 
-        return self.lm_head.weight.device
+        return next(self.lm.parameters()).device
 
     def embed_tokens(self, ids: torch.Tensor, context: ForwardBatch) -> torch.Tensor:
         """Embed token identifiers with the batch's tensor-parallel mesh."""
 
+        if self.lm.embed_tokens is None:
+            raise RuntimeError("token embedding belongs to the first pipeline stage")
         return self.lm.embed_tokens(ids)
 
     def gen_segment_embeds(
@@ -301,6 +337,8 @@ class _BagelGraph(nn.Module):
         Start/end image markers frame VAE latents augmented with timestep and
         position embeddings. Graph denoise and image commit share this layout.
         """
+        assert self.vae2llm is not None and self.time_embedder is not None
+        assert self.latent_pos_embed is not None
         hidden = self.cfg.llm.hidden_size
         total = int(num_vae) + 2
 
@@ -328,19 +366,10 @@ class _BagelGraph(nn.Module):
         return embeds
 
     @torch.no_grad()
-    def logits(
-        self,
-        hidden_last_row: torch.Tensor,
-        context: ForwardBatch,
-    ) -> torch.Tensor:
-        """Project selected hidden rows into tensor-parallel vocabulary logits."""
-
-        return self.lm_head(hidden_last_row)
-
-    @torch.no_grad()
     def velocity_from_hidden(self, hidden, num_vae) -> torch.Tensor:
         """Project the latent span, excluding its two marker rows, into velocity."""
 
+        assert self.llm2vae is not None
         return self.llm2vae(hidden[1 : 1 + int(num_vae)].to(torch.bfloat16))
 
     def latent_hw(self, height: int, width: int) -> tuple[int, int]:
@@ -577,6 +606,7 @@ class BagelForConditionalGeneration(ExecutionModel):
                 self.model,
                 map_weights=self.load_weights,
                 included=frozenset(self.checkpoint_parameter_names()),
+                nonresident=self.model.nonresident_parameters,
                 module_devices=(
                     ()
                     if self.generation_device is None
@@ -611,7 +641,7 @@ class BagelForConditionalGeneration(ExecutionModel):
             source_name = handle.name
             renamed = _bagel_checkpoint_name(source_name)
             if renamed is None:
-                report.skipped.append(source_name)
+                report.unexpected.append(source_name)
                 continue
             target_name, shard_id = (
                 stacked_weight_name(renamed, _BAGEL_STACKED_WEIGHTS)
@@ -619,6 +649,9 @@ class BagelForConditionalGeneration(ExecutionModel):
                 else (renamed, None)
             )
             if target_name not in parameters:
+                if target_name in self.model.nonresident_parameters:
+                    report.skipped.append(source_name)
+                    continue
                 report.unexpected.append(source_name)
                 continue
             parameter = parameters[target_name]
@@ -720,14 +753,24 @@ class BagelForConditionalGeneration(ExecutionModel):
 
         # Runtime pools are sized from rank-local attention and latent geometry.
         self.cache_geometry = CacheGeometry(
-            num_layers=int(llm.num_hidden_layers),
+            num_layers=len(self.model.lm.pipeline.layers),
+            total_layers=int(llm.num_hidden_layers),
+            layer_offset=self.model.lm.pipeline.layers.start,
             num_attention_heads=local_attention_head_count(
-                int(llm.num_attention_heads), parallel=self._parallel
+                int(llm.num_attention_heads),
+                parallel=self._parallel,
+                sequence=layer_config.sequence,
             ),
-            num_kv_heads=local_kv_head_count(int(llm.num_key_value_heads), parallel=self._parallel),
+            num_kv_heads=local_kv_head_count(
+                int(llm.num_key_value_heads),
+                parallel=self._parallel,
+                sequence=layer_config.sequence,
+            ),
             total_kv_heads=int(llm.num_key_value_heads),
             kv_head_offset=local_kv_head_offset(
-                int(llm.num_key_value_heads), parallel=self._parallel
+                int(llm.num_key_value_heads),
+                parallel=self._parallel,
+                sequence=layer_config.sequence,
             ),
             head_dim=int(llm.head_dim),
             dtype="bfloat16",
@@ -779,6 +822,9 @@ class BagelForConditionalGeneration(ExecutionModel):
             if batch.flow_row_indices:
                 raise TypeError("BAGEL paged decode accepts token rows only")
             decode_positions = positions
+
+        if not self.model.lm.pipeline.first:
+            return self.model.lm(None, batch, positions=decode_positions)
 
         # External image features replace only positions selected by the embedding mask.
         token_embeds = self.model.embed_tokens(input_ids.reshape(-1), batch)
@@ -835,82 +881,19 @@ class BagelForConditionalGeneration(ExecutionModel):
         )
 
     def project(self, hidden: torch.Tensor, batch: ForwardBatch) -> ForwardOutput:
-        """Project packed hidden rows into logits, hidden states, or latent velocities."""
+        """Project text through the shared head and preserve latent prediction math."""
 
-        # Reconstruct row extents from the token and flow descriptors.
-        row_lengths = [0] * batch.row_count
-        for row_index, count in zip(
-            batch.token_row_indices,
-            tuple(batch.query_lens_cpu[index] for index in batch.token_row_indices),
-            strict=True,
-        ):
-            row_lengths[row_index] = count
-        for flow_index, row_index in enumerate(batch.flow_row_indices):
-            row_lengths[row_index] = int(batch.flow_image_tokens[flow_index])
-        row_hidden: list[torch.Tensor] = []
-        offset = 0
-        for count in row_lengths:
-            row_hidden.append(hidden[offset : offset + count])
-            offset += count
-
-        # Token rows share one vocabulary projection whenever their selection permits it.
-        selection_by_row = dict(zip(batch.token_row_indices, batch.token_selections, strict=True))
-        row_hidden_values = tuple(row_hidden)
-        projected_rows = tuple(
-            index
-            for index, selection in selection_by_row.items()
-            if selection is not TokenSelection.HIDDEN
+        return project_outputs(
+            hidden,
+            batch,
+            self.model.lm_head,
+            project_flow=lambda rows, index: self.model.velocity_from_hidden(
+                rows, int(batch.flow_image_tokens[index]) - _BAGEL_IMAGE_MARKER_TOKENS
+            ),
+            pipeline=self.model.lm.pipeline,
+            vocabulary=vocabulary_partition(self.vocab_size, self._parallel),
+            flow_dtype=torch.bfloat16,
         )
-        projected: torch.Tensor | None = None
-        if projected_rows:
-            if (
-                len(projected_rows) == batch.row_count
-                and all(
-                    selection is TokenSelection.LAST_LOGITS
-                    for selection in selection_by_row.values()
-                )
-                and all(int(value.shape[0]) == 1 for value in row_hidden_values)
-            ):
-                selected = hidden
-            else:
-                selected_rows = tuple(
-                    row_hidden_values[index]
-                    if selection_by_row[index] is TokenSelection.ALL_LOGITS
-                    else row_hidden[index][-1:]
-                    for index in projected_rows
-                )
-                selected = (
-                    selected_rows[0] if len(selected_rows) == 1 else torch.cat(selected_rows, dim=0)
-                )
-            projected = self.model.logits(selected, batch)
-
-        # Restore heterogeneous results to scheduler row order.
-        outputs: list[torch.Tensor] = []
-        projected_offset = 0
-        flow_by_row = {row_index: index for index, row_index in enumerate(batch.flow_row_indices)}
-        for index in range(batch.row_count):
-            value_hidden = row_hidden_values[index]
-            selection = selection_by_row.get(index)
-            if selection is not None:
-                if selection is TokenSelection.HIDDEN:
-                    value = value_hidden
-                else:
-                    if projected is None:
-                        raise RuntimeError("BAGEL projected output buffer is missing")
-                    count = (
-                        int(value_hidden.shape[0]) if selection is TokenSelection.ALL_LOGITS else 1
-                    )
-                    value = projected[projected_offset : projected_offset + count]
-                    projected_offset += count
-                outputs.append(value)
-            else:
-                flow_index = flow_by_row[index]
-                prediction = self.model.velocity_from_hidden(
-                    value_hidden,
-                    int(batch.flow_image_tokens[flow_index]) - _BAGEL_IMAGE_MARKER_TOKENS,
-                )
-                outputs.append(prediction)
-        return ForwardOutput(tuple(outputs))
 
     def encode(self, pixels: tuple[torch.Tensor, ...], batch: ForwardBatch) -> ForwardOutput:
         """Encode a uniform image batch into language-width vision features."""

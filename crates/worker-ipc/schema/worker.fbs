@@ -103,6 +103,8 @@ table KvCacheConfig {
   block_size:uint;
   num_blocks:uint;
   num_layers:uint;
+  total_layers:uint;
+  layer_offset:uint;
   num_kv_heads:uint;
   total_kv_heads:uint;
   kv_head_offset:uint;

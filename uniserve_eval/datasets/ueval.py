@@ -35,9 +35,13 @@ class UEvalDataset(Dataset):
 
 
 def _load_local(dataset_path: str) -> list[dict[str, Any]]:
-    """Load object rows from a local JSON array or JSON Lines file."""
+    """Load object rows from a local Parquet, JSON array, or JSON Lines file."""
 
     path = Path(dataset_path)
+    if path.suffix.lower() == ".parquet":
+        load_dataset = getattr(importlib.import_module("datasets"), "load_dataset")
+        dataset = load_dataset("parquet", data_files=str(path), split="train")
+        return [dict(row) for row in dataset]
     text = path.read_text(encoding="utf-8")
     stripped = text.lstrip()
     if stripped.startswith("["):

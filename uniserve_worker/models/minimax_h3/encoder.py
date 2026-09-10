@@ -7,7 +7,6 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
-from ...backends.attention.torch_sdpa import TorchSDPAAttentionBackend
 from ...nn.decoder.qwen import Qwen3Config, Qwen3Model
 from ...nn.layer import LayerConfig
 from ...nn.mesh import DeviceMesh
@@ -93,10 +92,8 @@ class MiniMaxH3TextEncoder(nn.Module):
             self.language_model = Qwen3Model(
                 decoder_config,
                 layer_config=LayerConfig(mesh.get_group("tp"), quantization, "language_model"),
-                dense_provider=TorchSDPAAttentionBackend(),
                 attention_quantization=attention_quantization,
                 mlp_input_dtype=torch.float8_e4m3fn if linear_precision == "fp8" else None,
-                rotary_dtype=torch.bfloat16,
                 normalize_output=False,
             )
 

@@ -44,6 +44,8 @@ from uniserve_worker.foundation.errors import (
     invalid_descriptor,
 )
 from uniserve_worker.models.runtime import ExecutionModel, ModuleExecution
+from uniserve_worker.nn.attention_storage import attention_exchange_scope
+from uniserve_worker.nn.collective import collective_scope
 from uniserve_worker.nn.diffusion.schedule import DiffusionSchedule
 from uniserve_worker.runtime.device import HostStagingRing, canonical_device, fill_cpu_ints
 from uniserve_worker.runtime.device_products import device_product_storage
@@ -53,6 +55,7 @@ from .input_buffers import AttentionInputs, InputBuffers, InputGeometry
 
 if TYPE_CHECKING:
     from ..runtime.distributed import DistributedEnvironment
+    from .forward_batch import AttentionSelection
 from .lane import ExecutionLaneRuntime, LaneConfig, create_green_contexts
 from .rows import ForwardRow
 
@@ -85,12 +88,26 @@ class RunObservation:
 class ForwardResult:
     """Pairs a model output with the route and execution-path observation that produced it."""
 
-    values: tuple[torch.Tensor, ...]
+    output: ForwardOutput
     request_pool_indices: torch.Tensor
     path: RunPath
     output_event: torch.cuda.Event | None
     observation: RunObservation
     greedy: GraphGreedyOutput | None
+
+    def materialize_values(self) -> tuple[torch.Tensor, ...]:
+        """Order the consumer stream and collectively materialize raw outputs.
+
+        A consumer using ``greedy`` directly can retain vocabulary sharding.
+        Other consumers receive the complete unpadded logits through this
+        boundary. Every TP member must make the same consumption decision.
+        """
+
+        if self.output_event is not None:
+            torch.cuda.current_stream(self.request_pool_indices.device).wait_event(
+                self.output_event
+            )
+        return self.output.materialize().values
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,10 +187,20 @@ class ModelRunner:
         trace: ExecutionTrace,
         *,
         environment: DistributedEnvironment | None = None,
+        attention: AttentionSelection | None = None,
         schedule: DiffusionSchedule | None = None,
     ) -> None:
         """Bind loaded compute modules to one public execution resource owner."""
 
+        from ..backends.attention import resolve_attention_selection
+        from ..nn.attention import RadixAttention, bind_dense_attention_modules
+
+        self.attention = attention or resolve_attention_selection(
+            worker_config.attention_backend or "auto",
+            tuning=worker_config.flashinfer,
+            block_size=worker_config.block_size,
+        )
+        bind_dense_attention_modules(model, self.attention)
         self.model = model
         self.schedule = schedule
         self.worker_config = worker_config
@@ -214,6 +241,30 @@ class ModelRunner:
             if bool(model.resource_geometry.request_tensors)
             else None
         )
+        self._sum_reductions = environment.sum_reductions() if environment is not None else {}
+        self._attention_exchange_storage = {}
+        exchange_modules = tuple(
+            module
+            for module in model.modules()
+            if isinstance(module, RadixAttention) and module.exchange.ulysses_group.world_size > 1
+        )
+        if exchange_modules:
+            from ..bootstrap.capacity import packed_input_geometry
+            from ..runtime.attention_storage import allocate_attention_exchange_storage
+
+            if environment is None:
+                raise ValueError("sequence attention requires its distributed storage owner")
+            geometry = packed_input_geometry(model, worker_config)
+            dtype = getattr(torch, worker_config.model_dtype.removeprefix("torch."))
+            for lane in worker_config.lanes or (None,):
+                lane_id = None if lane is None else lane.lane_id
+                self._attention_exchange_storage[lane_id] = allocate_attention_exchange_storage(
+                    exchange_modules,
+                    environment,
+                    max_tokens=geometry.max_tokens,
+                    dtype=dtype,
+                    scope=("attention", id(self), lane_id),
+                )
 
         self.scratch: BoundedTensorStorage | None = None
         self.context_workspace = None
@@ -344,32 +395,37 @@ class ModelRunner:
         started = time.perf_counter_ns()
         path = RunPath.GRAPH_REPLAY if name in self._module_graphs else RunPath.EAGER
         try:
-            binding = self.model.module_execution(name, inputs)
-            if binding is not None and self.worker_config.cuda_graph and not self._warming_modules:
-                output, path = self._run_signature(name, inputs, binding)
-            elif path is RunPath.GRAPH_REPLAY:
-                if any(not isinstance(value, torch.Tensor) for value in inputs):
-                    raise InputError("captured module arguments must be Tensors")
-                output = self.run_captured(name, *cast(tuple[torch.Tensor, ...], inputs))
-            else:
+            with collective_scope(self._sum_reductions):
+                binding = self.model.module_execution(name, inputs)
                 if (
-                    self.worker_config.graph_policy == "full"
+                    binding is not None
+                    and self.worker_config.cuda_graph
                     and not self._warming_modules
-                    and binding is None
-                    and name not in self.model.capture_inputs
                 ):
-                    raise GraphExecutionError(
-                        f"full graph policy has no capture signature for {name}"
-                    )
-                from ..models.video import VideoModel
-
-                if name == "denoiser" and isinstance(self.model, VideoModel):
-                    tensors, metadata, step, count, schedule = inputs
-                    if count != 1:
-                        raise InputError("denoising calls evaluate exactly one scheduled step")
-                    output = self.model.bind_denoising_step(tensors, metadata, step, schedule)()
+                    output, path = self._run_signature(name, inputs, binding)
+                elif path is RunPath.GRAPH_REPLAY:
+                    if any(not isinstance(value, torch.Tensor) for value in inputs):
+                        raise InputError("captured module arguments must be Tensors")
+                    output = self.run_captured(name, *cast(tuple[torch.Tensor, ...], inputs))
                 else:
-                    output = module(*inputs)
+                    if (
+                        self.worker_config.graph_policy == "full"
+                        and not self._warming_modules
+                        and binding is None
+                        and name not in self.model.capture_inputs
+                    ):
+                        raise GraphExecutionError(
+                            f"full graph policy has no capture signature for {name}"
+                        )
+                    from ..models.video import VideoModel
+
+                    if name == "denoiser" and isinstance(self.model, VideoModel):
+                        tensors, metadata, step, count, schedule = inputs
+                        if count != 1:
+                            raise InputError("denoising calls evaluate exactly one scheduled step")
+                        output = self.model.bind_denoising_step(tensors, metadata, step, schedule)()
+                    else:
+                        output = module(*inputs)
             values = (output,) if isinstance(output, torch.Tensor) else output
             if not isinstance(values, tuple) or any(
                 not isinstance(value, torch.Tensor) for value in values
@@ -653,7 +709,8 @@ class ModelRunner:
             )
 
             def invoke() -> torch.Tensor:
-                value = module(*inputs)
+                with collective_scope(self._sum_reductions):
+                    value = module(*inputs)
                 if not isinstance(value, torch.Tensor):
                     raise TypeError(f"captured module {name!r} must return a tensor")
                 return value
@@ -747,9 +804,13 @@ class ModelRunner:
         self._text_tokens = None
         for lane_runtime in reversed(self._owned_lanes):
             lane_runtime.close()
+        for reduction in reversed(tuple(self._sum_reductions.values())):
+            reduction.close()
+        self._sum_reductions.clear()
         self._geometry_cache.clear()
         self.context_workspace = None
         self.scratch = None
+        self._attention_exchange_storage.clear()
         self._mixed_qualification.clear()
         self._execution_lanes.clear()
         self._owned_lanes.clear()
@@ -968,7 +1029,12 @@ class ModelRunner:
             calls += 1
             ids = buffers.input_ids[:0] if value.input_ids is None else value.input_ids
             positions = buffers.positions[0, :0] if value.positions is None else value.positions
-            result = _invoke(self.model, ids, positions, value)
+            # Module entries use the full device; packed work may use a
+            # restricted SM domain. Bind the native launch only to legal lanes.
+            reductions = self._sum_reductions if lane_runtime.full_device else {}
+            exchanges = self._attention_exchange_storage.get(lane_runtime.lane_id, {})
+            with collective_scope(reductions), attention_exchange_scope(exchanges):
+                result = _invoke(self.model, ids, positions, value)
             return result
 
         output_event = None
@@ -1036,7 +1102,7 @@ class ModelRunner:
                 execution_path=path.value,
             )
             return ForwardResult(
-                values=output.values,
+                output=output,
                 request_pool_indices=request_pool_indices,
                 path=path,
                 output_event=output_event,

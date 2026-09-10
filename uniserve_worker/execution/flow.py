@@ -337,6 +337,7 @@ def _finish(runtime: Worker, state: OperationState) -> None:
     request.latent_product = data["latent_output"]
     products = publish_latent_transfer(
         runtime,
+        operation,
         data["latent_output"],
         row,
         step=final_step,
@@ -378,6 +379,7 @@ def _finish(runtime: Worker, state: OperationState) -> None:
 
 def publish_latent_transfer(
     runtime: Worker,
+    operation: Operation,
     product: ProductRef,
     row: LatentExecution,
     *,
@@ -388,8 +390,7 @@ def publish_latent_transfer(
 
     transports = runtime.publication_transports
     if not any(name != "local" for name in transports) or (
-        runtime.worker_config is not None
-        and runtime.worker_config.rank != runtime.worker_config.output_rank
+        runtime.worker_config.rank != runtime.output_rank(operation.entry)
     ):
         return ()
     pool = runtime.require_latent_pool()

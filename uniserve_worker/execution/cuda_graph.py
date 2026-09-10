@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import itertools
 import logging
-from collections.abc import Callable, Hashable, Iterator, Sequence
+from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, fields, is_dataclass, replace
 from typing import Any, Generic, TypeVar, cast
@@ -25,6 +26,7 @@ from uniserve_worker.runtime.cache_pool import CachePool
 
 logger = logging.getLogger(__name__)
 TOKEN_CONTINUATION_BIT = 1 << 31
+_GRAPH_BINDINGS = itertools.count(1)
 
 
 class GraphExecutionError(RuntimeError):
@@ -35,6 +37,29 @@ class _GraphMiss(RuntimeError):
     """Signals that a requested CUDA graph signature has no captured executable."""
 
     pass
+
+
+def graph_mode_available(
+    selection: AttentionSelection,
+    mode: AttentionMode,
+    *,
+    head_dim: int,
+    block_size: int,
+    device: torch.device,
+) -> bool:
+    """Report whether the selected eager provider also supports graph capture."""
+
+    try:
+        _graph_provider(
+            selection,
+            mode,
+            head_dim=head_dim,
+            block_size=block_size,
+            device=device,
+        )
+    except _GraphMiss:
+        return False
+    return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -279,11 +304,9 @@ class _GraphState:
     batch: ForwardBatch
     output: ForwardOutput
     greedy: GraphGreedyOutput | None
-    published: tuple[ForwardOutput, ...]
     releases: tuple[Callable[[], None], ...]
     startup_resident: bool
     signature: tuple[object, ...]
-    publish_cursor: int = 0
     batch_leaves: tuple[torch.Tensor, ...] = ()
     plan_leaves: tuple[torch.Tensor, ...] = ()
 
@@ -332,12 +355,11 @@ class CudaGraphRunner:
         prefill_row_sizes: tuple[int, ...] = (8, 16),
         stream: torch.cuda.Stream | None = None,
         expected_context: int | None = None,
-        expected_resident_executables: int | None = None,
-        output_slot_count: int = 2,
+        required_resident_families: Mapping[str, int] | None = None,
     ) -> None:
         """Configure one lane's bounded graph catalog, workspaces, and capture identity."""
 
-        if weight_version < 0 or block_size < 1 or memory_budget_bytes < 0 or output_slot_count < 1:
+        if weight_version < 0 or block_size < 1 or memory_budget_bytes < 0:
             raise ValueError("graph-store identity and geometry are invalid")
         if decode_predicates is not None and (
             decode_predicates.ndim != 1 or decode_predicates.dtype is not torch.bool
@@ -369,18 +391,15 @@ class CudaGraphRunner:
         self._warmed: set[tuple[object, ...]] = set()
         self._warmed_exact: set[tuple[object, ...]] = set()
         self._covered_exact: set[tuple[object, ...]] = set()
-        self._next_binding = 1
         self._device: torch.device | None = None
         self._pool_handle: Any = None
         self._sealed = False
         self._stream = stream
         self._expected_context = expected_context
-        self._expected_resident_executables = (
-            None
-            if expected_resident_executables is None
-            else max(0, int(expected_resident_executables))
-        )
-        self._output_slot_count = int(output_slot_count)
+        self._required_resident_families = {
+            str(family): max(0, int(count))
+            for family, count in (required_resident_families or {}).items()
+        }
 
     @property
     def resident_bytes(self) -> int:
@@ -410,15 +429,16 @@ class CudaGraphRunner:
         self._warmed_exact.clear()
         if self._warmed:
             raise GraphExecutionError("startup left configured graph buckets uncaptured")
-        if (
-            self._expected_resident_executables is not None
-            and len(self._states) != self._expected_resident_executables
-        ):
+        resident_families = self._resident_family_counts()
+        missing_families = {
+            family: (resident_families.get(family, 0), required)
+            for family, required in self._required_resident_families.items()
+            if resident_families.get(family, 0) != required
+        }
+        if missing_families:
             raise GraphExecutionError(
-                "resident CUDA graph count does not match the physical executable catalog: "
-                f"resident={len(self._states)} "
-                f"expected={self._expected_resident_executables} "
-                f"families={self._resident_family_counts()!r}"
+                "resident CUDA graph families do not match the required bucket catalog: "
+                f"mismatches={missing_families!r} resident={resident_families!r}"
             )
         self._complete_equivalence_checks()
         if self.resident_bytes > self.memory_budget_bytes:
@@ -494,7 +514,13 @@ class CudaGraphRunner:
         if batch.forward_mode is AttentionMode.PACKED and _quantized_kv(self):
             return GraphRun(self._eager(batch, forward), "eager", rows, rows)
         try:
-            _graph_provider(self.attention, batch.forward_mode)
+            _graph_provider(
+                self.attention,
+                batch.forward_mode,
+                head_dim=self.cache.head_dim,
+                block_size=self.block_size,
+                device=batch.req_pool_indices.device,
+            )
         except _GraphMiss:
             return GraphRun(self._eager(batch, forward), "eager", rows, rows)
 
@@ -680,10 +706,9 @@ class CudaGraphRunner:
         self._device = _batch_device(batch)
         static = _graph_batch(
             batch,
-            self._next_binding,
+            next(_GRAPH_BINDINGS),
             own_inputs=not startup_resident,
         )
-        self._next_binding += 1
         releases = self._prepare_attention(static, batch, capture=True)
         entry = None
         try:
@@ -703,18 +728,11 @@ class CudaGraphRunner:
                 expected_context=self._expected_context,
             )
             output, greedy = entry.output
-            context = nullcontext() if self._stream is None else torch.cuda.stream(self._stream)
-            with context:
-                published = tuple(
-                    ForwardOutput(tuple(torch.empty_like(value) for value in output.values))
-                    for _ in range(self._output_slot_count)
-                )
             return _GraphState(
                 entry,
                 static,
                 output,
                 greedy,
-                published,
                 releases,
                 startup_resident,
                 signature,
@@ -756,24 +774,25 @@ class CudaGraphRunner:
             state.entry.replay()
 
     def _publish_output(self, state: _GraphState, rows: int) -> ForwardOutput:
-        """Expose graph-owned outputs trimmed to the live row count."""
+        """Publish caller-owned live rows before another graph reuses capture storage."""
 
-        published = state.published[state.publish_cursor]
-        state.publish_cursor = (state.publish_cursor + 1) % len(state.published)
+        consumer = None if self._stream is None else torch.cuda.current_stream(self._stream.device)
         context = nullcontext() if self._stream is None else torch.cuda.stream(self._stream)
         with context:
-            for destination, source in zip(
-                published.values[:rows], state.output.values[:rows], strict=True
-            ):
-                destination.copy_(source)
-        return ForwardOutput(published.values[:rows])
+            published = _trim_output(state.output, rows).clone()
+        if consumer is not None and consumer != self._stream:
+            # The caller orders consumption behind the lane's output event.
+            # Keep its allocation live until that consumer stream retires.
+            for value in published.values:
+                value.record_stream(consumer)
+        return published
 
     def _snapshot_output(self, output: ForwardOutput) -> ForwardOutput:
         """Clone a forward output for later direct-versus-graph comparison."""
 
         context = nullcontext() if self._stream is None else torch.cuda.stream(self._stream)
         with context:
-            return _clone_output(output)
+            return output.clone()
 
     def _queue_equivalence_check(
         self,
@@ -848,8 +867,14 @@ class CudaGraphRunner:
         if static.forward_mode not in {AttentionMode.PAGED_DECODE, AttentionMode.PAGED_VARLEN}:
             return ()
         prepared = _live_attention(static, live)
-        backend = _graph_provider(self.attention, static.forward_mode)
         key_cache, _value_cache = self.cache_pool.layer_cache(0, static.group_id)
+        backend = _graph_provider(
+            self.attention,
+            static.forward_mode,
+            head_dim=self.cache.head_dim,
+            block_size=self.block_size,
+            device=key_cache.device,
+        )
         q_dtype = key_cache.dtype
         kv_dtype = key_cache.dtype
         releases: list[Callable[[], None]] = []
@@ -1352,12 +1377,33 @@ def _copy_into_leaves(
         raise _GraphMiss(f"{structure} tensor structure changed")
 
 
-def _graph_provider(selection: AttentionSelection, mode: AttentionMode):
-    """Resolve the concrete paged-attention backend for a graph mode."""
+def _graph_provider(
+    selection: AttentionSelection,
+    mode: AttentionMode,
+    *,
+    head_dim: int,
+    block_size: int,
+    device: torch.device,
+):
+    """Resolve the geometry-bound paged-attention backend for a graph mode."""
 
     for provider in selection.providers:
-        if provider.supports(mode, cuda_graph=True):
+        if not provider.can_bind(
+            mode,
+            head_dim=head_dim,
+            block_size=block_size,
+            device=device,
+        ):
+            continue
+        if provider.can_bind(
+            mode,
+            head_dim=head_dim,
+            block_size=block_size,
+            device=device,
+            cuda_graph=True,
+        ):
             return provider
+        break
     raise _GraphMiss("no provisioned attention provider is graph-safe")
 
 
@@ -1477,7 +1523,7 @@ def _private_pool_bytes(device: torch.device | None) -> int:
 def _trim_output(output: ForwardOutput, rows: int) -> ForwardOutput:
     """Slice every forward-output row tensor to the live batch extent."""
 
-    return ForwardOutput(tuple(output.values[:rows]))
+    return ForwardOutput(tuple(output.values[:rows]), output.vocabularies[:rows])
 
 
 def _greedy_decode(
@@ -1511,6 +1557,9 @@ def _greedy_decode_values(
         or predicate_state is None
         or force_finish is None
         or len(output.values) != batch.row_count
+        or batch.token_row_indices != tuple(range(batch.row_count))
+        or any(selection is not TokenSelection.LAST_LOGITS for selection in batch.token_selections)
+        or batch.flow_row_indices
     ):
         return None
     rows = tuple(value.reshape(-1) for value in output.values)
@@ -1518,7 +1567,12 @@ def _greedy_decode_values(
     if logits is None:
         raise _GraphMiss("decode logits are not one contiguous graph output")
     logits = logits.reshape(batch.row_count, -1)
-    max_values, tokens = torch.max(logits, dim=-1)
+    from ..nn.logits import greedy_vocabulary
+
+    partitions = output.vocabularies
+    if any(partition != partitions[0] for partition in partitions):
+        return None
+    max_values, tokens = greedy_vocabulary(logits, partitions[0])
     valid = torch.isfinite(max_values)
     active = predicate_state.index_select(0, batch.request_pool_indices.reshape(-1))
     finish = force_finish.reshape(-1) & valid & active
@@ -1570,14 +1624,6 @@ def _trim_greedy(
         continuation=output.continuation[:rows],
         tagged_tokens=output.tagged_tokens[:rows],
         completion=completion,
-    )
-
-
-def _clone_output(output: ForwardOutput) -> ForwardOutput:
-    """Clone all tensors in a forward output without sharing storage."""
-
-    return ForwardOutput(
-        tuple(value.detach().clone(memory_format=torch.preserve_format) for value in output.values)
     )
 
 

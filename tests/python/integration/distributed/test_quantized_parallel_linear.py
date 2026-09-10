@@ -81,7 +81,6 @@ def _run(rank, rendezvous, checkpoint):
                     layer_config=local,
                     bias=False,
                     quant_method=_method(format),
-                    logical_input_row_partitions=4,
                 )
                 sharded = RowParallelLinear(
                     512,
@@ -89,7 +88,6 @@ def _run(rank, rendezvous, checkpoint):
                     layer_config=config,
                     bias=False,
                     quant_method=_method(format),
-                    logical_input_row_partitions=4,
                 )
             for module in (reference, sharded):
                 _load(module, checkpoint, "row", (256, 512))
@@ -168,7 +166,6 @@ def _run(rank, rendezvous, checkpoint):
                         layer_config=layout,
                         quant_method=method,
                         bias=False,
-                        weight_scale_partition_size=256,
                         sequence_group=layout.communicator,
                     )
                 for branch in range(4):
@@ -212,3 +209,86 @@ def test_checkpoint_quantization_preserves_logical_domains_across_tp(tmp_path):
     checkpoint = tmp_path / "projection.safetensors"
     save_file(tensors, checkpoint)
     mp.spawn(_run, args=((tmp_path / "rendezvous").as_uri(), str(checkpoint)), nprocs=4, join=True)
+
+
+@torch.inference_mode()
+def _run_sequence_scale(rank, rendezvous):
+    from uniserve_worker.nn.parallel import SequenceParallel
+    from uniserve_worker.nn.quant.nvfp4 import DynamicW4A4NvFp4LinearMethod
+
+    device = torch.device("cuda", rank)
+    environment = init_distributed_environment(
+        rank=rank,
+        local_rank=rank,
+        world_size=4,
+        device=device,
+        backend="nccl",
+        init_method=rendezvous,
+    )
+    mesh = initialize_model_parallel(
+        environment,
+        {
+            "rows": (
+                (3, 1, 2, 0),
+                ParallelConfig(sequence_parallel=SequenceParallel("ulysses", (4,))),
+            )
+        },
+    )["rows"]
+    group = mesh.get_group("sp")
+    graph = None
+    try:
+        values = ((torch.arange(384 * 512, device=device).view(384, 512) % 11 + 1) / 16).bfloat16()
+        values.mul_((torch.arange(384, device=device) // 32 + 1).unsqueeze(-1))
+        for method in (DynamicW8A8Fp8LinearMethod(tensorwise=True), DynamicW4A4NvFp4LinearMethod()):
+            reference = LinearBase(
+                512,
+                256,
+                layer_config=LayerConfig(Communicator(), None),
+                bias=False,
+                quant_method=method,
+            ).to(device=device, dtype=torch.bfloat16)
+            sharded = LinearBase(
+                512,
+                256,
+                layer_config=LayerConfig(Communicator(), None),
+                bias=False,
+                quant_method=method,
+                input_scale_group=group,
+            ).to(device=device, dtype=torch.bfloat16)
+            weights = (
+                (torch.arange(256 * 512, device=device).view(256, 512) % 7 + 1) / 512
+            ).bfloat16()
+            for linear in (reference, sharded):
+                linear.weight.copy_(weights)
+                linear.finalize_weights()
+            local = values.chunk(4)[group.rank_in_group].clone()
+
+            def execute():
+                return group.all_gather(sharded(local), dim=0)
+
+            torch.testing.assert_close(execute(), reference(values), rtol=2**-7, atol=0)
+            torch.cuda.synchronize(device)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                actual = execute()
+            values.mul_(2)
+            local.copy_(values.chunk(4)[group.rank_in_group])
+            graph.replay()
+            torch.testing.assert_close(actual, reference(values), rtol=2**-7, atol=0)
+            graph.reset()
+            graph = None
+            values.div_(2)
+    finally:
+        if graph is not None:
+            graph.reset()
+        environment.close()
+        dist.destroy_process_group()
+
+
+def test_tensor_scale_preserves_values_across_sequence_partitions(tmp_path):
+    mp.spawn(
+        _run_sequence_scale,
+        args=((tmp_path / "sequence-scales").as_uri(),),
+        nprocs=4,
+        join=True,
+    )

@@ -108,19 +108,29 @@ class CachePublications:
                 )
                 for index, views in enumerate(fields):
                     shape = (
-                        (suffix, self.pool.num_layers, self.pool.total_kv_heads, self.pool.head_dim)
+                        (
+                            suffix,
+                            self.pool.total_layers,
+                            self.pool.total_kv_heads,
+                            self.pool.head_dim,
+                        )
                         if index < 2
                         else (
                             len(views),
                             2,
-                            self.pool.num_layers,
+                            self.pool.total_layers,
                             self.pool.total_kv_heads // self.pool.n_kv,
                         )
                     )
                     offset = (
-                        (0, 0, self.pool.kv_head_offset, 0)
+                        (0, self.pool.layer_offset, self.pool.kv_head_offset, 0)
                         if index < 2
-                        else (0, 0, 0, self.pool.kv_head_offset // self.pool.n_kv)
+                        else (
+                            0,
+                            0,
+                            self.pool.layer_offset,
+                            self.pool.kv_head_offset // self.pool.n_kv,
+                        )
                     )
                     locations = publish_tensor(
                         transports,
@@ -205,7 +215,12 @@ class CachePublications:
             raise invalid_descriptor("KV installation group disagrees with publication")
         if publication.tensors:
             suffix = publication.published_extent - publication.base_extent
-            expected = (suffix, self.pool.num_layers, self.pool.total_kv_heads, self.pool.head_dim)
+            expected = (
+                suffix,
+                self.pool.total_layers,
+                self.pool.total_kv_heads,
+                self.pool.head_dim,
+            )
             if publication.tensors[0].shape != expected:
                 raise invalid_descriptor("KV transfer geometry does not match destination layers")
 

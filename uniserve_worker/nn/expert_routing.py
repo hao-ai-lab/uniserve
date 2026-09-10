@@ -13,6 +13,20 @@ from ..execution.forward_batch import ExpertRoute, RouteSpan
 __all__ = ["RoutedTensor"]
 
 
+def slice_route_spans(spans: tuple[RouteSpan, ...], interval: slice) -> tuple[RouteSpan, ...]:
+    """Intersect ordered expert spans with a packed row interval and rebase it."""
+
+    return tuple(
+        RouteSpan(
+            span.route,
+            max(interval.start, span.token_start) - interval.start,
+            min(interval.stop, span.token_end) - max(interval.start, span.token_start),
+        )
+        for span in spans
+        if span.token_start < interval.stop and span.token_end > interval.start
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class RoutedTensor:
     """Text and flow token tensors kept separate between shared attention calls."""
@@ -31,10 +45,13 @@ class RoutedTensor:
         cls,
         value: torch.Tensor,
         spans: tuple[RouteSpan, ...],
+        *,
+        routes: frozenset[ExpertRoute] = frozenset(),
     ) -> RoutedTensor:
         """Split a packed token axis into contiguous text and flow expert tensors."""
 
-        if value.ndim < 1 or not spans or spans[-1].token_end != int(value.shape[0]):
+        extent = spans[-1].token_end if spans else 0
+        if value.ndim < 1 or extent != int(value.shape[0]):
             raise ValueError("packed tensor does not match its expert spans")
         text_parts = tuple(
             value.narrow(0, span.token_start, span.token_count)
@@ -46,13 +63,26 @@ class RoutedTensor:
             for span in spans
             if span.route is ExpertRoute.FLOW
         )
-        return cls(_join(text_parts), _join(flow_parts))
+        text, flow = _join(text_parts), _join(flow_parts)
+        if text is None and ExpertRoute.TEXT in routes:
+            text = value[:0]
+        if flow is None and ExpertRoute.FLOW in routes:
+            flow = value[:0]
+        return cls(text, flow)
+
+    @property
+    def routes(self) -> frozenset[ExpertRoute]:
+        """Experts participating in this execution, including empty local shards."""
+
+        return frozenset(
+            route
+            for route, value in ((ExpertRoute.TEXT, self.text), (ExpertRoute.FLOW, self.flow))
+            if value is not None
+        )
 
     def packed(self, spans: tuple[RouteSpan, ...]) -> torch.Tensor:
         """Restore text and flow tensors to the scheduler-defined packed span order."""
 
-        if not spans:
-            raise ValueError("packed expert layout must contain a span")
         offsets = {ExpertRoute.TEXT: 0, ExpertRoute.FLOW: 0}
         values = {ExpertRoute.TEXT: self.text, ExpertRoute.FLOW: self.flow}
         parts: list[torch.Tensor] = []
@@ -70,7 +100,9 @@ class RoutedTensor:
                 raise ValueError(f"{route.value} tensor does not match its packed spans")
         packed = _join(tuple(parts))
         if packed is None:
-            raise RuntimeError("packed expert layout produced no tensor")
+            empty = self.text if self.text is not None else self.flow
+            assert empty is not None
+            return empty
         return packed
 
     def map(
@@ -83,6 +115,25 @@ class RoutedTensor:
         return RoutedTensor(
             None if self.text is None else text(self.text),
             None if self.flow is None else flow(self.flow),
+        )
+
+    def narrow(self, interval: slice, spans: tuple[RouteSpan, ...]) -> RoutedTensor:
+        """Select packed rows while retaining each expert's contiguous storage."""
+
+        starts = {ExpertRoute.TEXT: 0, ExpertRoute.FLOW: 0}
+        counts = {ExpertRoute.TEXT: 0, ExpertRoute.FLOW: 0}
+        for span in spans:
+            starts[span.route] += max(0, min(span.token_end, interval.start) - span.token_start)
+            counts[span.route] += max(
+                0, min(span.token_end, interval.stop) - max(span.token_start, interval.start)
+            )
+        return RoutedTensor(
+            None
+            if self.text is None
+            else self.text.narrow(0, starts[ExpertRoute.TEXT], counts[ExpertRoute.TEXT]),
+            None
+            if self.flow is None
+            else self.flow.narrow(0, starts[ExpertRoute.FLOW], counts[ExpertRoute.FLOW]),
         )
 
     def add(self, other: RoutedTensor) -> RoutedTensor:

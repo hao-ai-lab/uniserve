@@ -14,10 +14,8 @@ import torch
 
 from ..execution.batch import OpCode
 from ..execution.forward_batch import (
-    AttentionMode,
     ForwardBatch,
     ForwardOutput,
-    TokenSelection,
 )
 from ..loader.handles import WeightHandle
 from ..loader.mapping import LoadReport, WeightNameMap, stacked_weight_name
@@ -30,7 +28,8 @@ from ..nn import (
     local_kv_head_offset,
 )
 from ..nn.decoder import qwen
-from ..nn.logits import LogitsProcessor
+from ..nn.logits import project_outputs
+from ..nn.vocab_parallel_embedding import vocabulary_partition
 from .runtime import (
     CacheGeometry,
     ExecutionModel,
@@ -196,7 +195,11 @@ class Qwen3ForCausalLM(ExecutionModel):
 
         from ..loader.component import CheckpointComponent
 
-        return (CheckpointComponent(self, map_weights=self.load_weights),)
+        return (
+            CheckpointComponent(
+                self, map_weights=self.load_weights, nonresident=self._nonresident_names
+            ),
+        )
 
     def load_weights(
         self,
@@ -204,11 +207,19 @@ class Qwen3ForCausalLM(ExecutionModel):
     ) -> LoadReport:
         """Load Hugging Face Qwen tensors into the model's packed projections."""
 
-        parameter_names = set(dict(self.named_parameters()))
+        parameters = dict(self.named_parameters())
+        parameter_names = set(parameters)
         report = LoadReport()
         for handle in weights:
             source_name = handle.name
             repaired = f"model.{source_name}" if source_name.startswith("layers.") else source_name
+            if (
+                repaired == "model.embed_tokens.weight"
+                and self._tied_embeddings
+                and self.model.pipeline.last
+                and not self.model.pipeline.first
+            ):
+                repaired = "lm_head.weight"
             target_name, shard_id = stacked_weight_name(repaired, _QWEN_STACKED_WEIGHTS)
             if target_name not in parameter_names:
                 if repaired in parameter_names:
@@ -216,13 +227,15 @@ class Qwen3ForCausalLM(ExecutionModel):
                 elif repaired == "lm_head.weight" and self._tied_embeddings:
                     report.skipped.append(source_name)
                     continue
-                elif _qwen_declared_skip(source_name, target_name):
+                elif target_name in self._nonresident_names or _qwen_declared_skip(
+                    source_name, target_name
+                ):
                     report.skipped.append(source_name)
                     continue
                 else:
                     report.unexpected.append(source_name)
                     continue
-            parameter = dict(self.named_parameters())[target_name]
+            parameter = parameters[target_name]
             load_parameter_weight(parameter, handle, shard_id)
             report.loaded.add(target_name)
         return report
@@ -236,17 +249,28 @@ class Qwen3ForCausalLM(ExecutionModel):
         cfg = _parse_qwen_config(config)
         self._parallel = layer_config.communicator
         self.model = qwen.Qwen3Model(cfg, layer_config=layer_config.child("model"))
-        self.lm_head = ParallelLMHead(
-            cfg.hidden_size,
-            cfg.vocab_size,
-            layer_config=layer_config,
-            prefix="lm_head",
-            bias=False,
+        self.lm_head = (
+            ParallelLMHead(
+                cfg.hidden_size,
+                cfg.vocab_size,
+                layer_config=layer_config,
+                prefix="lm_head",
+                bias=False,
+            )
+            if self.model.pipeline.last
+            else None
         )
         self._tied_embeddings = cfg.tie_word_embeddings
-        if cfg.tie_word_embeddings:
+        if cfg.tie_word_embeddings and self.model.pipeline.first and self.model.pipeline.last:
+            assert self.lm_head is not None and self.model.embed_tokens is not None
             self.lm_head.weight = self.model.embed_tokens.weight
-        self.logits = LogitsProcessor()
+        layer_parameters = tuple(dict(next(iter(self.model.layers.values())).named_parameters()))
+        nonresident = self.model.pipeline.nonresident_layer_names("model.layers", layer_parameters)
+        if not self.model.pipeline.first:
+            nonresident |= {"model.embed_tokens.weight"}
+        if not self.model.pipeline.last:
+            nonresident |= {"model.norm.weight", "lm_head.weight"}
+        self._nonresident_names = nonresident
         self.num_layers = cfg.num_hidden_layers
         self.head_dim = cfg.head_dim
         self.architecture = "Qwen3ForCausalLM"
@@ -258,18 +282,24 @@ class Qwen3ForCausalLM(ExecutionModel):
             }
         )
         self.cache_geometry = CacheGeometry(
-            num_layers=int(self.num_layers),
+            num_layers=len(self.model.pipeline.layers),
+            total_layers=int(self.num_layers),
+            layer_offset=self.model.pipeline.layers.start,
             num_attention_heads=local_attention_head_count(
                 cfg.num_attention_heads,
                 parallel=self._parallel,
+                sequence=layer_config.sequence,
             ),
             num_kv_heads=local_kv_head_count(
                 cfg.num_key_value_heads,
                 parallel=self._parallel,
+                sequence=layer_config.sequence,
             ),
             total_kv_heads=int(cfg.num_key_value_heads),
             kv_head_offset=local_kv_head_offset(
-                int(cfg.num_key_value_heads), parallel=self._parallel
+                int(cfg.num_key_value_heads),
+                parallel=self._parallel,
+                sequence=layer_config.sequence,
             ),
             head_dim=cfg.head_dim,
             dtype="bfloat16",
@@ -291,7 +321,8 @@ class Qwen3ForCausalLM(ExecutionModel):
         """Merge optional multimodal embeddings and execute the packed Qwen decoder."""
 
         input_embeds: torch.Tensor | None = None
-        if forward_batch.input_embeddings is not None:
+        if forward_batch.input_embeddings is not None and self.model.pipeline.first:
+            assert self.model.embed_tokens is not None
             embedded = self.model.embed_tokens(input_ids.reshape(-1))
             mask = forward_batch.embedding_mask
             if mask is None:
@@ -309,67 +340,12 @@ class Qwen3ForCausalLM(ExecutionModel):
         )
 
     def project(self, hidden: torch.Tensor, forward_batch: ForwardBatch) -> ForwardOutput:
-        """Select per-request hidden states or vocabulary logits from packed decoder rows."""
+        """Select shared vocabulary or hidden outputs from packed decoder rows."""
 
-        selections = forward_batch.token_selections
-        query_lens = forward_batch.query_lens_cpu
-        dynamic_last = (
-            forward_batch.output_indices
-            if forward_batch.forward_mode is AttentionMode.PAGED_VARLEN
-            and all(selection is TokenSelection.LAST_LOGITS for selection in selections)
-            else None
+        return project_outputs(
+            hidden,
+            forward_batch,
+            self.lm_head,
+            pipeline=self.model.pipeline,
+            vocabulary=vocabulary_partition(self.vocab_size, self._parallel),
         )
-        if dynamic_last is not None:
-            selected = hidden.index_select(0, dynamic_last.to(dtype=torch.long))
-            dynamic_projected = self.logits(self.lm_head(selected))
-            return ForwardOutput(
-                tuple(dynamic_projected[index : index + 1] for index in range(len(selections)))
-            )
-        # Recover request-local row views before applying each request's output selection.
-        row_hidden: list[torch.Tensor] = []
-        begin = 0
-        for count in query_lens:
-            row_hidden.append(hidden[begin : begin + count])
-            begin += count
-        # Project all rows that require logits in one vocabulary-parallel operation.
-        projected_rows = tuple(
-            index
-            for index, selection in enumerate(selections)
-            if selection is not TokenSelection.HIDDEN
-        )
-        projected: torch.Tensor | None = None
-        if projected_rows:
-            if (
-                len(projected_rows) == len(selections)
-                and all(selection is TokenSelection.LAST_LOGITS for selection in selections)
-                and all(int(value.shape[0]) == 1 for value in row_hidden)
-            ):
-                selected = hidden
-            else:
-                selected_rows = tuple(
-                    row_hidden[index]
-                    if selections[index] is TokenSelection.ALL_LOGITS
-                    else row_hidden[index][-1:]
-                    for index in projected_rows
-                )
-                selected = (
-                    selected_rows[0] if len(selected_rows) == 1 else torch.cat(selected_rows, dim=0)
-                )
-            projected = self.logits(self.lm_head(selected))
-
-        # Slice the shared projection back into request order while preserving hidden outputs.
-        outputs: list[torch.Tensor] = []
-        projected_offset = 0
-        for index, selection in enumerate(selections):
-            if selection is TokenSelection.HIDDEN:
-                value = row_hidden[index]
-            else:
-                if projected is None:
-                    raise RuntimeError("Qwen3 projected output buffer is missing")
-                count = (
-                    int(row_hidden[index].shape[0]) if selection is TokenSelection.ALL_LOGITS else 1
-                )
-                value = projected[projected_offset : projected_offset + count]
-                projected_offset += count
-            outputs.append(value)
-        return ForwardOutput(tuple(outputs))

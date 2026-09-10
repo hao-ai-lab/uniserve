@@ -199,10 +199,9 @@ def _consume_encode(runtime: Worker, state: OperationState, output: torch.Tensor
         EncoderMetadata(height=prepared.height, width=prepared.width),
     )
     products: tuple[ProductPayload, ...] = ()
-    if (
-        any(name != "local" for name in runtime.publication_transports)
-        and runtime.worker_config.rank == runtime.worker_config.output_rank
-    ):
+    if any(
+        name != "local" for name in runtime.publication_transports
+    ) and runtime.worker_config.rank == runtime.output_rank(operation.entry):
         locations = publish_tensor(
             runtime.publication_transports,
             resident,

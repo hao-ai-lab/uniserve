@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import weakref
-from collections.abc import Callable
-from contextlib import nullcontext
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from itertools import accumulate
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -14,6 +15,26 @@ from ...foundation.math import ceil_div
 
 if TYPE_CHECKING:
     from .flashinfer_pool import WrapperKey
+
+
+@contextmanager
+def _plan_workspace(wrapper: Any) -> Iterator[None]:
+    """Give a native plan an immutable pinned upload generation.
+
+    FlashInfer writes this host workspace and enqueues its DMA directly. Its
+    next plan may run before the previous upload has reached the device. A fresh
+    allocation plus allocator stream tracking protects both reuse and teardown
+    while allowing CPU planning to continue asynchronously.
+    """
+
+    from uniserve_kernel.peer_memory import record_host_usage
+
+    source = torch.empty_like(wrapper._pin_memory_int_workspace_buffer, pin_memory=True)
+    wrapper._pin_memory_int_workspace_buffer = source
+    try:
+        yield
+    finally:
+        record_host_usage(source, torch.cuda.current_stream(wrapper.device))
 
 
 @dataclass
@@ -59,6 +80,58 @@ class _PrefillPlanTensors:
 
 
 @dataclass(frozen=True)
+class _PrefillHostPlan:
+    """Pinned CPU planning inputs derived from the current row lengths.
+
+    PyTorch's pinned allocator tracks asynchronous copies from these tensors,
+    retaining their storage until the device has consumed it. The views share
+    one allocation and need no stream-blocking reuse fence.
+    """
+
+    qo_indptr: torch.Tensor
+    kv_indptr: torch.Tensor
+    last_page_len: torch.Tensor
+    kv_lens: torch.Tensor
+    index_count: int
+    max_query_rows: int
+    max_kv_rows: int
+
+
+def _prefill_host_plan(
+    query_lens: tuple[int, ...],
+    kv_lens: tuple[int, ...],
+    batch_size: int,
+    page_size: int,
+) -> _PrefillHostPlan | None:
+    """Use host-known lengths when supplied; device-only callers keep device planning."""
+
+    if not query_lens or not kv_lens:
+        return None
+    if (
+        len(query_lens) != batch_size
+        or len(kv_lens) != batch_size
+        or page_size < 1
+        or any(length < 0 for length in (*query_lens, *kv_lens))
+    ):
+        raise ValueError("prefill host lengths must describe every query and KV row")
+    qo_indptr = tuple(accumulate(query_lens, initial=0))
+    kv_indptr = tuple(accumulate((ceil_div(length, page_size) for length in kv_lens), initial=0))
+    last_page_len = tuple((length - 1) % page_size + 1 for length in kv_lens)
+    storage = torch.tensor(
+        (*qo_indptr, *kv_indptr, *last_page_len, *kv_lens),
+        dtype=torch.int32,
+        device="cpu",
+        pin_memory=True,
+    )
+    qo, kv, last_page, lengths = storage.split(
+        (batch_size + 1, batch_size + 1, batch_size, batch_size)
+    )
+    return _PrefillHostPlan(
+        qo, kv, last_page, lengths, kv_indptr[-1], max(query_lens), max(kv_lens)
+    )
+
+
+@dataclass(frozen=True)
 class _FastDecodePlanDefaults:
     """Captures dtype and split-KV defaults required by FlashInfer fast decode planning."""
 
@@ -83,6 +156,16 @@ class _FastDecodePlanHostTensors:
     qo_indptr: torch.Tensor
     indptr: torch.Tensor
     kv_lens: torch.Tensor
+
+
+def _binding_identity(binding: Any) -> int | None:
+    """Return the stable key carried by a graph binding token."""
+
+    if binding is None:
+        return None
+    if isinstance(binding, int):
+        return int(binding)
+    return id(binding)
 
 
 class _PlanCache:
@@ -161,55 +244,20 @@ def _decode_plan_key(
 ) -> tuple[Any, ...]:
     """Build a decode-plan cache key from binding identity, tensor geometry, and scale."""
 
-    return _decode_plan_key_from_shape(
-        binding,
-        block_table,
-        cache_seqlens,
-        batch_size=int(q.shape[0]),
-        num_q_heads=int(q.shape[1]),
-        num_kv_heads=int(k_cache.shape[2]),
-        head_dim=int(q.shape[2]),
-        page_size=int(k_cache.shape[1]),
-        q_dtype=q.dtype,
-        kv_dtype=k_cache.dtype,
-        scale=scale,
-        current_tokens=current_tokens,
-        wrapper_key=wrapper_key,
-    )
-
-
-def _decode_plan_key_from_shape(
-    binding: Any,
-    block_table: torch.Tensor,
-    cache_seqlens: torch.Tensor,
-    *,
-    batch_size: int,
-    num_q_heads: int,
-    num_kv_heads: int,
-    head_dim: int,
-    page_size: int,
-    q_dtype: torch.dtype,
-    kv_dtype: torch.dtype,
-    scale: float | None,
-    current_tokens: int,
-    wrapper_key: "WrapperKey",
-) -> tuple[Any, ...]:
-    """Build a decode-plan cache key from explicit graph-capture geometry."""
-
     return (
         wrapper_key,
-        id(binding) if binding is not None else None,
+        _binding_identity(binding),
         int(block_table.data_ptr()),
         int(cache_seqlens.data_ptr()),
         tuple(int(dim) for dim in block_table.shape),
         tuple(int(dim) for dim in cache_seqlens.shape),
-        int(batch_size),
-        int(num_q_heads),
-        int(num_kv_heads),
-        int(head_dim),
-        int(page_size),
-        str(q_dtype),
-        str(kv_dtype),
+        int(q.shape[0]),
+        int(q.shape[1]),
+        int(k_cache.shape[2]),
+        int(q.shape[2]),
+        int(k_cache.shape[1]),
+        str(q.dtype),
+        str(k_cache.dtype),
         None if scale is None else float(scale),
         int(current_tokens),
     )
@@ -230,7 +278,7 @@ def _prefill_plan_key(
 
     return (
         wrapper_key,
-        id(binding) if binding is not None else None,
+        _binding_identity(binding),
         int(block_table.data_ptr()),
         int(cu_seqlens_q.data_ptr()),
         int(cu_seqlens_k.data_ptr()),
@@ -560,7 +608,9 @@ def _prepare_fast_decode_plan_buffers(
             )
         indices_buffer = getattr(wrapper, "_paged_kv_indices_buf", None)
         if indices_buffer is not None and len(indices) > len(indices_buffer):
-            raise ValueError("The size of indices should be less than or equal to the allocated buffer")
+            raise ValueError(
+                "The size of indices should be less than or equal to the allocated buffer"
+            )
         return
     wrapper._paged_kv_indptr_buf = indptr
     wrapper._paged_kv_indices_buf = indices
@@ -632,7 +682,8 @@ def _fast_decode_plan_args(
         int(window_left),
     ]
     if getattr(wrapper, "_backend", None) == "fa2":
-        args.extend((fixed_split_size, bool(disable_split_kv), 0))
+        # Single-query decode uses the planner's general query-length mode.
+        args.extend((fixed_split_size, bool(disable_split_kv), 0, 0))
     return args
 
 

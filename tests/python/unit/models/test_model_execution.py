@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
 from torch import nn
@@ -58,12 +60,6 @@ def _bagel_config() -> BagelConfig:
         vit_patch_size=14,
         vit_max_num_patch_per_side=16,
     )
-
-
-class _LoadedBagelGraph(nn.Module):
-    def __init__(self, config: BagelConfig) -> None:
-        super().__init__()
-        self.cfg = config
 
 
 def _projection_weight(module: nn.Module) -> torch.Tensor:
@@ -190,7 +186,7 @@ def test_qwen_decode_projection_preserves_row_alignment():
     hidden = torch.arange(32, dtype=torch.float32).view(4, 8)
     batch = _text_batch((1, 1, 1, 1), forward_mode=AttentionMode.PAGED_DECODE)
 
-    output = model.project(hidden, batch)
+    output = model.project(hidden, batch).materialize()
 
     assert len(output.values) == 4
     assert torch.equal(torch.cat(output.values), hidden @ weight.T)
@@ -202,7 +198,7 @@ def test_sensenova_decode_projection_preserves_row_alignment():
     hidden = torch.arange(32, dtype=torch.float32).view(4, 8)
     batch = _text_batch((1, 1, 1, 1), forward_mode=AttentionMode.PAGED_DECODE)
 
-    output = model.project(hidden, batch)
+    output = model.project(hidden, batch).materialize()
 
     assert len(output.values) == 4
     assert torch.equal(torch.cat(output.values), hidden @ weight.T)
@@ -214,9 +210,39 @@ def test_qwen_prefill_selects_the_last_logit_for_each_ragged_row():
     hidden = torch.arange(56, dtype=torch.float32).view(7, 8)
     batch = _text_batch((2, 5), forward_mode=AttentionMode.PAGED_VARLEN)
 
-    output = model.project(hidden, batch)
+    output = model.project(hidden, batch).materialize()
 
     assert torch.equal(torch.cat(output.values), hidden[[1, 6]] @ weight.T)
+
+
+@pytest.mark.parametrize("architecture", ["qwen", "sensenova", "bagel"])
+def test_model_projection_preserves_mixed_token_selections(architecture):
+    if architecture == "qwen":
+        model = Qwen3ForCausalLM(_qwen_config(), layer_config=_layer_config())
+        head = model.lm_head
+    elif architecture == "sensenova":
+        model = NEOChatModel(_sensenova_config(), layer_config=_layer_config())
+        head = model.language_model.lm_head
+    else:
+        # Projection only needs checkpoint storage for the vocabulary head.
+        # Build the complete model topology without allocating unused towers.
+        with torch.device("meta"):
+            model = BagelForConditionalGeneration(_bagel_config(), layer_config=_layer_config())
+        head = model.model.lm_head.to_empty(device="cpu")
+    weight = _projection_weight(head)
+    hidden = torch.arange(80, dtype=torch.float32).view(10, 8)
+    batch = replace(
+        _text_batch((2, 5, 3), forward_mode=AttentionMode.PAGED_VARLEN),
+        token_selections=(
+            TokenSelection.HIDDEN,
+            TokenSelection.ALL_LOGITS,
+            TokenSelection.LAST_LOGITS,
+        ),
+    )
+    actual = model.project(hidden, batch).materialize().values
+    expected = (hidden[:2], hidden[2:7] @ weight.T, hidden[9:10] @ weight.T)
+    for value, reference in zip(actual, expected, strict=True):
+        torch.testing.assert_close(value, reference, rtol=0, atol=0)
 
 
 def test_qwen_rejects_incomplete_or_untyped_configuration():
@@ -228,11 +254,8 @@ def test_qwen_rejects_incomplete_or_untyped_configuration():
 
 def test_bagel_exposes_configured_generation_behavior():
     config = _bagel_config()
-    model = BagelForConditionalGeneration(
-        config,
-        layer_config=_layer_config(),
-        graph=_LoadedBagelGraph(config),  # type: ignore[arg-type]
-    )
+    with torch.device("meta"):
+        model = BagelForConditionalGeneration(config, layer_config=_layer_config())
 
     assert model.tensorized_mixed
     assert model.generation.schedule_direction is ScheduleDirection.DESCENDING
@@ -253,7 +276,8 @@ def test_sensenova_freezes_runtime_behavior_at_construction():
 
 
 @pytest.mark.parametrize(
-    "total_kv_heads,intervals", ((8, ((2, 0), (2, 2), (2, 4), (2, 6))), (2, ((2, 0),) * 4))
+    "total_kv_heads,intervals",
+    ((8, ((2, 0), (2, 2), (2, 4), (2, 6))), (2, ((1, 0), (1, 0), (1, 1), (1, 1)))),
 )
 def test_cache_geometry_preserves_tp_member_order(total_kv_heads, intervals):
     ranks = (7, 3, 11, 5)

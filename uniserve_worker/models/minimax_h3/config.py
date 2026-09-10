@@ -101,7 +101,6 @@ def resolve_h3_contract(root: Path) -> dict[str, object]:
         "attention_backend": "VIDEO_SPARSE_ATTN_H3",
         "vsa_tile_size": 64,
         "vsa_sparsity": 0.9,
-        "vsa_kernel": "sm100a",
     }
     if not isinstance(manifest, dict):
         raise ValueError("fastvideo_inference.json must contain an object")

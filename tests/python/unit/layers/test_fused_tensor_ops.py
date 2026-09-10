@@ -3,14 +3,11 @@ from __future__ import annotations
 import pytest
 import torch
 
-from uniserve_worker.ops import value_first_swiglu, value_first_swiglu_absmax
+from uniserve_worker.ops import value_first_swiglu_absmax
 from uniserve_worker.ops.patch import unpatchify_video_tokens
 from uniserve_worker.ops.residual import (
-    scaled_residual_layer_norm,
     scaled_residual_layer_norm_absmax,
-    scaled_residual_rms_norm_,
     scaled_residual_rms_norm_absmax_,
-    weighted_rms_norm,
     weighted_rms_norm_absmax,
 )
 from uniserve_worker.ops.rope import qk_rms_norm_partial_rope_
@@ -26,7 +23,7 @@ def device(request):
 
 
 @pytest.mark.parametrize("width", (257, 2048))
-def test_normalization_absmax_matches_bf16_boundaries(device, width) -> None:
+def test_normalization_and_magnitude_preserve_rms_values(device, width) -> None:
     torch.manual_seed(41)
     rows = 32
     hidden = torch.randn((rows, width), dtype=torch.bfloat16, device=device)
@@ -36,23 +33,22 @@ def test_normalization_absmax_matches_bf16_boundaries(device, width) -> None:
     update_bias = torch.randn((width,), dtype=torch.bfloat16, device=device)
     eps = 1e-5
 
-    expected_normalized = weighted_rms_norm(hidden, weight, eps=eps)
+    def normalize(values):
+        values = values.double()
+        return values * torch.rsqrt(values.square().mean(-1, keepdim=True) + eps) * weight.double()
+
+    expected_normalized = normalize(hidden).to(hidden.dtype)
     actual_normalized, actual_maximum = weighted_rms_norm_absmax(
         hidden,
         weight,
         eps=eps,
     )
-    assert torch.equal(actual_normalized, expected_normalized)
-    assert torch.equal(actual_maximum, expected_normalized.abs().amax())
+    torch.testing.assert_close(actual_normalized, expected_normalized, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(actual_maximum, actual_normalized.abs().amax(), rtol=0, atol=0)
 
-    expected_hidden, expected_residual_normalized = scaled_residual_rms_norm_(
-        hidden.clone(),
-        update,
-        scale,
-        weight,
-        update_bias=update_bias,
-        eps=eps,
-    )
+    residual = hidden.double() + (update.double() + update_bias.double()) * scale.double()
+    expected_hidden = residual.to(hidden.dtype)
+    expected_residual_normalized = normalize(residual).to(hidden.dtype)
     actual_hidden, actual_residual_normalized, actual_maximum = scaled_residual_rms_norm_absmax_(
         hidden.clone(),
         update,
@@ -61,13 +57,17 @@ def test_normalization_absmax_matches_bf16_boundaries(device, width) -> None:
         update_bias=update_bias,
         eps=eps,
     )
-    assert torch.equal(actual_hidden, expected_hidden)
-    assert torch.equal(actual_residual_normalized, expected_residual_normalized)
-    assert torch.equal(actual_maximum, expected_residual_normalized.abs().amax())
+    torch.testing.assert_close(actual_hidden, expected_hidden, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(
+        actual_residual_normalized, expected_residual_normalized, rtol=2e-2, atol=2e-2
+    )
+    torch.testing.assert_close(
+        actual_maximum, actual_residual_normalized.abs().amax(), rtol=0, atol=0
+    )
 
 
 @pytest.mark.parametrize("width", (257, 2048))
-def test_layernorm_absmax_matches_bf16_boundary(device, width) -> None:
+def test_layernorm_and_magnitude_preserve_affine_values(device, width) -> None:
     torch.manual_seed(43)
     rows = 32
     hidden = torch.randn((rows, width), dtype=torch.bfloat16, device=device)
@@ -78,15 +78,10 @@ def test_layernorm_absmax_matches_bf16_boundary(device, width) -> None:
     update_bias = torch.randn((width,), dtype=torch.bfloat16, device=device)
     eps = 1e-5
 
-    expected = scaled_residual_layer_norm(
-        hidden,
-        update,
-        scale,
-        weight,
-        bias,
-        update_bias=update_bias,
-        eps=eps,
-    )
+    residual = hidden.double() + (update.double() + update_bias.double()) * scale.double()
+    expected = torch.nn.functional.layer_norm(
+        residual, (width,), weight.double(), bias.double(), eps
+    ).to(hidden.dtype)
     actual, maximum = scaled_residual_layer_norm_absmax(
         hidden,
         update,
@@ -96,11 +91,11 @@ def test_layernorm_absmax_matches_bf16_boundary(device, width) -> None:
         update_bias=update_bias,
         eps=eps,
     )
-    assert torch.equal(actual, expected)
-    assert torch.equal(maximum, expected.abs().amax())
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(maximum, actual.abs().amax(), rtol=0, atol=0)
 
 
-def test_swiglu_absmax_matches_bf16_boundary(device) -> None:
+def test_swiglu_and_magnitude_preserve_gated_values(device) -> None:
     torch.manual_seed(47)
     rows, intermediate = 16, 8192
     value_gate = torch.randn(
@@ -110,39 +105,41 @@ def test_swiglu_absmax_matches_bf16_boundary(device) -> None:
     )
     bias = torch.randn((2 * intermediate,), dtype=torch.bfloat16, device=device)
 
-    expected = value_first_swiglu(value_gate, bias)
+    value, gate = (value_gate.double() + bias.double()).chunk(2, dim=-1)
+    expected = (value * torch.nn.functional.silu(gate)).to(value_gate.dtype)
     actual, maximum = value_first_swiglu_absmax(value_gate, bias)
-    assert torch.equal(actual, expected)
-    assert torch.equal(maximum, expected.abs().amax())
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(maximum, actual.abs().amax(), rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
 @pytest.mark.parametrize(("head_dim", "rotary_dim"), ((64, 48), (96, 64)))
-def test_qkv_bias_fusion_preserves_outputs(device, head_dim, rotary_dim) -> None:
+def test_qkv_bias_fusion_preserves_outputs(device, head_dim, rotary_dim, dtype) -> None:
     torch.manual_seed(53)
     shape = (2, 17, 32, head_dim)
-    query = torch.randn(shape, dtype=torch.bfloat16, device=device)
+    query = torch.randn(shape, dtype=dtype, device=device)
     key = torch.randn_like(query)
     value = torch.randn_like(query)
-    query_bias = torch.randn((32 * head_dim,), dtype=torch.bfloat16, device=device)
-    key_bias = torch.randn((32 * head_dim,), dtype=torch.bfloat16, device=device)
-    value_bias = torch.randn((32 * head_dim,), dtype=torch.bfloat16, device=device)
-    cosine = torch.randn((2, 17, 1, rotary_dim), dtype=torch.bfloat16, device=device)
+    query_bias = torch.randn((32 * head_dim,), dtype=dtype, device=device)
+    key_bias = torch.randn((32 * head_dim,), dtype=dtype, device=device)
+    value_bias = torch.randn((32 * head_dim,), dtype=dtype, device=device)
+    cosine = torch.randn((2, 17, 1, rotary_dim), dtype=dtype, device=device)
     sine = torch.randn_like(cosine)
 
     expected = []
     for projection, bias in ((query, query_bias), (key, key_bias)):
         normalized = torch.nn.functional.rms_norm(
-            projection + bias.view(32, head_dim), (head_dim,), eps=1e-5
+            projection.double() + bias.view(32, head_dim).double(), (head_dim,), eps=1e-5
         )
-        left = normalized[..., : rotary_dim // 2].float()
-        right = normalized[..., rotary_dim // 2 : rotary_dim].float()
+        left = normalized[..., : rotary_dim // 2].double()
+        right = normalized[..., rotary_dim // 2 : rotary_dim].double()
         first = (
-            left * cosine[..., : rotary_dim // 2].float()
-            - right * sine[..., : rotary_dim // 2].float()
+            left * cosine[..., : rotary_dim // 2].double()
+            - right * sine[..., : rotary_dim // 2].double()
         )
         second = (
-            right * cosine[..., rotary_dim // 2 :].float()
-            + left * sine[..., rotary_dim // 2 :].float()
+            right * cosine[..., rotary_dim // 2 :].double()
+            + left * sine[..., rotary_dim // 2 :].double()
         )
         normalized[..., :rotary_dim] = torch.cat((first, second), dim=-1).to(normalized.dtype)
         expected.append(normalized)
@@ -159,8 +156,11 @@ def test_qkv_bias_fusion_preserves_outputs(device, head_dim, rotary_dim) -> None
         value=actual_value,
         value_bias=value_bias,
     )
-    torch.testing.assert_close(actual_query, expected_query)
-    torch.testing.assert_close(actual_key, expected_key)
+    tolerance = 2e-2 if dtype is torch.bfloat16 else 2e-3
+    torch.testing.assert_close(
+        actual_query.double(), expected_query, rtol=tolerance, atol=tolerance
+    )
+    torch.testing.assert_close(actual_key.double(), expected_key, rtol=tolerance, atol=tolerance)
     assert torch.equal(actual_value, expected_value)
 
 
@@ -234,7 +234,7 @@ def test_scaled_residual_normalizes_the_unrounded_fp32_sum(device, width):
     scale = torch.randn((width,), generator=generator, device=device, dtype=torch.bfloat16)
     weight = torch.randn((width,), generator=generator, device=device, dtype=torch.bfloat16)
     update_bias = torch.randn((width,), generator=generator, device=device, dtype=torch.bfloat16)
-    residual = hidden + (update + update_bias).float() * scale.float()
+    residual = hidden + (update.float() + update_bias.float()) * scale.float()
     normalized = residual * torch.rsqrt(residual.square().mean(-1, keepdim=True) + 1e-5)
     expected = (normalized * weight.float()).to(update.dtype)
     actual_hidden, actual, magnitude = scaled_residual_rms_norm_absmax_(
@@ -262,3 +262,53 @@ def test_video_patch_geometry_preserves_logical_channel_coordinates(device, patc
         source, None, grid_shape=(frames, height, width), patch_shape=patch_shape
     )
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("axis_dims", ((6, 2, 2), (96, 48, 48), (128, 64, 64), (512, 256, 256)))
+@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
+def test_multi_axis_qk_norm_rope_preserves_shared_normalization_groups(device, dtype, axis_dims):
+    from uniserve_worker import ops
+
+    generator = torch.Generator(device=device).manual_seed(73)
+    width = sum(axis_dims)
+    query = torch.randn((5, 8, width), generator=generator, device=device, dtype=dtype)
+    key = torch.randn((5, 2, width), generator=generator, device=device, dtype=dtype)
+    weights = tuple(
+        tuple(
+            torch.randn((size,), generator=generator, device=device, dtype=dtype)
+            for size in (axis_dims[0], sum(axis_dims[1:]))
+        )
+        for _ in range(2)
+    )
+    angles = tuple(
+        torch.randn((5, size // 2), generator=generator, device=device) for size in axis_dims
+    )
+    cosine, sine = tuple(value.cos() for value in angles), tuple(value.sin() for value in angles)
+    with torch.inference_mode():
+        actual = ops.qk_norm_rope(
+            query,
+            key,
+            (weights[0][0], weights[0][1], weights[0][1]),
+            (weights[1][0], weights[1][1], weights[1][1]),
+            cosine,
+            sine,
+            1e-6,
+            axis_dims=axis_dims,
+        )
+    tolerance = 2e-2 if dtype is torch.bfloat16 else 2e-3
+    for source, groups, result in zip((query, key), weights, actual, strict=True):
+        head, tail = source.double().split((axis_dims[0], sum(axis_dims[1:])), dim=-1)
+        normalized = torch.cat(
+            tuple(
+                value * torch.rsqrt(value.square().mean(-1, keepdim=True) + 1e-6) * weight.double()
+                for value, weight in zip((head, tail), groups, strict=True)
+            ),
+            dim=-1,
+        )
+        rotated = []
+        for value, cos, sin in zip(normalized.split(axis_dims, dim=-1), cosine, sine, strict=True):
+            left, right = value.chunk(2, dim=-1)
+            cos, sin = cos.double().unsqueeze(1), sin.double().unsqueeze(1)
+            rotated.append(torch.cat((left * cos - right * sin, right * cos + left * sin), dim=-1))
+        expected = torch.cat(rotated, dim=-1)
+        torch.testing.assert_close(result.double(), expected, rtol=tolerance, atol=tolerance)

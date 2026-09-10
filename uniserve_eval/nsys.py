@@ -23,7 +23,7 @@ class NsysCapture:
         output_dir: Path,
         *,
         trace_cuda: bool = True,
-        cuda_trace: Literal["cuda", "cuda-sw"] = "cuda",
+        cuda_trace: Literal["cuda", "cuda-hw"] = "cuda",
     ) -> None:
         """Create a unique profiler session for a benchmark point."""
 
@@ -32,7 +32,9 @@ class NsysCapture:
             raise RuntimeError("Nsight Systems is required for --nsys")
         self.executable = executable
         self.point_name = point_name
-        self.output_dir = Path(output_dir)
+        # The profiled executable may run in a different checkout. Artifact
+        # ownership stays with the evaluator's caller, independent of that cwd.
+        self.output_dir = Path(output_dir).resolve()
         slug = re.sub(r"[^A-Za-z0-9]+", "_", point_name).strip("_") or "point"
         self.session = f"uniserve_eval_{os.getpid()}_{slug}"
         self.report_prefix = self.output_dir / "trace"

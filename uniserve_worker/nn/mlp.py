@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from functools import partial
 from typing import Literal
 
 import torch
@@ -30,8 +29,8 @@ class GatedMLP(nn.Module):
     """Gated expansion and tensor-parallel reduction with explicit packed order.
 
     The packed projection retains the checkpoint-facing ``gate_up_proj`` name.
-    ``order`` identifies its physical halves. ``activation_dtype`` selects an
-    intermediate SiLU rounding boundary for value-first projections.
+    ``order`` identifies its physical halves. Activation providers may fuse
+    SiLU and multiplication before rounding to the output dtype.
     """
 
     def __init__(
@@ -44,21 +43,18 @@ class GatedMLP(nn.Module):
         weight_mode: WeightMode = WeightMode.VANILLA,
         quant_method: LinearMethod | None = None,
         order: Literal["gate_value", "value_gate"] = "gate_value",
-        activation_dtype: torch.dtype | None = None,
-        logical_input_row_partitions: int = 1,
         bias: bool = False,
     ) -> None:
         super().__init__()
         activation = hidden_act.lower()
         self._silu = activation in {"silu", "swish", "silu_and_mul", "swiglu"}
         self.order = order
-        self.activation_dtype = activation_dtype
         self.act: Callable[[torch.Tensor], torch.Tensor]
         if order == "value_gate":
-            if not self._silu or activation_dtype not in (None, torch.bfloat16):
-                raise ValueError("value-first gated MLP requires SiLU with optional BF16 rounding")
-            self.act = partial(ops.value_first_swiglu, activation_dtype=activation_dtype)
-        elif order == "gate_value" and activation_dtype is None:
+            if not self._silu:
+                raise ValueError("value-first gated MLP requires SiLU")
+            self.act = ops.value_first_swiglu
+        elif order == "gate_value":
             if self._silu:
                 self.act = ops.silu_and_mul
             elif activation in {"gelu", "gelu_and_mul", "geglu"}:
@@ -68,7 +64,7 @@ class GatedMLP(nn.Module):
             else:
                 raise ValueError(f"gated MLP does not support hidden_act={hidden_act!r}")
         else:
-            raise ValueError("gated MLP order and activation rounding are incompatible")
+            raise ValueError("gated MLP has an unsupported packed order")
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             (intermediate_size, intermediate_size),
@@ -81,7 +77,6 @@ class GatedMLP(nn.Module):
             prefix="gate_up_proj",
             bias=bias,
             weight_mode=weight_mode,
-            logical_input_row_partitions=logical_input_row_partitions,
         )
         # A singleton projection includes dense bias in GEMM. Sharded outputs
         # apply bias after summing partial results across their input columns.
@@ -93,21 +88,16 @@ class GatedMLP(nn.Module):
             quant_method=quant_method,
             prefix="down_proj",
             bias=bias,
-            logical_input_row_partitions=logical_input_row_partitions,
         )
 
     @property
     def accepts_prequantized_fp8(self) -> bool:
         """Whether row-scaled E4M3 producers can feed this SiLU projection pair."""
 
-        return (
-            self._silu
-            and (self.order == "gate_value" or self.activation_dtype is torch.bfloat16)
-            and all(
-                isinstance(projection.quant_method, DynamicW8A8Fp8LinearMethod)
-                and not projection.quant_method.tensorwise
-                for projection in (self.gate_up_proj, self.down_proj)
-            )
+        return self._silu and all(
+            isinstance(projection.quant_method, DynamicW8A8Fp8LinearMethod)
+            and not projection.quant_method.tensorwise
+            for projection in (self.gate_up_proj, self.down_proj)
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -129,10 +119,10 @@ class GatedMLP(nn.Module):
 
         The optional magnitude describes the complete input tensor. Tensor-scaled
         down projections reuse the magnitude of the rounded gated activation.
-        Dense projections retain their GEMM bias rounding boundaries.
+        Dense providers apply bias in their GEMM epilogue.
         """
 
-        if self.order != "value_gate" or self.activation_dtype is not None:
+        if self.order != "value_gate":
             raise ValueError("deferred gated MLP requires value-first SiLU with FP32 activation")
         packed, bias = project_with_deferred_bias(self.gate_up_proj, hidden, absmax=input_absmax)
         if self.down_proj.quant_method.input_scale_domain == "tensor":

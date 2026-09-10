@@ -36,7 +36,7 @@ from uniserve_worker.execution.model_runner import ModelRunner
 from uniserve_worker.execution.output import finalize_run_result
 from uniserve_worker.execution.trace import ExecutionTrace
 from uniserve_worker.foundation.errors import ComputeError, InputError
-from uniserve_worker.models.runtime import ExecutionModel
+from uniserve_worker.models.runtime import ExecutionModel, ResourceGeometry
 from uniserve_worker.models.stub import StubModel
 from uniserve_worker.nn.parallel import EntryConfig
 from uniserve_worker.process import dispatch
@@ -191,6 +191,7 @@ def test_text_entry_stages_successive_bounded_inputs(device):
     if device.startswith("cuda") and not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     model = ExecutionModel()
+    model.resource_geometry = ResourceGeometry(kv=False)
     model.text_encoder = torch.nn.Embedding(32, 4, device=device)
     model.text_max_tokens = 16
     model.entry_outputs = {
@@ -228,6 +229,7 @@ def test_text_entry_stages_successive_bounded_inputs(device):
 )
 def test_entry_rejects_outputs_outside_the_loaded_contract(shape, dtype, message):
     model = ExecutionModel()
+    model.resource_geometry = ResourceGeometry(kv=False)
     model.projection = torch.nn.Identity()
     model.entry_outputs = {
         "projection": (TensorSpec("values", DType.F32, ShapeBound((DeviceDim(2), StaticDim(4)))),),
@@ -257,5 +259,51 @@ def test_worker_reports_entry_result_bounds_with_its_static_membership():
         assert entry.name == "projection"
         assert entry.config.ranks == (0,)
         assert entry.outputs == model.entry_outputs["projection"]
+    finally:
+        worker.close()
+
+
+def test_worker_binds_dense_attention_without_requesting_kv_storage():
+    from uniserve_worker.nn.attention import RadixAttention
+    from uniserve_worker.worker import Worker
+
+    class DenseEntry(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attention = RadixAttention(2, 2, 8)
+
+        def forward(self, value):
+            return self.attention(value, value, value, None, causal=False)
+
+    model = ExecutionModel()
+    model.architecture = "DenseAttention"
+    model.resource_geometry = ResourceGeometry(kv=False)
+    model.supported_work = frozenset({OpCode.DIFFUSION_DECODE})
+    model.supports_weight_updates = False
+    model.decoder = DenseEntry()
+    model.entry_outputs = {
+        "decoder": (TensorSpec(
+            "values", DType.F32,
+            ShapeBound((StaticDim(1), StaticDim(2), DeviceDim(16), StaticDim(8))),
+        ),),
+    }
+    worker = Worker(
+        model, sampling_group=None,
+        worker_config=WorkerConfig(
+            device="cpu", cuda_graph=False, max_batch_operations=2,
+            max_batch_tokens=2, max_request_pool_size=2,
+        ),
+        attention=None, tokenizer=None, allowed_work_variants=model.supported_work,
+        transfer_backends=("local",), publication_backends=("local",), worker_id="decoder",
+        pipeline_depth=3, completion_payload_bytes=1 << 16,
+        components=(("decoder", EntryConfig((0,))),),
+    )
+    try:
+        info = WorkerInfo.from_mapping(dispatch(worker, {"kind": "info"})["info"])
+        assert info.uses_kv is False
+        assert info.kv_cache is None
+        values = torch.arange(64, dtype=torch.float32).reshape(1, 2, 4, 8) / 64
+        expected = torch.nn.functional.scaled_dot_product_attention(values, values, values)
+        torch.testing.assert_close(model.decoder(values), expected)
     finally:
         worker.close()

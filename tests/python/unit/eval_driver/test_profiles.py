@@ -45,6 +45,20 @@ def test_serving_runtime_suite_exposes_stream_and_image_latency_metrics() -> Non
     )
 
 
+def test_fast_h3_server_topology_accepts_environment_override(monkeypatch) -> None:
+    monkeypatch.setenv("UNISERVE_H3_WORKER_RANKS", "2")
+    monkeypatch.setenv("UNISERVE_H3_CUDA_VISIBLE_DEVICES", "0,1")
+    monkeypatch.setenv("UNISERVE_H3_MEM_FRACTION", "0.99")
+
+    server = load_config().servers["minimax-h3"]
+    rank_value = server.command.index("--worker-ranks") + 1
+    fraction_value = server.command.index("--mem-fraction-static") + 1
+
+    assert server.command[rank_value] == "2"
+    assert server.command[fraction_value] == "0.99"
+    assert server.environment["CUDA_VISIBLE_DEVICES"] == "0,1"
+
+
 def test_toml_rejects_an_unknown_benchmark_field(tmp_path: Path) -> None:
     config = tmp_path / "profiles.toml"
     config.write_text(

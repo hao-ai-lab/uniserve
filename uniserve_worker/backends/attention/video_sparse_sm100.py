@@ -8,6 +8,7 @@ import torch
 
 from ...nn.parallel_attention import AttentionOutputTargets
 from ...ops.video_sparse import compose_to_head_shards, pack_qkv, unpack_add_compression
+from ...ops.video_sparse_rows import SparseAttentionPattern
 from . import video_sparse_cute
 
 _IMPORT_ERROR: BaseException | None = None
@@ -21,13 +22,12 @@ else:  # pragma: no cover
     _provider = _provider_module
 
 
-def available() -> bool:
+def available(device: torch.device | None = None) -> bool:
     """Return whether the SM100 sparse-attention extension is registered."""
 
     if _provider is None or not torch.cuda.is_available():
         return False
-    major, _minor = torch.cuda.get_device_capability()
-    return major == 10 and _provider.available() and video_sparse_cute.available()
+    return _provider.available(device) and video_sparse_cute.available(device)
 
 
 def import_error() -> BaseException | None:
@@ -56,7 +56,7 @@ def _block_sparse_custom(
 ) -> None:
     """Dispatch sparse attention and write dense-compressed rank-local output shards."""
 
-    if not available() or _provider is None:
+    if not available(query.device) or _provider is None:
         raise RuntimeError("SM100a sparse video attention is unavailable") from import_error()
     # The provider's size boundary covers the key sequence traversed by each
     # query, including when query rows are distributed across devices.
@@ -140,7 +140,7 @@ def block_sparse_attention(
     mask_block_indices: torch.Tensor,
     valid_sizes: torch.Tensor,
     tile_size: int,
-    prefix_tiles: int,
+    pattern: SparseAttentionPattern,
     gate: torch.Tensor,
     compressed: torch.Tensor,
     attention_output: torch.Tensor,
@@ -148,7 +148,7 @@ def block_sparse_attention(
 ) -> torch.Tensor:
     """Execute SM100 block-sparse attention using per-query block counts and indices."""
 
-    if not available():
+    if not available(query.device):
         raise RuntimeError("SM100a sparse video attention is unavailable") from import_error()
     if tile_size != 64 or query.shape[-1] != 128:
         raise ValueError("sparse video attention requires tile 64 and head dimension 128")
@@ -192,7 +192,7 @@ def block_sparse_attention(
         attention_output,
         list(targets.buffers),
         targets.source_rank,
-        prefix_tiles,
+        pattern.dense_prefix_tiles,
     )
     return targets.buffers[targets.source_rank]
 

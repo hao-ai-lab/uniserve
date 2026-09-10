@@ -313,8 +313,15 @@ def test_incremental_kv_import_preserves_values_in_reserved_pages(
 
 
 @pytest.mark.parametrize(
-    "source_ranks,target_ranks,replicated",
-    ((1, 2, False), (2, 1, False), (3, 2, False), (2, 3, True)),
+    "source_ranks,target_ranks,replicated,source_stages,target_stages",
+    (
+        (1, 2, False, 1, 1),
+        (2, 1, False, 1, 1),
+        (3, 2, False, 1, 1),
+        (2, 3, True, 1, 1),
+        pytest.param(2, 1, False, 2, 3, id="layers-two-to-three"),
+        pytest.param(1, 2, False, 3, 2, id="layers-three-to-two"),
+    ),
 )
 @pytest.mark.parametrize(
     "source_dtype,target_dtype",
@@ -331,18 +338,24 @@ def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
     source_ranks: int,
     target_ranks: int,
     replicated: bool,
+    source_stages: int,
+    target_stages: int,
     source_dtype: str,
     target_dtype: str,
     device: str,
     target_page_size: int,
 ) -> None:
-    """Consumer head regions gather only the required producer pages and scales."""
+    """Consumer layer/head regions gather required producer pages and scales."""
+    total_layers = 5 if max(source_stages, target_stages) > 1 else 2
+    source_count = source_ranks * source_stages
     total_heads = 6
     source_heads = total_heads if replicated else total_heads // source_ranks
     target_heads = total_heads // target_ranks
     pools = [
         CachePool(
-            num_layers=2,
+            num_layers=layer_end - layer_start,
+            total_layers=total_layers,
+            layer_offset=layer_start,
             num_pages=4,
             page_size=page_size,
             num_kv_heads=heads,
@@ -353,13 +366,29 @@ def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
             store_dtype=dtype,
             device=device,
         )
-        for heads, offset, dtype, page_size in (
+        for heads, offset, dtype, page_size, layer_start, layer_end in (
             *(
-                (source_heads, 0 if replicated else rank * source_heads, source_dtype, 4)
+                (
+                    source_heads,
+                    0 if replicated else rank * source_heads,
+                    source_dtype,
+                    4,
+                    total_layers * stage // source_stages,
+                    total_layers * (stage + 1) // source_stages,
+                )
+                for stage in range(source_stages)
                 for rank in range(source_ranks)
             ),
             *(
-                (target_heads, rank * target_heads, target_dtype, target_page_size)
+                (
+                    target_heads,
+                    rank * target_heads,
+                    target_dtype,
+                    target_page_size,
+                    total_layers * stage // target_stages,
+                    total_layers * (stage + 1) // target_stages,
+                )
+                for stage in range(target_stages)
                 for rank in range(target_ranks)
             ),
         )
@@ -398,12 +427,17 @@ def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
             checkpoint = Checkpoint(operation, FixedCheckpoint(extent))
             shards = []
             for pool, owner, transport in zip(
-                pools[:source_ranks], owners[:source_ranks], transports[:source_ranks], strict=True
+                pools[:source_count], owners[:source_count], transports[:source_count], strict=True
             ):
                 values = wanted[start:extent, pool.kv_head_offset : pool.kv_head_offset + pool.n_kv]
-                for layer in range(2):
+                for layer in range(pool.num_layers):
+                    logical_layer = pool.layer_offset + layer
                     pool.write(
-                        layer, pages, start=start, k=values * 2**layer, v=-values * 2**layer / 2
+                        layer,
+                        pages,
+                        start=start,
+                        k=values * 2**logical_layer,
+                        v=-values * 2**logical_layer / 2,
                     )
                 shard = owner.publish(
                     request_pool_idx=1,
@@ -435,9 +469,9 @@ def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
             )
             for rank, (pool, owner, transport) in enumerate(
                 zip(
-                    pools[source_ranks:],
-                    owners[source_ranks:],
-                    transports[source_ranks:],
+                    pools[source_count:],
+                    owners[source_count:],
+                    transports[source_count:],
                     strict=True,
                 )
             ):
@@ -463,10 +497,12 @@ def test_kv_delivery_reshards_logical_heads_and_source_scale_groups(
                     write=write,
                 )
                 owner.apply_commit(owner.prepare_commit((), ((source, installed, value),)))
-                for layer in range(2):
+                for layer in range(pool.num_layers):
+                    logical_layer = pool.layer_offset + layer
                     key, value = pool.read(layer, pages, start=0, length=extent)
                     expected = (
-                        wanted[:extent, rank * target_heads : (rank + 1) * target_heads] * 2**layer
+                        wanted[:extent, pool.kv_head_offset : pool.kv_head_offset + pool.n_kv]
+                        * 2**logical_layer
                     )
                     torch.testing.assert_close(key, expected, rtol=0, atol=0)
                     torch.testing.assert_close(value, -expected / 2, rtol=0, atol=0)

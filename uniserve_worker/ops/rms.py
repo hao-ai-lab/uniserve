@@ -210,21 +210,15 @@ def _reshape_norm_rows(tensor: torch.Tensor, hidden_size: int) -> torch.Tensor:
     return tensor.reshape(tensor.numel() // int(hidden_size), int(hidden_size))
 
 
-def eager_rms_norm(
-    hidden_states: torch.Tensor, weight: torch.Tensor, eps: float, *, affine_in_fp32: bool = False
-) -> torch.Tensor:
+def eager_rms_norm(hidden_states: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """Apply the portable RMSNorm numerical contract along the final dimension."""
 
     in_dtype = hidden_states.dtype
 
-    # The affine contract selects whether normalized activations round before
-    # weighting or only after the FP32 weighted result is complete.
     x = hidden_states.to(torch.float32)
     variance = x.pow(2).mean(-1, keepdim=True)
     x = x * torch.rsqrt(variance + eps)
-    if affine_in_fp32:
-        return (x * weight.float()).to(in_dtype)
-    return weight * x.to(in_dtype)
+    return (x * weight.float()).to(in_dtype)
 
 
 def qk_rms_norm_eligible(

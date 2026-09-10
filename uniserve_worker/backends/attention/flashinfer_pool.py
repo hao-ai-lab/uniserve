@@ -10,9 +10,11 @@ from typing import Any, NamedTuple
 import torch
 
 from .flashinfer_plan import (
+    _binding_identity,
     _decode_fast_plan_signature,
     _DecodePlanWorkspace,
     _fast_decode_plan_with_cpu_metadata,
+    _plan_workspace,
     _PrefillPlanWorkspace,
 )
 from .paged_attention_plan_pool import PagedAttentionPlanPool
@@ -275,14 +277,15 @@ class _WrapperPool(PagedAttentionPlanPool):
     def _prefill_graph_wrapper_for_binding(self, binding: Any) -> tuple[WrapperKey, Any] | None:
         """Resolve the prefill graph wrapper registered for one binding identity."""
 
-        if binding is None:
+        binding_key = _binding_identity(binding)
+        if binding_key is None:
             return None
-        entry = self._binding_prefill_graph_wrappers.get(id(binding))
+        entry = self._binding_prefill_graph_wrappers.get(binding_key)
         if entry is None:
             return None
         wrapper_key, binding_ref = entry
         if binding_ref is not None and binding_ref() is not binding:
-            self._binding_prefill_graph_wrappers.pop(id(binding), None)
+            self._binding_prefill_graph_wrappers.pop(binding_key, None)
             return None
         wrapper = self._prefill_wrappers.get(wrapper_key)
         if wrapper is None:
@@ -336,47 +339,48 @@ class _WrapperPool(PagedAttentionPlanPool):
             workspace=self._workspace(indptr.device),
             wrapper=wrapper,
         )
-        if self._maybe_plan_decode_fast(
-            wrapper_key,
-            wrapper,
-            indptr,
-            indices,
-            last_page_len,
-            num_q_heads,
-            num_kv_heads,
-            head_dim,
-            page_size,
-            pos_encoding_mode=pos_encoding_mode,
-            q_data_type=q_data_type,
-            kv_data_type=kv_data_type,
-            data_type=data_type,
-            sm_scale=sm_scale,
-            options=options,
-            global_override_indptr_cpu=global_override_indptr_cpu,
-            global_override_last_page_len_cpu=global_override_last_page_len_cpu,
-            allow_fast=allow_fast,
-        ):
-            return
+        with _plan_workspace(wrapper):
+            if self._maybe_plan_decode_fast(
+                wrapper_key,
+                wrapper,
+                indptr,
+                indices,
+                last_page_len,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                page_size,
+                pos_encoding_mode=pos_encoding_mode,
+                q_data_type=q_data_type,
+                kv_data_type=kv_data_type,
+                data_type=data_type,
+                sm_scale=sm_scale,
+                options=options,
+                global_override_indptr_cpu=global_override_indptr_cpu,
+                global_override_last_page_len_cpu=global_override_last_page_len_cpu,
+                allow_fast=allow_fast,
+            ):
+                return
 
-        self._fallback_decode_plan(
-            wrapper,
-            indptr,
-            indices,
-            last_page_len,
-            num_q_heads,
-            num_kv_heads,
-            head_dim,
-            page_size,
-            pos_encoding_mode=pos_encoding_mode,
-            q_data_type=q_data_type,
-            kv_data_type=kv_data_type,
-            data_type=data_type,
-            sm_scale=sm_scale,
-            block_tables=block_tables,
-            seq_lens=seq_lens,
-            options=options,
-        )
-        self._remember_decode_fast_signature(wrapper_key, options.signature)
+            self._fallback_decode_plan(
+                wrapper,
+                indptr,
+                indices,
+                last_page_len,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                page_size,
+                pos_encoding_mode=pos_encoding_mode,
+                q_data_type=q_data_type,
+                kv_data_type=kv_data_type,
+                data_type=data_type,
+                sm_scale=sm_scale,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
+                options=options,
+            )
+            self._remember_decode_fast_signature(wrapper_key, options.signature)
 
     def _remember_decode_fast_signature(
         self,
@@ -597,14 +601,15 @@ class _WrapperPool(PagedAttentionPlanPool):
     def _decode_graph_wrapper_for_binding(self, binding: Any) -> tuple[WrapperKey, Any] | None:
         """Resolve the decode graph wrapper registered for one binding identity."""
 
-        if binding is None:
+        binding_key = _binding_identity(binding)
+        if binding_key is None:
             return None
-        entry = self._binding_graph_wrappers.get(id(binding))
+        entry = self._binding_graph_wrappers.get(binding_key)
         if entry is None:
             return None
         wrapper_key, binding_ref = entry
         if binding_ref is not None and binding_ref() is not binding:
-            self._binding_graph_wrappers.pop(id(binding), None)
+            self._binding_graph_wrappers.pop(binding_key, None)
             return None
         wrapper = self._decode_wrappers.get(wrapper_key)
         if wrapper is None:

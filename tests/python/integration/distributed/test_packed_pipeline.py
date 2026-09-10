@@ -1,0 +1,573 @@
+"""Pipeline placement preserves packed decoder outputs and logical KV state."""
+
+from dataclasses import replace
+from pathlib import Path
+
+import pytest
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+
+from uniserve_worker.backends.attention.fa4_cute import Fa4CuteAttentionBackend
+from uniserve_worker.backends.attention.flashinfer import FlashInferAttentionBackend
+from uniserve_worker.backends.attention.tuning import FlashInferTuningConfig
+from uniserve_worker.execution.forward_batch import (
+    AttentionMode,
+    AttentionSelection,
+    ExpertRoute,
+    FlowPatches,
+    ForwardBatch,
+    ModelPhase,
+    RouteSpan,
+    TokenSelection,
+)
+from uniserve_worker.loader.handles import TensorWeightHandle
+from uniserve_worker.loader.loader import assign_component
+from uniserve_worker.loader.weight_loaders import attach_parameter_loaders
+from uniserve_worker.models.bagel import BagelConfig, BagelForConditionalGeneration, LLMConfig
+from uniserve_worker.models.qwen3 import Qwen3ForCausalLM
+from uniserve_worker.models.sensenova.config import NeoChatConfig
+from uniserve_worker.models.sensenova.model import NEOChatModel
+from uniserve_worker.nn.attention import RadixAttention
+from uniserve_worker.nn.attention_storage import attention_exchange_scope
+from uniserve_worker.nn.layer import LayerConfig
+from uniserve_worker.nn.mesh import Communicator
+from uniserve_worker.nn.parallel import ParallelConfig, SequenceParallel
+from uniserve_worker.runtime.attention_storage import allocate_attention_exchange_storage
+from uniserve_worker.runtime.cache_pool import CachePool
+from uniserve_worker.runtime.distributed import (
+    init_distributed_environment,
+    initialize_model_parallel,
+)
+
+pytestmark = [pytest.mark.integration, pytest.mark.gpu]
+
+
+def _pool(model, device):
+    geometry = model.cache_geometry
+    pool = CachePool(
+        num_layers=geometry.num_layers,
+        total_layers=geometry.total_layers,
+        layer_offset=geometry.layer_offset,
+        num_pages=8,
+        page_size=64,
+        num_kv_heads=geometry.num_kv_heads,
+        total_kv_heads=geometry.total_kv_heads,
+        kv_head_offset=geometry.kv_head_offset,
+        head_dim=geometry.head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    pool.k.zero_()
+    pool.v.zero_()
+    model.bind_cache_pool(
+        pool,
+        AttentionSelection(
+            "flashinfer",
+            (FlashInferAttentionBackend(tuning=FlashInferTuningConfig(workspace_size=64 << 20)),),
+        ),
+    )
+    return pool
+
+
+def _prefill(device):
+    return ForwardBatch(
+        phase=ModelPhase.TEXT,
+        row_count=2,
+        forward_mode=AttentionMode.PAGED_VARLEN,
+        req_pool_indices=torch.tensor([1, 2], device=device),
+        seq_lens=torch.zeros(2, dtype=torch.int32, device=device),
+        query_lens=torch.tensor([3, 2], dtype=torch.int32, device=device),
+        out_cache_loc=torch.tensor([64, 65, 66, 128, 129], device=device),
+        block_table=torch.tensor([[1], [2]], dtype=torch.int32, device=device),
+        kv_lens=torch.tensor([3, 2], dtype=torch.int32, device=device),
+        cu_seqlens_q=torch.tensor([0, 3, 5], dtype=torch.int32, device=device),
+        cu_seqlens_k=torch.tensor([0, 3, 5], dtype=torch.int32, device=device),
+        max_seqlen_q=3,
+        max_seqlen_k=3,
+        seq_lens_cpu=(0, 0),
+        query_lens_cpu=(3, 2),
+        causal_rows_cpu=(True, True),
+        kv_lens_cpu=(3, 2),
+        token_row_indices=(0, 1),
+        input_ids=torch.tensor([1, 3, 5, 7, 9], device=device),
+        positions=torch.tensor([0, 1, 2, 0, 1], device=device),
+        token_selections=(TokenSelection.ALL_LOGITS, TokenSelection.HIDDEN),
+    )
+
+
+def _model(architecture, layer_config, tied=False):
+    common = dict(
+        vocab_size=65,
+        hidden_size=512,
+        intermediate_size=1024,
+        num_hidden_layers=5,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=256,
+    )
+    if architecture == "qwen":
+        return Qwen3ForCausalLM(
+            dict(common, head_dim=128, attention_bias=False, tie_word_embeddings=tied),
+            layer_config=layer_config,
+        )
+    if architecture == "sensenova":
+        config = NeoChatConfig(
+            vision_config=dict(
+                hidden_size=8,
+                llm_hidden_size=512,
+                downsample_ratio=0.5,
+                patch_size=2,
+                num_channels=3,
+                rope_theta_vision=10000.0,
+                max_position_embeddings_vision=128,
+            ),
+            llm_config=dict(
+                common,
+                head_dim=128,
+                attention_bias=False,
+                rms_norm_eps=1e-6,
+                rope_theta=10000.0,
+                rope_theta_hw=10000.0,
+                max_position_embeddings_hw=128,
+                pad_token_id=0,
+                bos_token_id=1,
+                eos_token_id=2,
+            ),
+            downsample_ratio=0.5,
+            max_image_seq_len=16,
+            fm_head_layers=2,
+        )
+        return NEOChatModel(config, layer_config=layer_config)
+    return BagelForConditionalGeneration(
+        BagelConfig(
+            llm=LLMConfig(**common),
+            start_of_image_id=61,
+            end_of_image_id=62,
+            max_latent_size=2,
+            vit_hidden_size=8,
+            vit_intermediate_size=16,
+            vit_num_hidden_layers=1,
+            vit_num_attention_heads=2,
+            vit_patch_size=14,
+            vit_image_size=224,
+            vit_max_num_patch_per_side=16,
+        ),
+        layer_config=layer_config,
+    )
+
+
+def _mixed_batch(architecture, device):
+    image_tokens = 1 if architecture == "sensenova" else 3
+    latent_width = 48 if architecture == "sensenova" else 64
+    side = 4 if architecture == "sensenova" else 16
+    dtype = torch.float32 if architecture == "sensenova" else torch.bfloat16
+    latent = torch.arange(latent_width, device=device, dtype=dtype).view(1, -1) / 128
+    patches = None
+    if architecture == "sensenova":
+        patches = FlowPatches(
+            pixels=torch.arange(48, device=device, dtype=torch.bfloat16).view(4, 12) / 128,
+            grid=torch.tensor([[2, 2]], device=device),
+            noise_scale=torch.tensor(0.3, device=device),
+        )
+    total = image_tokens + 2
+    return replace(
+        _prefill(device),
+        phase=ModelPhase.DENOISE,
+        forward_mode=AttentionMode.PACKED,
+        query_lens=torch.tensor([2, image_tokens], dtype=torch.int32, device=device),
+        out_cache_loc=torch.zeros(total, dtype=torch.int64, device=device),
+        has_cache_writes=False,
+        cu_seqlens_q=torch.tensor([0, 2, total], dtype=torch.int32, device=device),
+        cu_seqlens_k=torch.tensor([0, 2, total], dtype=torch.int32, device=device),
+        attention_indexes=torch.stack(
+            (
+                torch.arange(total, device=device),
+                torch.zeros(total, device=device, dtype=torch.long),
+                torch.zeros(total, device=device, dtype=torch.long),
+            )
+        ),
+        visible_end=torch.tensor([1, 2] + [total] * image_tokens, dtype=torch.int32, device=device),
+        route_spans=(
+            RouteSpan(ExpertRoute.TEXT, 0, 2),
+            RouteSpan(ExpertRoute.FLOW, 2, image_tokens),
+        ),
+        max_seqlen_q=max(2, image_tokens),
+        max_seqlen_k=max(2, image_tokens),
+        query_lens_cpu=(2, image_tokens),
+        kv_lens_cpu=(2, image_tokens),
+        causal_rows_cpu=(True, False),
+        binding=2,
+        input_ids=torch.tensor([1, 3], device=device),
+        positions=torch.tensor([0, 1], device=device),
+        token_row_indices=(0,),
+        token_selections=(TokenSelection.LAST_LOGITS,),
+        flow_row_indices=(1,),
+        flow_positions=(torch.zeros(1, dtype=torch.long, device=device),),
+        flow_timesteps=(torch.tensor(0.25, device=device),),
+        flow_latents=(latent,),
+        flow_conditioning=(patches,),
+        flow_image_tokens=(image_tokens,),
+        flow_heights=(side,),
+        flow_widths=(side,),
+    )
+
+
+def _load(model, architecture, weights):
+    attach_parameter_loaders(model, device="cpu", dtype=torch.float32)
+    if architecture == "qwen":
+        report = model.load_weights(weights)
+        assert not report.unexpected
+        invalid = model.load_weights(
+            (TensorWeightHandle("model.layers.0.unknown.weight", torch.zeros(1)),)
+        )
+        assert invalid.unexpected == ["model.layers.0.unknown.weight"]
+    else:
+        for component, source in zip(model.checkpoint_components(), weights, strict=True):
+            assign_component(component, source, device="cpu")
+
+
+def _checkpoint_name(architecture: str, source: str, name: str) -> str:
+    """Serialize synthetic global tensors in the checkpoint's external namespace."""
+
+    if architecture != "bagel" or source != "primary":
+        return name
+    if name == "lm_head.weight":
+        return "language_model.lm_head.weight"
+    if name.startswith("lm."):
+        return "language_model.model." + name.removeprefix("lm.")
+    if name.startswith("vit_model.encoder.post_layernorm."):
+        return "vit_model.vision_model.post_layernorm." + name.removeprefix(
+            "vit_model.encoder.post_layernorm."
+        )
+    if name.startswith("vit_model.encoder."):
+        return (
+            ("vit_model.vision_model.encoder." + name.removeprefix("vit_model.encoder."))
+            .replace(".mlp.0.", ".mlp.fc1.")
+            .replace(".mlp.2.", ".mlp.fc2.")
+        )
+    if name.startswith("vit_model."):
+        return "vit_model.vision_model.embeddings." + name.removeprefix("vit_model.")
+    return name
+
+
+def _run_pipeline(
+    rank: int,
+    rendezvous: str,
+    architecture: str,
+    tensor_size: int,
+    pipeline_size: int,
+    sequence_size: int,
+    long_rows: bool = False,
+) -> None:
+    device = torch.device("cuda", rank)
+    environment = init_distributed_environment(
+        rank=rank,
+        local_rank=rank,
+        world_size=pipeline_size * tensor_size * sequence_size,
+        device=device,
+        backend="nccl",
+        init_method=rendezvous,
+    )
+    members = tuple(range(pipeline_size * tensor_size * sequence_size))
+    parallel = ParallelConfig(
+        tensor_parallel_size=tensor_size,
+        pipeline_parallel_size=pipeline_size,
+        sequence_parallel=SequenceParallel()
+        if sequence_size == 1
+        else SequenceParallel("ulysses", (sequence_size,)),
+    )
+    meshes = initialize_model_parallel(
+        environment,
+        {
+            "ordered": (members, parallel),
+            "reversed": (members[::-1], parallel),
+        },
+    )
+    graph = None
+    try:
+        with torch.inference_mode():
+            for tied in (False, True) if architecture == "qwen" and not long_rows else (False,):
+                reference = _model(architecture, LayerConfig(Communicator(), None), tied)
+                generator = torch.Generator().manual_seed(641)
+                for parameter in reference.parameters():
+                    if parameter.ndim == 1:
+                        parameter.fill_(1)
+                    else:
+                        parameter.copy_(torch.randn(parameter.shape, generator=generator) * 0.02)
+                weights = (
+                    tuple(
+                        TensorWeightHandle(name, value.detach().clone())
+                        for name, value in reference.named_parameters()
+                    )
+                    if architecture == "qwen"
+                    else tuple(
+                        tuple(
+                            TensorWeightHandle(
+                                _checkpoint_name(architecture, component.source, name),
+                                value.detach().clone(),
+                            )
+                            for name, value in component.module.named_parameters()
+                            if component.included is None or name in component.included
+                        )
+                        for component in reference.checkpoint_components()
+                    )
+                )
+                del reference
+                for mesh in meshes.values():
+                    reference = _model(architecture, LayerConfig(mesh.get_group("tp"), None), tied)
+                    model = _model(
+                        architecture,
+                        LayerConfig(
+                            mesh.get_group("tp"),
+                            None,
+                            pipeline=mesh.get_group("pp"),
+                            sequence=mesh.get_group("ulysses"),
+                        ),
+                        tied,
+                    )
+                    # Parallel and graph execution retain the established
+                    # paged-attention BF16 error bound across reduction orders.
+                    tolerance = 2e-2
+                    for loaded in (reference, model):
+                        _load(loaded, architecture, weights)
+                        loaded.to(device=device, dtype=torch.bfloat16)
+                    reference_pool, pool = _pool(reference, device), _pool(model, device)
+                    batch = _prefill(device)
+                    if architecture != "qwen":
+                        batch = replace(
+                            batch,
+                            forward_mode=AttentionMode.PACKED,
+                            attention_indexes=torch.stack(
+                                (
+                                    batch.positions,
+                                    torch.zeros_like(batch.positions),
+                                    torch.zeros_like(batch.positions),
+                                )
+                            ),
+                            visible_end=torch.tensor(
+                                [1, 2, 3, 4, 5], dtype=torch.int32, device=device
+                            ),
+                            route_spans=(RouteSpan(ExpertRoute.TEXT, 0, 5),),
+                        )
+
+                    def execute(selected_model, selected_batch):
+                        hidden = selected_model(
+                            selected_batch.input_ids, selected_batch.positions, selected_batch
+                        )
+                        return selected_model.project(hidden, selected_batch)
+
+                    expected = execute(reference, batch).materialize()
+                    actual = execute(model, batch).materialize()
+                    for result, wanted in zip(actual.values, expected.values, strict=True):
+                        torch.testing.assert_close(result, wanted, rtol=tolerance, atol=tolerance)
+
+                    batch = replace(
+                        batch,
+                        forward_mode=AttentionMode.PAGED_DECODE,
+                        input_ids=torch.tensor([11, 13], device=device),
+                        positions=torch.tensor([3, 2], device=device),
+                        seq_lens=torch.tensor([3, 2], dtype=torch.int32, device=device),
+                        kv_lens=torch.tensor([4, 3], dtype=torch.int32, device=device),
+                        query_lens=torch.ones(2, dtype=torch.int32, device=device),
+                        out_cache_loc=torch.tensor([67, 130], device=device),
+                        cu_seqlens_q=None,
+                        cu_seqlens_k=None,
+                        seq_lens_cpu=(3, 2),
+                        kv_lens_cpu=(4, 3),
+                        query_lens_cpu=(1, 1),
+                        token_selections=(TokenSelection.LAST_LOGITS,) * 2,
+                        binding=1,
+                    )
+                    execute(model, batch)
+                    torch.cuda.synchronize(device)
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        captured = execute(model, batch)
+                    for tokens in ((17, 19), (23, 29)):
+                        batch.input_ids.copy_(torch.tensor(tokens, device=device))
+                        graph.replay()
+                        expected = execute(reference, batch).materialize()
+                        actual = captured.materialize()
+                        eager = execute(model, batch).materialize()
+                        for result, wanted in zip(actual.values, eager.values, strict=True):
+                            torch.testing.assert_close(
+                                result, wanted, rtol=tolerance, atol=tolerance
+                            )
+                        for result, wanted in zip(actual.values, expected.values, strict=True):
+                            torch.testing.assert_close(
+                                result, wanted, rtol=tolerance, atol=tolerance
+                            )
+                    for local_layer in range(pool.num_layers):
+                        for actual_cache, expected_cache in zip(
+                            pool.layer_cache(local_layer, 0),
+                            reference_pool.layer_cache(pool.layer_offset + local_layer, 0),
+                            strict=True,
+                        ):
+                            start = pool.kv_head_offset - reference_pool.kv_head_offset
+                            expected_cache = expected_cache.narrow(2, start, pool.n_kv)
+                            torch.testing.assert_close(
+                                actual_cache, expected_cache, rtol=tolerance, atol=tolerance
+                            )
+                    torch.cuda.synchronize(device)
+                    graph.reset()
+                    graph = None
+                    if architecture != "qwen":
+                        mixed = _mixed_batch(architecture, device)
+                        expected = execute(reference, mixed).materialize()
+                        actual = execute(model, mixed).materialize()
+                        for result, wanted in zip(actual.values, expected.values, strict=True):
+                            torch.testing.assert_close(
+                                result, wanted, rtol=tolerance, atol=tolerance
+                            )
+                    if long_rows:
+                        # PACKED graph execution requires a graph-capable
+                        # provider; FlashInfer's segmented forward plans on CPU.
+                        for loaded, cache in ((reference, reference_pool), (model, pool)):
+                            loaded.bind_cache_pool(
+                                cache,
+                                AttentionSelection("fa4_cute", (Fa4CuteAttentionBackend(),)),
+                            )
+                        storage = allocate_attention_exchange_storage(
+                            (
+                                module
+                                for module in model.modules()
+                                if isinstance(module, RadixAttention)
+                            ),
+                            environment,
+                            max_tokens=131075,
+                            dtype=torch.bfloat16,
+                            scope=("packed_rows", architecture),
+                        )
+                        with attention_exchange_scope(storage):
+                            _compare_long_packed_rows(model, reference, architecture, device)
+                        del storage
+                    del model, reference, pool, reference_pool
+    finally:
+        if graph is not None:
+            graph.reset()
+        torch.cuda.synchronize(device)
+        environment.close()
+        dist.destroy_process_group()
+
+
+def _compare_long_packed_rows(model, reference, architecture, device):
+    # The logical activation exceeds one 32 MiB per-peer exchange interval.
+    # Short independent requests keep attention work linear in the row count;
+    # the last request and the last sequence owner both have partial capacity.
+    rows = 131075
+    lengths = (128,) * (rows // 128) + (rows % 128,)
+    boundaries = torch.tensor((0, *lengths), device=device, dtype=torch.int32).cumsum(0).int()
+    positions = torch.arange(rows, device=device).remainder(128)
+    inputs = (
+        torch.arange(rows * 512, device=device).remainder(17).reshape(rows, 512).bfloat16() / 32
+    )
+    spans = (RouteSpan(ExpertRoute.TEXT, 0, rows),)
+    if architecture != "qwen":
+        spans = (
+            RouteSpan(ExpertRoute.TEXT, 0, 65537),
+            RouteSpan(ExpertRoute.FLOW, 65537, rows - 65537),
+        )
+    batch = replace(
+        _prefill(device),
+        row_count=len(lengths),
+        req_pool_indices=torch.arange(1, len(lengths) + 1, device=device),
+        forward_mode=AttentionMode.PACKED,
+        input_ids=torch.ones(rows, device=device, dtype=torch.long),
+        positions=positions,
+        seq_lens=torch.zeros(len(lengths), dtype=torch.int32, device=device),
+        query_lens=torch.tensor(lengths, dtype=torch.int32, device=device),
+        kv_lens=torch.tensor(lengths, dtype=torch.int32, device=device),
+        out_cache_loc=torch.empty(0, dtype=torch.long, device=device),
+        has_cache_writes=False,
+        block_table=torch.zeros((len(lengths), 1), dtype=torch.int32, device=device),
+        cu_seqlens_q=boundaries,
+        cu_seqlens_k=boundaries,
+        visible_end=torch.tensor(lengths, device=device, dtype=torch.int32)
+        .unsqueeze(1)
+        .expand(-1, 128)
+        .contiguous(),
+        attention_indexes=torch.stack(
+            (positions, torch.zeros_like(positions), torch.zeros_like(positions))
+        ),
+        route_spans=spans,
+        max_seqlen_q=128,
+        max_seqlen_k=128,
+        seq_lens_cpu=(0,) * len(lengths),
+        query_lens_cpu=lengths,
+        kv_lens_cpu=lengths,
+        causal_rows_cpu=(False,) * len(lengths),
+        token_row_indices=tuple(range(len(lengths))),
+        token_selections=(TokenSelection.HIDDEN,) * len(lengths),
+        binding=3,
+    )
+
+    def execute(selected):
+        if architecture == "qwen":
+            return selected.model(batch.input_ids, positions, batch, input_embeds=inputs.clone())
+        decoder = (
+            selected.language_model.model if architecture == "sensenova" else selected.model.lm
+        )
+        return decoder(inputs.clone(), batch)
+
+    graph = torch.cuda.CUDAGraph()
+    try:
+        expected = execute(reference)
+        actual = execute(model)
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+        torch.cuda.synchronize(device)
+        with torch.cuda.graph(graph):
+            captured = execute(model)
+        inputs.add_(0.0625)
+        graph.replay()
+        expected = execute(reference)
+        eager = execute(model)
+        torch.testing.assert_close(captured, eager, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(captured, expected, rtol=2e-2, atol=2e-2)
+    finally:
+        graph.reset()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="two CUDA devices are required")
+@pytest.mark.parametrize("architecture", ["qwen", "sensenova", "bagel"])
+def test_packed_decoder_streamed_rows_preserve_routed_outputs_under_replay(tmp_path, architecture):
+    mp.spawn(
+        _run_pipeline,
+        args=(f"file://{tmp_path / 'row_intervals'}", architecture, 1, 1, 2, True),
+        nprocs=2,
+        join=True,
+    )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="two CUDA devices are required")
+@pytest.mark.parametrize("architecture", ["qwen", "sensenova", "bagel"])
+@pytest.mark.parametrize(
+    "tensor_size,pipeline_size,sequence_size",
+    [
+        (1, 2, 1),
+        (2, 2, 1),
+        (1, 1, 2),
+        (1, 2, 2),
+        (2, 1, 2),
+        (1, 1, 4),
+        (4, 1, 1),
+    ],
+)
+def test_packed_pipeline_preserves_outputs_and_cache_regions(
+    tmp_path: Path, architecture: str, tensor_size: int, pipeline_size: int, sequence_size: int
+):
+    world_size = pipeline_size * tensor_size * sequence_size
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(f"{world_size} CUDA devices are required")
+    mp.spawn(
+        _run_pipeline,
+        args=(
+            f"file://{tmp_path / 'pipeline'}",
+            architecture,
+            tensor_size,
+            pipeline_size,
+            sequence_size,
+        ),
+        nprocs=world_size,
+        join=True,
+    )

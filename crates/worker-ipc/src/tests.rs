@@ -1020,6 +1020,12 @@ fn worker_info_round_trips() {
         let info = WorkerInfo {
             world_size: count as u32,
             configuration_id: "a".repeat(64),
+            kv_cache: Some(KvCacheConfig {
+                num_layers: 9,
+                total_layers: 28,
+                layer_offset: 11,
+                ..WorkerInfo::default().kv_cache.unwrap()
+            }),
             components: vec![EntryInfo {
                 name: "denoiser".into(),
                 config: EntryConfig::parallel((0..count).rev().collect(), config),

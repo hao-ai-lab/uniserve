@@ -7,6 +7,8 @@ import torch
 import torch.nn.functional as F
 
 from uniserve_worker.backends.attention.torch_sdpa import TorchSDPAAttentionBackend
+from uniserve_worker.execution.forward_batch import AttentionSelection
+from uniserve_worker.nn.attention import bind_dense_attention_modules
 from uniserve_worker.nn.decoder.qwen import Qwen3Config, Qwen3Model
 from uniserve_worker.nn.layer import LayerConfig
 from uniserve_worker.nn.mesh import Communicator
@@ -36,8 +38,10 @@ def _decoder(*, normalize_output: bool) -> Qwen3Model:
     model = Qwen3Model(
         config,
         layer_config=LayerConfig(Communicator(), None),
-        dense_provider=TorchSDPAAttentionBackend(),
         normalize_output=normalize_output,
+    )
+    bind_dense_attention_modules(
+        model, AttentionSelection("torch_sdpa", (TorchSDPAAttentionBackend(),))
     )
     generator = torch.Generator().manual_seed(193)
     with torch.no_grad():

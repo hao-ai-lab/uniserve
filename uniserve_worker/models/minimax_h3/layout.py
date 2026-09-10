@@ -395,8 +395,6 @@ class H3Scratch:
     local_text_hidden: torch.Tensor
     projected_input: torch.Tensor
     projected_input_bf16: torch.Tensor
-    local_video_hidden: torch.Tensor
-    local_audio_hidden: torch.Tensor
     video_velocity: torch.Tensor
     audio_velocity: torch.Tensor
     projection_peers: tuple[torch.Tensor, ...]
@@ -450,13 +448,19 @@ def scratch_tensor_schema(
     local_video = min(int(layout.packed.video_indices.numel()), rows)
     local_audio = min(int(layout.packed.audio_indices.numel()), rows)
     projected = max(local_video, local_audio)
+    gather_group = (
+        mesh.get_group("sp")
+        if mesh.size("tp") == 1 and mesh.size("cp") == 1 and mesh.size("sp") > 1
+        else None
+    )
+    output_group = (
+        mesh.get_group("ulysses") if mesh.size("cp") == 1 and mesh.size("ulysses") > 1 else None
+    )
     schema = {
         "packed_hidden": TensorSchema((1, rows, 5376), torch.bfloat16),
         "local_text_hidden": TensorSchema((1, local_text, 5376), torch.bfloat16),
         "projected_input": TensorSchema((projected, 5376), torch.float32),
         "projected_input_bf16": TensorSchema((projected, 5376), torch.bfloat16),
-        "local_video_hidden": TensorSchema((local_video, 5376), torch.bfloat16),
-        "local_audio_hidden": TensorSchema((local_audio, 5376), torch.bfloat16),
         "video_velocity": TensorSchema((local_video, 96), torch.float32),
         "audio_velocity": TensorSchema((local_audio, 32), torch.float32),
         "projection": TensorSchema(
@@ -467,8 +471,18 @@ def scratch_tensor_schema(
         ),
         "projection_sync_input": TensorSchema((1,), torch.int32, fill=layout.sp_rank),
         "projection_sync_output": TensorSchema((layout.ulysses_size,), torch.int32),
-        "attention_workspace": TensorSchema((global_rows * 5376,), attention_workspace_dtype),
-        "attention_output": TensorSchema((query_rows, heads, 128), torch.bfloat16),
+        "attention_workspace": TensorSchema(
+            (global_rows * 5376,),
+            attention_workspace_dtype,
+            memory="symmetric" if gather_group is not None else "device",
+            group=gather_group,
+        ),
+        "attention_output": TensorSchema(
+            (query_rows, heads, 128),
+            torch.bfloat16,
+            memory="symmetric" if output_group is not None else "device",
+            group=output_group,
+        ),
         "tile_scores": TensorSchema((heads, query_tiles, tiles), torch.float32),
         "block_indices": TensorSchema(
             (heads, query_tiles, layout.packed.prefix_tiles + layout.packed.video_tiles),
@@ -536,8 +550,6 @@ def bind_compute_tensors(
                 "local_text_hidden": (1, local_text, 5376),
                 "projected_input": (projected_rows, 5376),
                 "projected_input_bf16": (projected_rows, 5376),
-                "local_video_hidden": (local_video, 5376),
-                "local_audio_hidden": (local_audio, 5376),
                 "video_velocity": (local_video, 96),
                 "audio_velocity": (local_audio, 32),
                 "attention_workspace": (global_rows * 5376,),

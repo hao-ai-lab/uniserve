@@ -14,7 +14,7 @@ from queue import SimpleQueue
 from typing import TYPE_CHECKING, Any
 
 from .bootstrap.worker_info import RequestKind, ResponseKind
-from .execution.batch import Finish, OpCode, Retire, Run, RunResult
+from .execution.batch import Finish, Free, OpCode, Retire, Run, RunResult
 from .execution.rows import PreparedExecution
 from .execution.run import ReplayWindow, RunReader, WorkerRun
 from .foundation.env import env_int, env_optional_int
@@ -377,6 +377,30 @@ class WorkerProcess:
                 )
                 with profile_range(self._profile_name("run_decode", run_id=raw_run_id)):
                     run = raw_run if isinstance(raw_run, Run) else Run.from_mapping(raw_run)
+                resident = self.runs.get(run.run_id)
+                queued = next(
+                    (
+                        task.run
+                        for task in self._tasks.values()
+                        if task.run is not None and task.run.run_id == run.run_id
+                    ),
+                    None,
+                )
+                previous = resident.run if resident is not None else queued
+                if previous is not None and previous != run:
+                    raise invalid_descriptor(
+                        f"run id {run.run_id} conflicts with its submitted run"
+                    )
+                # Product release is independent of request-state transitions.
+                # An earlier numerical run may need this retired allocation,
+                # so revocation cannot wait behind that run's execution FIFO.
+                # Existing readers retain storage; the command's ordinary
+                # terminal acknowledgement still waits for their completion.
+                freed = tuple(
+                    command.buffer for command in run.commands if isinstance(command, Free)
+                )
+                if previous is None and freed:
+                    self.worker.release_buffers(freed)
                 requests = _run_requests(run)
                 early = self._launch_reorder and any(
                     operation.kind.encode_mode is not None or operation.kind is OpCode.AR_EXTEND

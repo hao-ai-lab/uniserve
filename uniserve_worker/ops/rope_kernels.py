@@ -1,7 +1,7 @@
 """Packed RoPE and fused QK normalization-plus-RoPE kernels.
 
-The launchers enforce tensor geometry before entering Triton, preserve the
-eager RMSNorm dtype boundaries, and combine query and key head rows into shared
+The launchers enforce tensor geometry before entering Triton, accumulate
+normalization and rotation in FP32, and combine query and key head rows into shared
 launch domains. Specialized kernels cover partial in-place rotation and the
 two multi-axis head/tail layouts selected by :mod:`uniserve_worker.ops.qk_plan`.
 """
@@ -112,13 +112,9 @@ if triton is not None:
         cos = tl.load(cos_ptr + q_token * half + d_half, mask=q_mask, other=0.0).to(tl.float32)
         sin = tl.load(sin_ptr + q_token * half + d_half, mask=q_mask, other=0.0).to(tl.float32)
 
-        # Preserve the operator's numerical contract: normalize in fp32, round
-        # to the tensor dtype, apply the weight and round again, then rotate the
-        # resulting values in fp32.
-        q1_norm = (q1 * q_inv).to(q_out_ptr.dtype.element_ty).to(tl.float32)
-        q2_norm = (q2 * q_inv).to(q_out_ptr.dtype.element_ty).to(tl.float32)
-        q1_norm = (q1_norm * qw1).to(q_out_ptr.dtype.element_ty).to(tl.float32)
-        q2_norm = (q2_norm * qw2).to(q_out_ptr.dtype.element_ty).to(tl.float32)
+        # Keep normalization, learned scale, and rotation in FP32 until store.
+        q1_norm = q1 * q_inv * qw1
+        q2_norm = q2 * q_inv * qw2
         q_rot = tl.where(first_half, q1_norm * cos - q2_norm * sin, q2_norm * cos + q1_norm * sin)
         tl.store(q_out_ptr + pid * dim + offs, q_rot, mask=q_mask)
 
@@ -142,10 +138,8 @@ if triton is not None:
         kw2 = tl.load(kw_ptr + second_offs, mask=col_mask, other=0.0).to(tl.float32)
         k_cos = tl.load(cos_ptr + k_token * half + d_half, mask=k_mask, other=0.0).to(tl.float32)
         k_sin = tl.load(sin_ptr + k_token * half + d_half, mask=k_mask, other=0.0).to(tl.float32)
-        k1_norm = (k1 * k_inv).to(k_out_ptr.dtype.element_ty).to(tl.float32)
-        k2_norm = (k2 * k_inv).to(k_out_ptr.dtype.element_ty).to(tl.float32)
-        k1_norm = (k1_norm * kw1).to(k_out_ptr.dtype.element_ty).to(tl.float32)
-        k2_norm = (k2_norm * kw2).to(k_out_ptr.dtype.element_ty).to(tl.float32)
+        k1_norm = k1 * k_inv * kw1
+        k2_norm = k2 * k_inv * kw2
         k_rot = tl.where(
             first_half,
             k1_norm * k_cos - k2_norm * k_sin,
@@ -194,12 +188,8 @@ if triton is not None:
         # prefix consumes sine and cosine factors.
         query_rstd = tl.rsqrt(tl.sum(query_values * query_values, axis=1) / head_dim + eps)
         key_rstd = tl.rsqrt(tl.sum(key_values * key_values, axis=1) / head_dim + eps)
-        normalized_query = (
-            (query_values * query_rstd[:, None] * query_weights).to(tl.bfloat16).to(tl.float32)
-        )
-        normalized_key = (
-            (key_values * key_rstd[:, None] * key_weights).to(tl.bfloat16).to(tl.float32)
-        )
+        normalized_query = query_values * query_rstd[:, None] * query_weights
+        normalized_key = key_values * key_rstd[:, None] * key_weights
 
         # Map each feature in the rotary prefix to its partner in the opposite
         # half. Tail features map to themselves and bypass rotation below.
@@ -228,14 +218,8 @@ if triton is not None:
         ).to(tl.float32)
         partner_query_weight = tl.load(query_weight + partner_columns)[None, :].to(tl.float32)
         partner_key_weight = tl.load(key_weight + partner_columns)[None, :].to(tl.float32)
-        partner_query = (
-            (partner_query * query_rstd[:, None] * partner_query_weight)
-            .to(tl.bfloat16)
-            .to(tl.float32)
-        )
-        partner_key = (
-            (partner_key * key_rstd[:, None] * partner_key_weight).to(tl.bfloat16).to(tl.float32)
-        )
+        partner_query = partner_query * query_rstd[:, None] * partner_query_weight
+        partner_key = partner_key * key_rstd[:, None] * partner_key_weight
 
         rotary_mask = columns[None, :] < rotary_dim
         cosine_values = tl.load(
@@ -284,8 +268,7 @@ if triton is not None:
     ):
         """Normalize a two-group row and rotate only its leading group."""
 
-        # The head group uses an independent RMS reduction and preserves the
-        # normalize/round/weight/round boundary before NeoX rotation.
+        # The head group uses an independent RMS reduction before NeoX rotation.
         offs_a = tl.arange(0, block_a)
         mask_a = (offs_a < rope_dim) & row_active
         xa = tl.load(x_ptr + base + offs_a * stride_2, mask=mask_a, other=0.0).to(tl.float32)
@@ -300,10 +283,8 @@ if triton is not None:
         w2 = tl.load(head_w_ptr + second_offs, mask=offs_a < rope_dim, other=0.0).to(tl.float32)
         cos = tl.load(cos_ptr + token * rope_half + d_half, mask=mask_a, other=0.0).to(tl.float32)
         sin = tl.load(sin_ptr + token * rope_half + d_half, mask=mask_a, other=0.0).to(tl.float32)
-        x1n = (x1 * inv_a).to(out_ptr.dtype.element_ty).to(tl.float32)
-        x2n = (x2 * inv_a).to(out_ptr.dtype.element_ty).to(tl.float32)
-        x1n = (x1n * w1).to(out_ptr.dtype.element_ty).to(tl.float32)
-        x2n = (x2n * w2).to(out_ptr.dtype.element_ty).to(tl.float32)
+        x1n = x1 * inv_a * w1
+        x2n = x2 * inv_a * w2
         rot = tl.where(first_half, x1n * cos - x2n * sin, x2n * cos + x1n * sin)
         tl.store(out_ptr + out_base + offs_a, rot, mask=mask_a)
 
@@ -447,10 +428,8 @@ if triton is not None:
         w2 = tl.load(head_w_ptr + second, mask=col_a, other=0.0).to(tl.float32)
         cos = tl.load(cos0_ptr + token * half0 + d_half, mask=col_a, other=0.0).to(tl.float32)
         sin = tl.load(sin0_ptr + token * half0 + d_half, mask=col_a, other=0.0).to(tl.float32)
-        x1n = (x1 * inv_a).to(out_ptr.dtype.element_ty).to(tl.float32)
-        x2n = (x2 * inv_a).to(out_ptr.dtype.element_ty).to(tl.float32)
-        x1n = (x1n * w1).to(out_ptr.dtype.element_ty).to(tl.float32)
-        x2n = (x2n * w2).to(out_ptr.dtype.element_ty).to(tl.float32)
+        x1n = x1 * inv_a * w1
+        x2n = x2 * inv_a * w2
         rot = tl.where(first_half, x1n * cos - x2n * sin, x2n * cos + x1n * sin)
         tl.store(out_ptr + out_base + offs_a, rot, mask=col_a)
 
@@ -473,8 +452,8 @@ if triton is not None:
         y2 = tl.load(x_ptr + base + (dim0 + src2) * stride_2, mask=col_b, other=0.0).to(tl.float32)
         wv1 = tl.load(tail_w_ptr + src1, mask=col_b, other=0.0).to(tl.float32)
         wv2 = tl.load(tail_w_ptr + src2, mask=col_b, other=0.0).to(tl.float32)
-        y1n = (y1 * inv_b * wv1).to(out_ptr.dtype.element_ty).to(tl.float32)
-        y2n = (y2 * inv_b * wv2).to(out_ptr.dtype.element_ty).to(tl.float32)
+        y1n = y1 * inv_b * wv1
+        y2n = y2 * inv_b * wv2
         c1 = tl.load(
             cos1_ptr + token * axis_half + dj,
             mask=col_b & (~is_second_axis),
@@ -874,9 +853,9 @@ def try_triton_qk_multi_axis_rms_norm_rope(
     ``q`` and ``k`` use ``[tokens, heads, dim]`` layout with
     ``axis_dims = (head, tail, tail)``. The head axis has its own RMS weight and
     rotary table. Both tail axes share one RMS weight while retaining separate
-    rotary tables. Reduction tiles are restricted to power-of-two widths 32 or
-    64 so each group uses a stable one-element-per-lane reduction tree. Returns
-    ``None`` when the tensors fall outside this contract.
+    rotary tables. Masked reduction tiles cover arbitrary even axis widths
+    within the fused head-size bound. Returns ``None`` when the tensors fall
+    outside this contract.
     """
 
     if not can_run_triton_qk_multi_axis_rms_norm_rope(
@@ -977,11 +956,8 @@ def can_run_triton_qk_multi_axis_rms_norm_rope(
         return False
     tail_dim = 2 * axis_dim
 
-    # Power-of-two blocks 32 and 64 retain the kernel's one-element-per-lane
-    # reduction order for both normalization groups.
-    if triton.next_power_of_2(dim0) not in (32, 64):
-        return False
-    if triton.next_power_of_2(tail_dim) not in (32, 64):
+    # Match the bounded head geometry of the other fused QK kernels.
+    if dim0 + tail_dim > 1024:
         return False
     if q.ndim != 3 or k.ndim != 3 or q.dtype != k.dtype:
         return False
@@ -1328,8 +1304,6 @@ if triton is not None:
             key += tl.load(
                 key_bias_ptr + bias_offsets, mask=columns[None, :] < HEAD_DIM, other=0.0
             ).to(tl.float32)
-            query = query.to(query_ptr.dtype.element_ty).to(tl.float32)
-            key = key.to(key_ptr.dtype.element_ty).to(tl.float32)
         if HAS_VALUE_BIAS:
             value = tl.load(value_ptr + offsets, mask=valid, other=0.0).to(tl.float32)
             value += tl.load(
@@ -1340,8 +1314,8 @@ if triton is not None:
             tl.store(value_ptr + offsets, value.to(value_ptr.dtype.element_ty), mask=valid)
         query_rstd = tl.rsqrt(tl.sum(query * query, axis=1) / HEAD_DIM + EPS)
         key_rstd = tl.rsqrt(tl.sum(key * key, axis=1) / HEAD_DIM + EPS)
-        query = (query * query_rstd[:, None]).to(query_ptr.dtype.element_ty).to(tl.float32)
-        key = (key * key_rstd[:, None]).to(key_ptr.dtype.element_ty).to(tl.float32)
+        query = query * query_rstd[:, None]
+        key = key * key_rstd[:, None]
 
         # Partner coordinates come from the opposite half of the rotary subspace.
         half_rotary: tl.constexpr = ROTARY_DIM // 2
@@ -1362,12 +1336,8 @@ if triton is not None:
             key_partner += tl.load(
                 key_bias_ptr + partner_bias_offsets, mask=columns[None, :] < HEAD_DIM, other=0.0
             ).to(tl.float32)
-            query_partner = query_partner.to(query_ptr.dtype.element_ty).to(tl.float32)
-            key_partner = key_partner.to(key_ptr.dtype.element_ty).to(tl.float32)
-        query_partner = (
-            (query_partner * query_rstd[:, None]).to(query_ptr.dtype.element_ty).to(tl.float32)
-        )
-        key_partner = (key_partner * key_rstd[:, None]).to(key_ptr.dtype.element_ty).to(tl.float32)
+        query_partner = query_partner * query_rstd[:, None]
+        key_partner = key_partner * key_rstd[:, None]
 
         rotary_mask = valid & (columns[None, :] < ROTARY_DIM)
         rotary_offsets = row[:, None] * rotary_row_stride + columns[None, :]

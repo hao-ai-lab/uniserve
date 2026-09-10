@@ -8,15 +8,12 @@ the worker-owned paged cache before calling the FA4 paged forward.
 
 from __future__ import annotations
 
-import inspect
-from collections import OrderedDict
 from collections.abc import Callable
 from typing import Any
 
 import torch
 
-from ...execution.forward_batch import ForwardBatch
-from ...foundation.math import ceil_div
+from ...execution.forward_batch import AttentionMode, ForwardBatch
 from ..paged_kv_math import paged_kv_write, write_locations
 from .base import AttentionBackend, merge_attention_states
 from .layout import QKVLayout, normalize_kv, normalize_to
@@ -34,41 +31,22 @@ _SUPPORTED_TRUNK_GEOMETRIES: frozenset[tuple[int, int, int]] = frozenset(
         (192, 192, 128),
     }
 )
-# FA4-cute kernel launch tuning, shared by every forward variant so the tile and
-# thread-count tuning lives in exactly one place.
+# Paged and hybrid attention bind the query-tile width to their mask metadata.
+# Dense attention uses the kernel's device- and geometry-specific launch policy.
 _FA4_TILE_MN = (128, 128)
 _FA4_NUM_THREADS = 384
-_PREFIX_BOUNDS_CACHE_LIMIT = 16
-_PREFIX_BOUNDS_CACHE: OrderedDict[
-    tuple[int, int | None, int, int | None, int],
-    tuple[torch.Tensor, torch.Tensor | None, torch.Tensor],
-] = OrderedDict()
-
-
-_compute_prefix_bounds: Callable[..., torch.Tensor] | None
-_compute_prefix_bounds_varlen: Callable[..., torch.Tensor] | None
 _fa4_flash_attn_fwd: Callable[..., Any] | None
 _hybrid_multimodal_mask: Any | None
 try:  # pragma: no cover - optional CUDA package.
     import uniserve_kernel.flash_attn_jagged as _jagged
 
     _fa4_flash_attn_fwd = _jagged.flash_attn_fwd
-    _compute_prefix_bounds = _jagged.compute_prefix_bounds
-    _compute_prefix_bounds_varlen = _jagged.compute_prefix_bounds_varlen
     _hybrid_multimodal_mask = _jagged.hybrid_multimodal_mask
     _IMPORT_ERROR = _jagged.import_error()
-    _fa4_accepts_prefix_bounds = (
-        "prefix_bounds" in inspect.signature(_fa4_flash_attn_fwd).parameters
-        if _fa4_flash_attn_fwd is not None
-        else False
-    )
 except Exception as exc:  # pragma: no cover
     _IMPORT_ERROR = exc
     _fa4_flash_attn_fwd = None
-    _compute_prefix_bounds = None
-    _compute_prefix_bounds_varlen = None
     _hybrid_multimodal_mask = None
-    _fa4_accepts_prefix_bounds = False
 
 
 class Fa4CuteAttentionBackend(AttentionBackend):
@@ -79,7 +57,35 @@ class Fa4CuteAttentionBackend(AttentionBackend):
     packed_cuda_graph = available
     head_geometries = _SUPPORTED_TRUNK_GEOMETRIES
     cuda_only = True
+    dense_dtypes = frozenset({torch.float16, torch.bfloat16})
+    min_compute_version = (8, 0)
+    max_compute_version = (12, 9)
     dense_ranks = frozenset({4})
+
+    def can_bind(self, mode: AttentionMode, *, device: torch.device, **geometry) -> bool:
+        """Bind cache storage only on architectures with a paged CuTe kernel."""
+
+        if device.type == "cuda" and torch.cuda.get_device_capability(device)[0] in (8, 12):
+            if mode is not AttentionMode.DENSE:
+                return False
+        return super().can_bind(mode, device=device, **geometry)
+
+    def can_run(self, req: object) -> bool:
+        """Apply paged-kernel architecture constraints to direct requests too."""
+
+        q = getattr(req, "q", None)
+        paged = any(
+            getattr(req, name, None) is not None
+            for name in ("block_table", "page_table", "prefix_k")
+        )
+        if (
+            paged
+            and isinstance(q, torch.Tensor)
+            and q.is_cuda
+            and torch.cuda.get_device_capability(q.device)[0] in (8, 12)
+        ):
+            return False
+        return super().can_run(req)
 
     def forward(
         self,
@@ -101,18 +107,18 @@ class Fa4CuteAttentionBackend(AttentionBackend):
             raise ValueError("fa4_cute backend expects q/k/v in [B, H, L, D] layout")
         _validate_unified_trunk_geometry(q.shape[-1], k.shape[-1], v.shape[-1], scale=scale)
         forward = _require_fa4()
+        # The upstream entry owns pointer/stride alignment. Preserve aligned
+        # interleaved projections and let it materialize only unsupported views.
         out = _fa4_output(
             forward(
-                q.transpose(1, 2).contiguous(),
-                k.transpose(1, 2).contiguous(),
-                v.transpose(1, 2).contiguous(),
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
                 softmax_scale=scale,
                 causal=causal,
-                tile_mn=_FA4_TILE_MN,
-                num_threads=_FA4_NUM_THREADS,
             )
         )
-        return out.transpose(1, 2).contiguous()
+        return out.transpose(1, 2)
 
     def forward_paged(
         self,
@@ -211,26 +217,43 @@ class Fa4CuteAttentionBackend(AttentionBackend):
             "max_seqlen_q": max_seqlen_q,
             "max_seqlen_k": max_seqlen_k,
             "softmax_scale": scale,
-            "tile_mn": _FA4_TILE_MN,
-            "num_threads": _FA4_NUM_THREADS,
         }
         if fully_visible:
             return _fa4_output(forward(q, k, v, **kwargs))
         kwargs["aux_tensors"] = [visible_end]
-        if use_prefix_bounds and _fa4_accepts_prefix_bounds:
-            # FA4 query-tile width (kernel-ABI); unrelated to the paged block size.
-            q_tile = 256
-            qhead_per_kvhead = int(q.shape[-2]) // int(k.shape[-2])
-            prefix_bounds = _cached_prefix_bounds(
-                visible_end,
-                cu_seqlens_q=cu_seqlens_q,
-                max_seqlen_q=max_seqlen_q,
-                qhead_per_kvhead=qhead_per_kvhead,
-                q_tile_size=q_tile,
+        kwargs["mask_mod"] = _hybrid_multimodal_mask
+        architecture = torch.cuda.get_device_capability(q.device)[0]
+        if use_prefix_bounds and architecture in (9, 10, 11):
+            from uniserve_kernel.flash_attn_jagged.prefix_bounds import prefix_block_sparsity
+
+            query_lengths = (
+                cu_seqlens_q.diff()
+                if cu_seqlens_q is not None
+                else torch.full((q.shape[0],), q.shape[1], dtype=torch.int32, device=q.device)
             )
-            kwargs["prefix_bounds"] = prefix_bounds
-        else:
-            kwargs["mask_mod"] = _hybrid_multimodal_mask
+            key_lengths = (
+                seqused_k
+                if seqused_k is not None
+                else cu_seqlens_k.diff()
+                if cu_seqlens_k is not None
+                else torch.full_like(query_lengths, k.shape[1])
+            )
+            key_bound = max_seqlen_k if max_seqlen_k is not None else k.shape[1]
+            query_tile = 256 if architecture in (10, 11) else 128
+            # Sparse metadata refers to logical query rows, independently of
+            # grouped heads. The kernel schedules each head over these rows.
+            kwargs["pack_gqa"] = False
+            kwargs["tile_mn"] = _FA4_TILE_MN
+            kwargs["num_threads"] = _FA4_NUM_THREADS
+            kwargs["block_sparse_tensors"] = prefix_block_sparsity(
+                visible_end,
+                query_lengths=query_lengths,
+                key_lengths=key_lengths,
+                max_key_length=key_bound,
+                query_tile=query_tile,
+                key_tile=128,
+                variable_length=cu_seqlens_q is not None,
+            )
         return _fa4_output(forward(q, k, v, **kwargs))
 
     def forward_segmented(
@@ -336,70 +359,6 @@ def _fa4_state(result: Any) -> tuple[torch.Tensor, torch.Tensor]:
     if tuple(lse.shape) != tuple(output.shape[:2]):
         raise RuntimeError("FA4 segmented attention returned an unexpected LSE layout")
     return output, lse
-
-
-def _cached_prefix_bounds(
-    visible_end: torch.Tensor,
-    *,
-    cu_seqlens_q: torch.Tensor | None,
-    max_seqlen_q: int | None,
-    qhead_per_kvhead: int,
-    q_tile_size: int,
-) -> torch.Tensor:
-    """Derive each query tile's visible cached-prefix interval from packed sequence metadata."""
-
-    compute_prefix_bounds = _compute_prefix_bounds
-    compute_prefix_bounds_varlen = _compute_prefix_bounds_varlen
-    if compute_prefix_bounds is None or compute_prefix_bounds_varlen is None:
-        detail = f": {_IMPORT_ERROR}" if _IMPORT_ERROR is not None else ""
-        raise RuntimeError(f"FA4 prefix-bound helper is unavailable{detail}")
-
-    key = (
-        id(visible_end),
-        None if cu_seqlens_q is None else id(cu_seqlens_q),
-        int(qhead_per_kvhead),
-        None if max_seqlen_q is None else int(max_seqlen_q),
-        int(q_tile_size),
-    )
-    cached = _PREFIX_BOUNDS_CACHE.get(key)
-    if cached is not None:
-        cached_visible, cached_cu_q, prefix_bounds = cached
-        if cached_visible is visible_end and cached_cu_q is cu_seqlens_q:
-            _PREFIX_BOUNDS_CACHE.move_to_end(key)
-            return prefix_bounds
-
-    bounds_visible_end = visible_end
-    bounds_max_seqlen_q = max_seqlen_q
-    if qhead_per_kvhead > 1:
-        # FA4's packed-GQA scheduler counts query tiles in head-expanded row
-        # space. Prefix bounds use that same tile space; prefix_visible_end
-        # remains indexed by logical q rows in the kernel mask.
-        bounds_visible_end = visible_end.repeat_interleave(
-            qhead_per_kvhead,
-            dim=1,
-        ).contiguous()
-        if bounds_max_seqlen_q is not None:
-            bounds_max_seqlen_q = int(bounds_max_seqlen_q) * int(qhead_per_kvhead)
-
-    if cu_seqlens_q is None:
-        prefix_bounds = compute_prefix_bounds(bounds_visible_end, q_tile_size=q_tile_size)
-    else:
-        seqlens_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).to(torch.int32)
-        if qhead_per_kvhead > 1:
-            seqlens_q = seqlens_q * int(qhead_per_kvhead)
-        tiles = None if bounds_max_seqlen_q is None else ceil_div(bounds_max_seqlen_q, q_tile_size)
-        prefix_bounds = compute_prefix_bounds_varlen(
-            bounds_visible_end,
-            seqlens_q,
-            q_tile_size=q_tile_size,
-            num_q_tiles=tiles,
-        )
-
-    _PREFIX_BOUNDS_CACHE[key] = (visible_end, cu_seqlens_q, prefix_bounds)
-    _PREFIX_BOUNDS_CACHE.move_to_end(key)
-    while len(_PREFIX_BOUNDS_CACHE) > _PREFIX_BOUNDS_CACHE_LIMIT:
-        _PREFIX_BOUNDS_CACHE.popitem(last=False)
-    return prefix_bounds
 
 
 def _validate_unified_trunk_geometry(

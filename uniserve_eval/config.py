@@ -26,6 +26,7 @@ from .types import (
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "profiles.toml"
 _ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+_ENV_DEFAULT_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*):-(.*?)\}")
 
 _ROOT_FIELDS = {
     "server",
@@ -134,7 +135,12 @@ def expand_environment(value: Any) -> Any:
     """Expand declared environment references recursively when values exist."""
 
     if isinstance(value, str):
-        return _ENV_REF.sub(lambda match: os.environ.get(match.group(1), match.group(0)), value)
+        expanded = _ENV_DEFAULT_REF.sub(
+            lambda match: os.environ.get(match.group(1), match.group(2)), value
+        )
+        return _ENV_REF.sub(
+            lambda match: os.environ.get(match.group(1), match.group(0)), expanded
+        )
     if isinstance(value, list):
         return [expand_environment(item) for item in value]
     if isinstance(value, dict):

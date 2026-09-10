@@ -12,11 +12,13 @@ import torch
 
 from ..execution.batch import (
     AttentionRegime,
+    BatchCommand,
     BlockTable,
     BufferAllocation,
     BufferId,
     CachePageAllocation,
     Domain,
+    Free,
     LatentParams,
     ModelOutput,
     NewRequest,
@@ -27,6 +29,7 @@ from ..execution.batch import (
     ProductPayload,
     ProductRef,
     RequestKey,
+    Retire,
     RowGeometry,
     Run,
     RunLane,
@@ -75,9 +78,12 @@ class WarmupContext:
         """Release warmup request, runtime, cache, latent, and product state for one identifier."""
 
         request = self.worker.requests.peek(int(request_id))
-        self.worker.drop_request(request_id)
         if request is None:
             return
+        self._execute_controls((Retire(request.request_key),))
+        # Serving keeps a terminal row until its slot is reassigned. Synthetic
+        # requests have no further scheduler messages and can leave the table.
+        self.worker.requests.drop(request_id)
         for group_id in range(
             0 if self.worker.cache_pool is None else self.worker.cache_pool.group_count
         ):
@@ -95,8 +101,24 @@ class WarmupContext:
     def free_products(self, buffers: tuple[BufferId, ...]) -> None:
         """Release warmup products and recycle their synthetic persistent-buffer allocations."""
 
-        self.worker.free_products(buffers)
+        if not buffers:
+            return
+        self._execute_controls(tuple(Free(buffer) for buffer in buffers))
         self._release_buffer_allocations(buffers)
+
+    def _execute_controls(self, commands: tuple[BatchCommand, ...]) -> None:
+        """Wait for the same physical retirement acknowledgement used by serving."""
+
+        self._warmup_run_id += 1
+        _execute_warmup(
+            self,
+            Run(
+                batch_id=self._warmup_run_id,
+                run_id=self._warmup_run_id,
+                commands=commands,
+            ),
+            retain_device_outputs=True,
+        )
 
     def _release_buffer_allocations(self, buffers: tuple[BufferId, ...]) -> None:
         """Release persistent warmup allocations by exact buffer identity."""
@@ -400,7 +422,13 @@ def _build_warmup_batch(
                 if candidate not in occupied_blocks
             )[:missing]
             if len(allocated) != missing:
-                raise invalid_descriptor("warmup KV allocation exceeds resident capacity")
+                raise invalid_descriptor(
+                    "warmup KV allocation exceeds resident capacity: "
+                    f"request={operation.request_key.request_id}, group={group_id}, "
+                    f"required_pages={missing}, available_pages={len(allocated)}, "
+                    f"resident_pages={len(self.worker.cache_pool.page_ids(group_id))}, "
+                    f"leased_pages={len(occupied_blocks)}"
+                )
             block_table.extend(allocated)
             occupied_blocks.update(allocated)
             tables.append(
@@ -1309,6 +1337,7 @@ def _warmup_flow(self: WarmupContext) -> None:
                         image_geometry=(height, width),
                     ),
                 )
+                self.free_products(tuple(product.buffer_id for product in current_latents))
                 current_latents = tuple(outputs)
                 flow_predecessors.update(zip(request_ids, flows, strict=True))
             flow_op_id = 5
@@ -1406,6 +1435,7 @@ def _warmup_flow(self: WarmupContext) -> None:
                         )
                     )
                     text_predecessors.update(zip(selected_text, text_operations, strict=True))
+                    self.free_products(tuple(product.buffer_id for product in current_latents))
                     current_latents = tuple(flow_outputs)
                     flow_predecessors.update(zip(request_ids, flow_operations, strict=True))
         finally:

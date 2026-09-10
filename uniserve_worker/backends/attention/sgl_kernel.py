@@ -35,6 +35,7 @@ class SglKernelAttentionBackend(AttentionBackend):
     )
     page_size_multiple = 256
     cuda_only = True
+    dense_dtypes = frozenset({torch.float16, torch.bfloat16})
     dense_ranks = frozenset({3, 4})
 
     def supports(self, mode: AttentionMode, *, cuda_graph: bool = False) -> bool:

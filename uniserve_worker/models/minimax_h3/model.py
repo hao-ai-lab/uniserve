@@ -178,7 +178,7 @@ class MiniMaxH3Model(VideoModel[H3ComputeInputs, H3Tensors]):
         super().__init__()
 
         self.warmup_inputs = self._warmup_inputs
-        self.bindings = bindings
+        self.bindings: EntryBindings = bindings
         self.owns_media_output = bindings.owns("output")
         self.device = bindings.process_group.device
         self.layout = layout

@@ -147,7 +147,7 @@ def _prepare_media(runtime: Worker, state: OperationState) -> None:
         )
     )
     request.latent_product = output
-    products = flow.publish_latent_transfer(runtime, output, row, step=0, scope=scope)
+    products = flow.publish_latent_transfer(runtime, operation, output, row, step=0, scope=scope)
     state.outcome = Outcome(
         status=OpStatus.OK,
         selected_point=1,

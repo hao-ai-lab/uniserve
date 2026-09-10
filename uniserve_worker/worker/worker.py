@@ -5,11 +5,11 @@ from __future__ import annotations
 import logging
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import replace
 from threading import Condition, RLock
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
@@ -18,7 +18,9 @@ from uniserve_worker.nn.parallel import EntryConfig
 
 from ..bootstrap.capacity import (
     device_total_bytes,
+    local_product_storage_bytes,
     request_tensor_arena_capacity,
+    request_tensor_window,
     tensor_slot_capacity,
 )
 from ..bootstrap.worker_info import EntryInfo, WorkerInfo
@@ -47,7 +49,7 @@ from ..execution.batch import (
 )
 from ..execution.cuda_graph import (
     CudaGraphRunner,
-    PrefixCapture,
+    graph_mode_available,
     select_flow_captures,
     select_mixed_captures,
     select_prefill_captures,
@@ -159,14 +161,10 @@ class Worker:
         loaded = materialize_worker_model(config, bindings)
         model_mesh = meshes.get("model")
         sampling_group = None if model_mesh is None else model_mesh.get_group("tp")
-        attention = (
-            resolve_attention_selection(
-                loaded.worker_config.attention_backend or "auto",
-                tuning=config.execution.flashinfer,
-                block_size=loaded.worker_config.block_size,
-            )
-            if loaded.model.resource_geometry.kv
-            else None
+        attention = resolve_attention_selection(
+            loaded.worker_config.attention_backend or "auto",
+            tuning=config.execution.flashinfer,
+            block_size=loaded.worker_config.block_size,
         )
         worker = cls(
             loaded.model,
@@ -231,7 +229,6 @@ class Worker:
         self.worker_config = worker_config
         self.sampling_group = sampling_group
         self.tokenizer = tokenizer
-        self.attention = attention
         self._device = canonical_device(worker_config.device)
         self._generation_device = canonical_device(
             worker_config.generation_device or worker_config.device
@@ -250,9 +247,11 @@ class Worker:
             worker_config,
             self.trace,
             environment=distributed_environment,
+            attention=attention,
             schedule=schedule,
         )
         self.runner = runner
+        self.attention = attention = runner.attention
         # Fixed executables and their storage are resident before variable pools are sized.
         runner.capture_modules()
         endpoint = WorkerEndpoint.local(worker_id, int(worker_config.rank))
@@ -265,18 +264,34 @@ class Worker:
             if schema:
                 if distributed_environment is None:
                     raise unsupported_setup("request tensor sizing requires its rank group")
-                public_arena = request_tensor_arena_capacity(
-                    worker_config,
-                    pipeline_depth=pipeline_depth,
-                    product_bytes_per_request=model.product_storage_bytes,
-                )
+
+                def auxiliary_bytes(count: int) -> int:
+                    capacity_config = replace(
+                        worker_config,
+                        max_request_pool_size=count,
+                        max_batch_operations=min(count, worker_config.max_batch_operations),
+                        max_batch_tokens=min(count, worker_config.max_batch_tokens),
+                    )
+                    product_bytes = local_product_storage_bytes(
+                        model.entry_outputs,
+                        bindings=model.bindings,
+                        plan=model.media_plan,
+                        max_unresolved_ops=request_tensor_window(pipeline_depth, count),
+                    )
+                    arena = request_tensor_arena_capacity(
+                        capacity_config,
+                        pipeline_depth=pipeline_depth,
+                        product_bytes_per_request=product_bytes,
+                    )
+                    return count * product_bytes + arena.device_product_bytes
+
                 slots = tensor_slot_capacity(
                     schema,
                     distributed_environment.process_group,
-                    maximum=worker_config.max_request_pool_size,
+                    maximum=min(worker_config.max_request_pool_size, pipeline_depth // 3),
                     minimum=worker_config.min_request_pool_size,
-                    available_bytes=max(0, available - public_arena.device_product_bytes),
-                    product_bytes_per_request=model.product_storage_bytes,
+                    available_bytes=available,
+                    auxiliary_bytes=auxiliary_bytes,
                 )
                 worker_config = replace(
                     worker_config,
@@ -294,7 +309,13 @@ class Worker:
             weight_version=self.weights.version,
             queue_depth=int(pipeline_depth),
             completion_payload_bytes=int(completion_payload_bytes),
-            capacity_group=sampling_group,
+            # The scheduler's page indices are shared across all resident layer
+            # and head regions, including stages with different memory grants.
+            capacity_group=(
+                distributed_environment.process_group
+                if distributed_environment is not None
+                else sampling_group
+            ),
         )
         layout = replace(
             layout,
@@ -369,10 +390,6 @@ class Worker:
         )
         owns_kv = bool(model.resource_geometry.kv)
         packed_model = model
-        if owns_kv != (attention is not None):
-            raise unsupported_setup(
-                "attention selection must exactly match model-owned KV resources"
-            )
         cache = packed_model.cache_geometry if owns_kv else None
         self.cache_pool = None
         self.req_to_token_pool = None
@@ -403,6 +420,8 @@ class Worker:
                 num_kv_heads=int(cache.num_kv_heads),
                 total_kv_heads=int(cache.total_kv_heads),
                 kv_head_offset=int(cache.kv_head_offset),
+                total_layers=cast(int, cache.total_layers),
+                layer_offset=int(cache.layer_offset),
                 head_dim=int(cache.head_dim),
                 device=worker_config.device,
                 dtype=cache_dtype,
@@ -497,8 +516,9 @@ class Worker:
             event_pool=self.device_events,
         )
         self.persistent_buffers = PersistentBuffers(
-            byte_capacity=int(self._info.buffer_pool_bytes),
+            byte_capacity=int(layout.physical_buffer_pool_bytes),
             devices=owner_devices,
+            compact=layout.physical_buffer_pool_bytes < self._info.buffer_pool_bytes,
         )
         self.device_products = DeviceProducts(
             capacity=arena.device_products,
@@ -523,10 +543,18 @@ class Worker:
             capacity=int(arena.cpu_tasks),
             workers=min(4, int(arena.cpu_tasks)),
         )
+        transfer_byte_capacity = int(arena.transfer_bytes)
+        if model.resource_geometry.request_tensors:
+            # Each live request tensor reserves one credit per publication
+            # representation and one read credit on every possible remote rank.
+            # These credits bound ownership lifetimes; they allocate no storage.
+            transfer_byte_capacity *= len(publication_backends) + max(
+                0, int(worker_config.world_size) - 1
+            )
         self.transports = make_transports(
             transfer_backends,
             source=endpoint,
-            byte_capacity=arena.transfer_bytes,
+            byte_capacity=transfer_byte_capacity,
             ticket_capacity=arena.transfer_tickets,
             event_pool=self.device_events,
         )
@@ -677,53 +705,6 @@ class Worker:
             )
         )
         mixed_flow_graph_buckets = select_mixed_captures(flow_graph_buckets, mixed_text_batch_sizes)
-        flow_prefix_lengths: dict[int, tuple[int, ...]] = {}
-        if flow is not None and owns_kv and packed_model.tensorized_mixed and flow_graph_buckets:
-            for cfg_branches in flow_cfg_branches:
-                image = capture_image_parameters(
-                    cfg_branches,
-                    steps=1,
-                    height=16,
-                    width=16,
-                )
-                guide = build_flow_cfg_plan(
-                    cfg_text_scale=float(image.cfg_text_scale),
-                    cfg_img_scale=float(image.cfg_img_scale),
-                    recipe=flow.cfg_recipe,
-                    renorm=image.cfg_renorm_type,
-                    renorm_min=float(image.cfg_renorm_min),
-                    use_cfg=True,
-                )
-                flow_prefix_lengths[cfg_branches] = tuple(
-                    len(prefix)
-                    for branch in guide.branches
-                    for prefix, copy_conditioning in (
-                        flow.prefix(
-                            flow.branch_source(branch),
-                            image_prompt="",
-                            negative_prompt=image.negative_prompt,
-                            negative_token_ids=(),
-                            tokenizer=tokenizer,
-                        ),
-                    )
-                    if prefix and not copy_conditioning
-                )
-        flow_prefix_graph_buckets = tuple(
-            PrefixCapture(
-                rows=rows,
-                prefix_lengths=flow_prefix_lengths[cfg_branches],
-            )
-            for rows, cfg_branches in sorted(
-                {(bucket.rows, bucket.cfg_branches) for bucket in flow_graph_buckets}
-            )
-            if flow_prefix_lengths.get(cfg_branches)
-            and sum(
-                1
-                for candidate in flow_graph_buckets
-                if candidate.rows == rows and candidate.cfg_branches == cfg_branches
-            )
-            > 1
-        )
         self._flow_cfg_branches = flow_cfg_branches
         graph_budget = graph_memory_budget_bytes(device_total_bytes(worker_config.device))
 
@@ -773,62 +754,36 @@ class Worker:
                 max_rows=lane_max_operations,
                 max_tokens=lane_max_tokens,
             )
-            lane_flow_buckets = (
-                tuple(value for value in flow_graph_buckets if value.rows <= lane_max_operations)
-                if owns_model_compute and Domain.FLOW in domains
-                else ()
-            )
-            lane_mixed_flow_buckets = (
-                tuple(
-                    value
-                    for value in mixed_flow_graph_buckets
-                    if value.decode_rows + value.flow_rows <= lane_max_operations
+            # Padded decode and prefill buckets are mandatory resident graphs.
+            # Exact packed shapes remain opportunistic: warmup retains repeated
+            # shapes and deliberately discards singleton candidates at sealing.
+            required_resident_families: dict[str, int] = {}
+            graph_mode_support = {
+                mode: graph_mode_available(
+                    attention,
+                    mode,
+                    head_dim=packed_model.cache_geometry.head_dim,
+                    block_size=worker_config.block_size,
+                    device=device,
                 )
-                if owns_model_compute and {Domain.DECODE, Domain.FLOW} <= set(domains)
-                else ()
-            )
-            lane_flow_prefix_buckets = (
-                tuple(
-                    value
-                    for value in flow_prefix_graph_buckets
-                    if value.rows <= lane_max_operations
-                    and value.rows * sum(value.prefix_lengths) <= lane_max_tokens
+                for mode in (
+                    AttentionMode.PAGED_DECODE,
+                    AttentionMode.PAGED_VARLEN,
                 )
-                if owns_model_compute and Domain.FLOW in domains
-                else ()
-            )
-            # The expected count reserves catalog metadata and provides a precise
-            # post-warmup completeness bound for this lane.
-            expected_resident_executables = 0
+            }
             if worker_config.cuda_graph:
-                if OpCode.AR_DECODE in self._effective_work_variants:
-                    expected_resident_executables += len(lane_decode_buckets)
+                if (
+                    OpCode.AR_DECODE in self._effective_work_variants
+                    and graph_mode_support[AttentionMode.PAGED_DECODE]
+                ):
+                    required_resident_families["paged_decode_bucket"] = len(lane_decode_buckets)
                 if (
                     worker_config.prefill_cuda_graph
                     and OpCode.AR_EXTEND in self._effective_work_variants
+                    and not packed_model.tensorized_mixed
+                    and graph_mode_support[AttentionMode.PAGED_VARLEN]
                 ):
-                    expected_resident_executables += (
-                        len(lane_prefill_buckets)
-                        if packed_model.tensorized_mixed
-                        else len(lane_prefill_catalog)
-                    )
-                if worker_config.prefill_cuda_graph and {
-                    OpCode.DIFFUSION_PREPARE,
-                    OpCode.DIFFUSION_STEP,
-                }.issubset(self._effective_work_variants):
-                    expected_resident_executables += len(
-                        {bucket.executable_key for bucket in lane_flow_buckets}
-                    )
-                    if OpCode.AR_DECODE in self._effective_work_variants:
-                        expected_resident_executables += len(
-                            {bucket.executable_key for bucket in lane_mixed_flow_buckets}
-                        )
-                    expected_resident_executables += len(
-                        {bucket.executable_key for bucket in lane_flow_prefix_buckets}
-                    )
-            output_slots = int(
-                (pipeline_depth if lane is None else lane.max_inflight or pipeline_depth) + 1
-            )
+                    required_resident_families["paged_prefill_bucket"] = len(lane_prefill_catalog)
             return CudaGraphRunner(
                 enabled=worker_config.cuda_graph,
                 prefill_enabled=worker_config.prefill_cuda_graph,
@@ -850,8 +805,7 @@ class Worker:
                 prefill_row_sizes=lane_prefill_row_sizes,
                 stream=stream,
                 expected_context=expected_context,
-                expected_resident_executables=expected_resident_executables,
-                output_slot_count=output_slots,
+                required_resident_families=required_resident_families,
             )
 
         if owns_kv:
@@ -875,7 +829,8 @@ class Worker:
             create_media_resources(
                 model,
                 rank=worker_config.rank,
-                output_rank=worker_config.output_rank,
+                owns_output=model.owns_media_output
+                and worker_config.rank == self.output_rank("output"),
                 state_slots=self._info.request_slots,
                 unresolved_window=self._info.max_unresolved_ops,
             )
@@ -1052,6 +1007,21 @@ class Worker:
             return self._generation_device
         return self._device
 
+    def output_rank(self, entry: str) -> int:
+        """Resolve the host publication owner from the operation's ordered entry.
+
+        Cooperative numerical outputs may reside on different stages. Host
+        products belong to the entry's first member, matching the rank-report
+        join contract. An unconfigured local worker has one possible owner.
+        """
+
+        for component in self._info.components:
+            if component.name == entry:
+                return component.config.ranks[0]
+        if self.worker_config.world_size == 1:
+            return 0
+        raise unsupported_setup(f"computation entry {entry!r} has no publication owner")
+
     def phase_device(self, phase: ModelPhase) -> torch.device:
         """Select the generation device for latent codecs and the model device otherwise."""
 
@@ -1137,6 +1107,24 @@ class Worker:
             ),
             self._end_model_call,
         )
+
+    def release_buffers(self, buffers: Sequence[BufferId]) -> None:
+        """Revoke product acquisition without waiting for existing physical readers.
+
+        Releases can arrive while earlier computation waits to reuse storage.
+        They do not advance request state or acknowledge physical retirement;
+        each owning store retains reader fences and transport registrations.
+        """
+
+        self.device_products.release_buffers(buffers)
+        self.encoder_cache.release_buffers(buffers)
+        if self.cache_pool is not None:
+            self.cache_pool.release_buffers(buffers)
+        if self.latent_pool is not None:
+            self.latent_pool.release_buffers(buffers)
+        for buffer in buffers:
+            for locator in self._transport_publications.get(buffer, ()):
+                self.transports[locator.backend].release(locator)
 
     def _retire_commands(
         self,
@@ -1408,14 +1396,6 @@ class Worker:
                 ),
             ),
         )
-
-    def free_products(self, buffers: tuple[BufferId, ...]) -> None:
-        """Release exact scheduler buffers from device-product and encoder-cache ownership."""
-
-        self.device_products.release_buffers(buffers)
-        self.encoder_cache.release_buffers(buffers)
-        if self.cache_pool is not None:
-            self.cache_pool.release_buffers(buffers)
 
     def close(self) -> None:
         """Release execution, transport, model-state, and distributed resources owned by the worker."""

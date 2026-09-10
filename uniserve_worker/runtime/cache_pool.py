@@ -63,6 +63,8 @@ class CachePool:
         dtype: torch.dtype,
         total_kv_heads: int | None = None,
         kv_head_offset: int = 0,
+        total_layers: int | None = None,
+        layer_offset: int = 0,
         store_dtype: torch.dtype | str | None = None,
         group_ranges: Sequence[tuple[int, int]] | None = None,
         import_capacity: int = 1,
@@ -72,6 +74,8 @@ class CachePool:
         # Normalize scheduler-visible geometry before device allocation so
         # every tensor shares one validated page interpretation.
         self.num_layers = int(num_layers)
+        self.total_layers = self.num_layers if total_layers is None else int(total_layers)
+        self.layer_offset = int(layer_offset)
         self.num_pages = int(num_pages)
         self.num_blocks = self.num_pages
         self.block_size = int(page_size)
@@ -87,6 +91,8 @@ class CachePool:
         self.supports_paged_attention_storage = not self.is_quantized
         if (
             self.num_layers < 1
+            or self.layer_offset < 0
+            or self.layer_offset + self.num_layers > self.total_layers
             or self.num_pages < 1
             or self.block_size < 1
             or self.n_kv < 1
@@ -284,11 +290,15 @@ class CachePool:
                 if future.done():
                     future.result()
         self._reap_sources()
+        # Free retires a publication, not the request's resident KV pages.
+        # Unrelated products can share that request while later computation
+        # still reads its prefix. Only request retirement waits for all such
+        # computations; physical page reuse separately checks their ranges.
         with self._execution_lock:
             executions = tuple(
                 execution
                 for execution in self._executions.values()
-                if execution.requests.intersection(owners | {buffer.owner for buffer in selected})
+                if execution.requests.intersection(owners)
             )
         for execution in executions:
             if execution.completion.done():

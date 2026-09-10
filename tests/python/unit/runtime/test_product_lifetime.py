@@ -8,6 +8,7 @@ import torch
 
 from uniserve_worker.execution.batch import (
     BufferAllocation,
+    BufferId,
     DType,
     PointRange,
     ProductKind,
@@ -27,6 +28,74 @@ from uniserve_worker.runtime.latent_pool import LatentPool
 from uniserve_worker.runtime.persistent_buffers import PersistentBuffers
 from uniserve_worker.transfer.layout import TensorRegion
 from uniserve_worker.transfer.tickets import make_transport
+
+
+def test_compact_persistent_buffers_remap_live_logical_allocations() -> None:
+    reference = ProductRef(
+        request_key=RequestKey(1, 1, 1),
+        producer_op_id=1,
+        output_index=0,
+        generation=1,
+        kind=ProductKind.TENSOR,
+        storage_class=StorageClass.DEVICE_TENSOR,
+        dtype=DType.F32,
+        shape_bound=ShapeBound((StaticDim(32),)),
+        point_range=PointRange(),
+    )
+    second = replace(reference, producer_op_id=2)
+    third = replace(reference, producer_op_id=3)
+    buffers = PersistentBuffers(byte_capacity=512, devices=("cpu",), compact=True)
+    first_binding = buffers.bind(
+        reference,
+        BufferAllocation(reference.buffer_id, 4096, 512),
+        device="cpu",
+        dtype=torch.float32,
+        shape=(32,),
+    )
+    second_binding = buffers.bind(
+        second,
+        BufferAllocation(second.buffer_id, 8192, 512),
+        device="cpu",
+        dtype=torch.float32,
+        shape=(32,),
+    )
+    first_binding.tensor.fill_(1)
+    second_binding.tensor.fill_(2)
+
+    try:
+        torch.testing.assert_close(
+            first_binding.tensor,
+            torch.full_like(first_binding.tensor, 1),
+            rtol=0,
+            atol=0,
+        )
+        with pytest.raises(WorkerError, match="exceeds the worker buffer pool"):
+            buffers.bind(
+                third,
+                BufferAllocation(third.buffer_id, 12288, 512),
+                device="cpu",
+                dtype=torch.float32,
+                shape=(32,),
+            )
+        buffers.release(first_binding)
+        third_binding = buffers.bind(
+            third,
+            BufferAllocation(third.buffer_id, 12288, 512),
+            device="cpu",
+            dtype=torch.float32,
+            shape=(32,),
+        )
+        third_binding.tensor.fill_(3)
+        torch.testing.assert_close(
+            second_binding.tensor,
+            torch.full_like(second_binding.tensor, 2),
+            rtol=0,
+            atol=0,
+        )
+        buffers.release(third_binding)
+    finally:
+        buffers.release(second_binding)
+        buffers.close()
 
 
 @pytest.mark.parametrize("device", ("cpu", pytest.param("cuda:0", marks=pytest.mark.gpu)))
@@ -61,6 +130,9 @@ def test_kv_computation_retains_pages_through_output_completion_and_reuse(
         for actual in cache.read(0, (2,), start=0, length=4):
             torch.testing.assert_close(actual, independent, rtol=0, atol=0)
         assert not cache.retirement_ready(requests=(request,))
+        # Releasing another product of this request does not retire its KV
+        # computation. The execution fence still protects page reuse above.
+        assert cache.retirement_ready(buffers=(BufferId(request, 2, 0, 2),))
 
         source = cache.transfer_views((1,), group=0, start=0, length=3)[0][0]
         if stream is not None:
@@ -158,6 +230,7 @@ def test_fp8_kv_append_preserves_page_scales_until_page_reuse(device: str) -> No
 
 def test_published_kv_prefix_allows_append_and_waits_for_every_reader_before_reuse() -> None:
     events = DeviceEventPool()
+    outputs = OutputPool(capacity=1, max_words=8, event_pool=events)
     transport = make_transport("local", byte_capacity=4096, ticket_capacity=2, event_pool=events)
     pool = CachePool(
         num_layers=1,
@@ -212,10 +285,23 @@ def test_published_kv_prefix_allows_append_and_waits_for_every_reader_before_reu
             pool.zero_pages(0, (3,))
         torch.testing.assert_close(readers[1].result(), -prefix, rtol=0, atol=0)
         dependencies = pool.write_dependencies(pages, group=0, start=0, length=3)
+        output = outputs.acquire(1, token_capacity=8, devices=("cpu",))
+        pool.retain_execution(
+            product.request_key,
+            pages,
+            group=0,
+            length=3,
+            completion=output.completion_future(),
+        )
         readers[1].close()
         for future in dependencies:
             future.result(timeout=5)
         assert pool.retirement_ready(buffers=(product.buffer_id,))
+        assert not pool.retirement_ready(requests=(product.request_key,))
+        with pytest.raises(WorkerError, match="executing producer or consumer"):
+            pool.zero_pages(0, (3,))
+        output.seal()
+        output.abandon()
         pool.zero_pages(0, (3,))
         keys, values = pool.read(0, pages, start=0, length=3)
         torch.testing.assert_close(keys, torch.zeros_like(prefix), rtol=0, atol=0)
@@ -226,6 +312,7 @@ def test_published_kv_prefix_allows_append_and_waits_for_every_reader_before_reu
         for location in locations:
             transport.release(location)
         transport.close()
+        outputs.close()
         pool.close()
         events.close()
 
@@ -246,7 +333,7 @@ def test_free_retains_an_acquired_consumer_until_it_records_completion(kind: Pro
         )
         if kind is ProductKind.VISION_FEATURE
         else DeviceProducts(
-            capacity=1, byte_capacity=16, persistent_buffers=buffers, event_pool=events
+            capacity=1, byte_capacity=1, persistent_buffers=buffers, event_pool=events
         )
     )
     product = ProductRef(

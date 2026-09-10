@@ -60,7 +60,6 @@ if triton is not None:
         output_offsets = tile * output_stride_tile + head * output_stride_head + columns
 
         # Query and key owners may cover different global tile intervals.
-        # Keep the same reduction and rounding for all physical partitions.
         if tile < query_tiles:
             query_valid_rows = tl.load(valid_sizes + query_tile_offset + tile)
             query_values = tl.load(
@@ -354,7 +353,7 @@ def _pack_qkv(
     """Allocate and return packed ``[3, heads, rows, width]`` Q/K/V storage."""
 
     if triton is None or not triton_available(query.device):
-        raise RuntimeError("FastH3 SM100a QKV packing requires Triton")
+        raise RuntimeError("sparse QKV packing requires Triton")
 
     rows, heads, width = (int(size) for size in query.shape)
     packed = torch.empty(
@@ -404,7 +403,7 @@ def _pool_qkv_means(
     """Average each Q/K/V head across fixed 64-row tiles into output buffers."""
 
     if triton is None or not triton_available(query.device):
-        raise RuntimeError("FastH3 VSA fused pooling requires Triton")
+        raise RuntimeError("sparse tile pooling requires Triton")
 
     rows, heads, width = (int(size) for size in query.shape)
     tiles = key.shape[0] // 64
@@ -420,7 +419,7 @@ def _pool_qkv_means(
         or query_tile_offset + query_tiles > valid_sizes.numel()
         or key_tile_offset + tiles > valid_sizes.numel()
     ):
-        raise ValueError("FastH3 VSA pooling metadata does not cover Q/K tile intervals")
+        raise ValueError("sparse pooling metadata does not cover Q/K tile intervals")
 
     # One program owns a tile/head pair and reduces only the live prefix given
     # by ``valid_sizes``; the final tile may therefore be partially occupied.
@@ -503,7 +502,7 @@ def _threshold_topk_indices(scores: torch.Tensor, output: torch.Tensor) -> None:
     """Fill ``output`` with threshold-selected indices for every score row."""
 
     if triton is None or not triton_available(scores.device):
-        raise RuntimeError("FastH3 VSA fused top-k requires Triton")
+        raise RuntimeError("sparse threshold selection requires Triton")
 
     heads, rows, columns = (int(size) for size in scores.shape)
     selected = int(output.shape[-1])
@@ -553,7 +552,7 @@ def _unpack_add_compression(
     """Write ``attended + gate * compressed_tile`` in row-major output layout."""
 
     if triton is None or not triton_available(attended.device):
-        raise RuntimeError("FastH3 SM100a output fusion requires Triton")
+        raise RuntimeError("sparse output composition requires Triton")
 
     rows, heads, width = (int(size) for size in gate.shape)
 
@@ -592,7 +591,7 @@ def _compose_to_head_shards(
     """Compose values and scatter this rank's heads into exchange shards."""
 
     if triton is None or not triton_available(attended.device):
-        raise RuntimeError("FastH3 SM100a output exchange requires Triton")
+        raise RuntimeError("sparse head-shard composition requires Triton")
 
     rows, local_heads, width = (int(size) for size in gate.shape)
     local_rows = int(outputs[0].shape[0])

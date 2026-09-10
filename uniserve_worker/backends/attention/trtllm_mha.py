@@ -62,6 +62,7 @@ class TRTLLMMHAAttentionBackend(AttentionBackend):
     paged_varlen_cuda_graph = available
     cuda_only = True
     min_compute_version = (10, 0)
+    max_compute_version = (10, 9)
     dense_ranks = frozenset()
 
     def __init__(self, *, tuning: FlashInferTuningConfig) -> None:
@@ -100,7 +101,7 @@ class TRTLLMMHAAttentionBackend(AttentionBackend):
         scale: float,
         context: ForwardBatch | None = None,
     ) -> torch.Tensor:
-        """Write current K/V and execute TensorRT-LLM paged decode on SM100 or newer."""
+        """Write current K/V and execute TensorRT-LLM paged decode on SM10x."""
 
         del causal
         if _trtllm_decode is None:
@@ -199,7 +200,7 @@ class TRTLLMMHAAttentionBackend(AttentionBackend):
 
         q_bhd, restore = normalize_to(q, QKVLayout.BHD)
         _validate_paged_cache(q_bhd, k_cache, v_cache)
-        _require_sm100(q_bhd.device)
+        _require_sm10x(q_bhd.device)
         return _PagedDecodeInputs(
             q=q_bhd,
             block_table=block_table.to(device=q_bhd.device, dtype=torch.int32).contiguous(),
@@ -220,7 +221,7 @@ class TRTLLMMHAAttentionBackend(AttentionBackend):
             raise RuntimeError("trtllm_mha varlen path requires a paged KV block table")
         if q.ndim != 3:
             raise ValueError("trtllm_mha varlen expects q in [total, heads, dim] layout")
-        _require_sm100(q.device)
+        _require_sm10x(q.device)
         block_table = block_table.to(device=q.device, dtype=torch.int32).contiguous()
         cu_seqlens_q = cu_seqlens_q.to(device=q.device, dtype=torch.int32).contiguous()
         cu_seqlens_k = cu_seqlens_k.to(device=q.device, dtype=torch.int32).contiguous()
@@ -332,11 +333,11 @@ def _canonicalize_stride(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.as_strided(sizes, new_strides)
 
 
-def _require_sm100(device: torch.device) -> None:
-    """Require an indexed CUDA device with Blackwell compute capability."""
+def _require_sm10x(device: torch.device) -> None:
+    """Require an indexed CUDA device supported by TRTLLM-Gen FMHA."""
 
     if device.type != "cuda":
         raise RuntimeError("trtllm_mha requires CUDA tensors")
     major, minor = torch.cuda.get_device_capability(device)
-    if (int(major), int(minor)) < (10, 0):
-        raise RuntimeError("trtllm_mha requires compute capability 10.0 or newer")
+    if int(major) != 10:
+        raise RuntimeError("trtllm_mha requires compute capability 10.x")

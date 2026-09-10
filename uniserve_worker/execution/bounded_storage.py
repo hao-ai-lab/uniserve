@@ -64,6 +64,7 @@ class BoundedTensorStorage:
         device: torch.device | str,
         *,
         environment: DistributedEnvironment | None = None,
+        layout: tuple[object, ...] = (),
     ) -> BoundedTensorStorage:
         """Allocate the declared tensor capacities on the publicly assigned device."""
 
@@ -76,7 +77,7 @@ class BoundedTensorStorage:
                 if field.group.device != torch.device(device):
                     raise ValueError("shared tensor storage must use the group's assigned device")
                 symmetric = environment.symmetric_memory(
-                    field.group, field.shape, dtype=field.dtype, name=name, layout=()
+                    field.group, field.shape, dtype=field.dtype, name=name, layout=layout
                 )
                 tensors[name] = symmetric.local
                 peers[name] = symmetric.peers

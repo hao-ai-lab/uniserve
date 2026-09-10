@@ -11,6 +11,10 @@ pub struct KvCacheConfig {
     pub num_blocks: u32,
     /// Transformer layers represented in the cache.
     pub num_layers: u32,
+    /// Transformer layers in the complete logical cache.
+    pub total_layers: u32,
+    /// First logical layer stored by this rank.
+    pub layer_offset: u32,
     /// KV heads stored per layer.
     pub num_kv_heads: u32,
     /// Logical model KV heads across all tensor-parallel members.
@@ -42,7 +46,7 @@ impl KvCacheConfig {
         } else {
             0
         };
-        (2 * u64::from(self.num_layers))
+        (2 * u64::from(self.total_layers))
             .saturating_mul(u64::from(self.total_kv_heads))
             .saturating_mul(head_bytes + scale_bytes)
     }
@@ -54,6 +58,8 @@ impl KvCacheConfig {
             self.block_size > 0
                 && self.num_blocks > 0
                 && self.num_layers > 0
+                && u64::from(self.layer_offset) + u64::from(self.num_layers)
+                    <= u64::from(self.total_layers)
                 && self.num_kv_heads > 0
                 && u64::from(self.kv_head_offset) + u64::from(self.num_kv_heads)
                     <= u64::from(self.total_kv_heads)
@@ -498,6 +504,8 @@ impl Default for WorkerInfo {
                 block_size: 64,
                 num_blocks: 4096,
                 num_layers: 28,
+                total_layers: 28,
+                layer_offset: 0,
                 num_kv_heads: 8,
                 total_kv_heads: 8,
                 kv_head_offset: 0,

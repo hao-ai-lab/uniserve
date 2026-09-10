@@ -9,7 +9,6 @@ from typing import cast
 import torch
 from torch import nn
 
-from ...backends.attention.torch_sdpa import TorchSDPAAttentionBackend
 from ...media.codec import blend_decoded_overlap, video_segment_rgb
 from ...nn.attention import RadixAttention
 from ...nn.layer import LayerConfig
@@ -79,7 +78,7 @@ class _Attention(nn.Module):
         self.heads = heads
         self.head_dim = head_dim
         self.attention = RadixAttention(
-            heads, heads, head_dim, dense_provider=TorchSDPAAttentionBackend()
+            heads, heads, head_dim
         )
         self.to_q = LinearBase(width, width, layer_config=layer_config, prefix="to_q")
         self.to_k = LinearBase(width, width, layer_config=layer_config, prefix="to_k")

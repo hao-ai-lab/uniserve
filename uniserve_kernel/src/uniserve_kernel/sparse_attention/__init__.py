@@ -6,10 +6,12 @@ from pathlib import Path
 import torch
 
 
-def available() -> bool:
+def available(device: torch.device | None = None) -> bool:
     """Resolve the required native artifact before serving or CUDA capture."""
 
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+    # The extension contains sm_100a code, whose architecture-conditional
+    # instructions do not carry the major-version cubin compatibility promise.
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability(device) != (10, 0):
         return False
     _extension()
     return True

@@ -281,6 +281,8 @@ pub(super) struct RankProcess {
     info: WorkerInfo,
     startup_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     child: Child,
+    /// Keep the shared store directory until every process in the group exits.
+    _rendezvous: Option<std::sync::Arc<tempfile::TempDir>>,
     depth: usize,
     rank: u32,
     world_size: u32,
@@ -322,7 +324,7 @@ impl RankProcess {
         device: &str,
         rank: u32,
         world_size: u32,
-        distributed_init_method: Option<&str>,
+        rendezvous: Option<std::sync::Arc<tempfile::TempDir>>,
         components: &std::collections::BTreeMap<String, crate::executor::EntryConfig>,
         startup_abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> anyhow::Result<Self> {
@@ -401,10 +403,10 @@ impl RankProcess {
             };
             cmd.env("PYTORCH_CUDA_ALLOC_CONF", allocation);
         }
-        if world_size > 1
-            && let Some(init_method) = distributed_init_method
-        {
-            cmd.arg("--distributed-init-method").arg(init_method);
+        if let Some(directory) = &rendezvous {
+            let store = directory.path().join("store");
+            cmd.arg("--distributed-init-method")
+                .arg(format!("file://{}", store.display()));
         }
         if let Some(c) = args.kv_token_capacity {
             cmd.arg("--kv-token-capacity").arg(c.to_string());
@@ -425,6 +427,7 @@ impl RankProcess {
             info: WorkerInfo::default(),
             startup_cancel: Some(startup_abort),
             child,
+            _rendezvous: rendezvous,
             depth,
             rank,
             world_size,
